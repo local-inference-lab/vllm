@@ -577,6 +577,32 @@ def test_gdn_prefill_checkpoint_refreshes_reused_block_table() -> None:
     )
 
 
+def test_gdn_packed_checkpoints_cover_internal_boundaries_and_empty_ranges() -> None:
+    builder = _create_gdn_builder(num_prefill_checkpoint_blocks=4)
+    builder.vllm_config.cache_config.mamba_cache_mode = "align"
+    batch = BatchSpec(seq_lens=[65, 48, 33], query_lens=[65, 16, 17])
+    common = create_common_attn_metadata(
+        batch,
+        BLOCK_SIZE,
+        DEVICE,
+        arange_block_indices=True,
+    ).replace(is_prefilling=torch.tensor([True, True, True]))
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    checkpoint = metadata.prefill_checkpoint
+    assert checkpoint is not None
+    assert checkpoint.checkpoint_offsets.tolist() == [16, 32, 48, 64, 16]
+    assert checkpoint.checkpoint_indptr.tolist() == [0, 4, 4, 5]
+    assert checkpoint.checkpoint_query_indices.tolist() == [0, 0, 0, 0, 2]
+    assert checkpoint.request_rows.tolist() == [0, 0, 0, 0, 2]
+    assert checkpoint.block_table_columns.tolist() == [0, 1, 2, 3, 1]
+    replacement = common.block_table_tensor + 100
+    updated = builder.update_block_table(metadata, replacement, common.slot_mapping)
+    torch.testing.assert_close(
+        updated.prefill_checkpoint.state_indices,
+        replacement[checkpoint.request_rows, checkpoint.block_table_columns],
+    )
+
+
 def test_gdn_update_block_table_uses_current_builders_graph_buffers() -> None:
     builder_a = _create_gdn_builder(full_cuda_graph=True)
     builder_b = _create_gdn_builder(full_cuda_graph=True)

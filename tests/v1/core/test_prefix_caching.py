@@ -4580,6 +4580,83 @@ def test_mamba_reachable_block_mask_sparsifies_retention():
     assert retained(0) == {14}
 
 
+@pytest.mark.parametrize("draft_slots", [0, 3, 7])
+@pytest.mark.parametrize("dcp", [1, 4])
+def test_mamba_packed_prefill_preserves_block_tables_and_releases_old_states(
+    draft_slots, dcp
+):
+    """Dense checkpoint output must not relocate worker-visible scratch columns."""
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((2, 2),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=draft_slots,
+        num_prefill_checkpoint_blocks=4,
+    )
+    pool = BlockPool(64, enable_caching=True, hash_block_size=16)
+    manager = MambaManager(
+        spec,
+        pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=64,
+        dcp_world_size=dcp,
+    )
+    request_id = "packed-state-query"
+    count = manager.get_num_blocks_to_allocate(request_id, 64, (), 0, 0, 64)
+    assert count == 4 + draft_slots
+    first = manager.allocate_new_blocks(request_id, 64, 64)
+    assert len(first) == count
+    assert all(not block.is_null for block in manager.req_to_blocks[request_id])
+    manager.remove_skipped_blocks(request_id, 64)
+    table = list(manager.req_to_blocks[request_id])
+    assert all(block.is_null for block in table[:3])
+    assert not table[3].is_null
+    count = manager.get_num_blocks_to_allocate(request_id, 128, (), 64, 64, 128)
+    assert count == 4
+    appended = manager.allocate_new_blocks(request_id, 128, 128)
+    assert len(appended) == count
+    assert manager.req_to_blocks[request_id][: len(table)] == table
+    for column in spec.prefill_checkpoint_indices(64, 128):
+        assert not manager.req_to_blocks[request_id][column].is_null
+    manager.remove_skipped_blocks(request_id, 128)
+    assert all(block.is_null for block in manager.req_to_blocks[request_id][:7])
+    remaining = manager.pop_blocks_for_free(request_id)
+    pool.free_blocks(remaining)
+    assert pool.get_num_free_blocks() == 63
+
+
+def test_mamba_packed_prefill_bounds_admission_to_one_query():
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((2, 2),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=4,
+    )
+    manager = MambaManager(
+        spec,
+        BlockPool(64, True, 16),
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=64,
+    )
+    assert (
+        manager.get_num_blocks_to_allocate(
+            "admission", 1000000, (), 0, 0, 1000000, apply_admission_cap=True
+        )
+        == 5
+    )
+    with pytest.raises(ValueError, match="declared capacity"):
+        spec.prefill_checkpoint_indices(0, 96)
+    assert spec.prefill_checkpoint_indices(17, 64) == ()
+
+
 def test_mamba_reachable_block_mask_pins_shared_prefix():
     """A Marconi-detected shared prefix (``shared_prefix_boundary``) lands before
     ``num_prompt`` so the replay-boundary rule alone would drop it. The mask must

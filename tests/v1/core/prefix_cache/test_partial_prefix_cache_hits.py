@@ -1381,6 +1381,89 @@ def test_hybrid_mamba_moved_partial_entry_defers_same_step_hit():
     assert manager.allocate_slots(req1, 2, num_computed, computed_blocks) is not None
 
 
+@pytest.mark.parametrize("dcp", [1, 4])
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_divergent_sibling_reuses_retained_recurrent_anchor(dcp, use_eagle):
+    """An attention page must authenticate a retained interior state boundary."""
+    hash_size = 2
+    attention_span = 16 * dcp
+    prompt_len = attention_span + 8
+    shared_tokens = prompt_len - hash_size
+    hit_tokens = shared_tokens - (hash_size if use_eagle else 0)
+    manager = make_full_mamba_manager(
+        dcp_world_size=dcp,
+        full_block_size=16,
+        mamba_block_size=hash_size,
+        hash_block_size=hash_size,
+        num_blocks=64,
+        use_eagle=use_eagle,
+    )
+    producer = make_request("producer", list(range(prompt_len)), hash_size, sha256)
+    # Materialize the exact recurrent states that a scheduler may retain.
+    # This isolates attention indexing from recurrent checkpoint production.
+    for endpoint in (attention_span, hit_tokens, shared_tokens, prompt_len):
+        if endpoint <= producer.num_computed_tokens:
+            continue
+        assert (
+            manager.allocate_slots(producer, endpoint - producer.num_computed_tokens)
+            is not None
+        )
+        producer.num_computed_tokens = endpoint
+        manager.new_step_starts()
+    state_hash = producer.block_hashes[hit_tokens // hash_size - 1]
+    assert manager.block_pool.get_cached_block(state_hash, [1]) is not None
+    manager.free(producer)
+
+    sibling = make_request(
+        "sibling",
+        list(range(shared_tokens)) + [1001, 1002],
+        hash_size,
+        sha256,
+    )
+    cached, hit, _ = manager.get_computed_blocks(sibling)
+    assert hit == hit_tokens
+    assert hit > attention_span
+    source_tail = cached.blocks[0][-1]
+    assert manager.allocate_slots(sibling, prompt_len - hit, hit, cached) is not None
+    private_tail = manager.get_blocks(sibling.request_id).blocks[0][-1]
+    assert private_tail.block_id != source_tail.block_id
+    copies, retained = manager.take_kv_cache_block_copies()
+    assert KVCacheBlockCopy(source_tail.block_id, private_tail.block_id) in copies
+    manager.block_pool.free_blocks(retained)
+    manager.free(sibling)
+    manager.new_step_starts()
+    assert manager.reset_prefix_cache()
+    _, hit_after_reset, _ = manager.get_computed_blocks(sibling)
+    assert hit_after_reset == 0
+
+
+@pytest.mark.parametrize("dcp", [1, 4])
+def test_packed_prefill_checkpoints_reuse_arbitrary_interior_prefix(dcp):
+    """A first sibling can reuse an internal, non-terminal checkpoint."""
+    hash_size = 16
+    manager = make_full_mamba_manager(
+        dcp_world_size=dcp,
+        full_block_size=64,
+        mamba_block_size=hash_size,
+        hash_block_size=hash_size,
+        num_blocks=128,
+        num_prefill_checkpoint_blocks=7,
+    )
+    producer = make_request("producer", list(range(256)), hash_size, sha256)
+    for endpoint in (128, 256):
+        assert (
+            manager.allocate_slots(producer, endpoint - producer.num_computed_tokens)
+            is not None
+        )
+        producer.num_computed_tokens = endpoint
+        manager.new_step_starts()
+    manager.free(producer)
+
+    sibling = make_request("sibling", list(range(80)) + [1001] * 32, hash_size, sha256)
+    _, hit, _ = manager.get_computed_blocks(sibling)
+    assert hit == 80
+
+
 def test_hybrid_full_attention_partial_hash_hit_uses_cow():
     hash_block_size = 2
     block_size = 2 * hash_block_size

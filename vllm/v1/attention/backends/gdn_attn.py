@@ -77,7 +77,7 @@ class GDNAttentionBackend(AttentionBackend):
 
 @dataclass
 class GDNPrefillCheckpointMetadata:
-    """One recurrent-state checkpoint inside each packed prefill sequence.
+    """Recurrent-state checkpoints inside packed prefill sequences.
 
     ``checkpoint_offsets`` are relative to the corresponding packed query.
     ``request_rows`` and ``block_table_columns`` identify the cache slots that
@@ -89,6 +89,8 @@ class GDNPrefillCheckpointMetadata:
     state_indices: torch.Tensor
     request_rows: torch.Tensor
     block_table_columns: torch.Tensor
+    checkpoint_indptr: torch.Tensor | None = None
+    checkpoint_query_indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -674,9 +676,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and self.kv_cache_spec.num_prefill_checkpoint_blocks > 0
             and self.vllm_config.cache_config.mamba_cache_mode == "align"
         ):
-            # FlashKDA can materialize one state at a cache-block boundary
-            # without splitting the target-model forward. Only prefill rows
-            # participate, in the same order as prefill_query_start_loc.
+            # Export the backend's supported internal cache boundaries without
+            # splitting the target forward. Only prefill rows participate, in
+            # the same order as prefill_query_start_loc.
             assert m.seq_lens_cpu_upper_bound is not None
             all_query_lens = query_start_loc_cpu.diff().tolist()
             if spec_sequence_masks_cpu is None:
@@ -693,9 +695,26 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             block_size = self.kv_cache_spec.block_size
             checkpoint_offsets: list[int] = []
             checkpoint_columns: list[int] = []
-            for row in request_rows:
+            packed = self.kv_cache_spec.num_prefill_checkpoint_blocks > 1
+            checkpoint_indptr = [0]
+            checkpoint_query_indices: list[int] = []
+            checkpoint_request_rows: list[int] = []
+            for query_index, row in enumerate(request_rows):
                 query_len = all_query_lens[row]
                 seq_len = seq_lens[row]
+                if packed:
+                    columns = self.kv_cache_spec.prefill_checkpoint_indices(
+                        seq_len - query_len, seq_len
+                    )
+                    checkpoint_columns.extend(columns)
+                    checkpoint_offsets.extend(
+                        (column + 1) * block_size - (seq_len - query_len)
+                        for column in columns
+                    )
+                    checkpoint_query_indices.extend([query_index] * len(columns))
+                    checkpoint_request_rows.extend([row] * len(columns))
+                    checkpoint_indptr.append(len(checkpoint_offsets))
+                    continue
                 offset = seq_len // block_size * block_size - (seq_len - query_len)
                 valid = (
                     seq_len % block_size != 0
@@ -714,7 +733,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     device=query_start_loc.device,
                 )
                 request_rows_tensor = async_tensor_h2d(
-                    request_rows,
+                    checkpoint_request_rows if packed else request_rows,
                     dtype=torch.int64,
                     device=query_start_loc.device,
                 )
@@ -736,6 +755,24 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     state_indices=checkpoint_state_indices,
                     request_rows=request_rows_tensor,
                     block_table_columns=checkpoint_columns_tensor,
+                    checkpoint_indptr=(
+                        async_tensor_h2d(
+                            checkpoint_indptr,
+                            dtype=torch.int32,
+                            device=query_start_loc.device,
+                        )
+                        if packed
+                        else None
+                    ),
+                    checkpoint_query_indices=(
+                        async_tensor_h2d(
+                            checkpoint_query_indices,
+                            dtype=torch.int64,
+                            device=query_start_loc.device,
+                        )
+                        if packed
+                        else None
+                    ),
                 )
 
         # Function code counted on either presency non-spec decode or spec decode,

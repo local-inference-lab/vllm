@@ -32,3 +32,28 @@ def test_restore_accepts_specialized_scalar_indices(slot, block, size):
     expected = torch.full((3, size), 165, dtype=torch.uint8)
     expected[slot].copy_(pool_cpu[block, 5 : 5 + size])
     torch.testing.assert_close(destination.cpu(), expected)
+
+
+def test_restore_keeps_page_offsets_above_signed_int32():
+    size, offset = 1057, 5
+    width = size + 11
+    block = (2**31 + width - 1) // width
+    # Initialize only the selected page; its byte offset must exceed 2 GiB.
+    pool = torch.empty((block + 1, width), dtype=torch.uint8, device="cuda")
+    source = torch.arange(width).to(torch.uint8)
+    pool[block].copy_(source)
+    destination = torch.full((3, size), 165, dtype=torch.uint8, device="cuda")
+    metadata = torch.tensor(
+        [[destination.data_ptr(), destination.stride(0), size, offset]],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    assert block * pool.stride(0) >= 2**31
+
+    _restore_auxiliary_state_kernel[(1,)](
+        metadata, pool, pool.stride(0), block, 1, BLOCK=1024
+    )
+
+    expected = torch.full((3, size), 165, dtype=torch.uint8)
+    expected[1].copy_(source[offset : offset + size])
+    torch.testing.assert_close(destination.cpu(), expected)

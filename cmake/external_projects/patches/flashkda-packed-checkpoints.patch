@@ -1,0 +1,554 @@
+diff --git a/README.md b/README.md
+index 15583bbdd98087e4799fe921542a869a69f982f8..1b8e4caf17038075d69ff0c3df068c6de98601af 100644
+--- a/README.md
++++ b/README.md
+@@ -74,7 +74,7 @@ bash tests/test.sh
+ ```
+ 
+ - `tests/test_fwd.py` — correctness tests (exact match against the torch reference; compared with `flash-linear-attention`)
+-- `tests/test_vsplit.py` — bitwise coverage for the experimental V-split K2 path
++- `tests/test_vsplit.py` — K2 dispatch, packed checkpoint export, independent prefix-state comparisons and CUDA graph replay
+ 
+ 
+ ## Kernel API
+@@ -84,7 +84,8 @@ bash tests/test.sh
+ ```python
+ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
+               initial_state=None, final_state=None, cu_seqlens=None,
+-              workspace=None)
++              workspace=None, checkpoint_state=None,
++              checkpoint_offsets=None, checkpoint_indptr=None)
+ ```
+ 
+ **Parameters:**
+@@ -105,6 +106,9 @@ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
+ | `final_state` | bf16/fp32/None | `[B, H, V, K]` or `[N, H, V, K]` | (optional, output) Final recurrent state |
+ | `cu_seqlens` | int32/int64 | `[N+1]` | (optional) Cumulative sequence lengths for variable-length batching |
+ | `workspace` | uint8/None | `[workspace_size]` | (optional) Reusable workspace; allocated automatically when omitted |
++| `checkpoint_state` | fp32/None | `[P, H, V, K]` | (optional, output) Recurrent states at selected sequence offsets |
++| `checkpoint_offsets` | int32/int64/None | `[P]` | (optional) Sequence-relative checkpoint offsets |
++| `checkpoint_indptr` | int32/int64/None | `[N+1]` | (optional) Per-sequence ranges in the packed checkpoint arrays |
+ 
+ - Currently requires `K = V = 128`.
+ - `initial_state` / `final_state` accept `None` (stateless), bf16, or fp32 tensors. When both are provided, their dtypes must match.
+@@ -114,6 +118,31 @@ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
+   `2 * H * N <= SM count`, targeting workloads with insufficient CTA-level
+   parallelism.
+ 
++### Packed recurrent checkpoints
++
++Status: implemented. A caller can export several recurrent states during one
++prefill without splitting the query into separate model forwards. These outputs
++do not replace `final_state` and do not change the main attention output.
++
++Provide `checkpoint_state` and `checkpoint_offsets` together. All checkpoint
++tensors must be contiguous CUDA tensors on the query device. Offsets use the
++same integer dtype as `cu_seqlens`, or int64 for fixed-length input. The caller
++owns and retains the output buffers through execution and graph replay.
++
++With `checkpoint_indptr`, sequence `i` owns rows
++`[checkpoint_indptr[i], checkpoint_indptr[i+1])`. The ranges must partition
++`[0, P)` without overlap; empty ranges are allowed. Offsets within each range
++must be strictly increasing, positive multiples of 16, no greater than that
++sequence's length. For example, `indptr=[0,2,2,3]` and
++`offsets=[256,512,256]` export two states from sequence 0, none from sequence 1,
++and one from sequence 2. These GPU-resident ordering/range invariants are the
++caller's responsibility; no device-to-host validation is inserted into forward.
++
++Without `checkpoint_indptr`, the single-checkpoint interface is preserved:
++`P=N`, with one offset per sequence; offset zero disables that sequence's
++checkpoint. Exported states retain FP32 recurrence precision even if the
++requested final-state buffer is BF16.
++
+ ## Development
+ 
+ To set up IntelliSense (clangd) for the CUDA/C++ sources, run:
+diff --git a/csrc/flash_kda.cpp b/csrc/flash_kda.cpp
+index a10d7fea059fc672246b9d86d2b9443998f81ccc..8cc0499cde06a1adcfdb83f6268192745178e6c6 100644
+--- a/csrc/flash_kda.cpp
++++ b/csrc/flash_kda.cpp
+@@ -44,7 +44,8 @@ void fwd(
+     std::optional<Tensor> final_state,
+     std::optional<Tensor> cu_seqlens,
+     std::optional<Tensor> checkpoint_state,
+-    std::optional<Tensor> checkpoint_offsets
++    std::optional<Tensor> checkpoint_offsets,
++    std::optional<Tensor> checkpoint_indptr
+ ) {
+     STD_TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
+                     "all tensors must be on CUDA");
+@@ -64,6 +65,8 @@ void fwd(
+     STD_TORCH_CHECK(
+         has_checkpoint == checkpoint_offsets.has_value(),
+         "checkpoint_state and checkpoint_offsets must be provided together");
++    STD_TORCH_CHECK(!checkpoint_indptr.has_value() || has_checkpoint,
++                    "checkpoint_indptr requires checkpoint outputs");
+     bool state_fp32 = false;
+ 
+     if (has_state_in) {
+@@ -216,17 +219,35 @@ void fwd(
+     if (has_checkpoint) {
+         auto& cs = checkpoint_state.value();
+         auto& co = checkpoint_offsets.value();
++        const int64_t checkpoint_count = co.numel();
+         STD_TORCH_CHECK(
+-            cs.dim() == 4 && cs.size(0) == N_val && cs.size(1) == H &&
++            cs.dim() == 4 && cs.size(0) == checkpoint_count && cs.size(1) == H &&
+                 cs.size(2) == D && cs.size(3) == D,
+-            "checkpoint_state must be [N, H, D, D]");
++            "checkpoint_state must be [P, H, D, D], with one row per checkpoint offset");
+         STD_TORCH_CHECK(
+-            co.dim() == 1 && co.size(0) == N_val,
+-            "checkpoint_offsets must be [N]");
++            co.dim() == 1,
++            "checkpoint_offsets must be [P]");
+         STD_TORCH_CHECK(
+             co.scalar_type() ==
+                 (cu_seqlens_is_int32 ? ScalarType::Int : ScalarType::Long),
+             "checkpoint_offsets and cu_seqlens must have matching dtypes");
++        if (checkpoint_indptr.has_value()) {
++            auto& ci = checkpoint_indptr.value();
++            STD_TORCH_CHECK(ci.is_cuda() && ci.is_contiguous(),
++                            "checkpoint_indptr must be a contiguous CUDA tensor");
++            STD_TORCH_CHECK(ci.scalar_type() == co.scalar_type(),
++                            "checkpoint_indptr and checkpoint_offsets must have matching dtypes");
++            STD_TORCH_CHECK(ci.dim() == 1 && ci.numel() == N_val + 1,
++                            "checkpoint_indptr must be [N+1]");
++            STD_TORCH_CHECK(ci.get_device_index() == q.get_device_index(),
++                            "checkpoint_indptr must be on the query device");
++        } else {
++            STD_TORCH_CHECK(checkpoint_count == N_val,
++                            "checkpoint_offsets must be [N] without checkpoint_indptr");
++        }
++        STD_TORCH_CHECK(cs.get_device_index() == q.get_device_index() &&
++                            co.get_device_index() == q.get_device_index(),
++                        "checkpoint tensors must be on the query device");
+     }
+ 
+     int total_tiles;
+@@ -241,11 +262,16 @@ void fwd(
+         SeqlenPtr typed_checkpoint_offsets = has_checkpoint
+             ? static_cast<SeqlenPtr>(checkpoint_offsets->const_data_ptr())
+             : nullptr;
++        SeqlenPtr typed_checkpoint_indptr = checkpoint_indptr.has_value()
++            ? static_cast<SeqlenPtr>(checkpoint_indptr->const_data_ptr())
++            : nullptr;
++        int64_t num_checkpoints = has_checkpoint ? checkpoint_offsets->numel() : 0;
+         #define LAUNCH(HI, HO, FP32, CKPT, VL) \
+             launch_fwd<128, HI, HO, FP32, CKPT, VL>( \
+                 q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
+                 initial_state_raw, scale_f, final_state_raw, \
+-                checkpoint_state_raw, typed_checkpoint_offsets, out_ptr, \
++                checkpoint_state_raw, typed_checkpoint_offsets, \
++                typed_checkpoint_indptr, num_checkpoints, out_ptr, \
+                 workspace_ptr, total_tiles, \
+                 int(T_total), int(H), int(N_val), typed_cu_seqlens, \
+                 A_log_ptr, dt_bias_ptr, gate_scale, use_vsplit, stream)
+diff --git a/csrc/flash_kda.h b/csrc/flash_kda.h
+index e7f708f9d0dc1dd9360748c6fd224d22b95992a0..e11079a9f4e86de82d3df9a0628e1bc110bed533 100644
+--- a/csrc/flash_kda.h
++++ b/csrc/flash_kda.h
+@@ -22,4 +22,5 @@ void fwd(
+     std::optional<torch::stable::Tensor> final_state = std::nullopt,
+     std::optional<torch::stable::Tensor> cu_seqlens = std::nullopt,
+     std::optional<torch::stable::Tensor> checkpoint_state = std::nullopt,
+-    std::optional<torch::stable::Tensor> checkpoint_offsets = std::nullopt);
++    std::optional<torch::stable::Tensor> checkpoint_offsets = std::nullopt,
++    std::optional<torch::stable::Tensor> checkpoint_indptr = std::nullopt);
+diff --git a/csrc/fwd.h b/csrc/fwd.h
+index c59b2a339d6ef73483db229b4650489460778595..3440dcc8d0e3596380242f8622a9b0f9015a59c6 100644
+--- a/csrc/fwd.h
++++ b/csrc/fwd.h
+@@ -22,6 +22,8 @@ void launch_fwd(
+     void* final_state_ptr,
+     float* checkpoint_state_ptr,
+     SeqlenT const* checkpoint_offsets_ptr,
++    SeqlenT const* checkpoint_indptr_ptr,
++    int64_t num_checkpoints,
+     cutlass::bfloat16_t* out_ptr,
+     void* workspace_ptr,
+     int total_tiles,
+diff --git a/csrc/smxx/fwd_kernel2.cuh b/csrc/smxx/fwd_kernel2.cuh
+index add4054ff296d648f3d54ef333f37d2db78d0845..ac6828d00ec393010a4bdd11b5c7f47caadce841 100644
+--- a/csrc/smxx/fwd_kernel2.cuh
++++ b/csrc/smxx/fwd_kernel2.cuh
+@@ -149,6 +149,8 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
+     cutlass::bfloat16_t* out_raw_ptr,
+     float* checkpoint_state_ptr,
+     SeqlenT const* checkpoint_offsets,
++    SeqlenT const* checkpoint_indptr,
++    int64_t num_checkpoints,
+     int T_total,
+     int H,
+     int N,
+@@ -448,8 +450,22 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
+         constexpr int kResidentStateRowBlocks = D / 16;
+         ResidentStateFragment resident_state[kValueBlocksPerWarp][kResidentStateRowBlocks];
+         SeqlenT checkpoint_offset = 0;
++        int64_t checkpoint_index = seq_idx;
++        int64_t checkpoint_end = seq_idx + 1;
+         if constexpr (HasCheckpoint) {
+-            checkpoint_offset = checkpoint_offsets[seq_idx];
++            if (checkpoint_indptr != nullptr) {
++                checkpoint_index = checkpoint_indptr[seq_idx];
++                checkpoint_end = checkpoint_indptr[seq_idx + 1];
++            }
++            // Device metadata must describe disjoint, ordered ranges. Bounds
++            // guards prevent malformed ranges from accessing another buffer.
++            if (checkpoint_index < 0 || checkpoint_end > num_checkpoints ||
++                checkpoint_index > checkpoint_end) {
++                checkpoint_end = checkpoint_index;
++            }
++            if (checkpoint_index < checkpoint_end) {
++                checkpoint_offset = checkpoint_offsets[checkpoint_index];
++            }
+         }
+ 
+         #pragma unroll
+@@ -769,7 +785,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
+                     cutlass::arch::NamedBarrier checkpoint_barrier(kComputeThreads, 0);
+                     checkpoint_barrier.arrive_and_wait();
+                     const int64_t checkpoint_base =
+-                        (int64_t(seq_idx * H + head_idx) * D +
++                        ((checkpoint_index * H + head_idx) * D +
+                          v_idx * VD) * D;
+                     for (int state_idx = compute_tid; state_idx < VD * D;
+                          state_idx += kComputeThreads) {
+@@ -779,6 +795,9 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
+                             float(s_acc(row, col));
+                     }
+                     checkpoint_barrier.arrive_and_wait();
++                    ++checkpoint_index;
++                    checkpoint_offset = checkpoint_index < checkpoint_end
++                        ? checkpoint_offsets[checkpoint_index] : 0;
+                 }
+             }
+             // The collective commit releases this input stage and publishes
+diff --git a/csrc/smxx/fwd_launch.cu b/csrc/smxx/fwd_launch.cu
+index aef551405ebf2658b821c95225d4d3e67e3abcaa..4832396098c03fa850d8783c01431db48cf7b082 100644
+--- a/csrc/smxx/fwd_launch.cu
++++ b/csrc/smxx/fwd_launch.cu
+@@ -24,6 +24,8 @@ void launch_fwd(
+     void* final_state_ptr,
+     float* checkpoint_state_ptr,
+     SeqlenT const* checkpoint_offsets_ptr,
++    SeqlenT const* checkpoint_indptr_ptr,
++    int64_t num_checkpoints,
+     cutlass::bfloat16_t* out_ptr,
+     void* workspace_ptr,
+     int total_tiles,
+@@ -218,6 +220,7 @@ void launch_fwd(
+                 tma_store_final_state_vsplit,
+                 tma_store_out_vsplit,
+                 out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
++                checkpoint_indptr_ptr, num_checkpoints,
+                 T_total, H, N, cu_seqlens_ptr, total_tiles,
+                 ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
+             return;
+@@ -248,6 +251,7 @@ void launch_fwd(
+             tma_store_final_state,
+             tma_store_out,
+             out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
++            checkpoint_indptr_ptr, num_checkpoints,
+             T_total, H, N, cu_seqlens_ptr, total_tiles,
+             ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk
+         );
+@@ -261,7 +265,8 @@ void launch_fwd(
+         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
+         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
+         cutlass::bfloat16_t const*, void const*, float, void*, \
+-        float*, SEQLEN_T const*, cutlass::bfloat16_t*, void*, \
++        float*, SEQLEN_T const*, SEQLEN_T const*, int64_t, \
++        cutlass::bfloat16_t*, void*, \
+         int, int, int, int, \
+         SEQLEN_T const*, float const*, float const*, float, bool, \
+         cudaStream_t);
+diff --git a/csrc/torch_api.cpp b/csrc/torch_api.cpp
+index a00ccbbcfc19fe50c89e686da7e05e08f4dba468..af43478dfe0455f4f7c3e46469f7ca75de566949 100644
+--- a/csrc/torch_api.cpp
++++ b/csrc/torch_api.cpp
+@@ -12,7 +12,8 @@ STABLE_TORCH_LIBRARY(flash_kda, m) {
+         "Tensor dt_bias, float lower_bound, Tensor? initial_state=None, "
+         "Tensor(b!)? final_state=None, Tensor? cu_seqlens=None, "
+         "Tensor(d!)? checkpoint_state=None, "
+-        "Tensor? checkpoint_offsets=None) -> ()");
++        "Tensor? checkpoint_offsets=None, "
++        "Tensor? checkpoint_indptr=None) -> ()");
+ }
+ 
+ STABLE_TORCH_LIBRARY_IMPL(flash_kda, CUDA, m) {
+diff --git a/flash_kda/__init__.py b/flash_kda/__init__.py
+index fdb557f369bd79834b1ce1a3d9939444f373cdab..5e56203338a994a066e0d7cb0ab339962c9aafd7 100644
+--- a/flash_kda/__init__.py
++++ b/flash_kda/__init__.py
+@@ -22,6 +22,9 @@ def fwd(
+     final_state=None,
+     cu_seqlens=None,
+     workspace=None,
++    checkpoint_state=None,
++    checkpoint_offsets=None,
++    checkpoint_indptr=None,
+ ):
+     """FlashKDA forward (Flash Kimi Delta Attention).
+ 
+@@ -47,6 +50,18 @@ def fwd(
+             or int64, shape ``[N+1]``. When provided, ``B`` must be 1.
+         workspace (torch.Tensor, optional): Reusable uint8 workspace. Allocated
+             automatically when omitted.
++        checkpoint_state (torch.Tensor, optional): FP32 output buffer with
++            shape ``[P, H, V, K]``, storing recurrent states at selected offsets.
++        checkpoint_offsets (torch.Tensor, optional): CUDA int32/int64 offsets
++            of shape ``[P]``, relative to each sequence. Its dtype must match
++            ``cu_seqlens`` (int64 for fixed-length input). Positive offsets
++            must be multiples of 16 no greater than the sequence length.
++        checkpoint_indptr (torch.Tensor, optional): CUDA tensor of shape
++            ``[N+1]`` and the offsets' dtype. Sequence ``i`` owns checkpoint
++            rows ``[indptr[i], indptr[i+1])``; ranges must partition ``[0, P)``
++            and offsets within each range must be strictly increasing.
++            Without this tensor, ``P=N`` and each sequence has one checkpoint;
++            a zero offset disables that sequence's checkpoint.
+     Notes:
+         * Currently requires ``K = V = 128``.
+         * Beta may be strided; other input and output tensors must be
+@@ -76,4 +91,7 @@ def fwd(
+         initial_state=initial_state,
+         final_state=final_state,
+         cu_seqlens=cu_seqlens,
++        checkpoint_state=checkpoint_state,
++        checkpoint_offsets=checkpoint_offsets,
++        checkpoint_indptr=checkpoint_indptr,
+     )
+diff --git a/tests/test_vsplit.py b/tests/test_vsplit.py
+index d6d9febde017d0879f3b08631603aa45a0106576..64e3b642e5f7cf23ec52b9cc08f118792ba686a3 100644
+--- a/tests/test_vsplit.py
++++ b/tests/test_vsplit.py
+@@ -1,11 +1,9 @@
+-"""Focused exactness matrix for the automatically dispatched K2 V-split.
+-
+-The cases are deliberately small (``H=2`` and at most 64 tokens) so this file
+-is suitable for the focused B300 test entry.  Coverage is nevertheless across
+-fixed and varlen dispatch, both cu_seqlens integer types, empty sequences, all
+-state input/output modes, and both supported state dtypes.  The automatic
+-dispatch selects V-split for these low-parallelism cases, and every result is
+-compared directly and bit-for-bit with ``torch_ref``.
++"""Exactness matrix for K2 dispatch and packed recurrent checkpoint export.
++
++Short fixed and varlen cases cover both sequence-offset dtypes, empty sequences,
++all state input/output modes and both state dtypes against ``torch_ref``.
++Packed-checkpoint cases additionally require unchanged native outputs and exact
++independent prefix states, including 256-token checkpoints through long queries.
+ """
+ 
+ from __future__ import annotations
+@@ -17,13 +15,12 @@ import pytest
+ import torch
+ import torch.nn.functional as F
+ 
+-
+ if not torch.cuda.is_available():
+     pytest.skip("CUDA is required", allow_module_level=True)
+ 
+-import flash_kda
+ from torch_ref import torch_ref
+ 
++import flash_kda
+ 
+ D = 128
+ H = 2
+@@ -276,3 +273,196 @@ def test_vsplit_varlen_exact(
+     state_case: StateCase, cu_dtype: torch.dtype
+ ) -> None:
+     _assert_vsplit_exact(_make_varlen_problem(cu_dtype), state_case)
++
++
++@pytest.mark.parametrize("num_sequences", (4, 64))
++@pytest.mark.parametrize("cu_dtype", (torch.int32, torch.int64))
++@pytest.mark.parametrize("state_dtype", (torch.bfloat16, torch.float32))
++def test_packed_checkpoints_match_prefix_states_without_changing_outputs(
++    num_sequences: int, cu_dtype: torch.dtype, state_dtype: torch.dtype
++) -> None:
++    """Export several states per sequence, including empty checkpoint ranges.
++
++    Four sequences select the V-split kernel; 64 sequences select the complete
++    value tile on a 188-SM GPU. Every exported state is checked against the
++    independent recurrence evaluated on that exact sequence prefix.
++    """
++    lengths = [0, 17, 64, 65] * (num_sequences // 4)
++    starts = [0]
++    indptr = [0]
++    checkpoints = []
++    owners = []
++    for seq, length in enumerate(lengths):
++        starts.append(starts[-1] + length)
++        for offset in (16, 32, 64):
++            if offset <= length:
++                checkpoints.append(offset)
++                owners.append(seq)
++        indptr.append(len(checkpoints))
++    problem = _make_problem(
++        batch=1, seq_len=starts[-1], num_sequences=num_sequences, seed=607,
++        cu_seqlens=torch.tensor(starts, dtype=cu_dtype, device="cuda"),
++    )
++    state_case = StateCase("packed_checkpoints", True, True, state_dtype)
++    initial = _state_template(problem, state_case)
++    reference_out, reference_final = _run_reference(problem, state_case, initial)
++    expected_out, expected_final = _run_kernel(problem, state_case, initial)
++    # Native matrix accumulation can differ from torch_ref by one BF16 ULP
++    # on these packed inputs, with or without checkpoint export. Preserve the
++    # non-checkpoint CUDA output bit-for-bit and bound reference rounding.
++    reference_ulp = (
++        expected_out.view(torch.int16).int() - reference_out.view(torch.int16).int()
++    ).abs()
++    assert int(reference_ulp.max()) <= 1
++    assert torch.equal(expected_final, reference_final)
++    output = torch.empty_like(problem.q)
++    final = _fresh_final_state(problem, state_case)
++    saved = torch.full(
++        (len(checkpoints), H, D, D), float("nan"), dtype=torch.float32, device="cuda"
++    )
++    offsets = torch.tensor(checkpoints, dtype=cu_dtype, device="cuda")
++    pointers = torch.tensor(indptr, dtype=cu_dtype, device="cuda")
++    workspace = torch.empty(
++        flash_kda.get_workspace_size(starts[-1], H, num_sequences),
++        dtype=torch.uint8, device="cuda",
++    )
++
++    def run() -> None:
++        flash_kda.fwd(
++            problem.q, problem.k, problem.v, problem.g, problem.beta,
++            problem.scale, output, problem.A_log, problem.dt_bias, LOWER_BOUND,
++            initial_state=initial, final_state=final,
++            cu_seqlens=problem.cu_seqlens, workspace=workspace,
++            checkpoint_state=saved, checkpoint_offsets=offsets,
++            checkpoint_indptr=pointers,
++        )
++
++    run()
++    torch.cuda.synchronize()
++    assert torch.equal(output, expected_out)
++    assert torch.equal(final, expected_final)
++    expected_checkpoints = torch.empty_like(saved)
++    for cutoff in (16, 32, 64):
++        clipped_lengths = [min(length, cutoff) for length in lengths]
++        clipped_starts = [0]
++        for length in clipped_lengths:
++            clipped_starts.append(clipped_starts[-1] + length)
++        fields = {}
++        for name in ("q", "k", "v", "g", "beta"):
++            tensor = getattr(problem, name)
++            fields[name] = torch.cat(
++                [tensor[:, start : start + length]
++                 for start, length in zip(starts, clipped_lengths)], dim=1,
++            )
++        clipped = dataclasses.replace(
++            problem, **fields,
++            cu_seqlens=torch.tensor(clipped_starts, dtype=cu_dtype, device="cuda"),
++        )
++        _, states = _run_kernel(clipped, state_case, initial)
++        for index, (owner, offset) in enumerate(zip(owners, checkpoints)):
++            if offset == cutoff:
++                expected_checkpoints[index].copy_(states[owner])
++    assert torch.equal(saved, expected_checkpoints)
++
++    # Capture and replay use the caller's output buffers, including all packed
++    # checkpoint rows. Poison them between replays to catch missing stores.
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run()
++    for _ in range(2):
++        saved.fill_(float("nan"))
++        graph.replay()
++        torch.cuda.synchronize()
++        assert torch.equal(output, expected_out)
++        assert torch.equal(final, expected_final)
++        assert torch.equal(saved, expected_checkpoints)
++
++
++@pytest.mark.parametrize("num_sequences", (4, 64))
++@pytest.mark.parametrize("cu_dtype", (torch.int32, torch.int64))
++def test_dense_checkpoints_across_long_prefill_match_independent_prefixes(
++    num_sequences: int, cu_dtype: torch.dtype
++) -> None:
++    """Check 256-token state exports through a 4096-token packed query.
++
++    Empty and short sequences coexist with a long query. Both K2 dispatches
++    must preserve outputs and every checkpoint across repeated pipeline-stage
++    reuse, not just the first few chunks. The reference uses the identical
++    native recurrence without checkpoint export on each truncated prefix.
++    """
++    lengths = [0, 257, 1025, 4096] + [16] * (num_sequences - 4)
++    starts = [0]
++    indptr = [0]
++    checkpoints = []
++    owners = []
++    for seq, length in enumerate(lengths):
++        starts.append(starts[-1] + length)
++        for offset in range(256, length + 1, 256):
++            checkpoints.append(offset)
++            owners.append(seq)
++        indptr.append(len(checkpoints))
++    problem = _make_problem(
++        batch=1, seq_len=starts[-1], num_sequences=num_sequences, seed=809,
++        cu_seqlens=torch.tensor(starts, dtype=cu_dtype, device="cuda"),
++    )
++    state_case = StateCase("dense_checkpoints", True, True, torch.float32)
++    initial = _state_template(problem, state_case)
++    expected_out, expected_final = _run_kernel(problem, state_case, initial)
++    output = torch.empty_like(problem.q)
++    final = _fresh_final_state(problem, state_case)
++    saved = torch.full(
++        (len(checkpoints), H, D, D), float("nan"), dtype=torch.float32, device="cuda"
++    )
++    offsets = torch.tensor(checkpoints, dtype=cu_dtype, device="cuda")
++    pointers = torch.tensor(indptr, dtype=cu_dtype, device="cuda")
++    workspace = torch.empty(
++        flash_kda.get_workspace_size(starts[-1], H, num_sequences),
++        dtype=torch.uint8, device="cuda",
++    )
++
++    def run() -> None:
++        flash_kda.fwd(
++            problem.q, problem.k, problem.v, problem.g, problem.beta,
++            problem.scale, output, problem.A_log, problem.dt_bias, LOWER_BOUND,
++            initial_state=initial, final_state=final,
++            cu_seqlens=problem.cu_seqlens, workspace=workspace,
++            checkpoint_state=saved, checkpoint_offsets=offsets,
++            checkpoint_indptr=pointers,
++        )
++
++    run()
++    torch.cuda.synchronize()
++    assert torch.equal(output, expected_out)
++    assert torch.equal(final, expected_final)
++    expected_checkpoints = torch.empty_like(saved)
++    for cutoff in sorted(set(checkpoints)):
++        clipped_lengths = [min(length, cutoff) for length in lengths]
++        clipped_starts = [0]
++        for length in clipped_lengths:
++            clipped_starts.append(clipped_starts[-1] + length)
++        fields = {}
++        for name in ("q", "k", "v", "g", "beta"):
++            tensor = getattr(problem, name)
++            fields[name] = torch.cat(
++                [tensor[:, start : start + length]
++                 for start, length in zip(starts, clipped_lengths)], dim=1,
++            )
++        clipped = dataclasses.replace(
++            problem, **fields,
++            cu_seqlens=torch.tensor(clipped_starts, dtype=cu_dtype, device="cuda"),
++        )
++        _, states = _run_kernel(clipped, state_case, initial)
++        for index, (owner, offset) in enumerate(zip(owners, checkpoints)):
++            if offset == cutoff:
++                expected_checkpoints[index].copy_(states[owner])
++    assert torch.equal(saved, expected_checkpoints)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run()
++    for _ in range(2):
++        saved.fill_(float("nan"))
++        graph.replay()
++        torch.cuda.synchronize()
++        assert torch.equal(output, expected_out)
++        assert torch.equal(final, expected_final)
++        assert torch.equal(saved, expected_checkpoints)
