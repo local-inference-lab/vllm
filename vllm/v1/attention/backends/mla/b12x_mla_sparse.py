@@ -34,6 +34,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    _remap_tiling,
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
 )
@@ -401,7 +402,16 @@ def _map_global_topk_to_gathered_ckv_kernel(
     valid_i32 = valid.to(tl.int32)
     local_offset = tl.cumsum(valid_i32) - valid_i32
     tile_valid_count = tl.sum(valid_i32)
-    output_base = tl.atomic_add(valid_count_ptr + row, tile_valid_count)
+    if tl.constexpr(BLOCK_N >= NUM_TOPK_TOKENS):
+        output_base = 0
+        tl.store(valid_count_ptr + row, tile_valid_count)
+        tl.store(
+            out_ptr + row * out_stride0 + cols * out_stride1,
+            -1,
+            mask=col_mask & (cols >= tile_valid_count),
+        )
+    else:
+        output_base = tl.atomic_add(valid_count_ptr + row, tile_valid_count)
     tl.store(
         out_ptr + row * out_stride0 + (output_base + local_offset) * out_stride1,
         gathered_slot,
@@ -440,12 +450,13 @@ def _map_global_topk_to_gathered_ckv(
     ):
         raise TypeError("CKV gather index metadata must be int32")
 
-    block_n = 128
-    out.fill_(-1)
-    valid_counts.zero_()
-    _map_global_topk_to_gathered_ckv_kernel[
-        (token_indices.shape[0], triton.cdiv(token_indices.shape[1], block_n))
-    ](
+    single_tile, block_n, tiles_per_row, num_warps = _remap_tiling(
+        token_indices.shape[1], 128, True
+    )
+    if not single_tile:
+        out.fill_(-1)
+        valid_counts.zero_()
+    _map_global_topk_to_gathered_ckv_kernel[(token_indices.shape[0], tiles_per_row)](
         req_ids,
         token_indices,
         rank_req_starts,
@@ -465,6 +476,7 @@ def _map_global_topk_to_gathered_ckv(
         DCP_INTERLEAVE=cp_kv_cache_interleave_size,
         NUM_TOPK_TOKENS=token_indices.shape[1],
         BLOCK_N=block_n,
+        num_warps=num_warps,
     )
 
 
