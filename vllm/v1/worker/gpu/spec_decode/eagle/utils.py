@@ -123,6 +123,11 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                     del sh.head
                     sh.head = target_lm_head
 
+    prepare_draft_lm_head = getattr(eagle_model, "prepare_draft_lm_head", None)
+    effective_draft_lm_head = getattr(eagle_model, "lm_head", None)
+    if prepare_draft_lm_head is not None and effective_draft_lm_head is not None:
+        prepare_draft_lm_head(effective_draft_lm_head)
+
     # MTP shares topk_indices_buffer with the target model. We update
     # every module in the draft that holds a buffer reference so that
     # the per-layer indexer and sparse-attention backends all point to
