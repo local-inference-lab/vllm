@@ -446,6 +446,16 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def poll_boundary_checkpoint(self, request: "Request") -> bool:
+        """Return False while an atomic external checkpoint import is pending.
+
+        A True result permits ordinary local lookup. It is not a hit claim;
+        imported bundles must first be published by the allocator after all
+        worker copies complete. Cancellation must retain destinations until
+        every submitted copy drains.
+        """
+        return True
+
     @abstractmethod
     def get_num_new_matched_tokens(
         self,
