@@ -362,6 +362,8 @@ class Scheduler(SchedulerInterface):
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
             enable_boundary_checkpoints=vllm_config.use_request_boundary_checkpoints,
+            max_concurrent_batches=vllm_config.max_concurrent_batches,
+            num_lookahead_tokens=self.num_lookahead_tokens,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -1602,6 +1604,37 @@ class Scheduler(SchedulerInterface):
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
+                    pending_boundary_requests=itertools.islice(
+                        itertools.chain(self.skipped_waiting, self.waiting),
+                        self.max_num_running_reqs,
+                    ),
+                    can_defer_boundary_restore=(
+                        request.boundary_checkpoint is not None
+                        and not load_kv_async
+                        and num_external_computed_tokens == 0
+                        # External imports need separate admission accounting.
+                        and self.connector is None
+                        and self.parallel_config.decode_context_parallel_size == 1
+                        and not self.use_pp
+                        and self.vllm_config.max_concurrent_batches <= 2
+                        and all(
+                            not isinstance(manager.kv_cache_spec, MambaSpec)
+                            or (
+                                manager.kv_cache_spec.mamba_cache_mode == "align"
+                                and manager.kv_cache_spec.num_prefill_checkpoint_blocks
+                                <= 1
+                                and 2 * (self.num_spec_tokens + 1) <= manager.block_size
+                            )
+                            for manager in (
+                                self.kv_cache_manager.coordinator.single_type_managers
+                            )
+                        )
+                        and any(
+                            self._request_is_runnable_decode(r)
+                            or r.request_id in num_scheduled_tokens
+                            for r in self.running
+                        )
+                    ),
                 )
 
                 if new_blocks is None:
