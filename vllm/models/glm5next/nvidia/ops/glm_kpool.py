@@ -897,7 +897,8 @@ def _expand_pool_ids_kernel(
     sequence_length = tl.load(positions + row).to(tl.int64) + 1
     complete_pools = sequence_length // POOL_SIZE
     tail_start = complete_pools * POOL_SIZE
-    history = column < HISTORY_TOKENS
+    live_history = tl.minimum(HISTORY_TOKENS, complete_pools * POOL_SIZE)
+    history = column < live_history
     pool_column = column // POOL_SIZE
     pool_offset = column % POOL_SIZE
     pool_id = tl.load(
@@ -906,7 +907,7 @@ def _expand_pool_ids_kernel(
         other=-1,
     ).to(tl.int64)
     history_value = tl.where(pool_id >= 0, pool_id * POOL_SIZE + pool_offset, -1)
-    tail_offset = column - HISTORY_TOKENS
+    tail_offset = column - live_history
     tail_count = sequence_length - tail_start
     in_tail = (tail_offset >= 0) & (tail_offset < tail_count)
     tail_value = tl.where(in_tail, tail_start + tail_offset, -1)

@@ -1291,9 +1291,9 @@ def test_glm53_pool_expansion_appends_only_the_incomplete_tail() -> None:
 
     expand_pool_ids(pool_ids, positions, output)
 
-    assert torch.all(output[0, :2048] == -1)
+    assert torch.all(output[0, 3:] == -1)
     assert torch.equal(
-        output[0, 2048:].cpu(), torch.tensor([0, 1, 2], dtype=torch.int32)
+        output[0, :3].cpu(), torch.tensor([0, 1, 2], dtype=torch.int32)
     )
     assert torch.equal(output[1, :8].cpu(), torch.tensor([4, 5, 6, 7, 0, 1, 2, 3]))
     assert torch.all(output[1, 8:] == -1)
