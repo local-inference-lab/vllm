@@ -248,6 +248,11 @@ def test_b12x_warmup_deduplicates_registered_signatures(monkeypatch) -> None:
 
     worker = SimpleNamespace(
         get_model=lambda: SimpleNamespace(modules=modules),
+        model_runner=SimpleNamespace(
+            cudagraph_manager=SimpleNamespace(
+                planned_token_counts=lambda: [6, 12],
+            )
+        ),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=8,
             max_num_scheduled_tokens=32,
@@ -274,8 +279,8 @@ def test_b12x_warmup_deduplicates_registered_signatures(monkeypatch) -> None:
 
     assert scans == 1
     assert calls == [
-        ("first", (1, 2, 4, 8, 16, 29, 32), torch.bfloat16),
-        ("second", (1, 2, 4, 8, 16, 29, 32), torch.bfloat16),
+        ("first", (1, 2, 4, 6, 8, 12, 16, 29, 32), torch.bfloat16),
+        ("second", (1, 2, 4, 6, 8, 12, 16, 29, 32), torch.bfloat16),
     ]
     assert synchronized == [True]
 
