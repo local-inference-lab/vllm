@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the V2 model runner's InputBatch (vllm.v1.worker.gpu.input_batch)."""
 
+import copy
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -15,12 +17,109 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    MambaSpec,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.boundary_checkpoint import BoundaryCheckpointState
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, post_update
 
 DEVICE = current_platform.device_type
+
+
+@pytest.mark.parametrize(
+    ("method", "draft_width"), [(None, None), ("mtp", 16), ("mtp", 8), ("dflash", None)]
+)
+def test_external_checkpoint_layout_restarts_with_a_different_pool_capacity(
+    monkeypatch, method, draft_width
+):
+    """Restarted workers must interpret raw pages before their first forward."""
+    monkeypatch.setattr(torch.cuda, "Event", lambda: SimpleNamespace())
+
+    def make_state(num_blocks):
+        pool = torch.zeros(num_blocks, 256, dtype=torch.uint8)
+        recurrent = pool.view(torch.float32).as_strided(
+            (num_blocks, 2, 2), (64, 2, 1), storage_offset=4
+        )
+        model = torch.nn.Module()
+        if draft_width == 16:
+            model.get_mtp_target_hidden_states = lambda: torch.zeros(2, 16)
+        model_state = SimpleNamespace(
+            device=torch.device("cpu"),
+            max_num_reqs=2,
+            model=model,
+            get_recurrent_checkpoint_tensors=lambda: (torch.zeros(2, 2),),
+            model_config=SimpleNamespace(
+                get_hidden_size=lambda: 8, dtype=torch.float32
+            ),
+            vllm_config=SimpleNamespace(
+                speculative_config=None
+                if method is None
+                else SimpleNamespace(method=method)
+            ),
+        )
+        config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["attn"],
+                    FullAttentionSpec(
+                        block_size=8,
+                        num_kv_heads=1,
+                        head_size=8,
+                        dtype=torch.float32,
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["recurrent"],
+                    MambaSpec(
+                        block_size=4,
+                        shapes=((2, 2),),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                    ),
+                ),
+            ],
+        )
+        return BoundaryCheckpointState(
+            model_state,
+            config,
+            {
+                "attn": SimpleNamespace(kv_cache=pool),
+                "recurrent": SimpleNamespace(kv_cache=(recurrent,)),
+            },
+        )
+
+    producer = make_state(16)
+    consumer = make_state(24)
+    layout = producer.get_external_checkpoint_layout()
+    assert json.loads(json.dumps(layout)) == layout
+    assert consumer.get_external_checkpoint_layout() == layout
+    assert consumer.hidden_shape is None
+    consumer.initialize_external_checkpoint_layout(layout)
+    pool = consumer.get_external_checkpoint_page_pool()
+    row = pool[7].view(torch.float32)
+    row[2:10].copy_(torch.arange(8))
+    torch.testing.assert_close(
+        consumer.get_hidden_states(7), torch.arange(8).float().view(1, 8)
+    )
+    if method == "mtp":
+        row[10 : 10 + draft_width].copy_(torch.arange(draft_width) + 50)
+        torch.testing.assert_close(
+            consumer.get_hidden_states(7, draft=True),
+            (torch.arange(draft_width) + 50).float().view(1, draft_width),
+        )
+    else:
+        assert layout["draft_hidden"] is None
+    for path in ("schema_version", "page_bytes"):
+        invalid = copy.deepcopy(layout)
+        invalid[path] += 1
+        with pytest.raises(ValueError, match="incompatible"):
+            consumer.initialize_external_checkpoint_layout(invalid)
+    # Descriptors must not expose mutable aliases into the worker's layout.
+    layout["auxiliary_fields"][0]["shape"][0] += 1
+    with pytest.raises(ValueError, match="incompatible"):
+        consumer.initialize_external_checkpoint_layout(layout)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

@@ -4,7 +4,7 @@
 """GPU capture of request endpoints into budgeted KV-pool blocks."""
 
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -282,6 +282,18 @@ class BoundaryCheckpointState:
         self.device = model_state.device
         self.max_reqs = model_state.max_num_reqs
         self.num_groups = len(kv_cache_config.kv_cache_groups)
+        self._external_cache_groups = [
+            [
+                (
+                    name,
+                    tuple(forward_context[name].kv_cache)
+                    if isinstance(forward_context[name].kv_cache, (tuple, list))
+                    else (forward_context[name].kv_cache,),
+                )
+                for name in group.layer_names
+            ]
+            for group in kv_cache_config.kv_cache_groups
+        ]
         self.metadata = torch.zeros(
             (self.max_reqs, 6), dtype=torch.int32, device=self.device
         )
@@ -372,6 +384,7 @@ class BoundaryCheckpointState:
         draft_metadata: list[list[int]] = []
         offset = 0
         seen_ptrs = set()
+        self._auxiliary_layout: list[dict[str, Any]] = []
         for i, tensor in enumerate(self._auxiliary_tensors):
             if tensor.data_ptr() in seen_ptrs:
                 continue
@@ -388,6 +401,15 @@ class BoundaryCheckpointState:
             )
             (target_metadata if i < target_tensor_count else draft_metadata).append(
                 auxiliary_metadata[-1]
+            )
+            self._auxiliary_layout.append(
+                {
+                    "owner": "target" if i < target_tensor_count else "draft",
+                    "dtype": str(tensor.dtype),
+                    "shape": list(tensor.shape[1:]),
+                    "offset_bytes": offset,
+                    "size_bytes": size,
+                }
             )
             offset += triton.cdiv(size, 8) * 8
         self.auxiliary_metadata = torch.tensor(
@@ -406,6 +428,149 @@ class BoundaryCheckpointState:
         self.spec_hidden_shape: tuple[int, ...] | None = None
         self.spec_hidden_dtype: torch.dtype | None = None
         self._completion = torch.cuda.Event()
+
+    def get_external_checkpoint_page_pool(self) -> torch.Tensor:
+        """Return the shared byte-page view used by external checkpoint copies.
+
+        All cache groups must overlay the same block-outermost allocation.
+        The caller must retain the checkpoint's physical pages until its CUDA
+        transfer event completes. This method neither allocates nor copies data.
+
+        Raises:
+            ValueError: If any group has a separate or non-page-outermost layout.
+        """
+        pointer = self.pool.untyped_storage().data_ptr()
+        num_blocks, page_bytes = self.pool.shape
+        for group in self._external_cache_groups:
+            for name, tensors in group:
+                for tensor in tensors:
+                    if (
+                        tensor.untyped_storage().data_ptr() != pointer
+                        or tensor.shape[0] % num_blocks
+                        or tensor.stride(0)
+                        * tensor.element_size()
+                        * (tensor.shape[0] // num_blocks)
+                        != page_bytes
+                    ):
+                        raise ValueError(
+                            "External boundary checkpoints require one shared "
+                            f"block-outermost page pool; incompatible layer {name!r}"
+                        )
+        return self.pool
+
+    def get_external_checkpoint_layout(self) -> dict[str, Any]:
+        """Describe byte interpretation without pointers or physical block IDs.
+
+        The descriptor is independent of pool capacity and request slots, so a
+        worker can validate it after restart before restoring any checkpoint.
+        Weight identity, parallel geometry, cache salt and token authentication
+        must additionally be enforced by the connector's namespace.
+
+        Raises:
+            ValueError: If the cache or speculative hidden-state layout is
+                unsupported, or auxiliary state does not fit its reserved page.
+        """
+        pool = self.get_external_checkpoint_page_pool()
+        target_shape, draft_shape, dtype = self._external_hidden_layout()
+        itemsize = dtype.itemsize
+        target_size = target_shape[0] * itemsize
+        draft_size = 0 if draft_shape is None else draft_shape[0] * itemsize
+        if self.hidden_offset + target_size + draft_size > pool.shape[1]:
+            raise ValueError("External checkpoint auxiliary state exceeds one page")
+        groups = []
+        for group in self._external_cache_groups:
+            layers = []
+            for name, tensors in group:
+                layers.append(
+                    {
+                        "layer": name,
+                        "views": [
+                            {
+                                "dtype": str(tensor.dtype),
+                                "shape": list(tensor.shape[1:]),
+                                "strides_bytes": [
+                                    stride * tensor.element_size()
+                                    for stride in tensor.stride()[1:]
+                                ],
+                                "offset_bytes": tensor.storage_offset()
+                                * tensor.element_size(),
+                                "kernel_pages_per_block": tensor.shape[0]
+                                // pool.shape[0],
+                            }
+                            for tensor in tensors
+                        ],
+                    }
+                )
+            groups.append(layers)
+        return {
+            "schema_version": 1,
+            "page_bytes": pool.shape[1],
+            "groups": groups,
+            "auxiliary_fields": [
+                {**field, "shape": list(field["shape"])}
+                for field in self._auxiliary_layout
+            ],
+            "target_hidden": {
+                "shape": list(target_shape),
+                "dtype": str(dtype),
+                "offset_bytes": self.hidden_offset,
+            },
+            "draft_hidden": (
+                {
+                    "shape": list(draft_shape),
+                    "dtype": str(dtype),
+                    "offset_bytes": self.hidden_offset + target_size,
+                }
+                if draft_shape is not None
+                else None
+            ),
+        }
+
+    def initialize_external_checkpoint_layout(self, layout: dict[str, Any]) -> None:
+        """Validate persisted layout and initialize hidden views before first use.
+
+        Args:
+            layout: Descriptor from ``get_external_checkpoint_layout`` on the
+                producer with the same authenticated model/cache namespace.
+
+        Raises:
+            ValueError: If any field differs from the receiving worker's layout.
+        """
+        if layout != self.get_external_checkpoint_layout():
+            raise ValueError("External checkpoint byte layout is incompatible")
+        target_shape, draft_shape, dtype = self._external_hidden_layout()
+        self.hidden_shape = target_shape
+        self.hidden_dtype = dtype
+        self.spec_hidden_offset = self.hidden_offset + target_shape[0] * dtype.itemsize
+        self.spec_hidden_shape = draft_shape
+        self.spec_hidden_dtype = dtype if draft_shape is not None else None
+
+    def _external_hidden_layout(
+        self,
+    ) -> tuple[tuple[int, ...], tuple[int, ...] | None, torch.dtype]:
+        config = self.model_state.model_config
+        target_shape = (config.get_hidden_size(),)
+        spec = self.model_state.vllm_config.speculative_config
+        draft_shape = None
+        if spec is not None and spec.method == "mtp":
+            get_hidden = getattr(
+                self.model_state.model, "get_mtp_target_hidden_states", None
+            )
+            if callable(get_hidden):
+                hidden = get_hidden()
+                if hidden is None or hidden.ndim != 2 or hidden.dtype != config.dtype:
+                    raise ValueError(
+                        "MTP checkpoint hidden-state layout is unavailable"
+                    )
+                draft_shape = tuple(hidden.shape[1:])
+            else:
+                # Models without a hidden-state override feed the target's
+                # ordinary output to MTP. capture_auxiliary stores that vector
+                # in both target and draft fields, including before restart.
+                draft_shape = target_shape
+        elif spec is not None and spec.method != "dflash":
+            raise ValueError("External checkpoints support MTP or DFlash speculation")
+        return target_shape, draft_shape, config.dtype
 
     def add_request(self, slot: int, request: "NewRequestData") -> None:
         self.seen[slot].zero_()

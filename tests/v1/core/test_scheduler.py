@@ -169,6 +169,40 @@ def test_full_boundary_hit_is_admitted_while_another_request_decodes(
     assert decode_step.num_scheduled_tokens == {"first": 4, "second": 4}
 
 
+@pytest.mark.parametrize("imported_tokens", [0, 32])
+def test_boundary_restore_preserves_external_cache_attribution(imported_tokens: int):
+    """Imported snapshots count as external hits; later GPU reuse stays local."""
+    scheduler = create_scheduler(enable_prefix_caching=True, use_v2_model_runner=True)
+    manager = scheduler.kv_cache_manager
+    manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
+    producer, repeat = create_requests(
+        num_requests=2,
+        num_tokens=32,
+        same_prompt=True,
+        req_ids=["producer", "repeat"],
+    )
+    manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(producer, 32) is not None
+    manager.publish_boundary_checkpoint(producer, 32, kind="prompt")
+    manager.free(producer)
+    scheduler.connector = Mock()
+    scheduler.connector.poll_boundary_checkpoint.return_value = True
+    scheduler.connector.boundary_checkpoint_external_tokens.return_value = (
+        imported_tokens
+    )
+    scheduler.connector.get_num_new_matched_tokens.return_value = (0, False)
+    scheduler.add_request(repeat)
+
+    output = scheduler.schedule()
+
+    assert output.boundary_logits_only
+    assert output.num_scheduled_tokens == {"repeat": 1}
+    assert repeat.num_computed_tokens == 32
+    assert repeat.prefill_stats.num_computed_tokens == 0
+    assert repeat.prefill_stats.num_external_cached_tokens == imported_tokens
+    assert repeat.prefill_stats.num_local_cached_tokens == 32 - imported_tokens
+
+
 def test_make_scheduled_encoder_input_stats_output_embeddings():
     scheduler = create_scheduler()
     mm_features = [

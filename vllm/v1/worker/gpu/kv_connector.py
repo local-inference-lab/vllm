@@ -24,6 +24,7 @@ from vllm.v1.outputs import (
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.worker.gpu.boundary_checkpoint import BoundaryCheckpointState
 
 
 class KVConnector:
@@ -43,6 +44,10 @@ class KVConnector:
     def set_disabled(self, disabled: bool) -> None:
         pass
 
+    def bind_boundary_checkpoint_state(self, state: "BoundaryCheckpointState") -> None:
+        """Expose caller-owned checkpoint pages to a compatible transfer connector."""
+        pass
+
 
 class ActiveKVConnector(KVConnector):
     def __init__(
@@ -55,6 +60,9 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
 
         self._disabled = False
+
+    def bind_boundary_checkpoint_state(self, state: "BoundaryCheckpointState") -> None:
+        self.kv_connector.bind_boundary_checkpoint_state(state)
 
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
         if self._disabled:

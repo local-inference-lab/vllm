@@ -637,9 +637,24 @@ class VllmConfig:
                 or model.hf_text_config.model_type in ("glm5_next_text", "glm5_next")
             )
             and parallel.prefill_context_parallel_size == 1
-            and self.kv_transfer_config is None
+            and self.external_boundary_checkpoint_adapter_available
             and cache.kv_offloading_size is None
         )
+
+    @property
+    def external_boundary_checkpoint_adapter_available(self) -> bool:
+        """Require an explicit atomic target/draft adapter for external storage.
+
+        Aligned connectors must not enable request-boundary retention merely
+        because they can transfer ordinary KV chunks. Worker initialization
+        additionally validates the negotiated server protocol and byte layout.
+        """
+        if self.kv_transfer_config is None:
+            return True
+        from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+        connector = KVConnectorFactory.get_connector_class(self.kv_transfer_config)
+        return connector.supports_request_boundary_checkpoints(self)
 
     @property
     def max_concurrent_batches(self) -> int:
@@ -1136,7 +1151,8 @@ class VllmConfig:
         # Engine-driven LMCache MP transport does not pin or register KV
         # addresses; GPU gather/scatter remains in the vLLM worker.
         if (
-            self.kv_transfer_config.kv_connector == "LMCacheMPConnector"
+            self.kv_transfer_config.kv_connector
+            in ("LMCacheMPConnector", "LMCacheRecurrentCheckpointConnector")
             and self.kv_transfer_config.kv_connector_extra_config.get(
                 "lmcache.mp.mp_transfer_mode"
             )

@@ -702,6 +702,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+        if self.boundary_checkpoint_state is not None:
+            self.kv_connector.bind_boundary_checkpoint_state(
+                self.boundary_checkpoint_state
+            )
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -1681,6 +1685,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 hidden_states = self.boundary_checkpoint_state.get_hidden_states(
                     checkpoint.auxiliary_block_ids[0]
                 )
+                # Connector metadata can carry stores for other requests even
+                # when this request resumes without an attention forward.
+                self.kv_connector.pre_forward(scheduler_output)
                 self.execute_model_state = ExecuteModelState(
                     input_batch=input_batch,
                     attn_metadata=None,
