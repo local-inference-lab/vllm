@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field, field_validator
 
+import vllm.envs as envs
 from vllm.config.utils import config, get_hash_factors, hash_factors
 from vllm.logger import init_logger
 
@@ -232,8 +233,14 @@ class KernelConfig:
     enable_bf16x3_router_gemm: bool = False
     """If True, use the experimental SM100 BF16x3 CuteDSL router GEMM."""
 
-    moe_backend: MoEBackend = "auto"
-    """Backend for MoE expert computation kernels. Available options:
+    moe_backend: MoEBackend = Field(
+        default_factory=lambda: envs.VLLM_DEFAULT_MOE_BACKEND,
+        validate_default=True,
+    )
+    """Backend for MoE expert computation kernels. Defaults to
+    `VLLM_DEFAULT_MOE_BACKEND`, or "auto" when the variable is unset.
+    Explicit configuration takes precedence over the deployment default.
+    Available options:
 
     - "auto": Automatically select the best backend based on model and hardware
     - "triton": Use Triton-based fused MoE kernels
