@@ -9,6 +9,8 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.sample.ops.topk_topp_sampler import (
+    apply_top_k_top_p,
+    apply_top_k_top_p_probs,
     apply_top_k_top_p_pytorch,
     random_sample,
 )
@@ -18,6 +20,46 @@ DEVICE_TYPE = current_platform.device_type
 
 BATCH_SIZE = 1024
 VOCAB_SIZE = 128 * 1024
+
+
+@pytest.mark.parametrize("batch_size", [1, 3, 7])
+@pytest.mark.parametrize("use_top_k", [False, True])
+def test_apply_top_k_top_p_probs_matches_processed_logits(
+    batch_size: int,
+    use_top_k: bool,
+):
+    vocab_size = 257
+    generator = torch.Generator(device=DEVICE_TYPE).manual_seed(41 + batch_size)
+    logits = torch.randn(
+        batch_size,
+        vocab_size,
+        dtype=torch.float32,
+        device=DEVICE_TYPE,
+        generator=generator,
+    )
+    top_k = (
+        torch.arange(17, 17 + batch_size, dtype=torch.int32, device=DEVICE_TYPE)
+        if use_top_k
+        else None
+    )
+    top_p = torch.linspace(0.55, 0.95, batch_size, device=DEVICE_TYPE)
+
+    expected = apply_top_k_top_p(logits.clone(), top_k, top_p).softmax(
+        dim=-1,
+        dtype=torch.float32,
+    )
+    input_buffer = logits.clone()
+    actual = apply_top_k_top_p_probs(input_buffer, top_k, top_p)
+
+    assert actual.data_ptr() == input_buffer.data_ptr()
+    assert torch.equal(actual != 0, expected != 0)
+    assert torch.allclose(actual, expected, atol=2e-7, rtol=2e-6)
+    assert torch.allclose(
+        actual.sum(dim=-1),
+        torch.ones(batch_size, device=DEVICE_TYPE),
+        atol=2e-7,
+        rtol=0,
+    )
 
 
 def _flashinfer_topk_topp_supported() -> bool:
