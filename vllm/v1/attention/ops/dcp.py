@@ -15,6 +15,7 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_dcp_group
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.cp_common import (
     DirectCPWorkspace,
@@ -295,7 +296,14 @@ def cp_lse_ag_out_rs(
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
     )
-    out = cp_group.reduce_scatter(out, dim=1)
+    if current_platform.is_cuda() and current_platform.is_device_capability_family(120):
+        # Preserve the head-major collective output for the following MLA
+        # value GEMM. Its batch matrices are disjoint, avoiding cuBLAS's
+        # SM120/121 overlapping-stride read defect and a redundant transpose copy.
+        out = cp_group.reduce_scatter(out.transpose(0, 1).contiguous(), dim=0)
+        out = out.transpose(0, 1)
+    else:
+        out = cp_group.reduce_scatter(out, dim=1)
 
     if return_lse:
         cp_num_heads = lse.shape[1] // cp_group.world_size

@@ -23,6 +23,37 @@ from vllm.utils.system_utils import update_environment_variables
 mp.set_start_method("spawn", force=True)
 
 
+@pytest.mark.parametrize("rank", range(4))
+def test_ag_rs_preserves_head_major_value_projection_storage(monkeypatch, rank):
+    from vllm.v1.attention.ops import dcp
+
+    partial = torch.arange(3 * 64 * 8, dtype=torch.float32).view(3, 64, 8)
+    lse = torch.zeros((3, 64))
+    monkeypatch.setattr(dcp.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        dcp.current_platform,
+        "is_device_capability_family",
+        lambda family: family == 120,
+    )
+    monkeypatch.setattr(dcp, "_cp_lse_common", lambda *args, **kwargs: (partial, lse))
+
+    class Group:
+        world_size = 4
+        rank_in_group = rank
+
+        def reduce_scatter(self, tensor, dim):
+            assert dim == 0 and tensor.is_contiguous()
+            self.output = tensor.chunk(4, dim=dim)[rank].clone()
+            return self.output
+
+    group = Group()
+    result, result_lse = dcp.cp_lse_ag_out_rs(partial, lse, group, return_lse=True)
+    torch.testing.assert_close(result, partial[:, rank * 16 : (rank + 1) * 16])
+    torch.testing.assert_close(result_lse, lse[:, rank * 16 : (rank + 1) * 16])
+    assert result.transpose(0, 1).is_contiguous()
+    assert result.data_ptr() == group.output.data_ptr()
+
+
 class _FakeCPGroup:
     def __init__(self, world_size: int, device_group: dist.ProcessGroup):
         self.world_size = world_size
