@@ -345,10 +345,10 @@ class DeepseekV4VLProcessingInfo(BaseProcessingInfo):
         }
 
     def get_image_placeholder_token_id(self) -> int:
-        token_id = self.get_tokenizer().convert_tokens_to_ids(IMAGE_PLACEHOLDER)
-        if token_id is None:
+        vocabulary = self.get_tokenizer().get_vocab()
+        if IMAGE_PLACEHOLDER not in vocabulary:
             raise ValueError(f"Token not found in tokenizer: {IMAGE_PLACEHOLDER}")
-        return token_id
+        return vocabulary[IMAGE_PLACEHOLDER]
 
     def get_image_size_with_most_features(self) -> ImageSize:
         hf_config = self.get_hf_config()

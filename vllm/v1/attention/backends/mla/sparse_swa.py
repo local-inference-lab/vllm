@@ -934,7 +934,9 @@ def _compute_image_visibility_kernel(
         left = tl.where(
             in_span, tl.minimum(pos - span_start, max_image_tokens - 1), left
         )
-        right = tl.where(in_span, tl.minimum(span_end - pos, max_image_tokens), right)
+        materialized_right = tl.maximum(seq_len - pos - 1, 0)
+        span_right = tl.minimum(span_end - pos, max_image_tokens)
+        right = tl.where(in_span, tl.minimum(span_right, materialized_right), right)
     tl.store(left_visible_ptr + token_idx, left)
     tl.store(right_visible_ptr + token_idx, right)
 

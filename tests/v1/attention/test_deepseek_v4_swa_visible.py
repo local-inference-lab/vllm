@@ -8,7 +8,9 @@ The reference semantics are a torch port of the official
 ``min(pos - span_start, max_image_tokens - 1)`` extra tokens to the left and
 ``min(span_end - pos, max_image_tokens)`` to the right; the window then starts
 at ``max(pos - (window - 1) - max(left - (window - 1), 0), 0)`` and ends at
-``pos + right`` (inclusive).
+``pos + right`` (inclusive), capped at the materialized sequence endpoint.
+For complete image spans this is identical to the reference. Metadata naming
+future image positions must not expose KV rows that have not been written.
 """
 
 import pytest
@@ -51,7 +53,11 @@ def ref_left_right(
             for span_start, span_end in spans:
                 if span_start <= pos <= span_end:
                     left = min(pos - span_start, max_image_tokens - 1)
-                    right = min(span_end - pos, max_image_tokens)
+                    right = min(
+                        span_end - pos,
+                        max_image_tokens,
+                        max(seq_len - pos - 1, 0),
+                    )
             lefts.append(left)
             rights.append(right)
     return lefts, rights
@@ -197,6 +203,12 @@ CASES: list[_Case] = [
         "seq_lens": [40, 9],
         "query_lens": [16, 9],
         "spans": [[(30, 38)], []],
+    },
+    # Metadata naming future image tokens must not expose unwritten KV rows.
+    {
+        "seq_lens": [35],
+        "query_lens": [11],
+        "spans": [[(30, 38)]],
     },
     # span ending exactly at the prompt end; tiny request
     {
