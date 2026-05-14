@@ -99,6 +99,10 @@ class SpecDecodeBaseProposer:
         )
         self.needs_extra_input_slots = self.net_num_new_slots_per_request > 0
 
+        # Draft models such as Gemma4 MTP can override this to reuse the first
+        # draft position for all steps; EAGLE-style drafters advance normally.
+        self.constant_draft_positions: bool = False
+
         self.parallel_drafting_token_id: int = 0
         self.parallel_drafting_hidden_state_tensor: torch.Tensor | None = None
         if self.parallel_drafting:
