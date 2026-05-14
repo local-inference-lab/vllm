@@ -674,16 +674,26 @@ class Indexer(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        positions,
+        rotary_emb,
+        kw: torch.Tensor | None = None,
+        q_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        q, _ = self.wq_b(qr)
+        if q_raw is None:
+            q, _ = self.wq_b(qr)
+        else:
+            q = q_raw
         q = q.view(-1, self.n_head, self.head_dim)
 
         if current_platform.is_rocm():
             # This path should works on all platform, will remove extra
             # branches in the future
             # Fused wk + weights_proj: one GEMM, then split
-            kw, _ = self.wk_weights_proj(hidden_states)
+            if kw is None:
+                kw, _ = self.wk_weights_proj(hidden_states)
             k = kw[:, : self.head_dim]
             weights = kw[:, self.head_dim :]
 
@@ -697,7 +707,8 @@ class Indexer(nn.Module):
                 q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
             # Fused wk + weights_proj: one GEMM, then split
-            kw, _ = self.wk_weights_proj(hidden_states)
+            if kw is None:
+                kw, _ = self.wk_weights_proj(hidden_states)
             k = kw[:, : self.head_dim]
             weights = kw[:, self.head_dim :]
 
@@ -735,6 +746,41 @@ class Indexer(nn.Module):
         weights = weights.squeeze(-1)
 
         return self.indexer_op(hidden_states, q_fp8, k, weights)
+
+
+def _should_skip_index_topk(
+    config: DeepseekV2Config | DeepseekV3Config,
+    layer_idx: int | None,
+) -> bool:
+    """Match GLM/DeepSeek IndexCache top-k reuse policy.
+
+    A layer marked as "S" reuses the previous layer's top-k indices. MTP/NextN
+    layers are excluded because they do not have a normal previous layer in the
+    same stack to reuse from.
+    """
+    if layer_idx is None:
+        return False
+
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    if num_hidden_layers is not None and layer_idx >= num_hidden_layers:
+        return False
+
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None:
+        if 0 <= layer_idx < len(pattern):
+            return pattern[layer_idx] == "S"
+        if num_hidden_layers is not None and layer_idx < num_hidden_layers:
+            logger.warning_once(
+                "index_topk_pattern is shorter than num_hidden_layers; "
+                "not skipping sparse MLA indexer computation on layer %s.",
+                layer_idx,
+            )
+        return False
+
+    freq = getattr(config, "index_topk_freq", None)
+    if freq is None:
+        return False
+    return max(layer_idx - 1, 0) % freq != 0
 
 
 def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
@@ -888,6 +934,7 @@ class DeepseekV2MLAAttention(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         input_size: int | None = None,
+        layer_idx: int | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -983,7 +1030,7 @@ class DeepseekV2MLAAttention(nn.Module):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
-        self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = getattr(config, "index_topk", 0) > 0
 
         _skip_topk = False
         if self.is_v32:
@@ -1004,19 +1051,16 @@ class DeepseekV2MLAAttention(nn.Module):
                 f"{prefix}.indexer",
             )
 
-            # Enable IndexCache for DeepSeek models to reduce redundant top-k
-            # token selection computations in sparse attention.
-            use_index_cache = getattr(config, "use_index_cache", False)
-            if use_index_cache:
-                # IndexCache config
-                # Refer: https://arxiv.org/abs/2603.12201 for more details.
-                _index_topk_freq = getattr(config, "index_topk_freq", 1)
-                _index_topk_pattern = getattr(config, "index_topk_pattern", None)
-                layer_id = extract_layer_index(prefix)
-                if _index_topk_pattern is None:
-                    _skip_topk = max(layer_id - 1, 0) % _index_topk_freq != 0
-                elif 0 <= layer_id < len(_index_topk_pattern):
-                    _skip_topk = _index_topk_pattern[layer_id] == "S"
+            layer_id = (
+                layer_idx if layer_idx is not None else extract_layer_index(prefix)
+            )
+            _skip_topk = _should_skip_index_topk(config, layer_id)
+            if _skip_topk:
+                logger.info_once(
+                    "Using index_topk_pattern/index_topk_freq to skip sparse MLA "
+                    "indexer computation on layer %s.",
+                    layer_id,
+                )
 
         else:
             self.indexer_rope_emb = None
@@ -1074,6 +1118,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        quant_config: QuantizationConfig | None = None,
+        layer_idx_override: int | None = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1081,7 +1128,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             config = vllm_config.model_config.hf_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
+        # NextN/MTP callers may pass None deliberately for BF16 draft layers
+        # inside an otherwise modelopt_fp4 target checkpoint.
+        if quant_config is None and not is_nextn:
+            quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
 
         self.hidden_size = config.hidden_size
@@ -1089,7 +1139,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         moe_layer_freq = getattr(config, "moe_layer_freq", 1)
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
-        layer_idx = int(prefix.split(sep=".")[-1])
+        layer_idx = (
+            layer_idx_override
+            if layer_idx_override is not None
+            else int(prefix.split(sep=".")[-1])
+        )
         self.layer_idx = layer_idx
 
         # verify MLA attention specific fields
@@ -1109,7 +1163,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             attn_cls = DeepseekV2MLAAttention
         else:
             attn_cls = DeepseekV2Attention
-        self.self_attn = attn_cls(
+        attn_kwargs = dict(
             vllm_config=vllm_config,
             config=config,
             hidden_size=self.hidden_size,
@@ -1125,12 +1179,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             topk_indices_buffer=topk_indices_buffer,
         )
+        if attn_cls is DeepseekV2MLAAttention:
+            attn_kwargs["layer_idx"] = layer_idx
+        self.self_attn = attn_cls(**attn_kwargs)
 
-        if (
-            config.n_routed_experts is not None
-            and layer_idx >= config.first_k_dense_replace
-            and layer_idx % moe_layer_freq == 0
-        ):
+        if _should_use_nextn_moe_layer(config, layer_idx, moe_layer_freq, is_nextn):
             self.mlp = DeepseekV2MoE(
                 config=config,
                 parallel_config=parallel_config,
@@ -1214,7 +1267,7 @@ class DeepseekV2Model(nn.Module):
         self.device = current_platform.device_type
 
         self.vocab_size = config.vocab_size
-        self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = getattr(config, "index_topk", 0) > 0
         if self.is_v32:
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
@@ -1382,6 +1435,15 @@ class DeepseekV2Model(nn.Module):
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
+
+            if (
+                getattr(self.config, "index_topk", 0) <= 0
+                and ".self_attn.indexer." in name
+            ):
+                # Explicit dense-equivalent GLM/DeepSeek evaluation disables
+                # sparse indexer modules, so checkpoint-only indexer weights
+                # are intentionally unused.
+                continue
 
             is_fusion_moe_shared_experts_layer = (
                 rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
@@ -1746,3 +1808,18 @@ def get_spec_layer_idx_from_weight_name(
             ) or weight_name.startswith(f"layers.{layer_idx + i}."):
                 return layer_idx + i
     return None
+
+
+def _should_use_nextn_moe_layer(
+    config: DeepseekV2Config | DeepseekV3Config,
+    layer_idx: int,
+    moe_layer_freq: int,
+    is_nextn: bool,
+) -> bool:
+    return config.n_routed_experts is not None and (
+        is_nextn
+        or (
+            layer_idx >= config.first_k_dense_replace
+            and layer_idx % moe_layer_freq == 0
+        )
+    )

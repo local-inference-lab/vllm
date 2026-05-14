@@ -133,7 +133,7 @@ def eagle_step_update_slot_mapping_and_metadata(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_reqs"])
 def eagle_prepare_inputs_padded_kernel(
     cu_num_draft_tokens_ptr,  # [num_reqs]
     valid_sampled_tokens_count_ptr,  # [num_reqs]
@@ -176,7 +176,14 @@ def eagle_prepare_inputs_padded_kernel(
     tl.store(num_rejected_tokens_gpu_ptr + req_idx, num_rejected_tokens)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "vocab_size",
+        "num_sampled_tokens_per_req",
+        "num_reqs",
+        "stride_sampled_token_ids",
+    ]
+)
 def eagle_prepare_next_token_padded_kernel(
     sampled_token_ids_ptr,  # [num_reqs, num_sampled_tokens_per_req]
     discard_request_mask_ptr,  # [num_reqs]

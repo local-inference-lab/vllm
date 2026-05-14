@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import json
+import os
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
 from typing_extensions import Self
 
 from vllm.config import LoadConfig
+from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
@@ -31,10 +34,101 @@ else:
 
 logger = init_logger(__name__)
 
+
+def _quant_config_targets_prefix(
+    quant_config: dict[str, Any],
+    module_prefix: str,
+) -> bool:
+    escaped_prefix = module_prefix.replace(".", r"\.")
+    config_groups = quant_config.get("config_groups", {})
+    if not isinstance(config_groups, dict):
+        config_groups = {}
+
+    for group in config_groups.values():
+        if not isinstance(group, dict):
+            continue
+        targets = group.get("targets", [])
+        if not isinstance(targets, list):
+            continue
+        for target in targets:
+            target_str = str(target)
+            if module_prefix in target_str or escaped_prefix in target_str:
+                return True
+
+    quantized_layers = quant_config.get("quantized_layers", {})
+    if isinstance(quantized_layers, dict):
+        for layer_name in quantized_layers:
+            layer_name = str(layer_name)
+            if (
+                layer_name == module_prefix
+                or layer_name.startswith(module_prefix + ".")
+                or module_prefix in layer_name
+                or escaped_prefix in layer_name
+            ):
+                return True
+    return False
+
+
+def _resolve_cached_hf_model_path(model_path: str | None) -> str | None:
+    if not model_path or os.path.isdir(model_path):
+        return model_path
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        cached_index = try_to_load_from_cache(
+            model_path, "model.safetensors.index.json"
+        )
+        if isinstance(cached_index, str):
+            return os.path.dirname(cached_index)
+    except Exception:
+        return None
+    return None
+
+
+def _has_serialized_glm_nextn_fp4_experts(hf_config: PretrainedConfig) -> bool:
+    model_path = None
+    for attr in ("_name_or_path", "name_or_path"):
+        model_path = _resolve_cached_hf_model_path(getattr(hf_config, attr, None))
+        if model_path:
+            break
+    if model_path is None:
+        return False
+
+    nextn_layer_id = getattr(hf_config, "num_hidden_layers", None)
+    if nextn_layer_id is None:
+        return False
+
+    prefix = f"model.layers.{nextn_layer_id}.mlp.experts.0.down_proj"
+    weight_name = f"{prefix}.weight"
+    required = {
+        weight_name,
+        f"{prefix}.weight_scale",
+        f"{prefix}.weight_scale_2",
+        f"{prefix}.input_scale",
+    }
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        return False
+
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+    except Exception:
+        return False
+    return required.issubset(weight_map)
+
+
+def _extend_unique(values: list[str], additions: list[str]) -> None:
+    seen = set(values)
+    for value in additions:
+        if value not in seen:
+            values.append(value)
+            seen.add(value)
+
+
 MTPModelTypes = Literal[
     "deepseek_mtp",
     "mimo_mtp",
-    "mimo_v2_mtp",
     "glm4_moe_mtp",
     "glm4_moe_lite_mtp",
     "glm_ocr_mtp",
@@ -66,7 +160,7 @@ SpeculativeMethod = Literal[
     EagleModelTypes,
     NgramGPUTypes,
 ]
-RejectionSampleMethod = Literal["standard", "synthetic"]
+RejectionSampleMethod = Literal["standard", "probabilistic", "synthetic"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
 
 
@@ -108,10 +202,21 @@ class SpeculativeConfig:
     inherits the target model's `--moe-backend` setting. Useful when the
     drafter and generator require different MoE kernels (e.g. quantized
     generator with unquantized drafter)."""
+    draft_kv_cache_dtype: CacheDType | None = None
+    """KV cache dtype to use for the draft model. When `None`, the draft
+    model inherits the target model's `--kv-cache-dtype` setting."""
+    draft_attention_backend: AttentionBackendEnum | Literal["auto"] | None = None
+    """Attention backend to use for the draft model. When `None`, the draft
+    model inherits the target model's attention backend."""
     attention_backend: AttentionBackendEnum | None = None
-    """Attention backend to use for the draft model. When `None`, the backend is
-    automatically selected. Useful when the drafter requires a different attention
-    backend (e.g. DFlash needs a non-causal-capable backend like FLASH_ATTN)."""
+    """Upstream name for the draft attention backend. Kept as an alias so
+    upstream configs and existing GLM/Kimi configs can both be parsed."""
+    dflash_draft_window_size: int | None = Field(default=None, ge=1)
+    """Optional sliding-window size for DFlash draft attention.
+
+    When set, the DFlash drafter attends only over a bounded local window,
+    analogous to SGLang's speculative DFlash draft window option.
+    """
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""
@@ -130,11 +235,18 @@ class SpeculativeConfig:
     speculative input batches can contain sequences of different lengths,
     which may only be supported by certain attention backends. This currently
     only affects the EAGLE method of speculation."""
-    use_local_argmax_reduction: bool = False
+    use_local_argmax_reduction: bool | None = None
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
     O(2 * tp_size) per token. Only applies to greedy draft selection in
-    non-tree speculation."""
+    non-tree speculation.
+
+    When None (the default), the value is auto-resolved in `__post_init__`:
+    True for model-based draft methods (eagle / eagle3 / mtp / draft_model /
+    dflash) at target tensor_parallel_size > 1, False otherwise. Empirical
+    validation on Kimi-K2.6 + Eagle3 MTP3 DCP=1 TP=8 showed +109% (2.09x)
+    decode TPS with this enabled. Set explicitly to True/False to override
+    the auto-resolution."""
 
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
@@ -190,9 +302,9 @@ class SpeculativeConfig:
 
     rejection_sample_method: RejectionSampleMethod = "standard"
     """The rejection sampling method to use. 'standard' uses probabilistic
-    rejection sampling (with or without cached draft logits, controlled by
-    draft_sample_method). 'synthetic' accepts draft tokens with a decaying
-    probability calibrated to synthetic_acceptance_rate."""
+    rejection sampling. The legacy value 'probabilistic' is accepted and
+    normalized to 'standard' with draft_sample_method='probabilistic' for
+    compatibility with existing GLM/Kimi launchers."""
 
     synthetic_acceptance_rates: list[float] | None = None
     """Per-position *unconditional* acceptance rates for synthetic rejection
@@ -261,6 +373,24 @@ class SpeculativeConfig:
     during rejection sampling. This comes at the cost of additional GPU memory
     usage."""
 
+    @field_validator("draft_attention_backend", mode="before")
+    @classmethod
+    def validate_draft_attention_backend_before(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            if value.lower() == "auto":
+                return "auto"
+            return AttentionBackendEnum[value.upper()]
+        return value
+
+    @field_validator("attention_backend", mode="before")
+    @classmethod
+    def validate_attention_backend_before(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            if value.lower() == "auto":
+                return None
+            return AttentionBackendEnum[value.upper()]
+        return value
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -294,28 +424,62 @@ class SpeculativeConfig:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
 
+        if self.method == "dflash":
+            factors.append(self.dflash_draft_window_size)
+
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         initial_architecture = hf_config.architectures[0]
-        if hf_config.model_type in (
-            "deepseek_v3",
-            "deepseek_v32",
-            "glm_moe_dsa",
-        ):
+        if hf_config.model_type in ("deepseek_v3", "deepseek_v32", "glm_moe_dsa"):
+            if hf_config.model_type == "glm_moe_dsa":
+                quant_config = getattr(hf_config, "quantization_config", None)
+                if isinstance(quant_config, dict):
+                    quant_config = copy.deepcopy(quant_config)
+                    ignored = list(quant_config.get("ignore", []))
+                    mtp_start = getattr(hf_config, "num_hidden_layers", None)
+                    mtp_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
+                    has_serialized_nextn_experts = (
+                        mtp_start is not None
+                        and mtp_layers
+                        and _has_serialized_glm_nextn_fp4_experts(hf_config)
+                    )
+                    if mtp_start is not None and mtp_layers:
+                        unquantized_mtp_prefixes = []
+                        for layer_idx in range(mtp_start, mtp_start + mtp_layers):
+                            prefix = f"model.layers.{layer_idx}"
+                            if has_serialized_nextn_experts:
+                                _extend_unique(
+                                    ignored,
+                                    [
+                                        f"{prefix}.self_attn*",
+                                        f"{prefix}.eh_proj*",
+                                        f"{prefix}.enorm*",
+                                        f"{prefix}.hnorm*",
+                                        f"{prefix}.shared_head*",
+                                        f"{prefix}.mlp.gate*",
+                                        f"{prefix}.mlp.shared_experts*",
+                                    ],
+                                )
+                            else:
+                                if _quant_config_targets_prefix(quant_config, prefix):
+                                    continue
+                                unquantized_mtp_prefixes.append(prefix)
+                                _extend_unique(ignored, [prefix, f"{prefix}.*"])
+                        if has_serialized_nextn_experts or unquantized_mtp_prefixes:
+                            quant_config["ignore"] = ignored
+                            hf_config.quantization_config = quant_config
+                        if unquantized_mtp_prefixes:
+                            hf_config.vllm_unquantized_mtp_layer_prefixes = (
+                                unquantized_mtp_prefixes
+                            )
             hf_config.model_type = "deepseek_mtp"
         if hf_config.model_type == "deepseek_mtp":
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["DeepSeekMTPModel"]}
-            )
-        if hf_config.model_type == "deepseek_v4":
-            hf_config.model_type = "deepseek_mtp"
-            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
-            hf_config.update(
-                {"n_predict": n_predict, "architectures": ["DeepSeekV4MTPModel"]}
             )
         if hf_config.model_type in ("pangu_ultra_moe"):
             hf_config.model_type = "pangu_ultra_moe_mtp"
@@ -333,48 +497,6 @@ class SpeculativeConfig:
                     "num_hidden_layers": 0,
                     "n_predict": n_predict,
                     "architectures": ["MiMoMTPModel"],
-                }
-            )
-
-        if (arch := hf_config.architectures[0]) in (
-            "MiMoV2ForCausalLM",
-            "MiMoV2OmniForCausalLM",
-        ):
-            from vllm.model_executor.models.mimo_v2_mtp import (
-                _MIMO_V2_PRO_NUM_MTP_LAYERS,
-            )
-
-            mtp_arch_maps = {
-                "MiMoV2ForCausalLM": "MiMoV2MTPModel",
-                "MiMoV2OmniForCausalLM": "MiMoV2OmniMTPModel",
-            }
-
-            hf_config.model_type = "mimo_v2_mtp"
-            # vLLM currently supports only the first MiMo-V2 MTP layer.
-            n_predict = _MIMO_V2_PRO_NUM_MTP_LAYERS
-            hf_config.update(
-                {
-                    "num_hidden_layers": 0,
-                    "n_predict": n_predict,
-                    "num_nextn_predict_layers": n_predict,
-                    "architectures": [mtp_arch_maps[arch]],
-                }
-            )
-
-        if hf_config.architectures[0] == "MiMoV2FlashForCausalLM":
-            from vllm.model_executor.models.mimo_v2_mtp import (
-                _MIMO_V2_FLASH_NUM_MTP_LAYERS,
-            )
-
-            hf_config.model_type = "mimo_v2_mtp"
-            # vLLM currently supports only the first MiMo-V2 MTP layer.
-            n_predict = _MIMO_V2_FLASH_NUM_MTP_LAYERS
-            hf_config.update(
-                {
-                    "num_hidden_layers": 0,
-                    "n_predict": n_predict,
-                    "num_nextn_predict_layers": n_predict,
-                    "architectures": ["MiMoV2MTPModel"],
                 }
             )
 
@@ -800,9 +922,37 @@ class SpeculativeConfig:
 
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
-                        self.target_parallel_config, self.draft_tensor_parallel_size
+                        self.target_parallel_config,
+                        self.draft_tensor_parallel_size,
+                        propagate_dcp_to_draft=self.method in get_args(MTPModelTypes),
                     )
                 )
+
+        # Resolve `use_local_argmax_reduction` auto-default. Eliminates the
+        # full-vocab `tensor_model_parallel_all_gather` per draft step in
+        # `_greedy_sample` (validated +109% on Kimi-K2.6 + Eagle3 MTP3 DCP=1
+        # TP=8, 2026-04-29). Auto-enabled for model-based draft methods at
+        # TP>1 since the AllGather is the only big inter-rank cost in the
+        # spec-decode hot path. User can override by passing the field
+        # explicitly in `--speculative-config '{"use_local_argmax_reduction":
+        # false}'`. The proposer falls back to `compute_logits.argmax` when
+        # the model class doesn't implement `get_top_tokens`, so this is
+        # safe to default-on for all model variants.
+        if self.use_local_argmax_reduction is None:
+            _supports = self.method in (
+                "eagle",
+                "eagle3",
+                "mtp",
+                "draft_model",
+                "dflash",
+            )
+            _target_tp = (
+                self.target_parallel_config.tensor_parallel_size
+                if self.target_parallel_config is not None
+                else 1
+            )
+            self.use_local_argmax_reduction = bool(_supports and _target_tp > 1)
+
         return self
 
     def _validate_suffix_decoding(self):
@@ -943,11 +1093,26 @@ class SpeculativeConfig:
     def create_draft_parallel_config(
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int,
+        propagate_dcp_to_draft: bool = False,
     ) -> ParallelConfig:
         """Create a parallel config for use by the draft worker.
 
         This is mostly a copy of the target parallel config, except the tp_size.
         """
+        dcp_kwargs = {}
+        if propagate_dcp_to_draft:
+            dcp_kwargs = {
+                "decode_context_parallel_size": (
+                    target_parallel_config.decode_context_parallel_size
+                ),
+                "dcp_kv_cache_interleave_size": (
+                    target_parallel_config.dcp_kv_cache_interleave_size
+                ),
+                "dcp_comm_backend": target_parallel_config.dcp_comm_backend,
+                "cp_kv_cache_interleave_size": (
+                    target_parallel_config.cp_kv_cache_interleave_size
+                ),
+            }
         draft_parallel_config = ParallelConfig(
             pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
@@ -956,18 +1121,10 @@ class SpeculativeConfig:
             disable_custom_all_reduce=target_parallel_config.disable_custom_all_reduce,
             ray_workers_use_nsight=target_parallel_config.ray_workers_use_nsight,
             placement_group=target_parallel_config.placement_group,
+            **dcp_kwargs,
         )
 
         return draft_parallel_config
-
-    @field_validator("attention_backend", mode="before")
-    @classmethod
-    def _parse_attention_backend(cls, value: Any) -> Any:
-        if isinstance(value, str):
-            if value.lower() == "auto":
-                return None
-            return AttentionBackendEnum[value.upper()]
-        return value
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
@@ -990,8 +1147,14 @@ class SpeculativeConfig:
                 f"than zero ({self.num_speculative_tokens})."
             )
 
+        if self.draft_attention_backend is None and self.attention_backend is not None:
+            self.draft_attention_backend = self.attention_backend
+
+        if self.rejection_sample_method == "probabilistic":
+            self.rejection_sample_method = "standard"
+            self.draft_sample_method = "probabilistic"
+
         if self.rejection_sample_method == "synthetic":
-            # Consolidate to per-position rates
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
                 self.num_speculative_tokens,
                 self.synthetic_acceptance_rates,
