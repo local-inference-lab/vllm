@@ -4,7 +4,7 @@ FROM voipmonitor/vllm:glm51-kimi-20260510
 SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
 ARG B12X_REPO=https://github.com/local-inference-lab/b12x.git
-ARG B12X_COMMIT=7bf571d5b80009c2cc169a14cc8bcfa520659cbf
+ARG B12X_COMMIT=c929144c7689668b07ca65af10ceadf1c745165d
 ARG FLASHINFER_REPO=https://github.com/flashinfer-ai/flashinfer.git
 ARG FLASHINFER_COMMIT=6885e76a5e12a59220b9dc199d86a64fbe5f6d78
 ARG VLLM_BUILD_VERSION=0.11.2.dev278+glm51kimi20260511
@@ -121,7 +121,7 @@ LABEL org.opencontainers.image.description="vLLM GLM/Kimi canonical full-install
       voipmonitor.vllm.canonical_branch="codex/glm51-kimi-canonical-a16-upstream-20260511" \
       voipmonitor.b12x.repo="local-inference-lab/b12x" \
       voipmonitor.b12x.branch="codex/glm51-kimi-b12x-a16-cpuhangfix-cutedsl45-20260512" \
-      voipmonitor.b12x.commit="7bf571d5b80009c2cc169a14cc8bcfa520659cbf" \
+      voipmonitor.b12x.commit="c929144c7689668b07ca65af10ceadf1c745165d" \
       voipmonitor.flashinfer.upstream_repo="flashinfer-ai/flashinfer" \
       voipmonitor.flashinfer.upstream_commit="6885e76a5e12a59220b9dc199d86a64fbe5f6d78" \
       voipmonitor.cutedsl.version="4.5.0"
