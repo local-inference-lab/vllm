@@ -52,6 +52,10 @@ class CachedRequestState:
     # To accumulate prompt logprobs tensor chunks across prefill steps.
     in_progress_prompt_logprobs_cpu: LogprobsTensors | None = None
 
+    # To accumulate raw prompt logits chunks across prefill steps when
+    # `SamplingParams.return_prompt_logits` is enabled.
+    in_progress_prompt_logits: list[torch.Tensor] | None = None
+
     # Per-position mask for mixed-mode inputs (e.g chat completion with
     # prompt_embeds content parts). See `Request.prompt_is_token_ids`.
     prompt_is_token_ids: list[bool] | None = None
@@ -62,6 +66,10 @@ class CachedRequestState:
     # for pooling models
     pooling_params: PoolingParams | None = None
     pooling_states: PoolingStates | None = None
+
+    # KLD mode: path and key for reference logits in safetensors
+    reference_logits_path: str | None = None
+    reference_logits_key: str | None = None
 
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
@@ -102,6 +110,7 @@ class InputBatch:
         max_num_blocks_per_req: list[int] | None = None,
         logitsprocs: LogitsProcessors | None = None,
         logitsprocs_need_output_token_ids: bool = False,
+        is_spec_decode: bool = False,
         num_spec_tokens: int = 0,
         is_pooling_model: bool = False,
         cp_kv_cache_interleave_size: int = 1,
@@ -116,6 +125,7 @@ class InputBatch:
         )
         self.thinking_token_budget_reqs: set[str] = set()
         self.is_pooling_model = is_pooling_model
+        self.is_spec_decode = is_spec_decode
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
         self.max_num_batched_tokens = max_num_batched_tokens
