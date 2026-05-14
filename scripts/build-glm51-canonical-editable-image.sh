@@ -11,6 +11,7 @@ VLLM_VERSION_OVERRIDE="${VLLM_VERSION_OVERRIDE:-0.11.2.dev278+glm51kimi${DATE_TA
 BASE_IMAGE="${BASE_IMAGE:-}"
 B12X_GIT_SHA="${B12X_GIT_SHA:-}"
 CONTAINER_NAME="${CONTAINER_NAME:-glm51-vllm-editable-build-test}"
+BUILD_DOCKER_GPU_ARGS="${BUILD_DOCKER_GPU_ARGS:---gpus all}"
 
 VLLM_GIT_SHA="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
 VLLM_GIT_SHORT="$(git -C "${ROOT_DIR}" rev-parse --short=7 HEAD)"
@@ -39,9 +40,11 @@ echo "Output image: ${IMAGE_TAG}"
 echo "vLLM git: ${VLLM_GIT_SHA}"
 echo "B12X git label: ${B12X_GIT_SHA}"
 echo "MAX_JOBS: ${MAX_JOBS}"
+echo "Build Docker GPU args: ${BUILD_DOCKER_GPU_ARGS}"
 
 docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
-docker run -d --name "${CONTAINER_NAME}" --entrypoint sleep "${BASE_IMAGE}" infinity >/dev/null
+docker run -d ${BUILD_DOCKER_GPU_ARGS} --name "${CONTAINER_NAME}" \
+  --entrypoint sleep "${BASE_IMAGE}" infinity >/dev/null
 
 git -C "${ROOT_DIR}" archive --format=tar HEAD \
   | docker exec -i "${CONTAINER_NAME}" bash -lc 'rm -rf /opt/vllm && mkdir -p /opt/vllm && tar -xf - -C /opt/vllm'
