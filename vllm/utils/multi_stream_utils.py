@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from enum import Enum
 from typing import Any
 
@@ -15,6 +15,24 @@ class AuxStreamType(Enum):
 class EventType(Enum):
     Main = 0
     Attention = 1
+
+
+def _is_tracing() -> bool:
+    try:
+        import torch.compiler
+
+        if torch.compiler.is_compiling():
+            return True
+    except (AttributeError, ImportError):
+        pass
+    try:
+        import torch._dynamo
+
+        if torch._dynamo.is_compiling():
+            return True
+    except (AttributeError, ImportError):
+        pass
+    return False
 
 
 def maybe_execute_in_parallel(
@@ -44,7 +62,7 @@ def maybe_execute_in_parallel(
     Returns:
         Tuple of (fn0_result, fn1_result).
     """
-    if aux_stream is not None:
+    if aux_stream is not None and not _is_tracing():
         event0.record()
         result0 = fn0()
         with torch.cuda.stream(aux_stream):
@@ -63,7 +81,11 @@ def execute_in_parallel(
     aux_fns: list[Callable[[], Any] | None],
     start_event: torch.cuda.Event,
     done_events: list[torch.cuda.Event],
-    aux_streams: list[torch.cuda.Stream] | None = None,
+    aux_streams: (
+        Sequence[torch.cuda.Stream]
+        | Callable[[], Sequence[torch.cuda.Stream]]
+        | None
+    ) = None,
     enable: bool = False,
 ) -> tuple[Any, list[Any]]:
     """Run default_fn on the current stream and aux_fns concurrently on
@@ -98,12 +120,14 @@ def execute_in_parallel(
         result of aux_fns[i] (or None when skipped).
     """
     aux_results: list[Any]
-    if aux_streams is None or not enable:
+    if aux_streams is None or not enable or _is_tracing():
         default_result = default_fn()
         aux_results = [fn() if fn is not None else None for fn in aux_fns]
         return default_result, aux_results
 
-    assert len(aux_fns) == len(aux_streams) == len(done_events), (
+    resolved_streams = aux_streams() if callable(aux_streams) else aux_streams
+
+    assert len(aux_fns) == len(resolved_streams) == len(done_events), (
         "aux_fns, aux_streams, and done_events must be the same length"
     )
 
@@ -114,7 +138,7 @@ def execute_in_parallel(
     for i, fn in enumerate(aux_fns):
         if fn is None:
             continue
-        with torch.cuda.stream(aux_streams[i]):
+        with torch.cuda.stream(resolved_streams[i]):
             start_event.wait()
             aux_results[i] = fn()
             done_events[i].record()

@@ -100,11 +100,19 @@ def _setup_triton_jit_hook() -> None:
         # pre-existing hook unchanged.
         fn = kwargs.get("fn")
         fn_name = getattr(fn, "name", "<unknown>")
+        compile_info = kwargs.get("compile") or {}
+        repr_info = kwargs.get("repr", "")
+        # Use plain strings here. `warning_once` requires hashable args and
+        # Triton passes nested dict/list structures in `compile`.
         logger.warning_once(
             "Triton kernel JIT compilation during inference: %s. "
-            "This causes a latency spike; consider extending warmup "
-            "to cover this shape/config.",
+            "This causes a latency spike; consider extending warmup to cover "
+            "this shape/config. repr=%s signature=%s constants=%s key=%s",
             fn_name,
+            repr(repr_info),
+            repr(compile_info.get("signature")),
+            repr(compile_info.get("constants")),
+            repr(compile_info.get("key")),
         )
         if existing_hook is not None:
             return existing_hook(**kwargs)

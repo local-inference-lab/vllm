@@ -168,6 +168,7 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+    VLLM_USE_B12X_SPARSE_INDEXER: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -184,6 +185,7 @@ if TYPE_CHECKING:
     )
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
+    VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -219,6 +221,8 @@ if TYPE_CHECKING:
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
     VLLM_NVFP4_GEMM_BACKEND: str | None = None
+    VLLM_B12X_KERNEL_PREWARM: bool = True
+    VLLM_B12X_PAD_M_TO_POW2: bool = True
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
@@ -253,6 +257,8 @@ if TYPE_CHECKING:
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
+    VLLM_ENABLE_MLA_PREATTN_FANOUT: bool = False
+    BOB_ENABLE_EAGLE3_FANOUT: bool = False
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
@@ -1295,6 +1301,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
     ),
+    # Route sparse MLA top-k score computation through b12x instead of
+    # DeepGEMM. This is opt-in while the b12x NSA backend is evaluated.
+    "VLLM_USE_B12X_SPARSE_INDEXER": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_SPARSE_INDEXER", "0"))
+    ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
     # JIT'ing in the hot-path. However, this warmup increases the engine
@@ -1430,6 +1441,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "auto",
         ["auto", "trtllm", "mnnvl"],
     ),
+    # Opt in to the b12x PCIe oneshot custom allreduce path on PCIe-only GPUs.
+    "VLLM_ENABLE_PCIE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_PCIE_ALLREDUCE", "0"))
+    ),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
         os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))
@@ -1530,6 +1545,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "flashinfer-cudnn": use flashinfer cudnn GEMM backend
     # - "flashinfer-trtllm": use flashinfer trtllm GEMM backend
     # - "flashinfer-cutlass": use flashinfer cutlass GEMM backend
+    # - "b12x": use b12x dense FP4 GEMM backend (SM120+)
     # - "marlin": use marlin GEMM backend (for GPUs without native FP4 support)
     # - "emulation":
     #     use BF16/FP16 GEMM, dequantizing weights and running QDQ on activations.
@@ -1544,9 +1560,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "flashinfer-trtllm",
             "flashinfer-cutlass",
             "cutlass",
+            "b12x",
             "marlin",
             "emulation",
         ],
+    ),
+    # Pre-warm the b12x CUTLASS DSL kernel cache at startup for typical
+    # MoE shapes. This is only used by the optional b12x MoE backend.
+    "VLLM_B12X_KERNEL_PREWARM": lambda: bool(
+        int(os.getenv("VLLM_B12X_KERNEL_PREWARM", "1"))
+    ),
+    # Pad MoE token count to a power-of-two before b12x dispatch to avoid
+    # unbounded first-use CUTLASS DSL JIT shapes during chunked prefill.
+    "VLLM_B12X_PAD_M_TO_POW2": lambda: bool(
+        int(os.getenv("VLLM_B12X_PAD_M_TO_POW2", "1"))
     ),
     # Controls garbage collection during CUDA graph capture.
     # If set to 0 (default), enables GC freezing to speed up capture time.
@@ -1717,6 +1744,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TODO(alexm-redhat): Tune to be more dynamic based on GPU type
     "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": lambda: int(
         int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
+    ),
+    # Enable sparse MLA pre-attention GEMM fan-out. The MLA layer auto-enables
+    # this for validated sparse MLA backends unless the env var is explicit.
+    "VLLM_ENABLE_MLA_PREATTN_FANOUT": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_MLA_PREATTN_FANOUT", "0"))
+    ),
+    # Optional dense MLA fan-out hook for draft models. Default off.
+    "BOB_ENABLE_EAGLE3_FANOUT": lambda: bool(
+        int(os.getenv("BOB_ENABLE_EAGLE3_FANOUT", "0"))
     ),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer

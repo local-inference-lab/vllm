@@ -10,6 +10,7 @@ from typing import Any
 import torch
 
 import vllm.envs as envs
+import vllm.ir
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -246,6 +247,37 @@ def override_forward_context(forward_context: ForwardContext | None):
         _forward_context = prev_context
 
 
+_in_static_forward_context: bool = False
+
+
+@contextmanager
+def static_forward_context(vllm_config: VllmConfig):
+    """Hoist static forward context managers outside spec-decode loops.
+
+    The hoist is default-off because it improved single-stream latency but
+    regressed high-concurrency runs in prior measurements. Keeping the helper
+    available preserves compatibility with spec-decode code that imports it,
+    while the default path remains the legacy per-call context entry.
+    """
+    import os
+
+    if os.getenv("BOB_DISABLE_STATIC_HOIST", "1") == "1":
+        yield
+        return
+
+    global _in_static_forward_context
+    was_in = _in_static_forward_context
+    _in_static_forward_context = True
+    try:
+        with vllm_config.kernel_config.ir_op_priority.set_priority():
+            with vllm.ir.enable_torch_wrap(
+                vllm_config.compilation_config.ir_enable_torch_wrap
+            ):
+                yield
+    finally:
+        _in_static_forward_context = was_in
+
+
 @contextmanager
 def set_forward_context(
     attn_metadata: Any,
@@ -261,6 +293,10 @@ def set_forward_context(
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
     Here we can inject common logic for every model forward pass.
+
+    When invoked inside a `static_forward_context(vllm_config)` block, the
+    static vllm_config-only context managers are already active and are not
+    re-entered.
     """
     global forward_start_time
     need_to_track_batchsize = track_batchsize and attn_metadata is not None
@@ -319,8 +355,18 @@ def set_forward_context(
     )
 
     try:
-        with override_forward_context(forward_context):
-            yield
+        if _in_static_forward_context:
+            with override_forward_context(forward_context):
+                yield
+        else:
+            with (
+                override_forward_context(forward_context),
+                vllm_config.kernel_config.ir_op_priority.set_priority(),
+                vllm.ir.enable_torch_wrap(
+                    vllm_config.compilation_config.ir_enable_torch_wrap
+                ),
+            ):
+                yield
     finally:
         global last_logging_time, batchsize_logging_interval
         if need_to_track_batchsize:

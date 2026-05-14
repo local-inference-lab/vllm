@@ -11,8 +11,13 @@ typedef __hip_bfloat16 nv_bfloat16;
 
 #include <iostream>
 #include <array>
+#include <cerrno>
+#include <cctype>
+#include <cstdint>
 #include <limits>
 #include <map>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include <cstdlib>
@@ -41,6 +46,71 @@ const int defaultBlockLimit = 16;
 hipPointer_attribute rangeStartAddrAttr =
     HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR;
 #endif
+
+inline int64_t parse_bytes_env_once(const char* name, int64_t default_value) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0') return default_value;
+
+  errno = 0;
+  char* end = nullptr;
+  int64_t value = std::strtoll(raw, &end, 10);
+  if (end == raw || errno != 0 || value < 0) {
+    throw std::runtime_error("Invalid " + std::string(name) + ": " + raw);
+  }
+
+  while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end))) {
+    ++end;
+  }
+
+  int64_t multiplier = 1;
+  if (*end != '\0') {
+    std::string suffix(end);
+    for (auto& c : suffix) {
+      c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    if (suffix == "K" || suffix == "KB" || suffix == "KIB") {
+      multiplier = 1024;
+    } else if (suffix == "M" || suffix == "MB" || suffix == "MIB") {
+      multiplier = 1024 * 1024;
+    } else {
+      throw std::runtime_error("Invalid " + std::string(name) +
+                               " suffix: " + suffix);
+    }
+  }
+
+  return value * multiplier;
+}
+
+inline int64_t custom_ar_1stage_cutoff_bytes(int world_size) {
+  // Keep the upstream default unless explicitly overridden. On PCIe-only
+  // RTX PRO 6000 Blackwell, microbenchmarks show 1stage only wins below 64KB.
+  static const int64_t override_cutoff =
+      parse_bytes_env_once("VLLM_CUSTOM_ALLREDUCE_1STAGE_MAX_SIZE", -1);
+  if (override_cutoff >= 0) return override_cutoff;
+  if (world_size <= 4) return 512 * 1024;
+  if (world_size <= 8) return 256 * 1024;
+  return 0;
+}
+
+inline int custom_ar_forced_algo() {
+  // 0 = selector, 1 = force 1stage, 2 = force 2stage.
+  static const int forced_algo = []() {
+    const char* env_algo = std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO");
+    if (env_algo == nullptr || env_algo[0] == '\0') return 0;
+    if (std::strcmp(env_algo, "1stage") == 0 ||
+        std::strcmp(env_algo, "oneshot") == 0) {
+      return 1;
+    }
+    if (std::strcmp(env_algo, "2stage") == 0 ||
+        std::strcmp(env_algo, "twoshot") == 0) {
+      return 2;
+    }
+    throw std::runtime_error(
+        "Invalid VLLM_CUSTOM_ALLREDUCE_ALGO: " + std::string(env_algo) +
+        ". Valid values: 1stage, oneshot, 2stage, twoshot");
+  }();
+  return forced_algo;
+}
 
 // Counter may overflow, but it's fine since unsigned int overflow is
 // well-defined behavior.
@@ -558,39 +628,23 @@ class CustomAllreduce {
     auto bytes = size * sizeof(typename packed_t<T>::P);
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
 
-    // Check environment variable once
-    const char* env_algo = std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO");
-    bool force_1stage = false;
-    bool force_2stage = false;
-    if (env_algo != nullptr) {
-      if (std::strcmp(env_algo, "1stage") == 0 ||
-          std::strcmp(env_algo, "oneshot") == 0) {
-        force_1stage = true;
-      } else if (std::strcmp(env_algo, "2stage") == 0 ||
-                 std::strcmp(env_algo, "twoshot") == 0) {
-        force_2stage = true;
-      } else {
-        throw std::runtime_error(
-            "Invalid VLLM_CUSTOM_ALLREDUCE_ALGO: " + std::string(env_algo) +
-            ". Valid values: 1stage, oneshot, 2stage, twoshot");
-      }
-    }
+    const int forced_algo = custom_ar_forced_algo();
+    const int64_t one_stage_cutoff = custom_ar_1stage_cutoff_bytes(world_size_);
 
 #define KL(ngpus, name)                                                       \
   name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
                                                  rank_, size);
 #define REDUCE_CASE(ngpus)                              \
   case ngpus: {                                         \
-    if (force_1stage) {                                 \
+    if (forced_algo == 1) {                             \
       KL(ngpus, cross_device_reduce_1stage);            \
-    } else if (force_2stage) {                          \
+    } else if (forced_algo == 2) {                      \
       KL(ngpus, cross_device_reduce_2stage);            \
     } else {                                            \
       if (world_size_ == 2) {                           \
         KL(ngpus, cross_device_reduce_1stage);          \
       } else if (fully_connected_) {                    \
-        if ((world_size_ <= 4 && bytes < 512 * 1024) || \
-            (world_size_ <= 8 && bytes < 256 * 1024)) { \
+        if (bytes < one_stage_cutoff) {                 \
           KL(ngpus, cross_device_reduce_1stage);        \
         } else {                                        \
           KL(ngpus, cross_device_reduce_2stage);        \
