@@ -5,9 +5,9 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized
 
 import vllm._custom_ops as ops
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
-from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
@@ -35,7 +35,15 @@ def fused_rope_unified_mla_kv_cache_update_impl(
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     layer_name = _resolve_layer_name(layer_name)
-    attn_metadata, _, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    forward_context = get_forward_context()
+    attn_layer = forward_context.no_compile_layers[layer_name]
+    kv_cache = attn_layer.kv_cache
+
+    slot_mapping = forward_context.slot_mapping
+    assert isinstance(slot_mapping, dict), (
+        f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
+    )
+    layer_slot_mapping = slot_mapping.get(layer_name)
     if layer_slot_mapping is not None:
         ops.concat_and_cache_mla_rope_fused(
             positions,
@@ -44,7 +52,7 @@ def fused_rope_unified_mla_kv_cache_update_impl(
             kv_c,
             cos_sin_cache,
             is_neox,
-            layer_slot_mapping,
+            layer_slot_mapping.flatten(),
             kv_cache,
             kv_cache_dtype,
             kv_cache_scale,

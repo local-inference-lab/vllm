@@ -1237,6 +1237,7 @@ def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
+    suppress_log: bool = False,
 ) -> KVCacheConfig:
     """
     Generate the KV cache configuration from the KV cache groups and spec

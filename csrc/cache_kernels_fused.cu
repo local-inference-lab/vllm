@@ -35,16 +35,12 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
     const int64_t kv_c_stride, const int num_q_heads,
     cache_t* __restrict__ kv_cache,  // [num_blocks, block_size, (kv_lora_rank +
                                      // rot_dim)]
+    const int num_tokens,
     const int64_t* __restrict__ slot_mapping,  // [num_tokens]
     const int block_stride, const int entry_stride, const int kv_lora_rank,
     const int block_size, const float* kv_cache_quant_scale) {
   // Each thread block is responsible for one token.
   const int64_t token_idx = blockIdx.x;
-  const int64_t slot_idx = slot_mapping[token_idx];
-  // NOTE: slot_idx can be -1 if the token is padded
-  if (slot_idx < 0) {
-    return;
-  }
   const int64_t pos = positions[token_idx];
 
   const cos_sin_t* cos_sin_ptr = rope_cos_sin_cache + pos * rot_dim;
@@ -86,8 +82,20 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
     q_pe_head_ptr[pair_idx_y] = y_dst;
   }
 
-  const int64_t block_idx = slot_idx / block_size;
-  const int64_t entry_idx = slot_idx % block_size;
+  int64_t block_idx = 0;
+  int64_t entry_idx = 0;
+  bool should_update_cache = token_idx < num_tokens;
+  if (should_update_cache) {
+    const int64_t slot_idx = slot_mapping[token_idx];
+    // NOTE: slot_idx can be -1 if the token is padded. RoPE still has to run
+    // for padded q/k rows to match the unfused path; only the cache write is
+    // skipped.
+    should_update_cache = slot_idx >= 0;
+    if (should_update_cache) {
+      block_idx = slot_idx / block_size;
+      entry_idx = slot_idx % block_size;
+    }
+  }
 
   // K with 1 HEAD
   for (int i = threadIdx.x; i < embed_dim; i += blockDim.x) {
@@ -118,6 +126,10 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
     k_pe_head_ptr[pair_idx_x] = x_dst;
     k_pe_head_ptr[pair_idx_y] = y_dst;
 
+    if (!should_update_cache) {
+      continue;
+    }
+
     // NOTE Why is this monster necessary?
     // When K is of type float16, the actual template replacement for
     // raw_kv_scalar_t with be u16. That's why it's used at the last moment
@@ -145,19 +157,21 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
   }
 
   // NOPE
-  for (int i = threadIdx.x; i < kv_lora_rank; i += blockDim.x) {
-    const qk_t* src_ptr = kv_c + token_idx * kv_c_stride + i;
-    const raw_kv_scalar_t src_value =
-        *reinterpret_cast<const raw_kv_scalar_t*>(src_ptr);
+  if (should_update_cache) {
+    for (int i = threadIdx.x; i < kv_lora_rank; i += blockDim.x) {
+      const qk_t* src_ptr = kv_c + token_idx * kv_c_stride + i;
+      const raw_kv_scalar_t src_value =
+          *reinterpret_cast<const raw_kv_scalar_t*>(src_ptr);
 
-    cache_t* kv_cache_ptr =
-        kv_cache + block_idx * block_stride + entry_idx * entry_stride;
+      cache_t* kv_cache_ptr =
+          kv_cache + block_idx * block_stride + entry_idx * entry_stride;
 
-    if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-      kv_cache_ptr[i] = src_value;
-    } else {
-      kv_cache_ptr[i] = fp8::scaled_convert<cache_t, raw_kv_scalar_t, kv_dt>(
-          src_value, *kv_cache_quant_scale);
+      if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+        kv_cache_ptr[i] = src_value;
+      } else {
+        kv_cache_ptr[i] = fp8::scaled_convert<cache_t, raw_kv_scalar_t, kv_dt>(
+            src_value, *kv_cache_quant_scale);
+      }
     }
   }
 }
@@ -182,8 +196,8 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
                       q_pe_stride_token, q_pe_stride_head, k_pe_stride,       \
                       kv_c_stride, num_q_heads,                               \
                       reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),        \
-                      slot_mapping.data_ptr<int64_t>(), block_stride,         \
-                      entry_stride, kv_lora_rank, block_size,                 \
+                      num_tokens, slot_mapping.data_ptr<int64_t>(),           \
+                      block_stride, entry_stride, kv_lora_rank, block_size,   \
                       kv_cache_quant_scale.data_ptr<float>());                \
             } else {                                                          \
               vllm::concat_and_cache_mla_rope_fused_kernel<                   \
@@ -195,8 +209,8 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
                       q_pe_stride_token, q_pe_stride_head, k_pe_stride,       \
                       kv_c_stride, num_q_heads,                               \
                       reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),        \
-                      slot_mapping.data_ptr<int64_t>(), block_stride,         \
-                      entry_stride, kv_lora_rank, block_size,                 \
+                      num_tokens, slot_mapping.data_ptr<int64_t>(),           \
+                      block_stride, entry_stride, kv_lora_rank, block_size,   \
                       kv_cache_quant_scale.data_ptr<float>());                \
             }                                                                 \
           });                                                                 \
@@ -226,8 +240,9 @@ void concat_and_cache_mla_rope_fused(
   // since key includes padding for CUDA graphs, while slot_mapping does not.
   // In this case, slot_mapping.size(0) represents the actual number of tokens
   // before padding.
-  // For compatibility with both cases, we use slot_mapping.size(0) as the
-  // number of tokens.
+  // RoPE must still run for padded q/k rows because the unfused path applies
+  // rotary embedding before the cache update. slot_mapping.size(0) controls
+  // only how many rows can write KV cache.
   int num_tokens = slot_mapping.size(0);
   int num_padded_tokens = q_pe.size(0);
   TORCH_CHECK_GE(num_padded_tokens, num_tokens);
@@ -283,7 +298,7 @@ void concat_and_cache_mla_rope_fused(
   int thread_block_size =
       std::min(std::max(rope_block_size, mla_block_size), 512);
 
-  dim3 grid(num_tokens, 1, 1);
+  dim3 grid(num_padded_tokens, 1, 1);
   dim3 block(thread_block_size, 1, 1);
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(positions));

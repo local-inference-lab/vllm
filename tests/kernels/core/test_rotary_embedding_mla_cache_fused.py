@@ -170,3 +170,122 @@ def test_concat_and_cache_mla_rope_fused(
     torch.testing.assert_close(
         query, ref_q_pe, atol=get_default_atol(query), rtol=get_default_rtol(query)
     )
+    torch.testing.assert_close(
+        k_pe, ref_k_pe, atol=get_default_atol(k_pe), rtol=get_default_rtol(k_pe)
+    )
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+@pytest.mark.parametrize("is_neox_style", [False, True])
+@torch.inference_mode()
+def test_concat_and_cache_mla_rope_fused_padded_invalid_slots(
+    default_vllm_config,
+    kv_cache_dtype: str,
+    is_neox_style: bool,
+) -> None:
+    if torch.accelerator.device_count() == 0:
+        pytest.skip("CUDA device is required")
+
+    set_random_seed(0)
+    torch.set_default_device("cuda:0")
+
+    dtype = torch.bfloat16
+    max_position = 8192
+    qk_rope_head_dim = 64
+    num_q_heads = 4
+    kv_lora_rank = 32
+    block_size = 16
+    num_blocks = 2
+    num_padded_tokens = 7
+
+    rope = RotaryEmbedding(
+        qk_rope_head_dim,
+        qk_rope_head_dim,
+        max_position,
+        10000,
+        is_neox_style,
+        torch.float32,
+    ).to(dtype=dtype, device=torch.get_default_device())
+
+    positions = torch.randint(0, max_position, (num_padded_tokens,))
+    query = torch.randn(
+        num_padded_tokens, num_q_heads, qk_rope_head_dim, dtype=dtype
+    )
+    k_pe = torch.randn(num_padded_tokens, qk_rope_head_dim, dtype=dtype)
+    kv_c = torch.randn(num_padded_tokens, kv_lora_rank, dtype=dtype)
+
+    if current_platform.is_rocm():
+        ref_q_pe, ref_k_pe = rope.forward_hip(
+            positions, query.clone(), k_pe.clone()
+        )
+    else:
+        ref_q_pe, ref_k_pe = rope.forward_native(
+            positions, query.clone(), k_pe.clone()
+        )
+    assert ref_k_pe is not None
+
+    # V1 can pass a slot_mapping that covers only actual tokens while q/k
+    # tensors include CUDA graph padding. Invalid slots must skip only the cache
+    # write; RoPE still has to be applied to the corresponding q/k rows.
+    slot_mapping = torch.tensor([0, -1, 17, 23], dtype=torch.long)
+    entry_size = kv_lora_rank + qk_rope_head_dim
+    kv_cache_scale = torch.tensor([0.1], dtype=torch.float32)
+    kv_cache = torch.zeros(
+        num_blocks,
+        block_size,
+        entry_size,
+        dtype=torch.uint8 if kv_cache_dtype == "fp8" else dtype,
+    )
+
+    ref_temp = torch.zeros(num_blocks, block_size, entry_size, dtype=dtype)
+    for i, slot in enumerate(slot_mapping.tolist()):
+        if slot < 0:
+            continue
+        block_idx = slot // block_size
+        block_offset = slot % block_size
+        ref_temp[block_idx, block_offset] = torch.cat(
+            (kv_c[i], ref_k_pe[i, :qk_rope_head_dim]), dim=-1
+        )
+
+    ops.concat_and_cache_mla_rope_fused(
+        positions,
+        query,
+        k_pe,
+        kv_c,
+        rope.cos_sin_cache,
+        is_neox_style,
+        slot_mapping,
+        kv_cache,
+        kv_cache_dtype,
+        kv_cache_scale,
+    )
+
+    if kv_cache_dtype == "fp8":
+        result_temp = torch.empty_like(kv_cache, dtype=torch.float16)
+        ops.convert_fp8(
+            result_temp,
+            kv_cache.contiguous(),
+            kv_cache_scale.item(),
+            kv_dtype=kv_cache_dtype,
+        )
+        expected_temp = torch.empty_like(kv_cache, dtype=torch.float16)
+        ref_kv_cache = torch.empty_like(kv_cache, dtype=torch.uint8)
+        ops.convert_fp8(
+            ref_kv_cache, ref_temp, kv_cache_scale.item(), kv_dtype=kv_cache_dtype
+        )
+        ops.convert_fp8(
+            expected_temp,
+            ref_kv_cache,
+            kv_cache_scale.item(),
+            kv_dtype=kv_cache_dtype,
+        )
+        torch.testing.assert_close(result_temp, expected_temp, atol=0.001, rtol=0.1)
+    else:
+        torch.testing.assert_close(kv_cache, ref_temp)
+
+    torch.testing.assert_close(
+        query, ref_q_pe, atol=get_default_atol(query), rtol=get_default_rtol(query)
+    )
+    torch.testing.assert_close(
+        k_pe, ref_k_pe, atol=get_default_atol(k_pe), rtol=get_default_rtol(k_pe)
+    )
