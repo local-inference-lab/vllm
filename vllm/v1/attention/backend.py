@@ -490,6 +490,9 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
+            seq_lens_cpu_upper_bound=maybe_slice_reqs(
+                self.seq_lens_cpu_upper_bound
+            ),
         )
 
 
@@ -755,6 +758,33 @@ class AttentionImplBase(ABC, Generic[T]):
             self.dcp_world_size > 1 and self.can_return_lse_for_decode
         )
         return self
+
+    def maybe_override_cp_for_vllm_config(
+        self,
+        vllm_config: "VllmConfig | None",
+    ) -> None:
+        if vllm_config is None:
+            return
+
+        parallel_config = vllm_config.parallel_config
+        if (
+            parallel_config.decode_context_parallel_size <= 1
+            and self.dcp_world_size > 1
+        ):
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
+        if (
+            parallel_config.prefill_context_parallel_size <= 1
+            and self.pcp_world_size > 1
+        ):
+            self.pcp_world_size = 1
+            self.pcp_rank = 0
+
+        self.total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+        self.total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        self.need_to_return_lse_for_decode = (
+            self.dcp_world_size > 1 and self.can_return_lse_for_decode
+        )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         pass

@@ -313,6 +313,7 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
     )
 
     assert backend in [
+        NvFp4MoeBackend.B12X,
         NvFp4MoeBackend.VLLM_CUTLASS,
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
@@ -326,11 +327,16 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         and is_act_and_mul
         and backend
         in [
+            NvFp4MoeBackend.B12X,
             NvFp4MoeBackend.FLASHINFER_CUTLASS,
             NvFp4MoeBackend.FLASHINFER_TRTLLM,
         ]
     ):
         w13, w13_scale = reorder_w1w3_to_w3w1(w13, w13_scale)
+        if w13_scale_2.ndim == 2 and w13_scale_2.shape[1] == 2:
+            # Checkpoints store logical [w1, w3] scales; B12X/FI kernels
+            # consume the physically reordered [w3, w1] fused W13 tensor.
+            w13_scale_2 = w13_scale_2[:, [1, 0]].contiguous()
 
     # For some FI kernels, the input scales are shared by all experts.
     if is_global_sf_supported_for_nvfp4_backend(backend):

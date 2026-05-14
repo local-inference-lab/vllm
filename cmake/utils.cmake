@@ -576,7 +576,14 @@ function (define_extension_target MOD_NAME)
   # Don't use `TORCH_LIBRARIES` for CUDA since it pulls in a bunch of
   # dependencies that are not necessary and may not be installed.
   if (ARG_LANGUAGE STREQUAL "CUDA")
-    target_link_libraries(${MOD_NAME} PRIVATE torch CUDA::cudart CUDA::cuda_driver ${ARG_LIBRARIES})
+    # CUDA 13/CUTLASS direct driver calls leave symbols such as
+    # cuTensorMapEncodeTiled unresolved until libcuda is loaded. Some build
+    # environments enable --as-needed, which can strip CUDA::cuda_driver even
+    # though the extension needs the driver library at import time.
+    target_link_libraries(${MOD_NAME} PRIVATE
+      torch CUDA::cudart
+      "-Wl,--no-as-needed" CUDA::cuda_driver "-Wl,--as-needed"
+      ${ARG_LIBRARIES})
   else()
     target_link_libraries(${MOD_NAME} PRIVATE torch ${TORCH_LIBRARIES} ${ARG_LIBRARIES})
   endif()

@@ -61,6 +61,13 @@ def _convert_req_index_to_global_index_kernel(
     bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
     is_invalid_tok |= ~valid_block
     base = tl.load(bt_ptr, mask=valid_block & ~is_prefill, other=0)
+    # DCP block tables may contain in-range but unmapped entries encoded as -1.
+    # Treat those as invalid selections too; otherwise valid_counts can report
+    # full top-k while page_table_1 contains negative physical KV offsets.
+    base_invalid = base < 0
+    if HAS_PREFILL:
+        base_invalid = base_invalid & ~is_prefill
+    is_invalid_tok |= base_invalid
     out_val = base * BLOCK_SIZE + inblock_off
 
     # Override with prefill output if prefill is enabled
@@ -93,6 +100,8 @@ def triton_convert_req_index_to_global_index(
     prefill_workspace_request_ids: torch.Tensor | None = None,
     prefill_workspace_starts: torch.Tensor | None = None,
     return_valid_counts: bool = False,
+    out: torch.Tensor | None = None,
+    valid_counts: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     out[token_id, indice_id] =
@@ -138,14 +147,26 @@ def triton_convert_req_index_to_global_index(
     req_id_c = req_id.contiguous()
     block_table_c = block_table.contiguous()
     token_indices_c = token_indices.contiguous()
-    out = torch.empty_like(token_indices_c)
+    if out is None:
+        out = torch.empty_like(token_indices_c)
+    else:
+        assert out.dtype == torch.int32
+        assert out.device == token_indices.device
+        assert out.shape == token_indices_c.shape
+        out = out.contiguous()
 
     # Allocate valid count buffer if needed (must be zero-initialized for atomics)
-    valid_counts: torch.Tensor | None = None
     if return_valid_counts:
-        valid_counts = torch.zeros(
-            num_tokens, dtype=torch.int32, device=token_indices.device
-        )
+        if valid_counts is None:
+            valid_counts = torch.empty(
+                num_tokens, dtype=torch.int32, device=token_indices.device
+            )
+        else:
+            assert valid_counts.dtype == torch.int32
+            assert valid_counts.device == token_indices.device
+            assert valid_counts.shape == (num_tokens,)
+            valid_counts = valid_counts.contiguous()
+        valid_counts.zero_()
 
     # Strides in elements
     bt_stride0, bt_stride1 = block_table_c.stride()

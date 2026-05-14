@@ -1,13 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.utils.multi_stream_utils import execute_in_parallel
+from vllm.utils.torch_utils import aux_stream
+
+logger = init_logger(__name__)
+
+_SPARSE_MLA_BACKENDS_AUTO_FANOUT = ("FLASHMLA_SPARSE", "B12X_MLA_SPARSE")
 
 
 @dataclass
@@ -116,6 +125,57 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         self.prefix = prefix
 
+        explicit_fanout = os.getenv("VLLM_ENABLE_MLA_PREATTN_FANOUT")
+        if explicit_fanout is not None:
+            fanout_enabled = envs.VLLM_ENABLE_MLA_PREATTN_FANOUT
+        else:
+            backend_name = self.mla_attn.attn_backend.get_name()
+            fanout_enabled = backend_name in _SPARSE_MLA_BACKENDS_AUTO_FANOUT
+            if fanout_enabled:
+                logger.info_once(
+                    "MLA pre-attn fan-out auto-enabled for %s backend "
+                    "(set VLLM_ENABLE_MLA_PREATTN_FANOUT=0 to disable)",
+                    backend_name,
+                )
+
+        self._mla_preattn_fanout = (
+            fanout_enabled
+            and self.indexer is not None
+            and self.is_sparse
+            and self.q_lora_rank is not None
+            and self.fused_qkv_a_proj is not None
+            and hasattr(self.indexer, "wk_weights_proj")
+        )
+        self._mla_midattn_fanout = self._mla_preattn_fanout and hasattr(
+            self.indexer, "wq_b"
+        )
+        self._mla_dense_midattn_fanout = (
+            envs.BOB_ENABLE_EAGLE3_FANOUT
+            and self.q_lora_rank is not None
+            and not self.is_sparse
+        )
+
+        if self._mla_preattn_fanout or self._mla_dense_midattn_fanout:
+            aux_stream()
+        if self._mla_preattn_fanout:
+            self._fanout_start_event = torch.cuda.Event()
+            self._fanout_done_event = torch.cuda.Event()
+        else:
+            self._fanout_start_event = None
+            self._fanout_done_event = None
+        if self._mla_midattn_fanout:
+            self._fanout2_start_event = torch.cuda.Event()
+            self._fanout2_done_event = torch.cuda.Event()
+        else:
+            self._fanout2_start_event = None
+            self._fanout2_done_event = None
+        if self._mla_dense_midattn_fanout:
+            self._fanout_dense_start_event = torch.cuda.Event()
+            self._fanout_dense_done_event = torch.cuda.Event()
+        else:
+            self._fanout_dense_start_event = None
+            self._fanout_dense_done_event = None
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -124,6 +184,10 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
     ) -> torch.Tensor:
         q_c = None
         kv_lora = None
+        indexer_kw: torch.Tensor | None = None
+        indexer_q_raw: torch.Tensor | None = None
+        kv_c_normed_pre: torch.Tensor | None = None
+        k_pe_pre: torch.Tensor | None = None
 
         if self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None, (
@@ -136,13 +200,54 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 "q_b_proj is required when q_lora_rank is not None"
             )
 
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            if self._mla_preattn_fanout:
+                indexer = self.indexer
+                qkv_lora, [indexer_kw] = execute_in_parallel(
+                    default_fn=lambda: self.fused_qkv_a_proj(hidden_states)[0],
+                    aux_fns=[lambda: indexer.wk_weights_proj(hidden_states)[0]],
+                    start_event=self._fanout_start_event,
+                    done_events=[self._fanout_done_event],
+                    aux_streams=lambda: [aux_stream()],
+                    enable=True,
+                )
+            else:
+                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
             q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
+
+            if self._mla_midattn_fanout:
+                indexer = self.indexer
+                indexer_q_raw, [q] = execute_in_parallel(
+                    default_fn=lambda: indexer.wq_b(q_c)[0],
+                    aux_fns=[lambda: self.q_b_proj(q_c)[0]],
+                    start_event=self._fanout2_start_event,
+                    done_events=[self._fanout2_done_event],
+                    aux_streams=lambda: [aux_stream()],
+                    enable=True,
+                )
+            elif self._mla_dense_midattn_fanout and aux_stream() is not None:
+                kv_lora_local = kv_lora
+
+                def kv_path():
+                    kv_c_loc, k_pe_loc = kv_lora_local.split(
+                        [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+                    )
+                    return self.kv_a_layernorm(kv_c_loc), k_pe_loc
+
+                q, [(kv_c_normed_pre, k_pe_pre)] = execute_in_parallel(
+                    default_fn=lambda: self.q_b_proj(q_c)[0],
+                    aux_fns=[kv_path],
+                    start_event=self._fanout_dense_start_event,
+                    done_events=[self._fanout_dense_done_event],
+                    aux_streams=lambda: [aux_stream()],
+                    enable=True,
+                )
+            else:
+                q = self.q_b_proj(q_c)[0]
         else:
             assert self.kv_a_proj_with_mqa is not None, (
                 "kv_a_proj_with_mqa is required when q_lora_rank is None"
@@ -153,8 +258,14 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             q = self.q_proj(hidden_states)[0]
 
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c)
+        if kv_c_normed_pre is not None:
+            kv_c_normed = kv_c_normed_pre
+            k_pe = k_pe_pre
+        else:
+            kv_c, k_pe = kv_lora.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+            kv_c_normed = self.kv_a_layernorm(kv_c)
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
@@ -166,7 +277,14 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
 
         if self.indexer and self.is_sparse and not self.skip_topk:
-            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+            self.indexer(
+                hidden_states,
+                q_c,
+                positions,
+                self.indexer_rope_emb,
+                kw=indexer_kw,
+                q_raw=indexer_q_raw,
+            )
 
         if llama_4_scaling is not None:
             q *= llama_4_scaling

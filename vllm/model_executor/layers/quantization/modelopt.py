@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import re
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any
 
@@ -99,6 +100,10 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
+
+# Matches "model.layers.{idx}." prefix and captures the rest, used by
+# apply_vllm_mapper to mirror MTP-internal patterns.
+_MTP_BLOCK_LAYER_PREFIX_RE = re.compile(r"^(model\.layers\.\d+\.)(.+)$")
 
 QUANT_ALGOS = [
     # FP8 (per-tensor weight + optional static activation scale).
@@ -233,6 +238,21 @@ class ModelOptQuantConfigBase(QuantizationConfig):
                     new_exclude_modules.append(exclude[:-1] + ".*")
                 else:
                     new_exclude_modules.append(exclude)
+
+            # Mirror "model.layers.{N}.<rest>" patterns to also include
+            # "model.layers.{N}.mtp_block.<rest>". vLLM wraps MTP decoder layers
+            # with an extra mtp_block infix, while ModelOpt configs often emit
+            # ignore lists without that infix.
+            mirrored = []
+            for pat in new_exclude_modules:
+                match = _MTP_BLOCK_LAYER_PREFIX_RE.match(pat)
+                if match is None:
+                    continue
+                layers_prefix, rest = match.group(1), match.group(2)
+                if rest.startswith("mtp_block."):
+                    continue
+                mirrored.append(f"{layers_prefix}mtp_block.{rest}")
+            new_exclude_modules.extend(mirrored)
 
             self.exclude_modules = hf_to_vllm_mapper.apply_list(new_exclude_modules)
 
@@ -1539,13 +1559,15 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
 
-        # Use a single gscale for w13.
+        # GLM-5.1 NVFP4 MTP acceptance is best when fused W13 follows the
+        # original b12x single-alpha behavior: use the gate_proj global scale
+        # for both gate and up halves.
         if self.moe.is_act_and_mul and not torch.allclose(
             layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
         ):
             logger.warning_once(
-                "w1_weight_scale_2 must match w3_weight_scale_2. "
-                "Accuracy may be affected."
+                "w1_weight_scale_2 does not match w3_weight_scale_2; "
+                "using w1/gate scale for fused W13."
             )
         w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0].contiguous()
 

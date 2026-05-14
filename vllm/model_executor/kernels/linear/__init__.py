@@ -89,6 +89,7 @@ from vllm.model_executor.kernels.linear.mxfp8.xpu import (
     XPUMxFp8LinearKernel,
 )
 from vllm.model_executor.kernels.linear.nvfp4 import (
+    B12xNvFp4LinearKernel,
     NvFp4LinearKernel,
     NvFp4LinearLayerConfig,
 )
@@ -812,6 +813,7 @@ def init_wfp8_a16_linear_kernel(
 
 # Maps VLLM_NVFP4_GEMM_BACKEND env var values to kernel classes.
 _NVFP4_BACKEND_TO_KERNEL: dict[str, type[NvFp4LinearKernel]] = {
+    "b12x": B12xNvFp4LinearKernel,
     "flashinfer-cutlass": FlashInferCutlassNvFp4LinearKernel,
     "cutlass": CutlassNvFp4LinearKernel,
     "marlin": MarlinNvFp4LinearKernel,
