@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+configure_nccl_transport() {
+  if [[ "${USE_NCCL_XML:-0}" == "1" ]]; then
+    return
+  fi
+
+  unset NCCL_GRAPH_FILE
+
+  local nccl_pr2127_path="${NCCL_PR2127_PATH:-/opt/libnccl-pr2127.so.2.30.3}"
+  if [[ -f "${nccl_pr2127_path}" ]]; then
+    export VLLM_NCCL_SO_PATH="${VLLM_NCCL_SO_PATH:-${nccl_pr2127_path}}"
+    case " ${LD_PRELOAD//:/ } " in
+      *" ${nccl_pr2127_path} "*) ;;
+      *) export LD_PRELOAD="${nccl_pr2127_path}${LD_PRELOAD:+ ${LD_PRELOAD}}" ;;
+    esac
+  elif [[ "${DCP_SIZE:-1}" != "1" ]]; then
+    echo "ERROR: USE_NCCL_XML=0 with DCP_SIZE=${DCP_SIZE} requires ${nccl_pr2127_path}" >&2
+    exit 1
+  fi
+}
+
+export VLLM_USE_B12X_SPARSE_INDEXER="${VLLM_USE_B12X_SPARSE_INDEXER:-1}"
+export VLLM_B12X_MLA_SPEC_SERIAL_DECODE="${VLLM_B12X_MLA_SPEC_SERIAL_DECODE:-0}"
+export VLLM_MTP_RETURN_NORMALIZED_HIDDEN="${VLLM_MTP_RETURN_NORMALIZED_HIDDEN:-1}"
+export VLLM_SPEC_ACCEPT_THRESHOLD_ACC="${VLLM_SPEC_ACCEPT_THRESHOLD_ACC:-1.0}"
+export VLLM_SPEC_ACCEPT_THRESHOLD_SINGLE="${VLLM_SPEC_ACCEPT_THRESHOLD_SINGLE:-1.0}"
+
+MODEL="${MODEL:-lukealonso/GLM-5.1-NVFP4-MTP}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5}"
+PORT="${PORT:-5261}"
+DCP_SIZE="${DCP_SIZE:-1}"
+TP_SIZE="${TP_SIZE:-8}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.865}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-202752}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
+MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-256}"
+MOE_BACKEND="${MOE_BACKEND:-b12x}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-B12X_MLA_SPARSE}"
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+
+configure_nccl_transport
+
+DEFAULT_HF_OVERRIDES='{"index_topk_pattern":"FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'
+HF_OVERRIDES="${HF_OVERRIDES:-$DEFAULT_HF_OVERRIDES}"
+
+SPEC_ARGS=()
+if [[ "${GLM51_DISABLE_MTP:-0}" != "1" ]]; then
+  DEFAULT_SPEC_CONFIG='{"model":"lukealonso/GLM-5.1-NVFP4-MTP","method":"mtp","num_speculative_tokens":3,"rejection_sample_method":"probabilistic","moe_backend":"b12x","use_local_argmax_reduction":true}'
+  SPEC_CONFIG="${SPEC_CONFIG:-$DEFAULT_SPEC_CONFIG}"
+  SPEC_ARGS+=(--speculative-config "${SPEC_CONFIG}")
+fi
+
+exec /opt/venv/bin/vllm serve "${MODEL}" \
+  --served-model-name "${SERVED_MODEL_NAME}" \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port "${PORT}" \
+  --tensor-parallel-size "${TP_SIZE}" \
+  --pipeline-parallel-size 1 \
+  --decode-context-parallel-size "${DCP_SIZE}" \
+  --dcp-comm-backend "${DCP_COMM_BACKEND:-ag_rs}" \
+  --dcp-kv-cache-interleave-size "${DCP_KV_CACHE_INTERLEAVE_SIZE:-1}" \
+  --enable-chunked-prefill \
+  --enable-prefix-caching \
+  --load-format fastsafetensors \
+  --async-scheduling \
+  -cc.pass_config.fuse_allreduce_rms=True \
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
+  --max-model-len "${MAX_MODEL_LEN}" \
+  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
+  --max-num-seqs "${MAX_NUM_SEQS}" \
+  --max-cudagraph-capture-size "${MAX_CUDAGRAPH_CAPTURE_SIZE}" \
+  --mm-processor-cache-gb 0 \
+  --mm-encoder-tp-mode weights \
+  --quantization modelopt_fp4 \
+  --attention-backend "${ATTENTION_BACKEND}" \
+  --moe-backend "${MOE_BACKEND}" \
+  --kv-cache-dtype "${KV_CACHE_DTYPE}" \
+  --tool-call-parser glm47 \
+  --enable-auto-tool-choice \
+  --reasoning-parser glm45 \
+  "${SPEC_ARGS[@]}" \
+  --hf-overrides "${HF_OVERRIDES}" \
+  "$@"

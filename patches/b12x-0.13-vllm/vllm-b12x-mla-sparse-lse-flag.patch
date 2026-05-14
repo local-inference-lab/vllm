@@ -1,0 +1,26 @@
+--- b12x_mla_sparse.py
++++ b12x_mla_sparse.py
+@@ -1407,6 +1407,11 @@
+                 kv_cache,
+                 page_table_width=int(page_table_1.shape[1]),
+             )
++            setattr(
++                workspace,
++                "_vllm_requires_lse",
++                bool(self.need_to_return_lse_for_decode),
++            )
+             metadata = MLASparseDecodeMetadata(
+                 page_table_1=page_table_1,
+                 cache_seqlens_int32=cache_seqlens,
+@@ -1488,6 +1493,11 @@
+             max_kv_rows=int(attn_metadata.max_seq_len),
+             page_table_width=int(page_table_1.shape[1]),
+         )
++        setattr(
++            workspace,
++            "_vllm_requires_lse",
++            bool(self.need_to_return_lse_for_decode),
++        )
+         nsa_cu_seqlens_k = attn_metadata.nsa_cu_seqlens_k[
+             : nsa_cache_seqlens.shape[0] + 1
+         ]

@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+configure_nccl_transport() {
+  if [[ "${USE_NCCL_XML:-0}" == "1" ]]; then
+    return
+  fi
+
+  unset NCCL_GRAPH_FILE
+
+  local nccl_pr2127_path="${NCCL_PR2127_PATH:-/opt/libnccl-pr2127.so.2.30.3}"
+  if [[ -f "${nccl_pr2127_path}" ]]; then
+    export VLLM_NCCL_SO_PATH="${VLLM_NCCL_SO_PATH:-${nccl_pr2127_path}}"
+    case " ${LD_PRELOAD//:/ } " in
+      *" ${nccl_pr2127_path} "*) ;;
+      *) export LD_PRELOAD="${nccl_pr2127_path}${LD_PRELOAD:+ ${LD_PRELOAD}}" ;;
+    esac
+  elif [[ "${DCP_SIZE:-1}" != "1" ]]; then
+    echo "ERROR: USE_NCCL_XML=0 with DCP_SIZE=${DCP_SIZE} requires ${nccl_pr2127_path}" >&2
+    exit 1
+  fi
+}
+
+export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
+export VLLM_PCIE_ALLREDUCE_BACKEND="${VLLM_PCIE_ALLREDUCE_BACKEND:-cpp}"
+export VLLM_DISABLE_SHARED_EXPERTS_STREAM="${VLLM_DISABLE_SHARED_EXPERTS_STREAM:-0}"
+export VLLM_USE_B12X_SPARSE_INDEXER="${VLLM_USE_B12X_SPARSE_INDEXER:-0}"
+export VLLM_MTP_PROB_DIAG="${VLLM_MTP_PROB_DIAG:-0}"
+export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-1}"
+export VLLM_DISABLED_KERNELS="${VLLM_DISABLED_KERNELS:-MarlinFP8ScaledMMLinearKernel}"
+
+MODEL="${MODEL:-moonshotai/Kimi-K2.6}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Kimi-K2.6}"
+PORT="${PORT:-5002}"
+DCP_SIZE="${DCP_SIZE:-1}"
+TP_SIZE="${TP_SIZE:-8}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.94}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}"
+MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-TRITON_MLA}"
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+
+configure_nccl_transport
+
+CUDAGRAPH_ARGS=()
+if [[ -n "${MAX_CUDAGRAPH_CAPTURE_SIZE}" ]]; then
+  CUDAGRAPH_ARGS+=(--max-cudagraph-capture-size "${MAX_CUDAGRAPH_CAPTURE_SIZE}")
+fi
+
+SPEC_ARGS=()
+if [[ "${KIMI_DISABLE_MTP:-0}" != "1" ]]; then
+  DEFAULT_SPEC_CONFIG='{"model":"lightseekorg/kimi-k2.6-eagle3-mla","method":"eagle3","num_speculative_tokens":3,"draft_attention_backend":"TRITON_MLA","draft_kv_cache_dtype":"fp8","rejection_sample_method":"probabilistic"}'
+  SPEC_CONFIG="${KIMI_SPEC_CONFIG:-${SPEC_CONFIG:-$DEFAULT_SPEC_CONFIG}}"
+  SPEC_ARGS+=(--speculative-config "${SPEC_CONFIG}")
+fi
+
+exec /opt/venv/bin/vllm serve "${MODEL}" \
+  --served-model-name "${SERVED_MODEL_NAME}" \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port "${PORT}" \
+  --tensor-parallel-size "${TP_SIZE}" \
+  --pipeline-parallel-size 1 \
+  --decode-context-parallel-size "${DCP_SIZE}" \
+  --enable-chunked-prefill \
+  --enable-prefix-caching \
+  --load-format fastsafetensors \
+  --async-scheduling \
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
+  --max-model-len "${MAX_MODEL_LEN}" \
+  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
+  --max-num-seqs "${MAX_NUM_SEQS}" \
+  --mm-processor-cache-gb 0 \
+  --mm-encoder-tp-mode weights \
+  --attention-backend "${ATTENTION_BACKEND}" \
+  --kv-cache-dtype "${KV_CACHE_DTYPE}" \
+  --tool-call-parser kimi_k2 \
+  --enable-auto-tool-choice \
+  --reasoning-parser kimi_k2 \
+  "${CUDAGRAPH_ARGS[@]}" \
+  "${SPEC_ARGS[@]}" \
+  "$@"
