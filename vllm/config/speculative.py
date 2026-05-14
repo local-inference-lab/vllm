@@ -160,7 +160,7 @@ SpeculativeMethod = Literal[
     EagleModelTypes,
     NgramGPUTypes,
 ]
-RejectionSampleMethod = Literal["standard", "probabilistic", "synthetic"]
+RejectionSampleMethod = Literal["standard", "synthetic"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
 
 
@@ -302,9 +302,9 @@ class SpeculativeConfig:
 
     rejection_sample_method: RejectionSampleMethod = "standard"
     """The rejection sampling method to use. 'standard' uses probabilistic
-    rejection sampling. The legacy value 'probabilistic' is accepted and
-    normalized to 'standard' with draft_sample_method='probabilistic' for
-    compatibility with existing GLM/Kimi launchers."""
+    rejection sampling (with or without cached draft logits, controlled by
+    draft_sample_method). 'synthetic' accepts draft tokens with a decaying
+    probability calibrated by synthetic_acceptance_rates."""
 
     synthetic_acceptance_rates: list[float] | None = None
     """Per-position *unconditional* acceptance rates for synthetic rejection
@@ -1149,10 +1149,6 @@ class SpeculativeConfig:
 
         if self.draft_attention_backend is None and self.attention_backend is not None:
             self.draft_attention_backend = self.attention_backend
-
-        if self.rejection_sample_method == "probabilistic":
-            self.rejection_sample_method = "standard"
-            self.draft_sample_method = "probabilistic"
 
         if self.rejection_sample_method == "synthetic":
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(

@@ -48,7 +48,7 @@ HF_OVERRIDES="${HF_OVERRIDES:-$DEFAULT_HF_OVERRIDES}"
 
 SPEC_ARGS=()
 if [[ "${GLM51_DISABLE_MTP:-0}" != "1" ]]; then
-  DEFAULT_SPEC_CONFIG='{"model":"lukealonso/GLM-5.1-NVFP4-MTP","method":"mtp","num_speculative_tokens":3,"rejection_sample_method":"probabilistic","moe_backend":"b12x","use_local_argmax_reduction":true}'
+  DEFAULT_SPEC_CONFIG='{"model":"lukealonso/GLM-5.1-NVFP4-MTP","method":"mtp","num_speculative_tokens":3,"moe_backend":"b12x","use_local_argmax_reduction":true}'
   SPEC_CONFIG="${SPEC_CONFIG:-$DEFAULT_SPEC_CONFIG}"
   SPEC_ARGS+=(--speculative-config "${SPEC_CONFIG}")
 fi

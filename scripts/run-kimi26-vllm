@@ -51,7 +51,7 @@ fi
 
 SPEC_ARGS=()
 if [[ "${KIMI_DISABLE_MTP:-0}" != "1" ]]; then
-  DEFAULT_SPEC_CONFIG='{"model":"lightseekorg/kimi-k2.6-eagle3-mla","method":"eagle3","num_speculative_tokens":3,"draft_attention_backend":"TRITON_MLA","draft_kv_cache_dtype":"fp8","rejection_sample_method":"probabilistic"}'
+  DEFAULT_SPEC_CONFIG='{"model":"lightseekorg/kimi-k2.6-eagle3-mla","method":"eagle3","num_speculative_tokens":3,"draft_attention_backend":"TRITON_MLA","draft_kv_cache_dtype":"fp8"}'
   SPEC_CONFIG="${KIMI_SPEC_CONFIG:-${SPEC_CONFIG:-$DEFAULT_SPEC_CONFIG}}"
   SPEC_ARGS+=(--speculative-config "${SPEC_CONFIG}")
 fi
