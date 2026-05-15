@@ -373,22 +373,26 @@ class MLAAttentionSpec(FullAttentionSpec):
             "All attention layers in the same KV cache group must be MLAAttentionSpec."
         )
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        dtype_set = set(spec.dtype for spec in specs)
+        kv_quant_mode_set = set(spec.kv_quant_mode for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
+            and len(dtype_set) == 1
+            and len(kv_quant_mode_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, and model version."
+            "dtype, quantization method, compress ratio, and model version."
         )
         return cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
-            dtype=specs[0].dtype,
-            kv_quant_mode=specs[0].kv_quant_mode,
+            dtype=dtype_set.pop(),
+            kv_quant_mode=kv_quant_mode_set.pop(),
             page_size_padded=specs[0].page_size_padded,
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
@@ -533,24 +537,29 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             "SlidingWindowMLASpec."
         )
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        dtype_set = set(spec.dtype for spec in specs)
+        kv_quant_mode_set = set(spec.kv_quant_mode for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
+            and len(dtype_set) == 1
+            and len(kv_quant_mode_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, model version and sliding "
-            "window size."
+            "dtype, quantization method, compress ratio, model version and "
+            "sliding window size."
         )
         return cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
-            dtype=specs[0].dtype,
+            dtype=dtype_set.pop(),
+            kv_quant_mode=kv_quant_mode_set.pop(),
             page_size_padded=specs[0].page_size_padded,
             sliding_window=sliding_window_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),

@@ -7767,12 +7767,16 @@ class GPUModelRunner(
                     )
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
+                    cache_dtype_str = (
+                        getattr(kv_cache_spec, "cache_dtype_str", None)
+                        or self.cache_config.cache_dtype
+                    )
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
                         kernel_block_size,
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
-                        cache_dtype_str=self.cache_config.cache_dtype,
+                        cache_dtype_str=cache_dtype_str,
                     )
                     dtype = kv_cache_spec.dtype
                     try:
@@ -7847,11 +7851,15 @@ class GPUModelRunner(
             kv_cache_spec = group.kv_cache_spec
             if not isinstance(kv_cache_spec, AttentionSpec):
                 continue
+            cache_dtype_str = (
+                getattr(kv_cache_spec, "cache_dtype_str", None)
+                or self.cache_config.cache_dtype
+            )
             block_dim = group.backend.get_kv_cache_block_dim(
                 kernel_block_sizes[group.kv_cache_group_id],
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
-                cache_dtype_str=self.cache_config.cache_dtype,
+                cache_dtype_str=cache_dtype_str,
             )
             # block_dim: 0 means (num_blocks, 2, ...); 1 means (2, num_blocks, ...).
             if block_dim == 0:

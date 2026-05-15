@@ -974,7 +974,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=kv_cache_dtype,
-            cache_dtype_str=vllm_config.cache_config.cache_dtype,
+            cache_dtype_str=self.kv_cache_dtype,
         )
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):

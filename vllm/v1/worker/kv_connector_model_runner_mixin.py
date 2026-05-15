@@ -166,12 +166,13 @@ class KVConnectorModelRunnerMixin:
             return False
 
         attn_backend = attn_group.backend
+        cache_dtype_str = getattr(kv_cache_spec, "cache_dtype_str", None) or cache_dtype
         kv_cache_shape = attn_backend.get_kv_cache_shape(
             1234,
             kv_cache_spec.block_size,
             kv_cache_spec.num_kv_heads,
             kv_cache_spec.head_size,
-            cache_dtype_str=cache_dtype,
+            cache_dtype_str=cache_dtype_str,
         )
 
         try:
@@ -238,12 +239,13 @@ class KVConnectorModelRunnerMixin:
         kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
         attn_backend = attn_group.backend
+        cache_dtype_str = getattr(kv_cache_spec, "cache_dtype_str", None) or cache_dtype
         kv_cache_shape = attn_backend.get_kv_cache_shape(
             kernel_num_blocks,
             kernel_block_size,
             kv_cache_spec.num_kv_heads,
             kv_cache_spec.head_size,
-            cache_dtype_str=cache_dtype,
+            cache_dtype_str=cache_dtype_str,
         )
 
         # prepend a num_layers dimension into the shape
