@@ -693,6 +693,59 @@ class SpecDecodeBaseProposer:
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
+
+    def _update_positions_dependent_metadata(
+        self,
+        positions: torch.Tensor,
+        common_attn_metadata,
+        batch_size: int,
+        input_batch_size: int,
+        block_size: int,
+    ) -> torch.Tensor:
+        """Update positions, slot mappings, and sequence metadata for the
+        next draft step. Returns the updated positions tensor."""
+        positions_1d = positions[0] if self.uses_mrope else positions
+        if self.uses_mrope:
+            out_pos = self.mrope_positions[0, :batch_size]
+        elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
+            out_pos = self.xdrope_positions[0, :batch_size]
+        else:
+            out_pos = self.positions[:batch_size]
+        eagle_step_update_slot_mapping_and_metadata(
+            positions_1d=positions_1d,
+            block_table_tensor=common_attn_metadata.block_table_tensor,
+            seq_lens=common_attn_metadata.seq_lens,
+            block_size=block_size,
+            max_model_len=self.max_model_len,
+            out_clamped_positions=out_pos,
+            out_slot_mapping=self._slot_mapping_buffer[:input_batch_size],
+            input_batch_size=input_batch_size,
+        )
+        common_attn_metadata.slot_mapping = self._slot_mapping_buffer[:batch_size]
+        if self.uses_mrope:
+            self.mrope_positions[1:, :batch_size] = self.mrope_positions[0, :batch_size]
+            positions = self.mrope_positions[:, :batch_size]
+        elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
+            self.xdrope_positions[1:, :batch_size] = self.xdrope_positions[
+                0, :batch_size
+            ]
+            positions = self.xdrope_positions[0, :batch_size]
+        else:
+            positions = self.positions[:batch_size]
+        common_attn_metadata.max_seq_len = min(
+            common_attn_metadata.max_seq_len + 1,
+            self.max_model_len,
+        )
+
+        if common_attn_metadata._seq_lens_cpu is not None:
+            common_attn_metadata._seq_lens_cpu += 1
+        if common_attn_metadata._num_computed_tokens_cpu is not None:
+            common_attn_metadata._num_computed_tokens_cpu += 1
+        if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
+            common_attn_metadata.seq_lens_cpu_upper_bound += 1
+
+        return positions
+
     def set_inputs_first_pass(
         self,
         target_token_ids: torch.Tensor,
