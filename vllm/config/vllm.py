@@ -223,6 +223,8 @@ OPTIMIZATION_LEVEL_01 = {
         "use_inductor_graph_partition": False,
     },
     "kernel_config": {
+        # Our FlashInfer 0.6.11+git build includes the fix for
+        # flashinfer-ai/flashinfer#3197, so keep the original autotune default.
         "enable_flashinfer_autotune": True,
     },
 }
@@ -244,6 +246,8 @@ OPTIMIZATION_LEVEL_02 = {
         "use_inductor_graph_partition": False,
     },
     "kernel_config": {
+        # Our FlashInfer 0.6.11+git build includes the fix for
+        # flashinfer-ai/flashinfer#3197, so keep the original autotune default.
         "enable_flashinfer_autotune": True,
     },
 }

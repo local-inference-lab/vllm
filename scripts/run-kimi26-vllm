@@ -39,25 +39,27 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}"
 MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-}"
-KIMI_ENABLE_FLASHINFER_AUTOTUNE="${KIMI_ENABLE_FLASHINFER_AUTOTUNE:-1}"
+KIMI_ENABLE_FLASHINFER_AUTOTUNE="${KIMI_ENABLE_FLASHINFER_AUTOTUNE:-}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-TRITON_MLA}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 
 configure_nccl_transport
 
 KERNEL_ARGS=()
-case "${KIMI_ENABLE_FLASHINFER_AUTOTUNE,,}" in
-  1|true|yes|on)
-    KERNEL_ARGS+=(--enable-flashinfer-autotune)
-    ;;
-  0|false|no|off)
-    KERNEL_ARGS+=(--no-enable-flashinfer-autotune)
-    ;;
-  *)
-    echo "ERROR: KIMI_ENABLE_FLASHINFER_AUTOTUNE must be one of 1/0, true/false, yes/no, on/off; got '${KIMI_ENABLE_FLASHINFER_AUTOTUNE}'" >&2
-    exit 1
-    ;;
-esac
+if [[ -n "${KIMI_ENABLE_FLASHINFER_AUTOTUNE}" ]]; then
+  case "${KIMI_ENABLE_FLASHINFER_AUTOTUNE,,}" in
+    1|true|yes|on)
+      KERNEL_ARGS+=(--enable-flashinfer-autotune)
+      ;;
+    0|false|no|off)
+      KERNEL_ARGS+=(--no-enable-flashinfer-autotune)
+      ;;
+    *)
+      echo "ERROR: KIMI_ENABLE_FLASHINFER_AUTOTUNE must be empty or one of 1/0, true/false, yes/no, on/off; got '${KIMI_ENABLE_FLASHINFER_AUTOTUNE}'" >&2
+      exit 1
+      ;;
+  esac
+fi
 
 CUDAGRAPH_ARGS=()
 if [[ -n "${MAX_CUDAGRAPH_CAPTURE_SIZE}" ]]; then
