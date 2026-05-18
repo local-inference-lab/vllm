@@ -8,7 +8,11 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
+from vllm.model_executor.layers.b12x_contract import (
+    b12x_sparse_indexer_active_for_config,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
@@ -17,7 +21,6 @@ from vllm.utils.deep_gemm import (
 )
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import num_compute_units
-from vllm.distributed.parallel_state import get_dcp_group
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -49,6 +52,14 @@ _DEBUG_INDEXER_BLOCK_WIDTH_MAX = int(
 _DCP_FULL_INDEXER_STATIC_BLOCK_TABLE_MODE = (
     os.getenv("VLLM_DCP_FULL_INDEXER_STATIC_BLOCK_TABLE", "auto").strip().lower()
 )
+
+
+def _use_b12x_sparse_indexer_for_config(vllm_config: VllmConfig | None) -> bool:
+    if not (
+        current_platform.is_cuda() and current_platform.is_device_capability_family(120)
+    ):
+        return False
+    return b12x_sparse_indexer_active_for_config(vllm_config)
 
 
 @triton.jit
@@ -263,7 +274,6 @@ class DeepSeekV32IndexerDecodeMetadata:
     b12x_workspace: object | None = None
     page_table_1: torch.Tensor | None = None
     cu_seqlens_q: torch.Tensor | None = None
-    active_width_hint: int | None = None
 
 
 @dataclass
@@ -1018,11 +1028,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 if common_attn_metadata._seq_lens_cpu is not None
                 else common_attn_metadata.seq_lens_cpu_upper_bound
             )
-            active_width_hint = (
-                int(seq_lens_cpu_hint[:num_decodes].max().item())
-                if seq_lens_cpu_hint is not None
-                else int(common_attn_metadata.max_seq_len)
-            )
             next_n = 1 + self.num_speculative_tokens
             use_native = not self.use_flattening and max_decode_len == next_n
 
@@ -1163,8 +1168,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 cu_seqlens_q = self.cu_seqlens_q_buffer[: batch_size + 1]
 
             # DeepGEMM is the default paged-MQA scheduler; b12x exposes a
-            # compatible scheduler for the opt-in b12x sparse indexer path.
-            if current_platform.is_cuda() and envs.VLLM_USE_B12X_SPARSE_INDEXER:
+            # compatible scheduler for the active b12x sparse indexer path.
+            if _use_b12x_sparse_indexer_for_config(self.vllm_config):
                 try:
                     from b12x.integration.nsa_indexer import (
                         get_paged_mqa_logits_metadata as b12x_get_metadata,
@@ -1207,7 +1212,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 schedule_metadata=self.scheduler_metadata_buffer,
                 page_table_1=page_table_1,
                 cu_seqlens_q=cu_seqlens_q,
-                active_width_hint=active_width_hint,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(

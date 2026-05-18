@@ -16,8 +16,13 @@ from typing import Any
 import torch
 
 import vllm.envs as envs
-import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.config import CUDAGraphMode, get_current_vllm_config_or_none
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.model_executor.layers.b12x_contract import (
+    b12x_sparse_mla_active_for_config,
+)
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
@@ -34,7 +39,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
-_B12X_PAD_M_TO_POW2 = envs.VLLM_B12X_PAD_M_TO_POW2
+_B12X_PAD_M_TO_POW2 = os.getenv("VLLM_B12X_PAD_M_TO_POW2", "1") != "0"
 _B12X_MOE_STATIC_CHUNK_TOKENS = int(
     os.getenv("VLLM_B12X_MOE_STATIC_CHUNK_TOKENS", "0")
 )
@@ -73,6 +78,11 @@ try:
     )
 except ImportError:
     _b12x_shared_arena_pool = None
+
+
+def _requires_b12x_joint_moe_pool() -> bool:
+    vllm_config = get_current_vllm_config_or_none()
+    return b12x_sparse_mla_active_for_config(vllm_config)
 
 
 def _next_pow2_ge(n: int) -> int:
@@ -197,17 +207,27 @@ def _b12x_moe_fp4_pad_m(
 def _get_b12x_workspace_pool(device: torch.device):
     """Return the b12x MoE pool for the active execution lane.
 
-    Newer b12x builds let attention and MoE share one execution-lane arena.
-    Fall back to the standalone TP-MoE pool for older wheels or for runs where
-    attention has not created a lane yet.
+    When sparse MLA is active, attention and MoE must share one execution-lane
+    arena. Otherwise this may use the standalone TP-MoE pool.
     """
+    requires_joint = _requires_b12x_joint_moe_pool()
     if _b12x_shared_arena_pool is not None:
         try:
             return _b12x_shared_arena_pool(device)
         except (AttributeError, RuntimeError) as exc:
+            if requires_joint:
+                raise RuntimeError(
+                    "B12X MoE cannot fall back to a standalone workspace pool "
+                    "while B12X sparse MLA attention is active"
+                ) from exc
             logger.warning_once(
                 "Falling back to standalone b12x MoE workspace pool: %s", exc
             )
+    elif requires_joint:
+        raise RuntimeError(
+            "B12X sparse MLA attention with B12X MoE requires a b12x build "
+            "with shared execution-lane arena support"
+        )
 
     from b12x.integration.tp_moe import allocate_tp_moe_workspace_pool
 
@@ -238,6 +258,56 @@ def _b12x_env_force_a16() -> bool:
         "false",
         "False",
     )
+
+
+def _iter_attn_metadata(attn_metadata: Any):
+    if isinstance(attn_metadata, dict):
+        yield from attn_metadata.values()
+        return
+    if isinstance(attn_metadata, list):
+        for item in attn_metadata:
+            yield from _iter_attn_metadata(item)
+        return
+    if attn_metadata is not None:
+        yield attn_metadata
+
+
+def _current_forward_is_decode_only() -> bool:
+    if not is_forward_context_available():
+        return False
+
+    forward_context = get_forward_context()
+    batch_descriptor = getattr(forward_context, "batch_descriptor", None)
+    if (
+        getattr(
+            forward_context,
+            "cudagraph_runtime_mode",
+            CUDAGraphMode.NONE,
+        )
+        != CUDAGraphMode.NONE
+        and batch_descriptor is not None
+        and batch_descriptor.uniform
+    ):
+        return True
+
+    saw_decode = False
+    for metadata in _iter_attn_metadata(forward_context.attn_metadata):
+        num_prefills = getattr(metadata, "num_prefills", None)
+        num_decodes = getattr(metadata, "num_decodes", None)
+        if num_prefills is not None or num_decodes is not None:
+            if int(num_prefills or 0) > 0:
+                return False
+            saw_decode = saw_decode or int(num_decodes or 0) > 0
+            continue
+
+        max_query_len = getattr(metadata, "max_query_len", None)
+        if max_query_len is None:
+            continue
+        if int(max_query_len) > 1:
+            return False
+        saw_decode = True
+
+    return saw_decode
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +418,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     def _supports_parallel_config(
         moe_parallel_config: FusedMoEParallelConfig,
     ) -> bool:
-        return True
+        return (
+            not moe_parallel_config.use_ep
+            and moe_parallel_config.ep_size <= 1
+            and not moe_parallel_config.use_all2all_kernels
+            and not moe_parallel_config.enable_eplb
+        )
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -378,6 +453,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         specific layer range during GLM-5.1 quality/debug runs.
         """
         if _B12X_MOE_FORCE_NVFP4:
+            return "nvfp4"
+
+        if envs.VLLM_B12X_MOE_DECODE_A16:
+            if _current_forward_is_decode_only():
+                return "w4a16"
             return "nvfp4"
 
         if _B12X_MOE_A16_MIN_LAYER >= 0 and _b12x_env_force_a16():

@@ -355,10 +355,17 @@ class ModelCudaGraphManager(CudaGraphManager):
             )
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
-                batch_descriptor = None
+                batch_descriptor = BatchDescriptor(
+                    num_tokens=num_tokens,
+                    num_reqs=num_reqs,
+                    uniform=desc.uniform_token_count == self.decode_query_len,
+                )
                 if cg_mode == CUDAGraphMode.PIECEWISE:
                     assert attn_metadata is None
-                    batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+                    batch_descriptor = BatchDescriptor(
+                        num_tokens=num_tokens,
+                        uniform=desc.uniform_token_count == self.decode_query_len,
+                    )
                 with set_forward_context(
                     attn_metadata,
                     self.vllm_config,

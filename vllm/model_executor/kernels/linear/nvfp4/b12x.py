@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 import importlib
+import os
 
 import torch
 
-import vllm.envs as envs
 from vllm._custom_ops import scaled_fp4_quant
 from vllm.model_executor.kernels.linear.nvfp4.base import (
     NvFp4LinearKernel,
@@ -15,7 +15,7 @@ from vllm.model_executor.kernels.linear.nvfp4.base import (
 )
 from vllm.platforms import current_platform
 
-_B12X_PAD_M_TO_POW2 = envs.VLLM_B12X_PAD_M_TO_POW2
+_B12X_PAD_M_TO_POW2 = os.getenv("VLLM_B12X_PAD_M_TO_POW2", "1") != "0"
 
 
 def _import_b12x():

@@ -39,6 +39,7 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.weight_transfer import WeightTransferEngineFactory
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.layers.b12x_contract import b12x_backend_active_for_config
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -404,7 +405,24 @@ class Worker(WorkerBase):
                 and self.vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
             ):
-                cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+                if b12x_backend_active_for_config(self.vllm_config):
+                    logger.info_once(
+                        "Skipping CUDA graph memory profiling for B12X "
+                        "backend; B12X graph memory is handled by the native "
+                        "arena/workspace contract."
+                    )
+                    from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+                        clear_b12x_mla_workspace_cache,
+                    )
+
+                    # Profile workspaces are tied to synthetic profile inputs.
+                    # Keep arena registrations: the native b12x execution lane
+                    # is already installed and charged to model memory.
+                    clear_b12x_mla_workspace_cache(clear_arenas=False)
+                else:
+                    cudagraph_memory_estimate = (
+                        self.model_runner.profile_cudagraph_memory()
+                    )
 
         # Use the pre-cudagraph torch peak to avoid double-counting.
         profile_result.torch_peak_increase = (
@@ -420,9 +438,20 @@ class Worker(WorkerBase):
         # On CUDA, respect the opt-in flag as originally designed.
         cudagraph_memory_estimate_applied = (
             cudagraph_memory_estimate
-            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+            if (
+                envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+                and not b12x_backend_active_for_config(self.vllm_config)
+            )
             else 0
         )
+        if (
+            cudagraph_memory_estimate > 0
+            and b12x_backend_active_for_config(self.vllm_config)
+        ):
+            logger.info_once(
+                "CUDA graph profiling ran for B12X backend warmup, but its "
+                "memory estimate is not subtracted from KV capacity."
+            )
 
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
@@ -464,7 +493,10 @@ class Worker(WorkerBase):
             format_gib(self.available_kv_cache_memory_bytes),
         )
 
-        if cudagraph_memory_estimate > 0:
+        if (
+            cudagraph_memory_estimate > 0
+            and not b12x_backend_active_for_config(self.vllm_config)
+        ):
             total_mem = self.init_snapshot.total_memory
             current_util = self.cache_config.gpu_memory_utilization
             cg_util_delta = cudagraph_memory_estimate / total_mem

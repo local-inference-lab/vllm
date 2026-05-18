@@ -35,7 +35,7 @@ logger = init_logger(__name__)
 
 
 def _get_pcie_allreduce_backend() -> str:
-    backend = os.getenv("VLLM_PCIE_ALLREDUCE_BACKEND", "b12x").lower()
+    backend = os.getenv("VLLM_PCIE_ALLREDUCE_BACKEND", "cpp").lower()
     if backend not in {"b12x", "cpp"}:
         raise ValueError(
             "Invalid VLLM_PCIE_ALLREDUCE_BACKEND: "
@@ -49,6 +49,21 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _is_full_cudagraph_runtime() -> bool:
+    try:
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+    except Exception:
+        return False
+    return (
+        is_forward_context_available()
+        and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+    )
 
 
 def _is_piecewise_cudagraph_runtime() -> bool:
@@ -259,6 +274,7 @@ class CustomAllreduce:
         self._cpp_ar_ignore_cutoff_max_rows = 0
         self._cpp_ar_shape_log = False
         self._cpp_ar_logged_shapes: set[tuple[tuple[int, ...], torch.dtype, str]] = set()
+        self._pcie_cpp_backend = False
         self._ptr = 0
 
         if not custom_ar:
@@ -360,6 +376,7 @@ class CustomAllreduce:
                 # Preserve the legacy PCIe opt-in behavior: allow the same
                 # small-tensor C++ custom allreduce path as fully-connected
                 # topologies once the user explicitly enables it.
+                self._pcie_cpp_backend = True
                 fully_connected = True
             else:
                 use_pcie_oneshot = current_platform.is_cuda()
@@ -475,11 +492,15 @@ class CustomAllreduce:
         self.rank = rank
         self.world_size = world_size
         self.fully_connected = fully_connected
-        cpp_ar_cutoff = os.getenv("VLLM_CPP_AR_1STAGE_NCCL_CUTOFF")
+        default_cutoff = "56KB" if self._pcie_cpp_backend else None
+        cpp_ar_cutoff = os.getenv(
+            "VLLM_CPP_AR_1STAGE_NCCL_CUTOFF", default_cutoff or ""
+        )
         if cpp_ar_cutoff:
             self._cpp_ar_cutoff_size = _parse_byte_size(cpp_ar_cutoff)
         cpp_ar_ignore_rows = os.getenv(
-            "VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS", "0"
+            "VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS",
+            "1" if self._pcie_cpp_backend else "0",
         ) or "0"
         self._cpp_ar_ignore_cutoff_max_rows = int(cpp_ar_ignore_rows)
         self._cpp_ar_shape_log = _env_flag("VLLM_CPP_AR_SHAPE_LOG")
@@ -687,6 +708,8 @@ class CustomAllreduce:
         if self.disabled:
             return False
         if self._pcie_runtime is not None:
+            if _is_full_cudagraph_runtime():
+                return False
             return self._pcie_runtime.should_allreduce(inp)
         inp_size = inp.numel() * inp.element_size()
         rows = int(inp.shape[0]) if inp.ndim >= 2 else 1

@@ -60,6 +60,9 @@ from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.b12x_contract import (
+    b12x_sparse_indexer_active_for_config,
+)
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
@@ -5360,6 +5363,27 @@ class GPUModelRunner(
             new_config = update_config(config, config_overrides)
             setattr(self, config_name, new_config)
 
+    def _preinstall_b12x_joint_attention_arenas(self) -> None:
+        kernel_cfg = getattr(self.vllm_config, "kernel_config", None)
+        moe_backend = str(getattr(kernel_cfg, "moe_backend", "") or "").lower()
+        if kernel_cfg is None or moe_backend != "b12x":
+            return
+
+        installed = 0
+        for _, module in self.model.named_modules():
+            impl = getattr(module, "impl", None)
+            preinstall = getattr(impl, "_preinstall_b12x_joint_arena", None)
+            if preinstall is None:
+                continue
+            preinstall()
+            installed += 1
+
+        if installed:
+            logger.info(
+                "Preinstalled b12x joint attention arena for %d MLA layers.",
+                installed,
+            )
+
     @instrument(span_name="Loading (GPU)")
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """
@@ -5447,6 +5471,9 @@ class GPUModelRunner(
                         self.model_config,
                     )
                     eplb_models += 1
+
+                if not load_dummy_weights:
+                    self._preinstall_b12x_joint_attention_arenas()
 
                 time_after_load = time.perf_counter()
             self.model_memory_usage = m.consumed_memory
@@ -6741,10 +6768,10 @@ class GPUModelRunner(
         key is shape-keyed (not layer-keyed), so warming one layer
         covers every other MoE layer in the model.
 
-        Env-gated via ``VLLM_B12X_KERNEL_PREWARM`` (default on). No-op
+        Internally env-gated via ``VLLM_B12X_KERNEL_PREWARM`` (default on). No-op
         for non-b12x MoE backends.
         """
-        if not envs.VLLM_B12X_KERNEL_PREWARM:
+        if os.getenv("VLLM_B12X_KERNEL_PREWARM", "1") == "0":
             return
         kernel_cfg = getattr(self.vllm_config, "kernel_config", None)
         if kernel_cfg is None or getattr(
@@ -6962,6 +6989,9 @@ class GPUModelRunner(
                     eagle_prepare_inputs_padded_kernel,
                     eagle_prepare_next_token_padded_kernel,
                 )
+                from vllm.v1.spec_decode.utils import (
+                    eagle_step_update_slot_mapping_and_metadata,
+                )
 
                 # Runtime can call this helper with either the target sampler
                 # output width (1) or the full speculative sampled width
@@ -7030,10 +7060,56 @@ class GPUModelRunner(
                         num_rejected_tokens_gpu,
                         batch_size,
                     )
+                block_size = int(self.vllm_config.cache_config.block_size or 64)
+                dcp_size = max(
+                    1,
+                    int(
+                        getattr(
+                            self.vllm_config.parallel_config,
+                            "decode_context_parallel_size",
+                            1,
+                        )
+                    ),
+                )
+                n_blocks_per_req = max(
+                    1,
+                    (
+                        int(self.max_model_len)
+                        + block_size * dcp_size
+                        - 1
+                    )
+                    // (block_size * dcp_size),
+                )
+                for batch_size in sorted(set(batch_sizes)):
+                    positions = torch.zeros(
+                        batch_size, dtype=torch.int64, device=self.device
+                    )
+                    block_table = torch.zeros(
+                        (batch_size, n_blocks_per_req),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    seq_lens = torch.ones(
+                        batch_size, dtype=torch.int32, device=self.device
+                    )
+                    out_clamped_positions = torch.empty_like(positions)
+                    out_slot_mapping = torch.empty(
+                        batch_size, dtype=torch.int64, device=self.device
+                    )
+                    eagle_step_update_slot_mapping_and_metadata(
+                        positions,
+                        block_table,
+                        seq_lens,
+                        block_size,
+                        int(self.max_model_len),
+                        out_clamped_positions,
+                        out_slot_mapping,
+                    )
                 warmed.extend(
                     [
                         "eagle_prepare_next_token_padded_kernel",
                         "eagle_prepare_inputs_padded_kernel",
+                        "eagle_step_slot_mapping_metadata_kernel",
                     ]
                 )
             except Exception as e:  # pragma: no cover - best-effort warmup
@@ -7127,8 +7203,15 @@ class GPUModelRunner(
                     e,
                 )
 
-        if current_platform.is_cuda() and envs.VLLM_USE_B12X_SPARSE_INDEXER:
+        if (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+            and b12x_sparse_indexer_active_for_config(self.vllm_config)
+        ):
             try:
+                from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+                    _mask_page_table_after_nsa_len,
+                )
                 from b12x.integration.nsa_indexer import (
                     get_paged_mqa_logits_metadata as b12x_get_metadata,
                 )
@@ -7173,7 +7256,26 @@ class GPUModelRunner(
                         self.num_sms,
                         out=out,
                     )
-                warmed.append("_build_paged_mqa_schedule_triton")
+                hf_config = self.vllm_config.model_config.hf_text_config
+                topk = int(getattr(hf_config, "index_topk", 2048) or 2048)
+                page_table_width = max(1, topk)
+                for batch_size in sorted(set(batch_sizes)):
+                    page_table = torch.zeros(
+                        (batch_size, page_table_width),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    nsa_lens = torch.full(
+                        (batch_size,),
+                        page_table_width // 2,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    _mask_page_table_after_nsa_len(page_table, nsa_lens)
+                warmed.append(
+                    "_build_paged_mqa_schedule_triton, "
+                    "_mask_page_table_after_nsa_len_kernel"
+                )
             except Exception as e:  # pragma: no cover - best-effort warmup
                 logger.warning(
                     "Runtime Triton prewarm: B12X paged-MQA schedule warmup "

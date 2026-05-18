@@ -49,6 +49,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 /.deps/
+serve-*
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

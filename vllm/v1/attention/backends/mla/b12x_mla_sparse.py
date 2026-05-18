@@ -10,9 +10,6 @@ by B12X.
 """
 
 from dataclasses import dataclass
-import functools
-import inspect
-import math
 import os
 import time
 from typing import TYPE_CHECKING, ClassVar
@@ -24,34 +21,6 @@ from vllm.distributed.parallel_state import get_dcp_group
 from vllm.triton_utils import tl, triton
 
 
-@functools.cache
-def _b12x_split_respects_max_chunks() -> bool:
-    """Detect whether the installed b12x version's split-config selectors
-    accept a ``max_chunks`` parameter.
-
-    Added in b12x 0.11.0; absent in 0.10.x. When absent, b12x's
-    ``default_sparse_mla_split_decode_config_for_width`` returns up to
-    ``_SPLIT_MAX_CHUNKS=64`` regardless of the workspace's
-    ``max_chunks_per_row``, and ``set_split_chunk_config`` then asserts
-    ``num_chunks <= max_chunks_per_row``. Setting
-    ``max_chunks_per_row=1`` for extend mode (the OOM-avoidance branch
-    introduced in df05044e) breaks under 0.10.x because the kernel still
-    requests num_chunks=64. With 0.11.0+, the kernel respects the cap.
-    """
-    try:
-        from b12x.attention.mla.split import (
-            default_sparse_mla_split_decode_config_for_width,
-        )
-    except Exception:
-        return False
-    try:
-        params = inspect.signature(
-            default_sparse_mla_split_decode_config_for_width
-        ).parameters
-    except (TypeError, ValueError):
-        return False
-    return "max_chunks" in params
-
 from vllm import _custom_ops as ops
 from vllm.config import (
     VllmConfig,
@@ -60,6 +29,9 @@ from vllm.config import (
 )
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
+from vllm.model_executor.layers.b12x_contract import (
+    B12X_KV_CACHE_DTYPES,
+)
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import (
@@ -87,84 +59,6 @@ logger = init_logger(__name__)
 _B12X_SYNC_DEBUG = os.getenv("VLLM_B12X_SYNC_DEBUG", "0") != "0"
 
 
-@functools.cache
-def _get_b12x_sparse_mla_runner():
-    try:
-        from b12x.attention.mla.api import _run_sparse_mla
-    except ImportError:
-        return None
-    return _run_sparse_mla
-
-
-@triton.jit
-def _b12x_split_decode_final_lse_kernel(
-    tmp_lse_ptr,
-    num_chunks_ptr,
-    out_lse_ptr,
-    tmp_lse_stride_b: tl.constexpr,
-    tmp_lse_stride_h: tl.constexpr,
-    tmp_lse_stride_c: tl.constexpr,
-    out_lse_stride_b: tl.constexpr,
-    out_lse_stride_h: tl.constexpr,
-    max_chunks: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    row = tl.program_id(0)
-    head = tl.program_id(1)
-    offs = tl.arange(0, BLOCK_C)
-    num_chunks = tl.load(num_chunks_ptr)
-    num_chunks = tl.minimum(num_chunks, max_chunks)
-    valid = offs < num_chunks
-    vals = tl.load(
-        tmp_lse_ptr
-        + row * tmp_lse_stride_b
-        + head * tmp_lse_stride_h
-        + offs * tmp_lse_stride_c,
-        mask=valid,
-        other=-float("inf"),
-    )
-    vals = tl.where(vals != vals, -float("inf"), vals)
-    lse_max = tl.max(vals, axis=0)
-    safe_max = tl.where(lse_max == -float("inf"), 0.0, lse_max)
-    lse_sum = tl.sum(tl.exp2(vals - safe_max), axis=0)
-    lse_base2 = safe_max + tl.log2(lse_sum)
-    lse_e = tl.where(
-        lse_max == -float("inf"),
-        -float("inf"),
-        lse_base2 * 0.69314718055994530942,
-    )
-    tl.store(out_lse_ptr + row * out_lse_stride_b + head * out_lse_stride_h, lse_e)
-
-
-def _b12x_split_decode_final_lse(
-    tmp_lse: torch.Tensor,
-    num_chunks_ptr: torch.Tensor,
-    *,
-    rows: int,
-    heads: int,
-    max_chunks: int,
-) -> torch.Tensor:
-    out_lse = torch.empty(
-        (rows, heads),
-        dtype=torch.float32,
-        device=tmp_lse.device,
-    )
-    block_c = triton.next_power_of_2(max(1, int(max_chunks)))
-    _b12x_split_decode_final_lse_kernel[(rows, heads)](
-        tmp_lse,
-        num_chunks_ptr,
-        out_lse,
-        tmp_lse.stride(0),
-        tmp_lse.stride(1),
-        tmp_lse.stride(2),
-        out_lse.stride(0),
-        out_lse.stride(1),
-        max_chunks,
-        BLOCK_C=block_c,
-    )
-    return out_lse
-
-
 def _sparse_mla_decode_forward_vllm_metadata(
     *,
     q_all: torch.Tensor,
@@ -174,35 +68,21 @@ def _sparse_mla_decode_forward_vllm_metadata(
     sm_scale: float,
     v_head_dim: int,
 ):
-    if getattr(workspace, "use_cuda_graph", False):
-        runner = _get_b12x_sparse_mla_runner()
-        if runner is not None:
-            # vLLM already provides graph-stable metadata buffers for captured
-            # decode. Avoid b12x prepare_decode() copying them again per layer.
-            workspace.page_table_1 = metadata.page_table_1
-            workspace.cache_seqlens_int32 = metadata.cache_seqlens_int32
-            workspace.nsa_cache_seqlens_int32 = metadata.nsa_cache_seqlens_int32
-            return runner(
-                q_all=q_all,
-                kv_cache=kv_cache,
-                workspace=workspace,
-                sm_scale=sm_scale,
-                v_head_dim=v_head_dim,
-            )
-
     from b12x.integration.mla import sparse_mla_decode_forward
 
     return sparse_mla_decode_forward(
         q_all=q_all,
         kv_cache=kv_cache,
-        metadata=metadata,
+        page_table_1=metadata.page_table_1,
+        cache_seqlens_int32=metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
         workspace=workspace,
         sm_scale=sm_scale,
         v_head_dim=v_head_dim,
     )
 
 
-def _sparse_mla_split_decode_forward_with_lse_vllm_metadata(
+def _sparse_mla_decode_forward_with_lse_vllm_metadata(
     *,
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -211,85 +91,45 @@ def _sparse_mla_split_decode_forward_with_lse_vllm_metadata(
     sm_scale: float,
     v_head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run B12X sparse split decode and return the final per-rank LSE.
+    from b12x.integration.mla import sparse_mla_decode_forward
 
-    DCP needs the local attention log-sum-exp to combine outputs across
-    context-parallel ranks. B12X's merge kernel already consumes per-chunk
-    ``tmp_lse`` to normalize the local output, but does not expose the final
-    merged LSE. For CUDA graph replay, reading ``tmp_lse`` after the black-box
-    combined wrapper proved unsafe for DCP. Keep the same B12X split kernels,
-    but make the graph sequence explicit: split forward, final-LSE kernel,
-    then split merge.
-    """
-    from b12x.attention.mla.api import _get_sm_scale_tensor
-    from b12x.attention.mla.split import (
-        run_sparse_mla_split_decode_forward,
-        run_sparse_mla_split_decode_merge,
-    )
-
-    if getattr(workspace, "use_cuda_graph", False):
-        # vLLM owns graph-stable metadata buffers during decode capture.
-        workspace.page_table_1 = metadata.page_table_1
-        workspace.cache_seqlens_int32 = metadata.cache_seqlens_int32
-        workspace.nsa_cache_seqlens_int32 = metadata.nsa_cache_seqlens_int32
-    else:
-        workspace.prepare_decode(
-            metadata.page_table_1,
-            metadata.cache_seqlens_int32,
-            metadata.nsa_cache_seqlens_int32,
-        )
-
-    if workspace.tmp_output is None or workspace.tmp_lse is None:
-        raise RuntimeError("B12X sparse MLA DCP requires split decode buffers")
-    if workspace.kv_chunk_size_ptr is None or workspace.num_chunks_ptr is None:
-        raise RuntimeError("B12X sparse MLA DCP split chunk config is missing")
-
-    output = torch.empty(
-        (q_all.shape[0], q_all.shape[1], v_head_dim),
-        dtype=q_all.dtype,
-        device=q_all.device,
-    )
-    sm_scale_tensor = _get_sm_scale_tensor(
-        workspace=workspace,
-        device=q_all.device,
-        sm_scale=sm_scale,
-    )
-    launch_num_chunks = (
-        int(workspace.max_chunks_per_row)
-        if (workspace.fixed_capacity or workspace.use_cuda_graph)
-        else int(getattr(workspace, "num_chunks_value", 0))
-    )
-    if launch_num_chunks <= 0:
-        raise RuntimeError("B12X sparse MLA DCP split chunk count is invalid")
-
-    run_sparse_mla_split_decode_forward(
+    return sparse_mla_decode_forward(
         q_all=q_all,
         kv_cache=kv_cache,
         page_table_1=metadata.page_table_1,
-        active_token_counts=metadata.nsa_cache_seqlens_int32,
-        sm_scale=sm_scale_tensor,
-        kv_chunk_size_ptr=workspace.kv_chunk_size_ptr,
-        num_chunks_ptr=workspace.num_chunks_ptr,
-        tmp_output=workspace.tmp_output,
-        tmp_lse=workspace.tmp_lse,
-        launch_num_chunks=launch_num_chunks,
+        cache_seqlens_int32=metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
         workspace=workspace,
+        sm_scale=sm_scale,
+        v_head_dim=v_head_dim,
+        return_lse=True,
+        lse_scale="natural",
     )
-    lse = _b12x_split_decode_final_lse(
-        workspace.tmp_lse,
-        workspace.num_chunks_ptr,
-        rows=int(q_all.shape[0]),
-        heads=int(q_all.shape[1]),
-        max_chunks=int(workspace.max_chunks_per_row),
-    )
-    run_sparse_mla_split_decode_merge(
-        tmp_output=workspace.tmp_output,
-        tmp_lse=workspace.tmp_lse,
-        num_chunks_ptr=workspace.num_chunks_ptr,
-        output=output,
+
+
+def _sparse_mla_extend_forward_with_lse_vllm_metadata(
+    *,
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    metadata,
+    workspace,
+    sm_scale: float,
+    v_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from b12x.integration.mla import sparse_mla_extend_forward
+
+    return sparse_mla_extend_forward(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        selected_token_offsets=metadata.selected_token_offsets,
+        cache_seqlens_int32=metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
         workspace=workspace,
+        sm_scale=sm_scale,
+        v_head_dim=v_head_dim,
+        return_lse=True,
+        lse_scale="natural",
     )
-    return output, lse
 
 
 def _b12x_sync_debug(stage: str) -> None:
@@ -397,7 +237,80 @@ def _compact_page_table_valid_prefix(
 
 B12X_WORKSPACES: dict[tuple[object, ...], object] = {}
 B12X_ARENAS: dict[tuple[object, ...], object] = {}
-_JOINT_ARENA_WARNED = False
+
+
+def clear_b12x_mla_workspace_cache(*, clear_arenas: bool = True) -> None:
+    B12X_WORKSPACES.clear()
+    if clear_arenas:
+        B12X_ARENAS.clear()
+
+
+def _get_b12x_covering_arena(
+    *,
+    device_type: str,
+    device_index: int | None,
+    mode: str,
+    dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_q_heads: int,
+    head_size: int,
+    kv_lora_rank: int,
+    indexer_num_q_heads: int,
+    topk: int,
+    decode_max_total_q: int,
+    caps_extend_max_total_q: int,
+    caps_extend_max_batch: int,
+    caps_extend_max_kv_rows: int,
+    reserve_extend_indexer_logits: bool,
+    use_joint_arena: bool,
+    moe_backend: str,
+):
+    for key, arena in B12X_ARENAS.items():
+        if len(key) != 17:
+            continue
+        (
+            key_device_type,
+            key_device_index,
+            key_mode,
+            key_dtype,
+            key_kv_dtype,
+            key_num_q_heads,
+            key_head_size,
+            key_kv_lora_rank,
+            key_indexer_num_q_heads,
+            key_topk,
+            key_decode_max_total_q,
+            key_caps_extend_max_total_q,
+            key_caps_extend_max_batch,
+            key_caps_extend_max_kv_rows,
+            key_reserve_extend_indexer_logits,
+            key_use_joint_arena,
+            key_moe_backend,
+        ) = key
+        if (
+            key_device_type != device_type
+            or key_device_index != device_index
+            or key_mode != mode
+            or key_dtype != dtype
+            or key_kv_dtype != kv_dtype
+            or key_head_size != head_size
+            or key_kv_lora_rank != kv_lora_rank
+            or key_indexer_num_q_heads < indexer_num_q_heads
+            or key_topk != topk
+            or key_decode_max_total_q < decode_max_total_q
+            or key_caps_extend_max_total_q < caps_extend_max_total_q
+            or key_caps_extend_max_batch < caps_extend_max_batch
+            or key_caps_extend_max_kv_rows < caps_extend_max_kv_rows
+            or key_use_joint_arena != use_joint_arena
+            or key_moe_backend != moe_backend
+        ):
+            continue
+        if key_num_q_heads < num_q_heads:
+            continue
+        if reserve_extend_indexer_logits and not key_reserve_extend_indexer_logits:
+            continue
+        return arena
+    return None
 
 
 def _env_int(name: str, default: int) -> int:
@@ -439,6 +352,7 @@ class B12xMLASparseBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "fp8",
+        "fp8_e4m3",
         "fp8_ds_mla",
     ]
 
@@ -472,9 +386,7 @@ class B12xMLASparseBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        # Blackwell is represented as SM120 in recent CUDA/PyTorch stacks. Keep
-        # SM10x accepted as a defensive fallback for older vLLM platform probes.
-        return capability.major in (10, 12)
+        return capability.major == 12
 
     @classmethod
     def supports_combination(
@@ -491,10 +403,10 @@ class B12xMLASparseBackend(AttentionBackend):
         del head_size, dtype, block_size, has_sink
         if not use_mla or not use_sparse:
             return "B12X sparse MLA requires an MLA sparse model"
-        if device_capability.major not in (10, 12):
+        if device_capability.major != 12:
             return f"B12X sparse MLA requires SM120, got {device_capability}"
-        if kv_cache_dtype not in ("fp8", "fp8_ds_mla"):
-            return "B12X sparse MLA requires fp8/fp8_ds_mla KV cache"
+        if kv_cache_dtype not in B12X_KV_CACHE_DTYPES:
+            return "B12X sparse MLA requires fp8/fp8_e4m3/fp8_ds_mla KV cache"
 
         vllm_config = get_current_vllm_config_or_none()
         if vllm_config is not None and vllm_config.model_config is not None:
@@ -542,7 +454,9 @@ class B12xMLASparseMetadata(AttentionMetadata):
 class B12xMLASparseMetadataBuilder(
     AttentionMetadataBuilder[B12xMLASparseMetadata]
 ):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_BATCH
+    )
 
     @classmethod
     def get_cudagraph_support(
@@ -550,13 +464,7 @@ class B12xMLASparseMetadataBuilder(
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
-        del kv_cache_spec
-        dcp_size = int(vllm_config.parallel_config.decode_context_parallel_size)
-        if (
-            dcp_size > 1
-            and os.getenv("VLLM_B12X_MLA_DCP_FORCE_PIECEWISE", "0") == "1"
-        ):
-            return AttentionCGSupport.NEVER
+        del vllm_config, kv_cache_spec
         return cls._cudagraph_support
 
     def __init__(
@@ -748,8 +656,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             )
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError("B12xMLASparseImpl only supports decoder MLA")
-        if kv_cache_dtype not in ("fp8", "fp8_ds_mla"):
-            raise NotImplementedError("B12X sparse MLA requires fp8/fp8_ds_mla KV cache")
+        if kv_cache_dtype not in B12X_KV_CACHE_DTYPES:
+            raise NotImplementedError(
+                "B12X sparse MLA requires fp8/fp8_e4m3/fp8_ds_mla KV cache"
+            )
         assert indexer is not None, "Indexer required for sparse MLA"
 
         self.num_heads = num_heads
@@ -786,9 +696,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self.arena_extend_max_kv_rows = _env_int(
             "VLLM_B12X_MLA_ARENA_EXTEND_MAX_KV_ROWS", self.max_model_len
         )
-        self.use_arena = os.getenv("VLLM_B12X_MLA_USE_ARENA", "0") != "0"
-        self.use_arena_extend = os.getenv("VLLM_B12X_MLA_ARENA_EXTEND", "0") != "0"
-        self.use_joint_arena = os.getenv("VLLM_B12X_MLA_JOINT_ARENA", "1") != "0"
+        moe_backend = self._moe_backend_name(vllm_config)
+        self.use_arena = True
+        self.use_joint_arena = moe_backend == "b12x"
         self.decode_topk_is_physical = (
             os.getenv("VLLM_B12X_MLA_RAW_DECODE_TOPK", "0") != "0"
             or os.getenv("VLLM_B12X_MLA_DECODE_TOPK_PHYSICAL", "0") != "0"
@@ -799,9 +709,6 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self.spec_decode_max_q = _env_int("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", 8)
         self.spec_extend_as_decode = (
             os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "1") != "0"
-        )
-        self.spec_serial_decode = (
-            os.getenv("VLLM_B12X_MLA_SPEC_SERIAL_DECODE", "1") != "0"
         )
         self.dcp_topk_per_rank = _env_int("VLLM_B12X_MLA_DCP_TOPK_PER_RANK", 0)
         speculative_config = getattr(vllm_config, "speculative_config", None)
@@ -842,19 +749,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self.decode_workspace_ring = _env_int(
             "VLLM_B12X_MLA_DECODE_WORKSPACE_RING", 1
         )
-        self.decode_copy_lse = (
-            os.getenv("VLLM_B12X_MLA_DECODE_COPY_LSE", "0") != "0"
-        )
-        self.decode_const_lse = (
-            os.getenv("VLLM_B12X_MLA_DECODE_CONST_LSE", "0") != "0"
-        )
-        self.decode_inline_lse = (
-            os.getenv("VLLM_B12X_MLA_DECODE_INLINE_LSE", "1") != "0"
-        )
-        self._decode_lse_copy_buffer: torch.Tensor | None = None
-        # B12X's single-pass sparse MLA kernel does not populate tmp_lse.
-        # DCP requires valid LSE for the cross-rank output combine, so extend
-        # must keep enough split chunks to make b12x select the split path.
+        # B12X native LSE mode currently uses the split sparse-MLA path.
+        # DCP therefore keeps a small chunk cap for extend so long prefill
+        # avoids the 64-chunk scratch footprint while still exposing valid LSE.
         self.extend_max_chunks_per_row = _env_int(
             "VLLM_B12X_MLA_EXTEND_MAX_CHUNKS",
             4 if self.dcp_world_size > 1 else 1,
@@ -869,7 +766,12 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         (self.q_concat_buffer,) = current_workspace_manager().get_simultaneous(
             ((max_tokens, num_heads, head_size), torch.bfloat16),
         )
-        self._preinstall_b12x_joint_arena()
+        self._b12x_joint_arena_preinstalled = False
+
+    @staticmethod
+    def _moe_backend_name(vllm_config: VllmConfig) -> str:
+        kernel_config = getattr(vllm_config, "kernel_config", None)
+        return str(getattr(kernel_config, "moe_backend", "") or "").lower()
 
     def _decode_workspace_layer_key(self, layer_key: str | None) -> str | None:
         if self.decode_workspace_per_layer:
@@ -889,13 +791,16 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
     def _build_b12x_moe_arena_caps(self, device: torch.device, dtype: torch.dtype):
         if not self.use_joint_arena:
             return None
-        if self.vllm_config.kernel_config.moe_backend != "b12x":
+        if self._moe_backend_name(self.vllm_config) != "b12x":
             return None
 
         try:
             from b12x.integration import B12XMoEArenaCaps
-        except ImportError:
-            return None
+        except ImportError as exc:
+            raise RuntimeError(
+                "B12X sparse MLA attention with B12X MoE requires a b12x "
+                "build with shared MoE arena capacity support"
+            ) from exc
 
         cfg = self.hf_config
         weight_e = getattr(cfg, "n_routed_experts", None)
@@ -920,22 +825,18 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             if value is None
         ]
         if missing:
-            logger.warning_once(
-                "B12X joint arena cannot size MoE workspace; missing %s",
-                ", ".join(missing),
+            raise RuntimeError(
+                "B12X joint arena cannot size MoE workspace; missing "
+                f"{', '.join(missing)}"
             )
-            return None
 
         tp_size = max(1, int(self.vllm_config.parallel_config.tensor_parallel_size))
         intermediate_size = int(intermediate_size)
         if intermediate_size % tp_size != 0:
-            logger.warning_once(
+            raise RuntimeError(
                 "B12X joint arena expected MoE intermediate_size divisible by TP: "
-                "intermediate_size=%d tp_size=%d",
-                intermediate_size,
-                tp_size,
+                f"intermediate_size={intermediate_size} tp_size={tp_size}"
             )
-            return None
 
         decode_tokens = max(1, int(self.decode_max_total_q))
         extend_tokens = max(1, int(self.arena_extend_max_total_q))
@@ -984,30 +885,14 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             extend_max_batch=caps_extend_max_batch,
             extend_max_kv_rows=caps_extend_max_kv_rows,
             paged_max_q_rows=self.decode_max_total_q,
-            paged_max_batch=self.arena_max_running_requests,
+            paged_max_batch=self.decode_max_total_q,
             page_size=64,
             max_chunks_per_row=max_chunks_per_row,
         )
-        # `reserve_extend_indexer_logits` was added in a newer b12x release.
-        # If the installed b12x lacks it, fall back without that hint —
-        # the arena will still work for decode (where the hint is False)
-        # and only undersize the extend-phase indexer logits arena slightly
-        # for non-MTP prefill.
-        try:
-            return B12XAttentionArenaCaps(
-                **kwargs,
-                reserve_extend_indexer_logits=reserve_extend_indexer_logits,
-            )
-        except TypeError as exc:
-            if "reserve_extend_indexer_logits" in str(exc):
-                logger.warning_once(
-                    "Installed b12x lacks `reserve_extend_indexer_logits` "
-                    "kwarg on B12XAttentionArenaCaps; falling back to "
-                    "default (no extend-indexer reservation). Upgrade "
-                    "b12x for the optimization.",
-                )
-                return B12XAttentionArenaCaps(**kwargs)
-            raise
+        return B12XAttentionArenaCaps(
+            **kwargs,
+            reserve_extend_indexer_logits=reserve_extend_indexer_logits,
+        )
 
     def _allocate_b12x_attention_arena(self, attention_caps, moe_caps):
         from b12x.integration.mla import B12XAttentionArena
@@ -1029,12 +914,15 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 if lane.arena is not None and lane.arena.attention_arena is not None:
                     return lane.arena.attention_arena
             except (AttributeError, ImportError, RuntimeError) as exc:
-                global _JOINT_ARENA_WARNED
-                if not _JOINT_ARENA_WARNED:
-                    logger.warning(
-                        "Falling back to standalone B12X attention arena: %s", exc
-                    )
-                    _JOINT_ARENA_WARNED = True
+                raise RuntimeError(
+                    "B12X sparse MLA attention with B12X MoE requires a shared "
+                    "execution-lane arena and cannot fall back to a standalone "
+                    "attention arena"
+                ) from exc
+            raise RuntimeError(
+                "B12X sparse MLA attention with B12X MoE requires a shared "
+                "execution-lane arena with an attention arena"
+            )
 
         return B12XAttentionArena.allocate(attention_caps)
 
@@ -1050,128 +938,138 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         if (
             not self.use_arena
             or not self.use_joint_arena
-            or self.vllm_config.kernel_config.moe_backend != "b12x"
+            or self._moe_backend_name(self.vllm_config) != "b12x"
             or not current_platform.is_cuda()
         ):
             return
+        if getattr(self, "_b12x_joint_arena_preinstalled", False):
+            return
 
-        try:
-            from b12x.integration.mla import B12XAttentionWorkspaceContract
+        from b12x.integration.mla import B12XAttentionWorkspaceContract
 
-            device = torch.device("cuda", torch.cuda.current_device())
-            dcp_size = max(
-                1,
-                int(
-                    getattr(
-                        self.vllm_config.parallel_config,
-                        "decode_context_parallel_size",
-                        1,
-                    )
-                ),
+        device = torch.device("cuda", torch.cuda.current_device())
+        dcp_size = max(
+            1,
+            int(
+                getattr(
+                    self.vllm_config.parallel_config,
+                    "decode_context_parallel_size",
+                    1,
+                )
+            ),
+        )
+        num_q_heads = int(self.num_heads) * dcp_size
+        topk = int(self.topk_indices_buffer.shape[1])
+        max_chunks_per_row = 64
+        if dcp_size > 1:
+            max_chunks_per_row = int(
+                getattr(self, "extend_max_chunks_per_row", 64)
             )
-            num_q_heads = int(self.num_heads) * dcp_size
-            topk = int(self.topk_indices_buffer.shape[1])
-            attention_caps = self._build_b12x_attention_arena_caps(
-                device=device,
-                dtype=torch.bfloat16,
-                kv_dtype=torch.uint8,
-                num_q_heads=num_q_heads,
-                topk=topk,
-                max_page_table_width=topk,
-                max_chunks_per_row=64,
-                caps_extend_max_total_q=1,
-                caps_extend_max_batch=1,
-                caps_extend_max_kv_rows=1,
-                reserve_extend_indexer_logits=False,
-            )
-            moe_caps = self._build_b12x_moe_arena_caps(device, torch.bfloat16)
+        attention_caps = self._build_b12x_attention_arena_caps(
+            device=device,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.uint8,
+            num_q_heads=num_q_heads,
+            topk=topk,
+            max_page_table_width=topk,
+            max_chunks_per_row=max_chunks_per_row,
+            caps_extend_max_total_q=self.arena_extend_max_total_q,
+            caps_extend_max_batch=self.arena_extend_max_batch,
+            caps_extend_max_kv_rows=self.arena_extend_max_kv_rows,
+            reserve_extend_indexer_logits=True,
+        )
+        moe_caps = self._build_b12x_moe_arena_caps(device, torch.bfloat16)
+        arena_key = (
+            device.type,
+            device.index,
+            "decode",
+            torch.bfloat16,
+            torch.uint8,
+            num_q_heads,
+            self.head_size,
+            self.kv_lora_rank,
+            self.indexer_num_q_heads,
+            topk,
+            self.decode_max_total_q,
+            self.arena_extend_max_total_q,
+            self.arena_extend_max_batch,
+            self.arena_extend_max_kv_rows,
+            True,
+            self.use_joint_arena,
+            self._moe_backend_name(self.vllm_config),
+        )
+        arena = B12X_ARENAS.get(arena_key)
+        if arena is None:
             arena = self._allocate_b12x_attention_arena(attention_caps, moe_caps)
-            arena_key = (
-                device.type,
-                device.index,
-                "decode",
-                torch.bfloat16,
-                torch.uint8,
-                num_q_heads,
-                self.head_size,
-                self.kv_lora_rank,
-                self.indexer_num_q_heads,
-                topk,
-                self.decode_max_total_q,
-                1,
-                1,
-                1,
-                False,
-                self.use_joint_arena,
-                self.vllm_config.kernel_config.moe_backend,
-            )
-            B12X_ARENAS.setdefault(arena_key, arena)
+            B12X_ARENAS[arena_key] = arena
+        decode_only_arena_key = (
+            device.type,
+            device.index,
+            "decode",
+            torch.bfloat16,
+            torch.uint8,
+            num_q_heads,
+            self.head_size,
+            self.kv_lora_rank,
+            self.indexer_num_q_heads,
+            topk,
+            self.decode_max_total_q,
+            1,
+            1,
+            1,
+            False,
+            self.use_joint_arena,
+            self._moe_backend_name(self.vllm_config),
+        )
+        B12X_ARENAS.setdefault(decode_only_arena_key, arena)
 
-            workspace_key = (
-                device.type,
-                device.index,
-                "decode",
-                torch.bfloat16,
-                torch.uint8,
-                num_q_heads,
-                self.head_size,
-                self.kv_lora_rank,
-                self.indexer_num_q_heads,
-                topk,
-                self.decode_max_total_q,
-                self.decode_max_total_q,
-                0,
-                topk,
-                64,
-                self.use_arena,
-                self.arena_max_running_requests,
-                self.arena_extend_max_total_q,
-                self.arena_extend_max_batch,
-                self.arena_extend_max_kv_rows,
-                self.use_joint_arena,
-                self.vllm_config.kernel_config.moe_backend,
+        workspace_key = (
+            device.type,
+            device.index,
+            "decode",
+            None,
+            torch.bfloat16,
+            torch.uint8,
+            num_q_heads,
+            self.head_size,
+            self.kv_lora_rank,
+            self.indexer_num_q_heads,
+            topk,
+            self.decode_max_total_q,
+            self.decode_max_total_q,
+            0,
+            topk,
+            64,
+            self.use_arena,
+            self.arena_max_running_requests,
+            self.arena_extend_max_total_q,
+            self.arena_extend_max_batch,
+            self.arena_extend_max_kv_rows,
+            self.use_joint_arena,
+            self._moe_backend_name(self.vllm_config),
+        )
+        workspace = B12X_WORKSPACES.get(workspace_key)
+        if workspace is None:
+            contract = B12XAttentionWorkspaceContract(
+                mode="decode",
+                max_total_q=self.decode_max_total_q,
+                max_batch=self.decode_max_total_q,
+                max_paged_q_rows=self.decode_max_total_q,
+                max_kv_rows=0,
+                v_head_dim=self.kv_lora_rank,
+                indexer_num_q_heads=self.indexer_num_q_heads,
+                max_page_table_width=topk,
             )
-            workspace = B12X_WORKSPACES.get(workspace_key)
-            if workspace is None:
-                contract = B12XAttentionWorkspaceContract(
-                    mode="decode",
-                    max_total_q=self.decode_max_total_q,
-                    max_batch=self.decode_max_total_q,
-                    max_paged_q_rows=self.decode_max_total_q,
-                    max_kv_rows=0,
-                    v_head_dim=self.kv_lora_rank,
-                    indexer_num_q_heads=self.indexer_num_q_heads,
-                    max_page_table_width=topk,
-                )
-                workspace = arena.make_workspace(
-                    contract, use_cuda_graph=self.decode_use_cuda_graph
-                )
-                B12X_WORKSPACES[workspace_key] = workspace
-            self._ensure_decode_split_chunk_config(
-                workspace,
-                page_table_width=topk,
+            workspace = arena.make_workspace(
+                contract, use_cuda_graph=self.decode_use_cuda_graph
             )
-            self._ensure_decode_lse_copy_buffer(workspace)
-            _prime_b12x_sm_scale(workspace, device, self.scale)
-        except (AttributeError, ImportError, RuntimeError, ValueError) as exc:
-            logger.warning_once("B12X joint arena preinstall skipped: %s", exc)
-
-    def _ensure_decode_lse_copy_buffer(self, workspace: object) -> torch.Tensor | None:
-        if not self.decode_copy_lse:
-            return None
-        tmp_lse = getattr(workspace, "tmp_lse", None)
-        if tmp_lse is None:
-            return None
-        buffer = self._decode_lse_copy_buffer
-        if (
-            buffer is None
-            or buffer.shape != tmp_lse.shape
-            or buffer.device != tmp_lse.device
-            or buffer.dtype != tmp_lse.dtype
-        ):
-            buffer = torch.empty_like(tmp_lse)
-            self._decode_lse_copy_buffer = buffer
-        return buffer
+            B12X_WORKSPACES[workspace_key] = workspace
+        self._ensure_decode_split_chunk_config(
+            workspace,
+            page_table_width=topk,
+        )
+        _prime_b12x_sm_scale(workspace, device, self.scale)
+        self._b12x_joint_arena_preinstalled = True
 
     def _ensure_decode_split_chunk_config(
         self,
@@ -1181,12 +1079,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
     ) -> None:
         if getattr(workspace, "tmp_lse", None) is None:
             return
-        try:
-            from b12x.attention.mla.split import (
-                forced_sparse_mla_split_decode_config_for_width,
-            )
-        except ImportError:
-            return
+        from b12x.attention.mla.split import (
+            forced_sparse_mla_split_decode_config_for_width,
+        )
+
         cfg = forced_sparse_mla_split_decode_config_for_width(
             int(page_table_width),
             max_chunks=int(getattr(workspace, "max_chunks_per_row", 64)),
@@ -1203,40 +1099,6 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             num_chunks=int(cfg.num_chunks),
         )
 
-    def _decode_lse_from_workspace(
-        self,
-        workspace: object,
-        q_all: torch.Tensor,
-    ) -> torch.Tensor:
-        if workspace.tmp_lse is None:
-            raise RuntimeError("B12X sparse MLA DCP requires split-decode LSE")
-        if self.decode_const_lse:
-            return torch.zeros(
-                (q_all.shape[0], q_all.shape[1]),
-                dtype=torch.float32,
-                device=q_all.device,
-            )
-        num_chunks = int(
-            getattr(workspace, "num_chunks_value", 0)
-            or getattr(workspace, "max_chunks_per_row", 0)
-            or workspace.tmp_lse.shape[-1]
-        )
-        num_chunks = max(1, min(num_chunks, int(workspace.tmp_lse.shape[-1])))
-        lse_base2 = workspace.tmp_lse[
-            : q_all.shape[0],
-            : q_all.shape[1],
-            :num_chunks,
-        ]
-        if self.decode_copy_lse:
-            buffer = self._ensure_decode_lse_copy_buffer(workspace)
-            if buffer is not None:
-                lse_copy = buffer[: q_all.shape[0], : q_all.shape[1]]
-                lse_copy.copy_(lse_base2)
-                lse_base2 = lse_copy
-        # B12X split-decode stores per-chunk log-sum-exp in base-2. Convert to
-        # natural-log LSE because the vLLM DCP reducer uses exp/log here.
-        return torch.logsumexp(lse_base2 * math.log(2.0), dim=-1)
-
     def _get_workspace(
         self,
         mode: str,
@@ -1248,9 +1110,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         layer_key: str | None = None,
     ):
         from b12x.integration.mla import (
-            B12XAttentionArena,
             B12XAttentionArenaCaps,
-            B12XAttentionWorkspace,
             B12XAttentionWorkspaceContract,
         )
 
@@ -1258,6 +1118,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
 
         # Decode CUDA-graph captures operate on graph-stable rows. With MTP,
         # speculative verify rows are target+draft tokens per active sequence.
+        # Keep row capacity separate from request-batch capacity: b12x arena caps
+        # reserve paged q rows for MTP verification, but paged batch remains the
+        # number of concurrently running requests.
         # Extend also needs a stable capacity contract: b12x kernels consume
         # live sequence lengths as runtime metadata, but CUTE host-launcher
         # cache keys still include tensor/workspace shapes.
@@ -1268,12 +1131,12 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         )
         topk = int(self.topk_indices_buffer.shape[1])
         max_chunks_per_row = 64
-        if mode != "decode" and _b12x_split_respects_max_chunks():
+        if mode != "decode":
             # DCP all-gathers Q heads before the B12X call. Keeping the default
             # 64 split chunks for extend would allocate Q x heads x 64 x V
             # scratch, which OOMs long-prefill scouts on 8-way DCP. Topk is
             # already selected by vLLM's NSA indexer, so non-DCP can prefer the
-            # single-pass sparse MLA kernel and keep only a one-chunk fallback.
+            # single-pass sparse MLA kernel and keep only a one-chunk reserve.
             #
             # DCP is different: the post-attention reducer needs softmax LSE
             # from each rank. B12X's single-pass sparse MLA kernel currently
@@ -1282,20 +1145,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             # so topk=2048 selects 4x512 chunks instead of falling through to
             # single-pass with uninitialized LSE.
             #
-            # NOTE (#84): only safe when b12x's split-config selectors accept
-            # the ``max_chunks`` parameter (added in 0.11.0). On older b12x
-            # (0.10.x), ``default_sparse_mla_split_decode_config_for_width``
-            # ignores the workspace's max_chunks_per_row and returns
-            # num_chunks up to _SPLIT_MAX_CHUNKS=64 regardless. The downstream
-            # ``workspace.set_split_chunk_config(num_chunks=64)`` call then
-            # asserts ``num_chunks <= max_chunks_per_row=1`` and crashes
-            # cudagraph capture. So: only apply the OOM-avoidance cap when
-            # the runtime b12x can actually honor it. On older b12x we
-            # fall through to max_chunks_per_row=64 which preserves the
-            # pre-df05044e behavior (the wip baseline that worked); the
-            # OOM risk on long-prefill DCP=8 scouts re-emerges but is
-            # better than a hard crash, and operators can avoid it by
-            # upgrading b12x to 0.11.0+.
+            # Only cap split chunks when the installed b12x split selectors
+            # accept the cap. Older b12x builds ignore the workspace limit and
+            # then assert while applying a 64-chunk split config.
             max_chunks_per_row = int(self.extend_max_chunks_per_row)
         max_kv_rows = (
             0
@@ -1312,13 +1164,13 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             else self.arena_extend_max_total_q
         )
         arena_max_batch = (
-            max_total_q
+            self.decode_max_total_q
             if mode == "decode"
             else self.arena_extend_max_batch
         )
         arena_max_kv_rows = 0 if mode == "decode" else self.arena_extend_max_kv_rows
         max_batch = (
-            max_total_q
+            self.decode_max_total_q
             if mode == "decode"
             else self.arena_extend_max_batch
         )
@@ -1351,7 +1203,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             self.arena_extend_max_batch,
             self.arena_extend_max_kv_rows,
             self.use_joint_arena,
-            self.vllm_config.kernel_config.moe_backend,
+            self._moe_backend_name(self.vllm_config),
         )
         workspace = B12X_WORKSPACES.get(key)
         if workspace is not None:
@@ -1360,17 +1212,17 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     workspace,
                     page_table_width=max_page_table_width,
                 )
-                self._ensure_decode_lse_copy_buffer(workspace)
             return workspace
 
-        # The B12X arena is needed for CUDA-graph-safe decode workspaces, but a
-        # single arena sized for both decode and long-context extend reserves
-        # several GiB of extend/indexer scratch and can starve the KV cache.
-        # Keep the hot decode path on an arena and leave extend on the smaller
-        # fixed-capacity fallback unless explicitly requested for experiments.
-        use_arena_for_mode = self.use_arena and (
-            mode == "decode" or self.use_arena_extend
-        )
+        # B12X sparse MLA always uses the b12x arena/workspace contract.  Decode
+        # and extend keep separate arena keys so the decode hot path does not
+        # inherit long-context extend scratch reservations.
+        use_arena_for_mode = self.use_arena
+        if not use_arena_for_mode:
+            raise RuntimeError(
+                "B12X sparse MLA requires the b12x attention arena/workspace "
+                "contract"
+            )
 
         if use_arena_for_mode:
             decode_only_arena = mode == "decode"
@@ -1401,9 +1253,31 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 caps_extend_max_kv_rows,
                 reserve_extend_indexer_logits,
                 self.use_joint_arena,
-                self.vllm_config.kernel_config.moe_backend,
+                self._moe_backend_name(self.vllm_config),
             )
             arena = B12X_ARENAS.get(arena_key)
+            if arena is None and self.use_joint_arena:
+                arena = _get_b12x_covering_arena(
+                    device_type=q.device.type,
+                    device_index=q.device.index,
+                    mode=mode,
+                    dtype=q.dtype,
+                    kv_dtype=kv_cache.dtype,
+                    num_q_heads=num_q_heads,
+                    head_size=self.head_size,
+                    kv_lora_rank=self.kv_lora_rank,
+                    indexer_num_q_heads=self.indexer_num_q_heads,
+                    topk=topk,
+                    decode_max_total_q=self.decode_max_total_q,
+                    caps_extend_max_total_q=caps_extend_max_total_q,
+                    caps_extend_max_batch=caps_extend_max_batch,
+                    caps_extend_max_kv_rows=caps_extend_max_kv_rows,
+                    reserve_extend_indexer_logits=reserve_extend_indexer_logits,
+                    use_joint_arena=self.use_joint_arena,
+                    moe_backend=self._moe_backend_name(self.vllm_config),
+                )
+                if arena is not None:
+                    B12X_ARENAS[arena_key] = arena
             if arena is None:
                 caps = self._build_b12x_attention_arena_caps(
                     device=q.device,
@@ -1448,90 +1322,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     workspace,
                     page_table_width=max_page_table_width,
                 )
-                self._ensure_decode_lse_copy_buffer(workspace)
             B12X_WORKSPACES[key] = workspace
             return workspace
-
-        if mode != "decode" and max_chunks_per_row != 64:
-            extend_caps_kwargs = dict(
-                device=q.device,
-                dtype=q.dtype,
-                kv_dtype=kv_cache.dtype,
-                num_q_heads=num_q_heads,
-                indexer_num_q_heads=self.indexer_num_q_heads,
-                head_dim=self.head_size,
-                max_v_head_dim=self.kv_lora_rank,
-                topk=topk,
-                max_page_table_width=max_page_table_width,
-                extend_max_total_q=max_total_q,
-                extend_max_batch=max_batch,
-                extend_max_kv_rows=max_kv_rows,
-                paged_max_q_rows=1,
-                paged_max_batch=1,
-                page_size=64,
-                max_chunks_per_row=max_chunks_per_row,
-            )
-            # `reserve_extend_indexer_logits` was added in a newer b12x release;
-            # older b12x (v0.10.0/0.10.2) raises TypeError. Fall back without it.
-            try:
-                caps = B12XAttentionArenaCaps(
-                    **extend_caps_kwargs,
-                    reserve_extend_indexer_logits=False,
-                )
-            except TypeError as exc:
-                if "reserve_extend_indexer_logits" not in str(exc):
-                    raise
-                caps = B12XAttentionArenaCaps(**extend_caps_kwargs)
-            arena = B12XAttentionArena.allocate(caps)
-            contract = B12XAttentionWorkspaceContract(
-                mode=mode,
-                max_total_q=max_total_q,
-                max_batch=max_batch,
-                max_paged_q_rows=1,
-                max_kv_rows=max_kv_rows,
-                v_head_dim=self.kv_lora_rank,
-                indexer_num_q_heads=self.indexer_num_q_heads,
-                max_page_table_width=max_page_table_width,
-            )
-            workspace = arena.make_workspace(
-                contract,
-                use_cuda_graph=self.extend_use_cuda_graph,
-            )
-            _prime_b12x_sm_scale(workspace, q.device, self.scale)
-            B12X_WORKSPACES[key] = workspace
-            return workspace
-
-        workspace = B12XAttentionWorkspace.for_fixed_capacity(
-            mode=mode,
-            device=q.device,
-            dtype=q.dtype,
-            kv_dtype=kv_cache.dtype,
-            num_q_heads=num_q_heads,
-            indexer_num_q_heads=self.indexer_num_q_heads,
-            head_dim=self.head_size,
-            v_head_dim=self.kv_lora_rank,
-            topk=topk,
-            max_page_table_width=max_page_table_width,
-            max_total_q=max_total_q,
-            max_batch=max_batch,
-            max_paged_q_rows=max_total_q if mode == "decode" else 1,
-            max_kv_rows=max_kv_rows,
-            page_size=64,
-            use_cuda_graph=(
-                self.decode_use_cuda_graph
-                if mode == "decode"
-                else self.extend_use_cuda_graph
-            ),
-        )
-        _prime_b12x_sm_scale(workspace, q.device, self.scale)
-        if mode == "decode":
-            self._ensure_decode_split_chunk_config(
-                workspace,
-                page_table_width=max_page_table_width,
-            )
-            self._ensure_decode_lse_copy_buffer(workspace)
-        B12X_WORKSPACES[key] = workspace
-        return workspace
 
     def forward_mqa(
         self,
@@ -1649,6 +1441,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         kv_cache = kv_c_and_k_pe_cache.view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         ).contiguous()
+        self._preinstall_b12x_joint_arena()
 
         use_decode_kernel = attn_metadata.max_query_len <= 1 or (
             self.spec_extend_as_decode
@@ -1657,10 +1450,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             <= attn_metadata.num_reqs * self.spec_decode_max_q
         )
         if use_decode_kernel:
-            from b12x.integration.mla import (
-                MLASparseDecodeMetadata,
-                sparse_mla_decode_forward,
-            )
+            from b12x.integration.mla import MLASparseDecodeMetadata
 
             cache_seqlens = (
                 attn_metadata.cache_seq_lens_per_req
@@ -1739,60 +1529,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 nsa_cache_seqlens_int32=nsa_cache_seqlens,
                 max_seq_len_k=attn_metadata.max_seq_len,
             )
-            serial_spec_decode = (
-                self.spec_serial_decode
-                and attn_metadata.max_query_len > 2
-                and q_all.shape[0] > 1
-            )
-            if serial_spec_decode:
-                out = q_all.new_empty(
-                    (q_all.shape[0], q_all.shape[1], self.kv_lora_rank)
-                )
-                lse = None
-                for row in range(q_all.shape[0]):
-                    row_metadata = MLASparseDecodeMetadata(
-                        page_table_1=page_table_1[row : row + 1],
-                        cache_seqlens_int32=cache_seqlens[row : row + 1],
-                        nsa_cache_seqlens_int32=nsa_cache_seqlens[row : row + 1],
-                        max_seq_len_k=attn_metadata.max_seq_len,
-                    )
-                    if self.need_to_return_lse_for_decode and self.decode_inline_lse:
-                        row_out, row_lse = (
-                            _sparse_mla_split_decode_forward_with_lse_vllm_metadata(
-                                q_all=q_all[row : row + 1],
-                                kv_cache=kv_cache,
-                                metadata=row_metadata,
-                                workspace=workspace,
-                                sm_scale=self.scale,
-                                v_head_dim=self.kv_lora_rank,
-                            )
-                        )
-                    else:
-                        row_out = _sparse_mla_decode_forward_vllm_metadata(
-                            q_all=q_all[row : row + 1],
-                            kv_cache=kv_cache,
-                            metadata=row_metadata,
-                            workspace=workspace,
-                            sm_scale=self.scale,
-                            v_head_dim=self.kv_lora_rank,
-                        )
-                        row_lse = (
-                            self._decode_lse_from_workspace(
-                                workspace, q_all[row : row + 1]
-                            )
-                            if self.need_to_return_lse_for_decode
-                            else None
-                        )
-                    out[row : row + 1].copy_(row_out)
-                    if row_lse is not None:
-                        if lse is None:
-                            lse = row_lse.new_empty(
-                                (q_all.shape[0], row_lse.shape[1])
-                            )
-                        lse[row : row + 1].copy_(row_lse)
-                return out, lse
-            if self.need_to_return_lse_for_decode and self.decode_inline_lse:
-                return _sparse_mla_split_decode_forward_with_lse_vllm_metadata(
+            if self.need_to_return_lse_for_decode:
+                return _sparse_mla_decode_forward_with_lse_vllm_metadata(
                     q_all=q_all,
                     kv_cache=kv_cache,
                     metadata=metadata,
@@ -1810,8 +1548,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             )
             if not self.need_to_return_lse_for_decode:
                 return out, None
-            lse = self._decode_lse_from_workspace(workspace, q_all)
-            return out, lse
+            raise RuntimeError("B12X sparse MLA DCP LSE path was not selected")
 
         from b12x.integration.mla import (
             MLASparseExtendMetadata,
@@ -1899,21 +1636,27 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 except Exception:
                     pass
                 setattr(self, "_debug_b12x_mla_extend_count", debug_count + 1)
+        if self.need_to_return_lse_for_decode:
+            out, lse = _sparse_mla_extend_forward_with_lse_vllm_metadata(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                metadata=metadata,
+                workspace=workspace,
+                sm_scale=self.scale,
+                v_head_dim=self.kv_lora_rank,
+            )
+            _b12x_sync_debug("mla.sparse_mla_extend_forward_with_lse")
+            return out, lse
+
         out = sparse_mla_extend_forward(
             q_all=q_all,
             kv_cache=kv_cache,
-            metadata=metadata,
+            selected_token_offsets=metadata.selected_token_offsets,
+            cache_seqlens_int32=metadata.cache_seqlens_int32,
+            nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
             workspace=workspace,
             sm_scale=self.scale,
             v_head_dim=self.kv_lora_rank,
         )
         _b12x_sync_debug("mla.sparse_mla_extend_forward")
-        if not self.need_to_return_lse_for_decode:
-            return out, None
-        if workspace.tmp_lse is None:
-            raise RuntimeError("B12X sparse MLA DCP requires split-extend LSE")
-        lse = torch.logsumexp(
-            workspace.tmp_lse[: q_all.shape[0], : q_all.shape[1]] * math.log(2.0),
-            dim=-1,
-        )
-        return out, lse
+        return out, None

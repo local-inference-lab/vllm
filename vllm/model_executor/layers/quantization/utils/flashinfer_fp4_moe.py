@@ -320,7 +320,7 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
     ]
 
-    # Reorder [w1, w3] to [w3, w1] for FI NVFP4 MoE kernels.
+    # Reorder [w1, w3] to [w3, w1] for FI/B12X NVFP4 MoE kernels.
     is_gated = layer.activation.is_gated
     if (
         is_gated

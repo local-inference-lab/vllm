@@ -9,9 +9,13 @@ import torch
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.forward_context import get_forward_context
+from vllm.config import get_current_vllm_config_or_none
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.b12x_contract import (
+    b12x_sparse_indexer_active_for_config,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
@@ -89,8 +93,6 @@ _B12X_INDEXER_WORKSPACES: dict[tuple[object, ...], object] = {}
 _B12X_INDEXER_PHANTOMS: dict[tuple[object, ...], dict[str, object]] = {}
 _B12X_INDEXER_EXTEND_ARENAS: dict[tuple[object, ...], object] = {}
 _B12X_INDEXER_EXTEND_WORKSPACES: dict[tuple[object, ...], object] = {}
-_B12X_EXTEND_TILED_TOPK_UNAVAILABLE = False
-_B12X_EXTEND_LOGITS_UNAVAILABLE = False
 _USE_SGL_KERNEL_FAST_TOPK = bool(int(os.getenv("VLLM_USE_SGL_KERNEL_FAST_TOPK", "0")))
 _USE_SGL_KERNEL_FAST_TOPK_V2 = bool(
     int(os.getenv("VLLM_USE_SGL_KERNEL_FAST_TOPK_V2", "0"))
@@ -98,36 +100,22 @@ _USE_SGL_KERNEL_FAST_TOPK_V2 = bool(
 _USE_SGL_KERNEL_FAST_TOPK_TRANSFORM = bool(
     int(os.getenv("VLLM_USE_SGL_KERNEL_FAST_TOPK_TRANSFORM", "0"))
 )
-_USE_B12X_INDEXER_WORKSPACE = (
-    os.getenv("VLLM_B12X_INDEXER_USE_WORKSPACE", "0") != "0"
-)
 _B12X_EXTEND_TOPK_SUPERTILE_K = int(
     os.getenv(
         "VLLM_B12X_NSA_EXTEND_TOPK_SUPERTILE_K",
-        os.getenv("B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "32768"),
+        "32768",
     )
 )
-_B12X_INDEXER_EXTEND_MAX_Q = int(
-    os.getenv("VLLM_B12X_INDEXER_EXTEND_MAX_Q", "8192")
-)
-_B12X_INDEXER_EXTEND_MAX_BATCH = int(
-    os.getenv("VLLM_B12X_INDEXER_EXTEND_MAX_BATCH", "64")
-)
-_B12X_INDEXER_EXTEND_MAX_KV_ROWS = int(
-    os.getenv("VLLM_B12X_INDEXER_EXTEND_MAX_KV_ROWS", "0")
-)
+_B12X_INDEXER_EXTEND_MAX_Q = 8192
+_B12X_INDEXER_EXTEND_MAX_BATCH = 64
+_B12X_INDEXER_EXTEND_MAX_KV_ROWS = 0
 _B12X_INDEXER_EXTEND_TILE_LOGITS_K_ROWS = int(
     os.getenv(
         "VLLM_B12X_INDEXER_EXTEND_TILE_LOGITS_K_ROWS",
         str(_B12X_EXTEND_TOPK_SUPERTILE_K),
     )
 )
-_B12X_INDEXER_DECODE_MAX_Q_ROWS = int(
-    os.getenv(
-        "VLLM_B12X_INDEXER_DECODE_MAX_Q_ROWS",
-        os.getenv("MAX_CUDAGRAPH_CAPTURE_SIZE", "0"),
-    )
-)
+_B12X_INDEXER_DECODE_MAX_Q_ROWS = 0
 _DEBUG_NSA_INDEXER = os.getenv("VLLM_DEBUG_NSA_INDEXER", "0") == "1"
 _DEBUG_NSA_INDEXER_FILE = os.getenv(
     "VLLM_NSA_INDEXER_DEBUG_FILE", "/diag/nsa_indexer_debug.log"
@@ -207,12 +195,21 @@ def _normalize_prefill_topk_to_req_relative(chunk, topk_indices: torch.Tensor) -
     topk_indices.copy_(torch.where(valid, normalized, topk_indices))
 
 
-def _is_b12x_missing_extend_logits_kernel(exc: ValueError) -> bool:
-    return "requires the CUDA sparse NSA extend logits kernel" in str(exc)
+def _get_runtime_vllm_config() -> object | None:
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is not None:
+        return vllm_config
+    if is_forward_context_available():
+        return getattr(get_forward_context(), "vllm_config", None)
+    return None
 
 
 def _use_b12x_sparse_indexer() -> bool:
-    return envs.VLLM_USE_B12X_SPARSE_INDEXER and current_platform.is_cuda()
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and b12x_sparse_indexer_active_for_config(_get_runtime_vllm_config())
+    )
 
 
 def _has_sgl_kernel_fast_topk() -> bool:
@@ -281,63 +278,6 @@ def _b12x_prefill_max_num_reqs(attn_metadata, chunk, q_rows: int) -> int:
         return max(int(cu_seq_lens.numel()) - 1, 1)
 
     return max(int(q_rows), 1)
-
-
-def _b12x_tiled_topk_workspace_specs(
-    *,
-    api,
-    q_rows: int,
-    k_rows: int,
-    num_heads: int,
-    topk: int,
-    supertile_k: int | None = None,
-    include_outputs: bool = True,
-) -> tuple[list[tuple[tuple[int, ...], torch.dtype]], int]:
-    prefill_block_k = api.resolve_sparse_nsa_extend_prefill_block_k(
-        valid_q_rows=q_rows,
-        k_rows=k_rows,
-        num_heads=num_heads,
-    )
-    if prefill_block_k is None:
-        prefill_block_k = 256
-    block_q = (
-        api._PREFILL512_BLOCK_Q
-        if prefill_block_k == api._PREFILL512_BLOCK_K
-        else api._PREFILL_BLOCK_Q
-    )
-    resolved_supertile_k = api._resolve_supertile_k(
-        supertile_k, block_k=prefill_block_k
-    )
-    supertile_tiles = max(1, resolved_supertile_k // prefill_block_k)
-    num_q_tiles = (q_rows + block_q - 1) // block_q
-    num_k_tiles = (k_rows + prefill_block_k - 1) // prefill_block_k
-    num_chunks = (num_k_tiles + supertile_tiles - 1) // supertile_tiles
-    # Allocate a full K-supertile even when the live chunk is shorter. b12x
-    # kernels take the live tile count at runtime, while a stable scratch shape
-    # keeps host-launcher/CUTE cache keys independent of exact sequence length.
-    max_chunk_tiles = supertile_tiles
-    tile_logits_elems = (
-        num_q_tiles * max_chunk_tiles * block_q * prefill_block_k
-    )
-
-    specs: list[tuple[tuple[int, ...], torch.dtype]] = [
-        ((tile_logits_elems,), torch.float32),
-    ]
-    if include_outputs:
-        specs.extend(
-            [
-                ((q_rows,), torch.int32),
-                ((q_rows, topk), torch.float32),
-            ]
-        )
-    if num_chunks > 1:
-        specs.extend(
-            [
-                ((num_chunks, q_rows, topk), torch.float32),
-                ((num_chunks, q_rows, topk), torch.int32),
-            ]
-        )
-    return specs, num_chunks
 
 
 def _get_b12x_indexer_workspace(
@@ -446,15 +386,7 @@ def _get_b12x_indexer_phantoms(
     See `b12x.attention.nsa_indexer.api.make_nsa_indexer_contract_phantoms`
     docstring: "avoid CUTLASS recompilation when batch size varies".
     """
-    try:
-        from b12x.integration.nsa_indexer import (
-            make_nsa_indexer_contract_phantoms,
-        )
-    except ImportError:
-        # Older b12x without phantoms support: caller falls through to
-        # the previous (recompile-per-shape) behavior. Both 0.10.x and
-        # 0.11.0 ship phantoms today; this guard is forward-defensive.
-        return None
+    from b12x.integration.nsa_indexer import make_nsa_indexer_contract_phantoms
 
     page_size = int(index_k_cache.shape[1])
     max_page_table_width = max(1, (int(max_model_len) + page_size - 1) // page_size)
@@ -476,20 +408,13 @@ def _get_b12x_indexer_phantoms(
     phantoms = _B12X_INDEXER_PHANTOMS.get(key)
     if phantoms is not None:
         return phantoms
-    try:
-        phantoms = make_nsa_indexer_contract_phantoms(
-            max_q_rows=max_q_rows,
-            num_heads=indexer_num_q_heads,
-            max_pages=max_page_table_width,
-            page_size=page_size,
-            device=q_fp8.device,
-        )
-    except Exception:
-        # Defensive: if phantom construction fails for any reason
-        # (b12x API drift, OOM at allocation, etc.), don't break the
-        # decode path — just skip phantoms and accept the per-shape
-        # recompile cost.
-        return None
+    phantoms = make_nsa_indexer_contract_phantoms(
+        max_q_rows=max_q_rows,
+        num_heads=indexer_num_q_heads,
+        max_pages=max_page_table_width,
+        page_size=page_size,
+        device=q_fp8.device,
+    )
     _B12X_INDEXER_PHANTOMS[key] = phantoms
     return phantoms
 
@@ -516,21 +441,18 @@ def _get_b12x_indexer_extend_workspace(
     indexer_num_q_heads = int(q_fp8.shape[1])
     v_head_dim = 512
     extend_topk_supertile_k = _B12X_EXTEND_TOPK_SUPERTILE_K
-    try:
-        from b12x.attention.nsa_indexer import (
-            resolve_sparse_nsa_extend_prefill_block_k,
-        )
-    except ImportError:
+    from b12x.attention.nsa_indexer import (
+        resolve_sparse_nsa_extend_prefill_block_k,
+    )
+
+    prefill_block_k = resolve_sparse_nsa_extend_prefill_block_k(
+        valid_q_rows=q_rows,
+        k_rows=k_rows,
+        num_heads=indexer_num_q_heads,
+    )
+    if prefill_block_k is None:
+        # tiled_topk explicitly forces the prefill scorer for small Q.
         prefill_block_k = 256
-    else:
-        prefill_block_k = resolve_sparse_nsa_extend_prefill_block_k(
-            valid_q_rows=q_rows,
-            k_rows=k_rows,
-            num_heads=indexer_num_q_heads,
-        )
-        if prefill_block_k is None:
-            # tiled_topk explicitly forces the prefill scorer for small Q.
-            prefill_block_k = 256
     # Match SGLang's model: compile against a stable capacity contract and pass
     # live sequence lengths as runtime metadata. If q/k capacity follows the
     # current chunk, b12x/CUTE sees different tensor metadata and compiles
@@ -627,9 +549,6 @@ def sparse_attn_indexer(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
 ) -> torch.Tensor:
-    global _B12X_EXTEND_LOGITS_UNAVAILABLE
-    global _B12X_EXTEND_TILED_TOPK_UNAVAILABLE
-
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
@@ -695,13 +614,8 @@ def sparse_attn_indexer(
         workspace_manager = current_workspace_manager()
         use_b12x_indexer = _use_b12x_sparse_indexer()
         b12x_nsa_indexer = None
-        b12x_nsa_api = None
         if use_b12x_indexer:
-            try:
-                from b12x.attention.nsa_indexer import api as b12x_nsa_api
-                from b12x.integration import nsa_indexer as b12x_nsa_indexer
-            except ImportError:
-                use_b12x_indexer = False
+            from b12x.integration import nsa_indexer as b12x_nsa_indexer
 
         if not use_b12x_indexer:
             k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(
@@ -714,98 +628,48 @@ def sparse_attn_indexer(
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
+            if use_b12x_indexer and chunk.total_seq_lens <= 0:
+                _debug_nsa_indexer_prefill(
+                    "b12x_extend_empty_local_kv", chunk, topk_indices
+                )
+                continue
 
             tile_logits = lengths = topk_values = None
             candidate_values = candidate_indices = None
-            b12x_workspace = None
             b12x_extend_phantoms = None
-            if use_b12x_indexer and b12x_nsa_api is not None:
-                try:
-                    b12x_max_num_reqs = _b12x_prefill_max_num_reqs(
-                        attn_metadata_narrowed, chunk, int(q_chunk.shape[0])
-                    )
-                    b12x_workspace = _get_b12x_indexer_extend_workspace(
-                        q_fp8=q_chunk,
-                        index_k_cache=kv_cache,
-                        topk_tokens=topk_tokens,
-                        max_num_reqs=b12x_max_num_reqs,
-                        max_model_len=max_model_len,
-                        total_seq_lens=chunk.total_seq_lens,
-                        head_dim=head_dim,
-                    )
-                    k_fp8, k_scale = b12x_workspace.get_indexer_gather_outputs(
-                        row_count=chunk.total_seq_lens
-                    )
-                    tile_logits = b12x_workspace.get_indexer_extend_tile_logits()
-                    lengths = b12x_workspace.get_indexer_extend_lengths(
+            if use_b12x_indexer:
+                b12x_max_num_reqs = _b12x_prefill_max_num_reqs(
+                    attn_metadata_narrowed, chunk, int(q_chunk.shape[0])
+                )
+                b12x_workspace = _get_b12x_indexer_extend_workspace(
+                    q_fp8=q_chunk,
+                    index_k_cache=kv_cache,
+                    topk_tokens=topk_tokens,
+                    max_num_reqs=b12x_max_num_reqs,
+                    max_model_len=max_model_len,
+                    total_seq_lens=chunk.total_seq_lens,
+                    head_dim=head_dim,
+                )
+                k_fp8, k_scale = b12x_workspace.get_indexer_gather_outputs(
+                    row_count=chunk.total_seq_lens
+                )
+                tile_logits = b12x_workspace.get_indexer_extend_tile_logits()
+                lengths = b12x_workspace.get_indexer_extend_lengths(
+                    row_count=q_chunk.shape[0]
+                )
+                topk_values, topk_indices_out = (
+                    b12x_workspace.get_indexer_extend_topk_buffers(
                         row_count=q_chunk.shape[0]
                     )
-                    topk_values, topk_indices_out = (
-                        b12x_workspace.get_indexer_extend_topk_buffers(
-                            row_count=q_chunk.shape[0]
-                        )
-                    )
-                    # #88 (Path D): pull workspace-side phantoms for stable
-                    # cache keys on the extend (prefill) NSA indexer kernels.
-                    # These were already allocated by the workspace's
-                    # `_allocate_contract_phantoms()` at construction time;
-                    # we just need to thread them into the call site.
-                    # Eliminates per-batch-shape recompile on the prefill
-                    # path that was the actual hang in alice's DCP=8 first
-                    # /v1/completions (#87 fixed only the decode path).
-                    try:
-                        b12x_extend_phantoms = (
-                            b12x_workspace.get_indexer_contract_phantoms()
-                        )
-                    except (AttributeError, RuntimeError):
-                        b12x_extend_phantoms = None
-                except (AttributeError, RuntimeError, ValueError):
-                    b12x_workspace = None
-                    b12x_extend_phantoms = None
-
-            if use_b12x_indexer and b12x_nsa_api is not None:
-                num_chunks = 0
-                if b12x_workspace is None:
-                    extra_specs, num_chunks = _b12x_tiled_topk_workspace_specs(
-                        api=b12x_nsa_api,
-                        q_rows=q_chunk.shape[0],
-                        k_rows=chunk.total_seq_lens,
-                        num_heads=q_chunk.shape[1],
-                        topk=topk_tokens,
-                        supertile_k=_B12X_EXTEND_TOPK_SUPERTILE_K,
-                    )
-                    workspace_views = workspace_manager.get_simultaneous(
-                        ((chunk.total_seq_lens, head_dim), fp8_dtype),
-                        ((chunk.total_seq_lens, 4), torch.uint8),
-                        *extra_specs,
-                    )
-                    k_fp8 = workspace_views[0]
-                    k_scale = workspace_views[1]
-                    tile_logits = workspace_views[2]
-                    lengths = workspace_views[3]
-                    topk_values = workspace_views[4]
-                    topk_indices_out = topk_indices
-                    if num_chunks > 1:
-                        candidate_values = workspace_views[5]
-                        candidate_indices = workspace_views[6]
-                elif tile_logits is None:
-                    extra_specs, num_chunks = _b12x_tiled_topk_workspace_specs(
-                        api=b12x_nsa_api,
-                        q_rows=q_chunk.shape[0],
-                        k_rows=chunk.total_seq_lens,
-                        num_heads=q_chunk.shape[1],
-                        topk=topk_tokens,
-                        supertile_k=_B12X_EXTEND_TOPK_SUPERTILE_K,
-                        include_outputs=False,
-                    )
-                    workspace_views = workspace_manager.get_simultaneous(*extra_specs)
-                    tile_logits = workspace_views[0]
-                    if num_chunks > 1:
-                        candidate_values = workspace_views[1]
-                        candidate_indices = workspace_views[2]
-                    if b12x_extend_phantoms is not None:
-                        b12x_extend_phantoms = dict(b12x_extend_phantoms)
-                        b12x_extend_phantoms["extend_tile_logits"] = tile_logits
+                )
+                candidate_values, candidate_indices = (
+                    b12x_workspace.get_indexer_extend_candidate_buffers()
+                )
+                # Thread workspace-side phantoms so the extend NSA indexer
+                # kernels compile against the stable arena contract.
+                b12x_extend_phantoms = (
+                    b12x_workspace.get_indexer_contract_phantoms()
+                )
             else:
                 k_fp8 = k_fp8_full[: chunk.total_seq_lens]
                 k_scale = k_scale_full[: chunk.total_seq_lens]
@@ -828,104 +692,48 @@ def sparse_attn_indexer(
             )
             if use_b12x_indexer:
                 assert b12x_nsa_indexer is not None
-                logits = None
-                if not _B12X_EXTEND_TILED_TOPK_UNAVAILABLE:
-                    try:
-                        topk_indices.copy_(
-                            b12x_nsa_indexer.sparse_nsa_index_extend_tiled_topk(
-                                q_fp8=q_chunk,
-                                weights=weights_chunk,
-                                kv_fp8=(k_fp8_b12x, k_scale_f32),
-                                metadata=(
-                                    b12x_nsa_indexer.NSAIndexerExtendLogitsMetadata(
-                                        k_start=chunk.cu_seqlen_ks,
-                                        k_end=chunk.cu_seqlen_ke,
-                                    )
-                                ),
-                                topk=topk_tokens,
-                                contract_phantoms=b12x_extend_phantoms,
-                                tile_logits=tile_logits,
-                                lengths=lengths,
-                                output_values=topk_values,
-                                output_indices=topk_indices_out,
-                                candidate_values=candidate_values,
-                                candidate_indices=candidate_indices,
-                                supertile_k=_B12X_EXTEND_TOPK_SUPERTILE_K,
+                row_has_no_kv = chunk.cu_seqlen_ke <= chunk.cu_seqlen_ks
+                # DCP can give a rank no local KV for early global query rows.
+                # b12x tiled top-k expects a non-empty range, so score a dummy
+                # local row and restore the invalid result after the call.
+                b12x_cu_seqlen_ks = torch.where(
+                    row_has_no_kv,
+                    torch.zeros_like(chunk.cu_seqlen_ks),
+                    chunk.cu_seqlen_ks,
+                )
+                b12x_cu_seqlen_ke = torch.where(
+                    row_has_no_kv,
+                    torch.ones_like(chunk.cu_seqlen_ke),
+                    chunk.cu_seqlen_ke,
+                )
+                topk_indices.copy_(
+                    b12x_nsa_indexer.sparse_nsa_index_extend_tiled_topk(
+                        q_fp8=q_chunk,
+                        weights=weights_chunk,
+                        kv_fp8=(k_fp8_b12x, k_scale_f32),
+                        metadata=(
+                            b12x_nsa_indexer.NSAIndexerExtendLogitsMetadata(
+                                k_start=b12x_cu_seqlen_ks,
+                                k_end=b12x_cu_seqlen_ke,
                             )
-                        )
-                        _normalize_prefill_topk_to_req_relative(chunk, topk_indices)
-                        _debug_nsa_indexer_prefill(
-                            "b12x_extend_tiled_topk", chunk, topk_indices
-                        )
-                        continue
-                    except AttributeError:
-                        # Older b12x builds expose only the dense-logits path.
-                        _B12X_EXTEND_TILED_TOPK_UNAVAILABLE = True
-                    except ImportError:
-                        _B12X_EXTEND_TILED_TOPK_UNAVAILABLE = True
-                        _B12X_EXTEND_LOGITS_UNAVAILABLE = True
-                    except ValueError as exc:
-                        if not _is_b12x_missing_extend_logits_kernel(exc):
-                            raise
-                        logger.warning_once(
-                            "b12x NSA tiled-topk prefill path is unavailable: %s; "
-                            "falling back to dense logits for this shape "
-                            "(q=%s/%s, weights=%s/%s, k=%s/%s, k_scale=%s/%s, "
-                            "k_start=%s/%s/%s, k_end=%s/%s/%s)",
-                            exc,
-                            tuple(q_chunk.shape),
-                            q_chunk.dtype,
-                            tuple(weights_chunk.shape),
-                            weights_chunk.dtype,
-                            tuple(k_fp8.shape),
-                            k_fp8.dtype,
-                            tuple(k_scale_f32.shape),
-                            k_scale_f32.dtype,
-                            tuple(chunk.cu_seqlen_ks.shape),
-                            chunk.cu_seqlen_ks.dtype,
-                            chunk.cu_seqlen_ks.device,
-                            tuple(chunk.cu_seqlen_ke.shape),
-                            chunk.cu_seqlen_ke.dtype,
-                            chunk.cu_seqlen_ke.device,
-                        )
-
-                if not _B12X_EXTEND_LOGITS_UNAVAILABLE:
-                    try:
-                        logits = b12x_nsa_indexer.sparse_nsa_index_extend_logits(
-                            q_fp8=q_chunk,
-                            weights=weights_chunk,
-                            kv_fp8=(k_fp8_b12x, k_scale_f32),
-                            metadata=(
-                                b12x_nsa_indexer.NSAIndexerExtendLogitsMetadata(
-                                    k_start=chunk.cu_seqlen_ks,
-                                    k_end=chunk.cu_seqlen_ke,
-                                )
-                            ),
-                            contract_phantoms=b12x_extend_phantoms,
-                        )
-                    except AttributeError:
-                        _B12X_EXTEND_LOGITS_UNAVAILABLE = True
-                    except ImportError:
-                        _B12X_EXTEND_LOGITS_UNAVAILABLE = True
-                    except ValueError as exc:
-                        if not _is_b12x_missing_extend_logits_kernel(exc):
-                            raise
-                        logger.warning(
-                            "b12x NSA dense-logits prefill path is unavailable: %s; "
-                            "falling back to fp8_mqa_logits",
-                            exc,
-                        )
-                        _B12X_EXTEND_LOGITS_UNAVAILABLE = True
-
-                if logits is None:
-                    logits = fp8_mqa_logits(
-                        q_chunk,
-                        (k_fp8, k_scale_f32),
-                        weights_chunk,
-                        chunk.cu_seqlen_ks,
-                        chunk.cu_seqlen_ke,
-                        clean_logits=False,
+                        ),
+                        topk=topk_tokens,
+                        contract_phantoms=b12x_extend_phantoms,
+                        tile_logits=tile_logits,
+                        lengths=lengths,
+                        output_values=topk_values,
+                        output_indices=topk_indices_out,
+                        candidate_values=candidate_values,
+                        candidate_indices=candidate_indices,
+                        supertile_k=_B12X_EXTEND_TOPK_SUPERTILE_K,
                     )
+                )
+                topk_indices.masked_fill_(row_has_no_kv[:, None], -1)
+                _normalize_prefill_topk_to_req_relative(chunk, topk_indices)
+                _debug_nsa_indexer_prefill(
+                    "b12x_extend_tiled_topk", chunk, topk_indices
+                )
+                continue
             else:
                 logits = fp8_mqa_logits(
                     q_chunk,
@@ -985,59 +793,44 @@ def sparse_attn_indexer(
             and b12x_seq_lens.dim() == 1
         )
         if b12x_decode_supported:
-            try:
-                from b12x.integration.nsa_indexer import (
-                    NSAIndexerPagedDecodeMetadata,
-                    sparse_nsa_index_decode_logits_paged,
-                )
+            from b12x.integration.nsa_indexer import (
+                NSAIndexerPagedDecodeMetadata,
+                sparse_nsa_index_decode_logits_paged,
+            )
 
-                seq_lens = b12x_seq_lens[:num_decode_tokens].contiguous()
-                block_table = b12x_block_table[:num_decode_tokens].contiguous()
-                index_k_cache = kv_cache.view(kv_cache.shape[0], -1)
-                workspace = None
-                if _USE_B12X_INDEXER_WORKSPACE:
-                    workspace = _get_b12x_indexer_workspace(
-                        q_fp8=q_fp8[:num_decode_tokens],
-                        index_k_cache=kv_cache,
-                        topk_tokens=topk_tokens,
-                        max_num_reqs=attn_metadata_narrowed.num_reqs,
-                        max_model_len=max_model_len,
-                    )
-                # #87 (Path C): pass contract_phantoms so the b12x indexer
-                # caches its compiled kernel by (max_q_rows, num_heads,
-                # max_pages, page_size) instead of the actual per-call
-                # batch shape. Eliminates per-cudagraph-capture-size
-                # recompiles (60-90 min cold-boot wall under DCP=8).
-                # Helper returns None on older b12x or construction error
-                # — call falls through to legacy per-shape behavior.
-                contract_phantoms = _get_b12x_indexer_phantoms(
-                    q_fp8=q_fp8[:num_decode_tokens],
-                    index_k_cache=kv_cache,
-                    max_num_reqs=attn_metadata_narrowed.num_reqs,
-                    max_model_len=max_model_len,
-                )
-                logits = sparse_nsa_index_decode_logits_paged(
-                    q_fp8=q_fp8[:num_decode_tokens],
-                    weights=weights[:num_decode_tokens],
-                    index_k_cache=index_k_cache,
-                    metadata=NSAIndexerPagedDecodeMetadata(
-                        real_page_table=block_table,
-                        cache_seqlens_int32=seq_lens,
-                        paged_mqa_schedule_metadata=decode_metadata.schedule_metadata,
-                        # Keep the live width as a runtime tensor inside b12x.
-                        # Passing the host hint lets b12x specialize
-                        # persistent_ctas by prompt length, which reintroduces
-                        # CUTE/JIT compiles during long prefill/decode.
-                        active_width_hint=None,
-                    ),
-                    page_size=kv_cache.shape[1],
-                    contract_phantoms=contract_phantoms,
-                    workspace=workspace,
-                )
-                next_n = 1
-                num_padded_tokens = num_decode_tokens
-            except ImportError:
-                b12x_decode_supported = False
+            seq_lens = b12x_seq_lens[:num_decode_tokens].contiguous()
+            block_table = b12x_block_table[:num_decode_tokens].contiguous()
+            index_k_cache = kv_cache.view(kv_cache.shape[0], -1)
+            workspace = _get_b12x_indexer_workspace(
+                q_fp8=q_fp8[:num_decode_tokens],
+                index_k_cache=kv_cache,
+                topk_tokens=topk_tokens,
+                max_num_reqs=attn_metadata_narrowed.num_reqs,
+                max_model_len=max_model_len,
+            )
+            # Pass contract phantoms so the b12x indexer caches its compiled
+            # kernel by the stable arena contract instead of per-call shape.
+            contract_phantoms = _get_b12x_indexer_phantoms(
+                q_fp8=q_fp8[:num_decode_tokens],
+                index_k_cache=kv_cache,
+                max_num_reqs=attn_metadata_narrowed.num_reqs,
+                max_model_len=max_model_len,
+            )
+            logits = sparse_nsa_index_decode_logits_paged(
+                q_fp8=q_fp8[:num_decode_tokens],
+                weights=weights[:num_decode_tokens],
+                index_k_cache=index_k_cache,
+                metadata=NSAIndexerPagedDecodeMetadata(
+                    real_page_table=block_table,
+                    cache_seqlens_int32=seq_lens,
+                    paged_mqa_schedule_metadata=decode_metadata.schedule_metadata,
+                ),
+                page_size=kv_cache.shape[1],
+                contract_phantoms=contract_phantoms,
+                workspace=workspace,
+            )
+            next_n = 1
+            num_padded_tokens = num_decode_tokens
 
         if not b12x_decode_supported:
             # kv_cache shape requirement for DeepGEMM:

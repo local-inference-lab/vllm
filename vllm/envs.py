@@ -168,7 +168,6 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
-    VLLM_USE_B12X_SPARSE_INDEXER: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -222,8 +221,6 @@ if TYPE_CHECKING:
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
     VLLM_NVFP4_GEMM_BACKEND: str | None = None
-    VLLM_B12X_KERNEL_PREWARM: bool = True
-    VLLM_B12X_PAD_M_TO_POW2: bool = True
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
@@ -929,6 +926,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
+    # Use b12x W4A16 MoE activations for pure decode forwards while forcing
+    # NVFP4 activation quantization for prefill and mixed decode/prefill.
+    "VLLM_B12X_MOE_DECODE_A16": lambda: bool(
+        int(os.getenv("VLLM_B12X_MOE_DECODE_A16", "0"))
+    ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
     "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH": lambda: bool(
@@ -1302,11 +1304,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
     ),
-    # Route sparse MLA top-k score computation through b12x instead of
-    # DeepGEMM. This is opt-in while the b12x NSA backend is evaluated.
-    "VLLM_USE_B12X_SPARSE_INDEXER": lambda: bool(
-        int(os.getenv("VLLM_USE_B12X_SPARSE_INDEXER", "0"))
-    ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
     # JIT'ing in the hot-path. However, this warmup increases the engine
@@ -1570,16 +1567,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "marlin",
             "emulation",
         ],
-    ),
-    # Pre-warm the b12x CUTLASS DSL kernel cache at startup for typical
-    # MoE shapes. This is only used by the optional b12x MoE backend.
-    "VLLM_B12X_KERNEL_PREWARM": lambda: bool(
-        int(os.getenv("VLLM_B12X_KERNEL_PREWARM", "1"))
-    ),
-    # Pad MoE token count to a power-of-two before b12x dispatch to avoid
-    # unbounded first-use CUTLASS DSL JIT shapes during chunked prefill.
-    "VLLM_B12X_PAD_M_TO_POW2": lambda: bool(
-        int(os.getenv("VLLM_B12X_PAD_M_TO_POW2", "1"))
     ),
     # Controls garbage collection during CUDA graph capture.
     # If set to 0 (default), enables GC freezing to speed up capture time.

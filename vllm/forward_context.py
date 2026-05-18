@@ -130,6 +130,7 @@ class DPMetadata:
 class ForwardContext:
     # copy from vllm_config.compilation_config.static_forward_context
     no_compile_layers: dict[str, Any]
+    vllm_config: VllmConfig
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]]
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]]
     """
@@ -220,6 +221,7 @@ def create_forward_context(
 
     return ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
+        vllm_config=vllm_config,
         all_moe_layers=all_moe_layers,
         attn_metadata=attn_metadata,
         slot_mapping=slot_mapping or {},
