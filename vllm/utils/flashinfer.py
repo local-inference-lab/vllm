@@ -146,6 +146,17 @@ autotune = _lazy_import_wrapper(
 )
 
 
+def _stable_fp8_gemm_backend(backend: str) -> str:
+    if backend != "auto":
+        return backend
+
+    # FlashInfer's dense FP8 GEMM "auto" path can enter the autotuner during
+    # vLLM warmup/graph initialization, before CUDA graph capture is observable
+    # through torch.cuda.is_current_stream_capturing(). Pin this wrapper to the
+    # stable default backend while leaving other FlashInfer autotune users alone.
+    return "cublas"
+
+
 @functools.cache
 def has_flashinfer_comm() -> bool:
     """Return `True` if FlashInfer comm module is available."""
@@ -555,6 +566,7 @@ if has_flashinfer():
     ) -> torch.Tensor:
         from flashinfer import bmm_fp8 as bmm_fp8_
 
+        backend = _stable_fp8_gemm_backend(backend)
         return bmm_fp8_(A, B, A_scale, B_scale, dtype, None, backend)
 
     @torch.library.register_fake(
@@ -811,6 +823,9 @@ def flashinfer_scaled_fp8_mm_out(
 
     from flashinfer import bmm_fp8 as bmm_fp8_
 
+    backend = "cublas" if torch.compiler.is_compiling() else "auto"
+    backend = _stable_fp8_gemm_backend(backend)
+
     bmm_fp8_(
         a.unsqueeze(0),
         # FlashInfer expects the weight in the same column-major view layout
@@ -820,7 +835,7 @@ def flashinfer_scaled_fp8_mm_out(
         scale_b,
         out_dtype or out.dtype,
         out.unsqueeze(0),
-        "auto",
+        backend,
     )
     return out
 
