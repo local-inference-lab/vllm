@@ -160,7 +160,7 @@ SpeculativeMethod = Literal[
     EagleModelTypes,
     NgramGPUTypes,
 ]
-RejectionSampleMethod = Literal["standard", "synthetic"]
+RejectionSampleMethod = Literal["standard", "probabilistic", "synthetic"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
 
 
@@ -235,18 +235,13 @@ class SpeculativeConfig:
     speculative input batches can contain sequences of different lengths,
     which may only be supported by certain attention backends. This currently
     only affects the EAGLE method of speculation."""
-    use_local_argmax_reduction: bool | None = None
+    use_local_argmax_reduction: bool = False
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
     O(2 * tp_size) per token. Only applies to greedy draft selection in
-    non-tree speculation.
-
-    When None (the default), the value is auto-resolved in `__post_init__`:
-    True for model-based draft methods (eagle / eagle3 / mtp / draft_model /
-    dflash) at target tensor_parallel_size > 1, False otherwise. Empirical
-    validation on Kimi-K2.6 + Eagle3 MTP3 DCP=1 TP=8 showed +109% (2.09x)
-    decode TPS with this enabled. Set explicitly to True/False to override
-    the auto-resolution."""
+    non-tree speculation. This is opt-in because correctness depends on the
+    draft model's `get_top_tokens()` implementation matching
+    `compute_logits(...).argmax()` exactly for that model family."""
 
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
@@ -636,6 +631,8 @@ class SpeculativeConfig:
         return hf_config
 
     def __post_init__(self):
+        self._normalize_probabilistic_rejection_alias()
+
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
         # will be used to set the draft model, eagle head, or additional weight
@@ -928,32 +925,15 @@ class SpeculativeConfig:
                     )
                 )
 
-        # Resolve `use_local_argmax_reduction` auto-default. Eliminates the
-        # full-vocab `tensor_model_parallel_all_gather` per draft step in
-        # `_greedy_sample` (validated +109% on Kimi-K2.6 + Eagle3 MTP3 DCP=1
-        # TP=8, 2026-04-29). Auto-enabled for model-based draft methods at
-        # TP>1 since the AllGather is the only big inter-rank cost in the
-        # spec-decode hot path. User can override by passing the field
-        # explicitly in `--speculative-config '{"use_local_argmax_reduction":
-        # false}'`. The proposer falls back to `compute_logits.argmax` when
-        # the model class doesn't implement `get_top_tokens`, so this is
-        # safe to default-on for all model variants.
-        if self.use_local_argmax_reduction is None:
-            _supports = self.method in (
-                "eagle",
-                "eagle3",
-                "mtp",
-                "draft_model",
-                "dflash",
-            )
-            _target_tp = (
-                self.target_parallel_config.tensor_parallel_size
-                if self.target_parallel_config is not None
-                else 1
-            )
-            self.use_local_argmax_reduction = bool(_supports and _target_tp > 1)
-
         return self
+
+    def _normalize_probabilistic_rejection_alias(self) -> None:
+        if self.rejection_sample_method != "probabilistic":
+            return
+        # Compatibility with the 0424 Kimi launcher: that image accepted
+        # `rejection_sample_method=probabilistic`, but its EAGLE proposer used
+        # the standard one-hot rejection path with greedy draft tokens.
+        self.rejection_sample_method = "standard"
 
     def _validate_suffix_decoding(self):
         if not has_arctic_inference():

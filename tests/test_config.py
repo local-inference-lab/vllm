@@ -1394,6 +1394,42 @@ def test_draft_sample_method_probabilistic_is_accepted():
     assert speculative_config.draft_sample_method == "probabilistic"
 
 
+def test_use_local_argmax_reduction_defaults_off():
+    speculative_config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=1,
+    )
+    assert speculative_config.use_local_argmax_reduction is False
+
+
+def test_use_local_argmax_reduction_explicit_true_is_preserved():
+    speculative_config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=1,
+        use_local_argmax_reduction=True,
+    )
+    assert speculative_config.use_local_argmax_reduction is True
+
+
+def test_legacy_rejection_sample_method_probabilistic_is_normalized():
+    speculative_config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=1,
+        rejection_sample_method="probabilistic",
+    )
+    assert speculative_config.rejection_sample_method == "standard"
+    assert speculative_config.draft_sample_method == "greedy"
+
+
+def test_draft_sample_method_legacy_probabilistic_is_rejected():
+    with pytest.raises(ValidationError):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            draft_sample_method="legacy_probabilistic",
+        )
+
+
 def test_draft_sample_method_gumbel_is_rejected():
     with pytest.raises(ValidationError):
         SpeculativeConfig(
