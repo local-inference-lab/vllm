@@ -88,8 +88,10 @@ def gumbel_block_argmax(
     processed_logits_ptr,
     processed_logits_stride,
     processed_logits_col_ptr,
+    processed_logits_active_rows_ptr,
     vocab_size,
     APPLY_TEMPERATURE: tl.constexpr,
+    HAS_ACTIVE_ROW_LIMIT: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
@@ -106,13 +108,20 @@ def gumbel_block_argmax(
             col = tl.load(processed_logits_col_ptr)
         else:
             col = 0
+        store_mask = mask
+        if HAS_ACTIVE_ROW_LIMIT:
+            # FULL CUDA graph replay can execute with padded request rows.
+            # Those rows may carry stale req_state indices; never let them
+            # overwrite cached draft logits for real requests.
+            active_rows = tl.load(processed_logits_active_rows_ptr)
+            store_mask = store_mask & (token_idx < active_rows)
         tl.store(
             processed_logits_ptr
             + req_state_idx * processed_logits_stride
             + col * vocab_size
             + block,
             logits,
-            mask=mask,
+            mask=store_mask,
         )
 
     # fp32 is the default reduction dtype; fp64 is ~1/32–1/64x the throughput
@@ -148,6 +157,7 @@ def _gumbel_sample_kernel(
     processed_logits_ptr,
     processed_logits_stride,
     processed_logits_col_ptr,
+    processed_logits_active_rows_ptr,
     logits_ptr,
     logits_stride,
     expanded_idx_mapping_ptr,
@@ -157,6 +167,7 @@ def _gumbel_sample_kernel(
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr,
+    HAS_ACTIVE_ROW_LIMIT: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
@@ -182,8 +193,10 @@ def _gumbel_sample_kernel(
         processed_logits_ptr,
         processed_logits_stride,
         processed_logits_col_ptr,
+        processed_logits_active_rows_ptr,
         vocab_size,
         APPLY_TEMPERATURE=APPLY_TEMPERATURE,
+        HAS_ACTIVE_ROW_LIMIT=HAS_ACTIVE_ROW_LIMIT,
         USE_FP64=USE_FP64,
     )
     token_id = block_idx * BLOCK_SIZE + idx
@@ -200,6 +213,7 @@ def gumbel_sample(
     apply_temperature: bool,
     output_processed_logits: torch.Tensor | None = None,
     output_processed_logits_col: torch.Tensor | None = None,
+    output_processed_logits_active_rows: torch.Tensor | None = None,
     use_fp64: bool = False,
 ) -> torch.Tensor:
     num_tokens, vocab_size = logits.shape
@@ -216,6 +230,7 @@ def gumbel_sample(
         output_processed_logits,
         output_processed_logits.stride(0) if output_processed_logits is not None else 0,
         output_processed_logits_col,
+        output_processed_logits_active_rows,
         logits,
         logits.stride(0),
         expanded_idx_mapping,
@@ -225,6 +240,7 @@ def gumbel_sample(
         vocab_size,
         BLOCK_SIZE=BLOCK_SIZE,
         APPLY_TEMPERATURE=apply_temperature,
+        HAS_ACTIVE_ROW_LIMIT=output_processed_logits_active_rows is not None,
         USE_FP64=use_fp64,
     )
     # NOTE(woosuk): Use int64 for later indexing.

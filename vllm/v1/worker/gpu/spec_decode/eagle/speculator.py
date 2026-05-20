@@ -97,6 +97,7 @@ class EagleSpeculator:
             device=device,
         )
         self.current_draft_step = torch.tensor(0, dtype=torch.int64, device=device)
+        self.num_active_reqs = torch.zeros((), dtype=torch.int32, device=device)
         self.last_token_indices = torch.zeros(
             self.max_num_reqs, dtype=torch.int64, device=device
         )
@@ -254,6 +255,7 @@ class EagleSpeculator:
                 apply_temperature=True,
                 output_processed_logits=draft_logits,
                 output_processed_logits_col=draft_step,
+                output_processed_logits_active_rows=self.num_active_reqs,
                 use_fp64=self.use_fp64_gumbel,
             )
         else:
@@ -505,6 +507,7 @@ class EagleSpeculator:
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
         max_query_len = input_batch.num_scheduled_tokens.max()
+        self.num_active_reqs.fill_(num_reqs)
 
         # NOTE(woosuk): To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of eagle's input_ids and
