@@ -23,6 +23,7 @@ from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseMetadataBuilder,
     B12xMLASparseImpl,
+    _default_decode_q_per_req,
     clear_b12x_mla_workspace_cache,
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -102,6 +103,25 @@ def test_explicit_non_b12x_attention_backend_disables_sparse_mla_auto_contract()
 
     assert not b12x_sparse_mla_active_for_config(vllm_config)
     assert not b12x_sparse_indexer_active_for_config(vllm_config)
+
+
+def test_b12x_decode_workspace_covers_short_extend_as_decode():
+    assert (
+        _default_decode_q_per_req(
+            3,
+            spec_extend_as_decode=True,
+            spec_decode_max_q=8,
+        )
+        == 8
+    )
+    assert (
+        _default_decode_q_per_req(
+            3,
+            spec_extend_as_decode=False,
+            spec_decode_max_q=8,
+        )
+        == 4
+    )
 
 
 def test_b12x_joint_arena_preinstall_normalizes_moe_backend():
@@ -363,12 +383,14 @@ def test_b12x_mla_extend_uses_attention_arena(monkeypatch):
     fake_b12x = types.ModuleType("b12x")
     fake_integration = types.ModuleType("b12x.integration")
     fake_mla = types.ModuleType("b12x.integration.mla")
+    caps_calls = []
     make_workspace_calls = []
 
     class FakeAttentionArenaCaps:
 
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
+            caps_calls.append(kwargs)
 
     class FakeWorkspaceContract:
 
@@ -418,6 +440,7 @@ def test_b12x_mla_extend_uses_attention_arena(monkeypatch):
     impl.extend_use_cuda_graph = True
     impl.decode_use_cuda_graph = True
     impl.extend_max_chunks_per_row = 4
+    impl.extend_indexer_tile_logits_k_rows = 16384
     impl.scale = 0.7
     impl._moe_backend_name = lambda _vllm_config: ""
 
@@ -433,6 +456,9 @@ def test_b12x_mla_extend_uses_attention_arena(monkeypatch):
     )
 
     assert make_workspace_calls == [("extend", True)]
+    assert caps_calls[0]["reserve_extend_indexer_logits"] is False
+    assert caps_calls[0]["extend_indexer_tile_logits_k_rows"] == 16384
+    assert caps_calls[0]["max_chunks_per_row"] == 4
 
 
 def test_b12x_mla_decode_arena_sizes_mtp_rows(monkeypatch):
@@ -585,8 +611,9 @@ def test_b12x_joint_arena_preinstall_uses_shared_lane_capacity(monkeypatch):
     assert caps_calls[0]["caps_extend_max_total_q"] == 128
     assert caps_calls[0]["caps_extend_max_batch"] == 32
     assert caps_calls[0]["caps_extend_max_kv_rows"] == 202752
-    assert caps_calls[0]["reserve_extend_indexer_logits"] is True
-    assert caps_calls[0]["max_chunks_per_row"] == 64
+    assert caps_calls[0]["reserve_extend_indexer_logits"] is False
+    assert caps_calls[0]["extend_indexer_tile_logits_k_rows"] == 32768
+    assert caps_calls[0]["max_chunks_per_row"] == 1
     assert contract_calls[0]["max_total_q"] == 4
     assert contract_calls[0]["max_batch"] == 4
     assert contract_calls[0]["max_paged_q_rows"] == 4

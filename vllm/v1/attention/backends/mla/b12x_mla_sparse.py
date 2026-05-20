@@ -262,11 +262,12 @@ def _get_b12x_covering_arena(
     caps_extend_max_batch: int,
     caps_extend_max_kv_rows: int,
     reserve_extend_indexer_logits: bool,
+    extend_indexer_tile_logits_k_rows: int,
     use_joint_arena: bool,
     moe_backend: str,
 ):
     for key, arena in B12X_ARENAS.items():
-        if len(key) != 17:
+        if len(key) != 18:
             continue
         (
             key_device_type,
@@ -284,6 +285,7 @@ def _get_b12x_covering_arena(
             key_caps_extend_max_batch,
             key_caps_extend_max_kv_rows,
             key_reserve_extend_indexer_logits,
+            key_extend_indexer_tile_logits_k_rows,
             key_use_joint_arena,
             key_moe_backend,
         ) = key
@@ -309,6 +311,12 @@ def _get_b12x_covering_arena(
             continue
         if reserve_extend_indexer_logits and not key_reserve_extend_indexer_logits:
             continue
+        if (
+            not reserve_extend_indexer_logits
+            and key_extend_indexer_tile_logits_k_rows
+            < extend_indexer_tile_logits_k_rows
+        ):
+            continue
         return arena
     return None
 
@@ -326,6 +334,34 @@ def _env_int(name: str, default: int) -> int:
         logger.warning("Ignoring non-positive %s=%r; using %d", name, value, default)
         return default
     return parsed
+
+
+def _env_nonnegative_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %d", name, value, default)
+        return default
+    if parsed < 0:
+        logger.warning("Ignoring negative %s=%r; using %d", name, value, default)
+        return default
+    return parsed
+
+
+def _default_decode_q_per_req(
+    num_speculative_tokens: int,
+    *,
+    spec_extend_as_decode: bool,
+    spec_decode_max_q: int,
+) -> int:
+    return max(
+        1,
+        1 + int(num_speculative_tokens),
+        int(spec_decode_max_q) if spec_extend_as_decode else 1,
+    )
 
 
 def _prime_b12x_sm_scale(workspace: object, device: torch.device, scale: float) -> None:
@@ -716,11 +752,16 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             getattr(speculative_config, "num_speculative_tokens", 0) or 0
         )
         # MTP/speculative verification sends target + draft rows through the
-        # decode kernel. Size the graph-stable decode workspace for rows, not
-        # just active requests, otherwise C=64/MTP3 hits q_all=256 > 64.
+        # decode kernel. Short speculative extend batches can also use the same
+        # decode path, so size the graph-stable workspace for the largest
+        # per-request query length that path accepts, not just active requests.
         decode_q_per_req = _env_int(
             "VLLM_B12X_MLA_DECODE_Q_PER_REQ",
-            max(1, 1 + num_speculative_tokens),
+            _default_decode_q_per_req(
+                num_speculative_tokens,
+                spec_extend_as_decode=self.spec_extend_as_decode,
+                spec_decode_max_q=self.spec_decode_max_q,
+            ),
         )
         self.decode_max_total_q = _env_int(
             "VLLM_B12X_MLA_DECODE_MAX_TOTAL_Q",
@@ -755,6 +796,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self.extend_max_chunks_per_row = _env_int(
             "VLLM_B12X_MLA_EXTEND_MAX_CHUNKS",
             4 if self.dcp_world_size > 1 else 1,
+        )
+        self.extend_indexer_tile_logits_k_rows = _env_nonnegative_int(
+            "VLLM_B12X_MLA_EXTEND_TOPK_SUPERTILE_K",
+            _env_nonnegative_int("B12X_NSA_EXTEND_TOPK_SUPERTILE_K", 32768),
         )
         self.clamp_nsa_to_valid_prefix = (
             os.getenv("VLLM_B12X_MLA_CLAMP_NSA_TO_VALID_PREFIX", "0") != "0"
@@ -868,6 +913,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         caps_extend_max_batch: int,
         caps_extend_max_kv_rows: int,
         reserve_extend_indexer_logits: bool,
+        extend_indexer_tile_logits_k_rows: int,
     ):
         from b12x.integration.mla import B12XAttentionArenaCaps
 
@@ -892,6 +938,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         return B12XAttentionArenaCaps(
             **kwargs,
             reserve_extend_indexer_logits=reserve_extend_indexer_logits,
+            extend_indexer_tile_logits_k_rows=extend_indexer_tile_logits_k_rows,
         )
 
     def _allocate_b12x_attention_arena(self, attention_caps, moe_caps):
@@ -960,11 +1007,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         )
         num_q_heads = int(self.num_heads) * dcp_size
         topk = int(self.topk_indices_buffer.shape[1])
-        max_chunks_per_row = 64
-        if dcp_size > 1:
-            max_chunks_per_row = int(
-                getattr(self, "extend_max_chunks_per_row", 64)
-            )
+        max_chunks_per_row = int(getattr(self, "extend_max_chunks_per_row", 64))
         attention_caps = self._build_b12x_attention_arena_caps(
             device=device,
             dtype=torch.bfloat16,
@@ -976,7 +1019,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             caps_extend_max_total_q=self.arena_extend_max_total_q,
             caps_extend_max_batch=self.arena_extend_max_batch,
             caps_extend_max_kv_rows=self.arena_extend_max_kv_rows,
-            reserve_extend_indexer_logits=True,
+            reserve_extend_indexer_logits=False,
+            extend_indexer_tile_logits_k_rows=int(
+                getattr(self, "extend_indexer_tile_logits_k_rows", 32768)
+            ),
         )
         moe_caps = self._build_b12x_moe_arena_caps(device, torch.bfloat16)
         arena_key = (
@@ -994,7 +1040,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             self.arena_extend_max_total_q,
             self.arena_extend_max_batch,
             self.arena_extend_max_kv_rows,
-            True,
+            False,
+            int(getattr(self, "extend_indexer_tile_logits_k_rows", 32768)),
             self.use_joint_arena,
             self._moe_backend_name(self.vllm_config),
         )
@@ -1018,6 +1065,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             1,
             1,
             False,
+            0,
             self.use_joint_arena,
             self._moe_backend_name(self.vllm_config),
         )
@@ -1045,6 +1093,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             self.arena_extend_max_total_q,
             self.arena_extend_max_batch,
             self.arena_extend_max_kv_rows,
+            0,
             self.use_joint_arena,
             self._moe_backend_name(self.vllm_config),
         )
@@ -1180,6 +1229,11 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             if mode == "decode"
             else None
         )
+        workspace_extend_indexer_tile_logits_k_rows = (
+            0
+            if mode == "decode"
+            else int(getattr(self, "extend_indexer_tile_logits_k_rows", 32768))
+        )
         key = (
             q.device.type,
             q.device.index,
@@ -1202,6 +1256,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             self.arena_extend_max_total_q,
             self.arena_extend_max_batch,
             self.arena_extend_max_kv_rows,
+            workspace_extend_indexer_tile_logits_k_rows,
             self.use_joint_arena,
             self._moe_backend_name(self.vllm_config),
         )
@@ -1235,7 +1290,12 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             caps_extend_max_kv_rows = (
                 1 if decode_only_arena else self.arena_extend_max_kv_rows
             )
-            reserve_extend_indexer_logits = not decode_only_arena
+            reserve_extend_indexer_logits = False
+            extend_indexer_tile_logits_k_rows = (
+                0
+                if decode_only_arena
+                else int(getattr(self, "extend_indexer_tile_logits_k_rows", 32768))
+            )
             arena_key = (
                 q.device.type,
                 q.device.index,
@@ -1252,6 +1312,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 caps_extend_max_batch,
                 caps_extend_max_kv_rows,
                 reserve_extend_indexer_logits,
+                extend_indexer_tile_logits_k_rows,
                 self.use_joint_arena,
                 self._moe_backend_name(self.vllm_config),
             )
@@ -1273,6 +1334,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     caps_extend_max_batch=caps_extend_max_batch,
                     caps_extend_max_kv_rows=caps_extend_max_kv_rows,
                     reserve_extend_indexer_logits=reserve_extend_indexer_logits,
+                    extend_indexer_tile_logits_k_rows=(
+                        extend_indexer_tile_logits_k_rows
+                    ),
                     use_joint_arena=self.use_joint_arena,
                     moe_backend=self._moe_backend_name(self.vllm_config),
                 )
@@ -1291,6 +1355,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     caps_extend_max_batch=caps_extend_max_batch,
                     caps_extend_max_kv_rows=caps_extend_max_kv_rows,
                     reserve_extend_indexer_logits=reserve_extend_indexer_logits,
+                    extend_indexer_tile_logits_k_rows=(
+                        extend_indexer_tile_logits_k_rows
+                    ),
                 )
                 moe_caps = self._build_b12x_moe_arena_caps(q.device, q.dtype)
                 arena = self._allocate_b12x_attention_arena(caps, moe_caps)
