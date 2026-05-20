@@ -128,16 +128,39 @@ class LogitsProcessor(PluggableLayer):
         if self.scale != 1.0:
             logits = logits * self.scale
 
-        # Mask out padding entries beyond org_vocab_size on this shard.
-        num_pad = lm_head.shard_indices.num_org_vocab_padding
-        if num_pad > 0:
-            logits[..., -num_pad:] = -float("inf")
+        shard_indices = lm_head.shard_indices
+
+        # VocabParallelEmbedding stores original-vocab and added-vocab slices
+        # separately, each with its own padding. Mask both padding regions so
+        # local argmax sees the same valid tokens as the full-logits path.
+        if shard_indices.num_org_vocab_padding > 0:
+            logits[
+                ...,
+                shard_indices.num_org_elements : shard_indices.num_org_elements_padded,
+            ] = -float("inf")
+
+        if shard_indices.num_added_vocab_padding > 0:
+            added_pad_start = (
+                shard_indices.num_org_elements_padded
+                + shard_indices.num_added_elements
+            )
+            added_pad_end = (
+                shard_indices.num_org_elements_padded
+                + shard_indices.num_added_elements_padded
+            )
+            logits[..., added_pad_start:added_pad_end] = -float("inf")
 
         local_max_vals, local_max_indices = logits.max(dim=-1)
 
         # Convert shard-local indices to global vocab indices.
-        vocab_start = lm_head.shard_indices.org_vocab_start_index
-        global_indices = local_max_indices + vocab_start
+        added_vocab_local_start = shard_indices.num_org_elements_padded
+        global_indices = torch.where(
+            local_max_indices >= added_vocab_local_start,
+            local_max_indices
+            - added_vocab_local_start
+            + shard_indices.added_vocab_start_index,
+            local_max_indices + shard_indices.org_vocab_start_index,
+        )
 
         if tp_size == 1:
             return global_indices
