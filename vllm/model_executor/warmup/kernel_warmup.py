@@ -7,6 +7,7 @@ happen during model execution.
 """
 
 import hashlib
+import inspect
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -157,11 +158,34 @@ def _flashinfer_autotune_speculator_logits(
     torch.cuda.empty_cache()
 
 
+def _dummy_run_for_flashinfer_autotune(
+    runner: "GPUModelRunner",
+    *,
+    skip_attn: bool,
+    **kwargs,
+) -> None:
+    """Call GPUModelRunner._dummy_run across both v1 runner variants.
+
+    The newer GPU runner accepts skip_attn directly.  The Kimi/MLA runner
+    instead defaults to no attention metadata for profile dummy runs and uses
+    force_attention=True when attention must be covered.
+    """
+    dummy_run_params = inspect.signature(runner._dummy_run).parameters
+    if "skip_attn" in dummy_run_params:
+        runner._dummy_run(skip_attn=skip_attn, **kwargs)
+        return
+
+    if not skip_attn and "force_attention" in dummy_run_params:
+        kwargs["force_attention"] = True
+    runner._dummy_run(**kwargs)
+
+
 def _flashinfer_autotune_dummy_run(
     runner: "GPUModelRunner",
     num_tokens: int,
 ) -> None:
-    runner._dummy_run(
+    _dummy_run_for_flashinfer_autotune(
+        runner,
         num_tokens=num_tokens,
         skip_attn=True,
         skip_eplb=True,
@@ -192,7 +216,8 @@ def _flashinfer_autotune_uniform_decode(
         uniform_token_sizes,
     )
     for num_tokens in uniform_token_sizes:
-        runner._dummy_run(
+        _dummy_run_for_flashinfer_autotune(
+            runner,
             num_tokens=num_tokens,
             skip_attn=True,
             uniform_decode=True,
@@ -229,7 +254,8 @@ def _flashinfer_autotune_attention_capture_runs(
         attention_token_sizes,
     )
     for num_tokens in attention_token_sizes:
-        runner._dummy_run(
+        _dummy_run_for_flashinfer_autotune(
+            runner,
             num_tokens=num_tokens,
             skip_attn=False,
             skip_eplb=True,
@@ -343,7 +369,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     # We skip EPLB here since we don't want to record dummy metrics.
     # FlashInfer's cuBLAS FP8 runner includes exact A/B shapes in its cache
     # extras, so non-bucket runtime token counts need explicit dummy runs.
-    dummy_run_kwargs = dict(skip_attn=True, skip_eplb=True, is_profile=True)
+    dummy_run_kwargs = dict(skip_eplb=True, is_profile=True)
 
     with torch.inference_mode():
         if is_leader:
@@ -352,13 +378,23 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
                 cache=str(cache_path),
             ):
                 for num_tokens in token_sizes:
-                    runner._dummy_run(num_tokens=num_tokens, **dummy_run_kwargs)
+                    _dummy_run_for_flashinfer_autotune(
+                        runner,
+                        num_tokens=num_tokens,
+                        skip_attn=True,
+                        **dummy_run_kwargs,
+                    )
                 _flashinfer_autotune_uniform_decode(runner, token_sizes)
                 _flashinfer_autotune_attention_capture_runs(runner, token_sizes)
                 _flashinfer_autotune_speculator_logits(runner, token_sizes)
         else:
             for num_tokens in token_sizes:
-                runner._dummy_run(num_tokens=num_tokens, **dummy_run_kwargs)
+                _dummy_run_for_flashinfer_autotune(
+                    runner,
+                    num_tokens=num_tokens,
+                    skip_attn=True,
+                    **dummy_run_kwargs,
+                )
             _flashinfer_autotune_uniform_decode(runner, token_sizes)
             _flashinfer_autotune_attention_capture_runs(runner, token_sizes)
             _flashinfer_autotune_speculator_logits(runner, token_sizes)
