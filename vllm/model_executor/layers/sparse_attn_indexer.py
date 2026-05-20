@@ -208,7 +208,10 @@ def _use_b12x_sparse_indexer() -> bool:
     return (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(120)
-        and b12x_sparse_indexer_active_for_config(_get_runtime_vllm_config())
+        and (
+            envs.VLLM_USE_B12X_SPARSE_INDEXER
+            or b12x_sparse_indexer_active_for_config(_get_runtime_vllm_config())
+        )
     )
 
 

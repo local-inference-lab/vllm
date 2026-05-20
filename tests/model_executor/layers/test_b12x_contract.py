@@ -26,6 +26,9 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     _default_decode_q_per_req,
     clear_b12x_mla_workspace_cache,
 )
+from vllm.v1.attention.backends.mla.indexer import (
+    _align_block_table_max_num_blocks,
+)
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
@@ -122,6 +125,13 @@ def test_b12x_decode_workspace_covers_short_extend_as_decode():
         )
         == 4
     )
+
+
+def test_mla_indexer_block_table_width_matches_runner_alignment():
+    assert _align_block_table_max_num_blocks(1563, 64) == 1564
+    assert _align_block_table_max_num_blocks(1564, 64) == 1564
+    assert _align_block_table_max_num_blocks(13, 16) == 16
+    assert _align_block_table_max_num_blocks(13, 256) == 13
 
 
 def test_b12x_joint_arena_preinstall_normalizes_moe_backend():

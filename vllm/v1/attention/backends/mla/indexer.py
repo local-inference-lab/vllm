@@ -59,7 +59,18 @@ def _use_b12x_sparse_indexer_for_config(vllm_config: VllmConfig | None) -> bool:
         current_platform.is_cuda() and current_platform.is_device_capability_family(120)
     ):
         return False
-    return b12x_sparse_indexer_active_for_config(vllm_config)
+    return (
+        envs.VLLM_USE_B12X_SPARSE_INDEXER
+        or b12x_sparse_indexer_active_for_config(vllm_config)
+    )
+
+
+def _align_block_table_max_num_blocks(max_num_blocks: int, block_size: int) -> int:
+    # Keep this in sync with MultiGroupBlockTable's row-width padding.
+    if block_size <= 128:
+        alignment = 128 // block_size
+        return cdiv(max_num_blocks, alignment) * alignment
+    return max_num_blocks
 
 
 @triton.jit
@@ -636,6 +647,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         max_num_blocks_per_req = cdiv(
             self.vllm_config.model_config.max_model_len,
             self.kv_cache_spec.block_size * get_total_cp_world_size(),
+        )
+        max_num_blocks_per_req = _align_block_table_max_num_blocks(
+            max_num_blocks_per_req, self.kv_cache_spec.block_size
         )
         self.expanded_block_table_buffer = torch.zeros(
             (
