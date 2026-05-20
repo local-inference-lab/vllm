@@ -576,7 +576,7 @@ def rejection_sample(
 
     # Sample up until the first rejected/bonus token, and store
     # the step.
-    sampled = draft_sampled.new_empty(
+    sampled = draft_sampled.new_zeros(
         num_reqs, num_speculative_steps + 1, dtype=torch.int64
     )
     num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
