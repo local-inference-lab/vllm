@@ -152,9 +152,14 @@ def _stable_fp8_gemm_backend(backend: str) -> str:
 
     # FlashInfer's dense FP8 GEMM "auto" path can enter the autotuner during
     # vLLM warmup/graph initialization, before CUDA graph capture is observable
-    # through torch.cuda.is_current_stream_capturing(). Pin this wrapper to the
-    # stable default backend while leaving other FlashInfer autotune users alone.
-    return "cublas"
+    # through torch.cuda.is_current_stream_capturing(). Pin this wrapper to a
+    # backend whose autotune cache can safely reuse bucketed M dimensions.
+    #
+    # cuBLASLt exposes shape-specific algorithm lists, so a tactic tuned for
+    # bucket M=16 cannot be safely reused for runtime M=14. cuDNN's SM100 FP8
+    # runner uses override_shape graphs with the bucketed M as the cache shape,
+    # which matches FlashInfer's autotune bucket model.
+    return "cudnn"
 
 
 @functools.cache

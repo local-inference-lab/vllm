@@ -7,6 +7,7 @@ happen during model execution.
 """
 
 import hashlib
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,9 +27,79 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_DEFAULT_FLASHINFER_AUTOTUNE_TOKEN_SIZES = (
+    24,
+    56,
+    75,
+    80,
+    120,
+    248,
+    496,
+    640,
+)
+
+
+def _flashinfer_autotune_token_sizes(
+    max_num_tokens: int,
+    capture_sizes: Iterable[int] | None = None,
+) -> tuple[int, ...]:
+    raw_token_sizes = envs.VLLM_FLASHINFER_AUTOTUNE_TOKEN_SIZES
+    if not raw_token_sizes:
+        token_sizes = set(_DEFAULT_FLASHINFER_AUTOTUNE_TOKEN_SIZES)
+    else:
+        try:
+            parsed_token_sizes = {
+                int(token_size.strip())
+                for token_size in raw_token_sizes.split(",")
+                if token_size.strip()
+            }
+        except ValueError:
+            logger.warning(
+                "Invalid VLLM_FLASHINFER_AUTOTUNE_TOKEN_SIZES=%r; "
+                "using default token sizes.",
+                raw_token_sizes,
+            )
+            parsed_token_sizes = set(_DEFAULT_FLASHINFER_AUTOTUNE_TOKEN_SIZES)
+
+        if not parsed_token_sizes or any(size <= 0 for size in parsed_token_sizes):
+            logger.warning(
+                "Invalid VLLM_FLASHINFER_AUTOTUNE_TOKEN_SIZES=%r; "
+                "using default token sizes.",
+                raw_token_sizes,
+            )
+            parsed_token_sizes = set(_DEFAULT_FLASHINFER_AUTOTUNE_TOKEN_SIZES)
+        token_sizes = parsed_token_sizes
+
+    if capture_sizes is not None:
+        token_sizes.update(int(size) for size in capture_sizes if int(size) > 0)
+
+    token_sizes = {size for size in token_sizes if size <= max_num_tokens}
+    token_sizes.add(max_num_tokens)
+
+    return tuple(sorted(token_sizes))
+
+
+def _flashinfer_autotune_capture_sizes(
+    runner: "GPUModelRunner",
+) -> tuple[int, ...]:
+    compilation_config = runner.vllm_config.compilation_config
+    capture_sizes = getattr(compilation_config, "cudagraph_capture_sizes", None)
+    if not capture_sizes:
+        return ()
+    return tuple(int(size) for size in capture_sizes if int(size) > 0)
+
 
 def _flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
+    token_sizes = _flashinfer_autotune_token_sizes(
+        runner.scheduler_config.max_num_batched_tokens,
+        _flashinfer_autotune_capture_sizes(runner),
+    )
     factors = aot_compile_hash_factors(runner.vllm_config)
+    factors.extend(
+        [
+            f"flashinfer_autotune_token_sizes={token_sizes}",
+        ]
+    )
     return hashlib.sha256(str(factors).encode()).hexdigest()
 
 
@@ -50,6 +121,121 @@ def _resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
     output_dir = root / _flashinfer_autotune_cache_hash(runner)
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir / "autotune_configs.json"
+
+
+def _flashinfer_autotune_speculator_logits(
+    runner: "GPUModelRunner",
+    token_sizes: tuple[int, ...],
+) -> None:
+    speculator = getattr(runner, "speculator", None)
+    if speculator is None:
+        return
+
+    model = getattr(speculator, "model", None)
+    hidden_states = getattr(speculator, "hidden_states", None)
+    if (
+        model is None
+        or hidden_states is None
+        or not hasattr(model, "compute_logits")
+    ):
+        return
+
+    max_tokens = min(
+        hidden_states.shape[0],
+        getattr(runner, "max_num_reqs", hidden_states.shape[0]),
+    )
+    logger.info(
+        "Running FlashInfer autotune for Eagle speculator logits up to %d "
+        "sample tokens.",
+        max_tokens,
+    )
+    for num_tokens in token_sizes:
+        if num_tokens > max_tokens:
+            continue
+        logits = model.compute_logits(hidden_states[:num_tokens])
+        del logits
+    torch.cuda.empty_cache()
+
+
+def _flashinfer_autotune_dummy_run(
+    runner: "GPUModelRunner",
+    num_tokens: int,
+) -> None:
+    runner._dummy_run(
+        num_tokens=num_tokens,
+        skip_attn=True,
+        skip_eplb=True,
+        is_profile=True,
+    )
+
+
+def _flashinfer_autotune_uniform_decode(
+    runner: "GPUModelRunner",
+    token_sizes: tuple[int, ...],
+) -> None:
+    decode_query_len = getattr(runner, "decode_query_len", None)
+    max_num_reqs = getattr(runner, "max_num_reqs", None)
+    if not decode_query_len or not max_num_reqs:
+        return
+
+    max_decode_tokens = max_num_reqs * decode_query_len
+    uniform_token_sizes = [
+        num_tokens
+        for num_tokens in token_sizes
+        if num_tokens <= max_decode_tokens and num_tokens % decode_query_len == 0
+    ]
+    if not uniform_token_sizes:
+        return
+
+    logger.info(
+        "Running FlashInfer autotune for uniform decode token sizes: %s.",
+        uniform_token_sizes,
+    )
+    for num_tokens in uniform_token_sizes:
+        runner._dummy_run(
+            num_tokens=num_tokens,
+            skip_attn=True,
+            uniform_decode=True,
+            skip_eplb=True,
+            is_profile=True,
+        )
+    torch.cuda.empty_cache()
+
+
+def _flashinfer_autotune_attention_capture_runs(
+    runner: "GPUModelRunner",
+    token_sizes: tuple[int, ...],
+) -> None:
+    decode_query_len = getattr(runner, "decode_query_len", None)
+    max_num_reqs = getattr(runner, "max_num_reqs", None)
+    max_decode_tokens = (
+        max_num_reqs * decode_query_len
+        if decode_query_len and max_num_reqs
+        else None
+    )
+
+    max_num_tokens = runner.scheduler_config.max_num_batched_tokens
+    attention_token_sizes = [
+        num_tokens
+        for num_tokens in token_sizes
+        if num_tokens < max_num_tokens
+        and (max_decode_tokens is None or num_tokens > max_decode_tokens)
+    ]
+    if not attention_token_sizes:
+        return
+
+    logger.info(
+        "Running FlashInfer autotune with attention for capture token sizes: %s.",
+        attention_token_sizes,
+    )
+    for num_tokens in attention_token_sizes:
+        runner._dummy_run(
+            num_tokens=num_tokens,
+            skip_attn=False,
+            skip_eplb=True,
+            is_profile=True,
+        )
+    torch.cuda.empty_cache()
 
 
 def kernel_warmup(worker: "Worker"):
@@ -128,13 +314,22 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import get_world_group
 
+    token_sizes = _flashinfer_autotune_token_sizes(
+        runner.scheduler_config.max_num_batched_tokens,
+        _flashinfer_autotune_capture_sizes(runner),
+    )
+    logger.info(
+        "Running FlashInfer autotune for exact token sizes: %s.",
+        token_sizes,
+    )
+
     if not _FLASHINFER_USE_PERSISTENT_CACHE:
         with torch.inference_mode(), fi_utils.autotune():
-            runner._dummy_run(
-                num_tokens=runner.scheduler_config.max_num_batched_tokens,
-                skip_eplb=True,
-                is_profile=True,
-            )
+            for num_tokens in token_sizes:
+                _flashinfer_autotune_dummy_run(runner, num_tokens)
+            _flashinfer_autotune_uniform_decode(runner, token_sizes)
+            _flashinfer_autotune_attention_capture_runs(runner, token_sizes)
+            _flashinfer_autotune_speculator_logits(runner, token_sizes)
         get_world_group().barrier()
         return
 
@@ -146,21 +341,27 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         logger.info("Using FlashInfer autotune cache file: %s", cache_path)
 
     # We skip EPLB here since we don't want to record dummy metrics.
-    # When autotuning with number of tokens m, flashinfer will autotune
-    # operations for all number of tokens up to m, so we only need to
-    # run with the max number of tokens.
-    dummy_run_kwargs = dict(
-        num_tokens=runner.scheduler_config.max_num_batched_tokens,
-        skip_eplb=True,
-        is_profile=True,
-    )
+    # FlashInfer's cuBLAS FP8 runner includes exact A/B shapes in its cache
+    # extras, so non-bucket runtime token counts need explicit dummy runs.
+    dummy_run_kwargs = dict(skip_attn=True, skip_eplb=True, is_profile=True)
 
     with torch.inference_mode():
         if is_leader:
-            with fi_utils.autotune(tune_mode=True, cache=str(cache_path)):
-                runner._dummy_run(**dummy_run_kwargs)
+            with fi_utils.autotune(
+                tune_mode=True,
+                cache=str(cache_path),
+            ):
+                for num_tokens in token_sizes:
+                    runner._dummy_run(num_tokens=num_tokens, **dummy_run_kwargs)
+                _flashinfer_autotune_uniform_decode(runner, token_sizes)
+                _flashinfer_autotune_attention_capture_runs(runner, token_sizes)
+                _flashinfer_autotune_speculator_logits(runner, token_sizes)
         else:
-            runner._dummy_run(**dummy_run_kwargs)
+            for num_tokens in token_sizes:
+                runner._dummy_run(num_tokens=num_tokens, **dummy_run_kwargs)
+            _flashinfer_autotune_uniform_decode(runner, token_sizes)
+            _flashinfer_autotune_attention_capture_runs(runner, token_sizes)
+            _flashinfer_autotune_speculator_logits(runner, token_sizes)
 
     # Broadcast autotune cache from rank 0 to all other ranks so every
     # rank loads the same set of chosen tactics.
