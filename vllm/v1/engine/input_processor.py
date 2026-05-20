@@ -107,6 +107,14 @@ class InputProcessor:
                     "not configured. Please set --reasoning-config to use "
                     "thinking_token_budget."
                 )
+            if (
+                params.thinking_token_budget is not None
+                and self.vllm_config.use_v2_model_runner
+            ):
+                raise ValueError(
+                    "thinking_token_budget is not supported by "
+                    "VLLM_USE_V2_MODEL_RUNNER yet."
+                )
         elif isinstance(params, PoolingParams):
             supported_pooling_tasks = [
                 task for task in supported_tasks if task in POOLING_TASKS

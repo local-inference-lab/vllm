@@ -20,6 +20,7 @@ from vllm.config import (
     ModelConfig,
     ParallelConfig,
     PoolerConfig,
+    ReasoningConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
@@ -65,6 +66,17 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", env_value)
 
     assert envs.VLLM_USE_V2_MODEL_RUNNER is expected
+
+
+def test_v2_model_runner_allows_reasoning_parser_config():
+    config = VllmConfig(
+        reasoning_config=ReasoningConfig(reasoning_parser="kimi_k2")
+    )
+
+    assert (
+        "reasoning budget enforcement"
+        not in config._get_v2_model_runner_unsupported_features()
+    )
 
 
 @pytest.mark.parametrize(
