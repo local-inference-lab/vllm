@@ -28,6 +28,23 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _is_flashinfer_backend(backend) -> bool:
+    try:
+        return backend.get_name() == "FLASHINFER"
+    except NotImplementedError:
+        return False
+
+
+def _uses_only_flashinfer_attention(runner: "GPUModelRunner") -> bool:
+    attn_groups = getattr(runner, "attn_groups", None)
+    return bool(attn_groups) and all(
+        _is_flashinfer_backend(group.backend)
+        for groups in attn_groups
+        for group in groups
+    )
+
+
 _DEFAULT_FLASHINFER_AUTOTUNE_TOKEN_SIZES = (
     24,
     56,
@@ -39,11 +56,24 @@ _DEFAULT_FLASHINFER_AUTOTUNE_TOKEN_SIZES = (
     640,
 )
 
+_FLASHINFER_FP8_LINEAR_PROBE_TOKEN_SIZES = (
+    4,
+    16,
+    75,
+    128,
+    512,
+    640,
+    8192,
+    16384,
+)
+
 
 def _flashinfer_autotune_token_sizes(
     max_num_tokens: int,
     capture_sizes: Iterable[int] | None = None,
+    max_bucket_tokens: int | None = None,
 ) -> tuple[int, ...]:
+    max_bucket_tokens = max(max_num_tokens, max_bucket_tokens or max_num_tokens)
     raw_token_sizes = envs.VLLM_FLASHINFER_AUTOTUNE_TOKEN_SIZES
     if not raw_token_sizes:
         token_sizes = set(_DEFAULT_FLASHINFER_AUTOTUNE_TOKEN_SIZES)
@@ -74,8 +104,9 @@ def _flashinfer_autotune_token_sizes(
     if capture_sizes is not None:
         token_sizes.update(int(size) for size in capture_sizes if int(size) > 0)
 
-    token_sizes = {size for size in token_sizes if size <= max_num_tokens}
+    token_sizes = {size for size in token_sizes if size <= max_bucket_tokens}
     token_sizes.add(max_num_tokens)
+    token_sizes.add(max_bucket_tokens)
 
     return tuple(sorted(token_sizes))
 
@@ -91,10 +122,7 @@ def _flashinfer_autotune_capture_sizes(
 
 
 def _flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
-    token_sizes = _flashinfer_autotune_token_sizes(
-        runner.scheduler_config.max_num_batched_tokens,
-        _flashinfer_autotune_capture_sizes(runner),
-    )
+    token_sizes = _flashinfer_autotune_token_sizes_for_runner(runner)
     factors = aot_compile_hash_factors(runner.vllm_config)
     factors.extend(
         [
@@ -102,6 +130,109 @@ def _flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
         ]
     )
     return hashlib.sha256(str(factors).encode()).hexdigest()
+
+
+def _flashinfer_autotune_max_bucket_tokens(runner: "GPUModelRunner") -> int:
+    max_num_tokens = runner.scheduler_config.max_num_batched_tokens
+    max_bucket_tokens = max_num_tokens
+
+    parallel_config = runner.vllm_config.parallel_config
+    dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
+    if dcp_size > 1:
+        # MLA DCP long-context prefill can dispatch local GEMM token dimensions
+        # above max_num_batched_tokens, e.g. Kimi 128k DCP8 emits M=16384 with
+        # max_num_batched_tokens=8192. Cover that common case by default.
+        max_bucket_tokens = max(max_bucket_tokens, max_num_tokens * 2)
+
+    return max_bucket_tokens
+
+
+def _flashinfer_autotune_token_sizes_for_runner(
+    runner: "GPUModelRunner",
+) -> tuple[int, ...]:
+    return _flashinfer_autotune_token_sizes(
+        runner.scheduler_config.max_num_batched_tokens,
+        _flashinfer_autotune_capture_sizes(runner),
+        _flashinfer_autotune_max_bucket_tokens(runner),
+    )
+
+
+def _flashinfer_autotune_dummy_token_sizes(
+    runner: "GPUModelRunner",
+    token_sizes: tuple[int, ...],
+) -> tuple[int, ...]:
+    max_num_tokens = runner.scheduler_config.max_num_batched_tokens
+    return tuple(size for size in token_sizes if size <= max_num_tokens)
+
+
+def _flashinfer_autotune_fp8_probe_token_sizes(
+    token_sizes: tuple[int, ...],
+) -> tuple[int, ...]:
+    available_token_sizes = set(token_sizes)
+    probe_token_sizes = [
+        token_size
+        for token_size in _FLASHINFER_FP8_LINEAR_PROBE_TOKEN_SIZES
+        if token_size in available_token_sizes
+    ]
+    if not probe_token_sizes:
+        probe_token_sizes = [min(token_sizes)]
+    return tuple(probe_token_sizes)
+
+
+def _activate_flashinfer_autotune_runtime_buckets(
+    runner: "GPUModelRunner",
+    autotune_kwargs: dict,
+) -> None:
+    """Keep FlashInfer runtime cache keys aligned with autotune cache keys.
+
+    FlashInfer includes the effective tuning-bucket mapper in several runner
+    hashes. If autotune runs with custom buckets but CUDA graph capture/runtime
+    falls back to FlashInfer's default buckets, tuned entries are invisible and
+    those shapes fall back to heuristic tactics.
+    """
+    import vllm.utils.flashinfer as fi_utils
+    from flashinfer.autotuner import AutoTuner
+
+    tuner = AutoTuner.get()
+    if not getattr(AutoTuner, "_vllm_global_override_installed", False):
+        original_buckets_property = AutoTuner._override_tuning_buckets
+        original_round_up_property = AutoTuner._override_round_up
+
+        def _override_tuning_buckets(self):
+            buckets = original_buckets_property.fget(self)
+            if buckets is not None:
+                return buckets
+            return getattr(self, "_vllm_global_override_tuning_buckets", None)
+
+        def _override_round_up(self):
+            round_up = original_round_up_property.fget(self)
+            if round_up:
+                return round_up
+            return getattr(self, "_vllm_global_override_round_up", False)
+
+        AutoTuner._override_tuning_buckets = property(_override_tuning_buckets)
+        AutoTuner._override_round_up = property(_override_round_up)
+        AutoTuner._vllm_global_override_installed = True
+
+    tuner._vllm_global_override_tuning_buckets = tuple(
+        autotune_kwargs["tuning_buckets"]
+    )
+    tuner._vllm_global_override_round_up = bool(autotune_kwargs.get("round_up"))
+
+    previous_context = getattr(
+        runner, "_flashinfer_autotune_runtime_context", None
+    )
+    if previous_context is not None:
+        previous_context.__exit__(None, None, None)
+
+    context = fi_utils.autotune(tune_mode=False, **autotune_kwargs)
+    context.__enter__()
+    runner._flashinfer_autotune_runtime_context = context
+    runner._flashinfer_autotune_runtime_kwargs = autotune_kwargs
+    logger.info(
+        "Activated FlashInfer runtime autotune buckets: %s.",
+        autotune_kwargs,
+    )
 
 
 def _resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
@@ -124,37 +255,126 @@ def _resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
     return output_dir / "autotune_configs.json"
 
 
-def _flashinfer_autotune_speculator_logits(
+def _flashinfer_autotune_fp8_linear_shapes(
     runner: "GPUModelRunner",
     token_sizes: tuple[int, ...],
 ) -> None:
-    speculator = getattr(runner, "speculator", None)
-    if speculator is None:
+    """Autotune dense FP8 GEMM shapes without mutating proposer state.
+
+    Kimi's MTP/drafter path can hit FP8 linear shapes that are not reached by
+    the main model dummy run with the same execution metadata as real
+    speculative decoding. Warming the raw GEMM shapes covers the FlashInfer
+    cache key directly while avoiding incomplete calls into proposer logits.
+    """
+    if not token_sizes:
         return
 
-    model = getattr(speculator, "model", None)
-    hidden_states = getattr(speculator, "hidden_states", None)
-    if (
-        model is None
-        or hidden_states is None
-        or not hasattr(model, "compute_logits")
-    ):
+    try:
+        from vllm.utils.flashinfer import flashinfer_scaled_fp8_mm_out
+    except Exception:
         return
 
-    max_tokens = min(
-        hidden_states.shape[0],
-        getattr(runner, "max_num_reqs", hidden_states.shape[0]),
-    )
-    logger.info(
-        "Running FlashInfer autotune for Eagle speculator logits up to %d "
-        "sample tokens.",
-        max_tokens,
-    )
-    for num_tokens in token_sizes:
-        if num_tokens > max_tokens:
+    models = [
+        ("target", getattr(runner, "model", None)),
+    ]
+    for attr in ("speculator", "drafter"):
+        speculator = getattr(runner, attr, None)
+        model = getattr(speculator, "model", None)
+        if model is not None:
+            models.append((speculator.__class__.__name__, model))
+
+    shapes: dict[tuple[int, int], str] = {}
+    for owner_name, model in models:
+        if model is None or not hasattr(model, "named_modules"):
             continue
-        logits = model.compute_logits(hidden_states[:num_tokens])
-        del logits
+        for module_name, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            fp8_linear = getattr(quant_method, "fp8_linear", None)
+            if fp8_linear is None:
+                continue
+            kernel_name = fp8_linear.__class__.__name__
+            if kernel_name != "FlashInferFP8ScaledMMLinearKernel":
+                continue
+
+            weight = getattr(module, "weight", None)
+            input_scale = getattr(module, "input_scale", None)
+            weight_scale = getattr(module, "weight_scale", None)
+            if (
+                not isinstance(weight, torch.Tensor)
+                or weight.ndim != 2
+                or weight.dtype != torch.float8_e4m3fn
+                or not isinstance(input_scale, torch.Tensor)
+                or not isinstance(weight_scale, torch.Tensor)
+                or input_scale.numel() != 1
+                or weight_scale.numel() != 1
+            ):
+                continue
+
+            k_dim, n_dim = (int(weight.shape[0]), int(weight.shape[1]))
+            shapes.setdefault((k_dim, n_dim), f"{owner_name}.{module_name}")
+
+    if not shapes:
+        return
+
+    probe_token_sizes = _flashinfer_autotune_fp8_probe_token_sizes(token_sizes)
+    device = runner.device
+    out_dtype = runner.model_config.dtype
+    input_scale = torch.ones((), dtype=torch.float32, device=device)
+    weight_scale = torch.ones((), dtype=torch.float32, device=device)
+
+    logger.info(
+        "Running FlashInfer autotune for %d dense FP8 linear shape(s) "
+        "and validating token sizes %s.",
+        len(shapes),
+        probe_token_sizes,
+    )
+    for (k_dim, n_dim), source in sorted(shapes.items()):
+        b = torch.zeros((k_dim, n_dim), dtype=torch.float8_e4m3fn, device=device)
+        for num_tokens in probe_token_sizes:
+            logger.debug(
+                "Autotuning FlashInfer dense FP8 linear shape M=%d K=%d "
+                "N=%d from %s.",
+                num_tokens,
+                k_dim,
+                n_dim,
+                source,
+            )
+            a = None
+            out = None
+            try:
+                a = torch.zeros(
+                    (num_tokens, k_dim),
+                    dtype=torch.float8_e4m3fn,
+                    device=device,
+                )
+                out = torch.empty(
+                    (num_tokens, n_dim), dtype=out_dtype, device=device
+                )
+                flashinfer_scaled_fp8_mm_out(
+                    a,
+                    b,
+                    input_scale,
+                    weight_scale,
+                    out,
+                    out_dtype=out_dtype,
+                )
+                torch.cuda.synchronize()
+            except Exception:
+                logger.exception(
+                    "FlashInfer dense FP8 linear autotune validation failed "
+                    "for M=%d K=%d N=%d from %s.",
+                    num_tokens,
+                    k_dim,
+                    n_dim,
+                    source,
+                )
+                raise
+            finally:
+                if a is not None:
+                    del a
+                if out is not None:
+                    del out
+        del b
     torch.cuda.empty_cache()
 
 
@@ -231,6 +451,13 @@ def _flashinfer_autotune_attention_capture_runs(
     runner: "GPUModelRunner",
     token_sizes: tuple[int, ...],
 ) -> None:
+    if not _uses_only_flashinfer_attention(runner):
+        logger.info(
+            "Skipping FlashInfer attention autotune because the active "
+            "attention backend is not FlashInfer."
+        )
+        return
+
     decode_query_len = getattr(runner, "decode_query_len", None)
     max_num_reqs = getattr(runner, "max_num_reqs", None)
     max_decode_tokens = (
@@ -243,7 +470,8 @@ def _flashinfer_autotune_attention_capture_runs(
     attention_token_sizes = [
         num_tokens
         for num_tokens in token_sizes
-        if num_tokens < max_num_tokens
+        if num_tokens >= 4
+        and num_tokens < max_num_tokens
         and (max_decode_tokens is None or num_tokens > max_decode_tokens)
     ]
     if not attention_token_sizes:
@@ -254,13 +482,20 @@ def _flashinfer_autotune_attention_capture_runs(
         attention_token_sizes,
     )
     for num_tokens in attention_token_sizes:
-        _dummy_run_for_flashinfer_autotune(
-            runner,
-            num_tokens=num_tokens,
-            skip_attn=False,
-            skip_eplb=True,
-            is_profile=True,
-        )
+        try:
+            _dummy_run_for_flashinfer_autotune(
+                runner,
+                num_tokens=num_tokens,
+                skip_attn=False,
+                skip_eplb=True,
+                is_profile=True,
+            )
+        except Exception:
+            logger.exception(
+                "FlashInfer attention autotune failed for num_tokens=%d.",
+                num_tokens,
+            )
+            raise
     torch.cuda.empty_cache()
 
 
@@ -288,23 +523,9 @@ def kernel_warmup(worker: "Worker"):
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
     # and is not a pooling model
-    def _is_flashinfer_backend(backend):
-        try:
-            return backend.get_name() == "FLASHINFER"
-        except NotImplementedError:
-            return False
-
     if (
         not worker.model_runner.is_pooling_model
-        and worker.model_runner.attn_groups
-        # NOTE: This should be `any` instead of `all` but other hybrid attention
-        # backends don't support this dummy run. Once we remove
-        # `build_for_cudagraph_capture`, we can change it to `any`.
-        and all(
-            _is_flashinfer_backend(group.backend)
-            for groups in worker.model_runner.attn_groups
-            for group in groups
-        )
+        and _uses_only_flashinfer_attention(worker.model_runner)
     ):
         logger.info("Warming up FlashInfer attention.")
         # Warmup with mixed batch containing both prefill and decode tokens
@@ -340,22 +561,24 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import get_world_group
 
-    token_sizes = _flashinfer_autotune_token_sizes(
-        runner.scheduler_config.max_num_batched_tokens,
-        _flashinfer_autotune_capture_sizes(runner),
-    )
+    token_sizes = _flashinfer_autotune_token_sizes_for_runner(runner)
+    dummy_token_sizes = _flashinfer_autotune_dummy_token_sizes(runner, token_sizes)
     logger.info(
-        "Running FlashInfer autotune for exact token sizes: %s.",
+        "Running FlashInfer autotune with token buckets %s; dummy runs use %s.",
         token_sizes,
+        dummy_token_sizes,
     )
 
+    autotune_kwargs = dict(tuning_buckets=token_sizes, round_up=True)
+
     if not _FLASHINFER_USE_PERSISTENT_CACHE:
-        with torch.inference_mode(), fi_utils.autotune():
-            for num_tokens in token_sizes:
+        with torch.inference_mode(), fi_utils.autotune(**autotune_kwargs):
+            for num_tokens in dummy_token_sizes:
                 _flashinfer_autotune_dummy_run(runner, num_tokens)
-            _flashinfer_autotune_uniform_decode(runner, token_sizes)
-            _flashinfer_autotune_attention_capture_runs(runner, token_sizes)
-            _flashinfer_autotune_speculator_logits(runner, token_sizes)
+            _flashinfer_autotune_uniform_decode(runner, dummy_token_sizes)
+            _flashinfer_autotune_attention_capture_runs(runner, dummy_token_sizes)
+            _flashinfer_autotune_fp8_linear_shapes(runner, token_sizes)
+        _activate_flashinfer_autotune_runtime_buckets(runner, autotune_kwargs)
         get_world_group().barrier()
         return
 
@@ -376,28 +599,31 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             with fi_utils.autotune(
                 tune_mode=True,
                 cache=str(cache_path),
+                **autotune_kwargs,
             ):
-                for num_tokens in token_sizes:
+                for num_tokens in dummy_token_sizes:
                     _dummy_run_for_flashinfer_autotune(
                         runner,
                         num_tokens=num_tokens,
                         skip_attn=True,
                         **dummy_run_kwargs,
                     )
-                _flashinfer_autotune_uniform_decode(runner, token_sizes)
-                _flashinfer_autotune_attention_capture_runs(runner, token_sizes)
-                _flashinfer_autotune_speculator_logits(runner, token_sizes)
+                _flashinfer_autotune_uniform_decode(runner, dummy_token_sizes)
+                _flashinfer_autotune_attention_capture_runs(
+                    runner, dummy_token_sizes
+                )
+                _flashinfer_autotune_fp8_linear_shapes(runner, token_sizes)
         else:
-            for num_tokens in token_sizes:
+            for num_tokens in dummy_token_sizes:
                 _dummy_run_for_flashinfer_autotune(
                     runner,
                     num_tokens=num_tokens,
                     skip_attn=True,
                     **dummy_run_kwargs,
                 )
-            _flashinfer_autotune_uniform_decode(runner, token_sizes)
-            _flashinfer_autotune_attention_capture_runs(runner, token_sizes)
-            _flashinfer_autotune_speculator_logits(runner, token_sizes)
+            _flashinfer_autotune_uniform_decode(runner, dummy_token_sizes)
+            _flashinfer_autotune_attention_capture_runs(runner, dummy_token_sizes)
+            _flashinfer_autotune_fp8_linear_shapes(runner, token_sizes)
 
     # Broadcast autotune cache from rank 0 to all other ranks so every
     # rank loads the same set of chosen tactics.
@@ -426,3 +652,5 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             world.rank_in_group,
             cache_path,
         )
+
+    _activate_flashinfer_autotune_runtime_buckets(runner, autotune_kwargs)
