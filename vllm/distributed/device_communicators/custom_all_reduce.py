@@ -3,10 +3,8 @@
 
 from contextlib import contextmanager
 from functools import lru_cache
-import importlib
 import os
 from pathlib import Path
-import sys
 from typing import Any
 from typing import cast
 
@@ -51,21 +49,6 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
-def _is_full_cudagraph_runtime() -> bool:
-    try:
-        from vllm.config import CUDAGraphMode
-        from vllm.forward_context import (
-            get_forward_context,
-            is_forward_context_available,
-        )
-    except Exception:
-        return False
-    return (
-        is_forward_context_available()
-        and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
-    )
-
-
 def _is_piecewise_cudagraph_runtime() -> bool:
     try:
         from vllm.config import CUDAGraphMode
@@ -96,29 +79,12 @@ def _parse_byte_size(value: str) -> int:
 
 
 @lru_cache(maxsize=1)
-def _load_b12x_pcie_oneshot_runtime() -> Any | None:
+def _load_b12x_pcie_oneshot_pool() -> Any | None:
     try:
-        from b12x.distributed import PCIeOneshotAllReduce
+        from b12x.distributed import PCIeOneshotAllReducePool
     except Exception:
         return None
-    return PCIeOneshotAllReduce
-
-
-@lru_cache(maxsize=1)
-def _load_rtx6k_pcie_fused_allreduce_ops() -> Any | None:
-    module_dir = os.getenv("VLLM_RTX6K_PCIE_FUSED_ALLREDUCE_PATH")
-    if not module_dir:
-        return None
-    if module_dir not in sys.path:
-        sys.path.insert(0, module_dir)
-    try:
-        return importlib.import_module("pcie_allreduce")
-    except Exception:
-        logger.exception(
-            "Failed to import RTX6K PCIe fused allreduce module from %s.",
-            module_dir,
-        )
-        return None
+    return PCIeOneshotAllReducePool
 
 
 def _get_physical_device_numa_node(physical_device_id: int) -> int | None:
@@ -257,19 +223,6 @@ class CustomAllreduce:
         self._IS_CAPTURING = False
         self.disabled = True
         self._pcie_runtime = None
-        self._fused_pcie_ops = None
-        self._fused_pcie_ptr = 0
-        self._fused_add_max_size = 0
-        self._fused_add_1stage_max_size = 0
-        self._fused_add_2stage_min_size = 0
-        self._fused_add_2stage_max_size = 0
-        self._fused_add_2stage_sizes: set[int] | None = None
-        self._fused_add_stage2_enabled = False
-        self._fused_add_rms_enabled = False
-        self._fused_add_rms_min_size = 0
-        self._fused_add_rms_max_size = 0
-        self._fused_add_rms_max_rows = 0
-        self._fused_add_logged_shapes: set[tuple[str, tuple[int, ...], torch.dtype]] = set()
         self._cpp_ar_cutoff_size: int | None = None
         self._cpp_ar_ignore_cutoff_max_rows = 0
         self._cpp_ar_shape_log = False
@@ -405,11 +358,11 @@ class CustomAllreduce:
                     physical_device_ids,
                 )
                 return
-            runtime_cls = _load_b12x_pcie_oneshot_runtime()
-            if runtime_cls is None:
+            pool_cls = _load_b12x_pcie_oneshot_pool()
+            if pool_cls is None:
                 logger.warning(
                     "PCIe custom allreduce was requested, but "
-                    "b12x.distributed.PCIeOneshotAllReduce is unavailable."
+                    "b12x.distributed.PCIeOneshotAllReducePool is unavailable."
                 )
                 return
             pcie_max_size = min(
@@ -418,12 +371,18 @@ class CustomAllreduce:
                     os.getenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "64KB")
                 ),
             )
+            if self.nccl_group is None:
+                logger.warning(
+                    "Custom allreduce is disabled because b12x PCIe oneshot "
+                    "allreduce requires a CUDA/NCCL device process group."
+                )
+                return
             self.max_size = pcie_max_size
             self.rank = rank
             self.world_size = world_size
             self.fully_connected = False
-            self._pcie_runtime = runtime_cls.from_exchange_group(
-                exchange_group=group,
+            self._pcie_runtime = pool_cls.from_exchange_group(
+                exchange_group=self.nccl_group,
                 device=self.device,
                 eager_buffer_bytes=pcie_max_size,
                 max_size=pcie_max_size,
@@ -443,10 +402,12 @@ class CustomAllreduce:
                 if iters is not None:
                     autotune_kwargs["iters"] = int(iters)
                 autotune_group = self.nccl_group if self.nccl_group is not None else group
-                tuned_size = self._pcie_runtime.find_crossover_size(
+                default_channel = self._pcie_runtime.for_stream()
+                tuned_size = default_channel.find_crossover_size(
                     autotune_group, **autotune_kwargs
                 )
-                self.max_size = self._pcie_runtime.max_size
+                self._pcie_runtime.max_size = default_channel.max_size
+                self.max_size = default_channel.max_size
                 logger.info(
                     "Autotuned b12x PCIe oneshot allreduce max_size=%d "
                     "(requested=%d, crossover=%d).",
@@ -518,130 +479,6 @@ class CustomAllreduce:
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
-        self._try_init_fused_pcie_allreduce_add(max_size=max_size, group=group)
-
-    def _try_init_fused_pcie_allreduce_add(
-        self, *, max_size: int, group: ProcessGroup
-    ) -> None:
-        if not _env_flag("VLLM_RTX6K_FUSED_ALLREDUCE_ADD"):
-            return
-        fused_ops = _load_rtx6k_pcie_fused_allreduce_ops()
-        if fused_ops is None:
-            logger.warning(
-                "RTX6K fused allreduce-add requested but prototype module "
-                "is unavailable; fused path disabled."
-            )
-            return
-        fused_add_1stage_max_size = max_size
-        fused_add_limit = os.getenv("VLLM_RTX6K_FUSED_ALLREDUCE_ADD_1STAGE_MAX_SIZE")
-        if fused_add_limit is None:
-            fused_add_limit = os.getenv("VLLM_RTX6K_FUSED_ALLREDUCE_ADD_MAX_SIZE")
-        if fused_add_limit is None:
-            fused_add_limit = os.getenv("VLLM_CPP_AR_1STAGE_NCCL_CUTOFF")
-        if fused_add_limit is not None:
-            fused_add_1stage_max_size = min(max_size, _parse_byte_size(fused_add_limit))
-
-        fused_add_stage2_enabled = _env_flag("VLLM_RTX6K_FUSED_ALLREDUCE_ADD_STAGE2")
-        if fused_add_stage2_enabled and not hasattr(fused_ops, "all_reduce_2stage_add"):
-            logger.warning(
-                "RTX6K fused allreduce-add stage2 requested but prototype module "
-                "does not expose all_reduce_2stage_add; stage2 disabled."
-            )
-            fused_add_stage2_enabled = False
-        fused_add_rms_enabled = _env_flag("VLLM_RTX6K_FUSED_ALLREDUCE_ADD_RMS")
-        if fused_add_rms_enabled and not hasattr(fused_ops, "all_reduce_2stage_add_rms"):
-            logger.warning(
-                "RTX6K fused allreduce-add-rms requested but prototype module "
-                "does not expose all_reduce_2stage_add_rms; add-rms disabled."
-            )
-            fused_add_rms_enabled = False
-        fused_add_2stage_min_size = _parse_byte_size(
-            os.getenv("VLLM_RTX6K_FUSED_ALLREDUCE_ADD_2STAGE_MIN_SIZE", "384KB")
-        )
-        fused_add_2stage_max_size = min(
-            max_size,
-            _parse_byte_size(
-                os.getenv(
-                    "VLLM_RTX6K_FUSED_ALLREDUCE_ADD_2STAGE_MAX_SIZE",
-                    str(max_size),
-                )
-            ),
-        )
-        fused_add_2stage_sizes_env = os.getenv(
-            "VLLM_RTX6K_FUSED_ALLREDUCE_ADD_2STAGE_SIZES"
-        )
-        fused_add_2stage_sizes = None
-        if fused_add_2stage_sizes_env:
-            fused_add_2stage_sizes = {
-                _parse_byte_size(part)
-                for part in fused_add_2stage_sizes_env.replace(";", ",").split(",")
-                if part.strip()
-            }
-        fused_add_rms_min_size = _parse_byte_size(
-            os.getenv("VLLM_RTX6K_FUSED_ALLREDUCE_ADD_RMS_MIN_SIZE", "384KB")
-        )
-        fused_add_rms_max_size = min(
-            max_size,
-            _parse_byte_size(
-                os.getenv("VLLM_RTX6K_FUSED_ALLREDUCE_ADD_RMS_MAX_SIZE", str(max_size))
-            ),
-        )
-        fused_add_rms_max_rows = int(
-            os.getenv("VLLM_RTX6K_FUSED_ALLREDUCE_ADD_RMS_MAX_ROWS", "512")
-        )
-        self._fused_meta_ptrs = self.create_shared_buffer(
-            fused_ops.meta_size() + max_size, group=group, uncached=True
-        )
-        self._fused_buffer_ptrs0 = self.create_shared_buffer(max_size, group=group)
-        self._fused_buffer_ptrs1 = self.create_shared_buffer(max_size, group=group)
-        self._fused_rank_data = torch.empty(
-            8 * 1024 * 1024, dtype=torch.uint8, device=self.device
-        )
-        self._fused_pcie_ptr = fused_ops.init_custom_ar(
-            self._fused_meta_ptrs, self._fused_rank_data, self.rank
-        )
-        fused_ops.register_pcie_buffers(
-            self._fused_pcie_ptr,
-            self._fused_buffer_ptrs0,
-            self._fused_buffer_ptrs1,
-        )
-        self._fused_pcie_ops = fused_ops
-        self._fused_add_1stage_max_size = fused_add_1stage_max_size
-        self._fused_add_2stage_min_size = fused_add_2stage_min_size
-        self._fused_add_2stage_max_size = fused_add_2stage_max_size
-        self._fused_add_2stage_sizes = fused_add_2stage_sizes
-        self._fused_add_stage2_enabled = fused_add_stage2_enabled
-        self._fused_add_rms_enabled = fused_add_rms_enabled
-        self._fused_add_rms_min_size = fused_add_rms_min_size
-        self._fused_add_rms_max_size = fused_add_rms_max_size
-        self._fused_add_rms_max_rows = fused_add_rms_max_rows
-        self._fused_add_max_size = max(
-            fused_add_1stage_max_size,
-            fused_add_2stage_max_size if fused_add_stage2_enabled else 0,
-            fused_add_rms_max_size if fused_add_rms_enabled else 0,
-        )
-        logger.info(
-            "Using experimental RTX6K fused PCIe allreduce-add prototype "
-            "(world_size=%d, max_size=%d, fused_add_1stage_max_size=%d, "
-            "stage2_enabled=%s, fused_add_2stage_min_size=%d, "
-            "fused_add_2stage_max_size=%d, fused_add_2stage_sizes=%s, "
-            "add_rms_enabled=%s, "
-            "fused_add_rms_min_size=%d, fused_add_rms_max_size=%d, "
-            "fused_add_rms_max_rows=%d).",
-            self.world_size,
-            max_size,
-            self._fused_add_1stage_max_size,
-            self._fused_add_stage2_enabled,
-            self._fused_add_2stage_min_size,
-            self._fused_add_2stage_max_size,
-            sorted(self._fused_add_2stage_sizes)
-            if self._fused_add_2stage_sizes is not None
-            else None,
-            self._fused_add_rms_enabled,
-            self._fused_add_rms_min_size,
-            self._fused_add_rms_max_size,
-            self._fused_add_rms_max_rows,
-        )
 
     @contextmanager
     def capture(self):
@@ -663,28 +500,8 @@ class CustomAllreduce:
                 self.register_graph_buffers()
 
     def register_graph_buffers(self):
-        if self._fused_pcie_ops is not None and self._fused_pcie_ptr:
-            handle, offset = self._fused_pcie_ops.get_graph_buffer_ipc_meta(
-                self._fused_pcie_ptr
-            )
-            logger.info("Registering %d fused PCIe cuda graph addresses", len(offset))
-            all_data: list[list[list[int] | None]]
-            all_data = [
-                [None, None] for _ in range(dist.get_world_size(group=self.group))
-            ]
-            all_data[self.rank] = [handle, offset]
-            ranks = sorted(dist.get_process_group_ranks(group=self.group))
-            for i, rank in enumerate(ranks):
-                dist.broadcast_object_list(
-                    all_data[i], src=rank, group=self.group, device="cpu"
-                )
-            handles = cast(list[list[int]], [d[0] for d in all_data])
-            offsets = cast(list[list[int]], [d[1] for d in all_data])
-            self._fused_pcie_ops.register_graph_buffers(
-                self._fused_pcie_ptr, handles, offsets
-            )
         if self._pcie_runtime is not None:
-            self._pcie_runtime.register_graph_buffers()
+            self._pcie_runtime.for_stream().register_graph_buffers()
             return
         handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
         logger.info("Registering %d cuda graph addresses", len(offset))
@@ -708,9 +525,7 @@ class CustomAllreduce:
         if self.disabled:
             return False
         if self._pcie_runtime is not None:
-            if _is_full_cudagraph_runtime():
-                return False
-            return self._pcie_runtime.should_allreduce(inp)
+            return self._pcie_runtime.for_stream().should_allreduce(inp)
         inp_size = inp.numel() * inp.element_size()
         rows = int(inp.shape[0]) if inp.ndim >= 2 else 1
         cutoff_applies = not (
@@ -795,158 +610,6 @@ class CustomAllreduce:
             )
         return out
 
-    def _select_fused_all_reduce_add_algo(
-        self, inp: torch.Tensor, addend: torch.Tensor
-    ) -> str | None:
-        if (
-            self.disabled
-            or self._fused_pcie_ops is None
-            or not self._fused_pcie_ptr
-        ):
-            return None
-        if inp.shape != addend.shape or inp.dtype != addend.dtype:
-            return None
-        inp_size = inp.numel() * inp.element_size()
-        if inp_size % 16 != 0:
-            return None
-        if not is_weak_contiguous(inp) or not is_weak_contiguous(addend):
-            return None
-        if inp_size <= self._fused_add_1stage_max_size:
-            return "1stage"
-        if (
-            self._fused_add_stage2_enabled
-            and self._fused_add_2stage_min_size <= inp_size <= self._fused_add_2stage_max_size
-            and (
-                self._fused_add_2stage_sizes is None
-                or inp_size in self._fused_add_2stage_sizes
-            )
-        ):
-            return "2stage"
-        return None
-
-    def should_fused_all_reduce_add(
-        self, inp: torch.Tensor, addend: torch.Tensor
-    ) -> bool:
-        return self._select_fused_all_reduce_add_algo(inp, addend) is not None
-
-    def fused_all_reduce_add(
-        self, inp: torch.Tensor, addend: torch.Tensor
-    ) -> torch.Tensor | None:
-        algo = self._select_fused_all_reduce_add_algo(inp, addend)
-        if algo is None:
-            return None
-        out = torch.empty_like(inp)
-        assert self._fused_pcie_ops is not None
-        log_key = (algo, tuple(inp.shape), inp.dtype)
-        if log_key not in self._fused_add_logged_shapes:
-            logger.info(
-                "RTX6K fused PCIe allreduce-add selected algo=%s shape=%s dtype=%s.",
-                algo,
-                tuple(inp.shape),
-                inp.dtype,
-            )
-            self._fused_add_logged_shapes.add(log_key)
-        if algo == "2stage":
-            all_reduce_add = self._fused_pcie_ops.all_reduce_2stage_add
-        else:
-            all_reduce_add = self._fused_pcie_ops.all_reduce_add
-        if self._IS_CAPTURING:
-            if torch.cuda.is_current_stream_capturing():
-                all_reduce_add(self._fused_pcie_ptr, inp, addend, out, 0, 0)
-                return out
-            if _is_piecewise_cudagraph_runtime():
-                all_reduce_add(self._fused_pcie_ptr, inp, addend, out, 0, 0)
-                return out
-            return torch.empty_like(inp)
-        all_reduce_add(self._fused_pcie_ptr, inp, addend, out, 0, 0)
-        return out
-
-    def should_fused_all_reduce_add_rms(
-        self, inp: torch.Tensor, addend: torch.Tensor, weight: torch.Tensor
-    ) -> bool:
-        if (
-            self.disabled
-            or not self._fused_add_rms_enabled
-            or self._fused_pcie_ops is None
-            or not self._fused_pcie_ptr
-        ):
-            return False
-        if inp.ndim != 2 or addend.shape != inp.shape or inp.dtype != addend.dtype:
-            return False
-        if weight.ndim != 1 or weight.numel() != inp.shape[1] or weight.dtype != inp.dtype:
-            return False
-        rows = inp.shape[0]
-        if rows <= 0 or rows > self._fused_add_rms_max_rows:
-            return False
-        if rows % self.world_size != 0:
-            return False
-        inp_size = inp.numel() * inp.element_size()
-        if (
-            inp_size < self._fused_add_rms_min_size
-            or inp_size > self._fused_add_rms_max_size
-            or inp_size % 16 != 0
-        ):
-            return False
-        return (
-            is_weak_contiguous(inp)
-            and is_weak_contiguous(addend)
-            and is_weak_contiguous(weight)
-        )
-
-    def fused_all_reduce_add_rms(
-        self,
-        inp: torch.Tensor,
-        addend: torch.Tensor,
-        weight: torch.Tensor,
-        eps: float,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        if not self.should_fused_all_reduce_add_rms(inp, addend, weight):
-            return None
-        rms_out = torch.empty_like(inp)
-        residual_out = torch.empty_like(inp)
-        assert self._fused_pcie_ops is not None
-        all_reduce_add_rms = self._fused_pcie_ops.all_reduce_2stage_add_rms
-        if self._IS_CAPTURING:
-            if torch.cuda.is_current_stream_capturing():
-                all_reduce_add_rms(
-                    self._fused_pcie_ptr,
-                    inp,
-                    addend,
-                    weight,
-                    rms_out,
-                    residual_out,
-                    eps,
-                    0,
-                    0,
-                )
-                return rms_out, residual_out
-            if _is_piecewise_cudagraph_runtime():
-                all_reduce_add_rms(
-                    self._fused_pcie_ptr,
-                    inp,
-                    addend,
-                    weight,
-                    rms_out,
-                    residual_out,
-                    eps,
-                    0,
-                    0,
-                )
-                return rms_out, residual_out
-            return torch.empty_like(inp), torch.empty_like(inp)
-        all_reduce_add_rms(
-            self._fused_pcie_ptr,
-            inp,
-            addend,
-            weight,
-            rms_out,
-            residual_out,
-            eps,
-            0,
-            0,
-        )
-        return rms_out, residual_out
-
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor | None:
         """The main allreduce API that provides support for cuda graph."""
         # When custom allreduce is disabled, this will be None.
@@ -971,10 +634,6 @@ class CustomAllreduce:
             return self.all_reduce(input, registered=False)
 
     def close(self):
-        if self._fused_pcie_ops is not None and self._fused_pcie_ptr:
-            self._fused_pcie_ops.dispose(self._fused_pcie_ptr)
-            self._fused_pcie_ptr = 0
-            self._fused_pcie_ops = None
         if self._pcie_runtime is not None:
             self._pcie_runtime.close()
             self._pcie_runtime = None

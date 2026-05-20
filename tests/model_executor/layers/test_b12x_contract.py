@@ -762,22 +762,55 @@ def test_compilation_does_not_disable_b12x_cudagraph_by_backend_name():
     )
 
 
-def test_b12x_pcie_oneshot_skips_full_cudagraph_capture(monkeypatch):
+def test_b12x_pcie_oneshot_uses_pool_channel_for_selection():
     communicator = object.__new__(custom_all_reduce.CustomAllreduce)
     communicator.disabled = False
-    communicator._fused_pcie_ops = None
-    communicator._fused_pcie_ptr = 0
     communicator._ptr = 0
-    communicator._pcie_runtime = SimpleNamespace(
-        close=lambda: None,
-        should_allreduce=lambda _inp: pytest.fail(
-            "full cudagraph capture must use the NCCL fallback"
-        )
-    )
 
-    monkeypatch.setattr(custom_all_reduce, "_is_full_cudagraph_runtime", lambda: True)
+    calls = []
 
-    assert not communicator.should_custom_ar(torch.empty(16, device="cpu"))
+    class FakePool:
+        def for_stream(self):
+            calls.append("for_stream")
+            return SimpleNamespace(should_allreduce=lambda _inp: True)
+
+        def close(self):
+            pass
+
+    communicator._pcie_runtime = FakePool()
+
+    assert communicator.should_custom_ar(torch.empty(16, device="cpu"))
+    assert calls == ["for_stream"]
+
+
+def test_b12x_pcie_oneshot_capture_delegates_to_pool():
+    communicator = object.__new__(custom_all_reduce.CustomAllreduce)
+    communicator.disabled = False
+    communicator._IS_CAPTURING = False
+    communicator._ptr = 0
+    events = []
+
+    class FakeCapture:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+
+    class FakePool:
+        def capture(self):
+            return FakeCapture()
+
+        def close(self):
+            pass
+
+    communicator._pcie_runtime = FakePool()
+
+    with communicator.capture():
+        events.append(("capturing", communicator._IS_CAPTURING))
+
+    assert events == ["enter", ("capturing", True), "exit"]
+    assert not communicator._IS_CAPTURING
 
 
 @pytest.mark.parametrize(

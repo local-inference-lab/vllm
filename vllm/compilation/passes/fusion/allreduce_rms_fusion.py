@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
-import ctypes
 import importlib
-import os
 import sys
 from importlib.util import find_spec
 from types import ModuleType
 from typing import Any
 
 import torch
-import torch.distributed as dist
 import torch._inductor.pattern_matcher as pm
 import torch.fx as fx
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
@@ -34,20 +31,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
 )
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import (
-    current_stream,
-    direct_register_custom_op,
-)
-from vllm.distributed.device_communicators.pynccl_wrapper import (
-    buffer_type,
-    cudaStream_t,
-    ncclComm_t,
-    ncclDataType_t,
-    ncclDataTypeEnum,
-    ncclRedOp_t,
-    ncclRedOpTypeEnum,
-    ncclResult_t,
-)
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import (
@@ -61,7 +45,6 @@ from .matcher_utils import MatcherFusedAddRMSNorm, MatcherQuantFP8
 FP8_DTYPE = current_platform.fp8_dtype()
 
 logger = init_logger(__name__)
-logger.info("RTX6K NCCL residual-add fusion overlay imported.")
 
 flashinfer_comm: ModuleType | None = None
 if find_spec("flashinfer"):
@@ -257,324 +240,6 @@ if flashinfer_comm is not None:
     )
 
 
-_rtx6k_fused_add_call_logged = False
-_rtx6k_fused_add_fallback_logged = False
-_rtx6k_fused_add_rms_call_logged = False
-_rtx6k_fused_add_rms_fallback_logged = False
-_rtx6k_nccl_preadd_work_call_logged = False
-_rtx6k_nccl_preadd_inplace_call_logged = False
-
-_RTX6K_USE_FUSED_ADD_RMS = os.getenv("VLLM_RTX6K_FUSED_ALLREDUCE_ADD_RMS") == "1"
-_RTX6K_NCCL_PREADD_FUSED_RMS_MODE = os.getenv(
-    "VLLM_RTX6K_NCCL_PREADD_FUSED_RMS", ""
-).strip().lower()
-_RTX6K_USE_FUSED_ADD = os.getenv("VLLM_RTX6K_FUSED_ALLREDUCE_ADD") == "1"
-_RTX6K_USE_NCCL_RESIDUAL_ADD = (
-    os.getenv("VLLM_RTX6K_NCCL_RESIDUAL_ADD", "") == "1"
-)
-_rtx6k_nccl_residual_add_call_logged = False
-_rtx6k_nccl_residual_add_fallback_logged = False
-
-
-def _get_nccl_residual_add_func(pynccl_comm: Any) -> Any:
-    func = getattr(pynccl_comm, "_rtx6k_nccl_residual_add_func", None)
-    if func is not None:
-        return func
-    func = pynccl_comm.nccl.lib.ncclAllReduceResidualAdd
-    func.restype = ncclResult_t
-    func.argtypes = [
-        buffer_type,
-        buffer_type,
-        buffer_type,
-        ctypes.c_size_t,
-        ncclDataType_t,
-        ncclRedOp_t,
-        ncclComm_t,
-        cudaStream_t,
-    ]
-    pynccl_comm._rtx6k_nccl_residual_add_func = func
-    return func
-
-
-def call_rtx6k_nccl_residual_add(
-    allreduce_in: torch.Tensor,
-    residual: torch.Tensor,
-) -> torch.Tensor | None:
-    global _rtx6k_nccl_residual_add_call_logged
-    global _rtx6k_nccl_residual_add_fallback_logged
-    if not _RTX6K_USE_NCCL_RESIDUAL_ADD:
-        return None
-    tp = get_tp_group()
-    communicator = tp.device_communicator
-    pynccl_comm = (
-        getattr(communicator, "pynccl_comm", None)
-        if communicator is not None
-        else None
-    )
-    if pynccl_comm is None or getattr(pynccl_comm, "disabled", True):
-        if not _rtx6k_nccl_residual_add_fallback_logged:
-            logger.warning("RTX6K NCCL residual-add fell back: PyNCCL unavailable.")
-            _rtx6k_nccl_residual_add_fallback_logged = True
-        return None
-    if allreduce_in.shape != residual.shape or allreduce_in.dtype != residual.dtype:
-        return None
-    if allreduce_in.device != residual.device or allreduce_in.device != pynccl_comm.device:
-        return None
-    out = torch.empty_like(allreduce_in)
-    func = _get_nccl_residual_add_func(pynccl_comm)
-    stream = current_stream()
-    pynccl_comm.nccl.NCCL_CHECK(
-        func(
-            buffer_type(allreduce_in.data_ptr()),
-            buffer_type(residual.data_ptr()),
-            buffer_type(out.data_ptr()),
-            allreduce_in.numel(),
-            ncclDataTypeEnum.from_torch(allreduce_in.dtype),
-            ncclRedOpTypeEnum.from_torch(dist.ReduceOp.SUM),
-            pynccl_comm.comm,
-            cudaStream_t(stream.cuda_stream),
-        )
-    )
-    if not _rtx6k_nccl_residual_add_call_logged:
-        logger.info(
-            "RTX6K NCCL residual-add is active (shape=%s, dtype=%s).",
-            tuple(allreduce_in.shape),
-            allreduce_in.dtype,
-        )
-        _rtx6k_nccl_residual_add_call_logged = True
-    return out
-
-
-def call_rtx6k_pcie_fused_allreduce_add(
-    allreduce_in: torch.Tensor,
-    residual: torch.Tensor,
-) -> torch.Tensor:
-    global _rtx6k_fused_add_call_logged
-    global _rtx6k_fused_add_fallback_logged
-    tp = get_tp_group()
-    nccl_fused = call_rtx6k_nccl_residual_add(allreduce_in, residual)
-    if nccl_fused is not None:
-        return nccl_fused
-    communicator = tp.device_communicator
-    ca_comm = getattr(communicator, "ca_comm", None) if communicator is not None else None
-    if ca_comm is not None:
-        fused = ca_comm.fused_all_reduce_add(allreduce_in, residual)
-        if fused is not None:
-            if not _rtx6k_fused_add_call_logged:
-                logger.info(
-                    "RTX6K fused PCIe allreduce-add custom op is active "
-                    "(shape=%s, dtype=%s).",
-                    tuple(allreduce_in.shape),
-                    allreduce_in.dtype,
-                )
-                _rtx6k_fused_add_call_logged = True
-            return fused
-    if not _rtx6k_fused_add_fallback_logged:
-        logger.warning(
-            "RTX6K fused PCIe allreduce-add custom op fell back to "
-            "allreduce+add (shape=%s, dtype=%s).",
-            tuple(allreduce_in.shape),
-            allreduce_in.dtype,
-        )
-        _rtx6k_fused_add_fallback_logged = True
-    return tp.all_reduce(allreduce_in) + residual
-
-
-def call_rtx6k_pcie_fused_allreduce_add_fake(
-    allreduce_in: torch.Tensor,
-    residual: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty_like(allreduce_in)
-
-
-direct_register_custom_op(
-    op_name="rtx6k_pcie_fused_allreduce_add",
-    op_func=call_rtx6k_pcie_fused_allreduce_add,
-    fake_impl=call_rtx6k_pcie_fused_allreduce_add_fake,
-)
-rtx6k_pcie_fused_allreduce_add = (
-    torch.ops.vllm.rtx6k_pcie_fused_allreduce_add.default
-)
-
-
-def call_rtx6k_pcie_fused_allreduce_add_rms(
-    allreduce_in: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    rms_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    global _rtx6k_fused_add_rms_call_logged
-    global _rtx6k_fused_add_rms_fallback_logged
-    tp = get_tp_group()
-    nccl_fused = call_rtx6k_nccl_residual_add(allreduce_in, residual)
-    if nccl_fused is not None:
-        rms = vllm.ir.ops.rms_norm(nccl_fused, weight, rms_eps)
-        return rms, nccl_fused
-    communicator = tp.device_communicator
-    ca_comm = getattr(communicator, "ca_comm", None) if communicator is not None else None
-    if ca_comm is not None:
-        fused = ca_comm.fused_all_reduce_add_rms(
-            allreduce_in, residual, weight, rms_eps
-        )
-        if fused is not None:
-            if not _rtx6k_fused_add_rms_call_logged:
-                logger.info(
-                    "RTX6K fused PCIe allreduce-add-rms custom op is active "
-                    "(shape=%s, dtype=%s).",
-                    tuple(allreduce_in.shape),
-                    allreduce_in.dtype,
-                )
-                _rtx6k_fused_add_rms_call_logged = True
-            return fused
-        fused_add = ca_comm.fused_all_reduce_add(allreduce_in, residual)
-        if fused_add is not None:
-            if not _rtx6k_fused_add_rms_call_logged:
-                logger.info(
-                    "RTX6K fused PCIe allreduce-add-rms custom op is using "
-                    "one-stage add + RMS fallback (shape=%s, dtype=%s).",
-                    tuple(allreduce_in.shape),
-                    allreduce_in.dtype,
-                )
-                _rtx6k_fused_add_rms_call_logged = True
-            rms = vllm.ir.ops.rms_norm(fused_add, weight, rms_eps)
-            return rms, fused_add
-    if not _rtx6k_fused_add_rms_fallback_logged:
-        logger.warning(
-            "RTX6K fused PCIe allreduce-add-rms custom op fell back to "
-            "allreduce+add+rms_norm (shape=%s, dtype=%s).",
-            tuple(allreduce_in.shape),
-            allreduce_in.dtype,
-        )
-        _rtx6k_fused_add_rms_fallback_logged = True
-    allreduce_out = tp.all_reduce(allreduce_in)
-    residual_out = allreduce_out + residual
-    rms = vllm.ir.ops.rms_norm(residual_out, weight, rms_eps)
-    return rms, residual_out
-
-
-def call_rtx6k_pcie_fused_allreduce_add_rms_fake(
-    allreduce_in: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    rms_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(allreduce_in), torch.empty_like(allreduce_in)
-
-
-direct_register_custom_op(
-    op_name="rtx6k_pcie_fused_allreduce_add_rms",
-    op_func=call_rtx6k_pcie_fused_allreduce_add_rms,
-    fake_impl=call_rtx6k_pcie_fused_allreduce_add_rms_fake,
-)
-rtx6k_pcie_fused_allreduce_add_rms = (
-    torch.ops.vllm.rtx6k_pcie_fused_allreduce_add_rms.default
-)
-
-
-def call_rtx6k_nccl_preadd_work_allreduce_rms(
-    allreduce_in: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    rms_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Algebraically fold residual add into NCCL input using a work buffer.
-
-    Computes NCCL(sum(input + residual / world_size)) which is equivalent to
-    sum(input) + residual when residual is replicated across tensor-parallel
-    ranks. This removes the post-NCCL add but adds a pre-NCCL add kernel.
-    """
-    global _rtx6k_nccl_preadd_work_call_logged
-    tp = get_tp_group()
-    world_size = get_tensor_model_parallel_world_size()
-    if not _rtx6k_nccl_preadd_work_call_logged:
-        logger.info(
-            "RTX6K NCCL preadd(work) allreduce+rms custom op is active "
-            "(shape=%s, dtype=%s, world_size=%d).",
-            tuple(allreduce_in.shape),
-            allreduce_in.dtype,
-            world_size,
-        )
-        _rtx6k_nccl_preadd_work_call_logged = True
-    work = torch.add(allreduce_in, residual, alpha=1.0 / world_size)
-    dist.all_reduce(work, group=tp.device_group)
-    rms = vllm.ir.ops.rms_norm(work, weight, rms_eps)
-    return rms, work
-
-
-def call_rtx6k_nccl_preadd_work_allreduce_rms_fake(
-    allreduce_in: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    rms_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(allreduce_in), torch.empty_like(allreduce_in)
-
-
-direct_register_custom_op(
-    op_name="rtx6k_nccl_preadd_work_allreduce_rms",
-    op_func=call_rtx6k_nccl_preadd_work_allreduce_rms,
-    fake_impl=call_rtx6k_nccl_preadd_work_allreduce_rms_fake,
-)
-rtx6k_nccl_preadd_work_allreduce_rms = (
-    torch.ops.vllm.rtx6k_nccl_preadd_work_allreduce_rms.default
-)
-
-
-def call_rtx6k_nccl_preadd_inplace_allreduce_rms(
-    allreduce_in: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    rms_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fold residual add into NCCL by using residual as the NCCL output buffer.
-
-    This is the lowest-copy stock-NCCL variant:
-      residual = input + residual / world_size
-      NCCL all_reduce(residual)
-      rms_norm(residual)
-
-    It is semantically valid only when the matched graph no longer needs the
-    old residual value after this fused site.
-    """
-    global _rtx6k_nccl_preadd_inplace_call_logged
-    tp = get_tp_group()
-    world_size = get_tensor_model_parallel_world_size()
-    if not _rtx6k_nccl_preadd_inplace_call_logged:
-        logger.info(
-            "RTX6K NCCL preadd(inplace residual) allreduce+rms custom op is active "
-            "(shape=%s, dtype=%s, world_size=%d).",
-            tuple(allreduce_in.shape),
-            allreduce_in.dtype,
-            world_size,
-        )
-        _rtx6k_nccl_preadd_inplace_call_logged = True
-    residual.mul_(1.0 / world_size)
-    residual.add_(allreduce_in)
-    dist.all_reduce(residual, group=tp.device_group)
-    rms = vllm.ir.ops.rms_norm(residual, weight, rms_eps)
-    return rms, residual
-
-
-def call_rtx6k_nccl_preadd_inplace_allreduce_rms_fake(
-    allreduce_in: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    rms_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(allreduce_in), torch.empty_like(allreduce_in)
-
-
-direct_register_custom_op(
-    op_name="rtx6k_nccl_preadd_inplace_allreduce_rms",
-    op_func=call_rtx6k_nccl_preadd_inplace_allreduce_rms,
-    mutates_args=["residual"],
-    fake_impl=call_rtx6k_nccl_preadd_inplace_allreduce_rms_fake,
-)
-rtx6k_nccl_preadd_inplace_allreduce_rms = (
-    torch.ops.vllm.rtx6k_nccl_preadd_inplace_allreduce_rms.default
-)
-
-
 class FlashInferFusedAllReduceParams:
     """Parameters for FlashInfer fused allreduce operations."""
 
@@ -732,68 +397,6 @@ class AllReduceFusedAddRMSNormPattern(BasePattern):
 
         # Same pattern, but only return the output and not residual
         # (helpful for end of graph where residual is not used again)
-        first_return_only = lambda fn: lambda a, b, c: fn(a, b, c)[0]
-
-        pm.register_replacement(
-            first_return_only(pattern),  # type: ignore[no-untyped-call]
-            first_return_only(replacement),  # type: ignore[no-untyped-call]
-            self.get_inputs(),
-            pm.fwd_only,
-            pm_pass,
-        )
-
-
-class Rtx6kPcieAllReduceAddRMSNormPattern(BasePattern):
-    """
-    Experimental RTX6K path: fuse only allreduce + residual add with the
-    PCIe prototype, then run RMSNorm as the existing IR op.
-    """
-
-    def __init__(
-        self,
-        epsilon: float,
-        dtype: torch.dtype,
-        device: str | None,
-    ) -> None:
-        super().__init__(dtype, device)
-        self.epsilon = epsilon
-        self.rmsnorm_matcher = MatcherFusedAddRMSNorm(epsilon)
-
-    def get_inputs(self) -> list[torch.Tensor]:
-        input, residual, weight = self.rmsnorm_matcher.inputs()
-        return [residual, input.to(self.dtype), weight]
-
-    def register(self, pm_pass: PatternMatcherPass) -> None:
-        def pattern(
-            residual: torch.Tensor, input: torch.Tensor, weight: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            allreduce_output = tensor_model_parallel_all_reduce(input)
-            rms, residual = self.rmsnorm_matcher(allreduce_output, weight, residual)
-            return rms, residual
-
-        def replacement(
-            residual: torch.Tensor, input: torch.Tensor, weight: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            if _RTX6K_NCCL_PREADD_FUSED_RMS_MODE == "work":
-                return rtx6k_nccl_preadd_work_allreduce_rms(
-                    input, residual, weight, self.epsilon
-                )
-            if _RTX6K_NCCL_PREADD_FUSED_RMS_MODE == "inplace":
-                return rtx6k_nccl_preadd_inplace_allreduce_rms(
-                    input, residual, weight, self.epsilon
-                )
-            if _RTX6K_USE_FUSED_ADD_RMS:
-                return rtx6k_pcie_fused_allreduce_add_rms(
-                    input, residual, weight, self.epsilon
-                )
-            residual_out = rtx6k_pcie_fused_allreduce_add(input, residual)
-            rms = vllm.ir.ops.rms_norm(residual_out, weight, self.epsilon)
-            return rms, residual_out
-
-        pm.register_replacement(
-            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
-        )
-
         first_return_only = lambda fn: lambda a, b, c: fn(a, b, c)[0]
 
         pm.register_replacement(
@@ -1162,24 +765,6 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         self.hidden_dim = config.model_config.get_hidden_size()
         self.group = get_tp_group().device_group
         rank = get_tensor_model_parallel_rank()
-        if _RTX6K_USE_FUSED_ADD:
-            self.max_token_num = config.scheduler_config.max_num_batched_tokens
-            self.supports_quant_fusion = False
-            self.allreduce_params = FlashInferFusedAllReduceParams(
-                world_size=self.tp_size,
-                max_token_num=self.max_token_num,
-            )
-            logger.info(
-                "RTX6K fused PCIe allreduce-add pass enabled for up to %d tokens.",
-                self.max_token_num,
-            )
-            logger.info(
-                "RTX6K NCCL residual-add requested=%s.",
-                _RTX6K_USE_NCCL_RESIDUAL_ADD,
-            )
-            self.register_patterns()
-            self.dump_patterns(config, self.patterns)
-            return
         if flashinfer_comm is None:
             logger.warning(
                 "Flashinfer is not installed or comm module not found, "
@@ -1246,14 +831,6 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
     @enable_fake_mode
     def register_patterns(self) -> None:
         for epsilon in [1e-5, 1e-6]:
-            if _RTX6K_USE_FUSED_ADD:
-                Rtx6kPcieAllReduceAddRMSNormPattern(
-                    epsilon,
-                    self.model_dtype,
-                    self.device,
-                ).register(self.patterns)
-                torch._inductor.pattern_matcher._seen_patterns.clear()
-                continue
             if self.supports_quant_fusion:
                 AllReduceFusedRMSNormStaticQuantFP8Pattern(
                     epsilon,
