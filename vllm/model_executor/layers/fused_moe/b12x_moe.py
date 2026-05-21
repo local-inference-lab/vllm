@@ -80,8 +80,15 @@ except ImportError:
     _b12x_shared_arena_pool = None
 
 
-def _requires_b12x_joint_moe_pool() -> bool:
+def _active_vllm_config_for_b12x_moe():
     vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None and is_forward_context_available():
+        vllm_config = get_forward_context().vllm_config
+    return vllm_config
+
+
+def _requires_b12x_joint_moe_pool() -> bool:
+    vllm_config = _active_vllm_config_for_b12x_moe()
     return b12x_sparse_mla_active_for_config(vllm_config)
 
 
@@ -213,6 +220,17 @@ def _get_b12x_workspace_pool(device: torch.device):
     requires_joint = _requires_b12x_joint_moe_pool()
     if _b12x_shared_arena_pool is not None:
         try:
+            if requires_joint:
+                from b12x.integration.arena import get_b12x_execution_lane
+
+                lane = get_b12x_execution_lane(
+                    device,
+                    create_standalone_moe_pool=False,
+                )
+                if lane is None or getattr(lane, "arena", None) is None:
+                    raise RuntimeError(
+                        "shared execution-lane arena is not installed"
+                    )
             return _b12x_shared_arena_pool(device)
         except (AttributeError, RuntimeError) as exc:
             if requires_joint:

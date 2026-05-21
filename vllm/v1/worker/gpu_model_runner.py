@@ -5370,13 +5370,34 @@ class GPUModelRunner(
             return
 
         installed = 0
-        for _, module in self.model.named_modules():
-            impl = getattr(module, "impl", None)
-            preinstall = getattr(impl, "_preinstall_b12x_joint_arena", None)
-            if preinstall is None:
+        models: list[tuple[str, nn.Module | None]] = [("model", self.model)]
+        drafter = getattr(self, "drafter", None)
+        models.append(("drafter", getattr(drafter, "model", None)))
+
+        seen_roots: set[int] = set()
+        seen_candidates: set[int] = set()
+        for root_name, root in models:
+            if root is None or id(root) in seen_roots:
                 continue
-            preinstall()
-            installed += 1
+            seen_roots.add(id(root))
+            for module_name, module in root.named_modules():
+                candidates = (module, getattr(module, "impl", None))
+                for candidate in candidates:
+                    if candidate is None:
+                        continue
+                    preinstall = getattr(
+                        candidate, "_preinstall_b12x_joint_arena", None
+                    )
+                    if preinstall is None or id(candidate) in seen_candidates:
+                        continue
+                    seen_candidates.add(id(candidate))
+                    preinstall()
+                    installed += 1
+                    logger.debug(
+                        "Preinstalled b12x joint attention arena for %s.%s.",
+                        root_name,
+                        module_name,
+                    )
 
         if installed:
             logger.info(

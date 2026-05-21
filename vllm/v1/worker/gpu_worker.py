@@ -635,6 +635,15 @@ class Worker(WorkerBase):
             self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
+        # B12X sparse MLA and B12X MoE share one execution-lane arena. Install it
+        # before MoE-only kernel warmup, otherwise b12x creates a standalone MoE
+        # lane that cannot be upgraded once CUDA graph capture reaches MLA.
+        preinstall_b12x = getattr(
+            self.model_runner, "_preinstall_b12x_joint_attention_arenas", None
+        )
+        if preinstall_b12x is not None:
+            preinstall_b12x()
+
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
         kernel_warmup(self)
