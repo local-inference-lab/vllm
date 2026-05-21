@@ -1594,8 +1594,10 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
 
     @property
     def supports_shared_experts_aux_stream(self) -> bool:
-        # B12X static/resident MoE kernels manage global barrier state and are
-        # not safe to overlap with the generic external shared-experts stream.
+        # B12X MoE kernels use resident-grid software barriers. They require
+        # their CTA grid to be resident without unrelated kernels occupying SM
+        # slots, so vLLM's generic aux-stream shared-experts GEMM must not be
+        # co-scheduled with them.
         return self.nvfp4_backend != NvFp4MoeBackend.B12X
 
     def maybe_make_prepare_finalize(
