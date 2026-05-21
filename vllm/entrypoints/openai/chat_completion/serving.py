@@ -1842,16 +1842,18 @@ class OpenAIServingChat(OpenAIServing):
             None,
         )
         original_fn = original_tc.function if original_tc else None
+        tool_call_kwargs: dict[str, Any] = {"index": index}
+        if original_tc is not None:
+            if original_tc.id is not None:
+                tool_call_kwargs["id"] = original_tc.id
+            if original_tc.type is not None:
+                tool_call_kwargs["type"] = original_tc.type
+
+        function_kwargs = {"arguments": remaining_call}
+        if original_fn is not None and original_fn.name is not None:
+            function_kwargs["name"] = original_fn.name
+        tool_call_kwargs["function"] = DeltaFunctionCall(**function_kwargs)
+
         return DeltaMessage(
-            tool_calls=[
-                DeltaToolCall(
-                    index=index,
-                    id=original_tc.id if original_tc else None,
-                    type=original_tc.type if original_tc else None,
-                    function=DeltaFunctionCall(
-                        name=original_fn.name if original_fn else None,
-                        arguments=remaining_call,
-                    ),
-                )
-            ]
+            tool_calls=[DeltaToolCall(**tool_call_kwargs)]
         )
