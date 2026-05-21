@@ -823,6 +823,30 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     return True
 
 
+def _maybe_remap_compressed_tensors_nvfp4_moe_name(
+    name: str,
+    params_dict: dict[str, torch.nn.Parameter],
+) -> str:
+    if name in params_dict or ".experts." not in name:
+        return name
+
+    aliases = (
+        ("w13_weight_scale_2", "w13_weight_global_scale"),
+        ("w2_weight_scale_2", "w2_weight_global_scale"),
+        ("w13_input_scale", "w13_input_global_scale"),
+        ("w2_input_scale", "w2_input_global_scale"),
+        ("w13_weight", "w13_weight_packed"),
+        ("w2_weight", "w2_weight_packed"),
+    )
+    for source, target in aliases:
+        if source not in name:
+            continue
+        remapped = name.replace(source, target)
+        if remapped in params_dict:
+            return remapped
+    return name
+
+
 def _min_latency_fused_qkv_a_proj_impl(
     input_: torch.Tensor,
     weight: torch.Tensor,
@@ -1553,6 +1577,9 @@ class DeepseekV2Model(nn.Module):
                         # Do not modify `name` since the loop may continue here
                         # Instead, create a new variable
                         name_mapped = chunk_name.replace(weight_name, param_name)
+                        name_mapped = _maybe_remap_compressed_tensors_nvfp4_moe_name(
+                            name_mapped, params_dict
+                        )
 
                         if is_pp_missing_parameter(name_mapped, self):
                             continue

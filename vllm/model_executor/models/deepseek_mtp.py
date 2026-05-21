@@ -39,6 +39,7 @@ from .deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2MixtureOfExperts,
     DeepseekV2MoE,
+    _maybe_remap_compressed_tensors_nvfp4_moe_name,
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
@@ -717,6 +718,9 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                         # Do not modify `name` since the loop may continue here
                         # Instead, create a new variable
                         name_mapped = chunk_name.replace(weight_name, param_name)
+                        name_mapped = _maybe_remap_compressed_tensors_nvfp4_moe_name(
+                            name_mapped, params_dict
+                        )
                         name_mapped = _maybe_remap_fp8_scale_inv_name(
                             name_mapped, params_dict
                         )
