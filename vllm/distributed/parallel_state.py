@@ -496,7 +496,7 @@ class GroupCoordinator:
             )
             ca_comm = self.device_communicator.ca_comm
             if ca_comm is not None:
-                maybe_ca_context = ca_comm.capture()  # type: ignore
+                maybe_ca_context = ca_comm.capture(stream=stream)  # type: ignore
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream

@@ -481,7 +481,7 @@ class CustomAllreduce:
         ops.register_buffer(self._ptr, self.buffer_ptrs)
 
     @contextmanager
-    def capture(self):
+    def capture(self, stream: torch.cuda.Stream | None = None):
         """
         The main responsibility of this context manager is the
         `register_graph_buffers` call at the end of the context.
@@ -492,7 +492,7 @@ class CustomAllreduce:
             if self._pcie_runtime is None:
                 yield
             else:
-                with self._pcie_runtime.capture():
+                with self._pcie_runtime.capture(stream=stream):
                     yield
         finally:
             self._IS_CAPTURING = False
