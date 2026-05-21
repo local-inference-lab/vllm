@@ -262,6 +262,48 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             tasks.extend(PoolingRunner.get_supported_tasks(self.model))
         return tuple(tasks)
 
+    def _preinstall_b12x_joint_attention_arenas(self) -> None:
+        kernel_cfg = getattr(self.vllm_config, "kernel_config", None)
+        moe_backend = str(getattr(kernel_cfg, "moe_backend", "") or "").lower()
+        if kernel_cfg is None or moe_backend != "b12x":
+            return
+
+        installed = 0
+        models: list[tuple[str, nn.Module | None]] = [("model", self.model)]
+        speculator = getattr(self, "speculator", None)
+        models.append(("speculator", getattr(speculator, "model", None)))
+
+        seen_roots: set[int] = set()
+        seen_candidates: set[int] = set()
+        for root_name, root in models:
+            if root is None or id(root) in seen_roots:
+                continue
+            seen_roots.add(id(root))
+            for module_name, module in root.named_modules():
+                candidates = (module, getattr(module, "impl", None))
+                for candidate in candidates:
+                    if candidate is None:
+                        continue
+                    preinstall = getattr(
+                        candidate, "_preinstall_b12x_joint_arena", None
+                    )
+                    if preinstall is None or id(candidate) in seen_candidates:
+                        continue
+                    seen_candidates.add(id(candidate))
+                    preinstall()
+                    installed += 1
+                    logger.debug(
+                        "Preinstalled b12x joint attention arena for %s.%s.",
+                        root_name,
+                        module_name,
+                    )
+
+        if installed:
+            logger.info(
+                "Preinstalled b12x joint attention arena for %d MLA layers.",
+                installed,
+            )
+
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         time_before_load = time.perf_counter()
         if load_dummy_weights:
@@ -288,6 +330,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
+            if not load_dummy_weights:
+                self._preinstall_b12x_joint_attention_arenas()
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
