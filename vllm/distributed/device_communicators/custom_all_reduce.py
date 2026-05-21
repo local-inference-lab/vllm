@@ -223,6 +223,7 @@ class CustomAllreduce:
         self._IS_CAPTURING = False
         self.disabled = True
         self._pcie_runtime = None
+        self._pcie_capture_stream: torch.cuda.Stream | None = None
         self._cpp_ar_cutoff_size: int | None = None
         self._cpp_ar_ignore_cutoff_max_rows = 0
         self._cpp_ar_shape_log = False
@@ -487,21 +488,34 @@ class CustomAllreduce:
         `register_graph_buffers` call at the end of the context.
         It records all the buffer addresses used in the CUDA graph.
         """
+        old_pcie_capture_stream = self._pcie_capture_stream
         try:
             self._IS_CAPTURING = True
             if self._pcie_runtime is None:
                 yield
             else:
+                self._pcie_capture_stream = stream
                 with self._pcie_runtime.capture(stream=stream):
                     yield
         finally:
+            self._pcie_capture_stream = old_pcie_capture_stream
             self._IS_CAPTURING = False
             if not self.disabled and self._pcie_runtime is None:
                 self.register_graph_buffers()
 
+    def _pcie_runtime_stream(self) -> torch.cuda.Stream | None:
+        if (
+            self._pcie_capture_stream is not None
+            and (self._IS_CAPTURING or torch.cuda.is_current_stream_capturing())
+        ):
+            return self._pcie_capture_stream
+        return None
+
     def register_graph_buffers(self):
         if self._pcie_runtime is not None:
-            self._pcie_runtime.for_stream().register_graph_buffers()
+            self._pcie_runtime.for_stream(
+                self._pcie_runtime_stream()
+            ).register_graph_buffers()
             return
         handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
         logger.info("Registering %d cuda graph addresses", len(offset))
@@ -525,7 +539,9 @@ class CustomAllreduce:
         if self.disabled:
             return False
         if self._pcie_runtime is not None:
-            return self._pcie_runtime.for_stream().should_allreduce(inp)
+            return self._pcie_runtime.for_stream(
+                self._pcie_runtime_stream()
+            ).should_allreduce(inp)
         inp_size = inp.numel() * inp.element_size()
         rows = int(inp.shape[0]) if inp.ndim >= 2 else 1
         cutoff_applies = not (
@@ -599,7 +615,9 @@ class CustomAllreduce:
         buffer.
         """
         if self._pcie_runtime is not None:
-            return self._pcie_runtime.all_reduce(inp, out=out)
+            return self._pcie_runtime.all_reduce(
+                inp, out=out, stream=self._pcie_runtime_stream()
+            )
         if out is None:
             out = torch.empty_like(inp)
         if registered:
