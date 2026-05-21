@@ -790,12 +790,14 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self.decode_workspace_ring = _env_int(
             "VLLM_B12X_MLA_DECODE_WORKSPACE_RING", 1
         )
-        # B12X native LSE mode currently uses the split sparse-MLA path.
-        # DCP therefore keeps a small chunk cap for extend so long prefill
-        # avoids the 64-chunk scratch footprint while still exposing valid LSE.
+        # B12X native LSE mode currently uses the split sparse-MLA path. Keep a
+        # bounded split reserve for extend: non-DCP mirrors the sglang b12x
+        # contract so short extend/prefill does not collapse to the one-pass
+        # q x head_tiles launch, while DCP keeps a smaller cap because
+        # all-gathered heads multiply split scratch.
         self.extend_max_chunks_per_row = _env_int(
             "VLLM_B12X_MLA_EXTEND_MAX_CHUNKS",
-            4 if self.dcp_world_size > 1 else 1,
+            4 if self.dcp_world_size > 1 else 32,
         )
         self.extend_indexer_tile_logits_k_rows = _env_nonnegative_int(
             "VLLM_B12X_MLA_EXTEND_TOPK_SUPERTILE_K",
@@ -1181,11 +1183,12 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         topk = int(self.topk_indices_buffer.shape[1])
         max_chunks_per_row = 64
         if mode != "decode":
-            # DCP all-gathers Q heads before the B12X call. Keeping the default
-            # 64 split chunks for extend would allocate Q x heads x 64 x V
-            # scratch, which OOMs long-prefill scouts on 8-way DCP. Topk is
-            # already selected by vLLM's NSA indexer, so non-DCP can prefer the
-            # single-pass sparse MLA kernel and keep only a one-chunk reserve.
+            # DCP all-gathers Q heads before the B12X call. Keeping the decode
+            # 64-way split reserve for extend would allocate Q x heads x 64 x V
+            # scratch. Use the configured extend cap instead: non-DCP defaults
+            # to a sglang-aligned 32 chunks for occupancy on short extend, while
+            # DCP defaults lower because the all-gathered head count multiplies
+            # scratch.
             #
             # DCP is different: the post-attention reducer needs softmax LSE
             # from each rank. B12X's single-pass sparse MLA kernel currently
