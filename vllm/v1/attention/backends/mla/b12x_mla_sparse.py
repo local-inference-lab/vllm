@@ -10,6 +10,7 @@ by B12X.
 """
 
 from dataclasses import dataclass
+import inspect
 import os
 import time
 from typing import TYPE_CHECKING, ClassVar
@@ -57,6 +58,40 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _B12X_SYNC_DEBUG = os.getenv("VLLM_B12X_SYNC_DEBUG", "0") != "0"
+_B12X_DECODE_ACCEPTS_METADATA: bool | None = None
+_B12X_DECODE_ACCEPTS_RETURN_LSE: bool | None = None
+_B12X_EXTEND_ACCEPTS_METADATA: bool | None = None
+_B12X_EXTEND_ACCEPTS_RETURN_LSE: bool | None = None
+
+
+def _b12x_sparse_mla_signature_flags(fn, *, mode: str) -> tuple[bool, bool]:
+    global _B12X_DECODE_ACCEPTS_METADATA
+    global _B12X_DECODE_ACCEPTS_RETURN_LSE
+    global _B12X_EXTEND_ACCEPTS_METADATA
+    global _B12X_EXTEND_ACCEPTS_RETURN_LSE
+
+    if mode == "decode":
+        if _B12X_DECODE_ACCEPTS_METADATA is not None:
+            return (
+                _B12X_DECODE_ACCEPTS_METADATA,
+                bool(_B12X_DECODE_ACCEPTS_RETURN_LSE),
+            )
+    elif _B12X_EXTEND_ACCEPTS_METADATA is not None:
+        return (
+            _B12X_EXTEND_ACCEPTS_METADATA,
+            bool(_B12X_EXTEND_ACCEPTS_RETURN_LSE),
+        )
+
+    params = inspect.signature(fn).parameters
+    accepts_metadata = "metadata" in params
+    accepts_return_lse = "return_lse" in params
+    if mode == "decode":
+        _B12X_DECODE_ACCEPTS_METADATA = accepts_metadata
+        _B12X_DECODE_ACCEPTS_RETURN_LSE = accepts_return_lse
+    else:
+        _B12X_EXTEND_ACCEPTS_METADATA = accepts_metadata
+        _B12X_EXTEND_ACCEPTS_RETURN_LSE = accepts_return_lse
+    return accepts_metadata, accepts_return_lse
 
 
 def _sparse_mla_decode_forward_vllm_metadata(
@@ -69,6 +104,20 @@ def _sparse_mla_decode_forward_vllm_metadata(
     v_head_dim: int,
 ):
     from b12x.integration.mla import sparse_mla_decode_forward
+
+    accepts_metadata, _ = _b12x_sparse_mla_signature_flags(
+        sparse_mla_decode_forward,
+        mode="decode",
+    )
+    if accepts_metadata:
+        return sparse_mla_decode_forward(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            metadata=metadata,
+            workspace=workspace,
+            sm_scale=sm_scale,
+            v_head_dim=v_head_dim,
+        )
 
     return sparse_mla_decode_forward(
         q_all=q_all,
@@ -92,6 +141,24 @@ def _sparse_mla_decode_forward_with_lse_vllm_metadata(
     v_head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from b12x.integration.mla import sparse_mla_decode_forward
+
+    accepts_metadata, accepts_return_lse = _b12x_sparse_mla_signature_flags(
+        sparse_mla_decode_forward,
+        mode="decode",
+    )
+    if not accepts_return_lse:
+        raise RuntimeError("Installed b12x sparse MLA decode does not support LSE")
+    if accepts_metadata:
+        return sparse_mla_decode_forward(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            metadata=metadata,
+            workspace=workspace,
+            sm_scale=sm_scale,
+            v_head_dim=v_head_dim,
+            return_lse=True,
+            lse_scale="natural",
+        )
 
     return sparse_mla_decode_forward(
         q_all=q_all,
@@ -118,6 +185,24 @@ def _sparse_mla_extend_forward_with_lse_vllm_metadata(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from b12x.integration.mla import sparse_mla_extend_forward
 
+    accepts_metadata, accepts_return_lse = _b12x_sparse_mla_signature_flags(
+        sparse_mla_extend_forward,
+        mode="extend",
+    )
+    if not accepts_return_lse:
+        raise RuntimeError("Installed b12x sparse MLA extend does not support LSE")
+    if accepts_metadata:
+        return sparse_mla_extend_forward(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            metadata=metadata,
+            workspace=workspace,
+            sm_scale=sm_scale,
+            v_head_dim=v_head_dim,
+            return_lse=True,
+            lse_scale="natural",
+        )
+
     return sparse_mla_extend_forward(
         q_all=q_all,
         kv_cache=kv_cache,
@@ -129,6 +214,43 @@ def _sparse_mla_extend_forward_with_lse_vllm_metadata(
         v_head_dim=v_head_dim,
         return_lse=True,
         lse_scale="natural",
+    )
+
+
+def _sparse_mla_extend_forward_vllm_metadata(
+    *,
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    metadata,
+    workspace,
+    sm_scale: float,
+    v_head_dim: int,
+):
+    from b12x.integration.mla import sparse_mla_extend_forward
+
+    accepts_metadata, _ = _b12x_sparse_mla_signature_flags(
+        sparse_mla_extend_forward,
+        mode="extend",
+    )
+    if accepts_metadata:
+        return sparse_mla_extend_forward(
+            q_all=q_all,
+            kv_cache=kv_cache,
+            metadata=metadata,
+            workspace=workspace,
+            sm_scale=sm_scale,
+            v_head_dim=v_head_dim,
+        )
+
+    return sparse_mla_extend_forward(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        selected_token_offsets=metadata.selected_token_offsets,
+        cache_seqlens_int32=metadata.cache_seqlens_int32,
+        nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
+        workspace=workspace,
+        sm_scale=sm_scale,
+        v_head_dim=v_head_dim,
     )
 
 
@@ -1620,10 +1742,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 return out, None
             raise RuntimeError("B12X sparse MLA DCP LSE path was not selected")
 
-        from b12x.integration.mla import (
-            MLASparseExtendMetadata,
-            sparse_mla_extend_forward,
-        )
+        from b12x.integration.mla import MLASparseExtendMetadata
 
         workspace = self._get_workspace(
             "extend",
@@ -1718,12 +1837,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             _b12x_sync_debug("mla.sparse_mla_extend_forward_with_lse")
             return out, lse
 
-        out = sparse_mla_extend_forward(
+        out = _sparse_mla_extend_forward_vllm_metadata(
             q_all=q_all,
             kv_cache=kv_cache,
-            selected_token_offsets=metadata.selected_token_offsets,
-            cache_seqlens_int32=metadata.cache_seqlens_int32,
-            nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
+            metadata=metadata,
             workspace=workspace,
             sm_scale=self.scale,
             v_head_dim=self.kv_lora_rank,
