@@ -99,6 +99,9 @@ class SharedExperts:
         if self._quant_method.mk_can_overlap_shared_experts:
             return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
 
+        if not self._quant_method.supports_shared_experts_aux_stream:
+            return SharedExpertsOrder.NO_OVERLAP
+
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda()
             and self._stream is not None
