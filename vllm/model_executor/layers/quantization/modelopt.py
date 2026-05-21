@@ -41,7 +41,6 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
-    NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
     make_nvfp4_moe_kernel,
@@ -1591,14 +1590,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
             self.nvfp4_backend
         )
-
-    @property
-    def supports_shared_experts_aux_stream(self) -> bool:
-        # B12X MoE kernels use resident-grid software barriers. They require
-        # their CTA grid to be resident without unrelated kernels occupying SM
-        # slots, so vLLM's generic aux-stream shared-experts GEMM must not be
-        # co-scheduled with them.
-        return self.nvfp4_backend != NvFp4MoeBackend.B12X
 
     def maybe_make_prepare_finalize(
         self,
