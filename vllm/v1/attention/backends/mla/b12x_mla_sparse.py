@@ -865,10 +865,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             os.getenv("VLLM_B12X_MLA_FAST_NSA_SEQLENS", "0") != "0"
         )
         self.spec_decode_max_q = _env_int("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", 8)
-        # MTP verify rows are short extend batches. Forcing them through the
-        # B12X sparse MLA decode path can corrupt FULL CUDA graph capture.
         self.spec_extend_as_decode = (
-            os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "0") != "0"
+            os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "1") != "0"
         )
         self.dcp_topk_per_rank = _env_int("VLLM_B12X_MLA_DCP_TOPK_PER_RANK", 0)
         speculative_config = getattr(vllm_config, "speculative_config", None)
