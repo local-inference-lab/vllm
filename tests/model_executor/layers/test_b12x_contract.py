@@ -766,11 +766,13 @@ def test_b12x_pcie_oneshot_uses_pool_channel_for_selection():
     communicator = object.__new__(custom_all_reduce.CustomAllreduce)
     communicator.disabled = False
     communicator._ptr = 0
+    communicator._IS_CAPTURING = False
+    communicator._pcie_capture_stream = None
 
     calls = []
 
     class FakePool:
-        def for_stream(self):
+        def for_stream(self, stream=None):
             calls.append("for_stream")
             return SimpleNamespace(should_allreduce=lambda _inp: True)
 
@@ -788,6 +790,7 @@ def test_b12x_pcie_oneshot_capture_delegates_to_pool():
     communicator.disabled = False
     communicator._IS_CAPTURING = False
     communicator._ptr = 0
+    communicator._pcie_capture_stream = None
     events = []
 
     class FakeCapture:
@@ -798,7 +801,7 @@ def test_b12x_pcie_oneshot_capture_delegates_to_pool():
             events.append("exit")
 
     class FakePool:
-        def capture(self):
+        def capture(self, stream=None):
             return FakeCapture()
 
         def close(self):
@@ -887,3 +890,117 @@ def test_b12x_moe_decode_a16_env_keeps_prefill_nvfp4(monkeypatch):
         ),
     )
     assert expert._select_quant_mode() == "w4a16"
+
+
+def test_b12x_moe_prepares_w4a16_weights_when_layer_is_committed(monkeypatch):
+    calls = {}
+
+    def fake_prepare(*args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return "prepared-w4a16"
+
+    fake_b12x = types.ModuleType("b12x")
+    fake_integration = types.ModuleType("b12x.integration")
+    fake_tp_moe = types.ModuleType("b12x.integration.tp_moe")
+    fake_tp_moe.prepare_b12x_w4a16_packed_weights = fake_prepare
+    monkeypatch.setitem(sys.modules, "b12x", fake_b12x)
+    monkeypatch.setitem(sys.modules, "b12x.integration", fake_integration)
+    monkeypatch.setitem(sys.modules, "b12x.integration.tp_moe", fake_tp_moe)
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    monkeypatch.setattr(b12x_moe, "_B12X_MOE_FORCE_NVFP4", False)
+    monkeypatch.setattr(b12x_moe, "_B12X_MOE_A16_MIN_LAYER", -1)
+    monkeypatch.setattr(b12x_moe, "_B12X_MOE_A16_MAX_LAYER", -1)
+    monkeypatch.setattr(b12x_moe.envs, "VLLM_B12X_MOE_DECODE_A16", False)
+
+    w13_weight_scale_2 = torch.ones(2, 1)
+    w2_weight_scale_2 = torch.ones(2)
+    expert = object.__new__(B12xExperts)
+    expert.quant_config = SimpleNamespace(
+        use_nvfp4_w4a4=True,
+        w1_scale=torch.ones(1),
+        w2_scale=torch.ones(1),
+        g1_alphas=w13_weight_scale_2,
+        g2_alphas=w2_weight_scale_2,
+        a1_gscale=torch.full((2,), 2.0),
+        a2_gscale=torch.full((2,), 3.0),
+    )
+    expert.layer_idx = 0
+    expert.layer_name = "model.layers.0.mlp.experts"
+    expert.out_dtype = torch.bfloat16
+    expert._prepared_w4a16 = None
+
+    layer = SimpleNamespace(
+        w13_input_scale=torch.tensor([2.0, 4.0]),
+        w2_input_scale=torch.tensor([3.0, 5.0]),
+        w13_weight_scale_2=w13_weight_scale_2,
+        w2_weight_scale_2=w2_weight_scale_2,
+        w13_weight=torch.empty(2, 4, 4, dtype=torch.uint8),
+        w2_weight=torch.empty(2, 4, 4, dtype=torch.uint8),
+        activation=b12x_moe.MoEActivation.SILU,
+    )
+
+    expert.process_weights_after_loading(layer)
+
+    assert expert._prepared_w4a16 == "prepared-w4a16"
+    assert torch.equal(layer.w13_weight_scale_2, torch.tensor([[2.0], [4.0]]))
+    assert torch.equal(layer.w2_weight_scale_2, torch.tensor([3.0, 5.0]))
+    assert calls["args"][0] is layer.w13_weight
+    assert calls["args"][2] is layer.w13_weight_scale_2
+    assert calls["args"][4] is layer.w2_weight
+    assert calls["args"][6] is layer.w2_weight_scale_2
+    assert calls["kwargs"] == {
+        "activation": "silu",
+        "params_dtype": torch.bfloat16,
+        "quant_mode": None,
+        "source_format": "modelopt",
+        "reuse_input_storage": True,
+    }
+
+
+def test_b12x_moe_apply_passes_prepared_w4a16(monkeypatch):
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    monkeypatch.setattr(b12x_moe, "_get_b12x_workspace_pool", lambda device: "pool")
+    calls = {}
+    monkeypatch.setattr(
+        b12x_moe,
+        "_b12x_moe_fp4_pad_m",
+        lambda **kwargs: calls.update(kwargs),
+    )
+
+    expert = object.__new__(B12xExperts)
+    expert.quant_config = SimpleNamespace(
+        w1_scale=torch.ones(1),
+        w2_scale=torch.ones(1),
+        g1_alphas=torch.ones(1),
+        g2_alphas=torch.ones(1),
+        a1_gscale=torch.ones(1),
+        a2_gscale=torch.ones(1),
+    )
+    expert._prepared_w4a16 = object()
+    expert._select_quant_mode = lambda: None
+
+    output = torch.empty(1, 4)
+    hidden_states = torch.empty(1, 4)
+    expert.apply(
+        output=output,
+        hidden_states=hidden_states,
+        w1=torch.empty(1, 4, 2, dtype=torch.uint8),
+        w2=torch.empty(1, 4, 2, dtype=torch.uint8),
+        topk_weights=torch.ones(1, 1),
+        topk_ids=torch.zeros(1, 1, dtype=torch.int64),
+        activation=b12x_moe.MoEActivation.SILU,
+        global_num_experts=1,
+        expert_map=None,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=None,
+        workspace2=None,
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=None,
+    )
+
+    assert calls["workspace"] == "pool"
+    assert calls["output"] is output
+    assert calls["quant_mode"] == "w4a16"
+    assert calls["prepared_w4a16"] is expert._prepared_w4a16

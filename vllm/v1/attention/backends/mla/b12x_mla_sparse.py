@@ -83,8 +83,12 @@ def _b12x_sparse_mla_signature_flags(fn, *, mode: str) -> tuple[bool, bool]:
         )
 
     params = inspect.signature(fn).parameters
+    accepts_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in params.values()
+    )
     accepts_metadata = "metadata" in params
-    accepts_return_lse = "return_lse" in params
+    accepts_return_lse = "return_lse" in params or accepts_kwargs
     if mode == "decode":
         _B12X_DECODE_ACCEPTS_METADATA = accepts_metadata
         _B12X_DECODE_ACCEPTS_RETURN_LSE = accepts_return_lse

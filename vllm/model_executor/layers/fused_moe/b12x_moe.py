@@ -232,7 +232,7 @@ def _get_b12x_workspace_pool(device: torch.device):
                         "shared execution-lane arena is not installed"
                     )
             return _b12x_shared_arena_pool(device)
-        except (AttributeError, RuntimeError) as exc:
+        except (AttributeError, RuntimeError, TypeError) as exc:
             if requires_joint:
                 raise RuntimeError(
                     "B12X MoE cannot fall back to a standalone workspace pool "
@@ -276,6 +276,18 @@ def _b12x_env_force_a16() -> bool:
         "false",
         "False",
     )
+
+
+def _b12x_quant_mode_uses_w4a16(quant_mode: str | None) -> bool:
+    if quant_mode is None:
+        return _b12x_env_force_a16()
+    return quant_mode == "w4a16"
+
+
+def _b12x_activation_name(activation: MoEActivation) -> str:
+    if activation in (MoEActivation.SILU, MoEActivation.SWIGLUOAI):
+        return "silu"
+    raise ValueError(f"B12xExperts does not support {activation} activation")
 
 
 def _iter_attn_metadata(attn_metadata: Any):
@@ -381,6 +393,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self.layer_name = moe_config.layer_name
         self.layer_idx = moe_config.layer_idx
         self._warned_global_a16 = False
+        self._prepared_w4a16: Any | None = None
 
     # ------------------------------------------------------------------
     # process_weights_after_loading: fuse input scales into g{1,2}_alphas
@@ -400,6 +413,38 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 w13_input_scale = w13_input_scale[:, None]
             layer.w13_weight_scale_2.data.mul_(w13_input_scale)
             layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
+
+        self._prepared_w4a16 = None
+        if not self._should_prepare_w4a16_weights():
+            return
+
+        assert self.w1_scale is not None and self.w2_scale is not None, (
+            "w1_scale and w2_scale must not be None for B12xExperts"
+        )
+        assert self.g1_alphas is not None and self.g2_alphas is not None, (
+            "g1_alphas and g2_alphas must not be None for B12xExperts"
+        )
+        assert self.a1_gscale is not None and self.a2_gscale is not None, (
+            "a1_gscale and a2_gscale must not be None for B12xExperts"
+        )
+
+        from b12x.integration.tp_moe import prepare_b12x_w4a16_packed_weights
+
+        self._prepared_w4a16 = prepare_b12x_w4a16_packed_weights(
+            layer.w13_weight,
+            self.w1_scale,
+            self.g1_alphas,
+            self.a1_gscale,
+            layer.w2_weight,
+            self.w2_scale,
+            self.g2_alphas,
+            self.a2_gscale,
+            activation=_b12x_activation_name(layer.activation),
+            params_dtype=self.out_dtype,
+            quant_mode=None,
+            source_format="modelopt",
+            reuse_input_storage=True,
+        )
 
     # ------------------------------------------------------------------
     # Static capabilities
@@ -510,6 +555,27 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 
         return None
 
+    def _should_prepare_w4a16_weights(self) -> bool:
+        if _B12X_MOE_FORCE_NVFP4:
+            return False
+        if envs.VLLM_B12X_MOE_DECODE_A16:
+            return False
+        if not _b12x_env_force_a16():
+            return False
+        if self.layer_idx is None:
+            return True
+        if (
+            _B12X_MOE_A16_MIN_LAYER >= 0
+            and self.layer_idx < _B12X_MOE_A16_MIN_LAYER
+        ):
+            return False
+        if (
+            _B12X_MOE_A16_MAX_LAYER >= 0
+            and self.layer_idx > _B12X_MOE_A16_MAX_LAYER
+        ):
+            return False
+        return True
+
     # ------------------------------------------------------------------
     # workspace_shapes
     # ------------------------------------------------------------------
@@ -564,6 +630,16 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
 
         workspace_pool = _get_b12x_workspace_pool(hidden_states.device)
+        quant_mode = self._select_quant_mode()
+        prepared_w4a16 = None
+        if self._prepared_w4a16 is not None:
+            if not _b12x_quant_mode_uses_w4a16(quant_mode):
+                raise RuntimeError(
+                    "B12x W4A16 weights were prepared in-place, but the "
+                    "current b12x MoE quant mode is not W4A16."
+                )
+            quant_mode = "w4a16"
+            prepared_w4a16 = self._prepared_w4a16
 
         _b12x_moe_fp4_pad_m(
             a=hidden_states,
@@ -586,7 +662,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             output=output,
             input_scales_are_reciprocal=True,
             input_scales_static=True,
-            quant_mode=self._select_quant_mode(),
+            quant_mode=quant_mode,
+            prepared_w4a16=prepared_w4a16,
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
