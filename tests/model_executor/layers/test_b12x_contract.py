@@ -250,6 +250,48 @@ def test_b12x_mla_requires_moe_arena_caps_for_joint_arena(monkeypatch):
         )
 
 
+def test_b12x_mla_joint_moe_caps_use_w4a16_quant_mode(monkeypatch):
+    captured = {}
+
+    class FakeMoEArenaCaps(SimpleNamespace):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            super().__init__(**kwargs)
+
+    fake_b12x = types.ModuleType("b12x")
+    fake_integration = types.ModuleType("b12x.integration")
+    fake_integration.B12XMoEArenaCaps = FakeMoEArenaCaps
+    fake_b12x.integration = fake_integration
+    monkeypatch.setitem(sys.modules, "b12x", fake_b12x)
+    monkeypatch.setitem(sys.modules, "b12x.integration", fake_integration)
+    monkeypatch.setenv("VLLM_B12X_FORCE_MOE_A16", "1")
+
+    impl = object.__new__(B12xMLASparseImpl)
+    impl.use_joint_arena = True
+    impl.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=8),
+    )
+    impl.hf_config = SimpleNamespace(
+        n_routed_experts=128,
+        hidden_size=8192,
+        moe_intermediate_size=18432,
+        num_experts_per_tok=8,
+    )
+    impl.decode_max_total_q = 256
+    impl.arena_extend_max_total_q = 8192
+    impl._moe_backend_name = lambda _vllm_config: "b12x"
+
+    caps = impl._build_b12x_moe_arena_caps(
+        device=torch.device("cuda", 0),
+        dtype=torch.bfloat16,
+    )
+
+    assert caps.quant_mode == "w4a16"
+    assert captured["quant_mode"] == "w4a16"
+    assert captured["max_tokens"] == 8192
+    assert captured["core_token_counts"] == (8192, 256)
+
+
 def test_b12x_mla_rejects_non_arena_workspace(monkeypatch):
     clear_b12x_mla_workspace_cache()
     fake_mla = types.ModuleType("b12x.integration.mla")
@@ -907,8 +949,7 @@ def test_b12x_moe_prepares_w4a16_weights_when_layer_is_committed(monkeypatch):
     monkeypatch.setitem(sys.modules, "b12x", fake_b12x)
     monkeypatch.setitem(sys.modules, "b12x.integration", fake_integration)
     monkeypatch.setitem(sys.modules, "b12x.integration.tp_moe", fake_tp_moe)
-    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
-    monkeypatch.setattr(b12x_moe, "_B12X_MOE_FORCE_NVFP4", False)
+    monkeypatch.setenv("VLLM_B12X_FORCE_MOE_A16", "1")
     monkeypatch.setattr(b12x_moe, "_B12X_MOE_A16_MIN_LAYER", -1)
     monkeypatch.setattr(b12x_moe, "_B12X_MOE_A16_MAX_LAYER", -1)
     monkeypatch.setattr(b12x_moe.envs, "VLLM_B12X_MOE_DECODE_A16", False)
@@ -952,19 +993,19 @@ def test_b12x_moe_prepares_w4a16_weights_when_layer_is_committed(monkeypatch):
     assert calls["kwargs"] == {
         "activation": "silu",
         "params_dtype": torch.bfloat16,
-        "quant_mode": None,
+        "quant_mode": "w4a16",
         "source_format": "modelopt",
         "reuse_input_storage": True,
     }
 
 
 def test_b12x_moe_apply_passes_prepared_w4a16(monkeypatch):
-    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    monkeypatch.setenv("VLLM_B12X_FORCE_MOE_A16", "1")
     monkeypatch.setattr(b12x_moe, "_get_b12x_workspace_pool", lambda device: "pool")
     calls = {}
     monkeypatch.setattr(
         b12x_moe,
-        "_b12x_moe_fp4_pad_m",
+        "_run_b12x_moe_fp4",
         lambda **kwargs: calls.update(kwargs),
     )
 

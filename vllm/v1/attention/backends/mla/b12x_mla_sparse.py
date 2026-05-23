@@ -23,6 +23,7 @@ from vllm.triton_utils import tl, triton
 
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
@@ -1014,9 +1015,11 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         decode_tokens = max(1, int(self.decode_max_total_q))
         extend_tokens = max(1, int(self.arena_extend_max_total_q))
         max_tokens = max(decode_tokens, extend_tokens)
+        quant_mode = "w4a16" if envs.VLLM_B12X_FORCE_MOE_A16 else "nvfp4"
         return B12XMoEArenaCaps(
             device=device,
             dtype=dtype,
+            quant_mode=quant_mode,
             weight_E=int(weight_e),
             k=int(hidden_size),
             n=intermediate_size // tp_size,

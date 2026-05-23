@@ -58,6 +58,8 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_USE_B12X_SPARSE_INDEXER: bool = False
+    VLLM_B12X_FORCE_MOE_A16: bool = False
+    VLLM_B12X_MOE_DECODE_A16: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -929,6 +931,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_USE_B12X_SPARSE_INDEXER": lambda: bool(
         int(os.getenv("VLLM_USE_B12X_SPARSE_INDEXER", "0"))
+    ),
+    "VLLM_B12X_FORCE_MOE_A16": lambda: bool(
+        int(os.getenv("VLLM_B12X_FORCE_MOE_A16", "0"))
     ),
     # Use b12x W4A16 MoE activations for pure decode forwards while forcing
     # NVFP4 activation quantization for prefill and mixed decode/prefill.
