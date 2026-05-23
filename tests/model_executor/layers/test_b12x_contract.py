@@ -250,7 +250,9 @@ def test_b12x_mla_requires_moe_arena_caps_for_joint_arena(monkeypatch):
         )
 
 
-def test_b12x_mla_joint_moe_caps_use_w4a16_quant_mode(monkeypatch):
+def test_b12x_mla_joint_moe_caps_use_w4a16_quant_mode(
+    monkeypatch,
+):
     captured = {}
 
     class FakeMoEArenaCaps(SimpleNamespace):
@@ -290,6 +292,48 @@ def test_b12x_mla_joint_moe_caps_use_w4a16_quant_mode(monkeypatch):
     assert captured["quant_mode"] == "w4a16"
     assert captured["max_tokens"] == 8192
     assert captured["core_token_counts"] == (8192, 256)
+
+
+def test_b12x_mla_joint_moe_caps_plan_both_modes_for_decode_a16(monkeypatch):
+    captured = []
+
+    class FakeMoEArenaCaps(SimpleNamespace):
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+            super().__init__(**kwargs)
+
+    fake_b12x = types.ModuleType("b12x")
+    fake_integration = types.ModuleType("b12x.integration")
+    fake_integration.B12XMoEArenaCaps = FakeMoEArenaCaps
+    fake_b12x.integration = fake_integration
+    monkeypatch.setitem(sys.modules, "b12x", fake_b12x)
+    monkeypatch.setitem(sys.modules, "b12x.integration", fake_integration)
+    monkeypatch.setenv("VLLM_B12X_MOE_DECODE_A16", "1")
+
+    impl = object.__new__(B12xMLASparseImpl)
+    impl.use_joint_arena = True
+    impl.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=8),
+    )
+    impl.hf_config = SimpleNamespace(
+        n_routed_experts=128,
+        hidden_size=8192,
+        moe_intermediate_size=18432,
+        num_experts_per_tok=8,
+    )
+    impl.decode_max_total_q = 256
+    impl.arena_extend_max_total_q = 8192
+    impl._moe_backend_name = lambda _vllm_config: "b12x"
+
+    caps = impl._build_b12x_moe_arena_caps(
+        device=torch.device("cuda", 0),
+        dtype=torch.bfloat16,
+    )
+
+    assert tuple(cap.quant_mode for cap in caps) == ("nvfp4", "w4a16")
+    assert tuple(call["quant_mode"] for call in captured) == ("nvfp4", "w4a16")
+    assert all(call["max_tokens"] == 8192 for call in captured)
+    assert all(call["core_token_counts"] == (8192, 256) for call in captured)
 
 
 def test_b12x_mla_rejects_non_arena_workspace(monkeypatch):
@@ -665,7 +709,7 @@ def test_b12x_joint_arena_preinstall_uses_shared_lane_capacity(monkeypatch):
     assert caps_calls[0]["caps_extend_max_kv_rows"] == 202752
     assert caps_calls[0]["reserve_extend_indexer_logits"] is False
     assert caps_calls[0]["extend_indexer_tile_logits_k_rows"] == 32768
-    assert caps_calls[0]["max_chunks_per_row"] == 1
+    assert caps_calls[0]["max_chunks_per_row"] == 64
     assert contract_calls[0]["max_total_q"] == 4
     assert contract_calls[0]["max_batch"] == 4
     assert contract_calls[0]["max_paged_q_rows"] == 4
@@ -731,7 +775,7 @@ def test_b12x_joint_arena_preinstall_caps_dcp_chunks(monkeypatch):
     impl._preinstall_b12x_joint_arena()
 
     assert caps_calls[0]["num_q_heads"] == 64
-    assert caps_calls[0]["max_chunks_per_row"] == 4
+    assert caps_calls[0]["max_chunks_per_row"] == 64
 
 
 def test_b12x_joint_arena_preinstall_fails_when_required(monkeypatch):
@@ -934,25 +978,23 @@ def test_b12x_moe_decode_a16_env_keeps_prefill_nvfp4(monkeypatch):
     assert expert._select_quant_mode() == "w4a16"
 
 
-def test_b12x_moe_prepares_w4a16_weights_when_layer_is_committed(monkeypatch):
-    calls = {}
-
-    def fake_prepare(*args, **kwargs):
-        calls["args"] = args
-        calls["kwargs"] = kwargs
-        return "prepared-w4a16"
-
-    fake_b12x = types.ModuleType("b12x")
-    fake_integration = types.ModuleType("b12x.integration")
-    fake_tp_moe = types.ModuleType("b12x.integration.tp_moe")
-    fake_tp_moe.prepare_b12x_w4a16_packed_weights = fake_prepare
-    monkeypatch.setitem(sys.modules, "b12x", fake_b12x)
-    monkeypatch.setitem(sys.modules, "b12x.integration", fake_integration)
-    monkeypatch.setitem(sys.modules, "b12x.integration.tp_moe", fake_tp_moe)
+def test_b12x_moe_keeps_modelopt_weights_when_a16_is_enabled(monkeypatch):
     monkeypatch.setenv("VLLM_B12X_FORCE_MOE_A16", "1")
     monkeypatch.setattr(b12x_moe, "_B12X_MOE_A16_MIN_LAYER", -1)
     monkeypatch.setattr(b12x_moe, "_B12X_MOE_A16_MAX_LAYER", -1)
     monkeypatch.setattr(b12x_moe.envs, "VLLM_B12X_MOE_DECODE_A16", False)
+    prepared = object()
+    prepare_calls = []
+
+    def fake_prepare(**kwargs):
+        prepare_calls.append(kwargs)
+        return prepared
+
+    monkeypatch.setattr(
+        b12x_moe,
+        "_prepare_b12x_w4a16_modelopt_weights",
+        fake_prepare,
+    )
 
     w13_weight_scale_2 = torch.ones(2, 1)
     w2_weight_scale_2 = torch.ones(2)
@@ -968,8 +1010,10 @@ def test_b12x_moe_prepares_w4a16_weights_when_layer_is_committed(monkeypatch):
     )
     expert.layer_idx = 0
     expert.layer_name = "model.layers.0.mlp.experts"
-    expert.out_dtype = torch.bfloat16
-    expert._prepared_w4a16 = None
+    expert.moe_config = SimpleNamespace(
+        in_dtype=torch.bfloat16,
+        activation=b12x_moe.MoEActivation.SILU,
+    )
 
     layer = SimpleNamespace(
         w13_input_scale=torch.tensor([2.0, 4.0]),
@@ -983,23 +1027,26 @@ def test_b12x_moe_prepares_w4a16_weights_when_layer_is_committed(monkeypatch):
 
     expert.process_weights_after_loading(layer)
 
-    assert expert._prepared_w4a16 == "prepared-w4a16"
     assert torch.equal(layer.w13_weight_scale_2, torch.tensor([[2.0], [4.0]]))
     assert torch.equal(layer.w2_weight_scale_2, torch.tensor([3.0, 5.0]))
-    assert calls["args"][0] is layer.w13_weight
-    assert calls["args"][2] is layer.w13_weight_scale_2
-    assert calls["args"][4] is layer.w2_weight
-    assert calls["args"][6] is layer.w2_weight_scale_2
-    assert calls["kwargs"] == {
-        "activation": "silu",
-        "params_dtype": torch.bfloat16,
-        "quant_mode": "w4a16",
-        "source_format": "modelopt",
-        "reuse_input_storage": True,
-    }
+    assert expert._prepared_w4a16_modelopt_by_dtype == {torch.bfloat16: prepared}
+    assert prepare_calls == [
+        {
+            "w1_fp4": layer.w13_weight,
+            "w1_blockscale": expert.w1_scale,
+            "w1_alphas": expert.g1_alphas,
+            "a1_gscale": expert.a1_gscale,
+            "w2_fp4": layer.w2_weight,
+            "w2_blockscale": expert.w2_scale,
+            "w2_alphas": expert.g2_alphas,
+            "a2_gscale": expert.a2_gscale,
+            "activation": "silu",
+            "params_dtype": torch.bfloat16,
+        }
+    ]
 
 
-def test_b12x_moe_apply_passes_prepared_w4a16(monkeypatch):
+def test_b12x_moe_apply_passes_quant_mode_and_modelopt_source(monkeypatch):
     monkeypatch.setenv("VLLM_B12X_FORCE_MOE_A16", "1")
     monkeypatch.setattr(b12x_moe, "_get_b12x_workspace_pool", lambda device: "pool")
     calls = {}
@@ -1018,8 +1065,9 @@ def test_b12x_moe_apply_passes_prepared_w4a16(monkeypatch):
         a1_gscale=torch.ones(1),
         a2_gscale=torch.ones(1),
     )
-    expert._prepared_w4a16 = object()
-    expert._select_quant_mode = lambda: None
+    expert._select_quant_mode = lambda: "w4a16"
+    prepared = object()
+    expert._prepared_w4a16_modelopt_by_dtype = {torch.float32: prepared}
 
     output = torch.empty(1, 4)
     hidden_states = torch.empty(1, 4)
@@ -1044,4 +1092,6 @@ def test_b12x_moe_apply_passes_prepared_w4a16(monkeypatch):
     assert calls["workspace"] == "pool"
     assert calls["output"] is output
     assert calls["quant_mode"] == "w4a16"
-    assert calls["prepared_w4a16"] is expert._prepared_w4a16
+    assert calls["source_format"] == "modelopt"
+    assert calls["activation"] == "silu"
+    assert calls["prepared_w4a16"] is prepared

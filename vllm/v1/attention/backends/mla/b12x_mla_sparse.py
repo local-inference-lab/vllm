@@ -365,6 +365,10 @@ def _compact_page_table_valid_prefix(
 B12X_WORKSPACES: dict[tuple[object, ...], object] = {}
 B12X_ARENAS: dict[tuple[object, ...], object] = {}
 
+_B12X_MLA_DECODE_MAX_CHUNKS_PER_ROW = 64
+_B12X_MLA_EXTEND_MAX_CHUNKS_PER_ROW = 32
+_B12X_MLA_DCP_EXTEND_TMP_OUTPUT_BUDGET_BYTES = 2 * 1024 * 1024 * 1024
+
 
 def clear_b12x_mla_workspace_cache(*, clear_arenas: bool = True) -> None:
     B12X_WORKSPACES.clear()
@@ -390,11 +394,13 @@ def _get_b12x_covering_arena(
     caps_extend_max_kv_rows: int,
     reserve_extend_indexer_logits: bool,
     extend_indexer_tile_logits_k_rows: int,
+    max_chunks_per_row: int,
+    mla_max_q_chunks: int,
     use_joint_arena: bool,
     moe_backend: str,
 ):
     for key, arena in B12X_ARENAS.items():
-        if len(key) != 18:
+        if len(key) != 20:
             continue
         (
             key_device_type,
@@ -413,13 +419,18 @@ def _get_b12x_covering_arena(
             key_caps_extend_max_kv_rows,
             key_reserve_extend_indexer_logits,
             key_extend_indexer_tile_logits_k_rows,
+            key_max_chunks_per_row,
+            key_mla_max_q_chunks,
             key_use_joint_arena,
             key_moe_backend,
         ) = key
+        mode_matches = key_mode == mode or (
+            use_joint_arena and key_use_joint_arena
+        )
         if (
             key_device_type != device_type
             or key_device_index != device_index
-            or key_mode != mode
+            or not mode_matches
             or key_dtype != dtype
             or key_kv_dtype != kv_dtype
             or key_head_size != head_size
@@ -432,6 +443,8 @@ def _get_b12x_covering_arena(
             or key_caps_extend_max_kv_rows < caps_extend_max_kv_rows
             or key_use_joint_arena != use_joint_arena
             or key_moe_backend != moe_backend
+            or key_max_chunks_per_row < max_chunks_per_row
+            or key_mla_max_q_chunks < mla_max_q_chunks
         ):
             continue
         if key_num_q_heads < num_q_heads:
@@ -476,6 +489,28 @@ def _env_nonnegative_int(name: str, default: int) -> int:
         logger.warning("Ignoring negative %s=%r; using %d", name, value, default)
         return default
     return parsed
+
+
+def _default_extend_max_chunks_per_row(
+    *,
+    dcp_world_size: int,
+    arena_max_total_q: int,
+    num_q_heads: int,
+    v_head_dim: int,
+    dtype: torch.dtype,
+) -> int:
+    if int(dcp_world_size) <= 1:
+        return _B12X_MLA_EXTEND_MAX_CHUNKS_PER_ROW
+    bytes_per_chunk = (
+        max(int(arena_max_total_q), 1)
+        * max(int(num_q_heads), 1)
+        * max(int(v_head_dim), 1)
+        * torch.empty((), dtype=dtype).element_size()
+    )
+    budgeted_chunks = (
+        _B12X_MLA_DCP_EXTEND_TMP_OUTPUT_BUDGET_BYTES // max(bytes_per_chunk, 1)
+    )
+    return max(1, min(_B12X_MLA_EXTEND_MAX_CHUNKS_PER_ROW, budgeted_chunks))
 
 
 def _default_decode_q_per_req(
@@ -917,14 +952,34 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self.decode_workspace_ring = _env_int(
             "VLLM_B12X_MLA_DECODE_WORKSPACE_RING", 1
         )
-        # B12X native LSE mode currently uses the split sparse-MLA path. Keep a
-        # bounded split reserve for extend: non-DCP mirrors the sglang b12x
-        # contract so short extend/prefill does not collapse to the one-pass
-        # q x head_tiles launch, while DCP keeps a smaller cap because
-        # all-gathered heads multiply split scratch.
+        # B12X native LSE mode currently uses the split sparse-MLA path. Size
+        # the extend split reserve from the arena contract: non-DCP mirrors the
+        # sglang b12x contract, while DCP budgets split scratch after Q-head
+        # all-gather instead of requiring a launcher override.
         self.extend_max_chunks_per_row = _env_int(
             "VLLM_B12X_MLA_EXTEND_MAX_CHUNKS",
-            4 if self.dcp_world_size > 1 else 32,
+            _default_extend_max_chunks_per_row(
+                dcp_world_size=self.dcp_world_size,
+                arena_max_total_q=self.arena_extend_max_total_q,
+                num_q_heads=int(self.num_heads) * int(self.dcp_world_size),
+                v_head_dim=self.kv_lora_rank,
+                dtype=torch.bfloat16,
+            ),
+        )
+        self.decode_mla_max_q_chunks = (
+            int(self.decode_max_total_q) * _B12X_MLA_DECODE_MAX_CHUNKS_PER_ROW
+        )
+        self.extend_mla_max_q_chunks = (
+            int(self.arena_extend_max_total_q)
+            * int(self.extend_max_chunks_per_row)
+        )
+        self.arena_max_chunks_per_row = max(
+            _B12X_MLA_DECODE_MAX_CHUNKS_PER_ROW,
+            int(self.extend_max_chunks_per_row),
+        )
+        self.arena_mla_max_q_chunks = max(
+            int(self.decode_mla_max_q_chunks),
+            int(self.extend_mla_max_q_chunks),
         )
         self.extend_indexer_tile_logits_k_rows = _env_nonnegative_int(
             "VLLM_B12X_MLA_EXTEND_TOPK_SUPERTILE_K",
@@ -1015,20 +1070,30 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         decode_tokens = max(1, int(self.decode_max_total_q))
         extend_tokens = max(1, int(self.arena_extend_max_total_q))
         max_tokens = max(decode_tokens, extend_tokens)
-        quant_mode = "w4a16" if envs.VLLM_B12X_FORCE_MOE_A16 else "nvfp4"
-        return B12XMoEArenaCaps(
-            device=device,
-            dtype=dtype,
-            quant_mode=quant_mode,
-            weight_E=int(weight_e),
-            k=int(hidden_size),
-            n=intermediate_size // tp_size,
-            num_topk=int(num_topk),
-            max_tokens=max_tokens,
-            core_token_counts=(extend_tokens, decode_tokens),
-            route_num_experts=int(weight_e),
-            route_logits_dtype=dtype,
+        if envs.VLLM_B12X_FORCE_MOE_A16:
+            quant_modes = ("w4a16",)
+        elif envs.VLLM_B12X_MOE_DECODE_A16:
+            quant_modes = ("nvfp4", "w4a16")
+        else:
+            quant_modes = ("nvfp4",)
+
+        caps = tuple(
+            B12XMoEArenaCaps(
+                device=device,
+                dtype=dtype,
+                quant_mode=quant_mode,
+                weight_E=int(weight_e),
+                k=int(hidden_size),
+                n=intermediate_size // tp_size,
+                num_topk=int(num_topk),
+                max_tokens=max_tokens,
+                core_token_counts=(extend_tokens, decode_tokens),
+                route_num_experts=int(weight_e),
+                route_logits_dtype=dtype,
+            )
+            for quant_mode in quant_modes
         )
+        return caps[0] if len(caps) == 1 else caps
 
     def _build_b12x_attention_arena_caps(
         self,
@@ -1040,6 +1105,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         topk: int,
         max_page_table_width: int,
         max_chunks_per_row: int,
+        mla_max_q_chunks: int,
         caps_extend_max_total_q: int,
         caps_extend_max_batch: int,
         caps_extend_max_kv_rows: int,
@@ -1065,6 +1131,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             paged_max_batch=self.decode_max_total_q,
             page_size=64,
             max_chunks_per_row=max_chunks_per_row,
+            mla_max_q_chunks=mla_max_q_chunks,
         )
         return B12XAttentionArenaCaps(
             **kwargs,
@@ -1138,7 +1205,21 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         )
         num_q_heads = int(self.num_heads) * dcp_size
         topk = int(self.topk_indices_buffer.shape[1])
-        max_chunks_per_row = int(getattr(self, "extend_max_chunks_per_row", 64))
+        decode_max_chunks_per_row = _B12X_MLA_DECODE_MAX_CHUNKS_PER_ROW
+        arena_max_chunks_per_row = int(
+            getattr(self, "arena_max_chunks_per_row", decode_max_chunks_per_row)
+        )
+        arena_mla_max_q_chunks = int(
+            getattr(
+                self,
+                "arena_mla_max_q_chunks",
+                max(
+                    int(self.decode_max_total_q) * decode_max_chunks_per_row,
+                    int(self.arena_extend_max_total_q)
+                    * int(getattr(self, "extend_max_chunks_per_row", 1)),
+                ),
+            )
+        )
         attention_caps = self._build_b12x_attention_arena_caps(
             device=device,
             dtype=torch.bfloat16,
@@ -1146,7 +1227,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             num_q_heads=num_q_heads,
             topk=topk,
             max_page_table_width=topk,
-            max_chunks_per_row=max_chunks_per_row,
+            max_chunks_per_row=arena_max_chunks_per_row,
+            mla_max_q_chunks=arena_mla_max_q_chunks,
             caps_extend_max_total_q=self.arena_extend_max_total_q,
             caps_extend_max_batch=self.arena_extend_max_batch,
             caps_extend_max_kv_rows=self.arena_extend_max_kv_rows,
@@ -1173,6 +1255,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             self.arena_extend_max_kv_rows,
             False,
             int(getattr(self, "extend_indexer_tile_logits_k_rows", 32768)),
+            arena_max_chunks_per_row,
+            arena_mla_max_q_chunks,
             self.use_joint_arena,
             self._moe_backend_name(self.vllm_config),
         )
@@ -1197,6 +1281,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             1,
             False,
             0,
+            decode_max_chunks_per_row,
+            int(self.decode_max_total_q) * decode_max_chunks_per_row,
             self.use_joint_arena,
             self._moe_backend_name(self.vllm_config),
         )
@@ -1218,7 +1304,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             self.decode_max_total_q,
             0,
             topk,
-            64,
+            decode_max_chunks_per_row,
             self.use_arena,
             self.arena_max_running_requests,
             self.arena_extend_max_total_q,
@@ -1239,6 +1325,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 v_head_dim=self.kv_lora_rank,
                 indexer_num_q_heads=self.indexer_num_q_heads,
                 max_page_table_width=topk,
+                max_chunks_per_row=decode_max_chunks_per_row,
             )
             workspace = arena.make_workspace(
                 contract, use_cuda_graph=self.decode_use_cuda_graph
@@ -1310,25 +1397,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             else max(1, int(q.shape[0]), int(self.arena_extend_max_total_q))
         )
         topk = int(self.topk_indices_buffer.shape[1])
-        max_chunks_per_row = 64
+        max_chunks_per_row = _B12X_MLA_DECODE_MAX_CHUNKS_PER_ROW
         if mode != "decode":
-            # DCP all-gathers Q heads before the B12X call. Keeping the decode
-            # 64-way split reserve for extend would allocate Q x heads x 64 x V
-            # scratch. Use the configured extend cap instead: non-DCP defaults
-            # to a sglang-aligned 32 chunks for occupancy on short extend, while
-            # DCP defaults lower because the all-gathered head count multiplies
-            # scratch.
-            #
-            # DCP is different: the post-attention reducer needs softmax LSE
-            # from each rank. B12X's single-pass sparse MLA kernel currently
-            # returns only output; LSE is produced by the split path via
-            # workspace.tmp_lse. Use a small split-chunk cap by default in DCP
-            # so topk=2048 selects 4x512 chunks instead of falling through to
-            # single-pass with uninitialized LSE.
-            #
-            # Only cap split chunks when the installed b12x split selectors
-            # accept the cap. Older b12x builds ignore the workspace limit and
-            # then assert while applying a 64-chunk split config.
             max_chunks_per_row = int(self.extend_max_chunks_per_row)
         max_kv_rows = (
             0
@@ -1428,6 +1498,38 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 if decode_only_arena
                 else int(getattr(self, "extend_indexer_tile_logits_k_rows", 32768))
             )
+            if decode_only_arena:
+                arena_max_chunks_per_row = _B12X_MLA_DECODE_MAX_CHUNKS_PER_ROW
+                arena_mla_max_q_chunks = (
+                    int(self.decode_max_total_q) * arena_max_chunks_per_row
+                )
+            elif self.use_joint_arena:
+                arena_max_chunks_per_row = int(
+                    getattr(
+                        self,
+                        "arena_max_chunks_per_row",
+                        max(
+                            _B12X_MLA_DECODE_MAX_CHUNKS_PER_ROW,
+                            int(max_chunks_per_row),
+                        ),
+                    )
+                )
+                arena_mla_max_q_chunks = int(
+                    getattr(
+                        self,
+                        "arena_mla_max_q_chunks",
+                        max(
+                            int(self.decode_max_total_q)
+                            * _B12X_MLA_DECODE_MAX_CHUNKS_PER_ROW,
+                            int(arena_max_total_q) * int(max_chunks_per_row),
+                        ),
+                    )
+                )
+            else:
+                arena_max_chunks_per_row = int(max_chunks_per_row)
+                arena_mla_max_q_chunks = int(arena_max_total_q) * int(
+                    max_chunks_per_row
+                )
             arena_key = (
                 q.device.type,
                 q.device.index,
@@ -1445,6 +1547,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 caps_extend_max_kv_rows,
                 reserve_extend_indexer_logits,
                 extend_indexer_tile_logits_k_rows,
+                arena_max_chunks_per_row,
+                arena_mla_max_q_chunks,
                 self.use_joint_arena,
                 self._moe_backend_name(self.vllm_config),
             )
@@ -1469,6 +1573,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     extend_indexer_tile_logits_k_rows=(
                         extend_indexer_tile_logits_k_rows
                     ),
+                    max_chunks_per_row=arena_max_chunks_per_row,
+                    mla_max_q_chunks=arena_mla_max_q_chunks,
                     use_joint_arena=self.use_joint_arena,
                     moe_backend=self._moe_backend_name(self.vllm_config),
                 )
@@ -1482,7 +1588,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     num_q_heads=num_q_heads,
                     topk=topk,
                     max_page_table_width=topk,
-                    max_chunks_per_row=max_chunks_per_row,
+                    max_chunks_per_row=arena_max_chunks_per_row,
+                    mla_max_q_chunks=arena_mla_max_q_chunks,
                     caps_extend_max_total_q=caps_extend_max_total_q,
                     caps_extend_max_batch=caps_extend_max_batch,
                     caps_extend_max_kv_rows=caps_extend_max_kv_rows,
@@ -1506,6 +1613,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 v_head_dim=self.kv_lora_rank,
                 indexer_num_q_heads=self.indexer_num_q_heads,
                 max_page_table_width=max_page_table_width,
+                max_chunks_per_row=max_chunks_per_row,
             )
             workspace = arena.make_workspace(
                 contract,
