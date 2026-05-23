@@ -452,6 +452,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             num_decode_tokens == 0
             or current_platform.is_rocm()
             or current_platform.is_xpu()
+            or current_platform.is_device_capability_family(120)
         ):
             return out
         for layer_type in self._layer_types:
