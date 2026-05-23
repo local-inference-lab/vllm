@@ -194,6 +194,15 @@ def has_flashinfer_moe() -> bool:
 
 
 @functools.cache
+def has_flashinfer_sparse_mla() -> bool:
+    """Return ``True`` if FlashInfer's SM120 sparse-MLA wrapper is available."""
+    return (
+        has_flashinfer()
+        and importlib.util.find_spec("flashinfer.sparse_mla_sm120") is not None
+    )
+
+
+@functools.cache
 def has_flashinfer_cutedsl() -> bool:
     """Return ``True`` if FlashInfer cutedsl module is available."""
     return (

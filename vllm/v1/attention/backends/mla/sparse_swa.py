@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
 )
 
+
 def _compute_swa_indices_and_lens(
     *,
     swa_indices: torch.Tensor,
@@ -38,27 +39,21 @@ def _compute_swa_indices_and_lens(
     token_offset: int,
     num_tokens: int,
 ) -> None:
-    """Compute per-token paged SWA slot IDs + window lengths.
+    """Compute per-token paged SWA slot IDs + window lengths."""
+    from flashinfer import compute_swa_indices_and_lens
 
-    Delegates to flash_mla_sm120's CUDA implementation (a 1:1 port of the
-    Triton kernel that previously lived in this file). The CUDA version
-    avoids the JIT-during-inference compilation suspected to participate
-    in an intermittent IMA on sm120.
-    """
-    import flash_mla_sm120.cuda as _flash_mla_cuda
-
-    _flash_mla_cuda.compute_swa_indices_and_lens(
-        swa_indices=swa_indices,
-        swa_lens=swa_lens,
-        window_size=window_size,
-        query_start_loc=query_start_loc,
-        seq_lens=seq_lens,
-        token_to_req_indices=token_to_req_indices,
-        is_valid_token=is_valid_token,
-        block_table=block_table,
-        block_size=block_size,
-        token_offset=token_offset,
-        num_tokens=num_tokens,
+    compute_swa_indices_and_lens(
+        swa_indices,
+        swa_lens,
+        window_size,
+        query_start_loc,
+        seq_lens,
+        token_to_req_indices,
+        is_valid_token,
+        block_table,
+        block_size,
+        token_offset,
+        num_tokens,
     )
 
 
@@ -197,8 +192,10 @@ class DeepseekSparseSWAMetadata:
     decode_swa_indices: torch.Tensor | None = None  # [num_decode_tokens, window_size]
     decode_swa_lens: torch.Tensor | None = None  # [num_decode_tokens]
     # Paged-coordinate prefill SWA indices/lens (FP8 paged-direct prefill).
-    prefill_swa_indices: torch.Tensor | None = None  # [num_prefill_tokens, 1, window_size]
-    prefill_swa_lens: torch.Tensor | None = None    # [num_prefill_tokens]
+    prefill_swa_indices: torch.Tensor | None = (
+        None  # [num_prefill_tokens, 1, window_size]
+    )
+    prefill_swa_lens: torch.Tensor | None = None  # [num_prefill_tokens]
 
     # Number of decode/prefill requests/tokens (batch is reordered: decodes first)
     num_decodes: int = 0
@@ -413,11 +410,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
             prefill_swa_indices=(
                 self.prefill_swa_indices[:num_prefill_tokens]
-                if num_prefill_tokens > 0 else None
+                if num_prefill_tokens > 0
+                else None
             ),
             prefill_swa_lens=(
                 self.prefill_swa_lens[:num_prefill_tokens]
-                if num_prefill_tokens > 0 else None
+                if num_prefill_tokens > 0
+                else None
             ),
             block_size=self.block_size,
             num_decodes=num_decodes,

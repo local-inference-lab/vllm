@@ -53,6 +53,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
+from vllm.utils.flashinfer import has_flashinfer_sparse_mla
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
@@ -66,16 +67,18 @@ from vllm.v1.attention.backends.mla.indexer import (
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
-from vllm.v1.attention.ops.flashmla import (
-    BatchSparseMLAPagedAttentionWrapper,
-    flash_mla_sparse_fwd_supports_fp8_kv,
-)
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 if TYPE_CHECKING:
     from vllm.models.deepseek_v4.nvidia.flashmla import (
         DeepseekV4SparseMLAAttentionImpl,
     )
+
+_flashinfer_sparse_mla_AVAILABLE = (
+    current_platform.is_cuda()
+    and current_platform.is_device_capability_family(120)
+    and has_flashinfer_sparse_mla()
+)
 
 logger = init_logger(__name__)
 
@@ -107,8 +110,7 @@ def _supported_padded_heads(num_heads: int) -> int:
     if num_heads <= 128:
         return 128
     raise ValueError(
-        f"DeepseekV4 attention does not support {num_heads} heads "
-        "(must be <= 128)."
+        f"DeepseekV4 attention does not support {num_heads} heads (must be <= 128)."
     )
 
 
@@ -646,7 +648,6 @@ direct_register_custom_op(
 
 
 class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
-
     def __init__(
         self,
         num_heads: int,
@@ -712,13 +713,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
         self.max_model_len = vllm_config.model_config.max_model_len
 
-        # SM120 sparse-MLA fast path: pre-allocate the flashinfer
-        # ``BatchSparseMLAPagedAttentionWrapper`` (workspace + LSE buffer)
-        # once per layer so DeepseekV4SM120SparseImpl can dispatch through
-        # it without per-step setup. On non-SM120 platforms the wrapper
-        # stub raises at __init__, so gate on the capability flag.
-        self._sparse_mla_wrapper: BatchSparseMLAPagedAttentionWrapper | None
-        if flash_mla_sparse_fwd_supports_fp8_kv:
+        if _flashinfer_sparse_mla_AVAILABLE:
+            from flashinfer import BatchSparseMLAPagedAttentionWrapper
+
             self._sparse_mla_wrapper = BatchSparseMLAPagedAttentionWrapper(
                 max_num_tokens=self.max_num_batched_tokens,
                 max_num_heads=self.padded_heads,
