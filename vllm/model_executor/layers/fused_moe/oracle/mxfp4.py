@@ -710,15 +710,49 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
     """Convert loaded weights into backend-specific kernel format."""
 
     if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
+        # Pack UE8M0 scales into the int32 layout DeepGEMM's SM100/SM120
+        # kernels consume directly. The fp32 legacy layout is 4× larger and
+        # spills ~13 GiB/rank on DSv4-Flash's 256-expert MoE.
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             _upcast_e8m0_to_fp32,
         )
+        from vllm.utils.deep_gemm import transform_sf_into_required_layout
+
+        num_experts = w13_weight.shape[0]
+        intermediate_size_2 = w13_weight.shape[1]      # = intermediate*2
+        hidden_size = w13_weight.shape[2] * 2          # weight is FP4-packed
+        intermediate_size = w2_weight.shape[2] * 2     # weight is FP4-packed
+        block_n, block_k = 1, 32                       # MXFP4 block (per-row, K=32)
+
+        def _pack(ws_e8m0: torch.Tensor, mn: int, k: int) -> torch.Tensor:
+            ws_fp32 = _upcast_e8m0_to_fp32(ws_e8m0)
+            packed = transform_sf_into_required_layout(
+                sf=ws_fp32,
+                mn=mn,
+                k=k,
+                recipe=(1, block_n, block_k),
+                num_groups=num_experts,
+                is_sfa=False,
+            )
+            logger.warning(
+                "[DEEPGEMM_MXFP4 SF pack] ue8m0=%s/%s (%.1f MB) fp32=(%.1f MB) "
+                "packed=%s/%s (%.1f MB) reserved=%.1fGiB allocated=%.1fGiB",
+                tuple(ws_e8m0.shape), ws_e8m0.dtype,
+                ws_e8m0.numel() * ws_e8m0.element_size() / 1e6,
+                ws_fp32.numel() * ws_fp32.element_size() / 1e6,
+                tuple(packed.shape), packed.dtype,
+                packed.numel() * packed.element_size() / 1e6,
+                torch.cuda.memory_reserved() / 1e9,
+                torch.cuda.memory_allocated() / 1e9,
+            )
+            del ws_fp32
+            return packed
 
         return (
             w13_weight.data,
             w2_weight.data,
-            _upcast_e8m0_to_fp32(w13_weight_scale.data),
-            _upcast_e8m0_to_fp32(w2_weight_scale.data),
+            _pack(w13_weight_scale.data, intermediate_size_2, hidden_size),
+            _pack(w2_weight_scale.data, hidden_size, intermediate_size),
             w13_bias,
             w2_bias,
         )
@@ -1253,17 +1287,37 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     """
 
     if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
+        # Pack UE8M0 scales into the int32 layout (see DEEPGEMM_MXFP4 branch
+        # above for the rationale).
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             _upcast_e8m0_to_fp32,
         )
+        from vllm.utils.deep_gemm import transform_sf_into_required_layout
 
-        # Weights stay as uint8 packed FP4 — no layout change needed.
-        # Convert E8M0 uint8 scales to float32.
+        num_experts = w13_weight.shape[0]
+        intermediate_size_2 = w13_weight.shape[1]  # = intermediate*2
+        hidden_size = w13_weight.shape[2] * 2      # FP4-packed
+        intermediate_size = w2_weight.shape[2] * 2 # FP4-packed
+        block_n, block_k = 1, 32                   # MXFP4 SF block
+
+        def _pack(ws_e8m0: torch.Tensor, mn: int, k: int) -> torch.Tensor:
+            ws_fp32 = _upcast_e8m0_to_fp32(ws_e8m0)
+            packed = transform_sf_into_required_layout(
+                sf=ws_fp32,
+                mn=mn,
+                k=k,
+                recipe=(1, block_n, block_k),
+                num_groups=num_experts,
+                is_sfa=False,
+            )
+            del ws_fp32
+            return packed
+
         return (
             w13_weight.data,
             w2_weight.data,
-            _upcast_e8m0_to_fp32(w13_weight_scale.data),
-            _upcast_e8m0_to_fp32(w2_weight_scale.data),
+            _pack(w13_weight_scale.data, intermediate_size_2, hidden_size),
+            _pack(w2_weight_scale.data, hidden_size, intermediate_size),
             w13_bias,
             w2_bias,
         )

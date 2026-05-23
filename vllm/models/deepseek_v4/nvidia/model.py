@@ -860,9 +860,15 @@ class DeepseekV4Attention(nn.Module):
         self.eps = config.rms_norm_eps
         self.max_position_embeddings = config.max_position_embeddings
 
-        # Padded to min 64 heads for FlashMLA, initialized to -inf
-        # (no sink effect). Weight loading fills the first n_local_heads slots.
-        padded_heads = max(self.n_local_heads, 64)
+        # Padded to next FlashMLA-supported head count ({16, 32, 64, 128}),
+        # initialized to -inf so padded slots contribute no sink effect.
+        # Must match DeepseekV4MLAAttention.padded_heads (capability-gated:
+        # SM120 supports the finer 16/32/64/128 matrix; other arch use
+        # FlashMLA's 64/128).
+        from vllm.models.deepseek_v4.nvidia.ops.attention import (
+            _supported_padded_heads,
+        )
+        padded_heads = _supported_padded_heads(self.n_local_heads)
         self.attn_sink = nn.Parameter(
             torch.full((padded_heads,), -float("inf"), dtype=torch.float32),
             requires_grad=False,

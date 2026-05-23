@@ -392,10 +392,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 num_heads=self.num_heads,
             )
 
-        # FlashMLA Sparse Attention fp8 backend uses "fp8_ds_mla" kv-cache format
-        # Automatically convert fp8 kv-cache format to "fp8_ds_mla"
+        # FlashMLA Sparse + SPARSE_MLA_SM120 sparse-MLA backends use the
+        # "fp8_ds_mla" kv-cache format. Automatically convert plain fp8 to
+        # fp8_ds_mla when one of these backends is selected.
         if (
-            self.attn_backend.get_name() == "FLASHMLA_SPARSE"
+            self.attn_backend.get_name() in ("FLASHMLA_SPARSE", "SPARSE_MLA_SM120")
             and is_quantized_kv_cache(kv_cache_dtype)
             and kv_cache_dtype != "fp8_ds_mla"
         ):

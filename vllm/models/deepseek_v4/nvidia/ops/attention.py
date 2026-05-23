@@ -66,6 +66,10 @@ from vllm.v1.attention.backends.mla.indexer import (
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.attention.ops.flashmla import (
+    BatchSparseMLAPagedAttentionWrapper,
+    flash_mla_sparse_fwd_supports_fp8_kv,
+)
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 if TYPE_CHECKING:
@@ -76,6 +80,38 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _supported_padded_heads(num_heads: int) -> int:
+    """Round ``num_heads`` up to the next padded count supported by the
+    platform's sparse-MLA kernel.
+
+    The flashinfer SM120 ``BatchSparseMLAPagedAttentionWrapper`` accepts
+    ``num_heads ∈ {8, 16, 32, 64, 128}`` natively — small-TP shards on
+    DSv4-Flash (e.g. TP=8 → 16 heads/rank) stay at their native count.
+    Hopper FlashMLA + ROCm aiter sparse only support 64 / 128, so on
+    those paths smaller shards still pad up to 64.
+
+    Must be called consistently by the layer, the outer attention wrapper,
+    and the model-side ``attn_sink`` allocation, otherwise the kernel
+    sees mismatched ``num_heads`` between ``q`` (padded) and ``attn_sink``
+    (un-padded).
+    """
+    cap = current_platform.get_device_capability()
+    sm120 = cap is not None and cap.major == 12
+    if sm120:
+        if num_heads <= 16:
+            return 16
+        if num_heads <= 32:
+            return 32
+    if num_heads <= 64:
+        return 64
+    if num_heads <= 128:
+        return 128
+    raise ValueError(
+        f"DeepseekV4 attention does not support {num_heads} heads "
+        "(must be <= 128)."
+    )
+
+
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
     """Pick the platform-specific V4 sparse MLA impl class. Sole platform check."""
     if current_platform.is_rocm():
@@ -84,6 +120,16 @@ def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
         )
 
         return DeepseekV4ROCMAiterMLASparseImpl
+    # Consumer Blackwell (SM120) drives sparse-MLA through the flashinfer
+    # ``BatchSparseMLAPagedAttentionWrapper`` SM120 fast path; SM 9/10 stay
+    # on the Hopper FlashMLA sparse impl.
+    cap = current_platform.get_device_capability()
+    if cap is not None and cap.major == 12:
+        from vllm.models.deepseek_v4.nvidia.sm120 import (
+            DeepseekV4SM120SparseImpl,
+        )
+
+        return DeepseekV4SM120SparseImpl
     from vllm.models.deepseek_v4.nvidia.flashmla import (
         DeepseekV4FlashMLASparseImpl,
     )
@@ -156,17 +202,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.head_dim = head_dim
         self.scale = scale
 
-        # FlashMLA sparse kernel only supports 64 or 128 heads; pad up to the
-        # next supported size. Must match DeepseekV4MLAAttention.padded_heads.
-        if num_heads <= 64:
-            self.padded_heads = 64
-        elif num_heads <= 128:
-            self.padded_heads = 128
-        else:
-            raise ValueError(
-                f"DeepseekV4 attention does not support {num_heads} heads "
-                "(must be <= 128)."
-            )
+        # Must match DeepseekV4MLAAttention.padded_heads and the model-side
+        # ``attn_sink`` allocation. SM120 supports a finer matrix; other
+        # arch pads up to 64/128.
+        self.padded_heads = _supported_padded_heads(num_heads)
 
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
@@ -607,8 +646,6 @@ direct_register_custom_op(
 
 
 class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
-    # FlashMLA FP8 sparse only supports 64 or 128 heads
-    SUPPORTED_HEAD_COUNTS = (64, 128)
 
     def __init__(
         self,
@@ -655,19 +692,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-        # Determine padded head count for FlashMLA
-        if num_heads not in self.SUPPORTED_HEAD_COUNTS:
-            if num_heads < 64:
-                self.padded_heads = 64
-            elif num_heads < 128:
-                self.padded_heads = 128
-            else:
-                raise ValueError(
-                    f"DeepseekV4MLAAttention does not support {num_heads} heads. "
-                    f"Supported: <= 128 (will be padded to 64 or 128)"
-                )
-        else:
-            self.padded_heads = num_heads
+        # Must match DeepseekV4MultiHeadLatentAttentionWrapper.padded_heads
+        # and the model-side attn_sink size; gated on capability so Hopper /
+        # SM10 / ROCm don't accidentally drive their FlashMLA / aiter
+        # kernels with an unsupported small head count.
+        self.padded_heads = _supported_padded_heads(num_heads)
 
         # Store attention sink
         assert attn_sink is not None
@@ -682,6 +711,22 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+
+        # SM120 sparse-MLA fast path: pre-allocate the flashinfer
+        # ``BatchSparseMLAPagedAttentionWrapper`` (workspace + LSE buffer)
+        # once per layer so DeepseekV4SM120SparseImpl can dispatch through
+        # it without per-step setup. On non-SM120 platforms the wrapper
+        # stub raises at __init__, so gate on the capability flag.
+        self._sparse_mla_wrapper: BatchSparseMLAPagedAttentionWrapper | None
+        if flash_mla_sparse_fwd_supports_fp8_kv:
+            self._sparse_mla_wrapper = BatchSparseMLAPagedAttentionWrapper(
+                max_num_tokens=self.max_num_batched_tokens,
+                max_num_heads=self.padded_heads,
+                d_v=512,
+            )
+        else:
+            self._sparse_mla_wrapper = None
+
         # DeepseekV4 only supports fp8 kv-cache format for now.
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
 
