@@ -1112,7 +1112,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         reserve_extend_indexer_logits: bool,
         extend_indexer_tile_logits_k_rows: int,
     ):
-        from b12x.integration.mla import B12XAttentionArenaCaps
+        from b12x.attention.workspace import B12XAttentionArenaCaps
 
         kwargs = dict(
             device=device,
@@ -1140,7 +1140,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         )
 
     def _allocate_b12x_attention_arena(self, attention_caps, moe_caps):
-        from b12x.integration.mla import B12XAttentionArena
+        from b12x.attention.workspace import B12XAttentionArena
 
         if self.use_joint_arena:
             try:
@@ -1190,7 +1190,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         if getattr(self, "_b12x_joint_arena_preinstalled", False):
             return
 
-        from b12x.integration.mla import B12XAttentionWorkspaceContract
+        from b12x.attention.workspace import B12XAttentionWorkspaceContract
 
         device = torch.device("cuda", torch.cuda.current_device())
         dcp_size = max(
@@ -1376,7 +1376,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         page_table_width: int | None = None,
         layer_key: str | None = None,
     ):
-        from b12x.integration.mla import (
+        from b12x.attention.workspace import (
             B12XAttentionArenaCaps,
             B12XAttentionWorkspaceContract,
         )

@@ -291,7 +291,7 @@ def _get_b12x_indexer_workspace(
     max_num_reqs: int,
     max_model_len: int,
 ):
-    from b12x.integration.mla import (
+    from b12x.attention.workspace import (
         B12XAttentionArena,
         B12XAttentionArenaCaps,
         B12XAttentionWorkspaceContract,
@@ -371,7 +371,7 @@ def _get_b12x_indexer_phantoms(
     """Build (and cache) phantom tensors for stable NSA-indexer host-launcher
     cache keys (#87 — Path C).
 
-    Without phantoms, ``sparse_nsa_index_decode_logits_paged()`` keys its
+    Without phantoms, ``paged_decode_logits()`` keys its
     compiled-kernel cache by the actual q_fp8 / page_table / etc. shapes,
     so every cudagraph capture-size variant (1, 4, 8, ...) and every
     eager-mode batch size triggers a fresh CUTLASS compile (~5-15 min
@@ -380,16 +380,16 @@ def _get_b12x_indexer_phantoms(
     watchdog.
 
     With phantoms (zero-strided base tensors registered as the contract
-    via ``make_nsa_indexer_contract_phantoms``), the cache key is fixed
+    via ``make_indexer_contract_phantoms``), the cache key is fixed
     to the (max_q_rows, num_heads, max_pages, page_size) tuple — all
     capture sizes ≤ max_q_rows hit the same compiled kernel. The phantom
     tensors are tiny (zero-stride views of `torch.empty(1, ...)`), so
     the cache footprint is negligible.
 
-    See `b12x.attention.nsa_indexer.api.make_nsa_indexer_contract_phantoms`
+    See `b12x.attention.indexer.api.make_indexer_contract_phantoms`
     docstring: "avoid CUTLASS recompilation when batch size varies".
     """
-    from b12x.integration.nsa_indexer import make_nsa_indexer_contract_phantoms
+    from b12x.integration.indexer import make_indexer_contract_phantoms
 
     page_size = int(index_k_cache.shape[1])
     max_page_table_width = max(1, (int(max_model_len) + page_size - 1) // page_size)
@@ -411,7 +411,7 @@ def _get_b12x_indexer_phantoms(
     phantoms = _B12X_INDEXER_PHANTOMS.get(key)
     if phantoms is not None:
         return phantoms
-    phantoms = make_nsa_indexer_contract_phantoms(
+    phantoms = make_indexer_contract_phantoms(
         max_q_rows=max_q_rows,
         num_heads=indexer_num_q_heads,
         max_pages=max_page_table_width,
@@ -432,7 +432,7 @@ def _get_b12x_indexer_extend_workspace(
     total_seq_lens: int,
     head_dim: int,
 ):
-    from b12x.integration.mla import (
+    from b12x.attention.workspace import (
         B12XAttentionArena,
         B12XAttentionArenaCaps,
         B12XAttentionWorkspaceContract,
@@ -444,11 +444,11 @@ def _get_b12x_indexer_extend_workspace(
     indexer_num_q_heads = int(q_fp8.shape[1])
     v_head_dim = 512
     extend_topk_supertile_k = _B12X_EXTEND_TOPK_SUPERTILE_K
-    from b12x.attention.nsa_indexer import (
-        resolve_sparse_nsa_extend_prefill_block_k,
+    from b12x.attention.indexer import (
+        resolve_extend_prefill_block_k,
     )
 
-    prefill_block_k = resolve_sparse_nsa_extend_prefill_block_k(
+    prefill_block_k = resolve_extend_prefill_block_k(
         valid_q_rows=q_rows,
         k_rows=k_rows,
         num_heads=indexer_num_q_heads,
@@ -616,9 +616,9 @@ def sparse_attn_indexer(
         # Get the full shared workspace buffers once (will allocate on first use)
         workspace_manager = current_workspace_manager()
         use_b12x_indexer = _use_b12x_sparse_indexer()
-        b12x_nsa_indexer = None
+        b12x_indexer = None
         if use_b12x_indexer:
-            from b12x.integration import nsa_indexer as b12x_nsa_indexer
+            from b12x.integration import indexer as b12x_indexer
 
         if not use_b12x_indexer:
             k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(
@@ -694,7 +694,7 @@ def sparse_attn_indexer(
                 else k_fp8
             )
             if use_b12x_indexer:
-                assert b12x_nsa_indexer is not None
+                assert b12x_indexer is not None
                 row_has_no_kv = chunk.cu_seqlen_ke <= chunk.cu_seqlen_ks
                 # DCP can give a rank no local KV for early global query rows.
                 # b12x tiled top-k expects a non-empty range, so score a dummy
@@ -710,12 +710,12 @@ def sparse_attn_indexer(
                     chunk.cu_seqlen_ke,
                 )
                 topk_indices.copy_(
-                    b12x_nsa_indexer.sparse_nsa_index_extend_tiled_topk(
+                    b12x_indexer.extend_tiled_topk(
                         q_fp8=q_chunk,
                         weights=weights_chunk,
                         kv_fp8=(k_fp8_b12x, k_scale_f32),
                         metadata=(
-                            b12x_nsa_indexer.NSAIndexerExtendLogitsMetadata(
+                            b12x_indexer.IndexerExtendMetadata(
                                 k_start=b12x_cu_seqlen_ks,
                                 k_end=b12x_cu_seqlen_ke,
                             )
@@ -796,9 +796,9 @@ def sparse_attn_indexer(
             and b12x_seq_lens.dim() == 1
         )
         if b12x_decode_supported:
-            from b12x.integration.nsa_indexer import (
-                NSAIndexerPagedDecodeMetadata,
-                sparse_nsa_index_decode_logits_paged,
+            from b12x.integration.indexer import (
+                IndexerPagedDecodeMetadata,
+                paged_decode_logits,
             )
 
             seq_lens = b12x_seq_lens[:num_decode_tokens].contiguous()
@@ -819,11 +819,11 @@ def sparse_attn_indexer(
                 max_num_reqs=attn_metadata_narrowed.num_reqs,
                 max_model_len=max_model_len,
             )
-            logits = sparse_nsa_index_decode_logits_paged(
+            logits = paged_decode_logits(
                 q_fp8=q_fp8[:num_decode_tokens],
                 weights=weights[:num_decode_tokens],
                 index_k_cache=index_k_cache,
-                metadata=NSAIndexerPagedDecodeMetadata(
+                metadata=IndexerPagedDecodeMetadata(
                     real_page_table=block_table,
                     cache_seqlens_int32=seq_lens,
                     paged_mqa_schedule_metadata=decode_metadata.schedule_metadata,

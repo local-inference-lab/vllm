@@ -7233,8 +7233,8 @@ class GPUModelRunner(
                 from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
                     _mask_page_table_after_nsa_len,
                 )
-                from b12x.integration.nsa_indexer import (
-                    get_paged_mqa_logits_metadata as b12x_get_metadata,
+                from b12x.integration.indexer import (
+                    build_paged_mqa_schedule_metadata as b12x_get_metadata,
                 )
 
                 block_kv = int(self.vllm_config.cache_config.block_size or 64)

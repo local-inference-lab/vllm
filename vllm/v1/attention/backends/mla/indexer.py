@@ -16,7 +16,7 @@ from vllm.model_executor.layers.b12x_contract import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
-    get_paged_mqa_logits_metadata,
+    build_paged_mqa_schedule_metadata,
     has_deep_gemm,
 )
 from vllm.utils.math_utils import cdiv
@@ -1185,8 +1185,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # compatible scheduler for the active b12x sparse indexer path.
             if _use_b12x_sparse_indexer_for_config(self.vllm_config):
                 try:
-                    from b12x.integration.nsa_indexer import (
-                        get_paged_mqa_logits_metadata as b12x_get_metadata,
+                    from b12x.integration.indexer import (
+                        build_paged_mqa_schedule_metadata as b12x_get_metadata,
                     )
 
                     b12x_sched_seq_lens = (
@@ -1212,7 +1212,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 sched_seq_lens = (
                     seq_lens if seq_lens.dim() == 2 else seq_lens.unsqueeze(-1)
                 )
-                self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
+                self.scheduler_metadata_buffer[:] = build_paged_mqa_schedule_metadata(
                     sched_seq_lens,
                     self.kv_cache_spec.block_size,
                     self.num_sms,
