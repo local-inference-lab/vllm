@@ -16,7 +16,7 @@ from typing import Any
 import torch
 
 import vllm.envs as envs
-from vllm.config import CUDAGraphMode, get_current_vllm_config_or_none
+from vllm.config import get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.b12x_contract import (
@@ -36,6 +36,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
 )
+from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -113,7 +114,7 @@ def _b12x_activation_name(activation: MoEActivation) -> str:
     return activation.value
 
 
-def _prepare_b12x_w4a16_modelopt_weights(
+def _prepare_b12x_w4a16_modelopt_nvfp4_weights(
     *,
     w1_fp4: torch.Tensor,
     w1_blockscale: torch.Tensor,
@@ -126,9 +127,9 @@ def _prepare_b12x_w4a16_modelopt_weights(
     activation: str,
     params_dtype: torch.dtype,
 ):
-    from b12x.integration import prepare_b12x_w4a16_modelopt_weights
+    from b12x.integration import prepare_b12x_w4a16_modelopt_nvfp4_weights
 
-    return prepare_b12x_w4a16_modelopt_weights(
+    return prepare_b12x_w4a16_modelopt_nvfp4_weights(
         w1_fp4,
         w1_blockscale,
         w1_alphas,
@@ -139,8 +140,44 @@ def _prepare_b12x_w4a16_modelopt_weights(
         a2_gscale,
         activation=activation,
         params_dtype=params_dtype,
-        source_format="modelopt",
+        source_format="modelopt_nvfp4",
+        reuse_input_storage=True,
     )
+
+
+def _replace_scale_parameter_with_empty(
+    layer: torch.nn.Module,
+    param_name: str,
+) -> torch.Tensor | None:
+    param = getattr(layer, param_name, None)
+    if not isinstance(param, torch.Tensor):
+        return None
+    empty = torch.empty((0,), dtype=param.dtype, device=param.device)
+    replace_parameter(layer, param_name, empty)
+    return getattr(layer, param_name)
+
+
+def _set_quant_config_weight_scale(
+    quant_config: FusedMoEQuantConfig,
+    weight_name: str,
+    scale: torch.Tensor,
+) -> None:
+    desc = getattr(quant_config, weight_name, None)
+    if desc is not None and hasattr(desc, "scale"):
+        desc.scale = scale
+        return
+
+    public_name = "w1_scale" if weight_name == "_w1" else "w2_scale"
+    if hasattr(quant_config, public_name):
+        setattr(quant_config, public_name, scale)
+
+
+def _maybe_release_cuda_cache(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    torch.cuda.empty_cache()
 
 
 def _get_b12x_workspace_pool(device: torch.device):
@@ -205,56 +242,6 @@ def _b12x_env_force_moe_a16() -> bool:
     return envs.VLLM_B12X_FORCE_MOE_A16
 
 
-def _iter_attn_metadata(attn_metadata: Any):
-    if isinstance(attn_metadata, dict):
-        yield from attn_metadata.values()
-        return
-    if isinstance(attn_metadata, list):
-        for item in attn_metadata:
-            yield from _iter_attn_metadata(item)
-        return
-    if attn_metadata is not None:
-        yield attn_metadata
-
-
-def _current_forward_is_decode_only() -> bool:
-    if not is_forward_context_available():
-        return False
-
-    forward_context = get_forward_context()
-    batch_descriptor = getattr(forward_context, "batch_descriptor", None)
-    if (
-        getattr(
-            forward_context,
-            "cudagraph_runtime_mode",
-            CUDAGraphMode.NONE,
-        )
-        != CUDAGraphMode.NONE
-        and batch_descriptor is not None
-        and batch_descriptor.uniform
-    ):
-        return True
-
-    saw_decode = False
-    for metadata in _iter_attn_metadata(forward_context.attn_metadata):
-        num_prefills = getattr(metadata, "num_prefills", None)
-        num_decodes = getattr(metadata, "num_decodes", None)
-        if num_prefills is not None or num_decodes is not None:
-            if int(num_prefills or 0) > 0:
-                return False
-            saw_decode = saw_decode or int(num_decodes or 0) > 0
-            continue
-
-        max_query_len = getattr(metadata, "max_query_len", None)
-        if max_query_len is None:
-            continue
-        if int(max_query_len) > 1:
-            return False
-        saw_decode = True
-
-    return saw_decode
-
-
 # ---------------------------------------------------------------------------
 # Expert implementation
 # ---------------------------------------------------------------------------
@@ -307,7 +294,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self.layer_name = moe_config.layer_name
         self.layer_idx = moe_config.layer_idx
         self._warned_global_a16 = False
-        self._prepared_w4a16_modelopt_by_dtype: dict[torch.dtype, Any] = {}
+        self._prepared_w4a16_modelopt_nvfp4_by_dtype: dict[torch.dtype, Any] = {}
+        self._released_w4a16_modelopt_source_scales = False
 
     # ------------------------------------------------------------------
     # process_weights_after_loading: fuse input scales into g{1,2}_alphas
@@ -328,18 +316,20 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             layer.w13_weight_scale_2.data.mul_(w13_input_scale)
             layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
 
-        if self._should_prepare_w4a16_modelopt_weights():
+        if self._should_prepare_w4a16_modelopt_nvfp4_weights():
             moe_config = getattr(self, "moe_config", None)
             params_dtype = getattr(moe_config, "in_dtype", torch.bfloat16)
             activation = getattr(layer, "activation", None)
             if activation is None:
                 activation = getattr(moe_config, "activation", MoEActivation.SILU)
-            self._get_or_prepare_w4a16_modelopt_weights(
+            self._get_or_prepare_w4a16_modelopt_nvfp4_weights(
                 w1=layer.w13_weight,
                 w2=layer.w2_weight,
                 activation=activation,
                 params_dtype=params_dtype,
             )
+            self._release_w4a16_modelopt_source_scales(layer)
+            _maybe_release_cuda_cache(layer.w13_weight.device)
 
     # ------------------------------------------------------------------
     # Static capabilities
@@ -403,20 +393,15 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         """Return the explicit b12x quant_mode override for this layer.
 
         ``"nvfp4"`` is the normal A4 path.
-        Passing ``"w4a16"`` asks b12x to use its W4A16 path while keeping the
-        modelopt checkpoint tensors owned by vLLM in their normal NVFP4 layout.
-        Passing ``"nvfp4"`` is used only for layer-gated or prefill/mixed
-        forwards cases that intentionally stay on NVFP4.
+        Passing ``"w4a16"`` asks b12x to use its W4A16 path. Selected layers
+        repack the ModelOpt NVFP4 checkpoint tensors into b12x's W4A16 layout.
+        Passing ``"nvfp4"`` is used only for layer-gated cases that
+        intentionally stay on NVFP4.
 
         W4A16 bypasses NVFP4 activation quant/dequant. The optional layer gate
         lets us keep selected layers on NVFP4 while isolating A16 numerics to a
         specific layer range during GLM-5.1 quality/debug runs.
         """
-        if envs.VLLM_B12X_MOE_DECODE_A16:
-            if _current_forward_is_decode_only():
-                return "w4a16"
-            return "nvfp4"
-
         if _B12X_MOE_A16_MIN_LAYER >= 0 and _b12x_env_force_moe_a16():
             if self.layer_idx is None:
                 logger.warning_once(
@@ -451,9 +436,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             return "w4a16"
         return "nvfp4"
 
-    def _should_prepare_w4a16_modelopt_weights(self) -> bool:
-        if envs.VLLM_B12X_MOE_DECODE_A16:
-            return True
+    def _should_prepare_w4a16_modelopt_nvfp4_weights(self) -> bool:
         if not _b12x_env_force_moe_a16():
             return False
         if self.layer_idx is None:
@@ -470,7 +453,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             return False
         return True
 
-    def _get_or_prepare_w4a16_modelopt_weights(
+    def _get_or_prepare_w4a16_modelopt_nvfp4_weights(
         self,
         *,
         w1: torch.Tensor,
@@ -479,11 +462,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         params_dtype: torch.dtype,
     ):
         prepared_by_dtype = getattr(
-            self, "_prepared_w4a16_modelopt_by_dtype", None
+            self, "_prepared_w4a16_modelopt_nvfp4_by_dtype", None
         )
         if prepared_by_dtype is None:
             prepared_by_dtype = {}
-            self._prepared_w4a16_modelopt_by_dtype = prepared_by_dtype
+            self._prepared_w4a16_modelopt_nvfp4_by_dtype = prepared_by_dtype
 
         prepared = prepared_by_dtype.get(params_dtype)
         if prepared is not None:
@@ -491,7 +474,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 
         if w1.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "B12X W4A16 modelopt weights were not prepared before CUDA "
+                "B12X W4A16 ModelOpt NVFP4 weights were not prepared before CUDA "
                 f"graph capture for dtype {params_dtype}."
             )
         assert self.w1_scale is not None and self.w2_scale is not None, (
@@ -504,7 +487,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             "a1_gscale and a2_gscale must not be None for B12xExperts"
         )
 
-        prepared = _prepare_b12x_w4a16_modelopt_weights(
+        prepared = _prepare_b12x_w4a16_modelopt_nvfp4_weights(
             w1_fp4=w1,
             w1_blockscale=self.w1_scale,
             w1_alphas=self.g1_alphas,
@@ -518,6 +501,28 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
         prepared_by_dtype[params_dtype] = prepared
         return prepared
+
+    def _release_w4a16_modelopt_source_scales(
+        self,
+        layer: torch.nn.Module,
+    ) -> None:
+        if getattr(self, "_released_w4a16_modelopt_source_scales", False):
+            return
+
+        w1_scale = _replace_scale_parameter_with_empty(
+            layer,
+            "w13_weight_scale",
+        )
+        w2_scale = _replace_scale_parameter_with_empty(
+            layer,
+            "w2_weight_scale",
+        )
+        if w1_scale is not None:
+            _set_quant_config_weight_scale(self.quant_config, "_w1", w1_scale)
+        if w2_scale is not None:
+            _set_quant_config_weight_scale(self.quant_config, "_w2", w2_scale)
+
+        self._released_w4a16_modelopt_source_scales = True
 
     # ------------------------------------------------------------------
     # workspace_shapes
@@ -576,7 +581,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         quant_mode = self._select_quant_mode()
         prepared_w4a16 = None
         if quant_mode == "w4a16":
-            prepared_w4a16 = self._get_or_prepare_w4a16_modelopt_weights(
+            prepared_w4a16 = self._get_or_prepare_w4a16_modelopt_nvfp4_weights(
                 w1=w1,
                 w2=w2,
                 activation=activation,
@@ -606,7 +611,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             input_scales_static=True,
             activation=_b12x_activation_name(activation),
             quant_mode=quant_mode,
-            source_format="modelopt",
+            source_format="modelopt_nvfp4",
             prepared_w4a16=prepared_w4a16,
         )
 

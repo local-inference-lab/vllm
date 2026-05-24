@@ -1072,8 +1072,6 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         max_tokens = max(decode_tokens, extend_tokens)
         if envs.VLLM_B12X_FORCE_MOE_A16:
             quant_modes = ("w4a16",)
-        elif envs.VLLM_B12X_MOE_DECODE_A16:
-            quant_modes = ("nvfp4", "w4a16")
         else:
             quant_modes = ("nvfp4",)
 
@@ -1346,7 +1344,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
     ) -> None:
         if getattr(workspace, "tmp_lse", None) is None:
             return
-        from b12x.attention.mla.split import (
+        from b12x.attention.workspace import (
             forced_sparse_mla_split_decode_config_for_width,
         )
 

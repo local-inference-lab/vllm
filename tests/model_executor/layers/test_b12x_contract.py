@@ -18,6 +18,7 @@ from vllm.model_executor.layers.b12x_contract import (
     b12x_sparse_mla_active_for_config,
 )
 from vllm.model_executor.layers.fused_moe import b12x_moe
+from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.b12x_moe import B12xExperts
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
@@ -30,6 +31,22 @@ from vllm.v1.attention.backends.mla.indexer import (
     _align_block_table_max_num_blocks,
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+
+def _install_fake_b12x_workspace(monkeypatch, fake_b12x=None, **attrs):
+    fake_b12x = fake_b12x or types.ModuleType("b12x")
+    fake_b12x.__path__ = []
+    fake_attention = types.ModuleType("b12x.attention")
+    fake_attention.__path__ = []
+    fake_workspace = types.ModuleType("b12x.attention.workspace")
+    for name, value in attrs.items():
+        setattr(fake_workspace, name, value)
+    fake_attention.workspace = fake_workspace
+    fake_b12x.attention = fake_attention
+    monkeypatch.setitem(sys.modules, "b12x", fake_b12x)
+    monkeypatch.setitem(sys.modules, "b12x.attention", fake_attention)
+    monkeypatch.setitem(sys.modules, "b12x.attention.workspace", fake_workspace)
+    return fake_workspace
 
 
 def test_b12x_backend_active_for_sparse_mla_attention():
@@ -195,7 +212,6 @@ def test_b12x_moe_requires_shared_arena_api_when_sparse_mla_is_active(
 def test_b12x_mla_requires_joint_attention_arena(monkeypatch):
     fake_b12x = types.ModuleType("b12x")
     fake_integration = types.ModuleType("b12x.integration")
-    fake_mla = types.ModuleType("b12x.integration.mla")
 
     class FakeAttentionArena:
 
@@ -211,14 +227,17 @@ def test_b12x_mla_requires_joint_attention_arena(monkeypatch):
     def fail_to_create_lane(_spec):
         raise RuntimeError("no shared lane")
 
-    fake_mla.B12XAttentionArena = FakeAttentionArena
+    _install_fake_b12x_workspace(
+        monkeypatch,
+        fake_b12x,
+        B12XAttentionArena=FakeAttentionArena,
+    )
     fake_integration.B12XJointArenaSpec = FakeJointArenaSpec
     fake_integration.ensure_b12x_execution_lane_arena = fail_to_create_lane
     fake_b12x.integration = fake_integration
 
     monkeypatch.setitem(sys.modules, "b12x", fake_b12x)
     monkeypatch.setitem(sys.modules, "b12x.integration", fake_integration)
-    monkeypatch.setitem(sys.modules, "b12x.integration.mla", fake_mla)
 
     impl = object.__new__(B12xMLASparseImpl)
     impl.use_joint_arena = True
@@ -294,51 +313,8 @@ def test_b12x_mla_joint_moe_caps_use_w4a16_quant_mode(
     assert captured["core_token_counts"] == (8192, 256)
 
 
-def test_b12x_mla_joint_moe_caps_plan_both_modes_for_decode_a16(monkeypatch):
-    captured = []
-
-    class FakeMoEArenaCaps(SimpleNamespace):
-        def __init__(self, **kwargs):
-            captured.append(kwargs)
-            super().__init__(**kwargs)
-
-    fake_b12x = types.ModuleType("b12x")
-    fake_integration = types.ModuleType("b12x.integration")
-    fake_integration.B12XMoEArenaCaps = FakeMoEArenaCaps
-    fake_b12x.integration = fake_integration
-    monkeypatch.setitem(sys.modules, "b12x", fake_b12x)
-    monkeypatch.setitem(sys.modules, "b12x.integration", fake_integration)
-    monkeypatch.setenv("VLLM_B12X_MOE_DECODE_A16", "1")
-
-    impl = object.__new__(B12xMLASparseImpl)
-    impl.use_joint_arena = True
-    impl.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(tensor_parallel_size=8),
-    )
-    impl.hf_config = SimpleNamespace(
-        n_routed_experts=128,
-        hidden_size=8192,
-        moe_intermediate_size=18432,
-        num_experts_per_tok=8,
-    )
-    impl.decode_max_total_q = 256
-    impl.arena_extend_max_total_q = 8192
-    impl._moe_backend_name = lambda _vllm_config: "b12x"
-
-    caps = impl._build_b12x_moe_arena_caps(
-        device=torch.device("cuda", 0),
-        dtype=torch.bfloat16,
-    )
-
-    assert tuple(cap.quant_mode for cap in caps) == ("nvfp4", "w4a16")
-    assert tuple(call["quant_mode"] for call in captured) == ("nvfp4", "w4a16")
-    assert all(call["max_tokens"] == 8192 for call in captured)
-    assert all(call["core_token_counts"] == (8192, 256) for call in captured)
-
-
 def test_b12x_mla_rejects_non_arena_workspace(monkeypatch):
     clear_b12x_mla_workspace_cache()
-    fake_mla = types.ModuleType("b12x.integration.mla")
 
     class FakeAttentionArenaCaps:
         pass
@@ -346,10 +322,11 @@ def test_b12x_mla_rejects_non_arena_workspace(monkeypatch):
     class FakeWorkspaceContract:
         pass
 
-    fake_mla.B12XAttentionArenaCaps = FakeAttentionArenaCaps
-    fake_mla.B12XAttentionWorkspaceContract = FakeWorkspaceContract
-
-    monkeypatch.setitem(sys.modules, "b12x.integration.mla", fake_mla)
+    _install_fake_b12x_workspace(
+        monkeypatch,
+        B12XAttentionArenaCaps=FakeAttentionArenaCaps,
+        B12XAttentionWorkspaceContract=FakeWorkspaceContract,
+    )
 
     impl = object.__new__(B12xMLASparseImpl)
     impl.use_arena = False
@@ -478,7 +455,6 @@ def test_b12x_mla_extend_uses_attention_arena(monkeypatch):
     clear_b12x_mla_workspace_cache()
     fake_b12x = types.ModuleType("b12x")
     fake_integration = types.ModuleType("b12x.integration")
-    fake_mla = types.ModuleType("b12x.integration.mla")
     caps_calls = []
     make_workspace_calls = []
 
@@ -511,14 +487,17 @@ def test_b12x_mla_extend_uses_attention_arena(monkeypatch):
         def allocate(_attention_caps):
             return FakeArena()
 
-    fake_mla.B12XAttentionArena = FakeAttentionArena
-    fake_mla.B12XAttentionArenaCaps = FakeAttentionArenaCaps
-    fake_mla.B12XAttentionWorkspace = FakeWorkspace
-    fake_mla.B12XAttentionWorkspaceContract = FakeWorkspaceContract
+    _install_fake_b12x_workspace(
+        monkeypatch,
+        fake_b12x,
+        B12XAttentionArena=FakeAttentionArena,
+        B12XAttentionArenaCaps=FakeAttentionArenaCaps,
+        B12XAttentionWorkspace=FakeWorkspace,
+        B12XAttentionWorkspaceContract=FakeWorkspaceContract,
+    )
 
     monkeypatch.setitem(sys.modules, "b12x", fake_b12x)
     monkeypatch.setitem(sys.modules, "b12x.integration", fake_integration)
-    monkeypatch.setitem(sys.modules, "b12x.integration.mla", fake_mla)
 
     impl = object.__new__(B12xMLASparseImpl)
     impl.use_arena = True
@@ -561,7 +540,6 @@ def test_b12x_mla_decode_arena_sizes_mtp_rows(monkeypatch):
     clear_b12x_mla_workspace_cache()
     fake_b12x = types.ModuleType("b12x")
     fake_integration = types.ModuleType("b12x.integration")
-    fake_mla = types.ModuleType("b12x.integration.mla")
     caps_calls = []
     contract_calls = []
 
@@ -595,14 +573,17 @@ def test_b12x_mla_decode_arena_sizes_mtp_rows(monkeypatch):
         def allocate(_attention_caps):
             return FakeArena()
 
-    fake_mla.B12XAttentionArena = FakeAttentionArena
-    fake_mla.B12XAttentionArenaCaps = FakeAttentionArenaCaps
-    fake_mla.B12XAttentionWorkspace = FakeWorkspace
-    fake_mla.B12XAttentionWorkspaceContract = FakeWorkspaceContract
+    _install_fake_b12x_workspace(
+        monkeypatch,
+        fake_b12x,
+        B12XAttentionArena=FakeAttentionArena,
+        B12XAttentionArenaCaps=FakeAttentionArenaCaps,
+        B12XAttentionWorkspace=FakeWorkspace,
+        B12XAttentionWorkspaceContract=FakeWorkspaceContract,
+    )
 
     monkeypatch.setitem(sys.modules, "b12x", fake_b12x)
     monkeypatch.setitem(sys.modules, "b12x.integration", fake_integration)
-    monkeypatch.setitem(sys.modules, "b12x.integration.mla", fake_mla)
 
     impl = object.__new__(B12xMLASparseImpl)
     impl.use_arena = True
@@ -645,7 +626,6 @@ def test_b12x_mla_decode_arena_sizes_mtp_rows(monkeypatch):
 
 def test_b12x_joint_arena_preinstall_uses_shared_lane_capacity(monkeypatch):
     clear_b12x_mla_workspace_cache()
-    fake_mla = types.ModuleType("b12x.integration.mla")
     caps_calls = []
     contract_calls = []
 
@@ -661,8 +641,10 @@ def test_b12x_joint_arena_preinstall_uses_shared_lane_capacity(monkeypatch):
             assert use_cuda_graph
             return SimpleNamespace(contract=contract)
 
-    fake_mla.B12XAttentionWorkspaceContract = FakeWorkspaceContract
-    monkeypatch.setitem(sys.modules, "b12x.integration.mla", fake_mla)
+    _install_fake_b12x_workspace(
+        monkeypatch,
+        B12XAttentionWorkspaceContract=FakeWorkspaceContract,
+    )
     monkeypatch.setattr(
         b12x_mla_sparse.current_platform,
         "is_cuda",
@@ -717,7 +699,6 @@ def test_b12x_joint_arena_preinstall_uses_shared_lane_capacity(monkeypatch):
 
 def test_b12x_joint_arena_preinstall_caps_dcp_chunks(monkeypatch):
     clear_b12x_mla_workspace_cache()
-    fake_mla = types.ModuleType("b12x.integration.mla")
     caps_calls = []
 
     class FakeWorkspaceContract:
@@ -731,8 +712,10 @@ def test_b12x_joint_arena_preinstall_caps_dcp_chunks(monkeypatch):
             assert use_cuda_graph
             return SimpleNamespace(contract=contract)
 
-    fake_mla.B12XAttentionWorkspaceContract = FakeWorkspaceContract
-    monkeypatch.setitem(sys.modules, "b12x.integration.mla", fake_mla)
+    _install_fake_b12x_workspace(
+        monkeypatch,
+        B12XAttentionWorkspaceContract=FakeWorkspaceContract,
+    )
     monkeypatch.setattr(
         b12x_mla_sparse.current_platform,
         "is_cuda",
@@ -780,15 +763,16 @@ def test_b12x_joint_arena_preinstall_caps_dcp_chunks(monkeypatch):
 
 def test_b12x_joint_arena_preinstall_fails_when_required(monkeypatch):
     clear_b12x_mla_workspace_cache()
-    fake_mla = types.ModuleType("b12x.integration.mla")
 
     class FakeWorkspaceContract:
 
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
-    fake_mla.B12XAttentionWorkspaceContract = FakeWorkspaceContract
-    monkeypatch.setitem(sys.modules, "b12x.integration.mla", fake_mla)
+    _install_fake_b12x_workspace(
+        monkeypatch,
+        B12XAttentionWorkspaceContract=FakeWorkspaceContract,
+    )
     monkeypatch.setattr(
         b12x_mla_sparse.current_platform,
         "is_cuda",
@@ -935,54 +919,10 @@ def test_b12x_moe_rejects_ep_all2all_and_eplb(parallel_config):
     assert not B12xExperts._supports_parallel_config(parallel_config)
 
 
-def test_b12x_moe_decode_a16_env_keeps_prefill_nvfp4(monkeypatch):
-    expert = object.__new__(B12xExperts)
-    expert.layer_idx = 0
-    expert.layer_name = "model.layers.0.mlp.experts"
-    expert._warned_global_a16 = False
-
-    monkeypatch.setenv("VLLM_B12X_MOE_DECODE_A16", "1")
-    monkeypatch.setattr(b12x_moe, "is_forward_context_available", lambda: True)
-
-    def set_metadata(attn_metadata):
-        monkeypatch.setattr(
-            b12x_moe,
-            "get_forward_context",
-            lambda: SimpleNamespace(attn_metadata=attn_metadata),
-        )
-
-    set_metadata(
-        {"model.layers.0.self_attn": SimpleNamespace(num_prefills=0, num_decodes=4)}
-    )
-    assert expert._select_quant_mode() == "w4a16"
-
-    set_metadata(
-        {"model.layers.0.self_attn": SimpleNamespace(num_prefills=1, num_decodes=0)}
-    )
-    assert expert._select_quant_mode() == "nvfp4"
-
-    set_metadata(
-        {"model.layers.0.self_attn": SimpleNamespace(num_prefills=1, num_decodes=4)}
-    )
-    assert expert._select_quant_mode() == "nvfp4"
-
-    monkeypatch.setattr(
-        b12x_moe,
-        "get_forward_context",
-        lambda: SimpleNamespace(
-            attn_metadata=None,
-            cudagraph_runtime_mode=b12x_moe.CUDAGraphMode.PIECEWISE,
-            batch_descriptor=SimpleNamespace(uniform=True),
-        ),
-    )
-    assert expert._select_quant_mode() == "w4a16"
-
-
-def test_b12x_moe_keeps_modelopt_weights_when_a16_is_enabled(monkeypatch):
+def test_b12x_moe_prepares_modelopt_nvfp4_weights_when_a16_is_enabled(monkeypatch):
     monkeypatch.setenv("VLLM_B12X_FORCE_MOE_A16", "1")
     monkeypatch.setattr(b12x_moe, "_B12X_MOE_A16_MIN_LAYER", -1)
     monkeypatch.setattr(b12x_moe, "_B12X_MOE_A16_MAX_LAYER", -1)
-    monkeypatch.setattr(b12x_moe.envs, "VLLM_B12X_MOE_DECODE_A16", False)
     prepared = object()
     prepare_calls = []
 
@@ -992,7 +932,7 @@ def test_b12x_moe_keeps_modelopt_weights_when_a16_is_enabled(monkeypatch):
 
     monkeypatch.setattr(
         b12x_moe,
-        "_prepare_b12x_w4a16_modelopt_weights",
+        "_prepare_b12x_w4a16_modelopt_nvfp4_weights",
         fake_prepare,
     )
 
@@ -1029,7 +969,9 @@ def test_b12x_moe_keeps_modelopt_weights_when_a16_is_enabled(monkeypatch):
 
     assert torch.equal(layer.w13_weight_scale_2, torch.tensor([[2.0], [4.0]]))
     assert torch.equal(layer.w2_weight_scale_2, torch.tensor([3.0, 5.0]))
-    assert expert._prepared_w4a16_modelopt_by_dtype == {torch.bfloat16: prepared}
+    assert expert._prepared_w4a16_modelopt_nvfp4_by_dtype == {
+        torch.bfloat16: prepared
+    }
     assert prepare_calls == [
         {
             "w1_fp4": layer.w13_weight,
@@ -1046,7 +988,105 @@ def test_b12x_moe_keeps_modelopt_weights_when_a16_is_enabled(monkeypatch):
     ]
 
 
-def test_b12x_moe_apply_passes_quant_mode_and_modelopt_source(monkeypatch):
+def test_b12x_moe_a16_preparation_releases_source_block_scales(monkeypatch):
+    monkeypatch.setenv("VLLM_B12X_FORCE_MOE_A16", "1")
+    monkeypatch.setattr(b12x_moe, "_B12X_MOE_A16_MIN_LAYER", -1)
+    monkeypatch.setattr(b12x_moe, "_B12X_MOE_A16_MAX_LAYER", -1)
+    prepared = object()
+    prepare_calls = []
+
+    def fake_prepare(**kwargs):
+        prepare_calls.append(kwargs)
+        return prepared
+
+    monkeypatch.setattr(
+        b12x_moe,
+        "_prepare_b12x_w4a16_modelopt_nvfp4_weights",
+        fake_prepare,
+    )
+
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.empty(2, 4, 4, dtype=torch.uint8)
+    layer.w2_weight = torch.empty(2, 4, 4, dtype=torch.uint8)
+    layer.w13_input_scale = torch.ones(2)
+    layer.w2_input_scale = torch.ones(2)
+    layer.w13_weight_scale_2 = torch.ones(2, 1)
+    layer.w2_weight_scale_2 = torch.ones(2)
+    layer.activation = b12x_moe.MoEActivation.SILU
+    layer.register_parameter(
+        "w13_weight_scale",
+        torch.nn.Parameter(torch.ones(2, 4, 4), requires_grad=False),
+    )
+    layer.register_parameter(
+        "w2_weight_scale",
+        torch.nn.Parameter(torch.ones(2, 4, 4), requires_grad=False),
+    )
+
+    expert = object.__new__(B12xExperts)
+    expert.quant_config = FusedMoEQuantConfig.make(
+        quant_dtype="nvfp4",
+        weight_dtype="nvfp4",
+        w1_scale=layer.w13_weight_scale,
+        w2_scale=layer.w2_weight_scale,
+        g1_alphas=layer.w13_weight_scale_2,
+        g2_alphas=layer.w2_weight_scale_2,
+        a1_gscale=torch.ones(2),
+        a2_gscale=torch.ones(2),
+    )
+    expert.layer_idx = 0
+    expert.layer_name = "model.layers.0.mlp.experts"
+    expert.moe_config = SimpleNamespace(
+        in_dtype=torch.bfloat16,
+        activation=b12x_moe.MoEActivation.SILU,
+    )
+
+    expert.process_weights_after_loading(layer)
+
+    assert prepare_calls[0]["w1_blockscale"].numel() == 32
+    assert prepare_calls[0]["w2_blockscale"].numel() == 32
+    assert layer.w13_weight_scale.numel() == 0
+    assert layer.w2_weight_scale.numel() == 0
+    assert expert.w1_scale.numel() == 0
+    assert expert.w2_scale.numel() == 0
+    assert expert._prepared_w4a16_modelopt_nvfp4_by_dtype == {
+        torch.bfloat16: prepared
+    }
+
+
+def test_b12x_moe_w4a16_prepare_calls_modelopt_nvfp4_api(monkeypatch):
+    fake_b12x = types.ModuleType("b12x")
+    fake_integration = types.ModuleType("b12x.integration")
+    calls = {}
+
+    def fake_prepare(*args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return "prepared"
+
+    fake_integration.prepare_b12x_w4a16_modelopt_nvfp4_weights = fake_prepare
+    fake_b12x.integration = fake_integration
+    monkeypatch.setitem(sys.modules, "b12x", fake_b12x)
+    monkeypatch.setitem(sys.modules, "b12x.integration", fake_integration)
+
+    result = b12x_moe._prepare_b12x_w4a16_modelopt_nvfp4_weights(
+        w1_fp4=torch.empty(1, 4, 2, dtype=torch.uint8),
+        w1_blockscale=torch.ones(1),
+        w1_alphas=torch.ones(1),
+        a1_gscale=torch.ones(1),
+        w2_fp4=torch.empty(1, 4, 2, dtype=torch.uint8),
+        w2_blockscale=torch.ones(1),
+        w2_alphas=torch.ones(1),
+        a2_gscale=torch.ones(1),
+        activation="silu",
+        params_dtype=torch.bfloat16,
+    )
+
+    assert result == "prepared"
+    assert calls["kwargs"]["source_format"] == "modelopt_nvfp4"
+    assert calls["kwargs"]["reuse_input_storage"] is True
+
+
+def test_b12x_moe_apply_passes_quant_mode_and_modelopt_nvfp4_source(monkeypatch):
     monkeypatch.setenv("VLLM_B12X_FORCE_MOE_A16", "1")
     monkeypatch.setattr(b12x_moe, "_get_b12x_workspace_pool", lambda device: "pool")
     calls = {}
@@ -1067,7 +1107,7 @@ def test_b12x_moe_apply_passes_quant_mode_and_modelopt_source(monkeypatch):
     )
     expert._select_quant_mode = lambda: "w4a16"
     prepared = object()
-    expert._prepared_w4a16_modelopt_by_dtype = {torch.float32: prepared}
+    expert._prepared_w4a16_modelopt_nvfp4_by_dtype = {torch.float32: prepared}
 
     output = torch.empty(1, 4)
     hidden_states = torch.empty(1, 4)
@@ -1092,6 +1132,6 @@ def test_b12x_moe_apply_passes_quant_mode_and_modelopt_source(monkeypatch):
     assert calls["workspace"] == "pool"
     assert calls["output"] is output
     assert calls["quant_mode"] == "w4a16"
-    assert calls["source_format"] == "modelopt"
+    assert calls["source_format"] == "modelopt_nvfp4"
     assert calls["activation"] == "silu"
     assert calls["prepared_w4a16"] is prepared
