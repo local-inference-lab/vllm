@@ -216,18 +216,40 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
         assert query_start_loc_cpu is not None
         prefill_token_base = query_start_loc_cpu[num_decodes]
 
-        topk_indices: torch.Tensor | None
+        local_topk_indices: torch.Tensor | None
         if swa_only:
-            topk_indices = None
+            local_topk_indices = None
         elif layer.compress_ratio == 4:
             assert layer.topk_indices_buffer is not None
-            topk_indices = layer.topk_indices_buffer[
+            local_topk_indices = layer.topk_indices_buffer[
                 num_decode_tokens : num_decode_tokens + num_prefill_tokens
             ]
         else:
             # C128A: pre-computed during metadata build.
             assert attn_metadata is not None
-            topk_indices = attn_metadata.c128a_prefill_topk_indices
+            local_topk_indices = attn_metadata.c128a_prefill_topk_indices
+
+        extra_topk_indices: torch.Tensor | None = None
+        extra_topk_lens: torch.Tensor | None = None
+        if local_topk_indices is not None:
+            assert attn_metadata is not None
+            assert swa_metadata.token_to_req_indices is not None
+            assert swa_metadata.is_valid_token is not None
+            prefill_token_slice = slice(
+                num_decode_tokens, num_decode_tokens + num_prefill_tokens
+            )
+            # FlashInfer prefill expects physical KV slots; keep padding rows
+            # masked through the metadata validity mask.
+            block_size = attn_metadata.block_size // layer.compress_ratio
+            extra_topk_indices, extra_topk_lens = (
+                compute_global_topk_indices_and_lens(
+                    local_topk_indices,
+                    swa_metadata.token_to_req_indices[prefill_token_slice],
+                    attn_metadata.block_table,
+                    block_size,
+                    swa_metadata.is_valid_token[prefill_token_slice],
+                )
+            )
 
         assert swa_metadata.prefill_swa_indices is not None
         assert swa_metadata.prefill_swa_lens is not None
@@ -255,8 +277,13 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
             )
 
             extra_indices_chunk = (
-                topk_indices[query_start:query_end]
-                if topk_indices is not None
+                extra_topk_indices[query_start:query_end]
+                if extra_topk_indices is not None
+                else None
+            )
+            extra_topk_length_chunk = (
+                extra_topk_lens[query_start:query_end]
+                if extra_topk_lens is not None
                 else None
             )
 
@@ -270,4 +297,5 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 attn_sink=layer.attn_sink,
                 extra_kv_cache=extra_kv_paged,
                 extra_indices=extra_indices_chunk,
+                extra_topk_length=extra_topk_length_chunk,
             )
