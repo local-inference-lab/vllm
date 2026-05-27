@@ -7,13 +7,13 @@ forward path is driven by flashinfer's :class:`BatchSparseMLAPagedAttention
 Wrapper` — the same wrapper used by the V32-family SPARSE_MLA_SM120 backend —
 which auto-dispatches decode (num_tokens <= 64) and prefill internally and
 accepts the SWA + compressed-indexer dual cache through its ``extra_kv_cache``
-parameter.
+parameter. Decode scratch is borrowed from vLLM's shared workspace so large
+C128A contexts do not allocate per-layer split-K buffers.
 
 Selected by ``_select_v4_sparse_impl()`` in :mod:`vllm.models.deepseek_v4
 .nvidia.ops.attention` when the runtime compute capability is SM120; the
 flashinfer wrapper itself lives on the layer (``layer._sparse_mla_wrapper``)
-so it can be allocated once per layer at construction time and reused
-across forward calls.
+only for its reusable LSE buffer; split-K decode scratch is supplied per call.
 """
 
 from typing import TYPE_CHECKING, ClassVar, cast
@@ -30,10 +30,53 @@ from vllm.models.deepseek_v4.nvidia.flashmla import (
 )
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadata
+from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.models.deepseek_v4.nvidia.ops.attention import DeepseekV4MLAAttention
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+
+_DECODE_MAX_TOKENS = 64
+_DECODE_SPLIT_TILE = 64
+_C128A_TOPK_ALIGNMENT = 128
+
+
+def _cdiv(x: int, y: int) -> int:
+    return (int(x) + int(y) - 1) // int(y)
+
+
+def _decode_num_splits(topk: int, extra_topk: int = 0) -> int:
+    return _cdiv(topk, _DECODE_SPLIT_TILE) + _cdiv(extra_topk, _DECODE_SPLIT_TILE)
+
+
+def _max_decode_workspace_tokens(max_num_batched_tokens: int) -> int:
+    return min(int(max_num_batched_tokens), _DECODE_MAX_TOKENS)
+
+
+def _c128a_max_compressed(max_model_len: int, compress_ratio: int) -> int:
+    return (
+        _cdiv(
+            _cdiv(max_model_len, compress_ratio),
+            _C128A_TOPK_ALIGNMENT,
+        )
+        * _C128A_TOPK_ALIGNMENT
+    )
+
+
+def _get_decode_scratch(
+    num_tokens: int,
+    num_heads: int,
+    d_v: int,
+    topk: int,
+    extra_topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_splits = _decode_num_splits(topk, extra_topk)
+    mid_out, mid_lse = current_workspace_manager().get_simultaneous(
+        ((num_tokens, num_heads, num_splits, d_v), torch.bfloat16),
+        ((num_tokens, num_heads, num_splits), torch.float32),
+    )
+    return mid_out, mid_lse
 
 
 class DeepseekV4SM120SparseBackend(DeepseekV4FlashMLASparseBackend):
@@ -79,9 +122,7 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
-            # Warmup dummy run before metadata is built — flashinfer wrapper
-            # carries its own pre-allocated workspace, so there's nothing
-            # additional to reserve here.
+            cls._reserve_decode_workspace(layer)
             output.zero_()
             return
 
@@ -127,6 +168,31 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
             )
 
     @classmethod
+    def _reserve_decode_workspace(cls, layer: "DeepseekV4MLAAttention") -> None:
+        if layer.compress_ratio <= 1:
+            extra_topk = 0
+        elif layer.compress_ratio == 4:
+            assert layer.topk_indices_buffer is not None
+            extra_topk = layer.topk_indices_buffer.shape[-1]
+        elif layer.compress_ratio == 128:
+            extra_topk = _c128a_max_compressed(
+                layer.max_model_len,
+                layer.compress_ratio,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported compress_ratio={layer.compress_ratio}; "
+                "expected 1, 4, or 128."
+            )
+        _get_decode_scratch(
+            _max_decode_workspace_tokens(layer.max_num_batched_tokens),
+            layer.padded_heads,
+            512,
+            layer.window_size,
+            extra_topk,
+        )
+
+    @classmethod
     def _forward_decode(
         cls,
         layer: "DeepseekV4MLAAttention",
@@ -165,6 +231,16 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
 
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
+        assert swa_indices is not None
+        assert swa_lens is not None
+        extra_topk = topk_indices.shape[-1] if topk_indices is not None else 0
+        mid_out, mid_lse = _get_decode_scratch(
+            num_decode_tokens,
+            q.shape[1],
+            output.shape[-1],
+            swa_indices.shape[-1],
+            extra_topk,
+        )
 
         # Treat queries in the same seq as independent queries (attended
         # purely by the generated indices). q arrives pre-padded to
@@ -189,6 +265,8 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
             extra_kv_cache=kv_cache if not swa_only else None,
             extra_indices=topk_indices,
             extra_topk_length=topk_lens,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
         )
 
     @classmethod
@@ -241,14 +319,12 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
             # FlashInfer prefill expects physical KV slots; keep padding rows
             # masked through the metadata validity mask.
             block_size = attn_metadata.block_size // layer.compress_ratio
-            extra_topk_indices, extra_topk_lens = (
-                compute_global_topk_indices_and_lens(
-                    local_topk_indices,
-                    swa_metadata.token_to_req_indices[prefill_token_slice],
-                    attn_metadata.block_table,
-                    block_size,
-                    swa_metadata.is_valid_token[prefill_token_slice],
-                )
+            extra_topk_indices, extra_topk_lens = compute_global_topk_indices_and_lens(
+                local_topk_indices,
+                swa_metadata.token_to_req_indices[prefill_token_slice],
+                attn_metadata.block_table,
+                block_size,
+                swa_metadata.is_valid_token[prefill_token_slice],
             )
 
         assert swa_metadata.prefill_swa_indices is not None
@@ -257,9 +333,11 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
 
         # unsqueeze(-2) adds the h_kv=1 axis without copying.
         swa_kv_paged = swa_k_cache.unsqueeze(-2)
-        extra_kv_paged = (
-            compressed_k_cache.unsqueeze(-2) if not swa_only else None
-        )
+        if swa_only:
+            extra_kv_paged = None
+        else:
+            assert compressed_k_cache is not None
+            extra_kv_paged = compressed_k_cache.unsqueeze(-2)
 
         num_chunks = (
             num_prefills + cls.PREFILL_CHUNK_SIZE - 1
@@ -268,12 +346,10 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
             chunk_start = chunk_idx * cls.PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + cls.PREFILL_CHUNK_SIZE, num_prefills)
             query_start = (
-                query_start_loc_cpu[num_decodes + chunk_start]
-                - prefill_token_base
+                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
             )
             query_end = (
-                query_start_loc_cpu[num_decodes + chunk_end]
-                - prefill_token_base
+                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
             extra_indices_chunk = (

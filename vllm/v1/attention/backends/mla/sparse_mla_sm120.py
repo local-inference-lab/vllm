@@ -12,7 +12,7 @@ INLINE: 512 NoPE + 16 scales + 128 RoPE), head_size = 576, paged block_size =
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import numpy as np
 import torch
@@ -37,13 +37,38 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
-from vllm.v1.attention.backends.utils import KVCacheLayoutType
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
 logger = init_logger(__name__)
+
+_DECODE_MAX_TOKENS = 64
+_DECODE_SPLIT_TILE = 64
+
+
+def _cdiv(x: int, y: int) -> int:
+    return (int(x) + int(y) - 1) // int(y)
+
+
+def _max_decode_workspace_tokens(max_num_batched_tokens: int) -> int:
+    return min(int(max_num_batched_tokens), _DECODE_MAX_TOKENS)
+
+
+def _get_decode_scratch(
+    num_tokens: int,
+    num_heads: int,
+    d_v: int,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_splits = _cdiv(topk, _DECODE_SPLIT_TILE)
+    mid_out, mid_lse = current_workspace_manager().get_simultaneous(
+        ((num_tokens, num_heads, num_splits, d_v), torch.bfloat16),
+        ((num_tokens, num_heads, num_splits), torch.float32),
+    )
+    return mid_out, mid_lse
 
 
 class SparseMLASm120Backend(AttentionBackend):
@@ -269,10 +294,9 @@ class SparseMLASm120Impl(SparseMLAAttentionImpl[SparseMLASm120Metadata]):
         )
         self.topk_indices_buffer: torch.Tensor | None = indexer.topk_indices_buffer
 
-        # BatchSparseMLAPagedAttentionWrapper is sized by max_num_batched_tokens
-        # and the per-rank head count. Construction allocates the V32 decode
-        # workspace + LSE buffer once and reuses them across calls (cudagraph
-        # friendly).
+        # BatchSparseMLAPagedAttentionWrapper owns only the reusable LSE buffer.
+        # Decode split-K scratch is borrowed from vLLM's shared workspace per
+        # call, so it is not multiplied by the number of layers.
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
@@ -281,6 +305,13 @@ class SparseMLASm120Impl(SparseMLAAttentionImpl[SparseMLASm120Metadata]):
             max_num_tokens=max_tokens,
             max_num_heads=num_heads,
             d_v=self.kv_lora_rank,  # latent V dim (= 512 for V32 family)
+        )
+        assert self.topk_indices_buffer is not None
+        _get_decode_scratch(
+            _max_decode_workspace_tokens(max_tokens),
+            num_heads,
+            self.kv_lora_rank,
+            self.topk_indices_buffer.shape[-1],
         )
 
         # Q is passed pre-quantized to fp8 only when the kernel asks for it;
@@ -307,12 +338,15 @@ class SparseMLASm120Impl(SparseMLAAttentionImpl[SparseMLASm120Metadata]):
 
         # Per-request indices → global cache slots. Matches the conversion in
         # FlashMLASparseImpl / FlashInferMLASparseImpl exactly.
-        topk_indices_physical = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token[:num_actual_toks],
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
+        topk_indices_physical = cast(
+            torch.Tensor,
+            triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token[:num_actual_toks],
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+            ),
         )
 
         output = q.new_empty(
@@ -327,11 +361,23 @@ class SparseMLASm120Impl(SparseMLAAttentionImpl[SparseMLASm120Metadata]):
         # form (singleton kv-head dim) matching the FlashMLA convention.
         kv_cache_4d = kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(-2)
 
+        mid_out = None
+        mid_lse = None
+        if num_actual_toks <= _DECODE_MAX_TOKENS:
+            mid_out, mid_lse = _get_decode_scratch(
+                num_actual_toks,
+                self.num_heads,
+                self.kv_lora_rank,
+                topk_indices_physical.shape[-1],
+            )
+
         self._wrapper.run(
             q=q,
             kv_cache=kv_cache_4d,
             indices=topk_indices_physical,
             output=output,
             sm_scale=self.scale,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
         )
         return output, None
