@@ -11,7 +11,7 @@ parameter. Decode scratch is borrowed from vLLM's shared workspace so large
 C128A contexts do not allocate per-layer split-K buffers.
 
 Selected by ``_select_v4_sparse_impl()`` in :mod:`vllm.models.deepseek_v4
-.nvidia.ops.attention` when the runtime compute capability is SM120; the
+.attention` when the runtime compute capability is SM120; the
 flashinfer wrapper itself lives on the layer (``layer._sparse_mla_wrapper``)
 only for its reusable LSE buffer; split-K decode scratch is supplied per call.
 """
@@ -33,7 +33,7 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadat
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
-    from vllm.models.deepseek_v4.nvidia.ops.attention import DeepseekV4MLAAttention
+    from vllm.models.deepseek_v4.attention import DeepseekV4MLAAttention
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 
@@ -102,6 +102,21 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
     """
 
     backend_cls: ClassVar[type[AttentionBackend]] = DeepseekV4SM120SparseBackend
+
+    @classmethod
+    def get_padded_num_q_heads(cls, num_heads: int) -> int:
+        if num_heads <= 16:
+            return 16
+        if num_heads <= 32:
+            return 32
+        if num_heads <= 64:
+            return 64
+        if num_heads <= 128:
+            return 128
+        raise ValueError(
+            f"DeepseekV4 SM120 sparse MLA does not support {num_heads} heads "
+            "(kernel requires h_q in {16, 32, 64, 128})."
+        )
 
     @classmethod
     def forward_mqa(  # type: ignore[override]

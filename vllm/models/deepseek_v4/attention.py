@@ -83,37 +83,6 @@ _flashinfer_sparse_mla_AVAILABLE = (
 logger = init_logger(__name__)
 
 
-def _supported_padded_heads(num_heads: int) -> int:
-    """Round ``num_heads`` up to the next padded count supported by the
-    platform's sparse-MLA kernel.
-
-    The flashinfer SM120 ``BatchSparseMLAPagedAttentionWrapper`` accepts
-    ``num_heads ∈ {8, 16, 32, 64, 128}`` natively — small-TP shards on
-    DSv4-Flash (e.g. TP=8 → 16 heads/rank) stay at their native count.
-    Hopper FlashMLA + ROCm aiter sparse only support 64 / 128, so on
-    those paths smaller shards still pad up to 64.
-
-    Must be called consistently by the layer, the outer attention wrapper,
-    and the model-side ``attn_sink`` allocation, otherwise the kernel
-    sees mismatched ``num_heads`` between ``q`` (padded) and ``attn_sink``
-    (un-padded).
-    """
-    cap = current_platform.get_device_capability()
-    sm120 = cap is not None and cap.major == 12
-    if sm120:
-        if num_heads <= 16:
-            return 16
-        if num_heads <= 32:
-            return 32
-    if num_heads <= 64:
-        return 64
-    if num_heads <= 128:
-        return 128
-    raise ValueError(
-        f"DeepseekV4 attention does not support {num_heads} heads (must be <= 128)."
-    )
-
-
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
     """Pick the platform-specific V4 sparse MLA impl class. Sole platform check."""
     if current_platform.is_rocm():
@@ -137,6 +106,10 @@ def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
     )
 
     return DeepseekV4FlashMLASparseImpl
+
+
+def get_deepseek_v4_padded_num_q_heads(num_heads: int) -> int:
+    return _select_v4_sparse_impl().get_padded_num_q_heads(num_heads)
 
 
 @dataclass
@@ -203,11 +176,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.n_local_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
-
-        # Must match DeepseekV4MLAAttention.padded_heads and the model-side
-        # ``attn_sink`` allocation. SM120 supports a finer matrix; other
-        # arch pads up to 64/128.
-        self.padded_heads = _supported_padded_heads(num_heads)
 
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
@@ -304,6 +272,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             indexer=self.indexer,
             topk_indices_buffer=self.topk_indices_buffer,
         )
+        # Mirror the inner layer's padded head count (single source of truth).
+        self.padded_heads = self.mla_attn.padded_heads
+
         # Register this layer in the compilation config's static forward context
         # This allows the custom op to retrieve the layer during execution
         compilation_config = mla_modules.vllm_config.compilation_config
@@ -491,7 +462,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
             def wq_b_kv_insert() -> torch.Tensor:
                 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
             # 3-way overlap (matches TRT-LLM PR #14142 Level 1): default runs
@@ -525,7 +496,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
             def wq_b_kv_insert() -> torch.Tensor:
                 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
             q, _ = maybe_execute_in_parallel(
@@ -538,12 +509,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         else:
             # SWA-only layer: no compressor, no overlap.
             q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-            self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
-
-        # Pad q to FlashMLA-required head count (64 or 128)
-        if self.n_local_heads < self.padded_heads:
-            pad_size = self.padded_heads - self.n_local_heads
-            q = F.pad(q, (0, 0, 0, pad_size), value=0.0)
+            q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
@@ -557,9 +523,17 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         attn_metadata: (
             dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None
         ),
-    ) -> None:
+    ) -> torch.Tensor:
         if not isinstance(attn_metadata, dict):
-            return
+            # Profile run: kernel doesn't fire; produce a padded tensor so
+            # downstream FlashMLA gets the right shape.
+            if self.n_local_heads < self.padded_heads:
+                return F.pad(
+                    q,
+                    (0, 0, 0, self.padded_heads - self.n_local_heads),
+                    value=0.0,
+                )
+            return q
 
         swa_metadata = cast(
             "DeepseekSparseSWAMetadata | None",
@@ -571,16 +545,19 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
 
         # Horizontally fused:
-        #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE
+        #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE,
+        #            with zero-fill for the padding head slots.  The kernel
+        #            allocates and returns the padded q tensor.
         #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert
         # kv is unchanged; mla_attn reads kv solely via swa_kv_cache.
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
             q,
             kv,
             swa_kv_cache_2d,
             swa_metadata.slot_mapping,
             positions.to(torch.int64),
             self.rotary_emb.cos_sin_cache,
+            self.padded_heads,
             self.eps,
             swa_metadata.block_size,
         )
@@ -693,11 +670,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-        # Must match DeepseekV4MultiHeadLatentAttentionWrapper.padded_heads
-        # and the model-side attn_sink size; gated on capability so Hopper /
-        # SM10 / ROCm don't accidentally drive their FlashMLA / aiter
-        # kernels with an unsupported small head count.
-        self.padded_heads = _supported_padded_heads(num_heads)
+        # Padded Q head count is dictated by the selected impl.
+        self.padded_heads = self.impl_cls.get_padded_num_q_heads(num_heads)
 
         # Store attention sink
         assert attn_sink is not None
