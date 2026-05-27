@@ -377,6 +377,22 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 if extra_topk_lens is not None
                 else None
             )
+            chunk_tokens = query_end - query_start
+            mid_out = None
+            mid_lse = None
+            if chunk_tokens <= _DECODE_MAX_TOKENS:
+                extra_topk = (
+                    extra_indices_chunk.shape[-1]
+                    if extra_indices_chunk is not None
+                    else 0
+                )
+                mid_out, mid_lse = _get_decode_scratch(
+                    chunk_tokens,
+                    q.shape[1],
+                    output.shape[-1],
+                    swa_metadata.prefill_swa_indices.shape[-1],
+                    extra_topk,
+                )
 
             layer._sparse_mla_wrapper.run(
                 q=q[query_start:query_end],
@@ -389,4 +405,6 @@ class DeepseekV4SM120SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 extra_kv_cache=extra_kv_paged,
                 extra_indices=extra_indices_chunk,
                 extra_topk_length=extra_topk_length_chunk,
+                mid_out=mid_out,
+                mid_lse=mid_lse,
             )
