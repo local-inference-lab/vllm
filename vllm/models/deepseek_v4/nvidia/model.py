@@ -8,6 +8,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -16,7 +17,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
@@ -32,9 +33,6 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mhc import (
     HCHeadOp,
-    MHCFusedPostPreOp,
-    MHCPostOp,
-    MHCPreOp,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -64,6 +62,31 @@ from vllm.models.deepseek_v4.nvidia.ops import prepare_megamoe_inputs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
+
+
+def _use_b12x_mhc() -> bool:
+    if not envs.VLLM_USE_B12X_MHC:
+        return False
+    if not current_platform.is_cuda():
+        raise RuntimeError("VLLM_USE_B12X_MHC requires CUDA.")
+    if not current_platform.is_device_capability_family(120):
+        raise RuntimeError("VLLM_USE_B12X_MHC currently requires an SM120 GPU.")
+    return True
+
+
+def _empty_b12x_plan_scratch(
+    plan: object,
+    device: torch.device,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    specs = plan.shapes_and_dtypes()
+    if not specs:
+        raise ValueError("b12x scratch plan did not provide any scratch specs")
+    buffers = tuple(
+        torch.empty(shape, dtype=dtype, device=device) for shape, dtype in specs
+    )
+    if len(buffers) == 1:
+        return buffers[0]
+    return buffers
 
 
 class DeepseekV4MLP(nn.Module):
@@ -451,6 +474,79 @@ direct_register_custom_op(
 )
 
 
+def _deepseek_v4_b12x_mhc_pre_op(
+    residual: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    self = get_forward_context().no_compile_layers[layer_name]
+    return self._run_b12x_mhc_pre(
+        residual,
+        hc_fn,
+        hc_scale,
+        hc_base,
+    )
+
+
+def _deepseek_v4_b12x_mhc_pre_op_fake(
+    residual: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del hc_fn, hc_scale, hc_base, layer_name
+    tokens, hc_mult, hidden_size = residual.shape
+    y_out = torch.empty(
+        (tokens, hidden_size), dtype=residual.dtype, device=residual.device
+    )
+    post_out = torch.empty(
+        (tokens, hc_mult), dtype=torch.float32, device=residual.device
+    )
+    comb_out = torch.empty(
+        (tokens, hc_mult, hc_mult), dtype=torch.float32, device=residual.device
+    )
+    return y_out, post_out, comb_out
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_b12x_mhc_pre",
+    op_func=_deepseek_v4_b12x_mhc_pre_op,
+    fake_impl=_deepseek_v4_b12x_mhc_pre_op_fake,
+)
+
+
+def _deepseek_v4_b12x_mhc_post_op(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    self = get_forward_context().no_compile_layers[layer_name]
+    return self._run_b12x_mhc_post(x, residual, post, comb)
+
+
+def _deepseek_v4_b12x_mhc_post_op_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    del x, post, comb, layer_name
+    return torch.empty_like(residual)
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_b12x_mhc_post",
+    op_func=_deepseek_v4_b12x_mhc_post_op,
+    fake_impl=_deepseek_v4_b12x_mhc_post_op_fake,
+)
+
+
 class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
@@ -743,6 +839,13 @@ class DeepseekV4Attention(nn.Module):
         )
         self.wo_a.is_bmm = True
         self.wo_a.bmm_batch_size = self.n_local_groups
+        if envs.VLLM_USE_B12X_WO_PROJECTION:
+            if not hasattr(self.wo_a, "weight_scale_inv"):
+                raise RuntimeError(
+                    "VLLM_USE_B12X_WO_PROJECTION requires FP8 wo_a.weight_scale_inv"
+                )
+            # Preserve checkpoint UE8M0 scales for the fused b12x WO kernel.
+            self.wo_a.weight_scale_inv.format_ue8m0 = True
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -751,6 +854,14 @@ class DeepseekV4Attention(nn.Module):
             return_bias=False,
             prefix=f"{prefix}.wo_b",
         )
+        if envs.VLLM_USE_B12X_WO_PROJECTION:
+            if not hasattr(self.wo_b, "weight_scale_inv"):
+                raise RuntimeError(
+                    "VLLM_USE_B12X_WO_PROJECTION requires FP8 wo_b.weight_scale_inv"
+                )
+            self.wo_a.b12x_skip_generic_block_fp8_linear = True
+            self.wo_b.b12x_skip_generic_block_fp8_linear = True
+
         self.softmax_scale = self.head_dim**-0.5
         self.scale_fmt = config.quantization_config["scale_fmt"]
 
@@ -842,6 +953,9 @@ class DeepseekV4Attention(nn.Module):
     ):
         return self.mla_attn(positions, hidden_states, llama_4_scaling)
 
+    def setup_b12x_wo_projection(self) -> None:
+        self.mla_attn.setup_b12x_wo_projection()
+
 
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
@@ -853,11 +967,21 @@ class DeepseekV4DecoderLayer(nn.Module):
     ):
         super().__init__()
 
-        # Lazy import to avoid top-level tilelang dependency.
-        # Registers both torch.ops.vllm.mhc_pre and mhc_post
-        import vllm.model_executor.layers.mhc  # noqa: F401
-
         config = vllm_config.model_config.hf_config
+        self.layer_name = prefix
+        self._use_b12x_mhc = _use_b12x_mhc()
+        if self._use_b12x_mhc:
+            if not prefix:
+                raise RuntimeError("DeepSeek V4 b12x mHC decoder layer needs a prefix")
+            compilation_config = vllm_config.compilation_config
+            if prefix in compilation_config.static_forward_context:
+                raise ValueError(f"Duplicate layer name: {prefix}")
+            compilation_config.static_forward_context[prefix] = self
+        else:
+            # Lazy import to avoid top-level tilelang dependency.
+            # Registers both torch.ops.vllm.mhc_pre and mhc_post.
+            import vllm.model_executor.layers.mhc  # noqa: F401
+
         self.hidden_size = config.hidden_size
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -919,9 +1043,123 @@ class DeepseekV4DecoderLayer(nn.Module):
             ),
             requires_grad=False,
         )
-        self.mhc_pre = MHCPreOp()
-        self.mhc_post = MHCPostOp()
-        self.mhc_fused_post_pre = MHCFusedPostPreOp()
+        if self._use_b12x_mhc:
+            from b12x.integration.residual import MHC_DEFAULT_BLOCK_K, MHC_MULT
+
+            if self.hc_mult != MHC_MULT:
+                raise NotImplementedError(
+                    f"DeepSeek V4 b12x mHC requires hc_mult={MHC_MULT}, "
+                    f"got {self.hc_mult}."
+                )
+            self._b12x_mhc_block_k = int(MHC_DEFAULT_BLOCK_K)
+            total_k = self.hc_mult * self.hidden_size
+            if total_k % self._b12x_mhc_block_k != 0:
+                raise ValueError(
+                    "DeepSeek V4 b12x mHC requires hc_mult * hidden_size to "
+                    f"be divisible by block_k={self._b12x_mhc_block_k}, got {total_k}."
+                )
+            self._b12x_mhc_split_k = total_k // self._b12x_mhc_block_k
+            if self._b12x_mhc_split_k <= 1:
+                raise ValueError(
+                    "DeepSeek V4 b12x mHC requires split_k > 1, got "
+                    f"{self._b12x_mhc_split_k}."
+                )
+            self.mhc_pre = None
+            self.mhc_post = None
+            self.mhc_fused_post_pre = None
+        else:
+            from vllm.model_executor.layers.mhc import (
+                MHCFusedPostPreOp,
+                MHCPostOp,
+                MHCPreOp,
+            )
+
+            self._b12x_mhc_block_k = 0
+            self._b12x_mhc_split_k = 0
+            self.mhc_pre = MHCPreOp()
+            self.mhc_post = MHCPostOp()
+            self.mhc_fused_post_pre = MHCFusedPostPreOp()
+
+    def _get_b12x_mhc_binding(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor | None = None,
+        post: torch.Tensor | None = None,
+        comb: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+    ) -> object:
+        from b12x.integration.residual import B12XMHCScratchCaps, plan_mhc_scratch
+
+        tokens = int(x.shape[0])
+        plan = plan_mhc_scratch(
+            B12XMHCScratchCaps(
+                device=x.device,
+                dtype=x.dtype,
+                max_tokens=max(1, tokens),
+                hidden_size=self.hidden_size,
+                split_k=self._b12x_mhc_split_k,
+            )
+        )
+        scratch = _empty_b12x_plan_scratch(plan, x.device)
+        return plan.bind(
+            scratch=scratch,
+            tokens=tokens,
+            y=y,
+            post=post,
+            comb=comb,
+            out=out,
+        )
+
+    def _run_b12x_mhc_pre(
+        self,
+        residual: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from b12x.integration.residual import b12x_mhc_pre
+
+        tokens, hc_mult, hidden_size = residual.shape
+        y_out = torch.empty(
+            (tokens, hidden_size), dtype=residual.dtype, device=residual.device
+        )
+        post_out = torch.empty(
+            (tokens, hc_mult), dtype=torch.float32, device=residual.device
+        )
+        comb_out = torch.empty(
+            (tokens, hc_mult, hc_mult), dtype=torch.float32, device=residual.device
+        )
+        binding = self._get_b12x_mhc_binding(
+            residual,
+            y=y_out,
+            post=post_out,
+            comb=comb_out,
+        )
+        return b12x_mhc_pre(
+            residual,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            rms_eps=self.rms_norm_eps,
+            hc_eps=self.hc_eps,
+            sinkhorn_iters=self.hc_sinkhorn_iters,
+            binding=binding,
+            block_k=self._b12x_mhc_block_k,
+        )
+
+    def _run_b12x_mhc_post(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> torch.Tensor:
+        from b12x.integration.residual import b12x_mhc_post
+
+        out = torch.empty_like(residual)
+        binding = self._get_b12x_mhc_binding(residual, out=out)
+        b12x_mhc_post(x, residual, post, comb, binding=binding)
+        return out
 
     def hc_pre(
         self,
@@ -932,6 +1170,19 @@ class DeepseekV4DecoderLayer(nn.Module):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
     ):
+        if self._use_b12x_mhc:
+            if not is_forward_context_available():
+                return self._run_b12x_mhc_pre(x, hc_fn, hc_scale, hc_base)
+            y, post_mix, res_mix = torch.ops.vllm.deepseek_v4_b12x_mhc_pre(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                self.layer_name,
+            )
+            return y, post_mix, res_mix
+
+        assert self.mhc_pre is not None
         post_mix, res_mix, layer_input = self.mhc_pre(
             residual=x,
             fn=hc_fn,
@@ -954,6 +1205,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         post: torch.Tensor,
         comb: torch.Tensor,
     ):
+        if self._use_b12x_mhc:
+            if not is_forward_context_available():
+                return self._run_b12x_mhc_post(x, residual, post, comb)
+            return torch.ops.vllm.deepseek_v4_b12x_mhc_post(
+                x,
+                residual,
+                post,
+                comb,
+                self.layer_name,
+            )
+
+        assert self.mhc_post is not None
         return self.mhc_post(x, residual, post, comb)
 
     def _forward_cuda(
@@ -965,6 +1228,40 @@ class DeepseekV4DecoderLayer(nn.Module):
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._use_b12x_mhc:
+            if residual is None:
+                residual = x
+            else:
+                assert post_mix is not None
+                assert res_mix is not None
+                residual = self.hc_post(
+                    x,
+                    residual,
+                    post_mix,
+                    res_mix,
+                )
+
+            x, post_mix, res_mix = self.hc_pre(
+                residual,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+            )
+            x = self.attn_norm(x)
+            x = self.attn(positions, x, None)
+            residual = self.hc_post(x, residual, post_mix, res_mix)
+
+            x, post_mix, res_mix = self.hc_pre(
+                residual,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+            )
+            x = self.ffn_norm(x)
+            x = self.ffn(x, input_ids)
+            return x, residual, post_mix, res_mix
+
+        assert self.mhc_fused_post_pre is not None
         attn_norm_weight = self.attn_norm.weight.data
         attn_norm_eps = self.attn_norm.variance_epsilon
         if residual is None:
@@ -1368,6 +1665,12 @@ class DeepseekV4Model(nn.Module):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
 
+    def setup_b12x_wo_projection(self) -> None:
+        if not envs.VLLM_USE_B12X_WO_PROJECTION:
+            return
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            layer.attn.setup_b12x_wo_projection()
+
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     if expert_dtype == "fp4":
@@ -1471,6 +1774,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.model.finalize_mega_moe_weights()
+        self.model.setup_b12x_wo_projection()
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

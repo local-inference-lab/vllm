@@ -371,6 +371,8 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                 routing_tables=layer._expert_routing_tables(),
                 layer=layer,
             )
+            if self.mxfp4_backend == Mxfp4MoeBackend.B12X:
+                self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         w13 = layer.w13_weight
@@ -705,6 +707,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 routing_tables=layer._expert_routing_tables(),
                 layer=layer,
             )
+            if self.mxfp4_backend == Mxfp4MoeBackend.B12X:
+                self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def process_weights_after_loading(self, layer):
         w13 = layer.w13_weight

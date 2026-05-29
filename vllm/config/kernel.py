@@ -124,6 +124,7 @@ MoEBackend = Literal[
     "triton",
     "deep_gemm",
     "deep_gemm_mega_moe",
+    "b12x",
     "cutlass",
     "flashinfer_trtllm",
     "flashinfer_cutlass",
@@ -138,6 +139,7 @@ MoEBackend = Literal[
 
 LinearBackend = Literal[
     "auto",
+    "b12x",
     "cutlass",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
@@ -175,6 +177,7 @@ class KernelConfig:
     - "triton": Use Triton-based fused MoE kernels
     - "deep_gemm": Use DeepGEMM kernels (FP8 block-quantized only)
     - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels
+    - "b12x": Use B12X kernels for Blackwell MXFP4 MoE
     - "cutlass": Use vLLM CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels
@@ -193,6 +196,7 @@ class KernelConfig:
     """Backend for quantized linear layer GEMM kernels. Available options:
 
     - "auto": Automatically select the best backend based on model and hardware
+    - "b12x": Use b12x kernels for Blackwell FP8 block-scaled linear layers
     - "cutlass": Use CUTLASS-based kernels
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TensorRT-LLM kernels

@@ -38,7 +38,10 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -183,6 +186,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.compress_ratio = compress_ratio if compress_ratio is not None else 1
         self.prefix = prefix
 
+        self._use_b12x_wo = bool(envs.VLLM_USE_B12X_WO_PROJECTION)
+        self._b12x_wo_projection_weights: Any | None = None
         # Extract config from vllm_config
         config = mla_modules.vllm_config.model_config.hf_config
         tp_size = get_tensor_model_parallel_world_size()
@@ -298,6 +303,156 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 k_cache_prefix=self.mla_attn.prefix,
             )
 
+    def _validate_wo_projection_tensors(self) -> tuple[int, int, int, int]:
+        if not hasattr(self.wo_a, "weight_scale_inv"):
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO path requires wo_a.weight_scale_inv"
+            )
+        if not hasattr(self.wo_b, "weight_scale_inv"):
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO path requires wo_b.weight_scale_inv"
+            )
+        if getattr(self.wo_a, "weight_scale_inv_is_cutlass_interleaved", False):
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO path requires canonical wo_a scales"
+            )
+        if getattr(self.wo_b, "weight_scale_inv_is_cutlass_interleaved", False):
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO path requires canonical wo_b scales"
+            )
+
+        groups = self.n_local_groups
+        heads_per_group = self.n_local_heads // groups
+        group_width = heads_per_group * self.head_dim
+        rank = self.o_lora_rank
+        hidden = self.hidden_size
+
+        wo_a_shape = (groups * rank, group_width)
+        wo_b_shape = (hidden, groups * rank)
+        wo_a_scale_shape = (groups * ((rank + 127) // 128), (group_width + 127) // 128)
+        wo_b_scale_shape = ((hidden + 127) // 128, (groups * rank + 127) // 128)
+
+        if tuple(self.wo_a.weight.shape) != wo_a_shape:
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO-A weight shape mismatch: "
+                f"expected {wo_a_shape}, got {tuple(self.wo_a.weight.shape)}"
+            )
+        if tuple(self.wo_b.weight.shape) != wo_b_shape:
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO-B weight shape mismatch: "
+                f"expected {wo_b_shape}, got {tuple(self.wo_b.weight.shape)}"
+            )
+        if tuple(self.wo_a.weight_scale_inv.shape) != wo_a_scale_shape:
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO-A scale shape mismatch: "
+                f"expected {wo_a_scale_shape}, "
+                f"got {tuple(self.wo_a.weight_scale_inv.shape)}"
+            )
+        if tuple(self.wo_b.weight_scale_inv.shape) != wo_b_scale_shape:
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO-B scale shape mismatch: "
+                f"expected {wo_b_scale_shape}, "
+                f"got {tuple(self.wo_b.weight_scale_inv.shape)}"
+            )
+        if self.wo_a.weight.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO-A weight must be torch.float8_e4m3fn, "
+                f"got {self.wo_a.weight.dtype}"
+            )
+        if self.wo_b.weight.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO-B weight must be torch.float8_e4m3fn, "
+                f"got {self.wo_b.weight.dtype}"
+            )
+        return groups, group_width, rank, hidden
+
+    def setup_b12x_wo_projection(self) -> None:
+        if not self._use_b12x_wo or self._b12x_wo_projection_weights is not None:
+            return
+
+        groups, group_width, rank, hidden = self._validate_wo_projection_tensors()
+
+        from b12x.gemm.wo_projection import (
+            pack_wo_projection_fp8_block_scaled_weights_mxfp8,
+        )
+
+        self._b12x_wo_projection_weights = (
+            pack_wo_projection_fp8_block_scaled_weights_mxfp8(
+                self.wo_a.weight.detach(),
+                self.wo_a.weight_scale_inv.detach(),
+                self.wo_b.weight.detach(),
+                self.wo_b.weight_scale_inv.detach(),
+                groups=groups,
+                group_width=group_width,
+                rank=rank,
+                hidden=hidden,
+            )
+        )
+
+    def _get_b12x_wo_projection_binding(
+        self,
+        o: torch.Tensor,
+        positions: torch.Tensor,
+        weights: Any,
+    ) -> Any:
+        from b12x.gemm.wo_projection import (
+            WOProjectionScratchCaps,
+            plan_wo_projection_scratch,
+        )
+
+        groups, group_width, rank, hidden = self._validate_wo_projection_tensors()
+        plan = plan_wo_projection_scratch(
+            WOProjectionScratchCaps(
+                device=o.device,
+                max_tokens=max(1, int(o.shape[0])),
+                groups=groups,
+                group_width=group_width,
+                rank=rank,
+                hidden=hidden,
+                dtype=o.dtype,
+            )
+        )
+        scratch = tuple(
+            torch.empty(shape, dtype=dtype, device=o.device)
+            for shape, dtype in plan.shapes_and_dtypes()
+        )
+        return plan.bind_inv_rope(
+            scratch=scratch,
+            o=o,
+            positions=positions,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            weights=weights,
+            heads_per_group=self.n_local_heads // self.n_local_groups,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+        )
+
+    def _apply_b12x_wo_projection(
+        self, o: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        num_tokens = int(o.shape[0])
+        if num_tokens == 0:
+            return torch.empty((0, self.hidden_size), dtype=o.dtype, device=o.device)
+        if o.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO projection requires bf16 attention output, "
+                f"got {o.dtype}"
+            )
+        if self._b12x_wo_projection_weights is None:
+            self.setup_b12x_wo_projection()
+        weights = self._b12x_wo_projection_weights
+        if weights is None:
+            raise RuntimeError("DeepSeek V4 b12x WO weights were not packed")
+
+        binding = self._get_b12x_wo_projection_binding(o, positions, weights)
+
+        from b12x.gemm.wo_projection import wo_projection_inv_rope_mxfp8
+
+        out = wo_projection_inv_rope_mxfp8(binding=binding)
+        if self.wo_b.reduce_results and self.wo_b.tp_size > 1:
+            out = tensor_model_parallel_all_reduce(out)
+        return out
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -321,6 +476,14 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.layer_name,
         )
         o = o_padded[:, : self.n_local_heads, :]
+
+        if self._use_b12x_wo:
+            return torch.ops.vllm.deepseek_v4_b12x_wo_projection(
+                o,
+                positions,
+                self.layer_name,
+                self.hidden_size,
+            )
 
         # Keep ROCm on the BF16 reference wo_a path util kernel ready.
         if current_platform.is_rocm():
@@ -621,6 +784,35 @@ direct_register_custom_op(
     op_func=deepseek_v4_fp8_einsum,
     mutates_args=["out"],
     fake_impl=deepseek_v4_fp8_einsum_fake,
+)
+
+
+def deepseek_v4_b12x_wo_projection(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    hidden_size: int,
+) -> torch.Tensor:
+    del hidden_size
+    forward_context: ForwardContext = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    return self._apply_b12x_wo_projection(o, positions)
+
+
+def deepseek_v4_b12x_wo_projection_fake(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    hidden_size: int,
+) -> torch.Tensor:
+    del positions, layer_name
+    return torch.empty((o.shape[0], hidden_size), dtype=o.dtype, device=o.device)
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_b12x_wo_projection",
+    op_func=deepseek_v4_b12x_wo_projection,
+    fake_impl=deepseek_v4_b12x_wo_projection_fake,
 )
 
 

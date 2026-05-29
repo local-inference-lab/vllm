@@ -105,6 +105,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 symm_mem_enabled=(
                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 ),
+                nccl_group=self.device_group,
             )
 
             if current_platform.is_rocm():
@@ -223,7 +224,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.fi_ar_comm is not None and not self.fi_ar_comm.disabled:
             enabled_ar_backends.append("FLASHINFER")
         if self.ca_comm is not None and not self.ca_comm.disabled:
-            enabled_ar_backends.append("CUSTOM")
+            enabled_ar_backends.append(self.ca_comm.backend_name())
         if self.symm_mem_comm is not None and not self.symm_mem_comm.disabled:
             enabled_ar_backends.append("SYMM_MEM")
         if self.pynccl_comm is not None and not self.pynccl_comm.disabled:

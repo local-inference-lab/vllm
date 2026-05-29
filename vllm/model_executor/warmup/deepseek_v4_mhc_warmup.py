@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Warm up DeepSeek V4 mHC TileLang kernels before serving requests.
+"""Warm up DeepSeek V4 mHC kernels before serving requests.
 
 Ported from lucifer1004/vllm-jasl with the two env-var knobs removed
 (`VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP`, `VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES`).
@@ -198,7 +198,7 @@ def deepseek_v4_mhc_warmup(
 
     started = time.perf_counter()
     logger.info(
-        "Warming up DeepSeek V4 mHC TileLang kernels for token sizes: %s",
+        "Warming up DeepSeek V4 mHC kernels for token sizes: %s",
         token_sizes,
     )
     with torch.inference_mode():
@@ -207,6 +207,6 @@ def deepseek_v4_mhc_warmup(
             _warmup_hc_head(deepseek_model, token_sizes)
         torch.accelerator.synchronize()
     logger.info(
-        "DeepSeek V4 mHC TileLang warmup finished in %.2f seconds.",
+        "DeepSeek V4 mHC warmup finished in %.2f seconds.",
         time.perf_counter() - started,
     )

@@ -131,6 +131,9 @@ def _fp8_linear_may_use_deep_gemm(module: torch.nn.Module) -> bool:
     Return True if the input module/layer could be processed with DeepGEMM.
     """
 
+    if getattr(module, "b12x_skip_generic_block_fp8_linear", False):
+        return False
+
     # FIXME: this logic is brittle and incorrect - since we
     # could use DeepGEMM with for than just Fp8LinearMethod
     block_size = get_mk_alignment_for_contiguous_layout()[0]
@@ -305,9 +308,16 @@ def _deepgemm_grouped_fp8_gemm_nt_contiguous_warmup(
             GROUPED_FP8_GEMM_NT_CONTIGUOUS_WARMUP_CACHE.add(w.size())
 
 
+def _deep_gemm_fp8_warmup_enabled() -> bool:
+    return not envs.VLLM_USE_B12X_FP8_GEMM
+
+
 def deepgemm_fp8_gemm_nt_warmup(
     model: torch.nn.Module, max_tokens: int, pbar: tqdm | None = None
 ):
+    if not _deep_gemm_fp8_warmup_enabled():
+        return
+
     dg_modules = [m for m in model.modules() if _fp8_linear_may_use_deep_gemm(m)]
 
     for dgm in dg_modules:
@@ -318,6 +328,9 @@ def deepgemm_fp8_gemm_nt_warmup(
 def deepgemm_grouped_fp8_gemm_nt_contiguous_warmup(
     model: torch.nn.Module, max_tokens: int, pbar: tqdm | None = None
 ):
+    if not _deep_gemm_fp8_warmup_enabled():
+        return
+
     dg_modules = [
         m for m in model.modules() if _fused_moe_grouped_gemm_may_use_deep_gemm(m)
     ]
@@ -332,6 +345,9 @@ def deepgemm_grouped_fp8_gemm_nt_contiguous_warmup(
 
 
 def _count_warmup_iterations(model: torch.nn.Module, max_tokens: int) -> int:
+    if not _deep_gemm_fp8_warmup_enabled():
+        return 0
+
     seen_fp8_sizes: set[torch.Size] = set(FP8_GEMM_NT_WARMUP_CACHE)
     seen_grouped_sizes: set[torch.Size] = set(
         GROUPED_FP8_GEMM_NT_CONTIGUOUS_WARMUP_CACHE
