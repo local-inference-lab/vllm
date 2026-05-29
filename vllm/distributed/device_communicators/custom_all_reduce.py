@@ -314,47 +314,29 @@ class CustomAllreduce:
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
         use_pcie_oneshot = False
-        pcie_backend = (
-            _get_pcie_allreduce_backend()
-            if envs.VLLM_ENABLE_PCIE_ALLREDUCE
-            else "disabled"
-        )
-        logger.info(
-            "Custom allreduce topology: rank=%d world_size=%d device=%s "
-            "physical_device_ids=%s fully_connected=%s "
-            "VLLM_ENABLE_PCIE_ALLREDUCE=%s VLLM_PCIE_ALLREDUCE_BACKEND=%s.",
-            rank,
-            world_size,
-            self.device,
-            physical_device_ids,
-            fully_connected,
-            envs.VLLM_ENABLE_PCIE_ALLREDUCE,
-            pcie_backend,
-        )
-        if (
-            envs.VLLM_ENABLE_PCIE_ALLREDUCE
-            and pcie_backend == "b12x"
-            and fully_connected
-        ):
-            logger.info(
-                "b12x PCIe oneshot allreduce was requested, but it only "
-                "overrides non-fully-connected PCIe topologies. "
-                "This group will use the regular custom allreduce selector "
-                "(world_size=%d, fully_connected=%s).",
-                world_size,
-                fully_connected,
-            )
         if not fully_connected:
-            if envs.VLLM_ENABLE_PCIE_ALLREDUCE and pcie_backend == "b12x":
-                logger.info(
-                    "b12x PCIe oneshot allreduce requested for "
-                    "non-fully-connected PCIe topology "
-                    "(world_size=%d, physical_device_ids=%s).",
-                    world_size,
-                    physical_device_ids,
-                )
-                use_pcie_oneshot = current_platform.is_cuda()
-            elif world_size > 2 and not envs.VLLM_ENABLE_PCIE_ALLREDUCE:
+            if envs.VLLM_ENABLE_PCIE_ALLREDUCE:
+                pcie_backend = _get_pcie_allreduce_backend()
+                if pcie_backend == "b12x":
+                    logger.info(
+                        "b12x PCIe oneshot allreduce requested for PCIe-only "
+                        "topology (world_size=%d, physical_device_ids=%s).",
+                        world_size,
+                        physical_device_ids,
+                    )
+                    use_pcie_oneshot = current_platform.is_cuda()
+                elif world_size > 2:
+                    logger.info(
+                        "PCIe custom allreduce enabled via "
+                        "VLLM_ENABLE_PCIE_ALLREDUCE=1 "
+                        "(backend=cpp, using vLLM C++ custom allreduce)."
+                    )
+                    # Preserve the legacy PCIe opt-in behavior: allow the same
+                    # small-tensor C++ custom allreduce path as fully-connected
+                    # topologies once the user explicitly enables it.
+                    self._pcie_cpp_backend = True
+                    fully_connected = True
+            elif world_size > 2:
                 logger.warning(
                     "Custom allreduce is disabled for >2 PCIe-only GPUs. "
                     "Set VLLM_ENABLE_PCIE_ALLREDUCE=1 to enable P2P custom "
@@ -362,17 +344,6 @@ class CustomAllreduce:
                     "see PR #39040 for details)."
                 )
                 return
-            elif world_size > 2 and pcie_backend == "cpp":
-                logger.info(
-                    "PCIe custom allreduce enabled via "
-                    "VLLM_ENABLE_PCIE_ALLREDUCE=1 "
-                    "(backend=cpp, using vLLM C++ custom allreduce)."
-                )
-                # Preserve the legacy PCIe opt-in behavior: allow the same
-                # small-tensor C++ custom allreduce path as fully-connected
-                # topologies once the user explicitly enables it.
-                self._pcie_cpp_backend = True
-                fully_connected = True
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
@@ -543,12 +514,23 @@ class CustomAllreduce:
                 self.register_graph_buffers()
 
     def _pcie_runtime_stream(self) -> torch.cuda.Stream | None:
-        if (
-            self._pcie_capture_stream is not None
-            and (self._IS_CAPTURING or torch.cuda.is_current_stream_capturing())
-        ):
-            return self._pcie_capture_stream
-        return None
+        pinned = self._pcie_capture_stream
+        if pinned is None:
+            return None
+        if not (self._IS_CAPTURING or torch.cuda.is_current_stream_capturing()):
+            return None
+        # Only pin the all-reduce onto the stored capture stream when that
+        # stream is the one actually being captured (the full-CUDA-graph
+        # path, where vLLM's graph_capture() makes _pcie_capture_stream the
+        # current stream). Piecewise / inductor CUDA graphs (e.g. MTP or
+        # spec-decode) capture on a torch-owned stream that is *not* our
+        # stored stream; redirecting onto the stored stream there would
+        # launch and allocate on a non-capturing stream and raise
+        # cudaErrorStreamCaptureUnsupported. In that case return None so the
+        # runtime runs inline on the current (capturing) stream.
+        if torch.cuda.current_stream().cuda_stream != pinned.cuda_stream:
+            return None
+        return pinned
 
     def register_graph_buffers(self):
         if self._pcie_runtime is not None:
