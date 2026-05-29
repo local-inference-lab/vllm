@@ -342,9 +342,9 @@ def _resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
 
 
 def kernel_warmup(worker: "Worker"):
-    # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
-    # layer per token; warm them across token sizes first so the first real
-    # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
+    # DSv4 mHC TileLang kernels run every decoder layer per token; warm them
+    # across token sizes first so the first real request doesn't pay JIT cost.
+    # No-op for non-DSv4 models and for the b12x mHC path (gated inside).
     deepseek_v4_mhc_warmup(
         worker.get_model(),
         max_tokens=worker.scheduler_config.max_num_batched_tokens,

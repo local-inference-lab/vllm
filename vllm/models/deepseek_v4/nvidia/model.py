@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import time
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -18,6 +20,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
@@ -63,6 +66,70 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 
+logger = init_logger(__name__)
+
+
+def _env_flag(*names: str) -> bool:
+    return any(
+        os.environ.get(name, "").lower() not in ("", "0", "false", "no")
+        for name in names
+    )
+
+
+_B12X_MHC_TRACE = _env_flag("B12X_TRACE_MHC", "VLLM_TRACE_B12X_MHC")
+_B12X_MHC_TRACE_LIMIT = int(
+    os.environ.get(
+        "B12X_TRACE_MHC_LIMIT",
+        os.environ.get("VLLM_TRACE_B12X_MHC_LIMIT", "240"),
+    )
+)
+_B12X_MHC_TRACE_COUNTS: dict[str, int] = {}
+
+
+def _trace_b12x_mhc_call(
+    op_name: str,
+    layer_name: str,
+    tokens: int,
+    run: Callable[[], typing.Any],
+) -> typing.Any:
+    if not _B12X_MHC_TRACE:
+        return run()
+
+    call_count = _B12X_MHC_TRACE_COUNTS.get(op_name, 0) + 1
+    _B12X_MHC_TRACE_COUNTS[op_name] = call_count
+    if call_count > _B12X_MHC_TRACE_LIMIT:
+        if call_count == _B12X_MHC_TRACE_LIMIT + 1:
+            logger.info(
+                "b12x mHC trace limit reached for %s at %d calls.",
+                op_name,
+                _B12X_MHC_TRACE_LIMIT,
+            )
+        return run()
+
+    is_capturing = False
+    is_current_stream_capturing = getattr(
+        torch.cuda, "is_current_stream_capturing", None
+    )
+    if is_current_stream_capturing is not None:
+        try:
+            is_capturing = bool(is_current_stream_capturing())
+        except Exception:
+            is_capturing = False
+
+    started = time.perf_counter()
+    try:
+        return run()
+    finally:
+        logger.info(
+            "b12x mHC %s call=%d layer=%s tokens=%d capturing=%s elapsed=%.3f ms",
+            op_name,
+            call_count,
+            layer_name,
+            tokens,
+            is_capturing,
+            (time.perf_counter() - started) * 1000.0,
+        )
+
 
 def _use_b12x_mhc() -> bool:
     if not envs.VLLM_USE_B12X_MHC:
@@ -72,6 +139,16 @@ def _use_b12x_mhc() -> bool:
     if not current_platform.is_device_capability_family(120):
         raise RuntimeError("VLLM_USE_B12X_MHC currently requires an SM120 GPU.")
     return True
+
+
+def _b12x_mhc_max_tokens() -> int:
+    raw = os.environ.get("B12X_MHC_MAX_TOKENS", "16")
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"B12X_MHC_MAX_TOKENS must be an integer, got {raw!r}"
+        ) from exc
 
 
 def _empty_b12x_plan_scratch(
@@ -482,11 +559,16 @@ def _deepseek_v4_b12x_mhc_pre_op(
     layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     self = get_forward_context().no_compile_layers[layer_name]
-    return self._run_b12x_mhc_pre(
-        residual,
-        hc_fn,
-        hc_scale,
-        hc_base,
+    return _trace_b12x_mhc_call(
+        "pre",
+        layer_name,
+        int(residual.shape[0]),
+        lambda: self._run_b12x_mhc_pre(
+            residual,
+            hc_fn,
+            hc_scale,
+            hc_base,
+        ),
     )
 
 
@@ -526,7 +608,12 @@ def _deepseek_v4_b12x_mhc_post_op(
     layer_name: str,
 ) -> torch.Tensor:
     self = get_forward_context().no_compile_layers[layer_name]
-    return self._run_b12x_mhc_post(x, residual, post, comb)
+    return _trace_b12x_mhc_call(
+        "post",
+        layer_name,
+        int(residual.shape[0]),
+        lambda: self._run_b12x_mhc_post(x, residual, post, comb),
+    )
 
 
 def _deepseek_v4_b12x_mhc_post_op_fake(
@@ -544,6 +631,65 @@ direct_register_custom_op(
     op_name="deepseek_v4_b12x_mhc_post",
     op_func=_deepseek_v4_b12x_mhc_post_op,
     fake_impl=_deepseek_v4_b12x_mhc_post_op_fake,
+)
+
+
+def _deepseek_v4_b12x_mhc_post_pre_op(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    self = get_forward_context().no_compile_layers[layer_name]
+    return _trace_b12x_mhc_call(
+        "post_pre",
+        layer_name,
+        int(residual.shape[0]),
+        lambda: self._run_b12x_mhc_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            hc_fn,
+            hc_scale,
+            hc_base,
+        ),
+    )
+
+
+def _deepseek_v4_b12x_mhc_post_pre_op_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del x, post, comb, hc_fn, hc_scale, hc_base, layer_name
+    tokens, hc_mult, hidden_size = residual.shape
+    residual_out = torch.empty_like(residual)
+    post_out = torch.empty(
+        (tokens, hc_mult), dtype=torch.float32, device=residual.device
+    )
+    comb_out = torch.empty(
+        (tokens, hc_mult, hc_mult), dtype=torch.float32, device=residual.device
+    )
+    y_out = torch.empty(
+        (tokens, hidden_size), dtype=residual.dtype, device=residual.device
+    )
+    return residual_out, post_out, comb_out, y_out
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_b12x_mhc_post_pre",
+    op_func=_deepseek_v4_b12x_mhc_post_pre_op,
+    fake_impl=_deepseek_v4_b12x_mhc_post_pre_op_fake,
 )
 
 
@@ -970,6 +1116,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         config = vllm_config.model_config.hf_config
         self.layer_name = prefix
         self._use_b12x_mhc = _use_b12x_mhc()
+        self._b12x_mhc_max_tokens = (
+            _b12x_mhc_max_tokens() if self._use_b12x_mhc else 0
+        )
         if self._use_b12x_mhc:
             if not prefix:
                 raise RuntimeError("DeepSeek V4 b12x mHC decoder layer needs a prefix")
@@ -977,10 +1126,25 @@ class DeepseekV4DecoderLayer(nn.Module):
             if prefix in compilation_config.static_forward_context:
                 raise ValueError(f"Duplicate layer name: {prefix}")
             compilation_config.static_forward_context[prefix] = self
-        else:
-            # Lazy import to avoid top-level tilelang dependency.
-            # Registers both torch.ops.vllm.mhc_pre and mhc_post.
-            import vllm.model_executor.layers.mhc  # noqa: F401
+
+            if self._b12x_mhc_max_tokens <= 0:
+                logger.info_once(
+                    "DeepSeek V4 b12x mHC enabled for all token counts."
+                )
+            else:
+                logger.info_once(
+                    "DeepSeek V4 b12x mHC enabled for token counts <= %d; "
+                    "using TileLang mHC above that.",
+                    self._b12x_mhc_max_tokens,
+                )
+
+        # Registers torch.ops.vllm.mhc_* and provides the fallback path for
+        # mixed/prefill capture sizes when b12x mHC is decode-limited.
+        from vllm.model_executor.layers.mhc import (
+            MHCFusedPostPreOp,
+            MHCPostOp,
+            MHCPreOp,
+        )
 
         self.hidden_size = config.hidden_size
 
@@ -1044,12 +1208,21 @@ class DeepseekV4DecoderLayer(nn.Module):
             requires_grad=False,
         )
         if self._use_b12x_mhc:
-            from b12x.integration.residual import MHC_DEFAULT_BLOCK_K, MHC_MULT
+            from b12x.integration.residual import (
+                MHC_DEFAULT_BLOCK_K,
+                MHC_DEFAULT_SPLIT_K,
+                MHC_MULT,
+            )
 
             if self.hc_mult != MHC_MULT:
                 raise NotImplementedError(
                     f"DeepSeek V4 b12x mHC requires hc_mult={MHC_MULT}, "
                     f"got {self.hc_mult}."
+                )
+            if self.hidden_size != 4096:
+                raise NotImplementedError(
+                    "DeepSeek V4 b12x mHC currently requires hidden_size=4096, "
+                    f"got {self.hidden_size}."
                 )
             self._b12x_mhc_block_k = int(MHC_DEFAULT_BLOCK_K)
             total_k = self.hc_mult * self.hidden_size
@@ -1059,26 +1232,23 @@ class DeepseekV4DecoderLayer(nn.Module):
                     f"be divisible by block_k={self._b12x_mhc_block_k}, got {total_k}."
                 )
             self._b12x_mhc_split_k = total_k // self._b12x_mhc_block_k
-            if self._b12x_mhc_split_k <= 1:
-                raise ValueError(
-                    "DeepSeek V4 b12x mHC requires split_k > 1, got "
-                    f"{self._b12x_mhc_split_k}."
+            if self._b12x_mhc_split_k != MHC_DEFAULT_SPLIT_K:
+                raise NotImplementedError(
+                    "DeepSeek V4 b12x mHC currently requires "
+                    f"split_k={MHC_DEFAULT_SPLIT_K}, got {self._b12x_mhc_split_k}."
                 )
-            self.mhc_pre = None
-            self.mhc_post = None
-            self.mhc_fused_post_pre = None
         else:
-            from vllm.model_executor.layers.mhc import (
-                MHCFusedPostPreOp,
-                MHCPostOp,
-                MHCPreOp,
-            )
-
             self._b12x_mhc_block_k = 0
             self._b12x_mhc_split_k = 0
-            self.mhc_pre = MHCPreOp()
-            self.mhc_post = MHCPostOp()
-            self.mhc_fused_post_pre = MHCFusedPostPreOp()
+        self.mhc_pre = MHCPreOp()
+        self.mhc_post = MHCPostOp()
+        self.mhc_fused_post_pre = MHCFusedPostPreOp()
+
+    def _should_run_b12x_mhc(self, tokens: int) -> bool:
+        if not self._use_b12x_mhc:
+            return False
+        max_tokens = self._b12x_mhc_max_tokens
+        return max_tokens <= 0 or int(tokens) <= max_tokens
 
     def _get_b12x_mhc_binding(
         self,
@@ -1129,12 +1299,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         comb_out = torch.empty(
             (tokens, hc_mult, hc_mult), dtype=torch.float32, device=residual.device
         )
-        binding = self._get_b12x_mhc_binding(
-            residual,
-            y=y_out,
-            post=post_out,
-            comb=comb_out,
-        )
         return b12x_mhc_pre(
             residual,
             hc_fn,
@@ -1143,7 +1307,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             rms_eps=self.rms_norm_eps,
             hc_eps=self.hc_eps,
             sinkhorn_iters=self.hc_sinkhorn_iters,
-            binding=binding,
+            y_out=y_out,
+            post_out=post_out,
+            comb_out=comb_out,
             block_k=self._b12x_mhc_block_k,
         )
 
@@ -1157,9 +1323,53 @@ class DeepseekV4DecoderLayer(nn.Module):
         from b12x.integration.residual import b12x_mhc_post
 
         out = torch.empty_like(residual)
-        binding = self._get_b12x_mhc_binding(residual, out=out)
-        b12x_mhc_post(x, residual, post, comb, binding=binding)
+        b12x_mhc_post(x, residual, post, comb, out=out)
         return out
+
+    def _run_b12x_mhc_post_pre(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        from b12x.integration.residual import b12x_mhc_post_pre
+
+        tokens, hc_mult, hidden_size = residual.shape
+        residual_out = torch.empty_like(residual)
+        y_out = torch.empty(
+            (tokens, hidden_size), dtype=residual.dtype, device=residual.device
+        )
+        post_out = torch.empty(
+            (tokens, hc_mult), dtype=torch.float32, device=residual.device
+        )
+        comb_out = torch.empty(
+            (tokens, hc_mult, hc_mult), dtype=torch.float32, device=residual.device
+        )
+        binding = self._get_b12x_mhc_binding(
+            residual,
+            y=y_out,
+            post=post_out,
+            comb=comb_out,
+            out=residual_out,
+        )
+        return b12x_mhc_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            rms_eps=self.rms_norm_eps,
+            hc_eps=self.hc_eps,
+            sinkhorn_iters=self.hc_sinkhorn_iters,
+            binding=binding,
+            block_k=self._b12x_mhc_block_k,
+        )
 
     def hc_pre(
         self,
@@ -1170,7 +1380,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
     ):
-        if self._use_b12x_mhc:
+        if self._should_run_b12x_mhc(int(x.shape[0])):
             if not is_forward_context_available():
                 return self._run_b12x_mhc_pre(x, hc_fn, hc_scale, hc_base)
             y, post_mix, res_mix = torch.ops.vllm.deepseek_v4_b12x_mhc_pre(
@@ -1205,7 +1415,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         post: torch.Tensor,
         comb: torch.Tensor,
     ):
-        if self._use_b12x_mhc:
+        if self._should_run_b12x_mhc(int(residual.shape[0])):
             if not is_forward_context_available():
                 return self._run_b12x_mhc_post(x, residual, post, comb)
             return torch.ops.vllm.deepseek_v4_b12x_mhc_post(
@@ -1219,6 +1429,56 @@ class DeepseekV4DecoderLayer(nn.Module):
         assert self.mhc_post is not None
         return self.mhc_post(x, residual, post, comb)
 
+    def hc_post_pre(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._should_run_b12x_mhc(int(residual.shape[0])):
+            if not is_forward_context_available():
+                return self._run_b12x_mhc_post_pre(
+                    x,
+                    residual,
+                    post,
+                    comb,
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                )
+            return torch.ops.vllm.deepseek_v4_b12x_mhc_post_pre(
+                x,
+                residual,
+                post,
+                comb,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                self.layer_name,
+            )
+
+        assert self.mhc_fused_post_pre is not None
+        return self.mhc_fused_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+            n_splits=1,
+            tile_n=1,
+        )
+
     def _forward_cuda(
         self,
         x: torch.Tensor,
@@ -1228,31 +1488,36 @@ class DeepseekV4DecoderLayer(nn.Module):
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self._use_b12x_mhc:
+        if self._should_run_b12x_mhc(int(x.shape[0])):
             if residual is None:
                 residual = x
+                x, post_mix, res_mix = self.hc_pre(
+                    residual,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                )
             else:
                 assert post_mix is not None
                 assert res_mix is not None
-                residual = self.hc_post(
+                residual, post_mix, res_mix, x = self.hc_post_pre(
                     x,
                     residual,
                     post_mix,
                     res_mix,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
                 )
 
-            x, post_mix, res_mix = self.hc_pre(
-                residual,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-            )
             x = self.attn_norm(x)
             x = self.attn(positions, x, None)
-            residual = self.hc_post(x, residual, post_mix, res_mix)
 
-            x, post_mix, res_mix = self.hc_pre(
+            residual, post_mix, res_mix, x = self.hc_post_pre(
+                x,
                 residual,
+                post_mix,
+                res_mix,
                 self.hc_ffn_fn,
                 self.hc_ffn_scale,
                 self.hc_ffn_base,
