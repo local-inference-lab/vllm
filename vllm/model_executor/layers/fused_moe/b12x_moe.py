@@ -24,6 +24,82 @@ from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
 
+def _dtype_element_size(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (int(a) + int(b) - 1) // int(b)
+
+
+def _plan_b12x_moe_fp4_scratch(
+    *,
+    tokens: int,
+    weight_E: int,
+    k: int,
+    n: int,
+    topk: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    activation: str,
+    quant_mode: str,
+    source_format: str,
+    w13_layout: str,
+    apply_router_weight_on_input: bool = False,
+    swiglu_limit: float | None = None,
+):
+    from b12x.integration.tp_moe import TPMoEScratchCaps, plan_tp_moe_scratch
+
+    return plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            max_tokens=max(int(tokens), 1),
+            weight_E=int(weight_E),
+            k=int(k),
+            n=int(n),
+            num_topk=int(topk),
+            device=device,
+            dtype=dtype,
+            core_token_counts=(max(int(tokens), 1),),
+            route_num_experts=0,
+            quant_mode=quant_mode,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            swiglu_limit=swiglu_limit,
+            source_format=source_format,
+            w13_layout=w13_layout,
+            frozen=True,
+        )
+    )
+
+
+def _b12x_scratch_nbytes(plan: Any) -> int:
+    specs = plan.scratch_specs()
+    if len(specs) != 1:
+        raise RuntimeError(f"expected one b12x MoE scratch buffer, got {len(specs)}")
+    spec = specs[0]
+    if spec.dtype != torch.uint8:
+        raise TypeError(f"expected b12x MoE scratch dtype uint8, got {spec.dtype}")
+    return int(spec.shape[0])
+
+
+def _workspace2_as_b12x_scratch(
+    workspace2: torch.Tensor | None,
+    plan: Any,
+) -> torch.Tensor:
+    if workspace2 is None:
+        raise RuntimeError("B12X MoE requires vLLM workspace2 scratch")
+    if not workspace2.is_contiguous():
+        raise ValueError("B12X MoE workspace2 must be contiguous")
+    scratch = workspace2.view(-1).view(torch.uint8)
+    required_nbytes = _b12x_scratch_nbytes(plan)
+    if int(scratch.numel()) < required_nbytes:
+        raise ValueError(
+            "B12X MoE workspace2 is too small for planned scratch: "
+            f"have={int(scratch.numel())} bytes, need={required_nbytes} bytes"
+        )
+    return scratch
+
+
 def _run_b12x_moe_fp4(
     *,
     a: torch.Tensor,
@@ -48,41 +124,12 @@ def _run_b12x_moe_fp4(
     w13_layout: str,
     prepared_w4a16: Any,
     swiglu_limit: float | None,
+    plan: Any,
+    scratch: torch.Tensor,
 ) -> None:
     """Call b12x MoE with caller-owned live scratch."""
-    from b12x.integration.tp_moe import (
-        TPMoEScratchCaps,
-        b12x_moe_fp4,
-        plan_tp_moe_scratch,
-    )
+    from b12x.integration.tp_moe import b12x_moe_fp4
 
-    weight_E = int(prepared_w4a16.num_experts)
-    n = int(prepared_w4a16.intermediate_size)
-    tokens = int(a.shape[0])
-    plan = plan_tp_moe_scratch(
-        TPMoEScratchCaps(
-            max_tokens=tokens,
-            weight_E=weight_E,
-            k=int(a.shape[1]),
-            n=n,
-            num_topk=int(topk_ids.shape[1]),
-            device=a.device,
-            dtype=a.dtype,
-            core_token_counts=(tokens,),
-            route_num_experts=0,
-            quant_mode=quant_mode,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            swiglu_limit=swiglu_limit,
-            source_format=source_format,
-            w13_layout=w13_layout,
-            frozen=True,
-        )
-    )
-    scratch = tuple(
-        torch.empty(shape, dtype=dtype, device=a.device)
-        for shape, dtype in plan.shapes_and_dtypes()
-    )
     binding = plan.bind(
         scratch=scratch,
         a=a,
@@ -440,7 +487,40 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        return (0,), (0,), (M, K)
+        prepared_w4a16 = self._lookup_prepared_w4a16()
+        if prepared_w4a16 is None:
+            weight_E = int(local_num_experts)
+            n = max(int(N) // 2, 1)
+            device = torch.device(
+                "cuda", torch.cuda.current_device()
+            ) if torch.cuda.is_available() else torch.device("cpu")
+        else:
+            weight_E = int(prepared_w4a16.num_experts)
+            n = int(prepared_w4a16.intermediate_size)
+            w13 = getattr(prepared_w4a16, "w13", None)
+            device = w13.device if isinstance(w13, torch.Tensor) else torch.device(
+                "cuda", torch.cuda.current_device()
+            )
+        workspace_dtype = getattr(self.moe_config, "in_dtype", torch.bfloat16)
+        plan = _plan_b12x_moe_fp4_scratch(
+            tokens=max(int(M), 1),
+            weight_E=weight_E,
+            k=int(K),
+            n=n,
+            topk=int(topk),
+            device=device,
+            dtype=workspace_dtype,
+            activation=_b12x_activation_name(activation),
+            quant_mode="w4a16",
+            source_format=self._source_format(),
+            w13_layout=self._w13_layout(),
+            swiglu_limit=getattr(self.quant_config, "gemm1_clamp_limit", None),
+        )
+        scratch_elements = max(
+            1,
+            _ceil_div(_b12x_scratch_nbytes(plan), _dtype_element_size(workspace_dtype)),
+        )
+        return (0,), (scratch_elements,), (M, K)
 
     def apply(
         self,
@@ -481,6 +561,26 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         unit_scale = self._unit_expert_scale(hidden_states.device, num_experts)
         topk_ids = _normalize_b12x_moe_topk_ids(topk_ids)
         topk_weights = _normalize_b12x_moe_topk_weights(topk_weights)
+        plan = _plan_b12x_moe_fp4_scratch(
+            tokens=int(hidden_states.shape[0]),
+            weight_E=num_experts,
+            k=int(hidden_states.shape[1]),
+            n=int(prepared_w4a16.intermediate_size),
+            topk=int(topk_ids.shape[1]),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+            activation=_b12x_activation_name(activation),
+            quant_mode="w4a16",
+            source_format=self._source_format(),
+            w13_layout=self._w13_layout(),
+            apply_router_weight_on_input=(
+                apply_router_weight_on_input
+                if apply_router_weight_on_input is not None
+                else False
+            ),
+            swiglu_limit=getattr(self.quant_config, "gemm1_clamp_limit", None),
+        )
+        scratch = _workspace2_as_b12x_scratch(workspace2, plan)
 
         _run_b12x_moe_fp4(
             a=hidden_states,
@@ -509,6 +609,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             w13_layout=self._w13_layout(),
             prepared_w4a16=prepared_w4a16,
             swiglu_limit=getattr(self.quant_config, "gemm1_clamp_limit", None),
+            plan=plan,
+            scratch=scratch,
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:

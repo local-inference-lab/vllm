@@ -2433,10 +2433,8 @@ class EngineArgs:
             self.enable_prefix_caching = False
 
     def _set_default_reasoning_config_args(self):
-        if not self.reasoning_parser:
+        if not self.reasoning_parser or self.reasoning_config is None:
             return
-        if self.reasoning_config is None:
-            self.reasoning_config = ReasoningConfig()
         self.reasoning_config.reasoning_parser = self.reasoning_parser
 
     @staticmethod

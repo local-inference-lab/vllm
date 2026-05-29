@@ -75,10 +75,25 @@ def _clamp_warmup_tokens(num_tokens: int, max_tokens: int) -> int:
     return max(0, min(num_tokens, max_tokens))
 
 
+def _runner_max_num_tokens(runner: "GPUModelRunner") -> int:
+    max_num_tokens = getattr(runner, "max_num_tokens", None)
+    if max_num_tokens is not None:
+        return int(max_num_tokens)
+
+    scheduler_config = getattr(runner, "scheduler_config", None)
+    max_num_batched_tokens = getattr(scheduler_config, "max_num_batched_tokens", 1)
+    return int(max_num_batched_tokens)
+
+
 def _deepseek_v4_slot_mapping_warmup(runner: "GPUModelRunner") -> None:
     """Pre-JIT `_compute_slot_mapping_kernel` across decode-shaped sizes."""
-    max_tokens = getattr(runner, "max_num_tokens", 1)
-    block_table = runner.input_batch.block_table
+    max_tokens = _runner_max_num_tokens(runner)
+    input_batch = getattr(runner, "input_batch", None)
+    legacy_block_table = getattr(input_batch, "block_table", None)
+    v2_block_tables = getattr(runner, "block_tables", None)
+    if legacy_block_table is None and v2_block_tables is None:
+        logger.debug("Skipping DeepSeek V4 slot-mapping warmup: no block tables.")
+        return
 
     # Snapshot the runner buffers we mutate so warmup doesn't leak state.
     saved_query_start_loc_np = None
@@ -115,8 +130,22 @@ def _deepseek_v4_slot_mapping_warmup(runner: "GPUModelRunner") -> None:
                 positions = positions_source
 
             try:
-                block_table.commit_block_table(1)
-                block_table.compute_slot_mapping(1, query_start_loc, positions)
+                if legacy_block_table is not None:
+                    legacy_block_table.commit_block_table(1)
+                    legacy_block_table.compute_slot_mapping(
+                        1, query_start_loc, positions
+                    )
+                else:
+                    idx_mapping = torch.zeros(
+                        1, dtype=torch.int32, device=runner.device
+                    )
+                    assert v2_block_tables is not None
+                    v2_block_tables.compute_slot_mappings(
+                        idx_mapping,
+                        query_start_loc,
+                        positions,
+                        num_tokens_padded=num_tokens,
+                    )
             finally:
                 if saved_positions is not None:
                     runner.positions[:num_tokens].copy_(saved_positions)
