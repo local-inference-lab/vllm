@@ -6,7 +6,6 @@ cd "$(dirname "$0")"
 export CUDA_VISIBLE_DEVICES=7,8
 export NCCL_IB_DISABLE=1
 export VLLM_USE_FLASHINFER_SAMPLER=1
-export VLLM_USE_B12X_MHC=0
 export B12X_W4A16_TC_DECODE=1
 export VLLM_USE_V2_MODEL_RUNNER=1
 export VLLM_PCIE_ALLREDUCE_BACKEND=b12x
@@ -42,7 +41,7 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --port 8000 \
   --kv-cache-dtype fp8 \
   --block-size 256 \
-  --max-model-len 65536 \  # just for testing perf/debugging
+  --max-model-len 65536 \
   --load-format fastsafetensors \
   --tensor-parallel-size 2 \
   --gpu-memory-utilization 0.88 \
