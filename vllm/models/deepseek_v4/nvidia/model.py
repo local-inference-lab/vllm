@@ -556,6 +556,8 @@ def _deepseek_v4_b12x_mhc_pre_op(
     hc_fn: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
     layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     self = get_forward_context().no_compile_layers[layer_name]
@@ -568,6 +570,8 @@ def _deepseek_v4_b12x_mhc_pre_op(
             hc_fn,
             hc_scale,
             hc_base,
+            norm_weight,
+            norm_eps,
         ),
     )
 
@@ -577,9 +581,11 @@ def _deepseek_v4_b12x_mhc_pre_op_fake(
     hc_fn: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
     layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    del hc_fn, hc_scale, hc_base, layer_name
+    del hc_fn, hc_scale, hc_base, norm_weight, norm_eps, layer_name
     tokens, hc_mult, hidden_size = residual.shape
     y_out = torch.empty(
         (tokens, hidden_size), dtype=residual.dtype, device=residual.device
@@ -642,6 +648,8 @@ def _deepseek_v4_b12x_mhc_post_pre_op(
     hc_fn: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
     layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     self = get_forward_context().no_compile_layers[layer_name]
@@ -657,6 +665,8 @@ def _deepseek_v4_b12x_mhc_post_pre_op(
             hc_fn,
             hc_scale,
             hc_base,
+            norm_weight,
+            norm_eps,
         ),
     )
 
@@ -669,9 +679,11 @@ def _deepseek_v4_b12x_mhc_post_pre_op_fake(
     hc_fn: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
     layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    del x, post, comb, hc_fn, hc_scale, hc_base, layer_name
+    del x, post, comb, hc_fn, hc_scale, hc_base, norm_weight, norm_eps, layer_name
     tokens, hc_mult, hidden_size = residual.shape
     residual_out = torch.empty_like(residual)
     post_out = torch.empty(
@@ -1286,6 +1298,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         from b12x.integration.residual import b12x_mhc_pre
 
@@ -1310,6 +1324,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             y_out=y_out,
             post_out=post_out,
             comb_out=comb_out,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
             block_k=self._b12x_mhc_block_k,
         )
 
@@ -1335,6 +1351,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         from b12x.integration.residual import b12x_mhc_post_pre
 
@@ -1367,6 +1385,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             rms_eps=self.rms_norm_eps,
             hc_eps=self.hc_eps,
             sinkhorn_iters=self.hc_sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
             binding=binding,
             block_k=self._b12x_mhc_block_k,
         )
@@ -1382,12 +1402,21 @@ class DeepseekV4DecoderLayer(nn.Module):
     ):
         if self._should_run_b12x_mhc(int(x.shape[0])):
             if not is_forward_context_available():
-                return self._run_b12x_mhc_pre(x, hc_fn, hc_scale, hc_base)
+                return self._run_b12x_mhc_pre(
+                    x,
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    norm_weight,
+                    norm_eps,
+                )
             y, post_mix, res_mix = torch.ops.vllm.deepseek_v4_b12x_mhc_pre(
                 x,
                 hc_fn,
                 hc_scale,
                 hc_base,
+                norm_weight,
+                norm_eps,
                 self.layer_name,
             )
             return y, post_mix, res_mix
@@ -1438,6 +1467,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 1e-6,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._should_run_b12x_mhc(int(residual.shape[0])):
             if not is_forward_context_available():
@@ -1449,6 +1480,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                     hc_fn,
                     hc_scale,
                     hc_base,
+                    norm_weight,
+                    norm_eps,
                 )
             return torch.ops.vllm.deepseek_v4_b12x_mhc_post_pre(
                 x,
@@ -1458,6 +1491,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hc_fn,
                 hc_scale,
                 hc_base,
+                norm_weight,
+                norm_eps,
                 self.layer_name,
             )
 
@@ -1477,6 +1512,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             n_splits=1,
             tile_n=1,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
         )
 
     def _forward_cuda(
@@ -1489,6 +1526,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._should_run_b12x_mhc(int(x.shape[0])):
+            attn_norm_weight = self.attn_norm.weight.data
+            attn_norm_eps = self.attn_norm.variance_epsilon
             if residual is None:
                 residual = x
                 x, post_mix, res_mix = self.hc_pre(
@@ -1496,6 +1535,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.hc_attn_fn,
                     self.hc_attn_scale,
                     self.hc_attn_base,
+                    norm_weight=attn_norm_weight,
+                    norm_eps=attn_norm_eps,
                 )
             else:
                 assert post_mix is not None
@@ -1508,11 +1549,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.hc_attn_fn,
                     self.hc_attn_scale,
                     self.hc_attn_base,
+                    norm_weight=attn_norm_weight,
+                    norm_eps=attn_norm_eps,
                 )
 
-            x = self.attn_norm(x)
             x = self.attn(positions, x, None)
 
+            ffn_norm_weight = self.ffn_norm.weight.data
+            ffn_norm_eps = self.ffn_norm.variance_epsilon
             residual, post_mix, res_mix, x = self.hc_post_pre(
                 x,
                 residual,
@@ -1521,8 +1565,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_ffn_fn,
                 self.hc_ffn_scale,
                 self.hc_ffn_base,
+                norm_weight=ffn_norm_weight,
+                norm_eps=ffn_norm_eps,
             )
-            x = self.ffn_norm(x)
             x = self.ffn(x, input_ids)
             return x, residual, post_mix, res_mix
 
