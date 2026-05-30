@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for the sparse MLA backends and utilities."""
 
+import importlib.util
 import math
 from types import MethodType, SimpleNamespace
 
@@ -38,6 +39,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseBackend,
 )
+from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseBackend
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
     triton_convert_req_index_to_global_index,
@@ -174,8 +176,8 @@ def _quantize_dequantize_fp8_ds_mla(
 
 @pytest.mark.parametrize(
     "backend_cls",
-    [FlashMLASparseBackend, FlashInferMLASparseBackend],
-    ids=["FlashMLA", "FlashInfer"],
+    [FlashMLASparseBackend, FlashInferMLASparseBackend, B12xMLASparseBackend],
+    ids=["FlashMLA", "FlashInfer", "B12x"],
 )
 @pytest.mark.parametrize("batch_name", list(SPARSE_BACKEND_BATCH_SPECS.keys()))
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8", "fp8_ds_mla"])
@@ -220,6 +222,16 @@ def test_sparse_backend_decode_correctness(
     elif backend_cls == FlashInferMLASparseBackend:
         if not current_platform.has_device_capability(100):
             pytest.skip("FlashInferMLASparseBackend requires SM 10.0 or higher")
+    elif backend_cls == B12xMLASparseBackend:
+        if not current_platform.has_device_capability(120):
+            pytest.skip("B12xMLASparseBackend requires SM 12.0 (consumer Blackwell)")
+        if importlib.util.find_spec("b12x") is None:
+            pytest.skip("b12x package not available")
+        if kv_cache_dtype != "fp8_ds_mla":
+            # b12x's GLM_NSA unified kernel consumes the fp8_ds_mla 656 B/token
+            # record (raw e4m3 + inline FP32 scales). The other cache dtypes are
+            # advertised for the serving alias path but not exercised here.
+            pytest.skip("b12x sparse MLA is validated with the fp8_ds_mla cache")
 
     batch_spec = SPARSE_BACKEND_BATCH_SPECS[batch_name]
     use_fp8_ds_mla_quantization = kv_cache_dtype == "fp8_ds_mla"
@@ -357,7 +369,15 @@ def test_sparse_backend_decode_correctness(
         k_pe_full = torch.rand(s_len, 1, qk_rope_head_dim, dtype=dtype, device=device)
 
         if use_fp8_ds_mla_quantization:
-            is_sm100 = torch.cuda.get_device_capability()[0] >= 10
+            # The SM100 FlashInfer/FlashMLA kernels read ue8m0 (power-of-2) block
+            # scales, so the reference truncates scales to match. b12x's GLM_NSA
+            # kernel instead keeps the raw e4m3 K with the inline arbitrary-FP32
+            # group scale (it is incompatible with ue8m0 block-scaling), so for
+            # B12x the reference must dequantize with the true FP32 scales.
+            is_sm100 = (
+                torch.cuda.get_device_capability()[0] >= 10
+                and backend_cls is not B12xMLASparseBackend
+            )
             kv_c_full, k_pe_squeezed = _quantize_dequantize_fp8_ds_mla(
                 kv_c_full,
                 k_pe_full.squeeze(1),

@@ -79,6 +79,12 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     SPARSE_MLA_SM120 = (
         "vllm.v1.attention.backends.mla.sparse_mla_sm120.SparseMLASm120Backend"
     )
+    # Opt-in b12x unified sparse-MLA backend (same SM120 envelope as
+    # SPARSE_MLA_SM120). Not in the platform auto-selection priority list; select
+    # it explicitly via VLLM_ATTENTION_BACKEND=B12X_MLA_SPARSE.
+    B12X_MLA_SPARSE = (
+        "vllm.v1.attention.backends.mla.b12x_mla_sparse.B12xMLASparseBackend"
+    )
     FLASH_ATTN_MLA = "vllm.v1.attention.backends.mla.flashattn_mla.FlashAttnMLABackend"
     NO_ATTENTION = "vllm.v1.attention.backends.no_attention.NoAttentionBackend"
     FLEX_ATTENTION = "vllm.v1.attention.backends.flex_attention.FlexAttentionBackend"
