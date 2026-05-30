@@ -13,7 +13,6 @@ from collections.abc import Iterable
 
 import torch
 
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.tracing import instrument
 from vllm.utils.math_utils import cdiv
@@ -181,11 +180,11 @@ def deepseek_v4_mhc_warmup(
     if model_type is not None and model_type != "deepseek_v4":
         return
 
-    if envs.VLLM_USE_B12X_MHC:
-        # b12x uses separate CuTe kernels and its fused post_pre path is captured
-        # by the normal graph warmup. The generic mHC warmup would compile many
-        # standalone pre/post shapes that the b12x forward path does not use.
-        return
+    # Under VLLM_USE_B12X_MHC the fused post_pre is served by the b12x Gram
+    # kernel (captured by the normal graph warmup); the standalone hc_pre /
+    # hc_post boundaries (first / last layer) fall through to the TileLang
+    # kernels, so the generic mHC warmup below still warms exactly the shapes
+    # the b12x forward path uses.
 
     layer = _find_first_mhc_layer(model)
     if layer is None:
