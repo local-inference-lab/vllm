@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """B12X modular fused-MoE backend for FP4 weights."""
 
+import os
+from types import SimpleNamespace
 from typing import Any, cast
 
 import torch
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -25,6 +28,15 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def _dtype_element_size(dtype: torch.dtype) -> int:
@@ -341,6 +353,15 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._unit_scale_by_device: dict[torch.device, torch.Tensor] = {}
 
     def _quant_mode(self) -> str:
+        if (
+            self.quant_config.quant_dtype == "nvfp4"
+            and _env_flag("B12X_MOE_FORCE_A16")
+        ):
+            logger.warning_once(
+                "B12X_MOE_FORCE_A16=1 forcing B12X MoE quant_mode=w4a16 "
+                "for NVFP4 weights."
+            )
+            return "w4a16"
         return "nvfp4" if self.quant_config.quant_dtype == "nvfp4" else "w4a16"
 
     def _source_format(self) -> str:
@@ -349,6 +370,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         return "fp4_e8m0_k32"
 
     def _w13_layout(self) -> str:
+        if (
+            self._source_format() == "modelopt_nvfp4"
+            and self._quant_mode() == "w4a16"
+        ):
+            return "w13"
         # vLLM fused MoE loading stores fused W13 as [w1/gate, w3/up], which is
         # the row order consumed by b12x for the runtime SwiGLU path. Declaring
         # "up_gate" here swaps gate/up in every expert -> corrupted MoE output.
@@ -554,6 +580,31 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             w2_global_scale = self._weight_global_scale(
                 w2.device, num_experts, weight_name="w2"
             )
+            if self._source_format() == "modelopt_nvfp4":
+                from b12x.moe.fused.w4a16.prepare import (
+                    prepare_w4a16_modelopt_native_weights,
+                )
+
+                w4a16 = prepare_w4a16_modelopt_native_weights(
+                    w1,
+                    self.w1_scale,
+                    w1_global_scale,
+                    w2,
+                    self.w2_scale,
+                    w2_global_scale,
+                    activation=_b12x_activation_name(activation),
+                    params_dtype=params_dtype,
+                    w13_layout=self._w13_layout(),
+                )
+                prepared = SimpleNamespace(
+                    source_format=self._source_format(),
+                    w13_layout=self._w13_layout(),
+                    w1_runtime_alphas=None,
+                    w2_runtime_alphas=None,
+                    w4a16=w4a16,
+                )
+                self._prepared_fp4_moe_by_dtype[params_dtype] = prepared
+                return prepared
             a1_gscale = unit_scale
             a2_gscale = unit_scale
 
