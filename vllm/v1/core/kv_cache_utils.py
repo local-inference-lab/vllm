@@ -1603,10 +1603,11 @@ def _get_kv_cache_groups_uniform_groups(
     ]
 
     swa_mla_specs = grouped_specs[1:]
-    # Non-first groups are SWA-MLA (DeepseekV4) or full-attention dcp_replicated
-    # drafts (DFlash under DCP). Both are padded to MLA buckets identically.
+    # Non-first groups are SWA-MLA (DeepseekV4), full-attention dcp_replicated
+    # drafts, or sliding-window dcp_replicated drafts (DFlash under DCP). All are
+    # padded to MLA buckets identically.
     assert all(
-        isinstance(spec, (SlidingWindowMLASpec, FullAttentionSpec))
+        isinstance(spec, (SlidingWindowMLASpec, FullAttentionSpec, SlidingWindowSpec))
         for group in swa_mla_specs
         for spec in group.kv_cache_specs.values()
     )

@@ -516,7 +516,17 @@ def _prepare_dflash_inputs_kernel(
         mask=is_ctx,
         other=0,
     ).to(tl.int64)
-    ctx_slot = ctx_block_id * block_size + (ctx_pos % block_size)
+    # Sliding-window draft cache: context positions older than the window have
+    # been evicted, so their block-table entry is the null block (id 0). Writing
+    # them would clobber physical block 0, so map them to PAD_SLOT_ID; the K/V
+    # write kernel (triton_reshape_and_cache_flash) skips negative slots. For a
+    # full-attention draft no context block is ever null, so this is a no-op.
+    ctx_resident = is_ctx & (ctx_block_id != 0)
+    ctx_slot = tl.where(
+        ctx_resident,
+        ctx_block_id * block_size + (ctx_pos % block_size),
+        PAD_SLOT_ID,
+    )
     tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
     tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
 
