@@ -477,6 +477,11 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
 class SlidingWindowSpec(AttentionSpec):
     sliding_window: int
     head_size_v: int = None  # type: ignore[assignment]
+    # Replicate this group's KV cache on every DCP rank instead of sharding it
+    # by token position. Used by the DFlash draft, whose attention backend
+    # cannot reduce across DCP ranks; every rank keeps the full (window-bounded)
+    # cache. Mirrors FullAttentionSpec.dcp_replicated.
+    dcp_replicated: bool = False
 
     def __post_init__(self):
         if self.head_size_v is None:
@@ -525,9 +530,13 @@ class SlidingWindowSpec(AttentionSpec):
         return cdiv(num_tokens, self.block_size) + 1
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
-            "DCP not support sliding window."
-        )
+        # DCP shards full-attention KV by token position; sliding window cannot
+        # be sharded that way. A dcp_replicated group keeps the full
+        # (window-bounded) cache on every rank, so DCP is fine in that case.
+        assert (
+            vllm_config.parallel_config.decode_context_parallel_size == 1
+            or self.dcp_replicated
+        ), "DCP only supports sliding window when the group is dcp_replicated."
         max_model_len = vllm_config.model_config.max_model_len
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         max_blocks = self.max_admission_blocks_per_request(

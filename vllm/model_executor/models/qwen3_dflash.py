@@ -41,6 +41,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
+    SlidingWindowSpec,
     get_kv_quant_mode,
 )
 
@@ -103,24 +104,28 @@ class DFlashAttention(Attention):
     """
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        # The draft attends over the full context with a backend that cannot
-        # reduce across DCP ranks; replicate the draft cache on every rank.
+        # The draft attends over a sliding window with a backend that cannot
+        # reduce across DCP ranks; replicate the (window-bounded) draft cache on
+        # every rank. DFlashQwen3DecoderLayer gives every draft layer a window
+        # (incl. the lone full_attention layer) so all layers share one uniform
+        # SlidingWindowSpec group — the single group the speculator requires.
         dcp_replicated = (
             vllm_config.parallel_config.decode_context_parallel_size > 1
         )
         if self.sliding_window is not None:
-            # Build the full spec directly instead of converting the parent's
+            # Build the spec directly instead of via the parent's
             # SlidingWindowSpec: Attention.get_kv_cache_spec asserts against
             # MLA *target* models for sliding-window layers, which would
-            # reject DFlash drafts beside MLA targets (e.g. Kimi K2.6) even
+            # reject DFlash drafts beside MLA targets (e.g. Kimi K2.7) even
             # though the draft layer itself is not MLA.
             assert self.attn_type == AttentionType.DECODER
-            return FullAttentionSpec(
+            return SlidingWindowSpec(
                 block_size=vllm_config.cache_config.block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
+                sliding_window=self.sliding_window,
                 kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
                 dcp_replicated=dcp_replicated,
             )
@@ -258,9 +263,16 @@ class DFlashQwen3DecoderLayer(nn.Module):
         self.layer_type = layer_type
         set_default_rope_theta(config, default_theta=1000000)
         attn_type = AttentionType.DECODER
-        sliding_window = (
-            config.sliding_window if layer_type == "sliding_attention" else None
-        )
+        # Window EVERY draft layer (including the lone full_attention layer) so
+        # the draft KV forms a single uniform SlidingWindowSpec group, letting
+        # the replicated draft cache be window-bounded (and evictable) under DCP.
+        # The target verifies every drafted token, so windowing the full layer
+        # can only cost acceptance rate, not output correctness. Both the
+        # compute window (per_layer_sliding_window) and the storage window
+        # (SlidingWindowSpec) must match, which this guarantees.
+        sliding_window = getattr(config, "sliding_window", None)
+        if sliding_window is None and layer_type == "sliding_attention":
+            sliding_window = config.sliding_window
         dflash_config = getattr(config, "dflash_config", None) or {}
         attention_sink_bias = bool(dflash_config.get("attention_sink_bias", False))
 
