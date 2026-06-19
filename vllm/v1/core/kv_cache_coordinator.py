@@ -543,30 +543,37 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self.hash_block_size = hash_block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        # Prefix caching is unsupported for hybrid groups under DCP. Besides
-        # the DeepseekV4 MLA/SWA hybrid, this also covers an MLA target plus a
-        # DCP-replicated DFlash draft group (different block sizes / cp).
-        _has_dcp_replicated = any(
-            getattr(g.kv_cache_spec, "dcp_replicated", False)
-            for g in kv_cache_config.kv_cache_groups
-        )
+        # Prefix caching under DCP is only disabled for the genuine DeepseekV4
+        # MLA/SWA hybrid. A DCP-*replicated* draft group (MTP/DFlash) keeps its
+        # full cache per rank (so cached blocks are consistent across ranks) and
+        # is now hashable alongside the sharded target via the GCD hash_block_size
+        # (see resolve_kv_cache_block_sizes) + the scaled-block-size assert below.
+        # So it no longer forces a model-wide prefix-cache disable.
         self.disable_prefix_cache_for_dsv4_dcp = (
             enable_caching
             and dcp_world_size > 1
             and pcp_world_size == 1
-            and (
-                is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
-                or _has_dcp_replicated
-            )
+            and is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
         )
         if not self.disable_prefix_cache_for_dsv4_dcp:
+            # R3 fix: compare against the *effective* (DCP-scaled) block size the
+            # manager actually uses, not the unscaled spec block size. Under DCP
+            # a sharded group's manager.block_size == spec.block_size * dcp, which
+            # matches hash_block_size (= LCM of effective sizes). The original
+            # used g.kv_cache_spec.block_size (unscaled) and so was structurally
+            # unsatisfiable under DCP. Mirrors UnitaryKVCacheCoordinator.
             assert all(
-                g.kv_cache_spec.block_size % hash_block_size == 0
-                for g in kv_cache_config.kv_cache_groups
+                mgr.block_size % hash_block_size == 0
+                for mgr in self.single_type_managers
             ), "block_size must be divisible by hash_block_size"
-        assert dcp_world_size == 1 or self.disable_prefix_cache_for_dsv4_dcp, (
-            "DCP not support hybrid attn now."
-        )
+        # DCP>1 is allowed with prefix caching for non-hybrid (e.g. uniformly
+        # DCP-sharded) layouts; only the genuine DeepseekV4 MLA/SWA hybrid must
+        # keep caching disabled under DCP.
+        assert (
+            dcp_world_size == 1
+            or not is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
+            or self.disable_prefix_cache_for_dsv4_dcp
+        ), "DCP prefix caching unsupported for the DeepseekV4 MLA/SWA hybrid."
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
         self.verify_and_split_kv_cache_groups()
 

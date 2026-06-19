@@ -592,7 +592,13 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         layer_id = extract_layer_index(self.prefix)
         num_hidden_layers = getattr(vllm_config.model_config.hf_config,
                                     "num_hidden_layers", None)
-        dcp_replicated = (layer_id is not None
+        import os as _os
+        _shard_draft = _os.environ.get("VLLM_DCP_SHARD_DRAFT", "0").lower() in (
+            "1", "true", "yes")
+        # R1 prototype: see MLAAttention.get_kv_cache_spec. Shard the indexer
+        # draft cache too when VLLM_DCP_SHARD_DRAFT is set.
+        dcp_replicated = (not _shard_draft
+                          and layer_id is not None
                           and num_hidden_layers is not None
                           and int(layer_id) >= int(num_hidden_layers))
         return MLAAttentionSpec(  # Only has one vector instead of K + V

@@ -13,10 +13,26 @@ def _create_draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
 
+    # DCP-sharded-draft: the draft is normally built with
+    # ``draft_parallel_config`` (decode_context_parallel_size=1), correct for a
+    # *replicated* draft. When the draft KV is DCP-*sharded*
+    # (VLLM_DCP_SHARD_DRAFT), the draft attention impls must be constructed with
+    # the parent's DCP world size so their workspace/scratch is sized for the
+    # DCP head all-gather and the cross-rank LSE-reduce path is taken.
+    import os as _os
+    _draft_parallel_config = speculative_config.draft_parallel_config
+    if _os.environ.get("VLLM_DCP_SHARD_DRAFT", "0").lower() in ("1", "true", "yes"):
+        _draft_parallel_config = replace(
+            _draft_parallel_config,
+            decode_context_parallel_size=(
+                vllm_config.parallel_config.decode_context_parallel_size
+            ),
+        )
+
     draft_vllm_config = replace(
         vllm_config,
         parallel_config=replace(
-            speculative_config.draft_parallel_config,
+            _draft_parallel_config,
             rank=vllm_config.parallel_config.rank,
         ),
         model_config=speculative_config.draft_model_config,

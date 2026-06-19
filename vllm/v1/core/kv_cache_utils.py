@@ -635,7 +635,13 @@ def resolve_kv_cache_block_sizes(
                 for g in groups
             ]
             scheduler_block_size = math.lcm(*effective_block_sizes)
-            return scheduler_block_size, scheduler_block_size
+            # hash_block_size = GCD (not the LCM scheduler size) so prefix
+            # caching can hash a replicated draft group (effective block_size
+            # `base`) alongside the DCP-sharded target (effective `base*dcp`):
+            # every group's block is a multiple of the GCD. scheduler_block_size
+            # stays the LCM, so cache hits still round to whole cross-rank
+            # blocks (alignment preserved); only hash granularity gets finer.
+            return scheduler_block_size, math.gcd(*effective_block_sizes)
         raise ValueError(
             "Hybrid KV cache groups with multiple block sizes do not "
             "support context parallelism (dcp_world_size/pcp_world_size > 1)."

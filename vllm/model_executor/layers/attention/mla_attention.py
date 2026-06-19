@@ -1061,7 +1061,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         layer_id = int(layer_match.group(1)) if layer_match is not None else None
         num_hidden_layers = getattr(vllm_config.model_config.hf_config,
                                     "num_hidden_layers", None)
-        dcp_replicated = (layer_id is not None
+        import os as _os
+        _shard_draft = _os.environ.get("VLLM_DCP_SHARD_DRAFT", "0").lower() in (
+            "1", "true", "yes")
+        # R1 prototype: when VLLM_DCP_SHARD_DRAFT is set, DCP-shard the draft
+        # (layers >= num_hidden_layers) instead of replicating it, so the draft
+        # KV uses the same sharded layout as the target (enables prefix caching
+        # under DCP, reclaims draft VRAM). Default unset = original replication.
+        dcp_replicated = (not _shard_draft
+                          and layer_id is not None
                           and num_hidden_layers is not None
                           and layer_id >= int(num_hidden_layers))
         return MLAAttentionSpec(
