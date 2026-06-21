@@ -69,6 +69,7 @@ logger = init_logger(__name__)
 # wave-balanced planner picks num_splits <= this cap.
 _DECODE_SPLIT_TILE = 64
 _PREFILL_HEADS_PER_BLOCK = 16
+_EXTEND_PREWARM_DONE: set[tuple[int | None, int, int, int, int, int, bool]] = set()
 
 
 def _cdiv(x: int, y: int) -> int:
@@ -674,9 +675,96 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             ((max_batched, self.num_heads, self.q_head_dim), torch.bfloat16),
             ((self._scratch_nbytes,), torch.uint8),
         )
+        self._prewarm_extend_kernels_once(max_batched)
 
         # Q arrives BF16; the unified kernel quantizes inside.
         self.supports_quant_query_input = False
+
+    def _sync_dcp_warmup(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        if self.dcp_world_size <= 1:
+            return
+        try:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            dcp_group = get_dcp_group()
+            dcp_group.barrier()
+        except Exception:
+            return
+        finally:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+
+    def _prewarm_extend_kernels_once(self, max_batched: int) -> None:
+        if self.device.type != "cuda":
+            return
+        key = (
+            self.device.index,
+            self.q_head_dim,
+            self.kv_lora_rank,
+            self._prefill_num_heads,
+            int(self.topk_tokens),
+            int(self.block_size),
+            bool(self.need_to_return_lse_for_decode),
+        )
+        if key in _EXTEND_PREWARM_DONE:
+            return
+        _EXTEND_PREWARM_DONE.add(key)
+
+        rows_to_warm = (1, 2, 4, max(1, int(max_batched)))
+        seen_rows: set[int] = set()
+        # GLM fp8_ds_mla cache records are 656 B/token. One page is enough:
+        # prewarm top-k indices all point at slot zero.
+        kv_cache = torch.zeros(
+            (self.block_size, 1, 656), dtype=torch.uint8, device=self.device
+        )
+        for rows in rows_to_warm:
+            rows = int(rows)
+            if rows in seen_rows:
+                continue
+            seen_rows.add(rows)
+            q = torch.zeros(
+                (rows, self._prefill_num_heads, self.q_head_dim),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            selected_indices = torch.zeros(
+                (rows, self.topk_tokens), dtype=torch.int32, device=self.device
+            )
+            cache_seqlens = torch.full(
+                (1,), self.block_size, dtype=torch.int32, device=self.device
+            )
+            nsa_cache_seqlens = torch.ones(
+                (rows,), dtype=torch.int32, device=self.device
+            )
+            scratch_storage = torch.empty(
+                (self._scratch_nbytes,), dtype=torch.uint8, device=self.device
+            )
+            binding = self._extend_plan.bind(
+                scratch=scratch_storage,
+                q=q,
+                selected_indices=selected_indices,
+                cache_seqlens_int32=cache_seqlens,
+                nsa_cache_seqlens_int32=nsa_cache_seqlens,
+            )
+            if self.need_to_return_lse_for_decode:
+                self._sparse_mla_extend_forward(
+                    binding=binding,
+                    kv_cache=kv_cache,
+                    sm_scale=self.scale,
+                    v_head_dim=self.kv_lora_rank,
+                    return_lse=True,
+                    lse_scale="natural",
+                )
+            else:
+                self._sparse_mla_extend_forward(
+                    binding=binding,
+                    kv_cache=kv_cache,
+                    sm_scale=self.scale,
+                    v_head_dim=self.kv_lora_rank,
+                )
+            self._sync_dcp_warmup()
 
     def forward_mqa(
         self,

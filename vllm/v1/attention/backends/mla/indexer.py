@@ -957,7 +957,13 @@ def build_prefill_chunk_metadata(
         total_seq_lens = int(compressed_seq_lens_np[start_idx:end_idx].sum())
     else:
         total_seq_lens = compressed_seq_lens_cpu[start_idx:end_idx].sum().item()
-    if total_seq_lens == 0:
+    keep_empty_dcp_chunk = (
+        envs.VLLM_USE_B12X_SPARSE_INDEXER
+        and dcp_world_size > 1
+        and os.environ.get("VLLM_DCP_GLOBAL_TOPK", "1").lower()
+        in ("1", "true", "yes", "on")
+    )
+    if total_seq_lens == 0 and not keep_empty_dcp_chunk:
         return None
 
     num_reqs = end_idx - start_idx

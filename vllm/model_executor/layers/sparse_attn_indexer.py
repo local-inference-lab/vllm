@@ -427,6 +427,25 @@ def _get_dcp_warmup_params() -> tuple[int, int, int]:
     return dcp_world_size, dcp_rank, cp_kv_cache_interleave_size
 
 
+def _sync_dcp_warmup() -> None:
+    """Finish one-time DCP warmup on every rank before graph warmup proceeds."""
+    if current_platform.is_cuda():
+        torch.cuda.synchronize()
+
+    try:
+        from vllm.distributed.parallel_state import get_dcp_group
+
+        dcp_group = get_dcp_group()
+        if int(dcp_group.world_size) <= 1:
+            return
+        dcp_group.barrier()
+    except Exception:
+        return
+    finally:
+        if current_platform.is_cuda():
+            torch.cuda.synchronize()
+
+
 def _prewarm_b12x_dcp_topk_merge(
     *,
     q_rows: int,
@@ -439,73 +458,30 @@ def _prewarm_b12x_dcp_topk_merge(
     if dcp_world_size <= 1 or topk_tokens <= 0:
         return
 
-    rows = max(1, int(q_rows))
     topk = int(topk_tokens)
-    world_size = int(dcp_world_size)
-    candidate_width = world_size * topk
-    (
-        candidates,
-        gathered_candidates,
-        candidate_indices,
-        candidate_score_bits,
-        candidate_lengths,
-    ) = current_workspace_manager().get_simultaneous(
-        ((rows, 2, topk), torch.int32),
-        ((rows * world_size, 2, topk), torch.int32),
-        ((rows, candidate_width), torch.int32),
-        ((rows, candidate_width), torch.int32),
-        ((rows,), torch.int32),
-    )
-    if not _use_triton_dcp_remap(candidate_indices):
-        return
-
-    from b12x.attention.indexer.tiled_topk import run_row_topk
-
-    from vllm.v1.attention.backends.mla.sparse_utils import (
-        triton_convert_dcp_local_topk_to_global,
-        triton_gather_topk_ids_by_position,
-    )
-
-    topk_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
-    topk_scores = torch.empty((rows, topk), dtype=torch.float32, device=device)
-    topk_indices.copy_(
-        torch.arange(topk, dtype=torch.int32, device=device).expand(rows, topk)
-    )
-    topk_scores.zero_()
-    triton_convert_dcp_local_topk_to_global(
-        topk_indices,
-        topk_scores,
-        dcp_world_size=world_size,
-        dcp_rank=int(dcp_rank),
-        cp_kv_cache_interleave_size=int(cp_kv_cache_interleave_size),
-    )
-
-    candidates[:, 0, :].copy_(topk_indices)
-    candidates[:, 1, :].copy_(topk_scores.view(torch.int32))
-    gathered_view = gathered_candidates.view(world_size, rows, 2, topk)
-    for rank in range(world_size):
-        gathered_view[rank].copy_(candidates)
-    _unpack_b12x_dcp_gathered_candidates(
-        gathered_candidates,
-        candidate_indices,
-        candidate_score_bits,
-        dcp_world_size=world_size,
-        topk_tokens=topk,
-    )
-
-    candidate_lengths.fill_(candidate_width)
-    run_row_topk(
-        row_logits=candidate_score_bits.view(torch.float32),
-        lengths=candidate_lengths,
-        topk=topk,
-        output_values=topk_scores,
-        output_indices=topk_indices,
-    )
-    triton_gather_topk_ids_by_position(
-        candidate_indices,
-        topk_indices,
-        topk_indices,
-    )
+    # Graph warmup later exercises both small decode rows and prefill chunks.
+    # Use the real runtime merge path here, including DCP all-gather, so Triton
+    # and b12x row-topk kernels are loaded before rank-sensitive attention
+    # collectives begin.
+    warmup_rows = (1, 2, 4, max(1, int(q_rows)))
+    seen_rows: set[int] = set()
+    base_ids = torch.arange(topk, dtype=torch.int32, device=device)
+    for rows in warmup_rows:
+        rows = int(rows)
+        if rows in seen_rows:
+            continue
+        seen_rows.add(rows)
+        topk_indices = base_ids.expand(rows, topk).clone()
+        topk_scores = torch.zeros((rows, topk), dtype=torch.float32, device=device)
+        _merge_b12x_dcp_topk(
+            topk_indices=topk_indices,
+            topk_scores=topk_scores,
+            topk_tokens=topk,
+            dcp_world_size=int(dcp_world_size),
+            dcp_rank=int(dcp_rank),
+            cp_kv_cache_interleave_size=int(cp_kv_cache_interleave_size),
+        )
+        _sync_dcp_warmup()
 
 
 def _dcp_global_topk_remap(
@@ -920,6 +896,35 @@ def _merge_b12x_dcp_topk(
         candidate_indices,
         topk_indices,
         topk_indices,
+    )
+
+
+def _convert_b12x_dcp_local_topk_to_global(
+    *,
+    topk_indices: torch.Tensor,
+    topk_scores: torch.Tensor | None,
+    dcp_world_size: int,
+    dcp_rank: int,
+    cp_kv_cache_interleave_size: int,
+) -> None:
+    if dcp_world_size <= 1 or topk_indices.numel() == 0:
+        return
+    if topk_scores is None:
+        raise RuntimeError(
+            "B12X sparse indexer DCP requires a topk_scores_buffer for "
+            "local-to-global candidate conversion."
+        )
+
+    from vllm.v1.attention.backends.mla.sparse_utils import (
+        triton_convert_dcp_local_topk_to_global,
+    )
+
+    triton_convert_dcp_local_topk_to_global(
+        topk_indices,
+        topk_scores,
+        dcp_world_size=dcp_world_size,
+        dcp_rank=dcp_rank,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
     )
 
 
@@ -1383,15 +1388,34 @@ def sparse_attn_indexer(
             ]
             if chunk.total_seq_lens <= 0:
                 topk_indices.fill_(-1)
-                if dcp_global_topk and not use_b12x_indexer:
-                    _dcp_global_topk_remap(
-                        topk_indices,
-                        None,
-                        topk_tokens,
-                        dcp_rank,
-                        dcp_world_size,
-                        cp_kv_cache_interleave_size,
-                    )
+                if dcp_global_topk:
+                    if use_b12x_indexer:
+                        if topk_scores_buffer is None:
+                            raise RuntimeError(
+                                "B12X sparse indexer DCP requires topk_scores_buffer."
+                            )
+                        topk_scores = topk_scores_buffer[
+                            chunk.token_start : chunk.token_end, :topk_tokens
+                        ]
+                        topk_scores.fill_(-float("inf"))
+                        _merge_b12x_dcp_topk(
+                            topk_indices=topk_indices,
+                            topk_scores=topk_scores,
+                            topk_tokens=topk_tokens,
+                            dcp_world_size=dcp_world_size,
+                            dcp_rank=dcp_rank,
+                            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                        )
+                        topk_indices.masked_fill_(topk_scores == -float("inf"), -1)
+                    else:
+                        _dcp_global_topk_remap(
+                            topk_indices,
+                            None,
+                            topk_tokens,
+                            dcp_rank,
+                            dcp_world_size,
+                            cp_kv_cache_interleave_size,
+                        )
                 continue
 
             if use_b12x_indexer:
@@ -1431,14 +1455,23 @@ def sparse_attn_indexer(
                     topk_scores=topk_scores,
                     shared_page_table=True,
                 )
-                _merge_b12x_dcp_topk(
-                    topk_indices=topk_indices,
-                    topk_scores=topk_scores,
-                    topk_tokens=topk_tokens,
-                    dcp_world_size=dcp_world_size,
-                    dcp_rank=dcp_rank,
-                    cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-                )
+                if dcp_global_topk:
+                    _merge_b12x_dcp_topk(
+                        topk_indices=topk_indices,
+                        topk_scores=topk_scores,
+                        topk_tokens=topk_tokens,
+                        dcp_world_size=dcp_world_size,
+                        dcp_rank=dcp_rank,
+                        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                    )
+                else:
+                    _convert_b12x_dcp_local_topk_to_global(
+                        topk_indices=topk_indices,
+                        topk_scores=topk_scores,
+                        dcp_world_size=dcp_world_size,
+                        dcp_rank=dcp_rank,
+                        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                    )
                 topk_indices.masked_fill_(row_has_no_kv[:, None], -1)
                 continue
 
@@ -1574,14 +1607,23 @@ def sparse_attn_indexer(
                 topk_tokens=topk_tokens,
                 topk_scores=topk_scores,
             )
-            _merge_b12x_dcp_topk(
-                topk_indices=topk_indices,
-                topk_scores=topk_scores,
-                topk_tokens=topk_tokens,
-                dcp_world_size=dcp_world_size,
-                dcp_rank=dcp_rank,
-                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-            )
+            if dcp_global_topk:
+                _merge_b12x_dcp_topk(
+                    topk_indices=topk_indices,
+                    topk_scores=topk_scores,
+                    topk_tokens=topk_tokens,
+                    dcp_world_size=dcp_world_size,
+                    dcp_rank=dcp_rank,
+                    cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                )
+            else:
+                _convert_b12x_dcp_local_topk_to_global(
+                    topk_indices=topk_indices,
+                    topk_scores=topk_scores,
+                    dcp_world_size=dcp_world_size,
+                    dcp_rank=dcp_rank,
+                    cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                )
             return topk_indices_buffer
 
         schedule_metadata = decode_metadata.schedule_metadata
