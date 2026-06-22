@@ -824,17 +824,19 @@ def _try_load_fp8_indexer_wk(
 ):
     """
     We fuse the WK and weights_proj projections, but in some checkpoints WK is stored
-    in FP8 with a separate weight_scale_inv, while weights_proj is stored in BF16.
-    Upcasting to BF16 during loading enables the fusion. This function loads the FP8 WK
-    weights and scale, and when both are available, dequantizes to BF16 and stores into
-    the fused wk_weights_proj.weight parameter.
+    in FP8 with a separate weight_scale_inv or MXFP8 with a separate weight_scale,
+    while weights_proj is stored in BF16. Upcasting to BF16 during loading enables
+    the fusion. This function loads the WK weights and scale, and when both are
+    available, dequantizes to BF16 and stores into the fused
+    wk_weights_proj.weight parameter.
     """
     if "indexer.wk." not in name or "wk_weights" in name:
         return False  # Weight is not an isolated WK weight for the indexer, ignore.
     is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
-    is_scale = "weight_scale_inv" in name
-    if not is_weight and not is_scale:
-        return False  # WK is not in FP8 format, ignore.
+    is_scale_inv = "weight_scale_inv" in name
+    is_mxfp8_scale = name.endswith(".weight_scale") and tensor.dtype == torch.uint8
+    if not is_weight and not is_scale_inv and not is_mxfp8_scale:
+        return False  # WK is not in a fused FP8/MXFP8 format, ignore.
     # Buffer this tensor (weight or scale) until both have arrived.
     layer_prefix = name.rsplit(".wk.", 1)[0]  # e.g. "model.layers.0.self_attn.indexer"
     fused_name = f"{layer_prefix}.wk_weights_proj.weight"
@@ -844,20 +846,35 @@ def _try_load_fp8_indexer_wk(
     ):
         return True
     entry = buf.setdefault(layer_prefix, {})
-    entry["weight" if is_weight else "scale"] = tensor
-    if "weight" not in entry or "scale" not in entry:
+    if is_weight:
+        entry["weight"] = tensor
+    elif is_scale_inv:
+        entry["scale_inv"] = tensor
+    else:
+        entry["mxfp8_scale"] = tensor
+    if "weight" not in entry or (
+        "scale_inv" not in entry and "mxfp8_scale" not in entry
+    ):
         return True  # still waiting for the other param
 
     # We have both weight and scale: dequantize FP8 to BF16.
-    weight_fp8, scale_inv = entry["weight"], entry["scale"]
+    weight_fp8 = entry["weight"]
     del buf[layer_prefix]
-    block_size = weight_fp8.shape[1] // scale_inv.shape[1]
-    weight_bf16 = scaled_dequantize(
-        weight_fp8,
-        scale_inv,
-        group_shape=GroupShape(block_size, block_size),
-        out_dtype=torch.bfloat16,
-    )
+    if "scale_inv" in entry:
+        scale_inv = entry["scale_inv"]
+        block_size = weight_fp8.shape[1] // scale_inv.shape[1]
+        weight_bf16 = scaled_dequantize(
+            weight_fp8,
+            scale_inv,
+            group_shape=GroupShape(block_size, block_size),
+            out_dtype=torch.bfloat16,
+        )
+    else:
+        from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+            dequant_mxfp8_to_bf16,
+        )
+
+        weight_bf16 = dequant_mxfp8_to_bf16(weight_fp8, entry["mxfp8_scale"])
 
     # Load the dequantized weight into shard 0 of the fused buffer.
     param = params_dict[fused_name]
