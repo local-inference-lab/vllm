@@ -822,13 +822,29 @@ def _should_skip_index_topk(
 def _try_load_fp8_indexer_wk(
     name, tensor, buf, params_dict, loaded_params, pp_missing_layer_names
 ):
-    """
-    We fuse the WK and weights_proj projections, but in some checkpoints WK is stored
-    in FP8 with a separate weight_scale_inv or MXFP8 with a separate weight_scale,
-    while weights_proj is stored in BF16. Upcasting to BF16 during loading enables
-    the fusion. This function loads the WK weights and scale, and when both are
-    available, dequantizes to BF16 and stores into the fused
-    wk_weights_proj.weight parameter.
+    """Load isolated FP8/MXFP8 indexer WK tensors into fused WK weights.
+
+    The model fuses WK and weights_proj projections, but some checkpoints store
+    WK separately in FP8 with ``weight_scale_inv`` or MXFP8 with
+    ``weight_scale`` while weights_proj stays BF16. This loader buffers the
+    isolated WK weight and scale until both are available, dequantizes WK to
+    BF16, and stores it into the fused ``wk_weights_proj.weight`` parameter.
+
+    Args:
+        name: Checkpoint tensor name.
+        tensor: Checkpoint tensor value.
+        buf: Pending WK weight/scale tensors keyed by layer prefix.
+        params_dict: Model parameters keyed by checkpoint tensor name.
+        loaded_params: Names of parameters already loaded by a special loader.
+        pp_missing_layer_names: Pipeline-parallel layer prefixes to skip.
+
+    Returns:
+        ``True`` when the tensor was consumed or intentionally skipped by this
+        special loader, otherwise ``False``.
+
+    Raises:
+        KeyError: If a matching isolated WK pair is ready but the fused
+            ``wk_weights_proj.weight`` parameter is missing.
     """
     if "indexer.wk." not in name or "wk_weights" in name:
         return False  # Weight is not an isolated WK weight for the indexer, ignore.
