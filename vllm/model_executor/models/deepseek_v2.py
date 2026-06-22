@@ -599,7 +599,7 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         )
         import os as _os
 
-        shard_draft = _os.environ.get("VLLM_DCP_SHARD_DRAFT", "0").lower() in (
+        shard_draft = _os.environ.get("VLLM_DCP_SHARD_DRAFT", "1").lower() in (
             "1",
             "true",
             "yes",

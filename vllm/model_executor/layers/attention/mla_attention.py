@@ -1083,7 +1083,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         num_hidden_layers = getattr(
             vllm_config.model_config.hf_config, "num_hidden_layers", None
         )
-        shard_draft = os.environ.get("VLLM_DCP_SHARD_DRAFT", "0").lower() in (
+        shard_draft = os.environ.get("VLLM_DCP_SHARD_DRAFT", "1").lower() in (
             "1",
             "true",
             "yes",

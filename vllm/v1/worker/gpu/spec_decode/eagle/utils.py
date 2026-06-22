@@ -16,7 +16,7 @@ def _create_draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
     import os as _os
 
     draft_parallel_config = speculative_config.draft_parallel_config
-    if _os.environ.get("VLLM_DCP_SHARD_DRAFT", "0").lower() in (
+    if _os.environ.get("VLLM_DCP_SHARD_DRAFT", "1").lower() in (
         "1",
         "true",
         "yes",
