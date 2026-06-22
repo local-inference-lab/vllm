@@ -233,40 +233,63 @@ def _try_load_fp8_linear_as_bf16(
     shard_id: int | str | None = None,
 ) -> bool:
     is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
-    is_scale = name.endswith(".weight_scale_inv")
-    if not is_weight and not is_scale:
+    is_scale_inv = name.endswith(".weight_scale_inv")
+    is_mxfp8_scale = name.endswith(".weight_scale") and tensor.dtype == torch.uint8
+    if not is_weight and not is_scale_inv and not is_mxfp8_scale:
         return False
 
-    base_name = name.rsplit(".", 1)[0] if is_weight else name.removesuffix(
-        ".weight_scale_inv"
-    )
+    if is_weight:
+        base_name = name.rsplit(".", 1)[0]
+    elif is_scale_inv:
+        base_name = name.removesuffix(".weight_scale_inv")
+    else:
+        base_name = name.removesuffix(".weight_scale")
     weight_name = f"{base_name}.weight"
-    scale_name = f"{base_name}.weight_scale_inv"
+    scale_inv_name = f"{base_name}.weight_scale_inv"
+    mxfp8_scale_name = f"{base_name}.weight_scale"
 
     # If the runtime module registered an FP8 scale parameter, let the normal
     # quantized loader handle it.
-    if _maybe_remap_fp8_scale_inv_name(scale_name, params_dict) in params_dict:
+    if (
+        _maybe_remap_fp8_scale_inv_name(scale_inv_name, params_dict) in params_dict
+        or mxfp8_scale_name in params_dict
+    ):
         return False
     if weight_name not in params_dict:
         return False
 
     buffer_key = base_name if shard_id is None else f"{base_name}:{shard_id}"
     entry = buf.setdefault(buffer_key, {})
-    entry["weight" if is_weight else "scale"] = tensor
-    if "weight" not in entry or "scale" not in entry:
+    if is_weight:
+        entry["weight"] = tensor
+    elif is_scale_inv:
+        entry["scale_inv"] = tensor
+    else:
+        entry["mxfp8_scale"] = tensor
+    if "weight" not in entry or (
+        "scale_inv" not in entry and "mxfp8_scale" not in entry
+    ):
         return True
 
     weight_fp8 = entry["weight"]
-    scale_inv = entry["scale"]
     del buf[buffer_key]
 
-    block_size = weight_fp8.shape[1] // scale_inv.shape[1]
-    weight_bf16 = scaled_dequantize(
-        weight_fp8,
-        scale_inv,
-        group_shape=GroupShape(block_size, block_size),
-        out_dtype=torch.bfloat16,
-    )
+    if "scale_inv" in entry:
+        scale_inv = entry["scale_inv"]
+        block_size = weight_fp8.shape[1] // scale_inv.shape[1]
+        weight_bf16 = scaled_dequantize(
+            weight_fp8,
+            scale_inv,
+            group_shape=GroupShape(block_size, block_size),
+            out_dtype=torch.bfloat16,
+        )
+    else:
+        from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+            dequant_mxfp8_to_bf16,
+        )
+
+        weight_bf16 = dequant_mxfp8_to_bf16(weight_fp8, entry["mxfp8_scale"])
+
     param = params_dict[weight_name]
     weight_loader = getattr(param, "weight_loader", default_weight_loader)
     if shard_id is None:
@@ -670,15 +693,22 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 # weight loading if it's not enabled
                 if param_name == "fused_qkv_a_proj":
                     # FP8 checkpoints provide scale tensors as
-                    # *.weight_scale_inv, while the fused runtime module may
-                    # only expose the fused weight or a remapped *.weight_scale.
-                    # Do not skip those scale tensors before the FP8 fallback
-                    # loader has a chance to pair them with the fused weight.
+                    # *.weight_scale_inv or MXFP8 *.weight_scale, while the
+                    # fused runtime module may only expose the fused BF16
+                    # weight. Do not skip those scale tensors before the
+                    # fallback loader has a chance to pair them with the fused
+                    # weight.
                     has_fused_target = name_mapped in params_dict
-                    if name_mapped.endswith(".weight_scale_inv"):
-                        fused_weight = name_mapped.removesuffix(
-                            ".weight_scale_inv"
-                        ) + ".weight"
+                    if name_mapped.endswith((".weight_scale_inv", ".weight_scale")):
+                        if name_mapped.endswith(".weight_scale_inv"):
+                            fused_weight = (
+                                name_mapped.removesuffix(".weight_scale_inv")
+                                + ".weight"
+                            )
+                        else:
+                            fused_weight = (
+                                name_mapped.removesuffix(".weight_scale") + ".weight"
+                            )
                         has_fused_target = (
                             has_fused_target
                             or fused_weight in params_dict

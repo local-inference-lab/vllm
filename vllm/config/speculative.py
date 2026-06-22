@@ -438,18 +438,28 @@ class SpeculativeConfig:
                         for layer_idx in range(mtp_start, mtp_start + mtp_layers):
                             prefix = f"model.layers.{layer_idx}"
                             if has_serialized_nextn_experts:
-                                _extend_unique(
-                                    ignored,
-                                    [
-                                        f"{prefix}.self_attn*",
-                                        f"{prefix}.eh_proj*",
-                                        f"{prefix}.enorm*",
-                                        f"{prefix}.hnorm*",
-                                        f"{prefix}.shared_head*",
-                                        f"{prefix}.mlp.gate*",
-                                        f"{prefix}.mlp.shared_experts*",
-                                    ],
-                                )
+                                # GLM NextN checkpoints can be partially
+                                # serialized. Older NVFP4 checkpoints only
+                                # carry quantized routed experts, while newer
+                                # mixed checkpoints also serialize FP8/MXFP8
+                                # attention and shared experts. Keep synthetic
+                                # ignores only for modules not explicitly
+                                # targeted by the checkpoint quant config.
+                                for module_prefix in (
+                                    f"{prefix}.self_attn",
+                                    f"{prefix}.eh_proj",
+                                    f"{prefix}.enorm",
+                                    f"{prefix}.hnorm",
+                                    f"{prefix}.shared_head",
+                                    f"{prefix}.mlp.gate",
+                                    f"{prefix}.mlp.shared_experts",
+                                ):
+                                    if not _quant_config_targets_prefix(
+                                        quant_config, module_prefix
+                                    ):
+                                        _extend_unique(
+                                            ignored, [f"{module_prefix}*"]
+                                        )
                             else:
                                 if _quant_config_targets_prefix(quant_config, prefix):
                                     continue
