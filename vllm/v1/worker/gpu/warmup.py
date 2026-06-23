@@ -35,6 +35,13 @@ def run_mixed_prefill_decode_warmup(
     """Run a V2 mixed prefill+decode step through normal scheduler inputs."""
     if model_runner.is_pooling_model or num_tokens < 3:
         return False
+    if model_runner.scheduler_config.max_num_seqs < 2:
+        logger.warning(
+            "Skipping V2 mixed prefill+decode warmup because max_num_seqs=%d "
+            "cannot hold both the warmup decode and prefill requests.",
+            model_runner.scheduler_config.max_num_seqs,
+        )
+        return False
 
     decode_req_id = f"{req_id_prefix}_decode_"
     prefill_req_id = f"{req_id_prefix}_prefill_"
