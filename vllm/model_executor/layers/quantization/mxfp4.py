@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -256,7 +257,17 @@ class Mxfp4Config(QuantizationConfig):
             )
             return UnquantizedLinearMethod()
         elif isinstance(layer, RoutedExperts):
-            return GptOssMxfp4MoEMethod(layer.moe_config)
+            model_type = getattr(
+                get_current_vllm_config().model_config.hf_config,
+                "model_type",
+                None,
+            )
+            if model_type == "gpt_oss":
+                return GptOssMxfp4MoEMethod(layer.moe_config)
+            logger.info_once(
+                "Using native MXFP4 MoE method for model_type=%s.", model_type
+            )
+            return Mxfp4MoEMethod(layer.moe_config)
         elif isinstance(layer, Attention):
             logger.debug_once(
                 "MXFP4 attention layer is not implemented. "
