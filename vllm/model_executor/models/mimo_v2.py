@@ -52,7 +52,6 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .interfaces import (
     EagleModelMixin,
@@ -316,39 +315,27 @@ class MiMoV2Attention(nn.Module):
         use_flashinfer = configured_backend_name == "FLASHINFER"
         use_b12x_paged = configured_backend_name == "B12X_ATTN"
 
-        attn_backend = None
-        attn_head_size_v = self.v_head_dim
-        self.pad_value_for_fa = False
-
         if use_b12x_paged:
             from vllm.v1.attention.backends.b12x_attn import (
                 get_b12x_paged_attention_backend,
             )
 
             attn_backend = get_b12x_paged_attention_backend(self.v_head_dim)
+        else:
+            attn_backend = None
 
-        # Use DiffKV when V has a different head dim than K, except for
-        # backends that accept the asymmetric V size through Attention.
-        elif (
+        # MiMo has asymmetric K/V dims (head_dim=192, v_head_dim=128). Keep
+        # the historical Triton/FA cache layout by padding V to head_dim and
+        # slicing the attention output back before o_proj. The DiffKV backend
+        # is valid for target-only serving, but it changes DFlash long-context
+        # performance substantially because the target and draft paths no
+        # longer use the same unified attention kernels.
+        self.pad_value_for_fa = (
             self.v_head_dim != self.head_dim
             and not use_flashinfer
-        ):
-            requested = configured_backend
-            if requested is not None and requested.name.endswith("_DIFFKV"):
-                backend_enum = requested
-            else:
-                fa_backend = AttentionBackendEnum.FLASH_ATTN_DIFFKV.get_class()
-                if fa_backend.is_supported_on_current_device(
-                    head_size=self.head_dim,
-                    head_size_v=self.v_head_dim,
-                    has_sinks=self.attention_sink_bias is not None,
-                ):
-                    backend_enum = AttentionBackendEnum.FLASH_ATTN_DIFFKV
-                else:
-                    backend_enum = AttentionBackendEnum.TRITON_ATTN_DIFFKV
-            attn_backend = backend_enum.get_class()
-            attn_backend.set_head_size_v(self.v_head_dim)
-            logger.info_once("Using %s for attention.", attn_backend.get_name())
+            and not use_b12x_paged
+        )
+        attn_head_size_v = self.head_dim if self.pad_value_for_fa else self.v_head_dim
 
         self.attn = Attention(
             self.num_heads,
