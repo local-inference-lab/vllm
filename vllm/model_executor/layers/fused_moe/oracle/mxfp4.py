@@ -1498,28 +1498,15 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         w3_w = w13_w[:, intermediate_size:, :]
         w13_weight_swapped = torch.cat([w3_w, w1_w], dim=1)
 
-        if w13_bias is None:
-            w13_bias = torch.zeros(
-                num_experts,
-                2 * intermediate_size,
-                dtype=torch.float32,
-                device=w13_weight.device,
-            )
-        else:
+        if w13_bias is not None:
             w13_bias = w13_bias.data.to(torch.float32)
-        if w2_bias is None:
-            w2_bias = torch.zeros(
-                num_experts,
-                hidden_size,
-                dtype=torch.float32,
-                device=w2_weight.device,
-            )
+            b1 = w13_bias[:, :intermediate_size]
+            b3 = w13_bias[:, intermediate_size:]
+            w13_bias_swapped = torch.cat([b3, b1], dim=-1).to(torch.bfloat16)
         else:
-            w2_bias = w2_bias.data.to(torch.float32)
-        b1 = w13_bias[:, :intermediate_size]
-        b3 = w13_bias[:, intermediate_size:]
-        w13_bias_swapped = torch.cat([b3, b1], dim=-1).to(torch.bfloat16)
-        w2_bias = w2_bias.to(torch.bfloat16)
+            w13_bias_swapped = None
+        if w2_bias is not None:
+            w2_bias = w2_bias.data.to(torch.float32).to(torch.bfloat16)
 
         w13_s = w13_weight_scale.data
         s1 = w13_s[:, :intermediate_size, :]
