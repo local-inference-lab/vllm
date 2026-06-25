@@ -192,6 +192,57 @@ class TestIsReasoningEnd:
         assert not parser.is_reasoning_end([])
 
 
+
+class TestIsReasoningEndForPrompt:
+    """The prompt-end check must defer to the per-delta state machine
+    when thinking is enabled, regardless of whether the prompt contains
+    </think> or <tool_call> tokens from prior turns / system examples.
+    """
+
+    def test_thinking_enabled_fresh_prompt(self, parser):
+        # A fresh prompt with no <think>/<tool_call> markers: still open.
+        assert not parser.is_reasoning_end_for_prompt([_TEXT_ID, _TEXT_ID])
+
+    def test_thinking_enabled_prior_turn_think_end(self, parser):
+        # Prompt ends with </think> from prior turn — does NOT decide the
+        # new turn's reasoning state.
+        assert not parser.is_reasoning_end_for_prompt(
+            [_TEXT_ID, _THINK_START_ID, _TEXT_ID, _THINK_END_ID]
+        )
+
+    def test_thinking_enabled_tool_call_in_system_prompt(self, parser):
+        # System prompt contains a <tool_call> example — does NOT decide
+        # the new turn's reasoning state.
+        assert not parser.is_reasoning_end_for_prompt(
+            [_TOOL_CALL_ID, _TEXT_ID, _TOOL_CALL_END_ID]
+        )
+
+    def test_thinking_disabled_fresh_prompt(self, mock_tokenizer):
+        p = Qwen3Parser(
+            mock_tokenizer, chat_template_kwargs={"enable_thinking": False}
+        )
+        # Thinking disabled: reasoning phase is over, skip it.
+        assert p.is_reasoning_end_for_prompt([_TEXT_ID, _TEXT_ID])
+
+    def test_thinking_disabled_prior_turn_think_end(self, mock_tokenizer):
+        p = Qwen3Parser(
+            mock_tokenizer, chat_template_kwargs={"enable_thinking": False}
+        )
+        assert p.is_reasoning_end_for_prompt(
+            [_TEXT_ID, _THINK_START_ID, _TEXT_ID, _THINK_END_ID]
+        )
+
+    def test_thinking_disabled_tool_call_in_system_prompt(
+        self, mock_tokenizer
+    ):
+        p = Qwen3Parser(
+            mock_tokenizer, chat_template_kwargs={"enable_thinking": False}
+        )
+        assert p.is_reasoning_end_for_prompt(
+            [_TOOL_CALL_ID, _TEXT_ID, _TOOL_CALL_END_ID]
+        )
+
+
 class TestDelegatingPromptDetection:
     def test_prompt_tool_example_does_not_skip_streaming_reasoning(
         self, mock_tokenizer, mock_request

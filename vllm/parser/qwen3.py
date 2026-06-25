@@ -238,3 +238,22 @@ class Qwen3Parser(ParserEngine):
                         continue
                     return True
         return False
+
+    def is_reasoning_end_for_prompt(self, input_ids):
+        # The default prompt-end heuristic (see
+        # vllm/reasoning/abs_reasoning_parsers.py) delegates to
+        # is_reasoning_end, which for Qwen3 also fires on an unpaired
+        # <tool_call> token. That is the right call for generated tokens
+        # but the wrong call for the prompt: a multi-turn prompt ends
+        # with </think> from the prior assistant turn, and any request
+        # that defines tools inlines a <tool_call> example into the
+        # system prompt. Either one flips the prompt-end check to True
+        # and the engine then bypasses the per-delta reasoning branch
+        # (vllm/parser/abstract_parser.py:762) on the first delta, so
+        # <think> markers leak into content.
+        #
+        # Defer to the per-delta state machine instead. When thinking
+        # is disabled the model will not emit <think> blocks at all, so
+        # the engine starts in CONTENT (see qwen3_config(thinking=...))
+        # and we must skip the reasoning branch entirely.
+        return not self.thinking_enabled
