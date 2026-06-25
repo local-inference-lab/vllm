@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 _DSV4_HEAD_DIM = 512
 _DSV4_V_HEAD_DIM = 512
 _DSV4_CACHE_BYTES_PER_TOKEN = 584
+_DSV4_CACHE_PAD_ALIGNMENT_BYTES = 576
 _DECODE_SPLIT_TILE = 64
 _C128A_TOPK_ALIGNMENT = 128
 _VALIDATE_DCP_INDICES_ENV = "VLLM_DSV4_DCP_VALIDATE_INDICES"
@@ -51,22 +52,30 @@ def _cdiv(x: int, y: int) -> int:
     return (int(x) + int(y) - 1) // int(y)
 
 
+def _dsv4_b12x_page_nbytes(page_size: int) -> int:
+    payload_nbytes = int(page_size) * _DSV4_CACHE_BYTES_PER_TOKEN
+    return (
+        _cdiv(payload_nbytes, _DSV4_CACHE_PAD_ALIGNMENT_BYTES)
+        * _DSV4_CACHE_PAD_ALIGNMENT_BYTES
+    )
+
+
 def _b12x_cache_page_view(
     cache: torch.Tensor,
     page_size: int,
     name: str,
 ) -> torch.Tensor:
     """Return a uint8 ``[pages, padded_page_bytes]`` view for b12x kernels."""
-    min_page_nbytes = int(page_size) * _DSV4_CACHE_BYTES_PER_TOKEN
-    if min_page_nbytes <= 0:
+    page_nbytes = _dsv4_b12x_page_nbytes(page_size)
+    if page_nbytes <= 0:
         raise ValueError(f"{name} page_size must be positive, got {page_size}")
 
     byte_cache = cache if cache.dtype == torch.uint8 else cache.view(torch.uint8)
     if byte_cache.ndim == 2:
-        if int(byte_cache.shape[1]) < min_page_nbytes:
+        if int(byte_cache.shape[1]) < page_nbytes:
             raise RuntimeError(
                 f"{name} page width {int(byte_cache.shape[1])} is smaller than "
-                f"DSV4 page payload {min_page_nbytes}"
+                f"DSV4 padded page width {page_nbytes}"
             )
         if not byte_cache.is_contiguous():
             raise RuntimeError(f"{name} page cache must be contiguous")
@@ -79,20 +88,43 @@ def _b12x_cache_page_view(
 
     pages = int(byte_cache.shape[0])
     page_stride_nbytes = int(byte_cache.stride(0))
-    if page_stride_nbytes < min_page_nbytes:
+    if page_stride_nbytes < page_nbytes:
         raise RuntimeError(
             f"{name} page stride {page_stride_nbytes} is smaller than DSV4 page "
-            f"payload {min_page_nbytes}"
+            f"width {page_nbytes}"
         )
 
+    # Packed DS4 KV cache views have a storage offset for this layer and a
+    # larger per-block stride for the whole packed block. Expose only this
+    # layer's page payload while preserving stride(0), so B12X can use the
+    # packed block stride without materializing/copying.
     page_view = torch.as_strided(
         byte_cache,
-        size=(pages, page_stride_nbytes),
+        size=(pages, page_nbytes),
         stride=(page_stride_nbytes, 1),
     )
-    if not page_view.is_contiguous():
-        raise RuntimeError(f"{name} padded page view must be contiguous")
     return page_view
+
+
+def _b12x_cache_page_view_key(
+    cache: torch.Tensor,
+    page_size: int,
+) -> tuple[int, int, torch.dtype, int, tuple[int, ...], tuple[int, ...]]:
+    """Stable key for cached KV page views.
+
+    Packed DS4 KV tensors are stable after vLLM cache initialization. B12X only
+    needs a static view mapping for a layer's cache tensor; the actual contents
+    mutate in-place under that view. Avoid rebuilding the same as_strided view
+    for every layer forward.
+    """
+    return (
+        int(cache.untyped_storage().data_ptr()),
+        int(cache.storage_offset()),
+        cache.dtype,
+        int(page_size),
+        tuple(int(dim) for dim in cache.shape),
+        tuple(int(stride) for stride in cache.stride()),
+    )
 
 
 def _validate_index_matrix_for_b12x(
@@ -406,6 +438,23 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
             "(kernel requires h_q in {16, 32, 64, 128})."
         )
 
+    def _get_b12x_cache_page_view(
+        self,
+        cache: torch.Tensor,
+        page_size: int,
+        name: str,
+    ) -> torch.Tensor:
+        views = getattr(self, "_b12x_cache_page_views", None)
+        if views is None:
+            views = {}
+            setattr(self, "_b12x_cache_page_views", views)
+        key = _b12x_cache_page_view_key(cache, page_size)
+        view = views.get(key)
+        if view is None:
+            view = _b12x_cache_page_view(cache, page_size, name)
+            views[key] = view
+        return view
+
     def _reserve_dummy_compressed_mla_scratch(self, q: torch.Tensor) -> None:
         from b12x.integration.compressed_scratch import (
             B12XCompressedMLAScratchCaps,
@@ -576,7 +625,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 topk_indices = attn_metadata.c128a_global_decode_topk_indices
                 topk_lens = attn_metadata.c128a_decode_topk_lens
             indexed_page_size = block_size
-            indexed_k_cache = _b12x_cache_page_view(
+            indexed_k_cache = self._get_b12x_cache_page_view(
                 kv_cache,
                 indexed_page_size,
                 "indexed_k_cache",
@@ -586,7 +635,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         swa_lens = swa_metadata.decode_swa_lens
         assert swa_indices is not None
         assert swa_lens is not None
-        swa_k_cache = _b12x_cache_page_view(
+        swa_k_cache = self._get_b12x_cache_page_view(
             swa_kv_cache,
             swa_metadata.block_size,
             "swa_k_cache",
@@ -703,7 +752,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                     )
                 )
             indexed_page_size = block_size
-            indexed_k_cache = _b12x_cache_page_view(
+            indexed_k_cache = self._get_b12x_cache_page_view(
                 compressed_k_cache,
                 indexed_page_size,
                 "indexed_k_cache",
@@ -711,7 +760,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
 
         assert swa_metadata.prefill_swa_indices is not None
         assert swa_metadata.prefill_swa_lens is not None
-        swa_k_cache = _b12x_cache_page_view(
+        swa_k_cache = self._get_b12x_cache_page_view(
             swa_k_cache,
             swa_metadata.block_size,
             "swa_k_cache",
