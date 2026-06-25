@@ -674,25 +674,49 @@ def _hc_head_fused_kernel_tilelang_fake(
     )
 
 
+_mhc_pre_tilelang_impl = mhc_pre_tilelang
+_mhc_post_tilelang_impl = mhc_post_tilelang
+_mhc_fused_post_pre_tilelang_impl = mhc_fused_post_pre_tilelang
+
 direct_register_custom_op(
     op_name="mhc_pre_tilelang",
-    op_func=mhc_pre_tilelang,
+    op_func=_mhc_pre_tilelang_impl,
     mutates_args=[],
     fake_impl=_mhc_pre_tilelang_fake,
 )
 direct_register_custom_op(
     op_name="mhc_post_tilelang",
-    op_func=mhc_post_tilelang,
+    op_func=_mhc_post_tilelang_impl,
     mutates_args=[],
     fake_impl=_mhc_post_tilelang_fake,
 )
 
 direct_register_custom_op(
     op_name="mhc_fused_post_pre_tilelang",
-    op_func=mhc_fused_post_pre_tilelang,
+    op_func=_mhc_fused_post_pre_tilelang_impl,
     mutates_args=[],
     fake_impl=_mhc_fused_post_pre_tilelang_fake,
 )
+
+
+def mhc_pre_tilelang(*args, **kwargs):
+    """Call MHC pre through the registered custom op.
+
+    Model code imports this symbol directly. Keeping the public symbol as a
+    thin custom-op wrapper prevents torch.compile from tracing into TileLang
+    Python/JIT internals during memory profiling and CUDA graph capture.
+    """
+    return torch.ops.vllm.mhc_pre_tilelang(*args, **kwargs)
+
+
+def mhc_post_tilelang(*args, **kwargs):
+    """Call MHC post through the registered custom op."""
+    return torch.ops.vllm.mhc_post_tilelang(*args, **kwargs)
+
+
+def mhc_fused_post_pre_tilelang(*args, **kwargs):
+    """Call fused MHC post/pre through the registered custom op."""
+    return torch.ops.vllm.mhc_fused_post_pre_tilelang(*args, **kwargs)
 
 direct_register_custom_op(
     op_name="hc_head_fused_kernel_tilelang",

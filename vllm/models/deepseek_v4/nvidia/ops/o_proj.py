@@ -8,6 +8,47 @@ from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum
+from vllm.utils.torch_utils import direct_register_custom_op
+
+
+def _deepseek_v4_fp8_o_proj_einsum(
+    o_fp8: torch.Tensor,
+    o_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    z: torch.Tensor,
+    recipe_0: int,
+    recipe_1: int,
+    recipe_2: int,
+) -> None:
+    fp8_einsum(
+        "bhr,hdr->bhd",
+        (o_fp8, o_scale),
+        (weight, weight_scale_inv),
+        z,
+        recipe=(recipe_0, recipe_1, recipe_2),
+    )
+
+
+def _deepseek_v4_fp8_o_proj_einsum_fake(
+    o_fp8: torch.Tensor,
+    o_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    z: torch.Tensor,
+    recipe_0: int,
+    recipe_1: int,
+    recipe_2: int,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_fp8_o_proj_einsum",
+    op_func=_deepseek_v4_fp8_o_proj_einsum,
+    mutates_args=["z"],
+    fake_impl=_deepseek_v4_fp8_o_proj_einsum_fake,
+)
 
 
 def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
@@ -60,11 +101,14 @@ def deep_gemm_fp8_o_proj(
         device=o.device,
         dtype=torch.bfloat16,
     )
-    fp8_einsum(
-        "bhr,hdr->bhd",
-        (o_fp8, o_scale),
-        (wo_a.weight, wo_a.weight_scale_inv),
+    torch.ops.vllm.deepseek_v4_fp8_o_proj_einsum(
+        o_fp8,
+        o_scale,
+        wo_a.weight,
+        wo_a.weight_scale_inv,
         z,
-        recipe=einsum_recipe,
+        einsum_recipe[0],
+        einsum_recipe[1],
+        einsum_recipe[2],
     )
     return wo_b(z.flatten(1))
