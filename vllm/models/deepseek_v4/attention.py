@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm.envs as envs
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -484,24 +485,52 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             device=hidden_states.device,
         )
 
-        # Attention runs inside a single `out`-mutating custom op (the
-        # torch.compile / breakable-cudagraph boundary). This is load-bearing:
-        # without it, `attention_impl` is traced inline and the o_padded buffer
-        # is threaded around the internal graph breaks (indexer / kv-cache
-        # update) as TWO aliasing outputs of its producer piece. The AOT
-        # piecewise runtime then merges that aliased pair into a single flat
-        # 1-D synthetic base (torch.empty((0,)).set_(storage)), so the WO
-        # consumer's assert_size_stride(o_padded, (tokens, heads, dim)) fails
-        # with "wrong number of dimensions". Wrapping the whole attention as one
-        # op makes o_padded the op's single mutated output, threaded cleanly
-        # across the boundary, and keeps the attention's internal CUDA streams /
-        # events out of the compiled artifact (so it stays serializable).
-        torch.ops.vllm.deepseek_v4_attention(
-            hidden_states,
-            positions,
-            o_padded,
-            self.prefix,
-        )
+        if envs.VLLM_USE_BREAKABLE_CUDAGRAPH and not self._use_b12x_wo:
+            # DS4 breakable-cudagraph serving is faster when metadata-free
+            # input GEMMs/RMSNorm stay in the captured graph and only the
+            # metadata-dependent sparse attention body enters the eager break.
+            # Keep the opaque custom op for AOT/non-breakable execution and for
+            # B12X WO, where it prevents o_padded aliasing across graph pieces.
+            qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+                self.attn_gemm_parallel_execute(hidden_states)
+            )
+            qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+            qr, kv = fused_q_kv_rmsnorm(
+                qr,
+                kv,
+                self.q_norm.weight.data,
+                self.kv_norm.weight.data,
+                self.eps,
+            )
+            self.attention_impl(
+                hidden_states,
+                qr,
+                kv,
+                kv_score,
+                indexer_kv_score,
+                indexer_weights,
+                positions,
+                o_padded,
+            )
+        else:
+            # Attention runs inside a single `out`-mutating custom op (the
+            # torch.compile / breakable-cudagraph boundary). This is load-bearing:
+            # without it, `attention_impl` is traced inline and the o_padded buffer
+            # is threaded around the internal graph breaks (indexer / kv-cache
+            # update) as TWO aliasing outputs of its producer piece. The AOT
+            # piecewise runtime then merges that aliased pair into a single flat
+            # 1-D synthetic base (torch.empty((0,)).set_(storage)), so the WO
+            # consumer's assert_size_stride(o_padded, (tokens, heads, dim)) fails
+            # with "wrong number of dimensions". Wrapping the whole attention as one
+            # op makes o_padded the op's single mutated output, threaded cleanly
+            # across the boundary, and keeps the attention's internal CUDA streams /
+            # events out of the compiled artifact (so it stays serializable).
+            torch.ops.vllm.deepseek_v4_attention(
+                hidden_states,
+                positions,
+                o_padded,
+                self.prefix,
+            )
         o = o_padded[:, : self.n_local_heads, :]
 
         if self._use_b12x_wo:
@@ -580,6 +609,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
+    @eager_break_during_capture
     def attention_impl(
         self,
         hidden_states: torch.Tensor,
