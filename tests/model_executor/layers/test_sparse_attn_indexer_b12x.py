@@ -1160,3 +1160,132 @@ def test_b12x_schedule_metadata_uses_canonical_indexer_import(monkeypatch):
         ("uses_schedule", 2, 3),
         ("build_schedule", (64, 128), 64, 4, True),
     ]
+
+
+def test_b12x_decode_topk_max_uses_exact_cpu_shadow():
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.attention.backends.mla import indexer as mla_indexer_mod
+
+    builder = object.__new__(mla_indexer_mod.DeepseekV32IndexerMetadataBuilder)
+    builder.compress_ratio = 1
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        seq_lens=torch.tensor([11, 23, 17], dtype=torch.int32, device="meta"),
+        _seq_lens_cpu=torch.tensor([11, 23, 17], dtype=torch.int32),
+        num_reqs=3,
+        num_actual_tokens=3,
+        max_query_len=1,
+        max_seq_len=100000,
+        block_table_tensor=torch.zeros((3, 1), dtype=torch.int32),
+        slot_mapping=torch.zeros((3,), dtype=torch.int64),
+    )
+
+    assert (
+        builder._decode_topk_max_seq_len_from_cpu(
+            common,
+            num_decodes=3,
+            decode_lens_np=np.array([1, 1, 1], dtype=np.int32),
+            max_decode_len=1,
+            use_native=True,
+            dcp_local_seq_lens_cpu=None,
+        )
+        == 23
+    )
+
+
+def test_b12x_decode_topk_max_prefers_dcp_local_cpu_shadow():
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.attention.backends.mla import indexer as mla_indexer_mod
+
+    builder = object.__new__(mla_indexer_mod.DeepseekV32IndexerMetadataBuilder)
+    builder.compress_ratio = 1
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([1000, 900], dtype=torch.int32, device="meta"),
+        _seq_lens_cpu=torch.tensor([1000, 900], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=2,
+        max_query_len=1,
+        max_seq_len=1000,
+        block_table_tensor=torch.zeros((2, 1), dtype=torch.int32),
+        slot_mapping=torch.zeros((2,), dtype=torch.int64),
+    )
+    dcp_local = torch.tensor([126, 113], dtype=torch.int32)
+
+    assert (
+        builder._decode_topk_max_seq_len_from_cpu(
+            common,
+            num_decodes=2,
+            decode_lens_np=np.array([1, 1], dtype=np.int32),
+            max_decode_len=1,
+            use_native=True,
+            dcp_local_seq_lens_cpu=dcp_local,
+        )
+        == 126
+    )
+
+
+def test_b12x_decode_topk_max_ignores_flattened_mtp_padding_rows():
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.attention.backends.mla import indexer as mla_indexer_mod
+
+    builder = object.__new__(mla_indexer_mod.DeepseekV32IndexerMetadataBuilder)
+    builder.compress_ratio = 1
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 3, 3], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 3, 3], dtype=torch.int32),
+        seq_lens=torch.tensor([80, 200], dtype=torch.int32, device="meta"),
+        _seq_lens_cpu=torch.tensor([80, 200], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=3,
+        max_query_len=3,
+        max_seq_len=200,
+        block_table_tensor=torch.zeros((2, 1), dtype=torch.int32),
+        slot_mapping=torch.zeros((3,), dtype=torch.int64),
+    )
+
+    assert (
+        builder._decode_topk_max_seq_len_from_cpu(
+            common,
+            num_decodes=2,
+            decode_lens_np=np.array([3, 0], dtype=np.int32),
+            max_decode_len=3,
+            use_native=False,
+            dcp_local_seq_lens_cpu=None,
+        )
+        == 80
+    )
+
+
+def test_b12x_decode_topk_max_returns_none_without_authoritative_cpu_shadow():
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.attention.backends.mla import indexer as mla_indexer_mod
+
+    builder = object.__new__(mla_indexer_mod.DeepseekV32IndexerMetadataBuilder)
+    builder.compress_ratio = 1
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([10], dtype=torch.int32, device="meta"),
+        _seq_lens_cpu=None,
+        num_reqs=1,
+        num_actual_tokens=1,
+        max_query_len=1,
+        max_seq_len=10,
+        block_table_tensor=torch.zeros((1, 1), dtype=torch.int32),
+        slot_mapping=torch.zeros((1,), dtype=torch.int64),
+    )
+
+    assert (
+        builder._decode_topk_max_seq_len_from_cpu(
+            common,
+            num_decodes=1,
+            decode_lens_np=np.array([1], dtype=np.int32),
+            max_decode_len=1,
+            use_native=True,
+            dcp_local_seq_lens_cpu=None,
+        )
+        is None
+    )
