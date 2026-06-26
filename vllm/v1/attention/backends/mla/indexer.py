@@ -931,6 +931,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             active_width = None
             active_width_tokens = None
+            if self.compress_ratio > 1:
+                active_width_tokens = -(
+                    -int(common_attn_metadata.max_seq_len) //
+                    self.compress_ratio
+                )
             if envs.VLLM_USE_B12X_SPARSE_INDEXER:
                 # Live scorer window in cache tokens. ceil(max_seq_len /
                 # compress_ratio) is an upper bound on the max compressed
@@ -938,9 +943,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 # to the capacity cap and only skips wasted k-tiles. Computed on
                 # the host here (metadata-prep, outside cudagraph capture) and
                 # filled into the persistent buffer the captured kernel reads.
-                active_width_tokens = -(
-                    -int(common_attn_metadata.max_seq_len) // self.compress_ratio
-                )
+                if active_width_tokens is None:
+                    active_width_tokens = int(common_attn_metadata.max_seq_len)
                 self.b12x_active_width_buffer.fill_(active_width_tokens)
                 active_width = self.b12x_active_width_buffer
                 if self.compress_ratio > 1:
@@ -968,6 +972,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                         # sync, so use the same graph-stable live-window bound
                         # already consumed by the B12X scorer.
                         decode_topk_max_seq_len = active_width_tokens
+            elif active_width_tokens is not None:
+                # DeepGEMM still receives exact per-row seq_lens on device.
+                # The scalar max_seq_len is only a host scorer bound; using the
+                # metadata upper bound avoids a per-token CUDA scalar sync.
+                decode_topk_max_seq_len = active_width_tokens
             else:
                 decode_topk_max_seq_len = int(seq_lens.max().item())
 
