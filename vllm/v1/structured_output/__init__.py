@@ -130,8 +130,37 @@ class StructuredOutputManager:
         if self.backend is None:
             assert request.sampling_params is not None
             backend = request.sampling_params.structured_outputs._backend
+            if not backend:
+                # Fallback: use the server-configured backend when
+                # SamplingParams.validate() hasn't auto-selected one.
+                # In the b12x fork, validate() may not be called before
+                # Request creation, leaving _backend as None.
+                backend = self.vllm_config.structured_outputs_config.backend
             vocab_size = self.vllm_config.model_config.get_vocab_size()
-            if backend == "xgrammar":
+            if backend == "auto":
+                # Resolve auto: try xgrammar first, then fall back to
+                # guidance/outlines, matching SamplingParams.validate().
+                try:
+                    self.backend = XgrammarBackend(
+                        self.vllm_config,
+                        tokenizer=self.tokenizer,
+                        vocab_size=vocab_size,
+                    )
+                except Exception:
+                    try:
+                        self.backend = GuidanceBackend(
+                            self.vllm_config,
+                            tokenizer=self.tokenizer,
+                            vocab_size=vocab_size,
+                        )
+                    except Exception:
+                        from vllm.v1.structured_output.backend_outlines import OutlinesBackend
+                        self.backend = OutlinesBackend(
+                            self.vllm_config,
+                            tokenizer=self.tokenizer,
+                            vocab_size=vocab_size,
+                        )
+            elif backend == "xgrammar":
                 self.backend = XgrammarBackend(
                     self.vllm_config,
                     tokenizer=self.tokenizer,
@@ -152,7 +181,7 @@ class StructuredOutputManager:
                     vocab_size=vocab_size,
                 )
             elif backend == "lm-format-enforcer":
-                from vllm.v1.structured_output.backend_lm_format_enforcer import (  # noqa: E501
+                from vllm.v1.structured_output.backend_lm_format_enforcer import (  # noqa: E602
                     LMFormatEnforcerBackend,
                 )
 
