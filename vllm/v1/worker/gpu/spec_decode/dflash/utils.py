@@ -61,16 +61,13 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
                 del draft_inner.embed_tokens
             draft_inner.embed_tokens = target_embed
 
-    # Share lm_head with the target when the draft has no own copy, unless
-    # the draft remaps vocab via draft_id_to_target_id.
+    # Share lm_head with the target when the draft has no own copy. DFlash
+    # may expose draft_id_to_target_id for sampled-token remapping, but its
+    # logits still need to be scored by the target-vocab head for acceptance.
     target_lm_head = getattr(target_language_model, "lm_head", None)
     draft_lm_head = getattr(dflash_model, "lm_head", None)
-    if (
-        target_lm_head is not None
-        and getattr(dflash_model, "draft_id_to_target_id", None) is None
-        and _should_share(
-            dflash_model, "has_own_lm_head", draft_lm_head, target_lm_head
-        )
+    if target_lm_head is not None and _should_share(
+        dflash_model, "has_own_lm_head", draft_lm_head, target_lm_head
     ):
         if draft_lm_head is not None:
             del dflash_model.lm_head
