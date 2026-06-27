@@ -311,6 +311,15 @@ class StructuredOutputManager:
             if self.enable_in_reasoning:
                 return True
             assert request.structured_output_request is not None
+            # Completions requests have no reasoning_parser_kwargs (only
+            # chat requests get them from the renderer). Without chat
+            # template kwargs, reasoning parsers like Qwen3Parser and
+            # Glm47MoeParser default thinking_enabled=True, which makes
+            # is_reasoning_end_for_prompt return False forever, silently
+            # disabling grammar enforcement. Bypass the reasoning gate
+            # for completions — there is no reasoning phase to wait for.
+            if not request.structured_output_request.reasoning_parser_kwargs:
+                return True
             if request.structured_output_request.reasoning_ended is None:
                 # This should be removed here, but since `openai_gptoss`
                 # is an independent code path, it is kept for now.
@@ -344,6 +353,11 @@ class StructuredOutputManager:
             return True
 
         structured_req = request.structured_output_request
+        # Completions requests have no reasoning_parser_kwargs (only chat
+        # requests get them from the renderer). Bypass the reasoning gate
+        # — there is no reasoning phase to wait for, so always advance.
+        if not structured_req.reasoning_parser_kwargs:
+            return True
         if structured_req.reasoning_ended:
             return True
 
