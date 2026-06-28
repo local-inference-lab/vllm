@@ -1337,9 +1337,18 @@ def sparse_attn_indexer(
         )
         if _b12x_sparse_indexer_requested(use_b12x_sparse_indexer):
             _ensure_b12x_sparse_indexer_supported()
-            profile_q_rows = _get_b12x_paged_indexer_profile_q_rows(
-                int(q_quant.shape[0])
+
+            # Profile B12X scratch for the runtime token capacity. The
+            # workspace is locked after warmup, so a smaller warmup q shape can
+            # under-size long-context sparse prefill.
+            profile_q_capacity = max(
+                int(q_quant.shape[0]),
+                int(topk_indices_buffer.shape[0]),
             )
+            profile_q_rows = _get_b12x_paged_indexer_profile_q_rows(
+                profile_q_capacity
+            )
+            
             profile_k_rows = _get_b12x_paged_indexer_profile_k_rows(
                 max_model_len=max_model_len,
                 total_seq_lens=total_seq_lens,
