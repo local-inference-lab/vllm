@@ -68,12 +68,16 @@ logger = init_logger(__name__)
 # mid_out/mid_lse scratch and the workspace ``max_chunks_per_row`` cap; b12x's
 # wave-balanced planner picks num_splits <= this cap.
 _DECODE_SPLIT_TILE = 64
-_PREFILL_HEADS_PER_BLOCK = 16
+_PREFILL_HEAD_ALIGNMENT = 8
 _EXTEND_PREWARM_DONE: set[tuple[int | None, int, int, int, int, int, bool]] = set()
 
 
 def _cdiv(x: int, y: int) -> int:
     return (int(x) + int(y) - 1) // int(y)
+
+
+def _round_prefill_num_heads(num_heads: int) -> int:
+    return _cdiv(num_heads, _PREFILL_HEAD_ALIGNMENT) * _PREFILL_HEAD_ALIGNMENT
 
 
 def _env_int(name: str, default: int) -> int:
@@ -572,9 +576,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # Split-K cap: ceil(topk / tile). Bounds the borrowed mid_out/mid_lse
         # chunk dim and the workspace max_chunks_per_row.
         self._num_splits_cap = max(1, _cdiv(self.topk_tokens, _DECODE_SPLIT_TILE))
-        self._prefill_num_heads = (
-            _cdiv(self._workspace_num_heads, _PREFILL_HEADS_PER_BLOCK)
-            * _PREFILL_HEADS_PER_BLOCK
+        self._prefill_num_heads = _round_prefill_num_heads(
+            self._workspace_num_heads
         )
         if self._prefill_num_heads != self._workspace_num_heads:
             logger.info_once(
@@ -907,14 +910,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             return out, None
         else:
             # Extend / prefill -> single-pass unified prefill (no split-K
-            # scratch needed; only output_buffer is read). The b12x prefill
-            # kernel currently requires head blocks of 16, so high-TP shards
-            # with fewer local heads are padded and sliced back after launch.
+            # scratch needed; only output_buffer is read). b12x supports native
+            # 8-aligned prefill heads; pad only odd cases to that boundary.
             cache_seqlens = attn_metadata.cache_seq_lens_per_req
-            prefill_num_heads = (
-                _cdiv(num_actual_heads, _PREFILL_HEADS_PER_BLOCK)
-                * _PREFILL_HEADS_PER_BLOCK
-            )
+            prefill_num_heads = _round_prefill_num_heads(num_actual_heads)
             if prefill_num_heads == num_actual_heads:
                 prefill_q = q_all
             else:
