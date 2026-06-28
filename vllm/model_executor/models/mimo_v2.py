@@ -73,9 +73,7 @@ logger = init_logger(__name__)
 
 # Escape hatch for A/B testing the DFlash aux-feature fix: set to 1 to restore
 # the old behavior of capturing the last aux hidden state before final norm.
-_DFLASH_PRENORM_LAST_AUX = (
-    os.environ.get("VLLM_DFLASH_PRENORM_LAST_AUX", "0") == "1"
-)
+_DFLASH_PRENORM_LAST_AUX = os.environ.get("VLLM_DFLASH_PRENORM_LAST_AUX", "0") == "1"
 
 
 class MiMoV2MLP(nn.Module):
@@ -331,7 +329,7 @@ class MiMoV2Attention(nn.Module):
         # performance substantially because the target and draft paths no
         # longer use the same unified attention kernels.
         self.pad_value_for_fa = (
-            self.v_head_dim != self.head_dim
+            self.v_head_dim < self.head_dim
             and not use_flashinfer
             and not use_b12x_paged
         )
@@ -873,9 +871,7 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
         return True
 
 
-class MiMoV2FlashForCausalLM(
-    nn.Module, SupportsPP, MixtureOfExperts, SupportsEagle3
-):
+class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsEagle3):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
