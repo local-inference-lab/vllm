@@ -687,11 +687,15 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             return
         try:
             from vllm.distributed.parallel_state import get_dcp_group
+        except Exception:
+            # DCP group not initialized yet.
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            return
 
+        try:
             dcp_group = get_dcp_group()
             dcp_group.barrier()
-        except Exception:
-            return
         finally:
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
@@ -707,10 +711,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             int(self.topk_tokens),
             int(self.block_size),
             bool(self.need_to_return_lse_for_decode),
+            int(max_batched),
         )
         if key in _EXTEND_PREWARM_DONE:
             return
-        _EXTEND_PREWARM_DONE.add(key)
 
         rows_to_warm = (1, 2, 4, max(1, int(max_batched)))
         seen_rows: set[int] = set()
@@ -765,6 +769,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     v_head_dim=self.kv_lora_rank,
                 )
             self._sync_dcp_warmup()
+        _EXTEND_PREWARM_DONE.add(key)
 
     def forward_mqa(
         self,

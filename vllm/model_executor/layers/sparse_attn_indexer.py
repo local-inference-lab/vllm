@@ -436,11 +436,16 @@ def _sync_dcp_warmup() -> None:
         from vllm.distributed.parallel_state import get_dcp_group
 
         dcp_group = get_dcp_group()
+    except Exception:
+        # DCP group not initialized yet.
+        if current_platform.is_cuda():
+            torch.cuda.synchronize()
+        return
+
+    try:
         if int(dcp_group.world_size) <= 1:
             return
         dcp_group.barrier()
-    except Exception:
-        return
     finally:
         if current_platform.is_cuda():
             torch.cuda.synchronize()
