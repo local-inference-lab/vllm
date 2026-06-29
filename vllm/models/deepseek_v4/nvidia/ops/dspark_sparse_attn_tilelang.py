@@ -36,11 +36,14 @@ def _build_dspark_sparse_attn_kernel(num_heads: int, head_dim: int, scale: float
         topk = T.symbolic("topk")
 
         num_stages = 2
-        # warp-repartition fix (B): at <=16 heads/rank (TP=4, num_attention_heads=64/4)
-        # the FullRow GEMM with 8 warps (256 thr) can only put 1 warp on the M=16 rows,
-        # so ~7 spill to N -> warp_col_tiles = N/n_warp = 4 (rejected; tilelang needs >=8).
-        # 4 warps (128 thr) halves the N-warps -> warp_col_tiles = 8. No padding, no extra
-        # shared memory. TP<=2 (>=32 heads) keeps 256 threads (already warp_col_tiles>=8).
+        # Warp-repartition fix (B): at <=16 heads/rank
+        # (TP=4, num_attention_heads=64/4), the FullRow GEMM with 8 warps
+        # can only put 1 warp on M=16 rows, so ~7 spill to N. That yields
+        # warp_col_tiles = N / n_warp = 4, which TileLang rejects because
+        # it requires >=8.
+        # 4 warps halves the N-warps, so warp_col_tiles = 8. This adds no
+        # padding or shared memory. TP<=2 keeps 256 threads, where
+        # warp_col_tiles is already >=8.
         threads = 128 if num_heads <= 16 else 256
         # The upstream DSpark reference uses 64, which asks for ~104 KiB
         # dynamic shared memory on DeepSeek V4 head dims and is rejected on
