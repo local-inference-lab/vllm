@@ -346,10 +346,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
                 device=self.device,
             )
             topk_scores_buffer = None
-            if (
-                vllm_config.parallel_config.decode_context_parallel_size > 1
-                and use_b12x_sparse_indexer()
-            ):
+            if vllm_config.parallel_config.decode_context_parallel_size > 1:
                 topk_scores_buffer = torch.empty(
                     vllm_config.scheduler_config.max_num_batched_tokens,
                     topk_tokens,
