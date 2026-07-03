@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -695,6 +695,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         use_dcp_local_kv = (
             self.dcp_world_size > 1
             and common_attn_metadata.dcp_local_seq_lens is not None
+            and not getattr(self.kv_cache_spec, "dcp_replicated", False)
         )
         effective_dcp_world_size = self.dcp_world_size if use_dcp_local_kv else 1
         effective_dcp_rank = self.dcp_rank if use_dcp_local_kv else 0
@@ -1020,6 +1021,49 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
 
         return attn_metadata
+
+    def build_for_drafting(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> DeepseekV32IndexerMetadata:
+        if draft_index > 0:
+            num_tokens = common_attn_metadata.num_actual_tokens
+            num_reqs = min(common_attn_metadata.num_reqs, num_tokens)
+            if num_tokens > 0 and num_reqs > 0:
+                needs_unpadded_decode_view = (
+                    common_attn_metadata.batch_topology is not None
+                    or common_attn_metadata.max_query_len > 1
+                    or common_attn_metadata.num_reqs != num_reqs
+                    or int(common_attn_metadata.query_start_loc_cpu[num_reqs])
+                    != num_tokens
+                )
+                if needs_unpadded_decode_view:
+                    query_start_loc = torch.arange(
+                        num_reqs + 1,
+                        dtype=common_attn_metadata.query_start_loc.dtype,
+                        device=common_attn_metadata.query_start_loc.device,
+                    )
+                    query_start_loc_cpu = torch.arange(
+                        num_reqs + 1,
+                        dtype=common_attn_metadata.query_start_loc_cpu.dtype,
+                        device=common_attn_metadata.query_start_loc_cpu.device,
+                    )
+                    common_attn_metadata = replace(
+                        common_attn_metadata.unpadded(
+                            num_actual_tokens=num_tokens,
+                            num_actual_reqs=num_reqs,
+                        ),
+                        query_start_loc=query_start_loc,
+                        query_start_loc_cpu=query_start_loc_cpu,
+                        max_query_len=1,
+                    )
+
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+            fast_build=True,
+        )
 
 
 def build_prefill_chunk_metadata(

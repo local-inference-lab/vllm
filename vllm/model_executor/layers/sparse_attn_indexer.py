@@ -1982,6 +1982,19 @@ class SparseAttnIndexer(CustomOp):
         self.max_model_len = max_model_len
         self.max_total_seq_len = max_total_seq_len
         self.topk_indices_buffer = topk_indices_buffer
+        if topk_scores_buffer is None and topk_indices_buffer is not None:
+            try:
+                from vllm.distributed.parallel_state import get_dcp_group
+
+                dcp_world_size = get_dcp_group().world_size
+            except Exception:
+                dcp_world_size = 1
+            if dcp_world_size > 1 and use_b12x_sparse_indexer():
+                topk_scores_buffer = torch.empty(
+                    topk_indices_buffer.shape,
+                    dtype=torch.float32,
+                    device=topk_indices_buffer.device,
+                )
         self.topk_scores_buffer = topk_scores_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
