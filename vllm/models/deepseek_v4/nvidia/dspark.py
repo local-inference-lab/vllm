@@ -1365,6 +1365,37 @@ class DeepSeekV4DSparkDraft(nn.Module):
             logger.info_once(
                 "DSpark draft logits use a local FP32 copy of target lm_head."
             )
+        elif os.getenv("VLLM_DSPARK_FP8_DRAFT_HEAD") == "1":
+            # Rowwise-fp8 copy of the (vocab-sharded local) target lm_head,
+            # used ONLY for draft base logits: w8 = w * (448 / rowmax) stored
+            # e4m3, row_scale = rowmax / 448 for the epilogue. Materialized
+            # eagerly here, before CUDA graph capture of the draft step.
+            # Verify pass never sees it, so accepted outputs are unchanged;
+            # a rare draft argmax flip only costs a rejected token.
+            with torch.no_grad():
+                weight = lm_head.weight.detach()
+                row_max = (
+                    weight.abs().amax(dim=1, keepdim=True).float().clamp(min=1e-6)
+                )
+                self.register_buffer(
+                    "lm_head_fp8_weight",
+                    (weight.float() * (448.0 / row_max)).to(torch.float8_e4m3fn),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    "lm_head_fp8_row_scale",
+                    (row_max / 448.0).to(weight.dtype).reshape(1, -1),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    "lm_head_fp8_unit_scale",
+                    torch.ones(1, dtype=torch.float32, device=weight.device),
+                    persistent=False,
+                )
+            logger.info_once(
+                "DSpark draft logits use a rowwise-FP8 copy of target lm_head "
+                "(draft-time only; verify pass untouched)."
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self.embed_tokens is None:
@@ -1380,6 +1411,29 @@ class DeepSeekV4DSparkDraft(nn.Module):
             logits = self.logits_processor._gather_logits(logits)
             if logits is not None:
                 logits = logits[..., : self.config.vocab_size]
+            return logits
+        lm_head_fp8_weight = getattr(self, "lm_head_fp8_weight", None)
+        if lm_head_fp8_weight is not None:
+            # Dynamic per-token activation quant + fp8 GEMM; the epilogue
+            # applies both dynamic scales. Same gather/slice as the FP32
+            # branch, so TP argmax semantics are unchanged. No allocations
+            # or data-dependent control flow beyond the GEMM: capture-safe.
+            hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
+            act_max = hidden_2d.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
+            act_fp8 = (hidden_2d * (448.0 / act_max)).to(torch.float8_e4m3fn)
+            logits = torch._scaled_mm(
+                act_fp8,
+                lm_head_fp8_weight.t(),
+                scale_a=self.lm_head_fp8_unit_scale,
+                scale_b=self.lm_head_fp8_unit_scale,
+                out_dtype=hidden_2d.dtype,
+            )
+            logits = logits * self.lm_head_fp8_row_scale
+            logits = logits * (act_max / 448.0).to(hidden_2d.dtype)
+            logits = self.logits_processor._gather_logits(logits)
+            if logits is not None:
+                logits = logits[..., : self.config.vocab_size]
+                logits = logits.view(*hidden_states.shape[:-1], -1)
             return logits
         return self.logits_processor(
             self.lm_head,
