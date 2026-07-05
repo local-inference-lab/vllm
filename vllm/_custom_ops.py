@@ -2622,8 +2622,44 @@ def concat_and_cache_mla(
     kv_cache_dtype: str,
     scale: torch.Tensor,
 ) -> None:
+    if kv_cache_dtype == "nvfp4_ds_mla":
+        concat_and_cache_nvfp4_mla(kv_c, k_pe, kv_cache, slot_mapping, scale)
+        return
     torch.ops._C_cache_ops.concat_and_cache_mla(
         kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
+    )
+
+
+_NVFP4_MLA_CACHE_EXT_LOADED = False
+
+
+def _ensure_nvfp4_mla_cache_ext() -> None:
+    """Load the companion _C_cache_ops fragment that registers
+    ``concat_and_cache_nvfp4_mla`` when the main ``_C_stable_libtorch``
+    build does not carry it (out-of-tree companion extension build)."""
+    global _NVFP4_MLA_CACHE_EXT_LOADED
+    if _NVFP4_MLA_CACHE_EXT_LOADED:
+        return
+    if not hasattr(torch.ops._C_cache_ops, "concat_and_cache_nvfp4_mla"):
+        import os as _os
+
+        _ext = _os.path.join(
+            _os.path.dirname(__file__), "_nvfp4_mla_cache_C.so"
+        )
+        torch.ops.load_library(_ext)
+    _NVFP4_MLA_CACHE_EXT_LOADED = True
+
+
+def concat_and_cache_nvfp4_mla(
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    scale: torch.Tensor,
+) -> None:
+    _ensure_nvfp4_mla_cache_ext()
+    torch.ops._C_cache_ops.concat_and_cache_nvfp4_mla(
+        kv_c, k_pe, kv_cache, slot_mapping, scale
     )
 
 
