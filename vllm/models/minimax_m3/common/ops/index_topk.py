@@ -145,7 +145,7 @@ def _index_block_score_kernel(
             + page * stride_ik_blk
             + off_k[None, :] * stride_ik_pos
             + off_d[:, None] * stride_ik_d,
-        )
+        ).to(q.dtype)  # upcast: the index cache may be fp8
         qk = tl.dot(q, k)
         # apply causal mask as needed
         if q_start < i + BLOCK_SIZE_K:
@@ -372,7 +372,7 @@ def _decode_index_score_kernel(
             + page * stride_ik_blk
             + off_k[:, None] * stride_ik_pos
             + off_d * stride_ik_d,
-        )  # [N,D]
+        ).to(q.dtype)  # [N,D] (upcast: the index cache may be fp8)
         kq = tl.dot(k, q)  # [N,HQ]
         kq = tl.where(pos_mask & q_mask[None, :], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [HQ]
