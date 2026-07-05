@@ -143,6 +143,7 @@ class B12xMLASparseBackend(AttentionBackend):
         "auto",
         "bfloat16",
         "fp8_ds_mla",
+        "nvfp4_ds_mla",
         "fp8",  # aliases for fp8_ds_mla on this backend
         "fp8_e4m3",
     ]
@@ -222,6 +223,10 @@ class B12xMLASparseBackend(AttentionBackend):
             # scales + 128 BF16 RoPE). Mirrors the FlashMLA / SPARSE_MLA_SM120
             # layout; b12x's GLM_NSA decode reads the same record.
             return (num_blocks, block_size, 656)
+        if cache_dtype_str == "nvfp4_ds_mla":
+            # NVFP4 MLA latent: 256 B NoPE data + 32 B E4M3 scales +
+            # 16 B alignment pad + 128 B BF16 RoPE.
+            return (num_blocks, block_size, 432)
         return (num_blocks, block_size, head_size)
 
 
@@ -560,6 +565,22 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # DCP backend. The kernel must therefore plan for, and return, the full
         # gathered head set; the outer layer reduces/scatters it back afterward.
         self._input_num_heads = self.num_heads * self.dcp_world_size
+        # b12x ScaleFormat.NVFP4_E4M3 == 2 selects the
+        # 432 B/token FP4 latent record in the unified SM120 decode/extend
+        # kernels; None keeps the dtype-inferred format (ARBITRARY_FP32 for
+        # the 656 B fp8_ds_mla record).
+        self._b12x_scale_format = (
+            2 if self.kv_cache_dtype == "nvfp4_ds_mla" else None
+        )
+        # Forwarded into every plan/decode/extend b12x
+        # call ONLY for the FP4 record, so fp8_ds_mla serving keeps the stock
+        # b12x call signature (works on a b12x tree without the nvfp4-ds-mla
+        # read-path port; the port is required only to serve nvfp4_ds_mla).
+        self._b12x_nvfp4_kwargs: dict[str, Any] = (
+            {}
+            if self._b12x_scale_format is None
+            else {"scale_format": self._b12x_scale_format}
+        )
 
         # Split-K cap: ceil(topk / tile). Bounds the borrowed mid_out/mid_lse
         # chunk dim and the workspace max_chunks_per_row.
@@ -616,6 +637,18 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         def _make_plan(
             mode: str, max_q_rows: int, num_q_heads: int, max_batch: int
         ) -> Any:
+            # The FP4 record needs the caps to carry the
+            # cache dtype + b12x ScaleFormat so the scratch planner sizes for
+            # the 432 B record; omit both for fp8_ds_mla so the caps stay
+            # constructible on a stock (pre-nvfp4-port) b12x tree.
+            caps_kwargs: dict[str, Any] = (
+                {}
+                if self._b12x_scale_format is None
+                else {
+                    "kv_cache_dtype": self.kv_cache_dtype,
+                    "scale_format": self._b12x_scale_format,
+                }
+            )
             return plan_sparse_mla_scratch(
                 B12XSparseMLAScratchCaps(
                     device=self.device,
@@ -630,6 +663,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     max_batch=int(max_batch),
                     max_chunks_per_row=self._num_splits_cap,
                     page_size=self.block_size,
+                    **caps_kwargs,
                 )
             )
 
@@ -708,18 +742,24 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
 
         rows_to_warm = (1, 2, 4, max(1, int(max_batched)))
         seen_rows: set[int] = set()
-        # GLM fp8_ds_mla cache records are 656 B/token; the real KV cache is
-        # laid out (num_blocks, block_size, 656) (see the allocator at the
-        # block-shape branch above), so a page's stride(0) = block_size*656.
-        # The prewarm dummy must match that layout -- (1, block_size, 656) --
-        # so _cache_block_stride_bytes sees stride >= page_size*656. The prior
-        # (block_size, 1, 656) shape put block_size in dim 0, giving stride(0)
-        # = 656 < page_size*656, which tripped the SM120 stride assertion
+        # GLM cache records are 656 B/token (fp8_ds_mla) or 432 B/token
+        # (nvfp4_ds_mla); the real KV cache is laid out
+        # (num_blocks, block_size, record_bytes) (see the allocator at the
+        # block-shape branch above), so a page's stride(0) =
+        # block_size*record_bytes. The prewarm dummy must match that layout --
+        # (1, block_size, record_bytes) -- so _cache_block_stride_bytes sees
+        # stride >= page_size*record_bytes. The prior (block_size, 1, ...)
+        # shape put block_size in dim 0, giving stride(0) = record_bytes <
+        # page_size*record_bytes, which tripped the SM120 stride assertion
         # whenever this prewarm ran (i.e. spec + cudagraphs, the first config
         # to reach here; verifier-only and eager-snap both skipped it).
         # One page is enough: prewarm top-k indices all point at slot zero.
+        # Record width follows the cache dtype.
+        record_bytes = 432 if self.kv_cache_dtype == "nvfp4_ds_mla" else 656
         kv_cache = torch.zeros(
-            (1, self.block_size, 656), dtype=torch.uint8, device=self.device
+            (1, self.block_size, record_bytes),
+            dtype=torch.uint8,
+            device=self.device,
         )
         for rows in rows_to_warm:
             rows = int(rows)
@@ -758,6 +798,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     v_head_dim=self.kv_lora_rank,
                     return_lse=True,
                     lse_scale="natural",
+                    **self._b12x_nvfp4_kwargs,
                 )
             else:
                 self._sparse_mla_extend_forward(
@@ -765,6 +806,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     kv_cache=kv_cache,
                     sm_scale=self.scale,
                     v_head_dim=self.kv_lora_rank,
+                    **self._b12x_nvfp4_kwargs,
                 )
             self._sync_warmup()
 
@@ -887,7 +929,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             kv_cache = kv_u8.reshape(-1, self.block_size, kv_u8.shape[-1])
         else:
             raise ValueError(
-                "B12X_MLA_SPARSE expected fp8_ds_mla KV cache as "
+                "B12X_MLA_SPARSE expected fp8_ds_mla/nvfp4_ds_mla KV cache as "
                 f"(blocks,{self.block_size},bytes) or (slots,1,bytes), got "
                 f"{tuple(kv_u8.shape)}"
             )
@@ -934,6 +976,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         forced_num_splits=self._num_splits_cap,
                         return_lse=True,
                         lse_scale="natural",
+                        **self._b12x_nvfp4_kwargs,
                     ),
                 )
                 if self._pad_heads:
@@ -951,6 +994,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     sm_scale=self.scale,
                     v_head_dim=self.kv_lora_rank,
                     forced_num_splits=self._num_splits_cap,
+                    **self._b12x_nvfp4_kwargs,
                 ),
             )
             if self._pad_heads:
@@ -989,6 +1033,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         v_head_dim=self.kv_lora_rank,
                         return_lse=True,
                         lse_scale="natural",
+                        **self._b12x_nvfp4_kwargs,
                     ),
                 )
             else:
@@ -999,6 +1044,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         kv_cache=kv_cache,
                         sm_scale=self.scale,
                         v_head_dim=self.kv_lora_rank,
+                        **self._b12x_nvfp4_kwargs,
                     ),
                 )
             if self._pad_heads:

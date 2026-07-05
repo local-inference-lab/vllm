@@ -354,6 +354,11 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     kv_cache_dtype: CacheDType,
 ) -> CacheDType:
     backend_name = attn_backend.get_name()
+    if backend_name == "B12X_MLA_SPARSE" and kv_cache_dtype == "nvfp4_ds_mla":
+        # B12X keeps the fp8_ds_mla default, but natively accepts the
+        # experimental nvfp4_ds_mla record (432 B/token: 256B FP4 NoPE +
+        # 32B E4M3 group-16 scales + 16B pad + 128B BF16 RoPE).
+        return kv_cache_dtype
     if backend_name in (
         "FLASHMLA_SPARSE",
         "B12X_MLA_SPARSE",
@@ -755,7 +760,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
 
-        if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
+        if fp8_attention and self.kv_cache_dtype not in ("fp8_ds_mla", "nvfp4_ds_mla"):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
         # Sparse MLA impls only support forward_mqa (decode-style attention)
