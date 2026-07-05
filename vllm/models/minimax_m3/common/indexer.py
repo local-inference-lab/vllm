@@ -120,16 +120,22 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         backend_cls: type[AttentionBackend] = MiniMaxM3IndexerBackend,
     ) -> None:
         super().__init__()
-        if indexer_kv_dtype != "bf16":
+        if indexer_kv_dtype not in ("bf16", "fp8"):
             raise NotImplementedError(
                 f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported yet "
-                "for the MiniMax M3 indexer cache (only 'bf16')."
+                "for the MiniMax M3 indexer cache (only 'bf16' or 'fp8')."
             )
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
         self.indexer_kv_dtype = indexer_kv_dtype
-        # Storage dtype for the side cache (bf16 today; quantized layouts later).
-        self.dtype = torch.bfloat16
+        # Storage dtype for the side cache. fp8 (e4m3) halves the per-step
+        # index-K read of the decode scorer -- the dominant linear-in-context
+        # decode cost at long context -- and halves the side cache's KV-pool
+        # footprint. The scores only feed a top-k block ranking, and the keys
+        # are RMS-normed (O(1) magnitudes), so a direct cast is sufficient.
+        self.dtype = (
+            torch.float8_e4m3fn if indexer_kv_dtype == "fp8" else torch.bfloat16
+        )
         self.prefix = prefix
         self.cache_config = cache_config
         # Impl-chosen backend -> each impl gets its own builder (get_attn_backend).
@@ -450,7 +456,7 @@ def select_indexer_impl_cls(
             f"indexer_kv_dtype={indexer_kv_dtype!r} needs the (not-yet-added) "
             "CuteDSL indexer impl."
         )
-    if indexer_kv_dtype != "bf16":
+    if indexer_kv_dtype not in ("bf16", "fp8"):
         raise NotImplementedError(
             f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported by the "
             "Triton indexer impl."
