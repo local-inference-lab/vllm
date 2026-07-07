@@ -840,6 +840,124 @@ def test_concat_and_cache_ds_mla(
 
 @pytest.mark.parametrize("kv_lora_rank", KV_LORA_RANKS)
 @pytest.mark.parametrize("qk_rope_head_dim", QK_ROPE_HEAD_DIMS)
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS_MLA)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES_MLA)
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS_MLA)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_concat_and_cache_nvfp4_mla(
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    num_tokens: int,
+    block_size: int,
+    num_blocks: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("nvfp4_ds_mla requires CUDA")
+    if current_platform.is_rocm():
+        pytest.skip("nvfp4_ds_mla is not supported on ROCm")
+    if not current_platform.has_device_capability(100):
+        pytest.skip("nvfp4_ds_mla requires SM100+ (Blackwell)")
+    if dtype.itemsize != 2:
+        pytest.skip("nvfp4_ds_mla only supports 16-bit input")
+    if kv_lora_rank != 512:
+        pytest.skip("nvfp4_ds_mla requires kv_lora_rank == 512")
+    from tests.kernels.quantization.nvfp4_utils import break_fp4_bytes
+
+    kv_cache_dtype = "nvfp4_ds_mla"
+    set_random_seed(seed)
+    torch.set_default_device(device)
+    torch.accelerator.set_device_index(device)
+
+    # 432 B/token record: 256 B packed E2M1 NoPE + 32 B E4M3 group-16
+    # scales + 16 B alignment pad + 128 B 16-bit RoPE.
+    group_size = 16
+    nope_bytes = kv_lora_rank // 2
+    num_groups = kv_lora_rank // group_size
+    pad_bytes = 16
+    rope_offset = nope_bytes + num_groups + pad_bytes
+    entry_size = rope_offset + 2 * qk_rope_head_dim
+    assert entry_size == 432
+
+    total_slots = num_blocks * block_size
+    slot_mapping_lst = random.sample(range(total_slots), num_tokens)
+    slot_mapping = torch.tensor(slot_mapping_lst, dtype=torch.long, device=device)
+
+    kv_c = torch.randn(num_tokens, kv_lora_rank, dtype=dtype, device=device)
+    k_pe = torch.randn(num_tokens, qk_rope_head_dim, dtype=dtype, device=device)
+
+    # The kernel quantizes with an implicit global scale of 1.0; the scale
+    # argument keeps the concat_and_cache_mla signature family but is unused.
+    scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    kv_cache = torch.zeros(
+        num_blocks, block_size, entry_size, dtype=torch.uint8, device=device
+    )
+
+    opcheck(
+        torch.ops._C_cache_ops.concat_and_cache_nvfp4_mla,
+        (kv_c, k_pe, kv_cache, slot_mapping, scale),
+        test_utils=DEFAULT_OPCHECK_TEST_UTILS,
+    )
+
+    # Route through the public entry point: concat_and_cache_mla dispatches
+    # to the nvfp4 op on kv_cache_dtype == "nvfp4_ds_mla".
+    ops.concat_and_cache_mla(kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale)
+
+    for i in range(num_tokens):
+        slot = slot_mapping_lst[i]
+        block_idx = slot // block_size
+        block_offset = slot % block_size
+        record = kv_cache[block_idx, block_offset]
+
+        # Group scales: E4M3(group_amax / 6.0). Round-to-nearest E4M3 stays
+        # within half a mantissa step (<= 6.25% relative); the slack also
+        # covers the kernel's approximate reciprocal.
+        kv_scales = (
+            record[nope_bytes : nope_bytes + num_groups]
+            .view(torch.float8_e4m3fn)
+            .float()
+        )
+        group_amax = kv_c[i].float().abs().reshape(num_groups, group_size).amax(dim=-1)
+        torch.testing.assert_close(kv_scales, group_amax / 6.0, atol=2**-9, rtol=0.08)
+
+        # NoPE payload: dequantize E2M1 nibbles x stored group scale. The
+        # E2M1 grid's largest half-gap is 1.0 (between 4 and 6), so the
+        # element error is bounded by ~1x the group scale.
+        fp4_vals = break_fp4_bytes(
+            record[:nope_bytes].unsqueeze(0), torch.float32
+        ).reshape(num_groups, group_size)
+        dequant = fp4_vals * kv_scales[:, None]
+        err = (dequant - kv_c[i].float().reshape(num_groups, group_size)).abs()
+        bound = 1.25 * kv_scales[:, None] + 2**-9
+        assert (err <= bound).all(), (
+            f"nvfp4 dequant error {err.max().item():.4f} exceeds the "
+            f"e2m1 grid bound at token {i}"
+        )
+        torch.testing.assert_close(
+            dequant.flatten(), kv_c[i].float(), atol=1.5, rtol=0.5
+        )
+
+        # The 16-byte alignment pad is zero-filled.
+        assert (record[nope_bytes + num_groups : rope_offset] == 0).all()
+
+        # RoPE lane is a verbatim 16-bit copy.
+        kv_rope = record[rope_offset:].view(dtype)
+        torch.testing.assert_close(kv_rope, k_pe[i], atol=0.0, rtol=0.0)
+
+    # Slots outside the mapping stay untouched (indexing/stride isolation).
+    written = torch.zeros(total_slots, dtype=torch.bool, device=device)
+    written[slot_mapping] = True
+    untouched = kv_cache.reshape(total_slots, entry_size)[~written]
+    assert (untouched == 0).all()
+
+
+@pytest.mark.parametrize("kv_lora_rank", KV_LORA_RANKS)
+@pytest.mark.parametrize("qk_rope_head_dim", QK_ROPE_HEAD_DIMS)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES_MLA)
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS_MLA)
 @pytest.mark.parametrize("dtype", DTYPES)
