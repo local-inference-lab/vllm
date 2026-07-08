@@ -15,6 +15,7 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.distributed.device_communicators.all_reduce_utils import (
     CUSTOM_ALL_REDUCE_MAX_SIZES,
+    MiB,
     gpu_p2p_access_check,
 )
 from vllm.distributed.parallel_state import in_the_same_node_as
@@ -299,6 +300,16 @@ class CustomAllreduce:
         # now `device` is a `torch.device` object
         assert isinstance(device, torch.device)
         self.device = device
+        # Read once: envs attribute access hits os.environ, and
+        # should_custom_ar is on the per-all-reduce dispatch path.
+        self.allow_pcie = envs.VLLM_ALLOW_CUSTOM_ALLREDUCE_PCIE
+        # On PCIe-only opt-in topologies the 2-stage kernel keeps beating
+        # NCCL well past the default 8 MB ceiling (measured 1.2-1.3x at
+        # 8-64 MB and 1.15x at 128-256 MB on 4x RTX PRO 6000), so raise the
+        # ceiling to cover chunked-prefill all-reduces (16k tokens x 4k
+        # hidden x bf16 = 128 MiB).
+        if self.allow_pcie:
+            max_size = max(max_size, 256 * MiB)
         device_capability = current_platform.get_device_capability()
         if (
             current_platform.is_cuda()
@@ -357,12 +368,28 @@ class CustomAllreduce:
                     # topologies once the user explicitly enables it.
                     self._pcie_cpp_backend = True
                     fully_connected = True
-            elif world_size > 2:
+            if world_size > 2 and not fully_connected and self.allow_pcie:
+                # The sync protocol is atomics-free (peer plain writes + local
+                # polling), so PCIe-only P2P is functionally fine. Keep the
+                # topology non-fully-connected so the C++ dispatch selects the
+                # explicitly requested algorithm below.
+                # The C++ dispatch launches no kernel for non-fully-connected
+                # world sizes > 2 unless VLLM_CUSTOM_ALLREDUCE_ALGO forces an
+                # algorithm; default to the 2-stage kernel, which beat NCCL
+                # across 8 KB - 64 MB in PCIe P2P measurements.
+                os.environ.setdefault("VLLM_CUSTOM_ALLREDUCE_ALGO", "2stage")
+                logger.info_once(
+                    "Custom allreduce enabled on %d PCIe-only GPUs by "
+                    "VLLM_ALLOW_CUSTOM_ALLREDUCE_PCIE (algo=%s).",
+                    world_size,
+                    os.environ["VLLM_CUSTOM_ALLREDUCE_ALGO"],
+                )
+            elif world_size > 2 and not fully_connected:
                 logger.warning(
                     "Custom allreduce is disabled for >2 PCIe-only GPUs. "
-                    "Set VLLM_ENABLE_PCIE_ALLREDUCE=1 to enable P2P custom "
-                    "allreduce on PCIe topology (requires P2P-capable driver, "
-                    "see PR #39040 for details)."
+                    "Set VLLM_ENABLE_PCIE_ALLREDUCE=1 for the integrated PCIe "
+                    "backend or VLLM_ALLOW_CUSTOM_ALLREDUCE_PCIE=1 for the "
+                    "generic 2-stage C++ path."
                 )
                 return
         # test P2P capability, this checks software/cudaruntime support
@@ -702,10 +729,10 @@ class CustomAllreduce:
             return False
         if not is_weak_contiguous(inp):
             return False
-        # Keep the runtime guard aligned with the initialization contract
-        # above. For >2 PCIe GPUs we only use custom allreduce when the
-        # topology is explicitly opted in and treated as fully connected.
-        if self.world_size == 2 or self.fully_connected:
+        # Keep the runtime guard aligned with the initialization contract.
+        # The generic PCIe path intentionally remains non-fully-connected and
+        # is admitted through its separate opt-in.
+        if self.world_size == 2 or self.fully_connected or self.allow_pcie:
             return inp_size < self.max_size
         return False
 
