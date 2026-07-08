@@ -338,6 +338,8 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC: bool = False
+    VLLM_ALLOW_CUSTOM_ALLREDUCE_PCIE: bool = False
+    VLLM_SYMM_MEM_PCIE_SAFE_BARRIER: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -2214,6 +2216,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC", "0"))
     ),
+<<<<<<< HEAD
     # Enable the B12X all-reduce implementation for PCIe-connected GPUs.
     "VLLM_ENABLE_PCIE_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_PCIE_ALLREDUCE", "0"))
@@ -2250,6 +2253,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PCIE_DMA_MIN_BYTES": lambda: os.getenv("VLLM_PCIE_DMA_MIN_BYTES", "6MB"),
     # Optional B12X DMA wire codec. Unset uses lossless transport.
     "VLLM_PCIE_DMA_FP8": lambda: os.getenv("VLLM_PCIE_DMA_FP8"),
+    # Replace the torch symm-mem group barrier with a stream-memops
+    # sequence protocol (peer plain writes + local waits). Needed for the
+    # pipelined fused GEMM+comm ops on platforms without native P2P
+    # atomics, where the stock CAS-based barrier wedges under load.
+    "VLLM_SYMM_MEM_PCIE_SAFE_BARRIER": lambda: bool(
+        int(os.getenv("VLLM_SYMM_MEM_PCIE_SAFE_BARRIER", "0"))
+    ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
