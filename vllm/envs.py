@@ -2216,7 +2216,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC", "0"))
     ),
-<<<<<<< HEAD
     # Enable the B12X all-reduce implementation for PCIe-connected GPUs.
     "VLLM_ENABLE_PCIE_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_PCIE_ALLREDUCE", "0"))
