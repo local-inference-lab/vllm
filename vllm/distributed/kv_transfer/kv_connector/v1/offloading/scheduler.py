@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from itertools import islice
 from typing import Any, NamedTuple
 
+import vllm.envs as envs
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
@@ -82,10 +83,11 @@ class GroupOffloadConfig(NamedTuple):
     kv_event_group_spec: OffloadingEventGroupSpec
     # None below means full attention
     sliding_window_size_in_blocks: int | None
-    # Number of this group's offloaded blocks per full-attention alignment
-    # segment. Used to skip storing SWA blocks that can never serve a load
-    # hit (e.g. DeepSeek V4 where SWA groups have much smaller block sizes
-    # than the MLA full-attention group).
+    # Number of this group's offloaded blocks per sparsity segment (the
+    # full-attention alignment size, or VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+    # when sparse retention is configured). Used to skip storing SWA blocks
+    # that can never serve a load hit (e.g. DeepSeek V4 where SWA groups have
+    # much smaller block sizes than the MLA full-attention group).
     # None for full-attention groups or when the optimization doesn't apply.
     alignment_block_count: int | None = None
     # True for EAGLE/MTP draft-model attention groups. The trailing block
@@ -132,6 +134,11 @@ class SchedulerOffloadConfig(NamedTuple):
     block_size_factor: int
     num_workers: int
     offload_prompt_only: bool
+    # Token alignment of the per-request "replay boundary" tail (see
+    # OffloadingConnectorScheduler._replay_tail_end_block). Set to the
+    # full-attention alignment size when sparse retention
+    # (VLLM_PREFIX_CACHE_RETENTION_INTERVAL) is enabled, else None.
+    replay_alignment_tokens: int | None = None
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -157,16 +164,34 @@ class SchedulerOffloadConfig(NamedTuple):
         if len(full_attn_offloaded_block_sizes) == 1:
             alignment_tokens = full_attn_offloaded_block_sizes.pop()
 
+        # Mirror SlidingWindowManager.reachable_block_mask's segment-size
+        # choice: with sparse retention (VLLM_PREFIX_CACHE_RETENTION_INTERVAL)
+        # the local GPU prefix cache keeps SWA tails once per retention
+        # segment rather than at every full-attention block boundary. Use the
+        # same granularity so stored tails sit exactly where lookups converge.
+        # An interval of 0 (latest-boundary-only retention) disables the
+        # store-side skip entirely (conservative: store all blocks).
+        retention_interval = envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+        segment_tokens: int | None = (
+            alignment_tokens
+            if retention_interval is None
+            else (None if retention_interval == 0 else retention_interval)
+        )
+
         def _alignment_block_count(
             offloaded_block_size: int,
             sliding_window_size_in_blocks: int | None,
+            is_eagle_group: bool,
         ) -> int | None:
-            if alignment_tokens is None or sliding_window_size_in_blocks is None:
+            if segment_tokens is None or sliding_window_size_in_blocks is None:
                 return None
-            if alignment_tokens <= offloaded_block_size:
+            if segment_tokens <= offloaded_block_size:
                 return None
-            per_segment = alignment_tokens // offloaded_block_size
-            if sliding_window_size_in_blocks >= per_segment:
+            per_segment = segment_tokens // offloaded_block_size
+            # Contiguous blocks a hit needs at a segment boundary, including
+            # the "+1 peek" block for EAGLE/MTP groups (see _lookup).
+            need = sliding_window_size_in_blocks + (1 if is_eagle_group else 0)
+            if need >= per_segment:
                 return None
             return per_segment
 
@@ -209,7 +234,9 @@ class SchedulerOffloadConfig(NamedTuple):
                         )
                     ),
                     alignment_block_count=_alignment_block_count(
-                        gpu_block_size * spec.block_size_factor, sw
+                        gpu_block_size * spec.block_size_factor,
+                        sw,
+                        idx in eagle_groups,
                     ),
                     kv_event_group_spec=get_offloading_event_group_spec(
                         spec.kv_cache_config.kv_cache_groups[idx]
@@ -220,6 +247,9 @@ class SchedulerOffloadConfig(NamedTuple):
             ),
             block_size_factor=spec.block_size_factor,
             offload_prompt_only=spec.offload_prompt_only,
+            replay_alignment_tokens=(
+                alignment_tokens if retention_interval is not None else None
+            ),
         )
 
 
@@ -379,6 +409,20 @@ class OffloadingConnectorScheduler:
         self._sliding_window_groups: tuple[int, ...] = tuple(sliding_window_groups)
         self._lookup_groups = tuple(full_attention_groups) + self._sliding_window_groups
         self._mamba_align_size: int | None = resolve_mamba_align_size(spec)
+
+        # Tokens that must remain past a replay boundary for it to be
+        # servable: the last prompt token is always recomputed (hence the
+        # default of 1), and each EAGLE/MTP group must be able to match one
+        # complete block past the boundary (its "+1 peek", dropped after
+        # verification in _lookup).
+        self._replay_reserve_tokens: int = max(
+            (
+                group_config.offloaded_block_size
+                for group_config in self.config.kv_group_configs
+                if group_config.is_eagle_group
+            ),
+            default=1,
+        )
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
@@ -895,6 +939,32 @@ class OffloadingConnectorScheduler:
                         ):
                             group_state.block_ids[j] = 0
 
+    def _replay_tail_end_block(
+        self, group_config: GroupOffloadConfig, num_prompt_tokens: int, shift: int
+    ) -> int | None:
+        """End block index (exclusive) of this group's replay-boundary tail.
+
+        Mirrors the replay-boundary handling of
+        SlidingWindowManager.reachable_block_mask: with sparse retention,
+        segment tails exist only once per retention interval, so a replay of
+        the same prompt would otherwise fall back a whole segment. Retain one
+        extra tail run per request, ending at the latest
+        full-attention-aligned boundary that every group can service (i.e.
+        far enough from the prompt end that each EAGLE/MTP group's "+1 peek"
+        block is still a complete prompt block).
+        """
+        alignment_tokens = self.config.replay_alignment_tokens
+        if alignment_tokens is None:
+            return None
+        latest = (
+            (num_prompt_tokens - self._replay_reserve_tokens)
+            // alignment_tokens
+            * alignment_tokens
+        )
+        if latest <= 0 or latest % group_config.offloaded_block_size != 0:
+            return None
+        return latest // group_config.offloaded_block_size + shift
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
@@ -952,22 +1022,46 @@ class OffloadingConnectorScheduler:
 
                 alignment_block_count = group_config.alignment_block_count
                 tail = group_config.sliding_window_size_in_blocks
+                # Blocks reachable by _sliding_window_lookup, mirroring
+                # SlidingWindowManager.reachable_block_mask: a hit needs
+                # `need` contiguous blocks ending at a segment boundary. For
+                # EAGLE/MTP groups the run includes the "+1 peek" block and
+                # is shifted one block past the boundary, so that after
+                # _lookup drops the peek the hit lands exactly on it.
+                need = shift = 0
+                replay_end_block: int | None = None
+                if alignment_block_count is not None:
+                    assert tail is not None
+                    shift = 1 if group_config.is_eagle_group else 0
+                    need = tail + shift
+                    replay_end_block = self._replay_tail_end_block(
+                        group_config, req.num_prompt_tokens, shift
+                    )
 
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
                 ):
                     if block_id == 0:
                         continue
-                    # Skip SWA blocks that can never serve a load hit:
-                    # within each full-attention alignment segment, only the
-                    # trailing `tail` blocks are reachable by
+                    # Skip SWA blocks that can never serve a load hit: only
+                    # the trailing `need` blocks of each alignment segment
+                    # (plus the replay-boundary tail) are reachable by
                     # _sliding_window_lookup. For DeepSeek V4 with 100K
                     # tokens this reduces SWA stores by ~78%.
                     if alignment_block_count is not None:
-                        assert tail is not None
                         abs_block_idx = start_block_idx + key_idx
-                        pos_in_segment = abs_block_idx % alignment_block_count
-                        if pos_in_segment < alignment_block_count - tail:
+                        reachable = (
+                            abs_block_idx >= shift
+                            and (abs_block_idx - shift) % alignment_block_count
+                            >= alignment_block_count - need
+                        )
+                        if not reachable and replay_end_block is not None:
+                            reachable = (
+                                replay_end_block - need
+                                <= abs_block_idx
+                                < replay_end_block
+                            )
+                        if not reachable:
                             continue
                     new_offload_keys.append(offload_key)
 
