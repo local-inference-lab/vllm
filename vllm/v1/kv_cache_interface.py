@@ -391,6 +391,21 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.cache_dtype_str == "nvfp4_ds_mla":
+            # NVFP4 MLA latent: 432 B/token (256B E2M1 NoPE + 32B E4M3 group-16
+            # scales + 16B pad + 128B BF16 RoPE). Same record for the
+            # DeepseekV4 (448-NoPE q_head_dim=512) and GLM/V3.2 (512-NoPE
+            # q_head_dim=576) family specs; the writer asserts kv_lora_rank
+            # so a mismatched geometry fails loudly at store time.
+            if self.model_version == "deepseek_v4":
+                return self.storage_block_size * 432
+            if self.model_version == "glm_fp8_rope":
+                # GLM-only runtime KV format: the 512-D NVFP4 latent remains
+                # byte-identical while the post-RoPE tail is E4M3+FP32 amax.
+                # The GLM model layer sets this private spec marker only for
+                # model_type=glm_moe_dsa. DeepSeek-V4 and V3.2 stay stock.
+                return self.block_size * 368
+            return self.block_size * 432
         if self.cache_dtype_str == "fp8_ds_mla":
             if self.model_version == "deepseek_v4":
                 # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.

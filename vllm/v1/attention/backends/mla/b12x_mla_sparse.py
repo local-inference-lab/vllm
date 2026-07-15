@@ -73,7 +73,63 @@ logger = init_logger(__name__)
 _DECODE_SPLIT_TILE = 64
 _HEAD_ALIGNMENT = 8
 _BF16_BYTES = 2
-_EXTEND_PREWARM_DONE: set[tuple[int | None, int, int, int, int, int, bool]] = set()
+_EXTEND_PREWARM_DONE: set[
+    tuple[int | None, int, int, int, int, int, bool, str, bool]
+] = set()
+_FP8_ROPE_WRITER_LOADED = False
+_KV_FP8_ROPE_REQUESTED = os.getenv("KV_FP8_ROPE", "0") == "1"
+
+
+def _is_glm_moe_dsa_model() -> bool:
+    """Return true only for GLM or its in-process MTP draft model."""
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    model_config = vllm_config.model_config
+    if model_config is None:
+        return False
+    model_type = getattr(model_config.hf_config, "model_type", None)
+    if model_type == "glm_moe_dsa":
+        return True
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    target_model_config = getattr(
+        speculative_config, "target_model_config", None
+    )
+    target_model_type = (
+        getattr(target_model_config.hf_config, "model_type", None)
+        if target_model_config is not None
+        else None
+    )
+    return model_type == "deepseek_mtp" and target_model_type == "glm_moe_dsa"
+
+
+def _kv_fp8_rope_enabled() -> bool:
+    """Strict public gate plus literal GLM architecture selection."""
+    return _KV_FP8_ROPE_REQUESTED and _is_glm_moe_dsa_model()
+
+
+def _load_fp8_rope_writer() -> None:
+    """Load the private 368-byte writer without modifying the stock writer."""
+    global _FP8_ROPE_WRITER_LOADED
+    if _FP8_ROPE_WRITER_LOADED:
+        return
+    library = os.getenv(
+        "KV_FP8_ROPE_WRITER_LIB", "/opt/fp8rope/_C_fp8_rope.so"
+    )
+    if not os.path.isfile(library):
+        raise RuntimeError(
+            "KV_FP8_ROPE=1 requires the standalone writer library at "
+            f"{library!r} (override with KV_FP8_ROPE_WRITER_LIB)"
+        )
+    torch.ops.load_library(library)
+    namespace = getattr(torch.ops, "_C_fp8_rope_ops", None)
+    if namespace is None or not hasattr(
+        namespace, "concat_and_cache_nvfp4_mla_fp8_rope"
+    ):
+        raise RuntimeError(
+            f"FP8-RoPE writer library {library!r} did not register the expected op"
+        )
+    _FP8_ROPE_WRITER_LOADED = True
 
 
 def _cdiv(x: int, y: int) -> int:
@@ -148,6 +204,7 @@ class B12xMLASparseBackend(AttentionBackend):
         "auto",
         "bfloat16",
         "fp8_ds_mla",
+        "nvfp4_ds_mla",
         "fp8",  # aliases for fp8_ds_mla on this backend
         "fp8_e4m3",
     ]
@@ -227,6 +284,16 @@ class B12xMLASparseBackend(AttentionBackend):
             # scales + 128 BF16 RoPE). Mirrors the FlashMLA / SPARSE_MLA_SM120
             # layout; b12x's GLM_NSA decode reads the same record.
             return (num_blocks, block_size, 656)
+        if cache_dtype_str == "nvfp4_ds_mla":
+            # NVFP4 MLA latent: 256 B E2M1 NoPE data + 32 B E4M3 group-16
+            # scales. The stock record has 16 B pad + 128 B BF16 RoPE (432 B).
+            # KV_FP8_ROPE=1 reuses the pad for one FP32 amax scale and stores
+            # 64 E4M3 bytes at the original RoPE offset (368 B total).
+            return (
+                num_blocks,
+                block_size,
+                368 if _kv_fp8_rope_enabled() else 432,
+            )
         return (num_blocks, block_size, head_size)
 
 
@@ -532,6 +599,22 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self._kv_fp8_rope = bool(
+            self.kv_cache_dtype == "nvfp4_ds_mla" and _kv_fp8_rope_enabled()
+        )
+        if _KV_FP8_ROPE_REQUESTED and not _is_glm_moe_dsa_model():
+            logger.warning(
+                "KV_FP8_ROPE=1 ignored: compact MLA records are restricted to "
+                "model_type=glm_moe_dsa and its associated MTP draft"
+            )
+        if _kv_fp8_rope_enabled() and self.kv_cache_dtype != "nvfp4_ds_mla":
+            logger.warning(
+                "KV_FP8_ROPE=1 has no effect for kv_cache_dtype=%s; the compact "
+                "record is GLM nvfp4_ds_mla-only",
+                self.kv_cache_dtype,
+            )
+        if self._kv_fp8_rope:
+            _load_fp8_rope_writer()
 
         # MLA dims (absorbed: Q post-projection is [T, H, kv_lora_rank + rope]).
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
@@ -589,6 +672,24 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         max_batched = int(scheduler_config.max_num_batched_tokens)
         max_num_seqs = int(scheduler_config.max_num_seqs)
         self.block_size = 64
+        # NVFP4 MLA record selection: ScaleFormat.NVFP4_E4M3 (2) rides the b12x
+        # scratch plan AND every decode/extend call so the CuTeDSL kernels
+        # specialize on the packed E2M1+E4M3 record instead of the 656 B
+        # fp8_ds_mla record. KV_FP8_ROPE only changes its RoPE tail; the latent
+        # format and outer-scale correction are deliberately untouched.
+        self._b12x_scale_format = 2 if self.kv_cache_dtype == "nvfp4_ds_mla" else None
+        self._kv_record_bytes = (
+            (368 if self._kv_fp8_rope else 432)
+            if self.kv_cache_dtype == "nvfp4_ds_mla"
+            else 656
+        )
+        logger.info(
+            "B12X GLM MLA KV format: KV_FP8_ROPE=%d kv_gmem_stride=%d "
+            "kv_cache_dtype=%s",
+            int(self._kv_fp8_rope),
+            self._kv_record_bytes,
+            self.kv_cache_dtype,
+        )
         # MLAAttention all-gathers the local query-head shard before entering a
         # DCP backend. The kernel must therefore plan for, and return, the full
         # gathered head set; the outer layer reduces/scatters it back afterward.
@@ -667,6 +768,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     max_batch=int(max_batch),
                     max_chunks_per_row=self._num_splits_cap,
                     page_size=self.block_size,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale_format=self._b12x_scale_format,
                 )
             )
 
@@ -712,6 +815,58 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
 
         # Q arrives BF16; the unified kernel quantizes inside.
         self.supports_quant_query_input = False
+
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+    ) -> None:
+        """Write the post-RoPE key using the selected runtime cache format.
+
+        The disabled branch delegates to the shipped implementation unchanged,
+        including its stock 432-byte NVFP4 writer.  The enabled branch calls a
+        separate operator so loading this overlay cannot replace or perturb the
+        stock operator used by KV_FP8_ROPE=0.
+        """
+        if not self._kv_fp8_rope:
+            return super().do_kv_cache_update(
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                slot_mapping,
+                kv_cache_dtype,
+                k_scale,
+            )
+        if kv_cache.numel() == 0:
+            return
+        if kv_cache_dtype != "nvfp4_ds_mla":
+            raise RuntimeError(
+                "KV_FP8_ROPE writer reached a non-NVFP4 cache: "
+                f"{kv_cache_dtype!r}"
+            )
+        k_pe_flat = k_pe.squeeze(1)
+        if kv_c_normed.shape[-1] != 512 or k_pe_flat.shape[-1] != 64:
+            raise RuntimeError(
+                "KV_FP8_ROPE is GLM MLA-only and requires latent=512, rope=64; "
+                f"got {tuple(kv_c_normed.shape)} and {tuple(k_pe.shape)}"
+            )
+        kv_u8 = kv_cache.view(torch.uint8)
+        if kv_u8.shape[-1] != 368:
+            raise RuntimeError(
+                "KV_FP8_ROPE expected a 368-byte cache record, got "
+                f"shape={tuple(kv_u8.shape)}"
+            )
+        torch.ops._C_fp8_rope_ops.concat_and_cache_nvfp4_mla_fp8_rope(
+            kv_c_normed,
+            k_pe_flat,
+            kv_cache,
+            slot_mapping.flatten(),
+            k_scale,
+        )
 
     def _borrow_workspaces(self) -> list[torch.Tensor]:
         return current_workspace_manager().get_simultaneous(*self._workspace_specs)
@@ -1017,6 +1172,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             int(self.topk_tokens),
             int(self.block_size),
             bool(self.need_to_return_lse_for_decode),
+            self.kv_cache_dtype,
+            bool(self._kv_fp8_rope),
         )
         if key in _EXTEND_PREWARM_DONE:
             return
@@ -1035,7 +1192,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # to reach here; verifier-only and eager-snap both skipped it).
         # One page is enough: prewarm top-k indices all point at slot zero.
         kv_cache = torch.zeros(
-            (1, self.block_size, 656), dtype=torch.uint8, device=self.device
+            (1, self.block_size, self._kv_record_bytes),
+            dtype=torch.uint8,
+            device=self.device,
         )
         for rows in rows_to_warm:
             rows = int(rows)
@@ -1074,6 +1233,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     v_head_dim=self.kv_lora_rank,
                     return_lse=True,
                     lse_scale="natural",
+                    scale_format=self._b12x_scale_format,
                 )
             else:
                 self._sparse_mla_extend_forward(
@@ -1081,6 +1241,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     kv_cache=kv_cache,
                     sm_scale=self.scale,
                     v_head_dim=self.kv_lora_rank,
+                    scale_format=self._b12x_scale_format,
                 )
             self._sync_warmup()
 
@@ -1091,6 +1252,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         attn_metadata: B12xMLASparseMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Stored by MultiHeadLatentAttentionWrapper as a host float. Avoid
+        # reading device state or allocating per-call CUDA state; the CuTe
+        # launch receives this as a runtime scalar.
+        latent_scale = float(getattr(layer, "_nvfp4_mla_outer_scale", 1.0))
         # q arrives as (mqa_ql_nope[T, H, kv_lora_rank], mqa_q_pe[T, H, rope]);
         # b12x's GLM_NSA contract wants a single contiguous [T, H, 576] tensor.
         # Co-allocate the q-concat buffer and the per-call attention scratch in ONE
@@ -1241,7 +1406,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             kv_cache = kv_u8.reshape(-1, self.block_size, kv_u8.shape[-1])
         else:
             raise ValueError(
-                "B12X_MLA_SPARSE expected fp8_ds_mla KV cache as "
+                f"B12X_MLA_SPARSE expected {self.kv_cache_dtype} KV cache as "
                 f"(blocks,{self.block_size},bytes) or (slots,1,bytes), got "
                 f"{tuple(kv_u8.shape)}"
             )
@@ -1284,10 +1449,12 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         binding=binding,
                         kv_cache=kv_cache,
                         sm_scale=self.scale,
+                        latent_scale=latent_scale,
                         v_head_dim=self.kv_lora_rank,
                         forced_num_splits=self._num_splits_cap,
                         return_lse=True,
                         lse_scale="natural",
+                        scale_format=self._b12x_scale_format,
                     ),
                 )
                 if self._pad_heads:
@@ -1303,8 +1470,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     binding=binding,
                     kv_cache=kv_cache,
                     sm_scale=self.scale,
+                    latent_scale=latent_scale,
                     v_head_dim=self.kv_lora_rank,
                     forced_num_splits=self._num_splits_cap,
+                    scale_format=self._b12x_scale_format,
                 ),
             )
             if self._pad_heads:
@@ -1340,9 +1509,11 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         binding=binding,
                         kv_cache=kv_cache,
                         sm_scale=self.scale,
+                        latent_scale=latent_scale,
                         v_head_dim=self.kv_lora_rank,
                         return_lse=True,
                         lse_scale="natural",
+                        scale_format=self._b12x_scale_format,
                     ),
                 )
             else:
@@ -1352,7 +1523,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         binding=binding,
                         kv_cache=kv_cache,
                         sm_scale=self.scale,
+                        latent_scale=latent_scale,
                         v_head_dim=self.kv_lora_rank,
+                        scale_format=self._b12x_scale_format,
                     ),
                 )
             if self._pad_heads:

@@ -316,6 +316,11 @@ def _can_use_b12x_dcp_prefill_workspace(
     )
 
 
+def _extract_single_layer_index(layer_name: str) -> int | None:
+    int_vals = [int(part) for part in layer_name.split(".") if part.isdecimal()]
+    return int_vals[0] if len(int_vals) == 1 else None
+
+
 def _match_merge_strides(
     prefix_output: torch.Tensor, suffix_output: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -377,10 +382,16 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     kv_cache_dtype: CacheDType,
 ) -> CacheDType:
     backend_name = attn_backend.get_name()
+    if backend_name == "B12X_MLA_SPARSE" and kv_cache_dtype == "nvfp4_ds_mla":
+        # B12X reads the packed 432B NVFP4 MLA record natively; do NOT coerce
+        # it to fp8_ds_mla. [nvfp4_reader_port]
+        return "nvfp4_ds_mla"
     if backend_name in (
         "FLASHMLA_SPARSE",
         "B12X_MLA_SPARSE",
     ) and is_quantized_kv_cache(kv_cache_dtype):
+        # NOTE: nvfp4_ds_mla deliberately falls through to fp8_ds_mla for
+        # FLASHMLA_SPARSE (no NVFP4 reader there).
         return "fp8_ds_mla"
     if backend_name == "FLASHINFER_MLA_SPARSE_SM120" and kv_cache_dtype in (
         "auto",
@@ -801,7 +812,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
 
-        if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
+        if fp8_attention and self.kv_cache_dtype not in ("fp8_ds_mla", "nvfp4_ds_mla"):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
         # Sparse MLA impls only support forward_mqa (decode-style attention)
@@ -932,6 +943,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             project_before_merge = False
             workspace_gather_used = False
             if self.impl.dcp_world_size > 1:
+                if not self.impl.can_return_lse_for_decode:
+                    raise NotImplementedError(
+                        f"{type(self.impl).__name__} cannot use DCP because it "
+                        "does not return decode softmax LSE."
+                    )
+                self.impl.need_to_return_lse_for_decode = True
+                if (
+                    fp8_attention
+                    and isinstance(mqa_q, torch.Tensor)
+                    and not getattr(self.impl, "supports_dcp_quant_query_input", False)
+                ):
+                    raise NotImplementedError(
+                        f"{type(self.impl).__name__} does not declare support for "
+                        "DCP with FP8 KV cache and pre-quantized query input."
+                    )
                 # Hybrid dispatch on the per-step token count. This is
                 # CUDA-graph safe: under capture the branch sees the padded
                 # capture size, so every graph bakes in one path, and eager
@@ -1313,12 +1339,53 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
+        layer_id = _extract_single_layer_index(self.layer_name)
+        num_hidden_layers = getattr(
+            vllm_config.model_config.hf_config, "num_hidden_layers", None
+        )
+        shard_draft = os.environ.get("VLLM_DCP_SHARD_DRAFT", "1").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        dcp_replicated = (
+            not shard_draft
+            and layer_id is not None
+            and num_hidden_layers is not None
+            and layer_id >= int(num_hidden_layers)
+        )
+        model_type = getattr(
+            vllm_config.model_config.hf_config, "model_type", None
+        )
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        target_model_config = getattr(
+            speculative_config, "target_model_config", None
+        )
+        target_model_type = (
+            getattr(target_model_config.hf_config, "model_type", None)
+            if target_model_config is not None
+            else None
+        )
+        glm_model_or_mtp = bool(
+            model_type == "glm_moe_dsa"
+            or (
+                model_type == "deepseek_mtp"
+                and target_model_type == "glm_moe_dsa"
+            )
+        )
+        glm_fp8_rope = bool(
+            os.environ.get("KV_FP8_ROPE", "0") == "1"
+            and self.kv_cache_dtype == "nvfp4_ds_mla"
+            and glm_model_or_mtp
+        )
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=kv_cache_dtype,
-            cache_dtype_str=vllm_config.cache_config.cache_dtype,
+            cache_dtype_str=self.kv_cache_dtype,
+            model_version="glm_fp8_rope" if glm_fp8_rope else None,
+            dcp_replicated=dcp_replicated,
         )
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
@@ -1344,6 +1411,82 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         else:
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
             torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
+
+    def _v_up_proj_bmm(
+        self,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        w_uv: torch.Tensor,
+    ) -> None:
+        """Project BF16 DCP partials with rank-major gathered W_UV."""
+        if x.ndim != 3 or out.ndim != 3 or w_uv.ndim != 3:
+            raise ValueError("DCP projection expects rank-three tensors.")
+        num_tokens, num_heads, latent_dim = x.shape
+        expected_out_shape = (num_tokens, num_heads, self.v_head_dim)
+        expected_weight_shape = (
+            num_heads,
+            self.kv_lora_rank,
+            self.v_head_dim,
+        )
+        if (
+            latent_dim != self.kv_lora_rank
+            or out.shape != expected_out_shape
+            or w_uv.shape != expected_weight_shape
+        ):
+            raise ValueError(
+                "DCP projection geometry mismatch: "
+                f"x={tuple(x.shape)}, out={tuple(out.shape)}, "
+                f"w_uv={tuple(w_uv.shape)}."
+            )
+        if (
+            x.dtype != torch.bfloat16
+            or out.dtype != x.dtype
+            or w_uv.dtype != x.dtype
+            or out.device != x.device
+            or w_uv.device != x.device
+            or not w_uv.is_contiguous()
+        ):
+            raise ValueError(
+                "DCP projection requires contiguous BF16 weights and matching "
+                "BF16 inputs/outputs on one device."
+            )
+        x_head_major = x.transpose(0, 1).contiguous()
+        projected_head_major = torch.empty(
+            (num_heads, num_tokens, self.v_head_dim),
+            dtype=out.dtype,
+            device=out.device,
+        )
+        torch.bmm(x_head_major, w_uv, out=projected_head_major)
+        out.copy_(projected_head_major.transpose(0, 1))
+
+    def _v_up_proj_bmm_chunked(
+        self,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        w_uv: torch.Tensor,
+    ) -> None:
+        """Bound temporary BF16 DCP projection storage to 144 MiB."""
+        if x.ndim != 3 or out.ndim != 3 or w_uv.ndim != 3:
+            raise ValueError(
+                "DCP projection expects rank-three tensors: "
+                f"x={tuple(x.shape)}, out={tuple(out.shape)}, "
+                f"w_uv={tuple(w_uv.shape)}."
+            )
+        num_tokens, num_heads, latent_dim = x.shape
+        if latent_dim != self.kv_lora_rank or w_uv.shape[0] != num_heads:
+            raise ValueError(
+                "DCP projection geometry mismatch: "
+                f"x={tuple(x.shape)}, w_uv={tuple(w_uv.shape)}."
+            )
+
+        temp_budget_bytes = 144 * 1024 * 1024
+        temp_bytes_per_token = (
+            num_heads * (self.kv_lora_rank + self.v_head_dim) * x.element_size()
+        )
+        max_chunk_tokens = max(1, temp_budget_bytes // temp_bytes_per_token)
+        for start in range(0, num_tokens, max_chunk_tokens):
+            end = min(start + max_chunk_tokens, num_tokens)
+            self._v_up_proj_bmm(x[start:end], out[start:end], w_uv)
 
     def _v_up_proj_bmm(
         self,
