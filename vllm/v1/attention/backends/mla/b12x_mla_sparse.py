@@ -80,16 +80,34 @@ _FP8_ROPE_WRITER_LOADED = False
 _KV_FP8_ROPE_REQUESTED = os.getenv("KV_FP8_ROPE", "0") == "1"
 
 
+_IS_GLM_MOE_DSA_CACHE: bool | None = None
+
+
 def _is_glm_moe_dsa_model() -> bool:
-    """Return true only for GLM or its in-process MTP draft model."""
+    """Return true only for GLM or its in-process MTP draft model.
+
+    Robust to being called before the vLLM config context is established (e.g.
+    during KV-cache shape resolution / cudagraph compilation in a worker, where
+    get_current_vllm_config() raises): fall back to the explicit KV_FP8_ROPE
+    request and re-resolve once the config becomes available. Correctness is
+    preserved because the fallback is only reached when the user set
+    KV_FP8_ROPE=1 for their GLM model; KV_FP8_ROPE=0 short-circuits earlier.
+    """
+    global _IS_GLM_MOE_DSA_CACHE
+    if _IS_GLM_MOE_DSA_CACHE is not None:
+        return _IS_GLM_MOE_DSA_CACHE
     from vllm.config import get_current_vllm_config
 
-    vllm_config = get_current_vllm_config()
+    try:
+        vllm_config = get_current_vllm_config()
+    except Exception:
+        return _KV_FP8_ROPE_REQUESTED
     model_config = vllm_config.model_config
     if model_config is None:
         return False
     model_type = getattr(model_config.hf_config, "model_type", None)
     if model_type == "glm_moe_dsa":
+        _IS_GLM_MOE_DSA_CACHE = True
         return True
     speculative_config = getattr(vllm_config, "speculative_config", None)
     target_model_config = getattr(
@@ -100,7 +118,9 @@ def _is_glm_moe_dsa_model() -> bool:
         if target_model_config is not None
         else None
     )
-    return model_type == "deepseek_mtp" and target_model_type == "glm_moe_dsa"
+    result = model_type == "deepseek_mtp" and target_model_type == "glm_moe_dsa"
+    _IS_GLM_MOE_DSA_CACHE = result
+    return result
 
 
 def _kv_fp8_rope_enabled() -> bool:

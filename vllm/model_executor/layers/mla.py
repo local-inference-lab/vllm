@@ -24,13 +24,26 @@ _NVFP4_MLA_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 _KV_FP8_ROPE_ENABLED = os.getenv("KV_FP8_ROPE", "0") == "1"
 
 
+_IS_GLM_MOE_DSA_CACHE: bool | None = None
+
+
 def _is_glm_moe_dsa_model() -> bool:
-    vllm_config = get_current_vllm_config()
+    # Robust to being called before the vLLM config context is established
+    # (cudagraph compilation in a worker): fall back to the explicit request and
+    # re-resolve once the config is available. Only reached when KV_FP8_ROPE=1.
+    global _IS_GLM_MOE_DSA_CACHE
+    if _IS_GLM_MOE_DSA_CACHE is not None:
+        return _IS_GLM_MOE_DSA_CACHE
+    try:
+        vllm_config = get_current_vllm_config()
+    except Exception:
+        return _KV_FP8_ROPE_ENABLED
     model_config = vllm_config.model_config
     if model_config is None:
         return False
     model_type = getattr(model_config.hf_config, "model_type", None)
     if model_type == "glm_moe_dsa":
+        _IS_GLM_MOE_DSA_CACHE = True
         return True
     speculative_config = getattr(vllm_config, "speculative_config", None)
     target_model_config = getattr(
@@ -41,7 +54,9 @@ def _is_glm_moe_dsa_model() -> bool:
         if target_model_config is not None
         else None
     )
-    return model_type == "deepseek_mtp" and target_model_type == "glm_moe_dsa"
+    result = model_type == "deepseek_mtp" and target_model_type == "glm_moe_dsa"
+    _IS_GLM_MOE_DSA_CACHE = result
+    return result
 
 
 @cache
