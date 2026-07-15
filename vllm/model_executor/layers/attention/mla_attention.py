@@ -187,6 +187,7 @@ for chunk_idx in range(cdiv(C, MCC)):
 return curr_o @ W_O
 """
 
+import os
 import functools
 from abc import abstractmethod
 from dataclasses import dataclass
@@ -1488,81 +1489,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             end = min(start + max_chunk_tokens, num_tokens)
             self._v_up_proj_bmm(x[start:end], out[start:end], w_uv)
 
-    def _v_up_proj_bmm(
-        self,
-        x: torch.Tensor,
-        out: torch.Tensor,
-        w_uv: torch.Tensor,
-    ) -> None:
-        """Project BF16 DCP partials with rank-major gathered W_UV."""
-        if x.ndim != 3 or out.ndim != 3 or w_uv.ndim != 3:
-            raise ValueError("DCP projection expects rank-three tensors.")
-        num_tokens, num_heads, latent_dim = x.shape
-        expected_out_shape = (num_tokens, num_heads, self.v_head_dim)
-        expected_weight_shape = (
-            num_heads,
-            self.kv_lora_rank,
-            self.v_head_dim,
-        )
-        if (
-            latent_dim != self.kv_lora_rank
-            or out.shape != expected_out_shape
-            or w_uv.shape != expected_weight_shape
-        ):
-            raise ValueError(
-                "DCP projection geometry mismatch: "
-                f"x={tuple(x.shape)}, out={tuple(out.shape)}, "
-                f"w_uv={tuple(w_uv.shape)}."
-            )
-        if (
-            x.dtype != torch.bfloat16
-            or out.dtype != x.dtype
-            or w_uv.dtype != x.dtype
-            or out.device != x.device
-            or w_uv.device != x.device
-            or not w_uv.is_contiguous()
-        ):
-            raise ValueError(
-                "DCP projection requires contiguous BF16 weights and matching "
-                "BF16 inputs/outputs on one device."
-            )
-        x_head_major = x.transpose(0, 1).contiguous()
-        projected_head_major = torch.empty(
-            (num_heads, num_tokens, self.v_head_dim),
-            dtype=out.dtype,
-            device=out.device,
-        )
-        torch.bmm(x_head_major, w_uv, out=projected_head_major)
-        out.copy_(projected_head_major.transpose(0, 1))
 
-    def _v_up_proj_bmm_chunked(
-        self,
-        x: torch.Tensor,
-        out: torch.Tensor,
-        w_uv: torch.Tensor,
-    ) -> None:
-        """Bound temporary BF16 DCP projection storage to 144 MiB."""
-        if x.ndim != 3 or out.ndim != 3 or w_uv.ndim != 3:
-            raise ValueError(
-                "DCP projection expects rank-three tensors: "
-                f"x={tuple(x.shape)}, out={tuple(out.shape)}, "
-                f"w_uv={tuple(w_uv.shape)}."
-            )
-        num_tokens, num_heads, latent_dim = x.shape
-        if latent_dim != self.kv_lora_rank or w_uv.shape[0] != num_heads:
-            raise ValueError(
-                "DCP projection geometry mismatch: "
-                f"x={tuple(x.shape)}, w_uv={tuple(w_uv.shape)}."
-            )
-
-        temp_budget_bytes = 144 * 1024 * 1024
-        temp_bytes_per_token = (
-            num_heads * (self.kv_lora_rank + self.v_head_dim) * x.element_size()
-        )
-        max_chunk_tokens = max(1, temp_budget_bytes // temp_bytes_per_token)
-        for start in range(0, num_tokens, max_chunk_tokens):
-            end = min(start + max_chunk_tokens, num_tokens)
-            self._v_up_proj_bmm(x[start:end], out[start:end], w_uv)
 
 
 def unified_mla_kv_cache_update(
