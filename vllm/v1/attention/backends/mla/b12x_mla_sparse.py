@@ -784,12 +784,6 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # graph and the merge specializes on that count, so no device-side control
         # scalar initialization is needed. final_lse is pre-materialized as a view
         # so the legacy lazy torch.empty(final_lse) never fires during capture.
-        scratch_format_kwargs: dict[str, Any] = (
-            {"kv_cache_dtype": self.kv_cache_dtype}
-            if self._b12x_scale_format is not None
-            else {}
-        )
-
         def _make_plan(
             mode: str, max_q_rows: int, num_q_heads: int, max_batch: int
         ) -> Any:
@@ -807,7 +801,6 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     max_batch=int(max_batch),
                     max_chunks_per_row=self._num_splits_cap,
                     page_size=self.block_size,
-                    **scratch_format_kwargs,
                 )
             )
 
