@@ -157,7 +157,14 @@ ONLINE_QUANT_SHORTHAND_NAMES: tuple[str, ...] = (
 # which the checkpoint explicitly leaves unquantized (shared experts via
 # `shared_experts`, other dense linears via `linear`).
 _MODELOPT_ONLINE_OVERLAY_NAMES = frozenset(
-    {"modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed", "mxfp4"}
+    {
+        "modelopt",
+        "modelopt_fp4",
+        "modelopt_mxfp8",
+        "modelopt_mixed",
+        "mxfp4",
+        "nvfp4_nf3_hybrid",
+    }
 )
 
 

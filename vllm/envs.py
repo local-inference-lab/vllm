@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_FP8_GEMM: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
+    VLLM_NF3_GRID188_DECODE: bool = True
     VLLM_USE_B12X_MINIMAX_M3_MSA: bool = False
     VLLM_USE_B12X_DCP_A2A: bool = False
     VLLM_DCP_PROJECT_BEFORE_MERGE: bool = False
@@ -1091,6 +1092,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use b12x for FP4 MoE experts.
     # This is opt-in while the b12x subsystems are brought over one at a time.
     "VLLM_USE_B12X_MOE": lambda: bool(int(os.getenv("VLLM_USE_B12X_MOE", "0"))),
+    # Exact TP4 GLM-5.2 E64-NVFP4/E192-NF3 one-grid decode specialization.
+    "VLLM_NF3_GRID188_DECODE": lambda: bool(
+        int(os.getenv("VLLM_NF3_GRID188_DECODE", "1"))
+    ),
     # Use b12x for MiniMax M3's block-sparse MSA attention.
     # This is opt-in while page-128 MSA support is integrated.
     "VLLM_USE_B12X_MINIMAX_M3_MSA": lambda: bool(
