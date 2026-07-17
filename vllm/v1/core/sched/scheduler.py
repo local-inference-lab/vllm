@@ -1666,6 +1666,9 @@ class Scheduler(SchedulerInterface):
         adaptive_num_drafts = 0
         adaptive_num_draft_tokens = 0
         adaptive_num_accepted_tokens = 0
+        acceptance_length_controller = getattr(
+            self, "acceptance_length_controller", None
+        )
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -1707,7 +1710,7 @@ class Scheduler(SchedulerInterface):
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
-                if self.acceptance_length_controller is not None:
+                if acceptance_length_controller is not None:
                     adaptive_num_drafts += 1
                     adaptive_num_draft_tokens += num_draft_tokens
                     adaptive_num_accepted_tokens += num_accepted
@@ -1876,8 +1879,8 @@ class Scheduler(SchedulerInterface):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
-        if self.acceptance_length_controller is not None:
-            update = self.acceptance_length_controller.observe_batch(
+        if acceptance_length_controller is not None:
+            update = acceptance_length_controller.observe_batch(
                 num_drafts=adaptive_num_drafts,
                 num_draft_tokens=adaptive_num_draft_tokens,
                 num_accepted_tokens=adaptive_num_accepted_tokens,
@@ -1894,13 +1897,13 @@ class Scheduler(SchedulerInterface):
                     update.num_spec_tokens,
                     update.mean_num_accepted_tokens,
                     update.mean_num_draft_tokens,
-                    self.acceptance_length_controller.observation_window,
+                    acceptance_length_controller.observation_window,
                 )
 
         if spec_decoding_stats is not None:
             spec_decoding_stats.current_num_spec_tokens = (
-                self.acceptance_length_controller.num_spec_tokens
-                if self.acceptance_length_controller is not None
+                acceptance_length_controller.num_spec_tokens
+                if acceptance_length_controller is not None
                 else scheduler_output.resolve_num_spec_tokens_to_schedule(
                     self.num_spec_tokens
                 )

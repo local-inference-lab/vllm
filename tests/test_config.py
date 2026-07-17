@@ -1650,6 +1650,75 @@ def test_draft_sample_method_gumbel_is_rejected():
         )
 
 
+def test_dspark_capacity_config_validation():
+    speculative_config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=1,
+        dspark_confidence_threshold=0.25,
+        dspark_budget_frac=0.5,
+        dspark_capacity_verification_mode="mask",
+    )
+    assert speculative_config.dspark_confidence_threshold == 0.25
+    assert speculative_config.dspark_budget_frac == 0.5
+    assert speculative_config.dspark_capacity_verification_mode == "mask"
+    assert (
+        SpeculativeConfig(
+            method="ngram", num_speculative_tokens=1
+        ).dspark_capacity_verification_mode
+        == "varlen"
+    )
+    assert (
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            dspark_capacity_verification_mode="compact",
+        ).dspark_capacity_verification_mode
+        == "varlen"
+    )
+    assert (
+        SpeculativeConfig(
+            method="ngram", num_speculative_tokens=1
+        ).dspark_confidence_threshold
+        == 0.0
+    )
+
+    for threshold in (-0.1, 1.1, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="dspark_confidence_threshold"):
+            SpeculativeConfig(
+                method="ngram",
+                num_speculative_tokens=1,
+                dspark_confidence_threshold=threshold,
+            )
+
+    for budget_frac in (0.0, -0.1, 1.1, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="dspark_budget_frac"):
+            SpeculativeConfig(
+                method="ngram",
+                num_speculative_tokens=1,
+                dspark_budget_frac=budget_frac,
+            )
+
+    for config_field, value in (
+        ("dspark_confidence_temperature", float("nan")),
+        ("dspark_confidence_temperature", float("inf")),
+        ("dspark_sps_overhead_ms", float("nan")),
+        ("dspark_sps_overhead_ms", float("inf")),
+    ):
+        with pytest.raises(ValueError, match=config_field):
+            SpeculativeConfig(
+                method="ngram",
+                num_speculative_tokens=1,
+                **{config_field: value},
+            )
+
+    with pytest.raises(ValueError, match="dspark_sps_curve"):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            dspark_sps_curve=[(1, float("nan"))],
+        )
+
+
 def test_ir_op_priority_default():
     """Test that IR op priority defaults are set correctly."""
     from vllm.config.kernel import IrOpPriorityConfig

@@ -105,6 +105,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
                 slot_mappings,
                 num_tokens_across_dp,
                 cg_mode,
+                num_query_per_req=desc.uniform_token_count,
             )
 
         super().capture(create_forward_fn, progress_bar_desc)

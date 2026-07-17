@@ -631,6 +631,7 @@ class EngineArgs:
     spec_method: str | None = None
     spec_model: str | None = None
     spec_tokens: int | None = None
+    dspark_capacity_verification_mode: Literal["varlen", "mask"] | None = None
     diffusion_config: dict[str, Any] | None = None
 
     show_hidden_metrics_for_version: str | None = (
@@ -1544,6 +1545,12 @@ class EngineArgs:
         vllm_group.add_argument(
             "--spec-tokens", **speculative_kwargs["num_speculative_tokens"]
         )
+        vllm_group.add_argument(
+            "--dspark-capacity-verification-mode",
+            choices=["varlen", "mask"],
+            default=None,
+            help=speculative_kwargs["dspark_capacity_verification_mode"]["help"],
+        )
         vllm_kwargs["diffusion_config"]["type"] = optional_type(json.loads)
         vllm_group.add_argument(
             "--diffusion-config", "-dc", **vllm_kwargs["diffusion_config"]
@@ -1750,6 +1757,11 @@ class EngineArgs:
             ("--spec-method", "method", self.spec_method),
             ("--spec-model", "model", self.spec_model),
             ("--spec-tokens", "num_speculative_tokens", self.spec_tokens),
+            (
+                "--dspark-capacity-verification-mode",
+                "dspark_capacity_verification_mode",
+                self.dspark_capacity_verification_mode,
+            ),
         ):
             if value is None:
                 continue
