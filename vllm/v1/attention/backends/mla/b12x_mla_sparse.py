@@ -169,9 +169,7 @@ def _env_int(name: str, default: int) -> int:
     return parsed
 
 
-def _get_ckv_gather_workspace(
-    device: torch.device, nbytes: int
-) -> torch.Tensor:
+def _get_ckv_gather_workspace(device: torch.device, nbytes: int) -> torch.Tensor:
     key = (device.type, device.index)
     workspace = _CKV_GATHER_WORKSPACES.get(key)
     if workspace is None:
@@ -299,9 +297,7 @@ def _map_global_topk_to_gathered_ckv_kernel(
         tok // (DCP_SIZE * DCP_INTERLEAVE)
     ) * DCP_INTERLEAVE + tok % DCP_INTERLEAVE
     req_start = tl.load(
-        rank_req_starts_ptr
-        + owner * starts_stride0
-        + req * starts_stride1,
+        rank_req_starts_ptr + owner * starts_stride0 + req * starts_stride1,
         mask=col_mask & (tok >= 0),
         other=0,
     )
@@ -684,8 +680,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             and envs_mod.VLLM_B12X_MLA_CKV_GATHER
             and num_decode_tokens == 0
             and num_prefill_tokens == num_tokens
-            and cm.max_query_len
-            > envs_mod.VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS
+            and cm.max_query_len > envs_mod.VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS
         ):
             assert self.dcp_rank_req_lens_buffer is not None
             assert self.dcp_rank_req_starts_buffer is not None
@@ -712,9 +707,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
                     out=dcp_rank_req_starts[:, 1:],
                 )
 
-            dcp_local_cu_seq_lens = self.dcp_local_cu_seq_lens_buffer[
-                : cm.num_reqs + 1
-            ]
+            dcp_local_cu_seq_lens = self.dcp_local_cu_seq_lens_buffer[: cm.num_reqs + 1]
             dcp_local_cu_seq_lens[0].zero_()
             torch.cumsum(
                 dcp_rank_req_lens[self.dcp_rank],
@@ -1235,12 +1228,8 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             self._ckv_gather_stream = torch.cuda.Stream(device=self.device)
             self._ckv_current_chunk_kv_c: torch.Tensor | None = None
             self._ckv_current_chunk_kpe: torch.Tensor | None = None
-            B12xMLASparseImpl._all_layer_kv_caches: list[
-                torch.Tensor | None
-            ] = []
-            B12xMLASparseImpl._shared_gather_event: (
-                torch.cuda.Event | None
-            ) = None
+            B12xMLASparseImpl._all_layer_kv_caches: list[torch.Tensor | None] = []
+            B12xMLASparseImpl._shared_gather_event: torch.cuda.Event | None = None
             B12xMLASparseImpl._shared_gather_buf_idx = 0
             if not self._ckv_prefetch_supported:
                 logger.warning_once(
@@ -1656,9 +1645,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         local_tokens = attn_metadata.dcp_local_total_tokens
         self._validate_ckv_workspace(ckv_workspace)
         half_nbytes = (
-            (self.dcp_world_size + 1)
-            * self._ckv_local_capacity
-            * self._kv_record_bytes
+            (self.dcp_world_size + 1) * self._ckv_local_capacity * self._kv_record_bytes
         )
         ws_half = ckv_workspace.view(-1, self._kv_record_bytes)
         base = buf_idx * (half_nbytes // self._kv_record_bytes)
@@ -1699,9 +1686,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             # stream; the synchronous path shares the default stream with the
             # merge and is safe on the main DCP communicator.
             dcp_group = (
-                get_dcp_ckv_prefetch_group()
-                if stream is not None
-                else get_dcp_group()
+                get_dcp_ckv_prefetch_group() if stream is not None else get_dcp_group()
             )
             _dcp_all_gather_current_stream(
                 dcp_group,
@@ -1717,9 +1702,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         gathered_tokens = gathered_buffer[
             : self.dcp_world_size * self._ckv_local_capacity
         ]
-        return gathered_tokens.view(
-            -1, self.block_size, self._kv_record_bytes
-        )
+        return gathered_tokens.view(-1, self.block_size, self._kv_record_bytes)
 
     def set_ckv_current_chunk_kv(
         self, kv_c_normed: torch.Tensor, k_pe: torch.Tensor
@@ -1766,10 +1749,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         tokens — not just the local rank's share — into the correct slots
         of the rank-ordered gathered buffer.
         """
-        if (
-            self._ckv_current_chunk_kv_c is None
-            or num_actual_toks == 0
-        ):
+        if self._ckv_current_chunk_kv_c is None or num_actual_toks == 0:
             return
         kv_c = self._ckv_current_chunk_kv_c[:num_actual_toks]
         k_pe_flat = self._ckv_current_chunk_kpe[:num_actual_toks]
@@ -1782,9 +1762,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         if global_seq_lens is None:
             return
         global_seq_lens = global_seq_lens[:num_reqs]
-        req_ids = attn_metadata.req_id_per_token[:num_actual_toks].to(
-            torch.int64
-        )
+        req_ids = attn_metadata.req_id_per_token[:num_actual_toks].to(torch.int64)
         global_seq_per_token = global_seq_lens[req_ids].to(torch.int32)
 
         # Map each current-chunk token to its absolute position within its
@@ -1794,18 +1772,12 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         # ``(t - query_start_loc[r])``-th of them. Using the batch-global
         # ``t``/``num_actual_toks`` is only correct for a single request and
         # otherwise misplaces every request but the last.
-        query_start_loc = attn_metadata.query_start_loc[: num_reqs + 1].to(
-            torch.int32
-        )
+        query_start_loc = attn_metadata.query_start_loc[: num_reqs + 1].to(torch.int32)
         req_chunk_start = query_start_loc[:-1][req_ids]
         req_chunk_len = (query_start_loc[1:] - query_start_loc[:-1])[req_ids]
-        t = torch.arange(
-            num_actual_toks, device=self.device, dtype=torch.int32
-        )
+        t = torch.arange(num_actual_toks, device=self.device, dtype=torch.int32)
         global_pos = global_seq_per_token - req_chunk_len + (t - req_chunk_start)
-        owner = (
-            (global_pos // interleave) % self.dcp_world_size
-        ).to(torch.int64)
+        owner = ((global_pos // interleave) % self.dcp_world_size).to(torch.int64)
         local_pos = (
             global_pos // (self.dcp_world_size * interleave) * interleave
             + global_pos % interleave
@@ -1820,9 +1792,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         rank_start = rank_req_starts.reshape(-1)[flat_idx].to(torch.int64)
 
         padded_tokens = attn_metadata.dcp_padded_total_tokens
-        slots = (
-            owner * int(padded_tokens) + rank_start + local_pos
-        )
+        slots = owner * int(padded_tokens) + rank_start + local_pos
 
         k_scale = getattr(layer, "_k_scale", None)
         if self._kv_fp8_rope:
@@ -2037,9 +2007,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             selected_indices = attn_metadata.ckv_page_table_1[
                 :num_actual_toks, : topk_indices.shape[1]
             ]
-            nsa_cache_seqlens = attn_metadata.ckv_nsa_cache_seqlens[
-                :num_actual_toks
-            ]
+            nsa_cache_seqlens = attn_metadata.ckv_nsa_cache_seqlens[:num_actual_toks]
             _map_global_topk_to_gathered_ckv(
                 attn_metadata.req_id_per_token[:num_actual_toks],
                 topk_indices,
@@ -2142,10 +2110,8 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     half_nbytes // self._kv_record_bytes
                 )
                 gathered_buffer = ws_half[
-                    base
-                    + self._ckv_local_capacity : base
-                    + self._ckv_local_capacity
-                    * (self.dcp_world_size + 1)
+                    base + self._ckv_local_capacity : base
+                    + self._ckv_local_capacity * (self.dcp_world_size + 1)
                 ]
                 kv_cache = gathered_buffer[
                     : self.dcp_world_size * self._ckv_local_capacity
@@ -2154,9 +2120,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     kv_cache, attn_metadata, layer, num_actual_toks
                 )
             else:
-                kv_cache = self._dcp_gather_ckv(
-                    kv_cache, attn_metadata, ckv_workspace
-                )
+                kv_cache = self._dcp_gather_ckv(kv_cache, attn_metadata, ckv_workspace)
             logger.info_once(
                 "Using transient full-CKV gather for B12X sparse MLA prefill "
                 "(capacity=%d logical tokens)",
@@ -2166,8 +2130,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 self._ckv_prefetch_supported
                 and layer_idx is not None
                 and layer_idx + 1 < len(B12xMLASparseImpl._all_layer_kv_caches)
-                and B12xMLASparseImpl._all_layer_kv_caches[layer_idx + 1]
-                is not None
+                and B12xMLASparseImpl._all_layer_kv_caches[layer_idx + 1] is not None
             ):
                 next_kv = B12xMLASparseImpl._all_layer_kv_caches[layer_idx + 1]
                 next_buf_idx = 1 - B12xMLASparseImpl._shared_gather_buf_idx
@@ -2181,9 +2144,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 B12xMLASparseImpl._shared_gather_event = torch.cuda.Event(
                     blocking=False
                 )
-                B12xMLASparseImpl._shared_gather_event.record(
-                    self._ckv_gather_stream
-                )
+                B12xMLASparseImpl._shared_gather_event.record(self._ckv_gather_stream)
                 B12xMLASparseImpl._shared_gather_buf_idx = next_buf_idx
 
         use_decode_kernel = attn_metadata.max_query_len <= 1 or (
@@ -2256,9 +2217,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             # granularity, so only a non-aligned local tail is padded here.
             if use_ckv_gather:
                 if attn_metadata.global_cache_seq_lens_per_req is None:
-                    raise RuntimeError(
-                        "CKV gather is missing global sequence lengths"
-                    )
+                    raise RuntimeError("CKV gather is missing global sequence lengths")
                 cache_seqlens = attn_metadata.global_cache_seq_lens_per_req
             else:
                 cache_seqlens = attn_metadata.cache_seq_lens_per_req
@@ -2267,9 +2226,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 prefill_q = q_buffer[:, : self._kernel_num_heads]
                 prefill_q[:, self._input_num_heads :, :].zero_()
 
-            extend_plan = (
-                self._ckv_extend_plan if use_ckv_gather else self._extend_plan
-            )
+            extend_plan = self._ckv_extend_plan if use_ckv_gather else self._extend_plan
             if extend_plan is None:
                 raise RuntimeError("CKV gather extend plan was not initialized")
             binding = extend_plan.bind(

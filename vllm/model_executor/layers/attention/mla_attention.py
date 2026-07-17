@@ -1089,9 +1089,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if not self.impl.is_sparse:
                 assert attn_metadata.decode is not None
             if ckv_gather_used:
-                ckv_setter = getattr(
-                    self.impl, "set_ckv_current_chunk_kv", None
-                )
+                ckv_setter = getattr(self.impl, "set_ckv_current_chunk_kv", None)
                 if callable(ckv_setter):
                     ckv_setter(k_c_normed, k_pe)
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
@@ -1425,13 +1423,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             and num_hidden_layers is not None
             and layer_id >= int(num_hidden_layers)
         )
-        model_type = getattr(
-            vllm_config.model_config.hf_config, "model_type", None
-        )
+        model_type = getattr(vllm_config.model_config.hf_config, "model_type", None)
         speculative_config = getattr(vllm_config, "speculative_config", None)
-        target_model_config = getattr(
-            speculative_config, "target_model_config", None
-        )
+        target_model_config = getattr(speculative_config, "target_model_config", None)
         target_model_type = (
             getattr(target_model_config.hf_config, "model_type", None)
             if target_model_config is not None
@@ -1439,10 +1433,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         glm_model_or_mtp = bool(
             model_type == "glm_moe_dsa"
-            or (
-                model_type == "deepseek_mtp"
-                and target_model_type == "glm_moe_dsa"
-            )
+            or (model_type == "deepseek_mtp" and target_model_type == "glm_moe_dsa")
         )
         glm_fp8_rope = bool(
             os.environ.get("KV_FP8_ROPE", "0") == "1"
@@ -1559,8 +1550,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         for start in range(0, num_tokens, max_chunk_tokens):
             end = min(start + max_chunk_tokens, num_tokens)
             self._v_up_proj_bmm(x[start:end], out[start:end], w_uv)
-
-
 
 
 def unified_mla_kv_cache_update(

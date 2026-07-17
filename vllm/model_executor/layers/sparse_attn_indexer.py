@@ -1604,11 +1604,7 @@ def sparse_attn_indexer(
             qs_active = False
             qs_row_start = chunk.token_start
             qs_row_end = chunk.token_end
-            if (
-                qs_world_size > 1
-                and use_b12x_indexer
-                and chunk.total_seq_lens > 0
-            ):
+            if qs_world_size > 1 and use_b12x_indexer and chunk.total_seq_lens > 0:
                 chunk_tokens = chunk.token_end - chunk.token_start
                 if chunk_tokens % qs_world_size == 0:
                     slice_tokens = chunk_tokens // qs_world_size
@@ -1691,7 +1687,7 @@ def sparse_attn_indexer(
                             "B12X sparse indexer DCP requires topk_scores_buffer."
                         )
                     topk_scores = topk_scores_buffer[
-                        qs_row_start : qs_row_end, :topk_tokens
+                        qs_row_start:qs_row_end, :topk_tokens
                     ]
                 _run_b12x_paged_topk(
                     q_fp8=q_slice.contiguous(),
