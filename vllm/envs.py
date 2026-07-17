@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_SPARSE_INDEXER: bool = False
     VLLM_USE_B12X_MHC: bool = False
     VLLM_USE_B12X_FP8_GEMM: bool = False
+    VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
     VLLM_USE_B12X_MINIMAX_M3_MSA: bool = False
@@ -1082,6 +1083,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # This is opt-in while the b12x subsystems are brought over one at a time.
     "VLLM_USE_B12X_FP8_GEMM": lambda: bool(
         int(os.getenv("VLLM_USE_B12X_FP8_GEMM", "0"))
+    ),
+    # Compute DSpark draft-proposal logits with a rowwise-fp8 copy of the
+    # shared target lm_head. Verification is unchanged, so accepted outputs
+    # retain target-model semantics. Requires fp8 tensor cores (SM89+).
+    "VLLM_DSPARK_FP8_DRAFT_HEAD": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_FP8_DRAFT_HEAD", "0"))
     ),
     # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
     # This is separate from the generic FP8 linear switch for perf isolation.
