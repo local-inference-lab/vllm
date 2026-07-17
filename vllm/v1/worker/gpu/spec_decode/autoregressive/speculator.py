@@ -177,6 +177,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.draft_max_seq_len = min(
                 max_seq_len + num_speculative_tokens, self.max_model_len
             )
+            # Draft attention metadata is rebuilt once per speculative step.
+            # Keep a CPU-resident conservative bound so sparse attention
+            # builders do not fall back to a blocking seq_lens D2H copy in
+            # that loop. Every draft step advances by at most one token, so
+            # adding the full proposal depth is valid for every step.
+            self._draft_decode_seq_lens_upper_bound = (
+                input_batch.seq_lens_cpu_upper_bound + num_speculative_tokens
+            )
 
             # NOTE(woosuk): To avoid CPU-GPU synchronization without CPU knowing the
             # number of rejected tokens, we maintain the size of input_ids and
@@ -500,6 +508,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                         num_reqs=num_reqs,
                         num_reqs_padded=batch_desc.num_reqs or num_reqs,
                         num_tokens_padded=batch_desc.num_tokens,
+                        seq_lens_cpu_upper_bound=(
+                            self._draft_decode_seq_lens_upper_bound
+                        ),
                     )
 
             # Update the current draft step.

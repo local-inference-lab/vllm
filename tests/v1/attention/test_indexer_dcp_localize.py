@@ -306,6 +306,19 @@ def test_get_dcp_local_seq_lens_preserves_mtp_bounds_shape():
     torch.testing.assert_close(actual, expected)
 
 
+def test_get_dcp_local_seq_lens_rank_does_not_allocate_cuda_scalar(monkeypatch):
+    seq_lens = torch.tensor([17, 33, 65], dtype=torch.int32)
+
+    def fail_tensor_allocation(*args, **kwargs):
+        raise AssertionError("rank localization must not allocate a scalar tensor")
+
+    monkeypatch.setattr(torch, "tensor", fail_tensor_allocation)
+
+    actual = get_dcp_local_seq_lens(seq_lens, dcp_size=4, dcp_rank=2)
+
+    assert actual.tolist() == [4, 8, 16]
+
+
 def test_get_dcp_local_seq_lens_must_run_after_decode_expansion():
     world = 2
     rank = 1
