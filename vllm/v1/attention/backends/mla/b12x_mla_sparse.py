@@ -570,6 +570,9 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         max_seqs = vllm_config.scheduler_config.max_num_seqs
+        from vllm import envs as envs_mod
+
+        ckv_gather_requested = envs_mod.VLLM_B12X_MLA_CKV_GATHER
         # Max-batched-token scratch buffers so cudagraph capture sees stable
         # allocations (sliced per build()).
         self.cache_seq_lens_per_token_buffer = torch.empty(
@@ -591,21 +594,28 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             self.req_ids_arange = torch.arange(
                 max_tokens, dtype=torch.int32, device=device
             )
-            self.ckv_page_table_1_buffer = torch.empty(
-                (max_tokens, self.topk_tokens), dtype=torch.int32, device=device
-            )
-            self.ckv_nsa_cache_seqlens_buffer = torch.empty(
-                (max_tokens,), dtype=torch.int32, device=device
-            )
-            self.dcp_rank_req_lens_buffer = torch.empty(
-                (self.dcp_world_size, max_seqs), dtype=torch.int32, device=device
-            )
-            self.dcp_rank_req_starts_buffer = torch.empty(
-                (self.dcp_world_size, max_seqs), dtype=torch.int32, device=device
-            )
-            self.dcp_local_cu_seq_lens_buffer = torch.empty(
-                (max_seqs + 1,), dtype=torch.int32, device=device
-            )
+            if ckv_gather_requested:
+                self.ckv_page_table_1_buffer = torch.empty(
+                    (max_tokens, self.topk_tokens), dtype=torch.int32, device=device
+                )
+                self.ckv_nsa_cache_seqlens_buffer = torch.empty(
+                    (max_tokens,), dtype=torch.int32, device=device
+                )
+                self.dcp_rank_req_lens_buffer = torch.empty(
+                    (self.dcp_world_size, max_seqs), dtype=torch.int32, device=device
+                )
+                self.dcp_rank_req_starts_buffer = torch.empty(
+                    (self.dcp_world_size, max_seqs), dtype=torch.int32, device=device
+                )
+                self.dcp_local_cu_seq_lens_buffer = torch.empty(
+                    (max_seqs + 1,), dtype=torch.int32, device=device
+                )
+            else:
+                self.ckv_page_table_1_buffer = None
+                self.ckv_nsa_cache_seqlens_buffer = None
+                self.dcp_rank_req_lens_buffer = None
+                self.dcp_rank_req_starts_buffer = None
+                self.dcp_local_cu_seq_lens_buffer = None
         else:
             self.req_id_per_token_buffer = None
             self.page_table_1_buffer = None
@@ -877,7 +887,9 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             dcp_rank_req_lens=dcp_rank_req_lens,
             dcp_local_cu_seq_lens=dcp_local_cu_seq_lens,
             global_cache_seq_lens_per_req=(
-                cm.seq_lens[: cm.num_reqs] if use_dcp else None
+                cm.seq_lens[: cm.num_reqs]
+                if use_dcp and envs_mod.VLLM_B12X_MLA_CKV_GATHER
+                else None
             ),
             dcp_local_total_tokens=dcp_local_total_tokens,
             dcp_padded_total_tokens=dcp_padded_total_tokens,
