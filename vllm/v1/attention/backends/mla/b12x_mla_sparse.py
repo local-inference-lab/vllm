@@ -169,12 +169,6 @@ def _env_int(name: str, default: int) -> int:
     return parsed
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() not in {"", "0", "false", "no", "off"}
-
 
 def _get_ckv_gather_workspace(
     device: torch.device, nbytes: int
@@ -1684,6 +1678,12 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 local_buffer[:padded_tokens].view(-1),
                 gathered_buffer[: self.dcp_world_size * padded_tokens].view(-1),
             )
+        # Keep the cache geometry stable across requests. CuTe/B12X caches the
+        # compiled prefill launch, while ``padded_tokens`` grows with context;
+        # exposing a differently sized first dimension on every request can
+        # reuse a launch specialized for an earlier, smaller cache. The live
+        # records remain packed in the prefix and selected indices are still
+        # based on ``padded_tokens``, so the unused capacity is unreachable.
         gathered_tokens = gathered_buffer[
             : self.dcp_world_size * self._ckv_local_capacity
         ]
