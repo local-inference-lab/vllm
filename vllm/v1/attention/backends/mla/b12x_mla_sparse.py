@@ -2019,9 +2019,36 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
                 padded_rank_tokens=attn_metadata.dcp_padded_total_tokens,
             )
+            # The gathered buffer holds the *global* sequence and the extend
+            # kernel attends it in full (cache_seqlens = global lengths), so
+            # the count of selected entries must be capped by the global
+            # per-token causal length. ``per_token_cache`` is the *local*
+            # per-rank length (~global/dcp); using it drops the other ranks'
+            # selected tokens whenever it is the smaller bound
+            # (local_len < min(topk, global_len)) -- i.e. for short contexts,
+            # which shows up as small-context-only garbage.
+            assert attn_metadata.global_cache_seq_lens_per_req is not None
+            g_num_reqs = attn_metadata.num_reqs
+            g_qsl = attn_metadata.query_start_loc[: g_num_reqs + 1].to(
+                torch.int32
+            )
+            g_req_ids = attn_metadata.req_id_per_token[:num_actual_toks].to(
+                torch.int64
+            )
+            g_chunk_start = g_qsl[:-1][g_req_ids]
+            g_chunk_len = (g_qsl[1:] - g_qsl[:-1])[g_req_ids]
+            g_full_seq = attn_metadata.global_cache_seq_lens_per_req[
+                g_req_ids
+            ].to(torch.int32)
+            g_t = torch.arange(
+                num_actual_toks, device=self.device, dtype=torch.int32
+            )
+            global_causal_len = (
+                g_full_seq - g_chunk_len + (g_t - g_chunk_start) + 1
+            )
             torch.minimum(
                 nsa_cache_seqlens,
-                per_token_cache,
+                global_causal_len,
                 out=nsa_cache_seqlens,
             )
             _mask_page_table_after_nsa_len(selected_indices, nsa_cache_seqlens)
