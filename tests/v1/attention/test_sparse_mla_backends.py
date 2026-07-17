@@ -354,6 +354,54 @@ def test_b12x_sparse_glm_uses_8_head_alignment(
         assert lse is None
 
 
+def test_b12x_sparse_nvfp4_uses_kernel_format_not_scratch_caps(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_init,
+) -> None:
+    if not current_platform.has_device_capability(120):
+        pytest.skip("B12xMLASparseBackend requires SM 12.0")
+    if importlib.util.find_spec("b12x") is None:
+        pytest.skip("b12x package not available")
+
+    default_vllm_config.scheduler_config.max_num_batched_tokens = 2
+    default_vllm_config.scheduler_config.max_num_seqs = 2
+    monkeypatch.setattr(
+        B12xMLASparseImpl,
+        "_prewarm_extend_kernels_once",
+        lambda self, max_batched: None,
+    )
+
+    impl = B12xMLASparseImpl(
+        num_heads=8,
+        head_size=576,
+        scale=1.0 / math.sqrt(576),
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="nvfp4_ds_mla",
+        logits_soft_cap=None,
+        attn_type="decoder",
+        kv_sharing_target_layer_name=None,
+        topk_indices_buffer=torch.zeros(
+            (2, 2048), dtype=torch.int32, device=DEVICE_TYPE
+        ),
+        kv_lora_rank=512,
+        qk_nope_head_dim=512,
+        qk_rope_head_dim=64,
+        v_head_dim=512,
+    )
+
+    # Scratch shape depends on query/output geometry, not the packed KV record.
+    # NVFP4 specialization belongs on every kernel call instead.
+    assert not hasattr(impl._decode_plan.caps, "kv_cache_dtype")
+    assert not hasattr(impl._extend_plan.caps, "kv_cache_dtype")
+    assert impl._b12x_kernel_format_kwargs(0.75) == {
+        "latent_scale": 0.75,
+        "scale_format": 2,
+    }
+
+
 def test_b12x_sparse_glm_dcp_expands_heads_and_converts_topk(
     default_vllm_config,
     monkeypatch: pytest.MonkeyPatch,
