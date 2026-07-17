@@ -2643,9 +2643,7 @@ def _ensure_nvfp4_mla_cache_ext() -> None:
     if not hasattr(torch.ops._C_cache_ops, "concat_and_cache_nvfp4_mla"):
         import os as _os
 
-        _ext = _os.path.join(
-            _os.path.dirname(__file__), "_nvfp4_mla_cache_C.so"
-        )
+        _ext = _os.path.join(_os.path.dirname(__file__), "_nvfp4_mla_cache_C.so")
         torch.ops.load_library(_ext)
     _NVFP4_MLA_CACHE_EXT_LOADED = True
 
