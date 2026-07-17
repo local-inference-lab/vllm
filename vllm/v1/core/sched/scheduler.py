@@ -1901,7 +1901,9 @@ class Scheduler(SchedulerInterface):
             spec_decoding_stats.current_num_spec_tokens = (
                 self.acceptance_length_controller.num_spec_tokens
                 if self.acceptance_length_controller is not None
-                else scheduler_output.num_spec_tokens_to_schedule
+                else scheduler_output.resolve_num_spec_tokens_to_schedule(
+                    self.num_spec_tokens
+                )
             )
 
         # Remove the stopped requests from the running and waiting queues.

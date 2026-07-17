@@ -305,8 +305,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             self.vllm_config.scheduler_config.max_num_batched_tokens
         )
 
-        # Keep the split aligned with target verification. DSpark verifies the
-        # sampled token plus K draft tokens, even though it drafts in parallel.
+        # Keep the decode/prefill split identical to the DeepSeek V4 C128A
+        # metadata and indexer. Target verification contains the bonus token
+        # plus N speculative tokens even for parallel drafters such as DSpark;
+        # the generic parallel-drafting threshold (1 + 2N) is not applicable.
         spec_config = self.vllm_config.speculative_config
         self.num_speculative_tokens = (
             spec_config.num_speculative_tokens if spec_config else 0

@@ -222,9 +222,15 @@ class CudaGraphManager:
                 self.decode_query_len - self.vllm_config.num_speculative_tokens
             )
             # Each entry is (range_start, range_end, num_speculative_tokens).
-            decode_query_lens = [
-                x[2] + num_new_sampled_tokens_per_step for x in num_spec_per_batch_size
-            ]
+            # K=0 disables drafting at that concurrency; no draft graph is
+            # needed, and a zero query length would break capture bucketing.
+            decode_query_lens = sorted(
+                {
+                    x[2] + num_new_sampled_tokens_per_step
+                    for x in num_spec_per_batch_size
+                    if x[2] + num_new_sampled_tokens_per_step > 0
+                }
+            )
         elif (
             speculative_config
             and speculative_config.uses_acceptance_length_adaptation()
