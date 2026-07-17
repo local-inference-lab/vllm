@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_SPARSE_INDEXER: bool = False
     VLLM_USE_B12X_MHC: bool = False
     VLLM_USE_B12X_FP8_GEMM: bool = False
+    VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
     VLLM_USE_B12X_MINIMAX_M3_MSA: bool = False
@@ -173,6 +174,9 @@ if TYPE_CHECKING:
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
+    VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH: bool = False
+    VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW: int = 8
+    VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE: int = 0
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1062,6 +1066,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_B12X_FP8_GEMM": lambda: bool(
         int(os.getenv("VLLM_USE_B12X_FP8_GEMM", "0"))
     ),
+    # Compute DSpark draft-proposal logits with a rowwise-fp8 copy of the
+    # shared target lm_head. Verification is unchanged, so accepted outputs
+    # retain target-model semantics. Requires fp8 tensor cores (SM89+).
+    "VLLM_DSPARK_FP8_DRAFT_HEAD": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_FP8_DRAFT_HEAD", "0"))
+    ),
     # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
     # This is separate from the generic FP8 linear switch for perf isolation.
     "VLLM_USE_B12X_WO_PROJECTION": lambda: bool(
@@ -1452,6 +1462,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
+    # Physically shorten DSpark's next draft block from the historical
+    # confidence-scheduled verification capacity. This captures/replays one
+    # draft graph per K instead of computing Kmax and slicing afterwards.
+    "VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH", "0"))
+    ),
+    "VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW": lambda: int(
+        os.getenv("VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW", "8")
+    ),
+    # Capture low-load DSpark draft graphs without confidence/capacity kernels.
+    # 0 keeps capacity active at every batch size; a positive value must match
+    # the profiled saturation knee used by the verification manager.
+    "VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE": lambda: int(
+        os.getenv("VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE", "0")
+    ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,

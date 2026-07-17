@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -28,10 +28,25 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.spec_decode.dspark.online_sts import DSparkOnlineSTS
+
 logger = init_logger(__name__)
 
 
 class BaseSpeculator(ABC):
+    # Draft-token capacity surface, implemented by speculators with a
+    # confidence head (see DSparkSpeculator).
+    use_draft_token_capacity: bool = False
+    online_sts: "DSparkOnlineSTS | None" = None
+    wants_auto_sps_curve: bool = False
+
+    def warmup_capacity_kernels(self) -> None:  # noqa: B027
+        pass
+
+    def set_sps_curve(self, sps_curve: list[tuple[int, float]]) -> None:
+        raise NotImplementedError
+
     @abstractmethod
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass
@@ -73,6 +88,9 @@ class BaseSpeculator(ABC):
         is_profile: bool = False,
     ) -> torch.Tensor:
         pass
+
+    def compute_capacities(self, input_batch: InputBatch) -> torch.Tensor | None:
+        return None
 
 
 class DraftModelSpeculator(BaseSpeculator):
@@ -185,6 +203,12 @@ class DraftModelSpeculator(BaseSpeculator):
                 num_unpadded_tokens,
             )
 
+    @property
+    def attn_vllm_config(self) -> VllmConfig:
+        """Config for the draft's attention metadata builders. Overridden by
+        speculators whose attention mode differs from the target's."""
+        return self.vllm_config
+
     def set_attn(
         self,
         model_state: ModelState,
@@ -193,9 +217,9 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> None:
         self.model_state = model_state
         self.kv_cache_config = kv_cache_config
-        self.attn_groups, _, _ = init_attn_backend(
+        self.attn_groups, self.attn_cg_support, _ = init_attn_backend(
             kv_cache_config,
-            self.vllm_config,
+            self.attn_vllm_config,
             self.device,
             active_layer_names=self.draft_attn_layer_names,
         )

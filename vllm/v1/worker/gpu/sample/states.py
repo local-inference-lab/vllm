@@ -15,9 +15,13 @@ _NP_INT64_MAX = np.iinfo(np.int64).max
 
 
 class SamplingStates:
-    def __init__(self, max_num_reqs: int, vocab_size: int):
+    def __init__(self, max_num_reqs: int, vocab_size: int, seed: int | None = None):
         self.max_num_reqs = max_num_reqs
         self.vocab_size = vocab_size
+
+        # Every TP rank must derive the same fallback request seeds. A private
+        # stream avoids rank-local consumers perturbing NumPy's global RNG.
+        self._fallback_seed_rng = np.random.default_rng(seed if seed is not None else 0)
 
         self.temperature = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
         self.top_k = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
@@ -50,7 +54,11 @@ class SamplingStates:
         seed = sampling_params.seed
         self.seeds_set[req_idx] = seed is not None
         if seed is None:
-            seed = np.random.randint(_NP_INT64_MIN, _NP_INT64_MAX)
+            seed = int(
+                self._fallback_seed_rng.integers(
+                    _NP_INT64_MIN, _NP_INT64_MAX, dtype=np.int64
+                )
+            )
         self.seeds.np[req_idx] = seed
 
         num_logprobs = sampling_params.logprobs

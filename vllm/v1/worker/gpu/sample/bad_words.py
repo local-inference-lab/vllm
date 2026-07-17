@@ -152,9 +152,11 @@ def _bad_words_kernel(
         from_spec_input = actual_pos >= output_len
         if from_spec_input:
             spec_offset = actual_pos - output_len
-            actual = tl.load(input_ids_ptr + cur_req_first_pos + spec_offset)
+            actual = tl.load(input_ids_ptr + cur_req_first_pos + spec_offset).to(
+                tl.int64
+            )
         else:
-            actual = tl.load(output_base + actual_pos)
+            actual = tl.load(output_base + actual_pos).to(tl.int64)
 
         match = match & (expected == actual)
 

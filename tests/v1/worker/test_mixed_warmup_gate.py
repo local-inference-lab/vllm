@@ -6,11 +6,33 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
+from vllm.v1.worker.gpu.warmup import (
+    _derive_dspark_draft_token_budget,
+    _stable_sps_step_ms,
+    run_mixed_prefill_decode_warmup,
+)
 
 
 def _fail(*args, **kwargs):
     raise AssertionError("worker callback must not run when warmup is skipped")
+
+
+def test_sps_profile_median_rejects_single_stall():
+    assert _stable_sps_step_ms([10.0, 10.2, 75.0, 9.9, 10.1]) == pytest.approx(10.1)
+
+
+def test_dspark_dynamic_budget_uses_upper_load_sps_knee():
+    curve = [
+        (6, 200.0),
+        (12, 80.0),
+        (24, 67.71),
+        (48, 58.52),
+        (96, 51.29),
+        (192, 40.33),
+        (384, 23.72),
+    ]
+
+    assert _derive_dspark_draft_token_budget(curve, max_draft_depth=5) == 160
 
 
 @pytest.mark.parametrize("max_num_reqs", [1, 0])

@@ -606,6 +606,7 @@ class CausalCascadeSpeculator(AutoRegressiveSpeculator):
             num_reqs,
             num_tokens,
             uniform_token_count,
+            max_req_tokens=None,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,

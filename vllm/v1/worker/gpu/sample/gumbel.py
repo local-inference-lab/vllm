@@ -11,9 +11,7 @@ from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 # in `tl.constexpr(...)`. We can only do that when Triton is actually
 # available — on the CPU worker path `tl` is a placeholder whose `constexpr`
 # attribute is `None`, and `tl.constexpr(...)` would crash at import time.
-_TL_RAND_MIN = (
-    tl.constexpr(4.6566127342e-10) if HAS_TRITON else 4.6566127342e-10
-)
+_TL_RAND_MIN = tl.constexpr(4.6566127342e-10) if HAS_TRITON else 4.6566127342e-10
 _FP64_ONE_MINUS_EPS = (
     tl.constexpr(0.9999999999999999) if HAS_TRITON else 0.9999999999999999
 )
@@ -227,7 +225,7 @@ def _gumbel_sample_kernel(
         USE_FP64=USE_FP64,
         PER_TOKEN_COL=PER_TOKEN_COL,
     )
-    token_id = block_idx * BLOCK_SIZE + idx
+    token_id = tl.minimum(block_idx * BLOCK_SIZE + idx, vocab_size - 1)
     tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
 

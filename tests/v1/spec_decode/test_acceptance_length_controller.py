@@ -268,6 +268,9 @@ def test_synthetic_scheduler_output_uses_default_speculative_depth():
     output.num_spec_tokens_to_schedule = 2
     assert output.resolve_num_spec_tokens_to_schedule(default=5) == 2
 
+    output.num_spec_tokens_to_schedule = 0
+    assert output.resolve_num_spec_tokens_to_schedule(default=5) == 0
+
 
 def test_runner_v2_autoregressive_drafter_stops_at_adaptive_depth(monkeypatch):
     monkeypatch.setattr(AutoRegressiveSpeculator, "__abstractmethods__", frozenset())

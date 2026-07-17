@@ -325,7 +325,8 @@ def _reshape_kv_cache(
                 # quantized cache dtype's (possibly packed) layout.
                 layer_cache_dtype = (
                     "auto"
-                    if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                    if cache_dtype != "fp8_ds_mla"
+                    and kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
                     and not isinstance(kv_cache_spec, TQFullAttentionSpec)
                     else cache_dtype
                 )
@@ -494,7 +495,8 @@ def _update_hybrid_attention_layout(
         # but it keeps both call sites consistent for skip layers.
         layer_cache_dtype = (
             "auto"
-            if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+            if cache_dtype != "fp8_ds_mla"
+            and kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
             and not isinstance(kv_cache_spec, TQFullAttentionSpec)
             else cache_dtype
         )
@@ -593,6 +595,8 @@ def build_attn_metadata(
     for_cudagraph_capture: bool = False,
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
+    is_prefilling: torch.Tensor | None = None,
+    max_req_tokens: int = 0,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -645,6 +649,8 @@ def build_attn_metadata(
             mm_req_doc_ranges=mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
             batch_topology=batch_topology,
+            max_req_tokens=max_req_tokens,
+            is_prefilling=is_prefilling,
             **common_attn_metadata_extra_kwargs,
         )
 

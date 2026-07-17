@@ -200,7 +200,8 @@ def warmup_kernels(
     # DCP rank receives zero local KV tokens.
     min_dcp_prompt_len = max(
         1,
-        getattr(model_runner, "dcp_size", 1) * getattr(model_runner, "cp_interleave", 1),
+        getattr(model_runner, "dcp_size", 1)
+        * getattr(model_runner, "cp_interleave", 1),
     )
     prompt_len = max(decode_query_len + 1, min_dcp_prompt_len)
     prompt_token_ids = list(range(prompt_len))
@@ -342,9 +343,141 @@ def warmup_kernels(
         worker_execute_model(decode_output)
         worker_sample_tokens(None)
 
+        if model_runner.verification_capacity_manager is not None:
+            model_runner.verification_capacity_manager.warmup(
+                model_runner.input_buffers
+            )
+            assert model_runner.speculator is not None
+            model_runner.speculator.warmup_capacity_kernels()
+            if model_runner.speculator.wants_auto_sps_curve:
+                _profile_sps_curve(model_runner)
+                model_runner.kv_connector.set_disabled(True)
+
     # Clean up - process finish_req_ids.
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = set(req_ids)
     worker_execute_model(cleanup_output)
     model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()
+
+
+def _stable_sps_step_ms(samples: list[float]) -> float:
+    if not samples or any(ms <= 0.0 for ms in samples):
+        raise ValueError(f"SPS timing samples must be positive, got {samples}.")
+    return float(np.median(samples))
+
+
+def _derive_dspark_draft_token_budget(
+    sps_curve: list[tuple[int, float]],
+    max_draft_depth: int,
+) -> int:
+    """Convert the upper-load SPS knee into a physical draft-token budget."""
+    if len(sps_curve) < 2:
+        raise ValueError("DSpark SPS curve needs at least two points")
+    if max_draft_depth < 1:
+        raise ValueError("max_draft_depth must be at least one")
+
+    # Startup profiles powers-of-two request counts at the maximum depth. Use
+    # the largest relative SPS drop in the upper half of that load range as the
+    # saturation knee. Remove the target bonus-token share from the knee to get
+    # the corresponding draft-only token budget.
+    first_drop = max(1, len(sps_curve) // 2)
+    knee_end = max(
+        range(first_drop, len(sps_curve)),
+        key=lambda i: (sps_curve[i - 1][1] - sps_curve[i][1]) / sps_curve[i - 1][1],
+    )
+    knee_tokens = sps_curve[knee_end - 1][0]
+    return cdiv(knee_tokens * max_draft_depth, max_draft_depth + 1)
+
+
+def _profile_sps_curve(
+    model_runner: GPUModelRunner,
+    warmup_iters: int = 5,
+    timed_iters: int = 10,
+    timed_rounds: int = 5,
+) -> None:
+    """Profile the engine step-rate curve for ``dspark_sps_curve="auto"``.
+
+    Times uniform-decode dummy runs per power-of-two request count — the same
+    self-contained path DP idle steps use (``execute_dummy_batch``), which
+    replays the captured verify graph AND the full DSpark draft step
+    (``propose(dummy_run=True)``) with no request bookkeeping. Runs after
+    graph capture with the placeholder flat table active, so the theta-argmax
+    verifies every candidate and B is exactly reqs * decode_query_len.
+    Real-step host prep, sampling, and true attention lengths are not
+    visible here; account for them via ``dspark_sps_overhead_ms``. Rank 0's
+    measurements are broadcast so every TP rank builds the identical table
+    (capacities feed batch-shape decisions, which must agree across ranks).
+    """
+    import time
+
+    from vllm.distributed.parallel_state import get_tp_group
+
+    decode_query_len = model_runner.decode_query_len
+    max_reqs = min(
+        model_runner.max_num_reqs,
+        model_runner.max_num_tokens // decode_query_len,
+    )
+    req_counts = []
+    count = 1
+    while count < max_reqs:
+        req_counts.append(count)
+        count *= 2
+    req_counts.append(max_reqs)
+
+    step_ms = []
+    step_ms_samples: list[list[float]] = []
+    for num_reqs in req_counts:
+        num_tokens = num_reqs * decode_query_len
+        for _ in range(warmup_iters):
+            model_runner._dummy_run(num_tokens, uniform_decode=True)
+        torch.accelerator.synchronize()
+        samples = []
+        for _ in range(timed_rounds):
+            start = time.perf_counter()
+            for _ in range(timed_iters):
+                model_runner._dummy_run(num_tokens, uniform_decode=True)
+            torch.accelerator.synchronize()
+            samples.append((time.perf_counter() - start) * 1000.0 / timed_iters)
+        # A lazy kernel initialization or a transient host stall must not become
+        # the scheduler's permanent cost model. Multiple independent windows
+        # make those events visible, and the median rejects an isolated one.
+        step_ms_samples.append(samples)
+        step_ms.append(_stable_sps_step_ms(samples))
+
+    timings = torch.tensor(step_ms, dtype=torch.float64, device=model_runner.device)
+    tp_group = get_tp_group()
+    if tp_group.world_size > 1:
+        tp_group.broadcast(timings, src=0)
+    step_ms = timings.cpu().tolist()
+
+    assert model_runner.speculative_config is not None
+    overhead_ms = model_runner.speculative_config.dspark_sps_overhead_ms
+    sps_curve = [
+        (num_reqs * decode_query_len, 1000.0 / (ms + overhead_ms))
+        for num_reqs, ms in zip(req_counts, step_ms)
+    ]
+    assert model_runner.speculator is not None
+    model_runner.speculator.set_sps_curve(sps_curve)
+    capacity_manager = model_runner.verification_capacity_manager
+    if capacity_manager is not None:
+        draft_token_budget = _derive_dspark_draft_token_budget(
+            sps_curve,
+            model_runner.num_speculative_steps,
+        )
+        capacity_manager.set_dynamic_draft_token_budget(draft_token_budget)
+        logger.info(
+            "DSpark auto-profiled dynamic draft-token budget: %d",
+            draft_token_budget,
+        )
+    logger.info(
+        "DSpark SPS profile windows (tokens, ms/step samples): %s",
+        [
+            (num_reqs * decode_query_len, [round(ms, 3) for ms in samples])
+            for num_reqs, samples in zip(req_counts, step_ms_samples)
+        ],
+    )
+    logger.info(
+        "DSpark auto-profiled SPS curve (tokens, steps/s): %s",
+        [(b, round(s, 2)) for b, s in sps_curve],
+    )

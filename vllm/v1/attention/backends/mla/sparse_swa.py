@@ -291,7 +291,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
     # Base threshold: query_len <= 1 is decode
     reorder_batch_threshold: int = 1
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
     supports_exact_metadata_reuse: bool = True
 
     def __init__(self, *args, **kwargs):
@@ -306,8 +306,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             self.vllm_config.scheduler_config.max_num_batched_tokens
         )
 
-        # Keep the split aligned with target verification. DSpark verifies the
-        # sampled token plus K draft tokens, even though it drafts in parallel.
+        # Keep the decode/prefill split identical to the DeepSeek V4 C128A
+        # metadata and indexer. Target verification contains the bonus token
+        # plus N speculative tokens even for parallel drafters such as DSpark;
+        # the generic parallel-drafting threshold (1 + 2N) is not applicable.
         spec_config = self.vllm_config.speculative_config
         self.num_speculative_tokens = (
             spec_config.num_speculative_tokens if spec_config else 0
@@ -812,6 +814,13 @@ def _compute_swa_indices_and_lens_kernel(
     is_valid = tl.load(is_valid_token_ptr + token_idx)
     if not is_valid:
         tl.store(swa_lens_ptr + pid, 0)
+        for i in range(0, window_size, TRITON_BLOCK_SIZE):
+            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+            tl.store(
+                swa_indices_ptr + pid * swa_indices_stride + offset,
+                -1,
+                mask=offset < window_size,
+            )
         return
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
@@ -878,6 +887,13 @@ def _compute_dspark_noncausal_swa_indices_kernel(
     is_valid = tl.load(is_valid_token_ptr + token_idx)
     if not is_valid:
         tl.store(swa_lens_ptr + pid, 0)
+        for i in range(0, index_width, TRITON_BLOCK_SIZE):
+            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+            tl.store(
+                swa_indices_ptr + pid * swa_indices_stride + offset,
+                -1,
+                mask=offset < index_width,
+            )
         return
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)

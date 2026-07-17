@@ -242,7 +242,7 @@ class SchedulerOutput:
 
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
-    num_spec_tokens_to_schedule: int = 0
+    num_spec_tokens_to_schedule: int | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
@@ -260,7 +260,9 @@ class SchedulerOutput:
 
     def resolve_num_spec_tokens_to_schedule(self, default: int) -> int:
         """Resolve the speculative depth for real and synthetic outputs."""
-        return self.num_spec_tokens_to_schedule or default
+        if self.num_spec_tokens_to_schedule is None:
+            return default
+        return self.num_spec_tokens_to_schedule
 
 
 @dataclass
