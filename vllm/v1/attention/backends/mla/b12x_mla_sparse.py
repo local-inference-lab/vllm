@@ -259,6 +259,27 @@ def _mask_page_table_after_nsa_len(
     )
 
 
+def _global_causal_lens_for_ckv_gather(
+    global_seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    req_id_per_token: torch.Tensor,
+    num_actual_toks: int,
+) -> torch.Tensor:
+    """Return each query token's causal length in the gathered global cache."""
+    num_reqs = global_seq_lens.shape[0]
+    qsl = query_start_loc[: num_reqs + 1].to(torch.int32)
+    req_ids = req_id_per_token[:num_actual_toks].to(torch.int64)
+    chunk_start = qsl[:-1][req_ids]
+    chunk_len = (qsl[1:] - qsl[:-1])[req_ids]
+    full_seq = global_seq_lens[req_ids].to(torch.int32)
+    token_idx = torch.arange(
+        num_actual_toks,
+        device=global_seq_lens.device,
+        dtype=torch.int32,
+    )
+    return full_seq - chunk_len + (token_idx - chunk_start) + 1
+
+
 @triton.jit
 def _map_global_topk_to_gathered_ckv_kernel(
     req_id_ptr,
@@ -2040,23 +2061,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             # (local_len < min(topk, global_len)) -- i.e. for short contexts,
             # which shows up as small-context-only garbage.
             assert attn_metadata.global_cache_seq_lens_per_req is not None
-            g_num_reqs = attn_metadata.num_reqs
-            g_qsl = attn_metadata.query_start_loc[: g_num_reqs + 1].to(
-                torch.int32
-            )
-            g_req_ids = attn_metadata.req_id_per_token[:num_actual_toks].to(
-                torch.int64
-            )
-            g_chunk_start = g_qsl[:-1][g_req_ids]
-            g_chunk_len = (g_qsl[1:] - g_qsl[:-1])[g_req_ids]
-            g_full_seq = attn_metadata.global_cache_seq_lens_per_req[
-                g_req_ids
-            ].to(torch.int32)
-            g_t = torch.arange(
-                num_actual_toks, device=self.device, dtype=torch.int32
-            )
-            global_causal_len = (
-                g_full_seq - g_chunk_len + (g_t - g_chunk_start) + 1
+            global_causal_len = _global_causal_lens_for_ckv_gather(
+                attn_metadata.global_cache_seq_lens_per_req,
+                attn_metadata.query_start_loc,
+                attn_metadata.req_id_per_token,
+                num_actual_toks,
             )
             torch.minimum(
                 nsa_cache_seqlens,

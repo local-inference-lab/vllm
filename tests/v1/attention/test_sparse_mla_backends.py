@@ -40,6 +40,7 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseBackend,
     B12xMLASparseImpl,
     B12xMLASparseMetadataBuilder,
+    _global_causal_lens_for_ckv_gather,
 )
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseTRTLLMBackend,
@@ -77,6 +78,31 @@ SPARSE_BACKEND_BATCH_SPECS["large_q_pure_prefill"] = BatchSpec(
 )
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.parametrize(
+    ("global_seq_lens", "query_start_loc", "req_ids", "expected"),
+    [
+        ([8], [0, 4], [0, 0, 0, 0], [5, 6, 7, 8]),
+        ([5, 10], [0, 2, 5], [0, 0, 1, 1, 1], [4, 5, 8, 9, 10]),
+    ],
+)
+def test_ckv_gather_uses_global_per_token_causal_lens(
+    global_seq_lens: list[int],
+    query_start_loc: list[int],
+    req_ids: list[int],
+    expected: list[int],
+) -> None:
+    device = torch.device(DEVICE_TYPE)
+    result = _global_causal_lens_for_ckv_gather(
+        torch.tensor(global_seq_lens, dtype=torch.int32, device=device),
+        torch.tensor(query_start_loc, dtype=torch.int32, device=device),
+        torch.tensor(req_ids, dtype=torch.int32, device=device),
+        len(req_ids),
+    )
+
+    assert result.dtype == torch.int32
+    assert result.tolist() == expected
 
 
 @pytest.mark.parametrize(
