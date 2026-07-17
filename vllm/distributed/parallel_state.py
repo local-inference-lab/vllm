@@ -1423,6 +1423,16 @@ def get_query_split_group() -> GroupCoordinator:
     return _QUERY_SPLIT
 
 
+_DCP_CKV_PREFETCH: GroupCoordinator | None = None
+
+
+def get_dcp_ckv_prefetch_group() -> GroupCoordinator:
+    assert _DCP_CKV_PREFETCH is not None, (
+        "DCP ckv prefetch group is not initialized"
+    )
+    return _DCP_CKV_PREFETCH
+
+
 _PP: GroupCoordinator | None = None
 
 
@@ -1914,6 +1924,23 @@ def initialize_model_parallel(
             group_name="query_split",
         )
 
+    # A dedicated communicator over the DCP ranks for the transient ckv
+    # prefetch gather (Fix B). The prefetch runs on a side stream and would
+    # otherwise share the DCP communicator with the indexer's DCP top-k
+    # merge on the default stream; concurrent collectives on one NCCL
+    # communicator from two streams is unsupported. Same ranks as ``_DCP``.
+    global _DCP_CKV_PREFETCH
+    assert _DCP_CKV_PREFETCH is None, (
+        "DCP ckv prefetch group is already initialized"
+    )
+    if decode_context_model_parallel_size > 1:
+        _DCP_CKV_PREFETCH = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="dcp_ckv_prefetch",
+        )
+
     global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
     group_ranks = (
@@ -2143,6 +2170,11 @@ def destroy_model_parallel():
     if _QUERY_SPLIT:
         _QUERY_SPLIT.destroy()
     _QUERY_SPLIT = None
+
+    global _DCP_CKV_PREFETCH
+    if _DCP_CKV_PREFETCH:
+        _DCP_CKV_PREFETCH.destroy()
+    _DCP_CKV_PREFETCH = None
 
     global _PCP
     if _PCP:

@@ -169,7 +169,6 @@ def _env_int(name: str, default: int) -> int:
     return parsed
 
 
-
 def _get_ckv_gather_workspace(
     device: torch.device, nbytes: int
 ) -> torch.Tensor:
@@ -317,6 +316,9 @@ def _map_global_topk_to_gathered_ckv_kernel(
     valid_i32 = valid.to(tl.int32)
     local_offset = tl.cumsum(valid_i32) - valid_i32
     tile_valid_count = tl.sum(valid_i32)
+    # Tiles race to reserve output ranges via atomic_add, so the surviving
+    # slots land in an unspecified order within a row. Attention is a softmax
+    # over the selected set, so order does not affect the result.
     output_base = tl.atomic_add(valid_count_ptr + row, tile_valid_count)
     output_col = output_base + local_offset
     tl.store(
@@ -665,6 +667,17 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         dcp_ckv_gather_eligible = False
 
         from vllm import envs as envs_mod
+
+        if envs_mod.VLLM_B12X_MLA_CKV_GATHER:
+            # Reset the cross-layer prefetch pipeline once per step so the
+            # first layer always sync-gathers. The event/buf-idx are class
+            # state that would otherwise leak across chunks (the last layer
+            # of a chunk consumes but never re-arms), mis-scheduling layer 0
+            # of subsequent chunks onto a stale gathered buffer. The
+            # layer->cache registry is intentionally left intact (stable
+            # cache pointers across chunks).
+            B12xMLASparseImpl._shared_gather_event = None
+            B12xMLASparseImpl._shared_gather_buf_idx = 0
 
         if (
             use_dcp
@@ -1655,6 +1668,12 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             + self._ckv_local_capacity * (self.dcp_world_size + 1)
         ]
         if stream is not None:
+            # The side stream must observe the default stream's prior writes
+            # to the paged KV cache (this and earlier steps' do_kv_cache_update)
+            # before gathering history off it; there is otherwise no ordering
+            # between the two streams in this direction. Enqueued before L's
+            # attention/MLP, so the prefetch still overlaps that compute.
+            stream.wait_stream(torch.cuda.current_stream())
             stream_ctx = torch.cuda.stream(stream)
         else:
             stream_ctx = torch.cuda.stream(torch.cuda.current_stream())
@@ -1670,9 +1689,20 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             if local_tokens < padded_tokens:
                 local_buffer[local_tokens:padded_tokens].zero_()
 
-            from vllm.distributed.parallel_state import get_dcp_group
+            from vllm.distributed.parallel_state import (
+                get_dcp_ckv_prefetch_group,
+                get_dcp_group,
+            )
 
-            dcp_group = get_dcp_group()
+            # The prefetch (side stream) uses a dedicated communicator so it
+            # cannot collide with the indexer's DCP merge on the default
+            # stream; the synchronous path shares the default stream with the
+            # merge and is safe on the main DCP communicator.
+            dcp_group = (
+                get_dcp_ckv_prefetch_group()
+                if stream is not None
+                else get_dcp_group()
+            )
             _dcp_all_gather_current_stream(
                 dcp_group,
                 local_buffer[:padded_tokens].view(-1),
@@ -1696,6 +1726,29 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
     ) -> None:
         self._ckv_current_chunk_kv_c = kv_c_normed
         self._ckv_current_chunk_kpe = k_pe
+
+    def _resolve_layer_index(self, layer) -> int | None:
+        """Global layer index used to key the cross-layer prefetch registry.
+
+        ``MLAAttention`` exposes ``layer_name`` (a dotted prefix), not
+        ``layer_idx``; without this fallback the prefetch pipeline never
+        engages and every layer gathers synchronously on the critical path.
+        """
+        layer_idx = getattr(layer, "layer_idx", None)
+        if layer_idx is not None:
+            try:
+                return int(layer_idx)
+            except (TypeError, ValueError):
+                return None
+        layer_name = getattr(layer, "layer_name", None)
+        if not layer_name:
+            return None
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        try:
+            return extract_layer_index(layer_name)
+        except (ValueError, AssertionError, IndexError):
+            return None
 
     def _append_current_chunk_to_gathered(
         self,
@@ -1734,10 +1787,22 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         )
         global_seq_per_token = global_seq_lens[req_ids].to(torch.int32)
 
+        # Map each current-chunk token to its absolute position within its
+        # own sequence. ``num_actual_toks`` spans the whole batch, so the
+        # position must be computed per request: the current chunk holds the
+        # last ``chunk_len_r`` positions of request r, and this token is the
+        # ``(t - query_start_loc[r])``-th of them. Using the batch-global
+        # ``t``/``num_actual_toks`` is only correct for a single request and
+        # otherwise misplaces every request but the last.
+        query_start_loc = attn_metadata.query_start_loc[: num_reqs + 1].to(
+            torch.int32
+        )
+        req_chunk_start = query_start_loc[:-1][req_ids]
+        req_chunk_len = (query_start_loc[1:] - query_start_loc[:-1])[req_ids]
         t = torch.arange(
             num_actual_toks, device=self.device, dtype=torch.int32
         )
-        global_pos = global_seq_per_token - num_actual_toks + t
+        global_pos = global_seq_per_token - req_chunk_len + (t - req_chunk_start)
         owner = (
             (global_pos // interleave) % self.dcp_world_size
         ).to(torch.int64)
@@ -1748,7 +1813,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
 
         rank_req_starts = attn_metadata.dcp_rank_req_starts
         flat_idx = owner * num_reqs + req_ids
-        rank_start = rank_req_starts.view(-1)[flat_idx].to(torch.int64)
+        # ``dcp_rank_req_starts`` is a ``[dcp, :num_reqs]`` slice of a
+        # ``[dcp, max_seqs]`` buffer, so it is non-contiguous whenever
+        # ``num_reqs < max_seqs``; ``reshape`` compacts to row-length
+        # ``num_reqs`` to match ``flat_idx``. ``view`` would raise here.
+        rank_start = rank_req_starts.reshape(-1)[flat_idx].to(torch.int64)
 
         padded_tokens = attn_metadata.dcp_padded_total_tokens
         slots = (
@@ -2056,7 +2125,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         if use_ckv_gather:
             if ckv_workspace is None:
                 raise RuntimeError("CKV gather workspace was not borrowed")
-            layer_idx = getattr(layer, "layer_idx", None)
+            layer_idx = self._resolve_layer_index(layer)
             if layer_idx is not None:
                 while len(B12xMLASparseImpl._all_layer_kv_caches) <= layer_idx:
                     B12xMLASparseImpl._all_layer_kv_caches.append(None)
