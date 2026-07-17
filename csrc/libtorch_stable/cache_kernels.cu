@@ -988,6 +988,13 @@ void concat_and_cache_mla(
 
   const torch::stable::accelerator::DeviceGuard device_guard(
       kv_c.get_device_index());
+  const cudaDeviceProp* device_prop = get_device_prop();
+  STD_TORCH_CHECK(
+      device_prop->major >= 10,
+      "nvfp4_ds_mla KV cache requires SM100+ (Blackwell); active device has "
+      "compute capability " +
+          std::to_string(device_prop->major) + "." +
+          std::to_string(device_prop->minor));
   const cudaStream_t stream = get_current_cuda_stream();
 
   if (kv_cache_dtype == "fp8_ds_mla") {

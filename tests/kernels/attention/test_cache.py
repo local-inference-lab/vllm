@@ -903,6 +903,7 @@ def test_concat_and_cache_nvfp4_mla(
         (kv_c, k_pe, kv_cache, slot_mapping, scale),
         test_utils=DEFAULT_OPCHECK_TEST_UTILS,
     )
+    kv_cache.zero_()
 
     # Route through the public entry point: concat_and_cache_mla dispatches
     # to the nvfp4 op on kv_cache_dtype == "nvfp4_ds_mla".
