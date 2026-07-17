@@ -10,7 +10,7 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CUDAGraphMode, get_current_vllm_config
-from vllm.distributed import get_dcp_group
+from vllm.distributed import get_dcp_group, get_query_split_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -1510,6 +1510,18 @@ def sparse_attn_indexer(
     # DCP scalars arrive as op arguments (resolved once at layer construction),
     # not through per-step metadata.
     dcp_global_topk = _dcp_global_topk_requested() and dcp_world_size > 1
+    qs_group = None
+    qs_world_size = 1
+    qs_rank = 0
+    if envs.VLLM_DCP_QUERY_SPLIT and dcp_world_size > 1:
+        try:
+            _qs = get_query_split_group()
+            if int(_qs.world_size) > 1:
+                qs_group = _qs
+                qs_world_size = int(_qs.world_size)
+                qs_rank = int(_qs.rank_in_group)
+        except Exception:
+            pass
     if output_physical_slots:
         if not _use_b12x_sparse_indexer(use_b12x_sparse_indexer):
             raise RuntimeError(
@@ -1589,6 +1601,30 @@ def sparse_attn_indexer(
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
+            qs_active = False
+            qs_row_start = chunk.token_start
+            qs_row_end = chunk.token_end
+            if (
+                qs_world_size > 1
+                and use_b12x_indexer
+                and chunk.total_seq_lens > 0
+            ):
+                chunk_tokens = chunk.token_end - chunk.token_start
+                if chunk_tokens % qs_world_size == 0:
+                    slice_tokens = chunk_tokens // qs_world_size
+                    qs_row_start = chunk.token_start + qs_rank * slice_tokens
+                    qs_row_end = qs_row_start + slice_tokens
+                    q_slice = q_quant[qs_row_start:qs_row_end]
+                    q_scale_slice = (
+                        q_scale[qs_row_start:qs_row_end]
+                        if q_scale is not None
+                        else None
+                    )
+                    weights_slice = weights[qs_row_start:qs_row_end]
+                    topk_indices = topk_indices_buffer[
+                        qs_row_start:qs_row_end, :topk_tokens
+                    ]
+                    qs_active = True
             if use_b12x_indexer and chunk.total_seq_lens <= 0:
                 topk_indices.fill_(-1)
                 if dcp_global_topk:
@@ -1617,15 +1653,36 @@ def sparse_attn_indexer(
                         "B12X sparse prefill requires single-request chunks so "
                         "the page table can be row-shared without packing."
                     )
-                row_has_no_kv = chunk.cu_seqlen_ke <= chunk.cu_seqlen_ks
+                if qs_active:
+                    rel_start = qs_row_start - chunk.token_start
+                    rel_end = qs_row_end - chunk.token_start
+                    cu_seqlen_ks = chunk.cu_seqlen_ks[rel_start:rel_end]
+                    cu_seqlen_ke = chunk.cu_seqlen_ke[rel_start:rel_end]
+                else:
+                    cu_seqlen_ks = chunk.cu_seqlen_ks
+                    cu_seqlen_ke = chunk.cu_seqlen_ke
+                row_has_no_kv = cu_seqlen_ke <= cu_seqlen_ks
                 seq_lens = torch.where(
                     row_has_no_kv,
-                    torch.zeros_like(chunk.cu_seqlen_ks),
-                    chunk.cu_seqlen_ke - chunk.cu_seqlen_ks,
+                    torch.zeros_like(cu_seqlen_ks),
+                    cu_seqlen_ke - cu_seqlen_ks,
                 )
-                block_table = chunk.block_table[:1].expand(
+                local_k_rows = (
+                    int(chunk.local_total_seq_lens)
+                    if dcp_world_size > 1
+                    else int(chunk.total_seq_lens)
+                )
+                active_page_width = max(
+                    1,
+                    (local_k_rows + _B12X_PAGED_INDEX_PAGE_SIZE - 1)
+                    // _B12X_PAGED_INDEX_PAGE_SIZE,
+                )
+                active_page_width = min(
+                    active_page_width, int(chunk.block_table.shape[1])
+                )
+                block_table = chunk.block_table[:1, :active_page_width].expand(
                     int(q_slice.shape[0]),
-                    int(chunk.block_table.shape[1]),
+                    active_page_width,
                 )
                 topk_scores = None
                 if dcp_world_size > 1:
@@ -1634,7 +1691,7 @@ def sparse_attn_indexer(
                             "B12X sparse indexer DCP requires topk_scores_buffer."
                         )
                     topk_scores = topk_scores_buffer[
-                        chunk.token_start : chunk.token_end, :topk_tokens
+                        qs_row_start : qs_row_end, :topk_tokens
                     ]
                 _run_b12x_paged_topk(
                     q_fp8=q_slice.contiguous(),
@@ -1666,6 +1723,20 @@ def sparse_attn_indexer(
                         dcp_rank=dcp_rank,
                         cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
                     )
+                if qs_active:
+                    gathered_indices = qs_group.all_gather(
+                        topk_indices.contiguous(), dim=0
+                    )
+                    topk_indices_buffer[
+                        chunk.token_start : chunk.token_end, :topk_tokens
+                    ].copy_(gathered_indices)
+                    if topk_scores is not None:
+                        gathered_scores = qs_group.all_gather(
+                            topk_scores.contiguous(), dim=0
+                        )
+                        topk_scores_buffer[
+                            chunk.token_start : chunk.token_end, :topk_tokens
+                        ].copy_(gathered_scores)
                 continue
 
             cu_seqlen_ks = chunk.cu_seqlen_ks

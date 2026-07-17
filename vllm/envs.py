@@ -72,6 +72,10 @@ if TYPE_CHECKING:
     VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
     VLLM_DCP_SHARD_DRAFT: str | None = None
     VLLM_DCP_GLOBAL_TOPK: bool = True
+    VLLM_DCP_QUERY_SPLIT: bool = False
+    VLLM_B12X_MLA_CKV_GATHER: bool = False
+    VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
+    VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
     VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
     VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
     VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
@@ -1139,6 +1143,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # top-k instead of a per-rank local top-k.
     "VLLM_DCP_GLOBAL_TOPK": lambda: (
         os.getenv("VLLM_DCP_GLOBAL_TOPK", "1").lower() in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DCP_QUERY_SPLIT": lambda: (
+        os.getenv("VLLM_DCP_QUERY_SPLIT", "0").lower() in ("1", "true", "yes", "on")
+    ),
+    "VLLM_B12X_MLA_CKV_GATHER": lambda: (
+        os.getenv("VLLM_B12X_MLA_CKV_GATHER", "0").lower() in ("1", "true", "yes", "on")
+    ),
+    "VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS", "16")
+    ),
+    "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
     ),
     # Diagnostic flag retained for local experiments. MiniMax M3 compile is
     # fail-closed in the model until the no-break path is validated.

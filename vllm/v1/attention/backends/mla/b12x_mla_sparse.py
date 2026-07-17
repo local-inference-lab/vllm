@@ -78,6 +78,7 @@ _EXTEND_PREWARM_DONE: set[
     tuple[int | None, int, int, int, int, int, bool, str, bool]
 ] = set()
 _FP8_ROPE_WRITER_LOADED = False
+_CKV_GATHER_WORKSPACES: dict[tuple[str, int | None], torch.Tensor] = {}
 _KV_FP8_ROPE_REQUESTED = os.getenv("KV_FP8_ROPE", "0") == "1"
 
 
@@ -168,6 +169,64 @@ def _env_int(name: str, default: int) -> int:
     return parsed
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _get_ckv_gather_workspace(
+    device: torch.device, nbytes: int
+) -> torch.Tensor:
+    key = (device.type, device.index)
+    workspace = _CKV_GATHER_WORKSPACES.get(key)
+    if workspace is None:
+        workspace = torch.empty((nbytes,), dtype=torch.uint8, device=device)
+        _CKV_GATHER_WORKSPACES[key] = workspace
+    elif workspace.numel() < nbytes:
+        raise RuntimeError(
+            "CKV gather workspace cannot grow after attention layers retain "
+            f"aliases: existing={workspace.numel()} requested={nbytes}"
+        )
+    return workspace[:nbytes]
+
+
+def _dcp_all_gather_current_stream(
+    group,
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+) -> None:
+    if not input_tensor.is_contiguous() or not output_tensor.is_contiguous():
+        raise ValueError("CKV all-gather tensors must be contiguous")
+    if (
+        output_tensor.shape[0] != input_tensor.shape[0] * group.world_size
+        or output_tensor.shape[1:] != input_tensor.shape[1:]
+    ):
+        raise ValueError("CKV all-gather tensors have incompatible shapes")
+
+    communicator = getattr(group, "device_communicator", None)
+    pynccl_comm = getattr(communicator, "pynccl_comm", None)
+    if pynccl_comm is not None and not getattr(pynccl_comm, "disabled", False):
+        pynccl_comm.all_gather(output_tensor, input_tensor)
+        return
+
+    device_group = getattr(group, "device_group", None)
+    if device_group is None:
+        device_group = getattr(communicator, "device_group", None)
+    if device_group is not None:
+        dist.all_gather_into_tensor(
+            output_tensor,
+            input_tensor,
+            group=device_group,
+            async_op=False,
+        )
+        return
+
+    gathered = group.all_gather(input_tensor, dim=0)
+    output_tensor.copy_(gathered)
+
+
 @triton.jit
 def _mask_page_table_after_nsa_len_kernel(
     page_table_ptr,
@@ -206,6 +265,130 @@ def _mask_page_table_after_nsa_len(
         page_table.stride(1),
         width,
         BLOCK_N=block_n,
+    )
+
+
+@triton.jit
+def _map_global_topk_to_gathered_ckv_kernel(
+    req_id_ptr,
+    token_indices_ptr,
+    rank_req_starts_ptr,
+    rank_req_lens_ptr,
+    out_ptr,
+    valid_count_ptr,
+    starts_stride0,
+    starts_stride1,
+    lens_stride0,
+    lens_stride1,
+    ti_stride0,
+    ti_stride1,
+    out_stride0,
+    out_stride1,
+    padded_rank_tokens,
+    DCP_SIZE: tl.constexpr,
+    DCP_INTERLEAVE: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    cols = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    col_mask = cols < NUM_TOPK_TOKENS
+
+    req = tl.load(req_id_ptr + row)
+    tok = tl.load(
+        token_indices_ptr + row * ti_stride0 + cols * ti_stride1,
+        mask=col_mask,
+        other=-1,
+    )
+    owner = (tok // DCP_INTERLEAVE) % DCP_SIZE
+    local_idx = (
+        tok // (DCP_SIZE * DCP_INTERLEAVE)
+    ) * DCP_INTERLEAVE + tok % DCP_INTERLEAVE
+    req_start = tl.load(
+        rank_req_starts_ptr
+        + owner * starts_stride0
+        + req * starts_stride1,
+        mask=col_mask & (tok >= 0),
+        other=0,
+    )
+    req_len = tl.load(
+        rank_req_lens_ptr + owner * lens_stride0 + req * lens_stride1,
+        mask=col_mask & (tok >= 0),
+        other=0,
+    )
+    valid = col_mask & (tok >= 0) & (local_idx >= 0) & (local_idx < req_len)
+    gathered_slot = owner * padded_rank_tokens + req_start + local_idx
+
+    valid_i32 = valid.to(tl.int32)
+    local_offset = tl.cumsum(valid_i32) - valid_i32
+    tile_valid_count = tl.sum(valid_i32)
+    output_base = tl.atomic_add(valid_count_ptr + row, tile_valid_count)
+    output_col = output_base + local_offset
+    tl.store(
+        out_ptr + row * out_stride0 + output_col * out_stride1,
+        gathered_slot,
+        mask=valid,
+    )
+
+
+def _map_global_topk_to_gathered_ckv(
+    req_ids: torch.Tensor,
+    token_indices: torch.Tensor,
+    rank_req_starts: torch.Tensor,
+    rank_req_lens: torch.Tensor,
+    out: torch.Tensor,
+    valid_counts: torch.Tensor,
+    *,
+    dcp_size: int,
+    cp_kv_cache_interleave_size: int,
+    padded_rank_tokens: int,
+) -> None:
+    if token_indices.shape != out.shape:
+        raise ValueError("CKV gather index output shape does not match top-k input")
+    if rank_req_starts.shape != rank_req_lens.shape:
+        raise ValueError("CKV gather request starts/lens shapes do not match")
+    if rank_req_starts.shape[0] != dcp_size:
+        raise ValueError("CKV gather request metadata does not match DCP size")
+    if any(
+        tensor.dtype != torch.int32
+        for tensor in (
+            req_ids,
+            token_indices,
+            rank_req_starts,
+            rank_req_lens,
+            out,
+            valid_counts,
+        )
+    ):
+        raise TypeError("CKV gather index metadata must be int32")
+    if token_indices.shape[1] % 128 != 0:
+        raise ValueError("CKV gather top-k width must be divisible by 128")
+
+    out.fill_(-1)
+    valid_counts.zero_()
+    _map_global_topk_to_gathered_ckv_kernel[
+        (token_indices.shape[0], token_indices.shape[1] // 128)
+    ](
+        req_ids,
+        token_indices,
+        rank_req_starts,
+        rank_req_lens,
+        out,
+        valid_counts,
+        rank_req_starts.stride(0),
+        rank_req_starts.stride(1),
+        rank_req_lens.stride(0),
+        rank_req_lens.stride(1),
+        token_indices.stride(0),
+        token_indices.stride(1),
+        out.stride(0),
+        out.stride(1),
+        padded_rank_tokens,
+        DCP_SIZE=dcp_size,
+        DCP_INTERLEAVE=cp_kv_cache_interleave_size,
+        NUM_TOPK_TOKENS=token_indices.shape[1],
+        BLOCK_N=128,
     )
 
 
@@ -348,6 +531,17 @@ class B12xMLASparseMetadata(AttentionMetadata):
     # For pure decode this equals ``seq_lens`` (one token per request).
     cache_seq_lens_per_token: torch.Tensor
 
+    # Transient full-CKV prefill gather metadata.
+    ckv_page_table_1: torch.Tensor | None = None
+    ckv_nsa_cache_seqlens: torch.Tensor | None = None
+    dcp_rank_req_starts: torch.Tensor | None = None
+    dcp_rank_req_lens: torch.Tensor | None = None
+    dcp_local_cu_seq_lens: torch.Tensor | None = None
+    global_cache_seq_lens_per_req: torch.Tensor | None = None
+    dcp_local_total_tokens: int = 0
+    dcp_padded_total_tokens: int = 0
+    dcp_ckv_gather_eligible: bool = False
+
     block_size: int = 64
     topk_tokens: int = 2048
 
@@ -405,11 +599,31 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             self.req_ids_arange = torch.arange(
                 max_tokens, dtype=torch.int32, device=device
             )
+            self.ckv_page_table_1_buffer = torch.empty(
+                (max_tokens, self.topk_tokens), dtype=torch.int32, device=device
+            )
+            self.ckv_nsa_cache_seqlens_buffer = torch.empty(
+                (max_tokens,), dtype=torch.int32, device=device
+            )
+            self.dcp_rank_req_lens_buffer = torch.empty(
+                (self.dcp_world_size, max_seqs), dtype=torch.int32, device=device
+            )
+            self.dcp_rank_req_starts_buffer = torch.empty(
+                (self.dcp_world_size, max_seqs), dtype=torch.int32, device=device
+            )
+            self.dcp_local_cu_seq_lens_buffer = torch.empty(
+                (max_seqs + 1,), dtype=torch.int32, device=device
+            )
         else:
             self.req_id_per_token_buffer = None
             self.page_table_1_buffer = None
             self.nsa_cache_seqlens_buffer = None
             self.req_ids_arange = None
+            self.ckv_page_table_1_buffer = None
+            self.ckv_nsa_cache_seqlens_buffer = None
+            self.dcp_rank_req_lens_buffer = None
+            self.dcp_rank_req_starts_buffer = None
+            self.dcp_local_cu_seq_lens_buffer = None
 
     def build(
         self,
@@ -449,6 +663,67 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             else cm.seq_lens
         )
         req_id_per_token_tensor = None
+        dcp_rank_req_lens = None
+        dcp_rank_req_starts = None
+        dcp_local_cu_seq_lens = None
+        dcp_local_total_tokens = 0
+        dcp_padded_total_tokens = 0
+        dcp_ckv_gather_eligible = False
+
+        from vllm import envs as envs_mod
+
+        if (
+            use_dcp
+            and envs_mod.VLLM_B12X_MLA_CKV_GATHER
+            and num_decode_tokens == 0
+            and num_prefill_tokens == num_tokens
+            and cm.max_query_len
+            > envs_mod.VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS
+        ):
+            assert self.dcp_rank_req_lens_buffer is not None
+            assert self.dcp_rank_req_starts_buffer is not None
+            assert self.dcp_local_cu_seq_lens_buffer is not None
+            global_seq_lens = cm.seq_lens[: cm.num_reqs]
+            all_rank_lens = get_dcp_local_seq_lens(
+                global_seq_lens,
+                self.dcp_world_size,
+                dcp_rank=None,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+            ).transpose(0, 1)
+            dcp_rank_req_lens = self.dcp_rank_req_lens_buffer[
+                : self.dcp_world_size, : cm.num_reqs
+            ]
+            dcp_rank_req_lens.copy_(all_rank_lens)
+            dcp_rank_req_starts = self.dcp_rank_req_starts_buffer[
+                : self.dcp_world_size, : cm.num_reqs
+            ]
+            dcp_rank_req_starts[:, 0].zero_()
+            if cm.num_reqs > 1:
+                torch.cumsum(
+                    dcp_rank_req_lens[:, :-1],
+                    dim=1,
+                    out=dcp_rank_req_starts[:, 1:],
+                )
+
+            dcp_local_cu_seq_lens = self.dcp_local_cu_seq_lens_buffer[
+                : cm.num_reqs + 1
+            ]
+            dcp_local_cu_seq_lens[0].zero_()
+            torch.cumsum(
+                dcp_rank_req_lens[self.dcp_rank],
+                dim=0,
+                out=dcp_local_cu_seq_lens[1:],
+            )
+            rank_totals = dcp_rank_req_lens.sum(dim=1).tolist()
+            dcp_local_total_tokens = int(rank_totals[self.dcp_rank])
+            dcp_padded_total_tokens = (
+                _cdiv(
+                    max(int(total) for total in rank_totals),
+                    self.kv_cache_spec.block_size,
+                )
+                * self.kv_cache_spec.block_size
+            )
+            dcp_ckv_gather_eligible = dcp_padded_total_tokens > 0
 
         # Per-token causal KV length. In pure decode the common metadata already
         # has exactly the graph-stable tensor both b12x consumers need, so bind it
@@ -588,6 +863,25 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             seq_lens=cache_seq_lens_per_req,
             cache_seq_lens_per_req=cache_seq_lens_per_req,
             cache_seq_lens_per_token=cache_seq_lens_per_token,
+            ckv_page_table_1=(
+                self.ckv_page_table_1_buffer[:num_tokens]
+                if self.ckv_page_table_1_buffer is not None
+                else None
+            ),
+            ckv_nsa_cache_seqlens=(
+                self.ckv_nsa_cache_seqlens_buffer[:num_tokens]
+                if self.ckv_nsa_cache_seqlens_buffer is not None
+                else None
+            ),
+            dcp_rank_req_starts=dcp_rank_req_starts,
+            dcp_rank_req_lens=dcp_rank_req_lens,
+            dcp_local_cu_seq_lens=dcp_local_cu_seq_lens,
+            global_cache_seq_lens_per_req=(
+                cm.seq_lens[: cm.num_reqs] if use_dcp else None
+            ),
+            dcp_local_total_tokens=dcp_local_total_tokens,
+            dcp_padded_total_tokens=dcp_padded_total_tokens,
+            dcp_ckv_gather_eligible=dcp_ckv_gather_eligible,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
         )
@@ -868,6 +1162,90 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self._workspace_specs = tuple(workspace_specs)
         self._borrow_workspaces()
         self._prewarm_extend_kernels_once(max_batched)
+
+        # CKV gather setup (Fix B).
+        from vllm import envs as envs_mod
+
+        ckv_gather_requested = envs_mod.VLLM_B12X_MLA_CKV_GATHER
+        self._ckv_gather_enabled = ckv_gather_requested and (
+            self.dcp_world_size > 1
+            and self.num_heads % _HEAD_ALIGNMENT == 0
+            and self.dcp_workspace_non_dbo
+        )
+        if ckv_gather_requested and not self._ckv_gather_enabled:
+            logger.warning_once(
+                "Ignoring VLLM_B12X_MLA_CKV_GATHER on unsupported "
+                "topology: dcp=%d local_heads=%d DBO=%s",
+                self.dcp_world_size,
+                self.num_heads,
+                not self.dcp_workspace_non_dbo,
+            )
+        self._ckv_kernel_num_heads = self.num_heads
+        self._ckv_gather_max_tokens = envs_mod.VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS
+        self._ckv_gather_min_tokens = envs_mod.VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS
+        self._ckv_local_capacity = (
+            _cdiv(
+                _cdiv(self._ckv_gather_max_tokens, max(1, self.dcp_world_size))
+                + max_num_seqs * self.cp_kv_cache_interleave_size,
+                self.block_size,
+            )
+            * self.block_size
+        )
+        self._ckv_workspace_nbytes = (
+            2
+            * (self.dcp_world_size + 1)
+            * self._ckv_local_capacity
+            * self._kv_record_bytes
+            if self._ckv_gather_enabled
+            else 0
+        )
+        self._ckv_workspace = (
+            _get_ckv_gather_workspace(self.device, self._ckv_workspace_nbytes)
+            if self._ckv_gather_enabled
+            else None
+        )
+
+        # Separate extend plan for the gathered-cache path: full local heads
+        # (no head all-gather), global seq lens.
+        if self._ckv_gather_enabled:
+            self._ckv_extend_plan = _make_plan(
+                "extend", max_batched, self._ckv_kernel_num_heads, max_num_seqs
+            )
+            self._scratch_nbytes = max(
+                self._scratch_nbytes,
+                int(self._ckv_extend_plan.layout.nbytes),
+            )
+        else:
+            self._ckv_extend_plan = None
+
+        # Layer prefetch (side stream + events + ping-pong).
+        # _shared_* are class-level: layer L kicks off the prefetch for
+        # layer L+1, and layer L+1 (a different impl instance) consumes it.
+        self._ckv_prefetch_supported = self._ckv_gather_enabled and (
+            self.kv_cache_dtype == "fp8_ds_mla" or self._kv_fp8_rope
+        )
+        if self._ckv_gather_enabled:
+            self._ckv_gather_stream = torch.cuda.Stream(device=self.device)
+            self._ckv_current_chunk_kv_c: torch.Tensor | None = None
+            self._ckv_current_chunk_kpe: torch.Tensor | None = None
+            B12xMLASparseImpl._all_layer_kv_caches: list[
+                torch.Tensor | None
+            ] = []
+            B12xMLASparseImpl._shared_gather_event: (
+                torch.cuda.Event | None
+            ) = None
+            B12xMLASparseImpl._shared_gather_buf_idx = 0
+            if not self._ckv_prefetch_supported:
+                logger.warning_once(
+                    "CKV gather prefetch disabled for kv_cache_dtype=%s "
+                    "(KV_FP8_ROPE=%s); falling back to synchronous gather.",
+                    self.kv_cache_dtype,
+                    int(self._kv_fp8_rope),
+                )
+        else:
+            self._ckv_gather_stream = None
+            self._ckv_current_chunk_kv_c = None
+            self._ckv_current_chunk_kpe = None
 
         # Q arrives BF16; the unified kernel quantizes inside.
         self.supports_quant_query_input = False
@@ -1201,6 +1579,207 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             raise RuntimeError("DCP reduce-scatter output is not contiguous")
         return output
 
+    def _validate_ckv_workspace(self, ckv_workspace: torch.Tensor) -> None:
+        if not self._ckv_gather_enabled:
+            raise RuntimeError("CKV gather workspace requested while disabled")
+        if (
+            tuple(ckv_workspace.shape) != (self._ckv_workspace_nbytes,)
+            or ckv_workspace.dtype != torch.uint8
+            or ckv_workspace.device != self.device
+            or not ckv_workspace.is_contiguous()
+        ):
+            raise RuntimeError("B12X CKV gather borrowed an invalid workspace")
+
+    def dcp_prefill_ckv_gather_eligible(
+        self,
+        attn_metadata: B12xMLASparseMetadata,
+        num_tokens: int,
+    ) -> bool:
+        if not self._ckv_gather_enabled:
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        if (
+            not attn_metadata.dcp_ckv_gather_eligible
+            or attn_metadata.num_decode_tokens != 0
+            or attn_metadata.num_prefill_tokens != attn_metadata.num_actual_tokens
+            or int(num_tokens) != attn_metadata.num_actual_tokens
+            or int(num_tokens) <= self._ckv_gather_min_tokens
+            or attn_metadata.dcp_padded_total_tokens > self._ckv_local_capacity
+            or attn_metadata.dcp_local_total_tokens
+            > attn_metadata.dcp_padded_total_tokens
+        ):
+            return False
+        return all(
+            tensor is not None
+            for tensor in (
+                attn_metadata.req_id_per_token,
+                attn_metadata.ckv_page_table_1,
+                attn_metadata.ckv_nsa_cache_seqlens,
+                attn_metadata.dcp_rank_req_starts,
+                attn_metadata.dcp_rank_req_lens,
+                attn_metadata.dcp_local_cu_seq_lens,
+            )
+        )
+
+    def _dcp_gather_ckv(
+        self,
+        kv_cache: torch.Tensor,
+        attn_metadata: B12xMLASparseMetadata,
+        ckv_workspace: torch.Tensor,
+        buf_idx: int = 0,
+        stream: torch.cuda.Stream | None = None,
+    ) -> torch.Tensor:
+        if not self.dcp_prefill_ckv_gather_eligible(
+            attn_metadata, attn_metadata.num_actual_tokens
+        ):
+            raise RuntimeError("CKV gather called for an ineligible attention batch")
+        if (
+            kv_cache.dtype != torch.uint8
+            or kv_cache.ndim != 3
+            or tuple(kv_cache.shape[1:]) != (self.block_size, self._kv_record_bytes)
+            or not kv_cache.is_contiguous()
+        ):
+            raise ValueError(
+                "CKV gather requires contiguous native paged KV cache pages"
+            )
+
+        assert attn_metadata.dcp_local_cu_seq_lens is not None
+        padded_tokens = attn_metadata.dcp_padded_total_tokens
+        local_tokens = attn_metadata.dcp_local_total_tokens
+        self._validate_ckv_workspace(ckv_workspace)
+        half_nbytes = (
+            (self.dcp_world_size + 1)
+            * self._ckv_local_capacity
+            * self._kv_record_bytes
+        )
+        ws_half = ckv_workspace.view(-1, self._kv_record_bytes)
+        base = buf_idx * (half_nbytes // self._kv_record_bytes)
+        local_buffer = ws_half[base : base + self._ckv_local_capacity]
+        gathered_buffer = ws_half[
+            base + self._ckv_local_capacity : base
+            + self._ckv_local_capacity * (self.dcp_world_size + 1)
+        ]
+        if stream is not None:
+            stream_ctx = torch.cuda.stream(stream)
+        else:
+            stream_ctx = torch.cuda.stream(torch.cuda.current_stream())
+        with stream_ctx:
+            if local_tokens:
+                ops.cp_gather_cache(
+                    src_cache=kv_cache,
+                    dst=local_buffer[:local_tokens],
+                    block_table=attn_metadata.block_table,
+                    cu_seq_lens=attn_metadata.dcp_local_cu_seq_lens,
+                    batch_size=attn_metadata.num_reqs,
+                )
+            if local_tokens < padded_tokens:
+                local_buffer[local_tokens:padded_tokens].zero_()
+
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            dcp_group = get_dcp_group()
+            _dcp_all_gather_current_stream(
+                dcp_group,
+                local_buffer[:padded_tokens].view(-1),
+                gathered_buffer[: self.dcp_world_size * padded_tokens].view(-1),
+            )
+        gathered_tokens = gathered_buffer[
+            : self.dcp_world_size * self._ckv_local_capacity
+        ]
+        return gathered_tokens.view(
+            -1, self.block_size, self._kv_record_bytes
+        )
+
+    def set_ckv_current_chunk_kv(
+        self, kv_c_normed: torch.Tensor, k_pe: torch.Tensor
+    ) -> None:
+        self._ckv_current_chunk_kv_c = kv_c_normed
+        self._ckv_current_chunk_kpe = k_pe
+
+    def _append_current_chunk_to_gathered(
+        self,
+        gathered_buffer: torch.Tensor,
+        attn_metadata: "B12xMLASparseMetadata",
+        layer,
+        num_actual_toks: int,
+    ) -> None:
+        """Write the current chunk's BF16 KV into the gathered buffer for
+        all DCP ranks.  Every rank already holds the full BF16 latent; the
+        normal ``do_kv_cache_update`` only writes this rank's interleaved
+        subset to the paged cache.  The prefetch gathered history from the
+        next layer's cache *before* that layer's ``do_kv_cache_update``
+        ran, so the current chunk is missing.  This method writes all
+        tokens — not just the local rank's share — into the correct slots
+        of the rank-ordered gathered buffer.
+        """
+        if (
+            self._ckv_current_chunk_kv_c is None
+            or num_actual_toks == 0
+        ):
+            return
+        kv_c = self._ckv_current_chunk_kv_c[:num_actual_toks]
+        k_pe_flat = self._ckv_current_chunk_kpe[:num_actual_toks]
+        if k_pe_flat.ndim == 3:
+            k_pe_flat = k_pe_flat.squeeze(1)
+
+        num_reqs = attn_metadata.num_reqs
+        interleave = self.cp_kv_cache_interleave_size
+        global_seq_lens = attn_metadata.global_cache_seq_lens_per_req
+        if global_seq_lens is None:
+            return
+        global_seq_lens = global_seq_lens[:num_reqs]
+        req_ids = attn_metadata.req_id_per_token[:num_actual_toks].to(
+            torch.int64
+        )
+        global_seq_per_token = global_seq_lens[req_ids].to(torch.int32)
+
+        t = torch.arange(
+            num_actual_toks, device=self.device, dtype=torch.int32
+        )
+        global_pos = global_seq_per_token - num_actual_toks + t
+        owner = (
+            (global_pos // interleave) % self.dcp_world_size
+        ).to(torch.int64)
+        local_pos = (
+            global_pos // (self.dcp_world_size * interleave) * interleave
+            + global_pos % interleave
+        ).to(torch.int64)
+
+        rank_req_starts = attn_metadata.dcp_rank_req_starts
+        flat_idx = owner * num_reqs + req_ids
+        rank_start = rank_req_starts.view(-1)[flat_idx].to(torch.int64)
+
+        padded_tokens = attn_metadata.dcp_padded_total_tokens
+        slots = (
+            owner * int(padded_tokens) + rank_start + local_pos
+        )
+
+        k_scale = getattr(layer, "_k_scale", None)
+        if self._kv_fp8_rope:
+            torch.ops._C_fp8_rope_ops.concat_and_cache_nvfp4_mla_fp8_rope(
+                kv_c,
+                k_pe_flat,
+                gathered_buffer,
+                slots,
+                k_scale,
+            )
+        elif self.kv_cache_dtype == "fp8_ds_mla":
+            ops.concat_and_cache_mla(
+                kv_c,
+                k_pe_flat,
+                gathered_buffer,
+                slots,
+                self.kv_cache_dtype,
+                k_scale,
+            )
+        else:
+            raise RuntimeError(
+                "CKV gather prefetch append is not yet supported for "
+                f"kv_cache_dtype={self.kv_cache_dtype!r}; disable prefetch "
+                "or use fp8_ds_mla / KV_FP8_ROPE."
+            )
+
     def _sync_warmup(self) -> None:
         if self.device.type == "cuda":
             torch.accelerator.synchronize(self.device)
@@ -1321,38 +1900,50 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         # launch receives this as a runtime scalar.
         latent_scale = float(getattr(layer, "_nvfp4_mla_outer_scale", 1.0))
         kernel_format_kwargs = self._b12x_kernel_format_kwargs(latent_scale)
-        # q arrives as (mqa_ql_nope[T, H, kv_lora_rank], mqa_q_pe[T, H, rope]);
-        # b12x's GLM_NSA contract wants a single contiguous [T, H, 576] tensor.
-        # Co-allocate the q-concat buffer and the per-call attention scratch in ONE
-        # get_simultaneous call so they receive distinct, non-overlapping offsets:
-        # the kernel reads q while writing the scratch (tmp_output/output), and the
-        # manager packs every call from offset 0, so separate calls would alias q
-        # with the scratch and corrupt the result.
+        query_rows = q[0].shape[0] if isinstance(q, tuple) else q.shape[0]
+        use_ckv_gather = self.dcp_prefill_ckv_gather_eligible(
+            attn_metadata, int(query_rows)
+        )
         workspace_tensors = self._borrow_workspaces()
         q_workspace = workspace_tensors[0]
         dense_out_workspace = workspace_tensors[1] if self._pad_heads else None
+        ckv_workspace = self._ckv_workspace
         scratch_storage = workspace_tensors[-1]
+        expected_input_heads = (
+            self.num_heads if use_ckv_gather else self._input_num_heads
+        )
+        if use_ckv_gather:
+            local_q_numel = (
+                self._max_batched * self._ckv_kernel_num_heads * self.q_head_dim
+            )
+            q_buffer = q_workspace.view(-1)[:local_q_numel].view(
+                self._max_batched,
+                self._ckv_kernel_num_heads,
+                self.q_head_dim,
+            )
+        else:
+            q_buffer = q_workspace
         if isinstance(q, tuple):
             ql_nope, q_pe = q
             num_actual_toks = ql_nope.shape[0]
             num_input_heads = ql_nope.shape[1]
-            if num_input_heads != self._input_num_heads:
+            if num_input_heads != expected_input_heads:
                 raise ValueError(
                     "B12X_MLA_SPARSE query heads do not match the planned "
-                    f"head count: {num_input_heads} != {self._input_num_heads}."
+                    f"head count: {num_input_heads} != {expected_input_heads}."
                 )
-            q_buffer = q_workspace[:num_actual_toks]
+            q_buffer = q_buffer[:num_actual_toks]
             q_all = q_buffer[:, :num_input_heads]
             ops.concat_mla_q(ql_nope, q_pe, q_all)
         else:
             num_actual_toks = q.shape[0]
             num_input_heads = q.shape[1]
-            if num_input_heads != self._input_num_heads:
+            if num_input_heads != expected_input_heads:
                 raise ValueError(
                     "B12X_MLA_SPARSE query heads do not match the planned "
-                    f"head count: {num_input_heads} != {self._input_num_heads}."
+                    f"head count: {num_input_heads} != {expected_input_heads}."
                 )
-            q_buffer = q_workspace[:num_actual_toks]
+            q_buffer = q_buffer[:num_actual_toks]
             q_all = q_buffer[:, :num_input_heads]
             exact_workspace_alias = (
                 tuple(q.shape) == tuple(q_all.shape)
@@ -1368,7 +1959,36 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
         per_token_cache = attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
-        if self.dcp_world_size > 1:
+        if use_ckv_gather:
+            assert attn_metadata.req_id_per_token is not None
+            assert attn_metadata.ckv_page_table_1 is not None
+            assert attn_metadata.ckv_nsa_cache_seqlens is not None
+            assert attn_metadata.dcp_rank_req_starts is not None
+            assert attn_metadata.dcp_rank_req_lens is not None
+            selected_indices = attn_metadata.ckv_page_table_1[
+                :num_actual_toks, : topk_indices.shape[1]
+            ]
+            nsa_cache_seqlens = attn_metadata.ckv_nsa_cache_seqlens[
+                :num_actual_toks
+            ]
+            _map_global_topk_to_gathered_ckv(
+                attn_metadata.req_id_per_token[:num_actual_toks],
+                topk_indices,
+                attn_metadata.dcp_rank_req_starts,
+                attn_metadata.dcp_rank_req_lens,
+                selected_indices,
+                nsa_cache_seqlens,
+                dcp_size=self.dcp_world_size,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+                padded_rank_tokens=attn_metadata.dcp_padded_total_tokens,
+            )
+            torch.minimum(
+                nsa_cache_seqlens,
+                per_token_cache,
+                out=nsa_cache_seqlens,
+            )
+            _mask_page_table_after_nsa_len(selected_indices, nsa_cache_seqlens)
+        elif self.dcp_world_size > 1:
             # The indexer globally merges logical top-k ids across DCP ranks.
             # Compact just this rank's winners into local physical cache slots;
             # the outer MLA layer combines the rank-local outputs using LSE.
@@ -1433,6 +2053,69 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 "B12X_MLA_SPARSE requires a contiguous native paged KV cache; "
                 f"got stride={tuple(kv_cache.stride())}"
             )
+        if use_ckv_gather:
+            if ckv_workspace is None:
+                raise RuntimeError("CKV gather workspace was not borrowed")
+            layer_idx = getattr(layer, "layer_idx", None)
+            if layer_idx is not None:
+                while len(B12xMLASparseImpl._all_layer_kv_caches) <= layer_idx:
+                    B12xMLASparseImpl._all_layer_kv_caches.append(None)
+                B12xMLASparseImpl._all_layer_kv_caches[layer_idx] = kv_cache
+            if B12xMLASparseImpl._shared_gather_event is not None:
+                B12xMLASparseImpl._shared_gather_event.wait()
+                half_nbytes = (
+                    (self.dcp_world_size + 1)
+                    * self._ckv_local_capacity
+                    * self._kv_record_bytes
+                )
+                ws_half = ckv_workspace.view(-1, self._kv_record_bytes)
+                base = B12xMLASparseImpl._shared_gather_buf_idx * (
+                    half_nbytes // self._kv_record_bytes
+                )
+                gathered_buffer = ws_half[
+                    base
+                    + self._ckv_local_capacity : base
+                    + self._ckv_local_capacity
+                    * (self.dcp_world_size + 1)
+                ]
+                kv_cache = gathered_buffer[
+                    : self.dcp_world_size * self._ckv_local_capacity
+                ].view(-1, self.block_size, self._kv_record_bytes)
+                self._append_current_chunk_to_gathered(
+                    kv_cache, attn_metadata, layer, num_actual_toks
+                )
+            else:
+                kv_cache = self._dcp_gather_ckv(
+                    kv_cache, attn_metadata, ckv_workspace
+                )
+            logger.info_once(
+                "Using transient full-CKV gather for B12X sparse MLA prefill "
+                "(capacity=%d logical tokens)",
+                self._ckv_gather_max_tokens,
+            )
+            if (
+                self._ckv_prefetch_supported
+                and layer_idx is not None
+                and layer_idx + 1 < len(B12xMLASparseImpl._all_layer_kv_caches)
+                and B12xMLASparseImpl._all_layer_kv_caches[layer_idx + 1]
+                is not None
+            ):
+                next_kv = B12xMLASparseImpl._all_layer_kv_caches[layer_idx + 1]
+                next_buf_idx = 1 - B12xMLASparseImpl._shared_gather_buf_idx
+                self._dcp_gather_ckv(
+                    next_kv,
+                    attn_metadata,
+                    ckv_workspace,
+                    buf_idx=next_buf_idx,
+                    stream=self._ckv_gather_stream,
+                )
+                B12xMLASparseImpl._shared_gather_event = torch.cuda.Event(
+                    blocking=False
+                )
+                B12xMLASparseImpl._shared_gather_event.record(
+                    self._ckv_gather_stream
+                )
+                B12xMLASparseImpl._shared_gather_buf_idx = next_buf_idx
 
         use_decode_kernel = attn_metadata.max_query_len <= 1 or (
             self.spec_extend_as_decode
@@ -1502,15 +2185,25 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             # Extend / prefill -> single-pass unified prefill (no split-K
             # scratch needed; only output_buffer is read). b12x supports 8-head
             # granularity, so only a non-aligned local tail is padded here.
-            cache_seqlens = attn_metadata.cache_seq_lens_per_req
+            if use_ckv_gather:
+                if attn_metadata.global_cache_seq_lens_per_req is None:
+                    raise RuntimeError(
+                        "CKV gather is missing global sequence lengths"
+                    )
+                cache_seqlens = attn_metadata.global_cache_seq_lens_per_req
+            else:
+                cache_seqlens = attn_metadata.cache_seq_lens_per_req
             prefill_q = q_all
-            if self._pad_heads:
+            if self._pad_heads and not use_ckv_gather:
                 prefill_q = q_buffer[:, : self._kernel_num_heads]
                 prefill_q[:, self._input_num_heads :, :].zero_()
 
-            # Eager bind into the extend views container (single-pass prefill;
-            # no split-K, output_buffer is the only scratch the kernel writes).
-            binding = self._extend_plan.bind(
+            extend_plan = (
+                self._ckv_extend_plan if use_ckv_gather else self._extend_plan
+            )
+            if extend_plan is None:
+                raise RuntimeError("CKV gather extend plan was not initialized")
+            binding = extend_plan.bind(
                 scratch=scratch_storage,
                 q=prefill_q,
                 selected_indices=selected_indices,
@@ -1518,7 +2211,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 nsa_cache_seqlens_int32=nsa_cache_seqlens,
             )
             lse = None
-            if self.need_to_return_lse_for_decode:
+            if self.need_to_return_lse_for_decode and not use_ckv_gather:
                 out, lse = cast(
                     tuple[torch.Tensor, torch.Tensor],
                     self._sparse_mla_extend_forward(
@@ -1542,7 +2235,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                         **kernel_format_kwargs,
                     ),
                 )
-            if self._pad_heads:
+            if self._pad_heads and not use_ckv_gather:
                 assert dense_out_workspace is not None
                 dense_out = dense_out_workspace[:num_actual_toks]
                 dense_out.copy_(out[:, : self._input_num_heads, :])
