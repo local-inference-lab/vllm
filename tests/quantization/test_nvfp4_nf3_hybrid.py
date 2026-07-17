@@ -4,12 +4,15 @@
 import pytest
 import torch
 
+from vllm.config.quantization import resolve_quantization_config
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.nvfp4_nf3_hybrid import (
     NvFp4Nf3HybridConfig,
+    _combined_tier_local_descriptors,
     _read_hybrid_keys,
     _unpack_nf3_codes,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 
 
 @pytest.mark.parametrize(
@@ -65,6 +68,21 @@ def test_config_rejects_missing_hybrid_bit_map():
         )
 
 
+def test_config_accepts_dense_mxfp8_online_overlay():
+    resolved = resolve_quantization_config(
+        "nvfp4_nf3_hybrid",
+        {
+            "linear": {"weight": "mxfp8"},
+            "ignore": ["re:.*kv_b_proj"],
+        },
+    )
+
+    assert resolved is not None
+    assert resolved.linear is not None
+    assert resolved.linear.weight == kMxfp8Dynamic
+    assert resolved.ignore == ["re:.*kv_b_proj"]
+
+
 def test_unpack_nf3_codes():
     expected = torch.tensor([[[0, 1, 2, 3, 4, 5, 6, 7]]], dtype=torch.int32)
     word = sum(int(code) << (index * 3) for index, code in enumerate(expected[0, 0]))
@@ -74,3 +92,20 @@ def test_unpack_nf3_codes():
     )
 
     torch.testing.assert_close(_unpack_nf3_codes(packed, size_k=8), expected)
+
+
+def test_grid188_tier_descriptors_encode_exact_partition():
+    remap = {
+        **{global_id: (0, global_id) for global_id in range(64)},
+        **{global_id: (1, global_id - 64) for global_id in range(64, 256)},
+    }
+
+    descriptors = _combined_tier_local_descriptors(remap)
+
+    assert descriptors[:64] == list(range(64))
+    assert descriptors[64:] == [0x100 | local_id for local_id in range(192)]
+
+
+def test_grid188_tier_descriptors_reject_incomplete_partition():
+    with pytest.raises(ValueError, match="does not cover all 256"):
+        _combined_tier_local_descriptors({0: (0, 0)})
