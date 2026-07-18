@@ -39,6 +39,10 @@ logger = init_logger(__name__)
 
 _B12X_DCP_A2A_POOLS: dict[tuple[int, int, int, int, int, int], Any] = {}
 _B12X_DCP_A2A_DISABLED: set[tuple[int, int, int, int, int, int]] = set()
+_DCP_A2A_GRAPH_BUFFERS: dict[
+    tuple[tuple[int, ...], torch.device, torch.dtype],
+    tuple[torch.Tensor, torch.Tensor],
+] = {}
 
 
 @lru_cache(maxsize=1)
@@ -531,15 +535,26 @@ def _dcp_a2a_send_recv_buffers(
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Don't use the shared WorkspaceManager here. A FULL cudagraph bakes in the
-    # buffer address at capture, but the workspace is growable and sized only to
-    # the largest *captured* batch (the cudagraph capture cap). Any eager a2a
-    # with a bigger batch regrows it, freeing that address and poisoning every
-    # captured graph -> illegal memory access on replay. This bites the very
-    # first request: the post-capture warmup runs an eager decode at
-    # max_num_seqs (> the cap), so the graphs are already dangling before the
-    # server is ready. torch.empty buffers instead live in the graph's private
-    # pool and stay valid for its lifetime (as _dcp_a2a_unpack_combine and the
-    # AG+RS combine path already rely on).
+    # buffer address at capture, but a larger eager batch can grow that workspace
+    # and free the captured address. Eager calls therefore use ordinary temporary
+    # tensors, while captured calls retain fixed-size owners below.
+    if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        # FULL graphs share a global graph pool. Without a live Python owner,
+        # a larger descriptor's staging allocation can be recycled while a
+        # smaller descriptor is captured, leaving both NCCL graph nodes bound
+        # to the same address. Keep one exact-shape pair alive per device so
+        # descriptors cannot alias each other's A2A staging storage. Layers of
+        # one graph may reuse the pair because all operations are stream-ordered.
+        key = (shape, device, dtype)
+        buffers = _DCP_A2A_GRAPH_BUFFERS.get(key)
+        if buffers is None:
+            buffers = (
+                torch.empty(shape, device=device, dtype=dtype),
+                torch.empty(shape, device=device, dtype=dtype),
+            )
+            _DCP_A2A_GRAPH_BUFFERS[key] = buffers
+        return buffers
+
     return (
         torch.empty(shape, device=device, dtype=dtype),
         torch.empty(shape, device=device, dtype=dtype),
