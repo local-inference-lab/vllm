@@ -680,6 +680,16 @@ class SpeculativeConfig:
         parts = model.split(".")
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
+    def _inherit_target_revision_for_mtp(self) -> None:
+        """Pin an in-checkpoint MTP draft to the target model revision."""
+        target = self.target_model_config
+        if self.method != "mtp" or target is None or self.model != target.model:
+            return
+        if self.revision is None:
+            self.revision = target.revision
+        if self.code_revision is None:
+            self.code_revision = target.code_revision
+
     def __post_init__(self):
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
@@ -852,6 +862,7 @@ class SpeculativeConfig:
             self.prompt_lookup_min = 0
 
             if self.model is not None:
+                self._inherit_target_revision_for_mtp()
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # lack a model_type key in config.json, so AutoConfig cannot
                 # detect them. When the method is explicitly "medusa", inject

@@ -68,14 +68,18 @@ def _restore_full_token_layout_if_needed(
     return hidden_states, residual
 
 
-def _resolve_cached_hf_model_path(model_path: str | None) -> str | None:
+def _resolve_cached_hf_model_path(
+    model_path: str | None, revision: str | None = None
+) -> str | None:
     if not model_path or os.path.isdir(model_path):
         return model_path
     try:
         from huggingface_hub import try_to_load_from_cache
 
         cached_index = try_to_load_from_cache(
-            model_path, "model.safetensors.index.json"
+            model_path,
+            "model.safetensors.index.json",
+            revision=revision or "main",
         )
         if isinstance(cached_index, str):
             return os.path.dirname(cached_index)
@@ -87,22 +91,49 @@ def _resolve_cached_hf_model_path(model_path: str | None) -> str | None:
 def _get_local_model_path(
     config: PretrainedConfig, vllm_config: VllmConfig
 ) -> str | None:
-    for attr in ("_name_or_path", "name_or_path"):
-        model_path = getattr(config, attr, None)
-        resolved_model_path = _resolve_cached_hf_model_path(model_path)
-        if resolved_model_path:
-            return resolved_model_path
-
     speculative_config = getattr(vllm_config, "speculative_config", None)
     draft_model_config = getattr(speculative_config, "draft_model_config", None)
     model_config = getattr(vllm_config, "model_config", None)
-    for model_path in (
-        getattr(draft_model_config, "model", None),
-        getattr(draft_model_config, "model_path", None),
-        getattr(model_config, "model", None),
-        getattr(model_config, "model_path", None),
-    ):
-        resolved_model_path = _resolve_cached_hf_model_path(model_path)
+
+    def _paths(model_config) -> tuple[str, ...]:
+        if model_config is None:
+            return ()
+        return tuple(
+            path
+            for path in (
+                getattr(model_config, "model", None),
+                getattr(model_config, "model_path", None),
+                getattr(model_config, "model_weights", None),
+            )
+            if path
+        )
+
+    draft_paths = _paths(draft_model_config)
+    target_paths = _paths(model_config)
+    draft_revision = getattr(draft_model_config, "revision", None) or getattr(
+        speculative_config, "revision", None
+    )
+    target_revision = getattr(model_config, "revision", None)
+
+    def _revision_for(model_path: str | None) -> str | None:
+        if model_path in draft_paths and draft_revision is not None:
+            return draft_revision
+        if model_path in target_paths:
+            return target_revision
+        return None
+
+    for attr in ("_name_or_path", "name_or_path"):
+        model_path = getattr(config, attr, None)
+        resolved_model_path = _resolve_cached_hf_model_path(
+            model_path, _revision_for(model_path)
+        )
+        if resolved_model_path:
+            return resolved_model_path
+
+    for model_path in (*draft_paths, *target_paths):
+        resolved_model_path = _resolve_cached_hf_model_path(
+            model_path, _revision_for(model_path)
+        )
         if resolved_model_path:
             return resolved_model_path
     return None

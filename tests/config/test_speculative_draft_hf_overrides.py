@@ -12,6 +12,7 @@ when the target itself is shrunk — which is what kept spec-decode archs like
 """
 
 import functools
+from types import SimpleNamespace
 
 import pytest
 from transformers import PretrainedConfig
@@ -132,3 +133,43 @@ def test_composed_override_is_picklable():
 
     out = composed(_make_hf_config())
     assert out.num_hidden_layers == 1
+
+
+@pytest.mark.cpu_test
+def test_mtp_same_model_inherits_target_revisions():
+    spec = SimpleNamespace(
+        method="mtp",
+        model="org/model",
+        revision=None,
+        code_revision=None,
+        target_model_config=SimpleNamespace(
+            model="org/model",
+            revision="weights-commit",
+            code_revision="code-commit",
+        ),
+    )
+
+    SpeculativeConfig._inherit_target_revision_for_mtp(spec)
+
+    assert spec.revision == "weights-commit"
+    assert spec.code_revision == "code-commit"
+
+
+@pytest.mark.cpu_test
+def test_mtp_explicit_draft_revisions_are_preserved():
+    spec = SimpleNamespace(
+        method="mtp",
+        model="org/model",
+        revision="draft-weights",
+        code_revision="draft-code",
+        target_model_config=SimpleNamespace(
+            model="org/model",
+            revision="target-weights",
+            code_revision="target-code",
+        ),
+    )
+
+    SpeculativeConfig._inherit_target_revision_for_mtp(spec)
+
+    assert spec.revision == "draft-weights"
+    assert spec.code_revision == "draft-code"
