@@ -377,6 +377,69 @@ def test_b12x_dispatch_bypasses_packed_nccl(monkeypatch: pytest.MonkeyPatch):
     }
 
 
+def test_packed_a2a_capture_buffers_stay_live_per_shape(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    created: list[object] = []
+
+    def fake_empty(*args, **kwargs):
+        value = object()
+        created.append(value)
+        return value
+
+    dcp_alltoall._DCP_A2A_GRAPH_BUFFERS.clear()
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    device = torch.device("cuda:0")
+
+    first = dcp_alltoall._dcp_a2a_send_recv_buffers(
+        (3, 4, 11, 514), device, torch.bfloat16
+    )
+    same_shape = dcp_alltoall._dcp_a2a_send_recv_buffers(
+        (3, 4, 11, 514), device, torch.bfloat16
+    )
+    larger = dcp_alltoall._dcp_a2a_send_recv_buffers(
+        (3, 8, 11, 514), device, torch.bfloat16
+    )
+
+    assert same_shape is first
+    assert larger is not first
+    assert len(created) == 4
+    assert len(dcp_alltoall._DCP_A2A_GRAPH_BUFFERS) == 2
+    dcp_alltoall._DCP_A2A_GRAPH_BUFFERS.clear()
+
+
+def test_packed_a2a_eager_buffers_are_not_retained(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    created: list[object] = []
+
+    def fake_empty(*args, **kwargs):
+        value = object()
+        created.append(value)
+        return value
+
+    dcp_alltoall._DCP_A2A_GRAPH_BUFFERS.clear()
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    device = torch.device("cuda:0")
+
+    first = dcp_alltoall._dcp_a2a_send_recv_buffers(
+        (3, 4, 11, 514), device, torch.bfloat16
+    )
+    second = dcp_alltoall._dcp_a2a_send_recv_buffers(
+        (3, 4, 11, 514), device, torch.bfloat16
+    )
+
+    assert first is not second
+    assert len(created) == 4
+    assert not dcp_alltoall._DCP_A2A_GRAPH_BUFFERS
+
+
 def test_b12x_query_gather_dispatch_bypasses_group(monkeypatch: pytest.MonkeyPatch):
     from vllm.v1.attention.ops import dcp_alltoall
 
