@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from types import SimpleNamespace
 
 import torch
 from transformers import PretrainedConfig
@@ -10,7 +11,10 @@ from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     dequant_mxfp8_to_bf16,
 )
-from vllm.model_executor.models.deepseek_mtp import _try_load_fp8_linear_as_bf16
+from vllm.model_executor.models.deepseek_mtp import (
+    _get_local_model_path,
+    _try_load_fp8_linear_as_bf16,
+)
 
 
 def _write_serialized_nextn_index(model_dir, layer: int) -> None:
@@ -81,3 +85,75 @@ def test_mtp_fallback_loader_accepts_mxfp8_weight_scale():
     assert torch.equal(param.data, expected)
     assert "model.layers.78.self_attn.fused_qkv_a_proj.weight" in loaded
     assert pending == {}
+
+
+def test_mtp_serialized_probe_uses_target_revision_for_same_model(monkeypatch):
+    calls: list[tuple[str | None, str | None]] = []
+
+    def fake_resolve(model_path, revision=None):
+        calls.append((model_path, revision))
+        return "/cache/pinned-snapshot"
+
+    monkeypatch.setattr(
+        "vllm.model_executor.models.deepseek_mtp._resolve_cached_hf_model_path",
+        fake_resolve,
+    )
+    model = "org/model"
+    config = PretrainedConfig()
+    config._name_or_path = model
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            revision=None,
+            draft_model_config=SimpleNamespace(
+                model=model,
+                model_path=None,
+                model_weights=None,
+                revision=None,
+            ),
+        ),
+        model_config=SimpleNamespace(
+            model=model,
+            model_path=None,
+            model_weights=None,
+            revision="target-commit",
+        ),
+    )
+
+    assert _get_local_model_path(config, vllm_config) == "/cache/pinned-snapshot"
+    assert calls == [(model, "target-commit")]
+
+
+def test_mtp_serialized_probe_prefers_explicit_draft_revision(monkeypatch):
+    calls: list[tuple[str | None, str | None]] = []
+
+    def fake_resolve(model_path, revision=None):
+        calls.append((model_path, revision))
+        return "/cache/draft-snapshot"
+
+    monkeypatch.setattr(
+        "vllm.model_executor.models.deepseek_mtp._resolve_cached_hf_model_path",
+        fake_resolve,
+    )
+    model = "org/model"
+    config = PretrainedConfig()
+    config._name_or_path = model
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            revision="draft-commit",
+            draft_model_config=SimpleNamespace(
+                model=model,
+                model_path=None,
+                model_weights=None,
+                revision="draft-commit",
+            ),
+        ),
+        model_config=SimpleNamespace(
+            model=model,
+            model_path=None,
+            model_weights=None,
+            revision="target-commit",
+        ),
+    )
+
+    assert _get_local_model_path(config, vllm_config) == "/cache/draft-snapshot"
+    assert calls == [(model, "draft-commit")]
