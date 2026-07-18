@@ -33,7 +33,6 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 import numpy as np
 import torch
 import torch.distributed as dist
-
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
@@ -77,7 +76,6 @@ _BF16_BYTES = 2
 _EXTEND_PREWARM_DONE: set[
     tuple[int | None, int, int, int, int, int, bool, str, bool]
 ] = set()
-_FP8_ROPE_WRITER_LOADED = False
 _KV_FP8_ROPE_REQUESTED = os.getenv("KV_FP8_ROPE", "0") == "1"
 
 
@@ -125,28 +123,6 @@ def _is_glm_moe_dsa_model() -> bool:
 def _kv_fp8_rope_enabled() -> bool:
     """Strict public gate plus literal GLM architecture selection."""
     return _KV_FP8_ROPE_REQUESTED and _is_glm_moe_dsa_model()
-
-
-def _load_fp8_rope_writer() -> None:
-    """Load the private 368-byte writer without modifying the stock writer."""
-    global _FP8_ROPE_WRITER_LOADED
-    if _FP8_ROPE_WRITER_LOADED:
-        return
-    library = os.getenv("KV_FP8_ROPE_WRITER_LIB", "/opt/fp8rope/_C_fp8_rope.so")
-    if not os.path.isfile(library):
-        raise RuntimeError(
-            "KV_FP8_ROPE=1 requires the standalone writer library at "
-            f"{library!r} (override with KV_FP8_ROPE_WRITER_LIB)"
-        )
-    torch.ops.load_library(library)
-    namespace = getattr(torch.ops, "_C_fp8_rope_ops", None)
-    if namespace is None or not hasattr(
-        namespace, "concat_and_cache_nvfp4_mla_fp8_rope"
-    ):
-        raise RuntimeError(
-            f"FP8-RoPE writer library {library!r} did not register the expected op"
-        )
-    _FP8_ROPE_WRITER_LOADED = True
 
 
 def _cdiv(x: int, y: int) -> int:
@@ -634,7 +610,18 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 self.kv_cache_dtype,
             )
         if self._kv_fp8_rope:
-            _load_fp8_rope_writer()
+            try:
+                from b12x.attention.mla.kv_cache import (
+                    concat_and_cache_nvfp4_mla_fp8_rope,
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "KV_FP8_ROPE=1 requires a b12x build with "
+                    "concat_and_cache_nvfp4_mla_fp8_rope package API support"
+                ) from exc
+            self._concat_and_cache_nvfp4_mla_fp8_rope = (
+                concat_and_cache_nvfp4_mla_fp8_rope
+            )
 
         # MLA dims (absorbed: Q post-projection is [T, H, kv_lora_rank + rope]).
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
@@ -866,9 +853,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         """Write the post-RoPE key using the selected runtime cache format.
 
         The disabled branch delegates to the shipped implementation unchanged,
-        including its stock 432-byte NVFP4 writer.  The enabled branch calls a
-        separate operator so loading this overlay cannot replace or perturb the
-        stock operator used by KV_FP8_ROPE=0.
+        including its stock 432-byte NVFP4 writer. The enabled branch calls the
+        b12x package writer API, which does not replace or perturb the stock
+        writer used by KV_FP8_ROPE=0.
         """
         if not self._kv_fp8_rope:
             return super().do_kv_cache_update(
@@ -886,18 +873,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 f"KV_FP8_ROPE writer reached a non-NVFP4 cache: {kv_cache_dtype!r}"
             )
         k_pe_flat = k_pe.squeeze(1)
-        if kv_c_normed.shape[-1] != 512 or k_pe_flat.shape[-1] != 64:
-            raise RuntimeError(
-                "KV_FP8_ROPE is GLM MLA-only and requires latent=512, rope=64; "
-                f"got {tuple(kv_c_normed.shape)} and {tuple(k_pe.shape)}"
-            )
-        kv_u8 = kv_cache.view(torch.uint8)
-        if kv_u8.shape[-1] != 368:
-            raise RuntimeError(
-                "KV_FP8_ROPE expected a 368-byte cache record, got "
-                f"shape={tuple(kv_u8.shape)}"
-            )
-        torch.ops._C_fp8_rope_ops.concat_and_cache_nvfp4_mla_fp8_rope(
+        self._concat_and_cache_nvfp4_mla_fp8_rope(
             kv_c_normed,
             k_pe_flat,
             kv_cache,
