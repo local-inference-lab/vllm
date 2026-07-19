@@ -21,6 +21,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.kv_cache_interface import CrossAttentionSpec, MambaSpec
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.workspace import use_workspace_lane
 
 logger = init_logger(__name__)
 
@@ -348,7 +349,8 @@ def warmup_kernels(
                 model_runner.input_buffers
             )
             assert model_runner.speculator is not None
-            model_runner.speculator.warmup_capacity_kernels()
+            with use_workspace_lane(1):
+                model_runner.speculator.warmup_capacity_kernels()
             if model_runner.speculator.wants_auto_sps_curve:
                 _profile_sps_curve(model_runner)
                 model_runner.kv_connector.set_disabled(True)

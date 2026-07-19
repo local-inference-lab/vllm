@@ -397,9 +397,16 @@ class Worker(WorkerBase):
         else:
             raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
 
-        # Initialize workspace manager
+        # Target and speculative captures retain workspace views concurrently,
+        # so speculative V2 execution needs a separate ownership lane.
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
-        init_workspace_manager(self.device, num_ubatches)
+        num_workspace_lanes = (
+            2
+            if self.use_v2_model_runner
+            and self.vllm_config.speculative_config is not None
+            else 1
+        )
+        init_workspace_manager(self.device, num_ubatches, num_workspace_lanes)
 
         # Construct the model runner
         if self.use_v2_model_runner:
