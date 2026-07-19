@@ -2,12 +2,52 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import contextmanager
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import torch
 
 import vllm.model_executor.layers.fused_moe.runner.shared_experts as shared_module
-from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+    SharedExperts,
+    SharedExpertsOrder,
+)
+
+
+def test_aux_stream_respects_expert_kernel_capability(monkeypatch) -> None:
+    stream = Mock()
+    supports_aux_stream = Mock(side_effect=lambda num_tokens: num_tokens <= 8)
+    monkeypatch.setattr(shared_module, "aux_stream", Mock(return_value=stream))
+    monkeypatch.setattr(shared_module.envs, "VLLM_DISABLE_SHARED_EXPERTS_STREAM", False)
+    monkeypatch.setattr(
+        shared_module,
+        "current_platform",
+        SimpleNamespace(is_cuda=lambda: True),
+    )
+    moe_config = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(
+            enable_eplb=False,
+            all2all_backend="allgather_reducescatter",
+            use_fi_nvl_two_sided_kernels=False,
+        )
+    )
+    shared_experts = SharedExperts(
+        layer=Mock(),
+        moe_config=moe_config,
+        enable_dbo=False,
+        mk_can_overlap_shared_experts=Mock(return_value=False),
+        experts_support_aux_stream=supports_aux_stream,
+    )
+
+    assert (
+        shared_experts._determine_shared_experts_order(torch.empty(8, 16))
+        == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+    )
+    assert (
+        shared_experts._determine_shared_experts_order(torch.empty(16, 16))
+        == SharedExpertsOrder.NO_OVERLAP
+    )
+    assert supports_aux_stream.call_args_list == [call(8), call(16)]
 
 
 def test_aux_stream_output_lifetime_extends_to_consumer(monkeypatch) -> None:

@@ -49,6 +49,20 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             self.moe_kernel is not None and self.moe_kernel.can_overlap_shared_experts
         )
 
+    def supports_shared_experts_aux_stream(self, num_tokens: int) -> bool:
+        """Whether the selected expert kernel can overlap another CUDA stream."""
+        if self.moe_kernel is None:
+            return True
+        experts = getattr(self.moe_kernel, "fused_experts", None)
+        supports_overlap = getattr(
+            experts,
+            "supports_shared_experts_aux_stream",
+            None,
+        )
+        if supports_overlap is None:
+            return True
+        return bool(supports_overlap(int(num_tokens)))
+
     @abstractmethod
     def create_weights(
         self,

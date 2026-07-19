@@ -89,6 +89,7 @@ def _make_fake_b12x_experts() -> b12x_moe.B12xExperts:
     experts._activation_amax_base_num_layers = None
     experts._activation_amax_state_key = None
     experts._activation_amax_layer_idx = None
+    experts._aux_stream_overlap_by_tokens = {}
     return experts
 
 
@@ -129,6 +130,39 @@ def test_non_b12x_moe_runner_keeps_generic_custom_op(monkeypatch) -> None:
     forward_entry = runner._select_forward()
 
     assert forward_entry._qualified_op_name == "vllm::moe_forward"
+
+
+def test_b12x_shared_expert_overlap_follows_launch_plan_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "B12X_MOE_FORCE_A8",
+        "B12X_FORCE_MOE_A8",
+        "B12X_MOE_FORCE_A16",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    plans = []
+    plan = object()
+
+    def fake_plan(**kwargs):
+        plans.append(kwargs)
+        return plan
+
+    monkeypatch.setattr(b12x_moe, "_plan_b12x_moe_execution", fake_plan)
+    monkeypatch.setattr(
+        b12x_moe,
+        "_b12x_moe_plan_supports_aux_stream_overlap",
+        lambda candidate: candidate is plan,
+    )
+    experts = _make_fake_b12x_experts()
+
+    assert experts.supports_shared_experts_aux_stream(8)
+    assert experts.supports_shared_experts_aux_stream(8)
+
+    assert len(plans) == 1
+    assert plans[0]["tokens"] == 8
+    assert plans[0]["topk"] == 4
+    assert plans[0]["quant_mode"] == "nvfp4"
 
 
 def test_b12x_moe_custom_op_matches_generic_mutation_contract() -> None:

@@ -296,11 +296,16 @@ class MoERunner(MoERunnerInterface):
         self._shared_experts: SharedExperts | None = None
         if shared_experts is not None:
             can_overlap = lambda: self._quant_method.mk_can_overlap_shared_experts
+
+            def supports_aux_stream(num_tokens: int) -> bool:
+                return self._quant_method.supports_shared_experts_aux_stream(num_tokens)
+
             self._shared_experts = SharedExperts(
                 shared_experts,
                 moe_config=moe_config,
                 enable_dbo=enable_dbo,
                 mk_can_overlap_shared_experts=can_overlap,
+                experts_support_aux_stream=supports_aux_stream,
             )
 
         # Needed for string -> MoERunner layer lookup in custom ops.

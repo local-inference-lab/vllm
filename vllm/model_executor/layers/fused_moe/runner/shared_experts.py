@@ -43,6 +43,7 @@ class SharedExperts(torch.nn.Module):
         moe_config: FusedMoEConfig,
         enable_dbo: bool,
         mk_can_overlap_shared_experts: Callable[[], bool],
+        experts_support_aux_stream: Callable[[int], bool],
     ):
         super().__init__()
 
@@ -56,6 +57,7 @@ class SharedExperts(torch.nn.Module):
         self._moe_config = moe_config
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
+        self._experts_support_aux_stream = experts_support_aux_stream
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
@@ -99,6 +101,7 @@ class SharedExperts(torch.nn.Module):
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda()
             and self._stream is not None
+            and self._experts_support_aux_stream(int(hidden_states.shape[0]))
             and hidden_states.shape[0]
             <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
         )
