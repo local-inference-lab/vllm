@@ -19,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
     RequestOffloadState,
 )
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
@@ -62,6 +63,39 @@ def test_scheduler_reports_allocation_failure(request_runner):
 
     reduced = _reduce_kv_connector_stats(runner)
     assert reduced[_ConnectorMetricName.ALLOCATION_FAILURE] == 1
+
+
+def test_store_defers_chunk_until_block_id_is_tracked(request_runner):
+    """Store the ready prefix, then retry a chunk once its GPU block ID arrives."""
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=10,
+        async_scheduling=True,
+    )
+    runner.new_request(token_ids=[0] * 12)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    req_status = runner.connector_scheduler._req_status["0"]
+    req_status.update_offload_keys()
+    group_state = req_status.group_states[0]
+    group_state.block_ids.extend([1, 2])
+
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"0": 12}
+    first_jobs = runner.connector_scheduler._build_store_jobs(scheduler_output)
+
+    assert len(first_jobs) == 1
+    assert next(iter(first_jobs.values())).src_spec.block_ids.tolist() == [1, 2]
+    assert group_state.next_stored_chunk_idx == 2
+
+    group_state.block_ids.append(3)
+    second_jobs = runner.connector_scheduler._build_store_jobs(scheduler_output)
+
+    assert len(second_jobs) == 1
+    assert next(iter(second_jobs.values())).src_spec.block_ids.tolist() == [3]
+    assert group_state.next_stored_chunk_idx == 3
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])

@@ -327,16 +327,15 @@ class RequestOffloadState:
             num_chunks = max(0, num_chunks - 1)
         return num_chunks
 
-    def advance_stored_idx(self, num_offloadable_tokens: int) -> None:
-        # max(): at the prefill->decode transition of a chunk-aligned prompt,
-        # storable_chunks drops by one (the eagle exclusion kicks in), and the
-        # index must not move backwards past already-stored chunks.
-        for group_config, group_state in zip(
-            self.config.kv_group_configs, self.group_states
+    def advance_stored_idx(self, num_chunks_by_group: Sequence[int]) -> None:
+        # Keep the cursor monotonic: the EAGLE exclusion can lower a group's
+        # storable boundary at the prefill-to-decode transition.
+        for num_chunks, group_state in zip(
+            num_chunks_by_group, self.group_states, strict=True
         ):
             group_state.next_stored_chunk_idx = max(
                 group_state.next_stored_chunk_idx,
-                self.storable_chunks(group_config, num_offloadable_tokens),
+                num_chunks,
             )
 
     def update_num_hit_chunks(self, num_cached_tokens: int) -> None:
@@ -950,14 +949,38 @@ class OffloadingConnectorScheduler:
 
             # Filter out chunks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
-            new_offload_keys: list[OffloadKey] = []
+            group_chunk_ends: list[int] = []
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
-                num_chunks = req_status.storable_chunks(
+                num_storable_chunks = req_status.storable_chunks(
                     group_config, num_offloadable_tokens
                 )
+                num_tracked_chunks = len(group_state.block_ids) // blocks_per_chunk
+                num_chunks = min(
+                    num_storable_chunks,
+                    len(group_state.offload_keys),
+                    num_tracked_chunks,
+                )
+                group_chunk_ends.append(num_chunks)
+                if num_chunks < num_storable_chunks:
+                    logger.debug(
+                        "Request %s deferring group %d offload chunks: "
+                        "storable=%d keys=%d tracked_blocks=%d",
+                        req_id,
+                        group_config.group_idx,
+                        num_storable_chunks,
+                        len(group_state.offload_keys),
+                        len(group_state.block_ids),
+                    )
 
+            new_offload_keys: list[OffloadKey] = []
+            for group_config, group_state, num_chunks in zip(
+                self.config.kv_group_configs,
+                req_status.group_states,
+                group_chunk_ends,
+                strict=True,
+            ):
                 start_chunk_idx = group_state.next_stored_chunk_idx
                 if num_chunks <= start_chunk_idx:
                     continue
@@ -972,7 +995,6 @@ class OffloadingConnectorScheduler:
                     + blocks_per_chunk
                     - 1 : num_chunks * blocks_per_chunk : blocks_per_chunk
                 ]
-                assert len(offload_keys) == len(offload_block_ids)
 
                 alignment_chunk_count = group_config.alignment_chunk_count
                 tail = group_config.sliding_window_size_in_chunks
@@ -996,7 +1018,7 @@ class OffloadingConnectorScheduler:
                     new_offload_keys.append(offload_key)
 
             if not new_offload_keys:
-                req_status.advance_stored_idx(num_offloadable_tokens)
+                req_status.advance_stored_idx(group_chunk_ends)
                 self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
@@ -1012,7 +1034,7 @@ class OffloadingConnectorScheduler:
                 continue
 
             if not store_output.keys_to_store:
-                req_status.advance_stored_idx(num_offloadable_tokens)
+                req_status.advance_stored_idx(group_chunk_ends)
                 self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
@@ -1025,14 +1047,14 @@ class OffloadingConnectorScheduler:
             src_block_ids: list[int] = []
             sliding_window_block_ids: list[int] = []
             non_sliding_window_block_ids: list[int] = []
-            for group_config, group_state in zip(
-                self.config.kv_group_configs, req_status.group_states
+            for group_config, group_state, num_chunks in zip(
+                self.config.kv_group_configs,
+                req_status.group_states,
+                group_chunk_ends,
+                strict=True,
             ):
                 is_sliding_window = (
                     group_config.sliding_window_size_in_chunks is not None
-                )
-                num_chunks = req_status.storable_chunks(
-                    group_config, num_offloadable_tokens
                 )
                 start_chunk_idx = group_state.next_stored_chunk_idx
                 block_ids = group_state.block_ids
