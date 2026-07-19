@@ -1532,10 +1532,20 @@ def graph_capture(
         if _DCP is not None and get_dcp_group().world_size > 1
         else nullcontext()
     )
+    if _DCP is not None and get_dcp_group().world_size > 1:
+        # Import locally to avoid making distributed initialization depend on
+        # attention modules. The helper is a no-op until DCP warmup creates a
+        # B12X pool for this process group.
+        from vllm.v1.attention.ops.dcp_alltoall import capture_b12x_dcp_a2a
+
+        maybe_b12x_dcp_capture = capture_b12x_dcp_a2a(get_dcp_group(), context.stream)
+    else:
+        maybe_b12x_dcp_capture = nullcontext()
     with (
         get_tp_group().graph_capture(context),
         get_pp_group().graph_capture(context),
         maybe_dcp_capture,
+        maybe_b12x_dcp_capture,
     ):
         yield context
 

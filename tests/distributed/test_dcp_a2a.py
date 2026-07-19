@@ -10,6 +10,7 @@ Tests cover:
 
 import importlib.util
 import math
+from contextlib import contextmanager
 from typing import Any
 
 import multiprocess as mp
@@ -536,6 +537,122 @@ def test_b12x_pool_init_consensus_uses_exchange_group(
     assert captured["tensor_device"] == device
     assert captured["group"] is device_group
     assert captured["op"] == dist.ReduceOp.MAX
+
+
+def test_b12x_pool_uses_independent_stream_channels(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    captured: dict[str, Any] = {}
+
+    class _FakePool:
+        @classmethod
+        def from_exchange_group(cls, **kwargs):
+            captured.update(kwargs)
+            return cls()
+
+        def for_stream(self):
+            captured["warmed"] = True
+
+    group = _FakeCPGroup(2, object())  # type: ignore[arg-type]
+    monkeypatch.setattr(dcp_alltoall, "_B12X_DCP_A2A_POOLS", {})
+    monkeypatch.setattr(dcp_alltoall, "_B12X_DCP_A2A_DISABLED", set())
+    monkeypatch.setattr(dcp_alltoall, "_load_b12x_dcp_a2a_pool", lambda: _FakePool)
+    monkeypatch.setattr(dcp_alltoall, "_b12x_dcp_init_failed", lambda *args: False)
+    monkeypatch.setattr(
+        dcp_alltoall.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: False,
+    )
+
+    pool = dcp_alltoall._get_b12x_dcp_a2a_pool(
+        group,  # type: ignore[arg-type]
+        device=torch.device("cuda:0"),
+        total_heads=64,
+        head_dim=512,
+        query_head_dim=576,
+        max_batch_size=64,
+    )
+
+    assert pool is not None
+    assert captured["single_channel"] is False
+    assert captured["warmed"] is True
+
+
+def test_b12x_dcp_capture_selects_only_current_group_pools(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    events = []
+
+    class _FakePool:
+        def __init__(self, name):
+            self.name = name
+
+        @contextmanager
+        def capture(self, *, stream):
+            events.append(("enter", self.name, stream))
+            try:
+                yield
+            finally:
+                events.append(("exit", self.name, stream))
+
+    device_group = object()
+    group = _FakeCPGroup(2, device_group)  # type: ignore[arg-type]
+    stream = object()
+    pools = {
+        (id(device_group), 0, 64, 512, 576, 64): _FakePool("output"),
+        (id(device_group), 0, 64, 576, 576, 64): _FakePool("query"),
+        (id(object()), 0, 64, 512, 576, 64): _FakePool("foreign"),
+    }
+    monkeypatch.setattr(dcp_alltoall, "_B12X_DCP_A2A_POOLS", pools)
+
+    with dcp_alltoall.capture_b12x_dcp_a2a(group, stream):  # type: ignore[arg-type]
+        events.append(("body", None, stream))
+
+    assert events == [
+        ("enter", "output", stream),
+        ("enter", "query", stream),
+        ("body", None, stream),
+        ("exit", "query", stream),
+        ("exit", "output", stream),
+    ]
+
+
+def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
+    from vllm.distributed import parallel_state
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    events = []
+
+    class _FakeGroup:
+        world_size = 2
+
+        @contextmanager
+        def graph_capture(self, context):
+            yield context
+
+    tp_group = _FakeGroup()
+    pp_group = _FakeGroup()
+    dcp_group = _FakeGroup()
+    stream = object()
+    context = parallel_state.GraphCaptureContext(stream)  # type: ignore[arg-type]
+
+    @contextmanager
+    def fake_b12x_capture(group, selected_stream):
+        events.append((group, selected_stream))
+        yield
+
+    monkeypatch.setattr(parallel_state, "_DCP", dcp_group)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: pp_group)
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: dcp_group)
+    monkeypatch.setattr(dcp_alltoall, "capture_b12x_dcp_a2a", fake_b12x_capture)
+
+    with parallel_state.graph_capture(torch.device("cpu"), context) as actual:
+        assert actual is context
+
+    assert events == [(dcp_group, stream)]
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")

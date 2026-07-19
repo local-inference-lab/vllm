@@ -80,6 +80,20 @@ def _parse_byte_size(value: str) -> int:
     return int(value)
 
 
+def _b12x_pcie_oneshot_limits() -> tuple[int, int, int]:
+    allreduce_max_size = _parse_byte_size(envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE)
+    fused_max_size = _parse_byte_size(
+        envs.VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE
+    )
+    if allreduce_max_size < 0 or fused_max_size < 0:
+        raise ValueError("b12x PCIe oneshot size limits must be non-negative")
+    # The pool only dispatches tensors within these limits. Reserving the
+    # scheduler's full prefill tensor capacity per stream wastes hundreds of
+    # MiB once target and draft graphs use independent channels.
+    buffer_size = max(allreduce_max_size, fused_max_size, 16)
+    return allreduce_max_size, fused_max_size, buffer_size
+
+
 @lru_cache(maxsize=1)
 def _load_b12x_pcie_oneshot_pool() -> Any | None:
     try:
@@ -424,9 +438,8 @@ class CustomAllreduce:
                     "sparkinfer.comm.pcie.OneshotAllReducePool is unavailable."
                 )
                 return
-            # The largest allreduce the model can issue (prefill chunk x
-            # hidden) determines buffer capacity. Dispatch crossovers come
-            # from envs below so startup does not benchmark the serving GPUs.
+            # DMA must accommodate the largest scheduled prefill tensor. The
+            # oneshot pool only needs its much smaller dispatch cutoffs.
             try:
                 from vllm.config import get_current_vllm_config
 
@@ -446,6 +459,11 @@ class CustomAllreduce:
                 )
             pcie_buffer_size = max_num_batched_tokens * model_hidden_size * 2
             pcie_single_channel = envs.VLLM_PCIE_ONESHOT_SINGLE_CHANNEL
+            (
+                self._pcie_allreduce_max_size,
+                self._pcie_fused_add_rms_norm_max_size,
+                pcie_oneshot_buffer_size,
+            ) = _b12x_pcie_oneshot_limits()
             if self.nccl_group is None:
                 logger.warning(
                     "Custom allreduce is disabled because b12x PCIe oneshot "
@@ -453,8 +471,6 @@ class CustomAllreduce:
                 )
                 return
             self.max_size = pcie_buffer_size
-            self._pcie_allreduce_max_size = 0
-            self._pcie_fused_add_rms_norm_max_size = 0
             self.rank = rank
             self.world_size = world_size
             self.fully_connected = False
@@ -464,8 +480,8 @@ class CustomAllreduce:
                 pcie_runtime = pool_cls.from_exchange_group(
                     exchange_group=self.nccl_group,
                     device=self.device,
-                    eager_buffer_bytes=pcie_buffer_size,
-                    max_size=pcie_buffer_size,
+                    eager_buffer_bytes=pcie_oneshot_buffer_size,
+                    max_size=pcie_oneshot_buffer_size,
                     single_channel=pcie_single_channel,
                 )
                 pcie_runtime.for_stream()
@@ -544,12 +560,6 @@ class CustomAllreduce:
                     self._pcie_dma = dma
                     logger.debug("b12x PCIe DMA allreduce wire mode: %s", dma.wire_mode)
 
-            self._pcie_allreduce_max_size = _parse_byte_size(
-                envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE
-            )
-            self._pcie_fused_add_rms_norm_max_size = _parse_byte_size(
-                envs.VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE
-            )
             if rank == 0:
                 logger.info(
                     "Configured b12x PCIe crossovers: "
@@ -562,12 +572,14 @@ class CustomAllreduce:
             logger.debug(
                 "Using b12x PCIe oneshot allreduce backend "
                 "(world_size=%d, allreduce_max_size=%d, "
-                "fused_add_rms_norm_max_size=%d, buffer_size=%d, "
+                "fused_add_rms_norm_max_size=%d, oneshot_buffer_size=%d, "
+                "dma_buffer_size=%d, "
                 "single_channel=%s).",
                 world_size,
                 self._pcie_allreduce_max_size,
                 self._pcie_fused_add_rms_norm_max_size,
-                self.max_size,
+                pcie_oneshot_buffer_size,
+                pcie_buffer_size,
                 pcie_single_channel,
             )
             return

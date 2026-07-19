@@ -230,7 +230,7 @@ if TYPE_CHECKING:
     VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
     VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
     VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA: bool = True
-    VLLM_PCIE_ONESHOT_SINGLE_CHANNEL: bool = True
+    VLLM_PCIE_ONESHOT_SINGLE_CHANNEL: bool = False
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
@@ -1818,9 +1818,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA": lambda: (
         os.getenv("VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA", "1") != "0"
     ),
-    # Use a single channel for the b12x PCIe oneshot allreduce.
+    # Reuse one b12x PCIe oneshot channel across CUDA streams. This saves
+    # buffers but is unsafe when target and draft graphs replay concurrently.
     "VLLM_PCIE_ONESHOT_SINGLE_CHANNEL": lambda: (
-        os.getenv("VLLM_PCIE_ONESHOT_SINGLE_CHANNEL", "1").strip().lower()
+        os.getenv("VLLM_PCIE_ONESHOT_SINGLE_CHANNEL", "0").strip().lower()
         not in ("", "0", "false", "no", "off")
     ),
     # Control the workspace buffer size for the FlashInfer backend.
