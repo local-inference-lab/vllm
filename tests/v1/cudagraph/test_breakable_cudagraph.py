@@ -17,6 +17,27 @@ import torch
 os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
 
 
+def test_cudagraph_manager_clear_releases_capture_state():
+    from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
+
+    manager = ModelCudaGraphManager.__new__(ModelCudaGraphManager)
+    manager.graphs = {object(): object()}
+    manager._graphs_captured = True
+    manager.breakable_cg_runner = object()
+    manager.hidden_states = object()
+    manager.aux_hidden_states = [object()]
+    manager.intermediate_tensors = object()
+
+    manager.clear()
+
+    assert manager.graphs == {}
+    assert not manager._graphs_captured
+    assert manager.breakable_cg_runner is None
+    assert manager.hidden_states is None
+    assert manager.aux_hidden_states == []
+    assert manager.intermediate_tensors is None
+
+
 def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
     from vllm.config import CUDAGraphMode
     from vllm.v1.worker.gpu.cudagraph_utils import (

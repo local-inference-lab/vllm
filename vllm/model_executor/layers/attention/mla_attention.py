@@ -318,6 +318,47 @@ def _can_use_b12x_dcp_prefill_workspace(
     )
 
 
+def _estimate_dcp_ag_rs_transient_bytes(
+    *,
+    num_tokens: int,
+    local_heads: int,
+    dcp_world_size: int,
+    q_head_dim: int,
+    output_head_dim: int,
+    kv_lora_rank: int,
+    v_head_dim: int,
+    project_before_merge: bool,
+) -> int:
+    """Upper-bound simultaneously live eager DCP AG/RS attention tensors."""
+    if num_tokens <= 0 or local_heads <= 0 or dcp_world_size <= 1:
+        return 0
+
+    bf16_bytes = 2
+    fp32_bytes = 4
+    global_heads = local_heads * dcp_world_size
+
+    gathered_query = num_tokens * global_heads * q_head_dim * bf16_bytes
+    attention_output = num_tokens * global_heads * output_head_dim * bf16_bytes
+    # CUDA communicator materializes a head-major contiguous RS input, then an
+    # output and its token-major contiguous return while attention_output lives.
+    reduce_scatter = attention_output + (
+        2 * num_tokens * local_heads * output_head_dim * bf16_bytes
+    )
+    gathered_lse = (dcp_world_size + 1) * num_tokens * global_heads * fp32_bytes
+    gathered_w_uv = (
+        global_heads * kv_lora_rank * v_head_dim * bf16_bytes
+        if project_before_merge
+        else 0
+    )
+    return (
+        gathered_query
+        + attention_output
+        + reduce_scatter
+        + gathered_lse
+        + gathered_w_uv
+    )
+
+
 def _extract_single_layer_index(layer_name: str) -> int | None:
     int_vals = [int(part) for part in layer_name.split(".") if part.isdecimal()]
     return int_vals[0] if len(int_vals) == 1 else None
@@ -697,6 +738,78 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             compile_native=True,
         )
 
+    def _get_sparse_memory_profile_bytes(self) -> int:
+        if (
+            not envs.VLLM_MEMORY_PROFILE_INCLUDE_ATTN
+            or self.attn_backend.get_name() != "B12X_MLA_SPARSE"
+            or self.impl.dcp_world_size <= 1
+        ):
+            return 0
+
+        max_tokens = int(getattr(self.impl, "_max_batched", 0))
+        if max_tokens <= 0:
+            return 0
+
+        # Pure A2A does not enter the allocating NCCL AG/RS path. Hybrid A2A
+        # enters it immediately above the configured small-batch cap.
+        if self.dcp_a2a:
+            if self.dcp_a2a_max_tokens <= 0 or self.dcp_a2a_large_backend == "a2a":
+                return 0
+            first_ag_rs_row = self.dcp_a2a_max_tokens + 1
+        else:
+            first_ag_rs_row = 1
+
+        project_threshold = self.dcp_project_before_merge_min_prefill_tokens
+        workspace_start = max(1025, project_threshold + 1)
+        workspace_eligible = (
+            workspace_start <= max_tokens
+            and _can_use_b12x_dcp_prefill_workspace(
+                enabled=envs.VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE,
+                project_before_merge=self.dcp_project_before_merge,
+                dcp_use_b12x=False,
+                num_tokens=workspace_start,
+                max_num_tokens=max_tokens,
+                non_dbo_workspace=getattr(self.impl, "dcp_workspace_non_dbo", False),
+                is_sparse_impl=self.impl.is_sparse,
+                backend_name=self.attn_backend.get_name(),
+                is_capturing=False,
+            )
+        )
+        last_ag_rs_row = (
+            min(max_tokens, workspace_start - 1) if workspace_eligible else max_tokens
+        )
+        if first_ag_rs_row > last_ag_rs_row:
+            return 0
+
+        candidates: list[tuple[int, bool]] = []
+        if not self.dcp_project_before_merge:
+            candidates.append((last_ag_rs_row, False))
+        else:
+            unprojected_rows = min(last_ag_rs_row, project_threshold)
+            if unprojected_rows >= first_ag_rs_row:
+                candidates.append((unprojected_rows, False))
+            if not workspace_eligible and last_ag_rs_row > project_threshold:
+                candidates.append((last_ag_rs_row, True))
+
+        return max(
+            (
+                _estimate_dcp_ag_rs_transient_bytes(
+                    num_tokens=num_tokens,
+                    local_heads=self.num_heads,
+                    dcp_world_size=self.impl.dcp_world_size,
+                    q_head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+                    output_head_dim=(
+                        self.v_head_dim if projected else self.kv_lora_rank
+                    ),
+                    kv_lora_rank=self.kv_lora_rank,
+                    v_head_dim=self.v_head_dim,
+                    project_before_merge=projected,
+                )
+                for num_tokens, projected in candidates
+            ),
+            default=0,
+        )
+
     @property
     def chunked_prefill_workspace_size(self) -> int:
         if self._chunked_prefill_workspace_size is None:
@@ -828,6 +941,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     device=k_c_normed.device,
                     dtype=k_c_normed.dtype,
                 )
+            else:
+                profile_workspace_bytes = self._get_sparse_memory_profile_bytes()
+                if profile_workspace_bytes > 0:
+                    _ = torch.empty(
+                        (profile_workspace_bytes,),
+                        device=k_c_normed.device,
+                        dtype=torch.uint8,
+                    )
+                    logger.info_once(
+                        "Including %.2f MiB of B12X sparse DCP transient "
+                        "memory in the profile peak",
+                        profile_workspace_bytes / (1 << 20),
+                    )
 
             # The zero fill is required when used with DP + EP
             # to ensure all ranks within a DP group compute the

@@ -132,6 +132,16 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             progress_bar_desc="Capturing decode CUDA graphs",
         )
 
+    def get_cudagraph_managers(self) -> tuple[SpeculatorCudaGraphManager, ...]:
+        return tuple(
+            manager
+            for manager in (
+                self.prefill_cudagraph_manager,
+                self.decode_cudagraph_manager,
+            )
+            if manager is not None
+        )
+
     @torch.inference_mode()
     def propose(
         self,
