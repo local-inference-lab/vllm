@@ -412,7 +412,7 @@ class Exl3Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Exl3LinearMethod(self)
         if isinstance(layer, RoutedExperts):
-            if not self._moe_prefix_is_exl3(prefix):
+            if not self._moe_prefix_is_exl3(prefix, layer):
                 return None
             return Exl3MoEMethod(self, layer.moe_config)
         return None
@@ -461,12 +461,26 @@ class Exl3Config(QuantizationConfig):
             for source in source_leaves
         )
 
-    def _moe_prefix_is_exl3(self, prefix: str) -> bool:
+    def _moe_prefix_is_exl3(
+        self, prefix: str, layer: torch.nn.Module | None = None
+    ) -> bool:
+        # Use the layer's checkpoint projection names (the same fields
+        # _validate_codebooks keys off) so remapped-projection MoE
+        # checkpoints are still detected; fall back to the defaults when the
+        # layer variant does not carry them.
+        projections = tuple(
+            getattr(layer, attr, default)
+            for attr, default in (
+                ("ckpt_gate_proj_name", "gate_proj"),
+                ("ckpt_up_proj_name", "up_proj"),
+                ("ckpt_down_proj_name", "down_proj"),
+            )
+        )
         expert_prefixes = (f"{prefix}.0", f"{prefix}.experts.0")
         return any(
             all(
                 self._is_exl3_prefix(f"{expert}.{projection}")
-                for projection in ("gate_proj", "up_proj", "down_proj")
+                for projection in projections
             )
             for expert in expert_prefixes
         )
