@@ -8,6 +8,7 @@ from unittest.mock import Mock, call
 import torch
 
 import vllm.model_executor.layers.fused_moe.runner.shared_experts as shared_module
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
@@ -73,3 +74,30 @@ def test_aux_stream_output_lifetime_extends_to_consumer(monkeypatch) -> None:
     shared_experts._layer.assert_called_once_with(shared_experts_input)
     consumer_stream.wait_stream.assert_called_once_with(aux_stream)
     output.record_stream.assert_called_once_with(consumer_stream)
+
+
+def test_aux_shared_experts_are_enqueued_before_resident_moe() -> None:
+    runner = object.__new__(MoERunner)
+    events: list[object] = []
+    fused_out = object()
+    shared_out = object()
+
+    runner._maybe_apply_shared_experts = lambda _input, order: events.append(order)
+    runner.routed_experts = SimpleNamespace(
+        quant_method=SimpleNamespace(is_monolithic=True),
+        forward_monolithic=lambda **_kwargs: events.append("routed") or fused_out,
+    )
+    runner._shared_experts = SimpleNamespace(output=shared_out)
+
+    result = runner._apply_quant_method(
+        hidden_states=Mock(),
+        router_logits=Mock(),
+        shared_experts_input=Mock(),
+    )
+
+    assert events == [
+        SharedExpertsOrder.NO_OVERLAP,
+        SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+        "routed",
+    ]
+    assert result == (shared_out, fused_out)

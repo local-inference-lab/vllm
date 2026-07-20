@@ -602,6 +602,16 @@ class MoERunner(MoERunnerInterface):
         self._maybe_apply_shared_experts(
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
+        # Enqueue auxiliary shared-expert work before the routed kernel. Some
+        # fused MoE kernels use a resident-grid barrier; launching that grid
+        # first can occupy every SM and prevent later auxiliary work from ever
+        # becoming resident. The shared stream already waits on the input-ready
+        # event, so submitting it here preserves overlap with routing and MoE
+        # while guaranteeing forward progress.
+        self._maybe_apply_shared_experts(
+            shared_experts_input,
+            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+        )
 
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
@@ -626,11 +636,6 @@ class MoERunner(MoERunnerInterface):
                 shared_experts=self._shared_experts,
                 shared_experts_input=shared_experts_input,
             )
-
-        self._maybe_apply_shared_experts(
-            shared_experts_input,
-            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-        )
 
         return (
             self._shared_experts.output if self._shared_experts is not None else None,
