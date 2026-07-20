@@ -417,11 +417,13 @@ class Exl3Config(QuantizationConfig):
         else:
             candidates.append(f"model.{prefix}")
 
-        # Multimodal wrappers often add an extra `.model` or
-        # `.language_model` segment relative to vLLM's text-only module.
+        # Multimodal wrappers often add an extra `model` or `language_model`
+        # segment relative to vLLM's text-only module — interior
+        # (`model.language_model.layers...`) or leading
+        # (`language_model.lm_head`), so leading segments collapse too.
         parts = prefix.split(".")
         for removable in ("model", "language_model"):
-            for idx in range(1, len(parts) - 1):
+            for idx in range(0, len(parts) - 1):
                 if parts[idx] != removable:
                     continue
                 collapsed = ".".join(parts[:idx] + parts[idx + 1 :])
