@@ -111,17 +111,24 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
     monkeypatch.setattr(model_runner_module.gc, "collect", lambda: None)
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda: next(memory_info))
     monkeypatch.setattr(
-        torch.accelerator, "get_memory_info", lambda: next(memory_info)
+        model_runner_module,
+        "checkpoint_b12x_graph_channels",
+        lambda: events.append("checkpoint") or ("channel-checkpoint",),
     )
     monkeypatch.setattr(
         model_runner_module,
         "rollback_b12x_graph_channels",
-        lambda _: events.append("rollback"),
+        lambda checkpoint: (
+            events.append("rollback")
+            if checkpoint == ("channel-checkpoint",)
+            else pytest.fail("rollback received the wrong channel checkpoint")
+        ),
     )
 
     assert runner.profile_cudagraph_memory() == 50
-    assert events == ["capture", "cleanup", "rollback"]
+    assert events == ["checkpoint", "capture", "cleanup", "rollback"]
     assert manager.pool is production_pool
     assert wrapper.graph_pool is production_pool
 

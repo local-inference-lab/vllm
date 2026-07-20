@@ -890,8 +890,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.empty_cache()
         torch.accelerator.synchronize()
         start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
-        draft_channel_checkpoints = ()
+        graph_channel_checkpoints = ()
         try:
+            # Both target and draft captures can allocate graph-owned B12X
+            # channels. Snapshot before either capture so the disposable
+            # profiling pass cannot leave stale channels behind.
+            graph_channel_checkpoints = checkpoint_b12x_graph_channels()
             with self.maybe_setup_dummy_loras(self.lora_config):
                 self.cudagraph_manager.capture(
                     self.model,
@@ -907,7 +911,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     progress_bar_desc="Profiling CUDA graph memory",
                 )
                 if self.speculator is not None:
-                    draft_channel_checkpoints = checkpoint_b12x_graph_channels()
                     self.speculator.capture()
                 self._zero_cudagraph_capture_kv_blocks()
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
@@ -919,7 +922,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 try:
                     self._cleanup_cudagraph_memory_profile()
                 finally:
-                    rollback_b12x_graph_channels(draft_channel_checkpoints)
+                    rollback_b12x_graph_channels(graph_channel_checkpoints)
             finally:
                 for manager in managers:
                     manager.pool = original_manager_pools[id(manager)]
