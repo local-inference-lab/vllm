@@ -35,9 +35,11 @@ from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
+    checkpoint_b12x_graph_channels,
     get_dcp_group,
     get_pp_group,
     prepare_communication_buffer_for_model,
+    rollback_b12x_graph_channels,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -888,6 +890,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.empty_cache()
         torch.accelerator.synchronize()
         start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+        draft_channel_checkpoints = ()
         try:
             with self.maybe_setup_dummy_loras(self.lora_config):
                 self.cudagraph_manager.capture(
@@ -904,25 +907,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     progress_bar_desc="Profiling CUDA graph memory",
                 )
                 if self.speculator is not None:
+                    draft_channel_checkpoints = checkpoint_b12x_graph_channels()
                     self.speculator.capture()
                 self._zero_cudagraph_capture_kv_blocks()
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
             gross_cuda_graph_size = max(start_free_gpu_memory - end_free_gpu_memory, 0)
         finally:
-            for manager in managers:
-                manager.pool = original_manager_pools[id(manager)]
-            wrappers = list(CUDAGraphWrapper._all_instances) + list(
-                BreakableCUDAGraphWrapper._all_instances
-            )
-            for wrapper in wrappers:
-                original_pool = original_wrapper_pools.get(id(wrapper))
-                if id(wrapper) in original_wrapper_pools:
-                    wrapper.graph_pool = original_pool
-                else:
-                    wrapper.graph_pool = current_platform.get_global_graph_pool()
-            del profiling_pool
-            self._cleanup_cudagraph_memory_profile()
-            compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
+            try:
+                # Destroy disposable graphs while every manager and wrapper still
+                # points at the private pool that owns their allocations.
+                try:
+                    self._cleanup_cudagraph_memory_profile()
+                finally:
+                    rollback_b12x_graph_channels(draft_channel_checkpoints)
+            finally:
+                for manager in managers:
+                    manager.pool = original_manager_pools[id(manager)]
+                wrappers = list(CUDAGraphWrapper._all_instances) + list(
+                    BreakableCUDAGraphWrapper._all_instances
+                )
+                for wrapper in wrappers:
+                    original_pool = original_wrapper_pools.get(id(wrapper))
+                    if id(wrapper) in original_wrapper_pools:
+                        wrapper.graph_pool = original_pool
+                    else:
+                        wrapper.graph_pool = current_platform.get_global_graph_pool()
+                del profiling_pool
+                compilation_counter.num_cudagraph_captured = (
+                    saved_num_cudagraph_captured
+                )
 
         free_after_cleanup = torch.accelerator.get_memory_info()[0]
         retained_pool_size = max(start_free_gpu_memory - free_after_cleanup, 0)

@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import threading
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -36,6 +37,93 @@ def test_cudagraph_manager_clear_releases_capture_state():
     assert manager.hidden_states is None
     assert manager.aux_hidden_states == []
     assert manager.intermediate_tensors is None
+
+
+def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
+    from vllm.v1.worker.gpu import model_runner as model_runner_module
+
+    profile_pool = object()
+    production_pool = object()
+    events: list[str] = []
+
+    class FakeManager:
+        def __init__(self):
+            self.pool = production_pool
+
+        def needs_capture(self):
+            return True
+
+        def capture(self, *args, **kwargs):
+            assert self.pool is profile_pool
+            assert wrapper.graph_pool is profile_pool
+            events.append("capture")
+
+    class FakeWrapper:
+        def __init__(self):
+            self.graph_pool = production_pool
+
+    manager = FakeManager()
+    wrapper = FakeWrapper()
+    runner = model_runner_module.GPUModelRunner.__new__(
+        model_runner_module.GPUModelRunner
+    )
+    runner.vllm_config = object()
+    runner.cudagraph_manager = manager
+    runner.speculator = None
+    runner.lora_config = None
+    runner.model = object()
+    runner.model_state = object()
+    runner.input_buffers = object()
+    runner.intermediate_tensors = object()
+    runner.block_tables = object()
+    runner.attn_groups = object()
+    runner.kv_cache_config = object()
+    runner.use_aux_hidden_state_outputs = False
+    runner._init_minimal_kv_cache_for_profiling = lambda: None
+    runner.maybe_setup_dummy_loras = lambda _: nullcontext()
+    runner._zero_cudagraph_capture_kv_blocks = lambda: None
+
+    def cleanup():
+        events.append("cleanup")
+        assert manager.pool is profile_pool
+        assert wrapper.graph_pool is profile_pool
+
+    runner._cleanup_cudagraph_memory_profile = cleanup
+
+    memory_info = iter(((1000, 0), (900, 0), (950, 0)))
+    monkeypatch.setattr(
+        model_runner_module, "set_current_vllm_config", lambda _: nullcontext()
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "current_platform",
+        SimpleNamespace(
+            graph_pool_handle=lambda: profile_pool,
+            get_global_graph_pool=lambda: production_pool,
+        ),
+    )
+    monkeypatch.setattr(
+        model_runner_module.CUDAGraphWrapper, "_all_instances", [wrapper]
+    )
+    monkeypatch.setattr(
+        model_runner_module.BreakableCUDAGraphWrapper, "_all_instances", []
+    )
+    monkeypatch.setattr(model_runner_module.gc, "collect", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda: next(memory_info)
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "rollback_b12x_graph_channels",
+        lambda _: events.append("rollback"),
+    )
+
+    assert runner.profile_cudagraph_memory() == 50
+    assert events == ["capture", "cleanup", "rollback"]
+    assert manager.pool is production_pool
+    assert wrapper.graph_pool is production_pool
 
 
 def test_piecewise_capture_builds_fresh_metadata_for_both_passes():

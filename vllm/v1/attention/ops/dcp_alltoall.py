@@ -150,6 +150,37 @@ def _get_b12x_dcp_a2a_pool(
     return pool
 
 
+def checkpoint_b12x_dcp_a2a_channels(
+    cp_group: GroupCoordinator,
+) -> tuple[int, dict[Any, tuple[Any, Any]]]:
+    """Snapshot DCP pools before a throwaway graph capture."""
+    group_id = id(cp_group.device_group)
+    checkpoints = {
+        key: (pool, pool.checkpoint_channels())
+        for key, pool in _B12X_DCP_A2A_POOLS.items()
+        if key[0] == group_id
+    }
+    return group_id, checkpoints
+
+
+def rollback_b12x_dcp_a2a_channels(
+    checkpoint: tuple[int, dict[Any, tuple[Any, Any]]],
+) -> None:
+    """Restore DCP pools after their profiling graphs have been destroyed."""
+    group_id, checkpoints = checkpoint
+    for key, pool in list(_B12X_DCP_A2A_POOLS.items()):
+        if key[0] != group_id:
+            continue
+        saved = checkpoints.get(key)
+        if saved is None:
+            pool.close()
+            del _B12X_DCP_A2A_POOLS[key]
+            continue
+        saved_pool, channel_checkpoint = saved
+        if pool is not saved_pool:
+            pool.close()
+            _B12X_DCP_A2A_POOLS[key] = saved_pool
+        saved_pool.rollback_channels(channel_checkpoint)
 def _try_b12x_dcp_lse_reduce(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
