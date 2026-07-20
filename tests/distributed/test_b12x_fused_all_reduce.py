@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+import vllm.envs as envs
 import vllm.ir.ops
 from tests.compile.backend import TestBackend
 from vllm.compilation.passes.fusion import allreduce_rms_fusion
@@ -26,6 +27,7 @@ from vllm.config import (
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.device_communicators.custom_all_reduce import (
     CustomAllreduce,
+    _b12x_pcie_oneshot_limits,
     get_b12x_pcie_allreduce,
 )
 from vllm.distributed.parallel_state import get_tp_group, graph_capture
@@ -131,6 +133,14 @@ def test_b12x_fused_allreduce_zero_cutoff_disables_support() -> None:
     assert not custom_allreduce.supports_fused_add_rms_norm()
 
 
+def test_b12x_oneshot_defaults_to_stream_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_PCIE_ONESHOT_SINGLE_CHANNEL", raising=False)
+
+    assert not envs.environment_variables["VLLM_PCIE_ONESHOT_SINGLE_CHANNEL"]()
+
+
 def test_b12x_channel_checkpoint_delegates_to_runtime() -> None:
     custom_allreduce, runtime = make_b12x_custom_allreduce(
         allreduce_max_size=64,
@@ -144,6 +154,22 @@ def test_b12x_channel_checkpoint_delegates_to_runtime() -> None:
 
     runtime.checkpoint_channels.assert_called_once_with()
     runtime.rollback_channels.assert_called_once_with(checkpoint)
+
+
+def test_b12x_oneshot_buffer_tracks_dispatch_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "64KB")
+    monkeypatch.setenv(
+        "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE",
+        "84KB",
+    )
+
+    assert _b12x_pcie_oneshot_limits() == (
+        64 * 1024,
+        84 * 1024,
+        84 * 1024,
+    )
 
 
 def test_b12x_fused_custom_op_dispatch(monkeypatch) -> None:

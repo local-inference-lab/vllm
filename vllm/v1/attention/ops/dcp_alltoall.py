@@ -20,6 +20,7 @@ Reference: https://arxiv.org/abs/2507.07120
 
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
@@ -113,7 +114,7 @@ def _get_b12x_dcp_a2a_pool(
             total_heads=total_heads,
             head_dim=head_dim,
             query_head_dim=query_head_dim,
-            single_channel=True,
+            single_channel=False,
         )
         pool.for_stream()
     except Exception as exc:
@@ -151,6 +152,32 @@ def _get_b12x_dcp_a2a_pool(
     return pool
 
 
+@contextmanager
+def capture_b12x_dcp_a2a(
+    cp_group: GroupCoordinator,
+    stream: torch.cuda.Stream | None = None,
+):
+    """Bind each CUDA graph manager to independent B12X DCP channels.
+
+    Args:
+        cp_group: DCP group whose registered pools should enter capture.
+        stream: CUDA stream owned by the enclosing graph capture.
+    """
+    group_id = id(cp_group.device_group)
+    matching_pools = sorted(
+        (
+            (key, pool)
+            for key, pool in _B12X_DCP_A2A_POOLS.items()
+            if key[0] == group_id
+        ),
+        key=lambda item: item[0][1:],
+    )
+    with ExitStack() as stack:
+        for _, pool in matching_pools:
+            stack.enter_context(pool.capture(stream=stream))
+        yield
+
+
 def checkpoint_b12x_dcp_a2a_channels(
     cp_group: GroupCoordinator,
 ) -> tuple[int, dict[Any, tuple[Any, Any]]]:
@@ -182,6 +209,8 @@ def rollback_b12x_dcp_a2a_channels(
             pool.close()
             _B12X_DCP_A2A_POOLS[key] = saved_pool
         saved_pool.rollback_channels(channel_checkpoint)
+
+
 def _try_b12x_dcp_lse_reduce(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,

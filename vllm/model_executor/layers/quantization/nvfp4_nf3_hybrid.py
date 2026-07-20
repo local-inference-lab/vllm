@@ -333,6 +333,16 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         super().__init__(moe_config)
         self.quant_config = quant_config
 
+    def supports_shared_experts_aux_stream(self, num_tokens: int) -> bool:
+        """The hybrid B12X launches must own the device while they run.
+
+        Both the unified Grid188 decode and the per-tier fused fallback use
+        resident-grid software barriers. Concurrent shared-expert work can
+        occupy an SM needed by a barrier participant and deadlock the grid;
+        the resulting asynchronous fault may surface in a later CUDA op.
+        """
+        return False
+
     def maybe_make_prepare_finalize(
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,

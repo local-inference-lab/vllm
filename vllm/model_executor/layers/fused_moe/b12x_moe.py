@@ -451,6 +451,12 @@ def _plan_b12x_moe_execution(
     )
 
 
+def _b12x_moe_plan_supports_aux_stream_overlap(plan: Any) -> bool:
+    from b12x.integration import tp_moe_plan_supports_aux_stream_overlap
+
+    return bool(tp_moe_plan_supports_aux_stream_overlap(plan))
+
+
 def _b12x_scratch_nbytes(plan: Any) -> int:
     specs = plan.scratch_specs()
     if len(specs) != 1:
@@ -792,6 +798,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._activation_amax_base_num_layers = _current_config_num_hidden_layers()
         self._activation_amax_state_key: tuple[str, str, int] | None = None
         self._activation_amax_layer_idx: int | None = None
+        self._aux_stream_overlap_by_tokens: dict[int, bool] = {}
 
     def _quant_mode(self) -> str:
         source_format = self._source_format()
@@ -815,6 +822,38 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             logger.warning_once("B12X MoE force-A16 enabled: using quant_mode=w4a16.")
             return "w4a16"
         return "nvfp4" if self.quant_config.quant_dtype == "nvfp4" else "w4a16"
+
+    def supports_shared_experts_aux_stream(self, num_tokens: int) -> bool:
+        """Allow overlap only when B12X selected a barrier-free launch."""
+        num_tokens = max(int(num_tokens), 1)
+        cached = self._aux_stream_overlap_by_tokens.get(num_tokens)
+        if cached is not None:
+            return cached
+
+        prepared = self._lookup_prepared_experts()
+        if prepared is None:
+            return False
+        activation = self.moe_config.activation
+        swiglu_limit, swiglu_alpha, swiglu_beta = self._b12x_swiglu_params(activation)
+        quant_mode = self._quant_mode()
+        if (
+            not _supports_swiglu_limit(quant_mode)
+            and activation != MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        ):
+            swiglu_limit = None
+        plan = _plan_b12x_moe_execution(
+            tokens=num_tokens,
+            topk=int(self.moe_config.experts_per_token),
+            device=prepared.w1_fp4.device,
+            quant_mode=quant_mode,
+            experts=prepared,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
+        supports_overlap = _b12x_moe_plan_supports_aux_stream_overlap(plan)
+        self._aux_stream_overlap_by_tokens[num_tokens] = supports_overlap
+        return supports_overlap
 
     def _source_format(self) -> str:
         if self.quant_config.weight_quant_dtype == "nvfp4":

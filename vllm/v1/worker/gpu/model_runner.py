@@ -130,7 +130,7 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
-from vllm.v1.worker.workspace import lock_workspace
+from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
 
@@ -351,10 +351,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
             if isinstance(self.speculator, DraftModelSpeculator):
-                self.speculator.load_model(self.model)
-                eplb_models_added = self.eplb.maybe_register_speculator(
-                    self.speculator, self.speculative_config, load_dummy_weights
-                )
+                with use_workspace_lane(1):
+                    self.speculator.load_model(self.model)
+                    eplb_models_added = self.eplb.maybe_register_speculator(
+                        self.speculator, self.speculative_config, load_dummy_weights
+                    )
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -556,25 +557,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
-            # HACK(woosuk)
-            self.speculator.set_attn(
-                self.model_state,
-                self.kv_cache_config,
-                self.block_tables,
-                self.input_buffers,
-                self.attn_groups,
-            )
-            if hasattr(self.speculator, "set_num_cached_tokens"):
-                # DFlash/DSpark mask cache-restored tokens out of the draft's
-                # context (their draft context KV was never computed).
-                self.speculator.set_num_cached_tokens(
-                    self.req_states.num_cached_tokens.gpu,
-                    self.req_states.num_cached_tokens_np,
+            with use_workspace_lane(1):
+                # HACK(woosuk)
+                self.speculator.set_attn(
+                    self.model_state,
+                    self.kv_cache_config,
+                    self.block_tables,
+                    self.input_buffers,
+                    self.attn_groups,
                 )
+                if hasattr(self.speculator, "set_num_cached_tokens"):
+                    # DFlash/DSpark mask cache-restored tokens out of the draft's
+                    # context (their draft context KV was never computed).
+                    self.speculator.set_num_cached_tokens(
+                        self.req_states.num_cached_tokens.gpu,
+                        self.req_states.num_cached_tokens_np,
+                    )
         if self.speculator is not None:
             # After set_attn, so the speculator can size its cudagraph mode
             # to its own attention support.
-            self.speculator.init_cudagraph_manager(cudagraph_mode)
+            with use_workspace_lane(1):
+                self.speculator.init_cudagraph_manager(cudagraph_mode)
 
         self.kv_caches: list[torch.Tensor] = []
         kv_caches_dict = init_kv_cache(
@@ -716,27 +719,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            self.speculator.propose(
-                input_batch=input_batch,
-                attn_metadata=attn_metadata,
-                slot_mappings=slot_mappings_by_layer,
-                last_hidden_states=spec_hidden_states,
-                aux_hidden_states=aux_hidden_states,
-                num_sampled=torch.ones(
-                    input_batch.num_reqs, dtype=torch.int32, device=self.device
-                ),
-                num_rejected=torch.zeros(
-                    input_batch.num_reqs, dtype=torch.int32, device=self.device
-                ),
-                last_sampled=self.req_states.last_sampled_tokens,
-                next_prefill_tokens=self.req_states.next_prefill_tokens,
-                temperature=self.sampler.sampling_states.temperature.gpu,
-                seeds=self.sampler.sampling_states.seeds.gpu,
-                dummy_run=True,
-                skip_attn_for_dummy_run=skip_attn,
-                mm_inputs=mm_inputs,
-                is_profile=is_profile,
-            )
+            with use_workspace_lane(1):
+                self.speculator.propose(
+                    input_batch=input_batch,
+                    attn_metadata=attn_metadata,
+                    slot_mappings=slot_mappings_by_layer,
+                    last_hidden_states=spec_hidden_states,
+                    aux_hidden_states=aux_hidden_states,
+                    num_sampled=torch.ones(
+                        input_batch.num_reqs, dtype=torch.int32, device=self.device
+                    ),
+                    num_rejected=torch.zeros(
+                        input_batch.num_reqs, dtype=torch.int32, device=self.device
+                    ),
+                    last_sampled=self.req_states.last_sampled_tokens,
+                    next_prefill_tokens=self.req_states.next_prefill_tokens,
+                    temperature=self.sampler.sampling_states.temperature.gpu,
+                    seeds=self.sampler.sampling_states.seeds.gpu,
+                    dummy_run=True,
+                    skip_attn_for_dummy_run=skip_attn,
+                    mm_inputs=mm_inputs,
+                    is_profile=is_profile,
+                )
             if sps_debug is not None:
                 ev[2].record()
                 sps_debug.append(ev)
@@ -911,7 +915,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     progress_bar_desc="Profiling CUDA graph memory",
                 )
                 if self.speculator is not None:
-                    self.speculator.capture()
+                    with use_workspace_lane(1):
+                        self.speculator.capture()
                 self._zero_cudagraph_capture_kv_blocks()
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
             gross_cuda_graph_size = max(start_free_gpu_memory - end_free_gpu_memory, 0)
@@ -986,7 +991,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
             )
             if self.speculator is not None:
-                self.speculator.capture()
+                with use_workspace_lane(1):
+                    self.speculator.capture()
             self._zero_cudagraph_capture_kv_blocks()
 
         end_time = time.perf_counter()
@@ -1946,7 +1952,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            with record_function_or_nullcontext(f"vllm:v2/speculator/{phase}/propose"):
+            with (
+                use_workspace_lane(1),
+                record_function_or_nullcontext(f"vllm:v2/speculator/{phase}/propose"),
+            ):
                 draft_tokens = self.speculator.propose(
                     input_batch,
                     attn_metadata,
@@ -1989,7 +1998,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.verification_capacity_manager is not None
                 and not self.verification_capacity_manager.capacity_bypassed
             ):
-                draft_token_capacity = self.speculator.compute_capacities(input_batch)
+                with use_workspace_lane(1):
+                    draft_token_capacity = self.speculator.compute_capacities(
+                        input_batch
+                    )
                 assert draft_token_capacity is not None
                 self.verification_capacity_manager.update_capacities(
                     draft_token_capacity
