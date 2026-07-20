@@ -198,6 +198,13 @@ def _load_b12x_dense() -> Any:
         _B12X_DENSE_API = _B12X_UNAVAILABLE
         return None
     try:
+        # The fused dense entry performs its outer rotations through
+        # exllamav3_ext.had_r_128, and b12x imports that extension by module
+        # name. Resolve it here through the same VLLM_EXL3_ABI_SHIM /
+        # VLLM_EXL3_EXT_PATH contract as the parity path so b12x sees the
+        # shimmed, correctly-located extension instead of whatever an
+        # unshimmed site-packages import would find.
+        _load_exl3_ext()
         from b12x.moe.fused.w4a16 import (
             prepare_trellis256_dense_weight,
             run_trellis256_dense,
