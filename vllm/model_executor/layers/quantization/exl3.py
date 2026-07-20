@@ -3,14 +3,29 @@
 
 """EXL3 (ExLlamaV3 trellis) quantization support.
 
-This is deliberately the correctness backend.  Every logical checkpoint
-matrix is dispatched independently through ``exllamav3_ext.exl3_gemm``.  In
-particular, vLLM's packed QKV and gate/up modules are *not* treated as one EXL3
-matrix: each source matrix owns its own Hadamard vectors and codebook marker.
+Compute paths, in selection order:
 
-The extension is imported lazily on the first CUDA execution.  Importing this
+1. **Fused path (primary).** Modules whose checkpoint carries the MCG codebook
+   marker run through the b12x fused CuTeDSL trellis kernel
+   (``b12x.moe.fused.w4a16.run_trellis256_dense``): native EXL3 storage is
+   consumed zero-copy at 3/4/5/6 bpw, the full input-rotation -> GEMM ->
+   output-rotation chain executes as one compiled artifact, and the output is
+   byte-identical across batch size m — a property the split upstream
+   GEMV/GEMM/reconstruct ladder does not have. Selection happens once per
+   shard at weight-processing time; ineligible shards (legacy ``default`` or
+   MUL1 codebooks, or shapes the kernel rejects) fall back per-shard.
+2. **Parity path (fallback + oracle).** The bit-faithful wrapper around
+   ``exllamav3_ext.exl3_gemm``. Every logical checkpoint matrix is dispatched
+   independently: vLLM's packed QKV and gate/up modules are *not* treated as
+   one EXL3 matrix — each source matrix owns its own Hadamard vectors and
+   codebook marker.
+
+``VLLM_EXL3_FUSED=0`` forces the parity path everywhere (A/B switch).
+``VLLM_EXL3_LOG_PATH_SELECTION=1`` logs the chosen path per shard.
+
+Both the extension and the b12x package are imported lazily.  Importing this
 module, parsing checkpoint metadata, or compiling it with ``py_compile`` does
-not load the extension or initialize CUDA.
+not load either one or initialize CUDA.
 """
 
 from __future__ import annotations
@@ -154,6 +169,80 @@ def _exl3_gemm_fake(
         dtype=torch.float16,
         device=x.device,
     )
+
+
+_B12X_UNAVAILABLE = object()
+_B12X_DENSE_API: Any = None
+
+
+def _fused_mode_enabled() -> bool:
+    return os.environ.get("VLLM_EXL3_FUSED", "1") == "1"
+
+
+def _load_b12x_dense() -> Any:
+    """Resolve the b12x fused dense entry points once, without hard-failing.
+
+    Returns a ``(prepare_trellis256_dense_weight, run_trellis256_dense)``
+    tuple, or None when the fused path is disabled or the b12x package is not
+    importable.  The parity path through exllamav3_ext remains the fallback
+    either way.  This backend requires eager execution (see
+    ``_require_enforce_eager``), so the fused call does not need an opaque
+    torch.library wrapper.
+    """
+    global _B12X_DENSE_API
+    if _B12X_DENSE_API is _B12X_UNAVAILABLE:
+        return None
+    if _B12X_DENSE_API is not None:
+        return _B12X_DENSE_API
+    if not _fused_mode_enabled():
+        _B12X_DENSE_API = _B12X_UNAVAILABLE
+        return None
+    try:
+        from b12x.moe.fused.w4a16 import (
+            prepare_trellis256_dense_weight,
+            run_trellis256_dense,
+        )
+    except Exception:
+        logger.warning(
+            "EXL3: the b12x fused trellis kernel is not importable; every "
+            "module will use the bit-faithful exllamav3_ext parity path."
+        )
+        _B12X_DENSE_API = _B12X_UNAVAILABLE
+        return None
+    _B12X_DENSE_API = (prepare_trellis256_dense_weight, run_trellis256_dense)
+    return _B12X_DENSE_API
+
+
+def _log_path_selection(prefix: str, chosen: str, reason: str) -> None:
+    if os.environ.get("VLLM_EXL3_LOG_PATH_SELECTION") == "1":
+        logger.info("EXL3 path %s -> %s (%s)", prefix, chosen, reason)
+
+
+def _try_prepare_fused(
+    prefix: str,
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    mcg: torch.Tensor | None,
+    mul1: torch.Tensor | None,
+) -> Any | None:
+    """Prepare one shard for the fused kernel; None selects the parity path."""
+    api = _load_b12x_dense()
+    if api is None:
+        return None
+    if mcg is None or mul1 is not None:
+        # The fused t256 decoder implements the MCG codebook only.  Legacy
+        # "default"-codebook and MUL1 checkpoints stay on the parity path.
+        _log_path_selection(prefix, "parity", "non-MCG codebook")
+        return None
+    prepare, _ = api
+    try:
+        prepared = prepare(trellis, suh, svh, mcg=mcg)
+    except Exception as exc:
+        _log_path_selection(prefix, "parity", f"prepare rejected: {exc}")
+        return None
+    _log_path_selection(prefix, "fused", "mcg")
+    return prepared
 
 
 class Exl3Config(QuantizationConfig):
@@ -520,6 +609,22 @@ class Exl3LinearMethod(LinearMethodBase):
                     device=device, non_blocking=True
                 ).contiguous()
 
+        fused: dict[ShardId, Any] = {}
+        if _fused_mode_enabled():
+            prefix = getattr(layer, "prefix", layer.__class__.__name__)
+            for shard_id in layer.exl3_shard_ids:
+                prepared = _try_prepare_fused(
+                    f"{prefix}[{shard_id!r}]",
+                    layer.trellis.exl3_tensors[shard_id],
+                    layer.suh.exl3_tensors[shard_id],
+                    layer.svh.exl3_tensors[shard_id],
+                    layer.mcg.exl3_tensors.get(shard_id),
+                    layer.mul1.exl3_tensors.get(shard_id),
+                )
+                if prepared is not None:
+                    fused[shard_id] = prepared
+        layer.exl3_fused_prepared = fused
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -773,14 +878,20 @@ class Exl3LinearMethod(LinearMethodBase):
             )
         if x.shape[-1] < packed_k:
             x = torch.nn.functional.pad(x, (0, packed_k - x.shape[-1]))
-        output = _exl3_gemm(
-            x,
-            trellis,
-            layer.suh.exl3_tensors[shard_id],
-            layer.svh.exl3_tensors[shard_id],
-            shard_id in layer.mcg.exl3_tensors,
-            shard_id in layer.mul1.exl3_tensors,
-        )
+        prepared = getattr(layer, "exl3_fused_prepared", {}).get(shard_id)
+        if prepared is not None:
+            api = _load_b12x_dense()
+            assert api is not None
+            output = api[1](x, prepared)
+        else:
+            output = _exl3_gemm(
+                x,
+                trellis,
+                layer.suh.exl3_tensors[shard_id],
+                layer.svh.exl3_tensors[shard_id],
+                shard_id in layer.mcg.exl3_tensors,
+                shard_id in layer.mul1.exl3_tensors,
+            )
         logical_n = Exl3LinearMethod._output_shard_size(layer, shard_id)
         if output.shape[-1] < logical_n:
             raise ValueError(
@@ -882,6 +993,29 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                         device=device, non_blocking=True
                     ).contiguous()
         self._validate_moe_shapes(layer)
+
+        fused: dict[tuple[str, int, str], Any] = {}
+        if _fused_mode_enabled():
+            for group, shard_ids in (("w13", ("w1", "w3")), ("w2", ("w2",))):
+                trellis_map = getattr(layer, f"{group}_trellis").exl3_tensors
+                suh_map = getattr(layer, f"{group}_suh").exl3_tensors
+                svh_map = getattr(layer, f"{group}_svh").exl3_tensors
+                mcg_map = getattr(layer, f"{group}_mcg").exl3_tensors
+                mul1_map = getattr(layer, f"{group}_mul1").exl3_tensors
+                for expert_id in range(layer.local_num_experts):
+                    for shard_id in shard_ids:
+                        key = (expert_id, shard_id)
+                        prepared = _try_prepare_fused(
+                            f"{layer.layer_name}.{expert_id}.{shard_id}",
+                            trellis_map[key],
+                            suh_map[key],
+                            svh_map[key],
+                            mcg_map.get(key),
+                            mul1_map.get(key),
+                        )
+                        if prepared is not None:
+                            fused[(group,) + key] = prepared
+        layer.exl3_moe_fused_prepared = fused
 
     def _validate_codebooks(self, layer: RoutedExperts) -> None:
         projections = {
@@ -1067,14 +1201,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
         if x.shape[-1] < packed_k:
             x = torch.nn.functional.pad(x, (0, packed_k - x.shape[-1]))
-        output = _exl3_gemm(
-            x,
-            trellis,
-            getattr(layer, f"{group}_suh").exl3_tensors[key],
-            getattr(layer, f"{group}_svh").exl3_tensors[key],
-            key in getattr(layer, f"{group}_mcg").exl3_tensors,
-            key in getattr(layer, f"{group}_mul1").exl3_tensors,
+        prepared = getattr(layer, "exl3_moe_fused_prepared", {}).get(
+            (group,) + key
         )
+        if prepared is not None:
+            api = _load_b12x_dense()
+            assert api is not None
+            output = api[1](x, prepared)
+        else:
+            output = _exl3_gemm(
+                x,
+                trellis,
+                getattr(layer, f"{group}_suh").exl3_tensors[key],
+                getattr(layer, f"{group}_svh").exl3_tensors[key],
+                key in getattr(layer, f"{group}_mcg").exl3_tensors,
+                key in getattr(layer, f"{group}_mul1").exl3_tensors,
+            )
         logical_n = (
             layer.hidden_size
             if shard_id == "w2"
