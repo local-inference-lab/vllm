@@ -265,10 +265,10 @@ def test_mla_v_up_proj_honors_bmm_contiguity(monkeypatch):
     real_bmm = torch.bmm
     seen_layouts = []
 
-    def checked_bmm(input, mat2, *, out=None):
+    def checked_bmm(input_tensor, mat2, *, out=None):
         assert out is not None
-        seen_layouts.append((input.is_contiguous(), out.is_contiguous()))
-        return real_bmm(input, mat2, out=out)
+        seen_layouts.append((input_tensor.is_contiguous(), out.is_contiguous()))
+        return real_bmm(input_tensor, mat2, out=out)
 
     monkeypatch.setattr(torch, "bmm", checked_bmm)
 
