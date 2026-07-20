@@ -1439,6 +1439,51 @@ def get_pp_group() -> GroupCoordinator:
     return _PP
 
 
+def checkpoint_b12x_graph_channels() -> tuple[
+    tuple[Callable[[Any], None], Any], ...
+]:
+    """Snapshot B12X channels used by disposable CUDA graph captures."""
+    checkpoints: list[tuple[Callable[[Any], None], Any]] = []
+    seen_communicators: set[int] = set()
+    for group in (_TP, _DCP, _PP):
+        device_communicator = (
+            None if group is None else group.device_communicator
+        )
+        communicator = getattr(device_communicator, "ca_comm", None)
+        if communicator is None or id(communicator) in seen_communicators:
+            continue
+        seen_communicators.add(id(communicator))
+        checkpoint_fn = getattr(communicator, "checkpoint_pcie_channels", None)
+        rollback_fn = getattr(communicator, "rollback_pcie_channels", None)
+        if checkpoint_fn is None or rollback_fn is None:
+            continue
+        checkpoint = checkpoint_fn()
+        if checkpoint is not None:
+            checkpoints.append((rollback_fn, checkpoint))
+
+    if _DCP is not None and _DCP.world_size > 1:
+        from vllm.v1.attention.ops.dcp_alltoall import (
+            checkpoint_b12x_dcp_a2a_channels,
+            rollback_b12x_dcp_a2a_channels,
+        )
+
+        checkpoints.append(
+            (
+                rollback_b12x_dcp_a2a_channels,
+                checkpoint_b12x_dcp_a2a_channels(_DCP),
+            )
+        )
+    return tuple(checkpoints)
+
+
+def rollback_b12x_graph_channels(
+    checkpoints: tuple[tuple[Callable[[Any], None], Any], ...],
+) -> None:
+    """Roll back B12X channels after disposable graphs are synchronized."""
+    for rollback, checkpoint in reversed(checkpoints):
+        rollback(checkpoint)
+
+
 _DP: GroupCoordinator | None = None
 
 

@@ -27,6 +27,7 @@ from vllm.v1.worker.gpu.spec_decode.utils import draft_gumbel_pos
 from vllm.v1.worker.utils import AttentionGroup
 
 if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
     from vllm.v1.worker.gpu.spec_decode.dspark.online_sts import DSparkOnlineSTS
 
 logger = init_logger(__name__)
@@ -52,6 +53,13 @@ class BaseSpeculator(ABC):
     @abstractmethod
     def capture(self) -> None:
         pass
+
+    def get_cudagraph_managers(self) -> tuple["CudaGraphManager", ...]:
+        return ()
+
+    def clear_cudagraphs(self) -> None:
+        for manager in self.get_cudagraph_managers():
+            manager.clear()
 
     @abstractmethod
     def propose(

@@ -4,8 +4,11 @@
 import pytest
 import torch
 
+from vllm import envs
 from vllm.model_executor.layers.attention.mla_attention import (
+    MLAAttention,
     _can_use_b12x_dcp_prefill_workspace,
+    _estimate_dcp_ag_rs_transient_bytes,
 )
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseImpl
 from vllm.v1.attention.ops import common
@@ -58,6 +61,110 @@ def test_dcp_workspace_gate_accepts_valid_rows(num_tokens, max_num_tokens):
         backend_name="B12X_MLA_SPARSE",
         is_capturing=False,
     )
+
+
+def _make_profile_attention(*, workspace_enabled: bool, pure_a2a: bool = False):
+    class Backend:
+        @staticmethod
+        def get_name():
+            return "B12X_MLA_SPARSE"
+
+    class Impl:
+        dcp_world_size = 6
+        dcp_workspace_non_dbo = True
+        is_sparse = True
+        _max_batched = 4096
+
+    attn = object.__new__(MLAAttention)
+    attn.attn_backend = Backend
+    attn.impl = Impl()
+    attn.num_heads = 11
+    attn.kv_lora_rank = 512
+    attn.qk_rope_head_dim = 64
+    attn.v_head_dim = 256
+    attn.dcp_project_before_merge = True
+    attn.dcp_project_before_merge_min_prefill_tokens = 1024
+    attn.dcp_a2a = True
+    attn.dcp_a2a_max_tokens = 0 if pure_a2a else 256
+    attn.dcp_a2a_large_backend = "ag_rs"
+    return attn, workspace_enabled
+
+
+def test_sparse_profile_reserves_largest_non_workspace_ag_rs_batch(monkeypatch):
+    attn, workspace_enabled = _make_profile_attention(workspace_enabled=True)
+    monkeypatch.setattr(envs, "VLLM_MEMORY_PROFILE_INCLUDE_ATTN", True)
+    monkeypatch.setattr(
+        envs, "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE", workspace_enabled
+    )
+
+    expected = _estimate_dcp_ag_rs_transient_bytes(
+        num_tokens=1024,
+        local_heads=11,
+        dcp_world_size=6,
+        q_head_dim=576,
+        output_head_dim=512,
+        kv_lora_rank=512,
+        v_head_dim=256,
+        project_before_merge=False,
+    )
+    assert attn._get_sparse_memory_profile_bytes() == expected
+
+
+def test_sparse_profile_accounts_for_projected_fallback_without_workspace(monkeypatch):
+    attn, workspace_enabled = _make_profile_attention(workspace_enabled=False)
+    monkeypatch.setattr(envs, "VLLM_MEMORY_PROFILE_INCLUDE_ATTN", True)
+    monkeypatch.setattr(
+        envs, "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE", workspace_enabled
+    )
+
+    unprojected = _estimate_dcp_ag_rs_transient_bytes(
+        num_tokens=1024,
+        local_heads=11,
+        dcp_world_size=6,
+        q_head_dim=576,
+        output_head_dim=512,
+        kv_lora_rank=512,
+        v_head_dim=256,
+        project_before_merge=False,
+    )
+    projected = _estimate_dcp_ag_rs_transient_bytes(
+        num_tokens=4096,
+        local_heads=11,
+        dcp_world_size=6,
+        q_head_dim=576,
+        output_head_dim=256,
+        kv_lora_rank=512,
+        v_head_dim=256,
+        project_before_merge=True,
+    )
+    assert attn._get_sparse_memory_profile_bytes() == max(unprojected, projected)
+
+
+def test_sparse_profile_accounts_for_unprojected_full_batch(monkeypatch):
+    attn, _ = _make_profile_attention(workspace_enabled=False)
+    attn.dcp_project_before_merge = False
+    monkeypatch.setattr(envs, "VLLM_MEMORY_PROFILE_INCLUDE_ATTN", True)
+    monkeypatch.setattr(envs, "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE", False)
+
+    expected = _estimate_dcp_ag_rs_transient_bytes(
+        num_tokens=4096,
+        local_heads=11,
+        dcp_world_size=6,
+        q_head_dim=576,
+        output_head_dim=512,
+        kv_lora_rank=512,
+        v_head_dim=256,
+        project_before_merge=False,
+    )
+    assert attn._get_sparse_memory_profile_bytes() == expected
+
+
+def test_sparse_profile_skips_pure_a2a(monkeypatch):
+    attn, _ = _make_profile_attention(workspace_enabled=True, pure_a2a=True)
+    monkeypatch.setattr(envs, "VLLM_MEMORY_PROFILE_INCLUDE_ATTN", True)
+    monkeypatch.setattr(envs, "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE", True)
+
+    assert attn._get_sparse_memory_profile_bytes() == 0
 
 
 @pytest.mark.parametrize("world_size", [2, 3, 4, 6, 8])

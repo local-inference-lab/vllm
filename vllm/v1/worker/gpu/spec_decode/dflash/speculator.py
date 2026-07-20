@@ -203,6 +203,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
 
+    def get_cudagraph_managers(self) -> tuple[DFlashCudaGraphManager, ...]:
+        if self.query_cudagraph_manager is None:
+            return ()
+        return (self.query_cudagraph_manager,)
+
+    def clear_cudagraphs(self) -> None:
+        super().clear_cudagraphs()
+        self._captured_backbone_outputs.clear()
+
     def _warmup_prepare_inputs_kernel(self) -> None:
         if self.draft_kv_cache_group_id < 0:
             return

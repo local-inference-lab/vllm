@@ -141,6 +141,21 @@ def test_b12x_oneshot_defaults_to_stream_isolation(
     assert not envs.environment_variables["VLLM_PCIE_ONESHOT_SINGLE_CHANNEL"]()
 
 
+def test_b12x_channel_checkpoint_delegates_to_runtime() -> None:
+    custom_allreduce, runtime = make_b12x_custom_allreduce(
+        allreduce_max_size=64,
+        fused_max_size=64,
+    )
+    checkpoint = object()
+    runtime.checkpoint_channels.return_value = checkpoint
+
+    assert custom_allreduce.checkpoint_pcie_channels() is checkpoint
+    custom_allreduce.rollback_pcie_channels(checkpoint)
+
+    runtime.checkpoint_channels.assert_called_once_with()
+    runtime.rollback_channels.assert_called_once_with(checkpoint)
+
+
 def test_b12x_oneshot_buffer_tracks_dispatch_limits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

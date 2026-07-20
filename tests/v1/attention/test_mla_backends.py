@@ -86,6 +86,77 @@ def test_mla_kv_cache_spec_uses_layer_cache_dtype(
         assert spec.page_size_bytes == 64 * 656
 
 
+def test_mla_init_propagates_backend_bmm_contiguity_contract(monkeypatch):
+    class FakeImpl:
+        is_sparse = True
+        supports_mha_prefill = False
+
+        def __init__(self, **kwargs):
+            self.force_contiguous_mla_bmm_input = True
+            self.force_contiguous_mla_bmm_weight = True
+            self.force_contiguous_mla_bmm_output = True
+
+    class FakeBackend:
+        @staticmethod
+        def is_mla():
+            return True
+
+        @staticmethod
+        def get_name():
+            return "TEST_MLA"
+
+        @staticmethod
+        def get_impl_cls():
+            return FakeImpl
+
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={}, cudagraph_capture_sizes=[]
+        ),
+        attention_config=SimpleNamespace(mla_prefill_backend=None),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=128),
+    )
+    monkeypatch.setattr(
+        mla_attention_module, "get_current_vllm_config", lambda: config
+    )
+    monkeypatch.setattr(
+        mla_attention_module, "get_current_vllm_config_or_none", lambda: config
+    )
+    monkeypatch.setattr(mla_attention_module, "_init_kv_cache_quant", lambda *a: None)
+    monkeypatch.setattr(
+        mla_attention_module,
+        "get_mla_prefill_backend",
+        lambda _: (_ for _ in ()).throw(ValueError),
+    )
+    monkeypatch.setattr(mla_attention_module, "_DecodeConcatQuantFP8", lambda **_: None)
+    monkeypatch.setattr(mla_attention_module, "QuantFP8", lambda **_: None)
+    monkeypatch.setattr(
+        mla_attention_module.rocm_aiter_ops, "is_fp8bmm_enabled", lambda: False
+    )
+    monkeypatch.setattr(
+        mla_attention_module.rocm_aiter_ops, "is_fp4bmm_enabled", lambda: False
+    )
+
+    layer = MLAAttention(
+        num_heads=8,
+        scale=1.0,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=2,
+        v_head_dim=3,
+        q_lora_rank=None,
+        kv_lora_rank=4,
+        kv_b_proj=SimpleNamespace(),
+        prefix="test",
+        attn_backend=FakeBackend,
+        use_sparse=True,
+    )
+
+    assert layer.force_contiguous_mla_bmm_input
+    assert layer.force_contiguous_mla_bmm_weight
+    assert layer.force_contiguous_mla_bmm_output
+
+
 # Remove sm100 backends from the list if not using sm100
 if not torch.cuda.is_available() or torch.cuda.get_device_properties(0).major < 10:
     BACKENDS_TO_TEST.remove(AttentionBackendEnum.CUTLASS_MLA)
@@ -122,6 +193,7 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
     layer.kv_b_proj.quant_method = None
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.force_contiguous_mla_bmm_weight = False
     layer.quant_config = None
     layer.layer_name = "test"
 
@@ -145,6 +217,65 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
     assert layer.W_UK_T.data_ptr() == w_uk_t_ptr
     torch.testing.assert_close(layer.W_UV, old_w_uv + 100)
     torch.testing.assert_close(layer.W_UK_T, old_w_uk_t + 100)
+
+
+def test_mla_post_load_honors_bmm_weight_contiguity(monkeypatch):
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.kv_lora_rank = 2
+    layer.num_heads = 2
+    layer.qk_nope_head_dim = 3
+    layer.v_head_dim = 4
+    layer.kv_b_proj = torch.nn.Module()
+    layer.kv_b_proj.weight = torch.nn.Parameter(
+        torch.arange(28.0, dtype=torch.float32).reshape(14, 2)
+    )
+    layer.kv_b_proj.quant_method = None
+    layer.is_aiter_triton_fp4_bmm_enabled = False
+    layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.force_contiguous_mla_bmm_weight = True
+    layer.quant_config = None
+    layer.layer_name = "test"
+
+    monkeypatch.setattr(
+        mla_attention_module, "set_default_quant_scales", lambda *_, **__: None
+    )
+
+    with torch.no_grad():
+        layer.process_weights_after_loading(torch.float32)
+
+    assert layer.W_UV.is_contiguous()
+    assert layer.W_UK_T.is_contiguous()
+
+
+def test_mla_v_up_proj_honors_bmm_contiguity(monkeypatch):
+    layer = object.__new__(MLAAttention)
+    layer.num_heads = 8
+    layer.kv_lora_rank = 4
+    layer.v_head_dim = 3
+    layer.is_aiter_triton_fp4_bmm_enabled = False
+    layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.force_contiguous_mla_bmm_input = True
+    layer.force_contiguous_mla_bmm_output = True
+    layer.W_UV = torch.randn((8, 4, 3), dtype=torch.bfloat16)
+
+    x = torch.randn((6, 8, 4), dtype=torch.bfloat16)
+    out = torch.empty((6, 8, 3), dtype=torch.bfloat16)
+    expected = torch.einsum("bnl,nlv->bnv", x, layer.W_UV)
+    real_bmm = torch.bmm
+    seen_layouts = []
+
+    def checked_bmm(input_tensor, mat2, *, out=None):
+        assert out is not None
+        seen_layouts.append((input_tensor.is_contiguous(), out.is_contiguous()))
+        return real_bmm(input_tensor, mat2, out=out)
+
+    monkeypatch.setattr(torch, "bmm", checked_bmm)
+
+    MLAAttention._v_up_proj(layer, x, out)
+
+    assert seen_layouts == [(True, True)]
+    torch.testing.assert_close(out, expected)
 
 
 # Filtered per-test via validate_configuration (capability/deps/dims).
