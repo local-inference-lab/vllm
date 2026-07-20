@@ -24,7 +24,9 @@ nvtx==0.2.15
 fastsafetensors >= 0.3.2
 
 # QuACK and Cutlass DSL for FA4 (cute-DSL implementation)
-nvidia-cutlass-dsl[cu13]==4.6.0
+# 4.6.0 spills the SM120 B12X W4A16 prefill kernel (255 registers and a
+# 256-byte stack per thread); 4.5.3 restores spill-free code generation.
+nvidia-cutlass-dsl[cu13]==4.5.3
 quack-kernels>=0.4.0  # Required for tml-fa4
 
 # Tokenspeed_MLA for faster mla with spec decode
