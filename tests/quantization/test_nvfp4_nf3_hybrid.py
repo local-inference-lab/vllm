@@ -8,6 +8,7 @@ from vllm.config.quantization import resolve_quantization_config
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.nvfp4_nf3_hybrid import (
     NvFp4Nf3HybridConfig,
+    NvFp4Nf3HybridMoEMethod,
     _combined_tier_local_descriptors,
     _read_hybrid_keys,
     _unpack_nf3_codes,
@@ -109,3 +110,10 @@ def test_grid188_tier_descriptors_encode_exact_partition():
 def test_grid188_tier_descriptors_reject_incomplete_partition():
     with pytest.raises(ValueError, match="does not cover all 256"):
         _combined_tier_local_descriptors({0: (0, 0)})
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 256, 3072])
+def test_hybrid_moe_rejects_shared_expert_aux_stream(num_tokens):
+    method = object.__new__(NvFp4Nf3HybridMoEMethod)
+
+    assert not method.supports_shared_experts_aux_stream(num_tokens)
