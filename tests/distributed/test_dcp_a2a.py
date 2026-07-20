@@ -542,6 +542,98 @@ def test_b12x_pool_init_consensus_uses_exchange_group(
     assert captured["op"] == dist.ReduceOp.MAX
 
 
+def test_b12x_dcp_channel_rollback_restores_existing_and_closes_new_pools(
+    monkeypatch,
+):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    events = []
+
+    class _FakePool:
+        def __init__(self, name):
+            self.name = name
+
+        def checkpoint_channels(self):
+            events.append(("checkpoint", self.name))
+            return f"{self.name}-checkpoint"
+
+        def rollback_channels(self, checkpoint):
+            events.append(("rollback", self.name, checkpoint))
+
+        def close(self):
+            events.append(("close", self.name))
+
+    device_group = object()
+    group = _FakeCPGroup(2, device_group)  # type: ignore[arg-type]
+    existing_key = (id(device_group), 0, 64, 512, 576, 64)
+    new_key = (id(device_group), 0, 64, 576, 576, 64)
+    foreign_key = (id(object()), 0, 64, 512, 576, 64)
+    existing = _FakePool("existing")
+    foreign = _FakePool("foreign")
+    pools = {existing_key: existing, foreign_key: foreign}
+    monkeypatch.setattr(dcp_alltoall, "_B12X_DCP_A2A_POOLS", pools)
+
+    checkpoint = dcp_alltoall.checkpoint_b12x_dcp_a2a_channels(group)
+    transient = _FakePool("transient")
+    pools[new_key] = transient
+    dcp_alltoall.rollback_b12x_dcp_a2a_channels(checkpoint)
+
+    assert pools == {existing_key: existing, foreign_key: foreign}
+    assert events == [
+        ("checkpoint", "existing"),
+        ("rollback", "existing", "existing-checkpoint"),
+        ("close", "transient"),
+    ]
+
+
+def test_profile_channel_checkpoint_rolls_back_all_b12x_transports(monkeypatch):
+    from vllm.distributed import parallel_state
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    events = []
+
+    class _FakeCommunicator:
+        def checkpoint_pcie_channels(self):
+            events.append("checkpoint-tp")
+            return "tp-checkpoint"
+
+        def rollback_pcie_channels(self, checkpoint):
+            events.append(("rollback-tp", checkpoint))
+
+    class _FakeGroup:
+        def __init__(self, *, world_size, communicator=None):
+            self.world_size = world_size
+            self.device_communicator = type(
+                "DeviceCommunicator", (), {"ca_comm": communicator}
+            )()
+
+    communicator = _FakeCommunicator()
+    tp_group = _FakeGroup(world_size=8, communicator=communicator)
+    pp_group = _FakeGroup(world_size=1, communicator=communicator)
+    dcp_group = _FakeGroup(world_size=2)
+    monkeypatch.setattr(parallel_state, "_TP", tp_group)
+    monkeypatch.setattr(parallel_state, "_PP", pp_group)
+    monkeypatch.setattr(parallel_state, "_DCP", dcp_group)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "checkpoint_b12x_dcp_a2a_channels",
+        lambda group: events.append("checkpoint-dcp") or "dcp-checkpoint",
+    )
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "rollback_b12x_dcp_a2a_channels",
+        lambda checkpoint: events.append(("rollback-dcp", checkpoint)),
+    )
+
+    checkpoint = parallel_state.checkpoint_b12x_graph_channels()
+    parallel_state.rollback_b12x_graph_channels(checkpoint)
+
+    assert events == [
+        "checkpoint-tp",
+        "checkpoint-dcp",
+        ("rollback-dcp", "dcp-checkpoint"),
+        ("rollback-tp", "tp-checkpoint"),
+    ]
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
 def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     from vllm.v1.attention.ops import dcp_alltoall

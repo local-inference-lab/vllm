@@ -131,6 +131,21 @@ def test_b12x_fused_allreduce_zero_cutoff_disables_support() -> None:
     assert not custom_allreduce.supports_fused_add_rms_norm()
 
 
+def test_b12x_channel_checkpoint_delegates_to_runtime() -> None:
+    custom_allreduce, runtime = make_b12x_custom_allreduce(
+        allreduce_max_size=64,
+        fused_max_size=64,
+    )
+    checkpoint = object()
+    runtime.checkpoint_channels.return_value = checkpoint
+
+    assert custom_allreduce.checkpoint_pcie_channels() is checkpoint
+    custom_allreduce.rollback_pcie_channels(checkpoint)
+
+    runtime.checkpoint_channels.assert_called_once_with()
+    runtime.rollback_channels.assert_called_once_with(checkpoint)
+
+
 def test_b12x_fused_custom_op_dispatch(monkeypatch) -> None:
     custom_allreduce = MagicMock()
     custom_allreduce.try_fused_add_rms_norm.return_value = True

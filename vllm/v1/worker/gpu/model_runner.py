@@ -29,13 +29,17 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
 from vllm.compilation.counter import compilation_counter
-from vllm.config import VllmConfig
+from vllm.compilation.cuda_graph import CUDAGraphWrapper
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
+    checkpoint_b12x_graph_channels,
     get_dcp_group,
     get_pp_group,
     prepare_communication_buffer_for_model,
+    rollback_b12x_graph_channels,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -44,6 +48,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
 )
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -51,6 +56,7 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
@@ -791,9 +797,163 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # SP is not supported yet.
         return num_scheduled_tokens
 
+    def _init_minimal_kv_cache_for_profiling(self) -> None:
+        from vllm.v1.core.kv_cache_utils import (
+            get_kv_cache_config_from_groups,
+            get_kv_cache_groups,
+        )
+
+        kv_cache_spec = self.get_kv_cache_spec()
+        KVCacheSpecRegistry.check_kv_cache_spec_registry(kv_cache_spec)
+        kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+        min_blocks = (
+            min(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
+            or 1
+        )
+
+        saved_override = self.cache_config.num_gpu_blocks_override
+        self.cache_config.num_gpu_blocks_override = min_blocks
+        try:
+            minimal_config = get_kv_cache_config_from_groups(
+                self.vllm_config, kv_cache_groups, available_memory=0
+            )
+        finally:
+            self.cache_config.num_gpu_blocks_override = saved_override
+
+        self.initialize_kv_cache(minimal_config)
+        self.cache_config.num_gpu_blocks = minimal_config.num_blocks
+
+    def _cleanup_cudagraph_memory_profile(self) -> None:
+        torch.accelerator.synchronize()
+        if self.cudagraph_manager is not None:
+            self.cudagraph_manager.clear()
+        if self.speculator is not None:
+            self.speculator.clear_cudagraphs()
+        CUDAGraphWrapper.clear_all_graphs()
+        BreakableCUDAGraphWrapper.clear_all_graphs()
+
+        if hasattr(self, "kv_caches"):
+            self.kv_caches.clear()
+        if hasattr(self, "attn_groups"):
+            self.attn_groups.clear()
+        if hasattr(self, "kv_cache_config"):
+            del self.kv_cache_config
+        for attr in ("block_tables", "kernel_block_sizes"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+        self.kv_connector = NO_OP_KV_CONNECTOR
+        self.kv_block_zeroer = None
+        self.cudagraph_manager = None
+        self.verification_capacity_manager = None
+        self.cache_config.num_gpu_blocks = None
+
+        for layer in self.compilation_config.static_forward_context.values():
+            if hasattr(layer, "kv_cache"):
+                kv_cache = layer.kv_cache
+                layer.kv_cache = (
+                    torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
+                )
+
+        gc.collect()
+        torch.accelerator.empty_cache()
+        torch.accelerator.synchronize()
+
     def profile_cudagraph_memory(self) -> int:
-        # NOTE(woosuk): It is TBD whether we keep this API or not.
-        return 0
+        with set_current_vllm_config(self.vllm_config):
+            self._init_minimal_kv_cache_for_profiling()
+
+        assert self.cudagraph_manager is not None
+        if not self.cudagraph_manager.needs_capture():
+            self._cleanup_cudagraph_memory_profile()
+            return 0
+
+        saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
+        profiling_pool = current_platform.graph_pool_handle()
+        managers = [self.cudagraph_manager]
+        if self.speculator is not None:
+            managers.extend(self.speculator.get_cudagraph_managers())
+        original_manager_pools = {id(manager): manager.pool for manager in managers}
+        for manager in managers:
+            manager.pool = profiling_pool
+
+        wrappers = list(CUDAGraphWrapper._all_instances) + list(
+            BreakableCUDAGraphWrapper._all_instances
+        )
+        original_wrapper_pools = {
+            id(wrapper): wrapper.graph_pool for wrapper in wrappers
+        }
+        for wrapper in wrappers:
+            wrapper.graph_pool = profiling_pool
+
+        gc.collect()
+        torch.accelerator.empty_cache()
+        torch.accelerator.synchronize()
+        start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+        graph_channel_checkpoints = ()
+        try:
+            # Both target and draft captures can allocate graph-owned B12X
+            # channels. Snapshot before either capture so the disposable
+            # profiling pass cannot leave stale channels behind.
+            graph_channel_checkpoints = checkpoint_b12x_graph_channels()
+            with self.maybe_setup_dummy_loras(self.lora_config):
+                self.cudagraph_manager.capture(
+                    self.model,
+                    self.model_state,
+                    self.input_buffers,
+                    self.intermediate_tensors,
+                    self.block_tables,
+                    self.attn_groups,
+                    self.kv_cache_config,
+                    has_lora=self.lora_config is not None,
+                    use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                    lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
+                    progress_bar_desc="Profiling CUDA graph memory",
+                )
+                if self.speculator is not None:
+                    self.speculator.capture()
+                self._zero_cudagraph_capture_kv_blocks()
+            end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+            gross_cuda_graph_size = max(start_free_gpu_memory - end_free_gpu_memory, 0)
+        finally:
+            try:
+                # Destroy disposable graphs while every manager and wrapper still
+                # points at the private pool that owns their allocations.
+                try:
+                    self._cleanup_cudagraph_memory_profile()
+                finally:
+                    rollback_b12x_graph_channels(graph_channel_checkpoints)
+            finally:
+                for manager in managers:
+                    manager.pool = original_manager_pools[id(manager)]
+                wrappers = list(CUDAGraphWrapper._all_instances) + list(
+                    BreakableCUDAGraphWrapper._all_instances
+                )
+                for wrapper in wrappers:
+                    original_pool = original_wrapper_pools.get(id(wrapper))
+                    if id(wrapper) in original_wrapper_pools:
+                        wrapper.graph_pool = original_pool
+                    else:
+                        wrapper.graph_pool = current_platform.get_global_graph_pool()
+                del profiling_pool
+                compilation_counter.num_cudagraph_captured = (
+                    saved_num_cudagraph_captured
+                )
+
+        free_after_cleanup = torch.accelerator.get_memory_info()[0]
+        retained_pool_size = max(start_free_gpu_memory - free_after_cleanup, 0)
+        # A CUDA graph private pool can retain physical pages after its graph
+        # objects are destroyed. memory_profiling observes those pages as
+        # non-torch memory, so only return the remaining capture cost here.
+        cuda_graph_size = max(gross_cuda_graph_size - retained_pool_size, 0)
+        logger.info(
+            "Estimated MRV2 CUDA graph memory: %.2f GiB additional "
+            "(%.2f GiB captured, %.2f GiB retained and counted as non-torch)",
+            cuda_graph_size / (1 << 30),
+            gross_cuda_graph_size / (1 << 30),
+            retained_pool_size / (1 << 30),
+        )
+        return int(cuda_graph_size)
 
     @torch.inference_mode()
     def capture_model(self) -> int:

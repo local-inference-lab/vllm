@@ -436,6 +436,12 @@ class CudaGraphManager:
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
 
+    def clear(self) -> None:
+        """Release captured graphs and reset this manager for a later capture."""
+        self.graphs.clear()
+        self._graphs_captured = False
+        self.breakable_cg_runner = None
+
     @torch.inference_mode()
     def capture(
         self,
@@ -742,6 +748,12 @@ class ModelCudaGraphManager(CudaGraphManager):
             return forward_fn
 
         super().capture(create_forward_fn, progress_bar_desc)
+
+    def clear(self) -> None:
+        super().clear()
+        self.hidden_states = None
+        self.aux_hidden_states.clear()
+        self.intermediate_tensors = None
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor
