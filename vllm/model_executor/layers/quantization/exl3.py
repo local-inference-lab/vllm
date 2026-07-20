@@ -1,0 +1,1090 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""EXL3 (ExLlamaV3 trellis) quantization support.
+
+This is deliberately the correctness backend.  Every logical checkpoint
+matrix is dispatched independently through ``exllamav3_ext.exl3_gemm``.  In
+particular, vLLM's packed QKV and gate/up modules are *not* treated as one EXL3
+matrix: each source matrix owns its own Hadamard vectors and codebook marker.
+
+The extension is imported lazily on the first CUDA execution.  Importing this
+module, parsing checkpoint metadata, or compiling it with ``py_compile`` does
+not load the extension or initialize CUDA.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import importlib
+import os
+import sys
+from typing import TYPE_CHECKING, Any
+
+import torch
+from transformers import PretrainedConfig
+
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from vllm.config import get_current_vllm_config_or_none
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEMethodBase,
+    FusedMoEQuantConfig,
+    MoEActivation,
+    RoutedExperts,
+)
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    UnquantizedLinearMethod,
+)
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from vllm.model_executor.parameter import BasevLLMParameter
+from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+        SharedExperts,
+    )
+    from vllm.model_executor.models.utils import WeightsMapper
+
+logger = init_logger(__name__)
+
+_MCG_SENTINEL = 0xCBAC1FED
+_MUL1_SENTINEL = 0x83DCD12D
+_HADAMARD_BLOCK = 128
+_EXL3_EXT: Any | None = None
+
+ShardId = str | int | tuple[int, ...] | None
+
+
+def _load_exl3_ext() -> Any:
+    """Load the existing ExLlamaV3 extension only from an actual CUDA call."""
+
+    global _EXL3_EXT
+    if _EXL3_EXT is not None:
+        return _EXL3_EXT
+
+    shim = os.environ.get("VLLM_EXL3_ABI_SHIM")
+    if shim:
+        ctypes.CDLL(shim, mode=ctypes.RTLD_GLOBAL)
+
+    ext_path = os.environ.get("VLLM_EXL3_EXT_PATH")
+    if ext_path:
+        search_dir = ext_path if os.path.isdir(ext_path) else os.path.dirname(ext_path)
+        if search_dir and search_dir not in sys.path:
+            sys.path.insert(0, search_dir)
+
+    try:
+        ext = importlib.import_module("exllamav3_ext")
+    except Exception as exc:
+        hint = (
+            "Set VLLM_EXL3_EXT_PATH to the directory containing "
+            "exllamav3_ext*.so (and VLLM_EXL3_ABI_SHIM when the local "
+            "PyTorch ABI shim is required)."
+        )
+        raise RuntimeError(f"Unable to import exllamav3_ext. {hint}") from exc
+
+    if not hasattr(ext, "exl3_gemm"):
+        raise RuntimeError(
+            "The imported exllamav3_ext does not export exl3_gemm; rebuild the "
+            "track_a_retile extension used by this overlay."
+        )
+    _EXL3_EXT = ext
+    return ext
+
+
+@torch.library.custom_op(
+    "vllm::exl3_gemm",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _exl3_gemm(
+    x: torch.Tensor,
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    mcg: bool,
+    mul1: bool,
+) -> torch.Tensor:
+    """Opaque torch op around the bit-faithful ExLlamaV3 dense call."""
+
+    ext = _load_exl3_ext()
+    output = torch.empty(
+        (x.shape[0], trellis.shape[1] * 16),
+        dtype=torch.float16,
+        device=x.device,
+    )
+    x_had = torch.empty_like(x)
+    ext.exl3_gemm(
+        x,
+        trellis,
+        output,
+        suh,
+        x_had,
+        svh,
+        -1,
+        mcg,
+        mul1,
+        0,
+    )
+    return output
+
+
+@_exl3_gemm.register_fake
+def _exl3_gemm_fake(
+    x: torch.Tensor,
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    mcg: bool,
+    mul1: bool,
+) -> torch.Tensor:
+    del suh, svh, mcg, mul1
+    return torch.empty(
+        (x.shape[0], trellis.shape[1] * 16),
+        dtype=torch.float16,
+        device=x.device,
+    )
+
+
+class Exl3Config(QuantizationConfig):
+    """Configuration for modern and legacy EXL3 trellis checkpoints."""
+
+    def __init__(
+        self,
+        bits: float | None = None,
+        head_bits: float | None = None,
+        codebook: str | None = None,
+        version: str | None = None,
+        tensor_storage: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        self.bits = bits
+        self.head_bits = head_bits
+        self.codebook = codebook
+        self.version = version
+        self.tensor_storage = tensor_storage or {}
+        self._eager_checked = False
+
+    def get_name(self) -> str:
+        return "exl3"
+
+    def get_supported_act_dtypes(self) -> list[torch.dtype]:
+        # The kernel boundary is always fp16.  BF16 model activations are cast
+        # in apply() and converted back after the fp16 bias addition.
+        return [torch.float16, torch.bfloat16]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 80
+
+    @staticmethod
+    def get_config_filenames() -> list[str]:
+        return ["quantization_config.json"]
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> "Exl3Config":
+        return cls(
+            bits=config.get("bits"),
+            head_bits=config.get("head_bits"),
+            codebook=config.get("codebook"),
+            version=config.get("version"),
+            tensor_storage=config.get("tensor_storage"),
+        )
+
+    def maybe_update_config(
+        self,
+        model_name: str,
+        hf_config: PretrainedConfig | None = None,
+        revision: str | None = None,
+    ) -> None:
+        # vLLM returns the summary embedded in config.json without consulting
+        # get_config_filenames().  Hydrate the per-module records explicitly.
+        if not self.tensor_storage:
+            resolved_revision = revision
+            if resolved_revision is None and hf_config is not None:
+                resolved_revision = getattr(hf_config, "_commit_hash", None)
+            config = get_hf_file_to_dict(
+                "quantization_config.json",
+                model_name,
+                revision=resolved_revision,
+            )
+            if not config or not config.get("tensor_storage"):
+                raise ValueError(
+                    "EXL3 requires quantization_config.json with a non-empty "
+                    "tensor_storage map. For branch-indexed Hugging Face repos, "
+                    "download/serve an actual bpw revision rather than main."
+                )
+            self.bits = config.get("bits", self.bits)
+            self.head_bits = config.get("head_bits", self.head_bits)
+            self.codebook = config.get("codebook", self.codebook)
+            self.version = config.get("version", self.version)
+            self.tensor_storage = config["tensor_storage"]
+
+        self._validate_storage_metadata()
+        self._force_independent_lm_head(hf_config)
+
+    def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper") -> None:
+        # Keep both spellings: loader prefixes use vLLM names, while packed
+        # source-matrix discovery intentionally refers to the unstacked HF name.
+        mapped = hf_to_vllm_mapper.apply_dict(self.tensor_storage)
+        self.tensor_storage = {**self.tensor_storage, **mapped}
+
+    def _validate_storage_metadata(self) -> None:
+        bad: list[str] = []
+        exl3_count = 0
+        for prefix, entry in self.tensor_storage.items():
+            if entry.get("quant_format") != "exl3":
+                continue
+            exl3_count += 1
+            stored = entry.get("stored_tensors", {})
+            suffixes = {name.rsplit(".", 1)[-1] for name in stored}
+            required = {"trellis"}
+            if not ({"suh", "su"} & suffixes):
+                required.add("suh|su")
+            if not ({"svh", "sv"} & suffixes):
+                required.add("svh|sv")
+            missing = [name for name in required if name not in suffixes]
+            if missing:
+                bad.append(f"{prefix}: missing {','.join(sorted(missing))}")
+            if {"mcg", "mul1"} <= suffixes:
+                bad.append(f"{prefix}: both mcg and mul1 are present")
+        if not exl3_count:
+            raise ValueError("quantization_config.json has no EXL3 tensor records")
+        if bad:
+            raise ValueError("Invalid EXL3 tensor metadata: " + "; ".join(bad[:16]))
+
+    def _force_independent_lm_head(self, hf_config: PretrainedConfig | None) -> None:
+        if hf_config is None or not self.has_quantized_lm_head():
+            return
+        configs: list[Any] = [hf_config]
+        try:
+            text_config = hf_config.get_text_config()
+        except (AttributeError, TypeError):
+            text_config = None
+        if text_config is not None and text_config is not hf_config:
+            configs.append(text_config)
+        changed = False
+        for config in configs:
+            if getattr(config, "tie_word_embeddings", False):
+                config.tie_word_embeddings = False
+                changed = True
+        if changed:
+            logger.warning_once(
+                "EXL3 metadata contains an independently quantized lm_head; "
+                "overriding tie_word_embeddings so vLLM instantiates it."
+            )
+
+    def _require_enforce_eager(self) -> None:
+        # exllamav3_ext's exl3_gemm autotunes with timing launches on the first
+        # call per (m-bucket, k, n, K) shape hash; under CUDA-graph capture
+        # those launches fault, and m-bucketing means a warmup pass cannot
+        # reliably cover every bucket. Fail fast at build time instead of
+        # faulting mid-capture.
+        if self._eager_checked:
+            return
+        self._eager_checked = True
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            return
+        if not vllm_config.model_config.enforce_eager:
+            raise ValueError(
+                "The EXL3 quantization backend requires eager execution: "
+                "pass --enforce-eager (enforce_eager=True). exl3_gemm "
+                "autotunes with timing launches on first use per shape "
+                "bucket, which is incompatible with CUDA-graph capture."
+            )
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> QuantizeMethodBase | None:
+        self._require_enforce_eager()
+        is_lm_head = layer.__class__.__name__ == "ParallelLMHead"
+        if is_lm_head and not prefix:
+            prefix = "lm_head"
+        if isinstance(layer, LinearBase) or is_lm_head:
+            if not self._linear_prefix_is_exl3(prefix):
+                return UnquantizedLinearMethod()
+            return Exl3LinearMethod(self)
+        if isinstance(layer, RoutedExperts):
+            if not self._moe_prefix_is_exl3(prefix):
+                return None
+            return Exl3MoEMethod(self, layer.moe_config)
+        return None
+
+    def _storage_entry(self, prefix: str) -> dict[str, Any] | None:
+        candidates = [prefix]
+        if prefix.startswith("model."):
+            candidates.append(prefix.removeprefix("model."))
+        else:
+            candidates.append(f"model.{prefix}")
+
+        # Multimodal wrappers often add an extra `.model` or
+        # `.language_model` segment relative to vLLM's text-only module.
+        parts = prefix.split(".")
+        for removable in ("model", "language_model"):
+            for idx in range(1, len(parts) - 1):
+                if parts[idx] != removable:
+                    continue
+                collapsed = ".".join(parts[:idx] + parts[idx + 1 :])
+                candidates.extend((collapsed, f"model.{collapsed}"))
+                if collapsed.startswith("model."):
+                    candidates.append(collapsed.removeprefix("model."))
+
+        for candidate in dict.fromkeys(candidates):
+            entry = self.tensor_storage.get(candidate)
+            if entry is not None:
+                return entry
+        return None
+
+    def _is_exl3_prefix(self, prefix: str) -> bool:
+        entry = self._storage_entry(prefix)
+        return entry is not None and entry.get("quant_format") == "exl3"
+
+    def _linear_prefix_is_exl3(self, prefix: str) -> bool:
+        if self._is_exl3_prefix(prefix):
+            return True
+        leaf = prefix.rsplit(".", 1)[-1]
+        source_leaves = self.packed_modules_mapping.get(leaf)
+        if not source_leaves:
+            return False
+        base = prefix.rsplit(".", 1)[0] if "." in prefix else ""
+        return all(
+            self._is_exl3_prefix(f"{base}.{source}" if base else source)
+            for source in source_leaves
+        )
+
+    def _moe_prefix_is_exl3(self, prefix: str) -> bool:
+        expert_prefixes = (f"{prefix}.0", f"{prefix}.experts.0")
+        return any(
+            all(
+                self._is_exl3_prefix(f"{expert}.{projection}")
+                for projection in ("gate_proj", "up_proj", "down_proj")
+            )
+            for expert in expert_prefixes
+        )
+
+    def codebook_for_prefix(self, prefix: str) -> str | None:
+        entry = self._storage_entry(prefix)
+        if entry is None:
+            return None
+        suffixes = {name.rsplit(".", 1)[-1] for name in entry.get("stored_tensors", {})}
+        if "mcg" in suffixes:
+            return "mcg"
+        if "mul1" in suffixes:
+            return "mul1"
+        return None
+
+    def has_quantized_lm_head(self) -> bool:
+        return self._is_exl3_prefix("lm_head")
+
+
+class Exl3Parameter(BasevLLMParameter):
+    """Zero-sized parameter holding independently shaped EXL3 components."""
+
+    def __new__(cls, *, weight_loader):
+        data = torch.empty(0, dtype=torch.uint8)
+        return super().__new__(cls, data=data, weight_loader=weight_loader)
+
+    def __init__(self, *, weight_loader):
+        self.exl3_tensors: dict[ShardId, torch.Tensor] = {}
+        super().__init__(data=self.data, weight_loader=weight_loader)
+
+    def load_exl3_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        shard_id: ShardId = None,
+    ) -> None:
+        self.exl3_tensors[shard_id] = loaded_weight.contiguous()
+
+
+def _exl3_weight_loader(
+    param: Exl3Parameter,
+    loaded_weight: torch.Tensor,
+    loaded_shard_id: ShardId = None,
+) -> None:
+    param.load_exl3_weight(loaded_weight, loaded_shard_id)
+
+
+class Exl3LinearMethod(LinearMethodBase):
+    def __init__(self, quant_config: Exl3Config) -> None:
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del params_dtype, extra_weight_attrs
+        if layer.__class__.__name__ == "ParallelLMHead":
+            org = getattr(layer, "org_vocab_size", None)
+            total = getattr(layer, "num_embeddings", None)
+            if org is not None and total is not None and org != total:
+                raise NotImplementedError(
+                    "EXL3 lm_head with added vocabulary is unsupported: the "
+                    f"trellis tensor covers the original {org} rows but the "
+                    f"layer allocates {total}; TP slicing would silently "
+                    "misalign. Strip --lora-extra-vocab-size / added tokens "
+                    "or leave lm_head unquantized."
+                )
+        # Respect the layer's effective topology. disable_tp linears set their
+        # own tp_size=1, while ReplicatedLinear carries full weights even when
+        # the process-wide tensor group is larger than one.
+        if isinstance(layer, ReplicatedLinear):
+            layer.exl3_tp_rank = 0
+            layer.exl3_tp_size = 1
+        else:
+            layer.exl3_tp_rank = getattr(
+                layer, "tp_rank", get_tensor_model_parallel_rank()
+            )
+            layer.exl3_tp_size = getattr(
+                layer, "tp_size", get_tensor_model_parallel_world_size()
+            )
+        layer.exl3_input_size = input_size
+        layer.exl3_input_size_per_partition = input_size_per_partition
+        layer.exl3_output_size = output_size
+        layer.exl3_output_partition_sizes = output_partition_sizes
+        layer.exl3_shard_ids = self._shard_ids_for_layer(layer, output_partition_sizes)
+        layer.exl3_parallel_mode = (
+            "row" if input_size_per_partition != input_size else "column"
+        )
+        source_prefixes = self._source_prefixes_for_layer(layer, layer.exl3_shard_ids)
+        layer.exl3_expected_codebooks = {
+            shard_id: self.quant_config.codebook_for_prefix(source_prefix)
+            for shard_id, source_prefix in zip(
+                layer.exl3_shard_ids, source_prefixes, strict=True
+            )
+        }
+
+        # su/sv are legacy packed sign bitfields.  Modern checkpoints load
+        # suh/svh directly.
+        for name in ("suh", "svh", "su", "sv", "trellis", "mcg", "mul1"):
+            layer.register_parameter(
+                name,
+                Exl3Parameter(weight_loader=_exl3_weight_loader),
+            )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self._materialize_legacy_hadamard(layer)
+        missing: list[str] = []
+        for attr in ("suh", "svh", "trellis"):
+            param = getattr(layer, attr)
+            for shard_id in layer.exl3_shard_ids:
+                if shard_id not in param.exl3_tensors:
+                    missing.append(f"{attr}[{shard_id!r}]")
+        for shard_id in layer.exl3_shard_ids:
+            expected = layer.exl3_expected_codebooks[shard_id]
+            has_mcg = shard_id in layer.mcg.exl3_tensors
+            has_mul1 = shard_id in layer.mul1.exl3_tensors
+            if has_mcg and has_mul1:
+                missing.append(f"codebook[{shard_id!r}]=both mcg and mul1")
+            elif expected == "mcg" and not has_mcg:
+                missing.append(f"mcg[{shard_id!r}]")
+            elif expected == "mul1" and not has_mul1:
+                missing.append(f"mul1[{shard_id!r}]")
+            elif expected is None and (has_mcg or has_mul1):
+                missing.append(f"unexpected codebook[{shard_id!r}]")
+        if missing:
+            prefix = getattr(layer, "prefix", layer.__class__.__name__)
+            raise ValueError(
+                f"Missing or inconsistent EXL3 tensors for {prefix}: "
+                + ", ".join(missing)
+            )
+
+        self._validate_loaded_tensors(layer)
+        self._shard_tensors_for_tensor_parallel(layer)
+        self._validate_loaded_tensors(layer)
+
+        # device_loading_context has moved the zero-sized registered parameter
+        # to the model target device.  Its device is the safest destination for
+        # the tensors kept in the side dictionaries.
+        device = layer.trellis.device
+        for attr in ("suh", "svh", "trellis", "mcg", "mul1"):
+            param = getattr(layer, attr)
+            for shard_id, tensor in list(param.exl3_tensors.items()):
+                param.exl3_tensors[shard_id] = tensor.to(
+                    device=device, non_blocking=True
+                ).contiguous()
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        original_shape = x.shape[:-1]
+        original_dtype = x.dtype
+        x_2d = x.reshape(-1, x.shape[-1]).to(torch.float16).contiguous()
+        outputs = [
+            self._apply_one(layer, x_2d, shard_id) for shard_id in layer.exl3_shard_ids
+        ]
+        output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
+        if bias is not None:
+            output = output + bias.to(dtype=output.dtype)
+        output = output.reshape(*original_shape, output.shape[-1])
+        return output if output.dtype == original_dtype else output.to(original_dtype)
+
+    @staticmethod
+    def _unpack_signs(bitfield: torch.Tensor) -> torch.Tensor:
+        words = bitfield.contiguous().view(torch.uint16).to(torch.int32)
+        masks = 1 << torch.arange(16, device=words.device, dtype=torch.int32)
+        negative = (words.unsqueeze(-1) & masks) != 0
+        return (
+            torch.where(
+                negative,
+                torch.tensor(-1.0, device=words.device, dtype=torch.float16),
+                torch.tensor(1.0, device=words.device, dtype=torch.float16),
+            )
+            .flatten()
+            .contiguous()
+        )
+
+    @classmethod
+    def _materialize_legacy_hadamard(cls, layer: torch.nn.Module) -> None:
+        for packed_name, half_name in (("su", "suh"), ("sv", "svh")):
+            packed = getattr(layer, packed_name).exl3_tensors
+            half = getattr(layer, half_name).exl3_tensors
+            for shard_id in layer.exl3_shard_ids:
+                if shard_id not in half and shard_id in packed:
+                    half[shard_id] = cls._unpack_signs(packed[shard_id])
+
+    @staticmethod
+    def _validate_marker(tensor: torch.Tensor, expected: int, name: str) -> None:
+        if tensor.dtype != torch.int32 or tensor.numel() != 1:
+            raise ValueError(f"EXL3 {name} must be a scalar int32 sentinel")
+        value = int(tensor.reshape(()).item()) & 0xFFFFFFFF
+        if value != expected:
+            raise ValueError(
+                f"Invalid EXL3 {name} sentinel 0x{value:08x}; expected 0x{expected:08x}"
+            )
+
+    @classmethod
+    def _validate_loaded_tensors(cls, layer: torch.nn.Module) -> None:
+        for shard_id in layer.exl3_shard_ids:
+            trellis = layer.trellis.exl3_tensors[shard_id]
+            suh = layer.suh.exl3_tensors[shard_id]
+            svh = layer.svh.exl3_tensors[shard_id]
+            if trellis.dtype != torch.int16 or trellis.ndim != 3:
+                raise ValueError("EXL3 trellis must be rank-3 int16")
+            if trellis.shape[2] % 16 or not 1 <= trellis.shape[2] // 16 <= 8:
+                raise ValueError(
+                    f"Invalid EXL3 trellis bit width {trellis.shape[2]} / 16"
+                )
+            if suh.dtype != torch.float16 or suh.ndim != 1:
+                raise ValueError("EXL3 suh must be rank-1 float16")
+            if svh.dtype != torch.float16 or svh.ndim != 1:
+                raise ValueError("EXL3 svh must be rank-1 float16")
+            k = trellis.shape[0] * 16
+            n = trellis.shape[1] * 16
+            if suh.numel() != k or svh.numel() != n:
+                raise ValueError(
+                    "EXL3 dimensions disagree: "
+                    f"trellis={tuple(trellis.shape)}, suh={suh.numel()}, "
+                    f"svh={svh.numel()}"
+                )
+            if k % _HADAMARD_BLOCK or n % _HADAMARD_BLOCK:
+                raise ValueError(
+                    f"EXL3 kernel dimensions must be {_HADAMARD_BLOCK}-aligned, "
+                    f"got K={k}, N={n}"
+                )
+            if shard_id in layer.mcg.exl3_tensors:
+                cls._validate_marker(
+                    layer.mcg.exl3_tensors[shard_id], _MCG_SENTINEL, "mcg"
+                )
+            if shard_id in layer.mul1.exl3_tensors:
+                cls._validate_marker(
+                    layer.mul1.exl3_tensors[shard_id], _MUL1_SENTINEL, "mul1"
+                )
+
+    @staticmethod
+    def _slice_exl3_tensor(
+        tensor: torch.Tensor,
+        *,
+        dim: int,
+        start: int,
+        size: int,
+    ) -> torch.Tensor:
+        if start % _HADAMARD_BLOCK or size % _HADAMARD_BLOCK:
+            axis = "output" if dim == 1 else "input"
+            raise ValueError(
+                f"EXL3 TP {axis} slice must be {_HADAMARD_BLOCK}-aligned, "
+                f"got start={start}, size={size}"
+            )
+        return tensor.narrow(dim, start // 16, size // 16).contiguous()
+
+    @staticmethod
+    def _output_shard_size(layer: torch.nn.Module, shard_id: ShardId) -> int:
+        if shard_id is None:
+            return layer.exl3_output_partition_sizes[0]
+        if isinstance(shard_id, str) and shard_id in ("q", "k", "v"):
+            return layer.exl3_output_partition_sizes[{"q": 0, "k": 1, "v": 2}[shard_id]]
+        if isinstance(shard_id, tuple):
+            return sum(layer.exl3_output_partition_sizes[idx] for idx in shard_id)
+        if isinstance(shard_id, int):
+            return layer.exl3_output_partition_sizes[shard_id]
+        return layer.exl3_output_partition_sizes[layer.exl3_shard_ids.index(shard_id)]
+
+    @staticmethod
+    def _qkv_output_start(
+        layer: torch.nn.Module, shard_id: ShardId, shard_size: int
+    ) -> int:
+        if shard_id in ("k", "v"):
+            shard_rank = layer.exl3_tp_rank // layer.num_kv_head_replicas
+        else:
+            shard_rank = layer.exl3_tp_rank
+        return shard_rank * shard_size
+
+    @classmethod
+    def _shard_tensors_for_tensor_parallel(cls, layer: torch.nn.Module) -> None:
+        if layer.exl3_tp_size == 1:
+            return
+        if layer.exl3_parallel_mode == "row":
+            start = layer.exl3_tp_rank * layer.exl3_input_size_per_partition
+            size = layer.exl3_input_size_per_partition
+            for shard_id in layer.exl3_shard_ids:
+                layer.suh.exl3_tensors[shard_id] = (
+                    layer.suh.exl3_tensors[shard_id].narrow(0, start, size).contiguous()
+                )
+                layer.trellis.exl3_tensors[shard_id] = cls._slice_exl3_tensor(
+                    layer.trellis.exl3_tensors[shard_id],
+                    dim=0,
+                    start=start,
+                    size=size,
+                )
+            return
+
+        already_sharded = cls._expand_tuple_output_shards(layer)
+        for shard_id in layer.exl3_shard_ids:
+            if shard_id in already_sharded:
+                continue
+            size = cls._output_shard_size(layer, shard_id)
+            start = cls._qkv_output_start(layer, shard_id, size)
+            layer.svh.exl3_tensors[shard_id] = (
+                layer.svh.exl3_tensors[shard_id].narrow(0, start, size).contiguous()
+            )
+            layer.trellis.exl3_tensors[shard_id] = cls._slice_exl3_tensor(
+                layer.trellis.exl3_tensors[shard_id],
+                dim=1,
+                start=start,
+                size=size,
+            )
+
+    @classmethod
+    def _expand_tuple_output_shards(cls, layer: torch.nn.Module) -> set[int]:
+        tuples = [sid for sid in layer.exl3_shard_ids if isinstance(sid, tuple)]
+        if not tuples:
+            return set()
+
+        expanded_ids: list[ShardId] = []
+        component_ids: set[int] = set()
+        for shard_id in layer.exl3_shard_ids:
+            if isinstance(shard_id, tuple):
+                expanded_ids.extend(shard_id)
+                component_ids.update(shard_id)
+            else:
+                expanded_ids.append(shard_id)
+
+        for tuple_id in tuples:
+            full_offsets: dict[int, int] = {}
+            offset = 0
+            for idx in tuple_id:
+                full_offsets[idx] = offset
+                offset += layer.exl3_output_partition_sizes[idx] * layer.exl3_tp_size
+            for idx in tuple_id:
+                size = layer.exl3_output_partition_sizes[idx]
+                start = full_offsets[idx] + layer.exl3_tp_rank * size
+                layer.suh.exl3_tensors[idx] = layer.suh.exl3_tensors[tuple_id]
+                layer.svh.exl3_tensors[idx] = (
+                    layer.svh.exl3_tensors[tuple_id].narrow(0, start, size).contiguous()
+                )
+                layer.trellis.exl3_tensors[idx] = cls._slice_exl3_tensor(
+                    layer.trellis.exl3_tensors[tuple_id],
+                    dim=1,
+                    start=start,
+                    size=size,
+                )
+                layer.exl3_expected_codebooks[idx] = layer.exl3_expected_codebooks[
+                    tuple_id
+                ]
+                for marker in ("mcg", "mul1"):
+                    tensors = getattr(layer, marker).exl3_tensors
+                    if tuple_id in tensors:
+                        tensors[idx] = tensors[tuple_id]
+            for attr in ("suh", "svh", "trellis", "mcg", "mul1"):
+                getattr(layer, attr).exl3_tensors.pop(tuple_id, None)
+            layer.exl3_expected_codebooks.pop(tuple_id, None)
+
+        layer.exl3_shard_ids = expanded_ids
+        return component_ids
+
+    @staticmethod
+    def _shard_ids_for_layer(
+        layer: torch.nn.Module,
+        output_partition_sizes: list[int],
+    ) -> list[ShardId]:
+        if len(output_partition_sizes) == 1:
+            return [None]
+        prefix = getattr(layer, "prefix", "")
+        if isinstance(layer, QKVParallelLinear) and len(output_partition_sizes) == 3:
+            return ["q", "k", "v"]
+        if prefix.endswith("in_proj_qkvz"):
+            return [(0, 1, 2), 3]
+        return list(range(len(output_partition_sizes)))
+
+    def _source_prefixes_for_layer(
+        self, layer: torch.nn.Module, shard_ids: list[ShardId]
+    ) -> list[str]:
+        prefix = getattr(layer, "prefix", "")
+        if len(shard_ids) == 1:
+            return [prefix or "lm_head"]
+        leaf = prefix.rsplit(".", 1)[-1]
+        base = prefix.rsplit(".", 1)[0] if "." in prefix else ""
+        sources = self.quant_config.packed_modules_mapping.get(leaf)
+        if sources and len(sources) == len(shard_ids):
+            return [f"{base}.{source}" if base else source for source in sources]
+        raise ValueError(
+            f"EXL3 does not know the source matrices for packed layer {prefix}; "
+            "add it to the model's packed_modules_mapping."
+        )
+
+    @staticmethod
+    def _apply_one(
+        layer: torch.nn.Module, x: torch.Tensor, shard_id: ShardId
+    ) -> torch.Tensor:
+        trellis = layer.trellis.exl3_tensors[shard_id]
+        packed_k = trellis.shape[0] * 16
+        if x.shape[-1] > packed_k:
+            raise ValueError(
+                f"EXL3 input width {x.shape[-1]} exceeds packed K={packed_k}"
+            )
+        if x.shape[-1] < packed_k:
+            x = torch.nn.functional.pad(x, (0, packed_k - x.shape[-1]))
+        output = _exl3_gemm(
+            x,
+            trellis,
+            layer.suh.exl3_tensors[shard_id],
+            layer.svh.exl3_tensors[shard_id],
+            shard_id in layer.mcg.exl3_tensors,
+            shard_id in layer.mul1.exl3_tensors,
+        )
+        logical_n = Exl3LinearMethod._output_shard_size(layer, shard_id)
+        if output.shape[-1] < logical_n:
+            raise ValueError(
+                f"EXL3 packed N={output.shape[-1]} is below logical N={logical_n}"
+            )
+        return output[..., :logical_n]
+
+
+class Exl3MoEParameter(BasevLLMParameter):
+    """Zero-sized parameter holding EXL3 tensors by expert and projection."""
+
+    def __new__(cls, *, weight_loader):
+        data = torch.empty(0, dtype=torch.uint8)
+        return super().__new__(cls, data=data, weight_loader=weight_loader)
+
+    def __init__(self, *, weight_loader):
+        self.exl3_tensors: dict[tuple[int, str], torch.Tensor] = {}
+        super().__init__(data=self.data, weight_loader=weight_loader)
+
+
+def _exl3_moe_weight_loader(
+    param: Exl3MoEParameter,
+    loaded_weight: torch.Tensor,
+    weight_name: str,
+    shard_id: str,
+    expert_id: int,
+    return_success: bool = False,
+) -> bool | None:
+    del weight_name
+    param.exl3_tensors[(expert_id, shard_id)] = loaded_weight.contiguous()
+    return True if return_success else None
+
+
+# Model loaders (e.g. llama4-style paths) check this attribute before routing
+# expert tensors through a param's weight_loader with MoE kwargs.
+_exl3_moe_weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
+
+
+class Exl3MoEMethod(FusedMoEMethodBase):
+    """Correctness MoE path: route, then use three dense EXL3 GEMMs/expert."""
+
+    def __init__(self, quant_config: Exl3Config, moe) -> None:
+        super().__init__(moe)
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: RoutedExperts,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del num_experts, params_dtype, extra_weight_attrs
+        if self.moe.moe_parallel_config.use_ep:
+            raise NotImplementedError(
+                "EXL3 correctness MoE currently supports TP but not expert parallelism"
+            )
+        if self.moe.has_bias:
+            raise NotImplementedError(
+                "EXL3 correctness MoE does not yet support expert biases"
+            )
+        layer.exl3_tp_rank = self.moe.moe_parallel_config.tp_rank
+        layer.exl3_tp_size = self.moe.moe_parallel_config.tp_size
+        layer.exl3_hidden_size = hidden_size
+        layer.exl3_intermediate_size_per_partition = intermediate_size_per_partition
+        for prefix in ("w13", "w2"):
+            for suffix in ("suh", "svh", "trellis", "mcg", "mul1"):
+                layer.register_parameter(
+                    f"{prefix}_{suffix}",
+                    Exl3MoEParameter(weight_loader=_exl3_moe_weight_loader),
+                )
+
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        required = {"w13": ("w1", "w3"), "w2": ("w2",)}
+        missing: list[str] = []
+        for prefix, shard_ids in required.items():
+            for attr in ("suh", "svh", "trellis"):
+                tensors = getattr(layer, f"{prefix}_{attr}").exl3_tensors
+                for expert_id in range(layer.local_num_experts):
+                    for shard_id in shard_ids:
+                        if (expert_id, shard_id) not in tensors:
+                            missing.append(f"{prefix}_{attr}[{expert_id},{shard_id}]")
+        if missing:
+            raise ValueError(
+                f"Missing EXL3 MoE tensors for {layer.layer_name}: "
+                + ", ".join(missing[:32])
+                + (" ..." if len(missing) > 32 else "")
+            )
+        self._validate_codebooks(layer)
+        self._shard_tensors_for_tensor_parallel(layer)
+        device = layer.w13_trellis.device
+        for prefix in ("w13", "w2"):
+            for attr in ("suh", "svh", "trellis", "mcg", "mul1"):
+                param = getattr(layer, f"{prefix}_{attr}")
+                for key, tensor in list(param.exl3_tensors.items()):
+                    param.exl3_tensors[key] = tensor.to(
+                        device=device, non_blocking=True
+                    ).contiguous()
+        self._validate_moe_shapes(layer)
+
+    def _validate_codebooks(self, layer: RoutedExperts) -> None:
+        projections = {
+            "w1": layer.ckpt_gate_proj_name,
+            "w2": layer.ckpt_down_proj_name,
+            "w3": layer.ckpt_up_proj_name,
+        }
+        for expert_id in range(layer.local_num_experts):
+            for shard_id, projection in projections.items():
+                prefix = f"{layer.layer_name}.{expert_id}.{projection}"
+                expected = self.quant_config.codebook_for_prefix(prefix)
+                group = "w2" if shard_id == "w2" else "w13"
+                key = (expert_id, shard_id)
+                has_mcg = key in getattr(layer, f"{group}_mcg").exl3_tensors
+                has_mul1 = key in getattr(layer, f"{group}_mul1").exl3_tensors
+                if has_mcg and has_mul1:
+                    raise ValueError(f"EXL3 MoE {prefix} has both codebooks")
+                if expected == "mcg" and not has_mcg:
+                    raise ValueError(f"EXL3 MoE {prefix} is missing mcg")
+                if expected == "mul1" and not has_mul1:
+                    raise ValueError(f"EXL3 MoE {prefix} is missing mul1")
+                if expected is None and (has_mcg or has_mul1):
+                    raise ValueError(
+                        f"EXL3 MoE {prefix} has an unexpected codebook marker"
+                    )
+                if has_mcg:
+                    Exl3LinearMethod._validate_marker(
+                        getattr(layer, f"{group}_mcg").exl3_tensors[key],
+                        _MCG_SENTINEL,
+                        "mcg",
+                    )
+                if has_mul1:
+                    Exl3LinearMethod._validate_marker(
+                        getattr(layer, f"{group}_mul1").exl3_tensors[key],
+                        _MUL1_SENTINEL,
+                        "mul1",
+                    )
+
+    @classmethod
+    def _shard_tensors_for_tensor_parallel(cls, layer: RoutedExperts) -> None:
+        if layer.exl3_tp_size == 1:
+            return
+        start = layer.exl3_tp_rank * layer.exl3_intermediate_size_per_partition
+        size = layer.exl3_intermediate_size_per_partition
+        for expert_id in range(layer.local_num_experts):
+            for shard_id in ("w1", "w3"):
+                key = (expert_id, shard_id)
+                layer.w13_svh.exl3_tensors[key] = (
+                    layer.w13_svh.exl3_tensors[key].narrow(0, start, size).contiguous()
+                )
+                layer.w13_trellis.exl3_tensors[key] = (
+                    Exl3LinearMethod._slice_exl3_tensor(
+                        layer.w13_trellis.exl3_tensors[key],
+                        dim=1,
+                        start=start,
+                        size=size,
+                    )
+                )
+            key = (expert_id, "w2")
+            layer.w2_suh.exl3_tensors[key] = (
+                layer.w2_suh.exl3_tensors[key].narrow(0, start, size).contiguous()
+            )
+            layer.w2_trellis.exl3_tensors[key] = Exl3LinearMethod._slice_exl3_tensor(
+                layer.w2_trellis.exl3_tensors[key],
+                dim=0,
+                start=start,
+                size=size,
+            )
+
+    @staticmethod
+    def _validate_moe_shapes(layer: RoutedExperts) -> None:
+        for expert_id in range(layer.local_num_experts):
+            for group, shard_ids in (("w13", ("w1", "w3")), ("w2", ("w2",))):
+                for shard_id in shard_ids:
+                    key = (expert_id, shard_id)
+                    trellis = getattr(layer, f"{group}_trellis").exl3_tensors[key]
+                    suh = getattr(layer, f"{group}_suh").exl3_tensors[key]
+                    svh = getattr(layer, f"{group}_svh").exl3_tensors[key]
+                    if (
+                        trellis.dtype != torch.int16
+                        or trellis.ndim != 3
+                        or trellis.shape[2] % 16
+                        or not 1 <= trellis.shape[2] // 16 <= 8
+                        or suh.dtype != torch.float16
+                        or suh.ndim != 1
+                        or svh.dtype != torch.float16
+                        or svh.ndim != 1
+                        or suh.numel() != trellis.shape[0] * 16
+                        or svh.numel() != trellis.shape[1] * 16
+                        or (trellis.shape[0] * 16) % _HADAMARD_BLOCK
+                        or (trellis.shape[1] * 16) % _HADAMARD_BLOCK
+                    ):
+                        raise ValueError(
+                            f"Invalid EXL3 MoE tensors for expert={expert_id}, "
+                            f"projection={shard_id}"
+                        )
+
+    def get_fused_moe_quant_config(
+        self, layer: RoutedExperts
+    ) -> FusedMoEQuantConfig | None:
+        del layer
+        return None
+
+    @property
+    def topk_indices_dtype(self) -> torch.dtype | None:
+        return torch.long
+
+    def apply(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: "SharedExperts | None",
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        del shared_experts, shared_experts_input
+        if layer.activation != MoEActivation.SILU:
+            raise NotImplementedError(
+                f"EXL3 correctness MoE supports SiLU only, got {layer.activation}"
+            )
+        if layer.expert_map is not None:
+            raise NotImplementedError("EXL3 MoE expert maps/EPLB are not supported")
+        if layer.apply_router_weight_on_input:
+            raise NotImplementedError(
+                "EXL3 MoE does not support router weights applied on input"
+            )
+
+        original_shape = x.shape[:-1]
+        original_dtype = x.dtype
+        x_2d = x.reshape(-1, x.shape[-1]).to(torch.float16).contiguous()
+        ids = topk_ids.reshape(x_2d.shape[0], -1).to(torch.long)
+        weights = topk_weights.reshape_as(ids).to(torch.float16)
+        output = torch.zeros(
+            (x_2d.shape[0], layer.hidden_size),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        for expert_id in range(layer.local_num_experts):
+            positions = (ids == expert_id).nonzero(as_tuple=False)
+            if positions.shape[0] == 0:
+                continue
+            token_ids = positions[:, 0]
+            route_ids = positions[:, 1]
+            expert_input = x_2d.index_select(0, token_ids)
+            gate = self._apply_expert(layer, "w13", expert_input, expert_id, "w1")
+            up = self._apply_expert(layer, "w13", expert_input, expert_id, "w3")
+            hidden = torch.nn.functional.silu(gate) * up
+            expert_output = self._apply_expert(layer, "w2", hidden, expert_id, "w2")
+            route_weight = weights[token_ids, route_ids].unsqueeze(-1)
+            output.index_add_(
+                0,
+                token_ids,
+                (expert_output * route_weight).to(torch.float32),
+            )
+        output = output.reshape(*original_shape, output.shape[-1])
+        return output if output.dtype == original_dtype else output.to(original_dtype)
+
+    def apply_monolithic(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del layer, x, router_logits, input_ids
+        raise NotImplementedError("EXL3 MoE uses vLLM's external router")
+
+    @staticmethod
+    def _apply_expert(
+        layer: RoutedExperts,
+        group: str,
+        x: torch.Tensor,
+        expert_id: int,
+        shard_id: str,
+    ) -> torch.Tensor:
+        key = (expert_id, shard_id)
+        trellis = getattr(layer, f"{group}_trellis").exl3_tensors[key]
+        packed_k = trellis.shape[0] * 16
+        if x.shape[-1] > packed_k:
+            raise ValueError(
+                f"EXL3 MoE input width {x.shape[-1]} exceeds packed K={packed_k}"
+            )
+        if x.shape[-1] < packed_k:
+            x = torch.nn.functional.pad(x, (0, packed_k - x.shape[-1]))
+        output = _exl3_gemm(
+            x,
+            trellis,
+            getattr(layer, f"{group}_suh").exl3_tensors[key],
+            getattr(layer, f"{group}_svh").exl3_tensors[key],
+            key in getattr(layer, f"{group}_mcg").exl3_tensors,
+            key in getattr(layer, f"{group}_mul1").exl3_tensors,
+        )
+        logical_n = (
+            layer.hidden_size
+            if shard_id == "w2"
+            else layer.exl3_intermediate_size_per_partition
+        )
+        if output.shape[-1] < logical_n:
+            raise ValueError(
+                f"EXL3 MoE packed N={output.shape[-1]} is below logical N={logical_n}"
+            )
+        return output[..., :logical_n]
+
+
+__all__ = ["Exl3Config", "Exl3LinearMethod", "Exl3MoEMethod"]
