@@ -29,6 +29,7 @@ import torch.distributed as dist
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.utils.multi_stream_utils import is_vllm_cudagraph_capture_active
 
 if TYPE_CHECKING:
     from vllm.distributed.parallel_state import GroupCoordinator
@@ -538,13 +539,19 @@ def _dcp_a2a_send_recv_buffers(
     # buffer address at capture, but a larger eager batch can grow that workspace
     # and free the captured address. Eager calls therefore use ordinary temporary
     # tensors, while captured calls retain fixed-size owners below.
-    if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+    if device.type == "cuda" and (
+        is_vllm_cudagraph_capture_active()
+        or torch.cuda.is_current_stream_capturing()
+    ):
         # FULL graphs share a global graph pool. Without a live Python owner,
         # a larger descriptor's staging allocation can be recycled while a
         # smaller descriptor is captured, leaving both NCCL graph nodes bound
-        # to the same address. Keep one exact-shape pair alive per device so
-        # descriptors cannot alias each other's A2A staging storage. Layers of
-        # one graph may reuse the pair because all operations are stream-ordered.
+        # to the same address. The vLLM capture scope starts before each eager
+        # graph prewarm, so this also allocates the retained pair before CUDA
+        # capture begins instead of from the shared graph pool. Keep one
+        # exact-shape pair alive per device so descriptors cannot alias each
+        # other's A2A staging storage. Layers of one graph may reuse the pair
+        # because all operations are stream-ordered.
         key = (shape, device, dtype)
         buffers = _DCP_A2A_GRAPH_BUFFERS.get(key)
         if buffers is None:
