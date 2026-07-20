@@ -20,6 +20,7 @@ Reference: https://arxiv.org/abs/2507.07120
 
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
@@ -36,6 +37,29 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+
+# cuBLAS selects TMA-tiled kernels for the strided/overlapping-batch view of
+# the DCP reduce-scatter output in MLA `_v_up_proj`. Those kernels perform a
+# bounded read-ahead (observed up to base + 64 KB) past the operand's logical
+# extent, relying on the caching allocator's natural segment padding. A tight
+# `torch.empty` output can land at a 2 MB segment tail with an unmapped VA page
+# after it, so the read-ahead faults (Xid 31 / FAULT_PDE) on all ranks at once.
+# Padding the output allocation keeps >= 64 KB past the logical end mapped
+# inside the same allocator block, regardless of segment layout.
+_CUBLAS_TAIL_PAD_BYTES = 65536
+
+
+def _tail_padded_empty(
+    shape: tuple[int, ...], device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Allocate a contiguous tensor of ``shape`` with >= 64 KB of live tail
+    padding inside the same allocator block, so downstream cuBLAS read-ahead
+    cannot cross into unmapped memory."""
+    numel = math.prod(shape)
+    pad = -(-_CUBLAS_TAIL_PAD_BYTES // dtype.itemsize)
+    flat = torch.empty(numel + pad, device=device, dtype=dtype)
+    return flat[:numel].view(shape)
+
 
 _B12X_DCP_A2A_POOLS: dict[tuple[int, int, int, int, int, int], Any] = {}
 _B12X_DCP_A2A_DISABLED: set[tuple[int, int, int, int, int, int]] = set()
@@ -225,9 +249,17 @@ def _try_b12x_dcp_lse_reduce(
     if not cp_attn_lse.is_contiguous():
         cp_attn_lse = cp_attn_lse.contiguous()
 
+    # Pass a tail-padded output so the reduce kernel writes directly into a
+    # buffer that is safe for the downstream `_v_up_proj` cuBLAS read-ahead.
+    out = _tail_padded_empty(
+        (batch, total_heads // world_size, head_dim),
+        cp_attn_out.device,
+        cp_attn_out.dtype,
+    )
     return pool.lse_reduce_scatter(
         cp_attn_out,
         cp_attn_lse,
+        out=out,
         is_lse_base_on_e=is_lse_base_on_e,
     )
 
@@ -279,7 +311,14 @@ def _try_b12x_dcp_all_gather_heads(
     )
     if pool is None:
         return None
-    return pool.all_gather_heads(local_input)
+    # Pad the gathered output for the same cuBLAS read-ahead safety reason as
+    # the reduce-scatter path (see `_tail_padded_empty`).
+    out = _tail_padded_empty(
+        (batch, local_heads * world_size, head_dim),
+        local_input.device,
+        local_input.dtype,
+    )
+    return pool.all_gather_heads(local_input, out=out)
 
 
 def dcp_b12x_all_gather_heads(
