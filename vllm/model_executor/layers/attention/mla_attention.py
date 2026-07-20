@@ -563,6 +563,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             **extra_impl_args,
         )
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
+        self.force_contiguous_mla_bmm_input = getattr(
+            self.impl, "force_contiguous_mla_bmm_input", False
+        )
+        self.force_contiguous_mla_bmm_weight = getattr(
+            self.impl, "force_contiguous_mla_bmm_weight", False
+        )
+        self.force_contiguous_mla_bmm_output = getattr(
+            self.impl, "force_contiguous_mla_bmm_output", False
+        )
         self.use_direct_call = not current_platform.opaque_attention_op()
 
         vllm_config = get_current_vllm_config()
@@ -963,6 +972,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 N, B, P = mqa_q_nope.shape
                 _, _, L = self.W_UK_T.shape
 
+                if self.force_contiguous_mla_bmm_input:
+                    mqa_q_nope = mqa_q_nope.contiguous()
+
                 if self.q_pad_num_heads is not None:
                     mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
                     mqa_ql_nope.resize_((N, B, L))
@@ -1362,9 +1374,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
         else:
             # Convert from (L, N, V) to (N, L, V)
-            replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
+            W_UV = W_UV.transpose(0, 1)
             # Convert from (L, N, P) to (N, P, L)
-            replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
+            W_UK_T = W_UK.permute(1, 2, 0)
+            if self.force_contiguous_mla_bmm_weight:
+                W_UV = W_UV.contiguous()
+                W_UK_T = W_UK_T.contiguous()
+            replace_parameter(self, "W_UV", W_UV, prefer_copy=True)
+            replace_parameter(self, "W_UK_T", W_UK_T, prefer_copy=True)
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
@@ -1473,7 +1490,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
         else:
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
-            torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
+            # Some CUDA BMM algorithms read a full tile beyond strided tensor
+            # bounds. Backends with tightly mapped buffers opt into contiguous
+            # operands so those accesses stay inside the logical allocation.
+            if self.force_contiguous_mla_bmm_input:
+                x = x.contiguous()
+            if self.force_contiguous_mla_bmm_output:
+                bmm_out = torch.empty(
+                    (self.num_heads, x.shape[1], self.v_head_dim),
+                    dtype=out.dtype,
+                    device=out.device,
+                )
+                torch.bmm(x, self.W_UV, out=bmm_out)
+                out.copy_(bmm_out.transpose(0, 1))
+            else:
+                torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
 
     def _v_up_proj_bmm(
         self,
