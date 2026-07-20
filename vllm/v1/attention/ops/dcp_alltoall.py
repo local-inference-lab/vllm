@@ -154,9 +154,14 @@ def _get_b12x_dcp_a2a_pool(
 @contextmanager
 def capture_b12x_dcp_a2a(
     cp_group: GroupCoordinator,
-    stream: object = None,
+    stream: torch.cuda.Stream | None = None,
 ):
-    """Bind each CUDA graph manager to independent B12X DCP channels."""
+    """Bind each CUDA graph manager to independent B12X DCP channels.
+
+    Args:
+        cp_group: DCP group whose registered pools should enter capture.
+        stream: CUDA stream owned by the enclosing graph capture.
+    """
     group_id = id(cp_group.device_group)
     matching_pools = sorted(
         (
