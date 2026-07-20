@@ -1944,14 +1944,15 @@ def initialize_model_parallel(
             group_name="query_split",
         )
 
-    # A dedicated communicator over the DCP ranks for the transient ckv
-    # prefetch gather (Fix B). The prefetch runs on a side stream and would
-    # otherwise share the DCP communicator with the indexer's DCP top-k
-    # merge on the default stream; concurrent collectives on one NCCL
-    # communicator from two streams is unsupported. Same ranks as ``_DCP``.
+    # A dedicated communicator over the DCP ranks for full-CKV prefetch and
+    # selected-record decode exchange. These paths run on a side stream and
+    # must not share the DCP communicator with the indexer's top-k merge on
+    # the default stream. Same ranks as ``_DCP``.
     global _DCP_CKV_PREFETCH
     assert _DCP_CKV_PREFETCH is None, "DCP ckv prefetch group is already initialized"
-    if decode_context_model_parallel_size > 1 and envs.VLLM_B12X_MLA_CKV_GATHER:
+    if decode_context_model_parallel_size > 1 and (
+        envs.VLLM_B12X_MLA_CKV_GATHER or envs.VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER
+    ):
         _DCP_CKV_PREFETCH = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
@@ -2155,6 +2156,15 @@ def model_parallel_is_initialized():
 _TP_STATE_PATCHED = False
 
 
+_MODEL_PARALLEL_CLEANUP_HOOKS: list[Callable[[], None]] = []
+
+
+def register_model_parallel_cleanup_hook(callback: Callable[[], None]) -> None:
+    """Register idempotent cleanup that must run before groups are destroyed."""
+    if callback not in _MODEL_PARALLEL_CLEANUP_HOOKS:
+        _MODEL_PARALLEL_CLEANUP_HOOKS.append(callback)
+
+
 def get_tensor_model_parallel_world_size() -> int:
     """Return world size for the tensor model parallel group."""
     return get_tp_group().world_size
@@ -2173,6 +2183,12 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    for cleanup in _MODEL_PARALLEL_CLEANUP_HOOKS:
+        try:
+            cleanup()
+        except Exception:
+            logger.exception("Model-parallel cleanup hook failed")
+
     global _TP
 
     if _TP:

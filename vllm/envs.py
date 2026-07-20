@@ -77,6 +77,9 @@ if TYPE_CHECKING:
     VLLM_DCP_GLOBAL_TOPK: bool = True
     VLLM_DCP_QUERY_SPLIT: bool = False
     VLLM_B12X_MLA_CKV_GATHER: bool = False
+    VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER: bool = False
+    VLLM_B12X_MLA_SPARSE_DECODE_MAX_SEQS: int = 8
+    VLLM_B12X_MLA_SPARSE_DECODE_POOL_RECORDS: int = 0
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
     VLLM_B12X_MLA_CKV_PREFETCH_DEPTH: int = 1
@@ -1173,6 +1176,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_B12X_MLA_CKV_GATHER": lambda: (
         os.getenv("VLLM_B12X_MLA_CKV_GATHER", "0").lower() in ("1", "true", "yes", "on")
+    ),
+    # Exchange only sparse-MLA-selected native CKV records during DCP decode.
+    "VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER": lambda: (
+        os.getenv("VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER", "0").lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_B12X_MLA_SPARSE_DECODE_MAX_SEQS": lambda: int(
+        os.getenv("VLLM_B12X_MLA_SPARSE_DECODE_MAX_SEQS", "8")
+    ),
+    # Zero sizes the pool for the full configured request count.
+    "VLLM_B12X_MLA_SPARSE_DECODE_POOL_RECORDS": lambda: int(
+        os.getenv("VLLM_B12X_MLA_SPARSE_DECODE_POOL_RECORDS", "0")
     ),
     "VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS", "16")
