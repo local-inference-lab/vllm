@@ -95,10 +95,33 @@ The filesystem tier (`type: "fs"`) writes blocks to a filesystem directory.
 | `root_dir` | yes | — | Base directory; vLLM creates subdirectories beneath it (see [On-Disk Layout](#on-disk-layout)). |
 | `n_read_threads` | no | `16` | Read-priority I/O threads (load path). |
 | `n_write_threads` | no | `16` | Write-priority I/O threads (store path). |
+| `max_cache_size_bytes` | no | unlimited | Maximum bytes of completed block files retained in this model/configuration namespace. Enables local LRU eviction when set. Must fit at least one offload block. |
 | `enable_kv_events` | no | `false` | Publish `BlockStored` KV events (medium `FS`) for successfully stored blocks. Requires KV cache events to be enabled globally. |
 | `locality` | no | unspecified | `LOCAL` or `REMOTE` relative to the publishing vLLM instance. Included in the tier's KV events only when explicitly configured. |
 
 Each thread group prefers its own queue but pulls from the other when its primary queue is empty, so a write-heavy or read-heavy burst won't leave the off-priority queue waiting. Size the totals to your storage's effective concurrency.
+
+Set `max_cache_size_bytes` to bound a local filesystem or NVMe cache. The
+filesystem tier indexes existing block files at startup, orders them by
+modification time, and removes the oldest files until the configured limit is
+met. During the run, successful lookups and `touch` calls maintain exact LRU
+order. Blocks selected by an active request and sources of queued load jobs are
+pinned until they are safe to reclaim. If every resident block is pinned, a new
+store job fails with `ENOSPC`; the tier never exceeds the configured limit or
+evicts an in-use load source.
+
+The limit applies to the current `<model>_<digest>_r<rank>` block namespace. It
+does not include `config.json`, stale temporary files, or namespaces belonging
+to other model/configuration digests under the same `root_dir`. Values that are
+not an exact multiple of the offload block size leave the remainder unused.
+
+!!! warning
+    Capacity tracking is process-local. Use `max_cache_size_bytes` only when one
+    live vLLM instance has exclusive ownership of the generated block
+    namespace. Do not enable it for a shared PVC or a `root_dir` concurrently
+    used by multiple instances; one process cannot honor another process's
+    in-flight pins or LRU state. Leave the option unset for cross-process
+    sharing and manage shared-storage retention externally.
 
 #### On-Disk Layout
 
@@ -181,6 +204,7 @@ Rather than embedding `host`/`port` in each `secondary_tiers` entry, set them on
 - For single-tier (CPU-only) setups, set `cpu_bytes_to_use` larger than the aggregate GPU KV cache. Because offloading is immediate, a smaller CPU tier just mirrors what the GPU already holds and adds no hit rate.
 - `block_size`: larger offloaded blocks reduce per-block bookkeeping overhead but increase the granularity of lookups. Must be a multiple of the GPU block size.
 - FS thread counts: tune `n_read_threads` and `n_write_threads` to the parallelism your storage can sustain. Reads are latency-sensitive on the prefill path, so prefer more read threads when prefill hit rates are high.
+- Local FS/NVMe capacity: set `max_cache_size_bytes` below the device's usable capacity, leaving headroom for filesystem metadata and any other data on the volume. The limit covers the active model/configuration namespace, not the entire `root_dir` or filesystem.
 - Sharing `root_dir` across runs: runs with the same model, `block_size`, parallelism layout, and dtype share files under the same `<digest>` subdirectory. Changing any of these produces a new subdirectory; old ones are orphaned but harmless. Delete them to reclaim disk.
 
 ## Per-Request Selective Offload

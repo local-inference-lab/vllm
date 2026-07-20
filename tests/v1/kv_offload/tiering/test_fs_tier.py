@@ -93,6 +93,7 @@ def make_job(
     keys: list[OffloadKey],
     block_ids: list[int] | None = None,
     is_promotion: bool = False,
+    req_context: ReqContext = _CTX,
 ) -> JobMetadata:
     if block_ids is None:
         block_ids = list(range(len(keys)))
@@ -101,7 +102,7 @@ def make_job(
         keys=keys,
         block_ids=np.array(block_ids, dtype=np.int64),
         is_promotion=is_promotion,
-        req_context=_CTX,
+        req_context=req_context,
     )
 
 
@@ -192,6 +193,32 @@ def fs_tier_with_events(tmp_path):
     )
     yield tier
     tier.shutdown()
+
+
+def _make_bounded_fs_tier(
+    tmp_path,
+    max_blocks: int,
+    *,
+    enable_events: bool = False,
+    n_read_threads: int = 4,
+    n_write_threads: int = 4,
+):
+    tensor = _page_aligned_zero_tensor(4, _BLOCK_ELEMENTS)
+    view = memoryview(tensor.numpy())
+    assert view.strides is not None
+    block_size = view.strides[0]
+    tier = FileSystemTierManager(
+        offloading_spec=_make_offloading_spec(enable_kv_cache_events=enable_events),
+        primary_kv_view=view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=n_read_threads,
+        n_write_threads=n_write_threads,
+        enable_kv_events=enable_events,
+        locality="LOCAL" if enable_events else None,
+        max_cache_size_bytes=max_blocks * block_size,
+    )
+    return tier, tensor, block_size
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +313,231 @@ def test_factory_forwards_locality_to_fs_tier(tmp_path):
         assert tier.locality is Locality.LOCAL
     finally:
         tier.shutdown()
+
+
+def test_factory_forwards_fs_capacity(tmp_path):
+    tensor = _page_aligned_zero_tensor(4, _BLOCK_ELEMENTS)
+    view = memoryview(tensor.numpy())
+    assert view.strides is not None
+    max_cache_size_bytes = 2 * view.strides[0]
+    tier = SecondaryTierFactory.create_secondary_tier(
+        {
+            "type": "fs",
+            "root_dir": str(tmp_path),
+            "n_read_threads": 1,
+            "n_write_threads": 1,
+            "max_cache_size_bytes": max_cache_size_bytes,
+        },
+        view,
+        _MOCK_OFFLOADING_SPEC,
+    )
+    try:
+        assert isinstance(tier, FileSystemTierManager)
+        assert tier._max_cache_size_bytes == max_cache_size_bytes
+    finally:
+        tier.shutdown()
+
+
+def test_fs_capacity_validation(tmp_path):
+    tensor = _page_aligned_zero_tensor(4, _BLOCK_ELEMENTS)
+    view = memoryview(tensor.numpy())
+    assert view.strides is not None
+
+    for invalid in (True, 1.5, "1024"):
+        with pytest.raises(TypeError, match="max_cache_size_bytes"):
+            FileSystemTierManager(
+                offloading_spec=_MOCK_OFFLOADING_SPEC,
+                primary_kv_view=view,
+                tier_type="fs",
+                root_dir=str(tmp_path),
+                max_cache_size_bytes=invalid,
+            )
+
+    with pytest.raises(ValueError, match="at least one"):
+        FileSystemTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=view,
+            tier_type="fs",
+            root_dir=str(tmp_path),
+            max_cache_size_bytes=view.strides[0] - 1,
+        )
+
+
+def test_bounded_fs_tier_evicts_lru_block(tmp_path):
+    tier, _, block_size = _make_bounded_fs_tier(tmp_path, max_blocks=2)
+    try:
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert all(result.success for result in drain(tier))
+        tier.submit_store(make_job(2, [key(2)], [1]))
+        assert all(result.success for result in drain(tier))
+
+        tier.touch([key(1)], _CTX)
+        tier.submit_store(make_job(3, [key(3)], [2]))
+        assert all(result.success for result in drain(tier))
+
+        assert os.path.exists(tier.file_mapper.get_file_name(key(1)))
+        assert not os.path.exists(tier.file_mapper.get_file_name(key(2)))
+        assert os.path.exists(tier.file_mapper.get_file_name(key(3)))
+        assert tier._cache_size_bytes == 2 * block_size
+    finally:
+        tier.shutdown()
+
+
+def test_lookup_hit_is_pinned_until_request_finishes(tmp_path):
+    tier, _, _ = _make_bounded_fs_tier(tmp_path, max_blocks=1)
+    ctx = ReqContext(req_id="pinned-request")
+    try:
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert all(result.success for result in drain(tier))
+        assert lookup_and_wait(tier, [key(1)], ctx) == [LookupResult.HIT]
+
+        tier.submit_store(make_job(2, [key(2)], [1]))
+        results = drain(tier)
+        assert len(results) == 1
+        assert not results[0].success
+        assert os.path.exists(tier.file_mapper.get_file_name(key(1)))
+
+        tier.on_request_finished(ctx)
+        tier.submit_store(make_job(3, [key(2)], [1]))
+        assert all(result.success for result in drain(tier))
+        assert not os.path.exists(tier.file_mapper.get_file_name(key(1)))
+        assert os.path.exists(tier.file_mapper.get_file_name(key(2)))
+    finally:
+        tier.shutdown()
+
+
+def test_lookup_pin_transfers_to_load_job(tmp_path):
+    tier, _, _ = _make_bounded_fs_tier(tmp_path, max_blocks=1)
+    ctx = ReqContext(req_id="promoted-request")
+    try:
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert all(result.success for result in drain(tier))
+        assert lookup_and_wait(tier, [key(1)], ctx) == [LookupResult.HIT]
+        assert tier._request_pins[ctx.req_id] == {key(1)}
+
+        tier.submit_load(make_job(2, [key(1)], [1], is_promotion=True, req_context=ctx))
+        assert ctx.req_id not in tier._request_pins
+        assert tier._load_job_keys[2] == [key(1)]
+        assert tier._pin_counts[key(1)] == 1
+
+        assert all(result.success for result in drain(tier))
+        assert tier._load_job_keys == {}
+        assert tier._pin_counts == {}
+        tier.on_request_finished(ctx)
+    finally:
+        tier.shutdown()
+
+
+def test_queued_load_source_is_pinned(tmp_path, monkeypatch):
+    import vllm.v1.kv_offload.tiering.fs.manager as mgr_mod
+
+    tier, _, _ = _make_bounded_fs_tier(tmp_path, max_blocks=1)
+    load_started = threading.Event()
+    release_load = threading.Event()
+    original_load_block = mgr_mod.load_block
+
+    def blocked_load(*args, **kwargs):
+        load_started.set()
+        assert release_load.wait(timeout=5.0)
+        return original_load_block(*args, **kwargs)
+
+    monkeypatch.setattr(mgr_mod, "load_block", blocked_load)
+    try:
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert all(result.success for result in drain(tier))
+
+        tier.submit_load(make_job(2, [key(1)], [1], is_promotion=True))
+        assert load_started.wait(timeout=5.0)
+        tier.submit_store(make_job(3, [key(2)], [0]))
+        release_load.set()
+
+        results = {result.job_id: result for result in drain(tier)}
+        assert results[2].success
+        assert not results[3].success
+        assert os.path.exists(tier.file_mapper.get_file_name(key(1)))
+    finally:
+        release_load.set()
+        tier.shutdown()
+
+
+def test_concurrent_stores_reserve_capacity(tmp_path, monkeypatch):
+    import vllm.v1.kv_offload.tiering.fs.manager as mgr_mod
+
+    tier, _, block_size = _make_bounded_fs_tier(
+        tmp_path, max_blocks=2, n_write_threads=4
+    )
+    release_stores = threading.Event()
+    entered = 0
+    entered_cv = threading.Condition()
+    original_store_block = mgr_mod.store_block
+
+    def blocked_store(*args, **kwargs):
+        nonlocal entered
+        with entered_cv:
+            entered += 1
+            entered_cv.notify_all()
+        assert release_stores.wait(timeout=5.0)
+        return original_store_block(*args, **kwargs)
+
+    monkeypatch.setattr(mgr_mod, "store_block", blocked_store)
+    try:
+        tier.submit_store(make_job(1, [key(1), key(2), key(3)], [0, 1, 2]))
+        with entered_cv:
+            assert entered_cv.wait_for(lambda: entered == 2, timeout=5.0)
+        time.sleep(0.1)
+        assert entered == 2
+        assert tier._pending_store_bytes == 2 * block_size
+
+        release_stores.set()
+        results = drain(tier)
+        assert len(results) == 1
+        assert results[0].success
+        assert tier._cache_size_bytes == 2 * block_size
+    finally:
+        release_stores.set()
+        tier.shutdown()
+
+
+def test_capacity_index_trims_existing_namespace_on_startup(tmp_path):
+    tensor = _page_aligned_zero_tensor(4, _BLOCK_ELEMENTS)
+    view = memoryview(tensor.numpy())
+    assert view.strides is not None
+    block_size = view.strides[0]
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+    )
+    paths: list[str] = []
+    try:
+        for job_id in (1, 2, 3):
+            tier.submit_store(make_job(job_id, [key(job_id)], [job_id - 1]))
+            assert all(result.success for result in drain(tier))
+            path = tier.file_mapper.get_file_name(key(job_id))
+            paths.append(path)
+            os.utime(path, ns=(job_id, job_id))
+    finally:
+        tier.shutdown()
+
+    bounded = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+        max_cache_size_bytes=2 * block_size,
+    )
+    try:
+        assert not os.path.exists(paths[0])
+        assert os.path.exists(paths[1])
+        assert os.path.exists(paths[2])
+        assert bounded._cache_size_bytes == 2 * block_size
+    finally:
+        bounded.shutdown()
 
 
 def test_failed_load_missing_file(fs_tier):
@@ -465,6 +717,31 @@ def test_batch_lookup_dispatch(fs_tier, monkeypatch, use_c_ext):
 # ---------------------------------------------------------------------------
 # KV events
 # ---------------------------------------------------------------------------
+
+
+def test_capacity_eviction_event_precedes_replacement_store(tmp_path):
+    tier, _, _ = _make_bounded_fs_tier(tmp_path, max_blocks=2, enable_events=True)
+    try:
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert all(result.success for result in drain(tier))
+        tier.submit_store(make_job(2, [key(2)], [1]))
+        assert all(result.success for result in drain(tier))
+        list(tier.take_events())
+
+        tier.touch([key(1)], _CTX)
+        tier.submit_store(make_job(3, [key(3)], [2]))
+        assert all(result.success for result in drain(tier))
+
+        events = list(tier.take_events())
+        assert len(events) == 2
+        assert events[0].removed
+        assert events[0].keys == [key(2)]
+        assert not events[1].removed
+        assert events[1].keys == [key(3)]
+        assert all(event.medium == "FS" for event in events)
+        assert all(event.locality is Locality.LOCAL for event in events)
+    finally:
+        tier.shutdown()
 
 
 def test_successful_store_emits_stored_event(fs_tier_with_events):
