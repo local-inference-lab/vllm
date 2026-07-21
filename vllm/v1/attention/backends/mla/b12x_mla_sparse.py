@@ -151,6 +151,15 @@ def _ckv_prefetch_supports_format(kv_cache_dtype: str) -> bool:
     return kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla")
 
 
+def _sparse_decode_supports_format(
+    kv_cache_dtype: str, record_bytes: int, kv_fp8_rope: bool
+) -> bool:
+    if kv_cache_dtype != "nvfp4_ds_mla":
+        return False
+    expected_record_bytes = 368 if kv_fp8_rope else 432
+    return int(record_bytes) == expected_record_bytes
+
+
 def _ckv_prefetch_ring_slots(depth: int) -> int:
     return max(0, int(depth)) + 1
 
@@ -1504,9 +1513,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             2 <= self.dcp_world_size <= 8
             and self.num_heads % _HEAD_ALIGNMENT == 0
             and self.dcp_workspace_non_dbo
-            and self.kv_cache_dtype == "nvfp4_ds_mla"
-            and self._kv_record_bytes == 432
-            and not self._kv_fp8_rope
+            and _sparse_decode_supports_format(
+                self.kv_cache_dtype,
+                self._kv_record_bytes,
+                self._kv_fp8_rope,
+            )
         )
         sparse_max_requests = min(
             max_num_seqs,
@@ -2390,14 +2401,24 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         k_pe = self._ckv_current_chunk_kpe[:num_rows]
         if k_pe.ndim == 3:
             k_pe = k_pe.squeeze(1)
-        ops.concat_and_cache_mla(
-            self._ckv_current_chunk_kv_c[:num_rows],
-            k_pe,
-            gathered_cache,
-            patch_slots[:num_rows],
-            self.kv_cache_dtype,
-            getattr(layer, "_k_scale", None),
-        )
+        k_scale = getattr(layer, "_k_scale", None)
+        if self._kv_fp8_rope:
+            self._concat_and_cache_nvfp4_mla_fp8_rope(
+                self._ckv_current_chunk_kv_c[:num_rows],
+                k_pe,
+                gathered_cache,
+                patch_slots[:num_rows],
+                k_scale,
+            )
+        else:
+            ops.concat_and_cache_mla(
+                self._ckv_current_chunk_kv_c[:num_rows],
+                k_pe,
+                gathered_cache,
+                patch_slots[:num_rows],
+                self.kv_cache_dtype,
+                k_scale,
+            )
 
     def _dcp_gather_ckv(
         self,

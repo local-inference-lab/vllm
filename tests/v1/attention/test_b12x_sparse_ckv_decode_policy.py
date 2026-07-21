@@ -4,14 +4,17 @@
 import sys
 from contextlib import nullcontext
 from types import ModuleType
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import pytest
 import torch
 
 from vllm.distributed import parallel_state
 from vllm.v1.attention.backends.mla import b12x_sparse_ckv_decode
-from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseImpl
+from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+    B12xMLASparseImpl,
+    _sparse_decode_supports_format,
+)
 from vllm.v1.attention.backends.mla.b12x_sparse_ckv_decode import (
     build_dense_union_remap,
     dense_union_remap_reference,
@@ -23,16 +26,43 @@ from vllm.v1.attention.backends.mla.b12x_sparse_ckv_decode import (
 )
 
 
-def _layout(*, dcp: int = 4, requests: int = 8, pool: int = 0):
+def _layout(
+    *,
+    dcp: int = 4,
+    requests: int = 8,
+    pool: int = 0,
+    record_bytes: int = 432,
+):
     return plan_sparse_ckv_decode(
         dcp_world_size=dcp,
         topk=2048,
         rows_per_request=4,
         max_requests=requests,
         pool_records=pool,
-        record_bytes=432,
+        record_bytes=record_bytes,
         prefetch_depth=3,
     )
+
+
+@pytest.mark.parametrize(("record_bytes", "kv_fp8_rope"), [(368, True), (432, False)])
+def test_sparse_decode_supports_native_nvfp4_record_formats(record_bytes, kv_fp8_rope):
+    assert _sparse_decode_supports_format("nvfp4_ds_mla", record_bytes, kv_fp8_rope)
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "record_bytes", "kv_fp8_rope"),
+    [
+        ("nvfp4_ds_mla", 368, False),
+        ("nvfp4_ds_mla", 432, True),
+        ("nvfp4_ds_mla", 304, False),
+        ("nvfp4_ds_mla", 656, False),
+        ("fp8_ds_mla", 656, False),
+    ],
+)
+def test_sparse_decode_rejects_unsupported_record_formats(
+    kv_cache_dtype, record_bytes, kv_fp8_rope
+):
+    assert not _sparse_decode_supports_format(kv_cache_dtype, record_bytes, kv_fp8_rope)
 
 
 def test_bulk_shared_prefetch_exchanges_three_layers_once_without_new_workspace():
@@ -335,18 +365,24 @@ def _install_fake_b12x_transport(monkeypatch, *, ce_error=None, include_ce=True)
         pass
 
     class DirectExchange:
+        init_kwargs: ClassVar[list[dict[str, Any]]] = []
+
         @classmethod
         def from_process_group(cls, **kwargs):
             calls.append("direct")
+            cls.init_kwargs.append(kwargs)
             return cls()
 
         def close(self):
             pass
 
     class CopyExchange:
+        init_kwargs: ClassVar[list[dict[str, Any]]] = []
+
         @classmethod
         def from_process_group(cls, **kwargs):
             calls.append("ce")
+            cls.init_kwargs.append(kwargs)
             if ce_error is not None:
                 raise InitializationError(ce_error)
             return cls()
@@ -399,6 +435,51 @@ def test_selected_record_transport_auto_prefers_copy_engine(monkeypatch):
     assert isinstance(exchange, CopyExchange)
     assert calls == ["ce"]
     assert b12x_sparse_ckv_decode.get_selected_record_stream(exchange) is stream
+
+
+@pytest.mark.parametrize("transport", ["ce", "direct"])
+def test_selected_record_transport_preserves_368_byte_record_size(
+    monkeypatch, transport
+):
+    _prepare_transport_factory_test(monkeypatch, transport)
+    calls, DirectExchange, CopyExchange = _install_fake_b12x_transport(monkeypatch)
+    layout = _layout(record_bytes=368)
+
+    exchange = b12x_sparse_ckv_decode.get_selected_record_exchange(
+        process_group=object(),
+        device=torch.device("cuda", 0),
+        layout=layout,
+        lane_key=("target", 1),
+    )
+
+    expected_class = CopyExchange if transport == "ce" else DirectExchange
+    assert isinstance(exchange, expected_class)
+    assert calls == [transport]
+    init_kwargs = expected_class.init_kwargs[-1]
+    assert init_kwargs["record_bytes"] == 368
+    assert init_kwargs["max_records"] == layout.pool_records
+
+
+def test_selected_record_transport_isolates_368_and_432_byte_abis(monkeypatch):
+    _prepare_transport_factory_test(monkeypatch, "direct")
+    calls, _, _ = _install_fake_b12x_transport(monkeypatch)
+    process_group = object()
+
+    record_432 = b12x_sparse_ckv_decode.get_selected_record_exchange(
+        process_group=process_group,
+        device=torch.device("cuda", 0),
+        layout=_layout(record_bytes=432),
+        lane_key=("target", 1),
+    )
+    record_368 = b12x_sparse_ckv_decode.get_selected_record_exchange(
+        process_group=process_group,
+        device=torch.device("cuda", 0),
+        layout=_layout(record_bytes=368),
+        lane_key=("target", 1),
+    )
+
+    assert record_432 is not record_368
+    assert calls == ["direct", "direct"]
 
 
 def test_selected_record_transport_auto_falls_back_to_direct(monkeypatch):
@@ -504,15 +585,16 @@ def test_selected_record_transport_rejects_unknown_mode(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("record_bytes", [368, 432])
 @pytest.mark.parametrize("dcp", [2, 3, 4, 5, 6, 7, 8])
-def test_sparse_decode_layout_supports_dcp_two_through_eight(dcp):
-    layout = _layout(dcp=dcp)
+def test_sparse_decode_layout_supports_dcp_two_through_eight(dcp, record_bytes):
+    layout = _layout(dcp=dcp, record_bytes=record_bytes)
 
     assert layout.dcp_world_size == dcp
     assert layout.per_request_capacity == 8192
     assert layout.pool_records == 65536
     assert layout.max_fast_requests == 8
-    assert layout.record_bytes == 432
+    assert layout.record_bytes == record_bytes
     assert layout.workspace_slots == 4
 
 

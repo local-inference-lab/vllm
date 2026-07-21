@@ -1683,7 +1683,12 @@ def test_resolve_kv_cache_block_sizes_mixed_dcp_replicated_groups():
     assert hash_block_size == 64
 
 
-def test_replicated_mla_uses_lockstep_pool_capacity_and_contiguous_tensors():
+@pytest.mark.parametrize(
+    ("model_version", "record_bytes"), [(None, 432), ("glm_fp8_rope", 368)]
+)
+def test_replicated_mla_uses_lockstep_pool_capacity_and_contiguous_tensors(
+    model_version, record_bytes
+):
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=262144),
         parallel_config=SimpleNamespace(
@@ -1700,6 +1705,7 @@ def test_replicated_mla_uses_lockstep_pool_capacity_and_contiguous_tensors():
             head_size=576,
             dtype=torch.uint8,
             cache_dtype_str="nvfp4_ds_mla",
+            model_version=model_version,
         )
         for i in range(3)
     }
@@ -1724,7 +1730,7 @@ def test_replicated_mla_uses_lockstep_pool_capacity_and_contiguous_tensors():
     )
     assert kv_cache_utils._use_lockstep_mla_allocation(groups, 4, 1)
 
-    bytes_per_pool_block = 3 * (64 * 432) + 2 * (256 * 132)
+    bytes_per_pool_block = 3 * (64 * record_bytes) + 2 * (256 * 132)
     request_blocks = 262144 // 256
     required_memory = bytes_per_pool_block * request_blocks
     kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
