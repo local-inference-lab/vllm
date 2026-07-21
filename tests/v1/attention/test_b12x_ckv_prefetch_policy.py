@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import vllm.v1.worker.workspace as workspace
+from vllm.v1.attention.backends.mla import b12x_sparse_ckv_decode
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseImpl,
     _ckv_prefetch_ring_slots,
@@ -161,19 +162,16 @@ def test_ckv_prefetch_first_request_discovers_caches_without_lookahead():
 
 
 def test_ckv_prefetch_target_and_draft_lifecycles_are_isolated(monkeypatch):
-    current_ubatch = [0]
-    monkeypatch.setattr(
-        workspace, "dbo_current_ubatch_id", lambda: current_ubatch[0]
-    )
-    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
-    manager = workspace.WorkspaceManager(torch.device("cpu"), num_ubatches=2)
-    (target_workspace,) = manager.get_simultaneous(((16,), torch.uint8))
-    current_ubatch[0] = 1
-    (draft_workspace,) = manager.get_simultaneous(((16,), torch.uint8))
-
+    shared_workspace = torch.empty(16, dtype=torch.uint8)
+    target_lane = ("target", 1)
+    draft_lane = ("draft", 2)
     registry = _CKVPrefetchStateRegistry()
-    target_state = registry.for_workspace(target_workspace)
-    draft_state = registry.for_workspace(draft_workspace)
+    target_state = registry.for_workspace(
+        shared_workspace, execution_lane_key=target_lane
+    )
+    draft_state = registry.for_workspace(
+        shared_workspace, execution_lane_key=draft_lane
+    )
     target_cache = torch.empty(0)
     draft_cache = torch.empty(0)
     target_event = _FakeEvent()
@@ -184,6 +182,19 @@ def test_ckv_prefetch_target_and_draft_lifecycles_are_isolated(monkeypatch):
     target_pending = target_state.register_pending_group({1: 1}, target_event)
     draft_state.register_cache(1, draft_cache)
 
+    class SparseState:
+        def __init__(self, *, layout, device, exchange):
+            self.layout = layout
+            self.device = device
+            self.exchange = exchange
+
+    monkeypatch.setattr(b12x_sparse_ckv_decode, "SparseCKVDecodeState", SparseState)
+    target_exchange = object()
+    draft_exchange = object()
+    layout = object()
+    target_sparse = target_state.get_sparse_decode_state(layout, target_exchange)
+    draft_sparse = draft_state.get_sparse_decode_state(layout, draft_exchange)
+
     assert target_state is not draft_state
     assert target_ring.untyped_storage().data_ptr() != (
         draft_ring.untyped_storage().data_ptr()
@@ -193,13 +204,13 @@ def test_ckv_prefetch_target_and_draft_lifecycles_are_isolated(monkeypatch):
     assert target_state.pending_layers[1].buf_idx == 1
     assert draft_state.layer_caches[1] is draft_cache
     assert draft_state.pending_layers == {}
+    assert target_sparse.exchange is target_exchange
+    assert draft_sparse.exchange is draft_exchange
 
 
 def test_ckv_prefetch_lazily_owns_one_stream_per_workspace_lane(monkeypatch):
     current_ubatch = [0]
-    monkeypatch.setattr(
-        workspace, "dbo_current_ubatch_id", lambda: current_ubatch[0]
-    )
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: current_ubatch[0])
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     manager = workspace.WorkspaceManager(torch.device("cpu"), num_ubatches=2)
     (target_workspace,) = manager.get_simultaneous(((16,), torch.uint8))
@@ -288,38 +299,50 @@ def test_ckv_prefetch_workspace_identity_invalidates_changed_geometry():
     assert len(registry.states) == 1
 
 
-def test_ckv_prefetch_workspace_identity_tracks_manager_resize(monkeypatch):
-    current_ubatch = [0]
-    monkeypatch.setattr(
-        workspace, "dbo_current_ubatch_id", lambda: current_ubatch[0]
-    )
-    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
-    manager = workspace.WorkspaceManager(torch.device("cpu"), num_ubatches=2)
-    (first_workspace,) = manager.get_simultaneous(((16,), torch.uint8))
-    current_ubatch[0] = 1
-    (draft_workspace,) = manager.get_simultaneous(((16,), torch.uint8))
-    current_ubatch[0] = 0
+def test_ckv_prefetch_resize_retires_only_matching_execution_lane():
+    workspace_buffer = torch.empty(257, dtype=torch.uint8)
+    first_workspace = workspace_buffer[:16]
+    draft_workspace = first_workspace
+    resized_workspace = workspace_buffer
+    target_lane = ("target", 1)
+    draft_lane = ("draft", 2)
     registry = _CKVPrefetchStateRegistry()
     cache = torch.empty(0)
-    first_state = registry.for_workspace(first_workspace, 0, cache)
+    first_state = registry.for_workspace(
+        first_workspace,
+        0,
+        cache,
+        execution_lane_key=target_lane,
+    )
     first_state.register_cache(0, cache)
     draft_cache = torch.empty(0)
-    draft_state = registry.for_workspace(draft_workspace, 0, draft_cache)
+    draft_state = registry.for_workspace(
+        draft_workspace,
+        0,
+        draft_cache,
+        execution_lane_key=draft_lane,
+    )
     draft_state.register_cache(0, draft_cache)
     event = _FakeEvent()
     first_state.register_pending_group({1: 0}, event)
 
-    (resized_workspace,) = manager.get_simultaneous(((257,), torch.uint8))
-    resized_state = registry.for_workspace(resized_workspace, 0, cache)
+    resized_state = registry.for_workspace(
+        resized_workspace,
+        0,
+        cache,
+        execution_lane_key=target_lane,
+    )
 
-    assert (
-        _ckv_workspace_identity(first_workspace).storage_generation
-        != _ckv_workspace_identity(resized_workspace).storage_generation
+    assert _ckv_workspace_identity(first_workspace) != _ckv_workspace_identity(
+        resized_workspace
     )
     assert resized_state is not first_state
     assert resized_state.layer_caches == []
     assert event.wait_calls == 1
-    assert registry.for_workspace(draft_workspace) is draft_state
+    assert (
+        registry.for_workspace(draft_workspace, execution_lane_key=draft_lane)
+        is draft_state
+    )
     assert len(registry.states) == 2
 
 
