@@ -161,12 +161,15 @@ def test_ckv_prefetch_first_request_discovers_caches_without_lookahead():
 
 
 def test_ckv_prefetch_target_and_draft_lifecycles_are_isolated(monkeypatch):
-    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    current_ubatch = [0]
+    monkeypatch.setattr(
+        workspace, "dbo_current_ubatch_id", lambda: current_ubatch[0]
+    )
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
-    manager = workspace.WorkspaceManager(torch.device("cpu"), num_lanes=2)
+    manager = workspace.WorkspaceManager(torch.device("cpu"), num_ubatches=2)
     (target_workspace,) = manager.get_simultaneous(((16,), torch.uint8))
-    with workspace.use_workspace_lane(1):
-        (draft_workspace,) = manager.get_simultaneous(((16,), torch.uint8))
+    current_ubatch[0] = 1
+    (draft_workspace,) = manager.get_simultaneous(((16,), torch.uint8))
 
     registry = _CKVPrefetchStateRegistry()
     target_state = registry.for_workspace(target_workspace)
@@ -193,13 +196,16 @@ def test_ckv_prefetch_target_and_draft_lifecycles_are_isolated(monkeypatch):
 
 
 def test_ckv_prefetch_lazily_owns_one_stream_per_workspace_lane(monkeypatch):
-    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    current_ubatch = [0]
+    monkeypatch.setattr(
+        workspace, "dbo_current_ubatch_id", lambda: current_ubatch[0]
+    )
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
-    manager = workspace.WorkspaceManager(torch.device("cpu"), num_lanes=2)
+    manager = workspace.WorkspaceManager(torch.device("cpu"), num_ubatches=2)
     (target_workspace,) = manager.get_simultaneous(((16,), torch.uint8))
     (target_workspace_reused,) = manager.get_simultaneous(((16,), torch.uint8))
-    with workspace.use_workspace_lane(1):
-        (draft_workspace,) = manager.get_simultaneous(((16,), torch.uint8))
+    current_ubatch[0] = 1
+    (draft_workspace,) = manager.get_simultaneous(((16,), torch.uint8))
 
     created_streams = []
 
@@ -225,7 +231,7 @@ def test_ckv_prefetch_lazily_owns_one_stream_per_workspace_lane(monkeypatch):
 def test_ckv_prefetch_ring_survives_intervening_workspace_borrow(monkeypatch):
     monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
-    manager = workspace.WorkspaceManager(torch.device("cpu"), num_lanes=1)
+    manager = workspace.WorkspaceManager(torch.device("cpu"), num_ubatches=1)
     (lane_workspace,) = manager.get_simultaneous(((256,), torch.uint8))
     registry = _CKVPrefetchStateRegistry()
     state = registry.for_workspace(lane_workspace)
@@ -283,12 +289,16 @@ def test_ckv_prefetch_workspace_identity_invalidates_changed_geometry():
 
 
 def test_ckv_prefetch_workspace_identity_tracks_manager_resize(monkeypatch):
-    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    current_ubatch = [0]
+    monkeypatch.setattr(
+        workspace, "dbo_current_ubatch_id", lambda: current_ubatch[0]
+    )
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
-    manager = workspace.WorkspaceManager(torch.device("cpu"), num_lanes=2)
+    manager = workspace.WorkspaceManager(torch.device("cpu"), num_ubatches=2)
     (first_workspace,) = manager.get_simultaneous(((16,), torch.uint8))
-    with workspace.use_workspace_lane(1):
-        (draft_workspace,) = manager.get_simultaneous(((16,), torch.uint8))
+    current_ubatch[0] = 1
+    (draft_workspace,) = manager.get_simultaneous(((16,), torch.uint8))
+    current_ubatch[0] = 0
     registry = _CKVPrefetchStateRegistry()
     cache = torch.empty(0)
     first_state = registry.for_workspace(first_workspace, 0, cache)
