@@ -4,6 +4,7 @@
 import sys
 from contextlib import nullcontext
 from types import ModuleType
+from typing import Any, cast
 
 import pytest
 import torch
@@ -358,12 +359,13 @@ def _install_fake_b12x_transport(monkeypatch, *, ce_error=None, include_ce=True)
     comm = ModuleType("sparkinfer.comm")
     comm.__path__ = []
     pcie = ModuleType("sparkinfer.comm.pcie")
-    pcie.SelectedRecordExchange = DirectExchange
-    pcie.SelectedRecordExchangeInitializationError = InitializationError
+    fake_pcie = cast(Any, pcie)
+    fake_pcie.SelectedRecordExchange = DirectExchange
+    fake_pcie.SelectedRecordExchangeInitializationError = InitializationError
     if include_ce:
-        pcie.SelectedRecordCopyExchange = CopyExchange
-    package.comm = comm
-    comm.pcie = pcie
+        fake_pcie.SelectedRecordCopyExchange = CopyExchange
+    cast(Any, package).comm = comm
+    cast(Any, comm).pcie = pcie
     monkeypatch.setitem(sys.modules, "sparkinfer", package)
     monkeypatch.setitem(sys.modules, "sparkinfer.comm", comm)
     monkeypatch.setitem(sys.modules, "sparkinfer.comm.pcie", pcie)
@@ -640,7 +642,7 @@ def test_cuda_union_accepts_runtime_rows_below_reserved_mtp_rows():
         first_to_dense,
         num_requests=1,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert counts[:, 0].cpu().tolist() == [2, 2]
     assert union[0, 0, :2].cpu().tolist() == [1, 2]

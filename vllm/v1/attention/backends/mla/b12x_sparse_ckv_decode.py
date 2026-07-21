@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Protocol
 
 import torch
 import torch.distributed as dist
@@ -328,7 +329,13 @@ class SparseCKVDecodeState:
         ]
 
 
-_SELECTED_RECORD_EXCHANGES: dict[tuple[object, ...], object] = {}
+class _ClosableSelectedRecordExchange(Protocol):
+    def close(self) -> None: ...
+
+
+_SELECTED_RECORD_EXCHANGES: dict[
+    tuple[object, ...], _ClosableSelectedRecordExchange
+] = {}
 _SELECTED_RECORD_STREAMS: dict[int, torch.cuda.Stream] = {}
 _UNION_PREFLIGHT_RESULTS: dict[tuple[int, str, int | None], tuple[bool, str]] = {}
 

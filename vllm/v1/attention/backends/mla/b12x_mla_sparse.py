@@ -1237,7 +1237,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
     """b12x unified sparse-MLA implementation (decode + extend/prefill)."""
 
-    is_sparse: bool = True
+    is_sparse: ClassVar[bool] = True
     can_return_lse_for_decode: bool = True
     # B12X handles decode and extend inside its own top-k MQA kernels; the
     # generic dense-MHA prefill path assumes cache layouts it never validated.
@@ -2526,7 +2526,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         if self._ckv_current_chunk_kv_c is None or num_actual_toks == 0:
             return
         kv_c = self._ckv_current_chunk_kv_c[:num_actual_toks]
-        k_pe_flat = self._ckv_current_chunk_kpe[:num_actual_toks]
+        k_pe_flat = cast(torch.Tensor, self._ckv_current_chunk_kpe)[:num_actual_toks]
         if k_pe_flat.ndim == 3:
             k_pe_flat = k_pe_flat.squeeze(1)
 
@@ -2536,7 +2536,8 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         if global_seq_lens is None:
             return
         global_seq_lens = global_seq_lens[:num_reqs]
-        req_ids = attn_metadata.req_id_per_token[:num_actual_toks].to(torch.int64)
+        req_id_per_token = cast(torch.Tensor, attn_metadata.req_id_per_token)
+        req_ids = req_id_per_token[:num_actual_toks].to(torch.int64)
         global_seq_per_token = global_seq_lens[req_ids].to(torch.int32)
 
         # Map each current-chunk token to its absolute position within its
@@ -2557,7 +2558,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             + global_pos % interleave
         ).to(torch.int64)
 
-        rank_req_starts = attn_metadata.dcp_rank_req_starts
+        rank_req_starts = cast(torch.Tensor, attn_metadata.dcp_rank_req_starts)
         flat_idx = owner * num_reqs + req_ids
         # ``dcp_rank_req_starts`` is a ``[dcp, :num_reqs]`` slice of a
         # ``[dcp, max_seqs]`` buffer, so it is non-contiguous whenever
@@ -2945,7 +2946,9 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 selected_indices = sparse_state.selected_indices[
                     :num_actual_toks, : layout.topk
                 ]
-                nsa_cache_seqlens = attn_metadata.nsa_cache_seqlens[:num_actual_toks]
+                nsa_cache_seqlens = cast(torch.Tensor, attn_metadata.nsa_cache_seqlens)[
+                    :num_actual_toks
+                ]
                 nsa_cache_seqlens.copy_(
                     sparse_decode_global_causal_lens, non_blocking=True
                 )

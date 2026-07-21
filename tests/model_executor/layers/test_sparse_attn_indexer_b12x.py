@@ -3,6 +3,7 @@
 
 import sys
 import types
+from typing import Any, cast
 
 import pytest
 import torch
@@ -176,16 +177,17 @@ def _install_fake_b12x_indexer(
         out.fill_(7)
         return out
 
-    indexer_mod.PAGED_INDEX_PAGE_SIZE = 64
-    indexer_mod.Caps = _Caps
-    indexer_mod.SOURCE_LAYOUT_PAGED = "paged"
-    indexer_mod.plan = plan_indexer_scratch
-    indexer_mod.index_topk_fp8 = index_topk_fp8
-    indexer_mod.uses_paged_schedule = uses_paged_mqa_schedule
-    indexer_mod.plan_paged_schedule = build_paged_mqa_schedule_metadata
+    fake_indexer_mod = cast(Any, indexer_mod)
+    fake_indexer_mod.PAGED_INDEX_PAGE_SIZE = 64
+    fake_indexer_mod.Caps = _Caps
+    fake_indexer_mod.SOURCE_LAYOUT_PAGED = "paged"
+    fake_indexer_mod.plan = plan_indexer_scratch
+    fake_indexer_mod.index_topk_fp8 = index_topk_fp8
+    fake_indexer_mod.uses_paged_schedule = uses_paged_mqa_schedule
+    fake_indexer_mod.plan_paged_schedule = build_paged_mqa_schedule_metadata
 
-    sparkinfer_mod.attention = attention_mod
-    attention_mod.nsa_indexer = indexer_mod
+    cast(Any, sparkinfer_mod).attention = attention_mod
+    cast(Any, attention_mod).nsa_indexer = indexer_mod
     monkeypatch.setitem(sys.modules, "sparkinfer", sparkinfer_mod)
     monkeypatch.setitem(sys.modules, "sparkinfer.attention", attention_mod)
     monkeypatch.setitem(
@@ -197,7 +199,7 @@ def _install_fake_b12x_indexer(
 
 def _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, *, world_size: int):
     tiled_topk_mod = types.ModuleType("sparkinfer.attention.nsa_indexer.tiled_topk")
-    tiled_topk_mod.run_row_topk = run_row_topk
+    cast(Any, tiled_topk_mod).run_row_topk = run_row_topk
     monkeypatch.setitem(
         sys.modules,
         "sparkinfer.attention.nsa_indexer.tiled_topk",

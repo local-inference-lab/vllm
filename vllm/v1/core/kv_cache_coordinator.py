@@ -799,10 +799,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                   sparse-retention group has not cached yet (0 unless hybrid).
         """
         if self.disable_prefix_cache_for_dcp_hybrid:
-            blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            empty_blocks: tuple[list[KVCacheBlock], ...] = tuple(
                 [] for _ in range(len(self.kv_cache_config.kv_cache_groups))
             )
-            return blocks, 0, 0
+            return empty_blocks, 0, 0
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length
@@ -880,8 +880,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     # length shrunk; invalidate previous eagle verifications
                     eagle_verified.clear()
                 curr_hit_length = _new_hit_length
-                for group_id, blocks in zip(group_ids, hit_blocks):
-                    hit_blocks_by_group[group_id] = blocks
+                for group_id, group_blocks in zip(group_ids, hit_blocks):
+                    hit_blocks_by_group[group_id] = group_blocks
                     hit_length_by_group[group_id] = _new_hit_length
 
                 longest_hit_length = max(longest_hit_length, curr_hit_length)
