@@ -27,6 +27,8 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
     QueryLenSupport,
     _DecodeConcatQuantFP8,
+    _materialize_kv_b_proj_weight,
+    _release_b12x_mxfp8_kv_b_proj,
 )
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonImpl,
@@ -124,6 +126,7 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
     layer.is_aiter_triton_fp8_bmm_enabled = False
     layer.quant_config = None
     layer.layer_name = "test"
+    layer.impl = SimpleNamespace(can_release_kv_b_proj_after_loading=False)
 
     monkeypatch.setattr(
         mla_attention_module, "set_default_quant_scales", lambda *_, **__: None
@@ -145,6 +148,89 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
     assert layer.W_UK_T.data_ptr() == w_uk_t_ptr
     torch.testing.assert_close(layer.W_UV, old_w_uv + 100)
     torch.testing.assert_close(layer.W_UK_T, old_w_uk_t + 100)
+
+
+class _PackedLinearMethod:
+    def __init__(self, weight: torch.Tensor):
+        self.weight = weight
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert layer.b12x_mxfp8_packed_weight is not None
+        assert bias is None
+        return x @ self.weight.T
+
+
+@pytest.mark.cpu_test
+def test_b12x_mxfp8_mla_post_load_releases_absorbed_sources(monkeypatch):
+    weight = torch.arange(28.0, dtype=torch.float32).reshape(14, 2)
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.kv_lora_rank = 2
+    layer.num_heads = 2
+    layer.qk_nope_head_dim = 3
+    layer.v_head_dim = 4
+    layer.kv_b_proj = torch.nn.Module()
+    layer.kv_b_proj.register_parameter(
+        "weight", torch.nn.Parameter(weight, requires_grad=False)
+    )
+    layer.kv_b_proj.register_parameter(
+        "weight_scale", torch.nn.Parameter(torch.ones((14, 1)), requires_grad=False)
+    )
+    layer.kv_b_proj.input_size_per_partition = 2
+    layer.kv_b_proj.quant_method = _PackedLinearMethod(weight)
+    layer.kv_b_proj.b12x_mxfp8_packed_weight = object()
+    layer.is_aiter_triton_fp4_bmm_enabled = False
+    layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.quant_config = None
+    layer.layer_name = "test"
+    layer.impl = SimpleNamespace(can_release_kv_b_proj_after_loading=True)
+    layer.prefill_backend = None
+
+    monkeypatch.setattr(
+        mla_attention_module, "set_default_quant_scales", lambda *_, **__: None
+    )
+
+    with torch.no_grad():
+        layer.process_weights_after_loading(torch.float32)
+
+    assert not hasattr(layer.kv_b_proj, "weight")
+    assert not hasattr(layer.kv_b_proj, "weight_scale")
+    assert layer.kv_b_proj.b12x_mxfp8_packed_weight is None
+
+
+@pytest.mark.cpu_test
+def test_release_kv_b_proj_is_inert_without_b12x_mxfp8_owner():
+    weight = torch.nn.Parameter(torch.ones((4, 3)), requires_grad=False)
+    layer = torch.nn.Module()
+    layer.register_parameter("weight", weight)
+
+    released = _release_b12x_mxfp8_kv_b_proj(layer)
+
+    assert released is False
+    assert layer.weight is weight
+
+
+@pytest.mark.cpu_test
+def test_reloads_absorbed_weight_from_regenerated_packed_owner():
+    expected = torch.arange(12, dtype=torch.float32).view(4, 3)
+    layer = SimpleNamespace(
+        input_size_per_partition=3,
+        quant_method=_PackedLinearMethod(expected),
+        b12x_mxfp8_packed_weight=object(),
+    )
+
+    materialized = _materialize_kv_b_proj_weight(
+        layer,
+        out_dtype=torch.float32,
+        fallback_device=torch.device("cpu"),
+    )
+
+    torch.testing.assert_close(materialized, expected)
 
 
 # Filtered per-test via validate_configuration (capability/deps/dims).

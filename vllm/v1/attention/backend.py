@@ -1234,6 +1234,8 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
 class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
     """MLA attention implementation with forward_mqa and forward_mha methods."""
 
+    can_release_kv_b_proj_after_loading: bool = False
+
     @abstractmethod
     def __init__(
         self,

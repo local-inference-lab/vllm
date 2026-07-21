@@ -905,6 +905,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
     # B12X handles decode and extend inside its own top-k MQA kernels; the
     # generic dense-MHA prefill path assumes cache layouts it never validated.
     supports_mha_prefill: bool = False
+    can_release_kv_b_proj_after_loading: bool = True
     supports_dcp_project_before_merge: bool = True
     supports_dcp_gather_query_in_workspace: bool = True
     supports_dcp_project_before_merge_in_workspace: bool = True
