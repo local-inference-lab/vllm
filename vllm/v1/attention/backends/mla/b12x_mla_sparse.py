@@ -1507,10 +1507,19 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         """Project DCP partials from 512 to 256 in borrowed MLA storage."""
         num_tokens = int(attn_out.shape[0])
         self._validate_dcp_prefill_workspace_contract(num_tokens)
+        # Virtual-TP head padding writes into a head-major workspace sized for
+        # the configured token capacity. A shorter final prefill chunk is a
+        # pitched, non-contiguous view of that allocation, but it is safe here:
+        # the projection input is compacted below before entering cuBLAS.
+        expected_attn_stride = (
+            self.kv_lora_rank,
+            (self._max_batched if self._pad_heads else num_tokens) * self.kv_lora_rank,
+            1,
+        )
         if (
             tuple(attn_out.shape)
             != (num_tokens, self._input_num_heads, self.kv_lora_rank)
-            or not attn_out.movedim(0, 1).is_contiguous()
+            or tuple(attn_out.stride()) != expected_attn_stride
             or attn_out.dtype != torch.bfloat16
             or tuple(w_uv.shape)
             != (self._input_num_heads, self.kv_lora_rank, self.v_head_dim)
@@ -1520,7 +1529,10 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             or lse.dtype != torch.float32
         ):
             raise ValueError(
-                "DCP workspace projection received an invalid tensor layout"
+                "DCP workspace projection received an invalid tensor layout: "
+                f"attn shape/stride={tuple(attn_out.shape)}/"
+                f"{tuple(attn_out.stride())}, expected stride="
+                f"{expected_attn_stride}"
             )
 
         q_workspace, dense_out_workspace, scratch_storage = (

@@ -192,3 +192,53 @@ def test_dcp_workspace_contract_rejects_unvalidated_topology(monkeypatch):
 
     with pytest.raises(RuntimeError, match="unsupported topology or geometry"):
         impl._validate_dcp_prefill_workspace_contract(2048)
+
+
+def test_dcp_workspace_projection_accepts_partial_pitched_head_major_output(
+    monkeypatch,
+):
+    max_batched = 8
+    num_tokens = 5
+    input_heads = 3
+    kernel_heads = 4
+    kv_lora_rank = 4
+    v_head_dim = 2
+
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._max_batched = max_batched
+    impl._input_num_heads = input_heads
+    impl._kernel_num_heads = kernel_heads
+    impl._pad_heads = True
+    impl.kv_lora_rank = kv_lora_rank
+    impl.v_head_dim = v_head_dim
+
+    q_workspace = torch.empty(
+        max_batched, kernel_heads, kv_lora_rank, dtype=torch.bfloat16
+    )
+    dense_storage = torch.arange(
+        input_heads * max_batched * kv_lora_rank, dtype=torch.float32
+    ).to(torch.bfloat16)
+    dense_workspace = dense_storage.view(
+        input_heads, max_batched, kv_lora_rank
+    ).transpose(0, 1)
+    projected_nbytes = input_heads * num_tokens * v_head_dim * 2
+    scratch_storage = torch.empty(projected_nbytes, dtype=torch.uint8)
+
+    monkeypatch.setattr(
+        impl, "_validate_dcp_prefill_workspace_contract", lambda _: None
+    )
+    monkeypatch.setattr(
+        impl,
+        "_borrow_workspace_parts",
+        lambda: (q_workspace, dense_workspace, scratch_storage),
+    )
+
+    attn_out = dense_workspace[:num_tokens]
+    lse = torch.zeros(num_tokens, input_heads, dtype=torch.float32)
+    w_uv = torch.randn(input_heads, kv_lora_rank, v_head_dim, dtype=torch.bfloat16)
+    expected = torch.bmm(attn_out.transpose(0, 1).contiguous(), w_uv).transpose(0, 1)
+
+    actual = impl.dcp_project_before_merge_in_workspace(attn_out, lse, w_uv)
+
+    assert actual.movedim(0, 1).is_contiguous()
+    torch.testing.assert_close(actual, expected)
