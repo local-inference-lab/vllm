@@ -158,7 +158,7 @@ def _ckv_prefetch_target_indices(
     layer_idx: int,
     depth: int,
     layer_caches: list[torch.Tensor | None],
-    pending_layers: dict[int, tuple[Any, int]],
+    pending_layers: dict[int, "_CKVPrefetchPendingLayer"],
 ) -> list[int]:
     targets: list[int] = []
     for distance in range(1, max(0, int(depth)) + 1):
@@ -180,6 +180,28 @@ class _CKVWorkspaceIdentity:
     shape: tuple[int, ...]
     stride: tuple[int, ...]
     dtype: torch.dtype
+
+
+@dataclass
+class _CKVPrefetchTicket:
+    event: Any
+    wait_scheduled: bool = False
+
+    def wait_once(self) -> None:
+        if not self.wait_scheduled:
+            self.event.wait()
+            self.wait_scheduled = True
+
+    def wait_on_stream_once(self, stream: Any) -> None:
+        if not self.wait_scheduled:
+            stream.wait_event(self.event)
+            self.wait_scheduled = True
+
+
+@dataclass(frozen=True)
+class _CKVPrefetchPendingLayer:
+    ticket: _CKVPrefetchTicket
+    buf_idx: int
 
 
 def _ckv_workspace_identity(workspace: torch.Tensor) -> _CKVWorkspaceIdentity:
@@ -209,7 +231,7 @@ class _CKVPrefetchState:
         self.workspace_storage_ref = weakref.ref(workspace.untyped_storage())
         self.layer_caches: list[torch.Tensor | None] = []
         self.layer_impls: list[B12xMLASparseImpl | None] = []
-        self.pending_layers: dict[int, tuple[Any, int]] = {}
+        self.pending_layers: dict[int, _CKVPrefetchPendingLayer] = {}
         self.sparse_decode_state: Any | None = None
         self.gather_stream: torch.cuda.Stream | None = None
         self.ckv_workspace: torch.Tensor | None = None
@@ -217,12 +239,45 @@ class _CKVPrefetchState:
         self.last_layer_idx: int | None = None
 
     def begin_step(self) -> None:
-        for event, _ in self.pending_layers.values():
+        tickets = {
+            id(pending.ticket): pending.ticket
+            for pending in self.pending_layers.values()
+        }
+        for ticket in tickets.values():
             # Preserve ring ordering without blocking the host indefinitely.
             # The next main-stream gather is enqueued after these dependencies.
-            event.wait()
+            ticket.wait_once()
         self.pending_layers.clear()
         self.last_layer_idx = None
+
+    def register_pending_group(
+        self,
+        layer_slots: dict[int, int],
+        event: Any,
+    ) -> _CKVPrefetchTicket:
+        if not layer_slots:
+            raise ValueError("prefetch group must contain at least one layer")
+        duplicate_layers = self.pending_layers.keys() & layer_slots.keys()
+        if duplicate_layers:
+            raise RuntimeError(
+                f"prefetch group overlaps pending layers {sorted(duplicate_layers)}"
+            )
+        ticket = _CKVPrefetchTicket(event)
+        self.pending_layers.update(
+            {
+                layer_idx: _CKVPrefetchPendingLayer(ticket, int(buf_idx))
+                for layer_idx, buf_idx in layer_slots.items()
+            }
+        )
+        return ticket
+
+    def pop_pending_layer(
+        self,
+        layer_idx: int | None,
+    ) -> _CKVPrefetchPendingLayer | None:
+        if layer_idx is None:
+            return None
+        return self.pending_layers.pop(layer_idx, None)
 
     def enter_layer(self, layer_idx: int) -> None:
         if self.last_layer_idx is not None and layer_idx <= self.last_layer_idx:
@@ -1443,6 +1498,9 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         )
         self._sparse_decode_layout = None
         self._sparse_decode_exchange = None
+        self._sparse_decode_bulk_prefetch = bool(
+            envs_mod.VLLM_B12X_MLA_SPARSE_DECODE_BULK_PREFETCH
+        )
         if self._sparse_decode_enabled:
             self._sparse_decode_layout = plan_sparse_ckv_decode(
                 dcp_world_size=self.dcp_world_size,
@@ -2211,6 +2269,88 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         gathered_cache = output.view(-1, self.block_size, layout.record_bytes)
         return gathered_cache, selected_indices, nsa_cache_seqlens, complete
 
+    def _dcp_gather_sparse_decode_shared_layers(
+        self,
+        targets: list[tuple[int, "B12xMLASparseImpl", torch.Tensor]],
+        attn_metadata: B12xMLASparseMetadata,
+        prefetch_state: _CKVPrefetchState,
+    ) -> tuple[dict[int, int], torch.cuda.Event] | None:
+        """Exchange one Full layer's S1/S2/S3 CKV payloads together."""
+        layout = self._sparse_decode_layout
+        exchange = self._sparse_decode_exchange
+        if (
+            not self._sparse_decode_bulk_prefetch
+            or layout is None
+            or exchange is None
+            or len(targets) != 3
+        ):
+            return None
+
+        num_requests = int(attn_metadata.num_reqs)
+        active_records = layout.active_records(num_requests)
+        state = prefetch_state.get_sparse_decode_state(layout, exchange)
+        layer_slots: dict[int, int] = {}
+        records_by_layer: list[torch.Tensor] = []
+        outputs_by_layer: list[torch.Tensor] = []
+        for target_idx, target_impl, target_kv in targets:
+            if (
+                target_impl._sparse_decode_layout != layout
+                or target_impl._sparse_decode_exchange is not exchange
+                or target_impl.block_size != self.block_size
+                or target_impl.cp_kv_cache_interleave_size
+                != self.cp_kv_cache_interleave_size
+                or target_kv.dtype != torch.uint8
+                or target_kv.ndim != 3
+                or tuple(target_kv.shape[1:]) != (self.block_size, layout.record_bytes)
+                or not target_kv.is_contiguous()
+            ):
+                return None
+            buf_idx = target_idx % layout.workspace_slots
+            if buf_idx in layer_slots.values():
+                return None
+            layer_slots[target_idx] = buf_idx
+            records_by_layer.append(target_kv.reshape(-1, layout.record_bytes))
+            outputs_by_layer.append(state.payload_workspace[buf_idx, :active_records])
+
+        from vllm import envs as envs_mod
+        from vllm.v1.attention.backends.mla.b12x_sparse_ckv_decode import (
+            get_selected_record_stream,
+            try_exchange_sparse_decode_shared_layers,
+        )
+
+        transport = envs_mod.VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT
+        if transport not in {"auto", "ce"}:
+            return None
+        if not callable(getattr(exchange, "exchange_layers", None)):
+            return None
+        layered_capacity = getattr(exchange, "layered_max_records", None)
+        if layered_capacity is not None and active_records > int(layered_capacity):
+            return None
+
+        gather_stream = get_selected_record_stream(exchange)
+        gather_stream.wait_stream(torch.cuda.current_stream())
+        for output in outputs_by_layer:
+            output.record_stream(gather_stream)
+
+        with torch.cuda.stream(gather_stream):
+            used_bulk = try_exchange_sparse_decode_shared_layers(
+                enabled=True,
+                transport=transport,
+                exchange=exchange,
+                records_by_layer=tuple(records_by_layer),
+                local_indices_by_destination=(
+                    state.transport_local_slots[num_requests]
+                ),
+                outputs_by_layer=tuple(outputs_by_layer),
+                active_records=active_records,
+                pool_records=layout.pool_records,
+            )
+            if not used_bulk:
+                return None
+            complete = state.complete_events[next(iter(layer_slots.values()))]
+            complete.record(gather_stream)
+        return layer_slots, complete
+
     def _append_current_token_to_sparse_decode_gathered(
         self,
         gathered_cache: torch.Tensor,
@@ -2766,14 +2906,10 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 prefetch_state.register_cache(layer_idx, kv_cache)
                 prefetch_state.register_impl(layer_idx, self)
             sparse_state = prefetch_state.get_sparse_decode_state(layout, exchange)
-            pending = (
-                prefetch_state.pending_layers.pop(layer_idx, None)
-                if layer_idx is not None
-                else None
-            )
+            pending = prefetch_state.pop_pending_layer(layer_idx)
             if pending is not None:
-                gather_event, current_buf_idx = pending
-                torch.cuda.current_stream().wait_event(gather_event)
+                pending.ticket.wait_on_stream_once(torch.cuda.current_stream())
+                current_buf_idx = pending.buf_idx
                 active_records = layout.active_records(int(attn_metadata.num_reqs))
                 kv_cache = sparse_state.payload_workspace[
                     current_buf_idx, :active_records
@@ -2845,6 +2981,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     layout.prefetch_depth,
                     emits_topk_by_layer,
                 )
+                target_entries: list[tuple[int, B12xMLASparseImpl, torch.Tensor]] = []
                 for target_idx in targets:
                     if target_idx in prefetch_state.pending_layers:
                         continue
@@ -2852,20 +2989,37 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     target_kv = prefetch_state.layer_caches[target_idx]
                     if target_impl is None or target_kv is None:
                         break
-                    target_buf_idx = target_idx % layout.workspace_slots
-                    _, _, _, target_event = target_impl._dcp_gather_sparse_decode_ckv(
-                        target_kv,
-                        attn_metadata,
-                        topk_indices,
-                        prefetch_state,
-                        buf_idx=target_buf_idx,
-                        build_union=False,
-                        wait_for_completion=False,
-                    )
-                    prefetch_state.pending_layers[target_idx] = (
+                    target_entries.append((target_idx, target_impl, target_kv))
+
+                bulk_pending = self._dcp_gather_sparse_decode_shared_layers(
+                    target_entries,
+                    attn_metadata,
+                    prefetch_state,
+                )
+                if bulk_pending is not None:
+                    layer_slots, target_event = bulk_pending
+                    prefetch_state.register_pending_group(
+                        layer_slots,
                         target_event,
-                        target_buf_idx,
                     )
+                else:
+                    for target_idx, target_impl, target_kv in target_entries:
+                        target_buf_idx = target_idx % layout.workspace_slots
+                        _, _, _, target_event = (
+                            target_impl._dcp_gather_sparse_decode_ckv(
+                                target_kv,
+                                attn_metadata,
+                                topk_indices,
+                                prefetch_state,
+                                buf_idx=target_buf_idx,
+                                build_union=False,
+                                wait_for_completion=False,
+                            )
+                        )
+                        prefetch_state.register_pending_group(
+                            {target_idx: target_buf_idx},
+                            target_event,
+                        )
         if use_ckv_gather:
             layer_idx = self._resolve_layer_index(layer)
             prefetch_registry = attn_metadata.ckv_prefetch_registry
@@ -2879,13 +3033,13 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 prefetch_state.enter_layer(layer_idx)
                 prefetch_state.register_cache(layer_idx, kv_cache)
             pending = (
-                prefetch_state.pending_layers.pop(layer_idx, None)
-                if layer_idx is not None and self._ckv_prefetch_depth > 0
+                prefetch_state.pop_pending_layer(layer_idx)
+                if self._ckv_prefetch_depth > 0
                 else None
             )
             if pending is not None:
-                gather_event, current_buf_idx = pending
-                gather_event.wait()
+                pending.ticket.wait_once()
+                current_buf_idx = pending.buf_idx
                 _, gathered_buffer = self._ckv_workspace_views(
                     ckv_workspace, current_buf_idx
                 )
@@ -2943,9 +3097,9 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     )
                     target_event = torch.cuda.Event(blocking=False)
                     target_event.record(prefetch_stream)
-                    prefetch_state.pending_layers[target_idx] = (
+                    prefetch_state.register_pending_group(
+                        {target_idx: target_buf_idx},
                         target_event,
-                        target_buf_idx,
                     )
 
         use_decode_kernel = (

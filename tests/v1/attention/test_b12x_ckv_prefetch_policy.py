@@ -94,13 +94,40 @@ class _FakeEvent:
         self.wait_calls += 1
 
 
+class _FakeStream:
+    def __init__(self):
+        self.waited_events = []
+
+    def wait_event(self, event):
+        self.waited_events.append(event)
+
+
+def test_ckv_bulk_prefetch_ticket_waits_once_for_three_shared_layers():
+    registry = _CKVPrefetchStateRegistry()
+    state = registry.for_workspace(torch.empty(16, dtype=torch.uint8))
+    event = _FakeEvent()
+    stream = _FakeStream()
+
+    ticket = state.register_pending_group({3: 0, 4: 1, 5: 2}, event)
+    pending = [state.pop_pending_layer(layer) for layer in (3, 4, 5)]
+
+    assert all(item is not None for item in pending)
+    assert all(item.ticket is ticket for item in pending if item is not None)
+    for item in pending:
+        assert item is not None
+        item.ticket.wait_on_stream_once(stream)
+
+    assert stream.waited_events == [event]
+    assert state.pending_layers == {}
+
+
 def test_ckv_prefetch_incomplete_step_recovers_with_stream_wait():
     registry = _CKVPrefetchStateRegistry()
     state = registry.for_workspace(torch.empty(16, dtype=torch.uint8))
     cache = torch.empty(0)
     event = _FakeEvent()
     state.register_cache(3, cache)
-    state.pending_layers[3] = (event, 0)
+    state.register_pending_group({3: 0}, event)
     state.last_layer_idx = 2
 
     state.enter_layer(0)
@@ -151,7 +178,7 @@ def test_ckv_prefetch_target_and_draft_lifecycles_are_isolated(monkeypatch):
     draft_ring = draft_state.get_ckv_workspace(64)
 
     target_state.register_cache(1, target_cache)
-    target_state.pending_layers[1] = (target_event, 1)
+    target_pending = target_state.register_pending_group({1: 1}, target_event)
     draft_state.register_cache(1, draft_cache)
 
     assert target_state is not draft_state
@@ -159,7 +186,8 @@ def test_ckv_prefetch_target_and_draft_lifecycles_are_isolated(monkeypatch):
         draft_ring.untyped_storage().data_ptr()
     )
     assert target_state.layer_caches[1] is target_cache
-    assert target_state.pending_layers[1] == (target_event, 1)
+    assert target_state.pending_layers[1].ticket is target_pending
+    assert target_state.pending_layers[1].buf_idx == 1
     assert draft_state.layer_caches[1] is draft_cache
     assert draft_state.pending_layers == {}
 
@@ -226,7 +254,7 @@ def test_ckv_prefetch_ring_resize_drains_pending_generation():
     assert state.ckv_workspace_generation == 1
 
     event = _FakeEvent()
-    state.pending_layers[1] = (event, 0)
+    state.register_pending_group({1: 0}, event)
     resized_ring = state.get_ckv_workspace(128)
 
     assert resized_ring is not first_ring
@@ -243,7 +271,7 @@ def test_ckv_prefetch_workspace_identity_invalidates_changed_geometry():
     changed_geometry = workspace_buffer[:8]
     old_state = registry.for_workspace(workspace_buffer)
     event = _FakeEvent()
-    old_state.pending_layers[1] = (event, 0)
+    old_state.register_pending_group({1: 0}, event)
 
     assert registry.for_workspace(same_geometry) is old_state
 
@@ -269,7 +297,7 @@ def test_ckv_prefetch_workspace_identity_tracks_manager_resize(monkeypatch):
     draft_state = registry.for_workspace(draft_workspace, 0, draft_cache)
     draft_state.register_cache(0, draft_cache)
     event = _FakeEvent()
-    first_state.pending_layers[1] = (event, 0)
+    first_state.register_pending_group({1: 0}, event)
 
     (resized_workspace,) = manager.get_simultaneous(((257,), torch.uint8))
     resized_state = registry.for_workspace(resized_workspace, 0, cache)
@@ -290,7 +318,7 @@ def test_ckv_prefetch_registry_retires_released_profile_workspace():
     profile_workspace = torch.empty(16, dtype=torch.uint8)
     state = registry.for_workspace(profile_workspace)
     event = _FakeEvent()
-    state.pending_layers[1] = (event, 0)
+    state.register_pending_group({1: 0}, event)
 
     del profile_workspace
     gc.collect()

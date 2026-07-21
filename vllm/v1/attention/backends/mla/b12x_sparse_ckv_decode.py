@@ -18,7 +18,11 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 from torch.utils.cpp_extension import load
 
+from vllm import envs
 from vllm.distributed.parallel_state import register_model_parallel_cleanup_hook
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -133,6 +137,58 @@ def sparse_decode_prefetch_targets(
             break
         targets.append(target)
     return targets
+
+
+def try_exchange_sparse_decode_shared_layers(
+    *,
+    enabled: bool,
+    transport: str,
+    exchange: object,
+    records_by_layer: tuple[torch.Tensor, ...],
+    local_indices_by_destination: torch.Tensor,
+    outputs_by_layer: tuple[torch.Tensor, ...],
+    active_records: int,
+    pool_records: int,
+) -> bool:
+    """Use one copy-engine exchange for a Full layer's S1/S2/S3 payloads."""
+    if not enabled:
+        return False
+    if transport not in {"auto", "ce"}:
+        logger.info_once(
+            "Bulk S1/S2/S3 CKV prefetch requires copy-engine transport; "
+            "using the per-layer exchange path"
+        )
+        return False
+    if len(records_by_layer) != 3 or len(outputs_by_layer) != 3:
+        return False
+    if not 0 < active_records <= pool_records:
+        raise ValueError(
+            f"active sparse records {active_records} exceed pool {pool_records}"
+        )
+    exchange_layers = getattr(exchange, "exchange_layers", None)
+    if exchange_layers is None:
+        logger.warning_once(
+            "Bulk S1/S2/S3 CKV prefetch requires B12X "
+            "PCIeSelectedRecordCopyExchange.exchange_layers; using the "
+            "per-layer exchange path"
+        )
+        return False
+    layered_capacity = getattr(exchange, "layered_max_records", None)
+    if layered_capacity is not None and active_records > int(layered_capacity):
+        logger.info_once(
+            "Bulk S1/S2/S3 CKV prefetch capacity %d is below this batch's "
+            "%d records; using the per-layer exchange path",
+            int(layered_capacity),
+            active_records,
+        )
+        return False
+    exchange_layers(
+        records_by_layer=records_by_layer,
+        local_indices_by_destination=local_indices_by_destination,
+        outputs_by_layer=outputs_by_layer,
+    )
+    logger.info_once("Using one bulk CKV exchange for S1/S2/S3 prefetch")
+    return True
 
 
 def owner_and_local_ordinal(
@@ -310,6 +366,12 @@ def get_selected_record_exchange(
     lane_key: tuple[str, int],
 ):
     """Return one generic B12X exchange per target/draft execution lane."""
+    transport = envs.VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT
+    if transport not in {"auto", "ce", "direct"}:
+        raise ValueError(
+            "VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT must be auto, ce, or "
+            f"direct; got {transport!r}"
+        )
     key = (
         id(process_group),
         device.type,
@@ -317,17 +379,53 @@ def get_selected_record_exchange(
         layout.dcp_world_size,
         layout.pool_records,
         layout.record_bytes,
+        transport,
         lane_key,
     )
     exchange = _SELECTED_RECORD_EXCHANGES.get(key)
     if exchange is None:
-        from sparkinfer.comm.pcie import SelectedRecordExchange
+        from sparkinfer.comm.pcie import (
+            SelectedRecordExchange,
+            SelectedRecordExchangeInitializationError,
+        )
 
-        exchange = SelectedRecordExchange.from_process_group(
-            process_group=process_group,
-            device=device,
-            max_records=layout.pool_records,
-            record_bytes=layout.record_bytes,
+        ce_error: Exception | None = None
+        if transport in {"auto", "ce"}:
+            try:
+                from sparkinfer.comm.pcie import SelectedRecordCopyExchange
+
+                exchange = SelectedRecordCopyExchange.from_process_group(
+                    process_group=process_group,
+                    device=device,
+                    max_records=layout.pool_records,
+                    record_bytes=layout.record_bytes,
+                )
+            except (
+                ImportError,
+                SelectedRecordExchangeInitializationError,
+            ) as exc:
+                ce_error = exc
+                if transport == "ce":
+                    raise RuntimeError(
+                        "strict copy-engine selected-record transport failed "
+                        "to initialize"
+                    ) from exc
+        if exchange is None:
+            if ce_error is not None:
+                logger.warning_once(
+                    "Copy-engine selected-record transport is unavailable; "
+                    "falling back to direct peer writes: %s",
+                    ce_error,
+                )
+            exchange = SelectedRecordExchange.from_process_group(
+                process_group=process_group,
+                device=device,
+                max_records=layout.pool_records,
+                record_bytes=layout.record_bytes,
+            )
+        logger.info_once(
+            "Using %s for sparse selected-record CKV exchange",
+            type(exchange).__name__,
         )
         _SELECTED_RECORD_EXCHANGES[key] = exchange
     if id(exchange) not in _SELECTED_RECORD_STREAMS:

@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
+from contextlib import nullcontext
+from types import ModuleType
+
 import pytest
 import torch
 
 from vllm.distributed import parallel_state
 from vllm.v1.attention.backends.mla import b12x_sparse_ckv_decode
+from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseImpl
 from vllm.v1.attention.backends.mla.b12x_sparse_ckv_decode import (
     build_dense_union_remap,
     dense_union_remap_reference,
@@ -13,6 +18,7 @@ from vllm.v1.attention.backends.mla.b12x_sparse_ckv_decode import (
     plan_sparse_ckv_decode,
     sparse_decode_batch_eligible,
     sparse_decode_prefetch_targets,
+    try_exchange_sparse_decode_shared_layers,
 )
 
 
@@ -26,6 +32,474 @@ def _layout(*, dcp: int = 4, requests: int = 8, pool: int = 0):
         record_bytes=432,
         prefetch_depth=3,
     )
+
+
+def test_bulk_shared_prefetch_exchanges_three_layers_once_without_new_workspace():
+    class Exchange:
+        def __init__(self):
+            self.calls = []
+
+        def exchange_layers(self, **kwargs):
+            self.calls.append(kwargs)
+
+    layout = _layout()
+    exchange = Exchange()
+    records = (object(), object(), object())
+    outputs = (object(), object(), object())
+    transport_indices = object()
+    workspace_geometry = (layout.workspace_slots, layout.workspace_bytes)
+
+    used_bulk = try_exchange_sparse_decode_shared_layers(
+        enabled=True,
+        transport="ce",
+        exchange=exchange,
+        records_by_layer=records,
+        local_indices_by_destination=transport_indices,
+        outputs_by_layer=outputs,
+        active_records=layout.active_records(1),
+        pool_records=layout.pool_records,
+    )
+
+    assert used_bulk
+    assert exchange.calls == [
+        {
+            "records_by_layer": records,
+            "local_indices_by_destination": transport_indices,
+            "outputs_by_layer": outputs,
+        }
+    ]
+    assert (layout.workspace_slots, layout.workspace_bytes) == workspace_geometry
+
+
+def test_bulk_shared_prefetch_is_default_off(monkeypatch):
+    name = "VLLM_B12X_MLA_SPARSE_DECODE_BULK_PREFETCH"
+    monkeypatch.delenv(name, raising=False)
+
+    assert b12x_sparse_ckv_decode.envs.environment_variables[name]() is False
+
+    monkeypatch.setenv(name, "1")
+    assert b12x_sparse_ckv_decode.envs.environment_variables[name]() is True
+
+
+@pytest.mark.parametrize("value", ["enabled", "1 ", ""])
+def test_bulk_shared_prefetch_rejects_invalid_value(monkeypatch, value):
+    name = "VLLM_B12X_MLA_SPARSE_DECODE_BULK_PREFETCH"
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match="Valid options"):
+        b12x_sparse_ckv_decode.envs.environment_variables[name]()
+
+
+def test_sparse_decode_transport_rejects_unknown_value(monkeypatch):
+    name = "VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT"
+    monkeypatch.setenv(name, "unknown")
+
+    with pytest.raises(ValueError, match="Valid options"):
+        b12x_sparse_ckv_decode.envs.environment_variables[name]()
+
+
+@pytest.mark.parametrize(
+    ("enabled", "transport"),
+    [(False, "ce"), (True, "direct")],
+)
+def test_bulk_shared_prefetch_preserves_per_layer_fallback(enabled, transport):
+    class Exchange:
+        pass
+
+    used_bulk = try_exchange_sparse_decode_shared_layers(
+        enabled=enabled,
+        transport=transport,
+        exchange=Exchange(),
+        records_by_layer=(object(), object(), object()),
+        local_indices_by_destination=object(),
+        outputs_by_layer=(object(), object(), object()),
+        active_records=8192,
+        pool_records=65536,
+    )
+
+    assert not used_bulk
+
+
+def test_bulk_shared_prefetch_old_b12x_falls_back_cleanly():
+    class LegacyCopyExchange:
+        pass
+
+    used_bulk = try_exchange_sparse_decode_shared_layers(
+        enabled=True,
+        transport="ce",
+        exchange=LegacyCopyExchange(),
+        records_by_layer=(object(), object(), object()),
+        local_indices_by_destination=object(),
+        outputs_by_layer=(object(), object(), object()),
+        active_records=8192,
+        pool_records=65536,
+    )
+
+    assert not used_bulk
+
+
+def test_bulk_shared_prefetch_requires_exact_depth_three():
+    class Exchange:
+        def exchange_layers(self, **kwargs):
+            raise AssertionError("partial groups must use the per-layer path")
+
+    used_bulk = try_exchange_sparse_decode_shared_layers(
+        enabled=True,
+        transport="ce",
+        exchange=Exchange(),
+        records_by_layer=(object(), object()),
+        local_indices_by_destination=object(),
+        outputs_by_layer=(object(), object()),
+        active_records=8192,
+        pool_records=65536,
+    )
+
+    assert not used_bulk
+
+
+def test_bulk_shared_prefetch_falls_back_above_layered_capacity():
+    class Exchange:
+        layered_max_records = 8191
+
+        def exchange_layers(self, **kwargs):
+            raise AssertionError("oversized batches must use the per-layer path")
+
+    used_bulk = try_exchange_sparse_decode_shared_layers(
+        enabled=True,
+        transport="ce",
+        exchange=Exchange(),
+        records_by_layer=(object(), object(), object()),
+        local_indices_by_destination=object(),
+        outputs_by_layer=(object(), object(), object()),
+        active_records=8192,
+        pool_records=65536,
+    )
+
+    assert not used_bulk
+
+
+def test_bulk_shared_prefetch_rejects_pool_overflow():
+    class Exchange:
+        def exchange_layers(self, **kwargs):
+            raise AssertionError("overflow must fail before exchange")
+
+    with pytest.raises(ValueError, match="exceed pool"):
+        try_exchange_sparse_decode_shared_layers(
+            enabled=True,
+            transport="ce",
+            exchange=Exchange(),
+            records_by_layer=(object(), object(), object()),
+            local_indices_by_destination=object(),
+            outputs_by_layer=(object(), object(), object()),
+            active_records=65537,
+            pool_records=65536,
+        )
+
+
+def test_bulk_shared_prefetch_reuses_existing_sparse_state(monkeypatch):
+    layout = plan_sparse_ckv_decode(
+        dcp_world_size=4,
+        topk=2,
+        rows_per_request=2,
+        max_requests=1,
+        pool_records=4,
+        record_bytes=8,
+        prefetch_depth=3,
+    )
+
+    class Output:
+        def __init__(self, slot):
+            self.slot = slot
+            self.streams = []
+
+        def record_stream(self, stream):
+            self.streams.append(stream)
+
+    outputs = [Output(slot) for slot in range(layout.workspace_slots)]
+
+    class Workspace:
+        def __getitem__(self, key):
+            slot, records = key
+            assert records == slice(None, layout.active_records(1), None)
+            return outputs[slot]
+
+    class Event:
+        def __init__(self):
+            self.streams = []
+
+        def record(self, stream):
+            self.streams.append(stream)
+
+    class Stream:
+        def __init__(self):
+            self.waited_for = []
+
+        def wait_stream(self, stream):
+            self.waited_for.append(stream)
+
+    class Exchange:
+        layered_max_records = layout.pool_records
+
+        def __init__(self):
+            self.calls = []
+
+        def exchange_layers(self, **kwargs):
+            self.calls.append(kwargs)
+
+    class State:
+        payload_workspace = Workspace()
+        transport_local_slots = {1: object()}
+        complete_events = [Event() for _ in range(layout.workspace_slots)]
+
+    class PrefetchState:
+        def get_sparse_decode_state(self, actual_layout, actual_exchange):
+            assert actual_layout is layout
+            assert actual_exchange is exchange
+            return state
+
+    class Metadata:
+        num_reqs = 1
+
+    exchange = Exchange()
+    state = State()
+    stream = Stream()
+    current_stream = object()
+    monkeypatch.setitem(
+        b12x_sparse_ckv_decode._SELECTED_RECORD_STREAMS,
+        id(exchange),
+        stream,
+    )
+    monkeypatch.setattr(
+        b12x_sparse_ckv_decode.envs,
+        "VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT",
+        "ce",
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._sparse_decode_bulk_prefetch = True
+    impl._sparse_decode_layout = layout
+    impl._sparse_decode_exchange = exchange
+    impl.block_size = 1
+    impl.cp_kv_cache_interleave_size = 1
+    targets = []
+    target_kv_caches = []
+    for target_idx in (1, 2, 3):
+        target_impl = object.__new__(B12xMLASparseImpl)
+        target_impl._sparse_decode_layout = layout
+        target_impl._sparse_decode_exchange = exchange
+        target_impl.block_size = 1
+        target_impl.cp_kv_cache_interleave_size = 1
+        target_kv = torch.zeros((1, 1, layout.record_bytes), dtype=torch.uint8)
+        target_kv_caches.append(target_kv)
+        targets.append((target_idx, target_impl, target_kv))
+
+    def fail_allocation(*args, **kwargs):
+        raise AssertionError("bulk prefetch must reuse allocated sparse state")
+
+    for allocator in ("empty", "empty_like", "zeros", "zeros_like"):
+        monkeypatch.setattr(torch, allocator, fail_allocation)
+    result = impl._dcp_gather_sparse_decode_shared_layers(
+        targets,
+        Metadata(),
+        PrefetchState(),
+    )
+
+    assert result is not None
+    layer_slots, complete = result
+    assert layer_slots == {1: 1, 2: 2, 3: 3}
+    assert stream.waited_for == [current_stream]
+    assert all(output.streams == [stream] for output in outputs[1:4])
+    assert complete is state.complete_events[1]
+    assert complete.streams == [stream]
+    assert len(exchange.calls) == 1
+    call = exchange.calls[0]
+    assert all(
+        actual.data_ptr() == expected.data_ptr()
+        and actual.dtype == expected.dtype
+        and actual.shape[-1] == layout.record_bytes
+        for actual, expected in zip(
+            call["records_by_layer"], target_kv_caches, strict=True
+        )
+    )
+    assert call["outputs_by_layer"] == tuple(outputs[1:4])
+    assert call["local_indices_by_destination"] is state.transport_local_slots[1]
+
+
+def _install_fake_b12x_transport(monkeypatch, *, ce_error=None, include_ce=True):
+    calls = []
+
+    class InitializationError(RuntimeError):
+        pass
+
+    class DirectExchange:
+        @classmethod
+        def from_process_group(cls, **kwargs):
+            calls.append("direct")
+            return cls()
+
+        def close(self):
+            pass
+
+    class CopyExchange:
+        @classmethod
+        def from_process_group(cls, **kwargs):
+            calls.append("ce")
+            if ce_error is not None:
+                raise InitializationError(ce_error)
+            return cls()
+
+        def close(self):
+            pass
+
+    package = ModuleType("sparkinfer")
+    package.__path__ = []
+    comm = ModuleType("sparkinfer.comm")
+    comm.__path__ = []
+    pcie = ModuleType("sparkinfer.comm.pcie")
+    pcie.SelectedRecordExchange = DirectExchange
+    pcie.SelectedRecordExchangeInitializationError = InitializationError
+    if include_ce:
+        pcie.SelectedRecordCopyExchange = CopyExchange
+    package.comm = comm
+    comm.pcie = pcie
+    monkeypatch.setitem(sys.modules, "sparkinfer", package)
+    monkeypatch.setitem(sys.modules, "sparkinfer.comm", comm)
+    monkeypatch.setitem(sys.modules, "sparkinfer.comm.pcie", pcie)
+    return calls, DirectExchange, CopyExchange
+
+
+def _prepare_transport_factory_test(monkeypatch, transport):
+    monkeypatch.setattr(
+        b12x_sparse_ckv_decode.envs,
+        "VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT",
+        transport,
+    )
+    monkeypatch.setattr(b12x_sparse_ckv_decode, "_SELECTED_RECORD_EXCHANGES", {})
+    monkeypatch.setattr(b12x_sparse_ckv_decode, "_SELECTED_RECORD_STREAMS", {})
+    stream = object()
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: stream)
+    return stream
+
+
+def test_selected_record_transport_auto_prefers_copy_engine(monkeypatch):
+    stream = _prepare_transport_factory_test(monkeypatch, "auto")
+    calls, _, CopyExchange = _install_fake_b12x_transport(monkeypatch)
+
+    exchange = b12x_sparse_ckv_decode.get_selected_record_exchange(
+        process_group=object(),
+        device=torch.device("cuda", 0),
+        layout=_layout(),
+        lane_key=("target", 1),
+    )
+
+    assert isinstance(exchange, CopyExchange)
+    assert calls == ["ce"]
+    assert b12x_sparse_ckv_decode.get_selected_record_stream(exchange) is stream
+
+
+def test_selected_record_transport_auto_falls_back_to_direct(monkeypatch):
+    _prepare_transport_factory_test(monkeypatch, "auto")
+    calls, DirectExchange, _ = _install_fake_b12x_transport(
+        monkeypatch, ce_error="CE unavailable"
+    )
+
+    exchange = b12x_sparse_ckv_decode.get_selected_record_exchange(
+        process_group=object(),
+        device=torch.device("cuda", 0),
+        layout=_layout(),
+        lane_key=("target", 1),
+    )
+
+    assert isinstance(exchange, DirectExchange)
+    assert calls == ["ce", "direct"]
+
+
+def test_selected_record_transport_auto_supports_older_b12x(monkeypatch):
+    _prepare_transport_factory_test(monkeypatch, "auto")
+    calls, DirectExchange, _ = _install_fake_b12x_transport(
+        monkeypatch, include_ce=False
+    )
+
+    exchange = b12x_sparse_ckv_decode.get_selected_record_exchange(
+        process_group=object(),
+        device=torch.device("cuda", 0),
+        layout=_layout(),
+        lane_key=("target", 1),
+    )
+
+    assert isinstance(exchange, DirectExchange)
+    assert calls == ["direct"]
+
+
+def test_selected_record_transport_direct_never_constructs_copy_engine(monkeypatch):
+    _prepare_transport_factory_test(monkeypatch, "direct")
+    calls, DirectExchange, _ = _install_fake_b12x_transport(monkeypatch)
+
+    exchange = b12x_sparse_ckv_decode.get_selected_record_exchange(
+        process_group=object(),
+        device=torch.device("cuda", 0),
+        layout=_layout(),
+        lane_key=("target", 1),
+    )
+
+    assert isinstance(exchange, DirectExchange)
+    assert calls == ["direct"]
+
+
+def test_selected_record_transport_isolates_target_and_draft_lanes(monkeypatch):
+    _prepare_transport_factory_test(monkeypatch, "direct")
+    calls, _, _ = _install_fake_b12x_transport(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: object())
+    process_group = object()
+    layout = _layout()
+
+    target = b12x_sparse_ckv_decode.get_selected_record_exchange(
+        process_group=process_group,
+        device=torch.device("cuda", 0),
+        layout=layout,
+        lane_key=("target", 1),
+    )
+    draft = b12x_sparse_ckv_decode.get_selected_record_exchange(
+        process_group=process_group,
+        device=torch.device("cuda", 0),
+        layout=layout,
+        lane_key=("draft", 1),
+    )
+
+    assert target is not draft
+    assert b12x_sparse_ckv_decode.get_selected_record_stream(target) is not (
+        b12x_sparse_ckv_decode.get_selected_record_stream(draft)
+    )
+    assert calls == ["direct", "direct"]
+
+
+def test_selected_record_transport_strict_ce_does_not_fallback(monkeypatch):
+    _prepare_transport_factory_test(monkeypatch, "ce")
+    calls, _, _ = _install_fake_b12x_transport(monkeypatch, ce_error="CE unavailable")
+
+    with pytest.raises(RuntimeError, match="strict copy-engine"):
+        b12x_sparse_ckv_decode.get_selected_record_exchange(
+            process_group=object(),
+            device=torch.device("cuda", 0),
+            layout=_layout(),
+            lane_key=("target", 1),
+        )
+
+    assert calls == ["ce"]
+
+
+def test_selected_record_transport_rejects_unknown_mode(monkeypatch):
+    _prepare_transport_factory_test(monkeypatch, "mystery")
+
+    with pytest.raises(ValueError, match="must be auto, ce, or direct"):
+        b12x_sparse_ckv_decode.get_selected_record_exchange(
+            process_group=object(),
+            device=torch.device("cuda", 0),
+            layout=_layout(),
+            lane_key=("target", 1),
+        )
 
 
 @pytest.mark.parametrize("dcp", [2, 3, 4, 5, 6, 7, 8])

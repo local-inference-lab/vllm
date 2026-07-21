@@ -78,6 +78,8 @@ if TYPE_CHECKING:
     VLLM_DCP_QUERY_SPLIT: bool = False
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER: bool = False
+    VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT: str = "direct"
+    VLLM_B12X_MLA_SPARSE_DECODE_BULK_PREFETCH: bool = False
     VLLM_B12X_MLA_SPARSE_DECODE_MAX_SEQS: int = 8
     VLLM_B12X_MLA_SPARSE_DECODE_POOL_RECORDS: int = 0
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
@@ -440,6 +442,26 @@ def env_with_choices(
         return value
 
     return _get_validated_env
+
+
+def env_bool_with_choices(
+    env_name: str,
+    default: bool = False,
+) -> Callable[[], bool]:
+    """Create a case-insensitive, strictly validated boolean env getter."""
+    getter = env_with_choices(
+        env_name,
+        "1" if default else "0",
+        ["0", "1", "false", "true", "no", "yes", "off", "on"],
+        case_sensitive=False,
+    )
+
+    def _get_validated_bool() -> bool:
+        value = getter()
+        assert value is not None
+        return value.lower() in ("1", "true", "yes", "on")
+
+    return _get_validated_bool
 
 
 def env_list_with_choices(
@@ -1181,6 +1203,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER": lambda: (
         os.getenv("VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER", "0").lower()
         in ("1", "true", "yes", "on")
+    ),
+    # Transport for sparse selected-record decode. Keep the existing direct
+    # path as the default because copy-engine staging has additional VRAM cost.
+    "VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT": env_with_choices(
+        "VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT",
+        "direct",
+        ["auto", "ce", "direct"],
+    ),
+    # Combine exactly three eligible Shared-layer selected-record prefetches
+    # into one CE exchange. Sparse decode must also be enabled. This is
+    # effective only with transport=ce|auto and sufficient layered capacity;
+    # direct transport, partial groups, and oversized groups retain the
+    # existing per-layer path.
+    "VLLM_B12X_MLA_SPARSE_DECODE_BULK_PREFETCH": env_bool_with_choices(
+        "VLLM_B12X_MLA_SPARSE_DECODE_BULK_PREFETCH"
     ),
     "VLLM_B12X_MLA_SPARSE_DECODE_MAX_SEQS": lambda: int(
         os.getenv("VLLM_B12X_MLA_SPARSE_DECODE_MAX_SEQS", "8")
