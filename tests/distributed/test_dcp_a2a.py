@@ -548,7 +548,9 @@ def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     sentinel = torch.zeros(1)
 
     class _FakePool:
-        def lse_reduce_scatter(self, out, lse, *, is_lse_base_on_e):
+        def lse_reduce_scatter(
+            self, partial, lse, out=None, *, is_lse_base_on_e
+        ):
             return sentinel
 
     def fake_get_pool(
@@ -633,8 +635,8 @@ def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
-def test_b12x_lse_reduce_makes_views_contiguous(monkeypatch: pytest.MonkeyPatch):
-    """Head-sliced attention views must reach the PCIe pool contiguous."""
+def test_b12x_lse_reduce_preserves_supported_layouts(monkeypatch: pytest.MonkeyPatch):
+    """Preserve head-major input while materializing legacy head slices."""
     from vllm.v1.attention.ops import dcp_alltoall
 
     monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
@@ -642,8 +644,10 @@ def test_b12x_lse_reduce_makes_views_contiguous(monkeypatch: pytest.MonkeyPatch)
     sentinel = torch.zeros(1)
 
     class _FakePool:
-        def lse_reduce_scatter(self, out, lse, *, is_lse_base_on_e):
-            received.update(out=out, lse=lse)
+        def lse_reduce_scatter(
+            self, partial, lse, out=None, *, is_lse_base_on_e
+        ):
+            received.update(partial=partial, lse=lse, out=out)
             return sentinel
 
     monkeypatch.setattr(
@@ -671,8 +675,26 @@ def test_b12x_lse_reduce_makes_views_contiguous(monkeypatch: pytest.MonkeyPatch)
         query_head_dim=64,
     )
     assert result is sentinel
-    assert received["out"].is_contiguous()
+    assert received["partial"].is_contiguous()
     assert received["lse"].is_contiguous()
+    assert received["out"].movedim(0, 1).is_contiguous()
+
+    head_major_storage = torch.zeros(
+        16, 8, 64, dtype=torch.bfloat16, device="cuda"
+    )
+    head_major = head_major_storage.transpose(0, 1)[:4]
+    result = dcp_alltoall._try_b12x_dcp_lse_reduce(
+        head_major,
+        torch.zeros(4, 16, dtype=torch.float32, device="cuda"),
+        group,  # type: ignore[arg-type]
+        return_lse=False,
+        is_lse_base_on_e=True,
+        max_batch_size=8192,
+        query_head_dim=64,
+    )
+    assert result is sentinel
+    assert received["partial"] is head_major
+    assert received["out"].stride() == (64, 4 * 64, 1)
 
 
 def test_b12x_query_gather_requires_env(monkeypatch: pytest.MonkeyPatch):
@@ -778,7 +800,44 @@ class TestPackedA2AKernels:
             _assert_packed_a2a_close(actual_out, expected_out, dtype)
             torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-4, atol=1e-4)
         else:
+            actual_out = actual
             _assert_packed_a2a_close(actual, expected_out, dtype)
+        assert actual_out.movedim(0, 1).is_contiguous()
+        assert not actual_out.is_contiguous()
+
+
+def test_cuda_reduce_scatter_can_preserve_head_major_output(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.distributed.device_communicators import cuda_communicator
+
+    monkeypatch.setattr(
+        cuda_communicator,
+        "should_nccl_symm_mem_ag_rs",
+        lambda: False,
+    )
+
+    class FakePyNccl:
+        disabled = False
+
+        def reduce_scatter(self, output, input_):
+            output.copy_(input_[: output.shape[0]])
+
+    class FakeCommunicator:
+        world_size = 2
+        pynccl_comm = FakePyNccl()
+
+    input_storage = torch.arange(8 * 3 * 16, dtype=torch.bfloat16).view(8, 3, 16)
+    input_ = input_storage.movedim(0, 1)
+    actual = cuda_communicator.CudaCommunicator.reduce_scatter_head_major(
+        FakeCommunicator(), input_, dim=1
+    )
+
+    expected = input_[:, :4]
+    torch.testing.assert_close(actual, expected)
+    assert actual.shape == (3, 4, 16)
+    assert actual.stride() == (16, 3 * 16, 1)
+    assert actual.movedim(0, 1).is_contiguous()
 
 
 def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:

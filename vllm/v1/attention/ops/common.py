@@ -231,6 +231,7 @@ def cp_lse_ag_out_rs(
     ctx: CPTritonContext | None = None,
     return_lse: bool = False,
     is_lse_base_on_e=True,
+    head_major_output: bool = False,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -239,7 +240,10 @@ def cp_lse_ag_out_rs(
     out, lse = _cp_lse_common(
         cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
     )
-    out = cp_group.reduce_scatter(out, dim=1)
+    if head_major_output:
+        out = cp_group.reduce_scatter_head_major(out, dim=1)
+    else:
+        out = cp_group.reduce_scatter(out, dim=1)
 
     if return_lse:
         cp_num_heads = lse.shape[1] // cp_group.world_size

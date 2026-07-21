@@ -1206,6 +1206,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                             lse,
                             get_dcp_group(),
                             is_lse_base_on_e=self.impl.lse_base_on_e,
+                            head_major_output=True,
                         )
 
             if project_before_merge:

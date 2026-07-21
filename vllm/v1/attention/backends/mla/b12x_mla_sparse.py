@@ -976,10 +976,6 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self.v_head_dim: int = mla_args.get("v_head_dim", 512)
         # GLM_NSA contract: q_head_dim = kv_lora_rank (512) + qk_rope (64) = 576.
         self.q_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
-        self.force_contiguous_mla_bmm_input = True
-        self.force_contiguous_mla_bmm_weight = True
-        self.force_contiguous_mla_bmm_output = True
-
         # The indexer carries the shared buffer for normal layers and tests;
         # the explicitly-passed buffer covers backbone skip layers, whose
         # indexer is not constructed (see deepseek_v2.py).
@@ -998,6 +994,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         parallel_config = vllm_config.parallel_config
         self.dcp_workspace_non_dbo = not bool(parallel_config.enable_dbo)
         self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self._head_major_mla_output = True
         self.tp_world_size = int(parallel_config.tensor_parallel_size)
         self.dcp_rank = 0
         if self.dcp_world_size > 1:
@@ -1138,6 +1135,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     max_batch=int(max_batch),
                     max_chunks_per_row=self._num_splits_cap,
                     page_size=self.block_size,
+                    head_major_output=self._head_major_mla_output,
                 )
             )
 
@@ -1305,7 +1303,17 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         )
 
     def _borrow_workspaces(self) -> list[torch.Tensor]:
-        return current_workspace_manager().get_simultaneous(*self._workspace_specs)
+        workspaces = current_workspace_manager().get_simultaneous(
+            *self._workspace_specs
+        )
+        if self._pad_heads:
+            dense_storage = workspaces[1]
+            workspaces[1] = dense_storage.view(
+                self._input_num_heads,
+                self._max_batched,
+                self.kv_lora_rank,
+            ).transpose(0, 1)
+        return workspaces
 
     def _borrow_workspace_parts(
         self,
@@ -1341,7 +1349,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             != (self._max_batched, self._input_num_heads, self.kv_lora_rank)
             or dense_out_workspace.dtype != torch.bfloat16
             or dense_out_workspace.device != self.device
-            or not dense_out_workspace.is_contiguous()
+            or not dense_out_workspace.movedim(0, 1).is_contiguous()
         ):
             raise RuntimeError("B12X DCP prefill borrowed an invalid dense output")
         if (
@@ -1502,7 +1510,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         if (
             tuple(attn_out.shape)
             != (num_tokens, self._input_num_heads, self.kv_lora_rank)
-            or not attn_out.is_contiguous()
+            or not attn_out.movedim(0, 1).is_contiguous()
             or attn_out.dtype != torch.bfloat16
             or tuple(w_uv.shape)
             != (self._input_num_heads, self.kv_lora_rank, self.v_head_dim)

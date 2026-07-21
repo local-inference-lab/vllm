@@ -751,6 +751,30 @@ class GroupCoordinator:
             raise RuntimeError("reduce_scatter_into did not preserve output identity")
         return output
 
+    def reduce_scatter_head_major(
+        self,
+        input_: torch.Tensor,
+        dim: int = -1,
+    ) -> torch.Tensor:
+        """Reduce-scatter and preserve a physically head-major output view."""
+        if self.world_size <= 1 or dim != 1:
+            raise RuntimeError(
+                "reduce_scatter_head_major requires DCP heads on dim 1"
+            )
+        if self.device_communicator is None:
+            raise RuntimeError(
+                "reduce_scatter_head_major requires a device communicator"
+            )
+        reduce_scatter_head_major = getattr(
+            self.device_communicator, "reduce_scatter_head_major", None
+        )
+        if not callable(reduce_scatter_head_major):
+            raise RuntimeError(
+                f"{type(self.device_communicator).__name__} does not support "
+                "head-major reduce-scatter"
+            )
+        return reduce_scatter_head_major(input_, dim)
+
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ) -> torch.Tensor:

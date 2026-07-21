@@ -467,6 +467,46 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         return output
 
+    def reduce_scatter_head_major(
+        self,
+        input_: torch.Tensor,
+        dim: int = -1,
+    ) -> torch.Tensor:
+        """Reduce-scatter heads without the final token-major copy."""
+        if self.world_size <= 1:
+            raise RuntimeError("head-major reduce-scatter requires world size > 1")
+        if dim < 0:
+            dim += input_.dim()
+        if dim != 1 or input_.ndim != 3:
+            raise ValueError(
+                "head-major reduce-scatter requires a rank-3 tensor on dim 1"
+            )
+
+        input_head_major = input_.movedim(0, dim).contiguous()
+        if input_head_major.shape[0] % self.world_size != 0:
+            raise ValueError("head count is not divisible by world size")
+        output_shape = (
+            input_head_major.shape[0] // self.world_size,
+            *input_head_major.shape[1:],
+        )
+
+        if should_nccl_symm_mem_ag_rs():
+            output_head_major = self._reduce_scatter_symm_mem(input_head_major)
+        else:
+            output_head_major = torch.empty(
+                output_shape,
+                dtype=input_head_major.dtype,
+                device=input_head_major.device,
+            )
+            pynccl_comm = self.pynccl_comm
+            if pynccl_comm is None or pynccl_comm.disabled:
+                raise RuntimeError(
+                    "head-major reduce-scatter requires an active PyNccl communicator"
+                )
+            pynccl_comm.reduce_scatter(output_head_major, input_head_major)
+
+        return output_head_major.movedim(0, dim)
+
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ):

@@ -46,6 +46,21 @@ _DCP_A2A_GRAPH_BUFFERS: dict[
 ] = {}
 
 
+def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
+    """Accept packed token-major or capacity-strided head-major BHD views."""
+    if tensor.ndim != 3 or int(tensor.stride(2)) != 1:
+        return False
+    batch, heads, head_dim = (int(value) for value in tensor.shape)
+    stride_batch, stride_head, _ = (int(value) for value in tensor.stride())
+    packed_token_major = (
+        stride_batch == heads * head_dim and stride_head == head_dim
+    )
+    capacity_strided_head_major = (
+        stride_batch == head_dim and stride_head >= batch * head_dim
+    )
+    return packed_token_major or capacity_strided_head_major
+
+
 @lru_cache(maxsize=1)
 def _load_b12x_dcp_a2a_pool() -> Any | None:
     try:
@@ -216,19 +231,24 @@ def _try_b12x_dcp_lse_reduce(
         )
         return None
 
-    # Sparse MLA backends can return head-sliced views (e.g. GLM TP6 pads
-    # 64 -> 66 heads and slices the kernel output back), and the PCIe pool
-    # requires contiguous operands. The NCCL packers take explicit strides,
-    # so only this fast path needs the copy; LSE is tiny and the output is
-    # already contiguous on unpadded head counts.
-    if not cp_attn_out.is_contiguous():
+    # The channel accepts packed token-major input and the capacity-strided
+    # head-major layout produced by B12X sparse MLA. Preserve either layout;
+    # only legacy padded-head slices need materialization.
+    if not _is_supported_bhd_layout(cp_attn_out):
         cp_attn_out = cp_attn_out.contiguous()
     if not cp_attn_lse.is_contiguous():
         cp_attn_lse = cp_attn_lse.contiguous()
 
+    reduced_storage = torch.empty(
+        (total_heads // world_size, batch, head_dim),
+        device=cp_attn_out.device,
+        dtype=cp_attn_out.dtype,
+    )
+    reduced = reduced_storage.transpose(0, 1)
     return pool.lse_reduce_scatter(
         cp_attn_out,
         cp_attn_lse,
+        out=reduced,
         is_lse_base_on_e=is_lse_base_on_e,
     )
 
@@ -789,11 +809,12 @@ def _dcp_a2a_unpack_combine(
     is_lse_base_on_e: bool,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     world_size, num_tokens, h_per_rank, _ = recv_buffer.shape
-    out = torch.empty(
-        (num_tokens, h_per_rank, head_dim),
+    out_storage = torch.empty(
+        (h_per_rank, num_tokens, head_dim),
         device=recv_buffer.device,
         dtype=recv_buffer.dtype,
     )
+    out = out_storage.transpose(0, 1)
     out_lse = torch.empty(
         (num_tokens, h_per_rank) if return_lse else (1, 1),
         device=recv_buffer.device,

@@ -102,6 +102,42 @@ def test_cp_lse_ag_out_rs_into_preserves_borrowed_output(monkeypatch, world_size
     assert torch.equal(lse, corrected_lse[:, rank : rank + 1])
 
 
+def test_cp_lse_ag_out_rs_requests_head_major_output(monkeypatch):
+    corrected_storage = torch.arange(8 * 3 * 16, dtype=torch.bfloat16).view(
+        8, 3, 16
+    )
+    corrected = corrected_storage.movedim(0, 1)
+    corrected_lse = torch.zeros(3, 8, dtype=torch.float32)
+
+    monkeypatch.setattr(
+        common,
+        "_cp_lse_common",
+        lambda *args, **kwargs: (corrected, corrected_lse),
+    )
+
+    class FakeGroup:
+        rank_in_group = 0
+        world_size = 2
+
+        def reduce_scatter_head_major(self, input_, dim):
+            assert input_ is corrected
+            assert dim == 1
+            storage = torch.empty(4, 3, 16, dtype=input_.dtype)
+            output = storage.movedim(0, 1)
+            output.copy_(input_[:, :4])
+            return output
+
+    output = common.cp_lse_ag_out_rs(
+        corrected,
+        corrected_lse,
+        FakeGroup(),
+        head_major_output=True,
+    )
+
+    assert output.stride() == (16, 3 * 16, 1)
+    torch.testing.assert_close(output, corrected[:, :4])
+
+
 @pytest.mark.parametrize(
     ("tp_size", "dcp_size", "local_heads", "input_heads", "kernel_heads"),
     [
