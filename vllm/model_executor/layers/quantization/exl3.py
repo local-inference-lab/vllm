@@ -1372,6 +1372,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         max_trellis_m = _positive_env_int("VLLM_EXL3_TRELLIS_MAX_M", 32)
         block_m = _positive_env_int("VLLM_EXL3_TRELLIS_BLOCK_M", 8)
         chunk = _positive_env_int("VLLM_EXL3_PREFILL_CHUNK", 128)
+        prefill_trellis = os.environ.get("VLLM_EXL3_PREFILL_TRELLIS", "1") == "1"
+        prefill_block_m = _positive_env_int("VLLM_EXL3_PREFILL_BLOCK_M", 64)
         if min_trellis_m > max_trellis_m:
             raise ValueError(
                 "VLLM_EXL3_TRELLIS_MIN_M cannot exceed VLLM_EXL3_TRELLIS_MAX_M"
@@ -1394,6 +1396,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             max_trellis_m,
             block_m,
             chunk,
+            prefill_trellis,
+            prefill_block_m,
             layer.exl3_trellis_tile_config,
         )
         runtime = _RANK_SLICED_RUNTIMES.get(key)
@@ -1406,26 +1410,41 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
 
         api = _load_sparkinfer_trellis()
-        caps = api.Caps(
-            max_tokens=max_trellis_m,
-            num_topk=topk,
-            num_experts=int(layer.local_num_experts),
-            hidden_size=int(layer.exl3_hidden_size),
-            intermediate_size=int(layer.exl3_intermediate_size_per_partition),
-            route_num_experts=int(layer.local_num_experts),
-            block_size_m=block_m,
-            trellis_bits=int(self.quant_config.bits),
-            tile_config=layer.exl3_trellis_tile_config,
-            input_dtype=x.dtype,
-            device=x.device,
-        )
-        trellis_plan = api.plan(caps)
-        scratch_spec = trellis_plan.scratch_specs()[0]
-        trellis_scratch = torch.empty(
-            scratch_spec.shape,
-            dtype=scratch_spec.dtype,
-            device=scratch_spec.device,
-        )
+
+        def _plan_with_scratch(plan_max_tokens: int, plan_block_m: int):
+            caps = api.Caps(
+                max_tokens=plan_max_tokens,
+                num_topk=topk,
+                num_experts=int(layer.local_num_experts),
+                hidden_size=int(layer.exl3_hidden_size),
+                intermediate_size=int(layer.exl3_intermediate_size_per_partition),
+                route_num_experts=int(layer.local_num_experts),
+                block_size_m=plan_block_m,
+                trellis_bits=int(self.quant_config.bits),
+                tile_config=layer.exl3_trellis_tile_config,
+                input_dtype=x.dtype,
+                device=x.device,
+            )
+            plan = api.plan(caps)
+            scratch_spec = plan.scratch_specs()[0]
+            scratch = torch.empty(
+                scratch_spec.shape,
+                dtype=scratch_spec.dtype,
+                device=scratch_spec.device,
+            )
+            return plan, scratch
+
+        trellis_plan, trellis_scratch = _plan_with_scratch(max_trellis_m, block_m)
+        # Prefill batches (m > max_trellis_m) run through a second planned
+        # Trellis capacity instead of the eager ExLlamaV3 parity path. The
+        # large block keeps expert tiles streamed once per block of routed
+        # rows rather than once per 8-row block.
+        prefill_plan = None
+        prefill_scratch = None
+        if prefill_trellis and max_batched_tokens > max_trellis_m:
+            prefill_plan, prefill_scratch = _plan_with_scratch(
+                max_batched_tokens, prefill_block_m
+            )
 
         ext = _load_exl3_ext()
         required_ext = {
@@ -1443,23 +1462,33 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         intermediate_size = int(layer.exl3_intermediate_size_per_partition)
         num_experts = int(layer.local_num_experts)
         device = x.device
+        # With the prefill plan live, the parity path only ever serves
+        # m < min_trellis_m, so its persistent staging shrinks to one chunk.
+        parity_rows = (
+            max_batched_tokens
+            if prefill_plan is None
+            else min(chunk, max_batched_tokens)
+        )
         runtime = {
             "api": api,
             "trellis_plan": trellis_plan,
             "trellis_scratch": trellis_scratch,
+            "prefill_plan": prefill_plan,
+            "prefill_scratch": prefill_scratch,
             "ext": ext,
             "min_trellis_m": min_trellis_m,
             "max_trellis_m": max_trellis_m,
             "max_batched_tokens": max_batched_tokens,
+            "parity_rows": parity_rows,
             "topk": topk,
             "chunk": chunk,
             "xh": torch.empty(
-                (max_batched_tokens, hidden_size),
+                (parity_rows, hidden_size),
                 dtype=torch.float16,
                 device=device,
             ),
             "out32": torch.empty(
-                (max_batched_tokens, hidden_size),
+                (parity_rows, hidden_size),
                 dtype=torch.float32,
                 device=device,
             ),
@@ -1494,12 +1523,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 device=device,
             ),
             "token_sorted": torch.empty(
-                max_batched_tokens * topk,
+                parity_rows * topk,
                 dtype=torch.int64,
                 device=device,
             ),
             "weight_sorted": torch.empty(
-                max_batched_tokens * topk,
+                parity_rows * topk,
                 dtype=torch.float16,
                 device=device,
             ),
@@ -1515,12 +1544,23 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             ),
         }
         _RANK_SLICED_RUNTIMES[key] = runtime
+        prefill_arena_mib = (
+            0.0
+            if prefill_scratch is None
+            else prefill_scratch.numel() * prefill_scratch.element_size() / (1 << 20)
+        )
         logger.info_once(
             "EXL3 rank-sliced runtime planned: Trellis m=%d..%d block_m=%d, "
-            "prefill capacity=%d chunk=%d topk=%d",
+            "prefill %s capacity=%d chunk=%d topk=%d",
             min_trellis_m,
             max_trellis_m,
             block_m,
+            (
+                f"trellis block_m={prefill_block_m} "
+                f"arena={prefill_arena_mib:.1f}MiB"
+                if prefill_plan is not None
+                else "parity"
+            ),
             max_batched_tokens,
             chunk,
             topk,
@@ -1548,10 +1588,33 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             output = runtime["api"].run(binding=binding)
             return output.to(x.dtype)
 
-        if m > runtime["max_batched_tokens"]:
+        if runtime["prefill_plan"] is not None and m > runtime["max_trellis_m"]:
+            if m > runtime["max_batched_tokens"]:
+                raise ValueError(
+                    "EXL3 batch exceeds its planned capacity: "
+                    f"m={m}, capacity={runtime['max_batched_tokens']}"
+                )
+            binding = runtime["api"].bind(
+                runtime["prefill_plan"],
+                scratch=runtime["prefill_scratch"],
+                a=x,
+                weights=layer.exl3_trellis_weights,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+            )
+            output = runtime["api"].run(binding=binding)
+            return output.to(x.dtype)
+
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "EXL3 eager parity path entered during CUDA graph capture "
+                f"(m={m}); capture sizes must lie inside the Trellis window "
+                f"[{runtime['min_trellis_m']}, {runtime['max_trellis_m']}]"
+            )
+        if m > runtime["parity_rows"]:
             raise ValueError(
-                "EXL3 batch exceeds its planned capacity: "
-                f"m={m}, capacity={runtime['max_batched_tokens']}"
+                "EXL3 batch exceeds its planned parity capacity: "
+                f"m={m}, capacity={runtime['parity_rows']}"
             )
         ext = runtime["ext"]
         xh = runtime["xh"][:m]
