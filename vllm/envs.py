@@ -74,11 +74,13 @@ if TYPE_CHECKING:
     VLLM_DCP_A2A_MAX_TOKENS: int = 0
     VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
     VLLM_DCP_SHARD_DRAFT: str | None = None
+    VLLM_DCP_REPLICATE_INDEXER_CACHE: bool = False
     VLLM_DCP_GLOBAL_TOPK: bool = True
     VLLM_DCP_QUERY_SPLIT: bool = False
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
+    VLLM_B12X_MLA_CKV_PREFETCH_DEPTH: int = 1
     VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
     VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
     VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
@@ -1160,6 +1162,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # target indexer cache and native MTP drafts, replicated for external
     # (Eagle-style) drafts.
     "VLLM_DCP_SHARD_DRAFT": lambda: os.getenv("VLLM_DCP_SHARD_DRAFT", None),
+    # Replicate the target model's sparse-indexer K cache on every DCP rank.
+    "VLLM_DCP_REPLICATE_INDEXER_CACHE": lambda: (
+        os.getenv("VLLM_DCP_REPLICATE_INDEXER_CACHE", "0").lower()
+        in ("1", "true", "yes", "on")
+    ),
     # Under DCP, gather sparse-indexer logits across ranks and select a global
     # top-k instead of a per-rank local top-k.
     "VLLM_DCP_GLOBAL_TOPK": lambda: (
@@ -1176,6 +1183,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
+    ),
+    # Number of future full-CKV layer gathers to queue. Zero keeps the
+    # synchronous gather path without allocating lookahead ring slots.
+    "VLLM_B12X_MLA_CKV_PREFETCH_DEPTH": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_PREFETCH_DEPTH", "1")
     ),
     # Diagnostic flag retained for local experiments. MiniMax M3 compile is
     # fail-closed in the model until the no-break path is validated.

@@ -1,22 +1,128 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
+import vllm.v1.attention.backends.mla.indexer as indexer_backend
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
-from vllm.v1.attention.backends.mla.indexer import build_prefill_chunk_metadata
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerMetadataBuilder,
+    build_prefill_chunk_metadata,
+    get_indexer_max_num_blocks_per_req,
+)
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_filter_and_convert_dcp_index,
 )
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.ops.common import CPTritonContext, correct_attn_out
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 
 def _local_count(length: int, rank: int, world: int, interleave: int) -> int:
     return sum(1 for pos in range(length) if (pos // interleave) % world == rank)
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 6, 8])
+def test_replicated_indexer_metadata_covers_full_context(dcp_size: int):
+    max_model_len = 131_071
+    storage_block_size = 64
+    manager_block_size = storage_block_size * dcp_size
+
+    sharded_blocks = get_indexer_max_num_blocks_per_req(
+        max_model_len=max_model_len,
+        block_size=storage_block_size,
+        configured_cp_world_size=dcp_size,
+        dcp_replicated=False,
+    )
+    replicated_blocks = get_indexer_max_num_blocks_per_req(
+        max_model_len=max_model_len,
+        block_size=manager_block_size,
+        configured_cp_world_size=dcp_size,
+        dcp_replicated=True,
+    )
+    expected_blocks = (max_model_len + manager_block_size - 1) // manager_block_size
+
+    assert sharded_blocks == expected_blocks
+    assert replicated_blocks == expected_blocks
+
+
+def test_replicated_builder_uses_global_lengths_without_dcp_localization(monkeypatch):
+    def fail_dcp_path(*args, **kwargs):
+        pytest.fail("replicated indexer metadata must not enter DCP localization")
+
+    monkeypatch.setattr(indexer_backend, "get_dcp_group", fail_dcp_path)
+    monkeypatch.setattr(indexer_backend, "num_compute_units", lambda device: 4)
+    monkeypatch.setattr(indexer_backend.envs, "VLLM_USE_B12X_SPARSE_INDEXER", True)
+
+    spec = MLAAttentionSpec(
+        block_size=1024,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        dcp_replicated=True,
+    )
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=8,
+            max_num_seqs=4,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=4,
+            prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=None,
+        attention_config=SimpleNamespace(use_fp4_indexer_cache=False),
+        model_config=SimpleNamespace(max_model_len=4096),
+    )
+    builder = DeepseekV32IndexerMetadataBuilder(
+        kv_cache_spec=spec,
+        layer_names=["model.layers.12.self_attn.indexer.k_cache"],
+        vllm_config=config,
+        device=torch.device("cpu"),
+    )
+    monkeypatch.setattr(builder, "_dcp_localize_decode_seq_lens", fail_dcp_path)
+    monkeypatch.setattr(
+        builder,
+        "_maybe_build_b12x_schedule_metadata",
+        lambda *args, **kwargs: None,
+    )
+
+    global_seq_lens = torch.tensor([9], dtype=torch.int32)
+    local_seq_lens = torch.tensor([3], dtype=torch.int32)
+    common_metadata = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=global_seq_lens,
+        num_reqs=1,
+        num_actual_tokens=1,
+        max_query_len=1,
+        max_seq_len=9,
+        block_table_tensor=torch.zeros((1, 1), dtype=torch.int32),
+        slot_mapping=torch.tensor([8], dtype=torch.int64),
+        dcp_local_seq_lens=local_seq_lens,
+        dcp_local_seq_lens_cpu=local_seq_lens.clone(),
+        seq_lens_cpu_upper_bound=global_seq_lens.clone(),
+        _seq_lens_cpu=global_seq_lens.clone(),
+    )
+
+    metadata = builder.build(0, common_metadata)
+
+    assert builder.dcp_world_size == 1
+    assert builder.dcp_rank == 0
+    assert metadata.seq_lens.tolist() == [9]
+    assert metadata.slot_mapping.tolist() == [8]
+    assert metadata.decode is not None
+    assert metadata.decode.seq_lens.tolist() == [[9]]
+    assert metadata.decode.max_seq_len == 9
+    assert metadata.decode.active_width.tolist() == [9]
+    assert metadata.decode.global_seq_lens is None
 
 
 def _global_to_local_indices(
@@ -89,6 +195,16 @@ def _attention_from_indices(
     v: torch.Tensor,
     indices: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if k.shape[0] == 0:
+        return (
+            torch.zeros_like(q),
+            torch.full(
+                (q.shape[0],),
+                float("-inf"),
+                dtype=q.dtype,
+                device=q.device,
+            ),
+        )
     valid = indices >= 0
     safe_indices = indices.clamp_min(0)
     selected_k = k[safe_indices]
@@ -253,7 +369,7 @@ def _merge_local_topks_global_with_fake_dcp(
         sparse_indexer.get_dcp_group = original_get_dcp_group
 
 
-@pytest.mark.parametrize("world", [1, 2, 4])
+@pytest.mark.parametrize("world", [1, 2, 4, 6, 8])
 @pytest.mark.parametrize("interleave", [1, 2, 4])
 def test_get_dcp_local_seq_lens_matches_naive(world: int, interleave: int):
     seq_lens = torch.arange(0, 33, dtype=torch.int32)
@@ -341,9 +457,11 @@ def test_get_dcp_local_seq_lens_must_run_after_decode_expansion():
 
 
 @pytest.mark.parametrize("interleave", [1, 2])
-def test_sparse_dcp_attention_matches_global_topk_attention(interleave: int):
+@pytest.mark.parametrize("world", [2, 4, 6, 8])
+def test_sparse_dcp_attention_matches_global_topk_attention(
+    interleave: int, world: int
+):
     torch.manual_seed(0)
-    world = 2
     topk = 3
     num_queries = 4
     max_seq_len = 13

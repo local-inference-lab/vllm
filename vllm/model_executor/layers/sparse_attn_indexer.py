@@ -2155,6 +2155,7 @@ class SparseAttnIndexer(CustomOp):
         topk_scores_buffer: torch.Tensor | None = None,
         output_physical_slots: bool = False,
         num_q_heads: int | None = None,
+        dcp_replicated: bool = False,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -2174,7 +2175,9 @@ class SparseAttnIndexer(CustomOp):
         # during model construction) and pass them into the custom op, rather
         # than threading them through per-step metadata.
         parallel_config = get_current_vllm_config().parallel_config
-        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_replicated = bool(dcp_replicated)
+        configured_dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_world_size = 1 if self.dcp_replicated else configured_dcp_world_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.use_b12x_sparse_indexer = use_b12x_sparse_indexer()
