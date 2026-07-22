@@ -38,6 +38,13 @@ def use_workspace_lane(lane: int) -> Iterator[None]:
 
     Target execution uses lane 0; speculative execution uses lane 1 so a
     captured graph cannot retain views into the target graph's buffer.
+
+    Args:
+        lane: Workspace owner index for this context. Must be non-negative;
+            target execution uses ``0`` and speculative execution uses ``1``.
+
+    Raises:
+        ValueError: If ``lane`` is negative.
     """
     if lane < 0:
         raise ValueError(f"Workspace lane must be non-negative, got {lane}.")
