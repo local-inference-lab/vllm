@@ -4,7 +4,7 @@ import hashlib
 import importlib
 from collections.abc import Callable
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -1683,6 +1683,26 @@ def test_resolve_kv_cache_block_sizes_mixed_dcp_replicated_groups():
     assert hash_block_size == 64
 
 
+def test_attention_block_table_width_respects_dcp_replication():
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=4,
+            prefill_context_parallel_size=1,
+        )
+    )
+    common = dict(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+    )
+    sharded = MLAAttentionSpec(**common)
+    replicated = MLAAttentionSpec(**common, dcp_replicated=True)
+
+    assert sharded.max_num_blocks_per_req(vllm_config, 135_500) == 530
+    assert replicated.max_num_blocks_per_req(vllm_config, 135_500) == 2_118
+
+
 def test_dsv4_engine_capacity_uses_worker_kv_cache_config():
     from vllm.v1.engine.core import EngineCore
 
@@ -2259,6 +2279,94 @@ def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():
     assert len(grouped) == 2
     layer_names = {name for g in grouped for name in g.kv_cache_specs}
     assert layer_names == {"mla.0", "mla.1", "swa.0"}
+
+
+def test_group_and_unify_kv_cache_specs_replicated_mla_draft():
+    target_mla = new_mla_spec()
+    target_indexer = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+    )
+    draft_mla = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=320,
+        dtype=torch.float32,
+        dcp_replicated=True,
+    )
+    draft_indexer = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=96,
+        dtype=torch.float32,
+        dcp_replicated=True,
+    )
+    specs = {
+        "model.layers.0.self_attn": target_mla,
+        "model.layers.0.self_attn.indexer.k_cache": target_indexer,
+        "model.layers.79.self_attn": draft_mla,
+        "model.layers.79.self_attn.indexer.k_cache": draft_indexer,
+    }
+
+    grouped = group_and_unify_kv_cache_specs(specs)
+
+    assert grouped is not None
+    assert len(grouped) == 2
+    assert set(grouped[0].kv_cache_specs) == {
+        "model.layers.0.self_attn",
+        "model.layers.0.self_attn.indexer.k_cache",
+    }
+    assert set(grouped[1].kv_cache_specs) == {
+        "model.layers.79.self_attn",
+        "model.layers.79.self_attn.indexer.k_cache",
+    }
+    assert all(not spec.dcp_replicated for spec in grouped[0].kv_cache_specs.values())
+    assert all(spec.dcp_replicated for spec in grouped[1].kv_cache_specs.values())
+
+    cache_groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped)
+    assert len(cache_groups) == 2
+
+    draft_group_spec = cache_groups[1].kv_cache_spec
+    assert isinstance(draft_group_spec, UniformTypeKVCacheSpecs)
+    assert all(
+        spec.page_size_padded is None
+        for spec in draft_group_spec.kv_cache_specs.values()
+    )
+
+    buckets = kv_cache_utils._bucket_layers_by_page_size(cache_groups)
+    bytes_per_block = sum(ps * len(slots) for ps, slots in buckets.items())
+    vllm_config = cast(
+        VllmConfig,
+        SimpleNamespace(
+            cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+            kv_transfer_config=None,
+            model_config=SimpleNamespace(max_model_len=16),
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=1,
+                prefill_context_parallel_size=1,
+            ),
+        ),
+    )
+    cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        cache_groups,
+        available_memory=bytes_per_block * 8,
+    )
+    assert cache_config.num_blocks == 8
+    assert all(tensor.block_stride == 0 for tensor in cache_config.kv_cache_tensors)
+    assert sum(tensor.size for tensor in cache_config.kv_cache_tensors) == (
+        bytes_per_block * 8
+    )
+    request_blocks = sum(
+        group.kv_cache_spec.max_memory_usage_pages(vllm_config)
+        for group in cache_groups
+        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+    )
+    assert kv_cache_utils._max_memory_usage_bytes_from_groups(
+        vllm_config, cache_groups
+    ) == (bytes_per_block * request_blocks)
 
 
 def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():

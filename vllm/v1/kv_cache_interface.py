@@ -225,11 +225,16 @@ class AttentionSpec(KVCacheSpec):
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         # Attention KV is token-interleaved across DCP/PCP ranks, so each rank
-        # only stores max_len // (dcp * pcp) tokens per request.
+        # only stores max_len // (dcp * pcp) tokens per request. Replicated
+        # draft groups retain the full global block table on every rank.
         parallel_config = vllm_config.parallel_config
         total_cp_size = (
-            parallel_config.decode_context_parallel_size
-            * parallel_config.prefill_context_parallel_size
+            1
+            if self.dcp_replicated
+            else (
+                parallel_config.decode_context_parallel_size
+                * parallel_config.prefill_context_parallel_size
+            )
         )
         return cdiv(max_len, self.block_size * total_cp_size)
 

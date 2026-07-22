@@ -315,6 +315,7 @@ class DraftModelSpeculator(BaseSpeculator):
                 kv_cache_config=self.kv_cache_config,
                 causal=causal,
                 dcp_local_seq_lens=dcp_local_seq_lens,
+                positions=self.input_buffers.positions[:num_tokens_padded],
                 seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
                 max_seq_len_upper_bound=max_seq_len_upper_bound,
             )

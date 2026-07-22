@@ -1373,6 +1373,74 @@ def _get_kv_cache_config_packed(
     return num_blocks, kv_cache_tensors
 
 
+def _kv_cache_groups_support_block_stride(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> bool:
+    """Whether every layer can consume an interleaved per-block backing."""
+    for group in kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        layer_specs = (
+            (group_spec.kv_cache_specs[name] for name in group.layer_names)
+            if isinstance(group_spec, UniformTypeKVCacheSpecs)
+            else (group_spec,)
+        )
+        if any(
+            not isinstance(spec, AttentionSpec) or not spec.indexes_kv_by_block_stride
+            for spec in layer_specs
+        ):
+            return False
+    return True
+
+
+def _validate_kv_cache_page_layouts(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> None:
+    """Reject padded pages for backends that require native contiguous pages."""
+    for group in kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        layer_specs = (
+            ((name, group_spec.kv_cache_specs[name]) for name in group.layer_names)
+            if isinstance(group_spec, UniformTypeKVCacheSpecs)
+            else ((name, group_spec) for name in group.layer_names)
+        )
+        for layer_name, spec in layer_specs:
+            if (
+                isinstance(spec, AttentionSpec)
+                and not spec.indexes_kv_by_block_stride
+                and spec.page_size_bytes != spec.real_page_size_bytes
+            ):
+                raise ValueError(
+                    f"Layer {layer_name} requires native contiguous KV pages, "
+                    f"but its real page size {spec.real_page_size_bytes} was "
+                    f"padded to {spec.page_size_bytes}."
+                )
+
+
+def _get_kv_cache_config_unpacked_buckets(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> tuple[int, list[KVCacheTensor]]:
+    """Plan contiguous tensors for a multi-page-size KV cache layout.
+
+    This uses the same block accounting and cross-group ``shared_by`` slots as
+    the packed planner, but gives each slot its own allocation. Backends that
+    require native contiguous pages can therefore use the DeepSeek-v4
+    multi-group scheduler without receiving an interleaved strided view.
+    """
+    buckets = _bucket_layers_by_page_size(kv_cache_groups)
+    total_num_bytes_per_block = sum(ps * len(slots) for ps, slots in buckets.items())
+
+    num_blocks = available_memory // total_num_bytes_per_block
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    kv_cache_tensors = [
+        KVCacheTensor(size=ps * num_blocks, shared_by=slot)
+        for ps, slots in buckets.items()
+        for slot in slots
+    ]
+    return num_blocks, kv_cache_tensors
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1398,6 +1466,8 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
+    _validate_kv_cache_page_layouts(kv_cache_groups)
+
     # Determine how model runners should initialize the KV cache tensors.
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
@@ -1420,9 +1490,18 @@ def get_kv_cache_config_from_groups(
     elif _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
         # DeepSeek V4 uses the packed layout by default. Other multi-group
         # layouts can opt in with --enable-cross-layers.
-        num_blocks, kv_cache_tensors = _get_kv_cache_config_packed(
-            vllm_config, kv_cache_groups, available_memory
-        )
+        if _kv_cache_groups_support_block_stride(kv_cache_groups):
+            num_blocks, kv_cache_tensors = _get_kv_cache_config_packed(
+                vllm_config, kv_cache_groups, available_memory
+            )
+        else:
+            logger.info(
+                "Using contiguous KV cache tensors because at least one "
+                "attention backend does not support block-stride indexing."
+            )
+            num_blocks, kv_cache_tensors = _get_kv_cache_config_unpacked_buckets(
+                vllm_config, kv_cache_groups, available_memory
+            )
     else:
         # General case:
         # We will have group_size memory pools, each is shared by one layer from
@@ -1565,14 +1644,10 @@ def group_and_unify_kv_cache_specs(
     has_swa = any(
         isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
     )
-    # DFlash-under-DCP draft: full-attention layers replicated on every DCP
-    # rank. They have a different page size than the MLA target and need their
-    # own group, but the DeepseekV4 multi-group allocator (with page-size
-    # padding) handles exactly that, so route them through here too.
+    # Draft attention replicated on every DCP rank needs a separate group from
+    # the sharded target. This includes both DFlash and native MLA MTP drafts.
     has_repl = any(
-        getattr(spec, "dcp_replicated", False)
-        and not isinstance(spec, MLAAttentionSpec)
-        for spec in kv_cache_spec.values()
+        getattr(spec, "dcp_replicated", False) for spec in kv_cache_spec.values()
     )
     if not (has_swa or has_repl):
         return None
@@ -1601,7 +1676,7 @@ def group_and_unify_kv_cache_specs(
                     spec.dcp_sharded,
                 )
             ][name] = spec
-        elif isinstance(spec, MLAAttentionSpec):
+        elif isinstance(spec, MLAAttentionSpec) and not spec.dcp_replicated:
             mla_specs[name] = spec
         elif getattr(spec, "dcp_replicated", False):
             grouped_repl_specs[(spec.block_size,)][name] = spec
@@ -1718,16 +1793,19 @@ def _get_kv_cache_groups_uniform_groups(
         layers_per_size: dict[int, list[str]] = defaultdict(list)
         assert max(sm_page_sizes) <= max(all_page_sizes)
 
-        # Unify page size by padding layers' page_size to the nearest larger page_size.
-        # Compute candidate (nearest larger page_size) for each unique page size.
-        size_to_candidate: dict[int, int] = {}
-        for ps in sm_page_sizes:
-            size_to_candidate[ps] = min(x for x in all_page_sizes if x >= ps)
-        # Pad and collect layer names per page size.
+        # Backends that index by the runtime block stride can pad to a target
+        # MLA page bucket. Native-layout backends retain their real page size;
+        # the allocator gives those buckets separate contiguous tensors.
         for layer_name, layer_spec in sm_spec.kv_cache_specs.items():
             current_size = layer_spec.page_size_bytes
-            candidate = size_to_candidate[current_size]
-            if current_size < candidate:
+            larger_target_sizes = [x for x in all_page_sizes if x >= current_size]
+            can_pad = (
+                isinstance(layer_spec, AttentionSpec)
+                and layer_spec.indexes_kv_by_block_stride
+                and larger_target_sizes
+            )
+            candidate = min(larger_target_sizes) if can_pad else current_size
+            if candidate != current_size:
                 object.__setattr__(layer_spec, "page_size_padded", candidate)
             layers_per_size[candidate].append(layer_name)
         # NOTE(yifan): for now, inside a UniformKV group, each page_size should
@@ -1916,27 +1994,18 @@ def _max_memory_usage_bytes_from_groups(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups
     ):
-        # Special case (only DeepseekV4 for now): all groups are
-        # UniformTypeKVCacheSpecs.
-        # They must already be page_size aligned and share a common padded
-        # layer-tuple layout. Even groups with fewer actual tuples still reserve
-        # the global number of tuple slots in the shared tensor layout.
-        full_mla_spec = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
-        layer_tuple_bytes = sum(full_mla_spec.get_page_sizes())
-        num_layer_tuples = max(
-            cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).get_num_layer_tuples()
+        # All groups draw block IDs from one global pool. Every live block ID
+        # occupies one slot in every physical page-size bucket, while a request
+        # consumes the sum of its per-group page counts. This formula applies
+        # to both interleaved and separate-contiguous bucket layouts.
+        pool_bytes_per_block = _pool_bytes_per_block(vllm_config, kv_cache_groups)
+        request_blocks = sum(
+            cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).max_memory_usage_pages(
+                vllm_config
+            )
             for group in kv_cache_groups
         )
-
-        total_max_mem_usage_bytes = 0
-        for group in kv_cache_groups:
-            group_spec = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec)
-            g_max_mem_usage_pages = group_spec.max_memory_usage_pages(vllm_config)
-            g_max_mem_usage_page_bytes = (
-                num_layer_tuples * g_max_mem_usage_pages * layer_tuple_bytes
-            )
-            total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
-        return total_max_mem_usage_bytes
+        return pool_bytes_per_block * request_blocks
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len

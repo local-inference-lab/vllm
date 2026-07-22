@@ -780,13 +780,21 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
                 if num_query_tokens:
                     req_ids[:num_query_tokens] = req_id_per_token_np
 
-            if not use_dcp and cm.positions is not None and cm.positions.ndim == 1:
+            if cm.positions is not None and cm.positions.ndim == 1:
                 # Async scheduling intentionally exposes only an optimistic CPU
                 # sequence-length bound. That bound can lag when a finished slot is
                 # recycled for a shorter request, so it is not a valid causal mask
                 # for multi-token verification. Positions are authoritative on the
-                # GPU and give the exact per-token KV length for DCP1.
+                # GPU and give the exact global per-token KV length. DCP consumers
+                # need the corresponding rank-local lengths.
                 per_token_lens_t = cm.positions[:num_tokens].to(torch.int32) + 1
+                if use_dcp:
+                    per_token_lens_t = get_dcp_local_seq_lens(
+                        per_token_lens_t,
+                        self.dcp_world_size,
+                        self.dcp_rank,
+                        self.cp_kv_cache_interleave_size,
+                    )
             else:
                 # DCP needs rank-local lengths rather than global positions. Avoid
                 # the blocking lazy seq_lens D2H copy and convert the scheduler's
@@ -1056,11 +1064,15 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self.spec_decode_max_q = _env_int("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", 8)
         # The decode kernel handles independent one-token query rows. MTP
         # verification has multiple query rows per request, and later rows must
-        # attend to earlier draft rows in the same verifier batch. Route those
-        # batches through the extend path unless explicitly overridden.
-        self.spec_extend_as_decode = (
-            os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "0") != "0"
-        )
+        # attend to earlier draft rows in the same verifier batch. The old
+        # override was not causally correct, so keep multi-row verification on
+        # the extend path even when a stale deployment still enables it.
+        self.spec_extend_as_decode = False
+        if os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "0") != "0":
+            logger.warning_once(
+                "Ignoring VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE=1 because the "
+                "decode kernel cannot causally verify multi-row MTP batches."
+            )
 
         # Decode query rows per request (1, plus speculative draft tokens).
         q_per_req = 1
@@ -2177,12 +2189,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 B12xMLASparseImpl._shared_gather_event.record(self._ckv_gather_stream)
                 B12xMLASparseImpl._shared_gather_buf_idx = next_buf_idx
 
-        use_decode_kernel = attn_metadata.max_query_len <= 1 or (
-            self.spec_extend_as_decode
-            and attn_metadata.max_query_len <= self.spec_decode_max_q
-            and num_actual_toks <= attn_metadata.num_reqs * self.spec_decode_max_q
-            and num_actual_toks <= self._decode_max_rows
-        )
+        use_decode_kernel = attn_metadata.max_query_len <= 1
         if use_decode_kernel:
             cache_seqlens = (
                 attn_metadata.cache_seq_lens_per_req

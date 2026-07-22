@@ -16,7 +16,6 @@ from vllm.utils.deep_gemm import (
     get_paged_mqa_logits_metadata,
     has_deep_gemm,
 )
-from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import num_compute_units
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -31,7 +30,6 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
-from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
 
@@ -444,9 +442,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
-        max_num_blocks_per_req = cdiv(
+        max_num_blocks_per_req = self.kv_cache_spec.max_num_blocks_per_req(
+            self.vllm_config,
             self.vllm_config.model_config.max_model_len,
-            self.kv_cache_spec.block_size * get_total_cp_world_size(),
         )
         self.expanded_block_table_buffer = torch.zeros(
             (

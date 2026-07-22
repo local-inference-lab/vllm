@@ -31,25 +31,28 @@ def _make_mla_spec(page_size: int, block_size: int = 256) -> MLAAttentionSpec:
         cache_dtype_str="fp8_ds_mla",
         model_version="deepseek_v4",
         alignment=576,
+        indexes_kv_by_block_stride=True,
     )
 
 
-def _make_full_spec() -> FullAttentionSpec:
+def _make_full_spec(*, indexes_kv_by_block_stride: bool = True) -> FullAttentionSpec:
     return FullAttentionSpec(
         block_size=16,
         num_kv_heads=2,
         head_size=64,
         dtype=torch.float16,
+        indexes_kv_by_block_stride=indexes_kv_by_block_stride,
     )
 
 
-def _make_sw_spec() -> SlidingWindowSpec:
+def _make_sw_spec(*, indexes_kv_by_block_stride: bool = True) -> SlidingWindowSpec:
     return SlidingWindowSpec(
         block_size=16,
         num_kv_heads=2,
         head_size=64,
         dtype=torch.float16,
         sliding_window=128,
+        indexes_kv_by_block_stride=indexes_kv_by_block_stride,
     )
 
 
@@ -212,6 +215,45 @@ class TestInterleavedPacking:
                 block_stride=page_size * 2,
             ),
         ]
+
+    def test_enable_cross_layers_falls_back_for_native_layout_backend(self):
+        full = _make_full_spec()
+        sw = _make_sw_spec(indexes_kv_by_block_stride=False)
+        page_size = full.page_size_bytes
+        groups = [
+            KVCacheGroupSpec(["full.0", "full.1"], full),
+            KVCacheGroupSpec(["sw.0", "sw.1"], sw),
+        ]
+
+        config = get_kv_cache_config_from_groups(
+            _mock_vllm_config({"enable_cross_layers_blocks": "True"}),
+            groups,
+            available_memory=page_size * 2 * 32,
+        )
+
+        assert config.num_blocks == 32
+        assert [tensor.block_stride for tensor in config.kv_cache_tensors] == [0, 0]
+        assert sum(tensor.size for tensor in config.kv_cache_tensors) == (
+            page_size * 2 * 32
+        )
+
+    def test_native_layout_backend_rejects_padded_pages(self):
+        full = _make_full_spec(indexes_kv_by_block_stride=False)
+        padded = FullAttentionSpec(
+            block_size=full.block_size,
+            num_kv_heads=full.num_kv_heads,
+            head_size=full.head_size,
+            dtype=full.dtype,
+            page_size_padded=full.page_size_bytes * 2,
+            indexes_kv_by_block_stride=False,
+        )
+
+        with pytest.raises(ValueError, match="requires native contiguous KV pages"):
+            get_kv_cache_config_from_groups(
+                _mock_vllm_config(),
+                [KVCacheGroupSpec(["full.0"], padded)],
+                available_memory=padded.page_size_bytes * 32,
+            )
 
     def test_single_group_attention_keeps_unpacked_layout(self):
         spec = _make_full_spec()

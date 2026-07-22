@@ -224,6 +224,60 @@ def test_b12x_sparse_dcp1_metadata_uses_exact_gpu_positions() -> None:
     assert result.nsa_cache_seqlens is None
 
 
+def test_b12x_sparse_dcp_metadata_uses_exact_gpu_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.distributed import parallel_state
+
+    class FakeDCPGroup:
+        rank_in_group = 1
+
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: FakeDCPGroup())
+
+    batch_spec = BatchSpec(seq_lens=[5], query_lens=[2])
+    hf_config = SimpleNamespace(
+        index_topk=512,
+        kv_lora_rank=512,
+        qk_nope_head_dim=512,
+        qk_rope_head_dim=64,
+        v_head_dim=512,
+    )
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=hf_config,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=2,
+            cp_kv_cache_interleave_size=1,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=4,
+            max_num_seqs=1,
+        ),
+    )
+    metadata = create_common_attn_metadata(
+        batch_spec,
+        block_size=64,
+        device=torch.device(DEVICE_TYPE),
+    )
+    metadata.positions = torch.tensor([3, 4], dtype=torch.int64, device=DEVICE_TYPE)
+    metadata.seq_lens_cpu_upper_bound = torch.tensor([500], dtype=torch.int32)
+    builder = B12xMLASparseMetadataBuilder(
+        SimpleNamespace(block_size=64),
+        ["placeholder"],
+        vllm_config,
+        torch.device(DEVICE_TYPE),
+    )
+
+    result = builder.build(0, metadata)
+
+    assert result.cache_seq_lens_per_token.tolist() == [2, 2]
+    assert result.req_id_per_token is not None
+    assert result.req_id_per_token.tolist() == [0, 0]
+
+
 @pytest.mark.parametrize(
     ("dcp_world_size", "output_physical_slots", "expected_output"),
     [
@@ -296,6 +350,7 @@ def test_b12x_sparse_glm_uses_8_head_alignment(
         "_prewarm_extend_kernels_once",
         lambda self, max_batched: None,
     )
+    monkeypatch.setenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "1")
 
     topk_indices = torch.zeros((2, 2048), dtype=torch.int32, device=DEVICE_TYPE)
     impl = B12xMLASparseImpl(
@@ -324,9 +379,12 @@ def test_b12x_sparse_glm_uses_8_head_alignment(
     assert impl._extend_plan.caps.num_q_heads == kernel_num_heads
 
     captured: dict[str, tuple[int, ...]] = {}
+    decode_calls = 0
     real_decode_forward = impl._sparse_mla_decode_forward
 
     def fake_decode_forward(*, binding, **kwargs):
+        nonlocal decode_calls
+        decode_calls += 1
         captured["q_shape"] = tuple(binding.q.shape)
         if num_heads == 8:
             return real_decode_forward(binding=binding, **kwargs)
@@ -353,6 +411,7 @@ def test_b12x_sparse_glm_uses_8_head_alignment(
 
     output, lse = impl.forward_mqa((q_nope, q_rope), kv_cache, metadata, layer=None)
     assert captured["q_shape"] == (1, kernel_num_heads, 576)
+    assert decode_calls == 1
     assert output.shape == (1, num_heads, 512)
     assert lse is None
 
@@ -378,6 +437,7 @@ def test_b12x_sparse_glm_uses_8_head_alignment(
         assert output.shape == (2, 8, 512)
         assert torch.isfinite(output).all()
         assert lse is None
+        assert decode_calls == 1
 
 
 def test_b12x_sparse_nvfp4_uses_kernel_format_not_scratch_caps(
