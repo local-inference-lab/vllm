@@ -48,12 +48,13 @@ def test_ckv_prefetch_targets_stop_at_first_unregistered_layer():
     assert _ckv_prefetch_target_indices(1, 3, caches, pending) == []
 
 
-def test_ckv_workspace_reuses_local_staging_across_ring_slots():
+@pytest.mark.parametrize("record_bytes", [368, 432])
+def test_ckv_workspace_reuses_local_staging_across_ring_slots(record_bytes):
     impl = object.__new__(B12xMLASparseImpl)
     impl._ckv_gather_enabled = True
     impl._ckv_workspace_slots = 4
     impl._ckv_local_capacity = 8
-    impl._kv_record_bytes = 432
+    impl._kv_record_bytes = record_bytes
     impl.dcp_world_size = 4
     impl.device = torch.device("cpu")
     impl._ckv_workspace_nbytes = (
@@ -67,7 +68,7 @@ def test_ckv_workspace_reuses_local_staging_across_ring_slots():
     local_3, gathered_3 = impl._ckv_workspace_views(workspace, 3)
 
     assert local_0.data_ptr() == local_3.data_ptr()
-    assert gathered_0.shape == gathered_3.shape == (32, 432)
+    assert gathered_0.shape == gathered_3.shape == (32, record_bytes)
     assert gathered_0.data_ptr() != gathered_3.data_ptr()
 
 
