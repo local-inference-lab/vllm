@@ -504,6 +504,9 @@ class B12xMLASparseMetadata(AttentionMetadata):
     num_decodes: int
     num_prefills: int
     prefill_max_seq_len: int
+    # True only for a multi-token speculative-verification batch. Unlike a
+    # short chunked prefill, every request has completed its prompt.
+    is_spec_decode: bool
 
     query_start_loc: torch.Tensor
     slot_mapping: torch.Tensor
@@ -565,6 +568,10 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 
             self.dcp_rank = get_dcp_group().rank_in_group
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        spec_config = getattr(vllm_config, "speculative_config", None)
+        self.num_speculative_tokens = int(
+            getattr(spec_config, "num_speculative_tokens", 0) or 0
+        )
 
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         max_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -655,6 +662,14 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
                 )
             )
         assert num_decode_tokens + num_prefill_tokens == num_tokens
+
+        is_spec_decode = False
+        if (
+            self.num_speculative_tokens > 0
+            and 1 < cm.max_query_len <= self.num_speculative_tokens + 1
+            and cm.is_prefilling is not None
+        ):
+            is_spec_decode = not bool(torch.any(cm.is_prefilling[: cm.num_reqs]))
 
         use_dcp = self.dcp_world_size > 1
         seq_lens_for_req = (
@@ -854,6 +869,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             num_decodes=num_decodes,
             num_prefills=num_prefills,
             prefill_max_seq_len=cm.max_seq_len if num_prefills > 0 else 0,
+            is_spec_decode=is_spec_decode,
             query_start_loc=cm.query_start_loc,
             slot_mapping=cm.slot_mapping,
             block_table=cm.block_table_tensor,
@@ -1054,20 +1070,33 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self._pad_heads = self._kernel_num_heads != self._input_num_heads
 
         self.spec_decode_max_q = _env_int("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", 8)
-        # The decode kernel handles independent one-token query rows. MTP
-        # verification has multiple query rows per request, and later rows must
-        # attend to earlier draft rows in the same verifier batch. Route those
-        # batches through the extend path unless explicitly overridden.
-        self.spec_extend_as_decode = (
-            os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "0") != "0"
+        spec_decode_mode = (
+            os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "auto").strip().lower()
         )
+        disabled_modes = {"0", "false", "off", "no"}
+        forced_modes = {"1", "true", "on", "yes"}
+        if spec_decode_mode not in {"auto", *disabled_modes, *forced_modes}:
+            raise ValueError(
+                "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE must be auto, 0, or 1 "
+                f"(got {spec_decode_mode!r})"
+            )
+        self.spec_extend_as_decode = spec_decode_mode not in disabled_modes
+        self.spec_extend_as_decode_force = spec_decode_mode in forced_modes
 
         # Decode query rows per request (1, plus speculative draft tokens).
         q_per_req = 1
         spec = getattr(vllm_config, "speculative_config", None)
-        if spec is not None and getattr(spec, "num_speculative_tokens", None):
+        if (
+            self.spec_extend_as_decode
+            and spec is not None
+            and getattr(spec, "num_speculative_tokens", None)
+        ):
             q_per_req = 1 + int(spec.num_speculative_tokens)
-        if self.spec_extend_as_decode:
+        # Auto mode only dispatches genuine verifier batches, whose maximum
+        # row count is fixed by speculative_config. The explicit force mode
+        # may also route arbitrary short extends and therefore reserves the
+        # full operator limit.
+        if self.spec_extend_as_decode_force:
             q_per_req = max(q_per_req, self.spec_decode_max_q)
         self._decode_max_rows = min(max_num_seqs * q_per_req, max_batched)
         if self._decode_max_rows < max_num_seqs:
@@ -2189,8 +2218,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 B12xMLASparseImpl._shared_gather_event.record(self._ckv_gather_stream)
                 B12xMLASparseImpl._shared_gather_buf_idx = next_buf_idx
 
+        use_spec_decode_kernel = self.spec_extend_as_decode and (
+            self.spec_extend_as_decode_force or attn_metadata.is_spec_decode
+        )
         use_decode_kernel = attn_metadata.max_query_len <= 1 or (
-            self.spec_extend_as_decode
+            use_spec_decode_kernel
             and attn_metadata.max_query_len <= self.spec_decode_max_q
             and num_actual_toks <= attn_metadata.num_reqs * self.spec_decode_max_q
             and num_actual_toks <= self._decode_max_rows
