@@ -3,6 +3,7 @@
 """Custom Sparse Attention Indexer layers."""
 
 import os
+from typing import cast
 
 import torch
 
@@ -10,7 +11,7 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CUDAGraphMode, get_current_vllm_config
-from vllm.distributed import get_dcp_group, get_query_split_group
+from vllm.distributed import GroupCoordinator, get_dcp_group, get_query_split_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -1732,17 +1733,18 @@ def sparse_attn_indexer(
                         cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
                     )
                 if qs_active:
-                    gathered_indices = qs_group.all_gather(
+                    active_qs_group = cast(GroupCoordinator, qs_group)
+                    gathered_indices = active_qs_group.all_gather(
                         topk_indices.contiguous(), dim=0
                     )
                     topk_indices_buffer[
                         chunk.token_start : chunk.token_end, :topk_tokens
                     ].copy_(gathered_indices)
                     if topk_scores is not None:
-                        gathered_scores = qs_group.all_gather(
+                        gathered_scores = active_qs_group.all_gather(
                             topk_scores.contiguous(), dim=0
                         )
-                        topk_scores_buffer[
+                        cast(torch.Tensor, topk_scores_buffer)[
                             chunk.token_start : chunk.token_end, :topk_tokens
                         ].copy_(gathered_scores)
                 continue
@@ -2155,6 +2157,7 @@ class SparseAttnIndexer(CustomOp):
         topk_scores_buffer: torch.Tensor | None = None,
         output_physical_slots: bool = False,
         num_q_heads: int | None = None,
+        dcp_replicated: bool = False,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -2174,7 +2177,9 @@ class SparseAttnIndexer(CustomOp):
         # during model construction) and pass them into the custom op, rather
         # than threading them through per-step metadata.
         parallel_config = get_current_vllm_config().parallel_config
-        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_replicated = bool(dcp_replicated)
+        configured_dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_world_size = 1 if self.dcp_replicated else configured_dcp_world_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.use_b12x_sparse_indexer = use_b12x_sparse_indexer()

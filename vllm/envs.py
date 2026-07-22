@@ -74,11 +74,18 @@ if TYPE_CHECKING:
     VLLM_DCP_A2A_MAX_TOKENS: int = 0
     VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
     VLLM_DCP_SHARD_DRAFT: str | None = None
+    VLLM_DCP_REPLICATE_INDEXER_CACHE: bool = False
     VLLM_DCP_GLOBAL_TOPK: bool = True
     VLLM_DCP_QUERY_SPLIT: bool = False
     VLLM_B12X_MLA_CKV_GATHER: bool = False
+    VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER: bool = False
+    VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT: str = "direct"
+    VLLM_B12X_MLA_SPARSE_DECODE_BULK_PREFETCH: bool = False
+    VLLM_B12X_MLA_SPARSE_DECODE_MAX_SEQS: int = 8
+    VLLM_B12X_MLA_SPARSE_DECODE_POOL_RECORDS: int = 0
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
+    VLLM_B12X_MLA_CKV_PREFETCH_DEPTH: int = 1
     VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
     VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
     VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
@@ -437,6 +444,26 @@ def env_with_choices(
         return value
 
     return _get_validated_env
+
+
+def env_bool_with_choices(
+    env_name: str,
+    default: bool = False,
+) -> Callable[[], bool]:
+    """Create a case-insensitive, strictly validated boolean env getter."""
+    getter = env_with_choices(
+        env_name,
+        "1" if default else "0",
+        ["0", "1", "false", "true", "no", "yes", "off", "on"],
+        case_sensitive=False,
+    )
+
+    def _get_validated_bool() -> bool:
+        value = getter()
+        assert value is not None
+        return value.lower() in ("1", "true", "yes", "on")
+
+    return _get_validated_bool
 
 
 def env_list_with_choices(
@@ -1160,6 +1187,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # target indexer cache and native MTP drafts, replicated for external
     # (Eagle-style) drafts.
     "VLLM_DCP_SHARD_DRAFT": lambda: os.getenv("VLLM_DCP_SHARD_DRAFT", None),
+    # Replicate the target model's sparse-indexer K cache on every DCP rank.
+    "VLLM_DCP_REPLICATE_INDEXER_CACHE": lambda: (
+        os.getenv("VLLM_DCP_REPLICATE_INDEXER_CACHE", "0").lower()
+        in ("1", "true", "yes", "on")
+    ),
     # Under DCP, gather sparse-indexer logits across ranks and select a global
     # top-k instead of a per-rank local top-k.
     "VLLM_DCP_GLOBAL_TOPK": lambda: (
@@ -1171,11 +1203,43 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MLA_CKV_GATHER": lambda: (
         os.getenv("VLLM_B12X_MLA_CKV_GATHER", "0").lower() in ("1", "true", "yes", "on")
     ),
+    # Exchange only sparse-MLA-selected native CKV records during DCP decode.
+    "VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER": lambda: (
+        os.getenv("VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER", "0").lower()
+        in ("1", "true", "yes", "on")
+    ),
+    # Transport for sparse selected-record decode. Keep the existing direct
+    # path as the default because copy-engine staging has additional VRAM cost.
+    "VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT": env_with_choices(
+        "VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT",
+        "direct",
+        ["auto", "ce", "direct"],
+    ),
+    # Combine exactly three eligible Shared-layer selected-record prefetches
+    # into one CE exchange. Sparse decode must also be enabled. This is
+    # effective only with transport=ce|auto and sufficient layered capacity;
+    # direct transport, partial groups, and oversized groups retain the
+    # existing per-layer path.
+    "VLLM_B12X_MLA_SPARSE_DECODE_BULK_PREFETCH": env_bool_with_choices(
+        "VLLM_B12X_MLA_SPARSE_DECODE_BULK_PREFETCH"
+    ),
+    "VLLM_B12X_MLA_SPARSE_DECODE_MAX_SEQS": lambda: int(
+        os.getenv("VLLM_B12X_MLA_SPARSE_DECODE_MAX_SEQS", "8")
+    ),
+    # Zero sizes the pool for the full configured request count.
+    "VLLM_B12X_MLA_SPARSE_DECODE_POOL_RECORDS": lambda: int(
+        os.getenv("VLLM_B12X_MLA_SPARSE_DECODE_POOL_RECORDS", "0")
+    ),
     "VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS", "16")
     ),
     "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
+    ),
+    # Number of future full-CKV layer gathers to queue. Zero keeps the
+    # synchronous gather path without allocating lookahead ring slots.
+    "VLLM_B12X_MLA_CKV_PREFETCH_DEPTH": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_PREFETCH_DEPTH", "1")
     ),
     # Diagnostic flag retained for local experiments. MiniMax M3 compile is
     # fail-closed in the model until the no-break path is validated.

@@ -177,6 +177,183 @@ def make_kv_cache_config_hybrid_model(
     )
 
 
+def make_lockstep_mla_manager(num_blocks: int = 5) -> KVCacheManager:
+    global_block_size = 256
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target"],
+                MLAAttentionSpec(
+                    block_size=global_block_size // 4,
+                    num_kv_heads=1,
+                    head_size=432,
+                    dtype=torch.uint8,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["indexer"],
+                MLAAttentionSpec(
+                    block_size=global_block_size,
+                    num_kv_heads=1,
+                    head_size=132,
+                    dtype=torch.uint8,
+                    dcp_replicated=True,
+                ),
+            ),
+        ],
+    )
+    return KVCacheManager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=4 * global_block_size,
+        scheduler_block_size=global_block_size,
+        hash_block_size=global_block_size,
+        enable_caching=True,
+        dcp_world_size=4,
+    )
+
+
+def test_mixed_mla_groups_share_block_ids_hashes_and_eviction_order():
+    block_size = 256
+    manager = make_lockstep_mla_manager()
+    assert manager.coordinator.lockstep_mla_allocations
+    request = make_request(
+        "lockstep",
+        list(range(4 * block_size)),
+        block_size,
+        sha256,
+    )
+
+    new_blocks = manager.allocate_slots(
+        request,
+        num_new_tokens=4 * block_size,
+        full_sequence_must_fit=True,
+    )
+    assert new_blocks is not None
+    target_ids, indexer_ids = manager.get_block_ids(request.request_id)
+    assert target_ids == indexer_ids
+    assert new_blocks.get_block_ids() == (target_ids, target_ids)
+    assert manager.block_pool.get_num_free_blocks() == 0
+    assert all(
+        manager.block_pool.blocks[block_id].ref_cnt == 2 for block_id in target_ids
+    )
+
+    for block_hash, block_id in zip(request.block_hashes, target_ids):
+        group_keys = [
+            make_block_hash_with_group_id(block_hash, group_id) for group_id in range(2)
+        ]
+        assert group_keys[0] != group_keys[1]
+        cached = manager.block_pool.get_cached_block(block_hash, [0, 1])
+        assert cached is not None
+        assert [block.block_id for block in cached] == [block_id, block_id]
+
+    manager.free(request)
+    assert manager.block_pool.get_num_free_blocks() == 4
+    assert all(
+        manager.block_pool.blocks[block_id].ref_cnt == 0 for block_id in target_ids
+    )
+    free_ids = [
+        block.block_id
+        for block in manager.block_pool.free_block_queue.get_all_free_blocks()
+    ]
+    assert free_ids == target_ids[::-1]
+
+    replay = make_request(
+        "lockstep-replay",
+        list(range(4 * block_size)),
+        block_size,
+        sha256,
+    )
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(replay)
+    assert num_computed_tokens == 3 * block_size
+    assert computed_blocks.get_block_ids() == (
+        target_ids[:3],
+        target_ids[:3],
+    )
+
+    replay_new_blocks = manager.allocate_slots(
+        replay,
+        num_new_tokens=block_size,
+        num_new_computed_tokens=num_computed_tokens,
+        new_computed_blocks=computed_blocks,
+    )
+    assert replay_new_blocks is not None
+    assert manager.get_block_ids(replay.request_id) == (target_ids, target_ids)
+    assert all(
+        manager.block_pool.blocks[block_id].ref_cnt == 2 for block_id in target_ids
+    )
+    manager.free(replay)
+    assert [
+        block.block_id
+        for block in manager.block_pool.free_block_queue.get_all_free_blocks()
+    ] == target_ids[::-1]
+
+    evicted = manager.block_pool.get_new_blocks(1)[0]
+    assert evicted.block_id == target_ids[-1]
+    assert manager.block_pool.get_cached_block(request.block_hashes[-1], [0]) is None
+    assert manager.block_pool.get_cached_block(request.block_hashes[-1], [1]) is None
+
+
+def test_lockstep_mla_rejects_external_computed_blocks():
+    manager = make_lockstep_mla_manager()
+
+    with pytest.raises(NotImplementedError, match="External KV loads"):
+        manager.coordinator.allocate_new_computed_blocks(
+            "external",
+            ([], []),
+            num_local_computed_tokens=0,
+            num_external_computed_tokens=256,
+        )
+
+    assert manager.get_block_ids("external") == ([], [])
+
+
+def test_lockstep_group_hashes_promote_partial_block_together():
+    hash_block_size = 64
+    block_size = 4 * hash_block_size
+    pool = BlockPool(
+        num_gpu_blocks=2,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    block = pool.get_new_blocks(1)[0]
+    request = make_request(
+        "promotion",
+        list(range(block_size)),
+        hash_block_size,
+        sha256,
+    )
+
+    for group_id in range(2):
+        pool.cache_partial_block(
+            request=request,
+            block=block,
+            num_tokens=2 * hash_block_size,
+            kv_cache_group_id=group_id,
+            block_size=block_size,
+        )
+    partial_hash = request.block_hashes[1]
+    partial_cached = pool.get_cached_block(partial_hash, [0, 1])
+    assert partial_cached == [block, block]
+
+    for group_id in range(2):
+        pool.cache_full_blocks(
+            request=request,
+            blocks=[block],
+            num_cached_blocks=0,
+            num_full_blocks=1,
+            block_size=block_size,
+            kv_cache_group_id=group_id,
+        )
+
+    assert pool.get_cached_block(partial_hash, [0]) is None
+    assert pool.get_cached_block(partial_hash, [1]) is None
+    full_hash = request.block_hashes[-1]
+    assert pool.get_cached_block(full_hash, [0, 1]) == [block, block]
+    assert block.block_hash_num_tokens == block_size
+
+
 def make_kv_cache_config_three_types(
     block_size: int, num_blocks: int, third_spec_type: str = "mamba"
 ) -> KVCacheConfig:

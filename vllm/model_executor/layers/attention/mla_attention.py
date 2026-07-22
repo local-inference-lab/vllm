@@ -1229,12 +1229,22 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             workspace_gather_used = False
             ckv_gather_used = False
             if self.impl.dcp_world_size > 1:
-                ckv_gather_selector = getattr(
+                prefill_ckv_gather_selector = getattr(
                     self.impl, "dcp_prefill_ckv_gather_eligible", None
                 )
-                ckv_gather_used = bool(
-                    callable(ckv_gather_selector)
-                    and ckv_gather_selector(attn_metadata, num_mqa_tokens)
+                sparse_decode_ckv_gather_selector = getattr(
+                    self.impl, "dcp_sparse_decode_ckv_gather_eligible", None
+                )
+                prefill_ckv_gather_used = bool(
+                    callable(prefill_ckv_gather_selector)
+                    and prefill_ckv_gather_selector(attn_metadata, num_mqa_tokens)
+                )
+                sparse_decode_ckv_gather_used = bool(
+                    callable(sparse_decode_ckv_gather_selector)
+                    and sparse_decode_ckv_gather_selector(attn_metadata, num_mqa_tokens)
+                )
+                ckv_gather_used = (
+                    prefill_ckv_gather_used or sparse_decode_ckv_gather_used
                 )
                 if not ckv_gather_used:
                     if not self.impl.can_return_lse_for_decode:
@@ -1291,8 +1301,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mqa_q = torch.cat(mqa_q, dim=-1)
                 if ckv_gather_used:
                     logger.info_once(
-                        "Keeping local query heads for transient full-CKV "
-                        "B12X sparse MLA prefill"
+                        "Keeping local query heads for B12X sparse MLA CKV gather"
                     )
                 elif dcp_use_b12x:
                     mqa_q = dcp_b12x_all_gather_heads(

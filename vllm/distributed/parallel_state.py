@@ -33,7 +33,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 from unittest.mock import patch
 
 import torch
@@ -41,6 +41,7 @@ import torch.distributed
 import torch.distributed._functional_collectives as funcol
 import torch.distributed._symmetric_memory
 from torch.distributed import Backend, ProcessGroup, Store
+from torch.distributed.distributed_c10d import GroupName
 
 import vllm.envs as envs
 from vllm.distributed.device_communicators.base_device_communicator import (
@@ -75,7 +76,20 @@ class Handle(Protocol):
 
     def is_completed(self) -> bool: ...
 
-    def wait(self) -> None: ...
+    def wait(self, timeout: timedelta = ...) -> bool: ...
+
+
+class _SplitGroupWithBackend(Protocol):
+    """Callable shape for the split_group backend extension used by vLLM."""
+
+    def __call__(
+        self,
+        *,
+        split_ranks: list[list[int]],
+        group_desc: str,
+        backend: str,
+        timeout: timedelta | None,
+    ) -> ProcessGroup | None: ...
 
 
 def _split_tensor_dict(
@@ -221,7 +235,7 @@ def patched_fused_scaled_matmul_reduce_scatter_fake(
         C,
         reduce_op,
         orig_scatter_dim,  # need original scatter dim for 3D+ output tensor here
-        group_name,
+        GroupName(group_name),
     )
     res = funcol.wait_tensor(res)
     return res
@@ -275,7 +289,8 @@ def _create_subgroups_split_group(
     )
 
     device_backend_str = _device_backend_str(torch_distributed_backend)
-    self_device_group = torch.distributed.split_group(
+    split_group = cast(_SplitGroupWithBackend, torch.distributed.split_group)
+    self_device_group = split_group(
         split_ranks=group_ranks,
         group_desc=f"{group_name}:device",
         backend=device_backend_str,
@@ -286,12 +301,14 @@ def _create_subgroups_split_group(
     # was bound to via ``device_id``), so a cpu-only filter is rejected.
     # Include the device backend in the filter; only the gloo backend is
     # actually used for CPU collectives on this group.
-    self_cpu_group = torch.distributed.split_group(
+    self_cpu_group = split_group(
         split_ranks=group_ranks,
         group_desc=f"{group_name}:cpu",
         backend=f"cpu:gloo,{device_backend_str}",
         timeout=get_cpu_distributed_timeout_or_none(),
     )
+    assert self_device_group is not None
+    assert self_cpu_group is not None
     return self_device_group, self_cpu_group
 
 
@@ -758,9 +775,7 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         """Reduce-scatter and preserve a physically head-major output view."""
         if self.world_size <= 1 or dim != 1:
-            raise RuntimeError(
-                "reduce_scatter_head_major requires DCP heads on dim 1"
-            )
+            raise RuntimeError("reduce_scatter_head_major requires DCP heads on dim 1")
         if self.device_communicator is None:
             raise RuntimeError(
                 "reduce_scatter_head_major requires a device communicator"
@@ -1107,6 +1122,7 @@ class GroupCoordinator:
             handle = torch.distributed.isend(
                 tensor, dst=self.ranks[dst], group=comm_group
             )
+            assert handle is not None
             if tensor.is_cuda:
                 tensor.record_stream(torch.cuda.current_stream(tensor.device))
             handles.append(handle)
@@ -1210,6 +1226,7 @@ class GroupCoordinator:
                     handle = torch.distributed.irecv(
                         slice_tensor, src=self.ranks[src], group=comm_group
                     )
+                    assert handle is not None
                     handles.append(handle)
 
                     def _postprocess(
@@ -1230,6 +1247,7 @@ class GroupCoordinator:
                     handle = torch.distributed.irecv(
                         full_tensor, src=self.ranks[src], group=comm_group
                     )
+                    assert handle is not None
                     handles.append(handle)
                     tensor_dict[key] = full_tensor
             else:
@@ -1887,6 +1905,7 @@ def initialize_model_parallel(
     """
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
+    assert decode_context_model_parallel_size is not None
 
     from vllm.config import get_current_vllm_config
 
@@ -1941,11 +1960,14 @@ def initialize_model_parallel(
     # Build the tensor model-parallel groups.
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
-    group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
+    group_ranks: list[list[int]] = [
+        x.tolist() for x in all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
+    ]
     if enable_elastic_ep:
-        group_ranks = local_all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
-        group_ranks = [x.tolist() for x in group_ranks]
+        group_ranks = [
+            x.tolist()
+            for x in local_all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
+        ]
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
         group_ranks,
@@ -1962,13 +1984,17 @@ def initialize_model_parallel(
     # dcp_size must not exceed tp_size, because the world size does not
     # change by DCP, it simply reuses the GPUs of TP group, and split one
     # TP group into tp_size//dcp_size DCP groups.
-    group_ranks = all_ranks.reshape(-1, decode_context_model_parallel_size).unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
+    group_ranks = [
+        x.tolist()
+        for x in all_ranks.reshape(-1, decode_context_model_parallel_size).unbind(0)
+    ]
     if enable_elastic_ep:
-        group_ranks = local_all_ranks.reshape(
-            -1, decode_context_model_parallel_size
-        ).unbind(0)
-        group_ranks = [x.tolist() for x in group_ranks]
+        group_ranks = [
+            x.tolist()
+            for x in local_all_ranks.reshape(
+                -1, decode_context_model_parallel_size
+            ).unbind(0)
+        ]
     _DCP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
@@ -1995,14 +2021,15 @@ def initialize_model_parallel(
             group_name="query_split",
         )
 
-    # A dedicated communicator over the DCP ranks for the transient ckv
-    # prefetch gather (Fix B). The prefetch runs on a side stream and would
-    # otherwise share the DCP communicator with the indexer's DCP top-k
-    # merge on the default stream; concurrent collectives on one NCCL
-    # communicator from two streams is unsupported. Same ranks as ``_DCP``.
+    # A dedicated communicator over the DCP ranks for full-CKV prefetch and
+    # selected-record decode exchange. These paths run on a side stream and
+    # must not share the DCP communicator with the indexer's top-k merge on
+    # the default stream. Same ranks as ``_DCP``.
     global _DCP_CKV_PREFETCH
     assert _DCP_CKV_PREFETCH is None, "DCP ckv prefetch group is already initialized"
-    if decode_context_model_parallel_size > 1 and envs.VLLM_B12X_MLA_CKV_GATHER:
+    if decode_context_model_parallel_size > 1 and (
+        envs.VLLM_B12X_MLA_CKV_GATHER or envs.VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER
+    ):
         _DCP_CKV_PREFETCH = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
@@ -2012,19 +2039,19 @@ def initialize_model_parallel(
 
     global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
-    group_ranks = (
-        all_ranks.transpose(3, 4)
+    group_ranks = [
+        x.tolist()
+        for x in all_ranks.transpose(3, 4)
         .reshape(-1, prefill_context_model_parallel_size)
         .unbind(0)
-    )
-    group_ranks = [x.tolist() for x in group_ranks]
+    ]
     if enable_elastic_ep:
-        group_ranks = (
-            local_all_ranks.transpose(1, 2)
+        group_ranks = [
+            x.tolist()
+            for x in local_all_ranks.transpose(1, 2)
             .reshape(-1, prefill_context_model_parallel_size)
             .unbind(0)
-        )
-        group_ranks = [x.tolist() for x in group_ranks]
+        ]
     _PCP = init_model_parallel_group(
         group_ranks, get_world_group().local_rank, backend, group_name="pcp"
     )
@@ -2032,26 +2059,31 @@ def initialize_model_parallel(
     # Build the pipeline model-parallel groups.
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
-    group_ranks = (
-        all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
-    )
-    group_ranks = [x.tolist() for x in group_ranks]
+    group_ranks = [
+        x.tolist()
+        for x in all_ranks.transpose(2, 4)
+        .reshape(-1, pipeline_model_parallel_size)
+        .unbind(0)
+    ]
     if enable_elastic_ep:
-        group_ranks = (
-            local_all_ranks.transpose(0, 2)
+        group_ranks = [
+            x.tolist()
+            for x in local_all_ranks.transpose(0, 2)
             .reshape(-1, pipeline_model_parallel_size)
             .unbind(0)
-        )
-        group_ranks = [x.tolist() for x in group_ranks]
+        ]
     _PP = init_model_parallel_group(
         group_ranks, get_world_group().local_rank, backend, group_name="pp"
     )
 
     global _DP
     assert _DP is None, "data parallel group is already initialized"
-    group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
+    group_ranks = [
+        x.tolist()
+        for x in all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
+    ]
     if enable_elastic_ep:
+        assert coord_store is not None
         _DP = _init_stateless_group(
             group_ranks,
             "dp",
@@ -2068,8 +2100,9 @@ def initialize_model_parallel(
     assert _EP is None, "expert parallel group is already initialized"
     # Don't create EP group for dense models.
     if config.model_config is None or config.model_config.is_moe:
-        group_ranks = (
-            all_ranks.transpose(1, 2)
+        group_ranks = [
+            x.tolist()
+            for x in all_ranks.transpose(1, 2)
             .reshape(
                 -1,
                 data_parallel_size
@@ -2077,9 +2110,9 @@ def initialize_model_parallel(
                 * tensor_model_parallel_size,
             )
             .unbind(0)
-        )
-        group_ranks = [x.tolist() for x in group_ranks]
+        ]
         if enable_elastic_ep:
+            assert coord_store is not None
             _EP = _init_stateless_group(
                 group_ranks,
                 "ep",
@@ -2100,6 +2133,7 @@ def initialize_model_parallel(
         assert _EPLB is None, "EPLB group is already initialized"
         if config.parallel_config.enable_eplb:
             if enable_elastic_ep:
+                assert coord_store is not None
                 _EPLB = _init_stateless_group(
                     group_ranks,
                     "eplb",
@@ -2206,6 +2240,15 @@ def model_parallel_is_initialized():
 _TP_STATE_PATCHED = False
 
 
+_MODEL_PARALLEL_CLEANUP_HOOKS: list[Callable[[], None]] = []
+
+
+def register_model_parallel_cleanup_hook(callback: Callable[[], None]) -> None:
+    """Register idempotent cleanup that must run before groups are destroyed."""
+    if callback not in _MODEL_PARALLEL_CLEANUP_HOOKS:
+        _MODEL_PARALLEL_CLEANUP_HOOKS.append(callback)
+
+
 def get_tensor_model_parallel_world_size() -> int:
     """Return world size for the tensor model parallel group."""
     return get_tp_group().world_size
@@ -2224,6 +2267,12 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    for cleanup in _MODEL_PARALLEL_CLEANUP_HOOKS:
+        try:
+            cleanup()
+        except Exception:
+            logger.exception("Model-parallel cleanup hook failed")
+
     global _TP
 
     if _TP:

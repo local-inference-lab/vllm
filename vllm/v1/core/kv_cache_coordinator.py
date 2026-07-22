@@ -11,6 +11,7 @@ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
+    _use_lockstep_mla_allocation,
     is_deepseek_v4_hybrid_kv_cache_config,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -119,6 +120,11 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+        self.lockstep_mla_allocations = _use_lockstep_mla_allocation(
+            kv_cache_config.kv_cache_groups,
+            dcp_world_size,
+            pcp_world_size,
+        )
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -164,31 +170,37 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
-        num_blocks_to_allocate = 0
+        blocks_by_group: list[int] = []
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id,
-                    num_encoder_tokens,
-                    [],
-                    0,
-                    0,
-                    num_encoder_tokens,
-                    apply_admission_cap=apply_admission_cap,
+                blocks_by_group.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_encoder_tokens,
+                        [],
+                        0,
+                        0,
+                        num_encoder_tokens,
+                        apply_admission_cap=apply_admission_cap,
+                    )
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id,
-                    num_tokens,
-                    new_computed_blocks[i],
-                    total_computed_tokens,
-                    num_local_computed_tokens,
-                    num_tokens_main_model,
-                    apply_admission_cap=apply_admission_cap,
+                blocks_by_group.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_tokens,
+                        new_computed_blocks[i],
+                        total_computed_tokens,
+                        num_local_computed_tokens,
+                        num_tokens_main_model,
+                        apply_admission_cap=apply_admission_cap,
+                    )
                 )
-        return num_blocks_to_allocate
+        if self.lockstep_mla_allocations:
+            return max(blocks_by_group, default=0)
+        return sum(blocks_by_group)
 
     def allocate_new_computed_blocks(
         self,
@@ -208,6 +220,11 @@ class KVCacheCoordinator(ABC):
             num_local_computed_tokens: The number of local computed tokens.
             num_external_computed_tokens: The number of external computed tokens.
         """
+        if self.lockstep_mla_allocations and num_external_computed_tokens:
+            raise NotImplementedError(
+                "External KV loads are not supported with lockstep MLA allocations."
+            )
+
         # A running request is already tracked in num_cached_block and won't
         # have new prefix-cache hits, so this is a no-op for it.
         if any(
@@ -236,6 +253,17 @@ class KVCacheCoordinator(ABC):
                     num_external_computed_tokens,
                 )
 
+        if self.lockstep_mla_allocations:
+            group_blocks = [
+                manager.req_to_blocks[request_id]
+                for manager in self.single_type_managers
+            ]
+            block_ids = [block.block_id for block in group_blocks[0]]
+            assert all(
+                [block.block_id for block in blocks] == block_ids
+                for blocks in group_blocks[1:]
+            )
+
     def allocate_new_blocks(
         self,
         request_id: str,
@@ -260,16 +288,38 @@ class KVCacheCoordinator(ABC):
         Returns:
             The new allocated blocks.
         """
-        return tuple(
-            manager.allocate_new_blocks(
-                request_id,
-                num_encoder_tokens
-                if isinstance(manager, CrossAttentionManager)
-                else num_tokens,
-                num_tokens_main_model,
+        if not self.lockstep_mla_allocations:
+            return tuple(
+                manager.allocate_new_blocks(
+                    request_id,
+                    num_encoder_tokens
+                    if isinstance(manager, CrossAttentionManager)
+                    else num_tokens,
+                    num_tokens_main_model,
+                )
+                for manager in self.single_type_managers
             )
-            for manager in self.single_type_managers
+
+        managers = self.single_type_managers
+        primary_ids = [
+            block.block_id for block in managers[0].req_to_blocks[request_id]
+        ]
+        assert all(
+            [block.block_id for block in manager.req_to_blocks[request_id]]
+            == primary_ids
+            for manager in managers[1:]
         )
+
+        new_blocks = managers[0].allocate_new_blocks(
+            request_id,
+            num_tokens,
+            num_tokens_main_model,
+        )
+        for manager in managers[1:]:
+            if new_blocks:
+                self.block_pool.touch(new_blocks)
+                manager.req_to_blocks[request_id].extend(new_blocks)
+        return tuple(list(new_blocks) for _ in managers)
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """
@@ -749,10 +799,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                   sparse-retention group has not cached yet (0 unless hybrid).
         """
         if self.disable_prefix_cache_for_dcp_hybrid:
-            blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            empty_blocks: tuple[list[KVCacheBlock], ...] = tuple(
                 [] for _ in range(len(self.kv_cache_config.kv_cache_groups))
             )
-            return blocks, 0, 0
+            return empty_blocks, 0, 0
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length
@@ -830,8 +880,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     # length shrunk; invalidate previous eagle verifications
                     eagle_verified.clear()
                 curr_hit_length = _new_hit_length
-                for group_id, blocks in zip(group_ids, hit_blocks):
-                    hit_blocks_by_group[group_id] = blocks
+                for group_id, group_blocks in zip(group_ids, hit_blocks):
+                    hit_blocks_by_group[group_id] = group_blocks
                     hit_length_by_group[group_id] = _new_hit_length
 
                 longest_hit_length = max(longest_hit_length, curr_hit_length)

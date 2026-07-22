@@ -24,6 +24,14 @@ class _WriterInitializationFailure(RuntimeError):
     pass
 
 
+class _FakePackageModule(types.ModuleType):
+    __path__: list[str]
+    attention: types.ModuleType
+    _shared: types.ModuleType
+    mla: types.ModuleType
+    kv_cache: types.ModuleType
+
+
 def _initialize_writer_seam(
     impl: B12xMLASparseImpl,
     *,
@@ -75,13 +83,13 @@ def _install_fake_writer_package(
     monkeypatch: pytest.MonkeyPatch,
     writer,
 ) -> None:
-    sparkinfer_module = types.ModuleType("sparkinfer")
+    sparkinfer_module = _FakePackageModule("sparkinfer")
     sparkinfer_module.__path__ = []
-    attention_module = types.ModuleType("sparkinfer.attention")
+    attention_module = _FakePackageModule("sparkinfer.attention")
     attention_module.__path__ = []
-    shared_module = types.ModuleType("sparkinfer.attention._shared")
+    shared_module = _FakePackageModule("sparkinfer.attention._shared")
     shared_module.__path__ = []
-    mla_module = types.ModuleType("sparkinfer.attention._shared.mla")
+    mla_module = _FakePackageModule("sparkinfer.attention._shared.mla")
     mla_module.__path__ = []
     kv_cache_module = types.ModuleType(_WRITER_MODULE)
 
@@ -233,6 +241,106 @@ def test_enabled_mode_calls_bound_public_writer_with_flattened_slots_and_scale(
     assert actual_kv_cache is kv_cache
     assert actual_slots.shape == (2,)
     assert torch.equal(actual_slots, slot_mapping.flatten())
+    assert actual_scale is k_scale
+
+
+def test_sparse_decode_current_token_patch_uses_compact_writer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    writer_calls = []
+
+    def public_writer(kv_c_arg, k_pe_arg, kv_cache_arg, slot_mapping_arg, scale_arg):
+        writer_calls.append(
+            (kv_c_arg, k_pe_arg, kv_cache_arg, slot_mapping_arg, scale_arg)
+        )
+
+    def set_patch_slots(union_indices, request_ids, causal_lens, output):
+        del union_indices, request_ids, causal_lens
+        output.copy_(torch.tensor([9, 3], dtype=output.dtype))
+
+    def reject_stock_writer(*args, **kwargs):
+        pytest.fail("compact sparse patch fell back to the stock MLA writer")
+
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "_find_sparse_decode_current_token_slot",
+        set_patch_slots,
+    )
+    monkeypatch.setattr(ops, "concat_and_cache_mla", reject_stock_writer)
+    impl = _enabled_impl(public_writer)
+    impl._ckv_current_chunk_kv_c = torch.zeros((2, 512), dtype=torch.bfloat16)
+    impl._ckv_current_chunk_kpe = torch.zeros((2, 1, 64), dtype=torch.bfloat16)
+
+    gathered_cache = torch.empty((1, 2, 368), dtype=torch.uint8)
+    metadata = types.SimpleNamespace(req_id_per_token=torch.tensor([0, 0]))
+    union_indices = torch.empty((2, 1), dtype=torch.int32)
+    causal_lens = torch.tensor([1, 2], dtype=torch.int32)
+    patch_slots = torch.empty(2, dtype=torch.int64)
+    k_scale = torch.tensor(0.125)
+
+    impl._append_current_token_to_sparse_decode_gathered(
+        gathered_cache,
+        metadata,
+        union_indices,
+        causal_lens,
+        patch_slots,
+        types.SimpleNamespace(_k_scale=k_scale),
+    )
+
+    assert len(writer_calls) == 1
+    actual_kv_c, actual_k_pe, actual_cache, actual_slots, actual_scale = writer_calls[0]
+    assert actual_kv_c.data_ptr() == impl._ckv_current_chunk_kv_c.data_ptr()
+    assert actual_k_pe.shape == (2, 64)
+    assert actual_cache is gathered_cache
+    assert torch.equal(actual_slots, torch.tensor([9, 3]))
+    assert actual_scale is k_scale
+
+
+def test_sparse_decode_current_token_patch_preserves_stock_432_writer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    stock_calls = []
+
+    def stock_writer(*args):
+        stock_calls.append(args)
+
+    def set_patch_slots(union_indices, request_ids, causal_lens, output):
+        del union_indices, request_ids, causal_lens
+        output.fill_(7)
+
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "_find_sparse_decode_current_token_slot",
+        set_patch_slots,
+    )
+    monkeypatch.setattr(ops, "concat_and_cache_mla", stock_writer)
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._kv_fp8_rope = False
+    impl.kv_cache_dtype = "nvfp4_ds_mla"
+    impl._ckv_current_chunk_kv_c = torch.zeros((1, 512), dtype=torch.bfloat16)
+    impl._ckv_current_chunk_kpe = torch.zeros((1, 1, 64), dtype=torch.bfloat16)
+
+    gathered_cache = torch.empty((1, 1, 432), dtype=torch.uint8)
+    patch_slots = torch.empty(1, dtype=torch.int64)
+    k_scale = torch.tensor(0.25)
+    impl._append_current_token_to_sparse_decode_gathered(
+        gathered_cache,
+        types.SimpleNamespace(req_id_per_token=torch.tensor([0])),
+        torch.empty((1, 1), dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int32),
+        patch_slots,
+        types.SimpleNamespace(_k_scale=k_scale),
+    )
+
+    assert len(stock_calls) == 1
+    actual_kv_c, actual_k_pe, actual_cache, actual_slots, actual_dtype, actual_scale = (
+        stock_calls[0]
+    )
+    assert actual_kv_c.data_ptr() == impl._ckv_current_chunk_kv_c.data_ptr()
+    assert actual_k_pe.shape == (1, 64)
+    assert actual_cache is gathered_cache
+    assert torch.equal(actual_slots, torch.tensor([7]))
+    assert actual_dtype == "nvfp4_ds_mla"
     assert actual_scale is k_scale
 
 

@@ -1683,6 +1683,170 @@ def test_resolve_kv_cache_block_sizes_mixed_dcp_replicated_groups():
     assert hash_block_size == 64
 
 
+@pytest.mark.parametrize(
+    ("model_version", "record_bytes"), [(None, 432), ("glm_fp8_rope", 368)]
+)
+def test_replicated_mla_uses_lockstep_pool_capacity_and_contiguous_tensors(
+    model_version, record_bytes
+):
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=262144),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=4,
+            prefill_context_parallel_size=1,
+        ),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        kv_transfer_config=None,
+    )
+    specs: dict[str, KVCacheSpec] = {
+        f"target.{i}": MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.uint8,
+            cache_dtype_str="nvfp4_ds_mla",
+            model_version=model_version,
+        )
+        for i in range(3)
+    }
+    specs.update(
+        {
+            f"indexer.{i}": MLAAttentionSpec(
+                block_size=256,
+                num_kv_heads=1,
+                head_size=132,
+                dtype=torch.uint8,
+                dcp_replicated=True,
+            )
+            for i in range(2)
+        }
+    )
+
+    grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(specs, 4, 1)
+    assert grouped_specs is not None
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
+    assert all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in groups
+    )
+    assert kv_cache_utils._use_lockstep_mla_allocation(groups, 4, 1)
+
+    bytes_per_pool_block = 3 * (64 * record_bytes) + 2 * (256 * 132)
+    request_blocks = 262144 // 256
+    required_memory = bytes_per_pool_block * request_blocks
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=required_memory * 2,
+    )
+
+    assert kv_cache_config.num_blocks == request_blocks * 2
+    assert all(tensor.block_stride == 0 for tensor in kv_cache_config.kv_cache_tensors)
+    assert sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors) == (
+        required_memory * 2
+    )
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
+        == required_memory
+    )
+    assert get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config
+    ) == pytest.approx(2.0)
+
+
+def test_lockstep_mla_predicate_rejects_nonmatching_layouts():
+    sharded = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+    )
+    replicated = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+        dcp_replicated=True,
+    )
+    groups = [
+        KVCacheGroupSpec(["target"], sharded),
+        KVCacheGroupSpec(["indexer"], replicated),
+    ]
+    assert not kv_cache_utils._use_lockstep_mla_allocation(groups, 1, 1)
+
+    mismatched = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+        dcp_replicated=True,
+    )
+    mismatched_groups = [groups[0], KVCacheGroupSpec(["indexer"], mismatched)]
+    assert not kv_cache_utils._use_lockstep_mla_allocation(mismatched_groups, 4, 1)
+    assert (
+        kv_cache_utils.group_and_unify_kv_cache_specs(
+            {"target": sharded, "indexer": mismatched}, 4, 1
+        )
+        is None
+    )
+
+    non_mla = FullAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+        dcp_replicated=True,
+    )
+    assert not kv_cache_utils._use_lockstep_mla_allocation(
+        [groups[0], KVCacheGroupSpec(["draft"], non_mla)], 4, 1
+    )
+
+
+def test_lockstep_mla_equal_page_sizes_use_distinct_tensors():
+    sharded = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    replicated = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=32,
+        dtype=torch.bfloat16,
+        dcp_replicated=True,
+    )
+    assert sharded.page_size_bytes == replicated.page_size_bytes
+    groups = [
+        KVCacheGroupSpec(["target"], sharded),
+        KVCacheGroupSpec(["indexer"], replicated),
+    ]
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=4,
+            prefill_context_parallel_size=1,
+        ),
+        kv_transfer_config=None,
+    )
+    bytes_per_pool_block = sharded.page_size_bytes + replicated.page_size_bytes
+
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=3 * bytes_per_pool_block,
+    )
+
+    assert kv_cache_config.num_blocks == 3
+    assert [tensor.shared_by for tensor in kv_cache_config.kv_cache_tensors] == [
+        ["target"],
+        ["indexer"],
+    ]
+    assert [tensor.size for tensor in kv_cache_config.kv_cache_tensors] == [
+        3 * sharded.page_size_bytes,
+        3 * replicated.page_size_bytes,
+    ]
+
+
 def test_dsv4_engine_capacity_uses_worker_kv_cache_config():
     from vllm.v1.engine.core import EngineCore
 

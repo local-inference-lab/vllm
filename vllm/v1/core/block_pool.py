@@ -282,14 +282,16 @@ class BlockPool:
                 block_hash, kv_cache_group_id
             )
             if blk.block_hash is not None:
-                # The only valid case where a "new full block" already has a
-                # hash is partial->full promotion of the same cache block.
-                assert (
-                    blk.block_hash_num_tokens is not None
-                    and blk.block_hash_num_tokens < num_hash_tokens
-                )
-                removed_hashes = self._remove_cached_block_hashes(blk)
-                self._emit_block_removed_events(removed_hashes)
+                assert blk.block_hash_num_tokens is not None
+                if blk.block_hash_num_tokens < num_hash_tokens:
+                    removed_hashes = self._remove_cached_block_hashes(blk)
+                    self._emit_block_removed_events(removed_hashes)
+                else:
+                    # Lockstep groups attach group-specific keys to one block
+                    # at the same token boundary.
+                    assert blk.block_hash_num_tokens == num_hash_tokens
+                    assert get_block_hash(blk.block_hash) == block_hash
+                    assert get_group_id(blk.block_hash) != kv_cache_group_id
             self._insert_block_hash(
                 block_hash_with_group_id,
                 blk,

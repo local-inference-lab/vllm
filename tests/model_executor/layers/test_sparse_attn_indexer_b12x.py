@@ -3,6 +3,7 @@
 
 import sys
 import types
+from typing import Any, cast
 
 import pytest
 import torch
@@ -34,6 +35,44 @@ class _FakeWorkspaceManager:
                 kwargs["device"] = self.device
             tensors.append(torch.empty(shape, **kwargs))
         return tensors
+
+
+def test_replicated_constructor_uses_single_rank_without_dcp_group(monkeypatch):
+    def init_module(self):
+        torch.nn.Module.__init__(self)
+
+    def fail_dcp_group():
+        pytest.fail("replicated indexer construction must not query the DCP group")
+
+    monkeypatch.setattr(indexer_mod.CustomOp, "__init__", init_module)
+    monkeypatch.setattr(
+        indexer_mod,
+        "get_current_vllm_config",
+        lambda: types.SimpleNamespace(
+            parallel_config=types.SimpleNamespace(
+                decode_context_parallel_size=4,
+                cp_kv_cache_interleave_size=1,
+            )
+        ),
+    )
+    monkeypatch.setattr(indexer_mod, "get_dcp_group", fail_dcp_group)
+    monkeypatch.setattr(indexer_mod, "use_b12x_sparse_indexer", lambda: True)
+
+    indexer = indexer_mod.SparseAttnIndexer(
+        k_cache=torch.nn.Identity(),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=4,
+        head_dim=128,
+        max_model_len=4096,
+        max_total_seq_len=4096,
+        topk_indices_buffer=torch.empty((2, 4), dtype=torch.int32),
+        dcp_replicated=True,
+    )
+
+    assert indexer.dcp_replicated is True
+    assert indexer.dcp_world_size == 1
+    assert indexer.dcp_rank == 0
 
 
 def _install_fake_b12x_indexer(
@@ -138,16 +177,17 @@ def _install_fake_b12x_indexer(
         out.fill_(7)
         return out
 
-    indexer_mod.PAGED_INDEX_PAGE_SIZE = 64
-    indexer_mod.Caps = _Caps
-    indexer_mod.SOURCE_LAYOUT_PAGED = "paged"
-    indexer_mod.plan = plan_indexer_scratch
-    indexer_mod.index_topk_fp8 = index_topk_fp8
-    indexer_mod.uses_paged_schedule = uses_paged_mqa_schedule
-    indexer_mod.plan_paged_schedule = build_paged_mqa_schedule_metadata
+    fake_indexer_mod = cast(Any, indexer_mod)
+    fake_indexer_mod.PAGED_INDEX_PAGE_SIZE = 64
+    fake_indexer_mod.Caps = _Caps
+    fake_indexer_mod.SOURCE_LAYOUT_PAGED = "paged"
+    fake_indexer_mod.plan = plan_indexer_scratch
+    fake_indexer_mod.index_topk_fp8 = index_topk_fp8
+    fake_indexer_mod.uses_paged_schedule = uses_paged_mqa_schedule
+    fake_indexer_mod.plan_paged_schedule = build_paged_mqa_schedule_metadata
 
-    sparkinfer_mod.attention = attention_mod
-    attention_mod.nsa_indexer = indexer_mod
+    cast(Any, sparkinfer_mod).attention = attention_mod
+    cast(Any, attention_mod).nsa_indexer = indexer_mod
     monkeypatch.setitem(sys.modules, "sparkinfer", sparkinfer_mod)
     monkeypatch.setitem(sys.modules, "sparkinfer.attention", attention_mod)
     monkeypatch.setitem(
@@ -159,7 +199,7 @@ def _install_fake_b12x_indexer(
 
 def _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, *, world_size: int):
     tiled_topk_mod = types.ModuleType("sparkinfer.attention.nsa_indexer.tiled_topk")
-    tiled_topk_mod.run_row_topk = run_row_topk
+    cast(Any, tiled_topk_mod).run_row_topk = run_row_topk
     monkeypatch.setitem(
         sys.modules,
         "sparkinfer.attention.nsa_indexer.tiled_topk",
@@ -411,7 +451,7 @@ def test_b12x_prefill_indexer_requires_packed_contiguous_route(monkeypatch):
         64 * 576,
     ],
 )
-def test_sparse_attn_indexer_decode_uses_non_shared_b12x_binding(
+def test_replicated_decode_skips_dcp_merge_and_keeps_global_topk_ids(
     monkeypatch,
     page_stride0,
 ):
@@ -437,6 +477,12 @@ def test_sparse_attn_indexer_decode_uses_non_shared_b12x_binding(
         lambda: torch.uint8,
         raising=False,
     )
+    monkeypatch.setattr(indexer_mod, "_dcp_global_topk_requested", lambda: True)
+
+    def fail_dcp_merge(**kwargs):
+        pytest.fail("replicated indexer must not all-gather top-k candidates")
+
+    monkeypatch.setattr(indexer_mod, "_merge_b12x_dcp_topk", fail_dcp_merge)
 
     q_rows = 2
     num_heads = 1
@@ -505,6 +551,7 @@ def test_sparse_attn_indexer_decode_uses_non_shared_b12x_binding(
     )
 
     assert result is topk_indices_buffer
+    # B12X indexes the full replicated cache, so its logical IDs are already global.
     assert topk_indices_buffer.tolist() == [[123] * topk, [123] * topk]
     assert calls == [
         (
