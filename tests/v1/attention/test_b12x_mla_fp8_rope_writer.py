@@ -24,6 +24,14 @@ class _WriterInitializationFailure(RuntimeError):
     pass
 
 
+class _FakePackageModule(types.ModuleType):
+    __path__: list[str]
+    attention: types.ModuleType
+    _shared: types.ModuleType
+    mla: types.ModuleType
+    kv_cache: types.ModuleType
+
+
 def _initialize_writer_seam(
     impl: B12xMLASparseImpl,
     *,
@@ -75,13 +83,13 @@ def _install_fake_writer_package(
     monkeypatch: pytest.MonkeyPatch,
     writer,
 ) -> None:
-    sparkinfer_module = types.ModuleType("sparkinfer")
+    sparkinfer_module = _FakePackageModule("sparkinfer")
     sparkinfer_module.__path__ = []
-    attention_module = types.ModuleType("sparkinfer.attention")
+    attention_module = _FakePackageModule("sparkinfer.attention")
     attention_module.__path__ = []
-    shared_module = types.ModuleType("sparkinfer.attention._shared")
+    shared_module = _FakePackageModule("sparkinfer.attention._shared")
     shared_module.__path__ = []
-    mla_module = types.ModuleType("sparkinfer.attention._shared.mla")
+    mla_module = _FakePackageModule("sparkinfer.attention._shared.mla")
     mla_module.__path__ = []
     kv_cache_module = types.ModuleType(_WRITER_MODULE)
 
