@@ -39,11 +39,10 @@ def test_cudagraph_manager_clear_releases_capture_state():
     assert manager.intermediate_tensors is None
 
 
-def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
+def test_memory_profile_reuses_production_pool_and_destroys_graphs(monkeypatch):
     from vllm.v1.worker import workspace as workspace_module
     from vllm.v1.worker.gpu import model_runner as model_runner_module
 
-    profile_pool = object()
     production_pool = object()
     events: list[str] = []
     lazy_wrappers: list[FakeWrapper] = []
@@ -56,8 +55,8 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
             return True
 
         def capture(self, *args, **kwargs):
-            assert self.pool is profile_pool
-            assert wrapper.graph_pool is profile_pool
+            assert self.pool is production_pool
+            assert wrapper.graph_pool is production_pool
             lazy_wrapper = FakeWrapper()
             lazy_wrapper.graph_pool = self.pool
             lazy_wrappers.append(lazy_wrapper)
@@ -98,9 +97,9 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
 
     def cleanup():
         events.append("cleanup")
-        assert manager.pool is profile_pool
-        assert wrapper.graph_pool is profile_pool
-        assert lazy_wrappers[0].graph_pool is profile_pool
+        assert manager.pool is production_pool
+        assert wrapper.graph_pool is production_pool
+        assert lazy_wrappers[0].graph_pool is production_pool
 
     runner._cleanup_cudagraph_memory_profile = cleanup
 
@@ -112,7 +111,9 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
         model_runner_module,
         "current_platform",
         SimpleNamespace(
-            graph_pool_handle=lambda: profile_pool,
+            graph_pool_handle=lambda: pytest.fail(
+                "memory profiling must not allocate a disposable graph pool"
+            ),
             get_global_graph_pool=lambda: production_pool,
         ),
     )

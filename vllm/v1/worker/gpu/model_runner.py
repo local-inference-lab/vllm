@@ -873,7 +873,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return 0
 
         saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
-        profiling_pool = current_platform.graph_pool_handle()
+        # Profile into the same pool used by the production capture. Destroying
+        # graphs can leave physical pages retained by their pool; a different
+        # disposable pool makes those pages unavailable to the later capture
+        # even though memory_profiling already counts them as non-torch usage.
+        # Reusing the global pool lets the identical production capture reuse
+        # that retained capacity, which is required for the
+        # gross-minus-retained estimate below to be a real headroom guarantee.
+        profiling_pool = current_platform.get_global_graph_pool()
         managers = [self.cudagraph_manager]
         if self.speculator is not None:
             managers.extend(self.speculator.get_cudagraph_managers())
@@ -896,7 +903,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
         graph_channel_checkpoints = ()
         try:
-            # Snapshot graph-owned SparkInfer channels before this disposable
+            # Snapshot graph-owned SparkInfer channels before this profiling
             # capture so profiling cannot leave stale channels behind.
             graph_channel_checkpoints = checkpoint_b12x_graph_channels()
             with self.maybe_setup_dummy_loras(self.lora_config):
@@ -921,8 +928,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             gross_cuda_graph_size = max(start_free_gpu_memory - end_free_gpu_memory, 0)
         finally:
             try:
-                # Destroy disposable graphs while every manager and wrapper still
-                # points at the private pool that owns their allocations.
+                # Destroy profiling graphs while every manager and wrapper still
+                # points at the pool that owns their allocations.
                 try:
                     self._cleanup_cudagraph_memory_profile()
                 finally:
@@ -948,7 +955,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         retained_pool_size = max(start_free_gpu_memory - free_after_cleanup, 0)
         # A CUDA graph private pool can retain physical pages after its graph
         # objects are destroyed. memory_profiling observes those pages as
-        # non-torch memory, so only return the remaining capture cost here.
+        # non-torch memory. Because production reuses this exact pool, only
+        # return the remaining capture cost here.
         cuda_graph_size = max(gross_cuda_graph_size - retained_pool_size, 0)
         logger.info(
             "Estimated MRV2 CUDA graph memory: %.2f GiB additional "
