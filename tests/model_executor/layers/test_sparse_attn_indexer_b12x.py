@@ -1090,3 +1090,49 @@ def test_b12x_schedule_metadata_uses_canonical_indexer_import(monkeypatch):
         ("uses_schedule", 2, 3),
         ("build_schedule", (64, 128), 64, 4, True),
     ]
+
+
+def test_mtp_variable_decode_drops_block_table_alignment_padding():
+    from vllm.v1.attention.backends.mla import indexer as mla_indexer_mod
+
+    builder = object.__new__(mla_indexer_mod.DeepseekV32IndexerMetadataBuilder)
+    # max_model_len=480000, block_size=64, DCP=4 requires 1875 logical
+    # blocks. The model runner aligns that row to 1876 entries.
+    logical_width = 1875
+    aligned_width = 1876
+    buffer_rows = 16
+    builder.decode_seq_lens_buffer = torch.zeros(buffer_rows, dtype=torch.int32)
+    builder.expanded_block_table_buffer = torch.zeros(
+        (buffer_rows, logical_width), dtype=torch.int32
+    )
+    builder.decode_lens_buffer = torch.zeros(buffer_rows, dtype=torch.int32)
+    builder.arange_buffer = torch.arange(buffer_rows, dtype=torch.int32)
+    builder.compress_ratio = 1
+
+    block_table = torch.arange(3 * aligned_width, dtype=torch.int32).view(
+        3, aligned_width
+    )
+    seq_lens = torch.tensor([100, 200, 300], dtype=torch.int32)
+    decode_lens = torch.tensor([3, 1, 3], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 3, 4], dtype=torch.int32)
+
+    _, expanded, _, batch_size, requires_padding = builder._prepare_decode_tensors(
+        seq_lens=seq_lens,
+        block_table=block_table,
+        decode_lens=decode_lens,
+        decode_lens_cpu=decode_lens,
+        query_start_loc=query_start_loc,
+        num_decodes=3,
+        num_decode_tokens=7,
+        use_native=False,
+        next_n=4,
+        max_decode_len=3,
+    )
+
+    expected = torch.repeat_interleave(
+        block_table[:, :logical_width], decode_lens, dim=0, output_size=7
+    )
+    assert expanded.shape == (7, logical_width)
+    torch.testing.assert_close(expanded, expected)
+    assert batch_size == 7
+    assert not requires_padding

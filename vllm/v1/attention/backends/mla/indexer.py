@@ -630,10 +630,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
 
                 # Give each of the flattened entries the same block table row as the
-                # original request.
+                # original request. The model runner may right-pad block-table rows
+                # for backend alignment (for example, 1875 logical blocks becomes
+                # 1876 at block_size=64), while this indexer buffer is sized to the
+                # logical page count. Match the uniform Triton path above, which
+                # copies only expanded_bt_stride entries and drops that unused tail.
+                expanded_block_table_width = self.expanded_block_table_buffer.shape[1]
                 self.expanded_block_table_buffer[:actual_expanded] = (
                     torch.repeat_interleave(
-                        block_table, decode_lens, dim=0, output_size=actual_expanded
+                        block_table[:, :expanded_block_table_width],
+                        decode_lens,
+                        dim=0,
+                        output_size=actual_expanded,
                     )
                 )
                 if actual_expanded < num_decode_tokens:
