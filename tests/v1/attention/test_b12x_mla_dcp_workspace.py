@@ -380,3 +380,55 @@ def test_dcp_workspace_projection_accepts_partial_pitched_head_major_output(
 
     assert actual.movedim(0, 1).is_contiguous()
     torch.testing.assert_close(actual, expected)
+
+
+def test_dcp_workspace_projection_accepts_aligned_head_capacity_pitch(monkeypatch):
+    max_batched = 8
+    num_tokens = 5
+    input_heads = kernel_heads = 4
+    kv_lora_rank = 4
+    v_head_dim = 2
+
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._max_batched = max_batched
+    impl._input_num_heads = input_heads
+    impl._kernel_num_heads = kernel_heads
+    impl._pad_heads = False
+    impl.kv_lora_rank = kv_lora_rank
+    impl.v_head_dim = v_head_dim
+
+    q_workspace = torch.empty(
+        max_batched, kernel_heads, kv_lora_rank, dtype=torch.bfloat16
+    )
+    scratch_nbytes = input_heads * max_batched * kv_lora_rank * 2
+    scratch_storage = torch.empty(scratch_nbytes, dtype=torch.uint8)
+    full_output = (
+        scratch_storage.view(torch.bfloat16)
+        .view(input_heads, max_batched, kv_lora_rank)
+        .transpose(0, 1)
+    )
+    full_output.copy_(
+        torch.arange(full_output.numel(), dtype=torch.float32)
+        .to(torch.bfloat16)
+        .view_as(full_output)
+    )
+
+    monkeypatch.setattr(
+        impl, "_validate_dcp_prefill_workspace_contract", lambda _: None
+    )
+    monkeypatch.setattr(
+        impl,
+        "_borrow_workspace_parts",
+        lambda: (q_workspace, None, scratch_storage),
+    )
+
+    attn_out = full_output[:num_tokens]
+    lse = torch.zeros(num_tokens, input_heads, dtype=torch.float32)
+    w_uv = torch.randn(input_heads, kv_lora_rank, v_head_dim, dtype=torch.bfloat16)
+    expected = torch.bmm(attn_out.transpose(0, 1).contiguous(), w_uv).transpose(0, 1)
+
+    actual = impl.dcp_project_before_merge_in_workspace(attn_out, lse, w_uv)
+
+    assert attn_out.stride() == (kv_lora_rank, max_batched * kv_lora_rank, 1)
+    assert actual.movedim(0, 1).is_contiguous()
+    torch.testing.assert_close(actual, expected)
