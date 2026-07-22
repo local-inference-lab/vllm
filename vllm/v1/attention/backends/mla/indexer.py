@@ -430,9 +430,23 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # caches). Outside the SM100 family the FP8
         # paged MQA logits kernel only supports next_n in (1, 2)
         # (deepgemm smxx_fp8_fp4_paged_mqa_logits.hpp:233), so flatten there.
-        self.use_flattening = not current_platform.is_device_capability_family(
-            100
-        ) and next_n not in (1, 2)
+        # The B12X / sparkinfer sparse indexer handles native next_n>2 on SM120
+        # directly (see sparse_attn_indexer warmup q_rows 1, 2, 4), so it must
+        # NOT be forced onto the DeepGEMM next_n<=2 flatten fallback. Flattening
+        # MTP-2/MTP-3 verification into rank-1 rows produced subtly wrong accepted
+        # tokens (code-gen syntax errors); the native (B, next_n) path keeps MTP
+        # correct. Use the canonical backend-aware predicate so this also holds
+        # when B12X is selected via --attention-backend B12X_MLA_SPARSE with the
+        # VLLM_USE_B12X_SPARSE_INDEXER env var unset (it also asserts SM120).
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            use_b12x_sparse_indexer,
+        )
+
+        self.use_flattening = (
+            not current_platform.is_device_capability_family(100)
+            and next_n not in (1, 2)
+            and not use_b12x_sparse_indexer()
+        )
         # SM100 supports the varlen paged MQA logits kernel (indices-selected,
         # next_n == 1 rows). Only compact spec-decode verification batches opt
         # into it; uniform DFlash draft proposal should keep the native path.
