@@ -1546,7 +1546,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 topk_ids=topk_ids,
             )
             output = runtime["api"].run(binding=binding)
-            return output.to(x.dtype).clone()
+            return output.to(x.dtype)
 
         if m > runtime["max_batched_tokens"]:
             raise ValueError(
@@ -1589,7 +1589,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 0.0,
                 0,
             )
-            return out32.to(x.dtype).clone()
+            return out32.to(x.dtype)
 
         local_ids = layer.exl3_expert_map[topk_ids.long()]
         half_weights = topk_weights.to(torch.float16)
@@ -1631,7 +1631,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 False,
                 0.0,
             )
-        return out32.to(x.dtype).clone()
+        return out32.to(x.dtype)
 
     def apply(
         self,
