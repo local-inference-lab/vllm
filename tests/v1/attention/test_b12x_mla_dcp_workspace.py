@@ -103,9 +103,7 @@ def test_cp_lse_ag_out_rs_into_preserves_borrowed_output(monkeypatch, world_size
 
 
 def test_cp_lse_ag_out_rs_requests_head_major_output(monkeypatch):
-    corrected_storage = torch.arange(8 * 3 * 16, dtype=torch.bfloat16).view(
-        8, 3, 16
-    )
+    corrected_storage = torch.arange(8 * 3 * 16, dtype=torch.bfloat16).view(8, 3, 16)
     corrected = corrected_storage.movedim(0, 1)
     corrected_lse = torch.zeros(3, 8, dtype=torch.float32)
 
@@ -192,3 +190,49 @@ def test_dcp_workspace_contract_rejects_unvalidated_topology(monkeypatch):
 
     with pytest.raises(RuntimeError, match="unsupported topology or geometry"):
         impl._validate_dcp_prefill_workspace_contract(2048)
+
+
+@pytest.mark.parametrize("num_tokens", [1025, 1640, 3072])
+def test_dcp_projection_accepts_b12x_output_layouts(monkeypatch, num_tokens):
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._max_batched = 3072
+    impl.dcp_workspace_non_dbo = True
+    impl.tp_world_size = 4
+    impl.dcp_world_size = 4
+    impl.num_heads = 1
+    impl._input_num_heads = 4
+    impl._kernel_num_heads = 8
+    impl._pad_heads = False
+    impl.q_head_dim = 576
+    impl.kv_lora_rank = 2
+    impl.v_head_dim = 1
+    monkeypatch.setattr(
+        impl, "_validate_dcp_prefill_workspace_contract", lambda _: None
+    )
+
+    q_workspace = torch.empty(num_tokens, 8, 576, dtype=torch.bfloat16)
+    scratch = torch.empty(8 * num_tokens * 2, dtype=torch.uint8)
+    monkeypatch.setattr(
+        impl,
+        "_borrow_workspace_parts",
+        lambda: (q_workspace, None, scratch),
+    )
+
+    lse = torch.zeros(num_tokens, 4, dtype=torch.float32)
+    w_uv = torch.ones(4, 2, 1, dtype=torch.bfloat16)
+    token_major = (
+        scratch[: num_tokens * 4 * 2 * 2].view(torch.bfloat16).view(num_tokens, 4, 2)
+    )
+    token_major.fill_(1)
+    result = impl.dcp_project_before_merge_in_workspace(token_major, lse, w_uv)
+    torch.testing.assert_close(result, torch.full_like(result, 2))
+
+    head_major = (
+        scratch[: num_tokens * 4 * 2 * 2]
+        .view(torch.bfloat16)
+        .view(4, num_tokens, 2)
+        .transpose(0, 1)
+    )
+    head_major.fill_(1)
+    result = impl.dcp_project_before_merge_in_workspace(head_major, lse, w_uv)
+    torch.testing.assert_close(result, torch.full_like(result, 2))
