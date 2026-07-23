@@ -373,6 +373,10 @@ def _preallocate_absorbed_mla_weights(
             and weight.shape == shape
             and weight.dtype == act_dtype
             and weight.device == device
+            and (
+                not getattr(layer, "force_contiguous_mla_bmm_weight", False)
+                or weight.is_contiguous()
+            )
         )
 
     pre_w_uv = (
@@ -699,6 +703,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             **extra_impl_args,
         )
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
+        self.force_contiguous_mla_bmm_input = getattr(
+            self.impl, "force_contiguous_mla_bmm_input", False
+        )
+        self.force_contiguous_mla_bmm_weight = getattr(
+            self.impl, "force_contiguous_mla_bmm_weight", False
+        )
         self.use_direct_call = not current_platform.opaque_attention_op()
 
         vllm_config = get_current_vllm_config()
@@ -1188,6 +1198,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     L = self.kv_lora_rank
                 else:
                     _, _, L = self.W_UK_T.shape
+
+                if self.force_contiguous_mla_bmm_input:
+                    mqa_q_nope = mqa_q_nope.contiguous()
 
                 if self.q_pad_num_heads is not None:
                     mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
@@ -1727,13 +1740,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if pre_w_uv is not None:
                 pre_w_uv.copy_(w_uv)
                 w_uv = pre_w_uv
-            replace_parameter(self, "W_UV", w_uv, prefer_copy=True)
+            replace_parameter(
+                self, "W_UV", w_uv, prefer_copy=pre_w_uv is None
+            )
             # Convert from (L, N, P) to (N, P, L)
             w_uk_t = W_UK.permute(1, 2, 0)
             if pre_w_uk_t is not None:
                 pre_w_uk_t.copy_(w_uk_t)
                 w_uk_t = pre_w_uk_t
-            replace_parameter(self, "W_UK_T", w_uk_t, prefer_copy=True)
+            replace_parameter(
+                self, "W_UK_T", w_uk_t, prefer_copy=pre_w_uk_t is None
+            )
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
