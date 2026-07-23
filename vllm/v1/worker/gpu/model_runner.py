@@ -853,6 +853,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.cache_config.num_gpu_blocks = None
 
         for layer in self.compilation_config.static_forward_context.values():
+            # Attention implementations may retain derived state or tensor
+            # pointers across scheduler steps. Those bindings become stale
+            # when this temporary profiling cache is replaced by the
+            # production cache. Keep the hook optional so backends without
+            # cache-generation state pay no cost.
+            impl = getattr(layer, "impl", None)
+            reset_binding_state = getattr(
+                impl, "reset_kv_cache_binding_state", None
+            )
+            if reset_binding_state is not None:
+                reset_binding_state()
             if hasattr(layer, "kv_cache"):
                 kv_cache = layer.kv_cache
                 layer.kv_cache = (

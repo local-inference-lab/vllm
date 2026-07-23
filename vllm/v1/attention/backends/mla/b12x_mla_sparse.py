@@ -1262,6 +1262,25 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         # Q arrives BF16; the unified kernel quantizes inside.
         self.supports_quant_query_input = False
 
+    @classmethod
+    def reset_kv_cache_binding_state(cls) -> None:
+        """Drop prefetch state whose pointers belong to an old KV cache.
+
+        Layer prefetch learns each layer's cache tensor during forward and
+        deliberately keeps those tensors across ordinary scheduler steps.
+        They are not valid across a KV-cache replacement, however. In
+        particular, MRV2 CUDA-graph memory profiling binds a temporary cache,
+        destroys it, and later binds the production cache without rebuilding
+        the attention implementations.
+
+        The runner calls this hook while tearing down the temporary cache.
+        The first forward on the new cache therefore primes the registry with
+        synchronous gathers; later forwards recover normal layer prefetch.
+        """
+        cls._all_layer_kv_caches = []
+        cls._shared_gather_event = None
+        cls._shared_gather_buf_idx = 0
+
     def do_kv_cache_update(
         self,
         kv_c_normed: torch.Tensor,

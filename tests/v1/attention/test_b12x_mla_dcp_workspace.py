@@ -14,6 +14,20 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseImpl
 from vllm.v1.attention.ops import common
 
 
+def test_ckv_prefetch_reset_drops_old_cache_generation(monkeypatch):
+    old_cache = torch.zeros((1, 64, 368), dtype=torch.uint8)
+    old_event = object()
+    monkeypatch.setattr(B12xMLASparseImpl, "_all_layer_kv_caches", [old_cache])
+    monkeypatch.setattr(B12xMLASparseImpl, "_shared_gather_event", old_event)
+    monkeypatch.setattr(B12xMLASparseImpl, "_shared_gather_buf_idx", 1)
+
+    B12xMLASparseImpl.reset_kv_cache_binding_state()
+
+    assert B12xMLASparseImpl._all_layer_kv_caches == []
+    assert B12xMLASparseImpl._shared_gather_event is None
+    assert B12xMLASparseImpl._shared_gather_buf_idx == 0
+
+
 @pytest.mark.parametrize(
     ("override", "value"),
     [

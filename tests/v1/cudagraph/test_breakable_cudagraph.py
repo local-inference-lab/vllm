@@ -18,6 +18,48 @@ import torch
 os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
 
 
+def test_memory_profile_cleanup_resets_backend_cache_bindings(monkeypatch):
+    from vllm.v1.worker.gpu import model_runner as model_runner_module
+
+    events: list[str] = []
+    old_cache = torch.ones((1,), dtype=torch.uint8)
+
+    class Impl:
+        def reset_kv_cache_binding_state(self):
+            events.append("reset")
+            assert layer.kv_cache is old_cache
+
+    layer = SimpleNamespace(impl=Impl(), kv_cache=old_cache)
+    runner = model_runner_module.GPUModelRunner.__new__(
+        model_runner_module.GPUModelRunner
+    )
+    runner.cudagraph_manager = None
+    runner.speculator = None
+    runner.kv_caches = [old_cache]
+    runner.attn_groups = []
+    runner.kv_cache_config = object()
+    runner.block_tables = object()
+    runner.kernel_block_sizes = object()
+    runner.kv_connector = object()
+    runner.kv_block_zeroer = object()
+    runner.verification_capacity_manager = object()
+    runner.cache_config = SimpleNamespace(num_gpu_blocks=1)
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context={"layer": layer}
+    )
+
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(model_runner_module.gc, "collect", lambda: None)
+
+    runner._cleanup_cudagraph_memory_profile()
+
+    assert events == ["reset"]
+    assert runner.kv_caches == []
+    assert layer.kv_cache.numel() == 0
+    assert runner.cache_config.num_gpu_blocks is None
+
+
 def test_cudagraph_manager_clear_releases_capture_state():
     from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
 
