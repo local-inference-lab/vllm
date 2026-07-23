@@ -1953,10 +1953,13 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         """Project DCP partials from 512 to 256 in borrowed MLA storage."""
         num_tokens = int(attn_out.shape[0])
         self._validate_dcp_prefill_workspace_contract(num_tokens)
+        attn_out_has_supported_layout = (
+            attn_out.is_contiguous() or attn_out.movedim(0, 1).is_contiguous()
+        )
         if (
             tuple(attn_out.shape)
             != (num_tokens, self._input_num_heads, self.kv_lora_rank)
-            or not attn_out.movedim(0, 1).is_contiguous()
+            or not attn_out_has_supported_layout
             or attn_out.dtype != torch.bfloat16
             or tuple(w_uv.shape)
             != (self._input_num_heads, self.kv_lora_rank, self.v_head_dim)
@@ -1966,7 +1969,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             or lse.dtype != torch.float32
         ):
             raise ValueError(
-                "DCP workspace projection received an invalid tensor layout"
+                "DCP workspace projection received an invalid tensor layout: "
+                f"attn_out={tuple(attn_out.shape)}/{tuple(attn_out.stride())}/"
+                f"{attn_out.dtype}, lse={tuple(lse.shape)}/{tuple(lse.stride())}/"
+                f"{lse.dtype}, w_uv={tuple(w_uv.shape)}/{tuple(w_uv.stride())}/"
+                f"{w_uv.dtype}"
             )
 
         q_workspace, dense_out_workspace, scratch_storage = (
