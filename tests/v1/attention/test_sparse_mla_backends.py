@@ -41,6 +41,7 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseImpl,
     B12xMLASparseMetadataBuilder,
     _global_causal_lens_for_ckv_gather,
+    _resolve_spec_decode_mode,
 )
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseSM120Backend,
@@ -79,6 +80,33 @@ SPARSE_BACKEND_BATCH_SPECS["large_q_pure_prefill"] = BatchSpec(
 )
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.parametrize(
+    ("mode", "kv_cache_dtype", "expected"),
+    [
+        ("0", "fp8_ds_mla", (False, False)),
+        ("auto", "fp8_ds_mla", (True, False)),
+        ("1", "fp8_ds_mla", (True, True)),
+        ("auto", "nvfp4_ds_mla", (False, False)),
+        ("1", "nvfp4_ds_mla", (True, True)),
+        ("auto", "bfloat16", (False, False)),
+    ],
+)
+def test_b12x_sparse_spec_decode_auto_is_format_qualified(
+    mode: str,
+    kv_cache_dtype: str,
+    expected: tuple[bool, bool],
+) -> None:
+    assert _resolve_spec_decode_mode(
+        mode,
+        kv_cache_dtype=kv_cache_dtype,
+    ) == expected
+
+
+def test_b12x_sparse_spec_decode_mode_rejects_unknown_value() -> None:
+    with pytest.raises(ValueError, match="must be auto, 0, or 1"):
+        _resolve_spec_decode_mode("sometimes", kv_cache_dtype="nvfp4_ds_mla")
 
 
 @pytest.mark.parametrize(
@@ -276,14 +304,22 @@ def test_b12x_sparse_rejects_incompatible_indexer_output(
 
 
 @pytest.mark.parametrize(
-    ("mode", "expected_rows"),
-    [("0", 2), ("auto", 8), ("1", 16)],
+    ("mode", "kv_cache_dtype", "expected_rows"),
+    [
+        ("0", "fp8_ds_mla", 2),
+        ("auto", "fp8_ds_mla", 8),
+        ("1", "fp8_ds_mla", 16),
+        ("0", "nvfp4_ds_mla", 2),
+        ("auto", "nvfp4_ds_mla", 2),
+        ("1", "nvfp4_ds_mla", 16),
+    ],
 )
 def test_b12x_sparse_spec_decode_scratch_capacity(
     default_vllm_config,
     monkeypatch: pytest.MonkeyPatch,
     workspace_init,
     mode: str,
+    kv_cache_dtype: str,
     expected_rows: int,
 ) -> None:
     if not current_platform.has_device_capability(120):
@@ -308,7 +344,7 @@ def test_b12x_sparse_spec_decode_scratch_capacity(
         num_kv_heads=1,
         alibi_slopes=None,
         sliding_window=None,
-        kv_cache_dtype="fp8_ds_mla",
+        kv_cache_dtype=kv_cache_dtype,
         logits_soft_cap=None,
         attn_type="decoder",
         kv_sharing_target_layer_name=None,

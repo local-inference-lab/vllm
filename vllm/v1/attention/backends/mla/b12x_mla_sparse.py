@@ -146,6 +146,32 @@ def _env_int(name: str, default: int) -> int:
     return parsed
 
 
+def _resolve_spec_decode_mode(
+    raw_mode: str, *, kv_cache_dtype: str
+) -> tuple[bool, bool]:
+    """Resolve the MTP verifier route without overextending ``auto``.
+
+    The flattened decode-verifier path is numerically qualified by
+    ``test_b12x_sparse_spec_decode_causality`` only for ``fp8_ds_mla``.  The
+    compact ``nvfp4_ds_mla`` format uses a different BF16-QK kernel arm and was
+    never covered by that qualification, so auto mode keeps it on the established
+    extend path.  Explicit force mode remains available for focused bring-up.
+
+    Returns ``(use_decode_for_verifier, explicitly_forced)``.
+    """
+    mode = raw_mode.strip().lower()
+    disabled_modes = {"0", "false", "off", "no"}
+    forced_modes = {"1", "true", "on", "yes"}
+    if mode not in {"auto", *disabled_modes, *forced_modes}:
+        raise ValueError(
+            "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE must be auto, 0, or 1 "
+            f"(got {mode!r})"
+        )
+    if mode == "auto":
+        return kv_cache_dtype == "fp8_ds_mla", False
+    return mode in forced_modes, mode in forced_modes
+
+
 def _get_ckv_gather_workspace(device: torch.device, nbytes: int) -> torch.Tensor:
     key = (device.type, device.index)
     workspace = _CKV_GATHER_WORKSPACES.get(key)
@@ -1070,18 +1096,26 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self._pad_heads = self._kernel_num_heads != self._input_num_heads
 
         self.spec_decode_max_q = _env_int("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", 8)
-        spec_decode_mode = (
-            os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "auto").strip().lower()
+        spec_decode_mode = os.getenv(
+            "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "auto"
         )
-        disabled_modes = {"0", "false", "off", "no"}
-        forced_modes = {"1", "true", "on", "yes"}
-        if spec_decode_mode not in {"auto", *disabled_modes, *forced_modes}:
-            raise ValueError(
-                "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE must be auto, 0, or 1 "
-                f"(got {spec_decode_mode!r})"
+        (
+            self.spec_extend_as_decode,
+            self.spec_extend_as_decode_force,
+        ) = _resolve_spec_decode_mode(
+            spec_decode_mode,
+            kv_cache_dtype=self.kv_cache_dtype,
+        )
+        if (
+            spec_decode_mode.strip().lower() == "auto"
+            and not self.spec_extend_as_decode
+        ):
+            logger.info_once(
+                "B12X MTP verifier auto-route keeps kv_cache_dtype=%s on the "
+                "numerically qualified extend path; set "
+                "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE=1 to force decode",
+                self.kv_cache_dtype,
             )
-        self.spec_extend_as_decode = spec_decode_mode not in disabled_modes
-        self.spec_extend_as_decode_force = spec_decode_mode in forced_modes
 
         # Decode query rows per request (1, plus speculative draft tokens).
         q_per_req = 1
