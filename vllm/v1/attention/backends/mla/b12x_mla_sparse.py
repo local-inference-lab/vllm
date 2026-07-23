@@ -909,6 +909,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
     supports_dcp_gather_query_in_workspace: bool = True
     supports_dcp_project_before_merge_in_workspace: bool = True
     supports_dcp_reduce_scatter_output_in_workspace: bool = True
+    # Cross-layer CKV prefetch state must exist before the first backend
+    # instance so profile-cache cleanup is independent of construction order.
+    _all_layer_kv_caches: list[torch.Tensor | None] = []
+    _shared_gather_event: torch.cuda.Event | None = None
+    _shared_gather_buf_idx: int = 0
 
     def __init__(
         self,
