@@ -1953,8 +1953,17 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         """Project DCP partials from 512 to 256 in borrowed MLA storage."""
         num_tokens = int(attn_out.shape[0])
         self._validate_dcp_prefill_workspace_contract(num_tokens)
+        padded_head_major = (
+            attn_out.ndim == 3
+            and attn_out.stride(2) == 1
+            and attn_out.stride(0) == attn_out.shape[2]
+            and attn_out.stride(1) >= attn_out.shape[0] * attn_out.shape[2]
+            and attn_out.stride(1) % attn_out.shape[2] == 0
+        )
         attn_out_has_supported_layout = (
-            attn_out.is_contiguous() or attn_out.movedim(0, 1).is_contiguous()
+            attn_out.is_contiguous()
+            or attn_out.movedim(0, 1).is_contiguous()
+            or padded_head_major
         )
         if (
             tuple(attn_out.shape)

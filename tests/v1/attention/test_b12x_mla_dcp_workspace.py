@@ -192,7 +192,7 @@ def test_dcp_workspace_contract_rejects_unvalidated_topology(monkeypatch):
         impl._validate_dcp_prefill_workspace_contract(2048)
 
 
-@pytest.mark.parametrize("num_tokens", [1025, 1640, 3072])
+@pytest.mark.parametrize("num_tokens", [1025, 1640, 2139, 3072])
 def test_dcp_projection_accepts_b12x_output_layouts(monkeypatch, num_tokens):
     impl = object.__new__(B12xMLASparseImpl)
     impl._max_batched = 3072
@@ -211,7 +211,7 @@ def test_dcp_projection_accepts_b12x_output_layouts(monkeypatch, num_tokens):
     )
 
     q_workspace = torch.empty(num_tokens, 8, 576, dtype=torch.bfloat16)
-    scratch = torch.empty(8 * num_tokens * 2, dtype=torch.uint8)
+    scratch = torch.empty(4 * impl._max_batched * 2 * 2, dtype=torch.uint8)
     monkeypatch.setattr(
         impl,
         "_borrow_workspace_parts",
@@ -235,4 +235,17 @@ def test_dcp_projection_accepts_b12x_output_layouts(monkeypatch, num_tokens):
     )
     head_major.fill_(1)
     result = impl.dcp_project_before_merge_in_workspace(head_major, lse, w_uv)
+    torch.testing.assert_close(result, torch.full_like(result, 2))
+
+    padded_head_major = (
+        scratch.view(torch.bfloat16)
+        .view(4, impl._max_batched, 2)
+        .transpose(0, 1)[:num_tokens]
+    )
+    padded_head_major.fill_(1)
+    result = impl.dcp_project_before_merge_in_workspace(
+        padded_head_major,
+        lse,
+        w_uv,
+    )
     torch.testing.assert_close(result, torch.full_like(result, 2))
