@@ -1447,6 +1447,29 @@ def get_query_split_group() -> GroupCoordinator:
     return _QUERY_SPLIT
 
 
+def _get_query_split_group_ranks(
+    tp_group_ranks: list[list[int]], dcp_size: int
+) -> list[list[int]]:
+    """Transpose DCP groups within each independent TP cohort."""
+    if dcp_size <= 0:
+        raise ValueError(f"dcp_size must be positive, got {dcp_size}")
+
+    query_split_ranks: list[list[int]] = []
+    for tp_ranks in tp_group_ranks:
+        if len(tp_ranks) % dcp_size != 0:
+            raise ValueError(
+                f"TP group size {len(tp_ranks)} must be divisible by "
+                f"dcp_size {dcp_size}"
+            )
+        dcp_groups = [
+            tp_ranks[start : start + dcp_size]
+            for start in range(0, len(tp_ranks), dcp_size)
+        ]
+        for dcp_rank in range(dcp_size):
+            query_split_ranks.append([group[dcp_rank] for group in dcp_groups])
+    return query_split_ranks
+
+
 _DCP_CKV_PREFETCH: GroupCoordinator | None = None
 
 
@@ -1946,6 +1969,7 @@ def initialize_model_parallel(
     if enable_elastic_ep:
         group_ranks = local_all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
         group_ranks = [x.tolist() for x in group_ranks]
+    tp_group_ranks = group_ranks
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
         group_ranks,
@@ -1985,9 +2009,9 @@ def initialize_model_parallel(
     global _QUERY_SPLIT
     assert _QUERY_SPLIT is None, "query split group is already initialized"
     if decode_context_model_parallel_size > 1 and envs.VLLM_DCP_QUERY_SPLIT:
-        query_split_ranks: list[list[int]] = []
-        for dcp_rank_idx in range(decode_context_model_parallel_size):
-            query_split_ranks.append([grp[dcp_rank_idx] for grp in group_ranks])
+        query_split_ranks = _get_query_split_group_ranks(
+            tp_group_ranks, decode_context_model_parallel_size
+        )
         _QUERY_SPLIT = init_model_parallel_group(
             query_split_ranks,
             get_world_group().local_rank,

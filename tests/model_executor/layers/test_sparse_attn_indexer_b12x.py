@@ -195,6 +195,47 @@ def _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, *, world_size: int):
     )
 
 
+def test_query_split_gathers_indices_in_place_without_scores():
+    calls: list[tuple[int, int]] = []
+
+    class FakePyNccl:
+        disabled = False
+
+        def all_gather(self, output, input_):
+            calls.append((output.data_ptr(), input_.data_ptr()))
+            rows = input_.shape[0]
+            output[:rows].fill_(10)
+            output[rows:].fill_(20)
+
+    group = types.SimpleNamespace(
+        world_size=2,
+        rank_in_group=1,
+        device_communicator=types.SimpleNamespace(pynccl_comm=FakePyNccl()),
+    )
+    gathered_indices = torch.full((4, 3), -1, dtype=torch.int32)
+    local_indices = gathered_indices[2:]
+    local_indices.fill_(20)
+    scores = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    scores_before = scores.clone()
+
+    indexer_mod._query_split_all_gather_indices(group, local_indices, gathered_indices)
+
+    assert calls == [(gathered_indices.data_ptr(), local_indices.data_ptr())]
+    assert gathered_indices.tolist() == [[10] * 3, [10] * 3, [20] * 3, [20] * 3]
+    assert torch.equal(scores, scores_before)
+
+
+def test_query_split_rejects_non_aliasing_local_indices():
+    group = types.SimpleNamespace(world_size=2, rank_in_group=0)
+    gathered_indices = torch.empty((4, 3), dtype=torch.int32)
+    local_indices = torch.empty((2, 3), dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="must alias"):
+        indexer_mod._query_split_all_gather_indices(
+            group, local_indices, gathered_indices
+        )
+
+
 @pytest.mark.parametrize(
     "page_stride0",
     [
