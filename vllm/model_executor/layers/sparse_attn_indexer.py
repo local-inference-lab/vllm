@@ -1555,7 +1555,7 @@ def sparse_attn_indexer(
     qs_group = None
     qs_world_size = 1
     qs_rank = 0
-    if envs.VLLM_DCP_QUERY_SPLIT and dcp_world_size > 1:
+    if envs.VLLM_DCP_QUERY_SPLIT:
         _qs = get_query_split_group()
         if int(_qs.world_size) > 1:
             qs_group = _qs

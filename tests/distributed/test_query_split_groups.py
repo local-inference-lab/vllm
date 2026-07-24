@@ -38,6 +38,11 @@ from vllm.distributed.parallel_state import _get_query_split_group_ranks
             8,
             [[0], [1], [2], [3], [4], [5], [6], [7]],
         ),
+        (
+            [list(range(8))],
+            1,
+            [list(range(8))],
+        ),
     ],
 )
 def test_get_query_split_group_ranks(tp_groups, dcp_size, expected):

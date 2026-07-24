@@ -2001,14 +2001,13 @@ def initialize_model_parallel(
         group_name="dcp",
     )
 
-    # Build the query-split groups for the indexer query split (Fix A).
-    # Ranks sharing the same dcp_rank (position within their DCP group)
-    # form a query-split group.  At TP=8/DCP=2 the DCP groups are
-    # {0,1},{2,3},{4,5},{6,7} and the query-split groups are
-    # {0,2,4,6} (dcp_rank=0) and {1,3,5,7} (dcp_rank=1).
+    # Build query-split groups for the sparse indexer. Ranks sharing the same
+    # dcp_rank form one group. This also applies to DCP=1: all TP ranks hold
+    # the same indexer inputs, so they can divide query rows and all-gather
+    # only the exact int32 top-k result.
     global _QUERY_SPLIT
     assert _QUERY_SPLIT is None, "query split group is already initialized"
-    if decode_context_model_parallel_size > 1 and envs.VLLM_DCP_QUERY_SPLIT:
+    if envs.VLLM_DCP_QUERY_SPLIT:
         query_split_ranks = _get_query_split_group_ranks(
             tp_group_ranks, decode_context_model_parallel_size
         )
