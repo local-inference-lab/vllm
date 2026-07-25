@@ -10,7 +10,10 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CUDAGraphMode, get_current_vllm_config
-from vllm.distributed import get_dcp_group, get_query_split_group
+from vllm.distributed import (
+    get_indexer_dcp_group,
+    get_indexer_query_split_group,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -458,9 +461,9 @@ def _get_dcp_warmup_params() -> tuple[int, int, int]:
         pass
 
     try:
-        from vllm.distributed.parallel_state import get_dcp_group
+        from vllm.distributed.parallel_state import get_indexer_dcp_group
 
-        dcp_group = get_dcp_group()
+        dcp_group = get_indexer_dcp_group()
         if int(dcp_group.world_size) > 1:
             dcp_world_size = int(dcp_group.world_size)
             dcp_rank = int(dcp_group.rank_in_group)
@@ -476,9 +479,9 @@ def _sync_dcp_warmup() -> None:
         torch.accelerator.synchronize()
 
     try:
-        from vllm.distributed.parallel_state import get_dcp_group
+        from vllm.distributed.parallel_state import get_indexer_dcp_group
 
-        dcp_group = get_dcp_group()
+        dcp_group = get_indexer_dcp_group()
         if int(dcp_group.world_size) <= 1:
             return
         dcp_group.barrier()
@@ -540,7 +543,7 @@ def _dcp_global_topk_remap(
     if world_size <= 1 or topk_indices.numel() == 0:
         return
 
-    from vllm.distributed.parallel_state import get_dcp_group
+    from vllm.distributed.parallel_state import get_indexer_dcp_group
 
     candidates = _dcp_pack_topk_candidates(
         topk_indices,
@@ -551,7 +554,7 @@ def _dcp_global_topk_remap(
         interleave,
         row_starts=row_starts,
     )
-    all_candidates = get_dcp_group().all_gather(candidates.contiguous(), dim=2)
+    all_candidates = get_indexer_dcp_group().all_gather(candidates.contiguous(), dim=2)
     all_scores = all_candidates[:, 1, :].view(torch.float32)
     _, selected = torch.topk(all_scores, topk_tokens, dim=1)
     _dcp_finalize_topk_remap(
@@ -767,7 +770,7 @@ def _merge_dcp_topk_global(
         cp_interleave,
         row_starts,
     )
-    gathered = get_dcp_group().all_gather(packed, dim=1)
+    gathered = get_indexer_dcp_group().all_gather(packed, dim=1)
     stable_topk_from_gathered_candidates_cutedsl(
         gathered, topk_tokens, out=topk_indices
     )
@@ -1076,7 +1079,7 @@ def _merge_b12x_dcp_topk(
 
     from sparkinfer.attention.nsa_indexer.tiled_topk import run_row_topk
 
-    from vllm.distributed.parallel_state import get_dcp_group
+    from vllm.distributed.parallel_state import get_indexer_dcp_group
     from vllm.v1.attention.backends.mla.sparse_utils import (
         triton_convert_dcp_local_topk_to_global,
         triton_gather_topk_ids_by_position,
@@ -1111,7 +1114,7 @@ def _merge_b12x_dcp_topk(
     candidates[:, 0, :].copy_(topk_indices)
     candidates[:, 1, :].copy_(topk_scores.view(torch.int32))
 
-    dcp_group = get_dcp_group()
+    dcp_group = get_indexer_dcp_group()
     _dcp_all_gather_first_dim_into(
         dcp_group,
         candidates,
@@ -1758,7 +1761,7 @@ def sparse_attn_indexer(
     qs_rank = 0
     if envs.VLLM_DCP_QUERY_SPLIT and dcp_world_size > 1:
         try:
-            _qs = get_query_split_group()
+            _qs = get_indexer_query_split_group()
             if int(_qs.world_size) > 1:
                 qs_group = _qs
                 qs_world_size = int(_qs.world_size)
@@ -2393,6 +2396,7 @@ class SparseAttnIndexer(CustomOp):
         output_physical_slots: bool = False,
         num_q_heads: int | None = None,
         dcp_replicated: bool = False,
+        dcp_kv_shard_count: int | None = None,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -2414,8 +2418,21 @@ class SparseAttnIndexer(CustomOp):
         parallel_config = get_current_vllm_config().parallel_config
         self.dcp_replicated = bool(dcp_replicated)
         configured_dcp_world_size = parallel_config.decode_context_parallel_size
-        self.dcp_world_size = 1 if self.dcp_replicated else configured_dcp_world_size
-        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        self.dcp_world_size = (
+            1
+            if self.dcp_replicated
+            else int(dcp_kv_shard_count or configured_dcp_world_size)
+        )
+        if self.dcp_world_size > 1:
+            indexer_group = get_indexer_dcp_group()
+            if int(indexer_group.world_size) != self.dcp_world_size:
+                raise RuntimeError(
+                    "Sparse-indexer DCP group does not match its KV shard count: "
+                    f"group={indexer_group.world_size}, shards={self.dcp_world_size}"
+                )
+            self.dcp_rank = int(indexer_group.rank_in_group)
+        else:
+            self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.use_b12x_sparse_indexer = use_b12x_sparse_indexer()
         if self.output_physical_slots and not self.use_b12x_sparse_indexer:

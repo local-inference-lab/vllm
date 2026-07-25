@@ -8,7 +8,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed import get_dcp_group
+from vllm.distributed import get_indexer_dcp_group
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -30,7 +30,11 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    MLAAttentionSpec,
+    get_kv_cache_cp_shard_count,
+)
 
 logger = init_logger(__name__)
 
@@ -284,9 +288,12 @@ def get_indexer_max_num_blocks_per_req(
     block_size: int,
     configured_cp_world_size: int,
     dcp_replicated: bool,
+    dcp_kv_shard_count: int | None = None,
 ) -> int:
     """Size indexer metadata for the cache group's effective DCP layout."""
-    effective_cp_world_size = 1 if dcp_replicated else configured_cp_world_size
+    effective_cp_world_size = (
+        1 if dcp_replicated else int(dcp_kv_shard_count or configured_cp_world_size)
+    )
     return cdiv(max_model_len, block_size * effective_cp_world_size)
 
 
@@ -370,8 +377,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         configured_cp_world_size = (
             configured_dcp_world_size * parallel_config.prefill_context_parallel_size
         )
-        self.dcp_world_size = 1 if self.dcp_replicated else configured_dcp_world_size
-        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        self.dcp_world_size = get_kv_cache_cp_shard_count(
+            self.kv_cache_spec,
+            configured_dcp_world_size,
+            parallel_config.prefill_context_parallel_size,
+        )
+        if self.dcp_world_size > 1:
+            indexer_group = get_indexer_dcp_group()
+            if int(indexer_group.world_size) != self.dcp_world_size:
+                raise RuntimeError(
+                    "Indexer metadata DCP group does not match its KV shard count: "
+                    f"group={indexer_group.world_size}, shards={self.dcp_world_size}"
+                )
+            self.dcp_rank = int(indexer_group.rank_in_group)
+        else:
+            self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         # The DCP sparse-indexer code is parameterized by interleave size, but
         # interleave > 1 is not yet validated end-to-end (gsm8k parity fails),
@@ -472,6 +492,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             self.kv_cache_spec.block_size,
             configured_cp_world_size,
             self.dcp_replicated,
+            getattr(self.kv_cache_spec, "dcp_kv_shard_count", None),
         )
         # Keep the expanded decode table layout identical to the model
         # runner's block table. The runner right-pads rows to a 128-token

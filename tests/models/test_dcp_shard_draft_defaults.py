@@ -9,6 +9,7 @@ import torch
 import vllm.model_executor.models.deepseek_v2 as deepseek_v2
 from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV32IndexerCache,
+    _indexer_cache_dcp_shard_count,
     _replicate_indexer_cache_under_dcp,
 )
 
@@ -45,7 +46,15 @@ def _indexer_cache(layer_id: int = 78):
 
 def _get_indexer_spec(layer_id: int, config):
     cache = _indexer_cache(layer_id)
-    cache.dcp_replicated = _replicate_indexer_cache_under_dcp(cache.prefix, config)
+    configured_cp = (
+        config.parallel_config.decode_context_parallel_size
+        * config.parallel_config.prefill_context_parallel_size
+    )
+    cache.dcp_shard_count = _indexer_cache_dcp_shard_count(cache.prefix, config)
+    cache.dcp_replicated = configured_cp > 1 and cache.dcp_shard_count == 1
+    cache.dcp_kv_shard_count = (
+        cache.dcp_shard_count if 1 < cache.dcp_shard_count < configured_cp else None
+    )
     return cache, cache.get_kv_cache_spec(config)
 
 
@@ -90,6 +99,35 @@ def test_target_indexer_replication_equalizes_global_block_coverage(
 
     assert spec.dcp_replicated is True
     assert spec.block_size == dcp_size * cache.cache_config.block_size
+
+
+def test_target_indexer_partial_replication_uses_four_shards_under_dcp8(
+    monkeypatch,
+):
+    monkeypatch.delenv("VLLM_DCP_REPLICATE_INDEXER_CACHE", raising=False)
+    monkeypatch.setenv("VLLM_DCP_INDEXER_SHARDS", "4")
+    monkeypatch.setattr(deepseek_v2, "use_b12x_sparse_indexer", lambda: True)
+
+    cache, spec = _get_indexer_spec(12, _vllm_config(dcp_size=8))
+
+    assert cache.dcp_shard_count == 4
+    assert spec.dcp_replicated is False
+    assert spec.dcp_kv_shard_count == 4
+    assert spec.block_size == 2 * cache.cache_config.block_size
+    assert spec.block_size * spec.dcp_kv_shard_count == 8 * 256
+
+
+@pytest.mark.parametrize("shards", [3, 5, 6, 7, 9])
+def test_target_indexer_partial_replication_requires_dcp_divisor(
+    monkeypatch, shards: int
+):
+    monkeypatch.setenv("VLLM_DCP_INDEXER_SHARDS", str(shards))
+    monkeypatch.setattr(deepseek_v2, "use_b12x_sparse_indexer", lambda: True)
+
+    with pytest.raises(ValueError, match="positive divisor"):
+        _indexer_cache_dcp_shard_count(
+            "model.layers.12.indexer.k_cache", _vllm_config(dcp_size=8)
+        )
 
 
 def test_target_indexer_replication_rejects_pcp(monkeypatch):
@@ -148,6 +186,7 @@ def test_indexer_constructor_forwards_cache_replication(monkeypatch):
         def __init__(self, *args, **kwargs):
             super().__init__()
             self.dcp_replicated = True
+            self.dcp_kv_shard_count = None
 
     def fake_sparse_attn_indexer(*args, **kwargs):
         captured["args"] = args
@@ -197,3 +236,4 @@ def test_indexer_constructor_forwards_cache_replication(monkeypatch):
     assert isinstance(sparse_kwargs, dict)
     assert sparse_args[0] is indexer.k_cache
     assert sparse_kwargs["dcp_replicated"] is True
+    assert sparse_kwargs["dcp_kv_shard_count"] is None

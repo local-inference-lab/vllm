@@ -56,7 +56,7 @@ def test_replicated_builder_uses_global_lengths_without_dcp_localization(monkeyp
     def fail_dcp_path(*args, **kwargs):
         pytest.fail("replicated indexer metadata must not enter DCP localization")
 
-    monkeypatch.setattr(indexer_backend, "get_dcp_group", fail_dcp_path)
+    monkeypatch.setattr(indexer_backend, "get_indexer_dcp_group", fail_dcp_path)
     monkeypatch.setattr(indexer_backend, "num_compute_units", lambda device: 4)
     monkeypatch.setattr(indexer_backend.envs, "VLLM_USE_B12X_SPARSE_INDEXER", True)
 

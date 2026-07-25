@@ -239,7 +239,7 @@ def test_mixed_mla_groups_share_block_ids_hashes_and_eviction_order():
         manager.block_pool.blocks[block_id].ref_cnt == 2 for block_id in target_ids
     )
 
-    for block_hash, block_id in zip(request.block_hashes, target_ids):
+    for block_hash, block_id in zip(request.block_hashes, target_ids, strict=True):
         group_keys = [
             make_block_hash_with_group_id(block_hash, group_id) for group_id in range(2)
         ]

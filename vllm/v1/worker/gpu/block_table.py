@@ -332,8 +332,11 @@ def _compute_slot_mappings_kernel(
             if group_cp_size == 1:
                 slot_ids = block_numbers * block_size + block_offsets
             else:
-                is_local = block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
-                rounds = block_offsets // (CP_INTERLEAVE * CP_SIZE)
+                group_cp_rank = cp_rank % group_cp_size
+                is_local = (
+                    block_offsets // CP_INTERLEAVE % group_cp_size == group_cp_rank
+                )
+                rounds = block_offsets // (CP_INTERLEAVE * group_cp_size)
                 remainder = block_offsets % CP_INTERLEAVE
                 local_offsets = rounds * CP_INTERLEAVE + remainder
                 slot_ids = block_numbers * block_size + local_offsets

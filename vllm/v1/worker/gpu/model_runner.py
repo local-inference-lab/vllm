@@ -56,7 +56,11 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    MambaSpec,
+    get_kv_cache_cp_shard_count,
+)
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.utils import record_function_or_nullcontext
@@ -515,8 +519,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # As a result, one block on the current rank covers `block_size * cp_size`
             # tokens in the full, global (unsharded) sequence. dcp_replicated
             # groups keep the full cache on every rank instead.
-            group_cp_size = (
-                1 if getattr(spec, "dcp_replicated", False) else self.dcp_size
+            group_cp_size = get_kv_cache_cp_shard_count(
+                spec,
+                self.dcp_size,
+                self.parallel_config.prefill_context_parallel_size,
             )
             group_cp_sizes.append(group_cp_size)
             max_num_blocks = cdiv(

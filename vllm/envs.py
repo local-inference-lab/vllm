@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
     VLLM_DCP_SHARD_DRAFT: str | None = None
     VLLM_DCP_REPLICATE_INDEXER_CACHE: bool = False
+    VLLM_DCP_INDEXER_SHARDS: int = 0
     VLLM_DCP_GLOBAL_TOPK: bool = True
     VLLM_DCP_QUERY_SPLIT: bool = False
     VLLM_DCP_TOPK_OWNER_MERGE: bool = False
@@ -1169,6 +1170,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_DCP_REPLICATE_INDEXER_CACHE", "0").lower()
         in ("1", "true", "yes", "on")
     ),
+    # Number of unique sparse-indexer KV shards inside each configured DCP
+    # group. Zero keeps the configured DCP size; one fully replicates the
+    # cache. Intermediate divisors create replicated shard groups (for
+    # example, 4 under DCP8 creates two replicas of four shards).
+    "VLLM_DCP_INDEXER_SHARDS": lambda: int(os.getenv("VLLM_DCP_INDEXER_SHARDS", "0")),
     # Under DCP, gather sparse-indexer logits across ranks and select a global
     # top-k instead of a per-rank local top-k.
     "VLLM_DCP_GLOBAL_TOPK": lambda: (

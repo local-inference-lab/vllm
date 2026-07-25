@@ -54,7 +54,7 @@ def test_replicated_constructor_uses_single_rank_without_dcp_group(monkeypatch):
             )
         ),
     )
-    monkeypatch.setattr(indexer_mod, "get_dcp_group", fail_dcp_group)
+    monkeypatch.setattr(indexer_mod, "get_indexer_dcp_group", fail_dcp_group)
     monkeypatch.setattr(indexer_mod, "use_b12x_sparse_indexer", lambda: True)
 
     indexer = indexer_mod.SparseAttnIndexer(

@@ -33,6 +33,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_cp_shard_count,
+    has_nondefault_kv_cp_layout,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -647,14 +649,19 @@ def resolve_kv_cache_block_sizes(
     pcp = vllm_config.parallel_config.prefill_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
 
-    if len(groups) <= 1:  # Single group: block_size * dcp * pcp
-        bs = cache_config.block_size * dcp * pcp
+    if len(groups) <= 1:
+        spec = groups[0].kv_cache_spec
+        bs = (
+            spec.block_size * get_kv_cache_cp_shard_count(spec, dcp, pcp)
+            if isinstance(spec, AttentionSpec)
+            else spec.block_size
+        )
         return bs, bs
 
     group_block_sizes = [
-        g.kv_cache_spec.block_size * dcp * pcp
+        g.kv_cache_spec.block_size
+        * get_kv_cache_cp_shard_count(g.kv_cache_spec, dcp, pcp)
         if isinstance(g.kv_cache_spec, AttentionSpec)
-        and not getattr(g.kv_cache_spec, "dcp_replicated", False)
         else g.kv_cache_spec.block_size
         for g in groups
     ]
@@ -1341,14 +1348,16 @@ def _is_lockstep_mla_spec_layout(
     if not all(isinstance(spec, MLAAttentionSpec) for spec in specs):
         return False
 
-    replication_modes = {bool(getattr(spec, "dcp_replicated", False)) for spec in specs}
-    global_block_sizes = {
-        spec.block_size
-        if getattr(spec, "dcp_replicated", False)
-        else spec.block_size * cp_world_size
+    shard_counts = {
+        get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size)
         for spec in specs
     }
-    return replication_modes == {False, True} and len(global_block_sizes) == 1
+    global_block_sizes = {
+        spec.block_size
+        * get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size)
+        for spec in specs
+    }
+    return len(shard_counts) > 1 and len(global_block_sizes) == 1
 
 
 def _use_lockstep_mla_allocation(
@@ -1368,10 +1377,11 @@ def _use_lockstep_mla_allocation(
             if isinstance(group_spec, UniformTypeKVCacheSpecs)
             else [group_spec]
         )
-        group_modes = {
-            bool(getattr(spec, "dcp_replicated", False)) for spec in group_layer_specs
+        group_layouts = {
+            get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size)
+            for spec in group_layer_specs
         }
-        if len(group_modes) != 1:
+        if len(group_layouts) != 1:
             return False
         layer_specs.extend(group_layer_specs)
 
@@ -1677,14 +1687,14 @@ def group_and_unify_kv_cache_specs(
     lockstep_mla_layout = _is_lockstep_mla_spec_layout(
         kv_cache_spec.values(), dcp_world_size, pcp_world_size
     )
-    # Replicated layers need a group separate from sharded layers because they
-    # have different token ownership and block-table semantics.
-    has_repl = any(
-        getattr(spec, "dcp_replicated", False)
+    # Any non-default CP layout needs a group separate from normally sharded
+    # layers because token ownership and block-table semantics differ.
+    has_custom_cp = any(
+        has_nondefault_kv_cp_layout(spec, dcp_world_size, pcp_world_size)
         and (not isinstance(spec, MLAAttentionSpec) or lockstep_mla_layout)
         for spec in kv_cache_spec.values()
     )
-    if not (has_swa or has_repl):
+    if not (has_swa or has_custom_cp):
         return None
 
     # Other uniform page layouts do not need tuple packing.
@@ -1696,11 +1706,11 @@ def group_and_unify_kv_cache_specs(
     grouped_swa_mla_specs: dict[tuple[int, int, bool, bool], dict[str, KVCacheSpec]] = (
         defaultdict(dict)
     )
-    # Keep incompatible replicated types and page layouts separate. This
-    # includes DFlash drafts and replicated MLA indexer caches.
-    grouped_repl_specs: dict[
-        tuple[int] | tuple[str, int, int], dict[str, KVCacheSpec]
-    ] = defaultdict(dict)
+    # Keep incompatible custom-CP types and page layouts separate. This
+    # includes DFlash drafts and partially/fully replicated MLA indexer caches.
+    grouped_repl_specs: dict[tuple[Any, ...], dict[str, KVCacheSpec]] = defaultdict(
+        dict
+    )
     # NOTE: Here we group SWA layers by (block_size, sliding_window,
     # dcp_replicated, dcp_sharded), which separates SWA layers, C4I+C4A
     # layers, C128A layers, and replicated compressor-state groups.
@@ -1714,11 +1724,16 @@ def group_and_unify_kv_cache_specs(
                     spec.dcp_sharded,
                 )
             ][name] = spec
-        elif getattr(spec, "dcp_replicated", False) and (
+        elif has_nondefault_kv_cp_layout(spec, dcp_world_size, pcp_world_size) and (
             not isinstance(spec, MLAAttentionSpec) or lockstep_mla_layout
         ):
             key = (
-                (type(spec).__name__, spec.block_size, spec.page_size_bytes)
+                (
+                    type(spec).__name__,
+                    spec.block_size,
+                    spec.page_size_bytes,
+                    get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size),
+                )
                 if isinstance(spec, MLAAttentionSpec)
                 else (spec.block_size,)
             )
@@ -1842,12 +1857,15 @@ def _get_kv_cache_groups_uniform_groups(
     for sm_spec in swa_mla_specs:
         sm_page_sizes = sm_spec.get_page_sizes()
         layers_per_size: dict[int, list[str]] = defaultdict(list)
-        is_replicated_mla = all(
+        is_nondefault_cp_mla = all(
             isinstance(spec, MLAAttentionSpec)
-            and getattr(spec, "dcp_replicated", False)
+            and (
+                getattr(spec, "dcp_replicated", False)
+                or getattr(spec, "dcp_kv_shard_count", None) is not None
+            )
             for spec in sm_spec.kv_cache_specs.values()
         )
-        if not is_replicated_mla:
+        if not is_nondefault_cp_mla:
             assert max(sm_page_sizes) <= max(all_page_sizes)
 
         # Unify page size by padding layers' page_size to the nearest larger page_size.
@@ -1859,7 +1877,7 @@ def _get_kv_cache_groups_uniform_groups(
         # Pad and collect layer names per page size.
         for layer_name, layer_spec in sm_spec.kv_cache_specs.items():
             current_size = layer_spec.page_size_bytes
-            if is_replicated_mla:
+            if is_nondefault_cp_mla:
                 candidate = current_size
             else:
                 assert current_size <= max(all_page_sizes)

@@ -758,9 +758,7 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         """Reduce-scatter and preserve a physically head-major output view."""
         if self.world_size <= 1 or dim != 1:
-            raise RuntimeError(
-                "reduce_scatter_head_major requires DCP heads on dim 1"
-            )
+            raise RuntimeError("reduce_scatter_head_major requires DCP heads on dim 1")
         if self.device_communicator is None:
             raise RuntimeError(
                 "reduce_scatter_head_major requires a device communicator"
@@ -1447,6 +1445,46 @@ def get_query_split_group() -> GroupCoordinator:
     return _QUERY_SPLIT
 
 
+_INDEXER_DCP: GroupCoordinator | None = None
+
+
+def get_indexer_dcp_group() -> GroupCoordinator:
+    """Return the sparse-indexer shard group, or the configured DCP group."""
+    return _INDEXER_DCP if _INDEXER_DCP is not None else get_dcp_group()
+
+
+_INDEXER_QUERY_SPLIT: GroupCoordinator | None = None
+
+
+def get_indexer_query_split_group() -> GroupCoordinator:
+    if _INDEXER_QUERY_SPLIT is not None:
+        return _INDEXER_QUERY_SPLIT
+    return get_query_split_group()
+
+
+def _build_indexer_replica_group_ranks(
+    tp_group_ranks: list[list[int]], indexer_shards: int
+) -> tuple[list[list[int]], list[list[int]]]:
+    """Build shard-owner groups and cross-replica query-split groups."""
+    dcp_groups: list[list[int]] = []
+    query_split_groups: list[list[int]] = []
+    for tp_ranks in tp_group_ranks:
+        if indexer_shards <= 0 or len(tp_ranks) % indexer_shards != 0:
+            raise ValueError(
+                f"Indexer shards={indexer_shards} must divide TP={len(tp_ranks)}"
+            )
+        replicas = [
+            tp_ranks[start : start + indexer_shards]
+            for start in range(0, len(tp_ranks), indexer_shards)
+        ]
+        dcp_groups.extend(replicas)
+        query_split_groups.extend(
+            [replica[shard_rank] for replica in replicas]
+            for shard_rank in range(indexer_shards)
+        )
+    return dcp_groups, query_split_groups
+
+
 _DCP_CKV_PREFETCH: GroupCoordinator | None = None
 
 
@@ -1946,6 +1984,7 @@ def initialize_model_parallel(
     if enable_elastic_ep:
         group_ranks = local_all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
         group_ranks = [x.tolist() for x in group_ranks]
+    tp_group_ranks = group_ranks
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
         group_ranks,
@@ -1994,6 +2033,36 @@ def initialize_model_parallel(
             backend,
             group_name="query_split",
         )
+
+    # A partially replicated sparse-indexer cache has its own shard topology.
+    # With TP8/DCP8 and four indexer shards, these are {0,1,2,3}/{4,5,6,7};
+    # ranks at the same position form two-way query-split groups.
+    global _INDEXER_DCP, _INDEXER_QUERY_SPLIT
+    assert _INDEXER_DCP is None, "indexer DCP group is already initialized"
+    assert _INDEXER_QUERY_SPLIT is None, (
+        "indexer query split group is already initialized"
+    )
+    indexer_shards = int(envs.VLLM_DCP_INDEXER_SHARDS)
+    if (
+        1 < indexer_shards < decode_context_model_parallel_size
+        and decode_context_model_parallel_size % indexer_shards == 0
+    ):
+        indexer_dcp_ranks, indexer_query_split_ranks = (
+            _build_indexer_replica_group_ranks(tp_group_ranks, indexer_shards)
+        )
+        _INDEXER_DCP = init_model_parallel_group(
+            indexer_dcp_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="indexer_dcp",
+        )
+        if envs.VLLM_DCP_QUERY_SPLIT:
+            _INDEXER_QUERY_SPLIT = init_model_parallel_group(
+                indexer_query_split_ranks,
+                get_world_group().local_rank,
+                backend,
+                group_name="indexer_query_split",
+            )
 
     # A dedicated communicator over the DCP ranks for the transient ckv
     # prefetch gather (Fix B). The prefetch runs on a side stream and would
@@ -2239,6 +2308,16 @@ def destroy_model_parallel():
     if _QUERY_SPLIT:
         _QUERY_SPLIT.destroy()
     _QUERY_SPLIT = None
+
+    global _INDEXER_DCP
+    if _INDEXER_DCP:
+        _INDEXER_DCP.destroy()
+    _INDEXER_DCP = None
+
+    global _INDEXER_QUERY_SPLIT
+    if _INDEXER_QUERY_SPLIT:
+        _INDEXER_QUERY_SPLIT.destroy()
+    _INDEXER_QUERY_SPLIT = None
 
     global _DCP_CKV_PREFETCH
     if _DCP_CKV_PREFETCH:

@@ -223,3 +223,56 @@ def test_compute_slot_mappings_mixed_sharded_and_replicated_groups():
         ],
         list(range(1280, 1288)),
     ]
+
+
+def test_compute_slot_mappings_partial_replica_pairs_share_four_way_shard():
+    device = torch.device("cuda")
+
+    def compute_for_rank(cp_rank: int) -> list[int]:
+        block_tables = BlockTables(
+            block_sizes=[128],
+            max_num_reqs=1,
+            max_num_batched_tokens=16,
+            max_num_blocks_per_group=[1],
+            device=device,
+            kernel_block_sizes=[64],
+            cp_size=8,
+            cp_rank=cp_rank,
+            group_cp_sizes=[4],
+        )
+        block_tables.append_block_ids(
+            req_index=0,
+            new_block_ids=([5],),
+            overwrite=True,
+        )
+        block_tables.apply_staged_writes()
+        result = block_tables.compute_slot_mappings(
+            torch.tensor([0], dtype=torch.int32, device=device),
+            torch.tensor([0, 16], dtype=torch.int32, device=device),
+            torch.arange(16, dtype=torch.int64, device=device),
+            num_tokens_padded=16,
+        )
+        torch.accelerator.synchronize()
+        return result[0].cpu().tolist()
+
+    rank0 = compute_for_rank(0)
+    rank4 = compute_for_rank(4)
+    assert rank0 == rank4
+    assert rank0 == [
+        640,
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+        641,
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+        642,
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+        643,
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+    ]
