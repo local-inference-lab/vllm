@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 
+from vllm.distributed import parallel_state
 from vllm.distributed.parallel_state import _build_indexer_replica_group_ranks
 
 
@@ -41,3 +44,29 @@ def test_build_indexer_replica_groups_stay_inside_each_tp_group():
 def test_build_indexer_replica_groups_rejects_non_divisor():
     with pytest.raises(ValueError, match="must divide"):
         _build_indexer_replica_group_ranks([list(range(8))], 3)
+
+
+def test_indexer_group_selector_supports_partial_target_and_full_draft(monkeypatch):
+    partial_dcp = SimpleNamespace(world_size=2)
+    full_dcp = SimpleNamespace(world_size=4)
+    partial_query_split = SimpleNamespace(world_size=4)
+    full_query_split = SimpleNamespace(world_size=2)
+    monkeypatch.setattr(parallel_state, "_INDEXER_DCP", partial_dcp)
+    monkeypatch.setattr(parallel_state, "_DCP", full_dcp)
+    monkeypatch.setattr(parallel_state, "_INDEXER_QUERY_SPLIT", partial_query_split)
+    monkeypatch.setattr(parallel_state, "_QUERY_SPLIT", full_query_split)
+
+    assert parallel_state.get_indexer_dcp_group(2) is partial_dcp
+    assert parallel_state.get_indexer_dcp_group(4) is full_dcp
+    assert parallel_state.get_indexer_query_split_group(2) is partial_query_split
+    assert parallel_state.get_indexer_query_split_group(4) is full_query_split
+
+
+def test_indexer_group_selector_rejects_unknown_shard_count(monkeypatch):
+    monkeypatch.setattr(parallel_state, "_INDEXER_DCP", SimpleNamespace(world_size=2))
+    monkeypatch.setattr(parallel_state, "_DCP", SimpleNamespace(world_size=4))
+
+    with pytest.raises(RuntimeError, match="requested=3, partial=2, configured=4"):
+        parallel_state.get_indexer_dcp_group(3)
+    with pytest.raises(RuntimeError, match="requested=3, partial=2, configured=4"):
+        parallel_state.get_indexer_query_split_group(3)

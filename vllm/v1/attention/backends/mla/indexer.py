@@ -383,7 +383,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             parallel_config.prefill_context_parallel_size,
         )
         if self.dcp_world_size > 1:
-            indexer_group = get_indexer_dcp_group()
+            indexer_group = get_indexer_dcp_group(self.dcp_world_size)
             if int(indexer_group.world_size) != self.dcp_world_size:
                 raise RuntimeError(
                     "Indexer metadata DCP group does not match its KV shard count: "
