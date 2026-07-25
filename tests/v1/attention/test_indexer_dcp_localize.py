@@ -347,8 +347,8 @@ def _merge_local_topks_global_with_fake_dcp(
         )
 
     fake_group = _FakeDCPGroup(torch.cat(packed_per_rank, dim=1).contiguous())
-    original_get_dcp_group = sparse_indexer.get_dcp_group
-    sparse_indexer.get_dcp_group = lambda: fake_group
+    original_get_indexer_dcp_group = sparse_indexer.get_indexer_dcp_group
+    sparse_indexer.get_indexer_dcp_group = lambda expected_world_size=None: fake_group
     try:
         merged = []
         for rank, (logits, indices) in enumerate(zip(local_logits, local_topks)):
@@ -366,7 +366,7 @@ def _merge_local_topks_global_with_fake_dcp(
             merged.append(rank_indices)
         return merged
     finally:
-        sparse_indexer.get_dcp_group = original_get_dcp_group
+        sparse_indexer.get_indexer_dcp_group = original_get_indexer_dcp_group
 
 
 @pytest.mark.parametrize("world", [1, 2, 4, 6, 8])
