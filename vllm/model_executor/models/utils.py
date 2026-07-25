@@ -796,11 +796,40 @@ def get_draft_quant_config(vllm_config: VllmConfig) -> "QuantizationConfig | Non
     draft_model_config = vllm_config.speculative_config.draft_model_config
     draft_load_config = vllm_config.load_config
 
-    return (
-        VllmConfig.get_quantization_config(draft_model_config, draft_load_config)
-        if draft_model_config
-        else None
+    if not draft_model_config:
+        return None
+
+    quant_config = VllmConfig.get_quantization_config(
+        draft_model_config, draft_load_config
     )
+
+    # EXL3 rank-sliced (hybrid_tr3_tail) metadata is hydrated by VllmConfig via
+    # Exl3Config.maybe_update_config() for the *target* model only. The draft/MTP
+    # quant config is built separately here, so without this call its
+    # rank_sliced_metadata stays None and a rank-sliced MTP MoE layer silently
+    # falls back to the stock (non-tr3) expert path, KeyError-ing on
+    # `...experts.routed_experts.wN_rankR.mcg`. Mirror the target-model call so
+    # the MTP layer's experts load through the tr3 path.
+    if (
+        quant_config is not None
+        and getattr(quant_config, "get_name", lambda: None)() == "exl3"
+    ):
+        draft_hf = getattr(draft_model_config, "hf_config", None)
+        target_hf = getattr(
+            getattr(vllm_config, "model_config", None), "hf_config", None
+        )
+        hf_config = draft_hf
+        if (
+            getattr(draft_hf, "hybrid_tr3_tail", None) is None
+            and getattr(target_hf, "hybrid_tr3_tail", None) is not None
+        ):
+            hf_config = target_hf
+        quant_config.maybe_update_config(
+            draft_model_config.model,
+            hf_config=hf_config,
+        )
+
+    return quant_config
 
 
 def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
