@@ -128,3 +128,58 @@ def test_rank_sliced_parameter_preallocates_projection_major_slab(monkeypatch):
     )
     torch.testing.assert_close(param.exl3_tensors[(1, "w1")], w1)
     torch.testing.assert_close(param.exl3_tensors[(2, "w3")], w3)
+
+
+def test_rank_sliced_runtime_scope_is_per_owning_model():
+    """Target and rank-sliced MTP draft layers must not share a cached runtime.
+
+    The rank-sliced runtime cache stores mutable Trellis/prefill scratch and
+    parity staging buffers. A target MoE layer and an MTP draft layer of the same
+    model have identical shapes, topk and planner settings, so a shape-only key
+    would hand the draft the target's scratch and break the target/draft
+    isolation their independently captured CUDA graphs depend on.
+    """
+    target_config = SimpleNamespace()
+    draft_config = SimpleNamespace()
+
+    target_scope = exl3_module._runtime_scope_id(target_config)
+    draft_scope = exl3_module._runtime_scope_id(draft_config)
+
+    # Distinct owning configs must never collide...
+    assert target_scope != draft_scope
+    # ...and the scope must be stable, so every layer of one model keeps sharing
+    # a single runtime (the prefill arena is ~1 GiB; per-layer runtimes would not
+    # fit on a 75+ layer model).
+    assert exl3_module._runtime_scope_id(target_config) == target_scope
+    assert exl3_module._runtime_scope_id(draft_config) == draft_scope
+
+
+def test_rank_sliced_runtime_key_differs_across_models_with_same_shape():
+    """Two same-shape layers owned by different models get different cache keys."""
+
+    def _key(quant_config):
+        # Mirrors the scope-prefixed key built in Exl3MoEMethod._rank_sliced_runtime
+        # for two layers whose shape/planner components are byte-for-byte equal.
+        return (
+            exl3_module._runtime_scope_id(quant_config),
+            0,  # device index
+            torch.bfloat16,
+            5120,  # hidden size
+            768,  # intermediate size per partition
+            64,  # local experts
+            8,  # topk
+            3072,  # max batched tokens
+        )
+
+    target_config = SimpleNamespace()
+    draft_config = SimpleNamespace()
+
+    target_key = _key(target_config)
+    draft_key = _key(draft_config)
+
+    assert target_key != draft_key
+    # Everything except the leading scope is identical, proving the scope is the
+    # only thing preventing the collision.
+    assert target_key[1:] == draft_key[1:]
+    # Same owner -> same key, so target layers still share one runtime.
+    assert _key(target_config) == target_key

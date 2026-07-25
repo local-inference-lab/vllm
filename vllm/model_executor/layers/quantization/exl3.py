@@ -68,6 +68,41 @@ _HADAMARD_BLOCK = 128
 _EXL3_EXT: Any | None = None
 _SPARKINFER_TRELLIS_API: Any | None = None
 _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
+_NEXT_RUNTIME_SCOPE_ID = 0
+
+
+def _runtime_scope_id(quant_config: Any) -> int:
+    """Stable identity for the model that owns a rank-sliced runtime.
+
+    A cached runtime owns mutable Trellis/prefill scratch plus parity staging and
+    sort buffers, so an entry must never be shared across models. A target MoE
+    layer and a rank-sliced MTP draft layer have identical shapes, topk and
+    planner settings -- both read ``max_num_batched_tokens`` from the same
+    scheduler config -- so a shape-only key makes the draft reuse the target's
+    scratch. That defeats the target/draft resource isolation their
+    independently captured CUDA graphs rely on.
+
+    Scoping by the owning quant config is deliberately coarser than per-layer:
+    the draft is built with its own ``Exl3Config`` while every layer of one model
+    shares a single config, so each model gets exactly one runtime. The prefill
+    arena alone is ~1 GiB, so per-layer runtimes would cost tens of GiB per rank
+    on a 75+ layer model and are not affordable.
+    """
+    global _NEXT_RUNTIME_SCOPE_ID
+    scope = getattr(quant_config, "_exl3_runtime_scope_id", None)
+    if scope is not None:
+        return scope
+    scope = _NEXT_RUNTIME_SCOPE_ID
+    _NEXT_RUNTIME_SCOPE_ID += 1
+    try:
+        quant_config._exl3_runtime_scope_id = scope
+    except AttributeError:
+        # Frozen/slotted config: fall back to object identity. Configs live for
+        # the process lifetime, so reuse-after-GC aliasing is not a concern here.
+        return id(quant_config)
+    return scope
+
+
 _RANK_SLICED_FORMAT = "exl3-trellis"
 _RANK_SLICED_WEIGHT_RE = re.compile(
     r"^(?P<prefix>.+)\.rank(?P<rank>\d+)\."
@@ -1385,6 +1420,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         topk = int(topk_ids.shape[1])
         device_index = x.device.index
         key = (
+            # Owning model scope first: the cached runtime holds mutable scratch,
+            # so a target layer and a same-shape rank-sliced MTP draft layer must
+            # not share an entry (see _runtime_scope_id).
+            _runtime_scope_id(self.quant_config),
             device_index,
             x.dtype,
             int(layer.exl3_hidden_size),
