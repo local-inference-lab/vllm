@@ -12,7 +12,7 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.distributed import (
     get_indexer_dcp_group,
-    get_indexer_query_split_group,
+    get_query_split_group,
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
@@ -1766,15 +1766,19 @@ def sparse_attn_indexer(
     qs_group = None
     qs_world_size = 1
     qs_rank = 0
-    if envs.VLLM_DCP_QUERY_SPLIT and dcp_world_size > 1:
-        try:
-            _qs = get_indexer_query_split_group(dcp_world_size)
-            if int(_qs.world_size) > 1:
-                qs_group = _qs
-                qs_world_size = int(_qs.world_size)
-                qs_rank = int(_qs.rank_in_group)
-        except Exception:
-            pass
+    if envs.VLLM_DCP_QUERY_SPLIT:
+        from vllm.distributed import parallel_state
+
+        selector = getattr(parallel_state, "get_indexer_query_split_group", None)
+        _qs = (
+            selector(dcp_world_size)
+            if selector is not None
+            else get_query_split_group()
+        )
+        if int(_qs.world_size) > 1:
+            qs_group = _qs
+            qs_world_size = int(_qs.world_size)
+            qs_rank = int(_qs.rank_in_group)
     if output_physical_slots:
         if not _use_b12x_sparse_indexer(use_b12x_sparse_indexer):
             raise RuntimeError(
