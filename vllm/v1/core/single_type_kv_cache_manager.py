@@ -387,6 +387,31 @@ class SingleTypeKVCacheManager(ABC):
         self._pending_cow_copies = []
         return pending_copies
 
+    def pending_cow_block_index(self, request_id: str) -> int | None:
+        """Return the pending partial-hit CoW index without consuming it."""
+        partial_hit = self._partial_hit_reqs.get(request_id)
+        return partial_hit[0] if partial_hit is not None else None
+
+    def apply_lockstep_cow(
+        self,
+        request_id: str,
+        block_idx: int,
+        cow_block: KVCacheBlock,
+    ) -> None:
+        """Mirror a peer manager's CoW substitution using the same block ID.
+
+        The primary manager owns the physical copy operation. A lockstep peer
+        only transfers its request reference from the shared source block to
+        the already allocated destination block.
+        """
+        pending_idx, source_block = self._partial_hit_reqs.pop(request_id)
+        assert pending_idx == block_idx
+        req_blocks = self.req_to_blocks[request_id]
+        assert req_blocks[block_idx] is source_block
+        self.block_pool.touch([cow_block])
+        req_blocks[block_idx] = cow_block
+        self.block_pool.free_blocks([source_block])
+
     def _apply_cow(
         self,
         request_id: str,

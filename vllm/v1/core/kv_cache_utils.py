@@ -1735,7 +1735,7 @@ def group_and_unify_kv_cache_specs(
                     get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size),
                 )
                 if isinstance(spec, MLAAttentionSpec)
-                else (spec.block_size,)
+                else (type(spec).__name__, spec.block_size)
             )
             grouped_repl_specs[key][name] = spec
         elif isinstance(spec, MLAAttentionSpec):

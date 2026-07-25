@@ -177,7 +177,9 @@ def make_kv_cache_config_hybrid_model(
     )
 
 
-def make_lockstep_mla_manager(num_blocks: int = 5) -> KVCacheManager:
+def make_lockstep_mla_manager(
+    num_blocks: int = 5, hash_block_size: int = 256
+) -> KVCacheManager:
     global_block_size = 256
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
@@ -208,7 +210,7 @@ def make_lockstep_mla_manager(num_blocks: int = 5) -> KVCacheManager:
         kv_cache_config=kv_cache_config,
         max_model_len=4 * global_block_size,
         scheduler_block_size=global_block_size,
-        hash_block_size=global_block_size,
+        hash_block_size=hash_block_size,
         enable_caching=True,
         dcp_world_size=4,
     )
@@ -293,6 +295,65 @@ def test_mixed_mla_groups_share_block_ids_hashes_and_eviction_order():
     assert evicted.block_id == target_ids[-1]
     assert manager.block_pool.get_cached_block(request.block_hashes[-1], [0]) is None
     assert manager.block_pool.get_cached_block(request.block_hashes[-1], [1]) is None
+
+
+def test_lockstep_mla_partial_prefix_hit_mirrors_single_cow_block():
+    hash_block_size = 64
+    manager = make_lockstep_mla_manager(num_blocks=6, hash_block_size=hash_block_size)
+    # Exercise the fine-grained lookup contract directly. Production DCP
+    # currently keeps this policy disabled, but lockstep allocation must still
+    # preserve group identity when such a hit is supplied.
+    manager.coordinator.enable_partial_hash_hits = True
+    owner = make_request(
+        "owner",
+        list(range(6 * hash_block_size)),
+        hash_block_size,
+        sha256,
+    )
+    assert manager.allocate_slots(owner, 6 * hash_block_size) is not None
+    owner_ids = manager.get_block_ids(owner.request_id)
+    assert owner_ids[0] == owner_ids[1]
+    source_block_id = owner_ids[0][1]
+    manager.free(owner)
+    manager.new_step_starts()
+
+    replay = make_request(
+        "replay",
+        list(range(8 * hash_block_size)),
+        hash_block_size,
+        sha256,
+    )
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(replay)
+    assert num_computed_tokens == 6 * hash_block_size
+    assert computed_blocks.get_block_ids() == (
+        list(owner_ids[0]),
+        list(owner_ids[1]),
+    )
+
+    new_blocks = manager.allocate_slots(
+        replay,
+        num_new_tokens=2 * hash_block_size,
+        num_new_computed_tokens=num_computed_tokens,
+        new_computed_blocks=computed_blocks,
+    )
+    assert new_blocks is not None
+    replay_ids = manager.get_block_ids(replay.request_id)
+    assert replay_ids[0] == replay_ids[1]
+    assert len(replay_ids[0]) == 2
+    cow_block_id = replay_ids[0][1]
+    assert cow_block_id != source_block_id
+    assert new_blocks.get_block_ids() == ([cow_block_id], [cow_block_id])
+
+    copies, retained = manager.take_kv_cache_block_copies()
+    assert [(copy.src_block_id, copy.dst_block_id) for copy in copies] == [
+        (source_block_id, cow_block_id)
+    ]
+    assert [block.block_id for block in retained] == [source_block_id, cow_block_id]
+    assert manager.block_pool.blocks[source_block_id].ref_cnt == 1
+    assert manager.block_pool.blocks[cow_block_id].ref_cnt == 3
+    manager.block_pool.free_blocks(retained)
+    assert manager.block_pool.blocks[source_block_id].ref_cnt == 0
+    assert manager.block_pool.blocks[cow_block_id].ref_cnt == 2
 
 
 def test_lockstep_mla_allocates_external_computed_blocks_once():

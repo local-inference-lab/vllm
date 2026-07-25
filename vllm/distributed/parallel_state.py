@@ -1531,6 +1531,17 @@ def _build_indexer_replica_group_ranks(
     return dcp_groups, query_split_groups
 
 
+def _validate_indexer_shard_count(indexer_shards: int, dcp_size: int) -> None:
+    """Reject partial-indexer layouts that cannot form equal replica groups."""
+    if indexer_shards in (0, 1, dcp_size):
+        return
+    if indexer_shards < 1 or indexer_shards > dcp_size or dcp_size % indexer_shards:
+        raise ValueError(
+            "VLLM_DCP_INDEXER_SHARDS must be 0, 1, or a positive divisor of "
+            f"the configured DCP size; got shards={indexer_shards}, DCP={dcp_size}"
+        )
+
+
 _DCP_CKV_PREFETCH: GroupCoordinator | None = None
 
 
@@ -2089,10 +2100,8 @@ def initialize_model_parallel(
         "indexer query split group is already initialized"
     )
     indexer_shards = int(envs.VLLM_DCP_INDEXER_SHARDS)
-    if (
-        1 < indexer_shards < decode_context_model_parallel_size
-        and decode_context_model_parallel_size % indexer_shards == 0
-    ):
+    _validate_indexer_shard_count(indexer_shards, decode_context_model_parallel_size)
+    if 1 < indexer_shards < decode_context_model_parallel_size:
         indexer_dcp_ranks, indexer_query_split_ranks = (
             _build_indexer_replica_group_ranks(tp_group_ranks, indexer_shards)
         )

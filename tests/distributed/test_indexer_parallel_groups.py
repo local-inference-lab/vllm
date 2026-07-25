@@ -6,7 +6,10 @@ from types import SimpleNamespace
 import pytest
 
 from vllm.distributed import parallel_state
-from vllm.distributed.parallel_state import _build_indexer_replica_group_ranks
+from vllm.distributed.parallel_state import (
+    _build_indexer_replica_group_ranks,
+    _validate_indexer_shard_count,
+)
 
 
 def test_build_indexer_two_by_four_groups_for_tp8():
@@ -44,6 +47,17 @@ def test_build_indexer_replica_groups_stay_inside_each_tp_group():
 def test_build_indexer_replica_groups_rejects_non_divisor():
     with pytest.raises(ValueError, match="must divide"):
         _build_indexer_replica_group_ranks([list(range(8))], 3)
+
+
+@pytest.mark.parametrize("indexer_shards", [0, 1, 2, 4])
+def test_validate_indexer_shard_count_accepts_supported_dcp4_layouts(indexer_shards):
+    _validate_indexer_shard_count(indexer_shards, 4)
+
+
+@pytest.mark.parametrize("indexer_shards", [-1, 3, 5, 8])
+def test_validate_indexer_shard_count_rejects_invalid_dcp4_layouts(indexer_shards):
+    with pytest.raises(ValueError, match=r"shards=.*DCP=4"):
+        _validate_indexer_shard_count(indexer_shards, 4)
 
 
 def test_indexer_group_selector_supports_partial_target_and_full_draft(monkeypatch):

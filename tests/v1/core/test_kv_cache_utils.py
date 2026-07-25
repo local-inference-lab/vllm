@@ -1874,6 +1874,47 @@ def test_lockstep_mla_equal_page_sizes_use_distinct_tensors():
     ]
 
 
+def test_custom_cp_specs_with_same_block_size_stay_in_type_specific_groups():
+    target = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+    )
+    replicated_full = FullAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+        dcp_replicated=True,
+    )
+    replicated_sink = SinkFullAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+        dcp_replicated=True,
+        sink_len=4,
+    )
+
+    grouped = group_and_unify_kv_cache_specs(
+        {
+            "target": target,
+            "full": replicated_full,
+            "sink": replicated_sink,
+        },
+        dcp_world_size=4,
+    )
+
+    assert grouped is not None
+    assert len(grouped) == 3
+    assert [set(group.kv_cache_specs) for group in grouped] == [
+        {"target"},
+        {"full"},
+        {"sink"},
+    ]
+
+
 def test_dsv4_engine_capacity_uses_worker_kv_cache_config():
     from vllm.v1.engine.core import EngineCore
 

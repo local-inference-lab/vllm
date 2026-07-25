@@ -331,15 +331,34 @@ class KVCacheCoordinator(ABC):
             for manager in managers[1:]
         )
 
+        cow_block_idx = managers[0].pending_cow_block_index(request_id)
         new_blocks = managers[0].allocate_new_blocks(
             request_id,
             num_tokens,
             num_tokens_main_model,
         )
+        blocks_to_append = new_blocks
+        cow_block = None
+        if cow_block_idx is not None:
+            cow_block = managers[0].req_to_blocks[request_id][cow_block_idx]
+            assert new_blocks and new_blocks[0] is cow_block
+            blocks_to_append = new_blocks[1:]
+
         for manager in managers[1:]:
-            if new_blocks:
-                self.block_pool.touch(new_blocks)
-                manager.req_to_blocks[request_id].extend(new_blocks)
+            peer_cow_idx = manager.pending_cow_block_index(request_id)
+            assert peer_cow_idx == cow_block_idx
+            if cow_block_idx is not None:
+                assert cow_block is not None
+                manager.apply_lockstep_cow(request_id, cow_block_idx, cow_block)
+            if blocks_to_append:
+                self.block_pool.touch(blocks_to_append)
+                manager.req_to_blocks[request_id].extend(blocks_to_append)
+
+        final_ids = [block.block_id for block in managers[0].req_to_blocks[request_id]]
+        assert all(
+            [block.block_id for block in manager.req_to_blocks[request_id]] == final_ids
+            for manager in managers[1:]
+        )
         return tuple(list(new_blocks) for _ in managers)
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
