@@ -7,6 +7,11 @@ import torch
 
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
+from vllm.utils.deep_gemm import (
+    DeepGemmQuantScaleFMT,
+    get_tma_aligned_size,
+    is_deep_gemm_supported,
+)
 from vllm.utils.torch_utils import set_random_seed
 
 
@@ -138,6 +143,70 @@ def test_quantfp8_group_multidimensional(
 
     _, scales_4d_col = quant_op_col.forward_native(x_4d.clone())
     assert scales_4d_col.shape == (batch1, batch2, hidden_dim // group_size, batch3)
+
+
+@pytest.mark.parametrize("batch_size", [16, 17])
+@pytest.mark.parametrize("seed", [42])
+@torch.inference_mode()
+def test_quantfp8_group_packed_ue8m0_native_matches_cuda(
+    default_vllm_config, batch_size: int, seed: int
+) -> None:
+    """forward_native must emit the same scale FORMAT as forward_cuda.
+
+    When the DeepGEMM oracle selects packed UE8M0, scales are four biased e8m0
+    exponent bytes per int32 in a TMA-aligned buffer -- not float32. Since
+    CustomOp.default_on() is False under inductor, forward_native is what a
+    compiled run executes, so a float32 fallback there hands DeepGEMM the wrong
+    format with no error raised.
+
+    batch_size 17 is deliberate: it is not TMA-aligned, so it catches a layout
+    that only holds when mn happens to be a multiple of four.
+    """
+    if not is_deep_gemm_supported():
+        pytest.skip("DeepGEMM not supported on this platform")
+    try:
+        wants_packed = (
+            DeepGemmQuantScaleFMT.from_oracle() == DeepGemmQuantScaleFMT.UE8M0
+        )
+    except AssertionError:
+        pytest.skip("DeepGEMM scale-format oracle not initialized")
+    if not wants_packed:
+        pytest.skip("Oracle does not select packed UE8M0 on this platform")
+
+    set_random_seed(seed)
+
+    hidden_dim, group_size = 1024, 128
+    x = torch.randn((batch_size, hidden_dim), dtype=torch.bfloat16, device="cuda") * 8
+
+    quant_op = QuantFP8(
+        static=False,
+        group_shape=GroupShape(1, group_size),
+        column_major_scales=False,
+        use_ue8m0=True,
+    )
+
+    x_q_native, scales_native = quant_op.forward_native(x.clone())
+    x_q_cuda, scales_cuda = quant_op.forward_cuda(x.clone())
+
+    # Format, not just values: a float32 fallback fails on dtype alone.
+    assert scales_native.dtype == torch.int32
+    assert scales_native.dtype == scales_cuda.dtype
+    assert scales_native.shape == scales_cuda.shape
+    assert scales_native.stride() == scales_cuda.stride()
+
+    # DeepGEMM's layout contract, asserted directly so a refactor that keeps the
+    # values but loses the strides still fails here.
+    assert scales_native.size(-2) == batch_size
+    assert scales_native.stride(-2) == 1
+    assert scales_native.stride(-1) == get_tma_aligned_size(
+        batch_size, scales_native.element_size()
+    )
+
+    # Packed exponent bytes are integers, so they must match exactly.
+    torch.testing.assert_close(scales_native, scales_cuda, rtol=0, atol=0)
+
+    diff_ratio = (x_q_cuda != x_q_native).sum().item() / x_q_cuda.numel()
+    assert diff_ratio < 0.002, f"Too many differences: {diff_ratio:.4%}"
 
 
 @pytest.mark.parametrize("seed", [42])
