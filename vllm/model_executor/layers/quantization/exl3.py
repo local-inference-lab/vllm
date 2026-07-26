@@ -71,6 +71,30 @@ _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
 
 
+def _is_draft_layer(layer: Any) -> bool:
+    """True for a rank-sliced MTP/EAGLE draft MoE layer.
+
+    Derived from the layer prefix rather than the quant config, because config
+    identity is not a reliable role signal: only some MTP model files build the
+    draft a fresh ``Exl3Config``. Several (e.g. ``glm4_moe_mtp``, ``qwen3_next_mtp``,
+    ``deepseek_eagle``) pass ``vllm_config.quant_config`` straight through, which
+    makes the draft's scope identical to the target's and silently restores the
+    shared-scratch corruption this scoping exists to prevent.
+    """
+    name = str(getattr(layer, "layer_name", "") or getattr(layer, "prefix", ""))
+    return any(t in name for t in (".mtp", "mtp.", "nextn", "eagle", "draft",
+                                   "speculator"))
+
+
+def _runtime_owner_token(quant_config: Any, layer: Any) -> tuple[int, bool]:
+    """Runtime-cache owner identity: (config scope, is_draft).
+
+    Adding the role makes target/draft isolation independent of whether the model
+    file happened to mint a separate quant config.
+    """
+    return (_runtime_scope_id(quant_config), _is_draft_layer(layer))
+
+
 def _runtime_scope_id(quant_config: Any) -> int:
     """Stable identity for the model that owns a rank-sliced runtime.
 
@@ -95,7 +119,7 @@ def _runtime_scope_id(quant_config: Any) -> int:
     scope = _NEXT_RUNTIME_SCOPE_ID
     _NEXT_RUNTIME_SCOPE_ID += 1
     try:
-        quant_config._exl3_runtime_scope_id = scope
+        quant_config._exl3_runtime_scope_id = scope  # noqa: SLF001
     except AttributeError:
         # Frozen/slotted config: fall back to object identity. Configs live for
         # the process lifetime, so reuse-after-GC aliasing is not a concern here.
@@ -1114,8 +1138,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             scheduler_config = (
                 vllm_config.scheduler_config if vllm_config is not None else None
             )
+            # No silent fallback: a wrong capacity here puts the target and the
+            # rank-sliced MTP draft on different plans with no error, which is
+            # exactly the class of mismatch that corrupts only at scale.
+            if scheduler_config is None or getattr(
+                scheduler_config, "max_num_batched_tokens", None
+            ) is None:
+                raise ValueError(
+                    "EXL3 rank-sliced MoE requires scheduler_config."
+                    "max_num_batched_tokens to plan its Trellis arena; refusing to "
+                    "guess a capacity."
+                )
             layer.exl3_max_num_batched_tokens = int(
-                getattr(scheduler_config, "max_num_batched_tokens", 4096)
+                scheduler_config.max_num_batched_tokens
             )
         for prefix, shard_ids in (("w13", ("w1", "w3")), ("w2", ("w2",))):
             for suffix in ("suh", "svh", "trellis", "mcg", "mul1"):
@@ -1413,17 +1448,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             raise ValueError(
                 "VLLM_EXL3_TRELLIS_MIN_M cannot exceed VLLM_EXL3_TRELLIS_MAX_M"
             )
-        max_batched_tokens = max(
-            int(layer.exl3_max_num_batched_tokens),
-            int(x.shape[0]),
-        )
+        # Batch-INVARIANT capacity. Including x.shape[0] here made the runtime
+        # cache key depend on the live batch, so any m above the planned capacity
+        # produced a cache MISS -- silently planning a fresh ~1 GiB arena mid-serve
+        # and making the capacity guard in _apply_rank_sliced unreachable. The
+        # planned capacity is a property of the layer, not of one forward pass.
+        max_batched_tokens = int(layer.exl3_max_num_batched_tokens)
         topk = int(topk_ids.shape[1])
         device_index = x.device.index
         key = (
             # Owning model scope first: the cached runtime holds mutable scratch,
             # so a target layer and a same-shape rank-sliced MTP draft layer must
             # not share an entry (see _runtime_scope_id).
-            _runtime_scope_id(self.quant_config),
+            _runtime_owner_token(self.quant_config, layer),
             device_index,
             x.dtype,
             int(layer.exl3_hidden_size),
