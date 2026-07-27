@@ -221,8 +221,17 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # The deployed NVFP4 writer accepts a scale tensor but discards it and
         # quantizes with outer scale 1.0.  Feeding x/s_l is exactly the missing
         # writer-side normalization; the CuTe readers restore s_l in-kernel.
+        # VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 supersedes both: the writer derives a
+        # per-token second-level scale stored in the record, so the host-side
+        # divide stays identity and a scales file must not also be supplied.
         self._nvfp4_mla_outer_scale = 1.0
         scale_file = os.getenv(_NVFP4_MLA_SCALES_ENV, "").strip()
+        if scale_file and os.getenv("VLLM_NVFP4_MLA_DYNAMIC_SCALE", "0") == "1":
+            raise ValueError(
+                f"{_NVFP4_MLA_SCALES_ENV} and VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 "
+                "are mutually exclusive: the dynamic mode derives per-token "
+                "scales in the writer and ignores static calibration"
+            )
         if scale_file and (
             self.mla_attn.kv_cache_dtype == "nvfp4_ds_mla"
             and self.mla_attn.attn_backend.get_name() == "B12X_MLA_SPARSE"
