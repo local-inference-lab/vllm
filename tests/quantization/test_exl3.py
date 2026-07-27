@@ -183,3 +183,49 @@ def test_rank_sliced_runtime_key_differs_across_models_with_same_shape():
     assert target_key[1:] == draft_key[1:]
     # Same owner -> same key, so target layers still share one runtime.
     assert _key(target_config) == target_key
+
+
+def test_draft_layer_window_defaults_to_min_capturable_m(monkeypatch) -> None:
+    """A rank-sliced draft layer must be capturable without an env workaround.
+
+    Regression test for the boot failure reported in vLLM #183: with the Trellis
+    window left at its historical default of 4, CUDA-graph capture of an EXL3
+    rank-sliced MTP draft reaches the eager parity path at m=1,2,3 and the engine
+    cannot start:
+
+        RuntimeError: EXL3 eager parity path entered during CUDA graph capture
+        (m=3); capture sizes must lie inside the Trellis window [4, 32]
+
+    It was invariant to num_speculative_tokens and to cudagraph_capture_sizes,
+    because m here is the draft's row count per step, not a target batch size.
+    The backend now declares MIN_CAPTURABLE_TRELLIS_M and defaults draft layers to
+    it, so no operator has to set VLLM_EXL3_TRELLIS_MIN_M by hand.
+    """
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.quantization import exl3 as exl3_mod
+
+    monkeypatch.delenv("VLLM_EXL3_TRELLIS_MIN_M", raising=False)
+
+    draft = SimpleNamespace(layer_name="model.layers.78.mtp.mlp.experts")
+    target = SimpleNamespace(layer_name="model.layers.30.mlp.experts")
+
+    assert exl3_mod._is_draft_layer(draft)
+    assert not exl3_mod._is_draft_layer(target)
+
+    def resolved(layer):
+        default = (
+            exl3_mod.MIN_CAPTURABLE_TRELLIS_M
+            if exl3_mod._is_draft_layer(layer)
+            else exl3_mod._DEFAULT_TRELLIS_MIN_M
+        )
+        return exl3_mod._positive_env_int("VLLM_EXL3_TRELLIS_MIN_M", default)
+
+    # The draft must admit m=1 so capture at m=1,2,3 stays on the Trellis path.
+    assert resolved(draft) <= exl3_mod.MIN_CAPTURABLE_TRELLIS_M == 1
+    # The target keeps its historical default.
+    assert resolved(target) == exl3_mod._DEFAULT_TRELLIS_MIN_M == 4
+
+    # An explicit value remains authoritative in both directions (kill switch).
+    monkeypatch.setenv("VLLM_EXL3_TRELLIS_MIN_M", "4")
+    assert resolved(draft) == 4
