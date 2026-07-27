@@ -207,11 +207,24 @@ def test_draft_layer_window_defaults_to_min_capturable_m(monkeypatch) -> None:
 
     monkeypatch.delenv("VLLM_EXL3_TRELLIS_MIN_M", raising=False)
 
-    draft = SimpleNamespace(layer_name="model.layers.78.mtp.mlp.experts")
+    # The GLM-5.2 MTP head is named exactly like a target layer, so the role
+    # comes from the exl3_is_draft stamp applied by load_eagle_model -- name
+    # inspection alone cannot classify it.
+    draft = SimpleNamespace(
+        layer_name="model.layers.78.mlp.experts", exl3_is_draft=True
+    )
     target = SimpleNamespace(layer_name="model.layers.30.mlp.experts")
 
     assert exl3_mod._is_draft_layer(draft)
     assert not exl3_mod._is_draft_layer(target)
+    # Unstamped draft with a distinctive prefix still classifies via fallback.
+    assert exl3_mod._is_draft_layer(
+        SimpleNamespace(layer_name="model.layers.0.mtp.mlp.experts")
+    )
+    # A stamp always wins over the name, in both directions.
+    assert not exl3_mod._is_draft_layer(
+        SimpleNamespace(layer_name="model.layers.0.mtp.experts", exl3_is_draft=False)
+    )
 
     def resolved(layer):
         default = (
@@ -229,3 +242,32 @@ def test_draft_layer_window_defaults_to_min_capturable_m(monkeypatch) -> None:
     # An explicit value remains authoritative in both directions (kill switch).
     monkeypatch.setenv("VLLM_EXL3_TRELLIS_MIN_M", "4")
     assert resolved(draft) == 4
+
+
+def test_draft_role_stamp_wins_over_name() -> None:
+    """The exl3_is_draft stamp set in create_weights is authoritative.
+
+    Forward/plan/capture time has no current vllm config, so the role cannot be
+    inferred there; create_weights stamps it from runner_type while the
+    construction context is live. Stamped values must win over any name
+    heuristic in both directions.
+    """
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.quantization import exl3 as exl3_mod
+
+    # GLM-5.2 MTP head: named like a target, stamped draft.
+    assert exl3_mod._is_draft_layer(
+        SimpleNamespace(layer_name="model.layers.78.mlp.experts", exl3_is_draft=True)
+    )
+    # Target stamped False keeps its role even with a suspicious name.
+    assert not exl3_mod._is_draft_layer(
+        SimpleNamespace(layer_name="model.layers.0.mtp.experts", exl3_is_draft=False)
+    )
+    # Unstamped layers fall back to the name heuristic.
+    assert exl3_mod._is_draft_layer(
+        SimpleNamespace(layer_name="model.layers.0.mtp.mlp.experts")
+    )
+    assert not exl3_mod._is_draft_layer(
+        SimpleNamespace(layer_name="model.layers.30.mlp.experts")
+    )

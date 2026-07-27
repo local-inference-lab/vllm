@@ -82,18 +82,27 @@ _DEFAULT_TRELLIS_MIN_M = 4
 
 
 def _is_draft_layer(layer: Any) -> bool:
-    """True for a rank-sliced MTP/EAGLE draft MoE layer.
+    """True for a rank-sliced MTP/nextn/eagle draft MoE layer.
 
-    Derived from the layer prefix rather than the quant config, because config
-    identity is not a reliable role signal: only some MTP model files build the
-    draft a fresh ``Exl3Config``. Several (e.g. ``glm4_moe_mtp``, ``qwen3_next_mtp``,
-    ``deepseek_eagle``) pass ``vllm_config.quant_config`` straight through, which
-    makes the draft's scope identical to the target's and silently restores the
-    shared-scratch corruption this scoping exists to prevent.
+    The role is stamped (``exl3_is_draft = True``) on every draft-owned module
+    by ``load_eagle_model`` at draft construction, which is the single funnel
+    every speculator draft passes through. It is NOT inferable here: a
+    GLM-5.2-style MTP head is an extra decoder layer named exactly like a
+    target layer (``model.layers.78.*`` with ``num_hidden_layers = 78``), and
+    this function runs at plan/capture/forward time, when
+    ``set_current_vllm_config`` has already exited and
+    ``get_current_vllm_config_or_none()`` returns None -- so both name and
+    layer-index inference silently fail. The substring fallback below covers
+    drafts built outside ``load_eagle_model``.
     """
+    stamped = getattr(layer, "exl3_is_draft", None)
+    if stamped is not None:
+        return bool(stamped)
     name = str(getattr(layer, "layer_name", "") or getattr(layer, "prefix", ""))
-    return any(t in name for t in (".mtp", "mtp.", "nextn", "eagle", "draft",
-                                   "speculator"))
+    return any(
+        token in name
+        for token in (".mtp", "mtp.", "nextn", "eagle", "draft", "speculator")
+    )
 
 
 def _runtime_owner_token(quant_config: Any, layer: Any) -> tuple[int, bool]:
@@ -200,7 +209,20 @@ def _load_sparkinfer_trellis() -> Any:
 
 
 def _positive_env_int(name: str, default: int) -> int:
-    value = int(os.environ.get(name, default))
+    # An env var that is present but blank means "unset". Compose and Kubernetes
+    # both render an unset variable as the empty string, so int("") would abort
+    # engine startup with a bare
+    #   ValueError: invalid literal for int() with base 10: ''
+    # that names neither the variable nor the fix.
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise ValueError(
+            f"{name} must be a positive integer or unset, got {raw!r}"
+        ) from None
     if value <= 0:
         raise ValueError(f"{name} must be positive, got {value}")
     return value
@@ -1161,6 +1183,18 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 )
             layer.exl3_max_num_batched_tokens = int(
                 scheduler_config.max_num_batched_tokens
+            )
+            # Stamp the layer role while the model-construction config context
+            # is still active. Forward time (the profile pass and CUDA graph
+            # capture) runs with no current vllm config, so neither name- nor
+            # index-based detection can resolve the role there -- a GLM-5.2
+            # style MTP head is named exactly like a target layer
+            # (model.layers.<num_hidden_layers>.*). runner_type is minted as
+            # "draft" for every model-backed speculator draft
+            # (SpeculativeConfig.__post_init__ -> ModelConfig(runner="draft")),
+            # which also covers speculators that bypass load_eagle_model.
+            layer.exl3_is_draft = (
+                getattr(vllm_config.model_config, "runner_type", None) == "draft"
             )
         for prefix, shard_ids in (("w13", ("w1", "w3")), ("w2", ("w2",))):
             for suffix in ("suh", "svh", "trellis", "mcg", "mul1"):
