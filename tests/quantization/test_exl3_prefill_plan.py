@@ -19,6 +19,7 @@ CPU-only; no CUDA, sparkinfer, or exllamav3_ext required.
 import os
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import vllm.model_executor.layers.quantization.exl3 as exl3_module
@@ -181,11 +182,19 @@ def test_dual_plan_construction_and_dispatch():
         assert runtime["xh"].shape[0] == 128
         assert runtime["token_sorted"].numel() == 128 * TOPK
 
-        # m above the scheduler capacity re-keys the runtime and re-plans
-        # at the larger capacity (eager-only; capture remains guarded).
-        _apply(method, layer, MAX_BATCHED + 1)
-        assert h.api.bound[-1][0].caps["max_tokens"] == MAX_BATCHED + 1
-        assert h.planned_caps()[-1]["max_tokens"] == MAX_BATCHED + 1
+        # Batches above the scheduler contract must fail before allocating a
+        # replacement runtime or a larger Trellis arena during serving.
+        runtime_keys = tuple(exl3_module._RANK_SLICED_RUNTIMES)
+        runtime_count = len(exl3_module._RANK_SLICED_RUNTIMES)
+        plan_count = len(h.planned_caps())
+        with pytest.raises(
+            ValueError,
+            match=rf"m={MAX_BATCHED + 1}, capacity={MAX_BATCHED}",
+        ):
+            _apply(method, layer, MAX_BATCHED + 1)
+        assert tuple(exl3_module._RANK_SLICED_RUNTIMES) == runtime_keys
+        assert len(exl3_module._RANK_SLICED_RUNTIMES) == runtime_count
+        assert len(h.planned_caps()) == plan_count
 
 
 def test_prefill_trellis_disabled_restores_parity():
