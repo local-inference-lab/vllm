@@ -4,6 +4,9 @@
 
 from typing import TYPE_CHECKING
 
+from vllm.model_executor.layers.mla_cache_format import (
+    NVFP4_MLA_CACHE_FORMAT,
+)
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
 from vllm.v1.kv_offload.config import (
@@ -144,6 +147,9 @@ def build_offloading_config(
         model=OffloadingModelConfig(
             name=vllm_config.model_config.model,
             dtype=str(vllm_config.cache_config.cache_dtype).replace("torch.", ""),
+            kv_cache_abi=NVFP4_MLA_CACHE_FORMAT.record_abi(
+                str(vllm_config.cache_config.cache_dtype)
+            ),
         ),
         cache=OffloadingCacheConfig(
             tokens_per_hash=tokens_per_hash,

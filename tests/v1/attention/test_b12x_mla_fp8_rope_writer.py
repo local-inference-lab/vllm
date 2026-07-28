@@ -3,6 +3,7 @@
 
 import sys
 import types
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -55,6 +56,7 @@ def _construct_through_writer_binding(
     enabled: bool,
 ) -> B12xMLASparseImpl:
     monkeypatch.setattr(b12x_mla_sparse, "_KV_FP8_ROPE_REQUESTED", enabled)
+    monkeypatch.setattr(b12x_mla_sparse, "_NVFP4_DYNAMIC_SCALE_REQUESTED", False)
     monkeypatch.setattr(b12x_mla_sparse, "_IS_GLM_MOE_DSA_CACHE", True)
 
     def stop_after_writer_binding():
@@ -106,6 +108,7 @@ def _install_fake_writer_package(
 def _enabled_impl(writer) -> B12xMLASparseImpl:
     impl = object.__new__(B12xMLASparseImpl)
     impl._kv_fp8_rope = True
+    impl._nvfp4_dynamic_scale = False
     impl._concat_and_cache_nvfp4_mla_fp8_rope = writer
     return impl
 
@@ -333,3 +336,101 @@ def test_enabled_mode_writer_initialization_failure_fails_closed(
         match="compact writer initialization failed",
     ):
         _initialize_writer_seam(object.__new__(B12xMLASparseImpl))
+
+
+def test_dynamic_mode_rejects_writer_without_per_token_scale(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def legacy_writer(kv_c, k_pe, kv_cache, slot_mapping, scale):
+        pass
+
+    _install_fake_writer_package(monkeypatch, legacy_writer)
+    monkeypatch.setattr(b12x_mla_sparse, "_KV_FP8_ROPE_REQUESTED", True)
+    monkeypatch.setattr(b12x_mla_sparse, "_NVFP4_DYNAMIC_SCALE_REQUESTED", True)
+    monkeypatch.setattr(b12x_mla_sparse, "_IS_GLM_MOE_DSA_CACHE", True)
+
+    with pytest.raises(RuntimeError, match="per_token_scale"):
+        _initialize_writer_seam(object.__new__(B12xMLASparseImpl))
+
+
+def test_dynamic_mode_rejects_non_368_byte_layout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(b12x_mla_sparse, "_KV_FP8_ROPE_REQUESTED", False)
+    monkeypatch.setattr(b12x_mla_sparse, "_NVFP4_DYNAMIC_SCALE_REQUESTED", True)
+    monkeypatch.setattr(b12x_mla_sparse, "_IS_GLM_MOE_DSA_CACHE", True)
+
+    with pytest.raises(RuntimeError, match="requires the 368-byte"):
+        _initialize_writer_seam(object.__new__(B12xMLASparseImpl))
+
+
+def test_dynamic_mode_rejects_reader_without_per_token_scale():
+    def decode(*, latent_scale, scale_format):
+        pass
+
+    def extend(*, latent_scale, scale_format, latent_scale_per_token):
+        pass
+
+    with pytest.raises(RuntimeError, match="unsupported: decode"):
+        b12x_mla_sparse._require_callable_parameters(
+            "dynamic readers",
+            (("decode", decode), ("extend", extend)),
+            frozenset({"latent_scale", "scale_format", "latent_scale_per_token"}),
+        )
+
+
+def test_dynamic_normal_writer_call_propagates_per_token_scale():
+    writer_calls = []
+
+    def writer(*args, **kwargs):
+        writer_calls.append((args, kwargs))
+
+    impl = _enabled_impl(writer)
+    impl._nvfp4_dynamic_scale = True
+    impl.do_kv_cache_update(
+        torch.zeros((2, 512), dtype=torch.bfloat16),
+        torch.zeros((2, 1, 64), dtype=torch.bfloat16),
+        torch.empty((1, 2, 368), dtype=torch.uint8),
+        torch.tensor([[0], [1]], dtype=torch.int64),
+        "nvfp4_ds_mla",
+        torch.tensor(1.0),
+    )
+
+    assert len(writer_calls) == 1
+    assert writer_calls[0][1] == {"per_token_scale": True}
+
+
+def test_dynamic_gathered_chunk_writer_call_propagates_per_token_scale():
+    writer_calls = []
+
+    def writer(*args, **kwargs):
+        writer_calls.append((args, kwargs))
+
+    impl = _enabled_impl(writer)
+    impl._nvfp4_dynamic_scale = True
+    impl._ckv_current_chunk_kv_c = torch.zeros((2, 512), dtype=torch.bfloat16)
+    impl._ckv_current_chunk_kpe = torch.zeros((2, 64), dtype=torch.bfloat16)
+    impl.device = torch.device("cpu")
+    impl.cp_kv_cache_interleave_size = 1
+    impl.dcp_world_size = 1
+    impl.kv_cache_dtype = "nvfp4_ds_mla"
+    metadata = SimpleNamespace(
+        num_reqs=1,
+        global_cache_seq_lens_per_req=torch.tensor([2], dtype=torch.int32),
+        req_id_per_token=torch.tensor([0, 0], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        dcp_rank_req_starts=torch.tensor([[0]], dtype=torch.int32),
+        dcp_padded_total_tokens=64,
+    )
+    layer = SimpleNamespace(_k_scale=torch.tensor(1.0))
+
+    impl._append_current_chunk_to_gathered(
+        torch.empty((64, 368), dtype=torch.uint8),
+        metadata,
+        layer,
+        num_actual_toks=2,
+    )
+
+    assert len(writer_calls) == 1
+    assert writer_calls[0][1] == {"per_token_scale": True}
+    assert torch.equal(writer_calls[0][0][3], torch.tensor([0, 1], dtype=torch.int64))

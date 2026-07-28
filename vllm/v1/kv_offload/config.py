@@ -22,6 +22,9 @@ class OffloadingModelConfig:
     name: str
     # KV cache data type (e.g. "float16").
     dtype: str
+    # Versioned identity of the bytes stored in external KV caches. Formats
+    # with identical tensor shapes but different reader semantics must differ.
+    kv_cache_abi: str = "vllm-default-v1"
 
 
 @dataclass(frozen=True)

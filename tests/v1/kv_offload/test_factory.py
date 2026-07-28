@@ -21,6 +21,7 @@ from vllm.config import KVTransferConfig, ParallelConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     build_offloading_config,
 )
+from vllm.model_executor.layers.mla_cache_format import Nvfp4MlaCacheFormat
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -445,6 +446,27 @@ def test_offloading_config_preserves_data_parallel_index():
     offloading_config = build_offloading_config(config, _make_kv_cache_config())
 
     assert offloading_config.parallel.data_parallel_index == 2
+
+
+def test_offloading_config_carries_nvfp4_record_abi():
+    config = _make_layout_vllm_config()
+    config.cache_config.cache_dtype = "nvfp4_ds_mla"
+    cache_format = Nvfp4MlaCacheFormat(
+        dynamic_scale=True,
+        fp8_rope=True,
+        scales_file="",
+    )
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.config."
+        "NVFP4_MLA_CACHE_FORMAT",
+        cache_format,
+    ):
+        offloading_config = build_offloading_config(config, _make_kv_cache_config())
+
+    assert offloading_config.model.kv_cache_abi == (
+        "nvfp4_ds_mla:fp8-rope-368:dynamic-token-v1"
+    )
 
 
 def test_offloading_spec_resolves_heterogeneous_hybrid_block_sizes():

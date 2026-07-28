@@ -29,13 +29,14 @@ def make_mapper_from_offloading_spec(**kwargs) -> FileMapper:
             )
             for tokens_per_block, layer_name in kwargs.get("groups", ())
         ),
-        worker_kv_bytes_per_block=0,
+        worker_kv_bytes_per_block=kwargs.get("worker_kv_bytes_per_block", 0),
         enable_kv_cache_events=False,
         extra_config={},
         engine_id="test-engine",
         model=OffloadingModelConfig(
             name=kwargs.get("model_name", "test-model"),
             dtype=kwargs.get("dtype", "float16"),
+            kv_cache_abi=kwargs.get("kv_cache_abi", "vllm-default-v1"),
         ),
         cache=OffloadingCacheConfig(
             tokens_per_hash=kwargs.get("tokens_per_hash", 16),
@@ -141,6 +142,32 @@ def test_hybrid_file_identity_uses_resolved_tokens_per_hash():
         {"tokens_per_block": 12, "layer_names": ["full_layer"]},
         {"tokens_per_block": 16, "layer_names": ["mla_layer"]},
     ]
+
+
+def test_record_abi_and_geometry_separate_persistent_namespaces():
+    static = make_mapper_from_offloading_spec(
+        kv_cache_abi="nvfp4_ds_mla:fp8-rope-368:static-calibrated-v1:abc",
+        worker_kv_bytes_per_block=23552,
+    )
+    dynamic = make_mapper_from_offloading_spec(
+        kv_cache_abi="nvfp4_ds_mla:fp8-rope-368:dynamic-token-v1",
+        worker_kv_bytes_per_block=23552,
+    )
+    different_geometry = make_mapper_from_offloading_spec(
+        kv_cache_abi="nvfp4_ds_mla:fp8-rope-368:dynamic-token-v1",
+        worker_kv_bytes_per_block=27648,
+    )
+
+    assert static.base_path != dynamic.base_path
+    assert dynamic.base_path != different_geometry.base_path
+    assert dynamic.fields["kv_cache_abi"].endswith("dynamic-token-v1")
+    assert dynamic.fields["worker_kv_bytes_per_block"] == 23552
+
+
+def test_default_record_abi_preserves_existing_namespace():
+    default = make_mapper_from_offloading_spec()
+    assert "kv_cache_abi" not in default.fields
+    assert "worker_kv_bytes_per_block" not in default.fields
 
 
 # ---------------------------------------------------------------------------

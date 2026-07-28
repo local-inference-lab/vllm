@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
 import math
-import os
 import re
 from dataclasses import dataclass
 from functools import cache
@@ -12,15 +11,19 @@ import torch
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.mla_cache_format import (
+    NVFP4_MLA_CACHE_FORMAT,
+    NVFP4_MLA_SCALES_ENV,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
-_NVFP4_MLA_SCALES_ENV = "VLLM_NVFP4_MLA_SCALES_FILE"
+_NVFP4_MLA_SCALES_ENV = NVFP4_MLA_SCALES_ENV
 _NVFP4_MLA_SCALES_FORMAT = "nvfp4_ds_mla_outer_scale_v1"
 _NVFP4_MLA_NUM_LAYERS = 78
 _NVFP4_MLA_LATENT_DIM = 512
 _NVFP4_MLA_SCALE_DENOMINATOR = 6.0 * 448.0
 _NVFP4_MLA_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
-_KV_FP8_ROPE_ENABLED = os.getenv("KV_FP8_ROPE", "0") == "1"
+_KV_FP8_ROPE_ENABLED = NVFP4_MLA_CACHE_FORMAT.fp8_rope
 
 
 _IS_GLM_MOE_DSA_CACHE: bool | None = None
@@ -45,9 +48,7 @@ def _is_glm_moe_dsa_model() -> bool:
         _IS_GLM_MOE_DSA_CACHE = True
         return True
     speculative_config = getattr(vllm_config, "speculative_config", None)
-    target_model_config = getattr(
-        speculative_config, "target_model_config", None
-    )
+    target_model_config = getattr(speculative_config, "target_model_config", None)
     target_model_type = (
         getattr(target_model_config.hf_config, "model_type", None)
         if target_model_config is not None
@@ -67,28 +68,27 @@ def _load_nvfp4_mla_outer_scales(path: str) -> tuple[float, ...]:
         raise ValueError(f"{_NVFP4_MLA_SCALES_ENV} must contain a JSON object")
     if payload.get("format") != _NVFP4_MLA_SCALES_FORMAT:
         raise ValueError(
-            f"{_NVFP4_MLA_SCALES_ENV} has unsupported format "
-            f"{payload.get('format')!r}"
+            f"{_NVFP4_MLA_SCALES_ENV} has unsupported format {payload.get('format')!r}"
         )
     if type(payload.get("num_layers")) is not int or (
         payload["num_layers"] != _NVFP4_MLA_NUM_LAYERS
     ):
         raise ValueError(
-            f"{_NVFP4_MLA_SCALES_ENV} must declare "
-            f"num_layers={_NVFP4_MLA_NUM_LAYERS}"
+            f"{_NVFP4_MLA_SCALES_ENV} must declare num_layers={_NVFP4_MLA_NUM_LAYERS}"
         )
     if type(payload.get("latent_dim")) is not int or (
         payload["latent_dim"] != _NVFP4_MLA_LATENT_DIM
     ):
         raise ValueError(
-            f"{_NVFP4_MLA_SCALES_ENV} must declare "
-            f"latent_dim={_NVFP4_MLA_LATENT_DIM}"
+            f"{_NVFP4_MLA_SCALES_ENV} must declare latent_dim={_NVFP4_MLA_LATENT_DIM}"
         )
     denominator = payload.get("denominator")
-    if isinstance(denominator, bool) or not isinstance(
-        denominator, (int, float)
-    ) or not math.isclose(
-        float(denominator), _NVFP4_MLA_SCALE_DENOMINATOR, rel_tol=0.0, abs_tol=0.0
+    if (
+        isinstance(denominator, bool)
+        or not isinstance(denominator, (int, float))
+        or not math.isclose(
+            float(denominator), _NVFP4_MLA_SCALE_DENOMINATOR, rel_tol=0.0, abs_tol=0.0
+        )
     ):
         raise ValueError(
             f"{_NVFP4_MLA_SCALES_ENV} must declare "
@@ -225,13 +225,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # per-token second-level scale stored in the record, so the host-side
         # divide stays identity and a scales file must not also be supplied.
         self._nvfp4_mla_outer_scale = 1.0
-        scale_file = os.getenv(_NVFP4_MLA_SCALES_ENV, "").strip()
-        if scale_file and os.getenv("VLLM_NVFP4_MLA_DYNAMIC_SCALE", "0") == "1":
-            raise ValueError(
-                f"{_NVFP4_MLA_SCALES_ENV} and VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 "
-                "are mutually exclusive: the dynamic mode derives per-token "
-                "scales in the writer and ignores static calibration"
-            )
+        NVFP4_MLA_CACHE_FORMAT.validate()
+        scale_file = NVFP4_MLA_CACHE_FORMAT.scales_file
         if scale_file and (
             self.mla_attn.kv_cache_dtype == "nvfp4_ds_mla"
             and self.mla_attn.attn_backend.get_name() == "B12X_MLA_SPARSE"
@@ -248,9 +243,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             # That layer is deep/late (not underflowing) and its KV is transient,
             # so identity there is a safe no-op for KLD.
             if 0 <= layer_idx < _NVFP4_MLA_NUM_LAYERS:
-                self._nvfp4_mla_outer_scale = _load_nvfp4_mla_outer_scales(
-                    scale_file
-                )[layer_idx]
+                self._nvfp4_mla_outer_scale = _load_nvfp4_mla_outer_scales(scale_file)[
+                    layer_idx
+                ]
         # forward_mqa receives this MLAAttention object as ``layer``.  Keep a
         # host float here so no device .item() or per-call scale tensor is needed.
         self.mla_attn._nvfp4_mla_outer_scale = self._nvfp4_mla_outer_scale
@@ -323,9 +318,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
-        if self._kv_fp8_rope and (
-            k_pe.dtype != torch.bfloat16 or k_pe.shape[-1] != 64
-        ):
+        if self._kv_fp8_rope and (k_pe.dtype != torch.bfloat16 or k_pe.shape[-1] != 64):
             raise RuntimeError(
                 "KV_FP8_ROPE POST-RoPE writer requires BF16 k_pe[...,64], got "
                 f"dtype={k_pe.dtype}, shape={tuple(k_pe.shape)}"

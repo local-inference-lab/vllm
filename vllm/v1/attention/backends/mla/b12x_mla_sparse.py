@@ -40,6 +40,9 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
+from vllm.model_executor.layers.mla_cache_format import (
+    NVFP4_MLA_CACHE_FORMAT,
+)
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
@@ -78,7 +81,7 @@ _BF16_BYTES = 2
 _EXTEND_PREWARM_DONE: set[
     tuple[int | None, int, int, int, int, int, bool, str, bool]
 ] = set()
-_KV_FP8_ROPE_REQUESTED = os.getenv("KV_FP8_ROPE", "0") == "1"
+_KV_FP8_ROPE_REQUESTED = NVFP4_MLA_CACHE_FORMAT.fp8_rope
 
 
 _IS_GLM_MOE_DSA_CACHE: bool | None = None
@@ -127,14 +130,29 @@ def _kv_fp8_rope_enabled() -> bool:
     return _KV_FP8_ROPE_REQUESTED and _is_glm_moe_dsa_model()
 
 
-# Self-describing two-level NVFP4 records: the writer derives a per-token
+# Inline-scale two-level NVFP4 records: the writer derives a per-token
 # second-level scale (fp32 at record bytes [292, 296)) and the readers consume
 # it from the record instead of a per-layer launch scalar.  Requires the
 # 368-byte KV_FP8_ROPE=1 record and a SparkInfer build with the matching
 # writer/reader mode.  Mutually exclusive with VLLM_NVFP4_MLA_SCALES_FILE.
-_NVFP4_DYNAMIC_SCALE_REQUESTED = (
-    os.getenv("VLLM_NVFP4_MLA_DYNAMIC_SCALE", "0") == "1"
-)
+_NVFP4_DYNAMIC_SCALE_REQUESTED = NVFP4_MLA_CACHE_FORMAT.dynamic_scale
+
+
+def _require_callable_parameters(
+    feature: str,
+    callables: tuple[tuple[str, Any], ...],
+    required: frozenset[str],
+) -> None:
+    unsupported = [
+        name
+        for name, function in callables
+        if not required.issubset(inspect.signature(function).parameters)
+    ]
+    if unsupported:
+        raise RuntimeError(
+            f"{feature} requires SparkInfer callables accepting "
+            f"{sorted(required)!r}; unsupported: {', '.join(unsupported)}"
+        )
 
 
 def _cdiv(x: int, y: int) -> int:
@@ -1304,16 +1322,16 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 f"{self.kv_cache_dtype!r}, KV_FP8_ROPE="
                 f"{'1' if _kv_fp8_rope_enabled() else '0'})"
             )
-        if self._nvfp4_dynamic_scale and (
-            "per_token_scale"
-            not in inspect.signature(
-                self._concat_and_cache_nvfp4_mla_fp8_rope
-            ).parameters
-        ):
-            raise RuntimeError(
-                "VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 requires a SparkInfer build "
-                "whose concat_and_cache_nvfp4_mla_fp8_rope supports "
-                "per_token_scale"
+        if self._nvfp4_dynamic_scale:
+            _require_callable_parameters(
+                "VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 writer",
+                (
+                    (
+                        "concat_and_cache_nvfp4_mla_fp8_rope",
+                        self._concat_and_cache_nvfp4_mla_fp8_rope,
+                    ),
+                ),
+                frozenset({"per_token_scale"}),
             )
 
         # MLA dims (absorbed: Q post-projection is [T, H, kv_lora_rank + rope]).
@@ -1460,20 +1478,14 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             required_kwargs = {"latent_scale", "scale_format"}
             if self._nvfp4_dynamic_scale:
                 required_kwargs = required_kwargs | {"latent_scale_per_token"}
-            unsupported_forwards = [
-                mode
-                for mode, forward in (
+            _require_callable_parameters(
+                "B12X_MLA_SPARSE with kv_cache_dtype='nvfp4_ds_mla'",
+                (
                     ("decode", sparse_mla_decode_forward),
                     ("extend", sparse_mla_extend_forward),
-                )
-                if not required_kwargs.issubset(inspect.signature(forward).parameters)
-            ]
-            if unsupported_forwards:
-                raise RuntimeError(
-                    "B12X_MLA_SPARSE with kv_cache_dtype='nvfp4_ds_mla' "
-                    "requires a b12x build with NVFP4 sparse-MLA API support; "
-                    "unsupported forwards: " + ", ".join(unsupported_forwards)
-                )
+                ),
+                frozenset(required_kwargs),
+            )
 
         # Eager PLAN -> BIND -> KERNEL (no b12x workspace/arena, ever). We build a
         # caller-owned-scratch PLAN once per mode; each forward maps a vLLM
