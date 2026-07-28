@@ -469,6 +469,35 @@ def test_offloading_config_carries_nvfp4_record_abi():
     )
 
 
+@pytest.mark.parametrize("cache_dtype", [torch.float16, torch.bfloat16, "auto"])
+def test_offloading_config_preserves_default_record_abi(cache_dtype):
+    config = _make_layout_vllm_config()
+    config.cache_config.cache_dtype = cache_dtype
+
+    offloading_config = build_offloading_config(config, _make_kv_cache_config())
+
+    assert offloading_config.model.kv_cache_abi == "vllm-default-v1"
+
+
+def test_offloading_config_preserves_implicit_nvfp4_record_abi():
+    config = _make_layout_vllm_config()
+    config.cache_config.cache_dtype = "nvfp4_ds_mla"
+    cache_format = Nvfp4MlaCacheFormat(
+        dynamic_scale=False,
+        fp8_rope=True,
+        scales_file="",
+    )
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.config."
+        "NVFP4_MLA_CACHE_FORMAT",
+        cache_format,
+    ):
+        offloading_config = build_offloading_config(config, _make_kv_cache_config())
+
+    assert offloading_config.model.kv_cache_abi == "vllm-default-v1"
+
+
 def test_offloading_spec_resolves_heterogeneous_hybrid_block_sizes():
     config = _make_layout_vllm_config(cpu_bytes_to_use=65536)
     config.cache_config.block_size = 4

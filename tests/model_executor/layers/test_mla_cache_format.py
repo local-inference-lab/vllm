@@ -87,10 +87,21 @@ def test_missing_static_scale_file_cannot_form_persistent_abi(tmp_path):
         cache_format.record_abi("nvfp4_ds_mla")
 
 
-def test_non_nvfp4_cache_abi_is_unaffected_by_nvfp4_mode():
+@pytest.mark.parametrize("cache_dtype", ["bfloat16", "float16", "auto"])
+def test_non_nvfp4_cache_abi_preserves_existing_namespace(cache_dtype):
     cache_format = Nvfp4MlaCacheFormat(
         dynamic_scale=True,
         fp8_rope=False,
         scales_file="/does/not/matter",
     )
-    assert cache_format.record_abi("bfloat16") == "bfloat16:default-v1"
+    assert cache_format.record_abi(cache_dtype) == "vllm-default-v1"
+
+
+@pytest.mark.parametrize("fp8_rope", [False, True])
+def test_implicit_nvfp4_cache_abi_preserves_existing_namespace(fp8_rope):
+    cache_format = Nvfp4MlaCacheFormat(
+        dynamic_scale=False,
+        fp8_rope=fp8_rope,
+        scales_file="",
+    )
+    assert cache_format.record_abi("nvfp4_ds_mla") == "vllm-default-v1"

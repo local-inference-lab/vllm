@@ -45,13 +45,19 @@ class Nvfp4MlaCacheFormat:
         """Return an identity suitable for persistent external-cache keys."""
         normalized_dtype = str(cache_dtype).replace("torch.", "")
         if normalized_dtype != "nvfp4_ds_mla":
-            return f"{normalized_dtype}:default-v1"
+            return "vllm-default-v1"
 
         self.validate()
+        if not self.dynamic_scale and not self.scales_file:
+            # Preserve the existing namespace for every unconfigured/default
+            # deployment. Only modes that change the record's scale semantics
+            # opt into a new external-cache identity.
+            return "vllm-default-v1"
+
         layout = "fp8-rope-368" if self.fp8_rope else "bf16-rope-432"
         if self.dynamic_scale:
             scale_mode = "dynamic-token-v1"
-        elif self.scales_file:
+        else:
             try:
                 scale_digest = hashlib.sha256(
                     Path(self.scales_file).read_bytes()
@@ -61,8 +67,6 @@ class Nvfp4MlaCacheFormat:
                     f"Cannot fingerprint {NVFP4_MLA_SCALES_ENV}={self.scales_file!r}"
                 ) from exc
             scale_mode = f"static-calibrated-v1:{scale_digest}"
-        else:
-            scale_mode = "implicit-unit-v1"
         return f"nvfp4_ds_mla:{layout}:{scale_mode}"
 
 
