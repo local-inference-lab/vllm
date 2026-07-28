@@ -61,6 +61,8 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_SPARSE_INDEXER: bool = False
     VLLM_USE_B12X_MHC: bool = False
     VLLM_USE_B12X_FP8_GEMM: bool = False
+    VLLM_NVFP4_MLA_DYNAMIC_SCALE: bool = False
+    VLLM_NVFP4_MLA_SCALES_FILE: str = ""
     VLLM_B12X_ABSORB_BMM: bool = False
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
@@ -1116,6 +1118,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use b12x for FP4 MoE experts.
     # This is opt-in while the b12x subsystems are brought over one at a time.
     "VLLM_USE_B12X_MOE": lambda: bool(int(os.getenv("VLLM_USE_B12X_MOE", "0"))),
+    "VLLM_NVFP4_MLA_DYNAMIC_SCALE": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_MLA_DYNAMIC_SCALE", "0"))
+    ),
+    "VLLM_NVFP4_MLA_SCALES_FILE": lambda: os.getenv(
+        "VLLM_NVFP4_MLA_SCALES_FILE", ""
+    ).strip(),
     # Exact TP4 GLM-5.2 E64-NVFP4/E192-NF3 one-grid decode specialization.
     "VLLM_NF3_GRID188_DECODE": lambda: bool(
         int(os.getenv("VLLM_NF3_GRID188_DECODE", "1"))

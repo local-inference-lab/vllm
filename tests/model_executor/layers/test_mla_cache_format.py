@@ -5,12 +5,18 @@ import hashlib
 
 import pytest
 
+from vllm import envs
 from vllm.model_executor.layers.mla_cache_format import (
     KV_FP8_ROPE_ENV,
     NVFP4_MLA_DYNAMIC_SCALE_ENV,
     NVFP4_MLA_SCALES_ENV,
     Nvfp4MlaCacheFormat,
 )
+
+
+def test_cache_format_envs_are_registered():
+    assert NVFP4_MLA_DYNAMIC_SCALE_ENV in envs.environment_variables
+    assert NVFP4_MLA_SCALES_ENV in envs.environment_variables
 
 
 def test_from_env_captures_one_server_static_mode(monkeypatch):
