@@ -458,7 +458,10 @@ class OffloadingConnectorScheduler:
         return job_id
 
     def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
-        for bid in block_ids or ():
+        # Lockstep MLA groups share physical block IDs, so a transfer job may
+        # contain the same ID once per logical group. The pending-job index is
+        # set-backed and therefore registers each (block, job) pair only once.
+        for bid in set(block_ids or ()):
             pending = self._block_id_to_pending_jobs[bid]
             pending.remove(job_id)
             if not pending:
