@@ -46,7 +46,7 @@ class _FakePlan:
         )
 
 
-class _FakeTrellisApi:
+class _FakeFusedMoeApi:
     def __init__(self):
         self.planned = []
         self.bound = []
@@ -59,8 +59,8 @@ class _FakeTrellisApi:
         self.planned.append(caps)
         return plan
 
-    def bind(self, plan, *, scratch, a, weights, topk_weights, topk_ids):
-        del scratch, weights, topk_weights, topk_ids
+    def bind(self, plan, *, scratch, a, experts, topk_weights, topk_ids):
+        del scratch, experts, topk_weights, topk_ids
         self.bound.append((plan, int(a.shape[0])))
         return SimpleNamespace(plan=plan, m=int(a.shape[0]))
 
@@ -90,7 +90,7 @@ def _make_layer():
         exl3_intermediate_size_per_partition=INTERMEDIATE,
         local_num_experts=EXPERTS,
         exl3_trellis_tile_config=(64, 128, 64, 128),
-        exl3_trellis_weights=object(),
+        exl3_trellis_weights=SimpleNamespace(plan=object()),
         exl3_pointer_tables=(),
         exl3_expert_map=torch.arange(EXPERTS, dtype=torch.int64),
     )
@@ -110,7 +110,7 @@ class _Harness:
         self._env = dict(env or {})
         self._saved_env = {}
         self._saved_capturing = None
-        self.api = _FakeTrellisApi()
+        self.api = _FakeFusedMoeApi()
         self.ext = _FakeExt()
 
     def __enter__(self):
@@ -121,10 +121,10 @@ class _Harness:
             else:
                 os.environ[name] = value
         self._saved_loaders = (
-            exl3_module._load_sparkinfer_trellis,
+            exl3_module._load_sparkinfer_fused_moe,
             exl3_module._load_exl3_ext,
         )
-        exl3_module._load_sparkinfer_trellis = lambda: self.api
+        exl3_module._load_sparkinfer_fused_moe = lambda: self.api
         exl3_module._load_exl3_ext = lambda: self.ext
         self._saved_capturing = torch.cuda.is_current_stream_capturing
         torch.cuda.is_current_stream_capturing = lambda: False
@@ -135,7 +135,7 @@ class _Harness:
 
     def __exit__(self, *exc):
         (
-            exl3_module._load_sparkinfer_trellis,
+            exl3_module._load_sparkinfer_fused_moe,
             exl3_module._load_exl3_ext,
         ) = self._saved_loaders
         torch.cuda.is_current_stream_capturing = self._saved_capturing
@@ -165,7 +165,8 @@ def test_dual_plan_construction_and_dispatch():
         assert out.dtype == torch.bfloat16 and out.shape == (16, HIDDEN)
         # Two plans: decode (32, block 8) then prefill (capacity, block 64).
         assert [
-            (caps["max_tokens"], caps["block_size_m"]) for caps in h.planned_caps()
+            (caps["max_tokens"], caps["w4a16_block_size_m"])
+            for caps in h.planned_caps()
         ] == [(32, 8), (MAX_BATCHED, 64)]
         assert h.api.bound[-1][0].caps["max_tokens"] == 32
 
@@ -205,7 +206,8 @@ def test_prefill_trellis_disabled_restores_parity():
         _apply(method, layer, 200)
         # Single decode plan only; large m runs the parity chunk loop.
         assert [
-            (caps["max_tokens"], caps["block_size_m"]) for caps in h.planned_caps()
+            (caps["max_tokens"], caps["w4a16_block_size_m"])
+            for caps in h.planned_caps()
         ] == [(32, 8)]
         assert not h.api.bound
         assert h.ext.moe_calls == [(128, 128), (72, 72)]
@@ -221,7 +223,7 @@ def test_prefill_block_m_env_override():
         method = _make_method()
         layer = _make_layer()
         _apply(method, layer, 40)
-        assert h.planned_caps()[-1]["block_size_m"] == 48
+        assert h.planned_caps()[-1]["w4a16_block_size_m"] == 48
         assert h.api.bound[-1][0].caps["max_tokens"] == MAX_BATCHED
 
 

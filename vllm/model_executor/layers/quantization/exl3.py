@@ -3,9 +3,10 @@
 
 """EXL3 (ExLlamaV3 trellis) quantization support.
 
-Rank-sliced routed-expert checkpoints use Sparkinfer's planned full-rotation
-Trellis MoE API for the decode window and the ExLlamaV3 extension for larger
-prefill batches. Generic dense and non-rank-sliced MoE checkpoints use the
+Rank-sliced routed-expert checkpoints use Sparkinfer's unified planned
+``fused_moe`` API for the Trellis decode/prefill windows and the ExLlamaV3
+extension for the small eager parity window. Generic dense and non-rank-sliced
+MoE checkpoints use the
 bit-faithful ``exllamav3_ext.exl3_gemm`` parity path. Every logical checkpoint
 matrix is dispatched independently: vLLM's packed QKV and gate/up modules are
 not treated as one EXL3 matrix because each source matrix owns its Hadamard
@@ -66,7 +67,7 @@ _MCG_SENTINEL = 0xCBAC1FED
 _MUL1_SENTINEL = 0x83DCD12D
 _HADAMARD_BLOCK = 128
 _EXL3_EXT: Any | None = None
-_SPARKINFER_TRELLIS_API: Any | None = None
+_SPARKINFER_FUSED_MOE_API: Any | None = None
 _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
 
@@ -191,21 +192,21 @@ def _load_exl3_ext() -> Any:
     return ext
 
 
-def _load_sparkinfer_trellis() -> Any:
-    """Resolve the public planned Trellis MoE API lazily."""
+def _load_sparkinfer_fused_moe() -> Any:
+    """Resolve the public unified MoE API lazily."""
 
-    global _SPARKINFER_TRELLIS_API
-    if _SPARKINFER_TRELLIS_API is not None:
-        return _SPARKINFER_TRELLIS_API
+    global _SPARKINFER_FUSED_MOE_API
+    if _SPARKINFER_FUSED_MOE_API is not None:
+        return _SPARKINFER_FUSED_MOE_API
     try:
-        from sparkinfer.moe import trellis_moe
+        from sparkinfer.moe import fused_moe
     except Exception as exc:
         raise RuntimeError(
-            "Rank-sliced EXL3 requires sparkinfer.moe.trellis_moe. Install "
-            "a Sparkinfer build containing the planned full-rotation API."
+            "Rank-sliced EXL3 requires the exl3_trellis_mcg source in "
+            "sparkinfer.moe.fused_moe. Install a matching Sparkinfer build."
         ) from exc
-    _SPARKINFER_TRELLIS_API = trellis_moe
-    return trellis_moe
+    _SPARKINFER_FUSED_MOE_API = fused_moe
+    return fused_moe
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -1137,7 +1138,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        del params_dtype, extra_weight_attrs
+        del extra_weight_attrs
+        if params_dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError(
+                f"EXL3 MoE requires BF16 or FP16 activations, got {params_dtype}"
+            )
         if self.moe.moe_parallel_config.use_ep:
             raise NotImplementedError(
                 "EXL3 correctness MoE currently supports TP but not expert parallelism"
@@ -1150,6 +1155,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_tp_size = self.moe.moe_parallel_config.tp_size
         layer.exl3_hidden_size = hidden_size
         layer.exl3_intermediate_size_per_partition = intermediate_size_per_partition
+        layer.exl3_params_dtype = params_dtype
         rank_sliced = self.quant_config.rank_sliced_metadata is not None
         if rank_sliced:
             checkpoint_tp = int(self.quant_config.rank_sliced_metadata["tp"])
@@ -1387,7 +1393,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         return (64, 128, 64, 128)
 
     def _prepare_rank_sliced_weights(self, layer: RoutedExperts) -> None:
-        api = _load_sparkinfer_trellis()
+        api = _load_sparkinfer_fused_moe()
         num_experts = int(layer.local_num_experts)
         hidden_size = int(layer.exl3_hidden_size)
         intermediate_size = int(layer.exl3_intermediate_size_per_partition)
@@ -1436,16 +1442,28 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         intermediate_rotations[:, 2 * intermediate_size :].copy_(down_suh)
         tile_config = self._trellis_tile_config(hidden_size, intermediate_size)
         marker = layer.w13_mcg.exl3_tensors[(0, "w1")]
+        weight_plan = api.plan_weights(
+            quant_modes="w4a16",
+            source_format="exl3_trellis_mcg",
+            activation=layer.activation.value,
+            params_dtype=layer.exl3_params_dtype,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            w13_layout="w13",
+            trellis_bits=bits,
+            trellis_tile_config=tile_config,
+        )
         layer.exl3_trellis_weights = api.prepare_weights(
-            w13,
-            w2,
+            plan=weight_plan,
+            params_dtype=layer.exl3_params_dtype,
+            w1_fp4=w13,
+            w2_fp4=w2,
             gate_suh=gate_suh,
             up_suh=up_suh,
             intermediate_rotations=intermediate_rotations,
             down_svh=down_svh,
-            codebook="mcg",
-            mcg=marker,
-            tile_config=tile_config,
+            trellis_mcg=marker,
         )
 
         slabs = (
@@ -1562,21 +1580,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "profile pass before CUDA graph capture"
             )
 
-        api = _load_sparkinfer_trellis()
+        api = _load_sparkinfer_fused_moe()
 
         def _plan_with_scratch(plan_max_tokens: int, plan_block_m: int):
             caps = api.Caps(
                 max_tokens=plan_max_tokens,
                 num_topk=topk,
-                num_experts=int(layer.local_num_experts),
-                hidden_size=int(layer.exl3_hidden_size),
-                intermediate_size=int(layer.exl3_intermediate_size_per_partition),
                 route_num_experts=int(layer.local_num_experts),
-                block_size_m=plan_block_m,
-                trellis_bits=int(self.quant_config.bits),
-                tile_config=layer.exl3_trellis_tile_config,
-                input_dtype=x.dtype,
                 device=x.device,
+                weight_plan=layer.exl3_trellis_weights.plan,
+                quant_mode="w4a16",
+                w4a16_block_size_m=plan_block_m,
             )
             plan = api.plan(caps)
             scratch_spec = plan.scratch_specs()[0]
@@ -1728,7 +1742,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 runtime["trellis_plan"],
                 scratch=runtime["trellis_scratch"],
                 a=x,
-                weights=layer.exl3_trellis_weights,
+                experts=layer.exl3_trellis_weights,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
             )
@@ -1745,7 +1759,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 runtime["prefill_plan"],
                 scratch=runtime["prefill_scratch"],
                 a=x,
-                weights=layer.exl3_trellis_weights,
+                experts=layer.exl3_trellis_weights,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
             )

@@ -9,9 +9,11 @@ import torch
 import vllm.model_executor.layers.quantization.exl3 as exl3_module
 import vllm.model_executor.parameter as parameter_module
 from vllm.config import CompilationMode
+from vllm.model_executor.layers.fused_moe import MoEActivation
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.exl3 import (
     Exl3Config,
+    Exl3MoEMethod,
     Exl3MoEParameter,
 )
 from vllm.model_executor.models import glm4_moe
@@ -163,6 +165,74 @@ def test_rank_sliced_parameter_preallocates_projection_major_slab(monkeypatch):
     )
     torch.testing.assert_close(param.exl3_tensors[(1, "w1")], w1)
     torch.testing.assert_close(param.exl3_tensors[(2, "w3")], w3)
+
+
+def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
+    experts = 2
+    hidden = intermediate = 128
+    bits = 3
+    slabs = {
+        "w13_trellis": torch.zeros(
+            (2, experts, hidden // 16, intermediate // 16, 16 * bits),
+            dtype=torch.int16,
+        ),
+        "w2_trellis": torch.zeros(
+            (experts, intermediate // 16, hidden // 16, 16 * bits),
+            dtype=torch.int16,
+        ),
+        "w13_suh": torch.ones((2, experts, hidden), dtype=torch.float16),
+        "w13_svh": torch.ones((2, experts, intermediate), dtype=torch.float16),
+        "w2_suh": torch.ones((experts, intermediate), dtype=torch.float16),
+        "w2_svh": torch.ones((experts, hidden), dtype=torch.float16),
+    }
+
+    class FakeFusedMoe:
+        def __init__(self):
+            self.plan_kwargs = None
+            self.prepare_kwargs = None
+
+        def plan_weights(self, **kwargs):
+            self.plan_kwargs = kwargs
+            return SimpleNamespace(source_format=kwargs["source_format"])
+
+        def prepare_weights(self, **kwargs):
+            self.prepare_kwargs = kwargs
+            return SimpleNamespace(plan=kwargs["plan"])
+
+    api = FakeFusedMoe()
+    monkeypatch.setattr(exl3_module, "_load_sparkinfer_fused_moe", lambda: api)
+    method = object.__new__(Exl3MoEMethod)
+    method.quant_config = SimpleNamespace(bits=float(bits))
+    method._rank_sliced_backing = lambda _layer, name: slabs[name]
+    marker = torch.tensor(0xCBAC1FED - (1 << 32), dtype=torch.int32)
+    layer = SimpleNamespace(
+        local_num_experts=experts,
+        exl3_hidden_size=hidden,
+        exl3_intermediate_size_per_partition=intermediate,
+        exl3_params_dtype=torch.float16,
+        activation=MoEActivation.SILU,
+        w13_mcg=SimpleNamespace(exl3_tensors={(0, "w1"): marker}),
+    )
+
+    method._prepare_rank_sliced_weights(layer)
+
+    assert api.plan_kwargs == {
+        "quant_modes": "w4a16",
+        "source_format": "exl3_trellis_mcg",
+        "activation": "silu",
+        "params_dtype": torch.float16,
+        "num_experts": experts,
+        "hidden_size": hidden,
+        "intermediate_size": intermediate,
+        "w13_layout": "w13",
+        "trellis_bits": bits,
+        "trellis_tile_config": (64, 128, 64, 128),
+    }
+    assert api.prepare_kwargs["plan"] is layer.exl3_trellis_weights.plan
+    assert api.prepare_kwargs["params_dtype"] == torch.float16
+    assert api.prepare_kwargs["w1_fp4"] is slabs["w13_trellis"]
+    assert api.prepare_kwargs["w2_fp4"] is slabs["w2_trellis"]
+    assert api.prepare_kwargs["trellis_mcg"] is marker
 
 
 def test_rank_sliced_runtime_scope_is_per_owning_model():
