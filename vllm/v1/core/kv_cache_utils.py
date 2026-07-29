@@ -625,6 +625,26 @@ def hash_block_tokens(
     )
 
 
+def _effective_kv_cache_block_size(
+    spec: KVCacheSpec,
+    dcp_world_size: int,
+    pcp_world_size: int,
+) -> int:
+    is_attention_group = isinstance(spec, AttentionSpec) or (
+        isinstance(spec, UniformTypeKVCacheSpecs)
+        and bool(spec.kv_cache_specs)
+        and all(
+            isinstance(inner_spec, AttentionSpec)
+            for inner_spec in spec.kv_cache_specs.values()
+        )
+    )
+    if not is_attention_group:
+        return spec.block_size
+    return spec.block_size * get_kv_cache_cp_shard_count(
+        spec, dcp_world_size, pcp_world_size
+    )
+
+
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -651,19 +671,11 @@ def resolve_kv_cache_block_sizes(
 
     if len(groups) <= 1:
         spec = groups[0].kv_cache_spec
-        bs = (
-            spec.block_size * get_kv_cache_cp_shard_count(spec, dcp, pcp)
-            if isinstance(spec, AttentionSpec)
-            else spec.block_size
-        )
+        bs = _effective_kv_cache_block_size(spec, dcp, pcp)
         return bs, bs
 
     group_block_sizes = [
-        g.kv_cache_spec.block_size
-        * get_kv_cache_cp_shard_count(g.kv_cache_spec, dcp, pcp)
-        if isinstance(g.kv_cache_spec, AttentionSpec)
-        else g.kv_cache_spec.block_size
-        for g in groups
+        _effective_kv_cache_block_size(g.kv_cache_spec, dcp, pcp) for g in groups
     ]
     scheduler_block_size = math.lcm(*group_block_sizes)
 
@@ -1684,8 +1696,13 @@ def group_and_unify_kv_cache_specs(
     has_swa = any(
         isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
     )
+    # Sliding-window and other cache types are grouped independently below.
+    # Detect lockstep only across full MLA/indexer specs so those unrelated
+    # groups cannot hide a valid partial-replication layout.
     lockstep_mla_layout = _is_lockstep_mla_spec_layout(
-        kv_cache_spec.values(), dcp_world_size, pcp_world_size
+        (spec for spec in kv_cache_spec.values() if isinstance(spec, MLAAttentionSpec)),
+        dcp_world_size,
+        pcp_world_size,
     )
     # Any non-default CP layout needs a group separate from normally sharded
     # layers because token ownership and block-table semantics differ.

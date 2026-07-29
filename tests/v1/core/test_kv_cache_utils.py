@@ -1780,6 +1780,97 @@ def test_partial_replicated_mla_uses_lockstep_dcp8_layout():
     assert grouped[1].kv_cache_spec.page_size_bytes == indexer.page_size_bytes
 
 
+def test_partial_replicated_uniform_groups_use_global_block_size():
+    target = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+    )
+    indexer = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        dcp_kv_shard_count=4,
+    )
+    grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(
+        {"target": target, "indexer": indexer}, 8, 1
+    )
+    assert grouped_specs is not None
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
+    assert all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in groups
+    )
+
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=64,
+            enable_prefix_caching=True,
+            prefix_match_unit=None,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=8,
+            prefill_context_parallel_size=1,
+        ),
+        kv_transfer_config=None,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+    )
+
+    single_group_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[groups[0]],
+    )
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(
+        single_group_config, vllm_config
+    ) == (512, 512)
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config
+    ) == (512, 512)
+
+
+def test_partial_replicated_mla_groups_with_sliding_window_mla():
+    target = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+    )
+    indexer = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        dcp_kv_shard_count=4,
+    )
+    sliding = SlidingWindowMLASpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.uint8,
+        sliding_window=4096,
+        dcp_sharded=True,
+    )
+
+    grouped = kv_cache_utils.group_and_unify_kv_cache_specs(
+        {"target": target, "indexer": indexer, "sliding": sliding}, 8, 1
+    )
+
+    assert grouped is not None
+    assert [set(group.kv_cache_specs) for group in grouped] == [
+        {"target"},
+        {"sliding"},
+        {"indexer"},
+    ]
+
+
 def test_lockstep_mla_predicate_rejects_nonmatching_layouts():
     sharded = MLAAttentionSpec(
         block_size=64,
