@@ -1800,6 +1800,10 @@ def test_partial_replicated_uniform_groups_use_global_block_size():
     )
     assert grouped_specs is not None
     groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
+    assert len(groups) == 2
+    assert {
+        name for group in groups for name in group.kv_cache_spec.kv_cache_specs
+    } == {"target", "indexer"}
     assert all(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in groups
     )
