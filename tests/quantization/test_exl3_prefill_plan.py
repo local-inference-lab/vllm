@@ -225,6 +225,31 @@ def test_prefill_block_m_env_override():
         assert h.api.bound[-1][0].caps["max_tokens"] == MAX_BATCHED
 
 
+def test_parity_window_capacity_is_validated_before_planning():
+    env = {
+        "VLLM_EXL3_TRELLIS_MIN_M": "160",
+        "VLLM_EXL3_TRELLIS_MAX_M": "192",
+        "VLLM_EXL3_PREFILL_CHUNK": "128",
+    }
+    with _Harness(env=env) as h:
+        with pytest.raises(ValueError, match="cannot cover the EXL3 parity window"):
+            _apply(_make_method(), _make_layer(), 16)
+        assert not h.planned_caps()
+
+
+def test_disabled_prefill_plan_keeps_full_parity_capacity():
+    env = {
+        "VLLM_EXL3_TRELLIS_MIN_M": "160",
+        "VLLM_EXL3_TRELLIS_MAX_M": "192",
+        "VLLM_EXL3_PREFILL_CHUNK": "128",
+        "VLLM_EXL3_PREFILL_TRELLIS": "0",
+    }
+    with _Harness(env=env):
+        _apply(_make_method(), _make_layer(), 159)
+        runtime = next(iter(exl3_module._RANK_SLICED_RUNTIMES.values()))
+        assert runtime["parity_rows"] == MAX_BATCHED
+
+
 def test_parity_path_guarded_against_capture():
     with _Harness() as h:
         method = _make_method()

@@ -1434,9 +1434,12 @@ def test_b12x_schedule_metadata_uses_canonical_indexer_import(monkeypatch):
     monkeypatch.setattr(
         mla_indexer_mod.envs,
         "VLLM_USE_B12X_SPARSE_INDEXER",
-        True,
+        False,
     )
     builder = object.__new__(mla_indexer_mod.DeepseekV32IndexerMetadataBuilder)
+    # Backend selection is resolved once in __init__. The metadata path must
+    # use that result even when the legacy environment flag is unset.
+    builder.use_b12x_sparse_indexer = True
     builder.scheduler_metadata_buffer = torch.zeros((5, 2), dtype=torch.int32)
     builder.kv_cache_spec = types.SimpleNamespace(storage_block_size=64)
     builder.num_sms = 4
@@ -1457,6 +1460,27 @@ def test_b12x_schedule_metadata_uses_canonical_indexer_import(monkeypatch):
         ("uses_schedule", 2, 3),
         ("build_schedule", (64, 128), 64, 4, True),
     ]
+
+
+def test_b12x_schedule_metadata_respects_cached_backend_choice(monkeypatch):
+    from vllm.v1.attention.backends.mla import indexer as mla_indexer_mod
+
+    monkeypatch.setattr(
+        mla_indexer_mod.envs,
+        "VLLM_USE_B12X_SPARSE_INDEXER",
+        True,
+    )
+    builder = object.__new__(mla_indexer_mod.DeepseekV32IndexerMetadataBuilder)
+    builder.use_b12x_sparse_indexer = False
+
+    result = builder._maybe_build_b12x_schedule_metadata(
+        seq_lens=torch.tensor([64], dtype=torch.int32),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        num_decode_tokens=1,
+        requires_padding=False,
+    )
+
+    assert result is None
 
 
 def test_mtp_variable_decode_preserves_block_table_alignment_padding():

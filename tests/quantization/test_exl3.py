@@ -8,11 +8,13 @@ import torch
 
 import vllm.model_executor.layers.quantization.exl3 as exl3_module
 import vllm.model_executor.parameter as parameter_module
+from vllm.config import CompilationMode
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.exl3 import (
     Exl3Config,
     Exl3MoEParameter,
 )
+from vllm.model_executor.models import glm4_moe
 
 
 def _rank_sliced_metadata(**overrides):
@@ -47,6 +49,39 @@ def test_rank_sliced_checkpoint_selects_exl3_override():
         )
         is None
     )
+
+
+def test_glm_model_retains_quant_config_for_weight_loading(monkeypatch):
+    pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=False)
+    monkeypatch.setattr(glm4_moe, "get_pp_group", lambda: pp_group)
+    monkeypatch.setattr(
+        glm4_moe,
+        "make_layers",
+        lambda *args, **kwargs: (0, 0, torch.nn.ModuleList()),
+    )
+    monkeypatch.setattr(
+        glm4_moe,
+        "make_empty_intermediate_tensors_factory",
+        lambda *args, **kwargs: object(),
+    )
+    quant_config = object()
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                vocab_size=1,
+                hidden_size=8,
+                num_hidden_layers=0,
+            )
+        ),
+        cache_config=object(),
+        quant_config=quant_config,
+        parallel_config=SimpleNamespace(enable_eplb=False),
+        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
+    )
+
+    model = glm4_moe.Glm4MoeModel(vllm_config=vllm_config)
+
+    assert model.quant_config is quant_config
 
 
 @pytest.mark.parametrize(

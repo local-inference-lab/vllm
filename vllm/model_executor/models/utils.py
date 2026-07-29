@@ -819,15 +819,13 @@ def get_draft_quant_config(vllm_config: VllmConfig) -> "QuantizationConfig | Non
             getattr(vllm_config, "model_config", None), "hf_config", None
         )
         hf_config = draft_hf
-        if (
-            getattr(draft_hf, "hybrid_tr3_tail", None) is None
-            and getattr(target_hf, "hybrid_tr3_tail", None) is not None
-        ):
+        if getattr(draft_hf, "hybrid_tr3_tail", None) is None:
             hf_config = target_hf
-        quant_config.maybe_update_config(
-            draft_model_config.model,
-            hf_config=hf_config,
-        )
+        if getattr(hf_config, "hybrid_tr3_tail", None) is not None:
+            quant_config.maybe_update_config(
+                draft_model_config.model,
+                hf_config=hf_config,
+            )
 
     return quant_config
 

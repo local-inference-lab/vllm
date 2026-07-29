@@ -297,12 +297,16 @@ def get_indexer_max_num_blocks_per_req(
     return cdiv(max_model_len, block_size * effective_cp_world_size)
 
 
-def _supports_varlen_paged_mqa_logits() -> bool:
-    if (
-        envs.VLLM_USE_B12X_SPARSE_INDEXER
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability_family(120)
-    ):
+def _supports_varlen_paged_mqa_logits(
+    use_b12x_sparse_indexer: bool | None = None,
+) -> bool:
+    if use_b12x_sparse_indexer is None and current_platform.is_cuda():
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            use_b12x_sparse_indexer as resolve_b12x_sparse_indexer,
+        )
+
+        use_b12x_sparse_indexer = resolve_b12x_sparse_indexer()
+    if use_b12x_sparse_indexer:
         # B12X consumes the already-flattened rank-1 seq_lens and repeated
         # block-table rows directly, so it does not need DeepGEMM's indices.
         return True
@@ -442,18 +446,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             use_b12x_sparse_indexer,
         )
 
+        self.use_b12x_sparse_indexer = use_b12x_sparse_indexer()
         self.use_flattening = (
             not current_platform.is_device_capability_family(100)
             and next_n not in (1, 2)
-            and not use_b12x_sparse_indexer()
+            and not self.use_b12x_sparse_indexer
         )
         # SM100 supports the varlen paged MQA logits kernel (indices-selected,
         # next_n == 1 rows). Only compact spec-decode verification batches opt
         # into it; uniform DFlash draft proposal should keep the native path.
-        self.use_varlen = (
-            _supports_varlen_paged_mqa_logits()
-            and _uses_varlen_dspark_capacity(self.vllm_config)
-        )
+        self.use_varlen = _supports_varlen_paged_mqa_logits(
+            self.use_b12x_sparse_indexer
+        ) and _uses_varlen_dspark_capacity(self.vllm_config)
         logger.info_once(
             "DSA indexer decode path: use_flattening=%s use_varlen=%s "
             "(next_n=%d, use_fp4_indexer_cache=%s)",
@@ -697,7 +701,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 # their slot mappings stay padded and their outputs are ignored.
                 padding_seq_len = (
                     self.compress_ratio
-                    if force_flatten and envs.VLLM_USE_B12X_SPARSE_INDEXER
+                    if force_flatten and self.use_b12x_sparse_indexer
                     else 0
                 )
                 self.decode_seq_lens_buffer[actual_expanded:num_decode_tokens] = (
@@ -832,7 +836,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         num_decode_tokens: int,
         requires_padding: bool,
     ) -> torch.Tensor | None:
-        if not envs.VLLM_USE_B12X_SPARSE_INDEXER or requires_padding:
+        if not self.use_b12x_sparse_indexer or requires_padding:
             return None
 
         schedule_seq_lens = seq_lens
@@ -995,7 +999,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # slice below).
             assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
-            if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+            if self.use_b12x_sparse_indexer:
                 # The b12x paged prefill streams one supertile at a time and
                 # row-shares the page table, which requires single-request
                 # chunks. Budget each request by the supertile K window.
@@ -1174,7 +1178,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             active_width: torch.Tensor | None = None
             decode_topk_max_seq_len: int | None = None
-            if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+            if self.use_b12x_sparse_indexer:
                 # Live scorer window in cache tokens. ceil(max_seq_len /
                 # compress_ratio) is an upper bound on the max compressed
                 # context across the batch, so windowing to it is

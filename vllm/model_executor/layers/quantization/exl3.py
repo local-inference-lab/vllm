@@ -1173,9 +1173,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             # No silent fallback: a wrong capacity here puts the target and the
             # rank-sliced MTP draft on different plans with no error, which is
             # exactly the class of mismatch that corrupts only at scale.
-            if scheduler_config is None or getattr(
-                scheduler_config, "max_num_batched_tokens", None
-            ) is None:
+            if (
+                scheduler_config is None
+                or getattr(scheduler_config, "max_num_batched_tokens", None) is None
+            ):
                 raise ValueError(
                     "EXL3 rank-sliced MoE requires scheduler_config."
                     "max_num_batched_tokens to plan its Trellis arena; refusing to "
@@ -1517,6 +1518,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # and making the capacity guard in _apply_rank_sliced unreachable. The
         # planned capacity is a property of the layer, not of one forward pass.
         max_batched_tokens = int(layer.exl3_max_num_batched_tokens)
+        prefill_plan_enabled = prefill_trellis and max_batched_tokens > max_trellis_m
+        parity_rows = (
+            min(chunk, max_batched_tokens)
+            if prefill_plan_enabled
+            else max_batched_tokens
+        )
+        max_parity_batch = min(max_batched_tokens, min_trellis_m - 1)
+        if max_parity_batch > parity_rows:
+            raise ValueError(
+                "VLLM_EXL3_PREFILL_CHUNK cannot cover the EXL3 parity window: "
+                f"chunk={chunk}, required_rows={max_parity_batch}. Increase "
+                "VLLM_EXL3_PREFILL_CHUNK or lower VLLM_EXL3_TRELLIS_MIN_M."
+            )
         topk = int(topk_ids.shape[1])
         device_index = x.device.index
         key = (
@@ -1580,7 +1594,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # rows rather than once per 8-row block.
         prefill_plan = None
         prefill_scratch = None
-        if prefill_trellis and max_batched_tokens > max_trellis_m:
+        if prefill_plan_enabled:
             prefill_plan, prefill_scratch = _plan_with_scratch(
                 max_batched_tokens, prefill_block_m
             )
@@ -1603,11 +1617,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         device = x.device
         # With the prefill plan live, the parity path only ever serves
         # m < min_trellis_m, so its persistent staging shrinks to one chunk.
-        parity_rows = (
-            max_batched_tokens
-            if prefill_plan is None
-            else min(chunk, max_batched_tokens)
-        )
         runtime = {
             "api": api,
             "trellis_plan": trellis_plan,
@@ -1695,8 +1704,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             max_trellis_m,
             block_m,
             (
-                f"trellis block_m={prefill_block_m} "
-                f"arena={prefill_arena_mib:.1f}MiB"
+                f"trellis block_m={prefill_block_m} arena={prefill_arena_mib:.1f}MiB"
                 if prefill_plan is not None
                 else "parity"
             ),
