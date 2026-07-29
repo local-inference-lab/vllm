@@ -93,7 +93,14 @@ logger = init_logger(__name__)
 
 
 def kernel_warmup(worker: "Worker") -> None:
-    """Run kernel warmup without importing its CUDA dependencies on preload."""
+    """Run kernel warmup without importing its CUDA dependencies on preload.
+
+    Args:
+        worker: Worker whose kernels should be warmed up.
+
+    Returns:
+        None.
+    """
     from vllm.model_executor.warmup.kernel_warmup import (
         kernel_warmup as run_kernel_warmup,
     )
