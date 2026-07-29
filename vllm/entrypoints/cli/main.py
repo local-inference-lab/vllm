@@ -6,6 +6,7 @@ Note that all future modules must be lazily loaded within main
 to avoid certain eager import breakage."""
 
 import importlib.metadata
+import os
 import sys
 from importlib.util import find_spec
 
@@ -14,7 +15,28 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _bootstrap_cuda_clean_forkserver() -> None:
+    """Start the serving forkserver before CLI imports can initialize CUDA."""
+    if len(sys.argv) < 2 or sys.argv[1] != "serve":
+        return
+    if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "forkserver":
+        return
+
+    from vllm.utils.system_utils import ensure_cuda_clean_forkserver
+
+    ensure_cuda_clean_forkserver(
+        [
+            "vllm.v1.engine.async_llm",
+            "vllm.v1.executor.multiproc_executor",
+            "vllm.v1.worker.gpu_worker",
+        ],
+        set_start_method=True,
+    )
+
+
 def main():
+    _bootstrap_cuda_clean_forkserver()
+
     import vllm.entrypoints.cli.benchmark.main
     import vllm.entrypoints.cli.collect_env
     import vllm.entrypoints.cli.launch

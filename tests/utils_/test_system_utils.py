@@ -47,6 +47,7 @@ def test_ensure_cuda_clean_forkserver_starts_with_deduplicated_preload(
     monkeypatch,
 ):
     calls: dict[str, object] = {}
+    monkeypatch.setattr(system_utils, "_cuda_clean_forkserver_owner_pid", None)
     monkeypatch.setattr(system_utils, "cuda_is_initialized", lambda: False)
     monkeypatch.setattr(system_utils, "xpu_is_initialized", lambda: False)
     monkeypatch.setattr(
@@ -75,12 +76,49 @@ def test_ensure_cuda_clean_forkserver_starts_with_deduplicated_preload(
         "preload": ["vllm.worker", "vllm.executor"],
         "running": True,
     }
+    assert system_utils._cuda_clean_forkserver_owner_pid == os.getpid()
+
+
+def test_ensure_cuda_clean_forkserver_is_idempotent(monkeypatch):
+    monkeypatch.setattr(system_utils, "_cuda_clean_forkserver_owner_pid", os.getpid())
+    monkeypatch.setattr(
+        system_utils,
+        "cuda_is_initialized",
+        lambda: pytest.fail("idempotent call must not recheck CUDA"),
+    )
+
+    ensure_cuda_clean_forkserver(["vllm.worker"])
+
+
+def test_active_cuda_clean_forkserver_is_not_replaced(monkeypatch):
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "forkserver")
+    monkeypatch.setattr(system_utils, "_cuda_clean_forkserver_owner_pid", os.getpid())
+    monkeypatch.setattr(system_utils, "cuda_is_initialized", lambda: True)
+
+    _maybe_force_spawn()
+
+    assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "forkserver"
+
+
+def test_unstarted_forkserver_is_replaced_after_cuda_init(monkeypatch):
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "forkserver")
+    monkeypatch.setattr(system_utils, "_cuda_clean_forkserver_owner_pid", None)
+    monkeypatch.setattr(system_utils, "cuda_is_initialized", lambda: True)
+    monkeypatch.setattr(system_utils, "xpu_is_initialized", lambda: False)
+    monkeypatch.setattr(system_utils, "is_in_ray_actor", lambda: False)
+    monkeypatch.setattr(system_utils, "in_wsl", lambda: False)
+    monkeypatch.setattr("sys.argv", ["vllm", "serve"])
+
+    _maybe_force_spawn()
+
+    assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
 
 
 @pytest.mark.parametrize("initialized", ["cuda", "xpu"])
 def test_ensure_cuda_clean_forkserver_rejects_initialized_parent(
     monkeypatch, initialized
 ):
+    monkeypatch.setattr(system_utils, "_cuda_clean_forkserver_owner_pid", None)
     monkeypatch.setattr(
         system_utils, "cuda_is_initialized", lambda: initialized == "cuda"
     )

@@ -112,6 +112,13 @@ def unique_filepath(fn: Callable[[int], Path]) -> Path:
 # Process management utilities
 
 
+_cuda_clean_forkserver_owner_pid: int | None = None
+
+
+def _cuda_clean_forkserver_is_running() -> bool:
+    return _cuda_clean_forkserver_owner_pid == os.getpid()
+
+
 def ensure_cuda_clean_forkserver(
     preload_modules: list[str],
     *,
@@ -124,6 +131,10 @@ def ensure_cuda_clean_forkserver(
     inheritance as a direct fork, so fail closed instead of creating workers
     that can fail later during device initialization.
     """
+    global _cuda_clean_forkserver_owner_pid
+
+    if _cuda_clean_forkserver_is_running():
+        return
     if cuda_is_initialized() or xpu_is_initialized():
         raise RuntimeError(
             "Cannot start the vLLM forkserver after CUDA/XPU initialization. "
@@ -139,6 +150,7 @@ def ensure_cuda_clean_forkserver(
     import multiprocessing.forkserver as forkserver
 
     forkserver.ensure_running()
+    _cuda_clean_forkserver_owner_pid = os.getpid()
 
 
 def _sync_visible_devices_env_vars():
@@ -156,7 +168,10 @@ def _maybe_force_spawn():
     """Check if we need to force the use of the `spawn` multiprocessing start
     method.
     """
-    if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") == "spawn":
+    method = os.environ.get("VLLM_WORKER_MULTIPROC_METHOD")
+    if method == "spawn" or (
+        method == "forkserver" and _cuda_clean_forkserver_is_running()
+    ):
         return
 
     reasons = []
