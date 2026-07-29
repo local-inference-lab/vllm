@@ -3,9 +3,6 @@
 import asyncio
 import importlib
 import inspect
-import multiprocessing
-import multiprocessing.forkserver as forkserver
-import os
 import signal
 import socket
 import tempfile
@@ -66,7 +63,11 @@ from vllm.tracing import instrument
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.network_utils import is_valid_ipv6_address
-from vllm.utils.system_utils import decorate_logs, set_ulimit
+from vllm.utils.system_utils import (
+    decorate_logs,
+    ensure_cuda_clean_forkserver,
+    set_ulimit,
+)
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -120,13 +121,19 @@ async def build_async_engine_client(
     usage_context: UsageContext = UsageContext.OPENAI_API_SERVER,
     client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
-    if os.getenv("VLLM_WORKER_MULTIPROC_METHOD") == "forkserver":
-        # The executor is expected to be mp.
-        # Pre-import heavy modules in the forkserver process
-        logger.debug("Setup forkserver with pre-imports")
-        multiprocessing.set_start_method("forkserver")
-        multiprocessing.set_forkserver_preload(["vllm.v1.engine.async_llm"])
-        forkserver.ensure_running()
+    if envs.VLLM_WORKER_MULTIPROC_METHOD == "forkserver":
+        # EngineCore is forked from this CUDA-clean server. Preloading the
+        # executor and worker stack lets its pages be shared instead of imported
+        # independently by every local rank.
+        logger.debug("Setup CUDA-clean API forkserver with worker preloads")
+        ensure_cuda_clean_forkserver(
+            [
+                "vllm.v1.engine.async_llm",
+                "vllm.v1.executor.multiproc_executor",
+                "vllm.v1.worker.gpu_worker",
+            ],
+            set_start_method=True,
+        )
         logger.debug("Forkserver setup complete!")
 
     # Context manager to handle engine_client lifecycle

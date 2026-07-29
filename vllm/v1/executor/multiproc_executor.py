@@ -55,6 +55,7 @@ from vllm.utils.ompmultiprocessing import OMPProcessManager
 from vllm.utils.system_utils import (
     _maybe_force_spawn,
     decorate_logs,
+    ensure_cuda_clean_forkserver,
     get_mp_context,
     set_process_title,
 )
@@ -114,6 +115,21 @@ class MultiprocExecutor(Executor):
         self.is_failed = False
         self.failure_callback: FailureCallback | None = None
 
+        if envs.VLLM_WORKER_MULTIPROC_METHOD == "forkserver":
+            # EngineCore owns a separate forkserver for its GPU workers. Start
+            # it before message-queue setup can touch CUDA and preload the stack
+            # each local rank would otherwise import independently.
+            ensure_cuda_clean_forkserver(
+                [
+                    "vllm.v1.executor.multiproc_executor",
+                    "vllm.v1.worker.gpu_worker",
+                ]
+            )
+
+        # Resolve the context immediately after the clean forkserver starts.
+        # Existing NUMA/Ray/WSL guards in get_mp_context remain authoritative.
+        context = get_mp_context()
+
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
             f"world_size ({self.world_size}) must be equal to the "
@@ -156,7 +172,6 @@ class MultiprocExecutor(Executor):
             )
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
         # Create workers
-        context = get_mp_context()
         shared_worker_lock = context.Lock()
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False

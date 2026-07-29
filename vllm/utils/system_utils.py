@@ -112,6 +112,35 @@ def unique_filepath(fn: Callable[[int], Path]) -> Path:
 # Process management utilities
 
 
+def ensure_cuda_clean_forkserver(
+    preload_modules: list[str],
+    *,
+    set_start_method: bool = False,
+) -> None:
+    """Start a forkserver before this process initializes an accelerator.
+
+    A forkserver child inherits the server's runtime state. Starting that
+    server after CUDA/XPU initialization would reproduce the same unsafe state
+    inheritance as a direct fork, so fail closed instead of creating workers
+    that can fail later during device initialization.
+    """
+    if cuda_is_initialized() or xpu_is_initialized():
+        raise RuntimeError(
+            "Cannot start the vLLM forkserver after CUDA/XPU initialization. "
+            "Use VLLM_WORKER_MULTIPROC_METHOD=spawn instead."
+        )
+    if not preload_modules:
+        raise ValueError("forkserver preload_modules must not be empty")
+
+    if set_start_method:
+        multiprocessing.set_start_method("forkserver", force=True)
+    multiprocessing.set_forkserver_preload(list(dict.fromkeys(preload_modules)))
+
+    import multiprocessing.forkserver as forkserver
+
+    forkserver.ensure_running()
+
+
 def _sync_visible_devices_env_vars():
     """Sync HIP/CUDA visibility env vars before spawning (ROCm only)."""
 

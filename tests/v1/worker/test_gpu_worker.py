@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -20,6 +21,23 @@ from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
+
+
+def test_gpu_worker_keeps_cuda_warmup_import_lazy(monkeypatch: pytest.MonkeyPatch):
+    # Forkserver preloads this module. Binding kernel_warmup at module scope
+    # imports CUDA-initializing warmup dependencies into the server snapshot.
+    assert gpu_worker_module.kernel_warmup.__module__ == gpu_worker_module.__name__
+
+    run_kernel_warmup = Mock()
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.warmup.kernel_warmup",
+        SimpleNamespace(kernel_warmup=run_kernel_warmup),
+    )
+    worker = object()
+    gpu_worker_module.kernel_warmup(worker)
+
+    run_kernel_warmup.assert_called_once_with(worker)
 
 
 def _worker_with_mm_config(
