@@ -14,9 +14,16 @@ from vllm.model_executor.layers.mla_cache_format import (
 )
 
 
-def test_cache_format_envs_are_registered():
+def test_cache_format_envs_are_registered(monkeypatch):
     assert NVFP4_MLA_DYNAMIC_SCALE_ENV in envs.environment_variables
     assert NVFP4_MLA_SCALES_ENV in envs.environment_variables
+
+    scales_file = envs.environment_variables[NVFP4_MLA_SCALES_ENV]
+    monkeypatch.delenv(NVFP4_MLA_SCALES_ENV, raising=False)
+    assert scales_file() == ""
+
+    monkeypatch.setenv(NVFP4_MLA_SCALES_ENV, "  /tmp/static-scales.json  ")
+    assert scales_file() == "/tmp/static-scales.json"
 
 
 def test_from_env_captures_one_server_static_mode(monkeypatch):

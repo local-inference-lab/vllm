@@ -2293,8 +2293,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Prebuilt exllamav3 extension location and torch-ABI compatibility shim.
     "VLLM_EXL3_EXT_PATH": lambda: os.getenv("VLLM_EXL3_EXT_PATH"),
     "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),
-    # Calibrated MLA outer scales for the nvfp4_ds_mla KV cache.
-    "VLLM_NVFP4_MLA_SCALES_FILE": lambda: os.getenv("VLLM_NVFP4_MLA_SCALES_FILE"),
 
 }
 
