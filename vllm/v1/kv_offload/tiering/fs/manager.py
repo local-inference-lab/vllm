@@ -311,6 +311,9 @@ class FileSystemTierManager(SecondaryTierManager):
                 if success and keys:
                     if self._max_cache_size_bytes is not None:
                         with self._capacity_cv:
+                            # Removal events are idempotent invalidations. If a
+                            # block was evicted before this completion poll,
+                            # do not publish a stale store event for it.
                             keys = [key for key in keys if key in self._cache_lru]
                             if keys:
                                 self._append_event(
@@ -405,15 +408,37 @@ class FileSystemTierManager(SecondaryTierManager):
         expected = os.path.normpath(self.file_mapper.get_file_name(key))
         return key if expected == os.path.normpath(path) else None
 
+    def _key_from_cache_temp_path(self, path: str) -> OffloadKey | None:
+        """Recover an OffloadKey from a FileMapper-owned temporary path."""
+        if not path.endswith(".tmp"):
+            return None
+        final_path, separator, suffix = path.removesuffix(".tmp").rpartition("_")
+        if not separator or not suffix.isdecimal():
+            return None
+        return self._key_from_cache_path(final_path)
+
     def _initialize_capacity_index(self) -> None:
         """Index existing block files and trim an oversized namespace."""
         data_dir = f"{self.file_mapper.base_path}_r{self.file_mapper.rank}"
         entries: list[tuple[int, str, OffloadKey, int]] = []
+        stale_temp_files_removed = 0
         for dir_path, _, filenames in os.walk(data_dir):
             for filename in filenames:
                 path = os.path.join(dir_path, filename)
                 key = self._key_from_cache_path(path)
                 if key is None:
+                    if self._key_from_cache_temp_path(path) is None:
+                        continue
+                    try:
+                        os.remove(path)
+                    except FileNotFoundError:
+                        continue
+                    except OSError as exc:
+                        raise OSError(
+                            f"Unable to remove stale filesystem KV temp file {path}: "
+                            f"{exc}"
+                        ) from exc
+                    stale_temp_files_removed += 1
                     continue
                 try:
                     stat_result = os.stat(path)
@@ -422,6 +447,13 @@ class FileSystemTierManager(SecondaryTierManager):
                 entries.append(
                     (stat_result.st_mtime_ns, path, key, stat_result.st_size)
                 )
+
+        if stale_temp_files_removed:
+            logger.info(
+                "Removed %d stale filesystem KV temp files from %s",
+                stale_temp_files_removed,
+                data_dir,
+            )
 
         # mtime is the restart-safe approximation of prior recency. Runtime
         # touches maintain exact LRU order after initialization.
@@ -449,39 +481,40 @@ class FileSystemTierManager(SecondaryTierManager):
     def _evict_until_fits_locked(self, required_bytes: int) -> bool:
         """Evict unpinned LRU entries until required_bytes can be reserved."""
         assert self._max_cache_size_bytes is not None
-        while (
+        if (
             self._cache_size_bytes + self._pending_store_bytes + required_bytes
-            > self._max_cache_size_bytes
+            <= self._max_cache_size_bytes
         ):
-            evicted = False
-            for key, size in list(self._cache_lru.items()):
-                if self._pin_counts.get(key, 0):
-                    continue
-                path = self.file_mapper.get_file_name(key)
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    logger.warning(
-                        "Failed to evict filesystem KV block %s: %s", path, exc
-                    )
-                    continue
-                del self._cache_lru[key]
-                self._cache_size_bytes -= size
-                self._append_event(
-                    OffloadingEvent(
-                        keys=[key],
-                        medium=self.medium,
-                        removed=True,
-                        locality=self.locality,
-                    )
+            return True
+
+        for key in tuple(self._cache_lru):
+            if self._pin_counts.get(key, 0):
+                continue
+            size = self._cache_lru[key]
+            path = self.file_mapper.get_file_name(key)
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("Failed to evict filesystem KV block %s: %s", path, exc)
+                continue
+            del self._cache_lru[key]
+            self._cache_size_bytes -= size
+            self._append_event(
+                OffloadingEvent(
+                    keys=[key],
+                    medium=self.medium,
+                    removed=True,
+                    locality=self.locality,
                 )
-                evicted = True
-                break
-            if not evicted:
-                return False
-        return True
+            )
+            if (
+                self._cache_size_bytes + self._pending_store_bytes + required_bytes
+                <= self._max_cache_size_bytes
+            ):
+                return True
+        return False
 
     def _reserve_store(self, key: OffloadKey) -> bool:
         """Reserve one block. Return False when it is already resident."""

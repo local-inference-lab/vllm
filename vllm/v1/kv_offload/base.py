@@ -106,6 +106,12 @@ class Locality(Enum):
 
 @dataclass
 class OffloadingEvent:
+    """Storage-state update emitted by an offloading tier.
+
+    Removal is an idempotent invalidation and need not have a preceding store
+    in the current event stream.
+    """
+
     keys: list[OffloadKey]
     medium: str
     # True if blocks are removed, False if stored

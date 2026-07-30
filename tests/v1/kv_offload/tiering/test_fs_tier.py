@@ -540,6 +540,124 @@ def test_capacity_index_trims_existing_namespace_on_startup(tmp_path):
         bounded.shutdown()
 
 
+def test_capacity_eviction_scans_each_candidate_once(tmp_path, monkeypatch):
+    import vllm.v1.kv_offload.tiering.fs.manager as mgr_mod
+
+    tier, _, block_size = _make_bounded_fs_tier(tmp_path, max_blocks=2)
+    paths = [tier.file_mapper.get_file_name(key(i)) for i in range(1, 5)]
+    for path in paths:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb"):
+            pass
+
+    with tier._capacity_cv:
+        for i in range(1, 5):
+            tier._cache_lru[key(i)] = block_size
+        tier._cache_size_bytes = 4 * block_size
+        tier._pin_counts[key(1)] = 1
+
+    remove_attempts: list[str] = []
+    original_remove = mgr_mod.os.remove
+
+    def tracked_remove(path):
+        remove_attempts.append(path)
+        if path == paths[1]:
+            raise PermissionError("injected eviction failure")
+        original_remove(path)
+
+    monkeypatch.setattr(mgr_mod.os, "remove", tracked_remove)
+    try:
+        with tier._capacity_cv:
+            assert tier._evict_until_fits_locked(0)
+        assert list(tier._cache_lru) == [key(1), key(2)]
+        assert tier._cache_size_bytes == 2 * block_size
+        assert paths[0] not in remove_attempts
+        assert remove_attempts.count(paths[1]) == 1
+        assert remove_attempts == paths[1:]
+    finally:
+        tier.shutdown()
+
+
+def test_capacity_index_removes_only_owned_stale_temp_files(tmp_path):
+    tensor = _page_aligned_zero_tensor(1, _BLOCK_ELEMENTS)
+    view = memoryview(tensor.numpy())
+    assert view.strides is not None
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+    )
+    block_path = tier.file_mapper.get_file_name(key(1))
+    tier.shutdown()
+
+    os.makedirs(os.path.dirname(block_path), exist_ok=True)
+    stale_temp_path = f"{block_path}_123.tmp"
+    unrelated_temp_path = f"{block_path}_writer.tmp"
+    for path in (stale_temp_path, unrelated_temp_path):
+        with open(path, "wb") as file:
+            file.write(b"stale")
+
+    bounded = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+        max_cache_size_bytes=view.strides[0],
+    )
+    try:
+        assert not os.path.exists(stale_temp_path)
+        assert os.path.exists(unrelated_temp_path)
+    finally:
+        bounded.shutdown()
+
+
+def test_capacity_index_fails_if_stale_temp_cannot_be_removed(tmp_path, monkeypatch):
+    import vllm.v1.kv_offload.tiering.fs.manager as mgr_mod
+
+    tensor = _page_aligned_zero_tensor(1, _BLOCK_ELEMENTS)
+    view = memoryview(tensor.numpy())
+    assert view.strides is not None
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+    )
+    block_path = tier.file_mapper.get_file_name(key(1))
+    tier.shutdown()
+
+    os.makedirs(os.path.dirname(block_path), exist_ok=True)
+    stale_temp_path = f"{block_path}_123.tmp"
+    with open(stale_temp_path, "wb") as file:
+        file.write(b"stale")
+
+    original_remove = mgr_mod.os.remove
+
+    def fail_stale_temp_remove(path):
+        if path == stale_temp_path:
+            raise PermissionError("injected cleanup failure")
+        original_remove(path)
+
+    monkeypatch.setattr(mgr_mod.os, "remove", fail_stale_temp_remove)
+    with pytest.raises(OSError, match="Unable to remove stale filesystem KV temp"):
+        FileSystemTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=view,
+            tier_type="fs",
+            root_dir=str(tmp_path),
+            n_read_threads=1,
+            n_write_threads=1,
+            max_cache_size_bytes=view.strides[0],
+        )
+
+
 def test_failed_load_missing_file(fs_tier):
     """Test that loading a block whose file does not exist results in a failed job."""
     tier, _ = fs_tier
@@ -740,6 +858,25 @@ def test_capacity_eviction_event_precedes_replacement_store(tmp_path):
         assert events[1].keys == [key(3)]
         assert all(event.medium == "FS" for event in events)
         assert all(event.locality is Locality.LOCAL for event in events)
+    finally:
+        tier.shutdown()
+
+
+def test_eviction_before_store_poll_emits_invalidation_only(tmp_path):
+    tier, _, _ = _make_bounded_fs_tier(tmp_path, max_blocks=1, enable_events=True)
+    try:
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        tier.drain_jobs()
+
+        tier.submit_store(make_job(2, [key(2)], [1]))
+        results = drain(tier)
+        assert all(result.success for result in results)
+
+        events = list(tier.take_events())
+        assert [(event.removed, event.keys) for event in events] == [
+            (True, [key(1)]),
+            (False, [key(2)]),
+        ]
     finally:
         tier.shutdown()
 

@@ -83,6 +83,13 @@ Each entry in `secondary_tiers` is a dict with a required `type` field plus tier
 
 The filesystem and object-store tiers can publish hash-only `BlockStored` KV events for blocks they successfully store, tagged with a stable per-tier `medium` (`FS` for the filesystem tier, `OBJ` for the object-store tier). Set `enable_kv_events: true` in the tier's entry to opt in; events are published only when KV cache events are also enabled globally via `--kv-events-config`.
 
+`BlockRemoved` is an idempotent state invalidation. It may appear without a
+preceding `BlockStored` in the current event stream, for example when a
+persistent block is trimmed at startup or a completed asynchronous store is
+evicted before the scheduler polls its result. Consumers must ignore removals
+for blocks they do not currently track. The filesystem tier suppresses a
+pending `BlockStored` event when the block is no longer resident.
+
 Set the optional `locality` tier field to `LOCAL` or `REMOTE` to describe the tier's storage location relative to the publishing vLLM instance. `LOCAL` marks storage local to that instance, while `REMOTE` marks storage that is not local to it. When the setting is omitted, locality is unspecified. vLLM does not infer it from the tier type, so an OBJ tier is not implicitly `REMOTE`. A KV event includes `locality` only when the tier explicitly configures it. This metadata describes the tier property without implying that a consumer can already route requests to its blocks.
 
 ### Filesystem (FS)
@@ -110,10 +117,12 @@ pinned until they are safe to reclaim. If every resident block is pinned, a new
 store job fails with `ENOSPC`; the tier never exceeds the configured limit or
 evicts an in-use load source.
 
-The limit applies to the current `<model>_<digest>_r<rank>` block namespace. It
-does not include `config.json`, stale temporary files, or namespaces belonging
-to other model/configuration digests under the same `root_dir`. Values that are
-not an exact multiple of the offload block size leave the remainder unused.
+The limit applies to the current `<model>_<digest>_r<rank>` block namespace.
+Bounded-mode startup removes stale temporary files created by interrupted
+FileMapper writes before indexing completed blocks. It does not include
+`config.json`, unrelated files, or namespaces belonging to other
+model/configuration digests under the same `root_dir`. Values that are not an
+exact multiple of the offload block size leave the remainder unused.
 
 !!! warning
     Capacity tracking is process-local. Use `max_cache_size_bytes` only when one
