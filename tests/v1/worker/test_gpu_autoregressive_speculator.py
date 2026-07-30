@@ -80,3 +80,46 @@ def test_run_model_reuses_tensor_return_for_mtp(monkeypatch):
 
     assert actual_logits_hidden is hidden
     assert actual_feedback_hidden is hidden
+
+
+def test_probabilistic_draft_uses_disjoint_philox_offsets(monkeypatch):
+    captured_positions = None
+
+    def fake_gumbel_sample(
+        logits,
+        idx_mapping,
+        temperature,
+        seeds,
+        positions,
+        **kwargs,
+    ):
+        nonlocal captured_positions
+        captured_positions = positions
+        return torch.zeros(logits.shape[0], dtype=torch.int64)
+
+    monkeypatch.setattr(spec_module, "gumbel_sample", fake_gumbel_sample)
+    speculator = object.__new__(_TestSpeculator)
+    speculator.model = SimpleNamespace(
+        compute_logits=lambda hidden_states: torch.zeros(hidden_states.shape[0], 5)
+    )
+    speculator.active_num_reqs = torch.tensor(2, dtype=torch.int32)
+    speculator.use_fp64_gumbel = False
+    positions = torch.tensor([12, 99], dtype=torch.int64)
+
+    speculator.sample_draft(
+        hidden_states=torch.zeros(2, 3),
+        positions=positions,
+        idx_mapping=torch.arange(2),
+        temperature=torch.ones(2),
+        seeds=torch.tensor([7, 11], dtype=torch.int64),
+        draft_step=torch.tensor(0, dtype=torch.int64),
+        draft_logits=torch.empty(2, 5),
+    )
+
+    assert captured_positions is not None
+    torch.testing.assert_close(
+        captured_positions,
+        positions + 1 + (1 << 30),
+        rtol=0,
+        atol=0,
+    )

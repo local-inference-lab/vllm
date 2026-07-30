@@ -23,6 +23,7 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.utils import draft_gumbel_pos
 
 logger = init_logger(__name__)
 
@@ -369,14 +370,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
     ) -> torch.Tensor:
         logits = self.model.compute_logits(hidden_states)
         if draft_logits is not None:
-            # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
-            # used for draft and target sampling.
+            # Draft proposal noise must not reuse the rejection sampler's
+            # acceptance and recovery Philox offsets.
             return gumbel_sample(
                 logits,
                 idx_mapping,
                 temperature,
                 seeds,
-                positions + 1,
+                draft_gumbel_pos(positions),
                 apply_temperature=True,
                 output_processed_logits=draft_logits,
                 output_processed_logits_col=draft_step,
