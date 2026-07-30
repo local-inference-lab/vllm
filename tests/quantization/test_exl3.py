@@ -118,6 +118,47 @@ def test_rank_sliced_metadata_admits_only_declared_moe_layers():
     )
 
 
+def test_mixed_rank_sliced_metadata_hydrates_per_layer_bitrates(monkeypatch):
+    metadata = _rank_sliced_metadata(
+        bits="mixed",
+        bits_per_expert="tier_bitmap.json:k",
+        k_values=[3, 4],
+        experts_per_layer=4,
+        moe_layers=[77, 78],
+    )
+    payload = {
+        "77": {"k": [3, 4, 3, 4]},
+        # The checkpoint's MTP overlay records a uniform K3 tail this way.
+        "78": {"tail_tr3": [0, 1, 2, 3]},
+    }
+    monkeypatch.setattr(
+        exl3_module,
+        "get_hf_file_to_dict",
+        lambda filename, model_name, revision=None: payload,
+    )
+    config = Exl3Config()
+
+    config.maybe_update_config(
+        "unused",
+        SimpleNamespace(hybrid_tr3_tail=metadata, _commit_hash="revision"),
+    )
+
+    assert config.bits is None
+    assert config.rank_sliced_k_values == (3, 4)
+    assert config.rank_sliced_layer_bitrates("model.layers.77.mlp.experts") == (
+        3,
+        4,
+        3,
+        4,
+    )
+    assert config.rank_sliced_layer_bitrates("model.layers.78.mlp.experts") == (
+        3,
+        3,
+        3,
+        3,
+    )
+
+
 def test_rank_sliced_weight_name_keeps_only_local_tp_rank(monkeypatch):
     config = Exl3Config()
     config.maybe_update_config(
@@ -210,6 +251,8 @@ def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
         exl3_hidden_size=hidden,
         exl3_intermediate_size_per_partition=intermediate,
         exl3_params_dtype=torch.float16,
+        exl3_layer_bitrates=(bits,) * experts,
+        exl3_mixed_bitrate=False,
         activation=MoEActivation.SILU,
         w13_mcg=SimpleNamespace(exl3_tensors={(0, "w1"): marker}),
     )
@@ -233,6 +276,108 @@ def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
     assert api.prepare_kwargs["w1_fp4"] is slabs["w13_trellis"]
     assert api.prepare_kwargs["w2_fp4"] is slabs["w2_trellis"]
     assert api.prepare_kwargs["trellis_mcg"] is marker
+
+
+def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypatch):
+    experts = 4
+    hidden = intermediate = 128
+    bitrates = (3, 4, 3, 4)
+
+    def parameter(shard_ids=(), tensors=None, backing=None):
+        return SimpleNamespace(
+            exl3_shard_ids=list(shard_ids),
+            exl3_tensors=dict(tensors or {}),
+            exl3_backing=backing,
+        )
+
+    w13_tensors = {}
+    w2_tensors = {}
+    for expert, bits in enumerate(bitrates):
+        for shard in ("w1", "w3"):
+            w13_tensors[(expert, shard)] = torch.zeros(
+                (hidden // 16, intermediate // 16, 16 * bits),
+                dtype=torch.int16,
+            )
+        w2_tensors[(expert, "w2")] = torch.zeros(
+            (intermediate // 16, hidden // 16, 16 * bits),
+            dtype=torch.int16,
+        )
+
+    slabs = {
+        "w13_suh": torch.ones((2, experts, hidden), dtype=torch.float16),
+        "w13_svh": torch.ones((2, experts, intermediate), dtype=torch.float16),
+        "w2_suh": torch.ones((experts, intermediate), dtype=torch.float16),
+        "w2_svh": torch.ones((experts, hidden), dtype=torch.float16),
+    }
+    layer = SimpleNamespace(
+        local_num_experts=experts,
+        exl3_hidden_size=hidden,
+        exl3_intermediate_size_per_partition=intermediate,
+        exl3_layer_bitrates=bitrates,
+        activation=MoEActivation.SILU,
+        layer_name="model.layers.3.mlp.experts",
+        w13_trellis=parameter(("w1", "w3"), w13_tensors),
+        w2_trellis=parameter(("w2",), w2_tensors),
+    )
+    for prefix, shards in (("w13", ("w1", "w3")), ("w2", ("w2",))):
+        for suffix in ("suh", "svh", "mcg", "mul1"):
+            name = f"{prefix}_{suffix}"
+            backing = slabs.get(name)
+            setattr(layer, name, parameter(shards, backing=backing))
+
+    class FakeMixedApi:
+        def __init__(self):
+            self.prepared = []
+
+        def prepare_weights(self, **kwargs):
+            self.prepared.append(kwargs)
+            return SimpleNamespace(**kwargs)
+
+        @staticmethod
+        def build_tiered_maps(tier0, tier1, *, device):
+            assert tuple(tier0) == (0, 2)
+            assert tuple(tier1) == (1, 3)
+            return (
+                torch.tensor([0, 2, 1, 3], dtype=torch.int32, device=device),
+                torch.tensor([0, 1, 256, 257], dtype=torch.int32, device=device),
+            )
+
+        @staticmethod
+        def combine_trellis_rotations(tier0, tier1):
+            return tier0, tier1
+
+    api = FakeMixedApi()
+    monkeypatch.setattr(exl3_module, "_load_sparkinfer_mixed_trellis", lambda: api)
+    method = object.__new__(Exl3MoEMethod)
+    method._rank_sliced_backing = lambda _layer, name: slabs[name]
+
+    method._prepare_mixed_rank_sliced_weights(layer)
+
+    assert [entry["trellis_bits"] for entry in api.prepared] == [3, 4]
+    assert [entry["num_experts"] for entry in api.prepared] == [2, 2]
+    assert [entry["tile_config"] for entry in api.prepared] == [
+        (128, 128, 128, 128),
+        (128, 128, 128, 128),
+    ]
+    assert layer.exl3_mixed_trellis["tier_ids"] == ((0, 2), (1, 3))
+    assert layer.w13_trellis.exl3_tensors == {}
+    assert layer.w2_trellis.exl3_tensors == {}
+    assert layer.w13_suh.exl3_backing is None
+    assert layer.w2_svh.exl3_backing is None
+
+
+@pytest.mark.parametrize(
+    ("hidden", "intermediate", "expected"),
+    [
+        (6144, 512, (128, 128, 32, 512)),
+        (256, 128, (128, 128, 64, 256)),
+        (128, 128, (128, 128, 128, 128)),
+    ],
+)
+def test_mixed_trellis_uses_large_m_safe_tile_geometry(
+    hidden, intermediate, expected
+):
+    assert Exl3MoEMethod._mixed_trellis_tile_config(hidden, intermediate) == expected
 
 
 def test_rank_sliced_runtime_scope_is_per_owning_model():

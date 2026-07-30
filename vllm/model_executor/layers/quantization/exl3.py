@@ -68,7 +68,9 @@ _MUL1_SENTINEL = 0x83DCD12D
 _HADAMARD_BLOCK = 128
 _EXL3_EXT: Any | None = None
 _SPARKINFER_FUSED_MOE_API: Any | None = None
+_SPARKINFER_MIXED_TRELLIS_API: Any | None = None
 _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
+_MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
 
 
@@ -211,6 +213,31 @@ def _load_sparkinfer_fused_moe() -> Any:
     return fused_moe
 
 
+def _load_sparkinfer_mixed_trellis() -> Any:
+    """Resolve the one-grid mixed-bitrate Trellis API lazily."""
+
+    global _SPARKINFER_MIXED_TRELLIS_API
+    if _SPARKINFER_MIXED_TRELLIS_API is not None:
+        return _SPARKINFER_MIXED_TRELLIS_API
+    try:
+        module = importlib.import_module(
+            "sparkinfer.moe._shared.kernels.w4a16.mixed_trellis"
+        )
+        prepare = importlib.import_module(
+            "sparkinfer.moe._shared.kernels.w4a16.prepare"
+        )
+        host = importlib.import_module("sparkinfer.moe._shared.kernels.w4a16.host")
+    except Exception as exc:
+        raise RuntimeError(
+            "Mixed-bitrate rank-sliced EXL3 requires the matching SparkInfer "
+            "mixed_trellis implementation."
+        ) from exc
+    module.prepare_weights = prepare.prepare_trellis256_moe_weights
+    module.max_packed_route_slots = host.max_packed_route_slots
+    _SPARKINFER_MIXED_TRELLIS_API = module
+    return module
+
+
 def _positive_env_int(name: str, default: int) -> int:
     # An env var that is present but blank means "unset". Compose and Kubernetes
     # both render an unset variable as the empty string, so int("") would abort
@@ -304,6 +331,8 @@ class Exl3Config(QuantizationConfig):
         self.tensor_storage = tensor_storage or {}
         self._eager_checked = False
         self.rank_sliced_metadata: dict[str, Any] | None = None
+        self.rank_sliced_k_values: tuple[int, ...] | None = None
+        self.rank_sliced_bits_by_layer: dict[int, tuple[int, ...]] = {}
 
     def get_name(self) -> str:
         return "exl3"
@@ -358,6 +387,14 @@ class Exl3Config(QuantizationConfig):
             and rank_sliced.get("format") == _RANK_SLICED_FORMAT
         ):
             self._configure_rank_sliced(rank_sliced)
+            if self.rank_sliced_k_values is not None:
+                resolved_revision = revision
+                if resolved_revision is None and hf_config is not None:
+                    resolved_revision = getattr(hf_config, "_commit_hash", None)
+                self._load_rank_sliced_bitrates(
+                    model_name,
+                    revision=resolved_revision,
+                )
             return
 
         # vLLM returns the summary embedded in config.json without consulting
@@ -422,9 +459,95 @@ class Exl3Config(QuantizationConfig):
                 f"{metadata['tensor_schema']!r}"
             )
         self.rank_sliced_metadata = dict(metadata)
-        self.bits = float(metadata["bits"])
+        bits_field = metadata["bits"]
+        if isinstance(bits_field, str) and bits_field.strip().lower() == "mixed":
+            k_values = tuple(
+                sorted({int(value) for value in metadata.get("k_values", ())})
+            )
+            if not k_values or any(value not in (3, 4, 5, 6) for value in k_values):
+                raise ValueError(
+                    "mixed rank-sliced EXL3 requires k_values within 3..6, got "
+                    f"{metadata.get('k_values')!r}"
+                )
+            if not isinstance(metadata.get("bits_per_expert"), str):
+                raise ValueError(
+                    "mixed rank-sliced EXL3 requires a bits_per_expert JSON reference"
+                )
+            self.bits = None
+            self.rank_sliced_k_values = k_values
+        else:
+            self.bits = float(bits_field)
+            self.rank_sliced_k_values = None
         self.codebook = str(metadata["codebook"])
         self.version = str(metadata.get("exllamav3_version", "rank-sliced"))
+
+    def _load_rank_sliced_bitrates(
+        self,
+        model_name: str,
+        *,
+        revision: str | None,
+    ) -> None:
+        assert self.rank_sliced_metadata is not None
+        reference = str(self.rank_sliced_metadata["bits_per_expert"])
+        try:
+            filename, field = reference.rsplit(":", 1)
+        except ValueError as exc:
+            raise ValueError(
+                "rank-sliced EXL3 bits_per_expert must use 'file.json:field' syntax, "
+                f"got {reference!r}"
+            ) from exc
+        payload = get_hf_file_to_dict(filename, model_name, revision=revision)
+        if not isinstance(payload, dict):
+            raise ValueError(f"rank-sliced EXL3 could not load {filename!r}")
+
+        experts = int(self.rank_sliced_metadata["experts_per_layer"])
+        first, last = (int(value) for value in self.rank_sliced_metadata["moe_layers"])
+        allowed = set(self.rank_sliced_k_values or ())
+        by_layer: dict[int, tuple[int, ...]] = {}
+        for layer_index in range(first, last + 1):
+            entry = payload.get(str(layer_index))
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"rank-sliced EXL3 bitrate map is missing layer {layer_index}"
+                )
+            raw = entry.get(field)
+            # The GLM-5.2 MTP overlay records all routed experts under tail_tr3
+            # instead of repeating a 256-entry K3 vector.
+            if raw is None and len(entry.get("tail_tr3", ())) == experts:
+                raw = [3] * experts
+            if not isinstance(raw, list) or len(raw) != experts:
+                raise ValueError(
+                    "rank-sliced EXL3 bitrate map must contain one entry per expert: "
+                    f"layer={layer_index}, field={field!r}, expected={experts}"
+                )
+            bitrates = tuple(int(value) for value in raw)
+            unexpected = sorted(set(bitrates).difference(allowed))
+            if unexpected:
+                raise ValueError(
+                    f"rank-sliced EXL3 layer {layer_index} uses undeclared bitrates "
+                    f"{unexpected}; declared={sorted(allowed)}"
+                )
+            by_layer[layer_index] = bitrates
+        self.rank_sliced_bits_by_layer = by_layer
+
+    def rank_sliced_layer_bitrates(self, layer_name: str) -> tuple[int, ...]:
+        match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_name)
+        if match is None:
+            raise ValueError(
+                f"cannot resolve rank-sliced EXL3 layer index from {layer_name!r}"
+            )
+        layer_index = int(match.group(1))
+        if self.rank_sliced_k_values is None:
+            if self.bits is None or float(self.bits) != int(self.bits):
+                raise ValueError(f"invalid uniform EXL3 bitrate {self.bits!r}")
+            experts = int(self.rank_sliced_metadata["experts_per_layer"])
+            return (int(self.bits),) * experts
+        try:
+            return self.rank_sliced_bits_by_layer[layer_index]
+        except KeyError as exc:
+            raise ValueError(
+                f"rank-sliced EXL3 bitrate map has no layer {layer_index}"
+            ) from exc
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
         # Keep both spellings: loader prefixes use vLLM names, while packed
@@ -1205,6 +1328,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.exl3_is_draft = (
                 getattr(vllm_config.model_config, "runner_type", None) == "draft"
             )
+            layer.exl3_layer_bitrates = self.quant_config.rank_sliced_layer_bitrates(
+                str(layer.layer_name)
+            )
+            layer.exl3_mixed_bitrate = (
+                len(set(layer.exl3_layer_bitrates)) > 1
+            )
         for prefix, shard_ids in (("w13", ("w1", "w3")), ("w2", ("w2",))):
             for suffix in ("suh", "svh", "trellis", "mcg", "mul1"):
                 layer.register_parameter(
@@ -1213,7 +1342,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                         weight_loader=_exl3_moe_weight_loader,
                         num_experts=num_experts,
                         shard_ids=shard_ids,
-                        preallocate=rank_sliced and suffix in {"suh", "svh", "trellis"},
+                        preallocate=rank_sliced
+                        and suffix
+                        in (
+                            {"suh", "svh"}
+                            if getattr(layer, "exl3_mixed_bitrate", False)
+                            else {"suh", "svh", "trellis"}
+                        ),
                     ),
                 )
 
@@ -1394,16 +1529,189 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             return (64, 256, 64, 256)
         return (64, 128, 64, 128)
 
+    @staticmethod
+    def _mixed_trellis_tile_config(hidden_size: int, intermediate_size: int):
+        if hidden_size % 128 or intermediate_size % 128:
+            raise ValueError(
+                "mixed rank-sliced EXL3 requires hidden and intermediate "
+                "dimensions divisible by 128"
+            )
+        # The mixed K3/K4 megakernel needs a 128-wide FC1 K tile. The older
+        # 64x256 FC1 geometry loses partial reductions at large prefill M. A
+        # 512-wide FC2 tile then removes the second persistent wave on GLM-5.2.
+        if hidden_size % 512 == 0:
+            return (128, 128, 32, 512)
+        if hidden_size % 256 == 0:
+            return (128, 128, 64, 256)
+        return (128, 128, 128, 128)
+
+    def _prepare_mixed_rank_sliced_weights(self, layer: RoutedExperts) -> None:
+        api = _load_sparkinfer_mixed_trellis()
+        num_experts = int(layer.local_num_experts)
+        hidden_size = int(layer.exl3_hidden_size)
+        intermediate_size = int(layer.exl3_intermediate_size_per_partition)
+        bitrates = tuple(int(value) for value in layer.exl3_layer_bitrates)
+        if len(bitrates) != num_experts:
+            raise ValueError(
+                "mixed rank-sliced EXL3 bitrate count does not match experts: "
+                f"bitrates={len(bitrates)}, experts={num_experts}"
+            )
+        tiers = {
+            bits: tuple(
+                expert_id
+                for expert_id, expert_bits in enumerate(bitrates)
+                if expert_bits == bits
+            )
+            for bits in sorted(set(bitrates))
+        }
+        if len(tiers) != 2:
+            raise ValueError(
+                "the one-grid mixed Trellis path currently requires exactly two "
+                f"bitrates, got {tuple(tiers)}"
+            )
+
+        w13_param = layer.w13_trellis
+        w2_param = layer.w2_trellis
+        w13_shards = tuple(w13_param.exl3_shard_ids)
+        w2_shards = tuple(w2_param.exl3_shard_ids)
+        if w13_shards != ("w1", "w3") or w2_shards != ("w2",):
+            raise ValueError(
+                "mixed rank-sliced EXL3 requires w13=(w1,w3) and w2=(w2), got "
+                f"{w13_shards}/{w2_shards}"
+            )
+
+        gate_suh, up_suh = self._rank_sliced_backing(layer, "w13_suh")
+        gate_svh, up_svh = self._rank_sliced_backing(layer, "w13_svh")
+        down_suh = self._rank_sliced_backing(layer, "w2_suh")
+        down_svh = self._rank_sliced_backing(layer, "w2_svh")
+        device = gate_suh.device
+        tile_config = self._mixed_trellis_tile_config(
+            hidden_size, intermediate_size
+        )
+        prepared_tiers = []
+        tier_ids = []
+        for bits, expert_ids in tiers.items():
+            expected_last = 16 * bits
+            w13 = torch.stack(
+                tuple(
+                    torch.stack(
+                        tuple(
+                            w13_param.exl3_tensors[(expert_id, shard_id)]
+                            for expert_id in expert_ids
+                        )
+                    )
+                    for shard_id in w13_shards
+                )
+            ).contiguous()
+            w2 = torch.stack(
+                tuple(
+                    w2_param.exl3_tensors[(expert_id, "w2")]
+                    for expert_id in expert_ids
+                )
+            ).contiguous()
+            expected_w13 = (
+                2,
+                len(expert_ids),
+                hidden_size // 16,
+                intermediate_size // 16,
+                expected_last,
+            )
+            expected_w2 = (
+                len(expert_ids),
+                intermediate_size // 16,
+                hidden_size // 16,
+                expected_last,
+            )
+            if tuple(w13.shape) != expected_w13 or tuple(w2.shape) != expected_w2:
+                raise ValueError(
+                    f"mixed EXL3 K{bits} slab geometry mismatch: "
+                    f"w13={tuple(w13.shape)}, w2={tuple(w2.shape)}, "
+                    f"expected={expected_w13}/{expected_w2}"
+                )
+
+            index = torch.tensor(expert_ids, dtype=torch.long, device=device)
+            tier_gate_suh = gate_suh.index_select(0, index).contiguous()
+            tier_up_suh = up_suh.index_select(0, index).contiguous()
+            intermediate_rotations = torch.cat(
+                (
+                    gate_svh.index_select(0, index),
+                    up_svh.index_select(0, index),
+                    down_suh.index_select(0, index),
+                ),
+                dim=1,
+            ).contiguous()
+            tier_down_svh = down_svh.index_select(0, index).contiguous()
+            prepared_tiers.append(
+                api.prepare_weights(
+                    w13=w13,
+                    w2=w2,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    num_experts=len(expert_ids),
+                    activation=layer.activation.value,
+                    fc1_tile_n=tile_config[1],
+                    fc2_tile_n=tile_config[3],
+                    params_dtype=torch.float16,
+                    w13_layout="trellis3_t256_proj",
+                    trellis_bits=bits,
+                    codebook="mcg",
+                    gate_suh=tier_gate_suh,
+                    up_suh=tier_up_suh,
+                    intermediate_rotations=intermediate_rotations,
+                    down_svh=tier_down_svh,
+                    tile_config=tile_config,
+                    workspace=w13.view(torch.int32).reshape(-1)[:1],
+                )
+            )
+            tier_ids.append(expert_ids)
+
+        global_to_combined, descriptor_map = api.build_tiered_maps(
+            tier_ids[0], tier_ids[1], device=device
+        )
+        layer.exl3_mixed_trellis = {
+            "tiers": tuple(prepared_tiers),
+            "tier_ids": tuple(tier_ids),
+            "tier_bits": tuple(tiers),
+            "global_to_combined": global_to_combined,
+            "descriptor_map": descriptor_map,
+            "rotations": api.combine_trellis_rotations(*prepared_tiers),
+            "tile_config": tile_config,
+        }
+        layer.exl3_trellis_tile_config = tile_config
+
+        # The prepared tier objects own compact, tier-ordered copies. Release
+        # per-expert source tensors and the original rotation slabs now rather
+        # than retaining both representations for every layer.
+        for prefix in ("w13", "w2"):
+            for suffix in ("suh", "svh", "trellis", "mcg", "mul1"):
+                param = getattr(layer, f"{prefix}_{suffix}")
+                param.exl3_tensors.clear()
+                param.exl3_backing = None
+        logger.info(
+            "EXL3 mixed Trellis %s: tiers=%s",
+            layer.layer_name,
+            tuple((bits, len(ids)) for bits, ids in zip(tiers, tier_ids)),
+        )
+
     def _prepare_rank_sliced_weights(self, layer: RoutedExperts) -> None:
+        if getattr(layer, "exl3_mixed_bitrate", False):
+            self._prepare_mixed_rank_sliced_weights(layer)
+            return
         api = _load_sparkinfer_fused_moe()
         num_experts = int(layer.local_num_experts)
         hidden_size = int(layer.exl3_hidden_size)
         intermediate_size = int(layer.exl3_intermediate_size_per_partition)
-        bits = int(self.quant_config.bits or 0)
-        if float(bits) != self.quant_config.bits or bits not in (3, 4, 5, 6):
+        layer_bitrates = tuple(getattr(layer, "exl3_layer_bitrates", ()))
+        if len(set(layer_bitrates)) != 1:
+            raise ValueError(
+                "uniform rank-sliced EXL3 layer has invalid bitrates "
+                f"{layer_bitrates!r}"
+            )
+        bits = int(layer_bitrates[0])
+        if bits not in (3, 4, 5, 6):
             raise ValueError(
                 "rank-sliced EXL3 requires an integral 3/4/5/6 bitrate, got "
-                f"{self.quant_config.bits!r}"
+                f"{bits!r}"
             )
 
         w13 = self._rank_sliced_backing(layer, "w13_trellis")
@@ -1496,6 +1804,149 @@ class Exl3MoEMethod(FusedMoEMethodBase):
     @property
     def topk_indices_dtype(self) -> torch.dtype | None:
         return torch.long
+
+    def _mixed_rank_sliced_runtime(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> dict[str, Any]:
+        mixed = layer.exl3_mixed_trellis
+        max_decode_m = _positive_env_int("VLLM_EXL3_TRELLIS_MAX_M", 32)
+        max_batched_tokens = int(layer.exl3_max_num_batched_tokens)
+        if max_decode_m > max_batched_tokens:
+            max_decode_m = max_batched_tokens
+        topk = int(topk_ids.shape[1])
+        tier_signature = tuple(
+            (int(bits), len(ids))
+            for bits, ids in zip(mixed["tier_bits"], mixed["tier_ids"])
+        )
+        key = (
+            _runtime_owner_token(self.quant_config, layer),
+            x.device.index,
+            x.dtype,
+            topk_ids.dtype,
+            int(layer.exl3_hidden_size),
+            int(layer.exl3_intermediate_size_per_partition),
+            tier_signature,
+            topk,
+            max_decode_m,
+            max_batched_tokens,
+            mixed["tile_config"],
+        )
+        runtime = _MIXED_TRELLIS_RUNTIMES.get(key)
+        if runtime is not None:
+            return runtime
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Mixed-bitrate EXL3 runtime must be compiled during the eager "
+                "profile pass before CUDA graph capture"
+            )
+        if topk_ids.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "mixed-bitrate EXL3 requires int32/int64 route IDs, got "
+                f"{topk_ids.dtype}"
+            )
+
+        api = _load_sparkinfer_mixed_trellis()
+        device = x.device
+        props = torch.cuda.get_device_properties(device)
+        total_experts = sum(experts for _, experts in tier_signature)
+
+        def make_state(capacity: int) -> dict[str, Any]:
+            route_slots = api.max_packed_route_slots(capacity * topk, 8, total_experts)
+            launch = api.compile_mixed_trellis(
+                size_m=capacity,
+                hidden_size=int(layer.exl3_hidden_size),
+                intermediate_size=int(layer.exl3_intermediate_size_per_partition),
+                tier0_num_experts=tier_signature[0][1],
+                tier1_num_experts=tier_signature[1][1],
+                tier0_bits=tier_signature[0][0],
+                tier1_bits=tier_signature[1][0],
+                top_k=topk,
+                max_m_blocks=(route_slots + 7) // 8,
+                sms=int(props.multi_processor_count),
+                max_shared_mem=int(props.shared_memory_per_block_optin),
+                force_tile_config=mixed["tile_config"],
+                rotation_input_dtype=("bf16" if x.dtype == torch.bfloat16 else "fp16"),
+                route_ids_dtype=topk_ids.dtype,
+            )
+            return {
+                "capacity": capacity,
+                "launch": launch,
+                "buffers": api.make_mixed_trellis_buffers(
+                    launch,
+                    device=device,
+                    sms=int(props.multi_processor_count),
+                ),
+            }
+
+        decode = make_state(max_decode_m)
+        prefill = (
+            make_state(max_batched_tokens)
+            if max_batched_tokens > max_decode_m
+            else decode
+        )
+        runtime = {
+            "api": api,
+            "decode": decode,
+            "prefill": prefill,
+            "max_decode_m": max_decode_m,
+            "max_batched_tokens": max_batched_tokens,
+        }
+        _MIXED_TRELLIS_RUNTIMES[key] = runtime
+        buffer_bytes = 0
+        seen: set[tuple[int, int]] = set()
+        for state in (decode, prefill):
+            for tensor in vars(state["buffers"]).values():
+                storage = tensor.untyped_storage()
+                storage_key = (storage.data_ptr(), storage.nbytes())
+                if storage_key not in seen:
+                    seen.add(storage_key)
+                    buffer_bytes += storage.nbytes()
+        logger.info_once(
+            "EXL3 mixed Trellis runtime planned: tiers=%s decode_capacity=%d "
+            "prefill_capacity=%d buffers=%.1f MiB",
+            tier_signature,
+            max_decode_m,
+            max_batched_tokens,
+            buffer_bytes / (1 << 20),
+        )
+        return runtime
+
+    def _apply_mixed_rank_sliced(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        runtime = self._mixed_rank_sliced_runtime(layer, x, topk_ids)
+        m = int(x.shape[0])
+        if m > runtime["max_batched_tokens"]:
+            raise ValueError(
+                "mixed-bitrate EXL3 batch exceeds planned capacity: "
+                f"m={m}, capacity={runtime['max_batched_tokens']}"
+            )
+        state = (
+            runtime["decode"]
+            if m <= runtime["max_decode_m"]
+            else runtime["prefill"]
+        )
+        mixed = layer.exl3_mixed_trellis
+        output = runtime["api"].run_mixed_trellis(
+            x,
+            mixed["tiers"][0],
+            mixed["tiers"][1],
+            topk_weights,
+            topk_ids,
+            mixed["global_to_combined"],
+            mixed["descriptor_map"],
+            mixed["rotations"],
+            state["launch"],
+            state["buffers"],
+        )
+        return output.to(x.dtype)
 
     def _rank_sliced_runtime(
         self,
@@ -1735,6 +2186,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
+        if getattr(layer, "exl3_mixed_bitrate", False):
+            return self._apply_mixed_rank_sliced(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+            )
         runtime = self._rank_sliced_runtime(layer, x, topk_ids)
         m = int(x.shape[0])
         if runtime["min_trellis_m"] <= m <= runtime["max_trellis_m"]:
