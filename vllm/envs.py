@@ -2281,9 +2281,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- EXL3 Trellis MoE runtime knobs (read directly by
     # model_executor/layers/quantization/exl3.py; registered here so startup
     # does not flag them as unknown). All are passthrough: consuming code
-    # applies its own context-dependent defaults (e.g. the Trellis window
-    # minimum defaults to MIN_CAPTURABLE_TRELLIS_M=1 for draft layers and 4
-    # for target layers when unset).
+    # applies its own defaults (the Trellis window minimum is 1 for both target
+    # and draft layers; an explicit value is a diagnostic override).
     "VLLM_EXL3_TRELLIS_MIN_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_MIN_M"),
     "VLLM_EXL3_TRELLIS_MAX_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_MAX_M"),
     "VLLM_EXL3_TRELLIS_BLOCK_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_BLOCK_M"),

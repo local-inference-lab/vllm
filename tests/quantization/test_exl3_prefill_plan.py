@@ -168,6 +168,7 @@ def test_dual_plan_construction_and_dispatch():
             (caps["max_tokens"], caps["w4a16_block_size_m"])
             for caps in h.planned_caps()
         ] == [(32, 8), (MAX_BATCHED, 64)]
+        assert all(caps["route_num_experts"] == 0 for caps in h.planned_caps())
         assert h.api.bound[-1][0].caps["max_tokens"] == 32
 
         _apply(method, layer, 200)
@@ -176,7 +177,9 @@ def test_dual_plan_construction_and_dispatch():
         assert not h.ext.moe_calls
 
         _apply(method, layer, 2)
-        assert h.ext.moe_calls == [(2, 2)]
+        assert h.api.bound[-1][0].caps["max_tokens"] == 32
+        assert h.api.bound[-1][1] == 2
+        assert not h.ext.moe_calls
 
         runtime = next(iter(exl3_module._RANK_SLICED_RUNTIMES.values()))
         assert runtime["parity_rows"] == 128
@@ -252,8 +255,8 @@ def test_disabled_prefill_plan_keeps_full_parity_capacity():
         assert runtime["parity_rows"] == MAX_BATCHED
 
 
-def test_parity_path_guarded_against_capture():
-    with _Harness() as h:
+def test_explicit_parity_path_guarded_against_capture():
+    with _Harness(env={"VLLM_EXL3_TRELLIS_MIN_M": "4"}) as h:
         method = _make_method()
         layer = _make_layer()
         # Plan eagerly, then flip into "capturing" state.

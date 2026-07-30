@@ -290,8 +290,8 @@ def test_rank_sliced_runtime_key_differs_across_models_with_same_shape():
     assert _key(target_config) == target_key
 
 
-def test_draft_layer_window_defaults_to_min_capturable_m(monkeypatch) -> None:
-    """A rank-sliced draft layer must be capturable without an env workaround.
+def test_rank_sliced_window_defaults_to_min_capturable_m(monkeypatch) -> None:
+    """Every rank-sliced layer must cover small rows without an env workaround.
 
     Regression test for the boot failure reported in vLLM #183: with the Trellis
     window left at its historical default of 4, CUDA-graph capture of an EXL3
@@ -303,8 +303,9 @@ def test_draft_layer_window_defaults_to_min_capturable_m(monkeypatch) -> None:
 
     It was invariant to num_speculative_tokens and to cudagraph_capture_sizes,
     because m here is the draft's row count per step, not a target batch size.
-    The backend now declares MIN_CAPTURABLE_TRELLIS_M and defaults draft layers to
-    it, so no operator has to set VLLM_EXL3_TRELLIS_MIN_M by hand.
+    Target profiling can also produce m=3, so role-dependent defaults merely
+    move the same failure from the draft to MTP0. The backend declares one
+    capability floor and uses it for both roles.
     """
     from types import SimpleNamespace
 
@@ -331,22 +332,17 @@ def test_draft_layer_window_defaults_to_min_capturable_m(monkeypatch) -> None:
         SimpleNamespace(layer_name="model.layers.0.mtp.experts", exl3_is_draft=False)
     )
 
-    def resolved(layer):
-        default = (
-            exl3_mod.MIN_CAPTURABLE_TRELLIS_M
-            if exl3_mod._is_draft_layer(layer)
-            else exl3_mod._DEFAULT_TRELLIS_MIN_M
+    def resolved():
+        return exl3_mod._positive_env_int(
+            "VLLM_EXL3_TRELLIS_MIN_M", exl3_mod._DEFAULT_TRELLIS_MIN_M
         )
-        return exl3_mod._positive_env_int("VLLM_EXL3_TRELLIS_MIN_M", default)
 
-    # The draft must admit m=1 so capture at m=1,2,3 stays on the Trellis path.
-    assert resolved(draft) <= exl3_mod.MIN_CAPTURABLE_TRELLIS_M == 1
-    # The target keeps its historical default.
-    assert resolved(target) == exl3_mod._DEFAULT_TRELLIS_MIN_M == 4
+    assert resolved() == exl3_mod._DEFAULT_TRELLIS_MIN_M
+    assert resolved() == exl3_mod.MIN_CAPTURABLE_TRELLIS_M == 1
 
-    # An explicit value remains authoritative in both directions (kill switch).
+    # An explicit value remains authoritative as a diagnostic kill switch.
     monkeypatch.setenv("VLLM_EXL3_TRELLIS_MIN_M", "4")
-    assert resolved(draft) == 4
+    assert resolved() == 4
 
 
 def test_draft_role_stamp_wins_over_name() -> None:
