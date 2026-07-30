@@ -111,6 +111,7 @@ def test_memory_profile_replays_model_after_kernel_warmup(
 ):
     worker = object.__new__(Worker)
     calls = []
+    worker.device = "cuda:0"
     worker.model_runner = SimpleNamespace(
         profile_run=lambda: calls.append("profile"),
     )
@@ -127,10 +128,21 @@ def test_memory_profile_replays_model_after_kernel_warmup(
         "_warmup_kernels_once",
         lambda: calls.append("kernel_warmup"),
     )
+    monkeypatch.setattr(
+        gpu_worker_module.torch.accelerator,
+        "reset_peak_memory_stats",
+        lambda device: calls.append(("reset_peak", device)),
+    )
 
     worker._profile_model_with_kernel_warmup()
 
-    assert calls == ["profile", "compressor", "kernel_warmup", "profile"]
+    assert calls == [
+        "profile",
+        "compressor",
+        "kernel_warmup",
+        ("reset_peak", "cuda:0"),
+        "profile",
+    ]
 
 
 @pytest.mark.parametrize("video_backend", [None, "opencv"])

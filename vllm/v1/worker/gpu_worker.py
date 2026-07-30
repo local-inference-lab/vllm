@@ -486,6 +486,12 @@ class Worker(WorkerBase):
         )
         self._warmup_kernels_once()
 
+        # The first pass may include one-time compiler or loader temporaries.
+        # Keep every persistent allocation initialized above, but exclude that
+        # startup-only high-water mark from the activation measurement. The
+        # second pass below establishes the repeatable serving peak.
+        torch.accelerator.reset_peak_memory_stats(self.device)
+
         # Kernel warmup can create persistent modules and communication pools.
         # A second pass is required so the measured peak contains both those
         # allocations and the model's transient activation workspace.
