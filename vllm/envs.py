@@ -2287,6 +2287,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_TRELLIS_MAX_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_MAX_M"),
     "VLLM_EXL3_TRELLIS_BLOCK_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_BLOCK_M"),
     "VLLM_EXL3_PREFILL_CHUNK": lambda: os.getenv("VLLM_EXL3_PREFILL_CHUNK"),
+    "VLLM_EXL3_PREFILL_CAPACITY": lambda: os.getenv(
+        "VLLM_EXL3_PREFILL_CAPACITY"
+    ),
     "VLLM_EXL3_PREFILL_TRELLIS": lambda: os.getenv("VLLM_EXL3_PREFILL_TRELLIS"),
     "VLLM_EXL3_PREFILL_BLOCK_M": lambda: os.getenv("VLLM_EXL3_PREFILL_BLOCK_M"),
     # Prebuilt exllamav3 extension location and torch-ABI compatibility shim.
