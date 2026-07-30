@@ -21,6 +21,39 @@ def test_build_indexer_two_by_four_groups_for_tp8():
     assert query_split_groups == [[0, 4], [1, 5], [2, 6], [3, 7]]
 
 
+@pytest.mark.parametrize(
+    ("indexer_shards", "expected_dcp", "expected_query_split"),
+    [
+        (
+            1,
+            [[0], [1], [2], [3], [4], [5], [6], [7]],
+            [list(range(8))],
+        ),
+        (
+            2,
+            [[0, 1], [2, 3], [4, 5], [6, 7]],
+            [[0, 2, 4, 6], [1, 3, 5, 7]],
+        ),
+        (
+            8,
+            [list(range(8))],
+            [[0], [1], [2], [3], [4], [5], [6], [7]],
+        ),
+    ],
+)
+def test_build_indexer_groups_cover_dcp1_partial_and_full(
+    indexer_shards,
+    expected_dcp,
+    expected_query_split,
+):
+    dcp_groups, query_split_groups = _build_indexer_replica_group_ranks(
+        [list(range(8))], indexer_shards
+    )
+
+    assert dcp_groups == expected_dcp
+    assert query_split_groups == expected_query_split
+
+
 def test_build_indexer_replica_groups_stay_inside_each_tp_group():
     dcp_groups, query_split_groups = _build_indexer_replica_group_ranks(
         [list(range(8)), list(range(8, 16))], 4
@@ -74,6 +107,18 @@ def test_indexer_group_selector_supports_partial_target_and_full_draft(monkeypat
     assert parallel_state.get_indexer_dcp_group(4) is full_dcp
     assert parallel_state.get_indexer_query_split_group(2) is partial_query_split
     assert parallel_state.get_indexer_query_split_group(4) is full_query_split
+
+
+def test_indexer_group_selector_uses_tp_query_split_for_dcp1(monkeypatch):
+    dcp = SimpleNamespace(world_size=1)
+    query_split = SimpleNamespace(world_size=8)
+    monkeypatch.setattr(parallel_state, "_INDEXER_DCP", None)
+    monkeypatch.setattr(parallel_state, "_INDEXER_QUERY_SPLIT", None)
+    monkeypatch.setattr(parallel_state, "_DCP", dcp)
+    monkeypatch.setattr(parallel_state, "_QUERY_SPLIT", query_split)
+
+    assert parallel_state.get_indexer_dcp_group(1) is dcp
+    assert parallel_state.get_indexer_query_split_group(1) is query_split
 
 
 def test_indexer_group_selector_rejects_unknown_shard_count(monkeypatch):

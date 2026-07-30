@@ -2073,17 +2073,17 @@ def initialize_model_parallel(
         group_name="dcp",
     )
 
-    # Build the query-split groups for the indexer query split (Fix A).
-    # Ranks sharing the same dcp_rank (position within their DCP group)
-    # form a query-split group.  At TP=8/DCP=2 the DCP groups are
-    # {0,1},{2,3},{4,5},{6,7} and the query-split groups are
-    # {0,2,4,6} (dcp_rank=0) and {1,3,5,7} (dcp_rank=1).
+    # Build the full-indexer query-split groups from the same topology helper
+    # used by partially replicated indexers below. At TP8/DCP2 this produces
+    # {0,2,4,6}/{1,3,5,7}. DCP1 intentionally produces one TP-wide group:
+    # every rank has the replicated indexer inputs and can process a query-row
+    # shard before restoring the exact int32 top-k indices.
     global _QUERY_SPLIT
     assert _QUERY_SPLIT is None, "query split group is already initialized"
-    if decode_context_model_parallel_size > 1 and envs.VLLM_DCP_QUERY_SPLIT:
-        query_split_ranks: list[list[int]] = []
-        for dcp_rank_idx in range(decode_context_model_parallel_size):
-            query_split_ranks.append([grp[dcp_rank_idx] for grp in group_ranks])
+    if envs.VLLM_DCP_QUERY_SPLIT:
+        _, query_split_ranks = _build_indexer_replica_group_ranks(
+            tp_group_ranks, decode_context_model_parallel_size
+        )
         _QUERY_SPLIT = init_model_parallel_group(
             query_split_ranks,
             get_world_group().local_rank,
