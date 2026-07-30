@@ -24,6 +24,7 @@ import importlib
 import os
 import re
 import sys
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -72,6 +73,7 @@ _SPARKINFER_MIXED_TRELLIS_API: Any | None = None
 _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
+_MIXED_TRELLIS_ROUTE_BLOCK_SIZE = 8
 
 
 # Smallest m the Trellis kernel path can service, and therefore the smallest
@@ -232,10 +234,34 @@ def _load_sparkinfer_mixed_trellis() -> Any:
             "Mixed-bitrate rank-sliced EXL3 requires the matching SparkInfer "
             "mixed_trellis implementation."
         ) from exc
-    module.prepare_weights = prepare.prepare_trellis256_moe_weights
-    module.max_packed_route_slots = host.max_packed_route_slots
-    _SPARKINFER_MIXED_TRELLIS_API = module
-    return module
+    api = SimpleNamespace(
+        build_tiered_maps=module.build_tiered_maps,
+        combine_trellis_rotations=module.combine_trellis_rotations,
+        compile_mixed_trellis=module.compile_mixed_trellis,
+        make_mixed_trellis_buffers=module.make_mixed_trellis_buffers,
+        max_packed_route_slots=host.max_packed_route_slots,
+        prepare_weights=prepare.prepare_trellis256_moe_weights,
+        run_mixed_trellis=module.run_mixed_trellis,
+    )
+    _SPARKINFER_MIXED_TRELLIS_API = api
+    return api
+
+
+def _unique_tensor_storage_bytes(*buffers: Any) -> int:
+    """Count unique tensor storage while ignoring buffer metadata fields."""
+
+    total = 0
+    seen: set[tuple[int, int]] = set()
+    for buffers_ in buffers:
+        for value in vars(buffers_).values():
+            if not isinstance(value, torch.Tensor):
+                continue
+            storage = value.untyped_storage()
+            storage_key = (storage.data_ptr(), storage.nbytes())
+            if storage_key not in seen:
+                seen.add(storage_key)
+                total += storage.nbytes()
+    return total
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -1331,9 +1357,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.exl3_layer_bitrates = self.quant_config.rank_sliced_layer_bitrates(
                 str(layer.layer_name)
             )
-            layer.exl3_mixed_bitrate = (
-                len(set(layer.exl3_layer_bitrates)) > 1
-            )
+            layer.exl3_mixed_bitrate = len(set(layer.exl3_layer_bitrates)) > 1
         for prefix, shard_ids in (("w13", ("w1", "w3")), ("w2", ("w2",))):
             for suffix in ("suh", "svh", "trellis", "mcg", "mul1"):
                 layer.register_parameter(
@@ -1585,9 +1609,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         down_suh = self._rank_sliced_backing(layer, "w2_suh")
         down_svh = self._rank_sliced_backing(layer, "w2_svh")
         device = gate_suh.device
-        tile_config = self._mixed_trellis_tile_config(
-            hidden_size, intermediate_size
-        )
+        tile_config = self._mixed_trellis_tile_config(hidden_size, intermediate_size)
         prepared_tiers = []
         tier_ids = []
         for bits, expert_ids in tiers.items():
@@ -1605,8 +1627,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             ).contiguous()
             w2 = torch.stack(
                 tuple(
-                    w2_param.exl3_tensors[(expert_id, "w2")]
-                    for expert_id in expert_ids
+                    w2_param.exl3_tensors[(expert_id, "w2")] for expert_id in expert_ids
                 )
             ).contiguous()
             expected_w13 = (
@@ -1690,7 +1711,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         logger.info(
             "EXL3 mixed Trellis %s: tiers=%s",
             layer.layer_name,
-            tuple((bits, len(ids)) for bits, ids in zip(tiers, tier_ids)),
+            tuple((bits, len(ids)) for bits, ids in zip(tiers, tier_ids, strict=True)),
         )
 
     def _prepare_rank_sliced_weights(self, layer: RoutedExperts) -> None:
@@ -1710,8 +1731,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         bits = int(layer_bitrates[0])
         if bits not in (3, 4, 5, 6):
             raise ValueError(
-                "rank-sliced EXL3 requires an integral 3/4/5/6 bitrate, got "
-                f"{bits!r}"
+                f"rank-sliced EXL3 requires an integral 3/4/5/6 bitrate, got {bits!r}"
             )
 
         w13 = self._rank_sliced_backing(layer, "w13_trellis")
@@ -1819,7 +1839,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         topk = int(topk_ids.shape[1])
         tier_signature = tuple(
             (int(bits), len(ids))
-            for bits, ids in zip(mixed["tier_bits"], mixed["tier_ids"])
+            for bits, ids in zip(mixed["tier_bits"], mixed["tier_ids"], strict=True)
         )
         key = (
             _runtime_owner_token(self.quant_config, layer),
@@ -1854,7 +1874,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         total_experts = sum(experts for _, experts in tier_signature)
 
         def make_state(capacity: int) -> dict[str, Any]:
-            route_slots = api.max_packed_route_slots(capacity * topk, 8, total_experts)
+            route_slots = api.max_packed_route_slots(
+                capacity * topk,
+                _MIXED_TRELLIS_ROUTE_BLOCK_SIZE,
+                total_experts,
+            )
             launch = api.compile_mixed_trellis(
                 size_m=capacity,
                 hidden_size=int(layer.exl3_hidden_size),
@@ -1864,7 +1888,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 tier0_bits=tier_signature[0][0],
                 tier1_bits=tier_signature[1][0],
                 top_k=topk,
-                max_m_blocks=(route_slots + 7) // 8,
+                max_m_blocks=(route_slots + _MIXED_TRELLIS_ROUTE_BLOCK_SIZE - 1)
+                // _MIXED_TRELLIS_ROUTE_BLOCK_SIZE,
+                moe_block_size=_MIXED_TRELLIS_ROUTE_BLOCK_SIZE,
                 sms=int(props.multi_processor_count),
                 max_shared_mem=int(props.shared_memory_per_block_optin),
                 force_tile_config=mixed["tile_config"],
@@ -1895,15 +1921,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "max_batched_tokens": max_batched_tokens,
         }
         _MIXED_TRELLIS_RUNTIMES[key] = runtime
-        buffer_bytes = 0
-        seen: set[tuple[int, int]] = set()
-        for state in (decode, prefill):
-            for tensor in vars(state["buffers"]).values():
-                storage = tensor.untyped_storage()
-                storage_key = (storage.data_ptr(), storage.nbytes())
-                if storage_key not in seen:
-                    seen.add(storage_key)
-                    buffer_bytes += storage.nbytes()
+        buffer_bytes = _unique_tensor_storage_bytes(
+            decode["buffers"], prefill["buffers"]
+        )
         logger.info_once(
             "EXL3 mixed Trellis runtime planned: tiers=%s decode_capacity=%d "
             "prefill_capacity=%d buffers=%.1f MiB",
@@ -1929,9 +1949,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 f"m={m}, capacity={runtime['max_batched_tokens']}"
             )
         state = (
-            runtime["decode"]
-            if m <= runtime["max_decode_m"]
-            else runtime["prefill"]
+            runtime["decode"] if m <= runtime["max_decode_m"] else runtime["prefill"]
         )
         mixed = layer.exl3_mixed_trellis
         output = runtime["api"].run_mixed_trellis(

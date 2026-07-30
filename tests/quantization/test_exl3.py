@@ -355,15 +355,39 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypat
 
     assert [entry["trellis_bits"] for entry in api.prepared] == [3, 4]
     assert [entry["num_experts"] for entry in api.prepared] == [2, 2]
+    for entry in api.prepared:
+        bits = entry["trellis_bits"]
+        assert tuple(entry["w13"].shape) == (
+            2,
+            2,
+            hidden // 16,
+            intermediate // 16,
+            16 * bits,
+        )
+        assert tuple(entry["w2"].shape) == (
+            2,
+            intermediate // 16,
+            hidden // 16,
+            16 * bits,
+        )
     assert [entry["tile_config"] for entry in api.prepared] == [
         (128, 128, 128, 128),
         (128, 128, 128, 128),
     ]
     assert layer.exl3_mixed_trellis["tier_ids"] == ((0, 2), (1, 3))
+    assert layer.exl3_mixed_trellis["tier_bits"] == (3, 4)
     assert layer.w13_trellis.exl3_tensors == {}
     assert layer.w2_trellis.exl3_tensors == {}
     assert layer.w13_suh.exl3_backing is None
     assert layer.w2_svh.exl3_backing is None
+
+
+def test_mixed_trellis_buffer_accounting_ignores_metadata() -> None:
+    shared = torch.empty(8, dtype=torch.uint8)
+    first = SimpleNamespace(tensor=shared, metadata=None, block_size=8)
+    second = SimpleNamespace(alias=shared.view(2, 4), label="prefill")
+
+    assert exl3_module._unique_tensor_storage_bytes(first, second) == 8
 
 
 @pytest.mark.parametrize(
@@ -374,9 +398,7 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypat
         (128, 128, (128, 128, 128, 128)),
     ],
 )
-def test_mixed_trellis_uses_large_m_safe_tile_geometry(
-    hidden, intermediate, expected
-):
+def test_mixed_trellis_uses_large_m_safe_tile_geometry(hidden, intermediate, expected):
     assert Exl3MoEMethod._mixed_trellis_tile_config(hidden, intermediate) == expected
 
 
