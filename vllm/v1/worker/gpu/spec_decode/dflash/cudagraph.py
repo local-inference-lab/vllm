@@ -72,6 +72,8 @@ class DFlashCudaGraphManager(CudaGraphManager):
         kv_cache_config: KVCacheConfig,
         max_model_len: int,
         causal: bool | Mapping[int, bool],
+        *,
+        channel_id: str,
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         def create_forward_fn(
@@ -108,4 +110,8 @@ class DFlashCudaGraphManager(CudaGraphManager):
                 num_query_per_req=desc.uniform_token_count,
             )
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        super().capture(
+            create_forward_fn,
+            channel_id=channel_id,
+            progress_bar_desc=progress_bar_desc,
+        )

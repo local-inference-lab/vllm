@@ -65,6 +65,7 @@ if TYPE_CHECKING:
 @dataclass
 class GraphCaptureContext:
     stream: torch.cuda.Stream
+    channel_id: str | None = None
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -620,7 +621,10 @@ class GroupCoordinator:
             )
             ca_comm = self.device_communicator.ca_comm
             if ca_comm is not None:
-                maybe_ca_context = ca_comm.capture(stream=stream)  # type: ignore
+                maybe_ca_context = ca_comm.capture(  # type: ignore
+                    stream=stream,
+                    channel_id=graph_capture_context.channel_id,
+                )
 
             from vllm._aiter_ops import rocm_aiter_ops
 
@@ -1643,14 +1647,15 @@ def get_pcp_group() -> GroupCoordinator:
 def graph_capture(
     device: torch.device,
     graph_capture_context: GraphCaptureContext | None = None,
+    channel_id: str | None = None,
 ):
     """
     `graph_capture` is a context manager which should surround the code that
     is capturing the CUDA graph. Its main purpose is to ensure that some
     operations will be run after the graph is captured, before the graph
     is replayed. It returns a `GraphCaptureContext` object which contains the
-    necessary data for the graph capture. Currently, it only contains the
-    stream that the graph capture is running on. This stream is set to the
+    necessary data for the graph capture: its stream and an optional semantic
+    channel identity for distributed capture resources. The stream is set to the
     current CUDA stream when the context manager is entered and reset to the
     default stream when the context manager is exited. This is to ensure that
     the graph capture is running on a separate stream from the default stream,
@@ -1660,21 +1665,37 @@ def graph_capture(
     A caller may pass an explicit ``graph_capture_context`` to control the
     stream used (e.g. to capture on the default stream).
     """
-    context = graph_capture_context or GraphCaptureContext(
-        torch.cuda.Stream(device=device)
-    )
+    if graph_capture_context is None:
+        context = GraphCaptureContext(
+            torch.cuda.Stream(device=device),
+            channel_id=channel_id,
+        )
+    else:
+        context = graph_capture_context
+        if channel_id is not None:
+            if context.channel_id is not None and context.channel_id != channel_id:
+                raise ValueError(
+                    "graph capture channel_id conflicts with GraphCaptureContext"
+                )
+            if context.channel_id is None:
+                context = GraphCaptureContext(context.stream, channel_id=channel_id)
     maybe_dcp_capture = (
         get_dcp_group().graph_capture(context)
         if _DCP is not None and get_dcp_group().world_size > 1
         else nullcontext()
     )
+    maybe_b12x_dcp_capture: contextlib.AbstractContextManager[Any]
     if _DCP is not None and get_dcp_group().world_size > 1:
         # Import locally to avoid making distributed initialization depend on
         # attention modules. The helper is a no-op until DCP warmup creates a
         # SparkInfer pool for this process group.
         from vllm.v1.attention.ops.dcp_alltoall import capture_b12x_dcp_a2a
 
-        maybe_b12x_dcp_capture = capture_b12x_dcp_a2a(get_dcp_group(), context.stream)
+        maybe_b12x_dcp_capture = capture_b12x_dcp_a2a(
+            get_dcp_group(),
+            context.stream,
+            channel_id=context.channel_id,
+        )
     else:
         maybe_b12x_dcp_capture = nullcontext()
     with (

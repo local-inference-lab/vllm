@@ -63,3 +63,34 @@ def test_dflash_does_not_retain_eager_backbone_output(monkeypatch):
     )
 
     assert speculator._captured_backbone_outputs == []
+
+
+def test_dflash_capture_uses_phase_specific_draft_channel_ids():
+    events = []
+
+    class FakeManager:
+        def capture(self, *args, **kwargs):
+            events.append(kwargs["channel_id"])
+
+    speculator = SimpleNamespace(
+        _speculator_name="DFlash",
+        sample_indices=torch.zeros(1),
+        sample_pos=torch.zeros(1),
+        sample_idx_mapping=torch.zeros(1),
+        query_cudagraph_manager=FakeManager(),
+        _generate_draft=object(),
+        input_buffers=object(),
+        block_tables=object(),
+        attn_groups=object(),
+        kv_cache_config=object(),
+        max_model_len=1,
+        _group_causal=True,
+    )
+
+    DFlashSpeculator.capture(speculator, capture_phase="profile")
+    DFlashSpeculator.capture(speculator, capture_phase="production")
+
+    assert events == [
+        "vllm:draft:dflash:profile",
+        "vllm:draft:dflash:production",
+    ]

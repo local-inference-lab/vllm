@@ -446,6 +446,8 @@ class CudaGraphManager:
     def capture(
         self,
         create_forward_fn: CreateForwardFn,
+        *,
+        channel_id: str,
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture CUDA graphs.
@@ -456,12 +458,16 @@ class CudaGraphManager:
                 it is invoked once with warmup=True and again with warmup=False
                 because attention backends may mutate or lazily initialize
                 metadata during warmup.
+            channel_id: Stable distributed identity for this graph owner.
         """
         # Keep event handles created by descriptor warmups alive together with
         # the graph artifacts captured below. Some multi-stream custom ops run
         # on joined auxiliary streams where CUDA's per-current-stream capture
         # query is false even though later graph nodes retain those handles.
-        with graph_capture(device=self.device), vllm_cudagraph_capture_scope():
+        with (
+            graph_capture(device=self.device, channel_id=channel_id),
+            vllm_cudagraph_capture_scope(),
+        ):
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -638,6 +644,8 @@ class ModelCudaGraphManager(CudaGraphManager):
         has_lora: bool = False,
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
+        *,
+        channel_id: str,
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
@@ -752,7 +760,11 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        super().capture(
+            create_forward_fn,
+            channel_id=channel_id,
+            progress_bar_desc=progress_bar_desc,
+        )
 
     def clear(self) -> None:
         super().clear()

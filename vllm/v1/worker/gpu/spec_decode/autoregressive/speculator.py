@@ -21,7 +21,10 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
-from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.speculator import (
+    CUDAGraphCapturePhase,
+    DraftModelSpeculator,
+)
 
 logger = init_logger(__name__)
 
@@ -87,7 +90,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             decode_query_len=1,
         )
 
-    def capture(self) -> None:
+    def capture(self, *, capture_phase: CUDAGraphCapturePhase) -> None:
         logger.info("Capturing model for speculator...")
         # Reset indices to zeros to prevent stale values from prior
         # dummy runs to cause out-of-bounds indexing during capture.
@@ -111,6 +114,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.block_tables,
             self.target_attn_groups,
             self.kv_cache_config,
+            channel_id=f"vllm:draft:prefill:{capture_phase}",
             progress_bar_desc="Capturing prefill CUDA graphs",
         )
 
@@ -128,6 +132,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.block_tables,
             self.attn_groups,
             self.kv_cache_config,
+            channel_id=f"vllm:draft:decode:{capture_phase}",
             progress_bar_desc="Capturing decode CUDA graphs",
         )
 

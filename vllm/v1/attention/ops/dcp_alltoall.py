@@ -53,9 +53,7 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
         return False
     batch, heads, head_dim = (int(value) for value in tensor.shape)
     stride_batch, stride_head, _ = (int(value) for value in tensor.stride())
-    packed_token_major = (
-        stride_batch == heads * head_dim and stride_head == head_dim
-    )
+    packed_token_major = stride_batch == heads * head_dim and stride_head == head_dim
     capacity_strided_head_major = (
         stride_batch == head_dim and stride_head >= batch * head_dim
     )
@@ -171,6 +169,8 @@ def _get_b12x_dcp_a2a_pool(
 def capture_b12x_dcp_a2a(
     cp_group: GroupCoordinator,
     stream: torch.cuda.Stream | None = None,
+    *,
+    channel_id: str | None = None,
 ):
     """Bind registered SparkInfer DCP pools to the graph's owning stream.
 
@@ -180,6 +180,7 @@ def capture_b12x_dcp_a2a(
     Args:
         cp_group: DCP group whose registered pools should enter capture.
         stream: CUDA stream owned by the enclosing graph capture.
+        channel_id: Stable identity shared by every rank for this graph owner.
     """
     group_id = id(cp_group.device_group)
     matching_pools = sorted(
@@ -190,9 +191,14 @@ def capture_b12x_dcp_a2a(
         ),
         key=lambda item: item[0][1:],
     )
+    if matching_pools and channel_id is None:
+        raise RuntimeError(
+            "distributed PCIe DCP graph capture requires an explicit semantic "
+            "channel_id"
+        )
     with ExitStack() as stack:
         for _, pool in matching_pools:
-            stack.enter_context(pool.capture(stream=stream))
+            stack.enter_context(pool.capture(stream=stream, channel_id=channel_id))
         yield
 
 

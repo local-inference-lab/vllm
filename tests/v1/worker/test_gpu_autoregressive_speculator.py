@@ -166,3 +166,42 @@ def test_ar_probabilistic_draft_uses_shared_sampler(monkeypatch):
 
     assert captured["positions"] is positions
     assert captured["active_rows"] is speculator.active_num_reqs
+
+
+def test_autoregressive_capture_ids_are_cross_rank_symmetric_and_separated():
+    def capture_for_rank() -> list[str]:
+        events = []
+
+        class FakeManager:
+            use_breakable_cg = False
+
+            def capture(self, *args, **kwargs):
+                events.append(kwargs["channel_id"])
+
+        speculator = object.__new__(_TestSpeculator)
+        speculator.last_token_indices = torch.zeros(1)
+        speculator.prefill_cudagraph_manager = FakeManager()
+        speculator.decode_cudagraph_manager = FakeManager()
+        speculator.model = object()
+        speculator._prefill = object()
+        speculator._generate_draft = object()
+        speculator.model_state = object()
+        speculator.target_input_buffers = object()
+        speculator.input_buffers = object()
+        speculator.block_tables = object()
+        speculator.target_attn_groups = object()
+        speculator.attn_groups = object()
+        speculator.kv_cache_config = object()
+        speculator.num_speculative_steps = 3
+
+        speculator.capture(capture_phase="profile")
+        speculator.capture(capture_phase="production")
+        return events
+
+    expected = [
+        "vllm:draft:prefill:profile",
+        "vllm:draft:decode:profile",
+        "vllm:draft:prefill:production",
+        "vllm:draft:decode:production",
+    ]
+    assert capture_for_rank() == capture_for_rank() == expected

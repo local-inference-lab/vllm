@@ -157,6 +157,40 @@ def test_b12x_channel_checkpoint_delegates_to_runtime() -> None:
     runtime.rollback_channels.assert_called_once_with(checkpoint)
 
 
+def test_b12x_capture_forwards_semantic_channel_id() -> None:
+    custom_allreduce, runtime = make_b12x_custom_allreduce(
+        allreduce_max_size=64,
+        fused_max_size=64,
+    )
+    stream = object()
+
+    with custom_allreduce.capture(  # type: ignore[arg-type]
+        stream,
+        channel_id="vllm:target:profile",
+    ):
+        pass
+
+    runtime.capture.assert_called_once_with(
+        stream=stream,
+        channel_id="vllm:target:profile",
+    )
+
+
+def test_b12x_capture_rejects_missing_semantic_channel_id() -> None:
+    custom_allreduce, runtime = make_b12x_custom_allreduce(
+        allreduce_max_size=64,
+        fused_max_size=64,
+    )
+
+    with (
+        pytest.raises(RuntimeError, match="semantic channel_id"),
+        custom_allreduce.capture(),
+    ):
+        pass
+
+    runtime.capture.assert_not_called()
+
+
 def test_b12x_oneshot_buffer_tracks_dispatch_limits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -357,7 +391,10 @@ def _run_b12x_fused_allreduce_gpu(rank: int, port: int) -> None:
     )
     inp.copy_(original_inp)
     residual.copy_(original_residual)
-    with graph_capture(device=device) as capture_context:
+    with graph_capture(
+        device=device,
+        channel_id="vllm:test:b12x-fused",
+    ) as capture_context:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=capture_context.stream):
             torch.ops.vllm.b12x_fused_allreduce_add_rms_norm.default(

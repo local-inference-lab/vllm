@@ -655,7 +655,12 @@ class CustomAllreduce:
         ops.register_buffer(self._ptr, self.buffer_ptrs)
 
     @contextmanager
-    def capture(self, stream: torch.cuda.Stream | None = None):
+    def capture(
+        self,
+        stream: torch.cuda.Stream | None = None,
+        *,
+        channel_id: str | None = None,
+    ):
         """Bind communicator resources to the enclosing CUDA graph capture.
 
         Legacy custom all-reduce registers graph buffers on exit. SparkInfer
@@ -668,8 +673,16 @@ class CustomAllreduce:
             if self._pcie_runtime is None:
                 yield
             else:
+                if channel_id is None:
+                    raise RuntimeError(
+                        "distributed PCIe graph capture requires an explicit "
+                        "semantic channel_id"
+                    )
                 self._pcie_capture_stream = stream
-                with self._pcie_runtime.capture(stream=stream):
+                with self._pcie_runtime.capture(
+                    stream=stream,
+                    channel_id=channel_id,
+                ):
                     yield
         finally:
             self._pcie_capture_stream = old_pcie_capture_stream
