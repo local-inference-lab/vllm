@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,6 +26,7 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.distributed.device_communicators import custom_all_reduce
 from vllm.distributed.device_communicators.custom_all_reduce import (
     CustomAllreduce,
     _b12x_pcie_dma_min_bytes,
@@ -107,8 +109,66 @@ def test_b12x_fused_allreduce_uses_independent_cutoff() -> None:
         out=inp,
         residual_out=residual,
         stream=None,
-        channel_id="eager:vllm-tp-allreduce",
+        channel_id="vllm:eager:allreduce",
     )
+    runtime.for_stream.assert_called_with(
+        None,
+        channel_id="vllm:eager:allreduce",
+    )
+
+
+def test_b12x_eager_allreduce_forwards_stable_semantic_channel() -> None:
+    custom_allreduce, runtime = make_b12x_custom_allreduce(
+        allreduce_max_size=64,
+        fused_max_size=64,
+    )
+    inp = torch.randn(2, 4)
+    expected = torch.empty_like(inp)
+    runtime.all_reduce.return_value = expected
+
+    actual = custom_allreduce.all_reduce(inp)
+
+    assert actual is expected
+    runtime.all_reduce.assert_called_once_with(
+        inp,
+        out=None,
+        stream=None,
+        channel_id="vllm:eager:allreduce",
+    )
+
+
+def test_b12x_eager_owner_fails_closed_on_second_stream_bind() -> None:
+    custom_allreduce, runtime = make_b12x_custom_allreduce(
+        allreduce_max_size=64,
+        fused_max_size=64,
+    )
+    first_stream = object()
+    second_stream = object()
+    custom_allreduce._pcie_runtime_stream = MagicMock(  # type: ignore[method-assign]
+        side_effect=(first_stream, second_stream)
+    )
+    bound_stream = None
+
+    def for_stream(stream, *, channel_id):
+        nonlocal bound_stream
+        assert channel_id == "vllm:eager:allreduce"
+        if bound_stream is None:
+            bound_stream = stream
+        elif stream is not bound_stream:
+            raise RuntimeError("stream-affine logical owner rebound")
+        channel = MagicMock()
+        channel.should_allreduce.return_value = True
+        return channel
+
+    runtime.for_stream.side_effect = for_stream
+    inp = torch.randn(2, 4)
+
+    assert custom_allreduce.should_custom_ar(inp)
+    with pytest.raises(RuntimeError, match="stream-affine"):
+        custom_allreduce.should_custom_ar(inp)
+    assert [
+        call.kwargs["channel_id"] for call in runtime.for_stream.call_args_list
+    ] == ["vllm:eager:allreduce", "vllm:eager:allreduce"]
 
 
 def test_b12x_fused_allreduce_falls_back_above_its_cutoff() -> None:
@@ -142,6 +202,121 @@ def test_b12x_oneshot_defaults_to_stream_isolation(
     monkeypatch.delenv("VLLM_PCIE_ONESHOT_SINGLE_CHANNEL", raising=False)
 
     assert not envs.environment_variables["VLLM_PCIE_ONESHOT_SINGLE_CHANNEL"]()
+
+
+def test_b12x_pool_prepares_single_stable_eager_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+    runtime = MagicMock()
+
+    class FakePool:
+        @classmethod
+        def from_exchange_group(cls, **kwargs):
+            captured.update(kwargs)
+            return runtime
+
+    def fake_all_gather(gather_list, tensor, *, group):
+        for index, slot in enumerate(gather_list):
+            slot.fill_(index)
+
+    fake_config = SimpleNamespace(
+        model_config=SimpleNamespace(get_hidden_size=lambda: 4),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+    )
+    monkeypatch.setattr(custom_all_reduce, "custom_ar", True)
+    monkeypatch.setattr(custom_all_reduce.dist, "get_backend", lambda group: "gloo")
+    monkeypatch.setattr(
+        custom_all_reduce,
+        "in_the_same_node_as",
+        lambda group, source_rank=0: [True, True],
+    )
+    monkeypatch.setattr(custom_all_reduce.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(custom_all_reduce.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(custom_all_reduce.dist, "all_gather", fake_all_gather)
+    monkeypatch.setattr(
+        custom_all_reduce.dist, "all_reduce", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        custom_all_reduce,
+        "_b12x_pcie_allreduce_requested",
+        lambda: True,
+    )
+    monkeypatch.setattr(custom_all_reduce, "_can_p2p", lambda *args: True)
+    monkeypatch.setattr(
+        custom_all_reduce,
+        "_is_cross_numa_topology",
+        lambda ids: False,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce,
+        "_load_b12x_pcie_oneshot_pool",
+        lambda: FakePool,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce,
+        "_b12x_pcie_dma_min_bytes",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce.current_platform,
+        "get_device_capability",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce.current_platform,
+        "visible_device_id_to_physical_device_id",
+        lambda index: index,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce.current_platform,
+        "is_cuda_alike",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce.current_platform,
+        "is_fully_connected",
+        lambda ids: False,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce.current_platform,
+        "is_cuda",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce.current_platform,
+        "is_rocm",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "vllm.config.get_current_vllm_config",
+        lambda: fake_config,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce.envs,
+        "VLLM_PCIE_ONESHOT_SINGLE_CHANNEL",
+        False,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce.envs,
+        "VLLM_ALLOW_CUSTOM_ALLREDUCE_PCIE",
+        False,
+        raising=False,
+    )
+
+    built = CustomAllreduce(
+        object(),  # type: ignore[arg-type]
+        torch.device("cuda:0"),
+        nccl_group=object(),  # type: ignore[arg-type]
+    )
+
+    assert not built.disabled
+    assert captured["single_channel"] is False
+    assert captured["max_concurrent_channels"] == 2
+    runtime.prepare_channels.assert_called_once_with(("vllm:eager:allreduce",))
+    runtime.for_stream.assert_called_once_with(channel_id="vllm:eager:allreduce")
 
 
 def test_b12x_channel_checkpoint_delegates_to_runtime() -> None:

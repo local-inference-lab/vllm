@@ -553,7 +553,7 @@ def test_b12x_pool_uses_independent_stream_channels(
             return cls()
 
         def prepare_channels(self, channel_ids):
-            captured["prepared"] = channel_ids
+            captured["prepared"] = tuple(channel_ids)
 
         def for_stream(self, *, channel_id):
             captured["warmed"] = channel_id
@@ -580,8 +580,9 @@ def test_b12x_pool_uses_independent_stream_channels(
 
     assert pool is not None
     assert captured["single_channel"] is False
-    assert captured["prepared"] == ("eager:vllm-dcp-a2a",)
-    assert captured["warmed"] == "eager:vllm-dcp-a2a"
+    assert captured["max_concurrent_channels"] == 2
+    assert captured["prepared"] == ("vllm:eager:dcp",)
+    assert captured["warmed"] == "vllm:eager:dcp"
 
 
 def test_b12x_dcp_capture_selects_only_current_group_pools(monkeypatch):
@@ -881,7 +882,7 @@ def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
             is_lse_base_on_e,
             channel_id,
         ):
-            assert channel_id == "eager:vllm-dcp-a2a"
+            created["channel_id"] = channel_id
             return sentinel
 
     def fake_get_pool(
@@ -907,6 +908,7 @@ def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     # Batch within the cap uses B12X, with the staging pool capped too.
     assert result is sentinel
     assert created["max_batch_size"] == 4
+    assert created["channel_id"] == "vllm:eager:dcp"
 
     out_large = torch.zeros(8, 16, 64, dtype=torch.bfloat16, device="cuda")
     lse_large = torch.zeros(8, 16, dtype=torch.float32, device="cuda")
@@ -934,7 +936,7 @@ def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
 
     class _FakePool:
         def all_gather_heads(self, local_input, *, channel_id):
-            assert channel_id == "eager:vllm-dcp-a2a"
+            created["channel_id"] = channel_id
             return sentinel
 
     def fake_get_pool(
@@ -955,6 +957,7 @@ def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     )
     assert result is sentinel
     assert created["max_batch_size"] == 4
+    assert created["channel_id"] == "vllm:eager:dcp"
 
     large = torch.zeros(8, 8, 64, dtype=torch.bfloat16, device="cuda")
     result = dcp_alltoall._try_b12x_dcp_all_gather_heads(
@@ -1021,7 +1024,7 @@ def test_b12x_lse_reduce_preserves_supported_layouts(monkeypatch: pytest.MonkeyP
     assert received["partial"].is_contiguous()
     assert received["lse"].is_contiguous()
     assert received["out"].movedim(0, 1).is_contiguous()
-    assert received["channel_id"] == "eager:vllm-dcp-a2a"
+    assert received["channel_id"] == "vllm:eager:dcp"
 
     head_major_storage = torch.zeros(16, 8, 64, dtype=torch.bfloat16, device="cuda")
     head_major = head_major_storage.transpose(0, 1)[:4]

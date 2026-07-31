@@ -31,7 +31,11 @@ except Exception:
 
 logger = init_logger(__name__)
 
-_B12X_PCIE_EAGER_CHANNEL_ID = "eager:vllm-tp-allreduce"
+# The eager scheduler has one stable all-reduce stream owner.  Never derive
+# this identity from a process-local CUDA stream handle; B12X deliberately
+# fails closed if the same logical owner is rebound to a second eager stream.
+_B12X_PCIE_EAGER_CHANNEL_ID = "vllm:eager:allreduce"
+_B12X_PCIE_MAX_CONCURRENT_CHANNELS = 2
 
 
 def _get_pcie_allreduce_backend() -> str:
@@ -491,10 +495,15 @@ class CustomAllreduce:
                     eager_buffer_bytes=pcie_oneshot_buffer_size,
                     max_size=pcie_oneshot_buffer_size,
                     single_channel=pcie_single_channel,
+                    max_concurrent_channels=_B12X_PCIE_MAX_CONCURRENT_CHANNELS,
                 )
                 if not pcie_single_channel:
                     pcie_runtime.prepare_channels((_B12X_PCIE_EAGER_CHANNEL_ID,))
-                pcie_runtime.for_stream(channel_id=_B12X_PCIE_EAGER_CHANNEL_ID)
+                pcie_runtime.for_stream(
+                    channel_id=(
+                        None if pcie_single_channel else _B12X_PCIE_EAGER_CHANNEL_ID
+                    )
+                )
             except Exception as exc:
                 pcie_init_error = exc
 
