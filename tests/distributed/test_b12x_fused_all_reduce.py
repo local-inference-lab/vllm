@@ -84,6 +84,42 @@ def make_b12x_custom_allreduce(
     return custom_allreduce, runtime
 
 
+def test_b12x_destructor_quarantines_live_runtime_without_close() -> None:
+    custom_allreduce, runtime = make_b12x_custom_allreduce(
+        allreduce_max_size=64,
+        fused_max_size=64,
+    )
+    dma = MagicMock()
+    custom_allreduce._pcie_dma = dma
+    quarantine: dict[int, object] = {}
+
+    custom_allreduce.__del__(quarantine)
+
+    dma.close.assert_not_called()
+    runtime.close.assert_not_called()
+    assert quarantine == {id(custom_allreduce): custom_allreduce}
+
+    custom_allreduce._pcie_dma = None
+    custom_allreduce._pcie_runtime = None
+    quarantine.clear()
+
+
+def test_b12x_explicit_close_remains_coordinated() -> None:
+    custom_allreduce, runtime = make_b12x_custom_allreduce(
+        allreduce_max_size=64,
+        fused_max_size=64,
+    )
+    dma = MagicMock()
+    custom_allreduce._pcie_dma = dma
+
+    custom_allreduce.close()
+
+    dma.close.assert_called_once_with()
+    runtime.close.assert_called_once_with()
+    assert custom_allreduce._pcie_dma is None
+    assert custom_allreduce._pcie_runtime is None
+
+
 def test_b12x_fused_allreduce_uses_independent_cutoff() -> None:
     custom_allreduce, runtime = make_b12x_custom_allreduce(
         allreduce_max_size=16,
