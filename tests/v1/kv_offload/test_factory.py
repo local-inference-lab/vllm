@@ -328,7 +328,8 @@ def test_create_cpu_offloading_spec_end_to_end():
 
 @pytest.mark.parametrize("packed", [False, True])
 def test_cpu_spec_sizing_preserves_tensor_layout(packed: bool):
-    cpu_bytes_to_use = 1920
+    alignment = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    cpu_bytes_to_use = alignment * 3
     config = _make_layout_vllm_config(
         cpu_bytes_to_use=cpu_bytes_to_use,
         extra_config={"block_size": 32},
@@ -340,8 +341,83 @@ def test_cpu_spec_sizing_preserves_tensor_layout(packed: bool):
 
     assert isinstance(spec, CPUOffloadingSpec)
     assert spec.cpu_page_size_per_worker == 32
-    assert spec.kv_bytes_per_chunk == 192
-    assert spec.num_blocks == cpu_bytes_to_use // 192
+    assert spec.kv_bytes_per_chunk == alignment
+    assert spec.num_blocks == 3
+
+
+def test_cpu_spec_create_worker_uses_shared_region_on_cuda(monkeypatch):
+    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
+
+    alignment = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    config = _make_layout_vllm_config(
+        cpu_bytes_to_use=alignment * 2,
+        tensor_parallel_size=4,
+    )
+    spec = _create_spec(config, _make_sizing_kv_cache_config(packed=False))
+    assert isinstance(spec, CPUOffloadingSpec)
+
+    region = MagicMock()
+    region_ctor = MagicMock(return_value=region)
+    worker_ctor = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(cpu_spec_module.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(cpu_spec_module, "SharedOffloadRegion", region_ctor)
+    monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", worker_ctor)
+    monkeypatch.setattr(
+        cpu_spec_module.torch.accelerator, "current_device_index", lambda: 5
+    )
+
+    kv_caches = MagicMock()
+    spec.create_worker(kv_caches)
+
+    region_ctor.assert_called_once_with(
+        engine_id=spec.config.engine_id,
+        num_blocks=spec.num_blocks,
+        rank=1,
+        kv_bytes_per_block=spec.kv_bytes_per_chunk,
+        cpu_page_size=spec.cpu_page_size_per_worker,
+    )
+    worker_ctor.assert_called_once_with(
+        kv_caches=kv_caches,
+        blocks_per_chunk=spec.blocks_per_chunk,
+        num_cpu_blocks=spec.num_blocks,
+        mmap_region=region,
+    )
+
+
+@pytest.mark.parametrize("num_blocks", [0, 2])
+def test_cpu_spec_create_worker_keeps_tensor_path_without_cuda_or_blocks(
+    monkeypatch, num_blocks: int
+):
+    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
+
+    alignment = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    config = _make_layout_vllm_config(cpu_bytes_to_use=alignment * 2)
+    kv_cache_config = _make_sizing_kv_cache_config(packed=False)
+    if num_blocks == 0:
+        kv_cache_config.num_blocks = 0
+    spec = _create_spec(config, kv_cache_config)
+    assert isinstance(spec, CPUOffloadingSpec)
+
+    region_ctor = MagicMock()
+    worker_ctor = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(
+        cpu_spec_module.current_platform,
+        "is_cuda_alike",
+        lambda: num_blocks == 0,
+    )
+    monkeypatch.setattr(cpu_spec_module, "SharedOffloadRegion", region_ctor)
+    monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", worker_ctor)
+
+    kv_caches = MagicMock()
+    spec.create_worker(kv_caches)
+
+    region_ctor.assert_not_called()
+    worker_ctor.assert_called_once_with(
+        kv_caches=kv_caches,
+        blocks_per_chunk=spec.blocks_per_chunk,
+        num_cpu_blocks=spec.num_blocks,
+        mmap_region=None,
+    )
 
 
 def test_cpu_spec_rejects_partially_packed_tensor_layout():

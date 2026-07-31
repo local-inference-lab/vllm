@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
+import torch
 from typing_extensions import override
 
 from vllm.platforms import current_platform
@@ -20,10 +21,11 @@ from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 
 class CPUOffloadingSpec(OffloadingSpec):
-    BLOCK_SIZE_ALIGNMENT = 1
+    BLOCK_SIZE_ALIGNMENT = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
 
     @classmethod
     def build_metric_definitions(
@@ -133,10 +135,22 @@ class CPUOffloadingSpec(OffloadingSpec):
         return self._manager
 
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
+        mmap_region: SharedOffloadRegion | None = None
+        if current_platform.is_cuda_alike() and self.num_blocks > 0:
+            world_size = self.config.parallel.world_size
+            rank = torch.accelerator.current_device_index() % world_size
+            mmap_region = SharedOffloadRegion(
+                engine_id=self.config.engine_id,
+                num_blocks=self.num_blocks,
+                rank=rank,
+                kv_bytes_per_block=self.kv_bytes_per_chunk,
+                cpu_page_size=self.cpu_page_size_per_worker,
+            )
         return CPUOffloadingWorker(
             kv_caches=kv_caches,
             blocks_per_chunk=self.blocks_per_chunk,
             num_cpu_blocks=self.num_blocks,
+            mmap_region=mmap_region,
         )
 
     @override
