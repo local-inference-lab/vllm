@@ -35,6 +35,8 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
         block_tables: BlockTables,
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
+        *,
+        channel_id: str,
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         def create_forward_fn(
@@ -71,4 +73,8 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
                 cg_mode,
             )
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        super().capture(
+            create_forward_fn,
+            channel_id=channel_id,
+            progress_bar_desc=progress_bar_desc,
+        )

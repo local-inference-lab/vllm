@@ -99,6 +99,7 @@ def test_memory_profile_reuses_production_pool_and_destroys_graphs(monkeypatch):
         def capture(self, *args, **kwargs):
             assert self.pool is production_pool
             assert wrapper.graph_pool is production_pool
+            assert kwargs["channel_id"] == "vllm:target:profile"
             lazy_wrapper = FakeWrapper()
             lazy_wrapper.graph_pool = self.pool
             lazy_wrappers.append(lazy_wrapper)
@@ -112,8 +113,9 @@ def test_memory_profile_reuses_production_pool_and_destroys_graphs(monkeypatch):
         def get_cudagraph_managers(self):
             return []
 
-        def capture(self):
+        def capture(self, *, capture_phase):
             assert workspace_module._workspace_lane.get() == 1
+            assert capture_phase == "profile"
             events.append("spec_capture")
 
     manager = FakeManager()
@@ -235,6 +237,7 @@ def test_production_capture_releases_pool_anchor_on_failure(monkeypatch):
 
         @staticmethod
         def capture(*args, **kwargs):
+            assert kwargs["channel_id"] == "vllm:target:production"
             events.append("capture")
             raise RuntimeError("capture failed")
 
@@ -267,6 +270,60 @@ def test_production_capture_releases_pool_anchor_on_failure(monkeypatch):
 
     assert runner._cudagraph_pool_anchor is None
     assert events == ["capture", "anchor_reset"]
+
+
+def test_production_capture_assigns_target_and_draft_phase_ids(monkeypatch):
+    from vllm.v1.worker.gpu import model_runner as model_runner_module
+
+    events = []
+
+    class FakeManager:
+        @staticmethod
+        def needs_capture():
+            return True
+
+        @staticmethod
+        def capture(*args, **kwargs):
+            events.append(("target", kwargs["channel_id"]))
+
+    class FakeSpeculator:
+        @staticmethod
+        def capture(*, capture_phase):
+            events.append(("draft", capture_phase))
+
+    runner = model_runner_module.GPUModelRunner.__new__(
+        model_runner_module.GPUModelRunner
+    )
+    runner.cudagraph_manager = FakeManager()
+    runner._cudagraph_pool_anchor = None
+    runner.lora_config = None
+    runner.model = object()
+    runner.model_state = object()
+    runner.input_buffers = object()
+    runner.intermediate_tensors = object()
+    runner.block_tables = object()
+    runner.attn_groups = object()
+    runner.kv_cache_config = object()
+    runner.use_aux_hidden_state_outputs = False
+    runner.speculator = FakeSpeculator()
+    runner.maybe_setup_dummy_loras = lambda _: nullcontext()
+    runner._zero_cudagraph_capture_kv_blocks = lambda: None
+
+    monkeypatch.setattr(model_runner_module.gc, "collect", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "get_memory_info",
+        lambda: (1000, 0),
+    )
+    monkeypatch.setattr(model_runner_module, "lock_workspace", lambda: None)
+
+    runner.capture_model()
+
+    assert events == [
+        ("target", "vllm:target:production"),
+        ("draft", "production"),
+    ]
 
 
 def test_skipped_production_capture_releases_pool_anchor():
@@ -372,13 +429,21 @@ def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
         patch(
             "vllm.v1.worker.gpu.cudagraph_utils.graph_capture",
             return_value=nullcontext(),
-        ),
+        ) as graph_capture_mock,
         patch(
             "vllm.v1.worker.gpu.cudagraph_utils.is_global_first_rank",
             return_value=False,
         ),
     ):
-        manager.capture(create_forward_fn)
+        manager.capture(
+            create_forward_fn,
+            channel_id="vllm:target:profile",
+        )
+
+    graph_capture_mock.assert_called_once_with(
+        device=torch.device("cpu"),
+        channel_id="vllm:target:profile",
+    )
 
     assert [warmup for warmup, _ in create_calls] == [True, False]
     assert [mode for _, mode, _ in forward_calls] == [

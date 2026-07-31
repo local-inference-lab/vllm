@@ -35,7 +35,10 @@ from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
     load_dflash_model,
     maybe_load_mask_embedding,
 )
-from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.speculator import (
+    CUDAGraphCapturePhase,
+    DraftModelSpeculator,
+)
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -185,7 +188,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             channel_id="graph:vllm-dflash-query",
         )
 
-    def capture(self) -> None:
+    def capture(self, *, capture_phase: CUDAGraphCapturePhase) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)
         # Reset sampling indices to prevent stale values from prior dummy runs
         # from being baked into the captured graph. Mapping rows stay inert.
@@ -201,6 +204,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.kv_cache_config,
             self.max_model_len,
             causal=self._group_causal,
+            channel_id=f"vllm:draft:dflash:{capture_phase}",
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
 

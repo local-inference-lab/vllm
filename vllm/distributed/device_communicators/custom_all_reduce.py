@@ -680,6 +680,11 @@ class CustomAllreduce:
             if self._pcie_runtime is None:
                 yield
             else:
+                if channel_id is None:
+                    raise RuntimeError(
+                        "distributed PCIe graph capture requires an explicit "
+                        "semantic channel_id"
+                    )
                 self._pcie_capture_stream = stream
                 self._pcie_capture_channel_id = channel_id
                 with self._pcie_runtime.capture(

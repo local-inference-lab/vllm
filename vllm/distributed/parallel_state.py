@@ -1655,8 +1655,8 @@ def graph_capture(
     is capturing the CUDA graph. Its main purpose is to ensure that some
     operations will be run after the graph is captured, before the graph
     is replayed. It returns a `GraphCaptureContext` object which contains the
-    necessary data for the graph capture. Currently, it only contains the
-    stream that the graph capture is running on. This stream is set to the
+    necessary data for the graph capture: its stream and an optional semantic
+    channel identity for distributed capture resources. The stream is set to the
     current CUDA stream when the context manager is entered and reset to the
     default stream when the context manager is exited. This is to ensure that
     the graph capture is running on a separate stream from the default stream,
@@ -1683,12 +1683,14 @@ def graph_capture(
                     "graph capture context and argument specify different "
                     "semantic channel IDs"
                 )
-            context.channel_id = channel_id
+            if context.channel_id is None:
+                context = GraphCaptureContext(context.stream, channel_id=channel_id)
     maybe_dcp_capture = (
         get_dcp_group().graph_capture(context)
         if _DCP is not None and get_dcp_group().world_size > 1
         else nullcontext()
     )
+    maybe_b12x_dcp_capture: contextlib.AbstractContextManager[Any]
     if _DCP is not None and get_dcp_group().world_size > 1:
         # Import locally to avoid making distributed initialization depend on
         # attention modules. The helper is a no-op until DCP warmup creates a
