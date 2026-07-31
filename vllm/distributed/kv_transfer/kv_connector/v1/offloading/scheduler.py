@@ -987,31 +987,36 @@ class OffloadingConnectorScheduler:
                         ):
                             group_state.block_ids[j] = 0
 
-    def _replay_tail_end_chunk(
-        self, group_config: GroupOffloadConfig, num_prompt_tokens: int, shift: int
-    ) -> int | None:
-        """End chunk index (exclusive) of this group's replay-boundary tail.
+    def _reachable_tail_end_chunks(
+        self, group_config: GroupOffloadConfig, req: Request, shift: int
+    ) -> tuple[int, ...]:
+        """End chunk indices (exclusive) of serviceable boundary tails.
 
         Mirrors the replay-boundary handling of
         SlidingWindowManager.reachable_block_mask: with sparse retention,
-        segment tails exist only once per retention interval, so a replay of
-        the same prompt would otherwise fall back a whole segment. Retain one
-        extra tail run per request, ending at the latest
-        full-attention-aligned boundary that every group can service (i.e.
-        far enough from the prompt end that each EAGLE/MTP group's "+1 peek"
-        chunk is still a complete prompt chunk).
+        segment tails exist only once per retention interval. Retain tails at
+        the request replay boundary and at a detected shared-prefix junction.
+        Clamp each boundary to the latest point that every group can service,
+        including a complete EAGLE/MTP peek chunk.
         """
         alignment_tokens = self.config.replay_alignment_tokens
         if alignment_tokens is None:
-            return None
-        latest = (
-            (num_prompt_tokens - self._replay_reserve_tokens)
-            // alignment_tokens
-            * alignment_tokens
-        )
-        if latest <= 0 or latest % group_config.tokens_per_chunk != 0:
-            return None
-        return latest // group_config.tokens_per_chunk + shift
+            return ()
+
+        latest_serviceable = req.num_prompt_tokens - self._replay_reserve_tokens
+        boundaries = [latest_serviceable]
+        if req.shared_prefix_boundary:
+            boundaries.append(min(req.shared_prefix_boundary, latest_serviceable))
+
+        ends: list[int] = []
+        for boundary in boundaries:
+            aligned = boundary // alignment_tokens * alignment_tokens
+            if aligned <= 0 or aligned % group_config.tokens_per_chunk != 0:
+                continue
+            end = aligned // group_config.tokens_per_chunk + shift
+            if end not in ends:
+                ends.append(end)
+        return tuple(ends)
 
     def _build_store_jobs(
         self,
@@ -1072,13 +1077,13 @@ class OffloadingConnectorScheduler:
                 # is shifted one chunk past the boundary, so that after
                 # _lookup drops the peek the hit lands exactly on it.
                 need = shift = 0
-                replay_end_chunk: int | None = None
+                reachable_end_chunks: tuple[int, ...] = ()
                 if alignment_chunk_count is not None:
                     assert tail is not None
                     shift = 1 if group_config.is_eagle_group else 0
                     need = tail + shift
-                    replay_end_chunk = self._replay_tail_end_chunk(
-                        group_config, req.num_prompt_tokens, shift
+                    reachable_end_chunks = self._reachable_tail_end_chunks(
+                        group_config, req, shift
                     )
 
                 for key_idx, (offload_key, block_id) in enumerate(
@@ -1098,11 +1103,10 @@ class OffloadingConnectorScheduler:
                             and (abs_chunk_idx - shift) % alignment_chunk_count
                             >= alignment_chunk_count - need
                         )
-                        if not reachable and replay_end_chunk is not None:
-                            reachable = (
-                                replay_end_chunk - need
-                                <= abs_chunk_idx
-                                < replay_end_chunk
+                        if not reachable:
+                            reachable = any(
+                                end - need <= abs_chunk_idx < end
+                                for end in reachable_end_chunks
                             )
                         if not reachable:
                             continue

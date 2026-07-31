@@ -2020,6 +2020,51 @@ def test_swa_alignment_retention_interval(
     )
 
 
+def test_swa_alignment_retains_shared_prefix_boundary(request_runner, monkeypatch):
+    """Native offload retains the same sparse shared-prefix tail as APC."""
+    monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "64")
+
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=8,
+            ),
+        ),
+    ]
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=200,
+        async_scheduling=False,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    runner.new_request(token_ids=[0] * 56)
+    request = runner.scheduler.requests[str(runner.req_id)]
+    request.shared_prefix_boundary = 32
+
+    group_config = runner.connector_scheduler.config.kv_group_configs[1]
+    assert runner.connector_scheduler._reachable_tail_end_chunks(
+        group_config, request, shift=0
+    ) == (
+        12,  # Latest replay boundary: floor((56 - 1) / 16) * 16 / 4.
+        8,  # Shared-prefix junction: 32 / 4.
+    )
+
+
 @pytest.mark.parametrize("async_scheduling", [True, False])
 def test_stale_sliding_window_block_after_prepare_store_failure(
     request_runner, async_scheduling: bool
