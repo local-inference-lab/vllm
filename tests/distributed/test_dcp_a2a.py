@@ -1401,12 +1401,12 @@ def _distributed_b12x_a2a_worker(env: dict[str, str]) -> None:
         dcp_alltoall._dcp_a2a_send_recv_buffers = fail_packed_nccl
         group.all_gather = fail_query_nccl  # type: ignore[attr-defined]
         graph = torch.cuda.CUDAGraph()
-        capture_stream = torch.cuda.Stream()
+        capture_stream = torch.cuda.Stream(device=f"cuda:{local_rank}")
         with (
             dcp_alltoall.capture_b12x_dcp_a2a(
                 group,  # type: ignore[arg-type]
                 capture_stream,
-                channel_id="graph:test-dcp-a2a",
+                channel_id="test:dcp:graph",
             ),
             torch.cuda.graph(graph, stream=capture_stream),
         ):
