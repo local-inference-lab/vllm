@@ -123,7 +123,6 @@ class CudaGraphManager:
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
         varlen_spec_decode: bool = False,
-        channel_id: str = "graph:vllm-model",
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -133,7 +132,6 @@ class CudaGraphManager:
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
         self.varlen_spec_decode = varlen_spec_decode
-        self.channel_id = channel_id
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size

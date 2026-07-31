@@ -36,7 +36,6 @@ logger = init_logger(__name__)
 # fails closed if the same logical owner is rebound to a second eager stream.
 _B12X_PCIE_EAGER_CHANNEL_ID = "vllm:eager:allreduce"
 _B12X_PCIE_MAX_CONCURRENT_CHANNELS = 2
-_ABANDONED_B12X_PCIE_ALLREDUCE_QUARANTINE: dict[int, object] = {}
 
 
 def _get_pcie_allreduce_backend() -> str:
@@ -680,8 +679,16 @@ class CustomAllreduce:
 
         Legacy custom all-reduce registers graph buffers on exit. B12X
         PCIe channels are instead created on the graph's owning stream and
-        remain valid for the graph lifetime. Distributed B12X capture requires
-        a rank-stable semantic ``channel_id``.
+        remain valid for the graph lifetime.
+
+        Args:
+            stream: CUDA stream owned by the enclosing graph capture.
+            channel_id: Stable identity shared by every rank for this graph
+                owner. Required when the B12X PCIe runtime is active.
+
+        Raises:
+            RuntimeError: If the PCIe runtime is active and ``channel_id`` is
+                ``None``.
         """
         old_pcie_capture_stream = self._pcie_capture_stream
         old_pcie_capture_channel_id = self._pcie_capture_channel_id
@@ -974,12 +981,12 @@ class CustomAllreduce:
             return self.all_reduce(input, registered=False)
 
     def close(self):
-        if self._pcie_dma is not None:
-            self._pcie_dma.close()
-            self._pcie_dma = None
         if self._pcie_runtime is not None:
             self._pcie_runtime.close()
             self._pcie_runtime = None
+        if self._pcie_dma is not None:
+            self._pcie_dma.close()
+            self._pcie_dma = None
         if not self.disabled and self._ptr:
             if ops is not None:
                 ops.dispose(self._ptr)
@@ -987,18 +994,15 @@ class CustomAllreduce:
             self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
             self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
 
-    def __del__(
-        self,
-        _quarantine: dict[int, object] = _ABANDONED_B12X_PCIE_ALLREDUCE_QUARANTINE,
-    ) -> None:
-        # A finalizer cannot collectively close SparkInfer after another rank
-        # has exited or vLLM has destroyed the process group. Keep the complete
-        # owner alive; explicit close() remains the coordinated cleanup path.
+    def __del__(self) -> None:
+        # A finalizer cannot collectively close B12X after another rank
+        # has exited or vLLM has destroyed the process group. The backend owns
+        # abnormal resource finalization; explicit close() is coordinated by
+        # CudaCommunicator.destroy() while both process groups are still live.
         if (
             getattr(self, "_pcie_runtime", None) is not None
             or getattr(self, "_pcie_dma", None) is not None
         ):
-            _quarantine[id(self)] = self
             return
         self.close()
 

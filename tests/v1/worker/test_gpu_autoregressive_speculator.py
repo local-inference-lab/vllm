@@ -168,8 +168,8 @@ def test_ar_probabilistic_draft_uses_shared_sampler(monkeypatch):
     assert captured["active_rows"] is speculator.active_num_reqs
 
 
-def test_autoregressive_capture_ids_are_cross_rank_symmetric_and_separated():
-    def capture_for_rank() -> list[str]:
+def test_autoregressive_capture_ids_are_deterministic_and_phase_separated():
+    def capture_channel_ids() -> list[str]:
         events = []
 
         class FakeManager:
@@ -204,4 +204,4 @@ def test_autoregressive_capture_ids_are_cross_rank_symmetric_and_separated():
         "vllm:draft:prefill:production",
         "vllm:draft:decode:production",
     ]
-    assert capture_for_rank() == capture_for_rank() == expected
+    assert capture_channel_ids() == capture_channel_ids() == expected
