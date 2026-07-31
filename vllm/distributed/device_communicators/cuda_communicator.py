@@ -662,11 +662,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        if self.ca_comm is not None:
+            # SparkInfer close is coordinated across ranks and must run before
+            # its NCCL exchange group is destroyed.
+            self.ca_comm.close()
+            self.ca_comm = None
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
-        if self.ca_comm is not None:
-            self.ca_comm = None
         if self.aiter_ar_comm is not None:
             self.aiter_ar_comm.close()
             self.aiter_ar_comm = None

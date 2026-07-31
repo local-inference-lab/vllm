@@ -1793,7 +1793,10 @@ def test_v1_capture_separates_target_and_draft_semantic_channels(monkeypatch):
         uses_extract_hidden_states=lambda: False,
     )
     runner.cudagraph_dispatcher = SimpleNamespace(
-        get_capture_descs=lambda: [(CUDAGraphMode.PIECEWISE, [object()])]
+        get_capture_descs=lambda: [
+            (CUDAGraphMode.FULL, []),
+            (CUDAGraphMode.PIECEWISE, [object()]),
+        ]
     )
     runner.encoder_cudagraph_manager = None
     runner.device = torch.device("cpu")
@@ -1920,7 +1923,10 @@ def test_v1_profile_rolls_back_distinct_target_and_draft_channels(monkeypatch):
     )
     desc = SimpleNamespace(num_tokens=32)
     runner.cudagraph_dispatcher = SimpleNamespace(
-        get_capture_descs=lambda: [(CUDAGraphMode.PIECEWISE, [desc])],
+        get_capture_descs=lambda: [
+            (CUDAGraphMode.FULL, []),
+            (CUDAGraphMode.PIECEWISE, [desc]),
+        ],
         cudagraph_keys={},
         keys_initialized=True,
     )
@@ -2032,7 +2038,11 @@ def test_v1_profile_rolls_back_distinct_target_and_draft_channels(monkeypatch):
     assert events[-1] == ("rollback", checkpoint)
 
 
-def test_v1_profile_rolls_back_channels_when_capture_fails(monkeypatch):
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_v1_profile_restores_state_when_capture_or_cleanup_fails(
+    monkeypatch,
+    cleanup_fails,
+):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.vllm_config = object()
     runner.device = torch.device("cpu")
@@ -2093,20 +2103,28 @@ def test_v1_profile_rolls_back_channels_when_capture_fails(monkeypatch):
         "set_cudagraph_capturing_enabled",
         lambda enabled: events.append(("capture-enabled", enabled)),
     )
+    original_pool = object()
+    wrapper = SimpleNamespace(graph_pool=original_pool)
     monkeypatch.setattr(
         gpu_model_runner_module.CUDAGraphWrapper,
         "_all_instances",
-        [],
+        [wrapper],
     )
     monkeypatch.setattr(
         gpu_model_runner_module.BreakableCUDAGraphWrapper,
         "_all_instances",
         [],
     )
+
+    def clear_target_graphs():
+        events.append("clear-target")
+        if cleanup_fails:
+            raise RuntimeError("expected cleanup failure")
+
     monkeypatch.setattr(
         gpu_model_runner_module.CUDAGraphWrapper,
         "clear_all_graphs",
-        lambda: events.append("clear-target"),
+        clear_target_graphs,
     )
     monkeypatch.setattr(
         gpu_model_runner_module.BreakableCUDAGraphWrapper,
@@ -2117,10 +2135,13 @@ def test_v1_profile_rolls_back_channels_when_capture_fails(monkeypatch):
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda: (1000, 0))
 
-    with pytest.raises(RuntimeError, match="expected capture failure"):
+    expected_error = "expected cleanup failure" if cleanup_fails else "capture failure"
+    with pytest.raises(RuntimeError, match=expected_error):
         runner.profile_cudagraph_memory()
 
-    assert events.index("clear-target") < events.index("cleanup")
-    assert events.index("cleanup-sync") < events.index("cleanup")
-    assert events.index("cleanup") < events.index(("rollback", checkpoint))
+    assert wrapper.graph_pool is original_pool
+    if not cleanup_fails:
+        assert events.index("clear-target") < events.index("cleanup")
+        assert events.index("cleanup-sync") < events.index("cleanup")
+        assert events.index("cleanup") < events.index(("rollback", checkpoint))
     assert events[-1] == ("rollback", checkpoint)

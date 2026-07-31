@@ -1265,14 +1265,14 @@ class GroupCoordinator:
         return self.device_communicator.recv(size, dtype, src)
 
     def destroy(self):
+        if self.device_communicator is not None:
+            self.device_communicator.destroy()
         if hasattr(self, "device_group"):
             torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
         if hasattr(self, "cpu_group"):
             torch.distributed.destroy_process_group(self.cpu_group)
             del self.cpu_group
-        if self.device_communicator is not None:
-            self.device_communicator.destroy()
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
@@ -1664,6 +1664,15 @@ def graph_capture(
 
     A caller may pass an explicit ``graph_capture_context`` to control the
     stream used (e.g. to capture on the default stream).
+
+    Args:
+        device: Device that owns a newly created capture stream.
+        graph_capture_context: Existing capture context to reuse.
+        channel_id: Stable distributed identity for this graph owner.
+
+    Raises:
+        ValueError: If ``channel_id`` conflicts with the identity stored on
+            ``graph_capture_context``.
     """
     if graph_capture_context is None:
         context = GraphCaptureContext(

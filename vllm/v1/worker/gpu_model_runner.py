@@ -4645,11 +4645,7 @@ class GPUModelRunner(
             )
             # Whether the drafter runs a GPU model forward (and thus carries
             # TP/EP/DP collectives), independent of padded-batch timing.
-            drafter_runs_model_forward = (
-                spec_config.use_eagle()
-                or spec_config.uses_draft_model()
-                or spec_config.uses_extract_hidden_states()
-            )
+            drafter_runs_model_forward = self._drafter_runs_model_forward()
             use_gpu_toks = (
                 drafter_runs_model_forward
                 and not spec_config.disable_padded_drafter_batch
@@ -6181,15 +6177,7 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if (
-                run_drafter
-                and self.speculative_config
-                and (
-                    self.speculative_config.use_eagle()
-                    or self.speculative_config.uses_draft_model()
-                    or self.speculative_config.uses_extract_hidden_states()
-                )
-            ):
+            if run_drafter and self._drafter_runs_model_forward():
                 assert isinstance(
                     self.drafter,
                     EagleProposer
@@ -6741,8 +6729,11 @@ class GPUModelRunner(
                     component_descs = [
                         (mode, descs)
                         for mode, descs in capture_descs
-                        if component == "target"
-                        or self._captures_independent_drafter_graphs(mode)
+                        if descs
+                        and (
+                            component == "target"
+                            or self._captures_independent_drafter_graphs(mode)
+                        )
                     ]
                     if not component_descs:
                         continue
@@ -6806,7 +6797,7 @@ class GPUModelRunner(
 
                             logger.debug(
                                 "Estimated %s %s CUDA graph memory: "
-                                "%.2f MiB first-capture + (%d-1) × %.2f MiB "
+                                "%.2f MiB first-capture + (%d-1) x %.2f MiB "
                                 "per-graph",
                                 component,
                                 mode.name,
@@ -6842,16 +6833,14 @@ class GPUModelRunner(
                     )
         finally:
             try:
-                set_cudagraph_capturing_enabled(False)
-                CUDAGraphWrapper.clear_all_graphs()
-                BreakableCUDAGraphWrapper.clear_all_graphs()
-                if encoder_cudagraph_manager is not None:
-                    encoder_cudagraph_manager.clear()
-                all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
-                    BreakableCUDAGraphWrapper._all_instances
-                )
-                for instance in all_wrappers:
-                    if id(instance) in original_pools:
+                try:
+                    set_cudagraph_capturing_enabled(False)
+                    CUDAGraphWrapper.clear_all_graphs()
+                    BreakableCUDAGraphWrapper.clear_all_graphs()
+                    if encoder_cudagraph_manager is not None:
+                        encoder_cudagraph_manager.clear()
+                finally:
+                    for instance in all_wrappers:
                         instance.graph_pool = original_pools[id(instance)]
                 for key_set in self.cudagraph_dispatcher.cudagraph_keys.values():
                     key_set.clear()
@@ -6914,8 +6903,11 @@ class GPUModelRunner(
                     component_descs = [
                         (mode, descs)
                         for mode, descs in capture_descs
-                        if component == "target"
-                        or self._captures_independent_drafter_graphs(mode)
+                        if descs
+                        and (
+                            component == "target"
+                            or self._captures_independent_drafter_graphs(mode)
+                        )
                     ]
                     if not component_descs:
                         continue
@@ -6971,16 +6963,29 @@ class GPUModelRunner(
         self,
         cudagraph_runtime_mode: CUDAGraphMode,
     ) -> bool:
+        """Return whether PIECEWISE capture needs a separate drafter pass.
+
+        Args:
+            cudagraph_runtime_mode: CUDA graph mode being captured.
+
+        Returns:
+            Whether the mode owns independently replayable drafter graphs.
+        """
         spec_config = self.speculative_config
         return (
             cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
             and spec_config is not None
             and not spec_config.enforce_eager
-            and (
-                spec_config.use_eagle()
-                or spec_config.uses_draft_model()
-                or spec_config.uses_extract_hidden_states()
-            )
+            and self._drafter_runs_model_forward()
+        )
+
+    def _drafter_runs_model_forward(self) -> bool:
+        """Return whether the configured drafter executes a model forward."""
+        spec_config = self.speculative_config
+        return spec_config is not None and (
+            spec_config.use_eagle()
+            or spec_config.uses_draft_model()
+            or spec_config.uses_extract_hidden_states()
         )
 
     def _warmup_and_capture(
