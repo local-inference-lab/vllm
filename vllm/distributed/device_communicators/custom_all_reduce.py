@@ -31,6 +31,12 @@ except Exception:
 
 logger = init_logger(__name__)
 
+# The eager scheduler has one stable all-reduce stream owner.  Never derive
+# this identity from a process-local CUDA stream handle; SparkInfer deliberately
+# fails closed if the same logical owner is rebound to a second eager stream.
+_B12X_PCIE_EAGER_CHANNEL_ID = "vllm:eager:allreduce"
+_B12X_PCIE_MAX_CONCURRENT_CHANNELS = 2
+
 
 def _get_pcie_allreduce_backend() -> str:
     backend = envs.VLLM_PCIE_ALLREDUCE_BACKEND.lower()
@@ -488,8 +494,15 @@ class CustomAllreduce:
                     eager_buffer_bytes=pcie_oneshot_buffer_size,
                     max_size=pcie_oneshot_buffer_size,
                     single_channel=pcie_single_channel,
+                    max_concurrent_channels=_B12X_PCIE_MAX_CONCURRENT_CHANNELS,
                 )
-                pcie_runtime.for_stream()
+                if not pcie_single_channel:
+                    pcie_runtime.prepare_channels((_B12X_PCIE_EAGER_CHANNEL_ID,))
+                pcie_runtime.for_stream(
+                    channel_id=(
+                        None if pcie_single_channel else _B12X_PCIE_EAGER_CHANNEL_ID
+                    )
+                )
             except Exception as exc:
                 pcie_init_error = exc
 
@@ -740,7 +753,8 @@ class CustomAllreduce:
     def register_graph_buffers(self):
         if self._pcie_runtime is not None:
             self._pcie_runtime.for_stream(
-                self._pcie_runtime_stream()
+                self._pcie_runtime_stream(),
+                channel_id=_B12X_PCIE_EAGER_CHANNEL_ID,
             ).register_graph_buffers()
             return
         handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
@@ -770,7 +784,8 @@ class CustomAllreduce:
                 self._pcie_allreduce_max_size is not None
                 and inp_size <= self._pcie_allreduce_max_size
                 and self._pcie_runtime.for_stream(
-                    self._pcie_runtime_stream()
+                    self._pcie_runtime_stream(),
+                    channel_id=_B12X_PCIE_EAGER_CHANNEL_ID,
                 ).should_allreduce(inp)
             )
             if (
@@ -849,7 +864,10 @@ class CustomAllreduce:
                     self._pcie_runtime_stream() is not None,
                 )
             return self._pcie_runtime.all_reduce(
-                inp, out=out, stream=self._pcie_runtime_stream()
+                inp,
+                out=out,
+                stream=self._pcie_runtime_stream(),
+                channel_id=_B12X_PCIE_EAGER_CHANNEL_ID,
             )
         if out is None:
             out = torch.empty_like(inp)
@@ -891,7 +909,8 @@ class CustomAllreduce:
             return False
         assert self._pcie_runtime is not None
         if not self._pcie_runtime.for_stream(
-            self._pcie_runtime_stream()
+            self._pcie_runtime_stream(),
+            channel_id=_B12X_PCIE_EAGER_CHANNEL_ID,
         ).should_allreduce(inp):
             return False
         if (
@@ -918,6 +937,7 @@ class CustomAllreduce:
             out=inp,
             residual_out=residual,
             stream=self._pcie_runtime_stream(),
+            channel_id=_B12X_PCIE_EAGER_CHANNEL_ID,
         )
         return True
 

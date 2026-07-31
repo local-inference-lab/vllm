@@ -41,6 +41,10 @@ logger = init_logger(__name__)
 
 _B12X_DCP_A2A_POOLS: dict[tuple[int, int, int, int, int, int], Any] = {}
 _B12X_DCP_A2A_DISABLED: set[tuple[int, int, int, int, int, int]] = set()
+# DCP likewise has one stable eager scheduler owner.  Graph target/draft/encoder
+# identities are supplied separately by their GraphCaptureContext.
+_B12X_DCP_EAGER_CHANNEL_ID = "vllm:eager:dcp"
+_B12X_DCP_MAX_CONCURRENT_CHANNELS = 2
 _DCP_A2A_GRAPH_BUFFERS: dict[
     tuple[tuple[int, ...], torch.device, torch.dtype],
     tuple[torch.Tensor, torch.Tensor],
@@ -128,8 +132,10 @@ def _get_b12x_dcp_a2a_pool(
             head_dim=head_dim,
             query_head_dim=query_head_dim,
             single_channel=False,
+            max_concurrent_channels=_B12X_DCP_MAX_CONCURRENT_CHANNELS,
         )
-        pool.for_stream()
+        pool.prepare_channels((_B12X_DCP_EAGER_CHANNEL_ID,))
+        pool.for_stream(channel_id=_B12X_DCP_EAGER_CHANNEL_ID)
     except Exception as exc:
         init_error = exc
 
@@ -319,6 +325,7 @@ def _try_b12x_dcp_lse_reduce(
         cp_attn_lse,
         out=reduced,
         is_lse_base_on_e=is_lse_base_on_e,
+        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
     )
 
 
@@ -369,7 +376,10 @@ def _try_b12x_dcp_all_gather_heads(
     )
     if pool is None:
         return None
-    return pool.all_gather_heads(local_input)
+    return pool.all_gather_heads(
+        local_input,
+        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+    )
 
 
 def dcp_b12x_all_gather_heads(
