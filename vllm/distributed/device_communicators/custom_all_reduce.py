@@ -36,6 +36,7 @@ logger = init_logger(__name__)
 # fails closed if the same logical owner is rebound to a second eager stream.
 _B12X_PCIE_EAGER_CHANNEL_ID = "vllm:eager:allreduce"
 _B12X_PCIE_MAX_CONCURRENT_CHANNELS = 2
+_ABANDONED_B12X_PCIE_ALLREDUCE_QUARANTINE: dict[int, object] = {}
 
 
 def _get_pcie_allreduce_backend() -> str:
@@ -986,7 +987,19 @@ class CustomAllreduce:
             self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
             self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
 
-    def __del__(self):
+    def __del__(
+        self,
+        _quarantine: dict[int, object] = _ABANDONED_B12X_PCIE_ALLREDUCE_QUARANTINE,
+    ) -> None:
+        # A finalizer cannot collectively close SparkInfer after another rank
+        # has exited or vLLM has destroyed the process group. Keep the complete
+        # owner alive; explicit close() remains the coordinated cleanup path.
+        if (
+            getattr(self, "_pcie_runtime", None) is not None
+            or getattr(self, "_pcie_dma", None) is not None
+        ):
+            _quarantine[id(self)] = self
+            return
         self.close()
 
     @staticmethod
