@@ -1799,12 +1799,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
     def _mixed_trellis_prefill_tile_config(
         hidden_size: int, intermediate_size: int
     ):
-        if hidden_size % 128 or intermediate_size % 128:
-            raise ValueError(
-                "mixed rank-sliced EXL3 prefill requires hidden and "
-                "intermediate dimensions divisible by 128"
-            )
-        return (128, 64, 64, 128)
+        # Route packing stays block-64, while SparkInfer's mixed-kernel ABI v2
+        # executes FC2 as arithmetic-equivalent 8-row subtiles.  Reuse the
+        # checkpoint's original one-grid tile geometry so prefill has the same
+        # reduction order as the stock-r16 quality reference.
+        return Exl3MoEMethod._mixed_trellis_tile_config(
+            hidden_size, intermediate_size
+        )
 
     def _prepare_mixed_rank_sliced_weights(self, layer: RoutedExperts) -> None:
         mixed_api = _load_sparkinfer_mixed_trellis()

@@ -702,9 +702,9 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(
         )
     assert [entry["tile_config"] for entry in api.prepared] == [
         (128, 128, 128, 128),
-        (128, 64, 64, 128),
         (128, 128, 128, 128),
-        (128, 64, 64, 128),
+        (128, 128, 128, 128),
+        (128, 128, 128, 128),
     ]
     assert layer.exl3_mixed_trellis["tier_ids"] == ((0, 2), (1, 3))
     assert layer.exl3_mixed_trellis["tier_bits"] == (3, 4)

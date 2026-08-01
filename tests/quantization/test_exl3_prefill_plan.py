@@ -158,7 +158,7 @@ def _make_mixed_layer():
         "descriptor_map": object(),
         "rotations": object(),
         "tile_config": (64, 128, 64, 128),
-        "prefill_tile_config": (128, 64, 64, 128),
+        "prefill_tile_config": (128, 128, 128, 128),
     }
     return layer
 
@@ -331,7 +331,7 @@ def test_mixed_prefill_capacity_slices_rows_and_routing():
 
         assert [launch.size_m for launch in h.mixed_api.compiled] == [32, 128]
         assert [launch.moe_block_size for launch in h.mixed_api.compiled] == [8, 64]
-        assert h.mixed_api.compiled[1].force_tile_config == (128, 64, 64, 128)
+        assert h.mixed_api.compiled[1].force_tile_config == (128, 128, 128, 128)
         assert not h.planned_caps()
         assert not h.api.bound
         assert torch.equal(out, x)
