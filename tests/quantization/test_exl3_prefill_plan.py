@@ -118,7 +118,6 @@ class _FakeMixedTrellisApi:
         self.routed.append((topk_weights.clone(), topk_ids.clone()))
         return x.to(torch.float32)
 
-
 class _FakeExt:
     """Parity extension without exl3_moe_fused: chunk loop only."""
 
@@ -152,23 +151,14 @@ def _make_mixed_layer():
     layer.exl3_mixed_bitrate = True
     layer.exl3_mixed_trellis = {
         "tiers": (object(), object()),
+        "prefill_tiers": (object(), object()),
         "tier_ids": ((0, 1, 2, 3), (4, 5, 6, 7)),
         "tier_bits": (3, 4),
         "global_to_combined": object(),
         "descriptor_map": object(),
         "rotations": object(),
         "tile_config": (64, 128, 64, 128),
-        "serial_tile_config": (64, 128, 64, 128),
-        "serial_tiers": (
-            {
-                "weights": SimpleNamespace(plan=object()),
-                "route_expert_map": torch.tensor([0, 1, 2, 3, -1, -1, -1, -1]),
-            },
-            {
-                "weights": SimpleNamespace(plan=object()),
-                "route_expert_map": torch.tensor([-1, -1, -1, -1, 0, 1, 2, 3]),
-            },
-        ),
+        "prefill_tile_config": (128, 64, 64, 128),
     }
     return layer
 
@@ -339,18 +329,16 @@ def test_mixed_prefill_capacity_slices_rows_and_routing():
 
         out = method._apply_rank_sliced(layer, x, weights, ids)
 
-        assert [launch.size_m for launch in h.mixed_api.compiled] == [32]
-        assert [caps["max_tokens"] for caps in h.planned_caps()] == [128, 128]
-        assert [bound[1] for bound in h.api.bound] == [128, 128, 72, 72]
+        assert [launch.size_m for launch in h.mixed_api.compiled] == [32, 128]
+        assert [launch.moe_block_size for launch in h.mixed_api.compiled] == [8, 64]
+        assert h.mixed_api.compiled[1].force_tile_config == (128, 64, 64, 128)
+        assert not h.planned_caps()
+        assert not h.api.bound
         assert torch.equal(out, x)
         assert torch.equal(
-            torch.cat([route[0] for route in h.api.routed[::2]]), weights
+            torch.cat([route[0] for route in h.mixed_api.routed]), weights
         )
-        assert torch.equal(torch.cat([route[1] for route in h.api.routed[::2]]), ids)
-        assert all(
-            torch.equal(left[0], right[0]) and torch.equal(left[1], right[1])
-            for left, right in zip(h.api.routed[::2], h.api.routed[1::2], strict=True)
-        )
+        assert torch.equal(torch.cat([route[1] for route in h.mixed_api.routed]), ids)
 
 
 def test_prefill_capacity_cannot_exceed_scheduler_bound():

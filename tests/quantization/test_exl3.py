@@ -655,9 +655,6 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(
             name = f"{prefix}_{suffix}"
             backing = slabs.get(name)
             setattr(layer, name, parameter(shards, backing=backing))
-    marker = torch.tensor(0xCBAC1FED - (1 << 32), dtype=torch.int32)
-    layer.w13_mcg.exl3_tensors[(0, "w1")] = marker
-
     class FakeMixedApi:
         def __init__(self):
             self.prepared = []
@@ -679,30 +676,15 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(
         def combine_trellis_rotations(tier0, tier1):
             return tier0, tier1
 
-    class FakeFusedApi:
-        def __init__(self):
-            self.plans = []
-            self.prepared = []
-
-        def plan_weights(self, **kwargs):
-            self.plans.append(kwargs)
-            return SimpleNamespace(**kwargs)
-
-        def prepare_weights(self, **kwargs):
-            self.prepared.append(kwargs)
-            return SimpleNamespace(plan=kwargs["plan"])
-
     api = FakeMixedApi()
-    fused_api = FakeFusedApi()
     monkeypatch.setattr(exl3_module, "_load_sparkinfer_mixed_trellis", lambda: api)
-    monkeypatch.setattr(exl3_module, "_load_sparkinfer_fused_moe", lambda: fused_api)
     method = object.__new__(Exl3MoEMethod)
     method._rank_sliced_backing = lambda _layer, name: slabs[name]
 
     method._prepare_mixed_rank_sliced_weights(layer)
 
-    assert [entry["trellis_bits"] for entry in api.prepared] == [3, 4]
-    assert [entry["num_experts"] for entry in api.prepared] == [2, 2]
+    assert [entry["trellis_bits"] for entry in api.prepared] == [3, 3, 4, 4]
+    assert [entry["num_experts"] for entry in api.prepared] == [2] * 4
     for entry in api.prepared:
         bits = entry["trellis_bits"]
         assert tuple(entry["w13"].shape) == (
@@ -720,33 +702,26 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(
         )
     assert [entry["tile_config"] for entry in api.prepared] == [
         (128, 128, 128, 128),
+        (128, 64, 64, 128),
         (128, 128, 128, 128),
+        (128, 64, 64, 128),
     ]
     assert layer.exl3_mixed_trellis["tier_ids"] == ((0, 2), (1, 3))
     assert layer.exl3_mixed_trellis["tier_bits"] == (3, 4)
-    assert [entry["trellis_bits"] for entry in fused_api.plans] == [3, 4]
-    assert [entry["trellis_tile_config"] for entry in fused_api.plans] == [
-        (64, 128, 64, 128),
-        (64, 128, 64, 128),
-    ]
-    assert all(entry["trellis_mcg"] is marker for entry in fused_api.prepared)
-    assert len(layer.exl3_mixed_trellis["serial_tiers"]) == 2
+    assert len(layer.exl3_mixed_trellis["tiers"]) == 2
+    assert len(layer.exl3_mixed_trellis["prefill_tiers"]) == 2
     rotations = layer.exl3_mixed_trellis["rotations"]
     expected_h_rows = 1 if shared_h else experts
     assert rotations.gate_suh.shape[0] == expected_h_rows
     assert rotations.up_suh.shape[0] == expected_h_rows
     assert rotations.down_svh.shape[0] == expected_h_rows
-    for mixed_entry, serial_entry in zip(api.prepared, fused_api.prepared, strict=True):
+    for entry in api.prepared:
         expected_tier_rows = 1 if shared_h else 2
-        assert mixed_entry["gate_suh"].shape[0] == expected_tier_rows
-        assert mixed_entry["up_suh"].shape[0] == expected_tier_rows
-        assert mixed_entry["down_svh"].shape[0] == expected_tier_rows
+        assert entry["gate_suh"].shape[0] == expected_tier_rows
+        assert entry["up_suh"].shape[0] == expected_tier_rows
+        assert entry["down_svh"].shape[0] == expected_tier_rows
         assert (
-            mixed_entry["gate_suh"].untyped_storage().data_ptr()
-            == rotations.gate_suh.untyped_storage().data_ptr()
-        )
-        assert (
-            serial_entry["gate_suh"].untyped_storage().data_ptr()
+            entry["gate_suh"].untyped_storage().data_ptr()
             == rotations.gate_suh.untyped_storage().data_ptr()
         )
     assert layer.w13_trellis.exl3_tensors == {}
@@ -763,57 +738,36 @@ def test_mixed_trellis_buffer_accounting_ignores_metadata() -> None:
     assert exl3_module._unique_tensor_storage_bytes(first, second) == 8
 
 
-def test_mixed_trellis_dispatches_decode_and_serial_prefill(monkeypatch):
+def test_mixed_trellis_dispatches_decode_and_one_grid_prefill(monkeypatch):
     class FakeMixedApi:
-        calls = 0
+        calls = []
 
         def run_mixed_trellis(self, x, *args):
-            self.calls += 1
-            return torch.ones_like(x)
-
-    class FakeFusedApi:
-        def __init__(self):
-            self.bindings = []
-
-        def bind(self, plan, **kwargs):
-            del plan
-            self.bindings.append(kwargs)
-            return kwargs
-
-        @staticmethod
-        def run(*, binding):
-            output = binding["output"]
-            if output is not None:
-                output.fill_(1)
-                return output
-            return torch.full_like(binding["a"], 2, dtype=torch.float32)
-
-    class FakePlan:
-        @staticmethod
-        def scratch_specs():
-            return [SimpleNamespace(shape=(16,), dtype=torch.uint8)]
+            launch = args[7]
+            self.calls.append((int(x.shape[0]), args[0], args[1], launch))
+            return torch.full_like(x, launch.value)
 
     mixed_api = FakeMixedApi()
-    fused_api = FakeFusedApi()
+    decode_tiers = (object(), object())
+    prefill_tiers = (object(), object())
     runtime = {
         "mixed_api": mixed_api,
-        "fused_api": fused_api,
-        "decode": {"launch": object(), "buffers": object()},
-        "prefill_plans": (FakePlan(), FakePlan()),
-        "prefill_arena": torch.empty(16, dtype=torch.uint8),
-        "prefill_accum": torch.empty((8, 4), dtype=torch.float32),
+        "decode": {
+            "launch": SimpleNamespace(value=1),
+            "buffers": object(),
+        },
+        "prefill": {
+            "launch": SimpleNamespace(value=3),
+            "buffers": object(),
+        },
         "max_decode_m": 8,
         "max_batched_tokens": 16,
         "prefill_capacity": 8,
     }
-    tiers = (
-        {"weights": object(), "route_expert_map": torch.tensor([0, -1])},
-        {"weights": object(), "route_expert_map": torch.tensor([-1, 0])},
-    )
     layer = SimpleNamespace(
         exl3_mixed_trellis={
-            "tiers": (object(), object()),
-            "serial_tiers": tiers,
+            "tiers": decode_tiers,
+            "prefill_tiers": prefill_tiers,
             "global_to_combined": object(),
             "descriptor_map": object(),
             "rotations": object(),
@@ -833,33 +787,9 @@ def test_mixed_trellis_dispatches_decode_and_serial_prefill(monkeypatch):
 
     torch.testing.assert_close(decode, torch.ones_like(decode))
     torch.testing.assert_close(prefill, torch.full_like(prefill, 3))
-    assert mixed_api.calls == 1
-    assert len(fused_api.bindings) == 4
-    assert [binding["a"].shape[0] for binding in fused_api.bindings] == [8] * 4
-    assert all(
-        torch.equal(binding["topk_weights"], weights[:8])
-        for binding in fused_api.bindings[:2]
-    )
-    assert all(
-        torch.equal(binding["topk_weights"], weights[8:])
-        for binding in fused_api.bindings[2:]
-    )
-    assert all(
-        torch.equal(binding["topk_ids"], ids[:8]) for binding in fused_api.bindings[:2]
-    )
-    assert all(
-        torch.equal(binding["topk_ids"], ids[8:]) for binding in fused_api.bindings[2:]
-    )
-    assert (
-        fused_api.bindings[0]["output"].data_ptr()
-        == runtime["prefill_accum"].data_ptr()
-    )
-    assert fused_api.bindings[1]["output"] is None
-    assert (
-        fused_api.bindings[2]["output"].data_ptr()
-        == runtime["prefill_accum"].data_ptr()
-    )
-    assert fused_api.bindings[3]["output"] is None
+    assert [call[0] for call in mixed_api.calls] == [4, 8, 8]
+    assert mixed_api.calls[0][1:3] == decode_tiers
+    assert all(call[1:3] == prefill_tiers for call in mixed_api.calls[1:])
 
 
 @pytest.mark.parametrize(
