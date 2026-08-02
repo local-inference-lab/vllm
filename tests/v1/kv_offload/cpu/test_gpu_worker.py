@@ -3,6 +3,8 @@
 import random
 import time
 import uuid
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -16,8 +18,9 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
 )
+from vllm.v1.kv_offload.cpu import gpu_worker
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker, pin_mmap_region
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 NUM_GPU_BLOCKS = [64]
@@ -30,6 +33,52 @@ DEVICE_TYPE = current_platform.device_type
 DEVICES = [f"{DEVICE_TYPE}:0"]
 NUM_MAPPINGS = [3]
 NUM_MAPPINGS_PER_GROUP = [2]
+
+
+class _CudaResult(int):
+    @property
+    def value(self) -> int:
+        return int(self)
+
+
+def _mock_mmap_region() -> SimpleNamespace:
+    return SimpleNamespace(
+        rank=2,
+        total_size_bytes=4096,
+        _base=SimpleNamespace(data_ptr=lambda: 0x1000),
+        is_pinned=False,
+    )
+
+
+def test_pin_mmap_region_clears_failed_registration_error(monkeypatch) -> None:
+    region = _mock_mmap_region()
+    cudart = MagicMock()
+    cudart.cudaHostRegister.return_value = _CudaResult(1)
+    runtime = MagicMock()
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(gpu_worker, "CudaRTLibrary", lambda: runtime)
+
+    pin_mmap_region(region)
+
+    cudart.cudaHostRegister.assert_called_once_with(0x1000, 4096, 0)
+    runtime.cudaGetLastError.assert_called_once_with()
+    assert region.is_pinned is False
+
+
+def test_pin_mmap_region_keeps_successful_registration(monkeypatch) -> None:
+    region = _mock_mmap_region()
+    cudart = MagicMock()
+    cudart.cudaHostRegister.return_value = _CudaResult(0)
+    runtime_factory = MagicMock()
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(gpu_worker, "CudaRTLibrary", runtime_factory)
+
+    pin_mmap_region(region)
+
+    runtime_factory.assert_not_called()
+    assert region.is_pinned is True
 
 
 @pytest.mark.parametrize("gpu_to_cpu", [True, False])

@@ -48,6 +48,8 @@ class CudaRTLibrary:
         Function("cudaDeviceReset", cudaError_t, []),
         # const char* 	cudaGetErrorString ( cudaError_t error )
         Function("cudaGetErrorString", ctypes.c_char_p, [cudaError_t]),
+        # cudaError_t cudaGetLastError ( void )
+        Function("cudaGetLastError", cudaError_t, []),
         # ​cudaError_t 	cudaMalloc ( void** devPtr, size_t size )
         Function(
             "cudaMalloc",
@@ -86,6 +88,7 @@ class CudaRTLibrary:
         "cudaDeviceSynchronize": "hipDeviceSynchronize",
         "cudaDeviceReset": "hipDeviceReset",
         "cudaGetErrorString": "hipGetErrorString",
+        "cudaGetLastError": "hipGetLastError",
         "cudaMalloc": "hipMalloc",
         "cudaFree": "hipFree",
         "cudaMemset": "hipMemset",
@@ -141,6 +144,10 @@ class CudaRTLibrary:
 
     def cudaGetErrorString(self, error: cudaError_t) -> str:
         return self.funcs["cudaGetErrorString"](error).decode("utf-8")
+
+    def cudaGetLastError(self) -> int:
+        """Return and clear the calling thread's pending runtime error."""
+        return int(self.funcs["cudaGetLastError"]())
 
     def cudaSetDevice(self, device: int) -> None:
         self.CUDART_CHECK(self.funcs["cudaSetDevice"](device))

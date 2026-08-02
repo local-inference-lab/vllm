@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, triton
@@ -141,6 +142,11 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
             rank,
             result,
         )
+        # cudaHostRegister records its failure as the thread's pending runtime
+        # error. Consume it before continuing with the documented unpinned
+        # fallback, otherwise an unrelated subsequent CUDA call reports this
+        # stale error and aborts worker initialization.
+        CudaRTLibrary().cudaGetLastError()
     else:
         logger.debug(
             "cudaHostRegister rank=%d %.2f GB",
