@@ -8,6 +8,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.v1.kv_offload.cpu.host_mem_ops import unregister_host_memory
 
 logger = init_logger(__name__)
 
@@ -174,16 +175,10 @@ class SharedOffloadRegion:
     def cleanup(self) -> None:
         if self.is_pinned and self._base is not None:
             if current_platform.is_cuda_alike():
-                from vllm.distributed.device_communicators.cuda_wrapper import (
-                    CudaRTLibrary,
-                )
-
-                cudart = torch.cuda.cudart()
                 registered_ptrs = self._registered_host_ptrs or [self._base.data_ptr()]
                 for ptr in reversed(registered_ptrs):
-                    result = cudart.cudaHostUnregister(ptr)
-                    if result.value != 0:
-                        CudaRTLibrary().cudaGetLastError()
+                    result = unregister_host_memory(ptr)
+                    if result != 0:
                         logger.warning(
                             "cudaHostUnregister failed for rank=%d ptr=%#x (code=%d)",
                             self.rank,

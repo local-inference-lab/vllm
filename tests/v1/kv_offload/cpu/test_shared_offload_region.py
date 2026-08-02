@@ -8,12 +8,10 @@ import os
 import threading
 import time
 import uuid
-from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
 import pytest
 
-from vllm.distributed.device_communicators import cuda_wrapper
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.kv_offload.cpu import shared_offload_region
 from vllm.v1.kv_offload.cpu.shared_offload_region import (
@@ -575,27 +573,27 @@ def test_cleanup_after_create_next_view_releases_mmap(iid):
 def test_cleanup_unregisters_tracked_segments_in_reverse(iid, monkeypatch):
     """cleanup() must unregister the exact segments accepted during pinning."""
     r = _make_region(iid)
-    cudart = MagicMock()
-    cudart.cudaHostUnregister.return_value = SimpleNamespace(value=0)
-    runtime_factory = MagicMock()
+    unregister = MagicMock(return_value=0)
     monkeypatch.setattr(
         shared_offload_region.current_platform,
         "is_cuda_alike",
         lambda: True,
     )
-    monkeypatch.setattr(shared_offload_region.torch.cuda, "cudart", lambda: cudart)
-    monkeypatch.setattr(cuda_wrapper, "CudaRTLibrary", runtime_factory)
+    monkeypatch.setattr(
+        shared_offload_region,
+        "unregister_host_memory",
+        unregister,
+    )
     r._registered_host_ptrs = [0x1000, 0x2000, 0x3000]
     r.is_pinned = True
 
     r.cleanup()
 
-    assert cudart.cudaHostUnregister.call_args_list == [
+    assert unregister.call_args_list == [
         call(0x3000),
         call(0x2000),
         call(0x1000),
     ]
-    runtime_factory.assert_not_called()
     assert r._registered_host_ptrs == []
     assert r.is_pinned is False
 

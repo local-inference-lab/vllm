@@ -9,7 +9,6 @@ import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, triton
@@ -23,6 +22,10 @@ from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     OffloadingWorker,
     TransferResult,
+)
+from vllm.v1.kv_offload.cpu.host_mem_ops import (
+    register_host_memory,
+    unregister_host_memory,
 )
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
@@ -141,14 +144,9 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     rank = region.rank
 
     base_ptr = region._base.data_ptr()
-    cudart = torch.cuda.cudart()
     region._registered_host_ptrs.clear()
-    result = cudart.cudaHostRegister(base_ptr, region.total_size_bytes, 0)
-    if result.value != 0:
-        runtime = CudaRTLibrary()
-        # cudaHostRegister records its failure as the thread's pending runtime
-        # error. Consume it before retrying or continuing unpinned.
-        runtime.cudaGetLastError()
+    result = register_host_memory(base_ptr, region.total_size_bytes)
+    if result != 0:
         if region.total_size_bytes <= HOST_REGISTER_SEGMENT_BYTES:
             logger.warning(
                 "cudaHostRegister failed for rank=%d (code=%d); "
@@ -165,16 +163,14 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
                 HOST_REGISTER_SEGMENT_BYTES,
                 region.total_size_bytes - offset,
             )
-            segment_result = cudart.cudaHostRegister(ptr, size, 0)
-            if segment_result.value == 0:
+            segment_result = register_host_memory(ptr, size)
+            if segment_result == 0:
                 registered_ptrs.append(ptr)
                 continue
 
-            runtime.cudaGetLastError()
             for registered_ptr in reversed(registered_ptrs):
-                unregister_result = cudart.cudaHostUnregister(registered_ptr)
-                if unregister_result.value != 0:
-                    runtime.cudaGetLastError()
+                unregister_result = unregister_host_memory(registered_ptr)
+                if unregister_result != 0:
                     logger.warning(
                         "cudaHostUnregister rollback failed for rank=%d "
                         "ptr=%#x (code=%d)",

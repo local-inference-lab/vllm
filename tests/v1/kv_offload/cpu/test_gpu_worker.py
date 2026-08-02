@@ -39,12 +39,6 @@ NUM_MAPPINGS = [3]
 NUM_MAPPINGS_PER_GROUP = [2]
 
 
-class _CudaResult(int):
-    @property
-    def value(self) -> int:
-        return int(self)
-
-
 def _mock_mmap_region(total_size_bytes: int = 4096) -> SimpleNamespace:
     return SimpleNamespace(
         rank=2,
@@ -55,34 +49,27 @@ def _mock_mmap_region(total_size_bytes: int = 4096) -> SimpleNamespace:
     )
 
 
-def test_pin_mmap_region_clears_failed_registration_error(monkeypatch) -> None:
+def test_pin_mmap_region_falls_back_after_failed_registration(monkeypatch) -> None:
     region = _mock_mmap_region()
-    cudart = MagicMock()
-    cudart.cudaHostRegister.return_value = _CudaResult(1)
-    runtime = MagicMock()
+    register = MagicMock(return_value=1)
     monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    monkeypatch.setattr(gpu_worker, "CudaRTLibrary", lambda: runtime)
+    monkeypatch.setattr(gpu_worker, "register_host_memory", register)
 
     pin_mmap_region(region)
 
-    cudart.cudaHostRegister.assert_called_once_with(0x1000, 4096, 0)
-    runtime.cudaGetLastError.assert_called_once_with()
+    register.assert_called_once_with(0x1000, 4096)
     assert region.is_pinned is False
 
 
 def test_pin_mmap_region_keeps_successful_registration(monkeypatch) -> None:
     region = _mock_mmap_region()
-    cudart = MagicMock()
-    cudart.cudaHostRegister.return_value = _CudaResult(0)
-    runtime_factory = MagicMock()
+    register = MagicMock(return_value=0)
     monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    monkeypatch.setattr(gpu_worker, "CudaRTLibrary", runtime_factory)
+    monkeypatch.setattr(gpu_worker, "register_host_memory", register)
 
     pin_mmap_region(region)
 
-    runtime_factory.assert_not_called()
+    register.assert_called_once_with(0x1000, 4096)
     assert region.is_pinned is True
     assert region._registered_host_ptrs == [0x1000]
 
@@ -91,31 +78,21 @@ def test_pin_mmap_region_retries_large_mapping_as_segments(monkeypatch) -> None:
     tail_bytes = 4096
     total_bytes = 2 * HOST_REGISTER_SEGMENT_BYTES + tail_bytes
     region = _mock_mmap_region(total_bytes)
-    cudart = MagicMock()
-    cudart.cudaHostRegister.side_effect = [
-        _CudaResult(1),
-        _CudaResult(0),
-        _CudaResult(0),
-        _CudaResult(0),
-    ]
-    runtime = MagicMock()
+    register = MagicMock(side_effect=[1, 0, 0, 0])
     monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    monkeypatch.setattr(gpu_worker, "CudaRTLibrary", lambda: runtime)
+    monkeypatch.setattr(gpu_worker, "register_host_memory", register)
 
     pin_mmap_region(region)
 
-    assert cudart.cudaHostRegister.call_args_list == [
-        call(0x1000, total_bytes, 0),
-        call(0x1000, HOST_REGISTER_SEGMENT_BYTES, 0),
+    assert register.call_args_list == [
+        call(0x1000, total_bytes),
+        call(0x1000, HOST_REGISTER_SEGMENT_BYTES),
         call(
             0x1000 + HOST_REGISTER_SEGMENT_BYTES,
             HOST_REGISTER_SEGMENT_BYTES,
-            0,
         ),
-        call(0x1000 + 2 * HOST_REGISTER_SEGMENT_BYTES, tail_bytes, 0),
+        call(0x1000 + 2 * HOST_REGISTER_SEGMENT_BYTES, tail_bytes),
     ]
-    runtime.cudaGetLastError.assert_called_once_with()
     assert region.is_pinned is True
     assert region._registered_host_ptrs == [
         0x1000,
@@ -129,26 +106,18 @@ def test_pin_mmap_region_rolls_back_partial_segment_registration(
 ) -> None:
     total_bytes = 3 * HOST_REGISTER_SEGMENT_BYTES
     region = _mock_mmap_region(total_bytes)
-    cudart = MagicMock()
-    cudart.cudaHostRegister.side_effect = [
-        _CudaResult(1),
-        _CudaResult(0),
-        _CudaResult(0),
-        _CudaResult(2),
-    ]
-    cudart.cudaHostUnregister.return_value = _CudaResult(0)
-    runtime = MagicMock()
+    register = MagicMock(side_effect=[1, 0, 0, 2])
+    unregister = MagicMock(return_value=0)
     monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    monkeypatch.setattr(gpu_worker, "CudaRTLibrary", lambda: runtime)
+    monkeypatch.setattr(gpu_worker, "register_host_memory", register)
+    monkeypatch.setattr(gpu_worker, "unregister_host_memory", unregister)
 
     pin_mmap_region(region)
 
-    assert cudart.cudaHostUnregister.call_args_list == [
+    assert unregister.call_args_list == [
         call(0x1000 + HOST_REGISTER_SEGMENT_BYTES),
         call(0x1000),
     ]
-    assert runtime.cudaGetLastError.call_count == 2
     assert region.is_pinned is False
     assert region._registered_host_ptrs == []
 
