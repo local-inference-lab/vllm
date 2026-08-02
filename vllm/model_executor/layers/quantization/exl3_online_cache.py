@@ -17,7 +17,7 @@ from typing import Any, Literal
 import filelock
 import torch
 from safetensors import safe_open
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 
 from vllm.logger import init_logger
 
@@ -77,13 +77,19 @@ def resolve_model_identity(
 ) -> str:
     """Fingerprint a Hub revision or a local checkpoint without reading weights."""
 
-    resolved_revision = revision or getattr(hf_config, "_commit_hash", None)
+    resolved_revision = getattr(hf_config, "_commit_hash", None) or revision
     model_path = Path(model_name).expanduser()
     if not model_path.exists():
+        if not resolved_revision:
+            raise ValueError(
+                "online EXL3 caching requires a resolved revision for Hub "
+                f"checkpoint {model_name!r}; pass --revision or set "
+                "VLLM_EXL3_ONLINE_CACHE_MODE=off"
+            )
         payload = {
             "kind": "hub",
             "model": model_name,
-            "revision": resolved_revision or "unresolved",
+            "revision": resolved_revision,
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -174,6 +180,13 @@ def cache_mode() -> CacheMode:
 
 
 def cache_root() -> Path:
+    """Return the trusted online-weight cache directory.
+
+    Cached payloads become model weights after schema validation. The directory
+    must therefore be writable only by the serving user and trusted to the same
+    degree as the source checkpoint.
+    """
+
     configured = os.getenv("VLLM_EXL3_ONLINE_CACHE_DIR")
     if configured and configured.strip():
         return Path(configured).expanduser()
@@ -224,9 +237,10 @@ def _validate_tensors(
 def _load(path: Path, key: Exl3OnlineCacheKey) -> Exl3OnlineCacheResult:
     with safe_open(path, framework="pt", device="cpu") as handle:
         metadata = handle.metadata() or {}
-    if metadata.get("cache_key") != key.canonical_json():
-        raise ValueError("online EXL3 cache key metadata does not match")
-    tensors = load_file(path, device="cpu")
+        if metadata.get("cache_key") != key.canonical_json():
+            raise ValueError("online EXL3 cache key metadata does not match")
+        # ``safe_open`` exposes ``keys()`` but is not itself iterable.
+        tensors = {name: handle.get_tensor(name) for name in handle.keys()}  # noqa: SIM118
     _validate_tensors(tensors, key)
     raw_error = metadata.get("proxy_error")
     proxy_error = None if raw_error in (None, "") else float(raw_error)
@@ -299,11 +313,11 @@ def load_or_quantize(
             logger.warning("Ignoring invalid online EXL3 cache %s: %s", path, exc)
 
     if mode == "readonly":
-        return _quantize(key, quantize, path=path)
+        return _quantize(key, quantize, path=None)
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        lock = filelock.FileLock(f"{path}.lock", mode=0o666)
+        lock = filelock.FileLock(f"{path}.lock")
         with lock:
             if path.is_file():
                 try:

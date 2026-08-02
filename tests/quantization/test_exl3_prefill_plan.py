@@ -99,6 +99,7 @@ class _FakeMixedTrellisApi:
     def __init__(self):
         self.compiled = []
         self.routed = []
+        self.calls = []
 
     def max_packed_route_slots(self, routed_rows, block_size, experts):
         del block_size, experts
@@ -114,9 +115,11 @@ class _FakeMixedTrellisApi:
         return SimpleNamespace(scratch=torch.empty(launch.size_m, dtype=torch.uint8))
 
     def run_mixed_trellis(self, *args):
-        x, topk_weights, topk_ids = args[0], args[3], args[4]
+        x, tier0, tier1, topk_weights, topk_ids = args[:5]
+        self.calls.append((int(x.shape[0]), tier0, tier1))
         self.routed.append((topk_weights.clone(), topk_ids.clone()))
         return x.to(torch.float32)
+
 
 class _FakeExt:
     """Parity extension without exl3_moe_fused: chunk loop only."""
@@ -334,11 +337,44 @@ def test_mixed_prefill_capacity_slices_rows_and_routing():
         assert h.mixed_api.compiled[1].force_tile_config == (128, 128, 128, 128)
         assert not h.planned_caps()
         assert not h.api.bound
+        assert [call[0] for call in h.mixed_api.calls] == [128, 72]
+        assert all(
+            call[1:] == layer.exl3_mixed_trellis["prefill_tiers"]
+            for call in h.mixed_api.calls
+        )
         assert torch.equal(out, x)
         assert torch.equal(
             torch.cat([route[0] for route in h.mixed_api.routed]), weights
         )
         assert torch.equal(torch.cat([route[1] for route in h.mixed_api.routed]), ids)
+
+
+def test_mixed_runtime_policy_is_resolved_once(monkeypatch):
+    calls = 0
+
+    def properties(device):
+        nonlocal calls
+        del device
+        calls += 1
+        return SimpleNamespace(
+            major=12,
+            multi_processor_count=1,
+            shared_memory_per_block_optin=1,
+        )
+
+    with _Harness() as h:
+        monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+        method = _make_method()
+        layer = _make_mixed_layer()
+        x = torch.zeros((16, HIDDEN), dtype=torch.bfloat16)
+        ids = torch.zeros((16, TOPK), dtype=torch.int64)
+
+        first = method._mixed_rank_sliced_runtime(layer, x, ids)
+        second = method._mixed_rank_sliced_runtime(layer, x, ids)
+
+        assert first is second
+        assert calls == 1
+        assert len(h.mixed_api.compiled) == 2
 
 
 def test_prefill_capacity_cannot_exceed_scheduler_bound():

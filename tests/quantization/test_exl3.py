@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -196,6 +198,39 @@ def test_exl3_online_trellis_selects_cached_k6_method(monkeypatch):
     assert method.bits == 6
     assert method.model_identity == "model"
     assert method.encoder_identity == "encoder"
+
+
+def test_online_trellis_cache_off_does_not_require_hub_commit(tmp_path, monkeypatch):
+    config = Exl3Config()
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_CACHE_MODE", "off")
+    monkeypatch.setenv("VLLM_EXL3_ENCODER_SOURCE", str(tmp_path))
+
+    config._configure_online_cache_identity(  # noqa: SLF001
+        "org/model", hf_config=None, revision=None
+    )
+
+    assert config._online_model_identity == "cache-disabled"  # noqa: SLF001
+    assert config._online_encoder_identity == "cache-disabled"  # noqa: SLF001
+
+
+def test_online_trellis_encoder_requires_quantize_entrypoint(tmp_path, monkeypatch):
+    encoder = tmp_path / "encoder"
+    quantizer = encoder / "modules" / "quant" / "exl3_lib"
+    quantizer.mkdir(parents=True)
+    (quantizer / "quantize.py").write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setenv("VLLM_EXL3_ENCODER_SOURCE", str(encoder))
+    monkeypatch.setattr(exl3_module, "_EXL3_ONLINE_QUANTIZER", None)
+    monkeypatch.setattr(
+        exl3_module.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="has no quantize_exl3"):
+        exl3_module._load_exl3_online_quantizer()
+    for name in tuple(exl3_module.sys.modules):
+        if name == "_vllm_exl3_encoder" or name.startswith("_vllm_exl3_encoder."):
+            monkeypatch.delitem(exl3_module.sys.modules, name, raising=False)
 
 
 def test_exl3_online_trellis_cache_hit_skips_encoder(monkeypatch):
@@ -731,6 +766,7 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(
             name = f"{prefix}_{suffix}"
             backing = slabs.get(name)
             setattr(layer, name, parameter(shards, backing=backing))
+
     class FakeMixedApi:
         def __init__(self):
             self.prepared = []
@@ -814,9 +850,37 @@ def test_mixed_trellis_buffer_accounting_ignores_metadata() -> None:
     assert exl3_module._unique_tensor_storage_bytes(first, second) == 8
 
 
+def test_prepared_dense_weight_is_owned_by_source_tensor(monkeypatch) -> None:
+    class FakeApi:
+        def __init__(self):
+            self.calls = 0
+
+        def prepare_weight(self, trellis, suh, svh, **kwargs):
+            del kwargs
+            self.calls += 1
+            return SimpleNamespace(trellis=trellis, suh=suh, svh=svh)
+
+    api = FakeApi()
+    monkeypatch.setattr(exl3_module, "_load_sparkinfer_trellis_linear", lambda: api)
+    trellis = torch.empty((8, 8, 96), dtype=torch.int16)
+    suh = torch.empty(128, dtype=torch.float16)
+    svh = torch.empty(128, dtype=torch.float16)
+
+    first = exl3_module._sparkinfer_trellis_weight(trellis, suh, svh, torch.float16)
+    second = exl3_module._sparkinfer_trellis_weight(trellis, suh, svh, torch.float16)
+    assert first is second
+    assert api.calls == 1
+
+    source_ref = weakref.ref(trellis)
+    del first, second, trellis
+    gc.collect()
+    assert source_ref() is None
+
+
 def test_mixed_trellis_dispatches_decode_and_one_grid_prefill(monkeypatch):
     class FakeMixedApi:
-        calls = []
+        def __init__(self):
+            self.calls = []
 
         def run_mixed_trellis(self, x, *args):
             launch = args[7]

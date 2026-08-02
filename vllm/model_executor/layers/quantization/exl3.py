@@ -61,6 +61,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
 )
 from vllm.model_executor.layers.quantization.exl3_online_cache import (
     Exl3OnlineCacheKey,
+    cache_mode,
     load_or_quantize,
     resolve_encoder_identity,
     resolve_model_identity,
@@ -92,7 +93,6 @@ _SPARKINFER_MIXED_TRELLIS_API: Any | None = None
 _SPARKINFER_TRELLIS_LINEAR_API: Any | None = None
 _EXL3_ONLINE_QUANTIZER: Any | None = None
 _EXL3_ONLINE_WARMED_SIGNATURES: set[tuple[int, int, int, int]] = set()
-_SPARKINFER_TRELLIS_LINEAR_WEIGHTS: dict[tuple[Any, ...], Any] = {}
 _SPARKINFER_TRELLIS_WARMED_DEVICES: set[int] = set()
 # The dense W4A16 kernel caps its temporary accumulation arena at
 # SMs * 4 * block_m * 256 fp32 elements.  SM120/SM121 devices supported by
@@ -133,8 +133,7 @@ def _resolve_mixed_trellis_prefill_block_m(
         and int(intermediate_size) == 512
         and tier_signature == ((3, 192), (4, 64))
         and int(topk) == 8
-        and tuple(int(value) for value in prefill_tile_config)
-        == (128, 128, 32, 512)
+        and tuple(int(value) for value in prefill_tile_config) == (128, 128, 32, 512)
     )
     if qualified:
         return _GLM52_MIXED_TRELLIS_PREFILL_BLOCK_SIZE
@@ -213,6 +212,11 @@ def _load_exl3_online_quantizer() -> Any:
     quantize = importlib.import_module(
         f"{package_name}.modules.quant.exl3_lib.quantize"
     )
+    if not hasattr(quantize, "quantize_exl3"):
+        raise RuntimeError(
+            "VLLM_EXL3_ENCODER_SOURCE points to an incompatible ExLlamaV3 "
+            "encoder: modules.quant.exl3_lib.quantize has no quantize_exl3"
+        )
     _EXL3_ONLINE_QUANTIZER = quantize.quantize_exl3
     return _EXL3_ONLINE_QUANTIZER
 
@@ -530,15 +534,15 @@ def _sparkinfer_trellis_weight(
     """Prepare each online weight before capture and retain its native views."""
 
     api = _load_sparkinfer_trellis_linear()
-    key = (
-        trellis.device.index,
-        trellis.data_ptr(),
-        suh.data_ptr(),
-        svh.data_ptr(),
-        tuple(trellis.shape),
-        dtype,
-    )
-    weight = _SPARKINFER_TRELLIS_LINEAR_WEIGHTS.get(key)
+    # Keep prepared views on the owning tensor. A process-global pointer-keyed
+    # cache can alias after allocator address reuse and retains released models
+    # forever. This small reference cycle is collected with the tensor.
+    cache = getattr(trellis, "_vllm_sparkinfer_prepared_weights", None)
+    if cache is None:
+        cache = {}
+        trellis._vllm_sparkinfer_prepared_weights = cache
+    key = (id(suh), id(svh), dtype)
+    weight = cache.get(key)
     if weight is None:
         weight = api.prepare_weight(
             trellis,
@@ -547,7 +551,7 @@ def _sparkinfer_trellis_weight(
             codebook="mcg",
             params_dtype=dtype,
         )
-        _SPARKINFER_TRELLIS_LINEAR_WEIGHTS[key] = weight
+        cache[key] = weight
     return weight
 
 
@@ -816,6 +820,10 @@ class Exl3Config(QuantizationConfig):
                 "VLLM_EXL3_ENCODER_SOURCE is required when "
                 "VLLM_EXL3_ONLINE_TRELLIS_BITS is enabled"
             )
+        if cache_mode() == "off":
+            self._online_model_identity = "cache-disabled"
+            self._online_encoder_identity = "cache-disabled"
+            return
         resolved_revision = revision or getattr(hf_config, "_commit_hash", None)
         self._online_model_identity = resolve_model_identity(
             model_name,
@@ -1075,19 +1083,21 @@ class Exl3Config(QuantizationConfig):
     def _get_bf16_online_linear_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
-        """Overlay MXFP8 only on linears absent from EXL3 tensor storage.
+        """Overlay online quantization on linears absent from EXL3 storage.
 
         EXL3-owned dense matrices are selected before this method and routed
         experts never enter it. Shared-expert projections have an independent
         spec so a broad ``linear`` overlay cannot quantize them accidentally.
+        When ``VLLM_EXL3_ONLINE_TRELLIS_BITS`` is set, eligible projections use
+        online EXL3 Trellis encoding instead of MXFP8.
 
         Args:
             layer: Candidate module for the online overlay.
             prefix: Fully qualified checkpoint module name.
 
         Returns:
-            An MXFP8 method for an eligible BF16 projection, otherwise
-            ``None``.
+            An online Trellis or MXFP8 method for an eligible BF16 projection,
+            otherwise ``None``.
 
         Raises:
             ValueError: If the EXL3 overlay requests an unsupported weight or
@@ -2395,16 +2405,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         return (128, 128, 128, 128)
 
     @staticmethod
-    def _mixed_trellis_prefill_tile_config(
-        hidden_size: int, intermediate_size: int
-    ):
+    def _mixed_trellis_prefill_tile_config(hidden_size: int, intermediate_size: int):
         # Route packing stays block-64, while SparkInfer's mixed-kernel ABI v2
         # executes FC2 as arithmetic-equivalent 8-row subtiles.  Reuse the
         # checkpoint's original one-grid tile geometry so prefill has the same
         # reduction order as the stock-r16 quality reference.
-        return Exl3MoEMethod._mixed_trellis_tile_config(
-            hidden_size, intermediate_size
-        )
+        return Exl3MoEMethod._mixed_trellis_tile_config(hidden_size, intermediate_size)
 
     def _prepare_mixed_rank_sliced_weights(self, layer: RoutedExperts) -> None:
         mixed_api = _load_sparkinfer_mixed_trellis()
@@ -2728,45 +2734,71 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
     ) -> dict[str, Any]:
         mixed = layer.exl3_mixed_trellis
-        max_decode_m = _positive_env_int("VLLM_EXL3_TRELLIS_MAX_M", 32)
-        max_batched_tokens = int(layer.exl3_max_num_batched_tokens)
-        prefill_capacity = _resolve_prefill_capacity(max_batched_tokens)
-        prefill_block_raw = os.environ.get("VLLM_EXL3_PREFILL_BLOCK_M")
-        prefill_block_m = _positive_env_int("VLLM_EXL3_PREFILL_BLOCK_M", 64)
-        if max_decode_m > max_batched_tokens:
-            max_decode_m = max_batched_tokens
         topk = int(topk_ids.shape[1])
-        tier_signature = tuple(
-            (int(bits), len(ids))
-            for bits, ids in zip(mixed["tier_bits"], mixed["tier_ids"], strict=True)
-        )
-        props = torch.cuda.get_device_properties(x.device)
-        prefill_block_m = _resolve_mixed_trellis_prefill_block_m(
-            configured_block_m=prefill_block_m,
-            explicit_override=bool(
+        policy = mixed.get("runtime_policy")
+        if policy is None:
+            max_decode_m = _positive_env_int("VLLM_EXL3_TRELLIS_MAX_M", 32)
+            max_batched_tokens = int(layer.exl3_max_num_batched_tokens)
+            prefill_capacity = _resolve_prefill_capacity(max_batched_tokens)
+            prefill_block_raw = os.environ.get("VLLM_EXL3_PREFILL_BLOCK_M")
+            configured_block_m = _positive_env_int("VLLM_EXL3_PREFILL_BLOCK_M", 64)
+            max_decode_m = min(max_decode_m, max_batched_tokens)
+            tier_signature = tuple(
+                (int(bits), len(ids))
+                for bits, ids in zip(mixed["tier_bits"], mixed["tier_ids"], strict=True)
+            )
+            props = torch.cuda.get_device_properties(x.device)
+            explicit_block_m = bool(
                 prefill_block_raw is not None and prefill_block_raw.strip()
-            ),
-            hidden_size=int(layer.exl3_hidden_size),
-            intermediate_size=int(layer.exl3_intermediate_size_per_partition),
-            tier_signature=tier_signature,
-            topk=topk,
-            device_major=int(getattr(props, "major", 0)),
-            prefill_tile_config=mixed["prefill_tile_config"],
-        )
-        logger.info_once(
-            "EXL3 mixed Trellis prefill block policy: selected=%d "
-            "configured=%d explicit=%s shape=%dx%d tiers=%s topk=%d "
-            "sm=%d tile=%s",
-            prefill_block_m,
-            _positive_env_int("VLLM_EXL3_PREFILL_BLOCK_M", 64),
-            bool(prefill_block_raw is not None and prefill_block_raw.strip()),
-            int(layer.exl3_hidden_size),
-            int(layer.exl3_intermediate_size_per_partition),
-            tier_signature,
-            topk,
-            int(getattr(props, "major", 0)),
-            mixed["prefill_tile_config"],
-        )
+            )
+            prefill_block_m = _resolve_mixed_trellis_prefill_block_m(
+                configured_block_m=configured_block_m,
+                explicit_override=explicit_block_m,
+                hidden_size=int(layer.exl3_hidden_size),
+                intermediate_size=int(layer.exl3_intermediate_size_per_partition),
+                tier_signature=tier_signature,
+                topk=topk,
+                device_major=int(getattr(props, "major", 0)),
+                prefill_tile_config=mixed["prefill_tile_config"],
+            )
+            policy = {
+                "device_index": x.device.index,
+                "topk": topk,
+                "max_decode_m": max_decode_m,
+                "max_batched_tokens": max_batched_tokens,
+                "prefill_capacity": prefill_capacity,
+                "prefill_block_m": prefill_block_m,
+                "tier_signature": tier_signature,
+                "sms": int(props.multi_processor_count),
+                "max_shared_mem": int(props.shared_memory_per_block_optin),
+            }
+            mixed["runtime_policy"] = policy
+            logger.info_once(
+                "EXL3 mixed Trellis prefill block policy: selected=%d "
+                "configured=%d explicit=%s shape=%dx%d tiers=%s topk=%d "
+                "sm=%d tile=%s",
+                prefill_block_m,
+                configured_block_m,
+                explicit_block_m,
+                int(layer.exl3_hidden_size),
+                int(layer.exl3_intermediate_size_per_partition),
+                tier_signature,
+                topk,
+                int(getattr(props, "major", 0)),
+                mixed["prefill_tile_config"],
+            )
+        elif policy["device_index"] != x.device.index or policy["topk"] != topk:
+            raise RuntimeError(
+                "mixed-bitrate EXL3 runtime geometry changed after planning: "
+                f"device/topk={x.device.index}/{topk}, expected "
+                f"{policy['device_index']}/{policy['topk']}"
+            )
+
+        max_decode_m = policy["max_decode_m"]
+        max_batched_tokens = policy["max_batched_tokens"]
+        prefill_capacity = policy["prefill_capacity"]
+        prefill_block_m = policy["prefill_block_m"]
+        tier_signature = policy["tier_signature"]
         key = (
             _runtime_owner_token(self.quant_config, layer),
             x.device.index,
@@ -2822,8 +2854,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 top_k=topk,
                 max_m_blocks=(route_slots + block_size_m - 1) // block_size_m,
                 moe_block_size=block_size_m,
-                sms=int(props.multi_processor_count),
-                max_shared_mem=int(props.shared_memory_per_block_optin),
+                sms=policy["sms"],
+                max_shared_mem=policy["max_shared_mem"],
                 force_tile_config=tile_config,
                 rotation_input_dtype=("bf16" if x.dtype == torch.bfloat16 else "fp16"),
                 route_ids_dtype=topk_ids.dtype,
@@ -2834,7 +2866,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "buffers": mixed_api.make_mixed_trellis_buffers(
                     launch,
                     device=device,
-                    sms=int(props.multi_processor_count),
+                    sms=policy["sms"],
                 ),
             }
 
@@ -2863,9 +2895,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         _MIXED_TRELLIS_RUNTIMES[key] = runtime
         decode_bytes = _unique_tensor_storage_bytes(decode["buffers"])
         prefill_bytes = (
-            0
-            if prefill is None
-            else _unique_tensor_storage_bytes(prefill["buffers"])
+            0 if prefill is None else _unique_tensor_storage_bytes(prefill["buffers"])
         )
         logger.info_once(
             "EXL3 mixed Trellis runtime planned: tiers=%s one-grid decode=%d "
@@ -2895,6 +2925,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 f"m={m}, capacity={runtime['max_batched_tokens']}"
             )
         mixed = layer.exl3_mixed_trellis
+
         def run_state(
             slice_x: torch.Tensor,
             slice_weights: torch.Tensor,
@@ -2902,18 +2933,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             state: dict[str, Any],
             tiers: tuple[Any, Any],
         ) -> torch.Tensor:
-            return runtime["mixed_api"].run_mixed_trellis(
-                slice_x,
-                tiers[0],
-                tiers[1],
-                slice_weights,
-                slice_ids,
-                mixed["global_to_combined"],
-                mixed["descriptor_map"],
-                mixed["rotations"],
-                state["launch"],
-                state["buffers"],
-            ).to(slice_x.dtype)
+            return (
+                runtime["mixed_api"]
+                .run_mixed_trellis(
+                    slice_x,
+                    tiers[0],
+                    tiers[1],
+                    slice_weights,
+                    slice_ids,
+                    mixed["global_to_combined"],
+                    mixed["descriptor_map"],
+                    mixed["rotations"],
+                    state["launch"],
+                    state["buffers"],
+                )
+                .to(slice_x.dtype)
+            )
 
         if m <= runtime["max_decode_m"]:
             return run_state(

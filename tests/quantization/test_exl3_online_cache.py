@@ -10,6 +10,7 @@ import torch
 
 from vllm.model_executor.layers.quantization.exl3_online_cache import (
     Exl3OnlineCacheKey,
+    cache_mode,
     cache_path,
     load_or_quantize,
     resolve_encoder_identity,
@@ -103,7 +104,48 @@ def test_readonly_miss_does_not_publish(tmp_path, monkeypatch):
     )
 
     assert not result.hit
+    assert result.path is None
     assert not cache_path(key).exists()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("off", "off"),
+        ("none", "off"),
+        ("readonly", "readonly"),
+        ("read-only", "readonly"),
+        ("readwrite", "readwrite"),
+        ("rw", "readwrite"),
+    ],
+)
+def test_cache_mode_aliases(raw, expected, monkeypatch):
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_CACHE_MODE", raw)
+    assert cache_mode() == expected
+
+
+def test_cache_mode_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_CACHE_MODE", "sometimes")
+    with pytest.raises(ValueError, match="must be off, readonly, or readwrite"):
+        cache_mode()
+
+
+def test_off_mode_neither_reads_nor_writes(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_CACHE_MODE", "off")
+    key = _key()
+    cache_path(key).parent.mkdir(parents=True)
+    cache_path(key).write_bytes(b"must not be read")
+
+    result = load_or_quantize(
+        key,
+        device=torch.device("cpu"),
+        quantize=lambda: (_tensors(key), 0.5),
+    )
+
+    assert not result.hit
+    assert result.path is None
+    assert cache_path(key).read_bytes() == b"must not be read"
 
 
 def test_cache_key_covers_every_rank_local_encoding_input():
@@ -143,6 +185,18 @@ def test_hub_model_identity_tracks_resolved_revision():
     second = resolve_model_identity("org/model", revision="commit-b")
 
     assert first != second
+
+    resolved = resolve_model_identity(
+        "org/model",
+        revision="main",
+        hf_config=type("Config", (), {"_commit_hash": "commit-a"})(),
+    )
+    assert resolved == first
+
+
+def test_hub_model_identity_rejects_unresolved_revision():
+    with pytest.raises(ValueError, match="requires a resolved revision"):
+        resolve_model_identity("org/model")
 
 
 def test_encoder_identity_tracks_source_without_explicit_revision(tmp_path):
