@@ -83,6 +83,41 @@ _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
 _MIXED_TRELLIS_ROUTE_BLOCK_SIZE = 8
+_GLM52_MIXED_TRELLIS_PREFILL_BLOCK_SIZE = 32
+
+
+def _resolve_mixed_trellis_prefill_block_m(
+    *,
+    configured_block_m: int,
+    explicit_override: bool,
+    hidden_size: int,
+    intermediate_size: int,
+    tier_signature: tuple[tuple[int, int], ...],
+    topk: int,
+    device_major: int,
+    prefill_tile_config: tuple[int, int, int, int],
+) -> int:
+    """Select the qualified GLM-5.2 mixed-K prefill route block.
+
+    SparkInfer's paired-M8 FC2 schedule makes block-32 numerically equivalent
+    to the established block-64 path while reducing scratch and improving the
+    dominant large-prefill kernel on SM12x. Explicit operator tuning and every
+    other model geometry retain the configured value.
+    """
+
+    qualified = (
+        not explicit_override
+        and int(device_major) == 12
+        and int(hidden_size) == 6144
+        and int(intermediate_size) == 512
+        and tier_signature == ((3, 192), (4, 64))
+        and int(topk) == 8
+        and tuple(int(value) for value in prefill_tile_config)
+        == (128, 128, 32, 512)
+    )
+    if qualified:
+        return _GLM52_MIXED_TRELLIS_PREFILL_BLOCK_SIZE
+    return int(configured_block_m)
 
 
 # Smallest m the Trellis kernel path can service, and therefore the smallest
@@ -1934,13 +1969,24 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 else combined_down_svh[tier_slice]
             )
 
-            def prepare_tier(tile_config: tuple[int, int, int, int]):
+            def prepare_tier(
+                tile_config: tuple[int, int, int, int],
+                *,
+                w13: torch.Tensor = w13,
+                w2: torch.Tensor = w2,
+                expert_count: int = len(expert_ids),
+                bits: int = bits,
+                tier_gate_suh: torch.Tensor = tier_gate_suh,
+                tier_up_suh: torch.Tensor = tier_up_suh,
+                intermediate_rotations: torch.Tensor = intermediate_rotations,
+                tier_down_svh: torch.Tensor = tier_down_svh,
+            ):
                 return mixed_api.prepare_weights(
                     w13=w13,
                     w2=w2,
                     hidden_size=hidden_size,
                     intermediate_size=intermediate_size,
-                    num_experts=len(expert_ids),
+                    num_experts=expert_count,
                     activation=layer.activation.value,
                     fc1_tile_n=tile_config[1],
                     fc2_tile_n=tile_config[3],
@@ -2121,6 +2167,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         max_decode_m = _positive_env_int("VLLM_EXL3_TRELLIS_MAX_M", 32)
         max_batched_tokens = int(layer.exl3_max_num_batched_tokens)
         prefill_capacity = _resolve_prefill_capacity(max_batched_tokens)
+        prefill_block_raw = os.environ.get("VLLM_EXL3_PREFILL_BLOCK_M")
         prefill_block_m = _positive_env_int("VLLM_EXL3_PREFILL_BLOCK_M", 64)
         if max_decode_m > max_batched_tokens:
             max_decode_m = max_batched_tokens
@@ -2128,6 +2175,33 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         tier_signature = tuple(
             (int(bits), len(ids))
             for bits, ids in zip(mixed["tier_bits"], mixed["tier_ids"], strict=True)
+        )
+        props = torch.cuda.get_device_properties(x.device)
+        prefill_block_m = _resolve_mixed_trellis_prefill_block_m(
+            configured_block_m=prefill_block_m,
+            explicit_override=bool(
+                prefill_block_raw is not None and prefill_block_raw.strip()
+            ),
+            hidden_size=int(layer.exl3_hidden_size),
+            intermediate_size=int(layer.exl3_intermediate_size_per_partition),
+            tier_signature=tier_signature,
+            topk=topk,
+            device_major=int(getattr(props, "major", 0)),
+            prefill_tile_config=mixed["prefill_tile_config"],
+        )
+        logger.info_once(
+            "EXL3 mixed Trellis prefill block policy: selected=%d "
+            "configured=%d explicit=%s shape=%dx%d tiers=%s topk=%d "
+            "sm=%d tile=%s",
+            prefill_block_m,
+            _positive_env_int("VLLM_EXL3_PREFILL_BLOCK_M", 64),
+            bool(prefill_block_raw is not None and prefill_block_raw.strip()),
+            int(layer.exl3_hidden_size),
+            int(layer.exl3_intermediate_size_per_partition),
+            tier_signature,
+            topk,
+            int(getattr(props, "major", 0)),
+            mixed["prefill_tile_config"],
         )
         key = (
             _runtime_owner_token(self.quant_config, layer),
@@ -2161,7 +2235,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         mixed_api = _load_sparkinfer_mixed_trellis()
         device = x.device
-        props = torch.cuda.get_device_properties(device)
         total_experts = sum(experts for _, experts in tier_signature)
 
         def make_state(

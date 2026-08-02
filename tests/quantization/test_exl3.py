@@ -792,6 +792,39 @@ def test_mixed_trellis_dispatches_decode_and_one_grid_prefill(monkeypatch):
     assert all(call[1:3] == prefill_tiers for call in mixed_api.calls[1:])
 
 
+def test_mixed_trellis_prefill_block_policy_is_narrow_and_overridable() -> None:
+    common = {
+        "configured_block_m": 64,
+        "explicit_override": False,
+        "hidden_size": 6144,
+        "intermediate_size": 512,
+        "tier_signature": ((3, 192), (4, 64)),
+        "topk": 8,
+        "device_major": 12,
+        "prefill_tile_config": (128, 128, 32, 512),
+    }
+
+    assert exl3_module._resolve_mixed_trellis_prefill_block_m(**common) == 32
+    assert (
+        exl3_module._resolve_mixed_trellis_prefill_block_m(
+            **{**common, "explicit_override": True}
+        )
+        == 64
+    )
+    assert (
+        exl3_module._resolve_mixed_trellis_prefill_block_m(
+            **{**common, "tier_signature": ((4, 256),)}
+        )
+        == 64
+    )
+    assert (
+        exl3_module._resolve_mixed_trellis_prefill_block_m(
+            **{**common, "device_major": 11}
+        )
+        == 64
+    )
+
+
 @pytest.mark.parametrize(
     ("hidden", "intermediate", "expected"),
     [
