@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import vllm.model_executor.layers.quantization.exl3 as exl3_module
+import vllm.model_executor.layers.quantization.online.fp8 as fp8_module
 import vllm.model_executor.parameter as parameter_module
 from vllm.config import CompilationMode
 from vllm.config.quantization import QuantizationConfigArgs
@@ -19,6 +20,10 @@ from vllm.model_executor.layers.quantization.exl3 import (
     Exl3LinearMethod,
     Exl3MoEMethod,
     Exl3MoEParameter,
+    Exl3OnlineLinearMethod,
+)
+from vllm.model_executor.layers.quantization.exl3_online_cache import (
+    Exl3OnlineCacheResult,
 )
 from vllm.model_executor.models import glm4_moe
 
@@ -171,6 +176,77 @@ def test_exl3_online_overlay_preserves_rank_sliced_routed_experts(monkeypatch):
     method = config.get_quant_method(routed, "model.layers.3.mlp.experts")
 
     assert isinstance(method, Exl3MoEMethod)
+
+
+def test_exl3_online_trellis_selects_cached_k6_method(monkeypatch):
+    config = Exl3Config()
+    config._online_model_identity = "model"  # noqa: SLF001
+    config._online_encoder_identity = "encoder"  # noqa: SLF001
+    _set_online_overlay(monkeypatch, QuantizationConfigArgs(linear="mxfp8"))
+    monkeypatch.setattr(
+        fp8_module,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16)),
+    )
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_TRELLIS_BITS", "6")
+
+    method = config.get_quant_method(_mock_linear(), "model.layers.3.self_attn.o_proj")
+
+    assert isinstance(method, Exl3OnlineLinearMethod)
+    assert method.bits == 6
+    assert method.model_identity == "model"
+    assert method.encoder_identity == "encoder"
+
+
+def test_exl3_online_trellis_cache_hit_skips_encoder(monkeypatch):
+    monkeypatch.setattr(
+        fp8_module,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16)),
+    )
+    method = Exl3OnlineLinearMethod(
+        bits=6,
+        prefix="model.layers.3.self_attn.o_proj",
+        model_identity="model",
+        encoder_identity="encoder",
+    )
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight",
+        torch.nn.Parameter(torch.zeros((256, 128), dtype=torch.float16)),
+    )
+    layer.exl3_online_input_size = 128
+    layer.exl3_online_output_size = 256
+    tensors = {
+        "trellis": torch.zeros((8, 16, 96), dtype=torch.int16),
+        "suh": torch.ones(128, dtype=torch.float16),
+        "svh": torch.ones(256, dtype=torch.float16),
+    }
+    captured = {}
+
+    def cache_hit(key, *, device, quantize):
+        del quantize
+        captured["key"] = key
+        captured["device"] = device
+        return Exl3OnlineCacheResult(tensors, 0.25, True, None)
+
+    monkeypatch.setattr(exl3_module, "load_or_quantize", cache_hit)
+    monkeypatch.setattr(
+        exl3_module,
+        "_load_exl3_online_quantizer",
+        lambda: pytest.fail("cache hit must not import the encoder"),
+    )
+    monkeypatch.setattr(exl3_module, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(exl3_module, "get_tensor_model_parallel_rank", lambda: 2)
+    monkeypatch.setattr(method, "_warm_decode_shapes", lambda layer: None)
+
+    method.process_weights_after_loading(layer)
+
+    assert captured["key"].tp_world_size == 4
+    assert captured["key"].tp_rank == 2
+    assert captured["device"] == torch.device("cpu")
+    assert layer.weight.numel() == 0
+    assert layer.exl3_online_trellis_weight is tensors["trellis"]
 
 
 def test_rank_sliced_checkpoint_selects_exl3_override():

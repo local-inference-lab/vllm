@@ -2290,6 +2290,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_PREFILL_CAPACITY": lambda: os.getenv("VLLM_EXL3_PREFILL_CAPACITY"),
     "VLLM_EXL3_PREFILL_TRELLIS": lambda: os.getenv("VLLM_EXL3_PREFILL_TRELLIS"),
     "VLLM_EXL3_PREFILL_BLOCK_M": lambda: os.getenv("VLLM_EXL3_PREFILL_BLOCK_M"),
+    # Deterministic online EXL3 encoding and its persistent rank-local cache.
+    "VLLM_EXL3_ONLINE_TRELLIS_BITS": lambda: os.getenv(
+        "VLLM_EXL3_ONLINE_TRELLIS_BITS"
+    ),
+    "VLLM_EXL3_ENCODER_SOURCE": lambda: os.getenv("VLLM_EXL3_ENCODER_SOURCE"),
+    "VLLM_EXL3_ENCODER_REVISION": lambda: os.getenv(
+        "VLLM_EXL3_ENCODER_REVISION"
+    ),
+    "VLLM_EXL3_ONLINE_CACHE_DIR": lambda: os.getenv(
+        "VLLM_EXL3_ONLINE_CACHE_DIR"
+    ),
+    "VLLM_EXL3_ONLINE_CACHE_MODE": lambda: os.getenv(
+        "VLLM_EXL3_ONLINE_CACHE_MODE"
+    ),
     # Prebuilt exllamav3 extension location and torch-ABI compatibility shim.
     "VLLM_EXL3_EXT_PATH": lambda: os.getenv("VLLM_EXL3_EXT_PATH"),
     "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),

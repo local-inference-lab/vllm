@@ -24,7 +24,9 @@ import importlib
 import os
 import re
 import sys
-from types import SimpleNamespace
+import zlib
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -57,12 +59,20 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
+from vllm.model_executor.layers.quantization.exl3_online_cache import (
+    Exl3OnlineCacheKey,
+    load_or_quantize,
+    resolve_encoder_identity,
+    resolve_model_identity,
+)
+from vllm.model_executor.layers.quantization.online.fp8 import _Fp8OnlineLinearBase
 from vllm.model_executor.layers.quantization.online.mxfp8 import (
     Mxfp8OnlineLinearMethod,
     is_shared_expert_projection,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.model_executor.parameter import BasevLLMParameter
+from vllm.model_executor.utils import replace_parameter
 from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
 if TYPE_CHECKING:
@@ -79,6 +89,17 @@ _HADAMARD_BLOCK = 128
 _EXL3_EXT: Any | None = None
 _SPARKINFER_FUSED_MOE_API: Any | None = None
 _SPARKINFER_MIXED_TRELLIS_API: Any | None = None
+_SPARKINFER_TRELLIS_LINEAR_API: Any | None = None
+_EXL3_ONLINE_QUANTIZER: Any | None = None
+_EXL3_ONLINE_WARMED_SIGNATURES: set[tuple[int, int, int, int]] = set()
+_SPARKINFER_TRELLIS_LINEAR_WEIGHTS: dict[tuple[Any, ...], Any] = {}
+_SPARKINFER_TRELLIS_WARMED_DEVICES: set[int] = set()
+# The dense W4A16 kernel caps its temporary accumulation arena at
+# SMs * 4 * block_m * 256 fp32 elements.  SM120/SM121 devices supported by
+# this path have at most 192 SMs, and block_m never exceeds 64.  Keeping this
+# architecture bound here lets Inductor own and reuse the temporary across
+# layers instead of allocating inside CUDA graph capture.
+_SPARKINFER_TRELLIS_C_TMP_CAP = 192 * 4 * 64 * 256
 _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
@@ -130,6 +151,70 @@ MIN_CAPTURABLE_TRELLIS_M = 1
 # Keep every supported row count on the native path by default; operators may
 # still raise the threshold explicitly as a diagnostic kill switch.
 _DEFAULT_TRELLIS_MIN_M = MIN_CAPTURABLE_TRELLIS_M
+
+
+def _online_trellis_bits() -> int | None:
+    raw = os.environ.get("VLLM_EXL3_ONLINE_TRELLIS_BITS")
+    if raw is None or not raw.strip():
+        return None
+    try:
+        bits = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"VLLM_EXL3_ONLINE_TRELLIS_BITS must be an integer from 3 to 8, got {raw!r}"
+        ) from None
+    if bits not in range(3, 9):
+        raise ValueError(
+            f"VLLM_EXL3_ONLINE_TRELLIS_BITS must be from 3 to 8, got {bits}"
+        )
+    return bits
+
+
+def _online_trellis_shape_supported(input_size: int, output_size: int) -> bool:
+    return input_size % _HADAMARD_BLOCK == 0 and output_size % _HADAMARD_BLOCK == 0
+
+
+def _load_exl3_online_quantizer() -> Any:
+    """Load the encoder without importing ExLlamaV3's serving front end."""
+
+    global _EXL3_ONLINE_QUANTIZER
+    if _EXL3_ONLINE_QUANTIZER is not None:
+        return _EXL3_ONLINE_QUANTIZER
+
+    raw_root = os.environ.get("VLLM_EXL3_ENCODER_SOURCE")
+    if raw_root is None or not raw_root.strip():
+        raise RuntimeError(
+            "online EXL3 Trellis requires VLLM_EXL3_ENCODER_SOURCE to point "
+            "to the exllamav3 Python package directory"
+        )
+    package_root = Path(raw_root).resolve()
+    quantizer_path = package_root / "modules" / "quant" / "exl3_lib"
+    if not (quantizer_path / "quantize.py").is_file():
+        raise RuntimeError(
+            "VLLM_EXL3_ENCODER_SOURCE does not contain the ExLlamaV3 encoder: "
+            f"{package_root}"
+        )
+
+    package_name = "_vllm_exl3_encoder"
+    packages = {
+        package_name: package_root,
+        f"{package_name}.modules": package_root / "modules",
+        f"{package_name}.modules.quant": package_root / "modules" / "quant",
+        f"{package_name}.modules.quant.exl3_lib": quantizer_path,
+    }
+    for name, path in packages.items():
+        if name in sys.modules:
+            continue
+        module = ModuleType(name)
+        module.__path__ = [str(path)]
+        module.__package__ = name
+        sys.modules[name] = module
+
+    quantize = importlib.import_module(
+        f"{package_name}.modules.quant.exl3_lib.quantize"
+    )
+    _EXL3_ONLINE_QUANTIZER = quantize.quantize_exl3
+    return _EXL3_ONLINE_QUANTIZER
 
 
 def _is_draft_layer(layer: Any) -> bool:
@@ -304,6 +389,23 @@ def _load_sparkinfer_mixed_trellis() -> Any:
     return api
 
 
+def _load_sparkinfer_trellis_linear() -> Any:
+    """Resolve the native dense Trellis API lazily."""
+
+    global _SPARKINFER_TRELLIS_LINEAR_API
+    if _SPARKINFER_TRELLIS_LINEAR_API is not None:
+        return _SPARKINFER_TRELLIS_LINEAR_API
+    try:
+        from sparkinfer.gemm import trellis_linear
+    except Exception as exc:
+        raise RuntimeError(
+            "Online EXL3 prefill requires sparkinfer.gemm.trellis_linear. "
+            "Install a matching SparkInfer build."
+        ) from exc
+    _SPARKINFER_TRELLIS_LINEAR_API = trellis_linear
+    return trellis_linear
+
+
 def _unique_tensor_storage_bytes(*buffers: Any) -> int:
     """Count unique tensor storage while ignoring buffer metadata fields."""
 
@@ -419,6 +521,166 @@ def _exl3_gemm_fake(
     )
 
 
+def _sparkinfer_trellis_weight(
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    dtype: torch.dtype,
+) -> Any:
+    """Prepare each online weight before capture and retain its native views."""
+
+    api = _load_sparkinfer_trellis_linear()
+    key = (
+        trellis.device.index,
+        trellis.data_ptr(),
+        suh.data_ptr(),
+        svh.data_ptr(),
+        tuple(trellis.shape),
+        dtype,
+    )
+    weight = _SPARKINFER_TRELLIS_LINEAR_WEIGHTS.get(key)
+    if weight is None:
+        weight = api.prepare_weight(
+            trellis,
+            suh,
+            svh,
+            codebook="mcg",
+            params_dtype=dtype,
+        )
+        _SPARKINFER_TRELLIS_LINEAR_WEIGHTS[key] = weight
+    return weight
+
+
+def _sparkinfer_trellis_k6_supported(
+    trellis: torch.Tensor,
+    *,
+    has_mcg: bool,
+    has_mul1: bool,
+) -> bool:
+    """Gate the native path to the exact K6/MCG contract it implements."""
+
+    return bool(
+        has_mcg
+        and not has_mul1
+        and trellis.dtype == torch.int16
+        and trellis.ndim == 3
+        and int(trellis.shape[2]) == 96
+        and int(trellis.shape[0]) % 8 == 0
+        and int(trellis.shape[1]) % 8 == 0
+    )
+
+
+def _warm_sparkinfer_trellis_device(
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+) -> None:
+    """Build the runtime extension before any CUDA graph starts capturing."""
+
+    device_index = trellis.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    if device_index in _SPARKINFER_TRELLIS_WARMED_DEVICES:
+        return
+    source = torch.zeros(
+        (1, int(trellis.shape[0]) * 16),
+        dtype=torch.float16,
+        device=trellis.device,
+    )
+    _sparkinfer_trellis_linear(source, trellis, suh, svh)
+    torch.cuda.synchronize(trellis.device)
+    _SPARKINFER_TRELLIS_WARMED_DEVICES.add(device_index)
+
+
+def _sparkinfer_trellis_c_tmp_elements(rows: int, columns: int) -> int:
+    """Return graph-safe dense-W4A16 scratch capacity for one static shape."""
+
+    rows = int(rows)
+    columns = int(columns)
+    if rows <= 128:
+        # The cooperative K6 small-M kernel does not consume W4A16 scratch.
+        return 1
+    padded_rows = max(
+        ((rows + 47) // 48) * 48,
+        ((rows + 63) // 64) * 64,
+    )
+    return min(columns * padded_rows, _SPARKINFER_TRELLIS_C_TMP_CAP)
+
+
+@torch.library.custom_op(
+    "vllm::sparkinfer_trellis_linear_out",
+    mutates_args=("output", "gemm_output", "c_tmp", "rotated_f16"),
+    device_types="cuda",
+)
+def _sparkinfer_trellis_linear_out(
+    x: torch.Tensor,
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    output: torch.Tensor,
+    gemm_output: torch.Tensor,
+    c_tmp: torch.Tensor,
+    rotated_f16: torch.Tensor,
+) -> None:
+    """Execute dense Trellis into graph-owned output and scratch tensors."""
+
+    api = _load_sparkinfer_trellis_linear()
+    weight = _sparkinfer_trellis_weight(trellis, suh, svh, x.dtype)
+    api.run(
+        x,
+        weight,
+        output=output,
+        gemm_output=gemm_output,
+        c_tmp=c_tmp,
+        rotated_f16=rotated_f16,
+    )
+
+
+@_sparkinfer_trellis_linear_out.register_fake
+def _sparkinfer_trellis_linear_out_fake(
+    x: torch.Tensor,
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    output: torch.Tensor,
+    gemm_output: torch.Tensor,
+    c_tmp: torch.Tensor,
+    rotated_f16: torch.Tensor,
+) -> None:
+    del x, trellis, suh, svh, output, gemm_output, c_tmp, rotated_f16
+
+
+def _sparkinfer_trellis_linear(
+    x: torch.Tensor,
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+) -> torch.Tensor:
+    """Run every online-K6 batch through SparkInfer with explicit storage."""
+
+    output = torch.empty(
+        (x.shape[0], trellis.shape[1] * 16), dtype=x.dtype, device=x.device
+    )
+    gemm_output = torch.empty_like(output)
+    c_tmp = torch.empty(
+        (_sparkinfer_trellis_c_tmp_elements(x.shape[0], output.shape[1]),),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    rotated_f16 = torch.empty_like(x)
+    _sparkinfer_trellis_linear_out(
+        x,
+        trellis,
+        suh,
+        svh,
+        output,
+        gemm_output,
+        c_tmp,
+        rotated_f16,
+    )
+    return output
+
+
 class Exl3Config(QuantizationConfig):
     """Configuration for modern and legacy EXL3 trellis checkpoints."""
 
@@ -441,6 +703,8 @@ class Exl3Config(QuantizationConfig):
         self.rank_sliced_rotation_layout = _PER_EXPERT_ROTATION_LAYOUT
         self.rank_sliced_k_values: tuple[int, ...] | None = None
         self.rank_sliced_bits_by_layer: dict[int, tuple[int, ...]] = {}
+        self._online_model_identity: str | None = None
+        self._online_encoder_identity: str | None = None
 
     def get_name(self) -> str:
         return "exl3"
@@ -489,6 +753,12 @@ class Exl3Config(QuantizationConfig):
         hf_config: PretrainedConfig | None = None,
         revision: str | None = None,
     ) -> None:
+        if _online_trellis_bits() is not None:
+            self._configure_online_cache_identity(
+                model_name,
+                hf_config=hf_config,
+                revision=revision,
+            )
         rank_sliced = getattr(hf_config, "hybrid_tr3_tail", None)
         if (
             isinstance(rank_sliced, dict)
@@ -530,6 +800,32 @@ class Exl3Config(QuantizationConfig):
 
         self._validate_storage_metadata()
         self._force_independent_lm_head(hf_config)
+
+    def _configure_online_cache_identity(
+        self,
+        model_name: str,
+        *,
+        hf_config: PretrainedConfig | None,
+        revision: str | None,
+    ) -> None:
+        if self._online_model_identity is not None:
+            return
+        encoder_source = os.getenv("VLLM_EXL3_ENCODER_SOURCE")
+        if encoder_source is None or not encoder_source.strip():
+            raise ValueError(
+                "VLLM_EXL3_ENCODER_SOURCE is required when "
+                "VLLM_EXL3_ONLINE_TRELLIS_BITS is enabled"
+            )
+        resolved_revision = revision or getattr(hf_config, "_commit_hash", None)
+        self._online_model_identity = resolve_model_identity(
+            model_name,
+            revision=resolved_revision,
+            hf_config=hf_config,
+        )
+        self._online_encoder_identity = resolve_encoder_identity(
+            encoder_source,
+            revision=os.getenv("VLLM_EXL3_ENCODER_REVISION"),
+        )
 
     def _configure_rank_sliced(self, metadata: dict[str, Any]) -> None:
         required = {
@@ -827,6 +1123,30 @@ class Exl3Config(QuantizationConfig):
                 "with no activation override."
             )
 
+        if (bits := _online_trellis_bits()) is not None:
+            if self._online_model_identity is None:
+                model_config = vllm_config.model_config
+                self._configure_online_cache_identity(
+                    model_config.model,
+                    hf_config=model_config.hf_config,
+                    revision=model_config.revision,
+                )
+            assert self._online_model_identity is not None
+            assert self._online_encoder_identity is not None
+            logger.warning_once(
+                "EXL3 BF16 online Trellis: encoding eligible non-EXL3 "
+                "linear weights at K=%d; 128-unaligned matrices retain the "
+                "configured MXFP8 path (module example: %s).",
+                bits,
+                prefix,
+            )
+            return Exl3OnlineLinearMethod(
+                bits=bits,
+                prefix=prefix,
+                model_identity=self._online_model_identity,
+                encoder_identity=self._online_encoder_identity,
+            )
+
         logger.info_once(
             "EXL3 BF16 online overlay: quantizing non-EXL3 %s projections "
             "to MXFP8 at load time (module example: %s).",
@@ -1007,6 +1327,218 @@ def _exl3_weight_loader(
     param.load_exl3_weight(loaded_weight, loaded_shard_id)
 
 
+class Exl3OnlineLinearMethod(_Fp8OnlineLinearBase):
+    """Encode eligible BF16 linear shards to cached dense EXL3 weights."""
+
+    def __init__(
+        self,
+        *,
+        bits: int,
+        prefix: str,
+        model_identity: str,
+        encoder_identity: str,
+    ) -> None:
+        super().__init__()
+        self.bits = bits
+        self.prefix = prefix
+        self.model_identity = model_identity
+        self.encoder_identity = encoder_identity
+        self.fallback: Mxfp8OnlineLinearMethod | None = None
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        output_size_per_partition = sum(output_partition_sizes)
+        layer.exl3_online_trellis = _online_trellis_shape_supported(
+            input_size_per_partition, output_size_per_partition
+        )
+        if not layer.exl3_online_trellis:
+            self.fallback = Mxfp8OnlineLinearMethod()
+            self.fallback.create_weights(
+                layer,
+                input_size_per_partition,
+                output_partition_sizes,
+                input_size,
+                output_size,
+                params_dtype,
+                **extra_weight_attrs,
+            )
+            logger.info_once(
+                "EXL3 online Trellis retains MXFP8 for 128-unaligned shards "
+                "(example %s: K=%d, N=%d).",
+                self.prefix,
+                input_size_per_partition,
+                output_size_per_partition,
+            )
+            return
+
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+        layer.exl3_online_input_size = input_size_per_partition
+        layer.exl3_online_output_size = output_size_per_partition
+
+    @staticmethod
+    def _h_data(input_size: int, device: torch.device) -> dict[str, Any]:
+        return {
+            "H": torch.zeros(
+                input_size, input_size, dtype=torch.float32, device="meta"
+            ),
+            "first_key": "vllm-online",
+            "count": 0,
+            "finalized": False,
+            "num_total": 0,
+            "inf_nan": torch.zeros(2, dtype=torch.long, device=device),
+            "device": device,
+        }
+
+    def _warm_decode_shapes(self, layer: torch.nn.Module) -> None:
+        device = layer.exl3_online_trellis_weight.device
+        _sparkinfer_trellis_weight(
+            layer.exl3_online_trellis_weight,
+            layer.exl3_online_suh,
+            layer.exl3_online_svh,
+            torch.float16,
+        )
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        signature = (
+            device_index,
+            layer.exl3_online_input_size,
+            layer.exl3_online_output_size,
+            self.bits,
+        )
+        if signature in _EXL3_ONLINE_WARMED_SIGNATURES:
+            return
+        for rows in range(1, 7):
+            source = torch.zeros(
+                (rows, layer.exl3_online_input_size),
+                dtype=torch.float16,
+                device=device,
+            )
+            _sparkinfer_trellis_linear(
+                source,
+                layer.exl3_online_trellis_weight,
+                layer.exl3_online_suh,
+                layer.exl3_online_svh,
+            )
+        torch.cuda.synchronize(device)
+        _EXL3_ONLINE_WARMED_SIGNATURES.add(signature)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.fallback is not None:
+            self.fallback.process_weights_after_loading(layer)
+            return
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+
+        device = layer.weight.device
+        seed = zlib.crc32(self.prefix.encode("utf-8")) & 0x7FFFFFFF
+        cache_key = Exl3OnlineCacheKey(
+            model_identity=self.model_identity,
+            encoder_identity=self.encoder_identity,
+            prefix=self.prefix,
+            bits=self.bits,
+            seed=seed,
+            tp_world_size=get_tensor_model_parallel_world_size(),
+            tp_rank=get_tensor_model_parallel_rank(),
+            input_size=layer.exl3_online_input_size,
+            output_size=layer.exl3_online_output_size,
+        )
+
+        def encode() -> tuple[dict[str, torch.Tensor], float]:
+            source = layer.weight.detach().t().float().contiguous()
+            quant_args = {
+                "K": self.bits,
+                "seed": seed,
+                "devices": [device],
+                "apply_out_scales": True,
+                "mcg": True,
+            }
+            quantize_exl3 = _load_exl3_online_quantizer()
+            _, proxy_error, tensors = quantize_exl3(
+                source,
+                self._h_data(layer.exl3_online_input_size, device),
+                quant_args,
+                return_weight_q=False,
+                verbose=False,
+            )
+            if not quant_args.get("q_fallback", False):
+                raise RuntimeError(
+                    "online EXL3 Trellis unexpectedly used calibrated LDLQ"
+                )
+            return {name: tensors[name] for name in ("trellis", "suh", "svh")}, float(
+                proxy_error
+            )
+
+        result = load_or_quantize(cache_key, device=device, quantize=encode)
+
+        layer.register_buffer(
+            "exl3_online_trellis_weight",
+            result.tensors["trellis"],
+            persistent=False,
+        )
+        layer.register_buffer(
+            "exl3_online_suh", result.tensors["suh"], persistent=False
+        )
+        layer.register_buffer(
+            "exl3_online_svh", result.tensors["svh"], persistent=False
+        )
+        replace_parameter(
+            layer,
+            "weight",
+            torch.empty(0, dtype=torch.uint8, device=device),
+        )
+        layer._already_called_process_weights_after_loading = True
+        self._warm_decode_shapes(layer)
+        logger.info(
+            "Online EXL3 K%d %s %s%s",
+            self.bits,
+            "cache hit for" if result.hit else "encoded",
+            self.prefix,
+            ""
+            if result.proxy_error is None
+            else f" (fallback proxy error {result.proxy_error:.8f})",
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.fallback is not None:
+            return self.fallback.apply(layer, x, bias)
+
+        original_shape = x.shape[:-1]
+        original_dtype = x.dtype
+        x_2d = x.reshape(-1, x.shape[-1]).to(torch.float16).contiguous()
+        output = _sparkinfer_trellis_linear(
+            x_2d,
+            layer.exl3_online_trellis_weight,
+            layer.exl3_online_suh,
+            layer.exl3_online_svh,
+        )
+        if bias is not None:
+            output = output + bias.to(dtype=output.dtype)
+        output = output.reshape(*original_shape, layer.exl3_online_output_size)
+        return output if output.dtype == original_dtype else output.to(original_dtype)
+
+
 class Exl3LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: Exl3Config) -> None:
         self.quant_config = quant_config
@@ -1111,6 +1643,24 @@ class Exl3LinearMethod(LinearMethodBase):
                 param.exl3_tensors[shard_id] = tensor.to(
                     device=device, non_blocking=True
                 ).contiguous()
+
+        for shard_id in layer.exl3_shard_ids:
+            trellis = layer.trellis.exl3_tensors[shard_id]
+            if not _sparkinfer_trellis_k6_supported(
+                trellis,
+                has_mcg=shard_id in layer.mcg.exl3_tensors,
+                has_mul1=shard_id in layer.mul1.exl3_tensors,
+            ):
+                continue
+            suh = layer.suh.exl3_tensors[shard_id]
+            svh = layer.svh.exl3_tensors[shard_id]
+            _sparkinfer_trellis_weight(
+                trellis,
+                suh,
+                svh,
+                torch.float16,
+            )
+            _warm_sparkinfer_trellis_device(trellis, suh, svh)
 
     def apply(
         self,
@@ -1365,14 +1915,28 @@ class Exl3LinearMethod(LinearMethodBase):
             )
         if x.shape[-1] < packed_k:
             x = torch.nn.functional.pad(x, (0, packed_k - x.shape[-1]))
-        output = _exl3_gemm(
-            x,
+        has_mcg = shard_id in layer.mcg.exl3_tensors
+        has_mul1 = shard_id in layer.mul1.exl3_tensors
+        if _sparkinfer_trellis_k6_supported(
             trellis,
-            layer.suh.exl3_tensors[shard_id],
-            layer.svh.exl3_tensors[shard_id],
-            shard_id in layer.mcg.exl3_tensors,
-            shard_id in layer.mul1.exl3_tensors,
-        )
+            has_mcg=has_mcg,
+            has_mul1=has_mul1,
+        ):
+            output = _sparkinfer_trellis_linear(
+                x,
+                trellis,
+                layer.suh.exl3_tensors[shard_id],
+                layer.svh.exl3_tensors[shard_id],
+            )
+        else:
+            output = _exl3_gemm(
+                x,
+                trellis,
+                layer.suh.exl3_tensors[shard_id],
+                layer.svh.exl3_tensors[shard_id],
+                has_mcg,
+                has_mul1,
+            )
         logical_n = Exl3LinearMethod._output_shard_size(layer, shard_id)
         if output.shape[-1] < logical_n:
             raise ValueError(
