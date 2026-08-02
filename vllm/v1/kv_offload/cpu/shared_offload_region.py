@@ -115,6 +115,7 @@ class SharedOffloadRegion:
 
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
         self._views: list[torch.Tensor] = []
+        self._registered_host_ptrs: list[int] = []
         self.is_pinned: bool = False
 
     def create_next_view(self, tensor_page_size: int) -> torch.Tensor:
@@ -173,14 +174,23 @@ class SharedOffloadRegion:
     def cleanup(self) -> None:
         if self.is_pinned and self._base is not None:
             if current_platform.is_cuda_alike():
-                base_ptr = self._base.data_ptr()
-                result = torch.cuda.cudart().cudaHostUnregister(base_ptr)
-                if result.value != 0:
-                    logger.warning(
-                        "cudaHostUnregister failed for rank=%d (code=%d)",
-                        self.rank,
-                        result,
-                    )
+                from vllm.distributed.device_communicators.cuda_wrapper import (
+                    CudaRTLibrary,
+                )
+
+                cudart = torch.cuda.cudart()
+                registered_ptrs = self._registered_host_ptrs or [self._base.data_ptr()]
+                for ptr in reversed(registered_ptrs):
+                    result = cudart.cudaHostUnregister(ptr)
+                    if result.value != 0:
+                        CudaRTLibrary().cudaGetLastError()
+                        logger.warning(
+                            "cudaHostUnregister failed for rank=%d ptr=%#x (code=%d)",
+                            self.rank,
+                            ptr,
+                            result,
+                        )
+            self._registered_host_ptrs.clear()
             self.is_pinned = False
         # Release views before _base: each view holds a _base reference and a
         # direct StorageImpl reference.  Freeing views first lets both refcounts

@@ -4,7 +4,7 @@ import random
 import time
 import uuid
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 import torch
@@ -20,7 +20,11 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu import gpu_worker
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker, pin_mmap_region
+from vllm.v1.kv_offload.cpu.gpu_worker import (
+    HOST_REGISTER_SEGMENT_BYTES,
+    CPUOffloadingWorker,
+    pin_mmap_region,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 NUM_GPU_BLOCKS = [64]
@@ -41,11 +45,12 @@ class _CudaResult(int):
         return int(self)
 
 
-def _mock_mmap_region() -> SimpleNamespace:
+def _mock_mmap_region(total_size_bytes: int = 4096) -> SimpleNamespace:
     return SimpleNamespace(
         rank=2,
-        total_size_bytes=4096,
+        total_size_bytes=total_size_bytes,
         _base=SimpleNamespace(data_ptr=lambda: 0x1000),
+        _registered_host_ptrs=[],
         is_pinned=False,
     )
 
@@ -79,6 +84,73 @@ def test_pin_mmap_region_keeps_successful_registration(monkeypatch) -> None:
 
     runtime_factory.assert_not_called()
     assert region.is_pinned is True
+    assert region._registered_host_ptrs == [0x1000]
+
+
+def test_pin_mmap_region_retries_large_mapping_as_segments(monkeypatch) -> None:
+    tail_bytes = 4096
+    total_bytes = 2 * HOST_REGISTER_SEGMENT_BYTES + tail_bytes
+    region = _mock_mmap_region(total_bytes)
+    cudart = MagicMock()
+    cudart.cudaHostRegister.side_effect = [
+        _CudaResult(1),
+        _CudaResult(0),
+        _CudaResult(0),
+        _CudaResult(0),
+    ]
+    runtime = MagicMock()
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(gpu_worker, "CudaRTLibrary", lambda: runtime)
+
+    pin_mmap_region(region)
+
+    assert cudart.cudaHostRegister.call_args_list == [
+        call(0x1000, total_bytes, 0),
+        call(0x1000, HOST_REGISTER_SEGMENT_BYTES, 0),
+        call(
+            0x1000 + HOST_REGISTER_SEGMENT_BYTES,
+            HOST_REGISTER_SEGMENT_BYTES,
+            0,
+        ),
+        call(0x1000 + 2 * HOST_REGISTER_SEGMENT_BYTES, tail_bytes, 0),
+    ]
+    runtime.cudaGetLastError.assert_called_once_with()
+    assert region.is_pinned is True
+    assert region._registered_host_ptrs == [
+        0x1000,
+        0x1000 + HOST_REGISTER_SEGMENT_BYTES,
+        0x1000 + 2 * HOST_REGISTER_SEGMENT_BYTES,
+    ]
+
+
+def test_pin_mmap_region_rolls_back_partial_segment_registration(
+    monkeypatch,
+) -> None:
+    total_bytes = 3 * HOST_REGISTER_SEGMENT_BYTES
+    region = _mock_mmap_region(total_bytes)
+    cudart = MagicMock()
+    cudart.cudaHostRegister.side_effect = [
+        _CudaResult(1),
+        _CudaResult(0),
+        _CudaResult(0),
+        _CudaResult(2),
+    ]
+    cudart.cudaHostUnregister.return_value = _CudaResult(0)
+    runtime = MagicMock()
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(gpu_worker, "CudaRTLibrary", lambda: runtime)
+
+    pin_mmap_region(region)
+
+    assert cudart.cudaHostUnregister.call_args_list == [
+        call(0x1000 + HOST_REGISTER_SEGMENT_BYTES),
+        call(0x1000),
+    ]
+    assert runtime.cudaGetLastError.call_count == 2
+    assert region.is_pinned is False
+    assert region._registered_host_ptrs == []
 
 
 @pytest.mark.parametrize("gpu_to_cpu", [True, False])

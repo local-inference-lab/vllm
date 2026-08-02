@@ -32,6 +32,8 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
 
 logger = init_logger(__name__)
 
+HOST_REGISTER_SEGMENT_BYTES = 256 << 20
+
 
 def _select_swap_blocks_fn(
     kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
@@ -122,7 +124,12 @@ def compute_sub_block_ptrs(
 
 
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
-    """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
+    """Register the mmap as CUDA pinned memory.
+
+    Large virtual mappings can be rejected by ``cudaHostRegister`` even when
+    enough host memory is available. Preserve the single-registration fast
+    path, then retry large mappings as bounded, non-overlapping segments.
+    """
     if not current_platform.is_cuda_alike():
         logger.info(
             "Skipping mmap host registration on %s; cudaHostRegister is only "
@@ -134,26 +141,74 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     rank = region.rank
 
     base_ptr = region._base.data_ptr()
-    result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
+    cudart = torch.cuda.cudart()
+    region._registered_host_ptrs.clear()
+    result = cudart.cudaHostRegister(base_ptr, region.total_size_bytes, 0)
     if result.value != 0:
-        logger.warning(
-            "cudaHostRegister failed for rank=%d (code=%d) — "
-            "transfers will still work but may be slower (unpinned DMA)",
-            rank,
-            result,
-        )
+        runtime = CudaRTLibrary()
         # cudaHostRegister records its failure as the thread's pending runtime
-        # error. Consume it before continuing with the documented unpinned
-        # fallback, otherwise an unrelated subsequent CUDA call reports this
-        # stale error and aborts worker initialization.
-        CudaRTLibrary().cudaGetLastError()
-    else:
-        logger.debug(
-            "cudaHostRegister rank=%d %.2f GB",
+        # error. Consume it before retrying or continuing unpinned.
+        runtime.cudaGetLastError()
+        if region.total_size_bytes <= HOST_REGISTER_SEGMENT_BYTES:
+            logger.warning(
+                "cudaHostRegister failed for rank=%d (code=%d); "
+                "transfers will continue with unpinned memory",
+                rank,
+                result,
+            )
+            return
+
+        registered_ptrs: list[int] = []
+        for offset in range(0, region.total_size_bytes, HOST_REGISTER_SEGMENT_BYTES):
+            ptr = base_ptr + offset
+            size = min(
+                HOST_REGISTER_SEGMENT_BYTES,
+                region.total_size_bytes - offset,
+            )
+            segment_result = cudart.cudaHostRegister(ptr, size, 0)
+            if segment_result.value == 0:
+                registered_ptrs.append(ptr)
+                continue
+
+            runtime.cudaGetLastError()
+            for registered_ptr in reversed(registered_ptrs):
+                unregister_result = cudart.cudaHostUnregister(registered_ptr)
+                if unregister_result.value != 0:
+                    runtime.cudaGetLastError()
+                    logger.warning(
+                        "cudaHostUnregister rollback failed for rank=%d "
+                        "ptr=%#x (code=%d)",
+                        rank,
+                        registered_ptr,
+                        unregister_result,
+                    )
+            logger.warning(
+                "Segmented cudaHostRegister failed for rank=%d offset=%d "
+                "size=%d (code=%d); transfers will continue with unpinned memory",
+                rank,
+                offset,
+                size,
+                segment_result,
+            )
+            return
+
+        region._registered_host_ptrs.extend(registered_ptrs)
+        region.is_pinned = True
+        logger.info(
+            "Registered rank=%d mmap as %d host-memory segments (%.2f GB)",
             rank,
+            len(registered_ptrs),
             region.total_size_bytes / 1e9,
         )
-        region.is_pinned = True
+        return
+
+    region._registered_host_ptrs.append(base_ptr)
+    region.is_pinned = True
+    logger.debug(
+        "cudaHostRegister rank=%d %.2f GB",
+        rank,
+        region.total_size_bytes / 1e9,
+    )
 
 
 def _new_descriptor_buffers(
