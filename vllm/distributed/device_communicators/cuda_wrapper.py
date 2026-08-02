@@ -146,7 +146,11 @@ class CudaRTLibrary:
         return self.funcs["cudaGetErrorString"](error).decode("utf-8")
 
     def cudaGetLastError(self) -> int:
-        """Return and clear the calling thread's pending runtime error."""
+        """Return and clear the calling thread's pending runtime error.
+
+        Returns:
+            The CUDA or HIP runtime error code that was cleared.
+        """
         return int(self.funcs["cudaGetLastError"]())
 
     def cudaSetDevice(self, device: int) -> None:
