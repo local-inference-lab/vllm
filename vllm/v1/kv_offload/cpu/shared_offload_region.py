@@ -134,6 +134,7 @@ class SharedOffloadRegion:
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
         self._views: list[torch.Tensor] = []
         self._registered_host_ptrs: list[int] = []
+        self._host_register_segment_bytes: int | None = None
         self.is_pinned: bool = False
 
     def _unlink_after_worker_mappings(
@@ -252,6 +253,7 @@ class SharedOffloadRegion:
                             result,
                         )
             self._registered_host_ptrs.clear()
+            self._host_register_segment_bytes = None
             self.is_pinned = False
         # Release views before _base: each view holds a _base reference and a
         # direct StorageImpl reference.  Freeing views first lets both refcounts

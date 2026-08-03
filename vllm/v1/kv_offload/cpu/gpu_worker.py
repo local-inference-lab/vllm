@@ -4,6 +4,7 @@ import functools
 import time
 from collections import deque
 from dataclasses import dataclass
+from math import lcm
 
 import numpy as np
 import torch
@@ -36,6 +37,73 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
 logger = init_logger(__name__)
 
 HOST_REGISTER_SEGMENT_BYTES = 256 << 20
+HOST_REGISTER_ALIGNMENT_BYTES = 64 << 10
+
+
+def _split_copy_descriptors_at_host_boundaries(
+    src: np.ndarray,
+    dst: np.ndarray,
+    sizes: np.ndarray,
+    count: int,
+    *,
+    host_is_src: bool,
+    host_base: int,
+    segment_bytes: int,
+) -> int:
+    """Split raw copies that cross separately registered host segments.
+
+    ``cuMemcpyBatchAsync`` rejects a single descriptor spanning two adjacent
+    ``cudaHostRegister`` regions. Expand only those descriptors in place;
+    processing backwards keeps unread inputs intact.
+    """
+    assert segment_bytes > 0
+    host_ptrs = src if host_is_src else dst
+    host_offsets = host_ptrs[:count] - host_base
+    copy_sizes = sizes[:count]
+    assert np.all(host_offsets >= 0) and np.all(copy_sizes > 0)
+    part_counts = np.floor_divide(
+        np.remainder(host_offsets, segment_bytes) + copy_sizes + segment_bytes - 1,
+        segment_bytes,
+    )
+    expanded_count = int(part_counts.sum())
+
+    if expanded_count == count:
+        return count
+
+    assert expanded_count <= len(src)
+    write_idx = expanded_count
+    for read_idx in range(count - 1, -1, -1):
+        src_ptr = int(src[read_idx])
+        dst_ptr = int(dst[read_idx])
+        size = int(sizes[read_idx])
+        host_ptr = src_ptr if host_is_src else dst_ptr
+        part_count = int(part_counts[read_idx])
+        if part_count == 1:
+            write_idx -= 1
+            src[write_idx] = src_ptr
+            dst[write_idx] = dst_ptr
+            sizes[write_idx] = size
+            continue
+
+        parts: list[tuple[int, int]] = []
+        copied = 0
+        while copied < size:
+            host_offset = host_ptr + copied - host_base
+            bytes_to_boundary = segment_bytes - host_offset % segment_bytes
+            part_size = min(size - copied, bytes_to_boundary)
+            parts.append((copied, part_size))
+            copied += part_size
+
+        assert len(parts) == part_count
+        write_idx -= len(parts)
+        for part_idx, (offset, part_size) in enumerate(parts):
+            out_idx = write_idx + part_idx
+            src[out_idx] = src_ptr + offset
+            dst[out_idx] = dst_ptr + offset
+            sizes[out_idx] = part_size
+
+    assert write_idx == 0
+    return expanded_count
 
 
 def _select_swap_blocks_fn(
@@ -145,6 +213,7 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
 
     base_ptr = region._base.data_ptr()
     region._registered_host_ptrs.clear()
+    region._host_register_segment_bytes = None
     result = register_host_memory(base_ptr, region.total_size_bytes)
     if result != 0:
         if region.total_size_bytes <= HOST_REGISTER_SEGMENT_BYTES:
@@ -156,11 +225,23 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
             )
             return
 
+        # Keep every canonical KV row inside one registration. CUDA's batched
+        # memcpy API rejects a descriptor spanning two adjacent registrations.
+        row_stride = region._row_stride
+        # CUDA 13 rejects adjacent registrations when their split offset does
+        # not preserve its 64 KiB host-registration granularity. Align to both
+        # that boundary and a full KV row so neither registration ranges nor
+        # batch-copy descriptors straddle a split.
+        segment_alignment = lcm(row_stride, HOST_REGISTER_ALIGNMENT_BYTES)
+        alignments_per_segment = max(
+            1, HOST_REGISTER_SEGMENT_BYTES // segment_alignment
+        )
+        segment_bytes = alignments_per_segment * segment_alignment
         registered_ptrs: list[int] = []
-        for offset in range(0, region.total_size_bytes, HOST_REGISTER_SEGMENT_BYTES):
+        for offset in range(0, region.total_size_bytes, segment_bytes):
             ptr = base_ptr + offset
             size = min(
-                HOST_REGISTER_SEGMENT_BYTES,
+                segment_bytes,
                 region.total_size_bytes - offset,
             )
             segment_result = register_host_memory(ptr, size)
@@ -189,11 +270,14 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
             return
 
         region._registered_host_ptrs.extend(registered_ptrs)
+        region._host_register_segment_bytes = segment_bytes
         region.is_pinned = True
         logger.info(
-            "Registered rank=%d mmap as %d host-memory segments (%.2f GB)",
+            "Registered rank=%d mmap as %d row-aligned host-memory segments "
+            "(segment=%d bytes, total=%.2f GB)",
             rank,
             len(registered_ptrs),
+            segment_bytes,
             region.total_size_bytes / 1e9,
         )
         return
@@ -236,6 +320,8 @@ class SingleDirectionOffloadingHandler:
         kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
         gpu_to_cpu: bool,
         mmap_region: SharedOffloadRegion | None = None,
+        segmented_host_base: int | None = None,
+        segmented_host_bytes: int | None = None,
     ):
         """
         Initialize a SingleDirectionOffloadingHandler.
@@ -275,6 +361,21 @@ class SingleDirectionOffloadingHandler:
         self._swap_blocks_batch = _select_swap_blocks_fn(
             kv_cache_groups_data_refs, gpu_to_cpu
         )
+        self._segmented_host_base = segmented_host_base
+        self._segmented_host_bytes = segmented_host_bytes
+        assert (segmented_host_base is None) == (segmented_host_bytes is None)
+        page_sizes = [
+            data_ref.page_size_bytes
+            for group in kv_cache_groups_data_refs
+            for data_ref in group
+        ]
+        self._descriptor_capacity_multiplier = 1
+        if segmented_host_base is not None and page_sizes:
+            assert segmented_host_bytes is not None
+            max_page_size = max(page_sizes)
+            self._descriptor_capacity_multiplier = 1 + cdiv(
+                max_page_size - 1, segmented_host_bytes
+            )
 
         # GPU blocks may be smaller
         # cpu_page_size = gpu_page_size * blocks_per_chunk.
@@ -344,13 +445,16 @@ class SingleDirectionOffloadingHandler:
             num_copy_ops += group_size * len(group_data_refs)
 
         # reuse a pooled buffer set, growing it if this transfer needs more room
+        descriptor_capacity = num_copy_ops * self._descriptor_capacity_multiplier
         batch_src, batch_dst, batch_sizes = (
             self._buffer_pool.pop()
             if self._buffer_pool
-            else _new_descriptor_buffers(num_copy_ops)
+            else _new_descriptor_buffers(descriptor_capacity)
         )
-        if batch_src.numel() < num_copy_ops:
-            batch_src, batch_dst, batch_sizes = _new_descriptor_buffers(num_copy_ops)
+        if batch_src.numel() < descriptor_capacity:
+            batch_src, batch_dst, batch_sizes = _new_descriptor_buffers(
+                descriptor_capacity
+            )
 
         src = batch_src[:num_copy_ops]
         dst = batch_dst[:num_copy_ops]
@@ -415,6 +519,21 @@ class SingleDirectionOffloadingHandler:
         assert src_offset == num_src_blocks
         assert dst_offset == num_dst_blocks
         assert op_idx == num_copy_ops
+
+        if self._segmented_host_base is not None and num_copy_ops > 0:
+            assert self._segmented_host_bytes is not None
+            num_copy_ops = _split_copy_descriptors_at_host_boundaries(
+                batch_src.numpy(),
+                batch_dst.numpy(),
+                batch_sizes.numpy(),
+                num_copy_ops,
+                host_is_src=not self.gpu_to_cpu,
+                host_base=self._segmented_host_base,
+                segment_bytes=self._segmented_host_bytes,
+            )
+            src = batch_src[:num_copy_ops]
+            dst = batch_dst[:num_copy_ops]
+            sizes = batch_sizes[:num_copy_ops]
 
         stream = (
             self._stream_pool.pop() if self._stream_pool else current_platform.Stream()
@@ -537,6 +656,8 @@ class CPUOffloadingWorker(OffloadingWorker):
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
         if mmap_region is not None and pin_memory:
             pin_mmap_region(mmap_region)
+        segmented_host_base = None
+        segmented_host_bytes = None
 
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
@@ -568,6 +689,15 @@ class CPUOffloadingWorker(OffloadingWorker):
             gpu_tensors.append(gpu_tensor)
             cpu_tensors.append(cpu_tensor)
 
+        if mmap_region is not None and len(mmap_region._registered_host_ptrs) > 1:
+            registration_bytes = mmap_region._host_register_segment_bytes
+            assert registration_bytes is not None
+            # Row-aligned registrations are the zero-overhead fast path. Keep
+            # the descriptor splitter only for alternate layouts.
+            if any(registration_bytes % tensor.stride(0) for tensor in cpu_tensors):
+                segmented_host_base = mmap_region._base.data_ptr()
+                segmented_host_bytes = registration_bytes
+
         self._store_handler = SingleDirectionOffloadingHandler(
             gpu_tensors=gpu_tensors,
             cpu_tensors=cpu_tensors,
@@ -575,6 +705,8 @@ class CPUOffloadingWorker(OffloadingWorker):
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             gpu_to_cpu=True,
             mmap_region=mmap_region,
+            segmented_host_base=segmented_host_base,
+            segmented_host_bytes=segmented_host_bytes,
         )
 
         self._load_handler = SingleDirectionOffloadingHandler(
@@ -583,6 +715,8 @@ class CPUOffloadingWorker(OffloadingWorker):
             blocks_per_chunk=blocks_per_chunk,
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             gpu_to_cpu=False,
+            segmented_host_base=segmented_host_base,
+            segmented_host_bytes=segmented_host_bytes,
         )
 
     def submit_store(

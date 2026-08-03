@@ -6,6 +6,7 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
+import numpy as np
 import pytest
 import torch
 
@@ -21,8 +22,10 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu import gpu_worker
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.gpu_worker import (
+    HOST_REGISTER_ALIGNMENT_BYTES,
     HOST_REGISTER_SEGMENT_BYTES,
     CPUOffloadingWorker,
+    _split_copy_descriptors_at_host_boundaries,
     pin_mmap_region,
 )
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
@@ -39,12 +42,16 @@ NUM_MAPPINGS = [3]
 NUM_MAPPINGS_PER_GROUP = [2]
 
 
-def _mock_mmap_region(total_size_bytes: int = 4096) -> SimpleNamespace:
+def _mock_mmap_region(
+    total_size_bytes: int = 4096, row_stride: int = 4096
+) -> SimpleNamespace:
     return SimpleNamespace(
         rank=2,
         total_size_bytes=total_size_bytes,
+        _row_stride=row_stride,
         _base=SimpleNamespace(data_ptr=lambda: 0x1000),
         _registered_host_ptrs=[],
+        _host_register_segment_bytes=None,
         is_pinned=False,
     )
 
@@ -99,6 +106,33 @@ def test_pin_mmap_region_retries_large_mapping_as_segments(monkeypatch) -> None:
         0x1000 + HOST_REGISTER_SEGMENT_BYTES,
         0x1000 + 2 * HOST_REGISTER_SEGMENT_BYTES,
     ]
+    assert region._host_register_segment_bytes == HOST_REGISTER_SEGMENT_BYTES
+
+
+def test_pin_mmap_region_aligns_segments_to_kv_rows(monkeypatch) -> None:
+    row_stride = 3 * 4096
+    segment_alignment = np.lcm(row_stride, HOST_REGISTER_ALIGNMENT_BYTES)
+    segment_bytes = (
+        HOST_REGISTER_SEGMENT_BYTES // segment_alignment
+    ) * segment_alignment
+    total_bytes = 2 * segment_bytes + row_stride
+    region = _mock_mmap_region(total_bytes, row_stride)
+    register = MagicMock(side_effect=[1, 0, 0, 0])
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(gpu_worker, "register_host_memory", register)
+
+    pin_mmap_region(region)
+
+    assert register.call_args_list == [
+        call(0x1000, total_bytes),
+        call(0x1000, segment_bytes),
+        call(0x1000 + segment_bytes, segment_bytes),
+        call(0x1000 + 2 * segment_bytes, row_stride),
+    ]
+    assert region.is_pinned is True
+    assert region._host_register_segment_bytes == segment_bytes
+    assert segment_bytes % row_stride == 0
+    assert segment_bytes % HOST_REGISTER_ALIGNMENT_BYTES == 0
 
 
 def test_pin_mmap_region_rolls_back_partial_segment_registration(
@@ -120,6 +154,65 @@ def test_pin_mmap_region_rolls_back_partial_segment_registration(
     ]
     assert region.is_pinned is False
     assert region._registered_host_ptrs == []
+
+
+@pytest.mark.parametrize("host_is_src", [False, True])
+def test_split_copy_descriptors_at_host_boundaries(host_is_src: bool) -> None:
+    host_base = 10_000
+    segment_bytes = 100
+    src = np.full(6, -1, dtype=np.int64)
+    dst = np.full(6, -1, dtype=np.int64)
+    sizes = np.full(6, -1, dtype=np.int64)
+
+    host_ptrs = [host_base + 90, host_base + 196]
+    device_ptrs = [20_000, 30_000]
+    if host_is_src:
+        src[:2], dst[:2] = host_ptrs, device_ptrs
+    else:
+        src[:2], dst[:2] = device_ptrs, host_ptrs
+    sizes[:2] = [20, 12]
+
+    count = _split_copy_descriptors_at_host_boundaries(
+        src,
+        dst,
+        sizes,
+        2,
+        host_is_src=host_is_src,
+        host_base=host_base,
+        segment_bytes=segment_bytes,
+    )
+
+    assert count == 4
+    expected_host = [host_base + 90, host_base + 100, host_base + 196, host_base + 200]
+    expected_device = [20_000, 20_010, 30_000, 30_004]
+    if host_is_src:
+        assert src[:count].tolist() == expected_host
+        assert dst[:count].tolist() == expected_device
+    else:
+        assert src[:count].tolist() == expected_device
+        assert dst[:count].tolist() == expected_host
+    assert sizes[:count].tolist() == [10, 10, 4, 8]
+
+
+def test_split_copy_descriptors_keeps_in_segment_copy() -> None:
+    src = np.array([20_000], dtype=np.int64)
+    dst = np.array([10_010], dtype=np.int64)
+    sizes = np.array([20], dtype=np.int64)
+
+    count = _split_copy_descriptors_at_host_boundaries(
+        src,
+        dst,
+        sizes,
+        1,
+        host_is_src=False,
+        host_base=10_000,
+        segment_bytes=100,
+    )
+
+    assert count == 1
+    assert src.tolist() == [20_000]
+    assert dst.tolist() == [10_010]
+    assert sizes.tolist() == [20]
 
 
 @pytest.mark.parametrize("gpu_to_cpu", [True, False])
