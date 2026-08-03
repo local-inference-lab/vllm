@@ -407,6 +407,67 @@ def mhc_pre_broadcast_tilelang(
     )
 
 
+def _mhc_pre_broadcast_tilelang_fake(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+    fn_broadcast: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del (
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        norm_weight,
+        norm_eps,
+        fn_broadcast,
+    )
+    num_tokens, hidden_size = residual.shape
+    hc_mult = fn.shape[1] // hidden_size
+    return (
+        torch.empty(
+            num_tokens,
+            hc_mult,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=residual.device,
+        ),
+        torch.empty(
+            num_tokens,
+            hc_mult,
+            1,
+            dtype=torch.float32,
+            device=residual.device,
+        ),
+        torch.empty(
+            num_tokens,
+            hc_mult,
+            hc_mult,
+            dtype=torch.float32,
+            device=residual.device,
+        ),
+        torch.empty(
+            num_tokens,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=residual.device,
+        ),
+    )
+
+
 def mhc_post_tilelang(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -782,6 +843,7 @@ def _hc_head_fused_kernel_tilelang_fake(
 
 
 _mhc_pre_tilelang_impl = mhc_pre_tilelang
+_mhc_pre_broadcast_tilelang_impl = mhc_pre_broadcast_tilelang
 _mhc_post_tilelang_impl = mhc_post_tilelang
 _mhc_fused_post_pre_tilelang_impl = mhc_fused_post_pre_tilelang
 
@@ -790,6 +852,12 @@ direct_register_custom_op(
     op_func=_mhc_pre_tilelang_impl,
     mutates_args=[],
     fake_impl=_mhc_pre_tilelang_fake,
+)
+direct_register_custom_op(
+    op_name="mhc_pre_broadcast_tilelang",
+    op_func=_mhc_pre_broadcast_tilelang_impl,
+    mutates_args=[],
+    fake_impl=_mhc_pre_broadcast_tilelang_fake,
 )
 direct_register_custom_op(
     op_name="mhc_post_tilelang",
@@ -816,6 +884,17 @@ def mhc_pre_tilelang(*args, **kwargs):
     return torch.ops.vllm.mhc_pre_tilelang(*args, **kwargs)
 
 
+def mhc_pre_broadcast_tilelang(*args, **kwargs):
+    """Call broadcast MHC pre through the registered custom op.
+
+    The implementation invokes DeepGEMM through a pybind extension, which
+    cannot be traced by Dynamo. Keeping that call behind a custom-op boundary
+    lets full-graph compilation represent the operation without entering its
+    Python implementation.
+    """
+    return torch.ops.vllm.mhc_pre_broadcast_tilelang(*args, **kwargs)
+
+
 def mhc_post_tilelang(*args, **kwargs):
     """Call MHC post through the registered custom op."""
     return torch.ops.vllm.mhc_post_tilelang(*args, **kwargs)
@@ -824,6 +903,7 @@ def mhc_post_tilelang(*args, **kwargs):
 def mhc_fused_post_pre_tilelang(*args, **kwargs):
     """Call fused MHC post/pre through the registered custom op."""
     return torch.ops.vllm.mhc_fused_post_pre_tilelang(*args, **kwargs)
+
 
 direct_register_custom_op(
     op_name="hc_head_fused_kernel_tilelang",
