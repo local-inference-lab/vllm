@@ -617,6 +617,38 @@ class FlashInferMetadata:
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
 
 
+def persistent_decode_wrapper_eligible(
+    *,
+    pure_decode: bool,
+    num_decode_tokens: int,
+    decode_cudagraph_max_bs: int,
+    decode_q_len: int,
+    planned_decode_q_len: int,
+) -> bool:
+    """Whether a decode-classified batch may reuse a persistent (CUDA-graph)
+    FlashInfer decode wrapper.
+
+    Persistent wrappers are planned once, during graph capture, with a frozen
+    ``q_len_per_req`` of exactly ``planned_decode_q_len`` (1 + num_spec_tokens;
+    1 without speculative decoding). Reuse is only sound when the runtime
+    per-request query length matches that frozen shape — FlashInfer's
+    ``fast_decode_plan`` hard-errors otherwise ("q_len_per_req is part of the
+    frozen cudagraph shape").
+
+    WARNING: ``planned_decode_q_len`` is NOT ``reorder_batch_threshold``. With
+    parallel drafting the decode-classification ceiling is
+    ``1 + 2 * num_spec_tokens``, which deliberately admits reduced-depth steps
+    (spec truncation near ``max_tokens``, short chunked-prefill tails fused
+    with the spec step). Those are valid decode batches, but they must take
+    the dynamic wrapper, which replans for the current shape on every call.
+    """
+    return (
+        pure_decode
+        and num_decode_tokens <= decode_cudagraph_max_bs
+        and decode_q_len == planned_decode_q_len
+    )
+
+
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     reorder_batch_threshold: int = 1
 
@@ -664,6 +696,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if speculative_config is not None
             else 0
         )
+        # The frozen per-request query length persistent decode wrappers are
+        # planned with during capture. See persistent_decode_wrapper_eligible
+        # for why this must never be conflated with reorder_batch_threshold.
+        self._planned_decode_q_len = 1 + num_spec_tokens
         self.enable_cuda_graph = (
             self.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         )
@@ -1507,16 +1543,21 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             else:
                 assert seq_lens_cpu is not None
                 pure_decode = num_prefills == 0
-                use_cudagraph = (
-                    self.enable_cuda_graph
-                    and pure_decode
-                    and num_decode_tokens <= self._decode_cudagraph_max_bs
-                )
                 # Spec-as-decode verify batches carry a uniform
                 # num_decode_tokens // num_decodes tokens per request; the
                 # wrapper's batch size and kv metadata are per request.
                 assert num_decode_tokens % num_decodes == 0
                 decode_q_len = num_decode_tokens // num_decodes
+                use_cudagraph = (
+                    self.enable_cuda_graph
+                    and persistent_decode_wrapper_eligible(
+                        pure_decode=pure_decode,
+                        num_decode_tokens=num_decode_tokens,
+                        decode_cudagraph_max_bs=self._decode_cudagraph_max_bs,
+                        decode_q_len=decode_q_len,
+                        planned_decode_q_len=self._planned_decode_q_len,
+                    )
+                )
 
                 decode_wrapper = self._get_decode_wrapper(num_decodes, use_cudagraph)
                 # Use the persistent buffer with padding length,
