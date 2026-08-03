@@ -22,6 +22,13 @@ def register_host_memory(ptr: int, size: int) -> int:
     can make a later unrelated PyTorch operation fail even when offload falls
     back to pageable memory. Driver API failures are returned directly and do
     not contaminate that runtime state.
+
+    Args:
+        ptr: Base address of the host-memory region.
+        size: Region size in bytes.
+
+    Returns:
+        The CUDA or HIP registration error code.
     """
     if current_platform.is_cuda():
         (result,) = _get_cuda_driver().cuMemHostRegister(ptr, size, 0)
@@ -38,7 +45,14 @@ def register_host_memory(ptr: int, size: int) -> int:
 
 
 def unregister_host_memory(ptr: int) -> int:
-    """Unregister host memory and return a CUDA/HIP error code."""
+    """Unregister host memory and return a CUDA/HIP error code.
+
+    Args:
+        ptr: Base address passed to :func:`register_host_memory`.
+
+    Returns:
+        The CUDA or HIP unregistration error code.
+    """
     if current_platform.is_cuda():
         (result,) = _get_cuda_driver().cuMemHostUnregister(ptr)
         return int(result.value)
