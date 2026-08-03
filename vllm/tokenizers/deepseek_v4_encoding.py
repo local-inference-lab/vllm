@@ -269,7 +269,7 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
     if tool_calls:
         tool_calls = tool_calls_from_openai_format(tool_calls)
 
-    # Reasoning effort prefix (only at index 0 in thinking mode with max effort)
+    # Reasoning effort prefix (only at index 0 in thinking mode, for high/max effort)
     assert reasoning_effort in ['max', None, 'high'], f"Invalid reasoning effort: {reasoning_effort}"
     if index == 0 and thinking_mode == "thinking" and reasoning_effort in ("high", "max"):
         prompt += REASONING_EFFORT_HIGH if reasoning_effort == "high" else REASONING_EFFORT_MAX
