@@ -69,13 +69,24 @@ REASONING_EFFORT_PROMPTS: Dict[str, str] = {
     "low": "",
     "high": (
         "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
-        "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
-        "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+        "You MUST be very thorough in your thinking and comprehensively "
+        "decompose the problem to resolve the root cause, rigorously "
+        "stress-testing your logic against all potential paths, edge cases, "
+        "and adversarial scenarios.\n"
+        "Explicitly write out your entire deliberation process, documenting "
+        "every intermediate step, considered alternative, and rejected "
+        "hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
     ),
     "max": (
-        "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
-        "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
-        "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
+        "Reasoning Effort: Beyond maximum — exhaustive, relentless, and "
+        "uncompromising.\n"
+        "You MUST reason with the utmost depth and rigor, leaving absolutely "
+        "nothing to chance: exhaustively decompose the problem into its most "
+        "fundamental components, trace every causal chain to its root, and "
+        "resolve the underlying cause rather than any surface symptom.\n"
+        "Do not stop reasoning until you have independently verified the "
+        "solution from multiple angles and are certain that no assumption "
+        "remains unchecked and no error remains undiscovered.\n\n"
     ),
 }
 DEFAULT_REASONING_EFFORT = "low"
@@ -148,10 +159,19 @@ def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
     p_dsml_template = '<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>'
     P_dsml_strs = []
 
-    if isinstance(tool_call["arguments"], str):
-        arguments = json.loads(tool_call["arguments"])
+    raw_arguments = tool_call.get("arguments")
+    if isinstance(raw_arguments, str):
+        try:
+            arguments = json.loads(raw_arguments)
+        except (TypeError, ValueError):
+            arguments = {"arguments": raw_arguments}
     else:
-        arguments = tool_call["arguments"]
+        arguments = raw_arguments
+
+    # Historical tool calls are not always normalized to an object. Preserve
+    # those values as one explicit parameter instead of failing prompt render.
+    if not isinstance(arguments, dict):
+        arguments = {"arguments": arguments}
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(

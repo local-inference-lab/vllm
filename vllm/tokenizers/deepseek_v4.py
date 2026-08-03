@@ -38,10 +38,21 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             messages = conversation.copy()
             if tools is not None and len(tools) > 0:
                 for index, message in enumerate(messages):
-                    if message.get("role") == "system":
-                        system_message = message.copy()
-                        system_message["tools"] = tools  # type: ignore[typeddict-unknown-key]
-                        messages[index] = system_message
+                    if message.get("role") in ("system", "developer"):
+                        prompt_message = message.copy()
+                        message_tools = prompt_message.get("tools")
+                        request_tool_names = {
+                            tool.get("function", {}).get("name") for tool in tools
+                        }
+                        merged_tools = [
+                            tool
+                            for tool in message_tools or []
+                            if tool.get("function", {}).get("name")
+                            not in request_tool_names
+                        ]
+                        merged_tools.extend(tools)
+                        prompt_message["tools"] = merged_tools  # type: ignore[typeddict-unknown-key]
+                        messages[index] = prompt_message
                         break
                 else:
                     messages.insert(0, {"role": "system"})
