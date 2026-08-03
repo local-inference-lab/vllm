@@ -406,6 +406,77 @@ def test_file_has_correct_size(iid):
         assert os.path.getsize(r.mmap_path) == 4 * PAGE_SIZE
 
 
+def test_unlink_after_all_workers_map_keeps_shared_mapping(iid):
+    """The production mode unlinks only after every worker owns its mmap."""
+    num_workers = 2
+    regions: list[SharedOffloadRegion | None] = [None, None]
+    errors: list[BaseException] = []
+    mmap_path = f"/dev/shm/vllm_offload_{iid}.mmap"
+
+    def create_rank0() -> None:
+        try:
+            regions[0] = SharedOffloadRegion(
+                engine_id=iid,
+                num_blocks=4,
+                rank=0,
+                kv_bytes_per_block=num_workers * PAGE_SIZE,
+                cpu_page_size=PAGE_SIZE,
+                unlink_after_workers_map=True,
+                num_workers=num_workers,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    rank0_thread = threading.Thread(target=create_rank0)
+    rank0_thread.start()
+    marker0 = f"{mmap_path}.mapped.0"
+    deadline = time.monotonic() + 5
+    while not os.path.exists(marker0):
+        assert time.monotonic() < deadline, "rank 0 did not publish its mmap marker"
+        time.sleep(0.005)
+
+    assert os.path.exists(mmap_path), "joiners still need the pathname"
+    regions[1] = SharedOffloadRegion(
+        engine_id=iid,
+        num_blocks=4,
+        rank=1,
+        kv_bytes_per_block=num_workers * PAGE_SIZE,
+        cpu_page_size=PAGE_SIZE,
+        unlink_after_workers_map=True,
+        num_workers=num_workers,
+    )
+    rank0_thread.join(timeout=5)
+
+    try:
+        assert not rank0_thread.is_alive()
+        assert not errors
+        assert regions[0] is not None
+        assert regions[1] is not None
+        assert not os.path.exists(mmap_path)
+        assert not os.path.exists(marker0)
+        assert not os.path.exists(f"{mmap_path}.mapped.1")
+
+        regions[0].mmap_obj[0:1] = b"\x2a"
+        assert regions[1].mmap_obj[0:1] == b"\x2a"
+    finally:
+        for region in regions:
+            if region is not None:
+                region.cleanup()
+        _cleanup_file(mmap_path)
+
+
+def test_unlink_after_workers_map_requires_worker_count(iid):
+    with pytest.raises(ValueError, match="num_workers must be positive"):
+        SharedOffloadRegion(
+            engine_id=iid,
+            num_blocks=4,
+            rank=0,
+            kv_bytes_per_block=PAGE_SIZE,
+            cpu_page_size=PAGE_SIZE,
+            unlink_after_workers_map=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Multi-worker race — concurrent construction
 # ---------------------------------------------------------------------------

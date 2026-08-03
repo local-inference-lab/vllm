@@ -375,6 +375,8 @@ def test_cpu_spec_create_worker_uses_shared_region_on_cuda(monkeypatch):
         rank=1,
         kv_bytes_per_block=spec.kv_bytes_per_chunk,
         cpu_page_size=spec.cpu_page_size_per_worker,
+        unlink_after_workers_map=True,
+        num_workers=4,
     )
     worker_ctor.assert_called_once_with(
         kv_caches=kv_caches,

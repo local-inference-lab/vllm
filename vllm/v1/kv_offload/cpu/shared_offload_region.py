@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import mmap
 import os
 import time
@@ -46,15 +47,27 @@ class SharedOffloadRegion:
         rank: int | None,
         kv_bytes_per_block: int,
         cpu_page_size: int,
+        *,
+        unlink_after_workers_map: bool = False,
+        num_workers: int | None = None,
     ) -> None:
         self.page_size = mmap.PAGESIZE
         assert kv_bytes_per_block % self.page_size == 0
+        if unlink_after_workers_map:
+            if num_workers is None or num_workers <= 0:
+                raise ValueError(
+                    "num_workers must be positive when "
+                    "unlink_after_workers_map is enabled"
+                )
+            if rank is not None and not 0 <= rank < num_workers:
+                raise ValueError(f"rank {rank} is outside num_workers={num_workers}")
 
         self.num_blocks = num_blocks
         self._row_stride = kv_bytes_per_block
         self.total_size_bytes = self.num_blocks * self._row_stride
 
         self.mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
+        self._mapping_marker: str | None = None
         self._creator = False  # set True only if this worker creates the file
         self.rank = rank
         if rank is not None:
@@ -85,6 +98,10 @@ class SharedOffloadRegion:
             flags=mmap.MAP_SHARED,
             prot=mmap.PROT_READ | mmap.PROT_WRITE,
         )
+
+        if unlink_after_workers_map and rank is not None:
+            assert num_workers is not None
+            self._unlink_after_worker_mappings(num_workers)
 
         # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
         _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
@@ -118,6 +135,55 @@ class SharedOffloadRegion:
         self._views: list[torch.Tensor] = []
         self._registered_host_ptrs: list[int] = []
         self.is_pinned: bool = False
+
+    def _unlink_after_worker_mappings(
+        self, num_workers: int, timeout: float = 30.0
+    ) -> None:
+        """Make the mmap anonymous after every worker has mapped the file.
+
+        The pathname is needed only while workers rendezvous during startup.
+        Once every rank owns a mapping, unlinking is safe: POSIX keeps the
+        pages alive until the last mapping closes and releases them even when
+        a worker is terminated before Python cleanup runs.
+        """
+        assert self.rank is not None
+        marker_prefix = f"{self.mmap_path}.mapped."
+        marker_path = f"{marker_prefix}{self.rank}"
+        marker_fd = os.open(marker_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(marker_fd)
+        self._mapping_marker = marker_path
+
+        # Rank 0 is the coordinator, independent of which rank created the
+        # backing file. Other ranks can continue as soon as their mapping is
+        # established; rank 0 keeps the pathname available until all markers
+        # are visible.
+        if self.rank != 0:
+            return
+
+        marker_paths = [f"{marker_prefix}{rank}" for rank in range(num_workers)]
+        deadline = time.monotonic() + timeout
+        while not all(os.path.exists(path) for path in marker_paths):
+            if time.monotonic() > deadline:
+                missing = [path for path in marker_paths if not os.path.exists(path)]
+                raise TimeoutError(
+                    "Timed out waiting for worker mmap markers: " + ", ".join(missing)
+                )
+            time.sleep(0.005)
+
+        try:
+            os.unlink(self.mmap_path)
+            logger.info(
+                "Unlinked mmap file %s after %d workers mapped it",
+                self.mmap_path,
+                num_workers,
+            )
+        except FileNotFoundError:
+            pass
+        finally:
+            for path in marker_paths:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(path)
+            self._mapping_marker = None
 
     def create_next_view(self, tensor_page_size: int) -> torch.Tensor:
         """Allocate a strided int8 view for this worker, one canonical tensor.
@@ -206,10 +272,16 @@ class SharedOffloadRegion:
             except Exception:
                 logger.warning("Failed to close fd %s", self.fd, exc_info=True)
             self.fd = None
+        if self._mapping_marker is not None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self._mapping_marker)
+            self._mapping_marker = None
         if self._creator and getattr(self, "mmap_path", None):
             try:
                 os.unlink(self.mmap_path)
                 logger.info("Removed mmap file %s", self.mmap_path)
+            except FileNotFoundError:
+                pass
             except Exception:
                 logger.warning(
                     "Failed to unlink path %s", self.mmap_path, exc_info=True
