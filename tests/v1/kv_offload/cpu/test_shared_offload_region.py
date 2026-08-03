@@ -406,6 +406,30 @@ def test_file_has_correct_size(iid):
         assert os.path.getsize(r.mmap_path) == 4 * PAGE_SIZE
 
 
+def test_prefault_can_be_disabled_for_delayed_scheduler(iid, monkeypatch):
+    """A scheduler join must not issue MADV_POPULATE_WRITE for the full region."""
+    monkeypatch.setattr(
+        shared_offload_region.mmap,
+        "MADV_POPULATE_WRITE",
+        2**31 - 1,
+        raising=False,
+    )
+    mmap_path = f"/dev/shm/vllm_offload_{iid}.mmap"
+    region = SharedOffloadRegion(
+        engine_id=iid,
+        num_blocks=4,
+        rank=None,
+        kv_bytes_per_block=PAGE_SIZE,
+        cpu_page_size=PAGE_SIZE,
+        prefault=False,
+    )
+    try:
+        assert region.mmap_obj is not None
+    finally:
+        region.cleanup()
+        _cleanup_file(mmap_path)
+
+
 def test_unlink_after_all_workers_map_keeps_shared_mapping(iid):
     """The production mode unlinks only after every worker owns its mmap."""
     num_workers = 2
@@ -475,6 +499,74 @@ def test_unlink_after_workers_map_requires_worker_count(iid):
             cpu_page_size=PAGE_SIZE,
             unlink_after_workers_map=True,
         )
+
+
+def test_unlink_rendezvous_timeout_cleans_resources_and_markers(iid, monkeypatch):
+    """A missing worker must not leak the creator mapping or rendezvous files."""
+    mmap_path = f"/dev/shm/vllm_offload_{iid}.mmap"
+    cleanup_state: list[tuple[int | None, mmap.mmap | None]] = []
+    original_cleanup = SharedOffloadRegion.cleanup
+
+    def tracked_cleanup(region: SharedOffloadRegion) -> None:
+        original_cleanup(region)
+        cleanup_state.append((region.fd, region.mmap_obj))
+
+    monotonic = MagicMock(side_effect=[0.0, 31.0])
+    monkeypatch.setattr(shared_offload_region.time, "monotonic", monotonic)
+    monkeypatch.setattr(SharedOffloadRegion, "cleanup", tracked_cleanup)
+
+    with pytest.raises(TimeoutError, match="worker mmap markers"):
+        SharedOffloadRegion(
+            engine_id=iid,
+            num_blocks=4,
+            rank=0,
+            kv_bytes_per_block=2 * PAGE_SIZE,
+            cpu_page_size=PAGE_SIZE,
+            unlink_after_workers_map=True,
+            num_workers=2,
+        )
+
+    assert cleanup_state == [(None, None)]
+    assert not os.path.exists(mmap_path)
+    assert not os.path.exists(f"{mmap_path}.mapped.0")
+    assert not os.path.exists(f"{mmap_path}.mapped.1")
+
+
+def test_delayed_scheduler_joins_worker_backing(iid):
+    """Tiering's delayed scheduler mapping must observe the worker backing."""
+    mmap_path = f"/dev/shm/vllm_offload_{iid}.mmap"
+    regions: list[SharedOffloadRegion] = []
+    try:
+        for rank in range(2):
+            regions.append(
+                SharedOffloadRegion(
+                    engine_id=iid,
+                    num_blocks=4,
+                    rank=rank,
+                    kv_bytes_per_block=2 * PAGE_SIZE,
+                    cpu_page_size=PAGE_SIZE,
+                )
+            )
+
+        assert os.path.exists(mmap_path)
+        scheduler = SharedOffloadRegion(
+            engine_id=iid,
+            num_blocks=4,
+            rank=None,
+            kv_bytes_per_block=2 * PAGE_SIZE,
+            cpu_page_size=PAGE_SIZE,
+            prefault=False,
+        )
+        regions.append(scheduler)
+
+        regions[0].mmap_obj[0:1] = b"\x2a"
+        assert scheduler.mmap_obj[0:1] == b"\x2a"
+        scheduler.mmap_obj[PAGE_SIZE : PAGE_SIZE + 1] = b"\x3b"
+        assert regions[1].mmap_obj[PAGE_SIZE : PAGE_SIZE + 1] == b"\x3b"
+    finally:
+        for region in reversed(regions):
+            region.cleanup()
+        _cleanup_file(mmap_path)
 
 
 # ---------------------------------------------------------------------------
@@ -558,26 +650,36 @@ def test_multiprocess_race_construct_and_write(iid):
     for rank, r in results.items():
         assert r["error"] is None, f"rank {rank}: {r['error']}"
 
-    # Read the raw file while all workers still hold it open.
-    mmap_path = f"/dev/shm/vllm_offload_{iid}.mmap"
-    with open(mmap_path, "rb") as f:
-        raw = f.read()
+    # Attach through the scheduler API only after every worker has mapped and
+    # written the region. This mirrors TieringOffloadingSpec startup ordering.
+    scheduler = SharedOffloadRegion(
+        engine_id=iid,
+        num_blocks=num_blocks,
+        rank=None,
+        kv_bytes_per_block=num_workers * PAGE_SIZE,
+        cpu_page_size=PAGE_SIZE,
+        prefault=False,
+    )
+    try:
+        assert scheduler.mmap_obj is not None
+        raw = bytes(scheduler.mmap_obj)
 
-    for blk in range(num_blocks):
-        for w in range(num_workers):
-            slot_start = (blk * num_workers + w) * PAGE_SIZE
-            slot = raw[slot_start : slot_start + PAGE_SIZE]
-            expected = w + 1  # fill_value = rank + 1
-            assert all(b == expected for b in slot), (
-                f"block {blk}, worker {w}: expected {expected} but got wrong bytes"
-            )
-
-    # Unblock all workers to clean up.
-    for _ in range(num_workers):
-        cleanup_queue.put(True)
-    for p in procs:
-        p.join(timeout=10)
-        assert p.exitcode == 0
+        for blk in range(num_blocks):
+            for w in range(num_workers):
+                slot_start = (blk * num_workers + w) * PAGE_SIZE
+                slot = raw[slot_start : slot_start + PAGE_SIZE]
+                expected = w + 1  # fill_value = rank + 1
+                assert all(b == expected for b in slot), (
+                    f"block {blk}, worker {w}: expected {expected} but got wrong bytes"
+                )
+    finally:
+        scheduler.cleanup()
+        # Unblock all workers to clean up.
+        for _ in range(num_workers):
+            cleanup_queue.put(True)
+        for proc in procs:
+            proc.join(timeout=10)
+            assert proc.exitcode == 0
 
 
 # ---------------------------------------------------------------------------

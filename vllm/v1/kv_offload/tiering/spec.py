@@ -179,8 +179,10 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 rank=None,
                 kv_bytes_per_block=self.kv_bytes_per_chunk,
                 cpu_page_size=self.cpu_page_size_per_worker,
-                unlink_after_workers_map=True,
-                num_workers=self.config.parallel.world_size,
+                # Workers already prefault every row. Repeating that work over
+                # the full region can fail for very large L1 tiers and provides
+                # no benefit to the scheduler's zero-copy secondary-tier view.
+                prefault=False,
             )
             self._scheduler_mmap = scheduler_mmap
 
@@ -249,8 +251,6 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             rank=rank,
             kv_bytes_per_block=self.kv_bytes_per_chunk,
             cpu_page_size=self.cpu_page_size_per_worker,
-            unlink_after_workers_map=True,
-            num_workers=world_size,
         )
         return CPUOffloadingWorker(
             kv_caches=kv_caches,

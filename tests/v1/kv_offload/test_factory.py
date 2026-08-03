@@ -464,6 +464,81 @@ def test_tiering_spec_aligns_row_size():
     assert spec.num_blocks == cpu_bytes_to_use // alignment
 
 
+def test_tiering_spec_keeps_region_named_for_delayed_scheduler(monkeypatch):
+    import vllm.v1.kv_offload.tiering.spec as tiering_spec_module
+
+    alignment = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    config = _make_layout_vllm_config(
+        spec_name="TieringOffloadingSpec",
+        cpu_bytes_to_use=alignment * 2,
+        tensor_parallel_size=2,
+    )
+    spec = _create_spec(config, _make_sizing_kv_cache_config(packed=False))
+    assert isinstance(spec, TieringOffloadingSpec)
+
+    scheduler_region = MagicMock()
+    region_ctor = MagicMock(return_value=scheduler_region)
+    primary_tier = MagicMock()
+    primary_tier.get_kv_memoryview.return_value = memoryview(bytearray(1))
+    primary_ctor = MagicMock(return_value=primary_tier)
+    manager_ctor = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(tiering_spec_module, "SharedOffloadRegion", region_ctor)
+    monkeypatch.setattr(
+        tiering_spec_module, "CPUPrimaryTierOffloadingManager", primary_ctor
+    )
+    monkeypatch.setattr(tiering_spec_module, "TieringOffloadingManager", manager_ctor)
+
+    spec.get_manager()
+
+    region_ctor.assert_called_once_with(
+        engine_id=spec._engine_id,
+        num_blocks=spec.num_blocks,
+        rank=None,
+        kv_bytes_per_block=spec.kv_bytes_per_chunk,
+        cpu_page_size=spec.cpu_page_size_per_worker,
+        prefault=False,
+    )
+
+
+def test_tiering_worker_keeps_region_named_for_scheduler(monkeypatch):
+    import vllm.v1.kv_offload.tiering.spec as tiering_spec_module
+
+    alignment = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    config = _make_layout_vllm_config(
+        spec_name="TieringOffloadingSpec",
+        cpu_bytes_to_use=alignment * 2,
+        tensor_parallel_size=2,
+    )
+    spec = _create_spec(config, _make_sizing_kv_cache_config(packed=False))
+    assert isinstance(spec, TieringOffloadingSpec)
+
+    worker_region = MagicMock()
+    region_ctor = MagicMock(return_value=worker_region)
+    worker_ctor = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(tiering_spec_module, "SharedOffloadRegion", region_ctor)
+    monkeypatch.setattr(tiering_spec_module, "CPUOffloadingWorker", worker_ctor)
+    monkeypatch.setattr(
+        tiering_spec_module.torch.accelerator, "current_device_index", lambda: 3
+    )
+
+    kv_caches = MagicMock()
+    spec.create_worker(kv_caches)
+
+    region_ctor.assert_called_once_with(
+        engine_id=spec._engine_id,
+        num_blocks=spec.num_blocks,
+        rank=1,
+        kv_bytes_per_block=spec.kv_bytes_per_chunk,
+        cpu_page_size=spec.cpu_page_size_per_worker,
+    )
+    worker_ctor.assert_called_once_with(
+        kv_caches=kv_caches,
+        blocks_per_chunk=spec.blocks_per_chunk,
+        num_cpu_blocks=spec.num_blocks,
+        mmap_region=worker_region,
+    )
+
+
 def test_offloading_spec_resolves_prefill_context_parallel_block_sizes():
     config = _make_layout_vllm_config(
         cpu_bytes_to_use=65536,
