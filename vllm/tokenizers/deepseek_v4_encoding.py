@@ -67,10 +67,16 @@ tool_output_template: str = (
     "<tool_result>{content}</tool_result>"
 )
 
-REASONING_EFFORT_MAX = (
+REASONING_EFFORT_HIGH = (
     "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
     "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
     "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+)
+
+REASONING_EFFORT_MAX = (
+    "Reasoning Effort: Beyond maximum \u2014 exhaustive, relentless, and uncompromising.\n"
+    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
 )
 
 TOOLS_TEMPLATE = """## Tools
@@ -265,8 +271,8 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
 
     # Reasoning effort prefix (only at index 0 in thinking mode with max effort)
     assert reasoning_effort in ['max', None, 'high'], f"Invalid reasoning effort: {reasoning_effort}"
-    if index == 0 and thinking_mode == "thinking" and reasoning_effort == 'max':
-        prompt += REASONING_EFFORT_MAX
+    if index == 0 and thinking_mode == "thinking" and reasoning_effort in ("high", "max"):
+        prompt += REASONING_EFFORT_HIGH if reasoning_effort == "high" else REASONING_EFFORT_MAX
 
     if role == "system":
         prompt += system_msg_template.format(content=content or "")
