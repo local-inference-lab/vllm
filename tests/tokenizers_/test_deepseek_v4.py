@@ -126,6 +126,69 @@ def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
     assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜></think>")
 
 
+def test_deepseek_v4_attaches_request_tools_after_existing_system_prompt():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look things up",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "system", "content": "Follow policy."},
+            {"role": "user", "content": "Find it."},
+        ],
+        tools=tools,
+        tokenize=False,
+        enable_thinking=True,
+        reasoning_effort="max",
+    )
+
+    max_prefix = "Reasoning Effort: Beyond maximum"
+    system = "Follow policy."
+    tool_block = "## Tools"
+    user = "<｜User｜>Find it."
+    assert prompt.index(max_prefix) < prompt.index(system)
+    assert prompt.index(system) < prompt.index(tool_block)
+    assert prompt.index(tool_block) < prompt.index(user)
+
+
+def test_deepseek_v4_renders_message_level_system_tools():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look things up",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    messages = [
+        {"role": "system", "content": "Follow policy.", "tools": tools},
+        {"role": "user", "content": "Find it."},
+    ]
+    conversation, _, _ = parse_chat_messages(
+        messages,
+        _model_config(),
+        content_format="string",
+    )
+
+    prompt = _tokenizer().apply_chat_template(
+        conversation=conversation,
+        messages=messages,
+        tokenize=False,
+    )
+
+    assert prompt.index("Follow policy.") < prompt.index("## Tools")
+    assert prompt.index("## Tools") < prompt.index("<｜User｜>Find it.")
+
+
 def test_deepseek_v4_renders_parsed_history_tool_arguments():
     messages = [
         {"role": "user", "content": "List the repo"},
@@ -183,8 +246,17 @@ def test_deepseek_v4_renders_parsed_history_tool_arguments():
     assert 'parameter name="arguments"' not in prompt
 
 
-@pytest.mark.parametrize("reasoning_effort", ["minimal", "low", "medium", "high"])
-def test_deepseek_v4_accepts_openai_reasoning_effort_values(reasoning_effort):
+@pytest.mark.parametrize(
+    ("reasoning_effort", "expected_prefix"),
+    [
+        ("low", "<｜begin▁of▁sentence｜><｜User｜>Hello"),
+        ("high", "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"),
+        ("max", "<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum"),
+    ],
+)
+def test_deepseek_v4_renders_0731_reasoning_effort_prompts(
+    reasoning_effort, expected_prefix
+):
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
@@ -193,7 +265,7 @@ def test_deepseek_v4_accepts_openai_reasoning_effort_values(reasoning_effort):
     )
 
     assert prompt.endswith("<｜Assistant｜><think>")
-    assert "Reasoning Effort: Absolute maximum" not in prompt
+    assert prompt.startswith(expected_prefix)
 
 
 def test_deepseek_v4_none_reasoning_effort_disables_thinking():
@@ -212,7 +284,7 @@ def test_deepseek_v4_none_reasoning_effort_disables_thinking():
     [
         ("none", "chat", None),
         ("minimal", "thinking", "high"),
-        ("low", "thinking", "high"),
+        ("low", "thinking", "low"),
         ("medium", "thinking", "high"),
         ("high", "thinking", "high"),
         ("xhigh", "thinking", "max"),
@@ -248,7 +320,7 @@ def test_deepseek_v4_maps_compatible_thinking_reasoning_effort_values(
     assert captured_kwargs[-1]["reasoning_effort"] == expected_effort
 
 
-def test_deepseek_v4_preserves_reference_max_reasoning_effort():
+def test_deepseek_v4_renders_0731_max_reasoning_effort():
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
@@ -256,12 +328,10 @@ def test_deepseek_v4_preserves_reference_max_reasoning_effort():
         reasoning_effort="max",
     )
 
-    assert prompt.startswith(
-        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
-    )
+    assert prompt.startswith("<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum")
 
 
-def test_deepseek_v4_maps_xhigh_to_reference_max_reasoning_effort():
+def test_deepseek_v4_maps_xhigh_to_0731_max_reasoning_effort():
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
@@ -269,9 +339,7 @@ def test_deepseek_v4_maps_xhigh_to_reference_max_reasoning_effort():
         reasoning_effort="xhigh",
     )
 
-    assert prompt.startswith(
-        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
-    )
+    assert prompt.startswith("<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum")
 
 
 @pytest.mark.parametrize(
