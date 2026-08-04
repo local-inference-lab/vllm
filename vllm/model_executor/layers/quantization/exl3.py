@@ -2464,6 +2464,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         tier_index = torch.tensor(tier_order, dtype=torch.long, device=device)
         combined_gate_suh = self._select_rotation_rows(gate_suh, tier_index)
         combined_up_suh = self._select_rotation_rows(up_suh, tier_index)
+        broadcast_suh = int(combined_gate_suh.shape[0]) == 1
+        if broadcast_suh != (int(combined_up_suh.shape[0]) == 1):
+            raise ValueError(
+                "mixed EXL3 gate/up SUH rotations must both be per-expert "
+                "or both broadcast"
+            )
         combined_intermediate_rotations = torch.cat(
             (
                 gate_svh.index_select(0, tier_index),
@@ -2473,6 +2479,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             dim=1,
         ).contiguous()
         combined_down_svh = self._select_rotation_rows(down_svh, tier_index)
+        broadcast_svh = int(combined_down_svh.shape[0]) == 1
         combined_rotations = SimpleNamespace(
             intermediate=combined_intermediate_rotations,
             gate_suh=combined_gate_suh,
@@ -2588,6 +2595,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "global_to_combined": global_to_combined,
             "descriptor_map": descriptor_map,
             "rotations": combined_rotations,
+            "broadcast_suh": broadcast_suh,
+            "broadcast_svh": broadcast_svh,
             "tile_config": mixed_tile_config,
             "prefill_tile_config": prefill_tile_config,
         }
@@ -2799,6 +2808,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         prefill_capacity = policy["prefill_capacity"]
         prefill_block_m = policy["prefill_block_m"]
         tier_signature = policy["tier_signature"]
+        broadcast_suh = bool(mixed["broadcast_suh"])
+        broadcast_svh = bool(mixed["broadcast_svh"])
         key = (
             _runtime_owner_token(self.quant_config, layer),
             x.device.index,
@@ -2814,6 +2825,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             mixed["tile_config"],
             mixed["prefill_tile_config"],
             prefill_block_m,
+            broadcast_suh,
+            broadcast_svh,
         )
         runtime = _MIXED_TRELLIS_RUNTIMES.get(key)
         if runtime is not None:
@@ -2859,6 +2872,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 force_tile_config=tile_config,
                 rotation_input_dtype=("bf16" if x.dtype == torch.bfloat16 else "fp16"),
                 route_ids_dtype=topk_ids.dtype,
+                broadcast_suh=broadcast_suh,
+                broadcast_svh=broadcast_svh,
             )
             return {
                 "capacity": capacity,

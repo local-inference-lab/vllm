@@ -160,6 +160,8 @@ def _make_mixed_layer():
         "global_to_combined": object(),
         "descriptor_map": object(),
         "rotations": object(),
+        "broadcast_suh": False,
+        "broadcast_svh": False,
         "tile_config": (64, 128, 64, 128),
         "prefill_tile_config": (128, 128, 128, 128),
     }
@@ -375,6 +377,22 @@ def test_mixed_runtime_policy_is_resolved_once(monkeypatch):
         assert first is second
         assert calls == 1
         assert len(h.mixed_api.compiled) == 2
+
+
+def test_mixed_runtime_forwards_shared_h_broadcast_contract():
+    with _Harness() as h:
+        method = _make_method()
+        layer = _make_mixed_layer()
+        layer.exl3_mixed_trellis["broadcast_suh"] = True
+        layer.exl3_mixed_trellis["broadcast_svh"] = True
+        x = torch.zeros((16, HIDDEN), dtype=torch.bfloat16)
+        ids = torch.zeros((16, TOPK), dtype=torch.int64)
+
+        method._mixed_rank_sliced_runtime(layer, x, ids)
+
+        assert len(h.mixed_api.compiled) == 2
+        assert all(launch.broadcast_suh is True for launch in h.mixed_api.compiled)
+        assert all(launch.broadcast_svh is True for launch in h.mixed_api.compiled)
 
 
 def test_prefill_capacity_cannot_exceed_scheduler_bound():

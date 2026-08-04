@@ -827,6 +827,8 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(
     assert rotations.gate_suh.shape[0] == expected_h_rows
     assert rotations.up_suh.shape[0] == expected_h_rows
     assert rotations.down_svh.shape[0] == expected_h_rows
+    assert layer.exl3_mixed_trellis["broadcast_suh"] is shared_h
+    assert layer.exl3_mixed_trellis["broadcast_svh"] is shared_h
     for entry in api.prepared:
         expected_tier_rows = 1 if shared_h else 2
         assert entry["gate_suh"].shape[0] == expected_tier_rows
