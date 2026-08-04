@@ -21,6 +21,7 @@ import torch
 
 from vllm.v1.attention.backend import AttentionMetadataBuilder
 from vllm.v1.attention.backends.flashinfer import (
+    decode_q_len_from_indptr,
     persistent_decode_wrapper_eligible,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
@@ -99,3 +100,40 @@ def test_other_predicate_terms_still_gate():
 def test_no_spec_planned_length_is_one():
     assert _eligible(1, planned=1)
     assert not _eligible(2, planned=1)
+
+
+def _indptr(*lens):
+    out = [0]
+    for n in lens:
+        out.append(out[-1] + n)
+    return torch.tensor(out, dtype=torch.int32)
+
+
+@pytest.mark.parametrize(
+    ("lens", "expected"),
+    [
+        ((PLANNED,), PLANNED),
+        ((PLANNED, 0), PLANNED),          # one active + one padding row
+        ((PLANNED, PLANNED, 0), PLANNED),
+        ((PLANNED,) * 3 + (0,), PLANNED), # total not divisible by num rows
+        ((0, 0), 0),                      # all-padding
+        ((5,), 5),                        # reduced-depth lone step
+    ],
+)
+def test_decode_q_len_ignores_zero_padding(lens, expected):
+    assert decode_q_len_from_indptr(_indptr(*lens), len(lens)) == expected
+
+
+def test_zero_padded_planned_batch_keeps_persistent_wrapper():
+    # Regression: uniform CUDA-graph batches may carry zero-length padding
+    # rows; averaging tokens over rows understated the active q_len and
+    # demoted a planned-shape batch to the dynamic wrapper.
+    lens = (PLANNED, 0)
+    q_len = decode_q_len_from_indptr(_indptr(*lens), len(lens))
+    assert persistent_decode_wrapper_eligible(
+        pure_decode=True,
+        num_decode_tokens=sum(lens),
+        decode_cudagraph_max_bs=MAX_BS,
+        decode_q_len=q_len,
+        planned_decode_q_len=PLANNED,
+    )

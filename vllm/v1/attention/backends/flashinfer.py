@@ -641,12 +641,51 @@ def persistent_decode_wrapper_eligible(
     (spec truncation near ``max_tokens``, short chunked-prefill tails fused
     with the spec step). Those are valid decode batches, but they must take
     the dynamic wrapper, which replans for the current shape on every call.
+
+    Args:
+        pure_decode: True when the batch contains no prefill requests.
+        num_decode_tokens: Total scheduled tokens across the decode requests.
+        decode_cudagraph_max_bs: Token capacity the persistent wrappers were
+            sized for ((1 + num_spec_tokens) * max_num_reqs, capped by
+            ``max_cudagraph_capture_size``).
+        decode_q_len: Runtime per-request query length of the active
+            (non-padding) decode requests.
+        planned_decode_q_len: Frozen per-request query length the persistent
+            wrappers were planned with (1 + num_spec_tokens).
+
+    Returns:
+        True when the batch may be routed to the persistent (CUDA-graph)
+        decode wrapper; False when it must use the dynamic wrapper.
     """
     return (
         pure_decode
         and num_decode_tokens <= decode_cudagraph_max_bs
         and decode_q_len == planned_decode_q_len
     )
+
+
+def decode_q_len_from_indptr(qo_indptr_cpu: torch.Tensor, num_decodes: int) -> int:
+    """Per-request query length of the active decode requests in a batch.
+
+    Uniform CUDA-graph decode batches may carry zero-length padding rows
+    (``split_decodes_and_prefills`` classifies ``q_len == 0`` padding as
+    decode so ``num_decodes`` matches the captured size). Averaging
+    ``num_decode_tokens`` over ``num_decodes`` would understate the active
+    query length for such batches and wrongly demote them to the dynamic
+    wrapper, so the length is taken as the maximum per-request span instead
+    (decode rows are uniform-or-zero by construction).
+
+    Args:
+        qo_indptr_cpu: CPU query-start-loc tensor for the batch.
+        num_decodes: Number of decode-classified requests, including any
+            zero-length padding rows.
+
+    Returns:
+        The uniform query length of the active decode requests, or 0 when
+        every row is padding.
+    """
+    lens = qo_indptr_cpu[1 : num_decodes + 1] - qo_indptr_cpu[:num_decodes]
+    return int(lens.max().item()) if num_decodes > 0 else 0
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -1543,11 +1582,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             else:
                 assert seq_lens_cpu is not None
                 pure_decode = num_prefills == 0
-                # Spec-as-decode verify batches carry a uniform
-                # num_decode_tokens // num_decodes tokens per request; the
-                # wrapper's batch size and kv metadata are per request.
-                assert num_decode_tokens % num_decodes == 0
-                decode_q_len = num_decode_tokens // num_decodes
+                # Spec-as-decode verify batches carry a uniform per-request
+                # query length; uniform CUDA-graph batches may additionally
+                # carry zero-length padding rows, so the active length comes
+                # from the per-request spans, not an average.
+                decode_q_len = decode_q_len_from_indptr(qo_indptr_cpu, num_decodes)
                 use_cudagraph = (
                     self.enable_cuda_graph
                     and persistent_decode_wrapper_eligible(
