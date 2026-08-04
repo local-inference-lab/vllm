@@ -105,6 +105,13 @@ _MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
 _MIXED_TRELLIS_ROUTE_BLOCK_SIZE = 8
 _GLM52_MIXED_TRELLIS_PREFILL_BLOCK_SIZE = 32
+_GLM52_MIXED_TRELLIS_BLOCK32_SIGNATURES = frozenset(
+    {
+        ((3, 192), (4, 64)),
+        ((3, 206), (4, 50)),
+        ((3, 148), (4, 108)),
+    }
+)
 
 
 def _resolve_mixed_trellis_prefill_block_m(
@@ -122,8 +129,9 @@ def _resolve_mixed_trellis_prefill_block_m(
 
     SparkInfer's paired-M8 FC2 schedule makes block-32 numerically equivalent
     to the established block-64 path while reducing scratch and improving the
-    dominant large-prefill kernel on SM12x. Explicit operator tuning and every
-    other model geometry retain the configured value.
+    dominant large-prefill kernel on SM12x. The allowlist contains only tier
+    partitions qualified end-to-end on GLM-5.2 checkpoints. Explicit operator
+    tuning and every other model geometry retain the configured value.
     """
 
     qualified = (
@@ -131,7 +139,7 @@ def _resolve_mixed_trellis_prefill_block_m(
         and int(device_major) == 12
         and int(hidden_size) == 6144
         and int(intermediate_size) == 512
-        and tier_signature == ((3, 192), (4, 64))
+        and tier_signature in _GLM52_MIXED_TRELLIS_BLOCK32_SIGNATURES
         and int(topk) == 8
         and tuple(int(value) for value in prefill_tile_config) == (128, 128, 32, 512)
     )

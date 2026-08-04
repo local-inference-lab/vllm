@@ -934,7 +934,38 @@ def test_mixed_trellis_dispatches_decode_and_one_grid_prefill(monkeypatch):
     assert all(call[1:3] == prefill_tiers for call in mixed_api.calls[1:])
 
 
-def test_mixed_trellis_prefill_block_policy_is_narrow_and_overridable() -> None:
+@pytest.mark.parametrize(
+    "tier_signature",
+    [
+        ((3, 192), (4, 64)),
+        ((3, 206), (4, 50)),
+        ((3, 148), (4, 108)),
+    ],
+)
+def test_mixed_trellis_prefill_block_policy_qualified_partitions(
+    tier_signature,
+) -> None:
+    common = {
+        "configured_block_m": 64,
+        "explicit_override": False,
+        "hidden_size": 6144,
+        "intermediate_size": 512,
+        "tier_signature": tier_signature,
+        "topk": 8,
+        "device_major": 12,
+        "prefill_tile_config": (128, 128, 32, 512),
+    }
+
+    assert exl3_module._resolve_mixed_trellis_prefill_block_m(**common) == 32
+    assert (
+        exl3_module._resolve_mixed_trellis_prefill_block_m(
+            **{**common, "explicit_override": True}
+        )
+        == 64
+    )
+
+
+def test_mixed_trellis_prefill_block_policy_rejects_unqualified_partition() -> None:
     common = {
         "configured_block_m": 64,
         "explicit_override": False,
@@ -945,11 +976,9 @@ def test_mixed_trellis_prefill_block_policy_is_narrow_and_overridable() -> None:
         "device_major": 12,
         "prefill_tile_config": (128, 128, 32, 512),
     }
-
-    assert exl3_module._resolve_mixed_trellis_prefill_block_m(**common) == 32
     assert (
         exl3_module._resolve_mixed_trellis_prefill_block_m(
-            **{**common, "explicit_override": True}
+            **{**common, "tier_signature": ((3, 128), (4, 128))}
         )
         == 64
     )
