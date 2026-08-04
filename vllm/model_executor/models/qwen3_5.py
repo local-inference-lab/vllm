@@ -279,6 +279,29 @@ class Qwen3_5Model(Qwen3NextModel):
             mapper = mapper | WeightsMapper(
                 orig_to_new_substr={"mlp.shared_expert.": f"mlp.experts.{num_routed}."}
             )
+        # Rank-sliced EXL3 checkpoints ship one tensor per TP rank
+        # (`...experts.{E}.{proj}.rank{r}.{trellis|suh|svh|mcg}`) while
+        # Exl3MoEMethod registers fused per-projection params (w13_trellis,
+        # ...). Strip the `.rank{r}` segment / drop non-local ranks BEFORE
+        # AutoWeightsLoader descends into RoutedExperts.load_weights, exactly
+        # as deepseek_v2.load_weights does; otherwise the expert-mapping
+        # string surgery produces `...experts.w13_rank0.trellis` and the
+        # parameter lookup fails.
+        rank_sliced_name = getattr(
+            self.quant_config,
+            "normalize_rank_sliced_weight_name",
+            None,
+        )
+        if rank_sliced_name is not None:
+
+            def _normalize_rank_sliced(weights):
+                for name, loaded_weight in weights:
+                    name = rank_sliced_name(name)
+                    if name is None:
+                        continue
+                    yield name, loaded_weight
+
+            weights = _normalize_rank_sliced(weights)
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=mapper)
 

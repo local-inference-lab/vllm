@@ -295,6 +295,23 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Rank-sliced EXL3 drafts reuse the target's hydrated quant config
+        # (the proposer copies it into the draft VllmConfig). Strip the
+        # `.rank{r}` segment / drop non-local ranks before the mtp.->model.
+        # prefix remap, mirroring Qwen3_5Model.load_weights; the rank segment
+        # is a name suffix, so the two rewrites cannot collide.
+        rank_sliced_name = getattr(
+            self.quant_config,
+            "normalize_rank_sliced_weight_name",
+            None,
+        )
+        if rank_sliced_name is not None:
+            weights = (
+                (new_name, weight)
+                for name, weight in weights
+                if (new_name := rank_sliced_name(name)) is not None
+            )
+
         def remap_weight_names(weights):
             for name, weight in weights:
                 if name.startswith("mtp."):
