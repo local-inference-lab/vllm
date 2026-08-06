@@ -9,7 +9,8 @@ from torch.nn.parameter import Parameter
 
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
+from vllm.config.quantization import QuantizationConfigArgs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     MarlinNvFp4LinearKernel,
@@ -57,7 +58,14 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+    should_ignore_layer,
+)
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.model_executor.layers.quantization.online.mxfp8 import (
+    Mxfp8OnlineLinearMethod,
+    is_shared_expert_projection,
+)
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     swap_w13_to_w31,
 )
@@ -81,6 +89,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8DynamicTokenSym,
     kFp8StaticTensorSym,
     kFp8StaticTokenSym,
+    kMxfp8Dynamic,
     kNvfp4Dynamic,
     kNvfp4Static,
 )
@@ -180,6 +189,71 @@ class ModelOptQuantConfigBase(QuantizationConfig):
 
         return False
 
+    @staticmethod
+    def _get_shared_expert_online_method(
+        layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        if not isinstance(layer, LinearBase) or not is_shared_expert_projection(prefix):
+            return None
+
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            return None
+        args = vllm_config.model_config.quantization_config
+        if not isinstance(args, QuantizationConfigArgs):
+            return None
+        spec = args.shared_experts
+        if spec is None:
+            return None
+        if spec.weight != kMxfp8Dynamic or spec.activation is not None:
+            raise ValueError(
+                "ModelOpt shared-expert overlay only supports "
+                "weight='mxfp8' with no activation override."
+            )
+        return Mxfp8OnlineLinearMethod()
+
+    def _get_dense_linear_online_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        """Overlay online MXFP8 on BF16 dense linears the checkpoint excludes.
+
+        Shared-expert projections are governed exclusively by the
+        ``shared_experts`` spec (see ``_get_shared_expert_online_method``), so
+        they are never selected here; ``quantization_config.ignore`` entries
+        (exact names or ``re:`` regexes, matched on unfused shard names) keep
+        individual modules on the unquantized BF16 path.
+        """
+        if not isinstance(layer, LinearBase) or is_shared_expert_projection(prefix):
+            return None
+
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            return None
+        args = vllm_config.model_config.quantization_config
+        if not isinstance(args, QuantizationConfigArgs):
+            return None
+        spec = args.linear
+        if spec is None:
+            return None
+        if args.ignore and should_ignore_layer(
+            prefix,
+            ignore=args.ignore,
+            fused_mapping=self.packed_modules_mapping,
+        ):
+            return None
+        if spec.weight != kMxfp8Dynamic or spec.activation is not None:
+            raise ValueError(
+                "ModelOpt dense-linear overlay only supports "
+                "weight='mxfp8' with no activation override."
+            )
+        logger.info_once(
+            "ModelOpt dense-linear overlay: quantizing checkpoint-excluded "
+            "BF16 linears to MXFP8 at load time (module example: %s).",
+            prefix,
+        )
+        logger.debug("MXFP8 dense-linear overlay applied to %s", prefix)
+        return Mxfp8OnlineLinearMethod()
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
@@ -189,6 +263,12 @@ class ModelOptQuantConfigBase(QuantizationConfig):
 
         # handle exclusion
         if self.is_layer_excluded(prefix):
+            if method := self._get_shared_expert_online_method(layer, prefix):
+                return method
+            if not isinstance(layer, ParallelLMHead) and (
+                method := self._get_dense_linear_online_method(layer, prefix)
+            ):
+                return method
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 return UnquantizedLinearMethod()
             return None
@@ -1409,9 +1489,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         # W4A16 mode fires for W4A16_NVFP4 on-disk checkpoints. With
         # activation_key=None every W4A4 backend's _supports_quant_scheme
         # rejects itself (they all require (kNvfp4Static, kNvfp4Dynamic)
-        # exactly); only Marlin survives. Marlin's MoE path drops
-        # activation scales in convert_to_nvfp4_moe_kernel_format, so no
-        # other change is needed.
+        # exactly); only W4A16-capable backends survive.
         self.use_a16 = quant_config.quant_method == "W4A16_NVFP4"
         self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
             config=self.moe,
@@ -1590,6 +1668,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             w2_scale_2=layer.w2_weight_scale_2,
             a2_scale=layer.w2_input_scale,
             is_act_and_mul=self.moe.is_act_and_mul,
+            use_a16=self.use_a16,
         )
 
         replace_parameter(layer, "w13_weight", w13)
@@ -1625,6 +1704,9 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             a2_scale=layer.w2_input_scale,
             swiglu_limit=getattr(layer, "swiglu_limit", None),
             layer=layer,
+            gemm1_alpha=getattr(layer, "swiglu_alpha", None),
+            gemm1_beta=getattr(layer, "swiglu_beta", None),
+            use_a16=self.use_a16,
         )
 
     @property
@@ -2286,6 +2368,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
     legacy ``hf_quant_config.json``.
     """
 
+    _fallback_packed_modules_mapping: dict[str, tuple[str, ...]] = {
+        "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+        "gate_up_proj": ("gate_proj", "up_proj"),
+    }
+
     def __init__(
         self,
         kv_cache_quant_method: str | None,
@@ -2341,18 +2428,40 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         group_size: int | None,
         **kwargs: Any,
     ) -> "ModelOptMixedPrecisionConfig":
-        if "quantization" in original_config:
-            quantized_layers = original_config["quantization"].get(
+        quantization_config = original_config.get("quantization", original_config)
+
+        quantized_layers = {
+            name: dict(layer_info)
+            for name, layer_info in quantization_config.get(
                 "quantized_layers", {}
-            )
-        else:
-            quantized_layers = original_config.get("quantized_layers", {})
+            ).items()
+        }
 
         if not quantized_layers:
             raise ValueError(
                 "MIXED_PRECISION quant_algo requires a non-empty "
                 "'quantized_layers' mapping in the quantization config."
             )
+
+        config_groups = quantization_config.get("config_groups", {})
+        for group in config_groups.values():
+            input_config = group.get("input_activations", {})
+            weight_config = group.get("weights", {})
+            is_static_w4a4 = all(
+                config.get("type") == "float"
+                and config.get("num_bits") == 4
+                and config.get("dynamic") is False
+                for config in (input_config, weight_config)
+            )
+            if not is_static_w4a4:
+                continue
+            for target in group.get("targets", []):
+                layer_info = quantized_layers.get(target)
+                if (
+                    layer_info is not None
+                    and layer_info.get("quant_algo", "").upper() == "W4A16_NVFP4"
+                ):
+                    layer_info["quant_algo"] = "NVFP4"
 
         # Determine group_size from the first NVFP4-family entry if not
         # provided. Both NVFP4 (W4A4) and W4A16_NVFP4 share the same packing
@@ -2427,24 +2536,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 return self.quantized_layers[candidate]["quant_algo"].upper()
 
         # 2. Packed / fused layer lookup
-        proj_name = prefix.rsplit(".", 1)[-1]
-        if self.packed_modules_mapping and proj_name in self.packed_modules_mapping:
-            algos: set[str] = set()
-            base = prefix.rsplit(".", 1)[0]
-            for base_candidate in self._quantized_layer_prefix_candidates(base):
-                for shard_name in self.packed_modules_mapping[proj_name]:
-                    shard_prefix = f"{base_candidate}.{shard_name}"
-                    if shard_prefix in self.quantized_layers:
-                        algos.add(
-                            self.quantized_layers[shard_prefix]["quant_algo"].upper()
-                        )
-            if len(algos) == 1:
-                return algos.pop()
-            if len(algos) > 1:
-                raise ValueError(
-                    f"Mixed quant_algo within fused layer {prefix}: "
-                    f"{algos}. All shards must use the same quantization."
-                )
+        if quant_algo := self._resolve_fused_quant_algo(prefix):
+            return quant_algo
 
         # 3. Prefix-based lookup (for RoutedExperts / parent modules)
         for candidate in self._quantized_layer_prefix_candidates(prefix):
@@ -2456,35 +2549,40 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         # FusedMoE expert prefix is e.g. "...moe.experts", while ModelOpt's
         # quantized_layers entries use "...moe.gate_proj" / "...moe.up_proj".
         if prefix.endswith(".experts"):
-            parent_dot = prefix.rsplit(".experts", 1)[0] + "."
-            for key, info in self.quantized_layers.items():
-                if key.startswith(parent_dot):
-                    return info["quant_algo"].upper()
+            parent = prefix.rsplit(".experts", 1)[0]
+            for candidate in self._quantized_layer_prefix_candidates(parent):
+                parent_dot = candidate + "."
+                for key, info in self.quantized_layers.items():
+                    if key.startswith(parent_dot):
+                        return info["quant_algo"].upper()
 
-        # 4. Parent-prefix fallback for fused projections whose config lists
-        # shard names instead of vLLM's packed module name.
-        fused_projection_shards = {
-            "qkv_proj": ("q_proj", "k_proj", "v_proj"),
-            "gate_up_proj": ("gate_proj", "up_proj"),
-        }
-        shard_names = fused_projection_shards.get(proj_name)
-        if shard_names is not None:
-            for candidate in self._quantized_layer_prefix_candidates(prefix):
-                parent_dot = candidate.rsplit(".", 1)[0] + "."
-                shard_algos: set[str] = set()
-                for shard_name in shard_names:
-                    shard_prefix = f"{parent_dot}{shard_name}"
-                    if shard_prefix in self.quantized_layers:
-                        algo = self.quantized_layers[shard_prefix]["quant_algo"].upper()
-                        shard_algos.add(algo)
-                if len(shard_algos) == 1:
-                    return shard_algos.pop()
-                if len(shard_algos) > 1:
-                    raise ValueError(
-                        f"Mixed quant_algo within fused layer {prefix}: "
-                        f"{shard_algos}. All shards must use the same quantization."
-                    )
+        return None
 
+    def _resolve_fused_quant_algo(self, prefix: str) -> str | None:
+        proj_name = prefix.rsplit(".", 1)[-1]
+        shard_names: list[str] | tuple[str, ...] | None = (
+            self.packed_modules_mapping.get(proj_name)
+        )
+        if shard_names is None:
+            shard_names = self._fallback_packed_modules_mapping.get(proj_name)
+        if not shard_names:
+            return None
+
+        algos: set[str] = set()
+        base = prefix.rsplit(".", 1)[0]
+        for shard_name in shard_names:
+            shard_prefix = f"{base}.{shard_name}"
+            for candidate in self._quantized_layer_prefix_candidates(shard_prefix):
+                if candidate in self.quantized_layers:
+                    algos.add(self.quantized_layers[candidate]["quant_algo"].upper())
+
+        if len(algos) == 1:
+            return algos.pop()
+        if len(algos) > 1:
+            raise ValueError(
+                f"Mixed quant_algo within fused layer {prefix}: "
+                f"{sorted(algos)}. All shards must use the same quantization."
+            )
         return None
 
     @staticmethod
@@ -2503,6 +2601,16 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 "language_model.model." + prefix[len("model.language_model.") :]
             )
 
+        for candidate in tuple(candidates):
+            if ".block_sparse_moe." in candidate:
+                candidates.append(candidate.replace(".block_sparse_moe.", ".mlp."))
+            elif candidate.endswith(".block_sparse_moe"):
+                candidates.append(candidate[: -len(".block_sparse_moe")] + ".mlp")
+            if ".mlp." in candidate:
+                candidates.append(candidate.replace(".mlp.", ".block_sparse_moe."))
+            elif candidate.endswith(".mlp"):
+                candidates.append(candidate[: -len(".mlp")] + ".block_sparse_moe")
+
         return tuple(dict.fromkeys(candidates))
 
     def get_quant_method(
@@ -2517,6 +2625,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         # Excluded layers
         if self.is_layer_excluded(prefix):
+            if method := self._get_shared_expert_online_method(layer, prefix):
+                return method
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 return UnquantizedLinearMethod()
             return None
@@ -2533,6 +2643,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             if quant_algo == "MXFP8":
                 return ModelOptMxFp8LinearMethod(self.mxfp8_config)
             # Layer not in quantized_layers — leave unquantized
+            if method := self._get_shared_expert_online_method(layer, prefix):
+                return method
             return UnquantizedLinearMethod()
 
         if isinstance(layer, RoutedExperts):

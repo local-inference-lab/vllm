@@ -60,6 +60,15 @@ class ParserEngineReasoningAdapter(ReasoningParser):
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         return self._parser_engine.is_reasoning_end(list(input_ids))
 
+    def is_reasoning_end_for_prompt(
+        self, input_ids: Sequence[int]
+    ) -> bool:
+        # Forward to the engine: parsers that render adaptive templates
+        # override this on the engine class itself (see Qwen3Parser).
+        # Without this forwarder the base-class default delegates to
+        # is_reasoning_end, which is the wrong check for the prompt.
+        return self._parser_engine.is_reasoning_end_for_prompt(list(input_ids))
+
     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
         self._parser_engine.adjust_initial_state_from_prompt(prompt_token_ids)
 
@@ -109,6 +118,18 @@ class ParserEngineReasoningAdapter(ReasoningParser):
 
     def has_engine_confirmed_reasoning_end(self) -> bool:
         return self._parser_engine.reasoning_ended
+
+    @property
+    def thinking_enabled(self) -> bool:
+        """Whether reasoning/thinking output is enabled for this request.
+
+        Mirrors the wrapped parser engine, which derives this from the
+        request's ``chat_template_kwargs`` (e.g. ``enable_thinking``). Used by
+        structural-tag construction to decide whether the grammar must model a
+        reasoning prefix. Defaults to ``True`` when the engine does not expose
+        it.
+        """
+        return bool(getattr(self._parser_engine, "thinking_enabled", True))
 
     def finish_streaming(self) -> DeltaMessage | None:
         with self._skip_tool_parsing():

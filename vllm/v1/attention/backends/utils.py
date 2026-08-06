@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -414,6 +415,7 @@ def make_local_attention_virtual_batches(
         block_table_tensor=block_table_local,
         slot_mapping=common_attn_metadata.slot_mapping,
         causal=True,
+        max_req_tokens=common_attn_metadata.max_req_tokens,
         seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
         _seq_lens_cpu=seq_lens_cpu,
         _num_computed_tokens_cpu=torch.from_numpy(num_computed_tokens_local),
@@ -482,6 +484,7 @@ def make_kv_sharing_fast_prefill_common_attn_metadata(
         block_table_tensor=common_attn_metadata.block_table_tensor,
         slot_mapping=common_attn_metadata.slot_mapping,
         causal=True,
+        max_req_tokens=common_attn_metadata.max_req_tokens,
         seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
         _seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
         _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
@@ -904,7 +907,10 @@ def get_dcp_local_seq_lens(
         )
         seq_lens_tiled = seq_lens_i32.unsqueeze(-1)
     else:
-        rank_offsets = torch.tensor(dcp_rank, dtype=torch.int32, device=seq_lens.device)
+        # Keep the rank as a host scalar. Constructing a one-element CUDA
+        # tensor here issues a pageable H2D copy on every MTP draft step and
+        # serializes CPU run-ahead with the active stream.
+        rank_offsets = dcp_rank
         seq_lens_tiled = seq_lens_i32
     base = (
         seq_lens_tiled
@@ -922,11 +928,44 @@ def get_dcp_local_seq_lens(
     return dcp_local_seq_lens
 
 
+@triton.jit
+def _mamba_select_block_table_kernel(
+    block_table_ptr,
+    seq_lens_ptr,
+    output_ptr,
+    block_table_stride_0,
+    block_table_stride_1,
+    seq_lens_stride_0,
+    output_stride_0,
+    output_stride_1,
+    MAMBA_BLOCK_SIZE: tl.constexpr,
+    NUM_STATE_BLOCKS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    seq_len = tl.load(seq_lens_ptr + req_idx * seq_lens_stride_0)
+    start_idx = tl.maximum((seq_len - 1) // MAMBA_BLOCK_SIZE, 0)
+    mask = offsets < NUM_STATE_BLOCKS
+    block_ids = tl.load(
+        block_table_ptr
+        + req_idx * block_table_stride_0
+        + (start_idx + offsets) * block_table_stride_1,
+        mask=mask,
+    )
+    tl.store(
+        output_ptr + req_idx * output_stride_0 + offsets * output_stride_1,
+        block_ids,
+        mask=mask,
+    )
+
+
 def mamba_get_block_table_tensor(
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     kv_cache_spec: KVCacheSpec,
     mamba_cache_mode: str,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Get the block table tensor for mamba kernels from the input
@@ -948,12 +987,44 @@ def mamba_get_block_table_tensor(
         return block_table
     else:
         assert isinstance(kv_cache_spec, MambaSpec)
+        num_reqs = block_table.shape[0]
+        num_state_blocks = 1 + kv_cache_spec.num_speculative_blocks
+        if output is not None:
+            assert output.dtype == block_table.dtype
+            assert output.device == block_table.device
+            assert output.shape[0] >= num_reqs
+            assert output.shape[1] >= num_state_blocks
+            output = output[:num_reqs, :num_state_blocks]
+
+        if block_table.is_cuda:
+            if output is None:
+                output = torch.empty(
+                    (num_reqs, num_state_blocks),
+                    dtype=block_table.dtype,
+                    device=block_table.device,
+                )
+            if num_reqs > 0:
+                block = triton.next_power_of_2(num_state_blocks)
+                _mamba_select_block_table_kernel[(num_reqs,)](
+                    block_table,
+                    seq_lens,
+                    output,
+                    block_table.stride(0),
+                    block_table.stride(1),
+                    seq_lens.stride(0),
+                    output.stride(0),
+                    output.stride(1),
+                    MAMBA_BLOCK_SIZE=kv_cache_spec.block_size,
+                    NUM_STATE_BLOCKS=num_state_blocks,
+                    BLOCK=block,
+                    num_warps=1,
+                )
+            return output
+
         # NOTE: For 0-length requests in CUDA graph, use a start_index of 0
         # to handle the invalid block table.
-        start_indices = torch.clamp(
-            (seq_lens - 1) // kv_cache_spec.block_size,
-            min=0,
-        )
+        start_indices = (seq_lens - 1) // kv_cache_spec.block_size
+        start_indices.clamp_(min=0)
         # Use int32 for arithmetic to avoid dtype promotion overhead,
         # then convert to int64 for gather (which requires Long indices)
         offsets = torch.arange(
@@ -962,4 +1033,8 @@ def mamba_get_block_table_tensor(
             dtype=torch.int32,
         )
         indices_to_gather = (start_indices.unsqueeze(1) + offsets).to(torch.int64)
-        return torch.gather(block_table, 1, indices_to_gather)
+        gathered = torch.gather(block_table, 1, indices_to_gather)
+        if output is not None:
+            output.copy_(gathered)
+            return output
+        return gathered

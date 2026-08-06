@@ -172,6 +172,8 @@ def mamba_v2_sharded_weight_loader(
     shard_spec: list[tuple[int, int, float]],
     tp_size: int,
     tp_rank: int,
+    *,
+    loaded_shard_sizes: list[int] | None = None,
 ) -> LoaderFunction:
     """Create a weight loader for mamba v2. This ensures that the projections
     are correctly sharded so that they can be split into x, B, C. It also
@@ -179,18 +181,29 @@ def mamba_v2_sharded_weight_loader(
     together with it.
     """
 
+    if loaded_shard_sizes is not None and len(loaded_shard_sizes) != len(shard_spec):
+        raise ValueError("loaded_shard_sizes must match the Mamba shard specification")
+
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         # - track boundary of (sharded) param, and loaded_weight, respectively
         boundary, loaded_boundary = 0, 0
+        if loaded_shard_sizes is not None:
+            param.data.zero_()
 
         # - iterate over the shard specs
-        for full_dim, extra, duplicate_groups in shard_spec:
+        for shard_idx, (full_dim, extra, duplicate_groups) in enumerate(shard_spec):
             # - full dim is the model dim (before TP).
             # - extra > 0, means there is expected overall increase
             #   of dimensions. This is so because of replication.
             # - ratio is used map the tp_rank to the actual shard
             #   rank. This is useful when there is replication of
             #   groups to accompany head shards.
+
+            loaded_full_dim = (
+                loaded_shard_sizes[shard_idx]
+                if loaded_shard_sizes is not None
+                else full_dim - extra
+            )
 
             # - size of the loaded shard
             shard_size = full_dim // tp_size
@@ -207,23 +220,24 @@ def mamba_v2_sharded_weight_loader(
             loaded_start_idx = loaded_boundary + loaded_skip
 
             # - take these many dims from the loaded weight.
-            take = min(shard_size, full_dim - extra - loaded_skip)
+            take = max(0, min(shard_size, loaded_full_dim - loaded_skip))
 
             # - always shard on dim 0
             # - the ignore is for a mundane mypy error as it does not
             #   seem to handle slices well.
             # https://github.com/python/mypy/issues/2410
-            param.data[
-                boundary : (boundary + take), ...  # type: ignore[misc]
-            ] = loaded_weight[
-                loaded_start_idx : (
-                    loaded_start_idx + take
-                )  # type: ignore[misc]
-            ]  # type: ignore[misc]
+            if take > 0:
+                param.data[
+                    boundary : (boundary + take), ...  # type: ignore[misc]
+                ] = loaded_weight[
+                    loaded_start_idx : (
+                        loaded_start_idx + take
+                    )  # type: ignore[misc]
+                ]  # type: ignore[misc]
 
             # move indexing boundaries
             boundary += shard_size
-            loaded_boundary += full_dim - extra
+            loaded_boundary += loaded_full_dim
 
     return loader
 

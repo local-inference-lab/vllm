@@ -83,8 +83,11 @@ class Qwen2MoeMLP(nn.Module):
         expert_gate: torch.nn.Linear | None = None,
         is_sequence_parallel: bool = False,
         prefix: str = "",
+        loaded_intermediate_size: int | None = None,
     ) -> None:
         super().__init__()
+        if loaded_intermediate_size is None:
+            loaded_intermediate_size = intermediate_size
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -92,6 +95,7 @@ class Qwen2MoeMLP(nn.Module):
             quant_config=quant_config,
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.gate_up_proj",
+            loaded_output_sizes=[loaded_intermediate_size] * 2,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -22,10 +23,12 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.config.load import LoadConfig
+from vllm.model_executor.models.deepseek_mtp import DeepSeekMTP
 from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
 mimo_7b_dir = "XiaomiMiMo/MiMo-7B-Base"
 DEVICE_TYPE = current_platform.device_type
@@ -59,6 +62,37 @@ def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:
     )
 
     return EagleProposer(vllm_config=vllm_config, device=DEVICE_TYPE)
+
+
+@pytest.mark.parametrize(
+    ("architectures", "expected"),
+    [
+        (["DeepSeekMTPModel"], True),
+        (["EagleDeepSeekMTPModel"], False),
+        (["SomeOtherMTPModel"], False),
+        (None, False),
+    ],
+)
+def test_autoregressive_mtp_tuple_return_detection(architectures, expected):
+    speculator = object.__new__(MTPSpeculator)
+    speculator.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=architectures)
+    )
+
+    assert speculator.model_returns_tuple is expected
+
+
+def test_deepseek_mtp_local_argmax_delegates_spec_step():
+    expected = torch.tensor([7], dtype=torch.int64)
+    inner = mock.Mock()
+    inner.get_top_tokens.return_value = expected
+    wrapper = SimpleNamespace(model=inner)
+    hidden_states = torch.zeros((1, 8), dtype=torch.bfloat16)
+
+    actual = DeepSeekMTP.get_top_tokens(wrapper, hidden_states, spec_step_idx=2)
+
+    assert actual is expected
+    inner.get_top_tokens.assert_called_once_with(hidden_states, 2)
 
 
 @mock.patch("vllm.v1.spec_decode.llm_base_proposer.get_pp_group")

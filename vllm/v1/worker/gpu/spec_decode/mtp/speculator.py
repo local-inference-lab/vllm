@@ -10,6 +10,14 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 
 class MTPSpeculator(AutoRegressiveSpeculator):
+    @property
+    def model_returns_tuple(self) -> bool:
+        # DeepSeek MTP recycles the post-final-norm hidden state between
+        # draft steps, so forward() returns (logit_hidden, recycle_hidden).
+        return "DeepSeekMTPModel" in (
+            self.draft_model_config.hf_config.architectures or []
+        )
+
     def load_draft_model(
         self,
         target_model: nn.Module,

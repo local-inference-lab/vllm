@@ -33,6 +33,7 @@ from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig, get_current_vllm_config
@@ -75,6 +76,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import (
     SparseAttnIndexer,
     fused_indexer_q_rope_quant,
+    use_b12x_sparse_indexer,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -94,6 +96,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.indexer import (
+    B12xNonCompressedIndexerBackend,
     DeepseekV32IndexerBackend,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
@@ -460,6 +463,7 @@ class DeepseekV2Attention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
         reduce_results: bool = True,
+        topk_scores_buffer: torch.Tensor | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -479,6 +483,9 @@ class DeepseekV2Attention(nn.Module):
         assert topk_indices_buffer is None, (
             "topk_indices_buffer is not \
         supported for DeepseekV2Attention"
+        )
+        assert topk_scores_buffer is None, (
+            "topk_scores_buffer is not supported for DeepseekV2Attention"
         )
 
         if self.q_lora_rank is not None:
@@ -626,16 +633,31 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        return MLAAttentionSpec(
+        layer_id = extract_layer_index(self.prefix)
+        num_hidden_layers = getattr(
+            vllm_config.model_config.hf_config, "num_hidden_layers", None
+        )
+        raw = envs.VLLM_DCP_SHARD_DRAFT
+        shard_draft = ("1" if raw is None else raw).lower() in ("1", "true", "yes")
+        dcp_replicated = (
+            not shard_draft
+            and layer_id is not None
+            and num_hidden_layers is not None
+            and int(layer_id) >= int(num_hidden_layers)
+        )
+        return MLAAttentionSpec(  # Only has one vector instead of K + V
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
-        )  # Only has one vector instead of K + V
+            dcp_replicated=dcp_replicated,
+        )
 
     def forward(self): ...
 
     def get_attn_backend(self) -> AttentionBackend:
+        if use_b12x_sparse_indexer():
+            return B12xNonCompressedIndexerBackend
         return DeepseekV32IndexerBackend
 
 
@@ -649,6 +671,7 @@ class Indexer(nn.Module):
         quant_config: QuantizationConfig | None,
         cache_config: CacheConfig | None,
         topk_indices_buffer: torch.Tensor | None,
+        topk_scores_buffer: torch.Tensor | None = None,
         prefix: str = "",
         is_inplace_rope: bool = False,
     ):
@@ -686,6 +709,21 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
+        self.topk_scores_buffer = topk_scores_buffer
+        attention_backend = vllm_config.attention_config.backend
+        attention_backend_name = (
+            attention_backend
+            if isinstance(attention_backend, str)
+            else getattr(attention_backend, "name", None)
+        )
+        # The GLM b12x MLA backend and its non-compressed paged indexer share a
+        # native flat-physical-slot contract when the KV cache is not sharded.
+        # Under DCP, keep logical token ids until the attention backend can map
+        # the globally selected top-k to each rank's local physical cache slots.
+        self.output_physical_slots = (
+            attention_backend_name == "B12X_MLA_SPARSE"
+            and vllm_config.parallel_config.decode_context_parallel_size == 1
+        )
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
@@ -710,6 +748,9 @@ class Indexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            topk_scores_buffer=self.topk_scores_buffer,
+            output_physical_slots=self.output_physical_slots,
+            num_q_heads=self.n_head,
         )
 
         self.is_inplace_rope = is_inplace_rope
@@ -723,9 +764,18 @@ class Indexer(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        positions,
+        rotary_emb,
+        kw: torch.Tensor | None = None,
+        q_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        q, _ = self.wq_b(qr)
+        if q_raw is None:
+            q, _ = self.wq_b(qr)
+        else:
+            q = q_raw
         q = q.view(-1, self.n_head, self.head_dim)
 
         if current_platform.is_rocm() and self.is_inplace_rope:
@@ -736,7 +786,8 @@ class Indexer(nn.Module):
             # In pytorch-native rope for inductor fusion, rotated q/k tensors
             # are not mutated inplace but returned as new tensors.
             # Fused wk + weights_proj: one GEMM, then split
-            kw, _ = self.wk_weights_proj(hidden_states)
+            if kw is None:
+                kw, _ = self.wk_weights_proj(hidden_states)
             k = kw[:, : self.head_dim]
             weights = kw[:, self.head_dim :]
 
@@ -747,7 +798,8 @@ class Indexer(nn.Module):
             )
         elif self.use_fused_indexer_q and q.dtype == torch.bfloat16:
             # fused wk + weights_proj: one GEMM, then split
-            kw, _ = self.wk_weights_proj(hidden_states)
+            if kw is None:
+                kw, _ = self.wk_weights_proj(hidden_states)
             k = kw[:, : self.head_dim]
             weights = kw[:, self.head_dim :]
 
@@ -779,7 +831,8 @@ class Indexer(nn.Module):
                 q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
             # Fused wk + weights_proj: one GEMM, then split
-            kw, _ = self.wk_weights_proj(hidden_states)
+            if kw is None:
+                kw, _ = self.wk_weights_proj(hidden_states)
             k = kw[:, : self.head_dim]
             weights = kw[:, self.head_dim :]
 
@@ -816,22 +869,76 @@ class Indexer(nn.Module):
         return self.indexer_op(hidden_states, q_fp8, k, weights)
 
 
+def _should_skip_index_topk(
+    config: DeepseekV2Config | DeepseekV3Config,
+    layer_idx: int | None,
+) -> bool:
+    """Match GLM/DeepSeek IndexCache top-k reuse policy.
+
+    A layer marked as "S" reuses the previous layer's top-k indices. MTP/NextN
+    layers are excluded because they do not have a normal previous layer in the
+    same stack to reuse from.
+    """
+    if layer_idx is None:
+        return False
+
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    if num_hidden_layers is not None and layer_idx >= num_hidden_layers:
+        return False
+
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None:
+        if 0 <= layer_idx < len(pattern):
+            return pattern[layer_idx] == "S"
+        if num_hidden_layers is not None and layer_idx < num_hidden_layers:
+            logger.warning_once(
+                "index_topk_pattern is shorter than num_hidden_layers; "
+                "not skipping sparse MLA indexer computation on layer %s.",
+                layer_idx,
+            )
+        return False
+
+    freq = getattr(config, "index_topk_freq", None)
+    if freq is None:
+        return False
+    skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
+    return max(layer_idx - skip_topk_offset + 1, 0) % freq != 0
+
+
 def _try_load_fp8_indexer_wk(
     name, tensor, buf, params_dict, loaded_params, pp_missing_layer_names
 ):
-    """
-    We fuse the WK and weights_proj projections, but in some checkpoints WK is stored
-    in FP8 with a separate weight_scale_inv, while weights_proj is stored in BF16.
-    Upcasting to BF16 during loading enables the fusion. This function loads the FP8 WK
-    weights and scale, and when both are available, dequantizes to BF16 and stores into
-    the fused wk_weights_proj.weight parameter.
+    """Load isolated FP8/MXFP8 indexer WK tensors into fused WK weights.
+
+    The model fuses WK and weights_proj projections, but some checkpoints store
+    WK separately in FP8 with ``weight_scale_inv`` or MXFP8 with
+    ``weight_scale`` while weights_proj stays BF16. This loader buffers the
+    isolated WK weight and scale until both are available, dequantizes WK to
+    BF16, and stores it into the fused ``wk_weights_proj.weight`` parameter.
+
+    Args:
+        name: Checkpoint tensor name.
+        tensor: Checkpoint tensor value.
+        buf: Pending WK weight/scale tensors keyed by layer prefix.
+        params_dict: Model parameters keyed by checkpoint tensor name.
+        loaded_params: Names of parameters already loaded by a special loader.
+        pp_missing_layer_names: Pipeline-parallel layer prefixes to skip.
+
+    Returns:
+        ``True`` when the tensor was consumed or intentionally skipped by this
+        special loader, otherwise ``False``.
+
+    Raises:
+        KeyError: If a matching isolated WK pair is ready but the fused
+            ``wk_weights_proj.weight`` parameter is missing.
     """
     if "indexer.wk." not in name or "wk_weights" in name:
         return False  # Weight is not an isolated WK weight for the indexer, ignore.
     is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
-    is_scale = "weight_scale" in name
-    if not is_weight and not is_scale:
-        return False  # WK is not in FP8 format, ignore.
+    is_scale_inv = "weight_scale_inv" in name
+    is_mxfp8_scale = name.endswith(".weight_scale") and tensor.dtype == torch.uint8
+    if not is_weight and not is_scale_inv and not is_mxfp8_scale:
+        return False  # WK is not in a fused FP8/MXFP8 format, ignore.
     # Buffer this tensor (weight or scale) until both have arrived.
     layer_prefix = name.rsplit(".wk.", 1)[0]  # e.g. "model.layers.0.self_attn.indexer"
     fused_name = f"{layer_prefix}.wk_weights_proj.weight"
@@ -841,20 +948,35 @@ def _try_load_fp8_indexer_wk(
     ):
         return True
     entry = buf.setdefault(layer_prefix, {})
-    entry["weight" if is_weight else "scale"] = tensor
-    if "weight" not in entry or "scale" not in entry:
+    if is_weight:
+        entry["weight"] = tensor
+    elif is_scale_inv:
+        entry["scale_inv"] = tensor
+    else:
+        entry["mxfp8_scale"] = tensor
+    if "weight" not in entry or (
+        "scale_inv" not in entry and "mxfp8_scale" not in entry
+    ):
         return True  # still waiting for the other param
 
     # We have both weight and scale: dequantize FP8 to BF16.
-    weight_fp8, scale_inv = entry["weight"], entry["scale"]
+    weight_fp8 = entry["weight"]
     del buf[layer_prefix]
-    block_size = weight_fp8.shape[1] // scale_inv.shape[1]
-    weight_bf16 = scaled_dequantize(
-        weight_fp8,
-        scale_inv,
-        group_shape=GroupShape(block_size, block_size),
-        out_dtype=torch.bfloat16,
-    )
+    if "scale_inv" in entry:
+        scale_inv = entry["scale_inv"]
+        block_size = weight_fp8.shape[1] // scale_inv.shape[1]
+        weight_bf16 = scaled_dequantize(
+            weight_fp8,
+            scale_inv,
+            group_shape=GroupShape(block_size, block_size),
+            out_dtype=torch.bfloat16,
+        )
+    else:
+        from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+            dequant_mxfp8_to_bf16,
+        )
+
+        weight_bf16 = dequant_mxfp8_to_bf16(weight_fp8, entry["mxfp8_scale"])
 
     # Load the dequantized weight into shard 0 of the fused buffer.
     param = params_dict[fused_name]
@@ -973,8 +1095,11 @@ class DeepseekV2MLAAttention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
         input_size: int | None = None,
         reduce_results: bool = True,
+        layer_idx: int | None = None,
+        non_causal_multi_token_decode: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -1071,37 +1196,29 @@ class DeepseekV2MLAAttention(nn.Module):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
-        self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = getattr(config, "index_topk", 0) > 0
 
         # IndexCache config
         # Refer: https://arxiv.org/abs/2603.12201 for more details.
         _skip_topk = False
-        is_mtp_layer = False
-        if self.is_v32:
-            _index_topk_freq = getattr(config, "index_topk_freq", 1)
-            _index_topk_pattern = getattr(config, "index_topk_pattern", None)
-            _index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
-            layer_id = extract_layer_index(prefix)
-
-            if _index_topk_pattern is None:
-                _skip_topk = (
-                    max(layer_id - _index_skip_topk_offset + 1, 0) % _index_topk_freq
-                    != 0
+        layer_id = layer_idx if layer_idx is not None else extract_layer_index(prefix)
+        # Honor an explicit index_topk_pattern whenever provided (GLM/Kimi
+        # set it via HF overrides); otherwise preserve main's use_index_cache
+        # opt-in for the frequency-based skip. MTP/nextn layers are excluded
+        # by _should_skip_index_topk so they always build a full indexer.
+        if self.is_v32 and (
+            getattr(config, "index_topk_pattern", None) is not None
+            or getattr(config, "use_index_cache", False)
+        ):
+            _skip_topk = _should_skip_index_topk(config, layer_id)
+            if _skip_topk:
+                logger.info_once(
+                    "Using index_topk_pattern/index_topk_freq to skip sparse MLA "
+                    "indexer computation on layer %s.",
+                    layer_id,
                 )
-            elif 0 <= layer_id < len(_index_topk_pattern):
-                _skip_topk = _index_topk_pattern[layer_id] == "S"
 
-            # The skip pattern only governs backbone layers. MTP/nextn
-            # layers (layer_id >= num_hidden_layers) always build a full
-            # indexer: they compute indices at draft step 0 and toggle
-            # at runtime via set_skip_topk
-            # (index_share_for_mtp_iteration).
-            _num_hidden_layers = getattr(config, "num_hidden_layers", None)
-            is_mtp_layer = (
-                _num_hidden_layers is not None and layer_id >= _num_hidden_layers
-            )
-
-        if self.is_v32 and (not _skip_topk or is_mtp_layer):
+        if self.is_v32 and not _skip_topk:
             self.indexer_rope_emb = get_rope(
                 qk_rope_head_dim,
                 max_position=max_position_embeddings,
@@ -1116,6 +1233,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config,
                 cache_config,
                 topk_indices_buffer,
+                topk_scores_buffer,
                 f"{prefix}.indexer",
                 is_inplace_rope=self.indexer_rope_emb.enabled(),
             )
@@ -1156,12 +1274,10 @@ class DeepseekV2MLAAttention(nn.Module):
             cache_config,
             quant_config,
             prefix,
-            # MTP layers must never start with skip_topk=True: their indexer
-            # computes indices at draft step 0, and the runtime toggle
-            # (set_skip_topk, index_share_for_mtp_iteration) only exists in
-            # the V1 proposer. A frozen True would leave the draft reading a
-            # never-written topk buffer.
-            skip_topk=_skip_topk and not is_mtp_layer,
+            # _should_skip_index_topk already returns False for MTP/NextN
+            # layer ids, so they always start with a populated indexer.
+            skip_topk=_skip_topk,
+            non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
 
     def forward(
@@ -1180,6 +1296,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
+        quant_config: QuantizationConfig | None = None,
+        layer_idx_override: int | None = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1187,7 +1307,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             config = vllm_config.model_config.hf_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
+        # NextN/MTP callers may pass None deliberately for BF16 draft layers
+        # inside an otherwise modelopt_fp4 target checkpoint.
+        if quant_config is None and not is_nextn:
+            quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
 
         self.hidden_size = config.hidden_size
@@ -1195,7 +1318,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         moe_layer_freq = getattr(config, "moe_layer_freq", 1)
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
-        layer_idx = int(prefix.split(sep=".")[-1])
+        layer_idx = (
+            layer_idx_override
+            if layer_idx_override is not None
+            else int(prefix.split(sep=".")[-1])
+        )
         self.layer_idx = layer_idx
 
         # verify MLA attention specific fields
@@ -1227,7 +1354,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             and parallel_config.pipeline_parallel_size == 1
             and is_moe_layer
         )
-        self.self_attn = attn_cls(
+        attn_kwargs = dict(
             vllm_config=vllm_config,
             config=config,
             hidden_size=self.hidden_size,
@@ -1243,9 +1370,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             topk_indices_buffer=topk_indices_buffer,
             reduce_results=not self.use_sequence_parallel_moe,
+            topk_scores_buffer=topk_scores_buffer,
         )
+        if attn_cls is DeepseekV2MLAAttention:
+            attn_kwargs["layer_idx"] = layer_idx
+        self.self_attn = attn_cls(**attn_kwargs)
 
-        if is_moe_layer:
+        if _should_use_nextn_moe_layer(config, layer_idx, moe_layer_freq, is_nextn):
             self.mlp = DeepseekV2MoE(
                 config=config,
                 parallel_config=parallel_config,
@@ -1355,7 +1486,7 @@ class DeepseekV2Model(nn.Module):
         self.device = current_platform.device_type
         self.hidden_size = config.hidden_size
         self.vocab_size = config.vocab_size
-        self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = getattr(config, "index_topk", 0) > 0
         if self.is_v32:
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
@@ -1364,8 +1495,20 @@ class DeepseekV2Model(nn.Module):
                 dtype=torch.int32,
                 device=self.device,
             )
+            topk_scores_buffer = None
+            if (
+                vllm_config.parallel_config.decode_context_parallel_size > 1
+                and use_b12x_sparse_indexer()
+            ):
+                topk_scores_buffer = torch.empty(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    topk_tokens,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
         else:
             topk_indices_buffer = None
+            topk_scores_buffer = None
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1382,6 +1525,7 @@ class DeepseekV2Model(nn.Module):
                 vllm_config=vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
+                topk_scores_buffer=topk_scores_buffer,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -1395,6 +1539,7 @@ class DeepseekV2Model(nn.Module):
         )
 
         self.aux_hidden_state_layers = tuple[int, ...]()
+        self.output_dflash_anchor_hidden_state = False
 
         # Needed by load_weights
         qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
@@ -1491,7 +1636,11 @@ class DeepseekV2Model(nn.Module):
             # fused_add_rms_norm requires a contiguous residual
             residual = residual.contiguous()
 
-        if self.end_layer in self.aux_hidden_state_layers:
+        if (
+            self.end_layer in self.aux_hidden_state_layers
+            or self.output_dflash_anchor_hidden_state
+        ):
+            assert residual is not None
             aux_hidden_states.append(hidden_states + residual)
 
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -1569,6 +1718,14 @@ class DeepseekV2Model(nn.Module):
                 name.rsplit(".indexer.", 1)[0] not in indexer_present_prefixes
             ):
                 continue  # this layer has no indexer; drop its checkpoint weights
+            if (
+                getattr(self.config, "index_topk", 0) <= 0
+                and ".self_attn.indexer." in name
+            ):
+                # Explicit dense-equivalent GLM/DeepSeek evaluation disables
+                # sparse indexer modules, so checkpoint-only indexer weights
+                # are intentionally unused.
+                continue
 
             is_fusion_moe_shared_experts_layer = (
                 rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
@@ -1865,6 +2022,9 @@ class DeepseekV2ForCausalLM(
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
 
+    def set_dflash_anchor_hidden_state_output(self, enabled: bool) -> None:
+        self.model.output_dflash_anchor_hidden_state = bool(enabled)
+
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         num_layers = len(self.model.layers)
         return (2, num_layers // 2, num_layers - 3)
@@ -1936,3 +2096,18 @@ def get_spec_layer_idx_from_weight_name(
             ) or weight_name.startswith(f"layers.{layer_idx + i}."):
                 return layer_idx + i
     return None
+
+
+def _should_use_nextn_moe_layer(
+    config: DeepseekV2Config | DeepseekV3Config,
+    layer_idx: int,
+    moe_layer_freq: int,
+    is_nextn: bool,
+) -> bool:
+    return config.n_routed_experts is not None and (
+        is_nextn
+        or (
+            layer_idx >= config.first_k_dense_replace
+            and layer_idx % moe_layer_freq == 0
+        )
+    )

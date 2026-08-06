@@ -7,10 +7,58 @@ from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.worker.gpu.async_utils import async_copy_to_np
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
+# Salt added to the Philox offsets used for draft-token Gumbel noise.
+# Positions are bounded by max_model_len, so this puts the draft stream in a
+# range disjoint from the target-side offsets.
+DRAFT_GUMBEL_POS_OFFSET = 1 << 30
+
+
+def draft_gumbel_pos(positions: torch.Tensor) -> torch.Tensor:
+    """Philox offsets for draft Gumbel noise, given draft-row positions.
+
+    The rejection sampler keys both its acceptance uniform and recovery
+    Gumbel noise for position P by offset P. Keep the draft proposal on a
+    disjoint Philox range so rejection sampling remains unbiased.
+    """
+    return positions + (1 + DRAFT_GUMBEL_POS_OFFSET)
+
+
+def limit_draft_tokens(
+    draft_tokens: torch.Tensor,
+    num_speculative_tokens: int,
+    max_num_speculative_tokens: int,
+) -> torch.Tensor:
+    """Limit a speculator's output to the scheduler-selected depth."""
+    if draft_tokens.ndim != 2:
+        raise RuntimeError(
+            "Speculator returned unsupported draft shape "
+            f"{tuple(draft_tokens.shape)}; expected a 2D tensor."
+        )
+    if not 1 <= num_speculative_tokens <= max_num_speculative_tokens:
+        raise RuntimeError(
+            "Scheduler selected an invalid speculative-token count "
+            f"{num_speculative_tokens}; expected a value between 1 and "
+            f"{max_num_speculative_tokens}."
+        )
+    if draft_tokens.shape[1] == 0:
+        return draft_tokens
+    if draft_tokens.shape[1] < num_speculative_tokens:
+        raise RuntimeError(
+            "Speculator returned too few draft tokens "
+            f"({draft_tokens.shape[1]}); expected at least "
+            f"{num_speculative_tokens}."
+        )
+    return draft_tokens[:, :num_speculative_tokens]
+
 
 class DraftTokensHandler:
-    def __init__(self, device: torch.device | None = None):
+    def __init__(
+        self,
+        device: torch.device | None = None,
+        needs_real_draft_tokens: bool = False,
+    ):
         self.device = device
+        self.needs_real_draft_tokens = needs_real_draft_tokens
         self.copy_stream = torch.cuda.Stream(device)
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
@@ -19,19 +67,24 @@ class DraftTokensHandler:
         self.draft_tokens_np: np.ndarray | None = None
         self.num_draft_tokens: int = 0
 
+    def needs_host_copy(self, input_batch: InputBatch) -> bool:
+        return self.needs_real_draft_tokens or input_batch.has_structured_output_reqs
+
     def set_draft_tokens(
         self, input_batch: InputBatch, draft_tokens: torch.Tensor
     ) -> None:
         self.req_ids = input_batch.req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
-        if not input_batch.has_structured_output_reqs:
-            # No draft token validation needs to be performed by
-            # the scheduler for this batch.
+        if not self.needs_host_copy(input_batch):
+            # Fixed-width speculators use scheduler placeholders. Avoid a D2H
+            # copy and per-step event synchronization on their decode path.
             self.draft_tokens_np = None
             return
 
-        # For spec decoding + structured outputs, we must transfer the
-        # draft tokens back to the scheduler for grammar validation.
+        # The scheduler needs the real draft lengths. Some speculators use
+        # -1 as a sentinel for fallback/no-draft slots; sending placeholder
+        # -1 values back to the scheduler can cause them to be scheduled as
+        # verifier inputs on the next step.
         current_stream = torch.cuda.current_stream(self.device)
         self.copy_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.copy_stream):
@@ -46,8 +99,14 @@ class DraftTokensHandler:
         if self.draft_tokens_np is not None:
             self.copy_event.synchronize()
             draft_token_ids = self.draft_tokens_np.tolist()
+            for token_ids in draft_token_ids:
+                for i, token_id in enumerate(token_ids):
+                    if token_id < 0:
+                        del token_ids[i:]
+                        break
         else:
-            # This case only happens when async scheduling is disabled.
+            # Fixed-width async scheduling only needs the draft count. The
+            # worker retains the actual token ids for verification.
             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
         return DraftTokenIds(self.req_ids, draft_token_ids)
 

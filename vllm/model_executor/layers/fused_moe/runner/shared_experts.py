@@ -120,8 +120,6 @@ class SharedExperts(torch.nn.Module):
             # Record that the clone will be used by shared_experts_stream
             # to avoid gc issue from deallocation of hidden_states_clone
             # For more details: https://docs.pytorch.org/docs/stable/generated/torch.Tensor.record_stream.html # noqa: E501
-            # NOTE: We don't need shared_output.record_stream(current_stream())
-            # because we synch the streams before using shared_output.
             shared_experts_input.record_stream(self._stream)
 
             # Mark sync start point for the aux stream since we will
@@ -137,7 +135,14 @@ class SharedExperts(torch.nn.Module):
         # Run shared experts in parallel on a separate stream.
         with torch.cuda.stream(self._stream):
             output = self._layer(shared_experts_input)
-        current_stream().wait_stream(self._stream)
+        consumer_stream = current_stream()
+        consumer_stream.wait_stream(self._stream)
+
+        # The output allocation belongs to the aux stream, but the routed and
+        # shared expert outputs are combined on the consumer stream. The wait
+        # orders producer before consumer; record_stream keeps the allocation
+        # alive until the consumer has finished using it.
+        output.record_stream(consumer_stream)
 
         return output
 

@@ -8,6 +8,7 @@ from tests.kernels.moe.utils import make_dummy_moe_config
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
     UnquantizedMoeBackend,
+    map_unquantized_backend,
     select_unquantized_moe_backend,
 )
 from vllm.platforms import current_platform
@@ -16,6 +17,10 @@ skipif_not_cuda_rocm = pytest.mark.skipif(
     not (current_platform.is_cuda() or current_platform.is_rocm()),
     reason="Only supported on CUDA/ROCm platforms.",
 )
+
+
+def test_b12x_maps_to_flashinfer_cutlass_for_unquantized_moe():
+    assert map_unquantized_backend("b12x") == UnquantizedMoeBackend.FLASHINFER_CUTLASS
 
 
 @pytest.mark.parametrize(

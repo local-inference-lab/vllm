@@ -24,6 +24,7 @@ from vllm.model_executor.kernels.linear import (
 from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsConfig,
+    CompressedTensorsKVCacheMethod,
     CompressedTensorsLinearMethod,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Mxfp4,
@@ -59,6 +60,35 @@ ROCM_TRITON_SCALED_MM_SUPPORTED_INT8_MODEL = [
     "nm-testing/tinyllama-oneshot-w8a8-dynamic-token-v2",
     "nm-testing/tinyllama-oneshot-w8a8-channel-dynamic-token-v2",
 ]
+
+
+@pytest.mark.parametrize("strategy,n_scales", [("tensor", 1), ("attn_head", 4)])
+def test_compressed_tensors_kv_cache_weights_disable_gradients(strategy, n_scales):
+    method = object.__new__(CompressedTensorsKVCacheMethod)
+    method.quant_config = Mock(
+        kv_cache_scheme={
+            "type": "float",
+            "num_bits": 8,
+            "strategy": strategy,
+            "symmetric": True,
+        }
+    )
+    layer = torch.nn.Module()
+    layer.num_kv_heads = 4
+
+    method.create_weights(layer)
+
+    for name in (
+        "k_scale",
+        "v_scale",
+        "q_scale",
+        "k_zero_point",
+        "v_zero_point",
+        "q_zero_point",
+    ):
+        parameter = getattr(layer, name)
+        assert parameter.shape == (n_scales,)
+        assert not parameter.requires_grad
 
 
 @pytest.fixture(scope="function", autouse=True)

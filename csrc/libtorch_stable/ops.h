@@ -198,6 +198,12 @@ void merge_attn_states(
     const std::optional<int64_t> prefill_tokens_with_context,
     const std::optional<torch::stable::Tensor>& output_scale = std::nullopt);
 
+// BF16 MLA query absorption BMM that avoids cuBLAS read-ahead on tight
+// DCP/custom-allocation inputs without materializing the query operand.
+void safe_mla_query_bmm(torch::stable::Tensor const& query,
+                        torch::stable::Tensor const& weight,
+                        torch::stable::Tensor& output);
+
 torch::stable::Tensor hadacore_transform(torch::stable::Tensor& x,
                                          bool inplace);
 
@@ -313,7 +319,7 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
     std::optional<torch::stable::Tensor> index_cache, int64_t block_size,
     std::optional<torch::stable::Tensor> q_out,
     std::optional<torch::stable::Tensor> index_q_out,
-    const std::string& kv_cache_dtype);
+    const std::string& kv_cache_dtype, bool skip_index_branch);
 
 // Sampler kernels (shared CUDA/ROCm)
 void apply_repetition_penalties_(
@@ -414,6 +420,8 @@ void gelu_new(torch::stable::Tensor& out, torch::stable::Tensor& input);
 void gelu_fast(torch::stable::Tensor& out, torch::stable::Tensor& input);
 void gelu_quick(torch::stable::Tensor& out, torch::stable::Tensor& input);
 
+void relu_squared(torch::stable::Tensor& out, torch::stable::Tensor& input);
+
 // INT8 quantization kernels (shared CUDA/ROCm)
 void static_scaled_int8_quant(torch::stable::Tensor& out,
                               torch::stable::Tensor const& input,
@@ -484,6 +492,12 @@ void concat_and_cache_mla(torch::stable::Tensor& kv_c,
                           const std::string& kv_cache_dtype,
                           torch::stable::Tensor& scale);
 
+void concat_and_cache_nvfp4_mla(torch::stable::Tensor& kv_c,
+                                torch::stable::Tensor& k_pe,
+                                torch::stable::Tensor& kv_cache,
+                                torch::stable::Tensor& slot_mapping,
+                                torch::stable::Tensor& scale);
+
 // NOTE: k_pe and kv_c order is flipped compared to concat_and_cache_mla
 void concat_and_cache_mla_rope_fused(
     torch::stable::Tensor& positions, torch::stable::Tensor& q_pe,
@@ -525,9 +539,9 @@ void cp_gather_and_upconvert_fp8_kv_cache(
                                                     // 656]
     torch::stable::Tensor const& dst,               // [TOT_TOKENS, 576]
     torch::stable::Tensor const& block_table,       // [BATCH, BLOCK_INDICES]
-    torch::stable::Tensor const& seq_lens,          // [BATCH]
     torch::stable::Tensor const& workspace_starts,  // [BATCH]
-    int64_t batch_size);
+    int64_t batch_size,
+    std::optional<torch::stable::Tensor> seq_starts = std::nullopt);
 
 // Indexer K quantization and cache function
 void indexer_k_quant_and_cache(
@@ -554,3 +568,12 @@ void cp_gather_indexer_k_quant_cache(
                                                 // quant_block_size * 4]
     const torch::stable::Tensor& block_table,   // [batch_size, num_blocks]
     const torch::stable::Tensor& cu_seq_lens);  // [batch_size + 1]
+
+// LongCat n-gram embedding index kernel (see ngram_embedding_kernels.cu).
+void ngram_compute_n_gram_ids(
+    int64_t ne_n, int64_t ne_k, torch::stable::Tensor& ne_weights,
+    torch::stable::Tensor& ne_mods,
+    torch::stable::Tensor& exclusive_ne_embedder_size_sums,
+    torch::stable::Tensor& exclusive_req_len_sums,
+    torch::stable::Tensor& ne_token_table, torch::stable::Tensor& row_indices,
+    torch::stable::Tensor& column_starts, torch::stable::Tensor& n_gram_ids);

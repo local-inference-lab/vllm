@@ -68,6 +68,10 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.module_mapping import MultiModelKeys
+from vllm.model_executor.virtual_tp import (
+    get_virtual_tp_axis_original_size,
+    get_virtual_tp_axis_padded_size,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.evs import (
     compute_mrope_for_media,
@@ -420,6 +424,9 @@ class Qwen3_VisionBlock(nn.Module):
         norm_layer: Callable[[int], nn.Module] | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        projection_size: int | None = None,
+        loaded_num_heads: int | None = None,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -429,7 +436,8 @@ class Qwen3_VisionBlock(nn.Module):
         self.attn = Qwen2_5_VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
-            projection_size=dim,
+            projection_size=projection_size or dim,
+            loaded_num_heads=loaded_num_heads,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
@@ -570,7 +578,17 @@ class Qwen3_VisionTransformer(nn.Module):
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        head_dim = self.hidden_size // self.num_heads
+        self.attention_projection_size = get_virtual_tp_axis_padded_size(
+            "vision_attention_projection_size",
+            self.hidden_size,
+            config=vision_config,
+        )
+        self.loaded_num_heads = get_virtual_tp_axis_original_size(
+            "vision_attention_heads",
+            self.num_heads,
+            config=vision_config,
+        )
+        head_dim = self.attention_projection_size // self.num_heads
 
         # FP8 attention: Q/K/V become independent contiguous tensors
         # after quantization, so cu_seqlens uses uniform stride (no 3x V).
@@ -620,6 +638,8 @@ class Qwen3_VisionTransformer(nn.Module):
                     dim=self.hidden_size,
                     num_heads=self.num_heads,
                     mlp_hidden_dim=vision_config.intermediate_size,
+                    projection_size=self.attention_projection_size,
+                    loaded_num_heads=self.loaded_num_heads,
                     act_fn=_ACTIVATION_REGISTRY[vision_config.hidden_act],
                     norm_layer=norm_layer,
                     quant_config=quant_config,
@@ -789,7 +809,7 @@ class Qwen3_VisionTransformer(nn.Module):
         metadata["cu_seqlens"] = MMEncoderAttention.maybe_recompute_cu_seqlens(
             self.attn_backend,
             cu_seqlens,
-            self.hidden_size,
+            self.attention_projection_size,
             self.tp_size,
             device,
             fp8_padded_hidden_size=self.fp8_padded_hidden_size,

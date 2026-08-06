@@ -146,10 +146,16 @@ class PassConfig:
     """Fuse paired q/kv RMS norms in MLA attention."""
     fuse_rope_kvcache: bool = None  # type: ignore[assignment]
     """Fuse the QK rope + KV cache ops."""
+    fuse_qk_norm_rope_kvcache: bool = Field(default=None)  # type: ignore[assignment]
+    """Fuse QK RMSNorm + RoPE + KV cache update into a single AITER HIP
+    kernel. Supersedes both enable_qk_norm_rope_fusion and fuse_rope_kvcache
+    for layers that support it. Auto-enabled at O1+ on ROCm for models
+    with QK-norm (e.g. Qwen3-MoE)."""
 
     rope_kvcache_fusion_max_token_num: int = 256
     """The threshold for ROCm AITER RoPE+KVCache fusion e.g. for small batch decode.
     Larger batch sizes e.g. during prefill will use the unfused kernels.
+    Also applies to the fused QK-Norm+RoPE+KVCache pass.
     """
 
     fi_allreduce_fusion_max_size_mb: float | None = None
@@ -228,6 +234,8 @@ class PassConfig:
         "fuse_act_padding",
         "fuse_mla_dual_rms_norm",
         "fuse_rope_kvcache",
+        "fuse_qk_norm_rope_kvcache",
+        "enable_qk_norm_rope_fusion",
         "fuse_rope_kvcache_cat_mla",
         mode="wrap",
     )
@@ -288,6 +296,12 @@ class PassConfig:
                 "The fusion will be disabled."
             )
             self.fuse_rope_kvcache = False
+        if self.fuse_qk_norm_rope_kvcache and not current_platform.is_rocm():
+            logger.warning_once(
+                "QK-Norm+RoPE+KVCache fusion requires ROCm with AITER. "
+                "The fusion will be disabled."
+            )
+            self.fuse_qk_norm_rope_kvcache = False
         if self.fuse_rope_kvcache_cat_mla and not current_platform.is_cuda_alike():
             logger.warning_once(
                 "MLA KV cache update with RoPE fusion enabled but the "
@@ -302,10 +316,13 @@ class PassConfig:
         after all defaults are finalized.
         TODO also log the compile ranges for which this is enabled.
         """
+        fusion_prefixes = ("fuse_", "enable_")
         enabled_fusions = [
-            f.name[len("fuse_") :]
+            f.name[len(prefix) :]
             for f in fields(self)  # type: ignore[arg-type]
-            if getattr(self, f.name) and f.name.startswith("fuse_")
+            if getattr(self, f.name)
+            for prefix in fusion_prefixes
+            if f.name.startswith(prefix)
         ]
 
         if enabled_fusions:
@@ -758,6 +775,7 @@ class CompilationConfig:
         "vllm::kda_attention",
         "vllm::sparse_attn_indexer",
         "vllm::rocm_aiter_sparse_attn_indexer",
+        "vllm::minimax_m3_sparse_attention_with_output",
         "vllm::deepseek_v4_attention",
         "vllm::hpc_rope_norm_forward",
     ]
@@ -947,12 +965,19 @@ class CompilationConfig:
             # TODO(zhuhaoran): support rope native forward match and remove this.
             # Linked issue: https://github.com/vllm-project/vllm/issues/28042
             self.custom_ops.append("+rotary_embedding")
+
         if (
             self.pass_config.fuse_rope_kvcache
             and "+rotary_embedding" not in self.custom_ops
         ):
             # TODO(Rohan138): support rope native forward match and remove this.
             # Linked issue: https://github.com/vllm-project/vllm/issues/28042
+            self.custom_ops.append("+rotary_embedding")
+
+        if (
+            self.pass_config.fuse_qk_norm_rope_kvcache
+            and "+rotary_embedding" not in self.custom_ops
+        ):
             self.custom_ops.append("+rotary_embedding")
 
         if (
@@ -1137,8 +1162,19 @@ class CompilationConfig:
                             "to enable RoPE+KV cache fusion."
                         )
                         self.pass_config.fuse_rope_kvcache = False
+                    if self.pass_config.fuse_qk_norm_rope_kvcache:
+                        logger.warning_once(
+                            "fuse_qk_norm_rope_kvcache is enabled, but "
+                            "splitting_ops is None and Inductor graph partition "
+                            "is not enabled. Disabling fuse_qk_norm_rope_kvcache. "
+                            "Please either set splitting_ops to an empty list [] "
+                            "or set use_inductor_graph_partition to True "
+                            "to enable QK-Norm+RoPE+KV cache fusion."
+                        )
+                        self.pass_config.fuse_qk_norm_rope_kvcache = False
                     self.splitting_ops.append("vllm::unified_kv_cache_update")
                     self.splitting_ops.append("vllm::unified_mla_kv_cache_update")
+                    self.splitting_ops.append("vllm::minimax_m3_sparse_kv_cache_update")
 
             elif len(self.splitting_ops) == 0:
                 if (
@@ -1182,7 +1218,11 @@ class CompilationConfig:
                 logger.warning_once(
                     "Sequence parallelism is incompatible with piecewise "
                     "cudagraph when use_inductor_graph_partition is off. "
-                    "Setting cudagraph_mode to FULL."
+                    "Setting cudagraph_mode to FULL. If the attention "
+                    "backend cannot capture FULL graphs (e.g. with "
+                    "spec-decode), cudagraphs are disabled entirely; set "
+                    "use_inductor_graph_partition=True to keep piecewise "
+                    "cudagraphs with SP."
                 )
                 self.cudagraph_mode = CUDAGraphMode.FULL
 
@@ -1247,6 +1287,7 @@ class CompilationConfig:
         kv_cache_update_ops = [
             "vllm::unified_kv_cache_update",
             "vllm::unified_mla_kv_cache_update",
+            "vllm::minimax_m3_sparse_kv_cache_update",
         ]
         return self.splitting_ops is not None and all(
             op in self.splitting_ops for op in kv_cache_update_ops
@@ -1470,11 +1511,24 @@ class CompilationConfig:
         self, uniform_decode_query_len: int, tensor_parallel_size: int
     ):
         multiple_of = uniform_decode_query_len
-        if tensor_parallel_size > 1 and self.pass_config.enable_sp:
-            multiple_of = max(uniform_decode_query_len, tensor_parallel_size)
+        sp_multiple_of = None
+        sp_min_token_num = self.pass_config.sp_min_token_num
+        # SP only binds captured sizes at or above sp_min_token_num; when no
+        # captured size can reach the threshold, spec-decode divisibility is
+        # the only constraint.
+        sp_binds_captured_sizes = sp_min_token_num is None or (
+            self.max_cudagraph_capture_size is not None
+            and self.max_cudagraph_capture_size >= sp_min_token_num
+        )
+        if (
+            tensor_parallel_size > 1
+            and self.pass_config.enable_sp
+            and sp_binds_captured_sizes
+        ):
+            sp_multiple_of = max(uniform_decode_query_len, tensor_parallel_size)
             if (
-                multiple_of % uniform_decode_query_len != 0
-                or multiple_of % tensor_parallel_size != 0
+                sp_multiple_of % uniform_decode_query_len != 0
+                or sp_multiple_of % tensor_parallel_size != 0
             ):
                 raise ValueError(
                     f"Can't determine cudagraph shapes that are both a "
@@ -1485,21 +1539,46 @@ class CompilationConfig:
                     f"num_speculative_tokens or disable sequence parallelism"
                 )
 
-        if not self.cudagraph_capture_sizes or multiple_of <= 1:
+        if not self.cudagraph_capture_sizes or (
+            multiple_of <= 1 and sp_multiple_of is None
+        ):
             return
+
+        def _round_for(size: int) -> int:
+            # Sizes below sp_min_token_num run non-SP graphs and only need
+            # spec-decode divisibility (sp_multiple_of % multiple_of == 0).
+            rounded = round_up(size, multiple_of)
+            if sp_multiple_of is not None and (
+                sp_min_token_num is None or rounded >= sp_min_token_num
+            ):
+                rounded = round_up(rounded, sp_multiple_of)
+            return rounded
 
         assert self.max_cudagraph_capture_size is not None
         rounded_sizes = sorted(
             set(
-                round_up(size, multiple_of)
+                _round_for(size)
                 for size in self.cudagraph_capture_sizes
-                if round_up(size, multiple_of) <= self.max_cudagraph_capture_size
+                if _round_for(size) <= self.max_cudagraph_capture_size
             )
         )
+        # Spec decode uniform decode graphs are shaped by request count:
+        # num_reqs * (1 + num_speculative_tokens). Keep small interactive
+        # request counts exact so FULL decode graphs do not replay with
+        # padded virtual requests just because the original capture-size list
+        # skipped that request count.
+        small_decode_sizes = {
+            multiple_of * num_reqs
+            for num_reqs in range(1, 33)
+            if multiple_of * num_reqs <= self.max_cudagraph_capture_size
+        }
+        rounded_sizes = sorted(set(rounded_sizes) | small_decode_sizes)
 
-        if len(rounded_sizes) == 0 and multiple_of <= self.max_cudagraph_capture_size:
+        if len(rounded_sizes) == 0:
             # if one valid but would be round_down use that
-            rounded_sizes = [multiple_of]
+            smallest = _round_for(1)
+            if smallest <= self.max_cudagraph_capture_size:
+                rounded_sizes = [smallest]
 
         if len(rounded_sizes) == 0:
             raise ValueError(

@@ -225,6 +225,43 @@ def test_jit_monitor_mode_arg(mode):
     assert engine_args.create_observability_config().jit_monitor_mode == mode
 
 
+def test_dspark_capacity_verification_mode_arg():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--spec-method",
+            "ngram",
+            "--spec-tokens",
+            "1",
+            "--dspark-capacity-verification-mode",
+            "mask",
+        ]
+    )
+
+    engine_args = EngineArgs.from_cli_args(args)
+    assert engine_args.dspark_capacity_verification_mode == "mask"
+    speculative_config = engine_args.create_speculative_config(None, None)
+    assert speculative_config is not None
+    assert speculative_config.dspark_capacity_verification_mode == "mask"
+
+
+def test_dspark_capacity_verification_mode_conflicts_with_speculative_config():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--speculative-config",
+            '{"method":"ngram","num_speculative_tokens":1,'
+            '"dspark_capacity_verification_mode":"mask"}',
+            "--dspark-capacity-verification-mode",
+            "varlen",
+        ]
+    )
+
+    engine_args = EngineArgs.from_cli_args(args)
+    with pytest.raises(ValueError, match="dspark_capacity_verification_mode"):
+        engine_args.create_speculative_config(None, None)
+
+
 def test_hf_token_get_kwargs():
     kwargs = get_kwargs(ModelConfig)["hf_token"]
 
@@ -467,6 +504,19 @@ def test_attention_config():
     engine_args = EngineArgs.from_cli_args(args)
     with pytest.raises(ValueError, match="mutually exclusive"):
         engine_args.create_engine_config()
+
+
+def test_b12x_virtual_tp_cli_args_removed():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--virtual-tp-sharding", "b12x-padded"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--b12x-allow-odd-tp"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--b12x-virtual-tp-attention-head-alignment", "8"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--b12x-virtual-tp-moe-intermediate-alignment", "32"])
 
 
 def test_prefix_cache_default():

@@ -141,11 +141,21 @@ __device__ __forceinline__ void find_threshold(uint32_t* histogram,
   __syncthreads();
 }
 
+// Per-rank cap on collected threshold-bin ties. Must be >= TopK so the
+// direct-write phase can always fill the output even when all ties land on
+// one rank (kMaxTies=1024 would under-fill TopK=2048 tail slots).
+// Caveat: threshold-bin ties beyond the cap are dropped before fp32
+// refinement, so selection among coarse-bin ties is approximate (pre-existing
+// behavior; refinement still orders the retained ties exactly).
+template <uint32_t TopK>
+constexpr uint32_t kTieCapPerRank =
+    TopK <= hist4096::kBlockSize ? hist4096::kMaxTies : TopK;
+
 // Streams data through shared memory in chunks, processing each chunk before
 // loading the next overwrites each buffer after processing it (the epilogue
 // prefetch loads the next chunk into the same slot)
 template <typename SmemType, uint32_t kStages, uint32_t kBinBits,
-          bool kIsScatter>
+          uint32_t kTieCap, bool kIsScatter>
 __device__ void tma_stream_pass(const float* scores, uint32_t length,
                                 uint32_t thr_bin, int32_t* indices,
                                 uint32_t* phases, SmemType* smem) {
@@ -201,7 +211,7 @@ __device__ void tma_stream_pass(const float* scores, uint32_t length,
           indices[atomicAdd(&smem->counter_gt, 1)] = gi;
         } else if (bn == thr_bin) {
           const auto p = atomicAdd(&smem->counter_eq, 1);
-          if (p < hist4096::kMaxTies) {
+          if (p < kTieCap) {
             smem->tie_buffer[p] = {gi, sc};
           }
         }
@@ -258,6 +268,9 @@ template <uint32_t TopK, uint32_t CS, typename SmemType, bool kFused>
 __device__ void large_topk(const float* __restrict__ row_input,
                            int32_t* __restrict__ row_output, uint32_t seq_len,
                            uint32_t* phases, hist4096::Tie* tie_ws) {
+  constexpr uint32_t kTieCap = kTieCapPerRank<TopK>;
+  static_assert(kTieCap <= kMaxTopK,
+                "smem tie_buffer must hold kTieCap entries");
   const auto rank = blockIdx.y;  // this block's position in cluster
   const auto tx = threadIdx.x;
   const auto lane = tx % hist4096::kWarpSize;
@@ -338,7 +351,7 @@ __device__ void large_topk(const float* __restrict__ row_input,
       smem->counter_eq = 0;
     }
     __syncthreads();
-    tma_stream_pass<SmemType, kStreamingStagesCS4, kHistBits, false>(
+    tma_stream_pass<SmemType, kStreamingStagesCS4, kHistBits, kTieCap, false>(
         row_input + my_start, my_len, 0, nullptr, phases, smem);
   }
 
@@ -369,7 +382,7 @@ __device__ void large_topk(const float* __restrict__ row_input,
         } else if (bin == thr) {
           const auto p = atomicAdd(&smem->counter_eq,
                                    1);  // equal -> ties (later refinement)
-          if (p < hist4096::kMaxTies) {
+          if (p < kTieCap) {
             smem->tie_buffer[p] = {gidx, score};
           }
         }
@@ -379,7 +392,7 @@ __device__ void large_topk(const float* __restrict__ row_input,
   } else {
     // Twopass scatter: re-stream data via TMA
     uint32_t scatter_phases[kStreamingStagesCS4] = {0, 0};
-    tma_stream_pass<SmemType, kStreamingStagesCS4, kHistBits, true>(
+    tma_stream_pass<SmemType, kStreamingStagesCS4, kHistBits, kTieCap, true>(
         row_input + my_start, my_len, thr, s_topk, scatter_phases, smem);
   }
 
@@ -392,8 +405,7 @@ __device__ void large_topk(const float* __restrict__ row_input,
 
   const uint32_t la = smem->counter_gt;
   const uint32_t le_full = smem->counter_eq;
-  const uint32_t le =
-      min(le_full, hist4096::kMaxTies);  // written smem tie_buffer entries
+  const uint32_t le = min(le_full, kTieCap);  // written smem tie_buffer entries
 
   __shared__ uint32_t s_local_counts[CS];
   __shared__ uint32_t s_prefix_packed;
@@ -442,7 +454,7 @@ __device__ void large_topk(const float* __restrict__ row_input,
       row_output[p] = t.idx + my_start;
     }
     uint32_t tp = prefix_equal + i;
-    if (tp < (TopK <= hist4096::kBlockSize ? hist4096::kMaxTies : TopK)) {
+    if (tp < kTieCap) {  // == kTieWsPerRow
       tie_ws[tp] = hist4096::Tie{t.idx + my_start, t.score};
     }
   }
@@ -527,8 +539,7 @@ __device__ void cooperative_topk_body(CooperativeTopKParams<TopK> params) {
 
   extern __shared__ uint8_t sr[];
 
-  constexpr uint32_t kTieWsPerRow =
-      TopK <= hist4096::kBlockSize ? hist4096::kMaxTies : TopK;
+  constexpr uint32_t kTieWsPerRow = kTieCapPerRank<TopK>;
   hist4096::Tie* row_tie_ws = params.tie_ws + row * kTieWsPerRow;
 
   if (use_singlepass) {

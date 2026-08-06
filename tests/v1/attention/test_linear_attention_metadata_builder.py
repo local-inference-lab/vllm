@@ -14,7 +14,10 @@ from vllm.v1.attention.backends.linear_attn import (
     BailingLinearAttentionMetadataBuilder,
     LinearAttentionMetadataBuilder,
 )
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.backends.utils import (
+    PAD_SLOT_ID,
+    mamba_get_block_table_tensor,
+)
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
@@ -28,6 +31,36 @@ def _create_mamba_spec(num_speculative_blocks: int = 1) -> MambaSpec:
         dtypes=(torch.float16,),
         num_speculative_blocks=num_speculative_blocks,
     )
+
+
+def test_mamba_align_block_table_selection_reuses_output_buffer():
+    spec = _create_mamba_spec(num_speculative_blocks=2)
+    block_table = torch.tensor(
+        [
+            [10, 11, 12, 13, 14],
+            [20, 21, 22, 23, 24],
+            [30, 31, 32, 33, 34],
+        ],
+        dtype=torch.int32,
+    )
+    seq_lens = torch.tensor([0, BLOCK_SIZE, BLOCK_SIZE + 1], dtype=torch.int32)
+    output = torch.empty((4, 4), dtype=torch.int32)
+
+    selected = mamba_get_block_table_tensor(
+        block_table,
+        seq_lens,
+        spec,
+        "align",
+        output=output,
+    )
+
+    assert selected.data_ptr() == output.data_ptr()
+    assert selected.shape == (3, 3)
+    assert selected.tolist() == [
+        [10, 11, 12],
+        [20, 21, 22],
+        [31, 32, 33],
+    ]
 
 
 def test_bailing_linear_attention_reports_uniform_batch_cudagraph_support():

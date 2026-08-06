@@ -53,6 +53,7 @@ class MiniMaxM3TextConfig(PretrainedConfig):
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
+        layer_types = kwargs.pop("layer_types", None)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -69,6 +70,8 @@ class MiniMaxM3TextConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.rotary_dim = rotary_dim
         self.partial_rotary_factor = partial_rotary_factor
+        if hidden_act == "silu":
+            hidden_act = "swigluoai"
         self.hidden_act = hidden_act
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
@@ -103,6 +106,7 @@ class MiniMaxM3TextConfig(PretrainedConfig):
             }
         )
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+        self.layer_types = layer_types
 
 
 class MiniMaxM3MTPConfig(MiniMaxM3TextConfig):

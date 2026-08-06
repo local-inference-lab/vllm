@@ -68,10 +68,60 @@ logger = init_logger(__name__)
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     {
         "DeepseekV2ForCausalLM",
-        "Qwen2MoeForCausalLM",
         "GraniteMoeForCausalLM",
+        "InklingForCausalLM",
+        "InklingForConditionalGeneration",
+        "LongcatFlashNgramForCausalLM",
+        "Qwen2MoeForCausalLM",
     }
 )
+
+AUTO_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV4ForCausalLM",
+        "DeepSeekV4MTPModel",
+        "InklingForCausalLM",
+        "InklingForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "KimiK3MTPModel",
+        "KimiLinearForCausalLM",
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    }
+)
+
+
+def _should_auto_enable_breakable_cudagraph(
+    model_config: ModelConfig | None,
+) -> bool:
+    if os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH") is not None:
+        return False
+    if model_config is None:
+        return False
+    return any(
+        arch in AUTO_BREAKABLE_CUDAGRAPH_ARCHITECTURES
+        for arch in model_config.architectures
+    )
+
+
+def _maybe_auto_enable_breakable_cudagraph(
+    model_config: ModelConfig | None,
+) -> bool:
+    if not _should_auto_enable_breakable_cudagraph(model_config):
+        return False
+
+    os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+    if envs.VLLM_USE_AOT_COMPILE:
+        os.environ["VLLM_USE_AOT_COMPILE"] = "0"
+        logger.warning_once(
+            "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1 for this "
+            "architecture, disabling VLLM_USE_AOT_COMPILE=1."
+        )
+    logger.info_once(
+        "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. "
+        "Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out."
+    )
+    return True
 
 
 class OptimizationLevel(IntEnum):
@@ -126,7 +176,7 @@ def enable_act_fusion(cfg: "VllmConfig") -> bool:
 
 
 def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
-    """Enable if TP > 1 and Hopper/Blackwell and flashinfer installed."""
+    """Enable when a supported fused all-reduce RMSNorm backend is active."""
     from vllm.platforms import current_platform
     from vllm.utils.flashinfer import has_flashinfer
 
@@ -137,14 +187,13 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
             rocm_aiter_ops.is_enabled() and cfg.parallel_config.tensor_parallel_size > 1
         )
 
-    return (
-        cfg.parallel_config.tensor_parallel_size > 1
-        and current_platform.is_cuda()
-        and has_flashinfer()
-        and (
-            current_platform.is_device_capability_family(100)
-            or current_platform.is_device_capability(90)
-        )
+    if cfg.parallel_config.tensor_parallel_size <= 1 or not current_platform.is_cuda():
+        return False
+    if envs.VLLM_ENABLE_PCIE_ALLREDUCE and envs.VLLM_PCIE_ALLREDUCE_BACKEND == "b12x":
+        return True
+    return has_flashinfer() and (
+        current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability(90)
     )
 
 
@@ -190,6 +239,15 @@ def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
     return rocm_aiter_ops.is_enabled() and check_aiter_fused_qk_rmsnorm()
 
 
+def enable_qk_norm_rope_kvcache(cfg: "VllmConfig") -> bool:
+    """Enable fused QK-norm + RoPE + KV cache update on ROCm with AITER."""
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    if not rocm_aiter_ops.is_enabled():
+        return False
+    return cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
+
+
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -202,6 +260,8 @@ OPTIMIZATION_LEVEL_00 = {
             "fuse_act_padding": False,
             "fuse_mla_dual_rms_norm": False,
             "fuse_rope_kvcache": False,
+            "fuse_qk_norm_rope_kvcache": False,
+            "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": False,
         },
         "cudagraph_mode": CUDAGraphMode.NONE,
@@ -223,6 +283,8 @@ OPTIMIZATION_LEVEL_01 = {
             "fuse_act_padding": enable_norm_pad_fusion,
             "fuse_mla_dual_rms_norm": enable_mla_dual_rms_norm_fusion,
             "fuse_rope_kvcache": False,
+            "fuse_qk_norm_rope_kvcache": False,
+            "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": False,
         },
         "cudagraph_mode": CUDAGraphMode.PIECEWISE,
@@ -244,6 +306,8 @@ OPTIMIZATION_LEVEL_02 = {
             "fuse_act_padding": enable_norm_pad_fusion,
             "fuse_mla_dual_rms_norm": enable_mla_dual_rms_norm_fusion,
             "fuse_rope_kvcache": enable_rope_kvcache_fusion,
+            "fuse_qk_norm_rope_kvcache": enable_qk_norm_rope_kvcache,
+            "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": enable_rope_kvcache_mla_fusion,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
@@ -265,6 +329,8 @@ OPTIMIZATION_LEVEL_03 = {
             "fuse_act_padding": enable_norm_pad_fusion,
             "fuse_mla_dual_rms_norm": enable_mla_dual_rms_norm_fusion,
             "fuse_rope_kvcache": enable_rope_kvcache_fusion,
+            "fuse_qk_norm_rope_kvcache": enable_qk_norm_rope_kvcache,
+            "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": enable_rope_kvcache_mla_fusion,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
@@ -806,6 +872,13 @@ class VllmConfig:
         ):
             return
 
+        if (
+            speculative_config.uses_acceptance_length_adaptation()
+            and not speculative_config.uses_batch_size_dynamic_speculative_decoding()
+            and self.use_v2_model_runner
+        ):
+            return
+
         logger.warning_once(
             "Dynamic speculative decoding changes the target verification "
             "length at runtime. Overriding cudagraph_mode from %s to "
@@ -925,6 +998,9 @@ class VllmConfig:
         self.try_verify_and_update_config()
 
         if self.model_config is not None:
+            from vllm.config.virtual_tp import maybe_apply_b12x_virtual_tp_padding
+
+            maybe_apply_b12x_virtual_tp_padding(self)
             self.model_config.verify_with_parallel_config(self.parallel_config)
             self.model_config.verify_dual_chunk_attention_config(self.load_config)
 
@@ -1154,28 +1230,9 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
-        # For model classes don't carry @support_torch_compile —
-        # the breakable cudagraph is the supported PIECEWISE path. Auto-enable
-        # it unless the user has explicitly opted out via the env var.
-        if (
-            self.model_config is not None
-            and "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
-            and any(
-                a
-                in (
-                    "DeepseekV4ForCausalLM",
-                    "DeepSeekV4MTPModel",
-                    "MiniMaxM3SparseForCausalLM",
-                    "MiniMaxM3SparseForConditionalGeneration",
-                )
-                for a in self.model_config.architectures
-            )
-        ):
-            os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
-            logger.info_once(
-                "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. "
-                "Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out."
-            )
+        # These architectures prefer breakable cudagraphs unless the caller
+        # explicitly chooses a different compile path.
+        _maybe_auto_enable_breakable_cudagraph(self.model_config)
 
         if envs.VLLM_USE_BREAKABLE_CUDAGRAPH:
             logger.warning_once(
@@ -1289,8 +1346,8 @@ class VllmConfig:
 
                 if pass_config.sp_min_token_num is None:
                     logger.warning(
-                        "Model hidden_size too small for the SP "
-                        "threshold heuristic, disabling. To force SP, "
+                        "No SP threshold heuristic for this device "
+                        "capability / hidden_size, disabling. To force SP, "
                         "set pass_config.sp_min_token_num manually."
                     )
                     pass_config.enable_sp = False
@@ -1644,10 +1701,18 @@ class VllmConfig:
     def update_sizes_for_sequence_parallelism(self, possible_sizes: list) -> list:
         # remove the sizes that not multiple of tp_size when
         # enable sequence parallelism
+        tp_size = self.parallel_config.tensor_parallel_size
+        sp_min_token_num = self.compilation_config.pass_config.sp_min_token_num
+
+        def needs_sp_shape(size: int) -> bool:
+            # SP only applies to compile ranges at or above sp_min_token_num;
+            # smaller captured sizes run non-SP graphs and keep their shapes.
+            return sp_min_token_num is None or size >= sp_min_token_num
+
         removed_sizes = [
             size
             for size in possible_sizes
-            if size % self.parallel_config.tensor_parallel_size != 0
+            if needs_sp_shape(size) and size % tp_size != 0
         ]
         if removed_sizes:
             logger.warning(
@@ -1655,13 +1720,13 @@ class VllmConfig:
                 "multiple of tp_size %d when "
                 "sequence parallelism is enabled",
                 removed_sizes,
-                self.parallel_config.tensor_parallel_size,
+                tp_size,
             )
 
         return [
             size
             for size in possible_sizes
-            if size % self.parallel_config.tensor_parallel_size == 0
+            if not needs_sp_shape(size) or size % tp_size == 0
         ]
 
     def _set_max_num_scheduled_tokens(self):
@@ -1963,6 +2028,21 @@ class VllmConfig:
                     logger.debug(
                         "Max num batched tokens below rope+kvcache fusion threshold, "
                         "rope+kvcache fusion enabled for num_tokens <= %d.",
+                        compile_range_end,
+                    )
+
+        if compilation_config.pass_config.fuse_qk_norm_rope_kvcache:
+            max_token_num = (
+                compilation_config.pass_config.rope_kvcache_fusion_max_token_num
+            )
+            if max_token_num is not None:
+                if compile_range_end is not None and max_token_num < compile_range_end:
+                    computed_compile_ranges_endpoints.append(max_token_num)
+                else:
+                    logger.debug(
+                        "Max num batched tokens below qk_norm+rope+kvcache "
+                        "fusion threshold, fusion enabled for "
+                        "num_tokens <= %d.",
                         compile_range_end,
                     )
 

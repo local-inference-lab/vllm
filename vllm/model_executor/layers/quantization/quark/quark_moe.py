@@ -1579,6 +1579,9 @@ class QuarkNvfp4MoEMethod(QuarkMoEMethod):
             a13_scale=layer.w13_input_scale_2,
             a2_scale=layer.w2_input_scale_2,
             layer=layer,
+            swiglu_limit=getattr(layer, "swiglu_limit", None),
+            gemm1_alpha=getattr(layer, "swiglu_alpha", None),
+            gemm1_beta=getattr(layer, "swiglu_beta", None),
         )
 
     def apply(

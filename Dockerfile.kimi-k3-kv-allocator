@@ -1,0 +1,11 @@
+FROM local/vllm:kimi-k3-kquant-4p05-tp16-20260729
+
+COPY vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py /opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py
+COPY vllm/v1/worker/gpu_worker.py /opt/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py
+COPY vllm/model_executor/layers/quantization/nvfp4_nf3_hybrid.py /opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/nvfp4_nf3_hybrid.py
+COPY vllm/model_executor/model_loader/default_loader.py /opt/venv/lib/python3.12/site-packages/vllm/model_executor/model_loader/default_loader.py
+COPY vllm/model_executor/model_loader/weight_utils.py /opt/venv/lib/python3.12/site-packages/vllm/model_executor/model_loader/weight_utils.py
+COPY vllm/third_party/flash_linear_attention/ops/kda.py /opt/venv/lib/python3.12/site-packages/vllm/third_party/flash_linear_attention/ops/kda.py
+COPY vllm/model_executor/models/kimi_linear.py /opt/venv/lib/python3.12/site-packages/vllm/model_executor/models/kimi_linear.py
+
+LABEL local-inference-lab.kimi-k3-kv-allocator="stream-nf3-repack-and-release-unused-warmup-blocks"

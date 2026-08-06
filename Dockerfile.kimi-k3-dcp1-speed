@@ -1,0 +1,18 @@
+FROM local/vllm:kimi-k3-kquant-4p05-tp16-production-20260729
+
+COPY --from=instanttensor-wheel instanttensor-0.1.9-cp312-cp312-linux_x86_64.whl /tmp/instanttensor-0.1.9-cp312-cp312-linux_x86_64.whl
+RUN pip install --force-reinstall --no-deps /tmp/instanttensor-0.1.9-cp312-cp312-linux_x86_64.whl
+
+COPY vllm/envs.py /opt/venv/lib/python3.12/site-packages/vllm/envs.py
+COPY vllm/entrypoints/openai/api_server.py /opt/venv/lib/python3.12/site-packages/vllm/entrypoints/openai/api_server.py
+COPY vllm/utils/system_utils.py /opt/venv/lib/python3.12/site-packages/vllm/utils/system_utils.py
+COPY vllm/model_executor/layers/quantization/nvfp4_nf3_hybrid.py /opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/nvfp4_nf3_hybrid.py
+COPY vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py /opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py
+COPY vllm/model_executor/model_loader/default_loader.py /opt/venv/lib/python3.12/site-packages/vllm/model_executor/model_loader/default_loader.py
+COPY vllm/model_executor/model_loader/weight_utils.py /opt/venv/lib/python3.12/site-packages/vllm/model_executor/model_loader/weight_utils.py
+COPY vllm/v1/executor/multiproc_executor.py /opt/venv/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py
+COPY vllm/v1/worker/gpu_worker.py /opt/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py
+COPY --from=sparkinfer sparkinfer/moe/_shared/kernels/micro.py /opt/venv/lib/python3.12/site-packages/sparkinfer/moe/_shared/kernels/micro.py
+COPY --from=sparkinfer sparkinfer/moe/_shared/kernels/w4a16/kernel.py /opt/venv/lib/python3.12/site-packages/sparkinfer/moe/_shared/kernels/w4a16/kernel.py
+
+LABEL local-inference-lab.kimi-k3-dcp1-speed="k3-hybrid-one-grid-cudagraph-indexed-instanttensor-event"

@@ -125,7 +125,17 @@ async def build_async_engine_client(
         # Pre-import heavy modules in the forkserver process
         logger.debug("Setup forkserver with pre-imports")
         multiprocessing.set_start_method("forkserver")
-        multiprocessing.set_forkserver_preload(["vllm.v1.engine.async_llm"])
+        # Preload the modules every local GPU worker otherwise imports while
+        # the parent is blocked writing its spawn payload.  On large TP this
+        # turns N serial Python/vLLM imports into one CUDA-clean preload whose
+        # pages are inherited by all forkserver children.
+        multiprocessing.set_forkserver_preload(
+            [
+                "vllm.v1.engine.async_llm",
+                "vllm.v1.executor.multiproc_executor",
+                "vllm.v1.worker.gpu_worker",
+            ]
+        )
         forkserver.ensure_running()
         logger.debug("Forkserver setup complete!")
 

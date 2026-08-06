@@ -41,6 +41,10 @@ from vllm.model_executor.parameter import (
     RowvLLMParameter,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.virtual_tp import (
+    get_current_virtual_tp_plan,
+    pad_or_narrow_weight,
+)
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -530,7 +534,9 @@ class ColumnParallelLinear(LinearBase):
         if output_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[output_dim]
             start_idx = self.tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            loaded_weight = pad_or_narrow_weight(
+                loaded_weight, output_dim, start_idx, shard_size
+            )
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
@@ -601,6 +607,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         return_bias: If true, return bias together with outputs in forward pass.
         disable_tp: If true, all weights matrix won't be sharded, this layer
                     will be treated as a "Replicated" MergedLinear.
+        loaded_output_sizes: Output dimensions of the logical matrices in the
+                             checkpoint. Defaults to ``output_sizes``. This can
+                             differ when the in-memory matrices are padded.
     """
 
     def __init__(
@@ -616,8 +625,18 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        loaded_output_sizes: list[int] | None = None,
     ):
         self.output_sizes = output_sizes
+        self.loaded_output_sizes = (
+            output_sizes if loaded_output_sizes is None else loaded_output_sizes
+        )
+        if len(self.loaded_output_sizes) != len(self.output_sizes):
+            raise ValueError(
+                "loaded_output_sizes must have the same length as output_sizes"
+            )
+        if any(output_size <= 0 for output_size in self.loaded_output_sizes):
+            raise ValueError("loaded_output_sizes must contain only positive sizes")
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
 
@@ -688,11 +707,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 param_data.copy_(loaded_weight)
                 return
 
-            output_sizes = (
-                self.output_sizes[loaded_shard_id[0] : loaded_shard_id[-1] + 1]
+            shard_ids = (
+                list(loaded_shard_id)
                 if loaded_shard_id is not None
-                else self.output_sizes
+                else list(range(len(self.loaded_output_sizes)))
             )
+            output_sizes = [self.loaded_output_sizes[idx] for idx in shard_ids]
             current_shard_offset = 0
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
             if (
@@ -705,8 +725,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     "for BNB quantization with TP yet."
                 )
             shard_offsets: list[tuple[int, int, int]] = []
-            for i, output_size in enumerate(output_sizes):
-                shard_offsets.append((i, current_shard_offset, output_size))
+            for shard_id, output_size in zip(shard_ids, output_sizes):
+                shard_offsets.append((shard_id, current_shard_offset, output_size))
                 current_shard_offset += output_size
             packed_dim = getattr(param, "packed_dim", None)
             for shard_id, shard_offset, shard_size in shard_offsets:
@@ -788,7 +808,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
             if not is_sharded_weight:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                loaded_weight = pad_or_narrow_weight(
+                    loaded_weight, output_dim, start_idx, shard_size
+                )
         # Special case for per-tensor scales in fused case.
         elif needs_scalar_to_array:
             param_data, loaded_weight = adjust_scalar_to_fused_array(
@@ -812,6 +834,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         param: BasevLLMParameter,
         loaded_weight: torch.Tensor,
         output_sizes: list[int] | None = None,
+        shard_ids: list[int] | None = None,
     ):
         """
         Handle special case for models where MLP layers are already
@@ -825,9 +848,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         current_shard_offset = 0
         shard_offsets: list[tuple[int, int, int]] = []
-        output_sizes = output_sizes or self.output_sizes
-        for i, output_size in enumerate(output_sizes):
-            shard_offsets.append((i, current_shard_offset, output_size))
+        output_sizes = output_sizes or self.loaded_output_sizes
+        shard_ids = shard_ids or list(range(len(output_sizes)))
+        if len(shard_ids) != len(output_sizes):
+            raise ValueError("shard_ids and output_sizes must have the same length")
+        for shard_id, output_size in zip(shard_ids, output_sizes):
+            shard_offsets.append((shard_id, current_shard_offset, output_size))
             current_shard_offset += output_size
 
         for shard_id, shard_offset, shard_size in shard_offsets:
@@ -875,20 +901,24 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 param.load_merged_column_weight(loaded_weight=loaded_weight)
                 return
-            output_sizes = (
-                [self.output_sizes[idx] for idx in loaded_shard_id]
-                if loaded_shard_id
-                else None
+            shard_ids = (
+                list(loaded_shard_id)
+                if loaded_shard_id is not None
+                else list(range(len(self.loaded_output_sizes)))
             )
+            output_sizes = [self.loaded_output_sizes[idx] for idx in shard_ids]
             if isinstance(param, BlockQuantScaleParameter):
                 weight_block_size = getattr(self, "weight_block_size", None)
                 output_sizes = [
                     adjust_block_scale_shard(weight_block_size, size, 0)[0]
-                    for size in (output_sizes or self.output_sizes)
+                    for size in output_sizes
                 ]
             # TODO: @dsikka - move to parameter.py
             self._load_fused_module_from_checkpoint(
-                param, loaded_weight, output_sizes=output_sizes
+                param,
+                loaded_weight,
+                output_sizes=output_sizes,
+                shard_ids=shard_ids,
             )
             return
 
@@ -965,6 +995,12 @@ class QKVParallelLinear(ColumnParallelLinear):
                         (e.g. model.layers.0.qkv_proj)
         return_bias: If true, return bias together with outputs in forward pass.
         disable_tp: If true, weights matrix won't be sharded through tp rank.
+        loaded_total_num_heads: Query-head count represented by the checkpoint.
+                                Defaults to ``total_num_heads`` and may differ
+                                when the in-memory projection is padded.
+        loaded_total_num_kv_heads: KV-head count represented by the checkpoint.
+                                   Defaults to ``total_num_kv_heads`` and may
+                                   differ when the in-memory projection is padded.
     """
 
     def __init__(
@@ -982,6 +1018,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         return_bias: bool = True,
         disable_tp: bool = False,
         v_head_size: int | None = None,
+        loaded_total_num_heads: int | None = None,
+        loaded_total_num_kv_heads: int | None = None,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -990,6 +1028,18 @@ class QKVParallelLinear(ColumnParallelLinear):
         if total_num_kv_heads is None:
             total_num_kv_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
+        self.loaded_total_num_heads = (
+            total_num_heads
+            if loaded_total_num_heads is None
+            else loaded_total_num_heads
+        )
+        self.loaded_total_num_kv_heads = (
+            total_num_kv_heads
+            if loaded_total_num_kv_heads is None
+            else loaded_total_num_kv_heads
+        )
+        if self.loaded_total_num_heads <= 0 or self.loaded_total_num_kv_heads <= 0:
+            raise ValueError("Loaded QKV head counts must be positive")
         # Divide the weight matrix along the last dimension.
         tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.num_heads = divide(self.total_num_heads, tp_size)
@@ -1060,16 +1110,17 @@ class QKVParallelLinear(ColumnParallelLinear):
         """
         shard_offsets = [
             # (shard_id, shard_offset, shard_size)
-            ("q", 0, self.total_num_heads * self.head_size),
+            ("q", 0, self.loaded_total_num_heads * self.head_size),
             (
                 "k",
-                self.total_num_heads * self.head_size,
-                self.total_num_kv_heads * self.head_size,
+                self.loaded_total_num_heads * self.head_size,
+                self.loaded_total_num_kv_heads * self.head_size,
             ),
             (
                 "v",
-                (self.total_num_heads + self.total_num_kv_heads) * self.head_size,
-                self.total_num_kv_heads * self.v_head_size,
+                (self.loaded_total_num_heads + self.loaded_total_num_kv_heads)
+                * self.head_size,
+                self.loaded_total_num_kv_heads * self.v_head_size,
             ),
         ]
 
@@ -1170,16 +1221,17 @@ class QKVParallelLinear(ColumnParallelLinear):
                 return
             shard_offsets = [
                 # (shard_id, shard_offset, shard_size)
-                ("q", 0, self.total_num_heads * self.head_size),
+                ("q", 0, self.loaded_total_num_heads * self.head_size),
                 (
                     "k",
-                    self.total_num_heads * self.head_size,
-                    self.total_num_kv_heads * self.head_size,
+                    self.loaded_total_num_heads * self.head_size,
+                    self.loaded_total_num_kv_heads * self.head_size,
                 ),
                 (
                     "v",
-                    (self.total_num_heads + self.total_num_kv_heads) * self.head_size,
-                    self.total_num_kv_heads * self.v_head_size,
+                    (self.loaded_total_num_heads + self.loaded_total_num_kv_heads)
+                    * self.head_size,
+                    self.loaded_total_num_kv_heads * self.v_head_size,
                 ),
             ]
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
@@ -1207,20 +1259,26 @@ class QKVParallelLinear(ColumnParallelLinear):
 
                 if use_bitsandbytes_4bit:
                     orig_qkv_offsets = {
-                        "q": (0, self.total_num_heads * self.head_size),
+                        "q": (0, self.loaded_total_num_heads * self.head_size),
                         "k": (
-                            self.total_num_heads * self.head_size,
-                            self.total_num_kv_heads * self.head_size,
+                            self.loaded_total_num_heads * self.head_size,
+                            self.loaded_total_num_kv_heads * self.head_size,
                         ),
                         "v": (
-                            (self.total_num_heads + self.total_num_kv_heads)
+                            (
+                                self.loaded_total_num_heads
+                                + self.loaded_total_num_kv_heads
+                            )
                             * self.head_size,
-                            self.total_num_kv_heads * self.v_head_size,
+                            self.loaded_total_num_kv_heads * self.v_head_size,
                         ),
                         "total": (
-                            (self.total_num_heads + self.total_num_kv_heads)
+                            (
+                                self.loaded_total_num_heads
+                                + self.loaded_total_num_kv_heads
+                            )
                             * self.head_size
-                            + self.total_num_kv_heads * self.v_head_size,
+                            + self.loaded_total_num_kv_heads * self.v_head_size,
                             0,
                         ),
                     }
@@ -1303,7 +1361,9 @@ class QKVParallelLinear(ColumnParallelLinear):
             start_idx = shard_rank * shard_size
 
             if not is_sharded_weight:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                loaded_weight = pad_or_narrow_weight(
+                    loaded_weight, output_dim, start_idx, shard_size
+                )
 
         # Special case for per-tensor scales in fused case.
         elif needs_scalar_to_array:
@@ -1346,6 +1406,173 @@ class QKVParallelLinear(ColumnParallelLinear):
                 name,
             )
             yield name
+
+
+def _get_minimax_m3_virtual_tp_plan(tp_size: int) -> dict[str, Any] | None:
+    plan = get_current_virtual_tp_plan()
+    if not isinstance(plan, dict) or plan.get("model_type") != "minimax_m3":
+        return None
+    attention_axis = plan.get("attention_heads")
+    if not isinstance(attention_axis, dict):
+        return None
+    if int(attention_axis.get("tp_size", -1)) != tp_size:
+        return None
+    return plan
+
+
+def _minimax_m3_axis_local_size(
+    plan: dict[str, Any],
+    axis_name: str,
+) -> int:
+    axis = plan.get(axis_name)
+    if not isinstance(axis, dict):
+        raise ValueError(f"MiniMax M3 virtual TP plan missing {axis_name!r}.")
+    return int(axis["local_size"])
+
+
+class MinimaxM3QKVParallelLinear(QKVParallelLinear):
+    """MiniMax-M3 QKV projection with an opt-in TP3 virtual shard layout."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: int | None = None,
+        bias: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: torch.dtype | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        *,
+        return_bias: bool = True,
+        disable_tp: bool = False,
+        v_head_size: int | None = None,
+    ) -> None:
+        tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+        self._minimax_m3_virtual_tp_plan = _get_minimax_m3_virtual_tp_plan(tp_size)
+        if self._minimax_m3_virtual_tp_plan is None:
+            super().__init__(
+                hidden_size=hidden_size,
+                head_size=head_size,
+                total_num_heads=total_num_heads,
+                total_num_kv_heads=total_num_kv_heads,
+                bias=bias,
+                skip_bias_add=skip_bias_add,
+                params_dtype=params_dtype,
+                quant_config=quant_config,
+                prefix=prefix,
+                return_bias=return_bias,
+                disable_tp=disable_tp,
+                v_head_size=v_head_size,
+            )
+            return
+
+        self.hidden_size = hidden_size
+        self.head_size = head_size
+        self.v_head_size = v_head_size if v_head_size is not None else head_size
+        self.total_num_heads = total_num_heads
+        if total_num_kv_heads is None:
+            total_num_kv_heads = total_num_heads
+        self.total_num_kv_heads = total_num_kv_heads
+        self.num_heads = _minimax_m3_axis_local_size(
+            self._minimax_m3_virtual_tp_plan, "attention_heads"
+        )
+        self.num_kv_heads = _minimax_m3_axis_local_size(
+            self._minimax_m3_virtual_tp_plan, "kv_heads"
+        )
+        self.num_kv_head_replicas = 1
+
+        input_size = self.hidden_size
+        output_size = (
+            self.num_heads * self.head_size
+            + self.num_kv_heads * self.head_size
+            + self.num_kv_heads * self.v_head_size
+        ) * tp_size
+        self.output_sizes = [
+            self.num_heads * self.head_size * tp_size,
+            self.num_kv_heads * self.head_size * tp_size,
+            self.num_kv_heads * self.v_head_size * tp_size,
+        ]
+
+        ColumnParallelLinear.__init__(
+            self,
+            input_size=input_size,
+            output_size=output_size,
+            bias=bias,
+            gather_output=False,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=prefix,
+            return_bias=return_bias,
+            disable_tp=disable_tp,
+        )
+
+    def _uses_minimax_m3_virtual_tp(self) -> bool:
+        return getattr(self, "_minimax_m3_virtual_tp_plan", None) is not None
+
+    def weight_loader_v2(
+        self,
+        param: BasevLLMParameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: str | None = None,
+    ) -> None:
+        if not self._uses_minimax_m3_virtual_tp():
+            super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
+            return
+
+        self.validate_shard_id(loaded_shard_id)
+        assert loaded_shard_id in ("q", "k", "v")
+
+        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
+        shard_size = self._get_shard_size_mapping(loaded_shard_id)
+        assert shard_offset is not None and shard_size is not None
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            shard_size, shard_offset = adjust_block_scale_shard(
+                weight_block_size, shard_size, shard_offset
+            )
+
+        param.load_qkv_weight(
+            loaded_weight=loaded_weight,
+            num_heads=1,
+            shard_id=loaded_shard_id,
+            shard_offset=shard_offset,
+            shard_size=shard_size,
+            tp_rank=self.tp_rank,
+        )
+
+    def weight_loader(
+        self,
+        param: Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: str | None = None,
+    ) -> None:
+        if not self._uses_minimax_m3_virtual_tp():
+            super().weight_loader(param, loaded_weight, loaded_shard_id)
+            return
+
+        self.validate_shard_id(loaded_shard_id)
+        assert loaded_shard_id in ("q", "k", "v")
+        output_dim = getattr(param, "output_dim", None)
+        assert output_dim is not None
+
+        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
+        shard_size = self._get_shard_size_mapping(loaded_shard_id)
+        assert shard_offset is not None and shard_size is not None
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            shard_size, shard_offset = adjust_block_scale_shard(
+                weight_block_size, shard_size, shard_offset
+            )
+
+        param_data = param.data.narrow(output_dim, shard_offset, shard_size)
+        loaded_weight = pad_or_narrow_weight(
+            loaded_weight, output_dim, self.tp_rank * shard_size, shard_size
+        )
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
 
 
 class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
@@ -1396,13 +1623,23 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         self.index_head_size = index_head_size
 
         tp_size = get_tensor_model_parallel_world_size()
-        self.num_heads = divide(self.total_num_heads, tp_size)
-        if tp_size >= self.total_num_kv_heads:
-            self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
-        else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+        self._minimax_m3_virtual_tp_plan = _get_minimax_m3_virtual_tp_plan(tp_size)
+        if self._minimax_m3_virtual_tp_plan is not None:
+            self.num_heads = _minimax_m3_axis_local_size(
+                self._minimax_m3_virtual_tp_plan, "attention_heads"
+            )
+            self.num_kv_heads = _minimax_m3_axis_local_size(
+                self._minimax_m3_virtual_tp_plan, "kv_heads"
+            )
             self.num_kv_head_replicas = 1
+        else:
+            self.num_heads = divide(self.total_num_heads, tp_size)
+            if tp_size >= self.total_num_kv_heads:
+                self.num_kv_heads = 1
+                self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+            else:
+                self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+                self.num_kv_head_replicas = 1
         # index_q shards identically to the KV heads.
         self.num_index_heads = self.num_kv_heads
 
@@ -1431,6 +1668,9 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
             quant_config=quant_config,
             prefix=prefix,
         )
+
+    def _uses_minimax_m3_virtual_tp(self) -> bool:
+        return getattr(self, "_minimax_m3_virtual_tp_plan", None) is not None
 
     def validate_shard_id(self, shard_id: Any) -> TypeIs[str | None]:
         if shard_id in {"q", "k", "v", "index_q", "index_k"} or shard_id is None:
@@ -1483,10 +1723,13 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
 
         # index_k is fully replicated: num_heads == tp_size makes
         # load_qkv_weight pick shard_id_int == 0 on every rank. q/k/v/index_q ride
-        # the KV-head replication factor.
+        # the KV-head replication factor, except under MiniMax M3 virtual TP
+        # where ranks map directly onto logical padded KV shards.
         num_heads = (
             self.tp_size if loaded_shard_id == "index_k" else self.num_kv_head_replicas
         )
+        if self._uses_minimax_m3_virtual_tp() and loaded_shard_id != "index_k":
+            num_heads = 1
         param.load_qkv_weight(
             loaded_weight=loaded_weight,
             num_heads=num_heads,
@@ -1519,14 +1762,165 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
             )
 
         param_data = param.data.narrow(output_dim, shard_offset, shard_size)
-        if loaded_shard_id == "q":
-            shard_rank = self.tp_rank
-        elif loaded_shard_id == "index_k":
+        if loaded_shard_id == "index_k":
             shard_rank = 0  # replicated to every rank
+        elif loaded_shard_id == "q" or self._uses_minimax_m3_virtual_tp():
+            shard_rank = self.tp_rank
         else:
             shard_rank = self.tp_rank // self.num_kv_head_replicas
-        loaded_weight = loaded_weight.narrow(
-            output_dim, shard_rank * shard_size, shard_size
+        loaded_weight = pad_or_narrow_weight(
+            loaded_weight, output_dim, shard_rank * shard_size, shard_size
+        )
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
+
+
+class MinimaxM3IndexerQKParallelLinear(ColumnParallelLinear):
+    """MiniMax-M3 lightning-indexer q/k projection.
+
+    This mirrors the indexer slice of ``MinimaxM3QKVParallelLinearWithIndexer``
+    for checkpoints where the main q/k/v projection is quantized differently
+    from the BF16 indexer projection.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        total_num_kv_heads: int,
+        total_num_index_heads: int,
+        index_head_size: int,
+        bias: bool = False,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        assert total_num_index_heads == total_num_kv_heads, (
+            "MinimaxM3IndexerQKParallelLinear requires "
+            "total_num_index_heads == total_num_kv_heads"
+        )
+        self.hidden_size = hidden_size
+        self.total_num_kv_heads = total_num_kv_heads
+        self.total_num_index_heads = total_num_index_heads
+        self.index_head_size = index_head_size
+
+        tp_size = get_tensor_model_parallel_world_size()
+        self._minimax_m3_virtual_tp_plan = _get_minimax_m3_virtual_tp_plan(tp_size)
+        if self._minimax_m3_virtual_tp_plan is not None:
+            self.num_index_heads = _minimax_m3_axis_local_size(
+                self._minimax_m3_virtual_tp_plan, "index_heads"
+            )
+            self.num_index_head_replicas = 1
+        elif tp_size >= self.total_num_index_heads:
+            self.num_index_heads = 1
+            self.num_index_head_replicas = divide(tp_size, self.total_num_index_heads)
+        else:
+            self.num_index_heads = divide(self.total_num_index_heads, tp_size)
+            self.num_index_head_replicas = 1
+
+        index_q = self.num_index_heads * self.index_head_size
+        index_k = self.index_head_size
+        self.output_sizes = [
+            index_q * tp_size,
+            index_k * tp_size,
+        ]
+
+        ColumnParallelLinear.__init__(
+            self,
+            input_size=self.hidden_size,
+            output_size=sum(self.output_sizes),
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def _uses_minimax_m3_virtual_tp(self) -> bool:
+        return getattr(self, "_minimax_m3_virtual_tp_plan", None) is not None
+
+    def validate_shard_id(self, loaded_shard_id: str | None) -> None:
+        if loaded_shard_id is None:
+            return
+        if loaded_shard_id not in ("index_q", "index_k"):
+            raise ValueError(
+                "Shard id for MinimaxM3IndexerQKParallelLinear must be one of "
+                "'index_q' or 'index_k'; got "
+                f"{loaded_shard_id}."
+            )
+
+    def _get_shard_offset_mapping(self, loaded_shard_id: str) -> int | None:
+        return {
+            "index_q": 0,
+            "index_k": self.num_index_heads * self.index_head_size,
+        }.get(loaded_shard_id)
+
+    def _get_shard_size_mapping(self, loaded_shard_id: str) -> int | None:
+        return {
+            "index_q": self.num_index_heads * self.index_head_size,
+            "index_k": self.index_head_size,
+        }.get(loaded_shard_id)
+
+    def weight_loader_v2(
+        self,
+        param: BasevLLMParameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: str | None = None,
+    ) -> None:
+        self.validate_shard_id(loaded_shard_id)
+        assert loaded_shard_id in ("index_q", "index_k")
+
+        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
+        shard_size = self._get_shard_size_mapping(loaded_shard_id)
+        assert shard_offset is not None and shard_size is not None
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            shard_size, shard_offset = adjust_block_scale_shard(
+                weight_block_size, shard_size, shard_offset
+            )
+
+        num_heads = (
+            self.tp_size
+            if loaded_shard_id == "index_k"
+            else self.num_index_head_replicas
+        )
+        if self._uses_minimax_m3_virtual_tp() and loaded_shard_id != "index_k":
+            num_heads = 1
+        param.load_qkv_weight(
+            loaded_weight=loaded_weight,
+            num_heads=num_heads,
+            shard_id=loaded_shard_id,
+            shard_offset=shard_offset,
+            shard_size=shard_size,
+            tp_rank=self.tp_rank,
+        )
+
+    def weight_loader(
+        self,
+        param: Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: str | None = None,
+    ) -> None:
+        self.validate_shard_id(loaded_shard_id)
+        assert loaded_shard_id in ("index_q", "index_k")
+        output_dim = getattr(param, "output_dim", None)
+        assert output_dim is not None
+
+        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
+        shard_size = self._get_shard_size_mapping(loaded_shard_id)
+        assert shard_offset is not None and shard_size is not None
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            shard_size, shard_offset = adjust_block_scale_shard(
+                weight_block_size, shard_size, shard_offset
+            )
+
+        param_data = param.data.narrow(output_dim, shard_offset, shard_size)
+        if loaded_shard_id == "index_k":
+            shard_rank = 0
+        elif self._uses_minimax_m3_virtual_tp():
+            shard_rank = self.tp_rank
+        else:
+            shard_rank = self.tp_rank // self.num_index_head_replicas
+        loaded_weight = pad_or_narrow_weight(
+            loaded_weight, output_dim, shard_rank * shard_size, shard_size
         )
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
@@ -1650,7 +2044,9 @@ class RowParallelLinear(LinearBase):
         if input_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[input_dim]
             start_idx = self.tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
+            loaded_weight = pad_or_narrow_weight(
+                loaded_weight, input_dim, start_idx, shard_size
+            )
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).

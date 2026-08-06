@@ -3,14 +3,19 @@
 """A layer that compute logits from hidden_stats."""
 
 import torch
+import torch.nn.functional as F
 
+from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_gather,
 )
 from vllm.model_executor.custom_op import PluggableLayer
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
+    VocabParallelEmbedding,
+)
 from vllm.platforms import current_platform
 
 
@@ -50,6 +55,11 @@ class LogitsProcessor(PluggableLayer):
         self.soft_cap = soft_cap
         # Whether to use gather or all-gather to gather the logits.
         self.use_all_gather = current_platform.use_all_gather()
+        # Dtype of the lm_head projection. Defaults to the model dtype; an
+        # fp32 head (via `--hf-overrides '{"head_dtype": "float32"}'`) is
+        # required for RL training-inference consistency.
+        model_config = get_current_vllm_config().model_config
+        self.head_dtype = model_config.head_dtype if model_config is not None else None
 
     def forward(
         self,
@@ -86,6 +96,45 @@ class LogitsProcessor(PluggableLayer):
             logits = tensor_model_parallel_gather(logits)
         return logits
 
+    def _apply_head(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Project hidden states through the lm_head, honoring head_dtype."""
+        if self.head_dtype is None or self.head_dtype == hidden_states.dtype:
+            return lm_head.quant_method.apply(
+                lm_head, hidden_states, bias=embedding_bias
+            )
+
+        if not isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod):
+            raise ValueError(
+                "A head_dtype different from the model dtype is only "
+                "supported for an unquantized lm_head."
+            )
+        if (
+            self.head_dtype == torch.float32
+            and (current_platform.is_cuda() or current_platform.is_rocm())
+            and hidden_states.is_cuda
+        ):
+            # Accumulate the projection directly into fp32. This avoids
+            # materializing an fp32 copy of the lm_head weight on every step,
+            # unlike casting both operands. `torch.mm(out_dtype=...)` only
+            # supports fp32 output for fp16/bf16 inputs, and is only
+            # implemented for CUDA and ROCm (the latter via the non-Lt GEMM
+            # path); other platforms fall back to the cast path below.
+            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            logits = torch.mm(flat, lm_head.weight.t(), out_dtype=self.head_dtype)
+            if embedding_bias is not None:
+                logits = logits + embedding_bias.to(self.head_dtype)
+            return logits.reshape(*hidden_states.shape[:-1], -1)
+        return F.linear(
+            hidden_states.to(self.head_dtype),
+            lm_head.weight.to(self.head_dtype),
+            embedding_bias.to(self.head_dtype) if embedding_bias is not None else None,
+        )
+
     def _get_logits(
         self,
         hidden_states: torch.Tensor,
@@ -93,10 +142,11 @@ class LogitsProcessor(PluggableLayer):
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor | None:
         # Get the logits for the next tokens.
-        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+        logits = self._apply_head(lm_head, hidden_states, embedding_bias)
 
         # Gather logits for TP
-        logits = self._gather_logits(logits)
+        if lm_head.tp_size > 1:
+            logits = self._gather_logits(logits)
 
         # Remove paddings in vocab (if any).
         if logits is not None:
@@ -122,22 +172,44 @@ class LogitsProcessor(PluggableLayer):
             )
         tp_size = get_tensor_model_parallel_world_size()
 
-        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+        logits = self._apply_head(lm_head, hidden_states, embedding_bias)
         if self.soft_cap is not None:
             logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
         if self.scale != 1.0:
             logits = logits * self.scale
 
-        # Mask out padding entries beyond org_vocab_size on this shard.
-        num_pad = lm_head.shard_indices.num_org_vocab_padding
-        if num_pad > 0:
-            logits[..., -num_pad:] = -float("inf")
+        shard_indices = lm_head.shard_indices
+
+        # VocabParallelEmbedding stores original-vocab and added-vocab slices
+        # separately, each with its own padding. Mask both padding regions so
+        # local argmax sees the same valid tokens as the full-logits path.
+        if shard_indices.num_org_vocab_padding > 0:
+            logits[
+                ...,
+                shard_indices.num_org_elements : shard_indices.num_org_elements_padded,
+            ] = -float("inf")
+
+        if shard_indices.num_added_vocab_padding > 0:
+            added_pad_start = (
+                shard_indices.num_org_elements_padded + shard_indices.num_added_elements
+            )
+            added_pad_end = (
+                shard_indices.num_org_elements_padded
+                + shard_indices.num_added_elements_padded
+            )
+            logits[..., added_pad_start:added_pad_end] = -float("inf")
 
         local_max_vals, local_max_indices = logits.max(dim=-1)
 
         # Convert shard-local indices to global vocab indices.
-        vocab_start = lm_head.shard_indices.org_vocab_start_index
-        global_indices = local_max_indices + vocab_start
+        added_vocab_local_start = shard_indices.num_org_elements_padded
+        global_indices = torch.where(
+            local_max_indices >= added_vocab_local_start,
+            local_max_indices
+            - added_vocab_local_start
+            + shard_indices.added_vocab_start_index,
+            local_max_indices + shard_indices.org_vocab_start_index,
+        )
 
         if tp_size == 1:
             return global_indices

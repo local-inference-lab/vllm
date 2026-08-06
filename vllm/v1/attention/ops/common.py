@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
+
 import torch
 
 from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import next_power_of_2
 
 
 @triton.jit
@@ -20,6 +23,7 @@ def _correct_attn_cp_out_kernel(
     lses_stride_H,
     lse_idx,
     HEAD_DIM: tl.constexpr,
+    N: tl.constexpr,
     N_ROUNDED: tl.constexpr,
     IS_BASE_E: tl.constexpr,
 ):
@@ -42,6 +46,7 @@ def _correct_attn_cp_out_kernel(
     head_idx = tl.program_id(axis=1).to(tl.int64)
     d_offsets = tl.arange(0, HEAD_DIM)
     num_n_offsets = tl.arange(0, N_ROUNDED)
+    valid_n_offsets = num_n_offsets < N
 
     # shape = [N]
     lse_offsets = (
@@ -51,7 +56,11 @@ def _correct_attn_cp_out_kernel(
     )
 
     # calc final lse
-    lse = tl.load(lses_ptr + lse_offsets)
+    lse = tl.load(
+        lses_ptr + lse_offsets,
+        mask=valid_n_offsets,
+        other=-float("inf"),
+    )
     lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
@@ -174,7 +183,12 @@ def correct_attn_out(
         l_sH,
         cp_rank,
     )
-    const_args = {"HEAD_DIM": D, "N_ROUNDED": N, "IS_BASE_E": is_lse_base_on_e}
+    const_args = {
+        "HEAD_DIM": D,
+        "N": N,
+        "N_ROUNDED": next_power_of_2(N),
+        "IS_BASE_E": is_lse_base_on_e,
+    }
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return out, lse
 
@@ -217,6 +231,7 @@ def cp_lse_ag_out_rs(
     ctx: CPTritonContext | None = None,
     return_lse: bool = False,
     is_lse_base_on_e=True,
+    head_major_output: bool = False,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -225,7 +240,45 @@ def cp_lse_ag_out_rs(
     out, lse = _cp_lse_common(
         cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
     )
-    out = cp_group.reduce_scatter(out, dim=1)
+    if head_major_output:
+        out = cp_group.reduce_scatter_head_major(out, dim=1)
+    else:
+        out = cp_group.reduce_scatter(out, dim=1)
+
+    if return_lse:
+        cp_num_heads = lse.shape[1] // cp_group.world_size
+        cp_rank = cp_group.rank_in_group
+        lse = lse[:, cp_num_heads * cp_rank : cp_num_heads * (cp_rank + 1)]
+        return out, lse
+    return out
+
+
+def cp_lse_ag_out_rs_into(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    output_provider: Callable[[torch.Tensor], torch.Tensor],
+    ctx: CPTritonContext | None = None,
+    return_lse: bool = False,
+    is_lse_base_on_e: bool = True,
+):
+    """Correct DCP partials and reduce-scatter into borrowed output storage."""
+    if cp_group.world_size <= 1:
+        raise RuntimeError("cp_lse_ag_out_rs_into requires DCP world size > 1")
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("cp_lse_ag_out_rs_into is eager-only")
+
+    out, lse = _cp_lse_common(
+        cp_attn_out,
+        cp_attn_lse,
+        cp_group,
+        ctx=ctx,
+        is_lse_base_on_e=is_lse_base_on_e,
+    )
+    output = output_provider(out)
+    if not isinstance(output, torch.Tensor):
+        raise TypeError("DCP output provider must return a tensor")
+    out = cp_group.reduce_scatter_into(out, output, dim=1)
 
     if return_lse:
         cp_num_heads = lse.shape[1] // cp_group.world_size

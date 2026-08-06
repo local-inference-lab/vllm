@@ -363,7 +363,9 @@ class StructuredOutputManager:
                 # After unifying the `openai_gptoss` and non-`openai_gptoss` styles,
                 # it can be removed.
                 request.structured_output_request.reasoning_ended = (
-                    reasoner.is_reasoning_end(request.prompt_token_ids or [])
+                    reasoner.is_reasoning_end_for_prompt(
+                        request.prompt_token_ids or []
+                    )
                 )
             return request.structured_output_request.reasoning_ended
         return True

@@ -130,6 +130,7 @@ class GlmOcrMTP(nn.Module, SupportsPP):
         self.config = vllm_config.model_config.hf_config.text_config
         quant_config = vllm_config.quant_config
         self.quant_config = quant_config
+        self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()
         self.model = GlmOcrMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -139,6 +140,20 @@ class GlmOcrMTP(nn.Module, SupportsPP):
             assert isinstance(layer, GlmOcrMultiTokenPredictorLayer)
             layer = layer.mtp_block
             assert isinstance(layer, Glm4DecoderLayer)
+
+    def _checkpoint_weight_name_prefixes(self) -> tuple[str, ...]:
+        return (
+            "lm_head.",
+            "model.embed_tokens.",
+            *(
+                f"model.layers.{layer_idx}."
+                for layer_idx in range(
+                    self.config.num_hidden_layers,
+                    self.config.num_hidden_layers
+                    + self.config.num_nextn_predict_layers,
+                )
+            ),
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

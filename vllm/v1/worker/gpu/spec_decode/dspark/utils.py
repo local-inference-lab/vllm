@@ -6,6 +6,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.model_loader import get_model
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _should_share,
     get_target_lm_head,
@@ -18,21 +19,36 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     draft_model_config = speculative_config.draft_model_config
 
     from vllm.compilation.backends import set_model_tag
+    from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
 
-    # DSpark uses non-causal attention.
-    causal = False
+    backend = speculative_config.attention_backend
+    if backend is None:
+        # DSpark needs a non-causal-capable backend for its drafts;
+        # auto-selection may pick one that downgrades the spec-decode
+        # cudagraph to PIECEWISE.
+        backend = AttentionBackendEnum.FLASH_ATTN
     draft_vllm_config = replace(
         vllm_config,
         attention_config=replace(
             vllm_config.attention_config,
-            use_non_causal=not causal,
-            backend=speculative_config.attention_backend,
+            use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
+            backend=backend,
+        ),
+        cache_config=(
+            replace(
+                vllm_config.cache_config,
+                cache_dtype=speculative_config.kv_cache_dtype,
+            )
+            if speculative_config.kv_cache_dtype is not None
+            else vllm_config.cache_config
         ),
     )
 
     with set_model_tag("dspark_head"):
         draft_model = get_model(
-            vllm_config=draft_vllm_config, model_config=draft_model_config
+            vllm_config=draft_vllm_config,
+            model_config=draft_model_config,
+            load_config=speculative_config.draft_load_config,
         )
 
     if get_pp_group().world_size != 1:
@@ -63,5 +79,12 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if draft_lm_head is not None:
             del draft_model.lm_head
         draft_model.lm_head = target_lm_head
+
+    # Opt-in rowwise-fp8 draft head (VLLM_DSPARK_FP8_DRAFT_HEAD). Must run
+    # after the lm_head aliasing above and BEFORE CUDA graph capture: the
+    # draft step is captured whole, so the fp8 copy is materialized eagerly.
+    maybe_init_fp8_draft_head = getattr(draft_model, "maybe_init_fp8_draft_head", None)
+    if maybe_init_fp8_draft_head is not None:
+        maybe_init_fp8_draft_head()
 
     return draft_model

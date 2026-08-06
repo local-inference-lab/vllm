@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeVar
 
@@ -122,11 +122,11 @@ class AttentionBackend(ABC):
     ) -> tuple[int, ...]:
         """
         Get the physical (memory layout) ordering of the kv cache dimensions.
-        e.g. if the KV cache shape is
-        [2, num_blocks, block_size, num_heads, head_size],
-        and get_kv_cache_stride_order returns (1, 3, 0, 2, 4) then the physical
+        Standard attention backends pack K and V into the content dim, giving
+        the logical shape [num_blocks, num_heads, block_size, 2 * head_size].
+        e.g. if get_kv_cache_stride_order returns (0, 2, 1, 3) then the physical
         ordering of dimensions is
-        [num_blocks, num_heads, 2, block_size, head_size].
+        [num_blocks, block_size, num_heads, 2 * head_size].
 
         If this function is unimplemented / raises NotImplementedError,
         the physical layout of the KV cache will match the logical shape.
@@ -135,9 +135,9 @@ class AttentionBackend(ABC):
             include_num_layers_dimension: if True, includes an additional
                 num_layers dimension, which is assumed to be prepended
                 to the logical KV cache shape.
-                With the above example, a return value (2, 4, 0, 1, 3, 5)
+                With the above example, a return value (1, 0, 3, 2, 4)
                 corresponds to
-                [num_blocks, num_heads, num_layers, 2, block_size, head_size].
+                [num_blocks, num_layers, block_size, num_heads, 2 * head_size].
 
                 If an additional dimension is NOT included in the returned
                 tuple, the physical layout will not include a layers dimension.
@@ -150,6 +150,11 @@ class AttentionBackend(ABC):
     @classmethod
     def full_cls_name(cls) -> tuple[str, str]:
         return (cls.__module__, cls.__qualname__)
+
+    @classmethod
+    def get_metadata_group_key(cls, attn_layer: Any) -> tuple[Any, ...]:
+        """Return extra layer attributes that require separate metadata builders."""
+        return ()
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -259,6 +264,10 @@ class AttentionBackend(ABC):
         return False
 
     @classmethod
+    def supports_sliding_window(cls) -> bool:
+        return False
+
+    @classmethod
     def supports_non_causal(cls) -> bool:
         """Check if backend supports non-causal (bidirectional) attention
         for decoder models.
@@ -319,6 +328,7 @@ class AttentionBackend(ABC):
         use_per_head_quant_scales: bool,
         device_capability: "DeviceCapability",
         attn_type: str,
+        has_sliding_window: bool = False,
         use_non_causal: bool = False,
         use_batch_invariant: bool = False,
         use_kv_connector: bool = False,
@@ -354,6 +364,8 @@ class AttentionBackend(ABC):
             invalid_reasons.append("compute capability not supported")
         if not cls.supports_attn_type(attn_type):
             invalid_reasons.append(f"attention type {attn_type} not supported")
+        if has_sliding_window and not cls.supports_sliding_window():
+            invalid_reasons.append("sliding window not supported")
         if use_non_causal and not cls.supports_non_causal():
             invalid_reasons.append("non-causal attention not supported")
         if use_batch_invariant and not cls.supports_batch_invariance():
@@ -392,6 +404,111 @@ T = TypeVar("T", bound=AttentionMetadata)
 
 
 @dataclass
+class CommonAttentionBatchTopology:
+    """Per-forward batch-shape data shared across KV-cache groups."""
+
+    query_start_loc_np: np.ndarray
+    num_reqs: int
+    max_query_len: int
+    max_seq_len_upper_bound: int
+
+    _query_lens_np: np.ndarray | None = None
+    _req_id_per_token_np: np.ndarray | None = None
+    _split_decodes_and_prefills_cache: dict[
+        tuple[int, bool, bool, int], tuple[int, int, int, int]
+    ] = field(default_factory=dict)
+
+    @property
+    def query_lens_np(self) -> np.ndarray:
+        if self._query_lens_np is None:
+            starts = self.query_start_loc_np[: self.num_reqs + 1]
+            self._query_lens_np = np.diff(starts)
+        return self._query_lens_np
+
+    @property
+    def req_id_per_token_np(self) -> np.ndarray:
+        if self._req_id_per_token_np is None:
+            self._req_id_per_token_np = np.repeat(
+                np.arange(self.num_reqs, dtype=np.int32), self.query_lens_np
+            )
+        return self._req_id_per_token_np
+
+    def split_decodes_and_prefills(
+        self,
+        common_attn_metadata: "CommonAttentionMetadata",
+        decode_threshold: int = 1,
+        require_uniform: bool = False,
+        treat_short_extends_as_decodes: bool = True,
+    ) -> tuple[int, int, int, int]:
+        is_prefilling_key = (
+            0
+            if treat_short_extends_as_decodes
+            else id(common_attn_metadata.is_prefilling)
+        )
+        key = (
+            decode_threshold,
+            require_uniform,
+            treat_short_extends_as_decodes,
+            is_prefilling_key,
+        )
+        if key not in self._split_decodes_and_prefills_cache:
+            if treat_short_extends_as_decodes:
+                self._split_decodes_and_prefills_cache[key] = (
+                    self._split_decodes_and_prefills_from_numpy(
+                        common_attn_metadata.num_actual_tokens,
+                        decode_threshold,
+                        require_uniform,
+                    )
+                )
+            else:
+                from vllm.v1.attention.backends.utils import (
+                    split_decodes_and_prefills,
+                )
+
+                self._split_decodes_and_prefills_cache[key] = (
+                    split_decodes_and_prefills(
+                        common_attn_metadata,
+                        decode_threshold=decode_threshold,
+                        require_uniform=require_uniform,
+                        treat_short_extends_as_decodes=treat_short_extends_as_decodes,
+                    )
+                )
+        return self._split_decodes_and_prefills_cache[key]
+
+    def _split_decodes_and_prefills_from_numpy(
+        self,
+        num_tokens: int,
+        decode_threshold: int,
+        require_uniform: bool,
+    ) -> tuple[int, int, int, int]:
+        if self.max_query_len <= decode_threshold and (
+            not require_uniform or decode_threshold <= 1
+        ):
+            return self.num_reqs, 0, num_tokens, 0
+
+        query_lens = self.query_lens_np
+        if int(query_lens[0]) > decode_threshold:
+            return 0, self.num_reqs, 0, num_tokens
+
+        if require_uniform:
+            if bool(np.all((query_lens == query_lens[0]) | (query_lens == 0))):
+                return self.num_reqs, 0, num_tokens, 0
+            is_prefill = query_lens != query_lens[0]
+        else:
+            is_prefill = query_lens > decode_threshold
+
+        if not bool(np.any(is_prefill)):
+            return self.num_reqs, 0, num_tokens, 0
+
+        first_prefill = int(np.argmax(is_prefill))
+        num_decodes = first_prefill
+        num_prefills = self.num_reqs - num_decodes
+        num_decode_tokens = int(self.query_start_loc_np[first_prefill])
+        num_prefill_tokens = num_tokens - num_decode_tokens
+        return num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens
+
+
+@dataclass
 class CommonAttentionMetadata:
     """
     Per-batch attention metadata, shared across layers and backends.
@@ -421,6 +538,7 @@ class CommonAttentionMetadata:
     slot_mapping: torch.Tensor
 
     causal: bool | torch.Tensor = True
+    max_req_tokens: int = 0
 
     # Needed by FastPrefillAttentionBuilder
     logits_indices_padded: torch.Tensor | None = None
@@ -463,6 +581,8 @@ class CommonAttentionMetadata:
     fixed sliding window. None disables R-SWA. The attention backend copies this
     into its own persistent buffer and reads ``rswa_window`` from model config."""
 
+    batch_topology: CommonAttentionBatchTopology | None = None
+
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
@@ -478,6 +598,19 @@ class CommonAttentionMetadata:
         return self.query_start_loc[1:] - self.query_start_loc[:-1]
 
     def replace(self, **kwargs) -> "CommonAttentionMetadata":
+        if "batch_topology" not in kwargs and any(
+            field_name in kwargs
+            for field_name in (
+                "query_start_loc",
+                "query_start_loc_cpu",
+                "num_reqs",
+                "num_actual_tokens",
+                "max_query_len",
+                "max_seq_len",
+                "is_prefilling",
+            )
+        ):
+            kwargs["batch_topology"] = None
         return replace(self, **kwargs)
 
     @property
@@ -542,6 +675,29 @@ class CommonAttentionMetadata:
         self._token_to_req_indices_cache = buffer[: max(num_mapped_tokens, num_tokens)]
         return self._token_to_req_indices_cache[:num_tokens]
 
+    def split_decodes_and_prefills(
+        self,
+        decode_threshold: int = 1,
+        require_uniform: bool = False,
+        treat_short_extends_as_decodes: bool = True,
+    ) -> tuple[int, int, int, int]:
+        if self.batch_topology is not None:
+            return self.batch_topology.split_decodes_and_prefills(
+                self,
+                decode_threshold=decode_threshold,
+                require_uniform=require_uniform,
+                treat_short_extends_as_decodes=treat_short_extends_as_decodes,
+            )
+
+        from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+
+        return split_decodes_and_prefills(
+            self,
+            decode_threshold=decode_threshold,
+            require_uniform=require_uniform,
+            treat_short_extends_as_decodes=treat_short_extends_as_decodes,
+        )
+
     # TODO(lucas): remove once we have FULL-CG spec-decode support
     def unpadded(
         self, num_actual_tokens: int, num_actual_reqs: int
@@ -566,6 +722,7 @@ class CommonAttentionMetadata:
             causal=self.causal[:num_actual_reqs]
             if isinstance(self.causal, torch.Tensor)
             else self.causal,
+            max_req_tokens=self.max_req_tokens,
             logits_indices_padded=self.logits_indices_padded,
             num_logits_indices=self.num_logits_indices,
             encoder_seq_lens=maybe_slice_reqs(self.encoder_seq_lens),
@@ -575,6 +732,100 @@ class CommonAttentionMetadata:
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
         )
+
+
+def _tensor_view_cache_key(tensor: torch.Tensor | None) -> tuple[Any, ...] | None:
+    if tensor is None:
+        return None
+    return (
+        "tensor",
+        tensor.data_ptr(),
+        tensor.storage_offset(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype),
+        str(tensor.device),
+    )
+
+
+def _array_view_cache_key(array: np.ndarray | None) -> tuple[Any, ...] | None:
+    if array is None:
+        return None
+    return (
+        "array",
+        array.__array_interface__["data"][0],
+        tuple(array.shape),
+        tuple(array.strides or ()),
+        str(array.dtype),
+    )
+
+
+def _static_range_cache_key(
+    ranges: dict[int, list[tuple[int, int]]] | None,
+) -> tuple[Any, ...] | None:
+    if ranges is None:
+        return None
+    return tuple(
+        (req_idx, tuple(tuple(range_) for range_ in req_ranges))
+        for req_idx, req_ranges in sorted(ranges.items())
+    )
+
+
+def _batch_topology_cache_key(
+    batch_topology: CommonAttentionBatchTopology | None,
+) -> tuple[Any, ...] | None:
+    if batch_topology is None:
+        return None
+    return (
+        _array_view_cache_key(batch_topology.query_start_loc_np),
+        batch_topology.num_reqs,
+        batch_topology.max_query_len,
+        batch_topology.max_seq_len_upper_bound,
+    )
+
+
+def exact_attention_metadata_cache_key(
+    kv_cache_spec: Any,
+    builder_type: type[Any],
+    common_prefix_len: int,
+    common_attn_metadata: CommonAttentionMetadata,
+) -> tuple[Any, ...]:
+    """Key facts that make a metadata object exactly reusable.
+
+    This is intentionally stricter than the block-table update cache. Builders
+    that opt into exact reuse may keep internal scratch buffers in their
+    metadata, so reuse is allowed only when the common metadata points at the
+    same tensor views and has the same scalar control facts.
+    """
+    cm = common_attn_metadata
+    return (
+        kv_cache_spec,
+        builder_type,
+        common_prefix_len,
+        cm.num_reqs,
+        cm.num_actual_tokens,
+        cm.max_query_len,
+        cm.max_seq_len,
+        _tensor_view_cache_key(cm.query_start_loc),
+        _tensor_view_cache_key(cm.query_start_loc_cpu),
+        _tensor_view_cache_key(cm.seq_lens),
+        _tensor_view_cache_key(cm.block_table_tensor),
+        _tensor_view_cache_key(cm.slot_mapping),
+        _tensor_view_cache_key(cm.seq_lens_cpu_upper_bound),
+        _tensor_view_cache_key(cm.dcp_local_seq_lens),
+        _tensor_view_cache_key(cm.positions),
+        _tensor_view_cache_key(cm.is_prefilling),
+        _tensor_view_cache_key(cm.logits_indices_padded),
+        cm.num_logits_indices,
+        _tensor_view_cache_key(cm.encoder_seq_lens),
+        _array_view_cache_key(cm.encoder_seq_lens_cpu),
+        _tensor_view_cache_key(cm.dcp_local_seq_lens_cpu),
+        _tensor_view_cache_key(cm.causal)
+        if isinstance(cm.causal, torch.Tensor)
+        else cm.causal,
+        _static_range_cache_key(cm.mm_req_doc_ranges),
+        _batch_topology_cache_key(cm.batch_topology),
+    )
 
 
 M = TypeVar("M")
@@ -608,6 +859,9 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
     # Does this backend/builder support updating the block table in existing
     # metadata
     supports_update_block_table: bool = False
+    # Can metadata built by one builder instance be reused directly for another
+    # same-type builder when all common metadata tensors are identical?
+    supports_exact_metadata_reuse: bool = False
 
     @abstractmethod
     def __init__(
@@ -750,7 +1004,9 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
 class AttentionLayer(Protocol):
     _q_scale: torch.Tensor
     _k_scale: torch.Tensor
+    _k_scale_cpu: torch.Tensor
     _v_scale: torch.Tensor
+    _v_scale_cpu: torch.Tensor
     _q_scale_float: float
     _k_scale_float: float
     _v_scale_float: float
@@ -774,6 +1030,10 @@ class AttentionImplBase(ABC, Generic[T]):
     method - subclasses define their own forward interfaces.
     """
 
+    # Whether this impl uses a sparse (top-k) attention path. Used by MLA to
+    # route between the dense-MHA prefill and sparse-MQA paths.
+    is_sparse: ClassVar[bool] = False
+
     # Required attributes that all impls should have
     num_heads: int
     head_size: int
@@ -796,6 +1056,8 @@ class AttentionImplBase(ABC, Generic[T]):
 
     # Whether the attention impl supports Prefill Context Parallelism.
     supports_pcp: bool = False
+    # Whether the attention impl supports Decode Context Parallelism.
+    supports_dcp: bool = True
     # Whether the attention impl(or ops) supports MTP
     # when cp_kv_cache_interleave_size > 1
     supports_mtp_with_cp_non_trivial_interleave_size: bool = False
@@ -910,6 +1172,14 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
         """
         return False
 
+    def fused_qk_norm_rope_kvcache_supported(self):
+        """
+        Does this attention implementation support fused QKNorm+RoPE+KVCache fusion.
+        This is used by the QkNormRopeKvCachePattern to only fuse the QKNorm ops
+        with the RoPE ops and the KV cache update for implementations that support it.
+        """
+        return False
+
     def fused_rope_kvcache_supported(self):
         """
         Does this attention implementation support RoPE+KVCache fusion.
@@ -917,6 +1187,29 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
         with the KV cache update for implementations that support it.
         """
         return False
+
+    def do_qk_norm_rope_kvcache_update(
+        self,
+        layer: AttentionLayer,
+        qkv: torch.Tensor,
+        q_out: torch.Tensor,
+        k_out: torch.Tensor,
+        positions: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        rms_norm_eps: float,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+        kv_cache: torch.Tensor,
+        layer_slot_mapping: torch.Tensor,
+    ):
+        """
+        If `fused_qk_norm_rope_kvcache_supported` returns True, this method
+        will be called by the fused custom op. Applies QK-norm + RoPE and
+        writes K/V to the KV cache. Results are written to the pre-allocated
+        q_out and k_out tensors; V is split from QKV at the graph level.
+        """
+        raise NotImplementedError
 
     def do_rope_and_kv_cache_update(
         self,
@@ -967,7 +1260,6 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
     ) -> None:
         raise NotImplementedError
 
-    @abstractmethod
     def forward_mha(
         self,
         q: torch.Tensor,
@@ -1005,86 +1297,6 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
             kFp8Dynamic128Sym,
             kFp8Dynamic64Sym,
         )
-
-    def do_kv_cache_update(
-        self,
-        kv_c_normed: torch.Tensor,
-        k_pe: torch.Tensor,
-        kv_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        kv_cache_dtype: str,
-        k_scale: torch.Tensor,
-    ) -> None:
-        if kv_cache.numel() == 0:
-            return
-        from vllm import _custom_ops as ops
-
-        ops.concat_and_cache_mla(
-            kv_c_normed,
-            k_pe.squeeze(1),
-            kv_cache,
-            slot_mapping.flatten(),
-            kv_cache_dtype=kv_cache_dtype,
-            scale=k_scale,
-        )
-
-
-class SparseMLAAttentionImpl(AttentionImplBase[T], Generic[T]):
-    """Sparse MLA attention implementation with only forward_mqa method.
-
-    Sparse MLA implementations only support decode (MQA-style) attention.
-    They do not support prefill (MHA-style) attention.
-    """
-
-    def fused_output_quant_supported(self, quant_key: "QuantKey"):
-        """
-        Does this attention implementation support fused output quantization.
-        Since MLA quantization is done manually in forward_impl (common code),
-        all MLA backends support it by default.
-        """
-        return quant_key in (
-            kFp8StaticTensorSym,
-            kNvfp4Dynamic,
-            kFp8Dynamic128Sym,
-            kFp8Dynamic64Sym,
-        )
-
-    @abstractmethod
-    def __init__(
-        self,
-        num_heads: int,
-        head_size: int,
-        scale: float,
-        num_kv_heads: int,
-        alibi_slopes: list[float] | None,
-        sliding_window: int | None,
-        kv_cache_dtype: str,
-        logits_soft_cap: float | None,
-        attn_type: str,
-        kv_sharing_target_layer_name: str | None,
-        # MLA Specific Arguments
-        q_lora_rank: int | None,
-        kv_lora_rank: int,
-        qk_nope_head_dim: int,
-        qk_rope_head_dim: int,
-        qk_head_dim: int,
-        v_head_dim: int,
-        kv_b_proj: "ColumnParallelLinear",
-        indexer: object | None = None,
-        q_pad_num_heads: int | None = None,
-    ) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def forward_mqa(
-        self,
-        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        kv_c_and_k_pe_cache: torch.Tensor,
-        attn_metadata: T,
-        layer: AttentionLayer,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """MQA-style decode forward pass."""
-        raise NotImplementedError
 
     def do_kv_cache_update(
         self,

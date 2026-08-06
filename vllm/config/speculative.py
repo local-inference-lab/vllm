@@ -3,6 +3,8 @@
 
 import copy
 import functools
+import math
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
@@ -10,6 +12,7 @@ from pydantic import Field, SkipValidation, field_validator, model_validator
 from typing_extensions import Self
 
 from vllm.config import LoadConfig
+from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import HfOverrides, ModelConfig
 from vllm.config.parallel import ParallelConfig
@@ -54,6 +57,7 @@ MTPModelTypes = Literal[
     "step3p5_mtp",
     "hy_v3_mtp",
     "gemma4_mtp",
+    "inkling_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
@@ -74,6 +78,7 @@ SpeculativeMethod = Literal[
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
+DSparkCapacityVerificationMode = Literal["varlen", "mask"]
 
 
 @config
@@ -118,6 +123,9 @@ class SpeculativeConfig:
     """Attention backend to use for the draft model. When `None`, the backend is
     automatically selected. Useful when the drafter requires a different attention
     backend (e.g. DFlash needs a non-causal-capable backend like FLASH_ATTN)."""
+    kv_cache_dtype: CacheDType | None = None
+    """KV cache dtype for the draft model. When `None`, the draft inherits the
+    target model's `--kv-cache-dtype`."""
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""
@@ -177,6 +185,12 @@ class SpeculativeConfig:
     inclusive batch-size range.
     """
 
+    adaptive_speculative_tokens_window: int | None = Field(default=None, ge=1)
+    """Number of speculative verification steps to average before adapting the
+    batch-wide speculative-token count from accepted draft lengths. ``None``
+    disables acceptance-length adaptation. ``num_speculative_tokens`` is the
+    initial value and upper bound."""
+
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""
@@ -229,6 +243,56 @@ class SpeculativeConfig:
     [1, num_speculative_tokens + 1]. Resolved internally to
     synthetic_acceptance_rates. Only valid when rejection_sample_method is 'synthetic'.
     Mutually exclusive with synthetic_acceptance_rates."""
+
+    dspark_confidence_threshold: float = 0.0
+    """Minimum DSpark cumulative prefix-survival probability for keeping a
+    per-request draft prefix. Set to 0.0 to use budget-based global top-k
+    allocation."""
+
+    dspark_budget_frac: float = 1.0
+    """Fraction of the full per-request draft-token budget available to the
+    DSpark global prefix allocator."""
+
+    dspark_capacity_verification_mode: DSparkCapacityVerificationMode = "varlen"
+    """How DSpark capacity-pruned target verification tokens are handled."""
+
+    dspark_confidence_temperature: float = 1.0
+    """Temperature applied to the DSpark confidence-head logits before the
+    survival-probability computation. The released heads can emit saturated
+    logits whose sigmoids round to exact 0/1 in fp32; exact zeros remove
+    tokens from the capacity allocator's candidate set entirely. A
+    temperature > 1 desaturates the logits (order-preserving) so every token
+    stays a candidate with a usable ranking. A stopgap until checkpoints ship
+    Sequential-Temperature-Scaling-calibrated heads."""
+
+    dspark_online_sts: bool = True
+    """Calibrate the DSpark confidence head online with per-position
+    temperatures (the paper's Sequential Temperature Scaling, fitted at
+    serving time): per draft position, track binned empirical conditional
+    acceptance from the rejection sampler's outcomes (exponentially decayed)
+    and fit the temperature minimizing the calibration error. Order
+    preserving; identity until outcomes accumulate. Only active together
+    with a capacity verification mode."""
+
+    dspark_sps_curve: list[tuple[int, float]] | str | None = None
+    """Profiled engine step-rate curve for the DSpark hardware-aware prefix
+    scheduler, as ``(batch_num_tokens, steps_per_sec)`` breakpoints with
+    strictly increasing token counts (linearly interpolated, clamped at the
+    ends), or the string ``"auto"`` to profile the curve at engine init:
+    after CUDA graph capture, warmup decode steps are timed per power-of-two
+    request count (wall clock, so worker-side host prep and the draft step
+    are included) and rank 0's measurements are broadcast so all TP ranks
+    build the identical table. When set, verification lengths are chosen by
+    maximizing expected throughput ``tau * SPS(B)`` (DSpark Algorithm 1)
+    instead of spending the whole ``dspark_budget_frac`` budget; the budget
+    still acts as an upper bound on total admissions. Only the curve's shape
+    matters, so any consistent rate unit works."""
+
+    dspark_sps_overhead_ms: float = 0.0
+    """Constant per-step overhead in milliseconds added to the step times
+    measured by ``dspark_sps_curve="auto"``, covering costs the init-time
+    profiling cannot see (scheduler/IPC above the worker). Flattens the
+    curve, making the theta-argmax verify more aggressively as it grows."""
 
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
@@ -315,6 +379,17 @@ class SpeculativeConfig:
                 "eagle_aux_hidden_state_layer_ids",
                 None,
             )
+            if layer_ids is None:
+                # DFlash checkpoints declare 0-based target layer ids; the
+                # captured aux ids are shifted by one (hidden_states[0] is the
+                # embedding output), matching eagle3_utils.
+                dflash_config = (
+                    getattr(self.draft_model_config.hf_config, "dflash_config", None)
+                    or {}
+                )
+                target_layer_ids = dflash_config.get("target_layer_ids")
+                if target_layer_ids is not None:
+                    layer_ids = [int(i) + 1 for i in target_layer_ids]
             if layer_ids is not None:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
@@ -518,7 +593,7 @@ class SpeculativeConfig:
                     "architectures": ["Qwen3_5MoeMTP" if is_moe else "Qwen3_5MTP"],
                 }
             )
-        if hf_config.model_type == "longcat_flash":
+        if hf_config.model_type in ("longcat_flash", "longcat_flash_ngram"):
             hf_config.model_type = "longcat_flash_mtp"
             n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
             hf_config.update(
@@ -547,6 +622,26 @@ class SpeculativeConfig:
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["HYV3MTPModel"]}
+            )
+
+        if hf_config.model_type in ("inkling_mm_model", "inkling_model"):
+            mtp_config = getattr(hf_config, "mtp_config", None) or {}
+            hf_config = getattr(hf_config, "text_config", hf_config)
+            checkpoint_depths = mtp_config.get("num_nextn_predict_layers", 0)
+            if checkpoint_depths < 1:
+                raise ValueError("The Inkling checkpoint does not contain MTP weights")
+            hf_config.model_type = "inkling_mtp"
+            hf_config.update(
+                {
+                    # Inkling currently exposes only the first checkpoint depth.
+                    "n_predict": 1,
+                    "num_nextn_predict_layers": checkpoint_depths,
+                    "chain_hidden_post_norm": mtp_config.get(
+                        "chain_hidden_post_norm", False
+                    ),
+                    "local_layer_ids": mtp_config.get("local_layer_ids", []),
+                    "architectures": ["InklingMTPModel"],
+                }
             )
 
         if hf_config.model_type in ("gemma4_assistant", "gemma4_unified_assistant"):
@@ -626,6 +721,50 @@ class SpeculativeConfig:
             SpeculativeConfig._apply_composed_hf_override, target_hf_overrides
         )
 
+    @staticmethod
+    def _is_custom_proposer_path(model: str | None) -> bool:
+        """True if ``model`` is a dotted import path (e.g. ``pkg.MyProposer``)."""
+        if model is None:
+            return False
+        if model.startswith(("http://", "https://", "file://")):
+            return False
+        if "/" in model:
+            return False
+        parts = model.split(".")
+        return len(parts) >= 2 and all(part.isidentifier() for part in parts)
+
+    def _inherit_target_revision_for_mtp(self) -> None:
+        """Pin an in-checkpoint MTP draft to the target model revision."""
+        target = self.target_model_config
+        if self.method != "mtp" or target is None or self.model != target.model:
+            return
+        if self.revision is None:
+            self.revision = target.revision
+        if self.code_revision is None:
+            self.code_revision = target.code_revision
+
+    def _cap_same_model_draft_position_embeddings(self) -> bool:
+        """Cap an in-checkpoint draft to the target's effective RoPE table."""
+        target = self.target_model_config
+        draft = self.draft_model_config
+        if target is None or draft is None or draft.model != target.model:
+            return False
+
+        target_hf = target.hf_text_config
+        draft_hf = draft.hf_text_config
+        target_max = getattr(target_hf, "max_position_embeddings", None)
+        draft_max = getattr(draft_hf, "max_position_embeddings", None)
+        if target_max is None or draft_max is None or target_max >= draft_max:
+            return False
+
+        draft_hf.max_position_embeddings = target_max
+        logger.info(
+            "Capped same-model draft max_position_embeddings from %d to %d.",
+            draft_max,
+            target_max,
+        )
+        return True
+
     def __post_init__(self):
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
@@ -636,14 +775,9 @@ class SpeculativeConfig:
         # default.
 
         # infer method from user args
-        # Check if the model field contains a custom module path (e.g., 'pkg.Mod')
-        if (
-            self.model is not None
-            and "." in self.model
-            and not self.model.startswith(("http://", "https://", "file://"))
-            and "/" not in self.model  # not a HuggingFace repo (org/model)
+        if self.method is None and SpeculativeConfig._is_custom_proposer_path(
+            self.model
         ):
-            # Treat as a custom class path
             self.method = "custom_class"
         elif self.method is None:
             if self.model in ("ngram", "[ngram]"):
@@ -701,6 +835,27 @@ class SpeculativeConfig:
 
         if self.method in ("ngram", "[ngram]"):
             self.method = "ngram"
+
+        if self.adaptive_speculative_tokens_window is not None:
+            unsupported_methods = {
+                "ngram",
+                "ngram_gpu",
+                "suffix",
+                "custom_class",
+            }
+            if self.method in unsupported_methods:
+                raise ValueError(
+                    "adaptive_speculative_tokens_window is only supported with "
+                    "model-backed speculative decoding methods."
+                )
+            if (
+                self.target_model_config is not None
+                and self.target_model_config.is_diffusion
+            ):
+                raise ValueError(
+                    "adaptive_speculative_tokens_window is not supported with "
+                    "diffusion models."
+                )
 
         if self.method in ("ngram", "ngram_gpu"):
             # Set default values if not provided
@@ -782,6 +937,7 @@ class SpeculativeConfig:
             self.prompt_lookup_min = 0
 
             if self.model is not None:
+                self._inherit_target_revision_for_mtp()
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # lack a model_type key in config.json, so AutoConfig cannot
                 # detect them. When the method is explicitly "medusa", inject
@@ -822,6 +978,8 @@ class SpeculativeConfig:
                     config_format=self.target_model_config.config_format,
                 )
 
+                self._cap_same_model_draft_position_embeddings()
+
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # omit vocab_size in config.json, so MedusaConfig falls back to
                 # its default (32001). Align with the target model's vocab size
@@ -850,6 +1008,7 @@ class SpeculativeConfig:
                 elif (
                     "dspark" in self.draft_model_config.model.lower()
                     or "Qwen3DSparkModel" in self.draft_model_config.architectures
+                    or "Gemma4DSparkModel" in self.draft_model_config.architectures
                 ):
                     self.method = "dspark"
                 elif self.draft_model_config.hf_config.model_type == "medusa":
@@ -863,7 +1022,7 @@ class SpeculativeConfig:
                     if (
                         self.num_speculative_tokens > 1
                         and self.draft_model_config.hf_config.model_type
-                        != "step3p5_mtp"
+                        not in ("step3p5_mtp", "inkling_mtp")
                     ):
                         logger.warning(
                             "Enabling num_speculative_tokens > 1 will run "
@@ -900,6 +1059,8 @@ class SpeculativeConfig:
 
                 if self.method == "dspark" and (
                     "Qwen3DSparkModel" not in self.draft_model_config.architectures
+                    and "Gemma4DSparkModel" not in self.draft_model_config.architectures
+                    and "K3DSparkModel" not in self.draft_model_config.architectures
                 ):
                     # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config
                     # and its weights ship in the target checkpoint.
@@ -908,6 +1069,23 @@ class SpeculativeConfig:
                         "DSparkDraftModel"
                     ]
                     self.update_arch_()
+                elif (
+                    self.method == "dspark"
+                    and "Gemma4DSparkModel" in self.draft_model_config.architectures
+                ):
+                    # Normalize the self-contained Gemma4 draft's config keys to
+                    # the DSpark conventions.
+                    hf = self.draft_model_config.hf_config
+                    if (
+                        getattr(hf, "dspark_target_layer_ids", None) is None
+                        and getattr(hf, "target_layer_ids", None) is not None
+                    ):
+                        hf.dspark_target_layer_ids = hf.target_layer_ids
+                    if (
+                        getattr(hf, "n_predict", None) is None
+                        and getattr(hf, "block_size", None) is not None
+                    ):
+                        hf.n_predict = hf.block_size
 
                 if self.method in ("dflash", "dspark"):
                     self.parallel_drafting = True
@@ -941,6 +1119,39 @@ class SpeculativeConfig:
                         "A speculative model was provided, but "
                         "`num_speculative_tokens` was not provided"
                     )
+
+                if (
+                    self.draft_model_config.hf_config.model_type == "inkling_mtp"
+                    and self.num_speculative_tokens != 1
+                ):
+                    raise ValueError(
+                        "Inkling MTP currently supports exactly one speculative token"
+                    )
+
+                if self.method == "dspark":
+                    # DSpark is a semi-autoregressive *block* drafter. A
+                    # speculative length smaller than the checkpoint's block
+                    # feeds the block / Markov-head machinery an unsupported
+                    # layout and yields incorrect (garbled) output rather than
+                    # merely lower acceptance. Require num_speculative_tokens to
+                    # be at least the block size (e.g. 5 or 7 for DeepSeek-V4).
+                    dspark_block_size = getattr(
+                        self.draft_model_config.hf_config,
+                        "dspark_block_size",
+                        None,
+                    )
+                    if (
+                        dspark_block_size is not None
+                        and self.num_speculative_tokens < dspark_block_size
+                    ):
+                        raise ValueError(
+                            "DSpark requires num_speculative_tokens >= "
+                            f"dspark_block_size ({dspark_block_size}); got "
+                            f"{self.num_speculative_tokens}. Smaller values "
+                            "produce incorrect output. Use "
+                            f"num_speculative_tokens={dspark_block_size} or "
+                            "larger (e.g. 7)."
+                        )
 
                 self.draft_tensor_parallel_size = (
                     SpeculativeConfig._verify_and_get_draft_tp(
@@ -1120,6 +1331,24 @@ class SpeculativeConfig:
 
         return draft_parallel_config
 
+    def _maybe_apply_virtual_tp_to_draft(self) -> None:
+        if (
+            self.method not in ("mtp", "dspark")
+            or self.draft_model_config is None
+            or self.draft_parallel_config is None
+            or self.draft_model_config is self.target_model_config
+        ):
+            return
+
+        from vllm.config.virtual_tp import (
+            apply_b12x_virtual_tp_padding_to_model_config,
+        )
+
+        apply_b12x_virtual_tp_padding_to_model_config(
+            self.draft_model_config,
+            self.draft_parallel_config,
+        )
+
     @field_validator("attention_backend", mode="before")
     @classmethod
     def _parse_attention_backend(cls, value: Any) -> Any:
@@ -1127,6 +1356,13 @@ class SpeculativeConfig:
             if value.lower() == "auto":
                 return None
             return AttentionBackendEnum[value.upper()]
+        return value
+
+    @field_validator("dspark_capacity_verification_mode", mode="before")
+    @classmethod
+    def _parse_dspark_capacity_verification_mode(cls, value: Any) -> Any:
+        if value == "compact":
+            return "varlen"
         return value
 
     @model_validator(mode="after")
@@ -1167,7 +1403,83 @@ class SpeculativeConfig:
                 "are only valid with rejection_sample_method='synthetic'."
             )
 
+        if not math.isfinite(self.dspark_confidence_threshold) or not (
+            0.0 <= self.dspark_confidence_threshold <= 1.0
+        ):
+            raise ValueError(
+                "dspark_confidence_threshold must be in [0, 1], got "
+                f"{self.dspark_confidence_threshold}."
+            )
+        if not math.isfinite(self.dspark_budget_frac) or not (
+            0.0 < self.dspark_budget_frac <= 1.0
+        ):
+            raise ValueError(
+                f"dspark_budget_frac must be in (0, 1], got {self.dspark_budget_frac}."
+            )
+        if (
+            not math.isfinite(self.dspark_confidence_temperature)
+            or self.dspark_confidence_temperature <= 0.0
+        ):
+            raise ValueError(
+                "dspark_confidence_temperature must be > 0, got "
+                f"{self.dspark_confidence_temperature}."
+            )
+        if (
+            not math.isfinite(self.dspark_sps_overhead_ms)
+            or self.dspark_sps_overhead_ms < 0.0
+        ):
+            raise ValueError(
+                "dspark_sps_overhead_ms must be >= 0, got "
+                f"{self.dspark_sps_overhead_ms}."
+            )
+        if isinstance(self.dspark_sps_curve, str):
+            if self.dspark_sps_curve != "auto":
+                raise ValueError(
+                    "dspark_sps_curve must be a list of (batch_num_tokens, "
+                    f'steps_per_sec) pairs or "auto", got '
+                    f"{self.dspark_sps_curve!r}."
+                )
+        elif self.dspark_sps_curve is not None:
+            self.dspark_sps_curve = [
+                (int(b), float(s)) for b, s in self.dspark_sps_curve
+            ]
+            batch_sizes = [b for b, _ in self.dspark_sps_curve]
+            if not self.dspark_sps_curve or any(
+                b <= 0 or not math.isfinite(s) or s <= 0.0
+                for b, s in self.dspark_sps_curve
+            ):
+                raise ValueError(
+                    "dspark_sps_curve entries must have positive batch token "
+                    f"counts and rates, got {self.dspark_sps_curve}."
+                )
+            if batch_sizes != sorted(set(batch_sizes)):
+                raise ValueError(
+                    "dspark_sps_curve batch token counts must be strictly "
+                    f"increasing, got {batch_sizes}."
+                )
+
+        if (
+            self.method == "dspark"
+            and self.dspark_capacity_verification_mode == "mask"
+            and (
+                self.dspark_confidence_threshold > 0.0
+                or self.dspark_budget_frac < 1.0
+                or self.dspark_sps_curve is not None
+            )
+            and "VLLM_MOE_SKIP_PADDING" not in os.environ
+        ):
+            # Mask mode keeps pruned verify rows in the batch as padding; the
+            # pruning only saves work if MoE kernels skip those rows. Set
+            # here (frontend) so spawned workers inherit it before their env
+            # caches freeze. Set VLLM_MOE_SKIP_PADDING=0 to override.
+            logger.info(
+                "DSpark mask capacity mode: defaulting VLLM_MOE_SKIP_PADDING=1 "
+                "so MoE kernels skip pruned verify rows."
+            )
+            os.environ["VLLM_MOE_SKIP_PADDING"] = "1"
+
         if self.draft_model_config:
+            self._maybe_apply_virtual_tp_to_draft()
             self.draft_model_config.verify_with_parallel_config(
                 self.draft_parallel_config
             )
@@ -1249,8 +1561,26 @@ class SpeculativeConfig:
     def use_dspark(self) -> bool:
         return self.method == "dspark"
 
-    def uses_dynamic_speculative_decoding(self) -> bool:
+    def requires_host_draft_token_ids(self) -> bool:
+        """Whether async scheduling needs the actual draft ids on the host.
+
+        Fixed-width speculators can use scheduler placeholders and keep draft
+        ids on the worker. Block speculators may return a shorter prefix using
+        ``-1`` sentinels, so the scheduler must receive their real draft ids.
+        """
+        return self.method in ("dflash", "dspark")
+
+    def uses_batch_size_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
+
+    def uses_acceptance_length_adaptation(self) -> bool:
+        return self.adaptive_speculative_tokens_window is not None
+
+    def uses_dynamic_speculative_decoding(self) -> bool:
+        return (
+            self.uses_batch_size_dynamic_speculative_decoding()
+            or self.uses_acceptance_length_adaptation()
+        )
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

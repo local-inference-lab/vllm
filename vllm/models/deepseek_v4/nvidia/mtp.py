@@ -160,7 +160,19 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         hidden_states, residual, post_mix, res_mix = self.mtp_block(
             positions=positions, x=hidden_states, input_ids=None
         )
-        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        if self.mtp_block._should_run_b12x_mhc(int(hidden_states.shape[0])):
+            from sparkinfer.norm.mhc import run_post as b12x_mhc_post
+
+            hidden_states = b12x_mhc_post(
+                hidden_states,
+                residual,
+                post_mix,
+                res_mix,
+            )
+        else:
+            hidden_states = mhc_post_tilelang(
+                hidden_states, residual, post_mix, res_mix
+            )
         # Return the flat pre-hc_head residual so it can be re-fed as the
         # next spec step's `previous_hidden_states` when
         # num_speculative_tokens > 1. hc_head is deferred to compute_logits.
@@ -262,8 +274,20 @@ class DeepSeekV4MTP(nn.Module):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
+        self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()
         self.model = DeepSeekV4MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+
+    def _checkpoint_weight_name_prefixes(self) -> tuple[str, ...]:
+        mtp_layers = range(self.config.num_nextn_predict_layers)
+        nextn_layers = range(
+            self.config.num_hidden_layers,
+            self.config.num_hidden_layers + self.config.num_nextn_predict_layers,
+        )
+        return tuple(
+            [f"mtp.{layer_idx}." for layer_idx in mtp_layers]
+            + [f"model.layers.{layer_idx}." for layer_idx in nextn_layers]
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

@@ -7,6 +7,147 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
+@triton.jit
+def _convert_dcp_local_topk_to_global_kernel(
+    token_indices_ptr,
+    scores_ptr,
+    ti_stride0,
+    ti_stride1,
+    scores_stride0,
+    scores_stride1,
+    width: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    offs = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs < width
+    idx_ptrs = token_indices_ptr + row * ti_stride0 + offs * ti_stride1
+    local_idx = tl.load(idx_ptrs, mask=mask, other=-1)
+    valid = local_idx >= 0
+
+    interleave_block = local_idx // CP_KV_CACHE_INTERLEAVE_SIZE
+    interleave_offset = local_idx % CP_KV_CACHE_INTERLEAVE_SIZE
+    global_idx = (
+        interleave_block * DCP_WORLD_SIZE + DCP_RANK
+    ) * CP_KV_CACHE_INTERLEAVE_SIZE + interleave_offset
+    tl.store(idx_ptrs, tl.where(valid, global_idx, -1), mask=mask)
+
+    score_ptrs = scores_ptr + row * scores_stride0 + offs * scores_stride1
+    scores = tl.load(score_ptrs, mask=mask, other=-float("inf"))
+    tl.store(score_ptrs, tl.where(valid, scores, -float("inf")), mask=mask)
+
+
+def triton_convert_dcp_local_topk_to_global(
+    token_indices: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    dcp_world_size: int,
+    dcp_rank: int,
+    cp_kv_cache_interleave_size: int,
+    BLOCK_N: int = 128,
+) -> None:
+    """Convert local DCP top-k ids in-place to global logical token ids."""
+    assert token_indices.dtype == torch.int32
+    assert scores.dtype == torch.float32
+    assert token_indices.shape == scores.shape
+    assert token_indices.is_contiguous()
+    assert scores.is_contiguous()
+    width = token_indices.shape[1]
+    assert width % BLOCK_N == 0, (
+        f"top-k width ({width}) must be divisible by BLOCK_N ({BLOCK_N})"
+    )
+    grid = (token_indices.shape[0], width // BLOCK_N)
+    _convert_dcp_local_topk_to_global_kernel[grid](
+        token_indices,
+        scores,
+        token_indices.stride(0),
+        token_indices.stride(1),
+        scores.stride(0),
+        scores.stride(1),
+        width,
+        DCP_WORLD_SIZE=dcp_world_size,
+        DCP_RANK=dcp_rank,
+        CP_KV_CACHE_INTERLEAVE_SIZE=cp_kv_cache_interleave_size,
+        BLOCK_N=BLOCK_N,
+    )
+
+
+@triton.jit
+def _gather_topk_ids_by_position_kernel(
+    candidate_ids_ptr,
+    positions_ptr,
+    out_ptr,
+    cand_stride0,
+    cand_stride1,
+    pos_stride0,
+    pos_stride1,
+    out_stride0,
+    out_stride1,
+    topk: tl.constexpr,
+    candidate_width: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    offs = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs < topk
+    pos = tl.load(
+        positions_ptr + row * pos_stride0 + offs * pos_stride1,
+        mask=mask,
+        other=-1,
+    )
+    valid = (pos >= 0) & (pos < candidate_width)
+    gathered = tl.load(
+        candidate_ids_ptr + row * cand_stride0 + pos * cand_stride1,
+        mask=mask & valid,
+        other=-1,
+    )
+    tl.store(
+        out_ptr + row * out_stride0 + offs * out_stride1,
+        tl.where(valid, gathered, -1),
+        mask=mask,
+    )
+
+
+def triton_gather_topk_ids_by_position(
+    candidate_ids: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    BLOCK_N: int = 128,
+) -> None:
+    """Gather final ids from flattened candidate ids using int32 top-k positions."""
+    assert candidate_ids.dtype == torch.int32
+    assert positions.dtype == torch.int32
+    assert out.dtype == torch.int32
+    assert candidate_ids.ndim == 2
+    assert positions.ndim == 2
+    assert out.shape == positions.shape
+    assert candidate_ids.shape[0] == positions.shape[0]
+    assert positions.shape[1] % BLOCK_N == 0, (
+        f"top-k width ({positions.shape[1]}) must be divisible by BLOCK_N ({BLOCK_N})"
+    )
+    grid = (positions.shape[0], positions.shape[1] // BLOCK_N)
+    _gather_topk_ids_by_position_kernel[grid](
+        candidate_ids,
+        positions,
+        out,
+        candidate_ids.stride(0),
+        candidate_ids.stride(1),
+        positions.stride(0),
+        positions.stride(1),
+        out.stride(0),
+        out.stride(1),
+        positions.shape[1],
+        candidate_ids.shape[1],
+        BLOCK_N=BLOCK_N,
+    )
+
+
 # Kernel with prefill workspace support and valid count tracking
 @triton.jit
 def _convert_req_index_to_global_index_kernel(
@@ -154,6 +295,11 @@ def triton_convert_req_index_to_global_index(
     assert req_id.dtype == torch.int32
     assert block_table.dtype == torch.int32
     assert token_indices.dtype == torch.int32
+    assert req_id.shape[0] == token_indices.shape[0], (
+        f"req_id ({req_id.shape[0]}) and token_indices ({token_indices.shape[0]}) "
+        "must cover the same tokens; the grid is sized by req_id but the output "
+        "is allocated like token_indices, so a longer req_id writes out of bounds"
+    )
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
         f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by BLOCK_N ({BLOCK_N})"
@@ -243,6 +389,8 @@ def triton_filter_and_convert_dcp_index(
     BLOCK_N: int = 128,
     return_valid_counts: bool = False,
     compact_valid_to_front: bool = True,
+    out: torch.Tensor | None = None,
+    valid_counts: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Filter global per-request indices to this DCP rank's local slots.
 
@@ -270,6 +418,9 @@ def triton_filter_and_convert_dcp_index(
     assert NUM_TOPK_TOKENS % BLOCK_N == 0
 
     if dcp_size == 1:
+        assert out is None and valid_counts is None, (
+            "preallocated out/valid_counts are only supported on the DCP path"
+        )
         return triton_convert_req_index_to_global_index(
             req_id,
             block_table,
@@ -290,17 +441,31 @@ def triton_filter_and_convert_dcp_index(
 
     # The compaction uses the valid-count buffer as an atomic slot allocator, so
     # it requires counting. Pre-fill out with -1 so the unwritten tail stays -1.
+    # Callers on the decode hot path (e.g. the b12x sparse-MLA backend) pass
+    # preallocated CUDA-graph-stable buffers to keep the conversion zero-copy.
     count_valid = return_valid_counts or compact_valid_to_front
-    if compact_valid_to_front:
-        out = torch.full_like(token_indices_c, -1)
+    if out is None:
+        if compact_valid_to_front:
+            out = torch.full_like(token_indices_c, -1)
+        else:
+            out = torch.empty_like(token_indices_c)
     else:
-        out = torch.empty_like(token_indices_c)
+        assert out.dtype == torch.int32 and out.device == token_indices.device
+        assert out.shape == token_indices_c.shape
+        if compact_valid_to_front:
+            out.fill_(-1)
 
-    valid_counts: torch.Tensor | None = None
     if count_valid:
-        valid_counts = torch.zeros(
-            num_tokens, dtype=torch.int32, device=token_indices.device
-        )
+        if valid_counts is None:
+            valid_counts = torch.zeros(
+                num_tokens, dtype=torch.int32, device=token_indices.device
+            )
+        else:
+            assert valid_counts.dtype == torch.int32
+            assert valid_counts.shape[0] == num_tokens
+            valid_counts.zero_()
+    else:
+        valid_counts = None
 
     bt_stride0, bt_stride1 = block_table_c.stride()
     ti_stride0, ti_stride1 = token_indices_c.stride()

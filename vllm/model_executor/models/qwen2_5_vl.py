@@ -350,6 +350,8 @@ class Qwen2_5_VisionAttention(nn.Module):
         projection_size: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        loaded_num_heads: int | None = None,
     ) -> None:
         super().__init__()
         # Per attention head and per partition values.
@@ -376,6 +378,8 @@ class Qwen2_5_VisionAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv",
             disable_tp=use_data_parallel,
+            loaded_total_num_heads=loaded_num_heads,
+            loaded_total_num_kv_heads=loaded_num_heads,
         )
 
         self.proj = RowParallelLinear(

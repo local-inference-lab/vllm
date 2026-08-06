@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 from importlib.util import find_spec
+from inspect import signature
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -39,7 +40,11 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
-from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import (
     empty_exponential_noise_like,
@@ -59,10 +64,21 @@ from vllm.v1.spec_decode.utils import (
 )
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
+from vllm.v1.worker.gpu.spec_decode.dflash.utils import maybe_load_mask_embedding
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _call_accepts_kwarg(method: Any, kwarg: str) -> bool:
+    try:
+        params = signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    return kwarg in params or any(
+        param.kind == param.VAR_KEYWORD for param in params.values()
+    )
 
 
 class SpecDecodeBaseProposer:
@@ -128,6 +144,9 @@ class SpecDecodeBaseProposer:
         self.use_local_argmax_reduction: bool = (
             self.speculative_config.use_local_argmax_reduction
         )
+        self._model_forward_accepts_spec_step_idx = False
+        self._compute_logits_accepts_spec_step_idx = False
+        self._get_top_tokens_accepts_spec_step_idx = False
         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
 
         self.use_heterogeneous_vocab: bool = (
@@ -151,6 +170,8 @@ class SpecDecodeBaseProposer:
 
         self.draft_attn_groups: list[AttentionGroup] = []
         self.kv_cache_gid: int = -1
+        self._draft_layer_to_kv_cache_gid: dict[str, int] = {}
+        self._draft_kv_cache_group_ids: list[int] = []
         self.eagle3_use_aux_hidden_state: bool = (
             self._get_eagle3_use_aux_hidden_state_from_config()
         )
@@ -425,17 +446,52 @@ class SpecDecodeBaseProposer:
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
 
-    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _model_compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int,
+    ) -> torch.Tensor:
+        if self._compute_logits_accepts_spec_step_idx:
+            return self.model.compute_logits(
+                hidden_states, spec_step_idx=spec_step_idx
+            )
+        return self.model.compute_logits(hidden_states)
+
+    def _model_get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int,
+    ) -> torch.Tensor:
+        if self._get_top_tokens_accepts_spec_step_idx:
+            return self.model.get_top_tokens(
+                hidden_states, spec_step_idx=spec_step_idx
+            )
+        return self.model.get_top_tokens(hidden_states)
+
+    def _model_forward(
+        self,
+        model_kwargs: dict[str, Any],
+        spec_step_idx: int,
+    ) -> Any:
+        if spec_step_idx != 0 and self._model_forward_accepts_spec_step_idx:
+            return self.model(**model_kwargs, spec_step_idx=spec_step_idx)
+        return self.model(**model_kwargs)
+
+    def _greedy_sample(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
         if self.use_local_argmax_reduction:
-            return self.model.get_top_tokens(hidden_states)
+            return self._model_get_top_tokens(hidden_states, spec_step_idx)
         if self.use_heterogeneous_vocab:
-            logits = self.model.compute_logits(hidden_states)
+            logits = self._model_compute_logits(hidden_states, spec_step_idx)
             assert self.vocab_mapping is not None
             logits = self.vocab_mapping.constrain_draft_logits(logits)
             draft_token_ids = logits.argmax(dim=-1)
             return self.vocab_mapping.map_draft_to_target_ids(draft_token_ids)
-        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+        return self._model_compute_logits(hidden_states, spec_step_idx).argmax(dim=-1)
 
     def _sample_from_logits(
         self,
@@ -469,10 +525,11 @@ class SpecDecodeBaseProposer:
         self,
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        spec_step_idx: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not self._enable_probabilistic_draft_probs or sampling_metadata.all_greedy:
-            return self._greedy_sample(hidden_states), None
-        logits = self.model.compute_logits(hidden_states)
+            return self._greedy_sample(hidden_states, spec_step_idx), None
+        logits = self._model_compute_logits(hidden_states, spec_step_idx)
         if self.use_heterogeneous_vocab:
             assert self.vocab_mapping is not None
             logits = self.vocab_mapping.constrain_draft_logits(logits)
@@ -488,8 +545,6 @@ class SpecDecodeBaseProposer:
             # use_heterogeneous_vocab is True, so this branch should never be
             # reached. Kept as a safety fallback until probabilistic rejection
             # sampling with heterogeneous vocabularies is implemented.
-            # TODO: remap draft_probs to target-vocab space for lossless
-            # probabilistic rejection sampling with heterogeneous vocabularies.
             assert draft_probs is None, (
                 "probabilistic draft sampling is not supported with "
                 "use_heterogeneous_vocab"
@@ -587,7 +642,7 @@ class SpecDecodeBaseProposer:
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
         ):
-            ret_hidden_states = self.model(**model_kwargs)
+            ret_hidden_states = self._model_forward(model_kwargs, spec_step_idx=0)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -618,7 +673,7 @@ class SpecDecodeBaseProposer:
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             draft_token_ids, draft_probs = self._sample_draft_tokens(
-                sample_hidden_states, sampling_metadata
+                sample_hidden_states, sampling_metadata, spec_step_idx=0
             )
             if draft_probs is not None:
                 self._last_draft_probs = draft_probs.view(
@@ -639,7 +694,7 @@ class SpecDecodeBaseProposer:
             self.positions[:batch_size] = positions
 
         draft_token_ids, draft_probs = self._sample_draft_tokens(
-            sample_hidden_states, sampling_metadata
+            sample_hidden_states, sampling_metadata, spec_step_idx=0
         )
         draft_probs_list = None if draft_probs is None else [draft_probs]
 
@@ -722,6 +777,7 @@ class SpecDecodeBaseProposer:
                 inputs_embeds = None
 
             # Run the model.
+            spec_step_idx = token_index + 1
             model_kwargs = {
                 "input_ids": input_ids,
                 "positions": self._get_positions(input_batch_size),
@@ -744,7 +800,9 @@ class SpecDecodeBaseProposer:
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(input_batch_size),
             ):
-                ret_hidden_states = self.model(**model_kwargs)
+                ret_hidden_states = self._model_forward(
+                    model_kwargs, spec_step_idx=spec_step_idx
+                )
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
@@ -753,7 +811,9 @@ class SpecDecodeBaseProposer:
 
             hidden_states = hidden_states[:batch_size]
             draft_token_ids, draft_probs = self._sample_draft_tokens(
-                last_hidden_states[:batch_size], sampling_metadata
+                last_hidden_states[:batch_size],
+                sampling_metadata,
+                spec_step_idx=spec_step_idx,
             )
             if draft_probs is not None:
                 assert draft_probs_list is not None
@@ -1278,29 +1338,46 @@ class SpecDecodeBaseProposer:
         Subclasses may override to apply additional config changes.
         """
         spec_cfg = self.speculative_config
-        base = self.vllm_config
+        config = replace(
+            self.vllm_config,
+            parallel_config=replace(
+                spec_cfg.draft_parallel_config,
+                rank=self.vllm_config.parallel_config.rank,
+            ),
+            model_config=spec_cfg.draft_model_config,
+        )
 
         if spec_cfg.moe_backend is not None:
-            base = replace(
-                base,
+            config = replace(
+                config,
                 kernel_config=replace(
-                    base.kernel_config,
+                    config.kernel_config,
                     moe_backend=spec_cfg.moe_backend,
+                ),
+            )
+
+        if spec_cfg.kv_cache_dtype is not None:
+            config = replace(
+                config,
+                cache_config=replace(
+                    config.cache_config,
+                    cache_dtype=spec_cfg.kv_cache_dtype,
                 ),
             )
 
         # Note (matt): Never inherit the attention backend from base, because there are
         # many opportunities for incompatibility, so we always independently autoselect
         # unless explicitly specified in the speculative config.
-        base = replace(
-            base,
+        draft_backend = spec_cfg.attention_backend
+        config = replace(
+            config,
             attention_config=replace(
-                base.attention_config,
-                backend=spec_cfg.attention_backend,
+                config.attention_config,
+                backend=draft_backend,
             ),
         )
 
-        return base
+        return config
 
     def _get_model(self) -> nn.Module:
         """
@@ -1327,6 +1404,16 @@ class SpecDecodeBaseProposer:
         )
 
         self.model = self._get_model()
+        self._model_forward_accepts_spec_step_idx = _call_accepts_kwarg(
+            self.model.forward, "spec_step_idx"
+        )
+        self._compute_logits_accepts_spec_step_idx = _call_accepts_kwarg(
+            self.model.compute_logits, "spec_step_idx"
+        )
+        if hasattr(self.model, "get_top_tokens"):
+            self._get_top_tokens_accepts_spec_step_idx = _call_accepts_kwarg(
+                self.model.get_top_tokens, "spec_step_idx"
+            )
 
         # Find draft layers (attention layers added by draft model)
         all_attn_layers = get_layers_from_vllm_config(
@@ -1393,6 +1480,7 @@ class SpecDecodeBaseProposer:
 
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_lm_head(target_language_model)
+        self._maybe_load_parallel_drafting_mask_embedding()
 
         if (
             self.parallel_drafting
@@ -1408,6 +1496,15 @@ class SpecDecodeBaseProposer:
                 )
             else:
                 self.parallel_drafting_hidden_state_tensor.copy_(flat_mask)
+
+    def _maybe_load_parallel_drafting_mask_embedding(self) -> None:
+        if not self.parallel_drafting:
+            return
+        maybe_load_mask_embedding(
+            self.model,
+            self.draft_model_config.model,
+            self.parallel_drafting_token_id,
+        )
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
         """
@@ -1702,6 +1799,9 @@ class SpecDecodeBaseProposer:
             == 1
         ), "All drafting layers should belong to the same kv cache group"
 
+    def allow_multiple_draft_kv_cache_groups(self) -> bool:
+        return False
+
     def initialize_attn_backend(
         self,
         kv_cache_config: KVCacheConfig,
@@ -1716,47 +1816,63 @@ class SpecDecodeBaseProposer:
             AttentionLayerBase,  # type: ignore[type-abstract]
         )
 
-        # Find which kv_cache_group the draft layers belong to
-        self.validate_same_kv_cache_group(kv_cache_config)
-        kv_cache_spec = None
-        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
-            if self._draft_attn_layer_names & set(group.layer_names):
-                self.kv_cache_gid = gid
-                kv_cache_spec = group.kv_cache_spec
-                break
+        self._draft_layer_to_kv_cache_gid = {
+            layer_name: gid
+            for gid, group in enumerate(kv_cache_config.kv_cache_groups)
+            for layer_name in group.layer_names
+            if layer_name in self._draft_attn_layer_names
+        }
+        missing_layers = self._draft_attn_layer_names - set(
+            self._draft_layer_to_kv_cache_gid
+        )
+        assert not missing_layers, (
+            "Draft attention layers are missing from KV cache groups: "
+            f"{sorted(missing_layers)}"
+        )
+        self._draft_kv_cache_group_ids = sorted(
+            set(self._draft_layer_to_kv_cache_gid.values())
+        )
+        if not self.allow_multiple_draft_kv_cache_groups():
+            assert len(self._draft_kv_cache_group_ids) == 1, (
+                "All drafting layers should belong to the same kv cache group"
+            )
+        self.kv_cache_gid = self._draft_kv_cache_group_ids[0]
 
-        attention_groups: dict[tuple[str, str], AttentionGroup] = {}
-        if kv_cache_spec is not None:
-            for layer_name in self._draft_attn_layer_names:
-                attn_backend = all_attn_layers[layer_name].get_attn_backend()
-                backend_key = attn_backend.full_cls_name()
-                if backend_key not in attention_groups:
-                    layer_kv_cache_spec = kv_cache_spec
-                    if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                        layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[
-                            layer_name
-                        ]
+        attention_groups: dict[
+            tuple[int, tuple[str, str], KVCacheSpec, tuple[Any, ...]], AttentionGroup
+        ] = {}
+        for layer_name in self._draft_attn_layer_names:
+            gid = self._draft_layer_to_kv_cache_gid[layer_name]
+            kv_cache_spec = kv_cache_config.kv_cache_groups[gid].kv_cache_spec
+            layer_kv_cache_spec = kv_cache_spec
+            if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+                layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
 
-                    kernel_block_size = (
-                        kernel_block_sizes[self.kv_cache_gid]
-                        if kernel_block_sizes is not None
-                        and self.kv_cache_gid < len(kernel_block_sizes)
-                        else None
-                    )
-                    attn_group = AttentionGroup(
-                        backend=attn_backend,
-                        layer_names=[layer_name],
-                        kv_cache_spec=layer_kv_cache_spec,
-                        kv_cache_group_id=self.kv_cache_gid,
-                    )
-                    attn_group.create_metadata_builders(
-                        self.vllm_config,
-                        self.device,
-                        kernel_block_size=kernel_block_size,
-                    )
-                    attention_groups[backend_key] = attn_group
-                else:
-                    attention_groups[backend_key].layer_names.append(layer_name)
+            attn_layer = all_attn_layers[layer_name]
+            attn_backend = attn_layer.get_attn_backend()
+            backend_key = attn_backend.full_cls_name()
+            metadata_group_key = attn_backend.get_metadata_group_key(attn_layer)
+            group_key = (gid, backend_key, layer_kv_cache_spec, metadata_group_key)
+            if group_key not in attention_groups:
+                kernel_block_size = (
+                    kernel_block_sizes[gid]
+                    if kernel_block_sizes is not None and gid < len(kernel_block_sizes)
+                    else None
+                )
+                attn_group = AttentionGroup(
+                    backend=attn_backend,
+                    layer_names=[layer_name],
+                    kv_cache_spec=layer_kv_cache_spec,
+                    kv_cache_group_id=gid,
+                )
+                attn_group.create_metadata_builders(
+                    self.vllm_config,
+                    self.device,
+                    kernel_block_size=kernel_block_size,
+                )
+                attention_groups[group_key] = attn_group
+            else:
+                attention_groups[group_key].layer_names.append(layer_name)
 
         self.draft_attn_groups = list(attention_groups.values())
         self.block_size = (

@@ -12,6 +12,9 @@ from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 # available — on the CPU worker path `tl` is a placeholder whose `constexpr`
 # attribute is `None`, and `tl.constexpr(...)` would crash at import time.
 _TL_RAND_MIN = tl.constexpr(4.6566127342e-10) if HAS_TRITON else 4.6566127342e-10
+_FP64_ONE_MINUS_EPS = (
+    tl.constexpr(0.9999999999999999) if HAS_TRITON else 0.9999999999999999
+)
 
 
 @triton.jit
@@ -94,8 +97,10 @@ def gumbel_block_argmax(
     processed_logits_ptr,
     processed_logits_stride,
     processed_logits_col_ptr,
+    processed_logits_active_rows_ptr,
     vocab_size,
     APPLY_TEMPERATURE: tl.constexpr,
+    HAS_ACTIVE_ROW_LIMIT: tl.constexpr,
     USE_FP64: tl.constexpr,
     PER_TOKEN_COL: tl.constexpr = False,
 ):
@@ -119,13 +124,20 @@ def gumbel_block_argmax(
                 col = tl.load(processed_logits_col_ptr)
         else:
             col = 0
+        store_mask = mask
+        if HAS_ACTIVE_ROW_LIMIT:
+            # FULL CUDA graph replay can execute with padded request rows.
+            # Those rows may carry stale req_state indices; never let them
+            # overwrite cached draft logits for real requests.
+            active_rows = tl.load(processed_logits_active_rows_ptr)
+            store_mask = store_mask & (token_idx < active_rows)
         tl.store(
             processed_logits_ptr
             + req_state_idx * processed_logits_stride
             + col * vocab_size
             + block,
             logits,
-            mask=mask & is_valid_req,
+            mask=store_mask & is_valid_req,
         )
 
     # fp32 is the default reduction dtype; fp64 is ~1/32–1/64x the throughput
@@ -140,6 +152,7 @@ def gumbel_block_argmax(
 
         if USE_FP64:
             u = tl_rand64(gumbel_seed, block, includes_zero=False)
+            u = tl.minimum(u, _FP64_ONE_MINUS_EPS)
             gumbel_noise = -tl.log(-tl.log(u))
         else:
             u = tl_rand32(gumbel_seed, block, includes_zero=False)
@@ -152,7 +165,8 @@ def gumbel_block_argmax(
             gumbel_noise = -tl.log(-tldevice.log1p(-u))
 
         # Apply gumbel noise.
-        logits = tl.where(mask, logits + gumbel_noise, float("-inf"))
+        finite = logits > float("-inf")
+        logits = tl.where(mask & finite, logits + gumbel_noise, float("-inf"))
 
     value, idx = tl.max(logits, axis=0, return_indices=True)
     return value, idx
@@ -167,6 +181,7 @@ def _gumbel_sample_kernel(
     processed_logits_ptr,
     processed_logits_stride,
     processed_logits_col_ptr,
+    processed_logits_active_rows_ptr,
     logits_ptr,
     logits_stride,
     expanded_idx_mapping_ptr,
@@ -176,6 +191,7 @@ def _gumbel_sample_kernel(
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr,
+    HAS_ACTIVE_ROW_LIMIT: tl.constexpr,
     USE_FP64: tl.constexpr,
     PER_TOKEN_COL: tl.constexpr,
 ):
@@ -202,12 +218,14 @@ def _gumbel_sample_kernel(
         processed_logits_ptr,
         processed_logits_stride,
         processed_logits_col_ptr,
+        processed_logits_active_rows_ptr,
         vocab_size,
         APPLY_TEMPERATURE=APPLY_TEMPERATURE,
+        HAS_ACTIVE_ROW_LIMIT=HAS_ACTIVE_ROW_LIMIT,
         USE_FP64=USE_FP64,
         PER_TOKEN_COL=PER_TOKEN_COL,
     )
-    token_id = block_idx * BLOCK_SIZE + idx
+    token_id = tl.minimum(block_idx * BLOCK_SIZE + idx, vocab_size - 1)
     tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
 
@@ -221,6 +239,7 @@ def gumbel_sample(
     apply_temperature: bool,
     output_processed_logits: torch.Tensor | None = None,
     output_processed_logits_col: torch.Tensor | None = None,
+    output_processed_logits_active_rows: torch.Tensor | None = None,
     use_fp64: bool = False,
 ) -> torch.Tensor:
     # Enforce contiguity on non-strided input tensors
@@ -246,6 +265,7 @@ def gumbel_sample(
         output_processed_logits,
         output_processed_logits.stride(0) if output_processed_logits is not None else 0,
         output_processed_logits_col,
+        output_processed_logits_active_rows,
         logits,
         logits.stride(0),
         expanded_idx_mapping,
@@ -255,6 +275,7 @@ def gumbel_sample(
         vocab_size,
         BLOCK_SIZE=BLOCK_SIZE,
         APPLY_TEMPERATURE=apply_temperature,
+        HAS_ACTIVE_ROW_LIMIT=output_processed_logits_active_rows is not None,
         USE_FP64=use_fp64,
         PER_TOKEN_COL=per_token_col,
     )

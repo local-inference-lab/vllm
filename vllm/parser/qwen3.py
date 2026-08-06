@@ -56,13 +56,22 @@ _PARAM_RE = re.compile(
 _PARTIAL_PARAM_RE = re.compile(r"<\s*parameter\s*=\s*([^>]+)>(.*)$", re.DOTALL)
 
 
+def _trim_wrapping_newlines(value: str) -> str:
+    """Strip one leading and one trailing newline (the Qwen3 template markup)."""
+    if value.startswith("\n"):
+        value = value[1:]
+    if value.endswith("\n"):
+        value = value[:-1]
+    return value
+
+
 def _qwen3_arg_converter(raw_args: str, partial: bool) -> str:
     params: dict[str, object] = {}
 
     for match in _PARAM_RE.finditer(raw_args):
         name = match.group(1)
         value = match.group(2)
-        params[name] = value.strip()
+        params[name] = _trim_wrapping_newlines(value)
 
     if partial:
         remaining = _PARAM_RE.sub("", raw_args)
@@ -71,7 +80,7 @@ def _qwen3_arg_converter(raw_args: str, partial: bool) -> str:
             name = m.group(1)
             value = m.group(2)
             if name:
-                params[name] = value.strip()
+                params[name] = _trim_wrapping_newlines(value)
 
     return json.dumps(params, ensure_ascii=False)
 
@@ -265,3 +274,22 @@ class Qwen3Parser(ParserEngine):
                         continue
                     return True
         return False
+
+    def is_reasoning_end_for_prompt(self, input_ids):
+        # The default prompt-end heuristic (see
+        # vllm/reasoning/abs_reasoning_parsers.py) delegates to
+        # is_reasoning_end, which for Qwen3 also fires on an unpaired
+        # <tool_call> token. That is the right call for generated tokens
+        # but the wrong call for the prompt: a multi-turn prompt ends
+        # with </think> from the prior assistant turn, and any request
+        # that defines tools inlines a <tool_call> example into the
+        # system prompt. Either one flips the prompt-end check to True
+        # and the engine then bypasses the per-delta reasoning branch
+        # (vllm/parser/abstract_parser.py:762) on the first delta, so
+        # <think> markers leak into content.
+        #
+        # Defer to the per-delta state machine instead. When thinking
+        # is disabled the model will not emit <think> blocks at all, so
+        # the engine starts in CONTENT (see qwen3_config(thinking=...))
+        # and we must skip the reasoning branch entirely.
+        return not self.thinking_enabled

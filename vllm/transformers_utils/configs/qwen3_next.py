@@ -160,6 +160,7 @@ class Qwen3NextConfig(PretrainedConfig):
     """  # noqa: E501
 
     model_type = "qwen3_next"
+    vllm_virtual_tp_profile = "gqa-gdn-moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     base_model_tp_plan = {

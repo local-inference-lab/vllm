@@ -21,6 +21,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 class Qwen3_5MoeTextConfig(PretrainedConfig):
     model_type = "qwen3_5_moe_text"
+    vllm_virtual_tp_profile = "gqa-gdn-moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     base_model_tp_plan = {

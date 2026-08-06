@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 //! Default output processing pipeline.
 
 mod structural_tag;
@@ -47,14 +50,15 @@ impl DefaultChatOutputProcessor {
         tool_call_parser: &ParserSelection,
         reasoning_parser: &ParserSelection,
     ) -> ChatResult<Self> {
-        let parser = if tool_call_parser == reasoning_parser
+        let (parser, has_reasoning_parser) = if tool_call_parser == reasoning_parser
             && let Some(parser) = Self::resolve_optional_unified_parser(
                 &request.tools,
                 model_id,
                 tokenizer.clone(),
                 tool_call_parser,
             )? {
-            parser
+            // Unified parsers handle the reasoning channel themselves.
+            (parser, true)
         } else {
             let tool_parsing_enabled = request.tool_parsing_enabled();
             let tool_parser = if tool_parsing_enabled {
@@ -68,10 +72,18 @@ impl DefaultChatOutputProcessor {
             };
             let reasoning_parser =
                 Self::resolve_optional_reasoning_parser(model_id, tokenizer, reasoning_parser)?;
-            Box::new(CombinedParser::new(reasoning_parser, tool_parser)) as Box<dyn UnifiedParser>
+            let has_reasoning_parser = reasoning_parser.is_some();
+            (
+                Box::new(CombinedParser::new(reasoning_parser, tool_parser))
+                    as Box<dyn UnifiedParser>,
+                has_reasoning_parser,
+            )
         };
 
-        apply_structural_tag_constraint(request, parser.structural_tag_model())?;
+        // Reasoning models emit a thinking prefix unless the request disabled
+        // it; the structural-tag grammar must match what the model produces.
+        let reasoning_enabled = has_reasoning_parser && request.enable_thinking()?.unwrap_or(true);
+        apply_structural_tag_constraint(request, parser.structural_tag_model(), reasoning_enabled)?;
 
         if parser.preserve_special_tokens() {
             request.decode_options.skip_special_tokens = false;

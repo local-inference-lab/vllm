@@ -51,6 +51,7 @@ def _get_workspace_buffer(return_lse: bool) -> torch.Tensor:
 class FlashInferMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
+    supports_non_causal_multi_token_decode: ClassVar[bool] = True
 
 
 class FlashInferMLABackend(MLACommonBackend):
@@ -90,6 +91,10 @@ class FlashInferMLABackend(MLACommonBackend):
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability.major == 10
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        return True
 
     @classmethod
     def supports_combination(

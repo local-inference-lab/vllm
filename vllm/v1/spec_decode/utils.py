@@ -133,7 +133,7 @@ def eagle_step_update_slot_mapping_and_metadata(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_reqs"])
 def eagle_prepare_inputs_padded_kernel(
     cu_num_draft_tokens_ptr,  # [num_reqs]
     valid_sampled_tokens_count_ptr,  # [num_reqs]
@@ -175,7 +175,14 @@ def eagle_prepare_inputs_padded_kernel(
     tl.store(num_rejected_tokens_gpu_ptr + req_idx, num_rejected_tokens)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "vocab_size",
+        "num_sampled_tokens_per_req",
+        "num_reqs",
+        "stride_sampled_token_ids",
+    ]
+)
 def eagle_prepare_next_token_padded_kernel(
     sampled_token_ids_ptr,  # [num_reqs, num_sampled_tokens_per_req]
     discard_request_mask_ptr,  # [num_reqs]
@@ -478,6 +485,7 @@ def copy_and_expand_dflash_inputs_kernel(
     num_query_per_req,  # tl.int32
     num_speculative_tokens,  # tl.int32
     total_input_tokens,  # tl.int32
+    PAD_SLOT_ID: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     HAS_NUM_REJECTED: tl.constexpr = False,
 ):
@@ -543,7 +551,11 @@ def copy_and_expand_dflash_inputs_kernel(
         other=0,
     ).to(tl.int64)
     slot = block_id * block_size + (positions % block_size)
-    tl.store(out_context_slot_mapping_ptr + ctx_pos_out, slot, mask=is_ctx)
+    # Sliding-window DFlash draft KV can evict old context positions and leave
+    # them mapped to the null block. Do not write those K/V rows into physical
+    # block 0; mark them as padding so the cache-write path skips them.
+    context_slot = tl.where(block_id != 0, slot, PAD_SLOT_ID)
+    tl.store(out_context_slot_mapping_ptr + ctx_pos_out, context_slot, mask=is_ctx)
     tl.store(out_query_slot_mapping_ptr + query_out, slot, mask=is_query)
 
     # --- Input IDs (query tokens only) ---

@@ -3,13 +3,16 @@
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
+from math import lcm
 
 import regex as re
 import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -18,10 +21,12 @@ from vllm.distributed import (
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_fused_post_pre_tilelang,
     mhc_post_tilelang,
+    mhc_pre_broadcast_tilelang,
     mhc_pre_tilelang,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
@@ -43,7 +48,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.sparse_attn_indexer import use_b12x_sparse_indexer
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
     VocabParallelEmbedding,
 )
@@ -65,6 +72,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.nvidia.b12x import DeepseekV4B12xMLAAttention
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -76,6 +84,68 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+from vllm.v1.worker.workspace import current_workspace_manager
+
+logger = init_logger(__name__)
+
+
+def _get_virtual_tp_axis_padded_size(config, axis_name: str, default: int) -> int:
+    plan = getattr(config, VIRTUAL_TP_PLAN_ATTR, None)
+    if not isinstance(plan, dict):
+        return default
+
+    axis = plan.get(axis_name)
+    if not isinstance(axis, dict):
+        return default
+
+    padded_size = axis.get("padded_size")
+    if padded_size is None:
+        return default
+    return int(padded_size)
+
+
+def _get_virtual_tp_vocab_padding_size(
+    config,
+    default: int = DEFAULT_VOCAB_PADDING_SIZE,
+) -> int:
+    plan = getattr(config, VIRTUAL_TP_PLAN_ATTR, None)
+    if not isinstance(plan, dict):
+        return default
+
+    axis = plan.get("vocab_size")
+    if not isinstance(axis, dict):
+        return default
+
+    padding_size = axis.get("padding_size")
+    if padding_size is not None:
+        return int(padding_size)
+
+    tp_size = axis.get("tp_size")
+    if tp_size is None:
+        tp_size = get_tensor_model_parallel_world_size()
+    return lcm(default, int(tp_size))
+
+
+def _use_b12x_mhc() -> bool:
+    if not envs.VLLM_USE_B12X_MHC:
+        return False
+    if not current_platform.is_cuda():
+        raise RuntimeError("VLLM_USE_B12X_MHC requires CUDA.")
+    if not current_platform.is_device_capability_family(120):
+        raise RuntimeError("VLLM_USE_B12X_MHC currently requires an SM120 GPU.")
+    return True
+
+
+def _get_b12x_plan_scratch(
+    plan: object,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    specs = plan.shapes_and_dtypes()
+    if not specs:
+        raise ValueError("b12x scratch plan did not provide any scratch specs")
+    buffers = current_workspace_manager().get_simultaneous(*specs)
+    if len(buffers) == 1:
+        return buffers[0]
+    return tuple(buffers)
 
 
 class DeepseekV4MLP(nn.Module):
@@ -585,6 +655,9 @@ class DeepseekV4MoE(nn.Module):
             self.shared_experts = None
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            intermediate_size = _get_virtual_tp_axis_padded_size(
+                config, "shared_expert_intermediate_size", intermediate_size
+            )
 
             self.shared_experts = DeepseekV4MLP(
                 hidden_size=config.hidden_size,
@@ -658,16 +731,6 @@ class DeepseekV4MoE(nn.Module):
         self.n_shared_experts = config.n_shared_experts or 0
         self.n_logical_experts = self.n_routed_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
-        assert self.n_physical_experts % self.tp_size == 0, (
-            f"n_physical_experts={self.n_physical_experts} must be divisible by "
-            f"tp_size={self.tp_size}. Adjust num_redundant_experts."
-        )
-        self.n_local_physical_experts = self.n_physical_experts // self.tp_size
-        self.n_local_experts = self.n_local_physical_experts
-        self.experts_start_idx = self.tp_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.physical_expert_start = self.experts_start_idx
-        self.physical_expert_end = self.experts_end_idx
 
         self.experts = FusedMoE(
             shared_experts=self.shared_experts,
@@ -688,6 +751,12 @@ class DeepseekV4MoE(nn.Module):
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
         )
+        self.n_local_experts = self.experts.expert_map_manager.local_num_experts
+        self.experts_start_idx = 0
+        self.experts_end_idx = self.n_local_experts
+        self.n_local_physical_experts = self.n_local_experts
+        self.physical_expert_start = self.experts_start_idx
+        self.physical_expert_end = self.experts_end_idx
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
@@ -762,7 +831,8 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     The generic CUDA backend selector does not instantiate DSv4 layers directly,
     so map generic sparse-MLA choices to the DSv4-specialized attention class.
     Without an explicit backend, SM12 defaults to FlashInfer while the other
-    CUDA arches keep the FlashMLA path.
+    CUDA arches keep the FlashMLA path. Select ``B12X_MLA_SPARSE`` explicitly
+    to use the b12x DSv4 sparse-MLA path.
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
@@ -779,6 +849,8 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         if device_capability is not None and device_capability.major == 12:
             return DeepseekV4FlashInferSM120Attention
         return DeepseekV4FlashInferMLAAttention
+    if backend == AttentionBackendEnum.B12X_MLA_SPARSE:
+        return DeepseekV4B12xMLAAttention
     if backend in (
         AttentionBackendEnum.FLASHMLA_SPARSE,
         AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
@@ -797,10 +869,23 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
     ):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
+        self.layer_name = prefix
+        self._use_b12x_mhc = _use_b12x_mhc()
+        if self._use_b12x_mhc:
+            if not prefix:
+                raise RuntimeError("DeepSeek V4 b12x mHC decoder layer needs a prefix")
+            compilation_config = vllm_config.compilation_config
+            if prefix in compilation_config.static_forward_context:
+                raise ValueError(f"Duplicate layer name: {prefix}")
+            compilation_config.static_forward_context[prefix] = self
+
+            logger.info_once("DeepSeek V4 b12x mHC enabled.")
+
         self.hidden_size = config.hidden_size
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -809,6 +894,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
+            topk_scores_buffer=topk_scores_buffer,
         )
         self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
 
@@ -827,12 +913,29 @@ class DeepseekV4DecoderLayer(nn.Module):
             ),
             requires_grad=False,
         )
+        self.hc_attn_fn_broadcast: torch.Tensor | None = None
         self.hc_ffn_fn = nn.Parameter(
             torch.empty(
                 (mix_hc, hc_dim),
                 dtype=torch.float32,
             ),
             requires_grad=False,
+        )
+        self.register_buffer(
+            "hc_attn_fn_bf16",
+            torch.empty(
+                (mix_hc, hc_dim),
+                dtype=torch.bfloat16,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "hc_ffn_fn_bf16",
+            torch.empty(
+                (mix_hc, hc_dim),
+                dtype=torch.bfloat16,
+            ),
+            persistent=False,
         )
         self.hc_attn_base = nn.Parameter(
             torch.empty(
@@ -863,6 +966,334 @@ class DeepseekV4DecoderLayer(nn.Module):
             requires_grad=False,
         )
 
+        if self._use_b12x_mhc:
+            from sparkinfer.norm.mhc import (
+                DEFAULT_BLOCK_K as MHC_DEFAULT_BLOCK_K,
+            )
+            from sparkinfer.norm.mhc import (
+                MULT as MHC_MULT,
+            )
+            from sparkinfer.norm.mhc._impl import (
+                MHC_GRAM_BLOCK_H,
+                MHC_SOURCE_TILE_H,
+                MHC_SUPPORTED_HIDDEN_SIZES,
+            )
+
+            if self.hc_mult != MHC_MULT:
+                raise NotImplementedError(
+                    f"DeepSeek V4 b12x mHC requires hc_mult={MHC_MULT}, "
+                    f"got {self.hc_mult}."
+                )
+            if self.hidden_size not in MHC_SUPPORTED_HIDDEN_SIZES:
+                raise NotImplementedError(
+                    "DeepSeek V4 b12x mHC supports hidden sizes "
+                    f"{MHC_SUPPORTED_HIDDEN_SIZES}, got {self.hidden_size}."
+                )
+            if self.hidden_size % MHC_SOURCE_TILE_H != 0:
+                raise ValueError(
+                    "DeepSeek V4 b12x mHC requires hidden_size to be "
+                    f"divisible by source tile {MHC_SOURCE_TILE_H}, got "
+                    f"{self.hidden_size}."
+                )
+            if self.hidden_size % MHC_GRAM_BLOCK_H != 0:
+                raise ValueError(
+                    "DeepSeek V4 b12x mHC requires hidden_size to be "
+                    f"divisible by finalize block {MHC_GRAM_BLOCK_H}, got "
+                    f"{self.hidden_size}."
+                )
+            self._b12x_mhc_block_k = int(MHC_DEFAULT_BLOCK_K)
+            total_k = self.hc_mult * self.hidden_size
+            if total_k % self._b12x_mhc_block_k != 0:
+                raise ValueError(
+                    "DeepSeek V4 b12x mHC requires hc_mult * hidden_size to "
+                    f"be divisible by block_k={self._b12x_mhc_block_k}, got {total_k}."
+                )
+            self._b12x_mhc_split_k = total_k // self._b12x_mhc_block_k
+        else:
+            self._b12x_mhc_block_k = 0
+            self._b12x_mhc_split_k = 0
+
+    def _should_run_b12x_mhc(self, tokens: int) -> bool:
+        del tokens
+        return self._use_b12x_mhc
+
+    def refresh_b12x_mhc_bf16_weights(self) -> None:
+        if not self._use_b12x_mhc:
+            return
+        self.hc_attn_fn_bf16.copy_(self.hc_attn_fn.detach().to(torch.bfloat16))
+        self.hc_ffn_fn_bf16.copy_(self.hc_ffn_fn.detach().to(torch.bfloat16))
+
+    def _require_b12x_mhc_norm_weight(
+        self, norm_weight: torch.Tensor | None
+    ) -> torch.Tensor:
+        if norm_weight is None:
+            raise RuntimeError(
+                "DeepSeek V4 b12x mHC requires fused RMSNorm; pass norm_weight."
+            )
+        return norm_weight
+
+    def _get_b12x_mhc_binding(
+        self,
+        x: torch.Tensor,
+        *,
+        expected_m: int,
+        y: torch.Tensor | None = None,
+        post: torch.Tensor | None = None,
+        comb: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+    ) -> object:
+        from sparkinfer.norm.mhc import (
+            Caps as B12XMHCScratchCaps,
+        )
+        from sparkinfer.norm.mhc import (
+            plan as plan_mhc_scratch,
+        )
+
+        tokens = int(x.shape[0])
+        expected_m = int(expected_m)
+        plan = plan_mhc_scratch(
+            B12XMHCScratchCaps(
+                device=x.device,
+                dtype=x.dtype,
+                max_tokens=max(1, tokens, expected_m),
+                hidden_size=self.hidden_size,
+                split_k=self._b12x_mhc_split_k,
+            )
+        )
+        scratch = _get_b12x_plan_scratch(plan)
+        return plan.bind(
+            scratch=scratch,
+            tokens=tokens,
+            y=y,
+            post=post,
+            comb=comb,
+            out=out,
+            expected_m=expected_m,
+        )
+
+    def _run_b12x_mhc_pre(
+        self,
+        residual: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        from sparkinfer.norm.mhc import run_pre as b12x_mhc_pre
+
+        norm_weight = self._require_b12x_mhc_norm_weight(norm_weight)
+        if torch.compiler.is_compiling():
+            return b12x_mhc_pre(
+                residual,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                sinkhorn_iters=self.hc_sinkhorn_iters,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+                split_k=self._b12x_mhc_split_k,
+                block_k=self._b12x_mhc_block_k,
+            )
+
+        tokens, hidden_size = residual.shape
+        hc_mult = self.hc_mult
+        expected_m = int(tokens)
+        residual_out = torch.empty(
+            (tokens, hc_mult, hidden_size),
+            dtype=residual.dtype,
+            device=residual.device,
+        )
+        layer_input = torch.empty(
+            (tokens, hidden_size), dtype=residual.dtype, device=residual.device
+        )
+        post_mix = torch.empty(
+            (tokens, hc_mult), dtype=torch.float32, device=residual.device
+        )
+        res_mix = torch.empty(
+            (tokens, hc_mult, hc_mult),
+            dtype=torch.float32,
+            device=residual.device,
+        )
+        binding = self._get_b12x_mhc_binding(
+            residual,
+            expected_m=expected_m,
+            y=layer_input,
+            post=post_mix,
+            comb=res_mix,
+            out=residual_out,
+        )
+        return b12x_mhc_pre(
+            residual,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            rms_eps=self.rms_norm_eps,
+            hc_eps=self.hc_eps,
+            sinkhorn_iters=self.hc_sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            binding=binding,
+            block_k=self._b12x_mhc_block_k,
+        )
+
+    def _run_b12x_mhc_post_pre(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+        hc_fn_bf16: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        from sparkinfer.norm.mhc import run_post_pre as b12x_mhc_post_pre
+
+        norm_weight = self._require_b12x_mhc_norm_weight(norm_weight)
+        expected_m = int(residual.shape[0])
+        if torch.compiler.is_compiling():
+            return b12x_mhc_post_pre(
+                x,
+                residual,
+                post,
+                comb,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                sinkhorn_iters=self.hc_sinkhorn_iters,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+                split_k=self._b12x_mhc_split_k,
+                block_k=self._b12x_mhc_block_k,
+                expected_m=expected_m,
+                fn_bf16=hc_fn_bf16,
+            )
+
+        tokens, hc_mult, hidden_size = residual.shape
+        residual_out = torch.empty_like(residual)
+        y_out = torch.empty(
+            (tokens, hidden_size), dtype=residual.dtype, device=residual.device
+        )
+        post_out = torch.empty(
+            (tokens, hc_mult), dtype=torch.float32, device=residual.device
+        )
+        comb_out = torch.empty(
+            (tokens, hc_mult, hc_mult), dtype=torch.float32, device=residual.device
+        )
+        binding = self._get_b12x_mhc_binding(
+            residual,
+            expected_m=expected_m,
+            y=y_out,
+            post=post_out,
+            comb=comb_out,
+            out=residual_out,
+        )
+        return b12x_mhc_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            rms_eps=self.rms_norm_eps,
+            hc_eps=self.hc_eps,
+            sinkhorn_iters=self.hc_sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            binding=binding,
+            block_k=self._b12x_mhc_block_k,
+            expected_m=expected_m,
+            fn_bf16=hc_fn_bf16,
+        )
+
+    def hc_pre(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+    ):
+        if self._should_run_b12x_mhc(int(x.shape[0])):
+            return self._run_b12x_mhc_pre(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_weight,
+                norm_eps,
+            )
+
+        post_mix, res_mix, layer_input = mhc_pre_tilelang(
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+        return layer_input, post_mix, res_mix
+
+    def hc_post_pre(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+        hc_fn_bf16: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._should_run_b12x_mhc(int(residual.shape[0])):
+            return self._run_b12x_mhc_post_pre(
+                x,
+                residual,
+                post,
+                comb,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_weight,
+                norm_eps,
+                hc_fn_bf16=hc_fn_bf16,
+            )
+
+        return mhc_fused_post_pre_tilelang(
+            x,
+            residual,
+            post,
+            comb,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+            n_splits=1,
+            tile_n=1,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -872,24 +1303,89 @@ class DeepseekV4DecoderLayer(nn.Module):
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._should_run_b12x_mhc(int(x.shape[0])):
+            attn_norm_weight = self.attn_norm.weight.data
+            attn_norm_eps = self.attn_norm.variance_epsilon
+            if residual is None:
+                assert x.dim() == 2
+                assert self.hc_attn_fn_broadcast is not None
+                residual, post_mix, res_mix, x = self.hc_pre(
+                    x,
+                    self.hc_attn_fn_broadcast,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    norm_weight=attn_norm_weight,
+                    norm_eps=attn_norm_eps,
+                )
+            else:
+                assert post_mix is not None
+                assert res_mix is not None
+                residual, post_mix, res_mix, x = self.hc_post_pre(
+                    x,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    norm_weight=attn_norm_weight,
+                    norm_eps=attn_norm_eps,
+                )
+
+            x = self.attn(positions, x, None)
+
+            ffn_norm_weight = self.ffn_norm.weight.data
+            ffn_norm_eps = self.ffn_norm.variance_epsilon
+            residual, post_mix, res_mix, x = self.hc_post_pre(
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                norm_weight=ffn_norm_weight,
+                norm_eps=ffn_norm_eps,
+                hc_fn_bf16=self.hc_ffn_fn_bf16,
+            )
+            x = self.ffn(x, input_ids)
+            return x, residual, post_mix, res_mix
+
         attn_norm_weight = self.attn_norm.weight.data
         attn_norm_eps = self.attn_norm.variance_epsilon
         if residual is None:
             # Run standalone mhc_pre on first layer
-            residual = x
-            post_mix, res_mix, x = mhc_pre_tilelang(
-                x,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                self.hc_post_alpha,
-                self.hc_sinkhorn_iters,
-                norm_weight=attn_norm_weight,
-                norm_eps=attn_norm_eps,
-            )
+            if x.dim() == 2:
+                assert self.hc_attn_fn_broadcast is not None
+                residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(
+                    x,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    norm_weight=attn_norm_weight,
+                    norm_eps=attn_norm_eps,
+                    fn_broadcast=self.hc_attn_fn_broadcast,
+                )
+            else:
+                residual = x
+                post_mix, res_mix, x = mhc_pre_tilelang(
+                    x,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    norm_weight=attn_norm_weight,
+                    norm_eps=attn_norm_eps,
+                )
         else:
             residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
                 x,
@@ -938,6 +1434,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
 class DeepseekV4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -965,7 +1469,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Three aux streams: one per non-default input GEMM in
         # DeepseekV4Attention.attn_gemm_parallel_execute
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
-        # kv_score). fused_wqa_wkv stays on the default stream.
+        # kv_score). fused_wqa_wkv stays on the default stream. The overlap (and
+        # its CUDA events) lives inside the opaque `deepseek_v4_attention` custom
+        # op, so it never enters the compiled graph.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
@@ -974,11 +1480,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             config.index_topk,
             dtype=torch.int32,
         )
+        self.topk_scores_buffer = None
+        if (
+            vllm_config.parallel_config.decode_context_parallel_size > 1
+            and use_b12x_sparse_indexer()
+        ):
+            self.topk_scores_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                config.index_topk,
+                dtype=torch.float32,
+            )
+        vocab_padding_size = _get_virtual_tp_vocab_padding_size(config)
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
+                padding_size=vocab_padding_size,
                 quant_config=quant_config,
                 prefix=f"{prefix}.embed_tokens",
             )
@@ -992,6 +1510,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
+                topk_scores_buffer=self.topk_scores_buffer,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -1034,6 +1553,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
         else:
             self._mtp_hidden_buffer = None
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+        self.aux_hidden_state_capture_mode: str | None = None
+
+    def set_dspark_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.aux_hidden_state_layers = layers
+        self.aux_hidden_state_capture_mode = "dspark_post_layer_mean"
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1064,13 +1589,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -1078,6 +1602,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
 
+        aux_hidden_states: list[torch.Tensor] = []
         residual, post_mix, res_mix = None, None, None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
@@ -1095,15 +1620,34 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
-                aux_recon = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
-                )
+                if layer._should_run_b12x_mhc(int(hidden_states.shape[0])):
+                    from sparkinfer.norm.mhc import run_post as b12x_mhc_post
+
+                    aux_recon = b12x_mhc_post(
+                        hidden_states,
+                        residual,
+                        post_mix,
+                        res_mix,
+                    )
+                else:
+                    aux_recon = mhc_post_tilelang(
+                        hidden_states, residual, post_mix, res_mix
+                    )
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
         if layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
+            elif layer._should_run_b12x_mhc(int(hidden_states.shape[0])):
+                from sparkinfer.norm.mhc import run_post as b12x_mhc_post
+
+                hidden_states = b12x_mhc_post(
+                    hidden_states,
+                    residual,
+                    post_mix,
+                    res_mix,
+                )
             else:
                 hidden_states = mhc_post_tilelang(
                     hidden_states, residual, post_mix, res_mix
@@ -1236,6 +1780,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     loaded_params.add(name)
                     continue
 
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            layer.refresh_b12x_mhc_bf16_weights()
+
         return loaded_params
 
     def _pad_shared_expert_weight(
@@ -1277,6 +1824,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
     def finalize_mega_moe_weights(self) -> None:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
+
+    def finalize_mhc_broadcast_weights(self) -> None:
+        if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
+            return
+        layer = self.layers[self.start_layer]
+        if isinstance(layer, DeepseekV4DecoderLayer):
+            layer.hc_attn_fn_broadcast = (
+                layer.hc_attn_fn.detach()
+                .view(-1, layer.hc_mult, layer.hidden_size)
+                .sum(dim=1)
+            )
+
+    def setup_b12x_wo_projection(self) -> None:
+        if not envs.VLLM_USE_B12X_WO_PROJECTION:
+            return
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            layer.attn.setup_b12x_wo_projection()
 
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
@@ -1374,10 +1938,12 @@ class DeepseekV4ForCausalLM(
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        vocab_padding_size = _get_virtual_tp_vocab_padding_size(config)
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
+                padding_size=vocab_padding_size,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
         else:
@@ -1424,7 +1990,7 @@ class DeepseekV4ForCausalLM(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -1440,6 +2006,8 @@ class DeepseekV4ForCausalLM(
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.model.finalize_mega_moe_weights()
+        self.model.finalize_mhc_broadcast_weights()
+        self.model.setup_b12x_wo_projection()
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

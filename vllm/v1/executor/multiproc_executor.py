@@ -114,6 +114,18 @@ class MultiprocExecutor(Executor):
         self.is_failed = False
         self.failure_callback: FailureCallback | None = None
 
+        if envs.VLLM_WORKER_MULTIPROC_METHOD == "forkserver":
+            # EngineCore creates its own forkserver rather than reusing the
+            # API process's server. Preload the worker stack here as well so
+            # TP ranks inherit it instead of importing it serially in every
+            # child while proc.start() blocks on the spawn pipe.
+            multiprocessing.set_forkserver_preload(
+                [
+                    "vllm.v1.executor.multiproc_executor",
+                    "vllm.v1.worker.gpu_worker",
+                ]
+            )
+
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
             f"world_size ({self.world_size}) must be equal to the "

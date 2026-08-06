@@ -459,3 +459,22 @@ def test_token_id_helpers_enabled_mode():
     assert parser.count_reasoning_tokens(open_reasoning_ids) == len(
         tokenizer.encode("abc")
     )
+
+
+def test_prompt_reasoning_end_uses_m3_thinking_mode():
+    parser, tokenizer = make_parser()
+    prompt_ids = tokenizer.encode("</mm:think>", add_special_tokens=False)
+
+    assert not parser.is_reasoning_end_for_prompt(prompt_ids)
+
+    parser, tokenizer = make_parser(chat_template_kwargs={"thinking_mode": "adaptive"})
+    prompt_ids = tokenizer.encode("</mm:think>", add_special_tokens=False)
+    assert not parser.is_reasoning_end_for_prompt(prompt_ids)
+
+    parser, tokenizer = make_parser(chat_template_kwargs={"thinking_mode": "enabled"})
+    prompt_ids = tokenizer.encode("<mm:think>", add_special_tokens=False)
+    assert not parser.is_reasoning_end_for_prompt(prompt_ids)
+
+    parser, tokenizer = make_parser(chat_template_kwargs={"thinking_mode": "disabled"})
+    prompt_ids = tokenizer.encode("</mm:think>", add_special_tokens=False)
+    assert parser.is_reasoning_end_for_prompt(prompt_ids)

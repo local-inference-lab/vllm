@@ -85,6 +85,7 @@ def _get_backend_priorities(
     device_capability: DeviceCapability,
     num_heads: int | None = None,
     kv_cache_dtype: CacheDType | None = None,
+    use_non_causal: bool = False,
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
     from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -141,7 +142,10 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
     else:
-        if device_capability.major == 10:
+        # SM100f defaults to FlashInfer for TRTLLM causal attention, but its non-causal
+        # cutlass path (used for dflash attention) is known to have problems.
+        # So prefer FlashAttention when non-causal on SM100f.
+        if device_capability.major == 10 and not use_non_causal:
             return [
                 AttentionBackendEnum.FLASHINFER,
                 AttentionBackendEnum.FLASH_ATTN,
@@ -275,6 +279,10 @@ class CudaPlatformBase(Platform):
         raise NotImplementedError
 
     @classmethod
+    def has_native_p2p_atomics(cls, device_ids: list[int]) -> bool:
+        raise NotImplementedError
+
+    @classmethod
     def log_warnings(cls):
         pass
 
@@ -368,6 +376,7 @@ class CudaPlatformBase(Platform):
             device_capability,
             num_heads,
             attn_selector_config.kv_cache_dtype,
+            attn_selector_config.use_non_causal,
         )
         for priority, backend in enumerate(backend_priorities):
             try:
@@ -793,6 +802,33 @@ class NvmlCudaPlatform(CudaPlatformBase):
         return True
 
     @classmethod
+    @with_nvml_context
+    def has_native_p2p_atomics(cls, physical_device_ids: list[int]) -> bool:
+        """
+        query if every gpu pair supports native P2P atomic operations
+        (system-scope atomics issued directly on peer-mapped memory)
+        """
+        handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
+        for i, handle in enumerate(handles):
+            for j, peer_handle in enumerate(handles):
+                if i < j:
+                    try:
+                        p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+                            handle,
+                            peer_handle,
+                            pynvml.NVML_P2P_CAPS_INDEX_ATOMICS,
+                        )
+                        if p2p_status != pynvml.NVML_P2P_STATUS_OK:
+                            return False
+                    except pynvml.NVMLError:
+                        logger.exception(
+                            "P2P atomics detection failed. Assuming native"
+                            " P2P atomics are not available."
+                        )
+                        return False
+        return True
+
+    @classmethod
     def _get_physical_device_name(cls, device_id: int = 0) -> str:
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
         return pynvml.nvmlDeviceGetName(handle)
@@ -979,6 +1015,14 @@ class NonNvmlCudaPlatform(CudaPlatformBase):
         logger.exception(
             "NVLink detection not possible, as context support was"
             " not found. Assuming no NVLink available."
+        )
+        return False
+
+    @classmethod
+    def has_native_p2p_atomics(cls, physical_device_ids: list[int]) -> bool:
+        logger.exception(
+            "P2P atomics detection not possible, as context support was"
+            " not found. Assuming native P2P atomics are not available."
         )
         return False
 

@@ -31,13 +31,26 @@ def _flatten_sampled_kernel(
     num_sampled_ptr,
     # [num_reqs + 1]
     cu_num_logits_ptr,
+    MAX_NUM_LOGITS: tl.constexpr,
+    SAMPLED_WIDTH: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
+    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+    num_logits = end_idx - start_idx
     num_sampled = tl.load(num_sampled_ptr + req_idx)
-    for i in range(num_sampled):
-        token_id = tl.load(sampled_ptr + req_idx * sampled_stride + i)
-        tl.store(flat_sampled_ptr + start_idx + i, token_id)
+    offsets = tl.arange(0, MAX_NUM_LOGITS)
+    load_mask = (offsets < num_sampled) & (offsets < SAMPLED_WIDTH)
+    token_ids = tl.load(
+        sampled_ptr + req_idx * sampled_stride + offsets,
+        mask=load_mask,
+        other=0,
+    )
+    tl.store(
+        flat_sampled_ptr + start_idx + offsets,
+        token_ids,
+        mask=offsets < num_logits,
+    )
 
 
 class RejectionSampler:
@@ -88,6 +101,8 @@ class RejectionSampler:
             sampled.stride(0),
             num_sampled,
             input_batch.cu_num_logits,
+            MAX_NUM_LOGITS=triton.next_power_of_2(sampled.shape[1]),
+            SAMPLED_WIDTH=sampled.shape[1],
             num_warps=1,
         )
         expanded_logits = num_logits != input_batch.idx_mapping.shape[0]
@@ -109,6 +124,9 @@ class RejectionSampler:
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
 
         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
+        draft_sampled.masked_fill_(
+            input_batch.is_padding[input_batch.logits_indices], -1
+        )
         pos = input_batch.positions[input_batch.logits_indices]
         processed_logits = self.sampler.apply_sampling_params(
             logits,

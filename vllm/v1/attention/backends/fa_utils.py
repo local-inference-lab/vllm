@@ -17,14 +17,43 @@ logger = init_logger(__name__)
 # This module-level flag avoids repeated import attempts and ensures
 # consistent behavior (similar to IS_AITER_FOUND in _aiter_ops.py).
 _ROCM_FLASH_ATTN_AVAILABLE = False
+_CUDA_FLASH_ATTN_AVAILABLE = False
+_cuda_flash_attn_unavailable_reason: str | None = None
+
+
+def _raise_cuda_flash_attn_unavailable(*args: Any, **kwargs: Any) -> Any:
+    reason = _cuda_flash_attn_unavailable_reason or "native extensions are unavailable"
+    raise ImportError(f"CUDA FlashAttention is unavailable: {reason}")
+
 
 if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
-    from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
-        compile_flash_attn_varlen_func_from_specs,
-        flash_attn_varlen_func,
-        get_scheduler_metadata,
-    )
+
+    try:
+        from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
+            compile_flash_attn_varlen_func_from_specs,
+            flash_attn_varlen_func,
+            get_scheduler_metadata,
+        )
+        from vllm.vllm_flash_attn.flash_attn_interface import (
+            FA2_AVAILABLE,
+            FA2_UNAVAILABLE_REASON,
+            FA3_AVAILABLE,
+            FA3_UNAVAILABLE_REASON,
+        )
+
+        _CUDA_FLASH_ATTN_AVAILABLE = FA2_AVAILABLE or FA3_AVAILABLE
+        if not _CUDA_FLASH_ATTN_AVAILABLE:
+            _cuda_flash_attn_unavailable_reason = (
+                f"FA2: {FA2_UNAVAILABLE_REASON}; FA3: {FA3_UNAVAILABLE_REASON}"
+            )
+    except ImportError as exc:
+        _cuda_flash_attn_unavailable_reason = str(exc)
+
+    if not _CUDA_FLASH_ATTN_AVAILABLE:
+        compile_flash_attn_varlen_func_from_specs = _raise_cuda_flash_attn_unavailable
+        flash_attn_varlen_func = _raise_cuda_flash_attn_unavailable
+        get_scheduler_metadata = _raise_cuda_flash_attn_unavailable
 
 elif current_platform.is_xpu():
     from vllm import _custom_ops as ops
@@ -322,8 +351,10 @@ def is_flash_attn_varlen_func_available() -> bool:
     Returns:
         bool: True if a working flash_attn_varlen_func implementation is available.
     """
-    if current_platform.is_cuda() or current_platform.is_xpu():
-        # CUDA and XPU always have flash_attn_varlen_func available
+    if current_platform.is_cuda():
+        return _CUDA_FLASH_ATTN_AVAILABLE
+
+    if current_platform.is_xpu():
         return True
 
     if current_platform.is_rocm():

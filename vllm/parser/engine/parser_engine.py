@@ -110,6 +110,8 @@ class ParserEngine(Parser):
 
         self._has_reasoning = (
             "THINK_END" in parser_engine_config.token_id_terminals
+            or "THINK_START" in parser_engine_config.terminals
+            or "THINK_END" in parser_engine_config.terminals
             or parser_engine_config.initial_state == ParserState.REASONING
         )
         self._reasoning_ended: bool = not self._has_reasoning
@@ -183,6 +185,16 @@ class ParserEngine(Parser):
     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
         """See :meth:`ReasoningParser.adjust_initial_state_from_prompt`."""
         return
+
+    def is_reasoning_end_for_prompt(self, input_ids: Sequence[int]) -> bool:
+        """See :meth:`ReasoningParser.is_reasoning_end_for_prompt`.
+
+        ParserEngine-backed parsers use the same default as ReasoningParser:
+        the rendered prompt is treated as proving reasoning has ended when the
+        normal generated-token state check says so. Parsers with adaptive
+        prompt templates can override this on the concrete engine class.
+        """
+        return self.is_reasoning_end(list(input_ids))
 
     def finish_streaming(self) -> DeltaMessage | None:
         events = self._engine.finish()
@@ -443,7 +455,15 @@ class ParserEngine(Parser):
         if finished:
             events.extend(self._engine.finish())
         result = self._events_to_delta(events, finished=finished)
-        return self._strip_trailing_reasoning(result)
+        result = self._strip_trailing_reasoning(result)
+
+        # Suppress reasoning deltas if not requested
+        if result and not request.include_reasoning:
+            result.reasoning = None
+            if not result.content and not result.tool_calls:
+                result = None
+
+        return result
 
     def _strip_trailing_reasoning(
         self,

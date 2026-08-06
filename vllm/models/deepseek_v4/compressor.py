@@ -14,6 +14,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
+    compress_norm_rope_store_two_stage_triton,
 )
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
@@ -27,11 +28,18 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
+
+
+def _prefer_two_stage_compressor() -> bool:
+    # Platforms that favor the triton variant of two-stage compressor split.
+    # Currently only tested on ROCm
+    return current_platform.is_rocm()
 
 
 class CompressorBackend(AttentionBackend):
@@ -81,10 +89,12 @@ class CompressorMetadata:
     block_size: int
 
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
+    num_decode_tokens: int | None = None
 
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    supports_exact_metadata_reuse: bool = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -107,11 +117,17 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         token_to_req_indices = common_attn_metadata.token_to_req_indices(
             self.token_to_req_indices
         )
+        num_decode_tokens = None
+        if _prefer_two_stage_compressor():
+            _, _, num_decode_tokens, _ = split_decodes_and_prefills(
+                common_attn_metadata, decode_threshold=1
+            )
         return CompressorMetadata(
             block_table=common_attn_metadata.block_table_tensor.clamp_(min=0),
             slot_mapping=common_attn_metadata.slot_mapping,
             block_size=self.block_size,
             token_to_req_indices=token_to_req_indices,
+            num_decode_tokens=num_decode_tokens,
         )
 
 
@@ -163,6 +179,7 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.sliding_window,
             alignment=576 if uses_fp8_ds_mla_layout else 512,
+            dcp_replicated=True,
         )
 
     def forward(self): ...
@@ -194,6 +211,7 @@ class DeepseekCompressor(nn.Module):
         use_fp4_cache: bool = False,
     ):
         super().__init__()
+        self.vllm_config = vllm_config
         self.compress_ratio = compress_ratio
         self.hidden_size = hidden_size
         self.head_dim = head_dim
@@ -212,6 +230,25 @@ class DeepseekCompressor(nn.Module):
 
         self.overlap = compress_ratio == 4
         self.coff = 1 + self.overlap
+
+        # The head=512 cr>=128 no-overlap deep gather uses the two-stage
+        # compressor, which needs an fp32 scratch [max_batched, 512] for
+        # the intermediate compressed_kv.
+        # Currently only tested on ROCm
+        self._use_two_stage_fused_compressor = (
+            _prefer_two_stage_compressor() and head_dim == 512 and not self.overlap
+        )
+        self.max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        self._compress_scratch: torch.Tensor | None = None
+        if self._use_two_stage_fused_compressor:
+            self._compress_scratch = torch.empty(
+                self.max_num_batched_tokens,
+                self.head_dim,
+                dtype=torch.float32,
+                device=self.device,
+            )
 
         state_dtype = torch.float32
         self.ape = nn.Parameter(
@@ -295,6 +332,8 @@ class DeepseekCompressor(nn.Module):
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
+        parallel_config = self.vllm_config.parallel_config
+        dcp_world_size = parallel_config.decode_context_parallel_size
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache
@@ -347,28 +386,58 @@ class DeepseekCompressor(nn.Module):
             else None
         )
 
-        # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
-        # does not, so the two callables have different signatures.
+        # cutedsl (head=512) accepts the full-cache flags; triton accepts the
+        # DCP mapping kwargs and stores the legacy UE8M0 paged layout.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
-            from .nvidia.ops.sparse_attn_compress_cutedsl import (
-                compress_norm_rope_store_cutedsl,
-            )
+        extra_kwargs: dict[str, Any] = {}
+        if current_platform.is_cuda() and not torch.compiler.is_compiling():
+            # NVIDIA GPUs.
+            use_triton_compressor = self.head_dim != 512 or dcp_world_size > 1
+            if not use_triton_compressor:
+                from .nvidia.ops.sparse_attn_compress_cutedsl import (
+                    compress_norm_rope_store_cutedsl,
+                )
 
-            # head=512 on CUDA always uses cutedsl, for both the fp8_ds_mla
-            # layout and the plain full-cache layout. The full-cache flags
-            # are consumed only here.
-            compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
-            extra_kwargs: dict[str, Any] = dict(
-                store_full_kv=store_full_kv,
-                store_full_fp8=store_full_fp8,
-                fp8_scale=fp8_scale,
-            )
+                # head=512 on CUDA uses cutedsl unless DCP needs Triton's
+                # mapped state lookup. The full-cache flags are consumed only
+                # by this path.
+                compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
+                extra_kwargs = dict(
+                    store_full_kv=store_full_kv,
+                    store_full_fp8=store_full_fp8,
+                    fp8_scale=fp8_scale,
+                )
+            else:
+                # Indexer path (head_dim == 128), and the DCP main-compressor
+                # path where the CuTe kernel's raw state lookup is not valid.
+                compress_norm_rope_store_fn = compress_norm_rope_store_triton
+        elif self._use_two_stage_fused_compressor:
+            # head=512 cr>=128 (no overlap): two-pass split compressor on the
+            # prefill suffix, single-pass on the decode prefix.
+            assert state_metadata.num_decode_tokens is not None
+            use_triton_compressor = False
+            compress_norm_rope_store_fn = compress_norm_rope_store_two_stage_triton
+            extra_kwargs = {
+                "num_decode_tokens": state_metadata.num_decode_tokens,
+                "compress_scratch": self._compress_scratch,
+            }
         else:
-            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
+            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.):
+            # use Triton and the legacy UE8M0 paged layout.
+            use_triton_compressor = True
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
-            extra_kwargs = {}
 
+        if use_triton_compressor:
+            extra_kwargs.update(
+                {
+                    # Compressor state is replicated under DCP so every rank
+                    # can form a complete compressed window. The destination
+                    # KV slot mapping still selects the owning DCP rank.
+                    "dcp_world_size": 1,
+                    "dcp_rank": 0,
+                    "cp_kv_cache_interleave_size": 1,
+                }
+            )
         compress_norm_rope_store_fn(
             state_cache=state_cache,
             num_actual=num_actual,

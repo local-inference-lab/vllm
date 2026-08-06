@@ -27,6 +27,10 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "OpsColQwen3Config": "vllm.transformers_utils.configs.colqwen3",
     "Qwen3VLNemotronEmbedConfig": "vllm.transformers_utils.configs.colqwen3",
     "Cosmos3Config": "vllm.transformers_utils.configs.cosmos3",
+    "Cosmos3EdgeConfig": "vllm.transformers_utils.configs.cosmos3_edge",
+    "Cosmos3EdgeProjectorConfig": "vllm.transformers_utils.configs.cosmos3_edge",
+    "Cosmos3EdgeTextConfig": "vllm.transformers_utils.configs.cosmos3_edge",
+    "Cosmos3EdgeVisionConfig": "vllm.transformers_utils.configs.cosmos3_edge",
     "DiffusionGemmaConfig": "vllm.transformers_utils.configs.diffusion_gemma",
     "DiffusionGemmaTextConfig": "vllm.transformers_utils.configs.diffusion_gemma",
     "DeepseekVLV2Config": "vllm.transformers_utils.configs.deepseek_vl2",
@@ -45,6 +49,11 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "HYV3Config": "vllm.transformers_utils.configs.hy_v3",
     "HyperCLOVAXConfig": "vllm.transformers_utils.configs.hyperclovax",
     "IsaacConfig": "vllm.transformers_utils.configs.isaac",
+    "KimiK25Config": "vllm.transformers_utils.configs.kimi_k25",
+    "KimiK3Config": "vllm.transformers_utils.configs.kimi_k3",
+    "K3DSparkConfig": "vllm.transformers_utils.configs.k3_dspark",
+    "KimiLinearConfig": "vllm.transformers_utils.configs.kimi_linear",
+    "KimiVLConfig": "vllm.transformers_utils.configs.kimi_vl",
     # RWConfig is for the original tiiuae/falcon-40b(-instruct) and
     # tiiuae/falcon-7b(-instruct) models. Newer Falcon models will use the
     # `FalconConfig` class from the official HuggingFace transformers library.
@@ -65,9 +74,6 @@ _CLASS_TO_MODULE: dict[str, str] = {
         "vllm.transformers_utils.configs.moss_transcribe_diarize"
     ),
     "MoonViTConfig": "vllm.transformers_utils.configs.moonvit",
-    "KimiLinearConfig": "vllm.transformers_utils.configs.kimi_linear",
-    "KimiVLConfig": "vllm.transformers_utils.configs.kimi_vl",
-    "KimiK25Config": "vllm.transformers_utils.configs.kimi_k25",
     "NemotronConfig": "vllm.transformers_utils.configs.nemotron",
     "NemotronHConfig": "vllm.transformers_utils.configs.nemotron_h",
     "OlmoHybridConfig": "vllm.transformers_utils.configs.olmo_hybrid",
@@ -90,6 +96,10 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "Qwen3_5TextConfig": "vllm.transformers_utils.configs.qwen3_5",
     "Qwen3_5MoeConfig": "vllm.transformers_utils.configs.qwen3_5_moe",
     "Qwen3_5MoeTextConfig": "vllm.transformers_utils.configs.qwen3_5_moe",
+    "InklingModelConfig": "vllm.models.inkling.configs",
+    "InklingAudioConfig": "vllm.models.inkling.configs",
+    "InklingVisionConfig": "vllm.models.inkling.configs",
+    "InklingMMConfig": "vllm.models.inkling.configs",
     # Special case: DeepseekV3Config is from HuggingFace Transformers
     "DeepseekV3Config": "transformers",
 }
@@ -107,6 +117,10 @@ __all__ = [
     "OpsColQwen3Config",
     "Qwen3VLNemotronEmbedConfig",
     "Cosmos3Config",
+    "Cosmos3EdgeConfig",
+    "Cosmos3EdgeProjectorConfig",
+    "Cosmos3EdgeTextConfig",
+    "Cosmos3EdgeVisionConfig",
     "DiffusionGemmaConfig",
     "DiffusionGemmaTextConfig",
     "DeepseekVLV2Config",
@@ -126,6 +140,11 @@ __all__ = [
     "HYV3Config",
     "HyperCLOVAXConfig",
     "IsaacConfig",
+    "KimiK25Config",
+    "KimiK3Config",
+    "K3DSparkConfig",
+    "KimiLinearConfig",
+    "KimiVLConfig",
     "RWConfig",
     "LagunaConfig",
     "Lfm2MoeConfig",
@@ -141,9 +160,6 @@ __all__ = [
     "Moondream3VisionConfig",
     "MossTranscribeDiarizeConfig",
     "MoonViTConfig",
-    "KimiLinearConfig",
-    "KimiVLConfig",
-    "KimiK25Config",
     "NemotronConfig",
     "NemotronHConfig",
     "OlmoHybridConfig",
@@ -166,6 +182,10 @@ __all__ = [
     "Qwen3_5TextConfig",
     "Qwen3_5MoeConfig",
     "Qwen3_5MoeTextConfig",
+    "InklingModelConfig",
+    "InklingAudioConfig",
+    "InklingVisionConfig",
+    "InklingMMConfig",
 ]
 
 

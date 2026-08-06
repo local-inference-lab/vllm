@@ -1,0 +1,16 @@
+--- a/flashinfer/artifacts.py
++++ b/flashinfer/artifacts.py
+@@ -267,8 +267,8 @@
+     for cubin_dir in cubin_dirs:
+         checksum_path = safe_urljoin(cubin_dir, "checksums.txt")
+         yield (checksum_path, CheckSumHash.map_checksums[checksum_path])
+-        for name in get_available_cubin_files(safe_urljoin(base, cubin_dir)):
+-            yield (safe_urljoin(cubin_dir, name), checksums[name])
+-        for name in get_available_header_files(safe_urljoin(base, cubin_dir)):
+-            full_path = safe_urljoin(cubin_dir, name)
+-            yield (full_path, checksums[full_path])
++        local_manifest = FLASHINFER_CUBIN_DIR / checksum_path
++        with open(local_manifest) as manifest:
++            for line in manifest:
++                checksum, name = line.strip().split()
++                yield (safe_urljoin(cubin_dir, name), checksum)

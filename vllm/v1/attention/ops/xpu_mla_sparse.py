@@ -181,9 +181,11 @@ def triton_bf16_mla_sparse_interface(
     sm_scale: float,
     d_v: int = 512,
     block_dpe: int = 64,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    out : [num_tokens, num_heads_q, d_v]
+    out : [num_tokens, num_heads_q, d_v]; when passed in, it is zeroed and
+        written directly (avoids a caller-side copy).
     max_logits : [num_tokens, num_heads_q]
     lse : logsumexp, [num_tokens, num_heads_q]
 
@@ -221,7 +223,19 @@ def triton_bf16_mla_sparse_interface(
         triton.cdiv(num_heads_q, min(BLOCK_H, kv_group_num)),
     )
 
-    out = torch.zeros((num_tokens, num_heads_q, d_v), dtype=q.dtype, device=q.device)
+    if out is None:
+        out = torch.zeros(
+            (num_tokens, num_heads_q, d_v), dtype=q.dtype, device=q.device
+        )
+    else:
+        assert out.shape == (num_tokens, num_heads_q, d_v), (
+            f"out shape {tuple(out.shape)} must be "
+            f"{(num_tokens, num_heads_q, d_v)}"
+        )
+        assert out.dtype == q.dtype, (
+            f"out dtype {out.dtype} must match q dtype {q.dtype}"
+        )
+        out.zero_()
     softmax_lse = torch.zeros(
         (num_tokens, num_heads_q), dtype=torch.float32, device=q.device
     )

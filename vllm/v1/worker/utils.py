@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import product as iprod
 from typing import Any
 
+import numpy as np
 import torch
 
 from vllm.config import CacheConfig, VllmConfig
@@ -18,11 +19,13 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import largest_power_of_2_divisor
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadataBuilder,
     MultipleOf,
 )
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -113,7 +116,7 @@ class KVBlockZeroer:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be at least 1")
         self.max_concurrency = max_concurrency
-        self._meta: tuple[torch.Tensor, int, int, int] | None = None
+        self._metas: list[tuple[torch.Tensor, int, int, int]] = []
         self._id_cap: int = 0
         self._ids_pinned: list[torch.Tensor] = []
         self._ids_gpu: list[torch.Tensor] = []
@@ -122,8 +125,7 @@ class KVBlockZeroer:
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
         seen_ptrs: set[int] = set()
-        seg_addrs: list[int] = []
-        page_size_el: int | None = None
+        segs_by_page: dict[int, list[int]] = {}
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
@@ -156,12 +158,6 @@ class KVBlockZeroer:
                 assert cur_bytes % 4 == 0
                 kernel_block_el = cur_bytes // 4
                 cur_page_el = kernel_block_el * ratio
-                if page_size_el is None:
-                    page_size_el = cur_page_el
-                else:
-                    assert page_size_el == cur_page_el, (
-                        f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
-                    )
 
                 block_stride_bytes = cur_bytes
                 outer_dims = [
@@ -170,23 +166,25 @@ class KVBlockZeroer:
                     if kv.stride(d) * el > block_stride_bytes
                 ]
                 outer_strides = [kv.stride(d) * el for d in outer_dims]
+                bucket = segs_by_page.setdefault(cur_page_el, [])
                 for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
-                    seg_addrs.append(dp + off_bytes)
+                    bucket.append(dp + off_bytes)
 
-        if not seg_addrs or page_size_el is None:
-            self._meta = None
+        if not segs_by_page:
             return
 
-        blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
         self._id_cap = 8192
         self._allocate_id_buffers()
-        self._meta = (
-            torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
-            page_size_el,
-            blk_size,
-            len(seg_addrs),
-        )
+        self._metas = [
+            (
+                torch.tensor(addrs, dtype=torch.uint64, device=self.device),
+                psize,
+                min(largest_power_of_2_divisor(psize), 1024),
+                len(addrs),
+            )
+            for psize, addrs in segs_by_page.items()
+        ]
 
     def _allocate_id_buffers(self) -> None:
         self._ids_pinned = [
@@ -205,9 +203,8 @@ class KVBlockZeroer:
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
-        if not block_ids or self._meta is None:
+        if not block_ids or not self._metas:
             return
-        seg_addrs, page_size_el, blk_size, n_segs = self._meta
         n_blocks = len(block_ids)
         if n_blocks > self._id_cap:
             # The old pinned buffers may still be the source of an in-flight
@@ -225,15 +222,16 @@ class KVBlockZeroer:
         ids_pinned[:n_blocks].numpy()[:] = block_ids
         idx = self._ids_gpu[buffer_index][:n_blocks]
         idx.copy_(ids_pinned[:n_blocks], non_blocking=True)
-        grid = (n_blocks * n_segs * (page_size_el // blk_size),)
-        _zero_kv_blocks_kernel[grid](
-            seg_addrs,
-            idx,
-            n_blocks,
-            N_SEGS=n_segs,
-            PAGE_SIZE_EL=page_size_el,
-            BLOCK_SIZE=blk_size,
-        )
+        for seg_addrs, page_size_el, blk_size, n_segs in self._metas:
+            grid = (n_blocks * n_segs * (page_size_el // blk_size),)
+            _zero_kv_blocks_kernel[grid](
+                seg_addrs,
+                idx,
+                n_blocks,
+                N_SEGS=n_segs,
+                PAGE_SIZE_EL=page_size_el,
+                BLOCK_SIZE=blk_size,
+            )
 
 
 @dataclass
@@ -535,6 +533,45 @@ def bind_kv_cache(
         forward_context[layer_name].kv_cache = kv_cache
 
 
+def copy_kv_cache_blocks_inplace(
+    kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
+    num_blocks: int,
+    kv_cache_block_copies: Sequence[KVCacheBlockCopy],
+) -> None:
+    if not kv_cache_block_copies:
+        return
+
+    storage_tensors: list[torch.Tensor] = []
+    seen_storage: set[int] = set()
+    for entry in kv_caches:
+        # Mamba layers hold a list of state tensors; attention layers a single
+        # tensor. Both alias the shared block-major backing storage.
+        tensors = entry if isinstance(entry, (list, tuple)) else (entry,)
+        for tensor in tensors:
+            ptr = tensor.untyped_storage().data_ptr()
+            if ptr in seen_storage:
+                continue
+            seen_storage.add(ptr)
+            storage_tensors.append(tensor)
+
+    if not storage_tensors:
+        return
+    device = storage_tensors[0].device
+    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
+    indices = async_tensor_h2d(indices_np, device=device)
+    src_indices, dst_indices = indices.unbind(dim=1)
+
+    for tensor in storage_tensors:
+        assert tensor.device == device
+        blocks = torch.empty(0, dtype=torch.uint8, device=device)
+        blocks.set_(tensor.untyped_storage())
+        # Block-major backing storage: block i owns the contiguous byte range
+        # [i * page_size, (i + 1) * page_size).
+        assert blocks.numel() % num_blocks == 0
+        blocks = blocks.view(num_blocks, -1)
+        blocks[dst_indices] = blocks[src_indices]
+
+
 def is_residual_scattered_for_sp(
     vllm_config: VllmConfig, num_input_tokens: int
 ) -> bool:
@@ -557,8 +594,14 @@ def is_residual_scattered_for_sp(
         or not vllm_config.compilation_config.splitting_ops
     ), "Sequence parallelism requires full-graph compilation"
 
-    # When sequence parallelism is enabled, we always pad num_input_tokens
-    # to be a multiple of tensor_parallel_size (tp) earlier.
+    sp_min_token_num = vllm_config.compilation_config.pass_config.sp_min_token_num
+    # Below sp_min_token_num the compile range is not SP-rewritten and the
+    # residual stays full-shape.
+    if sp_min_token_num is not None and num_input_tokens < sp_min_token_num:
+        return False
+
+    # When sequence parallelism applies, num_input_tokens was padded to a
+    # multiple of tensor_parallel_size (tp) earlier.
     assert num_input_tokens % tp == 0
 
     return True

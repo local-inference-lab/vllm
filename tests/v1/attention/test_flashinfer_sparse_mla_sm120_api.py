@@ -9,6 +9,7 @@ import torch
 from vllm.config import set_current_vllm_config
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils import flashinfer as fi_utils
+from vllm.v1.attention.backends.mla import flashinfer_mla_sparse
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseSM120Backend,
 )
@@ -52,3 +53,26 @@ def test_v32_glm_sm120_backend_accepts_glm_block_size(
         )
 
     assert invalid_reasons == []
+
+
+def test_sparse_workspace_is_cached_per_cuda_device(monkeypatch) -> None:
+    allocations = []
+
+    def fake_zeros(size, *, dtype, device):
+        workspace = SimpleNamespace(size=size, dtype=dtype, device=device)
+        allocations.append(workspace)
+        return workspace
+
+    monkeypatch.setattr(torch, "zeros", fake_zeros)
+    flashinfer_mla_sparse._fi_sparse_workspace_by_device.clear()
+
+    cuda0_first = flashinfer_mla_sparse._get_workspace_buffer(torch.device("cuda:0"))
+    cuda1 = flashinfer_mla_sparse._get_workspace_buffer(torch.device("cuda:1"))
+    cuda0_second = flashinfer_mla_sparse._get_workspace_buffer(torch.device("cuda:0"))
+
+    assert cuda0_first is cuda0_second
+    assert cuda0_first is not cuda1
+    assert [workspace.device for workspace in allocations] == [
+        torch.device("cuda:0"),
+        torch.device("cuda:1"),
+    ]

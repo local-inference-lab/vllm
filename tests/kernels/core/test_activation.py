@@ -15,8 +15,10 @@ from vllm.model_executor.layers.activation import (
     MulAndSilu,
     NewGELU,
     QuickGELU,
+    ReLUSquaredActivation,
     SiluAndMul,
     SiluAndMulWithClamp,
+    SituAndMul,
     SwigluOAIAndMul,
     SwigluStepAndMul,
     swiglustep_and_mul_triton,
@@ -30,6 +32,26 @@ SEEDS = [0]
 CUDA_DEVICES = [
     f"cuda:{i}" for i in range(1 if torch.accelerator.device_count() == 1 else 2)
 ]
+
+
+@pytest.mark.parametrize("linear_beta", [None, 25.0])
+@torch.inference_mode()
+def test_situ_and_mul(
+    default_vllm_config,
+    linear_beta: float | None,
+) -> None:
+    x = torch.randn(7, 1024, dtype=torch.bfloat16, device="cuda")
+    layer = SituAndMul(beta=4.0, linear_beta=linear_beta, compile_native=False)
+
+    actual = layer(x)
+    gate, up = x.float().chunk(2, dim=-1)
+    expected_gate = 4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
+    expected_up = (
+        up if linear_beta is None else linear_beta * torch.tanh(up / linear_beta)
+    )
+    expected = (expected_gate * expected_up).to(x.dtype)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -202,6 +224,7 @@ def test_silu_and_mul_with_clamp(
         (FastGELU, torch.ops._C.gelu_fast),
         (NewGELU, torch.ops._C.gelu_new),
         (QuickGELU, torch.ops._C.gelu_quick),
+        (ReLUSquaredActivation, torch.ops._C.relu_squared),
     ],
 )
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)

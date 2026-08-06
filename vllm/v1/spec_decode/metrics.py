@@ -24,6 +24,7 @@ class SpecDecodingStats:
     """
 
     num_spec_tokens: int
+    current_num_spec_tokens: int
     num_drafts: int = 0
     num_draft_tokens: int = 0
     num_accepted_tokens: int = 0
@@ -34,6 +35,7 @@ class SpecDecodingStats:
     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
         return cls(
             num_spec_tokens=num_spec_tokens,
+            current_num_spec_tokens=num_spec_tokens,
             num_accepted_tokens_per_pos=[0] * num_spec_tokens,
             num_draft_tokens_per_pos=[0] * num_spec_tokens,
         )
@@ -69,6 +71,7 @@ class SpecDecodingLogging:
         self.num_draft_tokens: list[int] = []
         self.num_accepted_tokens: list[int] = []
         self.accepted_tokens_per_pos_lists: list[list[int]] = []
+        self.current_num_spec_tokens: int | None = None
         self.last_log_time = time.monotonic()
 
     def observe(self, spec_decoding_stats: SpecDecodingStats):
@@ -78,6 +81,7 @@ class SpecDecodingLogging:
         self.accepted_tokens_per_pos_lists.append(
             spec_decoding_stats.num_accepted_tokens_per_pos
         )
+        self.current_num_spec_tokens = spec_decoding_stats.current_num_spec_tokens
 
     def log(self, log_fn=logger.info):
         if not self.num_drafts:
@@ -110,16 +114,18 @@ class SpecDecodingLogging:
             else float("nan")
         )
 
-        # Conventionally, mean acceptance length includes the bonus token
+        # Conventionally, mean acceptance length includes the bonus token.
         mean_acceptance_length = 1 + (num_accepted_tokens / num_drafts)
 
         pos_matrix = np.array(self.accepted_tokens_per_pos_lists)
         acceptance_rates = np.sum(pos_matrix, axis=0) / num_drafts
         rates_str = ", ".join(f"{p:.3f}" for p in acceptance_rates)
+        assert self.current_num_spec_tokens is not None
 
         log_fn(
             "SpecDecoding metrics: "
             "Mean acceptance length: %.2f, "
+            "Current speculative depth: %d, "
             "Accepted throughput: %.2f tokens/s, "
             "Drafted throughput: %.2f tokens/s, "
             "Accepted: %d tokens, "
@@ -127,6 +133,7 @@ class SpecDecodingLogging:
             "Per-position acceptance rate: %s, "
             "Avg Draft acceptance rate: %.1f%%",
             mean_acceptance_length,
+            self.current_num_spec_tokens,
             accepted_throughput,
             draft_throughput,
             num_accepted_tokens,

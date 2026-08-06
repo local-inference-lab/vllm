@@ -33,6 +33,7 @@ QuantizationMethods = Literal[
     "inc",
     "mxfp4",
     "gpt_oss_mxfp4",
+    "nvfp4_nf3_hybrid",
     "deepseek_v4_fp8",
     "online",
     # Below are online quant shorthand names (see vllm.config.quantization).
@@ -42,6 +43,7 @@ QuantizationMethods = Literal[
     "fp8_per_block",
     "fp8_per_channel",
     "int8_per_channel_weight_only",
+    "nvfp4_per_token",
     "mxfp8",
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
@@ -134,6 +136,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     )
     from .moe_wna16 import MoeWNA16Config
     from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
+    from .nvfp4_nf3_hybrid import NvFp4Nf3HybridConfig
     from .online.base import OnlineQuantizationConfig
     from .torchao import TorchAOConfig
 
@@ -160,6 +163,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "inc": INCConfig,
         "mxfp4": Mxfp4Config,
         "gpt_oss_mxfp4": GptOssMxfp4Config,
+        "nvfp4_nf3_hybrid": NvFp4Nf3HybridConfig,
         "deepseek_v4_fp8": DeepseekV4FP8Config,
         "humming": HummingConfig,
         "online": OnlineQuantizationConfig,

@@ -742,6 +742,13 @@ def report_usage_stats(
 
 
 _PROFILER_FUNC = None
+_TORCH_PROFILER_SCOPES_ENABLED = False
+
+
+def set_torch_profiler_scopes_enabled(enabled: bool) -> None:
+    global _PROFILER_FUNC, _TORCH_PROFILER_SCOPES_ENABLED
+    _TORCH_PROFILER_SCOPES_ENABLED = enabled
+    _PROFILER_FUNC = None
 
 
 def record_function_or_nullcontext(name: str) -> AbstractContextManager:
@@ -752,7 +759,7 @@ def record_function_or_nullcontext(name: str) -> AbstractContextManager:
         return _PROFILER_FUNC(name)
 
     func = contextlib.nullcontext
-    if envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING:
+    if _TORCH_PROFILER_SCOPES_ENABLED or envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING:
         func = record_function
     elif envs.VLLM_NVTX_SCOPES_FOR_PROFILING:
         import nvtx
@@ -782,12 +789,16 @@ class IterationDetails:
     num_ctx_tokens: int
     num_generation_requests: int
     num_generation_tokens: int
+    num_encoder_inputs: int = 0
+    num_encoder_output_tokens: int = 0
 
     def __repr__(self) -> str:
         return f"IterationDetails(num_ctx_requests={self.num_ctx_requests},\
                  num_ctx_tokens={self.num_ctx_tokens}, \
                  num_generation_requests={self.num_generation_requests}, \
-                 num_generation_tokens={self.num_generation_tokens})"
+                 num_generation_tokens={self.num_generation_tokens}, \
+                 num_encoder_inputs={self.num_encoder_inputs}, \
+                 num_encoder_output_tokens={self.num_encoder_output_tokens})"
 
 
 def compute_iteration_details(scheduler_output: SchedulerOutput) -> IterationDetails:
@@ -818,9 +829,18 @@ def compute_iteration_details(scheduler_output: SchedulerOutput) -> IterationDet
         else:
             num_generation_requests += 1
             num_generation_tokens += num_tokens
+    scheduled_encoder_input_stats = scheduler_output.scheduled_encoder_input_stats
+    num_encoder_inputs = 0
+    num_encoder_output_tokens = 0
+    if scheduled_encoder_input_stats is not None:
+        num_encoder_inputs = scheduled_encoder_input_stats.num_inputs
+        num_encoder_output_tokens = scheduled_encoder_input_stats.output_tokens
+
     return IterationDetails(
         num_context_requests,
         num_context_tokens,
         num_generation_requests,
         num_generation_tokens,
+        num_encoder_inputs,
+        num_encoder_output_tokens,
     )

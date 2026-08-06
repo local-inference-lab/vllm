@@ -43,7 +43,14 @@ _VLLM_TOKENIZERS = {
     "deepseek_v4": ("deepseek_v4", "DeepseekV4Tokenizer"),
     "hf": ("hf", "CachedHfTokenizer"),
     "kimi_audio": ("kimi_audio", "KimiAudioTokenizer"),
+    # Kimi K3 uses the plain HF tokenizer; the "kimi_k3" renderer applies
+    # its Python XTML chat encoding in place of a Jinja template.
+    "kimi_k3": ("hf", "CachedHfTokenizer"),
     "mistral": ("mistral", "MistralTokenizer"),
+    # Inkling uses the plain HF tokenizer for token operations; the "inkling"
+    # mode exists to select the InklingRenderer, which renders chat to
+    # token ids natively (Inkling has no Jinja chat template).
+    "inkling": ("hf", "CachedHfTokenizer"),
 }
 
 

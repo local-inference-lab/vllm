@@ -117,6 +117,10 @@ def fused_allreduce_gemma_rms_norm(
         # No all-reduce needed; identical to the unfused path.
         return norm(hidden_states, residual)
 
+    if torch.compiler.is_compiling():
+        reduced = tensor_model_parallel_all_reduce(hidden_states)
+        return norm(reduced, residual)
+
     ok, max_token_num = _can_use_flashinfer(hidden_states, tp_size)
     if ok:
         norm_out = torch.empty_like(hidden_states)

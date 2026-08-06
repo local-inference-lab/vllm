@@ -22,6 +22,7 @@ tools = [
         "function": {
             "name": "get_current_weather",
             "description": "Get the current weather in a given location",
+            "strict": True,
             "parameters": {
                 "type": "object",
                 "strict": True,

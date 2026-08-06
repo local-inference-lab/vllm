@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+from typing import ClassVar
 
 import numpy as np
 import torch
@@ -51,6 +52,7 @@ class InputBatch:
     # [num_reqs]
     # batch_idx -> num_scheduled_tokens
     num_scheduled_tokens: np.ndarray
+    max_query_len: int
     # sum(num_scheduled_tokens)
     num_tokens: int
     num_tokens_after_padding: int
@@ -66,6 +68,7 @@ class InputBatch:
     seq_lens: torch.Tensor
     # [num_reqs] CPU upper bound on seq_lens (see CommonAttentionMetadata).
     seq_lens_cpu_upper_bound: torch.Tensor
+    max_seq_len_upper_bound: int
     # [num_reqs]
     dcp_local_seq_lens: torch.Tensor | None
     # [num_reqs]
@@ -99,12 +102,23 @@ class InputBatch:
     # [num_reqs] per-request prompt length, only populated for R-SWA.
     prompt_lens: torch.Tensor | None
 
+    max_req_tokens: int | None = None
+    valid_num_draft_tokens_per_req: np.ndarray | None = None
+
+    # When > 0, dummy batches carry seeded-random token ids instead of zeros.
+    # All-zero ids embed identically, so every dummy token routes to the SAME
+    # MoE experts — grouped expert reads collapse and the profiled cost of a
+    # multi-token verify step is wildly understated vs real (spread) routing.
+    # Seeded per num_tokens so all TP ranks generate identical ids.
+    dummy_input_ids_random_high: ClassVar[int] = 0
+
     @classmethod
     def make_dummy(
         cls,
         num_reqs: int,
         num_tokens: int,
         input_buffers: InputBuffers,
+        max_req_tokens: int | None = None,
     ) -> "InputBatch":
         assert 0 < num_reqs <= num_tokens
         device = input_buffers.device
@@ -115,13 +129,27 @@ class InputBatch:
         expanded_idx_mapping = idx_mapping
         expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=device)
 
-        num_scheduled_tokens = np.full(num_reqs, num_tokens // num_reqs, dtype=np.int32)
-        num_scheduled_tokens[-1] += num_tokens % num_reqs
+        if max_req_tokens is None:
+            num_scheduled_tokens = np.full(
+                num_reqs, num_tokens // num_reqs, dtype=np.int32
+            )
+            num_scheduled_tokens[-1] += num_tokens % num_reqs
+        else:
+            assert num_tokens <= num_reqs * max_req_tokens
+            num_scheduled_tokens = np.ones(num_reqs, dtype=np.int32)
+            remaining = num_tokens - num_reqs
+            for i in range(num_reqs - 1, -1, -1):
+                num_tokens_for_req = min(remaining, max_req_tokens - 1)
+                num_scheduled_tokens[i] += num_tokens_for_req
+                remaining -= num_tokens_for_req
+                if remaining == 0:
+                    break
         assert int(num_scheduled_tokens.sum()) == num_tokens
 
         # seq_len equals to query_len
-        input_buffers.seq_lens[:num_reqs] = num_tokens // num_reqs
-        input_buffers.seq_lens[num_reqs - 1] += num_tokens % num_reqs
+        input_buffers.seq_lens[:num_reqs].copy_(
+            torch.from_numpy(num_scheduled_tokens).to(device=device)
+        )
         # Pad for full CUDA graph mode.
         input_buffers.seq_lens[num_reqs:] = 0
         seq_lens = input_buffers.seq_lens[:num_reqs]
@@ -137,13 +165,20 @@ class InputBatch:
         input_buffers.query_start_loc[num_reqs + 1 :] = num_tokens
         query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
 
-        input_ids = input_buffers.input_ids[:num_tokens].zero_()
+        random_high = cls.dummy_input_ids_random_high
+        if random_high > 0:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(0xB12C0 + num_tokens)
+            input_ids = input_buffers.input_ids[:num_tokens]
+            input_ids.random_(0, random_high, generator=gen)
+        else:
+            input_ids = input_buffers.input_ids[:num_tokens].zero_()
         positions = input_buffers.positions[:num_tokens].zero_()
 
         input_buffers.is_padding[:num_tokens].fill_(True)
         is_padding = input_buffers.is_padding[:num_tokens]
 
-        logits_indices = query_start_loc[1:] - 1
+        logits_indices = torch.clamp(query_start_loc[1:] - 1, min=0)
         cu_num_logits = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
         cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
         # Dummy: seq_len == query_len (fresh-prefill shape).
@@ -157,6 +192,7 @@ class InputBatch:
             expanded_idx_mapping=expanded_idx_mapping,
             expanded_local_pos=expanded_local_pos,
             num_scheduled_tokens=num_scheduled_tokens,
+            max_query_len=int(num_scheduled_tokens.max()),
             num_tokens=num_tokens,
             num_tokens_after_padding=num_tokens,
             num_draft_tokens=0,
@@ -165,6 +201,7 @@ class InputBatch:
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            max_seq_len_upper_bound=int(num_scheduled_tokens.max()),
             dcp_local_seq_lens=None,
             num_computed_tokens_np=np.zeros(num_reqs, dtype=np.int32),
             prefill_len_np=np.zeros(num_reqs, dtype=np.int32),
@@ -179,6 +216,7 @@ class InputBatch:
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=False,
             prompt_lens=None,
+            max_req_tokens=max_req_tokens,
         )
 
 

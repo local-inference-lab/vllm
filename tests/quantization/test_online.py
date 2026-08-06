@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests online quantization."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -9,14 +11,88 @@ from tests.quantization.utils import (
     _test_online_quant_peak_mem_impl,
     is_quant_method_supported,
 )
-from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.config.quantization import QuantizationConfigArgs
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.quantization.online import base as online_base
+from vllm.model_executor.layers.quantization.online.base import (
+    OnlineQuantizationConfig,
+)
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerBlockOnlineLinearMethod,
     Fp8PerBlockOnlineMoEMethod,
     Fp8PerTensorOnlineLinearMethod,
     Fp8PerTensorOnlineMoEMethod,
 )
+from vllm.model_executor.layers.quantization.online.mxfp8 import (
+    is_shared_expert_projection,
+)
+from vllm.model_executor.layers.quantization.online.nvfp4 import (
+    Nvfp4OnlineMoEMethod,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.platforms import current_platform
+from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "model.layers.3.mlp.shared_experts.gate_proj",
+        "model.layers.3.mlp.shared_experts.up_proj",
+        "model.layers.3.mlp.shared_experts.gate_up_proj",
+        "model.layers.3.mlp.shared_experts.down_proj",
+        "model.layers.3.mlp.shared_expert.down_proj",
+    ],
+)
+def test_shared_expert_projection_match(prefix: str):
+    assert is_shared_expert_projection(prefix)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "model.layers.3.mlp.experts.gate_up_proj",
+        "model.layers.3.mlp.shared_experts.router",
+        "model.layers.3.mlp.shared_experts.attention.up_proj",
+        "model.layers.3.self_attn.up_proj",
+        "model.layers.3.mlp.shared_experts",
+    ],
+)
+def test_shared_expert_projection_rejects_other_layers(prefix: str):
+    assert not is_shared_expert_projection(prefix)
+
+
+def test_online_quantization_targets_only_shared_expert_projections(monkeypatch):
+    sentinel = object()
+    monkeypatch.setitem(
+        online_base._ONLINE_LINEAR_METHODS,
+        kMxfp8Dynamic,
+        lambda: sentinel,
+    )
+    config = OnlineQuantizationConfig(QuantizationConfigArgs(shared_experts="mxfp8"))
+    linear = Mock(spec=LinearBase)
+
+    method = config.get_quant_method(
+        linear, "model.layers.3.mlp.shared_experts.gate_up_proj"
+    )
+    assert method is sentinel
+
+    broad_config = OnlineQuantizationConfig(QuantizationConfigArgs(linear="mxfp8"))
+    assert (
+        broad_config.get_quant_method(
+            linear, "model.layers.3.mlp.shared_experts.gate_up_proj"
+        )
+        is sentinel
+    )
+
+    for prefix in (
+        "model.layers.3.mlp.shared_experts.router",
+        "model.layers.3.mlp.experts.gate_up_proj",
+        "model.layers.3.self_attn.qkv_proj",
+    ):
+        assert isinstance(
+            config.get_quant_method(linear, prefix), UnquantizedLinearMethod
+        )
 
 
 @pytest.mark.skipif(
@@ -141,6 +217,38 @@ def test_online_quantization(
 
         llm.apply_model(check_model)
 
+        outputs = llm.generate_greedy(["Hello my name is"], max_tokens=4)
+        print(outputs[0][1])
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(100)
+        and has_flashinfer_trtllm_fused_moe()
+    ),
+    reason="nvfp4_per_token needs a Blackwell (SM100) GPU + FlashInfer TRTLLM MoE.",
+)
+def test_online_nvfp4_per_token_moe(vllm_runner, monkeypatch) -> None:
+    """Online NVFP4 quantizes the MoE and leaves dense layers unquantized."""
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+    with vllm_runner(
+        "ibm-granite/granite-3.0-1b-a400m-base",
+        quantization="nvfp4_per_token",
+        enforce_eager=True,
+    ) as llm:
+
+        def check_model(model):
+            layer = model.model.layers[0]
+            assert isinstance(
+                layer.block_sparse_moe.experts._quant_method, Nvfp4OnlineMoEMethod
+            )
+            assert isinstance(
+                layer.self_attn.o_proj.quant_method, UnquantizedLinearMethod
+            )
+
+        llm.apply_model(check_model)
         outputs = llm.generate_greedy(["Hello my name is"], max_tokens=4)
         print(outputs[0][1])
 

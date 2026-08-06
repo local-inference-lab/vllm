@@ -1,11 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
 from typing import Any
 
 import torch
+
+_vllm_cudagraph_capture_depth: ContextVar[int] = ContextVar(
+    "vllm_cudagraph_capture_depth", default=0
+)
+
+
+@contextmanager
+def vllm_cudagraph_capture_scope() -> Iterator[None]:
+    """Mark Python execution as belonging to a vLLM CUDA graph capture.
+
+    CUDA reports capture status per current stream. Python custom ops can run
+    on auxiliary streams joined to a multi-stream graph, where querying only
+    the current stream is insufficient to establish event-handle lifetime.
+    """
+    token = _vllm_cudagraph_capture_depth.set(_vllm_cudagraph_capture_depth.get() + 1)
+    try:
+        yield
+    finally:
+        _vllm_cudagraph_capture_depth.reset(token)
+
+
+def is_vllm_cudagraph_capture_active() -> bool:
+    return _vllm_cudagraph_capture_depth.get() > 0
 
 
 class AuxStreamType(Enum):
@@ -15,6 +40,55 @@ class AuxStreamType(Enum):
 class EventType(Enum):
     Main = 0
     Attention = 1
+
+
+class CUDAGraphCaptureEventPool:
+    """Keep CUDA event generations private to each graph or eager call.
+
+    Reusing one event handle across independently captured graphs is unsafe
+    when those graphs can be replayed at different shapes. A replay may record
+    a new generation while another graph still has waits bound to the same
+    handle. Some custom ops also execute eagerly between CUDA graph segments,
+    where capture-state detection is false even though adjacent graph shapes
+    can still overlap event generations.
+
+    Every real capture gets a retained private set embedded only in that graph.
+    Eager graph-break callers request a fresh set for every Python invocation;
+    the wrappers stay alive through enqueue and are then released. CUDA event
+    destruction is asynchronous for pending work, which is also the lifetime
+    pattern used by :meth:`torch.cuda.Stream.wait_stream`. Event handles are
+    never recycled into another graph artifact.
+    """
+
+    def __init__(self, num_events: int) -> None:
+        if num_events < 1:
+            raise ValueError("num_events must be at least one")
+        self.num_events = num_events
+        self.default_events = [torch.cuda.Event() for _ in range(num_events)]
+        self._captured_event_sets: list[list[torch.cuda.Event]] = []
+
+    @contextmanager
+    def lease(self, *, private_eager: bool = False) -> Iterator[list[torch.cuda.Event]]:
+        if (
+            is_vllm_cudagraph_capture_active()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            events = [torch.cuda.Event() for _ in range(self.num_events)]
+            # CUDA graphs retain the event handles, and this list keeps the
+            # wrappers alive for the same lifetime as the owning module.
+            self._captured_event_sets.append(events)
+            yield events
+            return
+
+        if not private_eager:
+            yield self.default_events
+            return
+
+        # Keep these wrappers alive until the caller has enqueued every record
+        # and wait. cudaEventDestroy then defers resource release until pending
+        # device work completes, so no Python-side retention is required.
+        events = [torch.cuda.Event() for _ in range(self.num_events)]
+        yield events
 
 
 def maybe_execute_in_parallel(
@@ -65,6 +139,8 @@ def execute_in_parallel(
     done_events: list[torch.cuda.Event],
     aux_streams: list[torch.cuda.Stream] | None = None,
     enable: bool = False,
+    *,
+    enqueue_default_first: bool = False,
 ) -> tuple[Any, list[Any]]:
     """Run default_fn on the current stream and aux_fns concurrently on
     aux_streams.
@@ -92,6 +168,13 @@ def execute_in_parallel(
             so callers that pass aux_streams must also pass enable=True
             (typically gated by an env var) to actually overlap. When False,
             execution falls back to sequential on the current stream.
+        enqueue_default_first: Enqueue ``default_fn`` before walking the
+            auxiliary callables. The CUDA dependency graph is unchanged: all
+            branches still wait on ``start_event`` and the default stream joins
+            every launched auxiliary branch before returning. This option is
+            useful when an auxiliary callable performs many host-side launches;
+            it prevents that launch loop from withholding independent default-
+            stream work from the GPU.
 
     Returns:
         Tuple of (default_result, aux_results) where aux_results[i] is the
@@ -111,6 +194,7 @@ def execute_in_parallel(
     pending: list[torch.cuda.Event] = []
 
     start_event.record()
+    default_result = default_fn() if enqueue_default_first else None
     for i, fn in enumerate(aux_fns):
         if fn is None:
             continue
@@ -120,7 +204,8 @@ def execute_in_parallel(
             done_events[i].record()
         pending.append(done_events[i])
 
-    default_result = default_fn()
+    if not enqueue_default_first:
+        default_result = default_fn()
 
     for ev in pending:
         ev.wait()

@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Any
@@ -61,6 +61,7 @@ except ImportError:
     SingleGroup = fastsafetensors.placeholder_attr("SingleGroup")
 
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
+from vllm.model_executor.virtual_tp import pad_or_narrow_weight
 
 logger = init_logger(__name__)
 
@@ -435,6 +436,7 @@ def download_weights_from_hf(
     revision: str | None = None,
     subfolder: str | None = None,
     ignore_patterns: str | list[str] | None = None,
+    weight_name_prefixes: Sequence[str] | None = None,
 ) -> str:
     """Download model weights from Hugging Face Hub.
 
@@ -451,6 +453,9 @@ def download_weights_from_hf(
         ignore_patterns (Optional[Union[str, list[str]]]): The patterns to
             filter out the weight files. Files matched by any of the patterns
             will be ignored.
+        weight_name_prefixes: Optional checkpoint tensor name prefixes. When
+            a safetensors index is present, only shards containing matching
+            tensor names are downloaded.
 
     Returns:
         str: The path to the downloaded model weights.
@@ -482,11 +487,19 @@ def download_weights_from_hf(
                 )
                 with open(index_path) as f:
                     weight_map = json.load(f)["weight_map"]
+                if weight_name_prefixes:
+                    weight_map = {
+                        name: filename
+                        for name, filename in weight_map.items()
+                        if _matches_weight_name_prefixes(name, weight_name_prefixes)
+                    }
+                    if not weight_map:
+                        allow_patterns = []
                 if weight_map:
                     # Extra [] so that weight_map files are treated as a
                     # single allow_pattern in the loop below
                     allow_patterns = [list(set(weight_map.values()))]  # type: ignore[list-item]
-                else:
+                elif not weight_name_prefixes:
                     allow_patterns = ["*.safetensors"]
             else:
                 # Use the first pattern found in the HF repo's files.
@@ -502,6 +515,12 @@ def download_weights_from_hf(
                 model_name_or_path,
                 e,
             )
+
+    if len(allow_patterns) == 0:
+        raise RuntimeError(
+            "The safetensors index does not contain any checkpoint tensors "
+            f"matching prefixes: {tuple(weight_name_prefixes or ())}"
+        )
 
     logger.debug("Using model weights format %s", allow_patterns)
     # Use file lock to prevent multiple processes from
@@ -595,9 +614,59 @@ def filter_duplicate_safetensors_files(
     weight_files_in_index = set()
     for weight_name in weight_map:
         weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
+    # Check if files referenced in model.safetensors.index.json actually exist.
+    # Raise error if any file is missing.
+    hf_weights_files_set = set(hf_weights_files)
+    missing_files = weight_files_in_index - hf_weights_files_set
+    if missing_files:
+        raise FileNotFoundError(
+            f"Weight files referenced in index but missing: {missing_files}"
+        )
     # Filter out any fields that are not found in the index file.
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
+
+
+def _matches_weight_name_prefixes(
+    weight_name: str, weight_name_prefixes: Sequence[str]
+) -> bool:
+    return weight_name.startswith(tuple(weight_name_prefixes))
+
+
+def filter_safetensors_files_by_weight_name_prefixes(
+    hf_weights_files: list[str],
+    hf_folder: str,
+    index_file: str,
+    weight_name_prefixes: Sequence[str] | None,
+) -> list[str]:
+    if not weight_name_prefixes:
+        return hf_weights_files
+
+    index_file_name = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_file_name):
+        return hf_weights_files
+
+    with open(index_file_name) as f:
+        weight_map = json.load(f)["weight_map"]
+
+    weight_files_for_prefixes = {
+        os.path.join(hf_folder, filename)
+        for weight_name, filename in weight_map.items()
+        if _matches_weight_name_prefixes(weight_name, weight_name_prefixes)
+    }
+    if not weight_files_for_prefixes:
+        raise RuntimeError(
+            "The safetensors index does not contain any checkpoint tensors "
+            f"matching prefixes: {tuple(weight_name_prefixes)}"
+        )
+
+    filtered_files = [f for f in hf_weights_files if f in weight_files_for_prefixes]
+    logger.info_once(
+        "Safetensors index filter selected %d/%d checkpoint shards.",
+        len(filtered_files),
+        len(hf_weights_files),
+    )
+    return filtered_files
 
 
 def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:
@@ -686,10 +755,22 @@ def _get_checkpoints_size_bytes(files: list[str]) -> int:
 
 
 def _get_available_ram_bytes() -> int:
-    """Return the available RAM in bytes."""
+    """Return available RAM, honoring cgroup limits on ROCm."""
     import psutil
 
-    return psutil.virtual_memory().available
+    host_available = psutil.virtual_memory().available
+    if not current_platform.is_rocm():
+        return host_available
+
+    from vllm.utils.cpu_resource_utils import get_cgroup_memory_limit
+
+    cgroup_limit, cgroup_usage = get_cgroup_memory_limit()
+    if cgroup_limit is None:
+        return host_available
+    cgroup_available = (
+        cgroup_limit if cgroup_usage is None else max(0, cgroup_limit - cgroup_usage)
+    )
+    return min(host_available, cgroup_available)
 
 
 def _get_fs_type(files: list[str]) -> str:
@@ -822,15 +903,24 @@ def safetensors_weights_iterator(
     use_tqdm_on_load: bool,
     safetensors_load_strategy: str | None = None,
     local_expert_ids: set[int] | None = None,
+    weight_name_prefixes: Sequence[str] | None = None,
     *,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
+    indexed_tensor_files: dict[str, str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
     When *local_expert_ids* is provided, expert weights not belonging to
     this rank are skipped **before** reading from disk, which drastically
     reduces storage I/O for MoE models under EP.
+
+    When *weight_name_prefixes* is provided, non-matching checkpoint tensors are
+    skipped before reading from disk when the load strategy supports it.
+
+    When *indexed_tensor_files* is provided, only tensors assigned to each shard
+    by the safetensors index are yielded. This matters for composed checkpoints
+    whose physical shards may contain stale copies of remapped tensors.
     """
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
@@ -909,10 +999,23 @@ def safetensors_weights_iterator(
         disable=not enable_tqdm(use_tqdm_on_load),
         bar_format=_BAR_FORMAT,
     ):
+        st_file_abs = os.path.abspath(st_file)
+
+        def is_indexed_here(name: str, indexed_file: str = st_file_abs) -> bool:
+            return indexed_tensor_files is None or (
+                indexed_tensor_files.get(name) == indexed_file
+            )
+
         if safetensors_load_strategy == "eager":
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
+                if not is_indexed_here(name):
+                    continue
+                if weight_name_prefixes and not _matches_weight_name_prefixes(
+                    name, weight_name_prefixes
+                ):
+                    continue
                 if not should_skip_weight(name, local_expert_ids):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
@@ -930,6 +1033,12 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 state_dict = {}
                 for name in f.keys():  # noqa: SIM118
+                    if not is_indexed_here(name):
+                        continue
+                    if weight_name_prefixes and not _matches_weight_name_prefixes(
+                        name, weight_name_prefixes
+                    ):
+                        continue
                     if should_skip_weight(name, local_expert_ids):
                         continue
                     state_dict[name] = f.get_tensor(name)
@@ -948,6 +1057,12 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
+                    if not is_indexed_here(name):
+                        continue
+                    if weight_name_prefixes and not _matches_weight_name_prefixes(
+                        name, weight_name_prefixes
+                    ):
+                        continue
                     if should_skip_weight(name, local_expert_ids):
                         continue
                     param = f.get_tensor(name)
@@ -958,6 +1073,7 @@ def multi_thread_safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     max_workers: int = 4,
+    weight_name_prefixes: Sequence[str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
 
@@ -981,6 +1097,11 @@ def multi_thread_safetensors_weights_iterator(
             state_dict = future.result()
             del future
             for key in list(state_dict):
+                if weight_name_prefixes and not _matches_weight_name_prefixes(
+                    key, weight_name_prefixes
+                ):
+                    state_dict.pop(key)
+                    continue
                 yield key, state_dict.pop(key)
 
 
@@ -1024,6 +1145,7 @@ def runai_safetensors_weights_iterator(
 def fastsafetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
+    weight_name_prefixes: Sequence[str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
     using fastsafetensor library.
@@ -1071,6 +1193,10 @@ def fastsafetensors_weights_iterator(
         try:
             pl = _make_loader(nogds)
             for name, tensor in pl.iterate_weights():
+                if weight_name_prefixes and not _matches_weight_name_prefixes(
+                    name, weight_name_prefixes
+                ):
+                    continue
                 yielded = True
                 yield name, tensor
         except RuntimeError as e:
@@ -1084,7 +1210,12 @@ def fastsafetensors_weights_iterator(
             if pl is not None:
                 pl.close()
             pl = _make_loader(nogds=True)
-            yield from pl.iterate_weights()
+            for name, tensor in pl.iterate_weights():
+                if weight_name_prefixes and not _matches_weight_name_prefixes(
+                    name, weight_name_prefixes
+                ):
+                    continue
+                yield name, tensor
     finally:
         if pl is not None:
             pl.close()
@@ -1093,9 +1224,22 @@ def fastsafetensors_weights_iterator(
 def instanttensor_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
+    weight_name_prefixes: Sequence[str] | None = None,
+    *,
+    indexed_tensor_files: dict[str, str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
-    using instanttensor library."""
+    using instanttensor library.
+
+    ``InstantTensor.safe_open`` normally streams every physical tensor in its
+    input files.  That is incorrect and unnecessarily expensive for composed
+    checkpoints, where the final safetensors index may remap a tensor to an
+    overlay shard while leaving a stale copy in a base shard.  When an index
+    is available, restrict InstantTensor's ordered metadata and C++ I/O layout
+    to the indexed byte ranges before opening the loader.  Consecutive selected
+    tensors are coalesced into one range; disjoint ranges reuse the same file
+    as independent loader inputs, so skipped payload bytes are never read.
+    """
     try:
         import instanttensor
     except ImportError as e:
@@ -1116,10 +1260,28 @@ def instanttensor_weights_iterator(
 
     device = current_platform.current_device()
 
-    with instanttensor.safe_open(
-        hf_weights_files, framework="pt", device=device, process_group=process_group
-    ) as f:
-        yield from tqdm(
+    restrict_before_io = indexed_tensor_files is not None or bool(weight_name_prefixes)
+    instant_open = instanttensor.safe_open(
+        list(hf_weights_files),
+        framework="pt",
+        device=device,
+        process_group=process_group,
+        load_now=not restrict_before_io,
+        # Model weight loaders consume and copy every yielded tensor before
+        # requesting the next one.  A second owning clone here only doubles
+        # device traffic and transient memory.  Our InstantTensor build records
+        # a consumer-stream event before reusing its ring-buffer storage.
+        copy=False,
+    )
+    if restrict_before_io:
+        _restrict_instanttensor_to_selected_ranges(
+            instant_open,
+            indexed_tensor_files=indexed_tensor_files,
+            weight_name_prefixes=weight_name_prefixes,
+        )
+
+    with instant_open as f:
+        for name, tensor in tqdm(
             f.tensors(),
             desc="Loading safetensors using InstantTensor loader",
             disable=not enable_tqdm(use_tqdm_on_load),
@@ -1127,7 +1289,134 @@ def instanttensor_weights_iterator(
             position=tqdm._get_free_pos(),
             total=len(f.keys()),
             mininterval=1.0,
+        ):
+            if weight_name_prefixes and not _matches_weight_name_prefixes(
+                name, weight_name_prefixes
+            ):
+                continue
+            yield name, tensor
+
+
+def _restrict_instanttensor_to_selected_ranges(
+    instant_open: Any,
+    *,
+    indexed_tensor_files: dict[str, str] | None,
+    weight_name_prefixes: Sequence[str] | None,
+) -> None:
+    """Replace an unopened InstantTensor layout with selected physical ranges.
+
+    InstantTensor 0.1.9 exposes the metadata and offset arrays used by its C++
+    loader.  The C++ API accepts repeated filenames, which lets each contiguous
+    selected run become a separate logical input without copying or repacking
+    the checkpoint.  Keep this adapter strict so an upstream API/layout change
+    fails before any weight I/O instead of silently loading the wrong tensor.
+    """
+    required_attrs = (
+        "filename",
+        "ordered_tensor_metadatas",
+        "tensor_offsets",
+        "tensor_sizes",
+        "total_tensor_size",
+        "tensor_name_to_index",
+        "loader_handle",
+        "_determine_buffer_size",
+    )
+    missing = [name for name in required_attrs if not hasattr(instant_open, name)]
+    if missing:
+        raise RuntimeError(
+            "Installed InstantTensor does not expose the metadata layout needed "
+            f"for index-aware loading (missing: {', '.join(missing)})"
         )
+    if instant_open.loader_handle is not None:
+        raise RuntimeError("InstantTensor selection must be applied before opening I/O")
+
+    filenames = list(instant_open.filename)
+    metadata = list(instant_open.ordered_tensor_metadatas)
+    offsets = list(instant_open.tensor_offsets)
+    selected_filenames: list[str] = []
+    selected_metadata: list[tuple[str, dict[str, object]]] = []
+    selected_offsets: list[tuple[int, int]] = []
+    metadata_pos = 0
+    offset_pos = 0
+
+    for filename in filenames:
+        filename_abs = os.path.abspath(filename)
+        with safe_open(filename, framework="pt") as physical_file:
+            physical_names = list(physical_file.offset_keys())
+        tensor_count = len(physical_names)
+        file_metadata = metadata[metadata_pos : metadata_pos + tensor_count]
+        file_offsets = offsets[offset_pos : offset_pos + tensor_count + 1]
+        if len(file_metadata) != tensor_count or len(file_offsets) != tensor_count + 1:
+            raise RuntimeError(
+                "InstantTensor metadata/offset count does not match safetensors "
+                f"header for {filename}"
+            )
+        metadata_names = [name for name, _ in file_metadata]
+        if metadata_names != physical_names:
+            raise RuntimeError(
+                "InstantTensor tensor order does not match safetensors offset order "
+                f"for {filename}"
+            )
+
+        keep = []
+        for name in physical_names:
+            indexed_here = indexed_tensor_files is None or (
+                indexed_tensor_files.get(name) == filename_abs
+            )
+            prefix_matches = not weight_name_prefixes or _matches_weight_name_prefixes(
+                name, weight_name_prefixes
+            )
+            keep.append(indexed_here and prefix_matches)
+
+        run_start = 0
+        while run_start < tensor_count:
+            while run_start < tensor_count and not keep[run_start]:
+                run_start += 1
+            if run_start == tensor_count:
+                break
+            run_end = run_start + 1
+            while run_end < tensor_count and keep[run_end]:
+                run_end += 1
+
+            logical_file_index = len(selected_filenames)
+            selected_filenames.append(filename)
+            selected_metadata.extend(file_metadata[run_start:run_end])
+            selected_offsets.extend(
+                (logical_file_index, int(file_offsets[idx][1]))
+                for idx in range(run_start, run_end)
+            )
+            selected_offsets.append((logical_file_index, int(file_offsets[run_end][1])))
+            run_start = run_end
+
+        metadata_pos += tensor_count
+        offset_pos += tensor_count + 1
+
+    if metadata_pos != len(metadata) or offset_pos != len(offsets):
+        raise RuntimeError(
+            "InstantTensor layout contains unaccounted metadata or offsets"
+        )
+    if not selected_metadata:
+        raise RuntimeError("InstantTensor index/prefix selection matched no tensors")
+
+    selected_names = [name for name, _ in selected_metadata]
+    if len(selected_names) != len(set(selected_names)):
+        raise RuntimeError(
+            "InstantTensor index-aware selection still contains duplicate tensor names"
+        )
+    selected_sizes = [
+        int(item["data_offsets"][1]) - int(item["data_offsets"][0])
+        for _, item in selected_metadata
+    ]
+    instant_open.filename = selected_filenames
+    instant_open.ordered_tensor_metadatas = selected_metadata
+    instant_open.tensor_name_to_index = {
+        name: idx for idx, name in enumerate(selected_names)
+    }
+    instant_open.tensor_offsets = selected_offsets
+    instant_open.tensor_sizes = selected_sizes
+    instant_open.total_tensor_size = sum(selected_sizes)
+    # Recompute the ring buffer against selected tensors and their I/O layout.
+    instant_open._determine_buffer_size(None)
 
 
 def pt_weights_iterator(
@@ -1226,7 +1515,9 @@ def row_parallel_weight_loader(
     if shard_dim is not None:
         shard_size = param.data.shape[shard_dim]
         start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(shard_dim, start_idx, shard_size)
+        loaded_weight = pad_or_narrow_weight(
+            loaded_weight, shard_dim, start_idx, shard_size
+        )
 
     return default_weight_loader(param, loaded_weight)
 
@@ -1242,7 +1533,9 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
+        loaded_weight = pad_or_narrow_weight(
+            loaded_weight, shard_axis, start_idx, shard_size
+        )
 
         return default_weight_loader(param, loaded_weight)
 

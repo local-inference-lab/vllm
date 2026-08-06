@@ -40,7 +40,8 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         self._start_token_ids = self._encode_marker(self.start_token)
         self._end_token_ids = self._encode_marker(self.end_token)
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
-        self._initial_in_reasoning = chat_kwargs.get("thinking_mode") == "enabled"
+        self._thinking_mode = chat_kwargs.get("thinking_mode")
+        self._initial_in_reasoning = self._thinking_mode == "enabled"
         self._reasoning_ended_streaming = False
         self._reasoning_active_streaming = self._initial_in_reasoning
         self._pending_marker_streaming = False
@@ -309,6 +310,12 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
                 count += 1
             i += 1
         return count
+
+    def is_reasoning_end_for_prompt(self, input_ids: Sequence[int]) -> bool:
+        # Prompt text (a previous turn's </mm:think>, tool-call examples) must
+        # not end the reasoning phase: generation re-enters reasoning unless
+        # this request disabled thinking entirely.
+        return self._thinking_mode == "disabled"
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         start_index = self._rfind_token_sequence(input_ids, self._start_token_ids)

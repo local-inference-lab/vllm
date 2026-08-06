@@ -101,3 +101,55 @@ def test_grouped_topk(
             baseline_topk_weights, test_topk_weights, atol=2e-2, rtol=0
         )
         torch.testing.assert_close(baseline_topk_ids, test_topk_ids, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
+)
+@pytest.mark.parametrize("n_token", [1, 128, 129])
+def test_grouped_topk_large_single_group(n_token: int):
+    """Cover Kimi K3's router and the small-batch dispatch boundary."""
+    set_random_seed(0)
+    num_experts = 896
+    topk = 16
+    hidden_states = torch.empty((n_token, 1), dtype=torch.float32, device="cuda")
+    gating_output = torch.randn(
+        (n_token, num_experts), dtype=torch.float32, device="cuda"
+    )
+    e_score_correction_bias = (
+        torch.randn((num_experts,), dtype=torch.float32, device="cuda") * 0.1
+    )
+
+    actual_weights, actual_ids = fused_grouped_topk(
+        hidden_states=hidden_states,
+        gating_output=gating_output,
+        topk=topk,
+        renormalize=True,
+        num_expert_group=1,
+        topk_group=1,
+        scoring_func="sigmoid",
+        routed_scaling_factor=1.0,
+        e_score_correction_bias=e_score_correction_bias,
+    )
+
+    scores = torch.sigmoid(gating_output)
+    expected_ids = torch.topk(
+        scores + e_score_correction_bias, topk, dim=-1, sorted=False
+    ).indices
+    expected_weights = scores.gather(1, expected_ids)
+    expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
+
+    actual_order = actual_ids.argsort(dim=-1)
+    expected_order = expected_ids.argsort(dim=-1)
+    torch.testing.assert_close(
+        actual_ids.gather(1, actual_order),
+        expected_ids.gather(1, expected_order).to(actual_ids.dtype),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        actual_weights.gather(1, actual_order),
+        expected_weights.gather(1, expected_order),
+        atol=2e-6,
+        rtol=2e-6,
+    )

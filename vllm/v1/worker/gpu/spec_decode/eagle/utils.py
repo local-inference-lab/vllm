@@ -3,10 +3,71 @@
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig
+import vllm.envs as envs
+from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.model_loader import get_model
+
+
+def _create_draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+
+    draft_parallel_config = speculative_config.draft_parallel_config
+    # External draft models (Eagle/Eagle3/DFlash) have their own attention
+    # layouts, so keep their native DCP unless explicitly requested. Native MTP
+    # layers are part of the target model path; under DCP they need the same
+    # sharded sparse-indexer buffers as the target.
+    default_shard_draft = "1" if speculative_config.method == "mtp" else "0"
+    raw = envs.VLLM_DCP_SHARD_DRAFT
+    shard_draft = default_shard_draft if raw is None else raw
+    if shard_draft.lower() in ("1", "true", "yes"):
+        draft_parallel_config = replace(
+            draft_parallel_config,
+            decode_context_parallel_size=(
+                vllm_config.parallel_config.decode_context_parallel_size
+            ),
+        )
+
+    draft_vllm_config = replace(
+        vllm_config,
+        parallel_config=replace(
+            draft_parallel_config,
+            rank=vllm_config.parallel_config.rank,
+        ),
+        model_config=speculative_config.draft_model_config,
+    )
+
+    if speculative_config.moe_backend is not None:
+        draft_vllm_config = replace(
+            draft_vllm_config,
+            kernel_config=replace(
+                draft_vllm_config.kernel_config,
+                moe_backend=speculative_config.moe_backend,
+            ),
+        )
+
+    if speculative_config.kv_cache_dtype is not None:
+        draft_vllm_config = replace(
+            draft_vllm_config,
+            cache_config=replace(
+                draft_vllm_config.cache_config,
+                cache_dtype=speculative_config.kv_cache_dtype,
+            ),
+        )
+
+    if speculative_config.attention_backend is not None:
+        draft_backend = speculative_config.attention_backend
+        draft_vllm_config = replace(
+            draft_vllm_config,
+            attention_config=replace(
+                draft_vllm_config.attention_config,
+                backend=draft_backend,
+            ),
+        )
+
+    return draft_vllm_config
 
 
 def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
@@ -39,9 +100,12 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
+    draft_vllm_config = _create_draft_vllm_config(vllm_config)
     with set_model_tag("eagle_head"):
         eagle_model = get_model(
-            vllm_config=vllm_config, model_config=draft_model_config
+            vllm_config=draft_vllm_config,
+            model_config=draft_model_config,
+            load_config=speculative_config.draft_load_config,
         )
 
     target_language_model = (

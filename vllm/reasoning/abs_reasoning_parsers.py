@@ -112,6 +112,16 @@ class ReasoningParser:
         """
         return self.is_reasoning_end(input_ids)
 
+    def is_reasoning_end_for_prompt(self, input_ids: Sequence[int]) -> bool:
+        """Return whether the rendered prompt proves reasoning has ended.
+
+        Most reasoning templates make the current generation state explicit in
+        the prompt, so this defaults to the ordinary token-state check. Parsers
+        for adaptive templates can override this when previous-turn markers in
+        the prompt must not decide the next turn's reasoning state.
+        """
+        return self.is_reasoning_end(input_ids)
+
     @abstractmethod
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         """

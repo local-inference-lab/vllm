@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Warm up DeepSeek V4 mHC TileLang kernels before serving requests.
+"""Warm up DeepSeek V4 mHC kernels before serving requests.
 
-Ported from lucifer1004/vllm-jasl with the two env-var knobs removed
-(`VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP`, `VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES`).
 Gating is intrinsic: non-DSv4 models and layers without hc_* attributes
 return early, so the warmup is a no-op except where it's needed.
 """
@@ -68,6 +66,9 @@ def _select_mhc_warmup_token_sizes(
     *,
     max_tokens: int,
     cudagraph_capture_sizes: list[int],
+    hidden_size: int,
+    hc_mult: int,
+    num_sms: int,
 ) -> list[int]:
     if max_tokens <= 0:
         return []
@@ -76,6 +77,18 @@ def _select_mhc_warmup_token_sizes(
     candidates = list(_DEFAULT_TOKEN_SIZE_CANDIDATES)
     candidates.extend(cudagraph_capture_sizes)
     candidates.append(max_auto_tokens)
+    last_split = None
+    for grid_size in range(1, cdiv(max_auto_tokens, 64) + 1):
+        size = (grid_size - 1) * 64 + 1
+        split = _compute_mhc_pre_num_split(
+            num_tokens=size,
+            hidden_size=hidden_size,
+            hc_mult=hc_mult,
+            num_sms=num_sms,
+        )
+        if split != last_split:
+            candidates.append(size)
+            last_split = split
     return _normalize_token_sizes(candidates, max_tokens=max_auto_tokens)
 
 
@@ -87,13 +100,15 @@ def _find_first_mhc_layer(model: torch.nn.Module) -> torch.nn.Module | None:
             hasattr(module, attr)
             for attr in (
                 "hc_pre",
-                "hc_post",
+                "hc_post_pre",
                 "hc_attn_fn",
                 "hc_attn_scale",
                 "hc_attn_base",
                 "hc_ffn_fn",
                 "hc_ffn_scale",
                 "hc_ffn_base",
+                "attn_norm",
+                "ffn_norm",
             )
         ):
             return module
@@ -120,27 +135,68 @@ def _warmup_layer_mhc(
     hidden_size = int(layer.hidden_size)
     hc_mult = int(layer.hc_mult)
     device = layer.hc_attn_fn.device
-    residual = torch.zeros(
-        max_tokens,
-        hc_mult,
-        hidden_size,
-        dtype=torch.bfloat16,
-        device=device,
-    )
+    use_b12x_mhc = bool(getattr(layer, "_use_b12x_mhc", False))
+    if use_b12x_mhc:
+        pre_fn = getattr(layer, "hc_attn_fn_broadcast", None)
+        if pre_fn is None:
+            raise RuntimeError(
+                "DeepSeek V4 b12x mHC warmup requires broadcast weights."
+            )
+        pre_input = torch.zeros(
+            max_tokens,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+    else:
+        pre_fn = layer.hc_attn_fn
+        pre_input = torch.zeros(
+            max_tokens,
+            hc_mult,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
 
     for size in token_sizes:
-        residual_slice = residual[:size]
-        for fn, scale, base in (
-            (layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base),
-            (layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base),
+        residual_work = pre_input[:size]
+        pre_outputs = layer.hc_pre(
+            residual_work,
+            pre_fn,
+            layer.hc_attn_scale,
+            layer.hc_attn_base,
+            norm_weight=layer.attn_norm.weight.data,
+            norm_eps=layer.attn_norm.variance_epsilon,
+        )
+        if use_b12x_mhc:
+            residual_work, post_mix, comb_mix, layer_input = pre_outputs
+        else:
+            layer_input, post_mix, comb_mix = pre_outputs
+        for fn, scale, base, norm in (
+            (
+                layer.hc_ffn_fn,
+                layer.hc_ffn_scale,
+                layer.hc_ffn_base,
+                layer.ffn_norm,
+            ),
+            (
+                layer.hc_attn_fn,
+                layer.hc_attn_scale,
+                layer.hc_attn_base,
+                layer.attn_norm,
+            ),
         ):
-            layer_input, post_mix, comb_mix = layer.hc_pre(
-                residual_slice,
+            residual_work, post_mix, comb_mix, layer_input = layer.hc_post_pre(
+                layer_input,
+                residual_work,
+                post_mix,
+                comb_mix,
                 fn,
                 scale,
                 base,
+                norm_weight=norm.weight.data,
+                norm_eps=norm.variance_epsilon,
             )
-            layer.hc_post(layer_input, residual_slice, post_mix, comb_mix)
 
 
 def _warmup_hc_head(
@@ -203,24 +259,27 @@ def deepseek_v4_mhc_warmup(
         return
 
     deepseek_model = _find_deepseek_v4_model(model)
+    hidden_size = int(layer.hidden_size)
+    hc_mult = int(layer.hc_mult)
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     token_sizes = _select_mhc_warmup_token_sizes(
         max_tokens=max_tokens,
         cudagraph_capture_sizes=cudagraph_capture_sizes or [],
+        hidden_size=hidden_size,
+        hc_mult=hc_mult,
+        num_sms=num_sms,
     )
     if not token_sizes:
         return
 
     started = time.perf_counter()
-    logger.info(
-        "Warming up DeepSeek V4 mHC TileLang kernels for token sizes: %s",
-        token_sizes,
-    )
+    logger.info("Warming up DeepSeek V4 mHC kernels for token sizes: %s", token_sizes)
     with torch.inference_mode():
         _warmup_layer_mhc(layer, token_sizes)
         if deepseek_model is not None:
             _warmup_hc_head(deepseek_model, token_sizes)
         torch.accelerator.synchronize()
     logger.info(
-        "DeepSeek V4 mHC TileLang warmup finished in %.2f seconds.",
+        "DeepSeek V4 mHC warmup finished in %.2f seconds.",
         time.perf_counter() - started,
     )

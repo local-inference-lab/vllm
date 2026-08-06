@@ -23,7 +23,9 @@ from vllm.model_executor.models.qwen3_next import (
     Qwen3NextModel,
     Qwen3NextRMSNorm,
     QwenNextMixtureOfExperts,
+    _all_gather_hidden_and_residual,
 )
+from vllm.model_executor.virtual_tp import get_virtual_tp_axis_padded_size
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 
@@ -72,9 +74,14 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             if (quant_config and quant_config.get_name() == "modelopt_fp4")
             else quant_config
         )
+        self.fc_output_size = get_virtual_tp_axis_padded_size(
+            "mtp_projection_size",
+            self.config.hidden_size,
+            config=self.config,
+        )
         self.fc = ColumnParallelLinear(
             self.config.hidden_size * 2,
-            self.config.hidden_size,
+            self.fc_output_size,
             gather_output=True,
             bias=False,
             return_bias=False,
@@ -122,7 +129,7 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
             hidden_states = self.pre_fc_norm_hidden(hidden_states)
             hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-            hidden_states = self.fc(hidden_states)
+            hidden_states = self.fc(hidden_states)[..., : self.config.hidden_size]
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -130,7 +137,8 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             residual = intermediate_tensors["residual"]
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
-        hidden_states, residual = self.layers[current_step_idx](
+        mtp_layer = self.layers[current_step_idx]
+        hidden_states, residual = mtp_layer(
             positions=positions,
             hidden_states=hidden_states,
             residual=residual,
@@ -141,6 +149,13 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
+        if mtp_layer.use_attn_reduce_scatter_for_moe:
+            hidden_states, residual = _all_gather_hidden_and_residual(
+                hidden_states,
+                residual,
+                positions.shape[-1],
+                self.config.hidden_size,
+            )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 

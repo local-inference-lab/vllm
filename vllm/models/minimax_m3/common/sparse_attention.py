@@ -15,11 +15,14 @@ attention-backend registry (by dotted path) and by spec-decode, so they must
 keep these names and stay in this module.
 """
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
 
+from vllm import envs
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
@@ -56,6 +59,23 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
 
 logger = init_logger(__name__)
+
+_SPARSE_STATS_ENV = "VLLM_DEBUG_MINIMAX_M3_SPARSE_STATS"
+
+
+def _minimax_m3_aiter_sparse_pa_requested() -> bool:
+    return rocm_aiter_ops.is_enabled() and rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+
+
+def minimax_m3_use_aiter_sparse_pa(num_kv_heads: int) -> bool:
+    """Whether to use the ROCm AITER page-16 sparse PA prototype."""
+    requested = _minimax_m3_aiter_sparse_pa_requested()
+    if requested and num_kv_heads != 1:
+        raise ValueError(
+            "MiniMax M3 AITER sparse paged attention requires "
+            f"num_kv_heads == 1 per tensor-parallel rank, got {num_kv_heads}."
+        )
+    return requested
 
 
 class MiniMaxM3SparseBackend(AttentionBackend):
@@ -104,20 +124,36 @@ class MiniMaxM3SparseBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        return (num_blocks, 2, block_size, num_kv_heads, head_size)
+        if minimax_m3_use_aiter_sparse_pa(num_kv_heads):
+            # AITER's assembly paged-attention kernels require independently
+            # contiguous K and V storage. Keep that specialized layout behind
+            # the shuffle flag while every other implementation uses the
+            # packed-content contract introduced by #44455.
+            return (num_blocks, 2, block_size, num_kv_heads, head_size)
+        # K and V are packed into the content dim: logical (B, H, N, 2*hs).
+        return (num_blocks, num_kv_heads, block_size, 2 * head_size)
 
     @staticmethod
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
-        # Permutation from get_kv_cache_shape to the actual memory layout.
+        # `stride_order` indicates the permutation that gets us from
+        # `get_kv_cache_shape` (logical (B, H, N, 2*hs)) to the actual memory
+        # layout we want.
         if include_num_layers_dimension:
             raise NotImplementedError  # no cross-layer KV blocks in M3
+        if _minimax_m3_aiter_sparse_pa_requested():
+            # The AITER page-16 sparse PA path reinterprets the K and V slices
+            # as separate SHUFFLE caches. Keep K/V physically separated so
+            # kv_cache[:, 0] and kv_cache[:, 1] are contiguous byte ranges.
+            return (1, 0, 2, 3, 4)
         cache_layout = get_kv_cache_layout()
         if cache_layout == "NHD":
-            stride_order = (0, 1, 2, 3, 4)
+            # (num_blocks, block_size, num_kv_heads, 2*head_size)
+            stride_order = (0, 2, 1, 3)
         elif cache_layout == "HND":
-            stride_order = (0, 1, 3, 2, 4)
+            # (num_blocks, num_kv_heads, block_size, 2*head_size)
+            stride_order = (0, 1, 2, 3)
         else:
             raise ValueError(f"Unknown cache layout format {cache_layout}.")
         return stride_order
@@ -142,6 +178,7 @@ class MiniMaxM3SparseDecodeMetadata:
     """Per-decode state (cudagraph-safe). ``decode_query_len`` is the uniform
     per-request query length (1, or 1 + num_speculative_tokens)."""
 
+    cu_seqlens_q: torch.Tensor  # [num_decodes + 1] int32, decode-first starts at 0
     seq_lens: torch.Tensor  # [num_decodes] int32
     block_table: torch.Tensor
     decode_query_len: int
@@ -202,6 +239,7 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
         block_table = common_attn_metadata.block_table_tensor
+        qsl_cpu = common_attn_metadata.query_start_loc_cpu
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
@@ -250,7 +288,6 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
 
         decode_metadata: MiniMaxM3SparseDecodeMetadata | None = None
         if num_decodes > 0:
-            qsl_cpu = common_attn_metadata.query_start_loc_cpu
             query_lens_cpu = qsl_cpu[1 : num_decodes + 1] - qsl_cpu[:num_decodes]
             decode_query_len = int(query_lens_cpu[0].item())
             assert decode_query_len > 0
@@ -259,6 +296,7 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
             )
             assert num_decode_tokens == num_decodes * decode_query_len
             decode_metadata = MiniMaxM3SparseDecodeMetadata(
+                cu_seqlens_q=query_start_loc[: num_decodes + 1].to(torch.int32),
                 seq_lens=seq_lens[:num_decodes],
                 block_table=block_table[:num_decodes],
                 decode_query_len=decode_query_len,
@@ -316,6 +354,55 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
         # Sparse selection parameters (block_size == page size == SPARSE_BLOCK_SIZE).
         self.topk_blocks = topk_blocks
         self.block_size = sparse_block_size
+        self._stats_reports = 0
+
+    def _maybe_log_sparse_stats(
+        self,
+        *,
+        layer_name: str,
+        mode: str,
+        q: torch.Tensor,
+        out: torch.Tensor,
+        topk: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        if os.getenv(_SPARSE_STATS_ENV, "0") != "1" or self._stats_reports >= 16:
+            return
+        if torch.cuda.is_available():
+            try:
+                if torch.cuda.is_current_stream_capturing():
+                    return
+            except RuntimeError:
+                return
+        q_f32 = q.float()
+        q_finite = bool(torch.isfinite(q_f32).all().item())
+        if not q_finite:
+            return
+        out_f32 = out.float()
+        logger.warning(
+            "MiniMax M3 sparse stats layer=%s mode=%s q=%s out=%s "
+            "finite q/out=%s/%s absmax q/out=%.6g/%.6g "
+            "mean_abs q/out=%.6g/%.6g topk_range=(%d,%d) "
+            "seq_lens=(%d,%d) stride q/out/topk=%s/%s/%s",
+            layer_name,
+            mode,
+            tuple(q.shape),
+            tuple(out.shape),
+            q_finite,
+            bool(torch.isfinite(out_f32).all().item()),
+            float(q_f32.abs().max().item()),
+            float(out_f32.abs().max().item()),
+            float(q_f32.abs().mean().item()),
+            float(out_f32.abs().mean().item()),
+            int(topk.min().item()),
+            int(topk.max().item()),
+            int(seq_lens.min().item()),
+            int(seq_lens.max().item()),
+            tuple(q.stride()),
+            tuple(out.stride()),
+            tuple(topk.stride()),
+        )
+        self._stats_reports += 1
 
     def forward(
         self,
@@ -360,6 +447,8 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
         kv_cache = (
             kv_cache.view(self.kv_cache_fp8_dtype) if self.use_fp8_kv else kv_cache
         )
+        k_scale = getattr(layer, "_k_scale", None) if self.use_fp8_kv else None
+        v_scale = getattr(layer, "_v_scale", None) if self.use_fp8_kv else None
 
         # Decode [:nd]: split-K over the selected blocks (request-major chunks).
         if main_md.num_decodes > 0:
@@ -375,6 +464,16 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
                 self.scale,
                 out[:nd],
                 d.decode_query_len,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            self._maybe_log_sparse_stats(
+                layer_name=layer.layer_name,
+                mode="decode" if d.decode_query_len == 1 else "extend",
+                q=q[:nd],
+                out=out[:nd],
+                topk=decode_topk,
+                seq_lens=d.seq_lens,
             )
 
         # Prefill [nd:]: cu_seqlens_q already rebased to 0.
@@ -393,6 +492,16 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
                 self.num_kv_heads,
                 self.scale,
                 out[nd:],
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            self._maybe_log_sparse_stats(
+                layer_name=layer.layer_name,
+                mode="extend",
+                q=q[nd:],
+                out=out[nd:],
+                topk=prefill_topk,
+                seq_lens=p.seq_lens,
             )
         return output
 
@@ -401,27 +510,62 @@ def select_main_impl_cls(
     *,
     topk_blocks: int,
     kv_cache_dtype: str,
+    num_kv_heads: int,
 ) -> type[MiniMaxM3SparseImpl]:
     """Pick the main attend impl off the main KV-cache dtype.
 
-    Blackwell (SM100) uses the MSA attend for supported top-k block counts
-    when the KV cache is BF16 or FP8 E4M3; non-Blackwell and FP8 E5M2 fall
-    back to Triton. The MSA module is imported lazily so AMD/non-SM100 never
-    import fmha_sm100.
+    B12X MiniMax MSA is opt-in. Otherwise Blackwell (SM100) uses the MSA
+    attend for supported top-k block counts when the KV cache is BF16 or FP8
+    E4M3; MI355 uses AITER sparse PA with shuffle KV cache layout; other
+    platforms and FP8 E5M2 fall back to Triton. The MSA modules are imported
+    lazily to avoid import errors on unsupported platforms.
     """
+    if envs.VLLM_USE_B12X_MINIMAX_M3_MSA:
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        ):
+            raise RuntimeError(
+                "VLLM_USE_B12X_MINIMAX_M3_MSA requires CUDA SM120."
+            )
+        if topk_blocks != 16:
+            raise NotImplementedError(
+                "B12X MiniMax M3 MSA currently requires sparse_topk_blocks=16, "
+                f"got {topk_blocks}."
+            )
+        if kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
+            raise NotImplementedError(
+                "B12X MiniMax M3 MSA supports auto, bfloat16, fp8, and "
+                f"fp8_e4m3 KV caches, got {kv_cache_dtype!r}."
+            )
+        from vllm.models.minimax_m3.nvidia.sparse_attention_b12x import (
+            MiniMaxM3SparseB12XImpl,
+        )
+
+        return MiniMaxM3SparseB12XImpl
+
+    use_aiter_sparse_pa = minimax_m3_use_aiter_sparse_pa(num_kv_heads)
     use_msa = (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(100)
         and topk_blocks in (4, 8, 16, 32)
         and kv_cache_dtype != "fp8_e5m2"
     )
-    selected = "MSA" if use_msa else "Triton"
+    selected = (
+        "AITER_SPARSE_PA" if use_aiter_sparse_pa else ("MSA" if use_msa else "Triton")
+    )
     logger.info_once(
         "MiniMax M3 sparse attention selected %s (kv_cache_dtype=%s, topk_blocks=%s)",
         selected,
         kv_cache_dtype,
         topk_blocks,
     )
+    if use_aiter_sparse_pa:
+        from vllm.models.minimax_m3.amd.sparse_attention_msa import (
+            MiniMaxM3SparseAiterPAImpl,
+        )
+
+        return MiniMaxM3SparseAiterPAImpl
     if use_msa:
         from vllm.models.minimax_m3.nvidia.sparse_attention_msa import (
             MiniMaxM3SparseMSAImpl,

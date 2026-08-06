@@ -157,6 +157,74 @@ def test_fast_decode_plan_importable() -> None:
     assert callable(fast_decode_plan)
 
 
+def test_fast_plan_decode_omits_q_len_for_legacy_flashinfer(monkeypatch) -> None:
+    """The cudagraph fast path remains compatible with FlashInfer 0.6.14."""
+    import types
+
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    calls: list[dict] = []
+
+    def legacy_fast_decode_plan(self, **kwargs) -> None:
+        del self
+        calls.append(kwargs)
+
+    wrapper = types.SimpleNamespace(
+        is_cuda_graph_enabled=True,
+        vllm_first_call=False,
+    )
+    monkeypatch.setattr(flashinfer_backend, "fast_decode_plan", legacy_fast_decode_plan)
+    flashinfer_backend.flashinfer_supports_uniform_multi_token_decode.cache_clear()
+
+    flashinfer_backend.fast_plan_decode(
+        wrapper,
+        indptr_cpu=torch.empty(0, dtype=torch.int32),
+        indices=torch.empty(0, dtype=torch.int32),
+        last_page_len_cpu=torch.empty(0, dtype=torch.int32),
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        page_size=16,
+    )
+
+    assert len(calls) == 1
+    assert "q_len_per_req" not in calls[0]
+    flashinfer_backend.flashinfer_supports_uniform_multi_token_decode.cache_clear()
+
+
+def test_fast_plan_decode_rejects_unsupported_multi_token_decode(
+    monkeypatch,
+) -> None:
+    """Legacy FlashInfer fails clearly if multi-token decode reaches it."""
+    import types
+
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    def legacy_fast_decode_plan(self, **kwargs) -> None:
+        raise AssertionError("unsupported planner should not be called")
+
+    wrapper = types.SimpleNamespace(
+        is_cuda_graph_enabled=True,
+        vllm_first_call=False,
+    )
+    monkeypatch.setattr(flashinfer_backend, "fast_decode_plan", legacy_fast_decode_plan)
+    flashinfer_backend.flashinfer_supports_uniform_multi_token_decode.cache_clear()
+
+    with pytest.raises(RuntimeError, match="does not support q_len_per_req=2"):
+        flashinfer_backend.fast_plan_decode(
+            wrapper,
+            indptr_cpu=torch.empty(0, dtype=torch.int32),
+            indices=torch.empty(0, dtype=torch.int32),
+            last_page_len_cpu=torch.empty(0, dtype=torch.int32),
+            num_qo_heads=8,
+            num_kv_heads=2,
+            head_dim=128,
+            page_size=16,
+            q_len_per_req=2,
+        )
+    flashinfer_backend.flashinfer_supports_uniform_multi_token_decode.cache_clear()
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @torch.inference_mode
 def test_fast_plan_decode_warmup_uses_full_plan(dtype: torch.dtype) -> None:

@@ -70,6 +70,15 @@ endif()
 #
 set(TORCH_SUPPORTED_VERSION_CUDA "2.11.0")
 set(TORCH_SUPPORTED_VERSION_ROCM "2.11.0")
+# TORCH_NIGHTLY=1 builds run against unpinned nightly wheels, so the supported-
+# version check would always warn. Only treat it as a nightly build when the
+# value is exactly "1" (the bootstrap exports TORCH_NIGHTLY=0 by default, which
+# must NOT suppress the warning for normal builds).
+if (DEFINED ENV{TORCH_NIGHTLY} AND "$ENV{TORCH_NIGHTLY}" STREQUAL "1")
+  set(TORCH_NIGHTLY_BUILD TRUE)
+else()
+  set(TORCH_NIGHTLY_BUILD FALSE)
+endif()
 
 #
 # Try to find python package with an executable that exactly matches
@@ -175,7 +184,7 @@ endif()
 if (NOT HIP_FOUND AND NOT PYTORCH_FOUND_HIP AND CUDA_FOUND)
   set(VLLM_GPU_LANG "CUDA")
 
-  if (NOT Torch_VERSION VERSION_EQUAL ${TORCH_SUPPORTED_VERSION_CUDA})
+  if (NOT TORCH_NIGHTLY_BUILD AND NOT Torch_VERSION VERSION_EQUAL ${TORCH_SUPPORTED_VERSION_CUDA})
     message(WARNING "Pytorch version ${TORCH_SUPPORTED_VERSION_CUDA} "
       "expected for CUDA build, saw ${Torch_VERSION} instead.")
   endif()
@@ -188,7 +197,7 @@ elseif(HIP_FOUND OR PYTORCH_FOUND_HIP)
   enable_language(HIP)
 
   # ROCm 5.X and 6.X
-  if (ROCM_VERSION_DEV_MAJOR GREATER_EQUAL 5 AND
+  if (NOT TORCH_NIGHTLY_BUILD AND ROCM_VERSION_DEV_MAJOR GREATER_EQUAL 5 AND
       Torch_VERSION VERSION_LESS ${TORCH_SUPPORTED_VERSION_ROCM})
     message(WARNING "Pytorch version >= ${TORCH_SUPPORTED_VERSION_ROCM} "
       "expected for ROCm build, saw ${Torch_VERSION} instead.")
@@ -381,6 +390,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/libtorch_stable/cuda_view.cu"
     "csrc/libtorch_stable/cuda_utils_kernels.cu"
     "csrc/libtorch_stable/activation_kernels.cu"
+    "csrc/libtorch_stable/ngram_embedding_kernels.cu"
     "csrc/libtorch_stable/quantization/activation_kernels.cu"
     "csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu"
     "csrc/libtorch_stable/quantization/w8a8/fp8/common.cu"
@@ -423,6 +433,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 
   if(VLLM_GPU_LANG STREQUAL "CUDA")
+    list(APPEND VLLM_STABLE_EXT_SRC
+      "csrc/libtorch_stable/attention/mla/safe_query_bmm.cu")
+
     SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
 
     # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages when building.
@@ -1096,6 +1109,15 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   # Needed to use cuda/hip APIs from C-shim
   if(VLLM_GPU_LANG STREQUAL "CUDA")
     target_compile_definitions(_C_stable_libtorch PRIVATE USE_CUDA)
+    find_library(VLLM_CUBLAS_LIBRARY cublas
+      PATHS "/usr/local/cuda/lib64" "/usr/local/cuda/lib" NO_DEFAULT_PATH)
+    if(NOT VLLM_CUBLAS_LIBRARY)
+      find_library(VLLM_CUBLAS_LIBRARY cublas)
+    endif()
+    if(NOT VLLM_CUBLAS_LIBRARY)
+      message(FATAL_ERROR "safe_mla_query_bmm requires libcublas")
+    endif()
+    target_link_libraries(_C_stable_libtorch PRIVATE ${VLLM_CUBLAS_LIBRARY})
     if(COOPERATIVE_TOPK_ARCHS)
       target_compile_definitions(_C_stable_libtorch PRIVATE
         VLLM_ENABLE_COOPERATIVE_TOPK=1)
@@ -1354,6 +1376,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   set(VLLM_ROCM_EXT_SRC
     "csrc/rocm/torch_bindings.cpp"
     "csrc/rocm/skinny_gemms.cu"
+    "csrc/rocm/skinny_gemms_int4.cu"
     "csrc/rocm/attention.cu")
 
   set(VLLM_ROCM_HAS_GFX1100 OFF)
@@ -1397,6 +1420,7 @@ if (VLLM_GPU_LANG STREQUAL "CUDA")
     include(cmake/external_projects/fmha_sm100.cmake)
     include(cmake/external_projects/flashmla.cmake)
     include(cmake/external_projects/qutlass.cmake)
+    include(cmake/external_projects/tml_fa4.cmake)
 
     # vllm-flash-attn should be last as it overwrites some CMake functions
     include(cmake/external_projects/vllm_flash_attn.cmake)

@@ -1,0 +1,14 @@
+--- a/flashinfer/artifacts.py
++++ b/flashinfer/artifacts.py
+@@ -200,7 +200,10 @@ def get_checksums(subdirs):
+             FLASHINFER_CUBINS_REPOSITORY, safe_urljoin(subdir, "checksums.txt")
+         )
+-        checksum_path = FLASHINFER_CUBIN_DIR / safe_urljoin(subdir, "checksums.txt")
+-        download_file(uri, checksum_path)
++        name = safe_urljoin(subdir, "checksums.txt")
++        checksum_path = FLASHINFER_CUBIN_DIR / name
++        expected = CheckSumHash.map_checksums[name]
++        if not checksum_path.exists() or not verify_cubin(checksum_path, expected):
++            download_file(uri, checksum_path)
+         with open(checksum_path, "r") as f:
+             for line in f:

@@ -18,6 +18,9 @@ vllm/third_party/deep_gemm/
 # fmha_sm100 vendored package built from source
 vllm/third_party/fmha_sm100/
 
+# tml-fa4 vendored package built from source
+vllm/third_party/tml_fa4/
+
 # triton jit
 .triton
 
@@ -251,6 +254,10 @@ ep_kernels_workspace/
 vllm/grpc/vllm_engine_pb2.py
 vllm/grpc/vllm_engine_pb2_grpc.py
 vllm/grpc/vllm_engine_pb2.pyi
+
+# DGX Spark local build products
+/.spark-artifacts/
+/.spark-build/
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h

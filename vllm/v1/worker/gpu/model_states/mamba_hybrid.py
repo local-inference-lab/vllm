@@ -33,16 +33,8 @@ from vllm.v1.worker.utils import AttentionGroup
 
 @dataclass
 class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
-    is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
-
-    def get_extra_common_attn_kwargs(
-        self,
-        kv_cache_group_id: int,
-        num_reqs: int,
-    ) -> dict[str, Any]:
-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
 
     def get_extra_attn_kwargs(
         self,
@@ -230,13 +222,12 @@ class MambaHybridModelState(DefaultModelState):
             num_reqs = input_batch.num_reqs
             num_tokens = input_batch.num_tokens
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
-        max_query_len = input_batch.num_scheduled_tokens.max().item()
+        max_query_len = input_batch.max_query_len
         seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
         if for_capture:
-            # Capture with worst-case max_seq_len so the graph is valid at any replay.
             max_seq_len = self.max_model_len
         else:
-            max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
+            max_seq_len = input_batch.max_seq_len_upper_bound
 
         is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
@@ -270,7 +261,6 @@ class MambaHybridModelState(DefaultModelState):
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
-            is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )
@@ -287,10 +277,12 @@ class MambaHybridModelState(DefaultModelState):
             slot_mappings=slot_mappings,
             kv_cache_config=kv_cache_config,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            max_seq_len_upper_bound=input_batch.max_seq_len_upper_bound,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
+            is_prefilling=is_prefilling,
         )
 
     def postprocess_state(

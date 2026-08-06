@@ -267,8 +267,20 @@ class DeepSeekV4MTP(nn.Module):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
+        self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()
         self.model = DeepSeekV4MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+
+    def _checkpoint_weight_name_prefixes(self) -> tuple[str, ...]:
+        mtp_layers = range(self.config.num_nextn_predict_layers)
+        nextn_layers = range(
+            self.config.num_hidden_layers,
+            self.config.num_hidden_layers + self.config.num_nextn_predict_layers,
+        )
+        return tuple(
+            [f"mtp.{layer_idx}." for layer_idx in mtp_layers]
+            + [f"model.layers.{layer_idx}." for layer_idx in nextn_layers]
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

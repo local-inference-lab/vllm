@@ -8,11 +8,270 @@ from __future__ import annotations
 
 import os
 import threading
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
 os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+
+
+def test_memory_profile_cleanup_resets_backend_cache_bindings(monkeypatch):
+    from vllm.v1.worker.gpu import model_runner as model_runner_module
+
+    events: list[str] = []
+    old_cache = torch.ones((1,), dtype=torch.uint8)
+
+    class Impl:
+        def reset_kv_cache_binding_state(self):
+            events.append("reset")
+            assert layer.kv_cache is old_cache
+
+    layer = SimpleNamespace(impl=Impl(), kv_cache=old_cache)
+    runner = model_runner_module.GPUModelRunner.__new__(
+        model_runner_module.GPUModelRunner
+    )
+    runner.cudagraph_manager = None
+    runner.speculator = None
+    runner.kv_caches = [old_cache]
+    runner.attn_groups = []
+    runner.kv_cache_config = object()
+    runner.block_tables = object()
+    runner.kernel_block_sizes = object()
+    runner.kv_connector = object()
+    runner.kv_block_zeroer = object()
+    runner.verification_capacity_manager = object()
+    runner.cache_config = SimpleNamespace(num_gpu_blocks=1)
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context={"layer": layer}
+    )
+
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(model_runner_module.gc, "collect", lambda: None)
+
+    runner._cleanup_cudagraph_memory_profile()
+
+    assert events == ["reset"]
+    assert runner.kv_caches == []
+    assert layer.kv_cache.numel() == 0
+    assert runner.cache_config.num_gpu_blocks is None
+
+
+def test_cudagraph_manager_clear_releases_capture_state():
+    from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
+
+    manager = ModelCudaGraphManager.__new__(ModelCudaGraphManager)
+    manager.graphs = {object(): object()}
+    manager._graphs_captured = True
+    manager.breakable_cg_runner = object()
+    manager.hidden_states = object()
+    manager.aux_hidden_states = [object()]
+    manager.intermediate_tensors = object()
+
+    manager.clear()
+
+    assert manager.graphs == {}
+    assert not manager._graphs_captured
+    assert manager.breakable_cg_runner is None
+    assert manager.hidden_states is None
+    assert manager.aux_hidden_states == []
+    assert manager.intermediate_tensors is None
+
+
+def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
+    from vllm.v1.worker import workspace as workspace_module
+    from vllm.v1.worker.gpu import model_runner as model_runner_module
+
+    profile_pool = object()
+    production_pool = object()
+    events: list[str] = []
+    lazy_wrappers: list[FakeWrapper] = []
+
+    class FakeManager:
+        def __init__(self):
+            self.pool = production_pool
+
+        def needs_capture(self):
+            return True
+
+        def capture(self, *args, **kwargs):
+            assert self.pool is profile_pool
+            assert wrapper.graph_pool is profile_pool
+            lazy_wrapper = FakeWrapper()
+            lazy_wrapper.graph_pool = self.pool
+            lazy_wrappers.append(lazy_wrapper)
+            events.append("capture")
+
+    class FakeWrapper:
+        def __init__(self):
+            self.graph_pool = production_pool
+
+    class FakeSpeculator:
+        def get_cudagraph_managers(self):
+            return []
+
+        def capture(self):
+            assert workspace_module._workspace_lane.get() == 1
+            events.append("spec_capture")
+
+    manager = FakeManager()
+    wrapper = FakeWrapper()
+    runner = model_runner_module.GPUModelRunner.__new__(
+        model_runner_module.GPUModelRunner
+    )
+    runner.vllm_config = object()
+    runner.cudagraph_manager = manager
+    runner.speculator = FakeSpeculator()
+    runner.lora_config = None
+    runner.model = object()
+    runner.model_state = object()
+    runner.input_buffers = object()
+    runner.intermediate_tensors = object()
+    runner.block_tables = object()
+    runner.attn_groups = object()
+    runner.kv_cache_config = object()
+    runner.use_aux_hidden_state_outputs = False
+    runner._init_minimal_kv_cache_for_profiling = lambda: None
+    runner.maybe_setup_dummy_loras = lambda _: nullcontext()
+    runner._zero_cudagraph_capture_kv_blocks = lambda: None
+
+    def cleanup():
+        events.append("cleanup")
+        assert manager.pool is profile_pool
+        assert wrapper.graph_pool is profile_pool
+        assert lazy_wrappers[0].graph_pool is profile_pool
+
+    runner._cleanup_cudagraph_memory_profile = cleanup
+
+    memory_info = iter(((1000, 0), (900, 0), (950, 0)))
+    monkeypatch.setattr(
+        model_runner_module, "set_current_vllm_config", lambda _: nullcontext()
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "current_platform",
+        SimpleNamespace(
+            graph_pool_handle=lambda: profile_pool,
+            get_global_graph_pool=lambda: production_pool,
+        ),
+    )
+    monkeypatch.setattr(
+        model_runner_module.CUDAGraphWrapper, "_all_instances", [wrapper]
+    )
+    monkeypatch.setattr(
+        model_runner_module.BreakableCUDAGraphWrapper,
+        "_all_instances",
+        lazy_wrappers,
+    )
+    monkeypatch.setattr(model_runner_module.gc, "collect", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda: next(memory_info))
+    monkeypatch.setattr(
+        model_runner_module,
+        "checkpoint_b12x_graph_channels",
+        lambda: events.append("checkpoint") or ("channel-checkpoint",),
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "rollback_b12x_graph_channels",
+        lambda checkpoint: (
+            events.append("rollback")
+            if checkpoint == ("channel-checkpoint",)
+            else pytest.fail("rollback received the wrong channel checkpoint")
+        ),
+    )
+
+    assert runner.profile_cudagraph_memory() == 50
+    assert events == [
+        "checkpoint",
+        "capture",
+        "spec_capture",
+        "cleanup",
+        "rollback",
+    ]
+    assert workspace_module._workspace_lane.get() == 0
+    assert manager.pool is production_pool
+    assert wrapper.graph_pool is production_pool
+    assert lazy_wrappers[0].graph_pool is production_pool
+
+
+def test_breakable_runner_inherits_active_manager_pool(monkeypatch):
+    from vllm.v1.worker.gpu import cudagraph_utils
+
+    active_pool = object()
+
+    class FakeBreakableWrapper:
+        def __init__(self, model, vllm_config):
+            self.model = model
+            self.vllm_config = vllm_config
+            self.graph_pool = object()
+
+    monkeypatch.setattr(
+        cudagraph_utils, "BreakableCUDAGraphWrapper", FakeBreakableWrapper
+    )
+    manager = cudagraph_utils.CudaGraphManager.__new__(cudagraph_utils.CudaGraphManager)
+    manager.breakable_cg_runner = None
+    manager.vllm_config = object()
+    manager.pool = active_pool
+    model = object()
+
+    manager.init_breakable_cg_runner(model)
+
+    assert manager.breakable_cg_runner is not None
+    assert manager.breakable_cg_runner.model is model
+    assert manager.breakable_cg_runner.graph_pool is active_pool
+
+
+def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.worker.gpu.cudagraph_utils import (
+        BatchExecutionDescriptor,
+        CudaGraphManager,
+    )
+
+    manager = CudaGraphManager.__new__(CudaGraphManager)
+    desc = BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 8, None)
+    manager.device = torch.device("cpu")
+    manager._capture_descs = {CUDAGraphMode.PIECEWISE: [desc]}
+    manager._graphs_captured = False
+    manager.use_breakable_cg = True
+
+    create_calls = []
+    forward_calls = []
+
+    def create_forward_fn(desc_arg, warmup):
+        assert desc_arg == desc
+        metadata = {"layer": object()}
+        create_calls.append((warmup, metadata))
+
+        def forward_fn(cg_mode):
+            assert metadata
+            forward_calls.append((warmup, cg_mode, metadata))
+
+        return forward_fn
+
+    with (
+        patch(
+            "vllm.v1.worker.gpu.cudagraph_utils.graph_capture",
+            return_value=nullcontext(),
+        ),
+        patch(
+            "vllm.v1.worker.gpu.cudagraph_utils.is_global_first_rank",
+            return_value=False,
+        ),
+    ):
+        manager.capture(create_forward_fn)
+
+    assert [warmup for warmup, _ in create_calls] == [True, False]
+    assert [mode for _, mode, _ in forward_calls] == [
+        CUDAGraphMode.NONE,
+        CUDAGraphMode.PIECEWISE,
+    ]
+    assert create_calls[0][1] is not create_calls[1][1]
 
 
 @pytest.fixture(autouse=True)

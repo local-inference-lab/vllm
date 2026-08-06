@@ -530,6 +530,21 @@ def _decode_grouped_att_m_fwd(
         # like non-MLA D_QK=576, BLOCK_DMODEL=1024, BLOCK_H=16
         # exceeds 101376 bytes limit
         num_stages = 1
+    elif not is_hip_ and BLOCK_DMODEL + BLOCK_DPE >= 576:
+        # MLA decode (DeepSeek/Kimi Lk=576) with num_stages=2 compiles to
+        # ~100KB of shared memory, which overflows GPUs that expose only
+        # 99KB per block (sm86/sm89/sm120, e.g. RTX PRO 6000 Blackwell:
+        # required 102400 > limit 101376). Use a single pipeline stage there.
+        props = torch.cuda.get_device_properties(q.device)
+        smem_limit = getattr(props, "shared_memory_per_block_optin", 0)
+        if not smem_limit:
+            smem_limit = 101376 if (props.major, props.minor) in (
+                (8, 6),
+                (8, 9),
+                (12, 0),
+            ) else 0
+        if smem_limit and smem_limit <= 102400:
+            num_stages = 1
 
     _fwd_grouped_kernel_stage1[grid](
         q,

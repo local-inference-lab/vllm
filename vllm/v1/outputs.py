@@ -243,6 +243,11 @@ class ModelRunnerOutput:
     # each request due to speculative/jump decoding.
     sampled_token_ids: list[list[int]] = field(default_factory=list)
 
+    # Draft token ids generated for the next scheduler step. Async block
+    # speculators attach these to the normal model output so their D2H transfer
+    # shares the sampled-output event instead of requiring a second worker RPC.
+    draft_token_ids: "DraftTokenIds | None" = None
+
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs]

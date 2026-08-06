@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepseekV4 rotary embedding initialization."""
 
+import torch
+
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
@@ -14,10 +16,12 @@ def build_deepseek_v4_rope(
     max_position_embeddings: int,
     compress_ratio: int,
 ) -> RotaryEmbedding:
-    rope_parameters = config.rope_parameters
+    rope_parameters = dict(config.rope_parameters)
     rope_parameters["rope_theta"] = (
         config.compress_rope_theta if compress_ratio > 1 else config.rope_theta
     )
+    if compress_ratio == 0:
+        rope_parameters["rope_type"] = "default"
     if rope_parameters["rope_type"] != "default":
         rope_parameters["rope_type"] = (
             "deepseek_yarn"
@@ -33,4 +37,8 @@ def build_deepseek_v4_rope(
         max_position=max_position_embeddings,
         rope_parameters=rope_parameters,
         is_neox_style=False,
+        # DeepSeek V4 kernels consume the cached cos/sin table directly and
+        # require FP32 even when the draft/MTP model is initialized under a
+        # lower default dtype.
+        dtype=torch.float32,
     )

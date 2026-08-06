@@ -85,14 +85,18 @@ class Qwen2MLP(nn.Module):
         hidden_act: str,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        loaded_intermediate_size: int | None = None,
     ) -> None:
         super().__init__()
+        if loaded_intermediate_size is None:
+            loaded_intermediate_size = intermediate_size
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            loaded_output_sizes=[loaded_intermediate_size] * 2,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,

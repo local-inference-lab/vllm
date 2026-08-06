@@ -10,12 +10,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm.model_executor.layers.fla.ops.kda import (
+from vllm.third_party.flash_linear_attention.ops.kda import (
     chunk_kda,
     chunk_kda_with_fused_gate,
     fused_kda_gate,
 )
-from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
+from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 
 DEVICE = "cuda"
 
@@ -162,16 +162,18 @@ def test_chunk_kda(
 
 
 @pytest.mark.parametrize(
-    ("cu_seqlens", "dtype"),
+    ("cu_seqlens", "dtype", "lower_bound"),
     [
-        ([0, 64], torch.float16),
-        ([0, 15, 100, 300], torch.bfloat16),
+        ([0, 64], torch.float16, None),
+        ([0, 15, 100, 300], torch.bfloat16, None),
+        ([0, 15, 100, 300], torch.bfloat16, -5.0),
     ],
 )
 @torch.inference_mode()
 def test_chunk_kda_fused_gate_cumsum_matches_unfused(
     cu_seqlens: list[int],
     dtype: torch.dtype,
+    lower_bound: float | None,
 ):
     H, D = 8, 64
     T = cu_seqlens[-1]
@@ -196,7 +198,14 @@ def test_chunk_kda_fused_gate_cumsum_matches_unfused(
         A_log,
         D,
         g_bias=dt_bias,
+        lower_bound=lower_bound,
     ).unsqueeze(0)
+    if lower_bound is not None:
+        expected_gate = lower_bound * torch.sigmoid(
+            A_log.exp()[None, :, None]
+            * (raw_g.float().view(T, H, D) + dt_bias.view(H, D))
+        )
+        torch.testing.assert_close(gate.squeeze(0), expected_gate)
     old_o, old_ht = chunk_kda(
         q=q.clone(),
         k=k.clone(),
@@ -220,6 +229,7 @@ def test_chunk_kda_fused_gate_cumsum_matches_unfused(
         output_final_state=True,
         cu_seqlens=cu_seqlens_t,
         use_qk_l2norm_in_kernel=True,
+        lower_bound=lower_bound,
     )
 
     assert_close("o", old_o, new_o, 1e-3, err_atol=1e-3)

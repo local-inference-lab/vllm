@@ -4,8 +4,9 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from vllm.model_executor.layers.fla.ops.utils import input_guard
 
-from vllm.model_executor.layers.fla.ops.layernorm_guard import (
+from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
     layer_norm_fwd,
     layernorm_fn,
     rms_norm_ref,
@@ -98,6 +99,17 @@ GROUP_SIZES = [None, 64, 128]  # None means full hidden size
 NORM_BEFORE_GATE = [True, False]
 IS_RMS_NORM = [True, False]
 SEEDS = [0, 42]
+
+
+def test_input_guard_supports_fullgraph_compile() -> None:
+    @input_guard
+    def guarded_add_one(x: torch.Tensor) -> torch.Tensor:
+        return x + 1
+
+    x = torch.randn(8, device="cuda")
+    compiled = torch.compile(guarded_add_one, backend="eager", fullgraph=True)
+
+    torch.testing.assert_close(compiled(x), x + 1)
 
 
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)

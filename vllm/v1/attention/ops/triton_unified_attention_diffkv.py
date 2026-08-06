@@ -225,8 +225,8 @@ def kernel_unified_attention_diffkv(
         seq_mask = compute_kv_seq_mask(
             query_abs_pos,
             seq_offset,
-            seq_idx,
             seq_len,
+            seq_idx,
             None,  # mm_prefix_range_ptr
             SLIDING_WINDOW,
             False,  # USE_MM_PREFIX

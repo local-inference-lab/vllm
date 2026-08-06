@@ -19,7 +19,9 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
+    CommonAttentionBatchTopology,
     CommonAttentionMetadata,
+    exact_attention_metadata_cache_key,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -103,8 +105,12 @@ def init_attn_backend(
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(vllm_config, layer_type, layer_names)
 
-        group_map: dict[tuple[tuple[str, str], KVCacheSpec, int], AttentionGroup] = {}
-        group_order: list[tuple[tuple[str, str], KVCacheSpec, int]] = []
+        group_map: dict[
+            tuple[tuple[str, str], KVCacheSpec, int, tuple[Any, ...]], AttentionGroup
+        ] = {}
+        group_order: list[
+            tuple[tuple[str, str], KVCacheSpec, int, tuple[Any, ...]]
+        ] = []
 
         for layer_name in layer_names:
             attn_backend = attn_layers[layer_name].get_attn_backend()
@@ -117,7 +123,15 @@ def init_attn_backend(
             # counts (e.g. a spec-decode draft head and its target) get separate
             # metadata builders.
             num_heads_q = getattr(attn_layers[layer_name], "num_heads", 0)
-            key = (attn_backend.full_cls_name(), layer_kv_cache_spec, num_heads_q)
+            metadata_group_key = attn_backend.get_metadata_group_key(
+                attn_layers[layer_name]
+            )
+            key = (
+                attn_backend.full_cls_name(),
+                layer_kv_cache_spec,
+                num_heads_q,
+                metadata_group_key,
+            )
             if key not in group_map:
                 group_map[key] = AttentionGroup(
                     attn_backend, [layer_name], layer_kv_cache_spec, kv_cache_group_id
@@ -203,6 +217,7 @@ def _reshape_attention_kv_cache(
     kv_cache_shape: tuple[int, ...],
     kv_cache_stride_order: tuple[int, ...],
     num_blocks: int,
+    num_blocks_per_kv_block: int,
     packing: tuple[int, int] | None,
 ) -> torch.Tensor:
     permuted_kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
@@ -218,7 +233,7 @@ def _reshape_attention_kv_cache(
         kv_cache = (
             kv_raw_tensor.view(-1, block_stride)[:, offset : offset + page_bytes]
             .view(dtype)
-            .view(kv_cache_shape)
+            .view(permuted_kv_cache_shape)
         )
     elif kv_cache_spec.page_size_padded is not None:
         # Use a strided view to skip the padding between physical pages.
@@ -235,10 +250,13 @@ def _reshape_attention_kv_cache(
             "kv-first layouts are not supported."
         )
         dtype_size = get_dtype_size(kv_cache_spec.dtype)
-        page_stride = kv_cache_spec.page_size_bytes // dtype_size
+        assert kv_cache_spec.page_size_bytes % num_blocks_per_kv_block == 0
+        page_stride = (
+            kv_cache_spec.page_size_bytes // num_blocks_per_kv_block // dtype_size
+        )
 
         num_blocks_dim = inv_order[0]
-        strides = list(torch.empty(permuted_kv_cache_shape).stride())
+        strides = list(torch.empty(permuted_kv_cache_shape, device="meta").stride())
         strides[num_blocks_dim] = page_stride
 
         kv_cache = torch.as_strided(
@@ -311,16 +329,20 @@ def _reshape_kv_cache(
                 # quantized cache dtype's (possibly packed) layout.
                 layer_cache_dtype = (
                     "auto"
-                    if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                    if cache_dtype != "fp8_ds_mla"
+                    and kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
                     and not isinstance(kv_cache_spec, TQFullAttentionSpec)
                     else cache_dtype
+                )
+                cache_dtype_str = (
+                    getattr(kv_cache_spec, "cache_dtype_str", None) or layer_cache_dtype
                 )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
                     kernel_block_size,
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
-                    cache_dtype_str=layer_cache_dtype,
+                    cache_dtype_str=cache_dtype_str,
                 )
 
                 # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
@@ -336,6 +358,7 @@ def _reshape_kv_cache(
                     kv_cache_shape,
                     kv_cache_stride_order,
                     kernel_num_blocks,
+                    num_blocks_per_kv_block,
                     packing,
                 )
 
@@ -477,7 +500,8 @@ def _update_hybrid_attention_layout(
         # but it keeps both call sites consistent for skip layers.
         layer_cache_dtype = (
             "auto"
-            if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+            if cache_dtype != "fp8_ds_mla"
+            and kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
             and not isinstance(kv_cache_spec, TQFullAttentionSpec)
             else cache_dtype
         )
@@ -540,7 +564,15 @@ def init_kv_cache(
         shared_kv_cache_layers=shared_kv_cache_layers,
         kv_cache_config=kv_cache_config,
     )
-    bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
+    # Dual-attention models (e.g. LongCat-Flash) put two Attention modules per
+    # decoder layer, so a layer name carries two integers (layer + module index).
+    num_attn_module = (
+        2
+        if vllm_config.model_config.hf_config.model_type
+        in ("longcat_flash", "longcat_flash_ngram")
+        else 1
+    )
+    bind_kv_cache(kv_caches, forward_context, runner_kv_caches, num_attn_module)
     return kv_caches
 
 
@@ -568,6 +600,7 @@ def build_attn_metadata(
     slot_mappings: torch.Tensor,
     kv_cache_config: KVCacheConfig,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+    max_seq_len_upper_bound: int | None = None,
     dcp_local_seq_lens: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None,
@@ -575,6 +608,8 @@ def build_attn_metadata(
     for_cudagraph_capture: bool = False,
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
+    is_prefilling: torch.Tensor | None = None,
+    max_req_tokens: int = 0,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -584,12 +619,30 @@ def build_attn_metadata(
 
     attn_metadata: dict[str, Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+    batch_topology = CommonAttentionBatchTopology(
+        query_start_loc_np=query_start_loc_cpu.numpy(),
+        num_reqs=num_reqs,
+        max_query_len=max_query_len,
+        max_seq_len_upper_bound=(
+            max_seq_len if max_seq_len_upper_bound is None else max_seq_len_upper_bound
+        ),
+    )
+    exact_cached_attn_metadata: dict[tuple[Any, ...], Any] = {}
+    # Every cache group sees the same request-level sequence and query lengths.
+    # Builders such as GDN lazily derive num_computed_tokens from those tensors;
+    # carry that result across groups instead of launching the same subtraction
+    # chain once per group.
+    shared_num_computed_tokens: torch.Tensor | None = None
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
         # Per-group causal for hybrid drafters (mixed SWA/full attention).
         group_causal = (
             causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
+        )
+        group_spec = kv_cache_config.kv_cache_groups[i].kv_cache_spec
+        group_dcp_local_seq_lens = (
+            None if getattr(group_spec, "dcp_replicated", False) else dcp_local_seq_lens
         )
 
         common_attn_metadata_extra_kwargs = (
@@ -609,19 +662,45 @@ def build_attn_metadata(
             block_table_tensor=block_table,
             slot_mapping=slot_mapping,
             causal=group_causal,
-            dcp_local_seq_lens=dcp_local_seq_lens,
+            dcp_local_seq_lens=group_dcp_local_seq_lens,
             positions=positions,
             mm_req_doc_ranges=mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
+            batch_topology=batch_topology,
+            max_req_tokens=max_req_tokens,
+            is_prefilling=is_prefilling,
             **common_attn_metadata_extra_kwargs,
         )
+        if (
+            shared_num_computed_tokens is not None
+            and common_attn_metadata._num_computed_tokens_cache is None
+        ):
+            common_attn_metadata._num_computed_tokens_cache = shared_num_computed_tokens
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
+            can_reuse_exact_metadata = (
+                not for_cudagraph_capture
+                and attn_metadata_builder.supports_exact_metadata_reuse
+            )
+            exact_cache_key = (
+                exact_attention_metadata_cache_key(
+                    attn_group.kv_cache_spec,
+                    type(attn_metadata_builder),
+                    0,
+                    common_attn_metadata,
+                )
+                if can_reuse_exact_metadata
+                else None
+            )
             if for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
                     common_attn_metadata
                 )
+            elif can_reuse_exact_metadata and (
+                exact_cache_key in exact_cached_attn_metadata
+            ):
+                metadata = exact_cached_attn_metadata[exact_cache_key]
             else:
                 attn_metadata_extra_kwargs = (
                     model_specific_attn_metadata.get_extra_attn_kwargs(
@@ -636,8 +715,13 @@ def build_attn_metadata(
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
+                if can_reuse_exact_metadata:
+                    assert exact_cache_key is not None
+                    exact_cached_attn_metadata[exact_cache_key] = metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
+        if shared_num_computed_tokens is None:
+            shared_num_computed_tokens = common_attn_metadata._num_computed_tokens_cache
     return attn_metadata
 
 

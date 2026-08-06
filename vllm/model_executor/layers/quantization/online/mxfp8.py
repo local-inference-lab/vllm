@@ -33,6 +33,20 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
+_SHARED_EXPERT_PROJECTIONS = frozenset(
+    {"gate_proj", "up_proj", "gate_up_proj", "down_proj"}
+)
+
+
+def is_shared_expert_projection(prefix: str) -> bool:
+    """Return whether a module path is a shared-expert MLP projection."""
+    parts = prefix.split(".")
+    return (
+        len(parts) >= 2
+        and parts[-1] in _SHARED_EXPERT_PROJECTIONS
+        and parts[-2] in {"shared_expert", "shared_experts"}
+    )
+
 
 class Mxfp8OnlineLinearMethod(_Fp8OnlineLinearBase):
     """Online MXFP8 linear method.

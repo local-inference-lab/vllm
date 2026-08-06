@@ -17,15 +17,20 @@ DATA_GENERATION = ["random", "10LSBits"]
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 
-def _has_device_capability(major: int) -> bool:
-    return current_platform.is_cuda() and current_platform.has_device_capability(major)
+def _is_device_capability_family(capability: int) -> bool:
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        capability
+    )
 
 
+# Match the production dispatch in sparse_attn_indexer.py: cooperative_topk is
+# an SM90-family path (it can launch-fail on SM120), so only test it there.
 COOPERATIVE_TOPK_BACKEND = pytest.param(
     "cooperative_topk",
     marks=pytest.mark.skipif(
-        not _has_device_capability(90),
-        reason="cooperative_topk requires SM90+",
+        not _is_device_capability_family(90),
+        reason="cooperative_topk requires the SM90 family (matches production "
+        "dispatch)",
     ),
 )
 WORKSPACE_TOPK_BACKENDS = ["persistent_topk", COOPERATIVE_TOPK_BACKEND]
@@ -803,7 +808,10 @@ def test_deepseek_topk_backends_no_error_and_reference(
     )
 
 
-@pytest.mark.skipif(not _has_device_capability(90), reason="This test requires SM90+")
+@pytest.mark.skipif(
+    not _is_device_capability_family(90),
+    reason="cooperative_topk requires the SM90 family (matches production dispatch)",
+)
 @torch.inference_mode()
 def test_cooperative_topk_512_tie_workspace_is_per_row() -> None:
     """Regression test for TopK=512 tie workspace row overlap."""

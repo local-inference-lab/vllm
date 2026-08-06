@@ -143,11 +143,14 @@ class LoggingStatLogger(StatLoggerBase):
 
     def _track_iteration_stats(self, iteration_stats: IterationStats):
         # Save tracked stats for token counters.
-        # Use computed tokens for prompt throughput (excludes cached/transferred)
-        self.num_prompt_tokens += iteration_stats.prompt_token_stats.computed
         self.num_generation_tokens += iteration_stats.num_generation_tokens
         self.num_corrupted_reqs += iteration_stats.num_corrupted_reqs
         self.num_preemptions += iteration_stats.num_preempted_reqs
+
+    def _track_scheduler_stats(self, scheduler_stats: SchedulerStats):
+        # Use scheduled context tokens for prompt throughput so chunked prefills
+        # are counted as each chunk finishes, not only when the request outputs.
+        self.num_prompt_tokens += scheduler_stats.num_scheduled_prompt_tokens
 
     def _get_throughput(self, tracked_stats: int, now: float) -> float:
         # Compute summary metrics for tracked stats
@@ -159,6 +162,42 @@ class LoggingStatLogger(StatLoggerBase):
     @property
     def log_prefix(self):
         return "Engine {:03d}: ".format(self.engine_index)
+
+    def _log_prefix_for_engine(self, engine_idx: int) -> str:
+        if self.engine_index == engine_idx:
+            return self.log_prefix
+        return "Engine {:03d}: ".format(engine_idx)
+
+    def _log_iteration_details(
+        self, scheduler_stats: SchedulerStats, engine_idx: int
+    ) -> None:
+        details = scheduler_stats.iteration_details
+        if details is None:
+            return
+
+        encoder_msg = ""
+        if details.num_encoder_inputs:
+            encoder_msg = (
+                f", encoder inputs: {details.num_encoder_inputs}, "
+                f"encoder output embeddings: {details.num_encoder_output_tokens}"
+            )
+
+        logger.info(
+            "%sIteration(%d): %d context requests, %d context tokens, "
+            "%d generation requests, %d generation tokens, "
+            "iteration elapsed time: %.2f ms%s, "
+            "GPU KV cache usage: %.1f%%%s",
+            self._log_prefix_for_engine(engine_idx),
+            details.iteration_index,
+            details.num_ctx_requests,
+            details.num_ctx_tokens,
+            details.num_generation_requests,
+            details.num_generation_tokens,
+            details.elapsed_ms,
+            " (dummy)" if details.is_dummy else "",
+            scheduler_stats.kv_cache_usage * 100,
+            encoder_msg,
+        )
 
     def record(
         self,
@@ -172,6 +211,8 @@ class LoggingStatLogger(StatLoggerBase):
             self._track_iteration_stats(iteration_stats)
 
         if scheduler_stats is not None:
+            self._log_iteration_details(scheduler_stats, engine_idx)
+            self._track_scheduler_stats(scheduler_stats)
             self.prefix_caching_metrics.observe(scheduler_stats.prefix_cache_stats)
 
             if scheduler_stats.connector_prefix_cache_stats is not None:

@@ -6,6 +6,11 @@ import torch
 
 from tests.v1.attention.test_attention_backends import BATCH_SPECS
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
+from vllm.v1.attention.backend import (
+    CommonAttentionBatchTopology,
+    CommonAttentionMetadata,
+)
+from vllm.v1.attention.backends.mla.indexer import split_indexer_prefill_chunks
 from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
@@ -179,6 +184,106 @@ def apply_split_decodes_and_prefills(
         decode_threshold=decode_threshold,
         require_uniform=require_uniform,
     )
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "query_lens", "decode_threshold", "require_uniform", "num_tokens"),
+    [
+        ([10, 20, 30], [1, 1, 1], 1, False, None),
+        ([10, 20, 30, 40], [1, 2, 5, 5], 2, False, None),
+        ([10, 20, 30], [5, 1, 1], 4, False, None),
+        ([10, 20, 0, 0], [1, 1, 0, 0], 1, True, 8),
+    ],
+)
+def test_common_attention_batch_topology_split_matches_torch_helper(
+    seq_lens: list[int],
+    query_lens: list[int],
+    decode_threshold: int,
+    require_uniform: bool,
+    num_tokens: int | None,
+):
+    common_metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=seq_lens, query_lens=query_lens),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    if num_tokens is not None:
+        common_metadata.num_actual_tokens = num_tokens
+
+    expected = split_decodes_and_prefills(
+        common_metadata,
+        decode_threshold=decode_threshold,
+        require_uniform=require_uniform,
+    )
+    topology = CommonAttentionBatchTopology(
+        query_start_loc_np=common_metadata.query_start_loc_cpu.numpy(),
+        num_reqs=common_metadata.num_reqs,
+        max_query_len=common_metadata.max_query_len,
+        max_seq_len_upper_bound=common_metadata.max_seq_len,
+    )
+    common_metadata = common_metadata.replace(batch_topology=topology)
+
+    assert common_metadata.split_decodes_and_prefills(
+        decode_threshold=decode_threshold,
+        require_uniform=require_uniform,
+    ) == expected
+
+
+def test_common_attention_batch_topology_handles_padded_requests():
+    query_start_loc_cpu = torch.tensor([0, 1, 3, 3, 3], dtype=torch.int32)
+    topology = CommonAttentionBatchTopology(
+        query_start_loc_np=query_start_loc_cpu.numpy(),
+        num_reqs=4,
+        max_query_len=2,
+        max_seq_len_upper_bound=6,
+    )
+    common_metadata = CommonAttentionMetadata(
+        query_start_loc=query_start_loc_cpu,
+        query_start_loc_cpu=query_start_loc_cpu,
+        seq_lens=torch.tensor([5, 6, 0, 0], dtype=torch.int32),
+        num_reqs=4,
+        num_actual_tokens=8,
+        max_query_len=2,
+        max_seq_len=6,
+        block_table_tensor=torch.zeros((4, 1), dtype=torch.int32),
+        slot_mapping=torch.full((8,), -1, dtype=torch.int64),
+        causal=True,
+        batch_topology=topology,
+    )
+
+    assert topology.query_lens_np.tolist() == [1, 2, 0, 0]
+    assert topology.req_id_per_token_np.tolist() == [0, 1, 1]
+    assert common_metadata.split_decodes_and_prefills(decode_threshold=1) == (
+        1,
+        3,
+        1,
+        7,
+    )
+    assert len(topology._split_decodes_and_prefills_cache) == 1
+    assert common_metadata.replace(max_query_len=3).batch_topology is None
+
+
+def test_split_indexer_prefill_chunks_accepts_numpy_inputs():
+    seq_lens_cpu = torch.tensor([8, 16, 32, 4], dtype=torch.int32)
+    query_lens_cpu = torch.tensor([2, 4, 8, 1], dtype=torch.int32)
+
+    expected = split_indexer_prefill_chunks(
+        seq_lens_cpu,
+        query_lens_cpu,
+        workspace_size=40,
+        max_logits_bytes=512,
+        request_offset=3,
+    )
+
+    actual = split_indexer_prefill_chunks(
+        seq_lens_cpu.numpy(),
+        query_lens_cpu.numpy(),
+        workspace_size=40,
+        max_logits_bytes=512,
+        request_offset=3,
+    )
+
+    assert actual == expected
 
 
 def test_split_decodes_and_prefills_nonuniform_all_ones():

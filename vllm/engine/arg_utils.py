@@ -547,7 +547,7 @@ class EngineArgs:
     quantization: QuantizationMethods | str | None = ModelConfig.quantization
     quantization_config: "dict[str, Any] | QuantizationConfigArgs | None" = None
     """User-facing quantization configuration. Carries per-layer-kind
-    QuantSpecs (linear, moe) and ignore patterns; see
+    QuantSpecs (linear, moe, shared_experts) and ignore patterns; see
     :class:`QuantizationConfigArgs`. Auto-populated from the matching online
     shorthand when `quantization` is one of the values in
     `ONLINE_QUANT_SHORTHAND_NAMES`."""
@@ -602,6 +602,7 @@ class EngineArgs:
     enable_tower_connector_lora: bool = LoRAConfig.enable_tower_connector_lora
     specialize_active_lora: bool = LoRAConfig.specialize_active_lora
     enable_mixed_moe_lora_format: bool = LoRAConfig.enable_mixed_moe_lora_format
+    enable_moe_shared_loras: bool = LoRAConfig.enable_moe_shared_loras
 
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
@@ -630,6 +631,7 @@ class EngineArgs:
     spec_method: str | None = None
     spec_model: str | None = None
     spec_tokens: int | None = None
+    dspark_capacity_verification_mode: Literal["varlen", "mask"] | None = None
     diffusion_config: dict[str, Any] | None = None
 
     show_hidden_metrics_for_version: str | None = (
@@ -665,6 +667,7 @@ class EngineArgs:
     enable_flashinfer_autotune: bool = get_field(
         KernelConfig, "enable_flashinfer_autotune"
     )
+    enable_bf16x3_router_gemm: bool | None = None
     worker_cls: str = ParallelConfig.worker_cls
     worker_extension_cls: str = ParallelConfig.worker_extension_cls
 
@@ -693,6 +696,7 @@ class EngineArgs:
     mamba_cache_dtype: MambaDType = CacheConfig.mamba_cache_dtype
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
+    prefix_match_unit: int | None = get_field(CacheConfig, "prefix_match_unit")
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
@@ -1195,6 +1199,9 @@ class EngineArgs:
             "--mamba-block-size", **cache_kwargs["mamba_block_size"]
         )
         cache_group.add_argument(
+            "--prefix-match-unit", **cache_kwargs["prefix_match_unit"]
+        )
+        cache_group.add_argument(
             "--mamba-cache-mode", **cache_kwargs["mamba_cache_mode"]
         )
         cache_group.add_argument(
@@ -1345,6 +1352,10 @@ class EngineArgs:
         lora_group.add_argument(
             "--enable-mixed-moe-lora-format",
             **lora_kwargs["enable_mixed_moe_lora_format"],
+        )
+        lora_group.add_argument(
+            "--enable-moe-shared-loras",
+            **lora_kwargs["enable_moe_shared_loras"],
         )
 
         # Observability arguments
@@ -1504,6 +1515,10 @@ class EngineArgs:
             "--enable-flashinfer-autotune",
             **kernel_kwargs["enable_flashinfer_autotune"],
         )
+        kernel_group.add_argument(
+            "--enable-bf16x3-router-gemm",
+            **kernel_kwargs["enable_bf16x3_router_gemm"],
+        )
         moe_backend_kwargs = kernel_kwargs["moe_backend"]
         moe_backend_kwargs["type"] = lambda s: s.lower().replace("-", "_")
         kernel_group.add_argument("--moe-backend", **moe_backend_kwargs)
@@ -1529,6 +1544,12 @@ class EngineArgs:
         vllm_group.add_argument("--spec-model", **speculative_kwargs["model"])
         vllm_group.add_argument(
             "--spec-tokens", **speculative_kwargs["num_speculative_tokens"]
+        )
+        vllm_group.add_argument(
+            "--dspark-capacity-verification-mode",
+            choices=["varlen", "mask"],
+            default=None,
+            help=speculative_kwargs["dspark_capacity_verification_mode"]["help"],
         )
         vllm_kwargs["diffusion_config"]["type"] = optional_type(json.loads)
         vllm_group.add_argument(
@@ -1736,6 +1757,11 @@ class EngineArgs:
             ("--spec-method", "method", self.spec_method),
             ("--spec-model", "model", self.spec_model),
             ("--spec-tokens", "num_speculative_tokens", self.spec_tokens),
+            (
+                "--dspark-capacity-verification-mode",
+                "dspark_capacity_verification_mode",
+                self.dspark_capacity_verification_mode,
+            ),
         ):
             if value is None:
                 continue
@@ -1749,6 +1775,10 @@ class EngineArgs:
 
         if self.speculative_config is None:
             return None
+
+        self.speculative_config = {
+            k.replace("-", "_"): v for k, v in self.speculative_config.items()
+        }
 
         # Note(Shangming): These parameters are not obtained from the cli arg
         # '--speculative-config' and must be passed in when creating the engine
@@ -1899,6 +1929,7 @@ class EngineArgs:
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
+            prefix_match_unit=self.prefix_match_unit,
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
@@ -2199,6 +2230,7 @@ class EngineArgs:
                 enable_tower_connector_lora=self.enable_tower_connector_lora,
                 specialize_active_lora=self.specialize_active_lora,
                 enable_mixed_moe_lora_format=self.enable_mixed_moe_lora_format,
+                enable_moe_shared_loras=self.enable_moe_shared_loras,
                 max_cpu_loras=self.max_cpu_loras
                 if self.max_cpu_loras and self.max_cpu_loras > 0
                 else None,
@@ -2277,6 +2309,8 @@ class EngineArgs:
                     "are mutually exclusive"
                 )
             kernel_config.enable_flashinfer_autotune = self.enable_flashinfer_autotune
+        if self.enable_bf16x3_router_gemm is not None:
+            kernel_config.enable_bf16x3_router_gemm = self.enable_bf16x3_router_gemm
         if self.moe_backend != "auto":
             kernel_config.moe_backend = self.moe_backend
         if self.linear_backend != "auto":
@@ -2493,7 +2527,11 @@ class EngineArgs:
         self, model_config: ModelConfig
     ) -> None:
         default_chunked_prefill = model_config.is_chunked_prefill_supported
-        default_prefix_caching = model_config.is_prefix_caching_supported
+        # Hybrid models support prefix caching but keep it opt-in for now
+        # while the feature matures.
+        default_prefix_caching = (
+            model_config.is_prefix_caching_supported and not model_config.is_hybrid
+        )
 
         if self.enable_chunked_prefill is None:
             self.enable_chunked_prefill = default_chunked_prefill
@@ -2560,10 +2598,8 @@ class EngineArgs:
             self.enable_prefix_caching = False
 
     def _set_default_reasoning_config_args(self):
-        if not self.reasoning_parser:
+        if not self.reasoning_parser or self.reasoning_config is None:
             return
-        if self.reasoning_config is None:
-            self.reasoning_config = ReasoningConfig()
         self.reasoning_config.reasoning_parser = self.reasoning_parser
 
     @staticmethod

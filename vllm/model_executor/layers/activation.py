@@ -158,6 +158,34 @@ class SiluAndMul(CustomOp):
         return self.forward_native(x)
 
 
+@CustomOp.register("situ_and_mul")
+class SituAndMul(CustomOp):
+    """SiTU activation used by Kimi models."""
+
+    def __init__(
+        self,
+        beta: float = 1.0,
+        linear_beta: float | None = None,
+        *,
+        compile_native: bool = True,
+    ) -> None:
+        super().__init__(compile_native=compile_native)
+        self.beta = float(beta)
+        self.linear_beta = None if linear_beta is None else float(linear_beta)
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        gate = x[..., :d].float()
+        up = x[..., d:].float()
+        gate = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
+        if self.linear_beta is not None:
+            up = self.linear_beta * torch.tanh(up / self.linear_beta)
+        return (gate * up).to(x.dtype)
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
+
 @CustomOp.register("silu_and_mul_with_clamp")
 class SiluAndMulWithClamp(CustomOp):
     """SwiGLU activation with input clamping (used by some MoE shared experts).
@@ -613,13 +641,19 @@ class ReLUSquaredActivation(CustomOp):
 
     # --8<-- [end:relu2]
 
+    def __init__(self):
+        super().__init__()
+        if current_platform.is_cuda_alike():
+            self.op = torch.ops._C.relu_squared
+
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
         return torch.square(F.relu(x))
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO : implement cuda kernels
-        return self.forward_native(x)
+        out = torch.empty_like(x)
+        self.op(out, x)
+        return out
 
 
 # --8<-- [start:xielu]

@@ -240,7 +240,7 @@ def _compute_local_logits_stats_kernel(
             other=float("-inf"),
         ).to(tl.float32)
         value, idx = tl.max(target_logits, axis=0, return_indices=True)
-        token_id = block_idx * BLOCK_SIZE + idx
+        token_id = tl.minimum(block_idx * BLOCK_SIZE + idx, vocab_size - 1)
         tl.store(
             target_local_argmax_ptr
             + logit_idx * target_local_argmax_stride
@@ -785,11 +785,13 @@ def _resample_kernel(
         None,  # processed_logits_ptr
         0,  # processed_logits_stride
         None,  # processed_logits_col_ptr
+        None,  # processed_logits_active_rows_ptr
         vocab_size,
         APPLY_TEMPERATURE=False,
+        HAS_ACTIVE_ROW_LIMIT=False,
         USE_FP64=USE_FP64,
     )
-    token_id = block_idx * BLOCK_SIZE + idx
+    token_id = tl.minimum(block_idx * BLOCK_SIZE + idx, vocab_size - 1)
     tl.store(
         resampled_local_argmax_ptr
         + req_idx * resampled_local_argmax_stride
@@ -1023,7 +1025,7 @@ def rejection_sample(
 
     # Sample up until the first rejected/bonus token, and store
     # the step.
-    sampled = draft_sampled.new_empty(
+    sampled = draft_sampled.new_zeros(
         num_reqs, num_speculative_steps + 1, dtype=torch.int64
     )
     num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)

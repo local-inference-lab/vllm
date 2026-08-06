@@ -3,6 +3,7 @@
 """Utilities for selecting and loading models."""
 
 import inspect
+import itertools
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -98,10 +99,49 @@ def initialize_model(
     return model
 
 
+def _log_device_tensor_census(model: nn.Module, tag: str) -> None:
+    """K3-DIAG: log where device memory sits, grouped by param leaf name/dtype."""
+    import collections
+
+    alloc = torch.cuda.memory_allocated() / 2**30
+    reserved = torch.cuda.memory_reserved() / 2**30
+    by_kind: collections.Counter = collections.Counter()
+    seen: set[int] = set()
+    for name, tensor in itertools.chain(
+        model.named_parameters(), model.named_buffers()
+    ):
+        if tensor is None or id(tensor) in seen:
+            continue
+        seen.add(id(tensor))
+        if tensor.device.type != "cuda":
+            continue
+        key = (name.rsplit(".", 1)[-1], str(tensor.dtype).removeprefix("torch."))
+        by_kind[key] += tensor.numel() * tensor.element_size()
+    total = sum(by_kind.values()) / 2**30
+    logger.info(
+        "K3-DIAG[%s] cuda_alloc=%.2f reserved=%.2f named_tensor_total=%.2f GiB "
+        "(untracked=%.2f)",
+        tag, alloc, reserved, total, alloc - total,
+    )
+    for key, nbytes in by_kind.most_common(20):
+        if nbytes < 50 * 2**20:
+            break
+        logger.info("K3-DIAG[%s]   %-34s %8.3f GiB", tag, str(key), nbytes / 2**30)
+
+
 def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
-    for _, module in model.named_modules():
+    _log_device_tensor_census(model, "pre-process")
+    # Convert routed-experts layers LAST: their per-layer repack transients
+    # then run against a model whose dense linears have already been
+    # quantized/frozen, minimizing peak memory on tight-VRAM deployments.
+    modules = list(model.named_modules())
+    modules.sort(
+        key=lambda nm: type(getattr(nm[1], "quant_method", None)).__name__
+        == "NvFp4Nf3HybridMoEMethod"
+    )
+    for _, module in modules:
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
             # When quant methods need to process weights after loading
@@ -114,6 +154,8 @@ def process_weights_after_loading(
             # Repacking transients above can leave large amounts of memory in
             # the caching allocator, which starves the OS on UMA devices.
             release_device_memory_under_pressure(target_device)
+
+    _log_device_tensor_census(model, "post-process")
 
     # Initialize post-load attention weights for Attention, MLA, and MM encoder.
     # NOTE: Happens after other modules so we can easily decompress weights.
@@ -154,6 +196,10 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
     # Store original device states and move parameters to GPU if they're on CPU
     for name, p in module.named_parameters():
         if p.device.type == "cpu":
+            if getattr(p, "_vllm_keep_on_cpu", False):
+                # Deliberately CPU-staged (e.g. streamed NF3 repack at
+                # near-capacity VRAM); the quant method streams it itself.
+                continue
             original_device_states[name] = p.device
             p.data = p.data.to(target_device)
         if getattr(p, "_vllm_is_uva_offloaded", False):

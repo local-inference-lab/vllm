@@ -48,6 +48,8 @@ static constexpr int NumTopGroupScores = 2;
 static constexpr int DefaultMaxNumTopExperts = 8;
 static constexpr int MaxSupportedTopExperts = 22;
 static constexpr int MaxNumTopGroups = 4;
+static constexpr int LargeSingleGroupMaxExperts = 4096;
+static constexpr int LargeSingleGroupMaxTokens = 128;
 // The empirical value for small batch
 static constexpr int PDLEnableTokens = 16;
 namespace warp_topk {
@@ -675,6 +677,126 @@ __global__ void grouped_topk_fused_kernel(
 #endif
 }
 
+template <typename T, typename BiasT, typename IdxT, ScoringFunc SF>
+__global__ void grouped_topk_fused_single_group_kernel(
+    T* scores, float* topk_values, IdxT* topk_indices, BiasT const* bias,
+    int64_t const num_tokens, int64_t const num_experts, int64_t const topk,
+    bool renormalize, double routed_scaling_factor) {
+  int32_t const token_id = static_cast<int32_t>(blockIdx.x);
+  if (token_id >= num_tokens) {
+    return;
+  }
+
+  int32_t const thread_id = threadIdx.x;
+  int32_t const warp_id = thread_id / WARP_SIZE;
+  int32_t const lane_id = thread_id % WARP_SIZE;
+  int32_t const topk_i32 = static_cast<int32_t>(topk);
+  int32_t const num_experts_i32 = static_cast<int32_t>(num_experts);
+
+  T* scores_token = scores + static_cast<int64_t>(token_id) * num_experts;
+  topk_values += static_cast<int64_t>(token_id) * topk;
+  topk_indices += static_cast<int64_t>(token_id) * topk;
+
+  int32_t const num_warps = blockDim.x / WARP_SIZE;
+  cg::thread_block block = cg::this_thread_block();
+  cg::thread_block_tile<WARP_SIZE> tile = cg::tiled_partition<WARP_SIZE>(block);
+
+  extern __shared__ char smem_buf[];
+  size_t const val_bytes =
+      static_cast<size_t>(num_warps) * WARP_SIZE * sizeof(T);
+  size_t const val_bytes_aligned =
+      warp_topk::round_up_to_multiple_of<256>(val_bytes);
+  size_t const idx_bytes =
+      static_cast<size_t>(num_warps) * WARP_SIZE * sizeof(int32_t);
+  size_t const internal_bytes = val_bytes_aligned + idx_bytes;
+  uintptr_t candidate_ptr =
+      reinterpret_cast<uintptr_t>(smem_buf + internal_bytes);
+  candidate_ptr =
+      (candidate_ptr + 15) & ~static_cast<uintptr_t>(15);  // align to 16B
+  T* candidate_scores = reinterpret_cast<T*>(candidate_ptr);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+
+  // Selecting one group out of one is an identity operation. Cooperatively
+  // stage the biased scores so their global loads and scoring are performed
+  // once, then let warp 0 select experts from low-latency shared memory.
+  for (int32_t i = thread_id; i < num_experts_i32; i += blockDim.x) {
+    T candidate = neg_inf<T>();
+    T input = scores_token[i];
+    if (is_finite(input)) {
+      candidate = apply_scoring<SF>(input) + static_cast<T>(bias[i]);
+    }
+    candidate_scores[i] = candidate;
+  }
+  __syncthreads();
+
+  if (warp_id != 0) {
+    return;
+  }
+
+  warp_topk::WarpSelect</*capability*/ WARP_SIZE, /*greater*/ true, T, int32_t,
+                        /* is_stable */ true>
+      expert_sel(topk_i32, neg_inf<T>());
+
+  int32_t const aligned_num_experts =
+      warp_topk::round_up_to_multiple_of<WARP_SIZE>(num_experts_i32);
+  for (int32_t i = lane_id; i < aligned_num_experts; i += WARP_SIZE) {
+    // All lanes must call add() the same number of times.
+    T candidate = neg_inf<T>();
+    int32_t expert_id = 0;
+    if (i < num_experts_i32) {
+      expert_id = i;
+      candidate = candidate_scores[expert_id];
+    }
+    expert_sel.add(candidate, expert_id);
+  }
+  expert_sel.done();
+
+  // Preserve the generic path's top-2 group-score validity check.
+  T first_val = __shfl_sync(FULL_WARP_MASK, expert_sel.get_val(0), 0);
+  T second_val = __shfl_sync(FULL_WARP_MASK, expert_sel.get_val(0), 1);
+  bool const proceed = (first_val + second_val != neg_inf<T>());
+  if (!proceed) {
+    if (lane_id < topk_i32) {
+      topk_indices[lane_id] = static_cast<IdxT>(lane_id);
+      topk_values[lane_id] = 1.0f / static_cast<float>(topk_i32);
+    }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+    return;
+  }
+
+  float lane_unbiased = 0.0f;
+  IdxT lane_idx = 0;
+  if (lane_id < topk_i32) {
+    lane_idx = static_cast<IdxT>(expert_sel.get_idx(0));
+    T input = scores_token[static_cast<int32_t>(lane_idx)];
+    lane_unbiased = cuda_cast<float, T>(apply_scoring<SF>(input));
+  }
+
+  float topk_sum = 1e-20f;
+  if (renormalize) {
+    topk_sum += cg::reduce(tile, lane_unbiased, cg::plus<float>());
+  }
+
+  float scale = static_cast<float>(routed_scaling_factor);
+  if (renormalize) {
+    scale /= topk_sum;
+  }
+
+  if (lane_id < topk_i32) {
+    topk_indices[lane_id] = lane_idx;
+    topk_values[lane_id] = lane_unbiased * scale;
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 template <typename T, typename BiasT, typename IdxT, ScoringFunc SF,
           int MaxNumExperts, bool UseGroups,
           int MaxNumTopExperts = DefaultMaxNumTopExperts>
@@ -912,6 +1034,11 @@ void invokeNoAuxTc(T* scores, float* topk_values, IdxT* topk_indices,
       (n_group == 1) && (topk_group == 1) &&
       (num_experts <= MaxSupportedExpertCount) &&
       (topk <= DefaultMaxNumTopExperts || topk == MaxSupportedTopExperts);
+  bool const is_large_single_group =
+      (n_group == 1) && (topk_group == 1) &&
+      (num_experts > MaxSupportedExpertCount) &&
+      (num_experts <= LargeSingleGroupMaxExperts) && (topk >= 2) &&
+      (num_tokens <= LargeSingleGroupMaxTokens);
 
   int64_t const experts_per_group = num_experts / n_group;
   bool const is_multi_group =
@@ -920,7 +1047,23 @@ void invokeNoAuxTc(T* scores, float* topk_values, IdxT* topk_indices,
       (experts_per_group * topk_group <= MaxNumExpertsUnit) &&
       (topk <= DefaultMaxNumTopExperts) && (topk_group <= MaxNumTopGroups);
 
-  if (is_single_group || is_multi_group) {
+  if (is_large_single_group) {
+    auto* kernel_instance =
+        &grouped_topk_fused_single_group_kernel<T, BiasT, IdxT, SF>;
+    int32_t constexpr num_warps = 32;
+    config.gridDim = static_cast<uint32_t>(num_tokens);
+    config.blockDim = num_warps * WARP_SIZE;
+    size_t const val_bytes = num_warps * WARP_SIZE * sizeof(T);
+    size_t const val_bytes_aligned =
+        warp_topk::round_up_to_multiple_of<256>(val_bytes);
+    size_t const idx_bytes = num_warps * WARP_SIZE * sizeof(int32_t);
+    size_t const candidate_bytes =
+        16 + static_cast<size_t>(num_experts) * sizeof(T);
+    config.dynamicSmemBytes = val_bytes_aligned + idx_bytes + candidate_bytes;
+    cudaLaunchKernelEx(&config, kernel_instance, scores, topk_values,
+                       topk_indices, bias, num_tokens, num_experts, topk,
+                       renormalize, routed_scaling_factor);
+  } else if (is_single_group || is_multi_group) {
     auto* kernel_instance =
         &grouped_topk_fused_small_expert_count_kernel<T, BiasT, IdxT, SF,
                                                       NumDeepseekExperts, true>;

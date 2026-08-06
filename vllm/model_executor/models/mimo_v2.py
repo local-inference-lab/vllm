@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -51,7 +52,6 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .interfaces import (
     EagleModelMixin,
@@ -70,6 +70,12 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+# Escape hatch for A/B testing the DFlash aux-feature fix: set to 1 to restore
+# the old behavior of capturing the last aux hidden state before final norm.
+_DFLASH_PRENORM_LAST_AUX = (
+    os.environ.get("VLLM_DFLASH_PRENORM_LAST_AUX", "0") == "1"
+)
 
 
 class MiMoV2MLP(nn.Module):
@@ -291,6 +297,9 @@ class MiMoV2Attention(nn.Module):
             },
         )
 
+        if os.getenv("VLLM_MIMO_DISABLE_ATTENTION_SINKS") == "1":
+            add_swa_attention_sink_bias = False
+
         self.attention_sink_bias = (
             torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
             if add_swa_attention_sink_bias
@@ -299,29 +308,34 @@ class MiMoV2Attention(nn.Module):
 
         sliding_window = sliding_window_size if sliding_window_size > -1 else None
 
-        # Use DiffKV backend when V has a different head dim than K.
-        # Auto-pick FA-DiffKV when FA3/4 is usable on this device, else fall
-        # back to TRITON_ATTN_DIFFKV.  Users can force a choice via
-        # `--attention-backend <FLASH_ATTN_DIFFKV|TRITON_ATTN_DIFFKV>`.
-        if self.v_head_dim != self.head_dim:
-            requested = get_current_vllm_config().attention_config.backend
-            if requested is not None and requested.name.endswith("_DIFFKV"):
-                backend_enum = requested
-            else:
-                fa_backend = AttentionBackendEnum.FLASH_ATTN_DIFFKV.get_class()
-                if fa_backend.is_supported_on_current_device(
-                    head_size=self.head_dim,
-                    head_size_v=self.v_head_dim,
-                    has_sinks=self.attention_sink_bias is not None,
-                ):
-                    backend_enum = AttentionBackendEnum.FLASH_ATTN_DIFFKV
-                else:
-                    backend_enum = AttentionBackendEnum.TRITON_ATTN_DIFFKV
-            attn_backend = backend_enum.get_class()
-            attn_backend.set_head_size_v(self.v_head_dim)
-            logger.info_once("Using %s for attention.", attn_backend.get_name())
+        configured_backend = get_current_vllm_config().attention_config.backend
+        configured_backend_name = (
+            configured_backend.name if configured_backend is not None else None
+        )
+        use_flashinfer = configured_backend_name == "FLASHINFER"
+        use_b12x_paged = configured_backend_name == "B12X_ATTN"
+
+        if use_b12x_paged:
+            from vllm.v1.attention.backends.b12x_attn import (
+                get_b12x_paged_attention_backend,
+            )
+
+            attn_backend = get_b12x_paged_attention_backend(self.v_head_dim)
         else:
             attn_backend = None
+
+        # MiMo has asymmetric K/V dims (head_dim=192, v_head_dim=128). Keep
+        # the historical Triton/FA cache layout by padding V to head_dim and
+        # slicing the attention output back before o_proj. The DiffKV backend
+        # is valid for target-only serving, but it changes DFlash long-context
+        # performance substantially because the target and draft paths no
+        # longer use the same unified attention kernels.
+        self.pad_value_for_fa = (
+            self.v_head_dim != self.head_dim
+            and not use_flashinfer
+            and not use_b12x_paged
+        )
+        attn_head_size_v = self.head_dim if self.pad_value_for_fa else self.v_head_dim
 
         self.attn = Attention(
             self.num_heads,
@@ -335,7 +349,7 @@ class MiMoV2Attention(nn.Module):
             prefix=f"{prefix}.attn",
             sinks=self.attention_sink_bias,
             attn_backend=attn_backend,
-            head_size_v=self.v_head_dim,
+            head_size_v=attn_head_size_v,
         )
 
     def forward(
@@ -351,7 +365,18 @@ class MiMoV2Attention(nn.Module):
         if self.v_scale is not None:
             v = v * self.v_scale
 
+        if self.pad_value_for_fa:
+            v = torch.nn.functional.pad(
+                v.view(-1, self.num_kv_heads, self.v_head_dim),
+                [0, self.head_dim - self.v_head_dim],
+                value=0,
+            ).reshape(-1, self.num_kv_heads * self.head_dim)
+
         attn_output = self.attn(q, k, v)
+        if self.pad_value_for_fa:
+            attn_output = attn_output.view(-1, self.num_heads, self.head_dim)[
+                ..., : self.v_head_dim
+            ].reshape(-1, self.num_heads * self.v_head_dim)
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -610,12 +635,24 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
         aux_hidden_states = self._maybe_add_hidden_state(
             [], self.start_layer, hidden_states, residual
         )
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer)
+        # The DFlash reference extracts HF `output_hidden_states` entries,
+        # where the entry after the FINAL layer is the post-final-norm hidden
+        # state (all other entries are raw residual-stream values). Mirror
+        # that: capture the last aux layer after self.norm below.
+        num_layers = len(self.layers)
+        post_norm_final_aux = (
+            num_layers in getattr(self, "aux_hidden_state_layers", ())
+            and not _DFLASH_PRENORM_LAST_AUX
+        )
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
         ):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if post_norm_final_aux and layer_idx + 1 == num_layers:
+                continue
             self._maybe_add_hidden_state(
-                aux_hidden_states, idx + 1, hidden_states, residual
+                aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
 
         if not get_pp_group().is_last_rank:
@@ -624,6 +661,11 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        if post_norm_final_aux:
+            aux_hidden_states.append(hidden_states)
+
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
@@ -871,6 +913,12 @@ class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsEa
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.model.aux_hidden_state_layers
 
     def forward(
         self,

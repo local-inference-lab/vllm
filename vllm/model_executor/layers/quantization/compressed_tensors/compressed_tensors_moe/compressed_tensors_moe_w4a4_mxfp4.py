@@ -8,6 +8,7 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoeWeightScaleSupported,
+    MoEActivation,
     RoutedExperts,
     SharedExperts,
 )
@@ -28,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     Mxfp4MoeBackend,
     make_mxfp4_moe_kernel,
     make_mxfp4_moe_quant_config,
+    select_mxfp4_moe_backend,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa E501
     CompressedTensorsMoEMethod,
@@ -49,7 +51,12 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
         # use cutlass if supported, otherwise fallback to marlin for weight-only FP4
         self.use_cutlass_mxfp4 = CutlassExpertsMxfp4._supports_current_device()
         self.experts_cls: type[mk.FusedMoEExperts]
-        if self.use_cutlass_mxfp4:
+        if moe.activation is MoEActivation.SITU:
+            self.mxfp4_backend, experts_cls = select_mxfp4_moe_backend(moe)
+            assert experts_cls is not None
+            self.experts_cls = experts_cls
+            self.use_cutlass_mxfp4 = False
+        elif self.use_cutlass_mxfp4:
             logger.info_once("Using CutlassExpertsMxfp4 for MXFP4 MoE")
             self.experts_cls = CutlassExpertsMxfp4
         elif current_platform.is_xpu():
@@ -188,6 +195,10 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight_scale = torch.nn.Parameter(
                 torch.stack(swizzled_w2), requires_grad=False
             )
+        elif self.mxfp4_backend == Mxfp4MoeBackend.B12X:
+            # B12X consumes the checkpoint's packed E2M1 values and E8M0
+            # K/32 scales directly; do not invoke the Marlin repacker.
+            pass
         elif current_platform.is_xpu():
             pass
         else:
@@ -207,6 +218,50 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
                 experts_cls=self.experts_cls,
                 mxfp4_backend=self.mxfp4_backend,
                 routing_tables=layer._expert_routing_tables(),
+            )
+            if self.mxfp4_backend == Mxfp4MoeBackend.B12X:
+                self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+                self._release_superseded_scale_storage(layer)
+
+    def _release_superseded_scale_storage(self, layer: RoutedExperts) -> None:
+        """Free checkpoint scale grids the prepared b12x weights supersede.
+
+        The W4A16 native prepare packs its own (kernel-layout) scale grids
+        and keeps the FP4 payloads by reference, so the checkpoint-layout
+        scale parameters become dead weight (~55 MiB per Kimi K3 TP16
+        layer, ~5 GiB per rank over 92 layers). Release their storage in
+        place unless the prepared representation aliases it.
+        """
+        prepared = self.moe_kernel.fused_experts._lookup_prepared_experts()
+        if prepared is None:
+            return
+        try:
+            rep = prepared.representation_for("w4a16")
+        except (KeyError, ValueError, AttributeError):
+            return
+        prep_ptrs = set()
+        for field in (
+            "w13", "w2", "w13_scale", "w2_scale",
+            "micro_w13_scale", "micro_w2_scale",
+        ):
+            value = getattr(rep, field, None)
+            if isinstance(value, torch.Tensor):
+                prep_ptrs.add(value.untyped_storage().data_ptr())
+        freed = 0
+        for name in ("w13_weight_scale", "w2_weight_scale"):
+            tensor = getattr(layer, name, None)
+            if (
+                isinstance(tensor, torch.nn.Parameter)
+                and tensor.numel() > 0
+                and tensor.untyped_storage().data_ptr() not in prep_ptrs
+            ):
+                freed += tensor.numel() * tensor.element_size()
+                tensor.data = tensor.data.new_empty((0,))
+        if freed:
+            logger.info_once(
+                "compressed-tensors b12x MXFP4: released %.1f MiB/layer of "
+                "superseded checkpoint scale storage",
+                freed / 2**20,
             )
 
     def apply(

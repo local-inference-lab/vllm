@@ -506,10 +506,8 @@ class ParallelConfig:
                 f"dcp_size={self.decode_context_parallel_size}."
             )
 
-        if self.dcp_comm_backend == "a2a" and self.decode_context_parallel_size <= 1:
-            raise ValueError(
-                "dcp_comm_backend='a2a' requires decode_context_parallel_size > 1."
-            )
+        if self.decode_context_parallel_size == 1:
+            self.dcp_comm_backend = "ag_rs"
 
         return self
 

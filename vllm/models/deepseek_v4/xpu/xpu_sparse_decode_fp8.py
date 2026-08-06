@@ -278,13 +278,13 @@ def xpu_sparse_decode_fp8(
             torch.tensor(-1, dtype=torch.int32, device=device),
         )
 
-    # Call BF16 sparse MLA kernel
-    out_attn, _, _ = triton_bf16_mla_sparse_interface(
+    # Call BF16 sparse MLA kernel; writes `out` directly (no extra copy).
+    triton_bf16_mla_sparse_interface(
         q=q,
         kv=workspace.unsqueeze(1),
         indices=combined_indices.unsqueeze(1),
         sm_scale=softmax_scale,
         d_v=q.shape[-1],
         block_dpe=0,
+        out=out,
     )
-    out.copy_(out_attn)

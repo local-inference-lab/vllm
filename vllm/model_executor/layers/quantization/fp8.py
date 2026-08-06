@@ -92,6 +92,46 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = init_logger(__name__)
 
 
+class Mxfp8SerializedLinearMethod(LinearMethodBase):
+    """Thin adapter serving MXFP8-serialized dense weights (e4m3 values +
+    per-32 ue8m0 scales) inside an FP8-checkpoint config, delegating to the
+    compressed-tensors MXFP8 scheme (weight [n,k] fp8 + weight_scale u8)."""
+
+    def __init__(self):
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_mxfp8 import (  # noqa: E501
+            CompressedTensorsW8A8Mxfp8,
+        )
+
+        self.scheme = CompressedTensorsW8A8Mxfp8()
+
+    def create_weights(
+        self,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        if weight_loader is None:
+            raise ValueError("weight_loader must be provided for serialized MXFP8")
+        self.scheme.create_weights(
+            layer=layer,
+            output_partition_sizes=output_partition_sizes,
+            input_size_per_partition=input_size_per_partition,
+            params_dtype=params_dtype,
+            weight_loader=weight_loader,
+        )
+
+    def process_weights_after_loading(self, layer):
+        self.scheme.process_weights_after_loading(layer)
+
+    def apply(self, layer, x, bias=None):
+        return self.scheme.apply_weights(layer, x, bias=bias)
+
+
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
 
@@ -102,6 +142,7 @@ class Fp8Config(QuantizationConfig):
         ignored_layers: list[str] | None = None,
         weight_block_size: list[int] | None = None,
         store_dtype: str | None = None,
+        dense_format: str | None = None,
     ) -> None:
         super().__init__()
 
@@ -112,6 +153,7 @@ class Fp8Config(QuantizationConfig):
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
         self.store_dtype = store_dtype
+        self.dense_format = dense_format
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
@@ -160,6 +202,7 @@ class Fp8Config(QuantizationConfig):
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         store_dtype = cls.get_from_keys_or(config, ["store_dtype"], None)
+        dense_format = cls.get_from_keys_or(config, ["dense_format"], None)
         if not ignored_layers:
             ignored_layers = cls.get_from_keys_or(
                 config, ["modules_to_not_convert"], None
@@ -170,12 +213,23 @@ class Fp8Config(QuantizationConfig):
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             store_dtype=store_dtype,
+            dense_format=dense_format,
         )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
         if isinstance(layer, LinearBase):
+            if self.dense_format == "mxfp8" and not is_layer_skipped(
+                prefix=prefix,
+                ignored_layers=self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                logger.info_once(
+                    "Using serialized-MXFP8 dense linear method for FP8 "
+                    "checkpoint with dense_format=mxfp8."
+                )
+                return Mxfp8SerializedLinearMethod()
             if is_layer_skipped(
                 prefix=prefix,
                 ignored_layers=self.ignored_layers,
@@ -201,12 +255,59 @@ class Fp8Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
+            if self.store_dtype == "nvfp4":
+                from vllm.model_executor.layers.quantization.modelopt import (
+                    ModelOptNvFp4Config,
+                    ModelOptNvFp4FusedMoE,
+                )
+
+                logger.info_once(
+                    "Using ModelOpt NVFP4 MoE method for FP8 checkpoint "
+                    "with store_dtype=nvfp4."
+                )
+                nv_cfg = ModelOptNvFp4Config(
+                    quant_method="NVFP4",
+                    is_checkpoint_nvfp4_serialized=True,
+                    kv_cache_quant_algo=None,
+                    exclude_modules=[],
+                    group_size=16,
+                )
+                return ModelOptNvFp4FusedMoE(nv_cfg, layer.moe_config)
             if self.store_dtype == "mxfp4":
                 from vllm.model_executor.layers.quantization.mxfp4 import (
+                    GptOssMxfp4MoEMethod,
                     Mxfp4MoEMethod,
                 )
 
-                return Mxfp4MoEMethod(layer.moe_config)
+                moe_backend = layer.moe_config.moe_backend
+                # FP8 checkpoints with store_dtype=mxfp4 (GLM/DeepSeek/MiMo
+                # style) use the standard SwiGLU. GptOssMxfp4MoEMethod
+                # hardcodes the GPT-OSS clamped activation
+                # (gemm1_alpha=1.702, beta=1.0, swiglu_limit=7.0); the B12X
+                # W4A16 kernel honors swiglu_limit and would clamp gate/up at
+                # +-7 in every MoE layer, distorting long generations.
+                if moe_backend in {
+                    "b12x",
+                    "deep_gemm",
+                    "flashinfer_cutlass",
+                    "flashinfer_cutlass_afp8",
+                    "flashinfer_trtllm",
+                    "flashinfer_trtllm_afp8",
+                }:
+                    logger.info_once(
+                        "Using DeepSeek-style MXFP4 MoE method for FP8 "
+                        "checkpoint with store_dtype=mxfp4 and "
+                        "moe_backend=%s.",
+                        moe_backend,
+                    )
+                    return Mxfp4MoEMethod(layer.moe_config)
+
+                logger.info_once(
+                    "Using GPT-OSS-style MXFP4 MoE method for FP8 "
+                    "checkpoint with store_dtype=mxfp4 and moe_backend=%s.",
+                    moe_backend,
+                )
+                return GptOssMxfp4MoEMethod(layer.moe_config)
             if self.is_checkpoint_fp8_serialized:
                 return Fp8MoEMethod(self, layer)
             else:
@@ -395,7 +496,10 @@ class Fp8LinearMethod(LinearMethodBase):
 
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if getattr(layer, "b12x_skip_generic_block_fp8_linear", False):
+            return
+
         if self.use_marlin:
             if not self.block_quant:
                 # Canonicalize to (K, N) for the kernel.

@@ -33,6 +33,10 @@ from typing import Any, ClassVar, TypeVar
 import torch
 
 import vllm.envs as envs
+from vllm.compilation.b12x_capture import (
+    b12x_cuda_graph_wrapper_prewarm_enabled,
+    guard_b12x_kernel_resolution,
+)
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
@@ -44,6 +48,7 @@ from vllm.forward_context import (
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
+from vllm.utils.multi_stream_utils import vllm_cudagraph_capture_scope
 from vllm.utils.torch_utils import weak_ref_tensor, weak_ref_tensors
 
 logger = init_logger(__name__)
@@ -378,8 +383,24 @@ class BreakableCUDAGraphWrapper:
         # pre-capture prefetches are complete and don't leak into the graph.
         get_offloader().sync_prev_onload()
 
+        if b12x_cuda_graph_wrapper_prewarm_enabled(
+            is_piecewise=(
+                get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+            )
+        ):
+            prewarm_output = self.runnable(*args, **kwargs)
+            get_offloader().join_after_forward()
+            del prewarm_output
+            get_offloader().sync_prev_onload()
+
         capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
-        with capture:
+        with (
+            guard_b12x_kernel_resolution(
+                "vLLM BreakableCUDAGraphWrapper capture after B12X eager warmup"
+            ),
+            vllm_cudagraph_capture_scope(),
+            capture,
+        ):
             output = self.runnable(*args, **kwargs)
             # Join the offloader's copy stream while we still hold the last
             # segment open, so the join is captured into the graph (otherwise

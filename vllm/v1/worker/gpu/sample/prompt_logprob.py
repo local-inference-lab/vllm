@@ -10,6 +10,10 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
+from vllm.v1.worker.kld_capture import (
+    is_kld_prompt_logit_capture_enabled,
+    maybe_capture_kld_prompt_logits,
+)
 
 
 class PromptLogprobsWorker:
@@ -68,6 +72,45 @@ class PromptLogprobsWorker:
             else int(requested_num_prompt_logprobs.max())
         )
 
+        pos_after_step = computed_prefill + input_batch.num_scheduled_tokens
+        is_prompt_chunked = pos_after_step < prompt_lens
+        query_start_loc_np = input_batch.query_start_loc_np
+
+        logits_fn_for_prompt = logits_fn
+        capture_rows_remaining = 0
+        if is_kld_prompt_logit_capture_enabled():
+            capture_indices = np.flatnonzero(needs_prompt_logprobs)
+            if len(input_batch.req_ids) != 1 or capture_indices.size != 1:
+                raise RuntimeError(
+                    "KLD prompt-logit capture requires exactly one active "
+                    "prompt-logprobs request"
+                )
+            capture_idx = int(capture_indices[0])
+            capture_rows_remaining = int(
+                query_start_loc_np[capture_idx + 1]
+                - query_start_loc_np[capture_idx]
+                - (not is_prompt_chunked[capture_idx])
+            )
+            capture_req_id = input_batch.req_ids[capture_idx]
+            capture_next_row = int(computed_prefill[capture_idx])
+
+            def capture_logits_fn(hidden: torch.Tensor) -> torch.Tensor:
+                nonlocal capture_next_row, capture_rows_remaining
+                logits = logits_fn(hidden)
+                rows = min(capture_rows_remaining, logits.shape[0])
+                if rows:
+                    maybe_capture_kld_prompt_logits(
+                        logits[:rows],
+                        req_id=capture_req_id,
+                        start_idx=capture_next_row,
+                        vocab_size=logits.shape[-1],
+                    )
+                    capture_next_row += rows
+                    capture_rows_remaining -= rows
+                return logits
+
+            logits_fn_for_prompt = capture_logits_fn
+
         # Get the prompt logprobs token_ids.
         prompt_logprobs_token_ids = get_prompt_logprobs_token_ids(
             input_batch.num_tokens,
@@ -80,15 +123,15 @@ class PromptLogprobsWorker:
             compute_prompt_logprobs_with_chunking(
                 prompt_logprobs_token_ids,
                 hidden_states[: input_batch.num_tokens],
-                logits_fn,
+                logits_fn_for_prompt,
                 max_num_prompt_logprobs,
             )
         )
+        if capture_rows_remaining:
+            raise RuntimeError(
+                f"KLD prompt-logit capture missed {capture_rows_remaining} rows"
+            )
 
-        pos_after_step = computed_prefill + input_batch.num_scheduled_tokens
-        is_prompt_chunked = pos_after_step < prompt_lens
-
-        query_start_loc_np = input_batch.query_start_loc_np
         prompt_logprobs_dict: dict[str, LogprobsTensors] = {}
         for i, req_id in enumerate(input_batch.req_ids):
             if not needs_prompt_logprobs[i]:

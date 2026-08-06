@@ -16,6 +16,15 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _set_torch_profiler_scopes_enabled(enabled: bool) -> None:
+    try:
+        from vllm.v1.utils import set_torch_profiler_scopes_enabled
+
+        set_torch_profiler_scopes_enabled(enabled)
+    except Exception:
+        logger.debug("Failed to toggle torch profiler scopes", exc_info=True)
+
+
 class WorkerProfiler(ABC):
     def __init__(self, profiler_config: ProfilerConfig) -> None:
         self._delay_iters = profiler_config.delay_iterations
@@ -260,11 +269,19 @@ class TorchProfilerWrapper(WorkerProfiler):
 
     @override
     def _start(self) -> None:
-        self.profiler.start()
+        _set_torch_profiler_scopes_enabled(True)
+        try:
+            self.profiler.start()
+        except Exception:
+            _set_torch_profiler_scopes_enabled(False)
+            raise
 
     @override
     def _stop(self) -> None:
-        self.profiler.stop()
+        try:
+            self.profiler.stop()
+        finally:
+            _set_torch_profiler_scopes_enabled(False)
 
         profiler_config = self.profiler_config
         rank = self.local_rank

@@ -145,15 +145,20 @@ def _hc_head_triton(
     fn: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
-    out: torch.Tensor,
     hidden_size: int,
     rms_eps: float,
     hc_eps: float,
     hc_mult: int,
-) -> None:
-    """Fill pre-allocated `out` (T, H) in-place with the hc_head result."""
+) -> torch.Tensor:
+    """Apply hc_head and return the dense output."""
+    out = torch.empty(
+        hs_flat.shape[0],
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=hs_flat.device,
+    )
     if hs_flat.shape[0] == 0:
-        return
+        return out
 
     hc_head_reduce_triton_kernel(
         hs_flat,
@@ -164,11 +169,52 @@ def _hc_head_triton(
         rms_eps,
         hc_eps,
     )
-    return
+    return out
+
+
+def _hc_head_triton_fake(
+    hs_flat: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hidden_size: int,
+    rms_eps: float,
+    hc_eps: float,
+    hc_mult: int,
+) -> torch.Tensor:
+    return torch.empty(
+        hs_flat.shape[0],
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=hs_flat.device,
+    )
+
+
+def hc_head_fused_kernel_triton(
+    hs_flat: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    """Apply hc_head through the Triton custom op and return the dense output."""
+    _, hc_mult, hidden_size = hs_flat.shape
+    return torch.ops.vllm.hc_head_triton(
+        hs_flat,
+        fn,
+        hc_scale,
+        hc_base,
+        hidden_size,
+        rms_eps,
+        hc_eps,
+        hc_mult,
+    )
 
 
 direct_register_custom_op(
     op_name="hc_head_triton",
     op_func=_hc_head_triton,
-    mutates_args=["out"],
+    mutates_args=[],
+    fake_impl=_hc_head_triton_fake,
 )

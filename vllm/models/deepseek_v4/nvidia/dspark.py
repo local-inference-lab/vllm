@@ -15,6 +15,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -24,6 +25,12 @@ from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_post_tilelang,
+)
+from vllm.model_executor.layers.fp8_draft_head import (
+    Fp8DraftHead,
+    fp8_draft_head_logits,
+    fp8_draft_head_supported,
+    quantize_draft_head,
 )
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -37,6 +44,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import (
+    DSparkConfidenceHead,
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import maybe_prefix
@@ -96,7 +104,7 @@ class DSparkDeepseekV4Model(nn.Module):
             ]
         )
 
-        # Heads: final norm + hc_head, and the Markov head
+        # Heads: final norm + hc_head, and the Markov + confidence heads
         # Loaded from the "final" MTP layer weights (mtp.*) in the target checkpoint
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         hc_dim = self.hc_mult * config.hidden_size
@@ -119,6 +127,12 @@ class DSparkDeepseekV4Model(nn.Module):
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
         )
+        self.confidence_head: DSparkConfidenceHead | None = None
+        if getattr(config, "enable_confidence_head", True):
+            self.confidence_head = DSparkConfidenceHead(
+                config.hidden_size + config.dspark_markov_rank,
+                prefix=maybe_prefix(prefix, "confidence_head"),
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -129,6 +143,18 @@ class DSparkDeepseekV4Model(nn.Module):
         ``aux_hidden_states`` is [T, hidden_size * len(target_layer_ids)].
         """
         return self.main_norm(self.main_proj(aux_hidden_states))
+
+    def finalize_mhc_weights(self) -> None:
+        for layer in self.layers:
+            layer.refresh_b12x_mhc_bf16_weights()
+
+        first_layer = self.layers[0]
+        if first_layer._use_b12x_mhc:
+            first_layer.hc_attn_fn_broadcast = (
+                first_layer.hc_attn_fn.detach()
+                .view(-1, first_layer.hc_mult, first_layer.hidden_size)
+                .sum(dim=1)
+            )
 
     @torch.inference_mode()
     def precompute_and_store_context_kv(
@@ -171,8 +197,10 @@ class DSparkDeepseekV4Model(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
-        # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
-        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        if getattr(self.layers[0], "_use_b12x_mhc", False):
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
         residual = post_mix = res_mix = None
         for layer in self.layers:
@@ -287,6 +315,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        # Optional rowwise-fp8 copy of the (shared) lm_head, used ONLY for
+        # draft-proposal logits. Materialized eagerly at load time via
+        # maybe_init_fp8_draft_head(); None means the bf16 path is used.
+        self._fp8_draft_head: Fp8DraftHead | None = None
 
     # --- Hooks used by the speculator -------------------------------------
 
@@ -324,8 +356,48 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         """Base logits U_k = lm_head(norm(head_hidden))."""
         return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
 
+    def maybe_init_fp8_draft_head(self) -> None:
+        """Materialize the rowwise-fp8 draft lm_head copy (opt-in).
+
+        Called by ``load_dspark_model`` right after the target's lm_head is
+        aliased onto this model. This must happen eagerly at load time, NOT
+        lazily on the first draft call: the whole DSpark draft step
+        (including ``compute_draft_logits``) runs inside a FULL captured
+        CUDA graph, so the quantization kernels must not fire during
+        capture/replay.
+
+        TP: the lm_head is vocab-sharded, so each rank quantizes its local
+        shard with per-local-row scales; the draft path's gather and argmax
+        semantics are unchanged.
+        """
+        if not envs.VLLM_DSPARK_FP8_DRAFT_HEAD:
+            return
+        if not fp8_draft_head_supported(self.lm_head.weight.device):
+            logger.warning(
+                "VLLM_DSPARK_FP8_DRAFT_HEAD is set but this device has no "
+                "fp8 support (SM89+ required); using the unquantized "
+                "draft lm_head."
+            )
+            return
+        self._fp8_draft_head = quantize_draft_head(self.lm_head.weight)
+        logger.info_once(
+            "DSpark draft-proposal logits use a rowwise-fp8 copy of the "
+            "target lm_head (draft-time only; verify pass untouched)."
+        )
+
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Full-vocab draft: base logits, no d2t scatter.
+        if self._fp8_draft_head is not None:
+            # Draft-proposal-only fp8 path. Mirrors compute_logits ->
+            # LogitsProcessor._get_logits: local (shard) logits, then the
+            # same TP gather and vocab-padding slice.
+            local_logits = fp8_draft_head_logits(
+                self.model.norm(hidden_states), self._fp8_draft_head
+            )
+            logits = self.logits_processor._gather_logits(local_logits)
+            if logits is not None:
+                logits = logits[..., : self.logits_processor.org_vocab_size]
+            return logits
         return self.compute_logits(hidden_states)
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
@@ -336,6 +408,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+
+    def compute_confidence(
+        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor | None:
+        if self.model.confidence_head is None:
+            return None
+        return self.model.confidence_head(head_hidden, markov_embed)
 
     # --- Weight loading ----------------------------------------------------
 
@@ -375,6 +454,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        loaded_confidence_head = False
 
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
@@ -387,6 +467,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             if mapped is None:
                 continue
             name = mapped
+            if "confidence_head." in name:
+                loaded_confidence_head = True
 
             # ``.scale`` -> per-method scale suffix.
             if name.endswith(".scale"):
@@ -423,8 +505,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 continue
 
             # Stacked rules only apply to decoder-layer weights. Head-stack params
-            # (main_proj/norm/hc_head/markov_head) load directly — otherwise e.g.
-            # "markov_w1" would collide with the "w1" shard rule.
+            # (main_proj/norm/hc_head/markov_head/confidence_head) load directly —
+            # otherwise e.g. "markov_w1" would collide with the "w1" shard rule.
             is_layer_param = name.startswith("model.layers.")
             for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
                 if not is_layer_param or weight_name not in name:
@@ -454,6 +536,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 loaded_params.add(name)
 
         self._finalize_moe()
+        self.model.finalize_mhc_weights()
+        if self.model.confidence_head is not None and not loaded_confidence_head:
+            self.model.confidence_head = None
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
@@ -471,8 +556,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             return None
         stage = int(m.group(1))
         rest = m.group(2)
-        # The confidence head is not wired into inference yet; drop its weights.
-        if rest.startswith("confidence_head."):
+        if rest.startswith("confidence_head.") and self.model.confidence_head is None:
             return None
         # Head-stack params live at model level (mtp.last), context combiner at
         # model level (mtp.0); everything else is a per-layer decoder block.
@@ -482,6 +566,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             "hc_head_base",
             "hc_head_scale",
             "markov_head.",
+            "confidence_head.",
         )
         if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(
             head_prefixes

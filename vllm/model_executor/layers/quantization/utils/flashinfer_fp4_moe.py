@@ -14,6 +14,7 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
     swizzle_blockscale,
 )
+from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -23,7 +24,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-
 __all__ = [
     "reorder_w1w3_to_w3w1",
 ]
@@ -32,18 +32,117 @@ __all__ = [
 def reorder_w1w3_to_w3w1(
     weight: torch.Tensor, scale: torch.Tensor, dim: int = -2
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Re-order the concatenated `[w1, w3]` tensors to `[w3, w1]`"""
+    """Re-order concatenated `[w1, w3]` tensors to `[w3, w1]` in-place.
+
+    `weight` and `scale` must be contiguous; they remain contiguous on return.
+    """
+    assert weight.is_contiguous(), "weight must be contiguous"
+    assert scale.is_contiguous(), "scale must be contiguous"
     size = weight.size(dim)
     assert size % 2 == 0, f"Expected even size in dim {dim}, got {size}"
     half = size // 2
+    d = dim % weight.dim()
 
-    w1, w3 = weight.split(half, dim=dim)
-    s1, s3 = scale.split(half, dim=dim)
-
-    return (
-        torch.cat([w3, w1], dim=dim).contiguous(),
-        torch.cat([s3, s1], dim=dim).contiguous(),
+    # 64 MB transient cap
+    bytes_per_row = max(
+        weight.numel() // size * weight.element_size(),
+        scale.numel() // size * scale.element_size(),
     )
+    chunk = max(1, min(half, (64 << 20) // max(bytes_per_row, 1)))
+
+    fa, fb = [slice(None)] * weight.dim(), [slice(None)] * weight.dim()
+    for off in range(0, half, chunk):
+        end = min(off + chunk, half)
+        fa[d], fb[d] = slice(off, end), slice(half + off, half + end)
+        a, b = tuple(fa), tuple(fb)
+        for t in (weight, scale):
+            tmp = t[b].clone()
+            t[b] = t[a]
+            t[a] = tmp
+
+    return weight, scale
+
+
+def _pad_dim(tensor: torch.Tensor, dim: int, pad_size: int) -> torch.Tensor:
+    if pad_size <= 0:
+        return tensor
+
+    dim %= tensor.ndim
+    shape = list(tensor.shape)
+    original_size = shape[dim]
+    shape[dim] += pad_size
+    padded = tensor.new_zeros(shape)
+    slices = [slice(None)] * tensor.ndim
+    slices[dim] = slice(0, original_size)
+    padded[tuple(slices)] = tensor
+    return padded.contiguous()
+
+
+def _pad_gated_w13_intermediate_dim(
+    tensor: torch.Tensor,
+    half_pad_size: int,
+) -> torch.Tensor:
+    if half_pad_size <= 0:
+        return tensor
+    if tensor.size(1) % 2 != 0:
+        raise ValueError(
+            "Gated NVFP4 MoE w13 tensors must have an even intermediate dimension."
+        )
+
+    half_size = tensor.size(1) // 2
+    first, second = tensor.split(half_size, dim=1)
+    return torch.cat(
+        (
+            _pad_dim(first, 1, half_pad_size),
+            _pad_dim(second, 1, half_pad_size),
+        ),
+        dim=1,
+    ).contiguous()
+
+
+def _pad_gated_nvfp4_moe_for_swizzled_scales(
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    padded_w13_rows = round_up(w13_scale.size(1), 128)
+    pad_size = padded_w13_rows - w13.size(1)
+    if pad_size <= 0:
+        return w13, w13_scale, w2, w2_scale
+    if w13_scale.size(1) != w13.size(1):
+        raise ValueError(
+            "Gated NVFP4 MoE w13 weight and scale row counts must match before "
+            "swizzling."
+        )
+    if w13.size(1) % 2 != 0:
+        raise ValueError(
+            "Gated NVFP4 MoE w13 tensors must have an even intermediate dimension."
+        )
+    if pad_size % 2 != 0:
+        raise ValueError(
+            "Gated NVFP4 MoE intermediate padding must be split evenly across "
+            "w1 and w3."
+        )
+
+    half_pad_size = pad_size // 2
+    if half_pad_size % 16 != 0:
+        raise ValueError(
+            "Gated NVFP4 MoE intermediate padding must be divisible by the "
+            "NVFP4 block size."
+        )
+
+    half_size = w13.size(1) // 2
+    if w2.size(2) * 2 != half_size:
+        raise ValueError("Gated NVFP4 MoE w2 shape does not match w13.")
+    if w2_scale.size(2) * 16 != half_size:
+        raise ValueError("Gated NVFP4 MoE w2 scale shape does not match w13.")
+
+    w13 = _pad_gated_w13_intermediate_dim(w13, half_pad_size)
+    w13_scale = _pad_gated_w13_intermediate_dim(w13_scale, half_pad_size)
+    w2 = _pad_dim(w2, 2, half_pad_size // 2)
+    w2_scale = _pad_dim(w2_scale, 2, half_pad_size // 16)
+    return w13, w13_scale, w2, w2_scale
 
 
 def interleave_linear_and_gate(
@@ -138,6 +237,81 @@ def prepare_nvfp4_moe_layer_for_flashinfer_cutedsl(
         w2_scale_2,
         a2_scale,
     )
+
+
+def _per_expert_input_scale(
+    scale: torch.Tensor,
+    num_experts: int,
+    name: str,
+) -> torch.Tensor:
+    scale = scale.to(torch.float32)
+    if scale.dim() == 0:
+        return scale.expand(num_experts).contiguous()
+    if scale.dim() == 1:
+        if scale.numel() != num_experts:
+            raise ValueError(
+                f"{name} must have {num_experts} elements, got {scale.numel()}"
+            )
+        return scale.contiguous()
+    if scale.dim() == 2:
+        if scale.size(0) != num_experts:
+            raise ValueError(
+                f"{name} first dimension must be {num_experts}, "
+                f"got {scale.size(0)}"
+            )
+        return scale.max(dim=1).values.contiguous()
+    raise ValueError(f"{name} must be scalar, 1D, or 2D, got {tuple(scale.shape)}")
+
+
+def prepare_nvfp4_moe_layer_for_b12x(
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w13_scale_2: torch.Tensor,
+    a13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w2_scale_2: torch.Tensor,
+    a2_scale: torch.Tensor,
+    is_act_and_mul: bool,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Prepare native B12X NVFP4 MoE metadata without repacking weights."""
+    num_experts = w13.shape[0]
+    a13_scale = _per_expert_input_scale(a13_scale, num_experts, "a13_scale")
+    a2_scale = _per_expert_input_scale(a2_scale, num_experts, "a2_scale")
+
+    if is_act_and_mul:
+        (
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+        ) = _pad_gated_nvfp4_moe_for_swizzled_scales(
+            w13, w13_scale, w2, w2_scale
+        )
+
+    w13_scale = swizzle_blockscale(w13_scale)
+    pad_size = w13_scale.size(1) - w13.size(1)
+    if pad_size > 0:
+        if is_act_and_mul:
+            raise NotImplementedError(
+                "Intermediate size padding for gated native B12X NvFp4 MoE "
+                "must be handled before scale swizzling."
+            )
+        w13 = torch.nn.functional.pad(w13, (0, 0, 0, pad_size))
+        w2 = torch.nn.functional.pad(w2, (0, pad_size // 2, 0, 0))
+        w2_scale = torch.nn.functional.pad(w2_scale, (0, pad_size // 16))
+
+    w2_scale = swizzle_blockscale(w2_scale)
+    return w13, w13_scale, w13_scale_2, a13_scale, w2, w2_scale, w2_scale_2, a2_scale
 
 
 def prepare_static_weights_for_trtllm_fp4_moe(
@@ -337,7 +511,13 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         layer.moe_config.hidden_dim = padded_hidden
 
         # Align weights for FI NVFP4 MoE kernels.
-        min_alignment = 16 if is_gated else 128
+        # FlashInfer's TRT-LLM block-scale shuffle asserts the gate/up row dim
+        # (= up_mult * padded_intermediate, up_mult=2 when gated) is a multiple of
+        # 128. So gated needs padded_intermediate % 64 (2*64=128); the old value 16
+        # left 2*intermediate a multiple of only 32, so an NVFP4 MoE whose rank-local
+        # intermediate is not 128-aligned at TP>1 (e.g. Gemma-4-26B-A4B at tp4) hit
+        # `assert M % 128 == 0`. Padded rows are zero -> outputs unchanged.
+        min_alignment = 64 if is_gated else 128
         w13, w13_scale, w2, w2_scale, padded_intermediate = (
             align_fp4_moe_weights_for_fi(
                 w13, w13_scale, w2, w2_scale, is_act_and_mul, min_alignment
@@ -356,6 +536,16 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
             is_gated_activation=is_gated,
         )
     else:
+        if is_act_and_mul:
+            (
+                w13,
+                w13_scale,
+                w2,
+                w2_scale,
+            ) = _pad_gated_nvfp4_moe_for_swizzled_scales(
+                w13, w13_scale, w2, w2_scale
+            )
+
         # Swizzle the block scales for other FI NVFP4 MoE kernels.
         w13_scale = swizzle_blockscale(w13_scale)
 

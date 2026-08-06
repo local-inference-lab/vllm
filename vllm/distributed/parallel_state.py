@@ -620,7 +620,7 @@ class GroupCoordinator:
             )
             ca_comm = self.device_communicator.ca_comm
             if ca_comm is not None:
-                maybe_ca_context = ca_comm.capture()  # type: ignore
+                maybe_ca_context = ca_comm.capture(stream=stream)  # type: ignore
 
             from vllm._aiter_ops import rocm_aiter_ops
 
@@ -713,6 +713,67 @@ class GroupCoordinator:
             )
         else:
             return self._reduce_scatter_out_place(input_, dim)
+
+    def reduce_scatter_into(
+        self,
+        input_: torch.Tensor,
+        output: torch.Tensor,
+        dim: int = -1,
+    ) -> torch.Tensor:
+        """Run eager reduce-scatter into caller-provided CUDA storage."""
+        if self.world_size <= 1 or dim != 1:
+            raise RuntimeError("reduce_scatter_into requires DCP heads on dim 1")
+        if input_.ndim != 3 or output.ndim != 3:
+            raise ValueError("reduce_scatter_into requires rank-3 tensors")
+        if input_.device != output.device or input_.device.type != "cuda":
+            raise ValueError("reduce_scatter_into requires one CUDA device")
+        if (
+            input_.shape[0] != output.shape[0]
+            or input_.shape[1] != self.world_size * output.shape[1]
+            or input_.shape[2:] != output.shape[2:]
+        ):
+            raise ValueError("reduce_scatter_into shape mismatch")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("reduce_scatter_into is eager-only")
+        if self.device_communicator is None:
+            raise RuntimeError("reduce_scatter_into requires a device communicator")
+
+        reduce_scatter_into = getattr(
+            self.device_communicator, "reduce_scatter_into", None
+        )
+        if not callable(reduce_scatter_into):
+            raise RuntimeError(
+                f"{type(self.device_communicator).__name__} does not support "
+                "reduce_scatter_into"
+            )
+        result = reduce_scatter_into(input_, output, dim)
+        if result is not output:
+            raise RuntimeError("reduce_scatter_into did not preserve output identity")
+        return output
+
+    def reduce_scatter_head_major(
+        self,
+        input_: torch.Tensor,
+        dim: int = -1,
+    ) -> torch.Tensor:
+        """Reduce-scatter and preserve a physically head-major output view."""
+        if self.world_size <= 1 or dim != 1:
+            raise RuntimeError(
+                "reduce_scatter_head_major requires DCP heads on dim 1"
+            )
+        if self.device_communicator is None:
+            raise RuntimeError(
+                "reduce_scatter_head_major requires a device communicator"
+            )
+        reduce_scatter_head_major = getattr(
+            self.device_communicator, "reduce_scatter_head_major", None
+        )
+        if not callable(reduce_scatter_head_major):
+            raise RuntimeError(
+                f"{type(self.device_communicator).__name__} does not support "
+                "head-major reduce-scatter"
+            )
+        return reduce_scatter_head_major(input_, dim)
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
@@ -1378,12 +1439,69 @@ def get_dcp_group() -> GroupCoordinator:
     return _DCP
 
 
+_QUERY_SPLIT: GroupCoordinator | None = None
+
+
+def get_query_split_group() -> GroupCoordinator:
+    assert _QUERY_SPLIT is not None, "query split group is not initialized"
+    return _QUERY_SPLIT
+
+
+_DCP_CKV_PREFETCH: GroupCoordinator | None = None
+
+
+def get_dcp_ckv_prefetch_group() -> GroupCoordinator:
+    assert _DCP_CKV_PREFETCH is not None, "DCP ckv prefetch group is not initialized"
+    return _DCP_CKV_PREFETCH
+
+
 _PP: GroupCoordinator | None = None
 
 
 def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
+
+
+def checkpoint_b12x_graph_channels() -> tuple[tuple[Callable[[Any], None], Any], ...]:
+    """Snapshot SparkInfer channels used by disposable graph captures."""
+    checkpoints: list[tuple[Callable[[Any], None], Any]] = []
+    seen_communicators: set[int] = set()
+    for group in (_TP, _DCP, _PP):
+        device_communicator = None if group is None else group.device_communicator
+        communicator = getattr(device_communicator, "ca_comm", None)
+        if communicator is None or id(communicator) in seen_communicators:
+            continue
+        seen_communicators.add(id(communicator))
+        checkpoint_fn = getattr(communicator, "checkpoint_pcie_channels", None)
+        rollback_fn = getattr(communicator, "rollback_pcie_channels", None)
+        if checkpoint_fn is None or rollback_fn is None:
+            continue
+        checkpoint = checkpoint_fn()
+        if checkpoint is not None:
+            checkpoints.append((rollback_fn, checkpoint))
+
+    if _DCP is not None and _DCP.world_size > 1:
+        from vllm.v1.attention.ops.dcp_alltoall import (
+            checkpoint_b12x_dcp_a2a_channels,
+            rollback_b12x_dcp_a2a_channels,
+        )
+
+        checkpoints.append(
+            (
+                rollback_b12x_dcp_a2a_channels,
+                checkpoint_b12x_dcp_a2a_channels(_DCP),
+            )
+        )
+    return tuple(checkpoints)
+
+
+def rollback_b12x_graph_channels(
+    checkpoints: tuple[tuple[Callable[[Any], None], Any], ...],
+) -> None:
+    """Roll back SparkInfer channels after disposable graphs are destroyed."""
+    for rollback, checkpoint in reversed(checkpoints):
+        rollback(checkpoint)
 
 
 _DP: GroupCoordinator | None = None
@@ -1427,7 +1545,10 @@ def get_pcp_group() -> GroupCoordinator:
 
 
 @contextmanager
-def graph_capture(device: torch.device):
+def graph_capture(
+    device: torch.device,
+    graph_capture_context: GraphCaptureContext | None = None,
+):
     """
     `graph_capture` is a context manager which should surround the code that
     is capturing the CUDA graph. Its main purpose is to ensure that some
@@ -1440,9 +1561,33 @@ def graph_capture(device: torch.device):
     the graph capture is running on a separate stream from the default stream,
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
+
+    A caller may pass an explicit ``graph_capture_context`` to control the
+    stream used (e.g. to capture on the default stream).
     """
-    context = GraphCaptureContext(torch.cuda.Stream(device=device))
-    with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
+    context = graph_capture_context or GraphCaptureContext(
+        torch.cuda.Stream(device=device)
+    )
+    maybe_dcp_capture = (
+        get_dcp_group().graph_capture(context)
+        if _DCP is not None and get_dcp_group().world_size > 1
+        else nullcontext()
+    )
+    if _DCP is not None and get_dcp_group().world_size > 1:
+        # Import locally to avoid making distributed initialization depend on
+        # attention modules. The helper is a no-op until DCP warmup creates a
+        # SparkInfer pool for this process group.
+        from vllm.v1.attention.ops.dcp_alltoall import capture_b12x_dcp_a2a
+
+        maybe_b12x_dcp_capture = capture_b12x_dcp_a2a(get_dcp_group(), context.stream)
+    else:
+        maybe_b12x_dcp_capture = nullcontext()
+    with (
+        get_tp_group().graph_capture(context),
+        get_pp_group().graph_capture(context),
+        maybe_dcp_capture,
+        maybe_b12x_dcp_capture,
+    ):
         yield context
 
 
@@ -1832,6 +1977,39 @@ def initialize_model_parallel(
         group_name="dcp",
     )
 
+    # Build the query-split groups for the indexer query split (Fix A).
+    # Ranks sharing the same dcp_rank (position within their DCP group)
+    # form a query-split group.  At TP=8/DCP=2 the DCP groups are
+    # {0,1},{2,3},{4,5},{6,7} and the query-split groups are
+    # {0,2,4,6} (dcp_rank=0) and {1,3,5,7} (dcp_rank=1).
+    global _QUERY_SPLIT
+    assert _QUERY_SPLIT is None, "query split group is already initialized"
+    if decode_context_model_parallel_size > 1 and envs.VLLM_DCP_QUERY_SPLIT:
+        query_split_ranks: list[list[int]] = []
+        for dcp_rank_idx in range(decode_context_model_parallel_size):
+            query_split_ranks.append([grp[dcp_rank_idx] for grp in group_ranks])
+        _QUERY_SPLIT = init_model_parallel_group(
+            query_split_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="query_split",
+        )
+
+    # A dedicated communicator over the DCP ranks for the transient ckv
+    # prefetch gather (Fix B). The prefetch runs on a side stream and would
+    # otherwise share the DCP communicator with the indexer's DCP top-k
+    # merge on the default stream; concurrent collectives on one NCCL
+    # communicator from two streams is unsupported. Same ranks as ``_DCP``.
+    global _DCP_CKV_PREFETCH
+    assert _DCP_CKV_PREFETCH is None, "DCP ckv prefetch group is already initialized"
+    if decode_context_model_parallel_size > 1 and envs.VLLM_B12X_MLA_CKV_GATHER:
+        _DCP_CKV_PREFETCH = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="dcp_ckv_prefetch",
+        )
+
     global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
     group_ranks = (
@@ -2056,6 +2234,16 @@ def destroy_model_parallel():
     if _DCP:
         _DCP.destroy()
     _DCP = None
+
+    global _QUERY_SPLIT
+    if _QUERY_SPLIT:
+        _QUERY_SPLIT.destroy()
+    _QUERY_SPLIT = None
+
+    global _DCP_CKV_PREFETCH
+    if _DCP_CKV_PREFETCH:
+        _DCP_CKV_PREFETCH.destroy()
+    _DCP_CKV_PREFETCH = None
 
     global _PCP
     if _PCP:
