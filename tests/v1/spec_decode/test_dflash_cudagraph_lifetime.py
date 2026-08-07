@@ -7,6 +7,8 @@ from unittest.mock import Mock
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.worker.gpu.spec_decode.dflash import speculator as spec_module
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
 
@@ -103,6 +105,51 @@ def test_dflash_capture_uses_phase_specific_draft_channel_ids():
         ("context", "vllm:draft:dflash:context:profile"),
         ("query", "vllm:draft:dflash:production"),
         ("context", "vllm:draft:dflash:context:production"),
+    ]
+
+
+def test_dflash_graph_channel_is_bound_at_capture_not_construction(monkeypatch):
+    created = []
+
+    class FakeQueryManager:
+        def __init__(self, vllm_config, device, cudagraph_mode, decode_query_len):
+            created.append(
+                ("query", vllm_config, device, cudagraph_mode, decode_query_len)
+            )
+
+    class FakeContextManager:
+        def __init__(self, vllm_config, device, max_num_context_tokens):
+            created.append(("context", vllm_config, device, max_num_context_tokens))
+
+    monkeypatch.setattr(spec_module, "DFlashCudaGraphManager", FakeQueryManager)
+    monkeypatch.setattr(
+        spec_module,
+        "DFlashContextCudaGraphManager",
+        FakeContextManager,
+    )
+
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.vllm_config = object()
+    speculator.device = torch.device("cpu")
+    speculator.num_query_per_req = 6
+    speculator.max_num_tokens = 128
+    speculator._speculator_name = "DSpark"
+    speculator.attn_cg_support = SimpleNamespace(
+        min_cg_support=AttentionCGSupport.UNIFORM_BATCH,
+        min_cg_attn_backend="test",
+    )
+
+    DFlashSpeculator.init_cudagraph_manager(speculator, CUDAGraphMode.FULL)
+
+    assert created == [
+        (
+            "query",
+            speculator.vllm_config,
+            speculator.device,
+            CUDAGraphMode.FULL_DECODE_ONLY,
+            6,
+        ),
+        ("context", speculator.vllm_config, speculator.device, 128),
     ]
 
 

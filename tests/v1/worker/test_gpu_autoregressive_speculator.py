@@ -205,3 +205,39 @@ def test_autoregressive_capture_ids_are_deterministic_and_phase_separated():
         "vllm:draft:decode:production",
     ]
     assert capture_channel_ids() == capture_channel_ids() == expected
+
+
+def test_autoregressive_graph_channel_is_bound_at_capture_not_construction(
+    monkeypatch,
+):
+    created = []
+
+    class FakeManager:
+        def __init__(self, vllm_config, device, cudagraph_mode, decode_query_len):
+            created.append((vllm_config, device, cudagraph_mode, decode_query_len))
+
+    monkeypatch.setattr(spec_module, "SpeculatorCudaGraphManager", FakeManager)
+    speculator = object.__new__(_TestSpeculator)
+    speculator.vllm_config = object()
+    speculator.device = torch.device("cpu")
+    speculator.num_speculative_steps = 3
+
+    AutoRegressiveSpeculator.init_cudagraph_manager(
+        speculator,
+        CUDAGraphMode.FULL,
+    )
+
+    assert created == [
+        (
+            speculator.vllm_config,
+            speculator.device,
+            CUDAGraphMode.FULL,
+            4,
+        ),
+        (
+            speculator.vllm_config,
+            speculator.device,
+            CUDAGraphMode.FULL_DECODE_ONLY,
+            1,
+        ),
+    ]

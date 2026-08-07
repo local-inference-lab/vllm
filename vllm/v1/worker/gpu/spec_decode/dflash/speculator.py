@@ -193,7 +193,6 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
-            channel_id="graph:vllm-dflash-query",
         )
         if wants_full and supports_full and self._speculator_name == "DSpark":
             self.context_cudagraph_manager = DFlashContextCudaGraphManager(
