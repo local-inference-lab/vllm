@@ -3,7 +3,7 @@
 
 """EXL3 (ExLlamaV3 trellis) quantization support.
 
-Rank-sliced routed-expert checkpoints use B12X's unified planned
+Rank-sliced routed-expert checkpoints use Sparkinfer's unified planned
 ``fused_moe`` API for the Trellis decode/prefill windows and the ExLlamaV3
 extension for the small eager parity window. Generic dense and non-rank-sliced
 MoE checkpoints use the
@@ -68,8 +68,8 @@ _MCG_SENTINEL = 0xCBAC1FED
 _MUL1_SENTINEL = 0x83DCD12D
 _HADAMARD_BLOCK = 128
 _EXL3_EXT: Any | None = None
-_B12X_FUSED_MOE_API: Any | None = None
-_B12X_MIXED_TRELLIS_API: Any | None = None
+_SPARKINFER_FUSED_MOE_API: Any | None = None
+_SPARKINFER_MIXED_TRELLIS_API: Any | None = None
 _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
@@ -198,36 +198,40 @@ def _load_exl3_ext() -> Any:
     return ext
 
 
-def _load_b12x_fused_moe() -> Any:
+def _load_sparkinfer_fused_moe() -> Any:
     """Resolve the public unified MoE API lazily."""
 
-    global _B12X_FUSED_MOE_API
-    if _B12X_FUSED_MOE_API is not None:
-        return _B12X_FUSED_MOE_API
+    global _SPARKINFER_FUSED_MOE_API
+    if _SPARKINFER_FUSED_MOE_API is not None:
+        return _SPARKINFER_FUSED_MOE_API
     try:
-        from b12x.moe import fused_moe
+        from sparkinfer.moe import fused_moe
     except Exception as exc:
         raise RuntimeError(
             "Rank-sliced EXL3 requires the exl3_trellis_mcg source in "
-            "b12x.moe.fused_moe. Install a matching B12X build."
+            "sparkinfer.moe.fused_moe. Install a matching Sparkinfer build."
         ) from exc
-    _B12X_FUSED_MOE_API = fused_moe
+    _SPARKINFER_FUSED_MOE_API = fused_moe
     return fused_moe
 
 
-def _load_b12x_mixed_trellis() -> Any:
+def _load_sparkinfer_mixed_trellis() -> Any:
     """Resolve the one-grid mixed-bitrate Trellis API lazily."""
 
-    global _B12X_MIXED_TRELLIS_API
-    if _B12X_MIXED_TRELLIS_API is not None:
-        return _B12X_MIXED_TRELLIS_API
+    global _SPARKINFER_MIXED_TRELLIS_API
+    if _SPARKINFER_MIXED_TRELLIS_API is not None:
+        return _SPARKINFER_MIXED_TRELLIS_API
     try:
-        module = importlib.import_module("b12x.moe._shared.kernels.w4a16.mixed_trellis")
-        prepare = importlib.import_module("b12x.moe._shared.kernels.w4a16.prepare")
-        host = importlib.import_module("b12x.moe._shared.kernels.w4a16.host")
+        module = importlib.import_module(
+            "sparkinfer.moe._shared.kernels.w4a16.mixed_trellis"
+        )
+        prepare = importlib.import_module(
+            "sparkinfer.moe._shared.kernels.w4a16.prepare"
+        )
+        host = importlib.import_module("sparkinfer.moe._shared.kernels.w4a16.host")
     except Exception as exc:
         raise RuntimeError(
-            "Mixed-bitrate rank-sliced EXL3 requires the matching B12X "
+            "Mixed-bitrate rank-sliced EXL3 requires the matching SparkInfer "
             "mixed_trellis implementation."
         ) from exc
     api = SimpleNamespace(
@@ -239,7 +243,7 @@ def _load_b12x_mixed_trellis() -> Any:
         prepare_weights=prepare.prepare_trellis256_moe_weights,
         run_mixed_trellis=module.run_mixed_trellis,
     )
-    _B12X_MIXED_TRELLIS_API = api
+    _SPARKINFER_MIXED_TRELLIS_API = api
     return api
 
 
@@ -1566,7 +1570,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         return (128, 128, 128, 128)
 
     def _prepare_mixed_rank_sliced_weights(self, layer: RoutedExperts) -> None:
-        api = _load_b12x_mixed_trellis()
+        api = _load_sparkinfer_mixed_trellis()
         num_experts = int(layer.local_num_experts)
         hidden_size = int(layer.exl3_hidden_size)
         intermediate_size = int(layer.exl3_intermediate_size_per_partition)
@@ -1714,7 +1718,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if getattr(layer, "exl3_mixed_bitrate", False):
             self._prepare_mixed_rank_sliced_weights(layer)
             return
-        api = _load_b12x_fused_moe()
+        api = _load_sparkinfer_fused_moe()
         num_experts = int(layer.local_num_experts)
         hidden_size = int(layer.exl3_hidden_size)
         intermediate_size = int(layer.exl3_intermediate_size_per_partition)
@@ -1864,7 +1868,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 f"{topk_ids.dtype}"
             )
 
-        api = _load_b12x_mixed_trellis()
+        api = _load_sparkinfer_mixed_trellis()
         device = x.device
         props = torch.cuda.get_device_properties(device)
         total_experts = sum(experts for _, experts in tier_signature)
@@ -2042,7 +2046,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "profile pass before CUDA graph capture"
             )
 
-        api = _load_b12x_fused_moe()
+        api = _load_sparkinfer_fused_moe()
 
         def _plan_with_scratch(plan_max_tokens: int, plan_block_m: int):
             caps = api.Caps(
