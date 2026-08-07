@@ -441,7 +441,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         groups, group_width, rank, hidden = self._validate_wo_projection_tensors()
 
-        from sparkinfer.gemm.wo_projection import (
+        from b12x.gemm.wo_projection import (
             pack_weights as pack_wo_projection_fp8_block_scaled_weights_mxfp8,
         )
 
@@ -484,7 +484,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if weights is None:
             raise RuntimeError("DeepSeek V4 b12x WO weights were not packed")
 
-        from sparkinfer.gemm.wo_projection import (
+        from b12x.gemm.wo_projection import (
             run_inv_rope as wo_projection_inv_rope_mxfp8,
         )
 

@@ -41,7 +41,7 @@ def _import_b12x_blockscaled() -> Any | None:
     if _B12X_MISSING:
         return None
     try:
-        _B12X_BLOCKSCALED = importlib.import_module("sparkinfer.gemm.blockscaled")
+        _B12X_BLOCKSCALED = importlib.import_module("b12x.gemm.blockscaled")
     except ImportError:
         _B12X_MISSING = True
         return None
@@ -55,7 +55,7 @@ def _import_b12x_intrinsics() -> Any | None:
     if _B12X_MISSING:
         return None
     try:
-        _B12X_INTRINSICS = importlib.import_module("sparkinfer._lib.intrinsics")
+        _B12X_INTRINSICS = importlib.import_module("b12x._lib.intrinsics")
     except ImportError:
         _B12X_MISSING = True
         return None
@@ -102,7 +102,7 @@ def _apply_b12x_nvfp4_linear(
     blockscaled = _import_b12x_blockscaled()
     intrinsics = _import_b12x_intrinsics()
     if blockscaled is None or intrinsics is None:
-        raise ImportError("sparkinfer native NVFP4 GEMM is not importable")
+        raise ImportError("b12x native NVFP4 GEMM is not importable")
 
     output_size = int(layer.output_size_per_partition)
     output_shape = [*x.shape[:-1], output_size]
@@ -180,9 +180,9 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
             return False, "B12X NVFP4 kernels require a Blackwell 12x device"
         blockscaled = _import_b12x_blockscaled()
         if blockscaled is None or _import_b12x_intrinsics() is None:
-            return False, "sparkinfer native NVFP4 GEMM is not importable"
+            return False, "b12x native NVFP4 GEMM is not importable"
         if not blockscaled.is_supported():
-            return False, "sparkinfer native NVFP4 GEMM is not supported"
+            return False, "b12x native NVFP4 GEMM is not supported"
         return True, None
 
     @classmethod
@@ -195,7 +195,7 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         intrinsics = _import_b12x_intrinsics()
         if intrinsics is None:
-            raise ImportError("sparkinfer native NVFP4 GEMM is not importable")
+            raise ImportError("b12x native NVFP4 GEMM is not importable")
         layer.weight_scale = torch.nn.Parameter(
             intrinsics.swizzle_block_scale(layer.weight_scale.data),
             requires_grad=False,

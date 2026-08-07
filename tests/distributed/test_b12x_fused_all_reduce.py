@@ -380,7 +380,7 @@ def _run_b12x_fused_allreduce_gpu(rank: int, port: int) -> None:
     reason="B12X fused PCIe all-reduce test requires SM120",
 )
 def test_b12x_fused_allreduce_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
-    pytest.importorskip("sparkinfer.comm.pcie")
+    pytest.importorskip("b12x.comm.pcie")
     monkeypatch.setenv("VLLM_ENABLE_PCIE_ALLREDUCE", "1")
     monkeypatch.setenv("VLLM_PCIE_ALLREDUCE_BACKEND", "b12x")
     monkeypatch.setenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "16KB")

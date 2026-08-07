@@ -1863,7 +1863,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE": lambda: os.getenv(
         "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "84KB"
     ),
-    # Minimum input size for uncompressed SparkInfer DMA allreduce dispatch;
+    # Minimum input size for uncompressed B12X DMA allreduce dispatch;
     # defaults to 6 MiB. Accepts raw bytes or a case-insensitive KB/MB suffix.
     # Whitespace is ignored. "off", "disabled", and "none" disable DMA.
     # A deployment preflight may override this with a measured crossover.
@@ -2292,7 +2292,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Prebuilt exllamav3 extension location and torch-ABI compatibility shim.
     "VLLM_EXL3_EXT_PATH": lambda: os.getenv("VLLM_EXL3_EXT_PATH"),
     "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),
-
 }
 
 

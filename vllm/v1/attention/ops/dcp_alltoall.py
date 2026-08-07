@@ -53,9 +53,7 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
         return False
     batch, heads, head_dim = (int(value) for value in tensor.shape)
     stride_batch, stride_head, _ = (int(value) for value in tensor.stride())
-    packed_token_major = (
-        stride_batch == heads * head_dim and stride_head == head_dim
-    )
+    packed_token_major = stride_batch == heads * head_dim and stride_head == head_dim
     capacity_strided_head_major = (
         stride_batch == head_dim and stride_head >= batch * head_dim
     )
@@ -65,7 +63,7 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
 @lru_cache(maxsize=1)
 def _load_b12x_dcp_a2a_pool() -> Any | None:
     try:
-        from sparkinfer.comm.pcie import DcpAllToAllPool as PCIeDCPA2APool
+        from b12x.comm.pcie import DcpAllToAllPool as PCIeDCPA2APool
     except Exception:
         return None
     return PCIeDCPA2APool
@@ -172,7 +170,7 @@ def capture_b12x_dcp_a2a(
     cp_group: GroupCoordinator,
     stream: torch.cuda.Stream | None = None,
 ):
-    """Bind registered SparkInfer DCP pools to the graph's owning stream.
+    """Bind registered B12X DCP pools to the graph's owning stream.
 
     Each graph capture receives independent channels; reusing channels across
     target and draft graphs would make one graph depend on another's lifetime.
@@ -199,7 +197,7 @@ def capture_b12x_dcp_a2a(
 def checkpoint_b12x_dcp_a2a_channels(
     cp_group: GroupCoordinator,
 ) -> tuple[int, dict[Any, tuple[Any, Any]]]:
-    """Snapshot SparkInfer DCP pools before a disposable graph capture."""
+    """Snapshot B12X DCP pools before a disposable graph capture."""
     group_id = id(cp_group.device_group)
     checkpoints = {
         key: (pool, pool.checkpoint_channels())

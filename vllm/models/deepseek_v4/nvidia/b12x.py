@@ -248,16 +248,16 @@ def _run_compressed_mla(
     {16,32,64,128} by the outer wrapper). Indices are global slot ids, so no
     indexed page table is needed.
     """
-    from sparkinfer.attention.compressed_mla import (
+    from b12x.attention.compressed_mla import (
         Caps as B12XCompressedMLAScratchCaps,
     )
-    from sparkinfer.attention.compressed_mla import (
+    from b12x.attention.compressed_mla import (
         plan as plan_compressed_mla_scratch,
     )
-    from sparkinfer.attention.compressed_mla import (
+    from b12x.attention.compressed_mla import (
         run as compressed_mla_decode_forward,
     )
-    from sparkinfer.attention.compressed_mla import (
+    from b12x.attention.compressed_mla import (
         split_chunks_for_contract as compressed_mla_split_chunks_for_contract,
     )
 
@@ -476,13 +476,13 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         return view
 
     def _reserve_dummy_compressed_mla_scratch(self, q: torch.Tensor) -> None:
-        from sparkinfer.attention.compressed_mla import (
+        from b12x.attention.compressed_mla import (
             Caps as B12XCompressedMLAScratchCaps,
         )
-        from sparkinfer.attention.compressed_mla import (
+        from b12x.attention.compressed_mla import (
             plan as plan_compressed_mla_scratch,
         )
-        from sparkinfer.attention.compressed_mla import (
+        from b12x.attention.compressed_mla import (
             split_chunks_for_contract as compressed_mla_split_chunks_for_contract,
         )
 

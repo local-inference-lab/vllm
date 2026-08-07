@@ -1559,7 +1559,7 @@ def get_pp_group() -> GroupCoordinator:
 
 
 def checkpoint_b12x_graph_channels() -> tuple[tuple[Callable[[Any], None], Any], ...]:
-    """Snapshot SparkInfer channels used by disposable graph captures."""
+    """Snapshot B12X channels used by disposable graph captures."""
     checkpoints: list[tuple[Callable[[Any], None], Any]] = []
     seen_communicators: set[int] = set()
     for group in (_TP, _DCP, _PP):
@@ -1594,7 +1594,7 @@ def checkpoint_b12x_graph_channels() -> tuple[tuple[Callable[[Any], None], Any],
 def rollback_b12x_graph_channels(
     checkpoints: tuple[tuple[Callable[[Any], None], Any], ...],
 ) -> None:
-    """Roll back SparkInfer channels after disposable graphs are destroyed."""
+    """Roll back B12X channels after disposable graphs are destroyed."""
     for rollback, checkpoint in reversed(checkpoints):
         rollback(checkpoint)
 
@@ -1671,7 +1671,7 @@ def graph_capture(
     if _DCP is not None and get_dcp_group().world_size > 1:
         # Import locally to avoid making distributed initialization depend on
         # attention modules. The helper is a no-op until DCP warmup creates a
-        # SparkInfer pool for this process group.
+        # B12X pool for this process group.
         from vllm.v1.attention.ops.dcp_alltoall import capture_b12x_dcp_a2a
 
         maybe_b12x_dcp_capture = capture_b12x_dcp_a2a(get_dcp_group(), context.stream)

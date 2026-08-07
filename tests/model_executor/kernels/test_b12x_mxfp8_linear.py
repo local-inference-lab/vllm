@@ -586,7 +586,7 @@ def test_b12x_mxfp8_support_requires_runtime_api(monkeypatch) -> None:
     is_supported, reason = B12xMxfp8LinearKernel.is_supported()
 
     assert not is_supported
-    assert reason == "sparkinfer.gemm.mxfp8_linear missing callable pack_weight"
+    assert reason == "b12x.gemm.mxfp8_linear missing callable pack_weight"
 
 
 def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:

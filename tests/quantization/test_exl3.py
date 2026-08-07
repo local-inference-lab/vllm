@@ -241,7 +241,7 @@ def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
             return SimpleNamespace(plan=kwargs["plan"])
 
     api = FakeFusedMoe()
-    monkeypatch.setattr(exl3_module, "_load_sparkinfer_fused_moe", lambda: api)
+    monkeypatch.setattr(exl3_module, "_load_b12x_fused_moe", lambda: api)
     method = object.__new__(Exl3MoEMethod)
     method.quant_config = SimpleNamespace(bits=float(bits))
     method._rank_sliced_backing = lambda _layer, name: slabs[name]
@@ -347,7 +347,7 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypat
             return tier0, tier1
 
     api = FakeMixedApi()
-    monkeypatch.setattr(exl3_module, "_load_sparkinfer_mixed_trellis", lambda: api)
+    monkeypatch.setattr(exl3_module, "_load_b12x_mixed_trellis", lambda: api)
     method = object.__new__(Exl3MoEMethod)
     method._rank_sliced_backing = lambda _layer, name: slabs[name]
 

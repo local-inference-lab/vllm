@@ -44,7 +44,7 @@ def _import_b12x_block_fp8() -> Any | None:
     if _B12X_BLOCK_FP8_MISSING:
         return None
     try:
-        _B12X_BLOCK_FP8 = importlib.import_module("sparkinfer.gemm.block_fp8_linear")
+        _B12X_BLOCK_FP8 = importlib.import_module("b12x.gemm.block_fp8_linear")
     except ImportError:
         _B12X_BLOCK_FP8_MISSING = True
         return None
@@ -90,7 +90,7 @@ def _run_b12x_fp8_block_scaled_linear(
 ) -> torch.Tensor:
     block_fp8 = _import_b12x_block_fp8()
     if block_fp8 is None:
-        raise ImportError("sparkinfer.gemm.block_fp8_linear is not importable")
+        raise ImportError("b12x.gemm.block_fp8_linear is not importable")
 
     tokens = int(input_2d.shape[0])
     out_features = int(packed_weight.out_features)
@@ -180,7 +180,7 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         if not current_platform.is_device_capability_family(120):
             return False, "b12x FP8 kernels require a Blackwell 12x device"
         if _import_b12x_block_fp8() is None:
-            return False, "sparkinfer.gemm.block_fp8_linear is not importable"
+            return False, "b12x.gemm.block_fp8_linear is not importable"
         return True, None
 
     @classmethod
@@ -232,7 +232,7 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
 
         block_fp8 = _import_b12x_block_fp8()
         if block_fp8 is None:
-            raise ImportError("sparkinfer.gemm.block_fp8_linear is not importable")
+            raise ImportError("b12x.gemm.block_fp8_linear is not importable")
         layer.b12x_packed_weight = block_fp8.pack_weight(
             params.weight.detach(),
             weight_scale.detach(),

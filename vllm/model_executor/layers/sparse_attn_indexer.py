@@ -1063,17 +1063,17 @@ def _run_b12x_paged_topk(
     live K-row window (a metadata tensor, not an in-kernel reduction); when
     None, b12x falls back to the capacity cap.
     """
-    from sparkinfer.attention.nsa_indexer import (
+    from b12x.attention.nsa_indexer import (
         PAGED_INDEX_PAGE_SIZE,
         index_topk_fp8,
     )
-    from sparkinfer.attention.nsa_indexer import (
+    from b12x.attention.nsa_indexer import (
         SOURCE_LAYOUT_PAGED as INDEXER_SOURCE_LAYOUT_PAGED,
     )
-    from sparkinfer.attention.nsa_indexer import (
+    from b12x.attention.nsa_indexer import (
         Caps as B12XIndexerScratchCaps,
     )
-    from sparkinfer.attention.nsa_indexer import (
+    from b12x.attention.nsa_indexer import (
         plan as plan_indexer_scratch,
     )
 
@@ -1142,7 +1142,7 @@ def _merge_b12x_dcp_topk(
             "cross-rank candidate merge."
         )
 
-    from sparkinfer.attention.nsa_indexer.tiled_topk import run_row_topk
+    from b12x.attention.nsa_indexer.tiled_topk import run_row_topk
 
     from vllm.distributed.parallel_state import get_indexer_dcp_group
     from vllm.v1.attention.backends.mla.sparse_utils import (
@@ -1296,7 +1296,7 @@ def _merge_b12x_dcp_topk_by_owner(
             "DCP owner top-k local rows must alias their TP query partition"
         )
 
-    from sparkinfer.attention.nsa_indexer.tiled_topk import run_row_topk
+    from b12x.attention.nsa_indexer.tiled_topk import run_row_topk
 
     from vllm.v1.attention.backends.mla.sparse_utils import (
         triton_convert_dcp_local_topk_to_global,
@@ -1518,10 +1518,10 @@ def _prewarm_b12x_contiguous_prefill_variants(
         return
 
     try:
-        from sparkinfer.attention.nsa_indexer.contiguous_kernel import (
+        from b12x.attention.nsa_indexer.contiguous_kernel import (
             run_contiguous_logits_kernel,
         )
-        from sparkinfer.attention.nsa_indexer.tiled_topk import run_tiled_topk
+        from b12x.attention.nsa_indexer.tiled_topk import run_tiled_topk
     except (AttributeError, ImportError, ModuleNotFoundError):
         return
 
@@ -1618,16 +1618,16 @@ def _reserve_b12x_paged_indexer_scratch(
     device: torch.device,
     shared_page_table: bool = False,
 ) -> None:
-    from sparkinfer.attention.nsa_indexer import (
+    from b12x.attention.nsa_indexer import (
         PAGED_INDEX_PAGE_SIZE,
     )
-    from sparkinfer.attention.nsa_indexer import (
+    from b12x.attention.nsa_indexer import (
         SOURCE_LAYOUT_PAGED as INDEXER_SOURCE_LAYOUT_PAGED,
     )
-    from sparkinfer.attention.nsa_indexer import (
+    from b12x.attention.nsa_indexer import (
         Caps as B12XIndexerScratchCaps,
     )
-    from sparkinfer.attention.nsa_indexer import (
+    from b12x.attention.nsa_indexer import (
         plan as plan_indexer_scratch,
     )
 

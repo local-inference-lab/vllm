@@ -33,7 +33,7 @@ def guard_b12x_kernel_resolution(reason: str) -> Iterator[None]:
         return
 
     try:
-        from sparkinfer import (
+        from b12x import (
             freeze_kernel_resolution,
             kernel_resolution_frozen,
             unfreeze_kernel_resolution,

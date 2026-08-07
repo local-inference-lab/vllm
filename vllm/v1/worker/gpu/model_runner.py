@@ -952,7 +952,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
         graph_channel_checkpoints: tuple[tuple[Callable[[Any], None], Any], ...] = ()
         try:
-            # Snapshot graph-owned SparkInfer channels before this profiling
+            # Snapshot graph-owned B12X channels before this profiling
             # capture so profiling cannot leave stale channels behind.
             graph_channel_checkpoints = checkpoint_b12x_graph_channels()
             with self.maybe_setup_dummy_loras(self.lora_config):

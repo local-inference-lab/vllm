@@ -1731,7 +1731,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if not (uk_supported and uv_supported):
             logger.warning_once(
                 "VLLM_B12X_ABSORB_BMM=1 but the MLA geometry is outside the "
-                "sparkinfer.gemm.bmm envelope; falling back to the materialized "
+                "b12x.gemm.bmm envelope; falling back to the materialized "
                 "absorbed weights."
             )
             return False

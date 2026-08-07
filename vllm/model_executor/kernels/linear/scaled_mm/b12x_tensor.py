@@ -44,7 +44,7 @@ def _import_b12x_tensor_fp8() -> Any | None:
     if _B12X_TENSOR_FP8_MISSING:
         return None
     try:
-        _B12X_TENSOR_FP8 = importlib.import_module("sparkinfer.gemm.tensor_fp8_linear")
+        _B12X_TENSOR_FP8 = importlib.import_module("b12x.gemm.tensor_fp8_linear")
     except ImportError:
         _B12X_TENSOR_FP8_MISSING = True
         return None
@@ -65,7 +65,7 @@ def _b12x_tensor_fp8_enabled() -> bool:
 def _missing_b12x_tensor_fp8_api(tensor_fp8: Any) -> str | None:
     for name in ("pack_weight", "mm", "prewarm"):
         if not callable(getattr(tensor_fp8, name, None)):
-            return f"sparkinfer.gemm.tensor_fp8_linear missing callable {name}"
+            return f"b12x.gemm.tensor_fp8_linear missing callable {name}"
     return None
 
 
@@ -109,7 +109,7 @@ def _apply_b12x_tensor_fp8_packed_linear(
 
     tensor_fp8 = _import_b12x_tensor_fp8()
     if tensor_fp8 is None:
-        raise ImportError("sparkinfer.gemm.tensor_fp8_linear is not importable")
+        raise ImportError("b12x.gemm.tensor_fp8_linear is not importable")
 
     input_2d = x_q.reshape(-1, x_q.shape[-1]).contiguous()
     output_shape = [*x_q.shape[:-1], int(packed_weight.out_features)]
@@ -250,13 +250,13 @@ class B12xTensorFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
             return False, "b12x tensor FP8 GEMM is not enabled"
         tensor_fp8 = _import_b12x_tensor_fp8()
         if tensor_fp8 is None:
-            return False, "sparkinfer.gemm.tensor_fp8_linear is not importable"
+            return False, "b12x.gemm.tensor_fp8_linear is not importable"
         missing_api = _missing_b12x_tensor_fp8_api(tensor_fp8)
         if missing_api is not None:
             return False, missing_api
         support_probe = getattr(tensor_fp8, "is_supported", None)
         if callable(support_probe) and not support_probe():
-            return False, "sparkinfer.gemm.tensor_fp8_linear is not supported"
+            return False, "b12x.gemm.tensor_fp8_linear is not supported"
         return True, None
 
     @classmethod
@@ -304,7 +304,7 @@ class B12xTensorFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 
         tensor_fp8 = _import_b12x_tensor_fp8()
         if tensor_fp8 is None:
-            raise ImportError("sparkinfer.gemm.tensor_fp8_linear is not importable")
+            raise ImportError("b12x.gemm.tensor_fp8_linear is not importable")
         output_scale = (
             input_scale.detach().to(torch.float32).reshape(1)
             * weight_scale.detach().to(torch.float32).reshape(1)

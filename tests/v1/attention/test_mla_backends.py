@@ -501,7 +501,7 @@ def test_b12x_mla_mxfp8_bmm_warmup_skips_replaced_uk_signature(
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_mxfp8_mla_query_custom_op_uses_sparkinfer_api(monkeypatch, output_dtype):
+def test_mxfp8_mla_query_custom_op_uses_b12x_api(monkeypatch, output_dtype):
     calls = []
     mla_query = SimpleNamespace(
         run=lambda *args, **kwargs: calls.append((args, kwargs))
@@ -527,7 +527,7 @@ def test_mxfp8_mla_query_custom_op_uses_sparkinfer_api(monkeypatch, output_dtype
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_bf16_mla_query_custom_op_uses_sparkinfer_api(monkeypatch, output_dtype):
+def test_bf16_mla_query_custom_op_uses_b12x_api(monkeypatch, output_dtype):
     calls = []
     mla_query = SimpleNamespace(
         run=lambda *args, **kwargs: calls.append((args, kwargs))

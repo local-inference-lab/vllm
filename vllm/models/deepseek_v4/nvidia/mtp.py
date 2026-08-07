@@ -161,7 +161,7 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             positions=positions, x=hidden_states, input_ids=None
         )
         if self.mtp_block._should_run_b12x_mhc(int(hidden_states.shape[0])):
-            from sparkinfer.norm.mhc import run_post as b12x_mhc_post
+            from b12x.norm.mhc import run_post as b12x_mhc_post
 
             hidden_states = b12x_mhc_post(
                 hidden_states,

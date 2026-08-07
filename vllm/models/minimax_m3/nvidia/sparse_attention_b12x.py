@@ -239,13 +239,13 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
 
         _disable_cutlass_memory_debug_snapshot_if_off()
 
-        from sparkinfer.attention.paged import (
+        from b12x.attention.paged import (
             Caps as B12XPagedAttentionScratchCaps,
         )
-        from sparkinfer.attention.paged import (
+        from b12x.attention.paged import (
             plan as plan_paged_attention_scratch,
         )
-        from sparkinfer.attention.paged import (
+        from b12x.attention.paged import (
             run as paged_attention_forward,
         )
 

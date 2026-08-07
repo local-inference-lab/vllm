@@ -144,7 +144,7 @@ def test_b12x_moe_custom_op_matches_generic_mutation_contract() -> None:
 
 
 def test_b12x_moe_run_binds_only_the_prepared_expert_owner(monkeypatch) -> None:
-    sparkinfer_fused_moe = pytest.importorskip("sparkinfer.moe.fused_moe")
+    b12x_fused_moe = pytest.importorskip("b12x.moe.fused_moe")
 
     execute_calls = []
 
@@ -156,7 +156,7 @@ def test_b12x_moe_run_binds_only_the_prepared_expert_owner(monkeypatch) -> None:
             return "binding"
 
     monkeypatch.setattr(
-        sparkinfer_fused_moe,
+        b12x_fused_moe,
         "run",
         lambda *, binding: execute_calls.append(binding),
     )
@@ -531,7 +531,7 @@ def test_b12x_activation_amax_save_every_writes_main_and_mtp_files(
 
 
 def test_b12x_force_a8_mxfp4_prepares_one_expert_owner(monkeypatch) -> None:
-    sparkinfer_fused_moe = pytest.importorskip("sparkinfer.moe.fused_moe")
+    b12x_fused_moe = pytest.importorskip("b12x.moe.fused_moe")
 
     monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
     monkeypatch.setenv("B12X_FORCE_MOE_A8", "1")
@@ -561,12 +561,12 @@ def test_b12x_force_a8_mxfp4_prepares_one_expert_owner(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(
-        sparkinfer_fused_moe,
+        b12x_fused_moe,
         "plan_weights",
         fake_plan,
     )
     monkeypatch.setattr(
-        sparkinfer_fused_moe,
+        b12x_fused_moe,
         "prepare_weights",
         fake_prepare,
     )

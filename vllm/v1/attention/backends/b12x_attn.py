@@ -270,7 +270,7 @@ def _env_optional_storage_limit(name: str, *, allow_zero: bool) -> int | None:
         parsed = int(value)
     except ValueError:
         logger.warning(
-            "Ignoring invalid %s=%r; using Sparkinfer's planned capacity",
+            "Ignoring invalid %s=%r; using B12X's planned capacity",
             name,
             value,
         )
@@ -278,7 +278,7 @@ def _env_optional_storage_limit(name: str, *, allow_zero: bool) -> int | None:
     minimum = 0 if allow_zero else 1
     if parsed < minimum:
         logger.warning(
-            "Ignoring %s=%r below the minimum %d; using Sparkinfer's planned capacity",
+            "Ignoring %s=%r below the minimum %d; using B12X's planned capacity",
             name,
             value,
             minimum,
@@ -753,28 +753,28 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
 
         _disable_cutlass_memory_debug_snapshot_if_off()
 
-        from sparkinfer.attention.paged import (
+        from b12x.attention.paged import (
             Caps as B12XPagedAttentionScratchCaps,
         )
-        from sparkinfer.attention.paged import (
+        from b12x.attention.paged import (
             compile as compile_paged_attention,
         )
-        from sparkinfer.attention.paged import (
+        from b12x.attention.paged import (
             decode_graph_capacity as plan_decode_graph_capacity,
         )
-        from sparkinfer.attention.paged import (
+        from b12x.attention.paged import (
             decode_graph_scratch_envelope as plan_decode_graph_scratch_envelope,
         )
-        from sparkinfer.attention.paged import (
+        from b12x.attention.paged import (
             extend_graph_capacity as plan_extend_graph_capacity,
         )
-        from sparkinfer.attention.paged import (
+        from b12x.attention.paged import (
             plan as plan_paged_attention_scratch,
         )
-        from sparkinfer.attention.paged import (
+        from b12x.attention.paged import (
             run as paged_attention_forward,
         )
-        from sparkinfer.attention.paged import (
+        from b12x.attention.paged import (
             verify_graph_capacity as plan_verify_graph_capacity,
         )
 
@@ -824,7 +824,7 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
         if os.getenv("VLLM_B12X_PAGED_DECODE_MAX_CHUNKS_PER_REQ"):
             logger.warning_once(
                 "VLLM_B12X_PAGED_DECODE_MAX_CHUNKS_PER_REQ is ignored; "
-                "Sparkinfer owns decode graph chunk policy. Use the fixed "
+                "B12X owns decode graph chunk policy. Use the fixed "
                 "work/partial capacity controls only to constrain storage."
             )
         decode_work_items_limit = _env_optional_storage_limit(
@@ -1088,13 +1088,13 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
             ) = current_workspace_manager().get_simultaneous(
                 *self._contig_workspace_specs(include_scratch=False)
             )
-            from sparkinfer.attention.varlen import (
+            from b12x.attention.varlen import (
                 create_plan as create_varlen_attention_plan,
             )
-            from sparkinfer.attention.varlen import (
+            from b12x.attention.varlen import (
                 plan as plan_varlen_attention_scratch,
             )
-            from sparkinfer.attention.varlen import (
+            from b12x.attention.varlen import (
                 run as b12x_varlen_attention_forward,
             )
 

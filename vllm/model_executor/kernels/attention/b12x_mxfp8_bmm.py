@@ -31,7 +31,7 @@ def _import_b12x_bmm() -> Any | None:
     if _B12X_BMM_MISSING:
         return None
     try:
-        gemm = importlib.import_module("sparkinfer.gemm")
+        gemm = importlib.import_module("b12x.gemm")
     except ImportError:
         _B12X_BMM_MISSING = True
         return None
@@ -50,7 +50,7 @@ def _import_fused_mla_query() -> Any | None:
     if _FUSED_MLA_QUERY_MISSING:
         return None
     try:
-        mla_query = importlib.import_module("sparkinfer.gemm.mla_query_projection")
+        mla_query = importlib.import_module("b12x.gemm.mla_query_projection")
     except ImportError:
         _FUSED_MLA_QUERY_MISSING = True
         return None
@@ -163,7 +163,7 @@ def _b12x_mxfp8_bmm_impl(
 ) -> None:
     gemm = _import_b12x_bmm()
     if gemm is None:
-        raise ImportError("sparkinfer.gemm.bmm is not available")
+        raise ImportError("b12x.gemm.bmm is not available")
     major = "k" if b_major == 0 else "n"
     gemm.bmm(
         lhs,
@@ -204,7 +204,7 @@ def _mxfp8_mla_query_impl(
 ) -> None:
     mla_query = _import_fused_mla_query()
     if mla_query is None:
-        raise ImportError("sparkinfer.gemm.mla_query_projection is not available")
+        raise ImportError("b12x.gemm.mla_query_projection is not available")
     mla_query.run(
         lhs,
         (b_values, b_scales),
@@ -243,7 +243,7 @@ def _bf16_mla_query_impl(
 ) -> None:
     mla_query = _import_fused_mla_query()
     if mla_query is None:
-        raise ImportError("sparkinfer.gemm.mla_query_projection is not available")
+        raise ImportError("b12x.gemm.mla_query_projection is not available")
     mla_query.run(
         lhs,
         weight,

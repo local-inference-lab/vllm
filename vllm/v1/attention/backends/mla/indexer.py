@@ -434,7 +434,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # caches). Outside the SM100 family the FP8
         # paged MQA logits kernel only supports next_n in (1, 2)
         # (deepgemm smxx_fp8_fp4_paged_mqa_logits.hpp:233), so flatten there.
-        # The B12X / sparkinfer sparse indexer handles native next_n>2 on SM120
+        # The B12X / b12x sparse indexer handles native next_n>2 on SM120
         # directly (see sparse_attn_indexer warmup q_rows 1, 2, 4), so it must
         # NOT be forced onto the DeepGEMM next_n<=2 flatten fallback. Flattening
         # MTP-2/MTP-3 verification into rank-1 rows produced subtly wrong accepted
@@ -848,10 +848,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         if schedule_seq_lens.dim() != 1:
             return None
 
-        from sparkinfer.attention.nsa_indexer import (
+        from b12x.attention.nsa_indexer import (
             plan_paged_schedule as build_paged_mqa_schedule_metadata,
         )
-        from sparkinfer.attention.nsa_indexer import (
+        from b12x.attention.nsa_indexer import (
             uses_paged_schedule as uses_paged_mqa_schedule,
         )
 

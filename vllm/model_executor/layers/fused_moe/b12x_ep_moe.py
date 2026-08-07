@@ -38,8 +38,8 @@ def _plan_b12x_ep_moe_fp4_scratch(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
 ):
-    from sparkinfer.moe.ep_moe import Caps as EPMoEScratchCaps
-    from sparkinfer.moe.ep_moe import plan as plan_ep_moe_scratch
+    from b12x.moe.ep_moe import Caps as EPMoEScratchCaps
+    from b12x.moe.ep_moe import plan as plan_ep_moe_scratch
 
     return plan_ep_moe_scratch(
         EPMoEScratchCaps(
@@ -67,7 +67,7 @@ def _run_b12x_ep_moe_fp4(
     plan: Any,
     scratch: torch.Tensor,
 ) -> None:
-    from sparkinfer.moe.ep_moe import run as b12x_ep_moe_fp4
+    from b12x.moe.ep_moe import run as b12x_ep_moe_fp4
 
     binding = plan.bind(
         scratch=scratch,
@@ -129,7 +129,7 @@ class B12xEPExperts(B12xExperts):
         if not B12xExperts._supports_current_device():
             return False
         try:
-            from sparkinfer.moe.ep_moe import run as b12x_ep_moe_fp4  # noqa: F401
+            from b12x.moe.ep_moe import run as b12x_ep_moe_fp4  # noqa: F401
 
             return True
         except ImportError:
@@ -186,7 +186,7 @@ class B12xEPExperts(B12xExperts):
                     "B12X EP expert_map changed before/during CUDA graph capture"
                 )
 
-        from sparkinfer.moe.ep_moe import prepare_expert_map as prepare_ep_expert_map
+        from b12x.moe.ep_moe import prepare_expert_map as prepare_ep_expert_map
 
         prepared = prepare_ep_expert_map(
             expert_map,
