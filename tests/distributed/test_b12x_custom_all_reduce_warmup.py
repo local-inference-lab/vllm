@@ -12,6 +12,14 @@ from vllm.distributed.device_communicators.custom_all_reduce import CustomAllred
 def _make_custom_allreduce(
     *, allreduce_max_size: int
 ) -> tuple[CustomAllreduce, MagicMock]:
+    """Build a minimal custom all-reduce with a mocked PCIe runtime.
+
+    Args:
+        allreduce_max_size: Largest input eligible for one-shot all-reduce.
+
+    Returns:
+        The custom all-reduce instance and its mocked PCIe runtime.
+    """
     runtime = MagicMock()
     runtime.for_stream.return_value.should_allreduce.return_value = True
 
@@ -32,6 +40,15 @@ def _mock_capture_warmup(
     monkeypatch: pytest.MonkeyPatch,
     custom_allreduce: CustomAllreduce,
 ) -> object:
+    """Place a custom all-reduce in the non-capturing graph warmup phase.
+
+    Args:
+        monkeypatch: Pytest fixture used to replace capture state helpers.
+        custom_allreduce: Instance whose PCIe stream should be mocked.
+
+    Returns:
+        The mocked PCIe capture stream.
+    """
     capture_stream = object()
     monkeypatch.setattr(
         custom_allreduce,
@@ -50,6 +67,7 @@ def _mock_capture_warmup(
 def test_capture_warmup_prepares_plain_graph_allreduce(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verify that plain one-shot warmup prepares without communication."""
     custom_allreduce, runtime = _make_custom_allreduce(allreduce_max_size=64)
     capture_stream = _mock_capture_warmup(monkeypatch, custom_allreduce)
     inp = torch.randn(2, 4)
@@ -68,6 +86,7 @@ def test_capture_warmup_prepares_plain_graph_allreduce(
 def test_capture_warmup_does_not_prepare_dma_only_input(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verify that DMA-only warmup keeps the communication-free placeholder."""
     custom_allreduce, runtime = _make_custom_allreduce(allreduce_max_size=16)
     custom_allreduce._pcie_dma = MagicMock()
     custom_allreduce._pcie_dma.should_allreduce.return_value = True
@@ -77,4 +96,7 @@ def test_capture_warmup_does_not_prepare_dma_only_input(
     output = custom_allreduce.custom_all_reduce(inp)
 
     assert output is not None
+    assert output.shape == inp.shape
     runtime.prepare_graph_all_reduce.assert_not_called()
+    runtime.all_reduce.assert_not_called()
+    custom_allreduce._pcie_dma.all_reduce.assert_not_called()
