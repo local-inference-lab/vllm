@@ -37,6 +37,10 @@ from vllm.v1.kv_offload.base import (
     get_offload_block_hash,
     make_offload_key,
 )
+from vllm.v1.kv_offload.tiering.manager import (
+    CPUPrimaryTierOffloadingManager,
+    TieringOffloadingManager,
+)
 from vllm.v1.request import RequestStatus
 
 
@@ -65,7 +69,8 @@ def test_scheduler_reports_allocation_failure(request_runner):
     runner.run(decoded_tokens=[EOS_TOKEN_ID])
 
     reduced = _reduce_kv_connector_stats(runner)
-    assert reduced[_ConnectorMetricName.ALLOCATION_FAILURE] == 1
+    # The final scheduler step retries the failed store before finalization.
+    assert reduced[_ConnectorMetricName.ALLOCATION_FAILURE] == 2
 
 
 @pytest.mark.parametrize("missing_metadata", ["block_ids", "offload_keys"])
@@ -166,7 +171,7 @@ def test_abort_queued_request_does_not_build_store_job(
 def test_last_block_offloaded_at_request_finish(
     request_runner, async_scheduling: bool, prompt_offset: int
 ):
-    """EOS fills the last block at request finish — verify req_status is kept alive.
+    """EOS fills the last block at request finish and stores it before cleanup.
 
     prompt = block_size + prompt_offset tokens → not a full block at schedule time,
     so _build_store_jobs creates no store job. After EOS, request_finished
@@ -188,18 +193,49 @@ def test_last_block_offloaded_at_request_finish(
         generate_store_output(list(keys))
     )
 
-    # Run with one step (EOS)
-    runner.run(
-        decoded_tokens=[EOS_TOKEN_ID],
-    )
+    if prompt_offset == -1:
+        runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
+    else:
+        runner.run(decoded_tokens=[EOS_TOKEN_ID])
 
     cs = runner.connector_scheduler
-    # Verify req_status is kept alive for _build_store_jobs to process
-    # regardless of whether there are storable blocks
-    assert "0" in cs._req_status, (
-        "req_status was deleted but should be kept alive "
-        "for _build_store_jobs to process finished_req_ids."
+    assert "0" not in cs._req_status
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_tiering_manager_final_store_precedes_request_finish(
+    request_runner, async_scheduling: bool
+):
+    """Regression for a final-store KeyError in TieringOffloadingManager."""
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=10,
+        async_scheduling=async_scheduling,
     )
+
+    manager_events: list[str] = []
+    primary = MagicMock(spec=CPUPrimaryTierOffloadingManager)
+    primary.lookup.return_value = LookupResult.MISS
+    primary.get_stats.return_value = None
+    primary.take_events.return_value = []
+
+    def prepare_store(keys, req_context):
+        manager_events.append("prepare_store")
+        return generate_store_output(keys)
+
+    primary.prepare_store.side_effect = prepare_store
+    primary.on_request_finished.side_effect = lambda req_context: manager_events.append(
+        "on_request_finished"
+    )
+
+    tiering_manager = TieringOffloadingManager(primary_tier=primary)
+    runner.connector_scheduler.manager = tiering_manager
+
+    runner.new_request(token_ids=[0, 0, 0])
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
+
+    assert manager_events == ["prepare_store", "on_request_finished"]
+    assert tiering_manager._req_state == {}
 
 
 def test_scheduler_reports_lookup_sync_delay(request_runner):
@@ -423,10 +459,10 @@ def test_request_preemption(request_runner, async_scheduling: bool):
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
-def test_on_request_finished_is_not_deferred_until_store_completion(
+def test_on_request_finished_not_deferred_until_store_completion(
     request_runner, async_scheduling: bool
 ):
-    """on_request_finished fires when no more stores will be submitted.
+    """on_request_finished fires after the last prepare_store is submitted.
 
     A request can finish while its GPU->primary store is still in flight. The
     manager-level hook should not wait for that completion; complete_store may
@@ -467,8 +503,8 @@ def test_on_request_finished_is_not_deferred_until_store_completion(
         complete_transfers=False,
     )
 
-    # Finish the request while its stores are still in flight. The hook should
-    # fire immediately even though no complete_store has arrived yet.
+    # The following scheduler step submits the final store and fires the hook,
+    # without waiting for any complete_store callback.
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
         complete_transfers=False,
@@ -685,7 +721,7 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
     touch_calls = runner.manager.touch.call_args_list
     assert len(touch_calls) == 6
 
-    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(6,))
 
     runner.scheduler.reset_prefix_cache()
 
@@ -698,19 +734,11 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
         # Group 1 (sliding window, window=2): only the last 2 blocks
         #   are within the window → loads blocks 1,2
         expected_loaded=((0, 0), (0, 1), (0, 2), (1, 1), (1, 2)),
-        # The deferred store from the previous request's last block
-        # completes during this step, and its blocks are flushed because
-        # they were reallocated to the new request.
-        # Only block 1 (sliding window group) is stored — block 0's
-        # deferred store is flushed because it was reallocated.
-        expected_stored=((0, 1),),
-        expected_flushed=((0, 1),),
     )
 
-    # 4 touch calls: 2 from get_num_new_matched_tokens (2 groups)
-    # + 2 from _get_reqs_to_store (2 groups)
+    # 2 touch calls from get_num_new_matched_tokens (2 groups).
     touch_calls = runner.manager.touch.call_args_list
-    assert len(touch_calls) == 4
+    assert len(touch_calls) == 2
     # full attention group touched all 3 blocks
     assert len(touch_calls[0].args[0]) == 3
     # sliding window group touched just the last 2 blocks
@@ -1553,16 +1581,13 @@ def test_reset_cache_finalizes_finished_request_with_pending_store(
     assert req_status.transfer_jobs, "expected an in-flight store before finish"
     assert any(job.is_store for job in cs._jobs.values())
 
-    # Finish the request while its store is still in flight. request_finished
-    # fires the hook eagerly, but the entry stays tracked so later completions
-    # can still call complete_store().
+    # Finalization is deferred because the final store decision has not run.
     req_status.req.status = RequestStatus.FINISHED_STOPPED
     cs.request_finished(req_status.req)
-    assert finalized == [req_id]
+    assert finalized == []
     assert req_id in cs._req_status
 
-    # reset_cache discards the in-flight store and drops the state without a
-    # duplicate on_request_finished call.
+    # reset_cache discards pending work, signals finalization, and drops state.
     cs.reset_cache()
     assert finalized == [req_id]
     assert req_id not in cs._req_status
