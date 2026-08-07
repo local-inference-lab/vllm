@@ -922,6 +922,24 @@ class CustomAllreduce:
                 # all-reduce; returning a placeholder is only valid for warmup.
                 if _is_piecewise_cudagraph_runtime():
                     return self.all_reduce(input, registered=False)
+                # The warmup intentionally skips communication, but CuTe-based
+                # PCIe launchers still need their graph specialization loaded
+                # before the nested Inductor capture starts.
+                inp_size = input.numel() * input.element_size()
+                prepare_graph_all_reduce = getattr(
+                    self._pcie_runtime,
+                    "prepare_graph_all_reduce",
+                    None,
+                )
+                if (
+                    prepare_graph_all_reduce is not None
+                    and self._pcie_allreduce_max_size is not None
+                    and inp_size <= self._pcie_allreduce_max_size
+                ):
+                    prepare_graph_all_reduce(
+                        input,
+                        stream=self._pcie_runtime_stream(),
+                    )
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
                 return torch.empty_like(input)
