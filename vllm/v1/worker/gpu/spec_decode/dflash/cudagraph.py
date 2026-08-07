@@ -4,6 +4,7 @@ from collections.abc import Callable, Mapping
 
 import torch
 
+from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
@@ -114,4 +115,102 @@ class DFlashCudaGraphManager(CudaGraphManager):
             create_forward_fn,
             channel_id=channel_id,
             progress_bar_desc=progress_bar_desc,
+        )
+
+
+class DFlashContextCudaGraphManager(CudaGraphManager):
+    """CUDA graphs for the variable-size DFlash context-KV projection.
+
+    The draft-query graph is keyed by request count, while the context rows
+    depend on how many target tokens survived verification. Keeping a second
+    manager avoids padding every request to the full speculative width. Each
+    real row count is mapped to the smallest configured capture bucket.
+    """
+
+    def _init_candidates(self) -> None:
+        capture_sizes = self.compilation_config.cudagraph_capture_sizes
+        if not (self.cudagraph_mode and capture_sizes):
+            return
+
+        max_capture_size = self.compilation_config.max_cudagraph_capture_size
+        capture_sizes = sorted(
+            {
+                size
+                for size in capture_sizes
+                if 0 < size <= self.max_num_context_tokens and size <= max_capture_size
+            }
+        )
+        if not capture_sizes:
+            return
+
+        descs = [
+            BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.FULL,
+                num_tokens=size,
+                num_reqs=None,
+            )
+            for size in reversed(capture_sizes)
+        ]
+        self._capture_descs[CUDAGraphMode.FULL] = descs
+
+        self._context_candidates = {}
+        previous = 0
+        for size in capture_sizes:
+            desc = BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.FULL,
+                num_tokens=size,
+                num_reqs=None,
+            )
+            for num_tokens in range(previous + 1, size + 1):
+                self._context_candidates[num_tokens] = desc
+            previous = size
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        max_num_context_tokens: int,
+    ) -> None:
+        self.max_num_context_tokens = max_num_context_tokens
+        self._context_candidates: dict[int, BatchExecutionDescriptor] = {}
+        super().__init__(
+            vllm_config,
+            device,
+            CUDAGraphMode.FULL_DECODE_ONLY,
+            decode_query_len=1,
+        )
+
+    def dispatch_context(self, num_tokens: int) -> BatchExecutionDescriptor:
+        if self._graphs_captured:
+            desc = self._context_candidates.get(num_tokens)
+            if desc is not None:
+                return desc
+        return BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.NONE,
+            num_tokens=num_tokens,
+            num_reqs=None,
+        )
+
+    def capture_context(
+        self,
+        forward_fn: Callable[[int], None],
+        *,
+        channel_id: str,
+    ) -> None:
+        def create_forward_fn(
+            desc: BatchExecutionDescriptor,
+            warmup: bool,
+        ) -> Callable[[CUDAGraphMode], None]:
+            del warmup
+
+            def run_context(cg_mode: CUDAGraphMode) -> None:
+                del cg_mode
+                forward_fn(desc.num_tokens)
+
+            return run_context
+
+        super().capture(
+            create_forward_fn,
+            channel_id=channel_id,
+            progress_bar_desc="Capturing DFlash context-KV CUDA graphs",
         )

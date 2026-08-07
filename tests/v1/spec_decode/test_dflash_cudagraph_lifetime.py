@@ -68,16 +68,24 @@ def test_dflash_does_not_retain_eager_backbone_output(monkeypatch):
 def test_dflash_capture_uses_phase_specific_draft_channel_ids():
     events = []
 
-    class FakeManager:
+    class FakeQueryManager:
         def capture(self, *args, **kwargs):
-            events.append(kwargs["channel_id"])
+            events.append(("query", kwargs["channel_id"]))
+
+    class FakeContextManager:
+        def capture_context(self, *args, **kwargs):
+            events.append(("context", kwargs["channel_id"]))
 
     speculator = SimpleNamespace(
         _speculator_name="DFlash",
         sample_indices=torch.zeros(1),
         sample_pos=torch.zeros(1),
         sample_idx_mapping=torch.zeros(1),
-        query_cudagraph_manager=FakeManager(),
+        query_cudagraph_manager=FakeQueryManager(),
+        context_cudagraph_manager=FakeContextManager(),
+        _context_slot_mappings=torch.zeros(1, 1),
+        context_positions=torch.ones(1),
+        _capture_context_kv=object(),
         _generate_draft=object(),
         input_buffers=object(),
         block_tables=object(),
@@ -91,6 +99,57 @@ def test_dflash_capture_uses_phase_specific_draft_channel_ids():
     DFlashSpeculator.capture(speculator, capture_phase="production")
 
     assert events == [
-        "vllm:draft:dflash:profile",
-        "vllm:draft:dflash:production",
+        ("query", "vllm:draft:dflash:profile"),
+        ("context", "vllm:draft:dflash:context:profile"),
+        ("query", "vllm:draft:dflash:production"),
+        ("context", "vllm:draft:dflash:context:production"),
     ]
+
+
+def test_dflash_context_precompute_replays_full_graph():
+    manager = Mock()
+    model = Mock()
+    speculator = SimpleNamespace(
+        context_cudagraph_manager=manager,
+        model=model,
+        hidden_states=torch.zeros(8, 4),
+        context_positions=torch.zeros(8, dtype=torch.int64),
+    )
+    desc = SimpleNamespace(cg_mode=CUDAGraphMode.FULL)
+
+    DFlashSpeculator._precompute_context_kv(
+        speculator,
+        num_target_tokens=3,
+        batch_desc=desc,
+        context_slots=torch.zeros(3, dtype=torch.int64),
+    )
+
+    manager.run_fullgraph.assert_called_once_with(desc)
+    model.precompute_and_store_context_kv.assert_not_called()
+
+
+def test_dflash_context_precompute_keeps_eager_fallback():
+    model = Mock()
+    hidden_states = torch.zeros(8, 4)
+    context_positions = torch.zeros(8, dtype=torch.int64)
+    context_slots = torch.zeros(3, dtype=torch.int64)
+    speculator = SimpleNamespace(
+        context_cudagraph_manager=None,
+        model=model,
+        hidden_states=hidden_states,
+        context_positions=context_positions,
+    )
+
+    DFlashSpeculator._precompute_context_kv(
+        speculator,
+        num_target_tokens=3,
+        batch_desc=SimpleNamespace(cg_mode=CUDAGraphMode.NONE),
+        context_slots=context_slots,
+    )
+
+    args = model.precompute_and_store_context_kv.call_args.args
+    assert args[0].data_ptr() == hidden_states.data_ptr()
+    assert args[0].shape == (3, 4)
+    assert args[1].data_ptr() == context_positions.data_ptr()
+    assert args[1].shape == (3,)
+    assert args[2] is context_slots
