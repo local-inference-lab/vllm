@@ -759,7 +759,9 @@ def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     sentinel = torch.zeros(1)
 
     class _FakePool:
-        def lse_reduce_scatter(self, partial, lse, out=None, *, is_lse_base_on_e):
+        def lse_reduce_scatter(
+            self, partial, lse, out=None, *, is_lse_base_on_e
+        ):
             return sentinel
 
     def fake_get_pool(
@@ -853,7 +855,9 @@ def test_b12x_lse_reduce_preserves_supported_layouts(monkeypatch: pytest.MonkeyP
     sentinel = torch.zeros(1)
 
     class _FakePool:
-        def lse_reduce_scatter(self, partial, lse, out=None, *, is_lse_base_on_e):
+        def lse_reduce_scatter(
+            self, partial, lse, out=None, *, is_lse_base_on_e
+        ):
             received.update(partial=partial, lse=lse, out=out)
             return sentinel
 
@@ -886,7 +890,9 @@ def test_b12x_lse_reduce_preserves_supported_layouts(monkeypatch: pytest.MonkeyP
     assert received["lse"].is_contiguous()
     assert received["out"].movedim(0, 1).is_contiguous()
 
-    head_major_storage = torch.zeros(16, 8, 64, dtype=torch.bfloat16, device="cuda")
+    head_major_storage = torch.zeros(
+        16, 8, 64, dtype=torch.bfloat16, device="cuda"
+    )
     head_major = head_major_storage.transpose(0, 1)[:4]
     result = dcp_alltoall._try_b12x_dcp_lse_reduce(
         head_major,
@@ -1339,11 +1345,12 @@ def test_distributed_packed_a2a_with_workspace_matches_reference():
 
 
 @pytest.mark.skipif(
-    torch.accelerator.device_count() < 2 or importlib.util.find_spec("b12x") is None,
-    reason="Need two GPUs and b12x.",
+    torch.accelerator.device_count() < 2
+    or importlib.util.find_spec("sparkinfer") is None,
+    reason="Need two GPUs and sparkinfer.",
 )
 def test_distributed_b12x_a2a_eager_and_graph_matches_reference():
-    from b12x.comm.pcie.pcie_dcp_a2a import _load_extension
+    from sparkinfer.comm.pcie.pcie_dcp_a2a import _load_extension
 
     _load_extension()
     _distributed_run(
