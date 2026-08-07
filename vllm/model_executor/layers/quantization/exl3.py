@@ -3,7 +3,7 @@
 
 """EXL3 (ExLlamaV3 trellis) quantization support.
 
-Rank-sliced routed-expert checkpoints use Sparkinfer's unified planned
+Rank-sliced routed-expert checkpoints use B12X's unified planned
 ``fused_moe`` API for the Trellis decode/prefill windows and the ExLlamaV3
 extension for the small eager parity window. Generic dense and non-rank-sliced
 MoE checkpoints use the
@@ -88,18 +88,18 @@ _MCG_SENTINEL = 0xCBAC1FED
 _MUL1_SENTINEL = 0x83DCD12D
 _HADAMARD_BLOCK = 128
 _EXL3_EXT: Any | None = None
-_SPARKINFER_FUSED_MOE_API: Any | None = None
-_SPARKINFER_MIXED_TRELLIS_API: Any | None = None
-_SPARKINFER_TRELLIS_LINEAR_API: Any | None = None
+_B12X_FUSED_MOE_API: Any | None = None
+_B12X_MIXED_TRELLIS_API: Any | None = None
+_B12X_TRELLIS_LINEAR_API: Any | None = None
 _EXL3_ONLINE_QUANTIZER: Any | None = None
 _EXL3_ONLINE_WARMED_SIGNATURES: set[tuple[int, int, int, int]] = set()
-_SPARKINFER_TRELLIS_WARMED_DEVICES: set[int] = set()
+_B12X_TRELLIS_WARMED_DEVICES: set[int] = set()
 # The dense W4A16 kernel caps its temporary accumulation arena at
 # SMs * 4 * block_m * 256 fp32 elements.  SM120/SM121 devices supported by
 # this path have at most 192 SMs, and block_m never exceeds 64.  Keeping this
 # architecture bound here lets Inductor own and reuse the temporary across
 # layers instead of allocating inside CUDA graph capture.
-_SPARKINFER_TRELLIS_C_TMP_CAP = 192 * 4 * 64 * 256
+_B12X_TRELLIS_C_TMP_CAP = 192 * 4 * 64 * 256
 _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
@@ -127,7 +127,7 @@ def _resolve_mixed_trellis_prefill_block_m(
 ) -> int:
     """Select the qualified GLM-5.2 mixed-K prefill route block.
 
-    SparkInfer's paired-M8 FC2 schedule makes block-32 numerically equivalent
+    B12X's paired-M8 FC2 schedule makes block-32 numerically equivalent
     to the established block-64 path while reducing scratch and improving the
     dominant large-prefill kernel on SM12x. The allowlist contains only tier
     partitions qualified end-to-end on GLM-5.2 checkpoints. Explicit operator
@@ -352,40 +352,36 @@ def _load_exl3_ext() -> Any:
     return ext
 
 
-def _load_sparkinfer_fused_moe() -> Any:
+def _load_b12x_fused_moe() -> Any:
     """Resolve the public unified MoE API lazily."""
 
-    global _SPARKINFER_FUSED_MOE_API
-    if _SPARKINFER_FUSED_MOE_API is not None:
-        return _SPARKINFER_FUSED_MOE_API
+    global _B12X_FUSED_MOE_API
+    if _B12X_FUSED_MOE_API is not None:
+        return _B12X_FUSED_MOE_API
     try:
-        from sparkinfer.moe import fused_moe
+        from b12x.moe import fused_moe
     except Exception as exc:
         raise RuntimeError(
             "Rank-sliced EXL3 requires the exl3_trellis_mcg source in "
-            "sparkinfer.moe.fused_moe. Install a matching Sparkinfer build."
+            "b12x.moe.fused_moe. Install a matching B12X build."
         ) from exc
-    _SPARKINFER_FUSED_MOE_API = fused_moe
+    _B12X_FUSED_MOE_API = fused_moe
     return fused_moe
 
 
-def _load_sparkinfer_mixed_trellis() -> Any:
+def _load_b12x_mixed_trellis() -> Any:
     """Resolve the one-grid mixed-bitrate Trellis API lazily."""
 
-    global _SPARKINFER_MIXED_TRELLIS_API
-    if _SPARKINFER_MIXED_TRELLIS_API is not None:
-        return _SPARKINFER_MIXED_TRELLIS_API
+    global _B12X_MIXED_TRELLIS_API
+    if _B12X_MIXED_TRELLIS_API is not None:
+        return _B12X_MIXED_TRELLIS_API
     try:
-        module = importlib.import_module(
-            "sparkinfer.moe._shared.kernels.w4a16.mixed_trellis"
-        )
-        prepare = importlib.import_module(
-            "sparkinfer.moe._shared.kernels.w4a16.prepare"
-        )
-        host = importlib.import_module("sparkinfer.moe._shared.kernels.w4a16.host")
+        module = importlib.import_module("b12x.moe._shared.kernels.w4a16.mixed_trellis")
+        prepare = importlib.import_module("b12x.moe._shared.kernels.w4a16.prepare")
+        host = importlib.import_module("b12x.moe._shared.kernels.w4a16.host")
     except Exception as exc:
         raise RuntimeError(
-            "Mixed-bitrate rank-sliced EXL3 requires the matching SparkInfer "
+            "Mixed-bitrate rank-sliced EXL3 requires the matching B12X "
             "mixed_trellis implementation."
         ) from exc
     api = SimpleNamespace(
@@ -397,24 +393,24 @@ def _load_sparkinfer_mixed_trellis() -> Any:
         prepare_weights=prepare.prepare_trellis256_moe_weights,
         run_mixed_trellis=module.run_mixed_trellis,
     )
-    _SPARKINFER_MIXED_TRELLIS_API = api
+    _B12X_MIXED_TRELLIS_API = api
     return api
 
 
-def _load_sparkinfer_trellis_linear() -> Any:
+def _load_b12x_trellis_linear() -> Any:
     """Resolve the native dense Trellis API lazily."""
 
-    global _SPARKINFER_TRELLIS_LINEAR_API
-    if _SPARKINFER_TRELLIS_LINEAR_API is not None:
-        return _SPARKINFER_TRELLIS_LINEAR_API
+    global _B12X_TRELLIS_LINEAR_API
+    if _B12X_TRELLIS_LINEAR_API is not None:
+        return _B12X_TRELLIS_LINEAR_API
     try:
-        from sparkinfer.gemm import trellis_linear
+        from b12x.gemm import trellis_linear
     except Exception as exc:
         raise RuntimeError(
-            "Online EXL3 prefill requires sparkinfer.gemm.trellis_linear. "
-            "Install a matching SparkInfer build."
+            "Online EXL3 prefill requires b12x.gemm.trellis_linear. "
+            "Install a matching B12X build."
         ) from exc
-    _SPARKINFER_TRELLIS_LINEAR_API = trellis_linear
+    _B12X_TRELLIS_LINEAR_API = trellis_linear
     return trellis_linear
 
 
@@ -533,7 +529,7 @@ def _exl3_gemm_fake(
     )
 
 
-def _sparkinfer_trellis_weight(
+def _b12x_trellis_weight(
     trellis: torch.Tensor,
     suh: torch.Tensor,
     svh: torch.Tensor,
@@ -541,14 +537,14 @@ def _sparkinfer_trellis_weight(
 ) -> Any:
     """Prepare each online weight before capture and retain its native views."""
 
-    api = _load_sparkinfer_trellis_linear()
+    api = _load_b12x_trellis_linear()
     # Keep prepared views on the owning tensor. A process-global pointer-keyed
     # cache can alias after allocator address reuse and retains released models
     # forever. This small reference cycle is collected with the tensor.
-    cache = getattr(trellis, "_vllm_sparkinfer_prepared_weights", None)
+    cache = getattr(trellis, "_vllm_b12x_prepared_weights", None)
     if cache is None:
         cache = {}
-        trellis._vllm_sparkinfer_prepared_weights = cache
+        trellis._vllm_b12x_prepared_weights = cache
     key = (id(suh), id(svh), dtype)
     weight = cache.get(key)
     if weight is None:
@@ -563,7 +559,7 @@ def _sparkinfer_trellis_weight(
     return weight
 
 
-def _sparkinfer_trellis_k6_supported(
+def _b12x_trellis_k6_supported(
     trellis: torch.Tensor,
     *,
     has_mcg: bool,
@@ -582,7 +578,7 @@ def _sparkinfer_trellis_k6_supported(
     )
 
 
-def _warm_sparkinfer_trellis_device(
+def _warm_b12x_trellis_device(
     trellis: torch.Tensor,
     suh: torch.Tensor,
     svh: torch.Tensor,
@@ -592,19 +588,19 @@ def _warm_sparkinfer_trellis_device(
     device_index = trellis.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    if device_index in _SPARKINFER_TRELLIS_WARMED_DEVICES:
+    if device_index in _B12X_TRELLIS_WARMED_DEVICES:
         return
     source = torch.zeros(
         (1, int(trellis.shape[0]) * 16),
         dtype=torch.float16,
         device=trellis.device,
     )
-    _sparkinfer_trellis_linear(source, trellis, suh, svh)
+    _b12x_trellis_linear(source, trellis, suh, svh)
     torch.cuda.synchronize(trellis.device)
-    _SPARKINFER_TRELLIS_WARMED_DEVICES.add(device_index)
+    _B12X_TRELLIS_WARMED_DEVICES.add(device_index)
 
 
-def _sparkinfer_trellis_c_tmp_elements(rows: int, columns: int) -> int:
+def _b12x_trellis_c_tmp_elements(rows: int, columns: int) -> int:
     """Return graph-safe dense-W4A16 scratch capacity for one static shape."""
 
     rows = int(rows)
@@ -616,15 +612,15 @@ def _sparkinfer_trellis_c_tmp_elements(rows: int, columns: int) -> int:
         ((rows + 47) // 48) * 48,
         ((rows + 63) // 64) * 64,
     )
-    return min(columns * padded_rows, _SPARKINFER_TRELLIS_C_TMP_CAP)
+    return min(columns * padded_rows, _B12X_TRELLIS_C_TMP_CAP)
 
 
 @torch.library.custom_op(
-    "vllm::sparkinfer_trellis_linear_out",
+    "vllm::b12x_trellis_linear_out",
     mutates_args=("output", "gemm_output", "c_tmp", "rotated_f16"),
     device_types="cuda",
 )
-def _sparkinfer_trellis_linear_out(
+def _b12x_trellis_linear_out(
     x: torch.Tensor,
     trellis: torch.Tensor,
     suh: torch.Tensor,
@@ -636,8 +632,8 @@ def _sparkinfer_trellis_linear_out(
 ) -> None:
     """Execute dense Trellis into graph-owned output and scratch tensors."""
 
-    api = _load_sparkinfer_trellis_linear()
-    weight = _sparkinfer_trellis_weight(trellis, suh, svh, x.dtype)
+    api = _load_b12x_trellis_linear()
+    weight = _b12x_trellis_weight(trellis, suh, svh, x.dtype)
     api.run(
         x,
         weight,
@@ -648,8 +644,8 @@ def _sparkinfer_trellis_linear_out(
     )
 
 
-@_sparkinfer_trellis_linear_out.register_fake
-def _sparkinfer_trellis_linear_out_fake(
+@_b12x_trellis_linear_out.register_fake
+def _b12x_trellis_linear_out_fake(
     x: torch.Tensor,
     trellis: torch.Tensor,
     suh: torch.Tensor,
@@ -662,25 +658,25 @@ def _sparkinfer_trellis_linear_out_fake(
     del x, trellis, suh, svh, output, gemm_output, c_tmp, rotated_f16
 
 
-def _sparkinfer_trellis_linear(
+def _b12x_trellis_linear(
     x: torch.Tensor,
     trellis: torch.Tensor,
     suh: torch.Tensor,
     svh: torch.Tensor,
 ) -> torch.Tensor:
-    """Run every online-K6 batch through SparkInfer with explicit storage."""
+    """Run every online-K6 batch through B12X with explicit storage."""
 
     output = torch.empty(
         (x.shape[0], trellis.shape[1] * 16), dtype=x.dtype, device=x.device
     )
     gemm_output = torch.empty_like(output)
     c_tmp = torch.empty(
-        (_sparkinfer_trellis_c_tmp_elements(x.shape[0], output.shape[1]),),
+        (_b12x_trellis_c_tmp_elements(x.shape[0], output.shape[1]),),
         dtype=torch.float32,
         device=x.device,
     )
     rotated_f16 = torch.empty_like(x)
-    _sparkinfer_trellis_linear_out(
+    _b12x_trellis_linear_out(
         x,
         trellis,
         suh,
@@ -1425,7 +1421,7 @@ class Exl3OnlineLinearMethod(_Fp8OnlineLinearBase):
 
     def _warm_decode_shapes(self, layer: torch.nn.Module) -> None:
         device = layer.exl3_online_trellis_weight.device
-        _sparkinfer_trellis_weight(
+        _b12x_trellis_weight(
             layer.exl3_online_trellis_weight,
             layer.exl3_online_suh,
             layer.exl3_online_svh,
@@ -1448,7 +1444,7 @@ class Exl3OnlineLinearMethod(_Fp8OnlineLinearBase):
                 dtype=torch.float16,
                 device=device,
             )
-            _sparkinfer_trellis_linear(
+            _b12x_trellis_linear(
                 source,
                 layer.exl3_online_trellis_weight,
                 layer.exl3_online_suh,
@@ -1545,7 +1541,7 @@ class Exl3OnlineLinearMethod(_Fp8OnlineLinearBase):
         original_shape = x.shape[:-1]
         original_dtype = x.dtype
         x_2d = x.reshape(-1, x.shape[-1]).to(torch.float16).contiguous()
-        output = _sparkinfer_trellis_linear(
+        output = _b12x_trellis_linear(
             x_2d,
             layer.exl3_online_trellis_weight,
             layer.exl3_online_suh,
@@ -1664,7 +1660,7 @@ class Exl3LinearMethod(LinearMethodBase):
 
         for shard_id in layer.exl3_shard_ids:
             trellis = layer.trellis.exl3_tensors[shard_id]
-            if not _sparkinfer_trellis_k6_supported(
+            if not _b12x_trellis_k6_supported(
                 trellis,
                 has_mcg=shard_id in layer.mcg.exl3_tensors,
                 has_mul1=shard_id in layer.mul1.exl3_tensors,
@@ -1672,13 +1668,13 @@ class Exl3LinearMethod(LinearMethodBase):
                 continue
             suh = layer.suh.exl3_tensors[shard_id]
             svh = layer.svh.exl3_tensors[shard_id]
-            _sparkinfer_trellis_weight(
+            _b12x_trellis_weight(
                 trellis,
                 suh,
                 svh,
                 torch.float16,
             )
-            _warm_sparkinfer_trellis_device(trellis, suh, svh)
+            _warm_b12x_trellis_device(trellis, suh, svh)
 
     def apply(
         self,
@@ -1935,12 +1931,12 @@ class Exl3LinearMethod(LinearMethodBase):
             x = torch.nn.functional.pad(x, (0, packed_k - x.shape[-1]))
         has_mcg = shard_id in layer.mcg.exl3_tensors
         has_mul1 = shard_id in layer.mul1.exl3_tensors
-        if _sparkinfer_trellis_k6_supported(
+        if _b12x_trellis_k6_supported(
             trellis,
             has_mcg=has_mcg,
             has_mul1=has_mul1,
         ):
-            output = _sparkinfer_trellis_linear(
+            output = _b12x_trellis_linear(
                 x,
                 trellis,
                 layer.suh.exl3_tensors[shard_id],
@@ -2414,14 +2410,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
     @staticmethod
     def _mixed_trellis_prefill_tile_config(hidden_size: int, intermediate_size: int):
-        # Route packing stays block-64, while SparkInfer's mixed-kernel ABI v2
+        # Route packing stays block-64, while B12X's mixed-kernel ABI v2
         # executes FC2 as arithmetic-equivalent 8-row subtiles.  Reuse the
         # checkpoint's original one-grid tile geometry so prefill has the same
         # reduction order as the stock-r16 quality reference.
         return Exl3MoEMethod._mixed_trellis_tile_config(hidden_size, intermediate_size)
 
     def _prepare_mixed_rank_sliced_weights(self, layer: RoutedExperts) -> None:
-        mixed_api = _load_sparkinfer_mixed_trellis()
+        mixed_api = _load_b12x_mixed_trellis()
         num_experts = int(layer.local_num_experts)
         hidden_size = int(layer.exl3_hidden_size)
         intermediate_size = int(layer.exl3_intermediate_size_per_partition)
@@ -2628,7 +2624,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if getattr(layer, "exl3_mixed_bitrate", False):
             self._prepare_mixed_rank_sliced_weights(layer)
             return
-        api = _load_sparkinfer_fused_moe()
+        api = _load_b12x_fused_moe()
         num_experts = int(layer.local_num_experts)
         hidden_size = int(layer.exl3_hidden_size)
         intermediate_size = int(layer.exl3_intermediate_size_per_partition)
@@ -2850,7 +2846,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 f"{topk_ids.dtype}"
             )
 
-        mixed_api = _load_sparkinfer_mixed_trellis()
+        mixed_api = _load_b12x_mixed_trellis()
         device = x.device
         total_experts = sum(experts for _, experts in tier_signature)
 
@@ -3087,7 +3083,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "profile pass before CUDA graph capture"
             )
 
-        api = _load_sparkinfer_fused_moe()
+        api = _load_b12x_fused_moe()
 
         def _plan_with_scratch(plan_max_tokens: int, plan_block_m: int):
             caps = api.Caps(

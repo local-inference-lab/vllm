@@ -14,7 +14,7 @@ prove backend policy only:
   with full-capacity staging;
 * m above planned capacity raises.
 
-CPU-only; no CUDA, sparkinfer, or exllamav3_ext required.
+CPU-only; no CUDA, b12x, or exllamav3_ext required.
 """
 
 import os
@@ -194,12 +194,12 @@ class _Harness:
             else:
                 os.environ[name] = value
         self._saved_loaders = (
-            exl3_module._load_sparkinfer_fused_moe,
-            exl3_module._load_sparkinfer_mixed_trellis,
+            exl3_module._load_b12x_fused_moe,
+            exl3_module._load_b12x_mixed_trellis,
             exl3_module._load_exl3_ext,
         )
-        exl3_module._load_sparkinfer_fused_moe = lambda: self.api
-        exl3_module._load_sparkinfer_mixed_trellis = lambda: self.mixed_api
+        exl3_module._load_b12x_fused_moe = lambda: self.api
+        exl3_module._load_b12x_mixed_trellis = lambda: self.mixed_api
         exl3_module._load_exl3_ext = lambda: self.ext
         self._saved_capturing = torch.cuda.is_current_stream_capturing
         torch.cuda.is_current_stream_capturing = lambda: False
@@ -216,8 +216,8 @@ class _Harness:
 
     def __exit__(self, *exc):
         (
-            exl3_module._load_sparkinfer_fused_moe,
-            exl3_module._load_sparkinfer_mixed_trellis,
+            exl3_module._load_b12x_fused_moe,
+            exl3_module._load_b12x_mixed_trellis,
             exl3_module._load_exl3_ext,
         ) = self._saved_loaders
         torch.cuda.is_current_stream_capturing = self._saved_capturing

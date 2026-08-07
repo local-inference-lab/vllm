@@ -621,7 +621,7 @@ def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
             return SimpleNamespace(plan=kwargs["plan"])
 
     api = FakeFusedMoe()
-    monkeypatch.setattr(exl3_module, "_load_sparkinfer_fused_moe", lambda: api)
+    monkeypatch.setattr(exl3_module, "_load_b12x_fused_moe", lambda: api)
     method = object.__new__(Exl3MoEMethod)
     method.quant_config = SimpleNamespace(bits=float(bits))
     method._rank_sliced_backing = lambda _layer, name: slabs[name]
@@ -686,9 +686,7 @@ def test_rank_sliced_weights_pass_shared_h_rows_without_expansion(monkeypatch):
         def prepare_weights(**kwargs):
             return SimpleNamespace(**kwargs)
 
-    monkeypatch.setattr(
-        exl3_module, "_load_sparkinfer_fused_moe", lambda: FakeFusedMoe()
-    )
+    monkeypatch.setattr(exl3_module, "_load_b12x_fused_moe", lambda: FakeFusedMoe())
     method = object.__new__(Exl3MoEMethod)
     method.quant_config = SimpleNamespace(bits=float(bits))
     method._rank_sliced_backing = lambda _layer, name: slabs[name]
@@ -789,7 +787,7 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(
             return tier0, tier1
 
     api = FakeMixedApi()
-    monkeypatch.setattr(exl3_module, "_load_sparkinfer_mixed_trellis", lambda: api)
+    monkeypatch.setattr(exl3_module, "_load_b12x_mixed_trellis", lambda: api)
     method = object.__new__(Exl3MoEMethod)
     method._rank_sliced_backing = lambda _layer, name: slabs[name]
 
@@ -863,13 +861,13 @@ def test_prepared_dense_weight_is_owned_by_source_tensor(monkeypatch) -> None:
             return SimpleNamespace(trellis=trellis, suh=suh, svh=svh)
 
     api = FakeApi()
-    monkeypatch.setattr(exl3_module, "_load_sparkinfer_trellis_linear", lambda: api)
+    monkeypatch.setattr(exl3_module, "_load_b12x_trellis_linear", lambda: api)
     trellis = torch.empty((8, 8, 96), dtype=torch.int16)
     suh = torch.empty(128, dtype=torch.float16)
     svh = torch.empty(128, dtype=torch.float16)
 
-    first = exl3_module._sparkinfer_trellis_weight(trellis, suh, svh, torch.float16)
-    second = exl3_module._sparkinfer_trellis_weight(trellis, suh, svh, torch.float16)
+    first = exl3_module._b12x_trellis_weight(trellis, suh, svh, torch.float16)
+    second = exl3_module._b12x_trellis_weight(trellis, suh, svh, torch.float16)
     assert first is second
     assert api.calls == 1
 
