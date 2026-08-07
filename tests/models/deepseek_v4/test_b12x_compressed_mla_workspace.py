@@ -38,12 +38,12 @@ class _RecordingWorkspaceManager:
         return []
 
 
-def _install_recording_sparkinfer(monkeypatch, caps_calls: list[SimpleNamespace]):
-    sparkinfer = types.ModuleType("sparkinfer")
-    sparkinfer.__path__ = []
-    attention = types.ModuleType("sparkinfer.attention")
+def _install_recording_b12x(monkeypatch, caps_calls: list[SimpleNamespace]):
+    b12x = types.ModuleType("b12x")
+    b12x.__path__ = []
+    attention = types.ModuleType("b12x.attention")
     attention.__path__ = []
-    compressed_mla = types.ModuleType("sparkinfer.attention.compressed_mla")
+    compressed_mla = types.ModuleType("b12x.attention.compressed_mla")
 
     def caps(**kwargs) -> SimpleNamespace:
         return SimpleNamespace(**kwargs)
@@ -70,11 +70,11 @@ def _install_recording_sparkinfer(monkeypatch, caps_calls: list[SimpleNamespace]
     compressed_mla.split_chunks_for_contract = (  # type: ignore[attr-defined]
         split_chunks_for_contract
     )
-    monkeypatch.setitem(sys.modules, "sparkinfer", sparkinfer)
-    monkeypatch.setitem(sys.modules, "sparkinfer.attention", attention)
+    monkeypatch.setitem(sys.modules, "b12x", b12x)
+    monkeypatch.setitem(sys.modules, "b12x.attention", attention)
     monkeypatch.setitem(
         sys.modules,
-        "sparkinfer.attention.compressed_mla",
+        "b12x.attention.compressed_mla",
         compressed_mla,
     )
     return split_chunks_for_contract
@@ -140,7 +140,7 @@ def test_reserve_uses_full_runtime_width(
     expected_width: int,
 ) -> None:
     caps_calls: list[SimpleNamespace] = []
-    split_chunks = _install_recording_sparkinfer(monkeypatch, caps_calls)
+    split_chunks = _install_recording_b12x(monkeypatch, caps_calls)
     workspace = _RecordingWorkspaceManager()
     monkeypatch.setattr(b12x_mod, "current_workspace_manager", lambda: workspace)
     layer = _make_layer(compress_ratio=compress_ratio, dspark=dspark)
@@ -167,7 +167,7 @@ def test_reserve_uses_full_runtime_width(
 
 def test_reserve_uses_dcp_gathered_heads(monkeypatch) -> None:
     caps_calls: list[SimpleNamespace] = []
-    _install_recording_sparkinfer(monkeypatch, caps_calls)
+    _install_recording_b12x(monkeypatch, caps_calls)
     monkeypatch.setattr(
         b12x_mod,
         "current_workspace_manager",
@@ -423,7 +423,7 @@ def _runtime_plan_nbytes(compressed_mla, *, rows: int, width: int, heads: int) -
         pytest.param(128, False, 2, (4224,), 1060.627929688, id="c128-dcp2"),
     ],
 )
-def test_real_sparkinfer_reserve_dominates_runtime_envelope(
+def test_real_b12x_reserve_dominates_runtime_envelope(
     monkeypatch,
     compress_ratio: int,
     dspark: bool,
@@ -431,7 +431,7 @@ def test_real_sparkinfer_reserve_dominates_runtime_envelope(
     runtime_widths: tuple[int, ...],
     expected_reserve_mib: float,
 ) -> None:
-    compressed_mla = pytest.importorskip("sparkinfer.attention.compressed_mla")
+    compressed_mla = pytest.importorskip("b12x.attention.compressed_mla")
     workspace = _RecordingWorkspaceManager()
     monkeypatch.setattr(b12x_mod, "current_workspace_manager", lambda: workspace)
     layer = _make_layer(
@@ -464,7 +464,7 @@ def test_real_sparkinfer_reserve_dominates_runtime_envelope(
 def test_mns64_contract_does_not_grow_production_mnb8192_scratch(
     monkeypatch,
 ) -> None:
-    compressed_mla = pytest.importorskip("sparkinfer.attention.compressed_mla")
+    compressed_mla = pytest.importorskip("b12x.attention.compressed_mla")
     workspace = _RecordingWorkspaceManager()
     monkeypatch.setattr(b12x_mod, "current_workspace_manager", lambda: workspace)
     max_rows = 8192
