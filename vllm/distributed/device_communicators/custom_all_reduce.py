@@ -451,17 +451,18 @@ class CustomAllreduce:
             return
 
         if use_pcie_oneshot:
+            pcie_backend = _get_pcie_allreduce_backend()
             allow_cross_numa = envs.VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA
             if _is_cross_numa_topology(physical_device_ids) and not allow_cross_numa:
                 logger.warning(
-                    "Custom allreduce is disabled because b12x PCIe oneshot "
+                    "Custom allreduce is disabled because %s PCIe oneshot "
                     "allreduce was requested on a cross-NUMA PCIe topology "
                     "(physical_device_ids=%s). Set "
                     "VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA=1 or unset it to force it.",
+                    pcie_backend,
                     physical_device_ids,
                 )
                 return
-            pcie_backend = _get_pcie_allreduce_backend()
             pool_cls = (
                 _load_b12x_pcie_oneshot_pool()
                 if pcie_backend == "b12x"
@@ -489,7 +490,8 @@ class CustomAllreduce:
                 max_num_batched_tokens = 8192
                 logger.warning(
                     "vLLM config unavailable during CustomAllreduce init; "
-                    "allocating b12x PCIe buffers for hidden=%d, rows<=%d.",
+                    "allocating %s PCIe buffers for hidden=%d, rows<=%d.",
+                    pcie_backend,
                     model_hidden_size,
                     max_num_batched_tokens,
                 )
@@ -502,8 +504,9 @@ class CustomAllreduce:
             ) = _b12x_pcie_oneshot_limits()
             if self.nccl_group is None:
                 logger.warning(
-                    "Custom allreduce is disabled because b12x PCIe oneshot "
-                    "allreduce requires a CUDA/NCCL device process group."
+                    "Custom allreduce is disabled because %s PCIe oneshot "
+                    "allreduce requires a CUDA/NCCL device process group.",
+                    pcie_backend,
                 )
                 return
             self.max_size = pcie_buffer_size
@@ -535,15 +538,17 @@ class CustomAllreduce:
                     pcie_runtime.close()
                 if pcie_init_error is not None:
                     logger.warning(
-                        "b12x PCIe oneshot allreduce initialization failed on "
+                        "%s PCIe oneshot allreduce initialization failed on "
                         "rank %d: %s. Falling back to PyNCCL allreduce.",
+                        pcie_backend,
                         rank,
                         pcie_init_error,
                     )
                 else:
                     logger.warning(
-                        "b12x PCIe oneshot allreduce initialization failed on "
-                        "another TP rank. Falling back to PyNCCL allreduce."
+                        "%s PCIe oneshot allreduce initialization failed on "
+                        "another TP rank. Falling back to PyNCCL allreduce.",
+                        pcie_backend,
                     )
                 return
             assert pcie_runtime is not None

@@ -10,6 +10,15 @@ _LAUNCHER = _REPO_ROOT / "serve-ds4-flash.sh"
 
 
 def _dry_run(tmp_path: Path, **overrides: str) -> str:
+    """Run the DS4 launcher without starting a server.
+
+    Args:
+        tmp_path: Isolated home and cache root for the launcher.
+        **overrides: Environment values applied to the launcher defaults.
+
+    Returns:
+        The launcher's diagnostic stderr output.
+    """
     env = {
         "PATH": os.environ["PATH"],
         "HOME": str(tmp_path),
@@ -29,18 +38,21 @@ def _dry_run(tmp_path: Path, **overrides: str) -> str:
 
 
 def test_ds4_launcher_auto_selects_flashinfer_ipc_for_tp2(tmp_path: Path) -> None:
+    """Verify that automatic selection uses FlashInfer IPC at TP2."""
     output = _dry_run(tmp_path, TP="2")
 
     assert "allreduce=flashinfer-ipc" in output
 
 
 def test_ds4_launcher_auto_keeps_b12x_for_tp4(tmp_path: Path) -> None:
+    """Verify that automatic selection retains B12X at TP4."""
     output = _dry_run(tmp_path, TP="4")
 
     assert "allreduce=b12x" in output
 
 
 def test_ds4_launcher_explicit_allreduce_overrides_auto(tmp_path: Path) -> None:
+    """Verify that an explicit all-reduce mode overrides automatic selection."""
     output = _dry_run(tmp_path, TP="2", ALLREDUCE_MODE="b12x")
 
     assert "allreduce=b12x" in output
