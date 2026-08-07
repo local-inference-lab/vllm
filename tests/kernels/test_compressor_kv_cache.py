@@ -21,6 +21,7 @@ from vllm import _custom_ops as ops
 from vllm.models.deepseek_v4.common.ops import (
     dequantize_and_gather_k_cache,
     quantize_and_insert_k_cache,
+    save_partial_states,
 )
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     _fused_kv_compress_norm_rope_insert_indexer_attn,
@@ -59,6 +60,77 @@ def _ue8m0_reference(x: torch.Tensor, block_size: int, fp8_max: float):
 
 
 # ── Test A: DeepseekV4 Attention path ──────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("draft_tokens", [5, 7])
+def test_save_partial_states_writes_every_verifier_row(draft_tokens: int) -> None:
+    """The compressor state write covers all target rows for each request."""
+    device = "cuda"
+    verifier_width = draft_tokens + 1
+    num_reqs = 2
+    num_actual = num_reqs * verifier_width
+    head_size = 16
+    block_size = 16
+    compress_ratio = 4
+
+    kv = (
+        torch.arange(
+            (num_actual + 1) * head_size,
+            dtype=torch.float32,
+            device=device,
+        )
+        .view(num_actual + 1, head_size)
+        .to(torch.bfloat16)
+    )
+    score = (kv + 1000).to(torch.bfloat16)
+    ape = (
+        torch.arange(
+            compress_ratio * head_size,
+            dtype=torch.float32,
+            device=device,
+        )
+        .view(compress_ratio, head_size)
+        .to(torch.bfloat16)
+    )
+    positions = torch.arange(num_actual + 1, dtype=torch.int64, device=device)
+    slot_mapping = torch.cat(
+        (
+            torch.arange(verifier_width, dtype=torch.int64, device=device),
+            torch.arange(
+                block_size,
+                block_size + verifier_width,
+                dtype=torch.int64,
+                device=device,
+            ),
+            torch.tensor([-1], dtype=torch.int64, device=device),
+        )
+    )
+    state_cache = torch.full(
+        (2, block_size, 2 * head_size),
+        fill_value=-1,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    save_partial_states(
+        kv=kv,
+        score=score,
+        ape=ape,
+        positions=positions,
+        state_cache=state_cache,
+        slot_mapping=slot_mapping,
+        block_size=block_size,
+        state_width=head_size,
+        compress_ratio=compress_ratio,
+    )
+    torch.cuda.synchronize()
+
+    actual_slots = slot_mapping[:num_actual]
+    actual = state_cache.view(-1, 2 * head_size)[actual_slots]
+    torch.testing.assert_close(actual[:, :head_size], kv[:num_actual])
+    expected_score = score[:num_actual] + ape[positions[:num_actual] % compress_ratio]
+    torch.testing.assert_close(actual[:, head_size:], expected_score)
+    assert torch.all(state_cache.view(-1, 2 * head_size)[verifier_width] == -1)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 8, 17])

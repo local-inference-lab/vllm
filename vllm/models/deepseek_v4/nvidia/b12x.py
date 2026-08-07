@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 import torch
 
+from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.common.ops import (
     compute_dcp_global_topk_indices_and_lens,
@@ -51,6 +52,36 @@ _DSV4_HEAD_DIM = 512
 _DSV4_V_HEAD_DIM = 512
 _DSV4_CACHE_BYTES_PER_TOKEN = 584
 _VALIDATE_DCP_INDICES_ENV = "VLLM_DSV4_DCP_VALIDATE_INDICES"
+
+
+def _get_dspark_decode_row_capacity(vllm_config: VllmConfig) -> int | None:
+    """Return the largest target-verifier row count the scheduler can emit."""
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or not speculative_config.use_dspark():
+        return None
+    num_speculative_tokens = int(speculative_config.num_speculative_tokens or 0)
+    if num_speculative_tokens <= 0:
+        return None
+    scheduler_config = vllm_config.scheduler_config
+    return min(
+        int(scheduler_config.max_num_batched_tokens),
+        int(scheduler_config.max_num_seqs) * (1 + num_speculative_tokens),
+    )
+
+
+def _validate_compressed_mla_decode_row_capacity(
+    *,
+    rows: int,
+    mode: Literal["decode", "extend"],
+    decode_row_capacity: int | None,
+) -> None:
+    if mode != "decode" or decode_row_capacity is None:
+        return
+    if int(rows) > int(decode_row_capacity):
+        raise ValueError(
+            f"compressed MLA decode rows {rows} exceed the declared "
+            f"capacity {decode_row_capacity}"
+        )
 
 
 def _cdiv(x: int, y: int) -> int:
@@ -286,6 +317,7 @@ def _run_compressed_mla(
     indexed_lens: torch.Tensor | None,
     indexed_page_size: int | None,
     mode: Literal["decode", "extend"] = "decode",
+    decode_row_capacity: int | None = None,
     return_lse: bool = False,
     lse_scale: Literal["natural", "base2"] = "natural",
 ) -> torch.Tensor | None:
@@ -309,6 +341,11 @@ def _run_compressed_mla(
     )
 
     rows, heads = int(q.shape[0]), int(q.shape[1])
+    _validate_compressed_mla_decode_row_capacity(
+        rows=rows,
+        mode=mode,
+        decode_row_capacity=decode_row_capacity,
+    )
     q = q.contiguous()
     swa_indices = swa_indices.contiguous()
     swa_lens = swa_lens.contiguous()
@@ -341,6 +378,7 @@ def _run_compressed_mla(
         rows=max(1, rows),
         width=width,
         max_chunks=decode_split_cap,
+        decode_row_capacity=decode_row_capacity,
     )
 
     plan = plan_compressed_mla_scratch(
@@ -353,6 +391,7 @@ def _run_compressed_mla(
             v_head_dim=_DSV4_V_HEAD_DIM,
             page_size=int(swa_page_size),
             max_chunks_per_row=num_splits_cap,
+            decode_row_capacity=decode_row_capacity,
         )
     )
     scratch = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
@@ -411,6 +450,7 @@ def _run_dcp_compressed_mla(
     indexed_lens: torch.Tensor | None,
     indexed_page_size: int | None,
     mode: Literal["decode", "extend"] = "decode",
+    decode_row_capacity: int | None = None,
 ) -> None:
     from vllm.distributed.parallel_state import get_dcp_group
 
@@ -443,6 +483,7 @@ def _run_dcp_compressed_mla(
         indexed_lens=indexed_lens,
         indexed_page_size=indexed_page_size,
         mode=mode,
+        decode_row_capacity=decode_row_capacity,
         return_lse=True,
         lse_scale="natural",
     )
@@ -547,6 +588,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
 
         swa_width = int(self.window_size)
         speculative_config = self.vllm_config.speculative_config
+        decode_row_capacity = _get_dspark_decode_row_capacity(self.vllm_config)
         if speculative_config is not None and speculative_config.use_dspark():
             swa_width = max(
                 swa_width,
@@ -563,12 +605,14 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
             rows=rows,
             width=width,
             max_chunks=decode_split_cap,
+            decode_row_capacity=decode_row_capacity,
         )
         max_q_chunks = get_compressed_mla_max_q_chunks(
             rows,
             width,
             decode_split_cap,
             compressed_mla_split_chunks_for_contract,
+            decode_row_capacity=decode_row_capacity,
         )
         dcp_world_size = max(
             int(self.vllm_config.parallel_config.decode_context_parallel_size),
@@ -587,6 +631,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 page_size=int(self.swa_cache_layer.block_size),
                 max_chunks_per_row=num_splits_cap,
                 max_q_chunks=max_q_chunks,
+                decode_row_capacity=decode_row_capacity,
             )
         )
         current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
@@ -693,6 +738,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        decode_row_capacity = _get_dspark_decode_row_capacity(vllm_config)
         dcp_rank = 0
         if dcp_world_size > 1:
             from vllm.distributed.parallel_state import get_dcp_group
@@ -770,6 +816,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 indexed_lens=topk_lens,
                 indexed_page_size=indexed_page_size,
                 mode="decode",
+                decode_row_capacity=decode_row_capacity,
             )
         else:
             _run_compressed_mla(
@@ -786,6 +833,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 indexed_lens=topk_lens,
                 indexed_page_size=indexed_page_size,
                 mode="decode",
+                decode_row_capacity=decode_row_capacity,
             )
 
     def _forward_b12x_prefill(

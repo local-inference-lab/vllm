@@ -62,6 +62,7 @@ def get_compressed_mla_max_q_chunks(
     width: int,
     max_chunks: int,
     split_chunks_for_contract: Callable[..., int],
+    decode_row_capacity: int | None = None,
 ) -> int:
     """Return the q-chunk cap over every reachable row count.
 
@@ -70,6 +71,7 @@ def get_compressed_mla_max_q_chunks(
         width: Combined SWA and indexed width.
         max_chunks: Maximum chunks allowed for each row.
         split_chunks_for_contract: Kernel contract split-count function.
+        decode_row_capacity: Integration-declared decode/verifier row capacity.
 
     Returns:
         The largest reachable product of rows and chunks per row.
@@ -83,6 +85,7 @@ def get_compressed_mla_max_q_chunks(
             rows=rows,
             width=width,
             max_chunks=max_chunks,
+            decode_row_capacity=decode_row_capacity,
         )
         for rows in range(1, max_rows + 1)
     )

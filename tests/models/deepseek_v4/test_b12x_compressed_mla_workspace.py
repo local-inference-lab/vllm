@@ -9,8 +9,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.models.deepseek_v4 import compressor as compressor_mod
 from vllm.models.deepseek_v4.nvidia import b12x as b12x_mod
 from vllm.utils.math_utils import round_up
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_c128a_topk_width,
     get_compressed_mla_max_q_chunks,
@@ -52,9 +54,16 @@ def _install_recording_sparkinfer(monkeypatch, caps_calls: list[SimpleNamespace]
             shapes_and_dtypes=lambda: (((1,), torch.uint8),),
         )
 
-    def split_chunks_for_contract(*, rows: int, width: int, max_chunks: int) -> int:
+    def split_chunks_for_contract(
+        *,
+        rows: int,
+        width: int,
+        max_chunks: int,
+        decode_row_capacity: int | None = None,
+    ) -> int:
         del width
-        return min(max_chunks, 8 if rows <= 256 else 1)
+        decode_split_max_rows = max(256, int(decode_row_capacity or 0))
+        return min(max_chunks, 8 if rows <= decode_split_max_rows else 1)
 
     compressed_mla.Caps = caps  # type: ignore[attr-defined]
     compressed_mla.plan = plan  # type: ignore[attr-defined]
@@ -76,6 +85,8 @@ def _make_layer(
     compress_ratio: int,
     dspark: bool,
     dcp_world_size: int = 1,
+    max_num_batched_tokens: int = _MAX_ROWS,
+    max_num_seqs: int = 64,
 ):
     layer = object.__new__(b12x_mod.DeepseekV4B12xMLAAttention)
     torch.nn.Module.__init__(layer)
@@ -88,7 +99,7 @@ def _make_layer(
     layer.indexer = None
     layer.max_model_len = 524288
     layer.window_size = _WINDOW_SIZE
-    layer.max_num_batched_tokens = _MAX_ROWS
+    layer.max_num_batched_tokens = max_num_batched_tokens
     layer.swa_cache_layer = SimpleNamespace(block_size=_PAGE_SIZE)
     speculative_config = (
         SimpleNamespace(
@@ -100,6 +111,10 @@ def _make_layer(
     )
     layer.vllm_config = SimpleNamespace(
         speculative_config=speculative_config,
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+        ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=dcp_world_size,
         ),
@@ -136,13 +151,16 @@ def test_reserve_uses_full_runtime_width(
 
     caps = caps_calls[-1]
     split_cap = get_compressed_mla_split_cap(expected_width)
+    decode_row_capacity = 64 * (1 + 5) if dspark else None
     assert caps.max_width == expected_width
     assert caps.max_q_rows == _MAX_ROWS
+    assert caps.decode_row_capacity == decode_row_capacity
     assert caps.max_q_chunks == get_compressed_mla_max_q_chunks(
         _MAX_ROWS,
         expected_width,
         split_cap,
         split_chunks,
+        decode_row_capacity=decode_row_capacity,
     )
     assert workspace.specs is not None
 
@@ -170,6 +188,105 @@ def test_workspace_width_helpers_match_reporter_geometry() -> None:
     assert get_dspark_swa_index_width(512, 5) == 1024
 
 
+@pytest.mark.parametrize(
+    ("max_num_seqs", "num_speculative_tokens", "expected"),
+    [
+        pytest.param(24, 5, 144, id="mns24-k5"),
+        pytest.param(64, 5, 384, id="mns64-k5"),
+        pytest.param(128, 5, 768, id="mns128-k5"),
+        pytest.param(64, 7, 512, id="mns64-k7"),
+    ],
+)
+def test_dspark_decode_row_capacity_comes_from_scheduler_contract(
+    max_num_seqs: int,
+    num_speculative_tokens: int,
+    expected: int,
+) -> None:
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            use_dspark=lambda: True,
+            num_speculative_tokens=num_speculative_tokens,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=8192,
+        ),
+    )
+    assert b12x_mod._get_dspark_decode_row_capacity(vllm_config) == expected
+
+
+def test_non_dspark_has_no_declared_decode_row_capacity() -> None:
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(use_dspark=lambda: False),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=128,
+            max_num_batched_tokens=8192,
+        ),
+    )
+    assert b12x_mod._get_dspark_decode_row_capacity(vllm_config) is None
+
+
+def test_dspark_decode_row_capacity_fails_closed() -> None:
+    b12x_mod._validate_compressed_mla_decode_row_capacity(
+        rows=384,
+        mode="decode",
+        decode_row_capacity=384,
+    )
+    b12x_mod._validate_compressed_mla_decode_row_capacity(
+        rows=8192,
+        mode="extend",
+        decode_row_capacity=384,
+    )
+    with pytest.raises(ValueError, match="rows 385 exceed.*capacity 384"):
+        b12x_mod._validate_compressed_mla_decode_row_capacity(
+            rows=385,
+            mode="decode",
+            decode_row_capacity=384,
+        )
+
+
+@pytest.mark.parametrize("draft_tokens", [5, 7])
+def test_compressor_metadata_keeps_every_verifier_row(
+    monkeypatch,
+    draft_tokens: int,
+) -> None:
+    verifier_width = draft_tokens + 1
+    num_reqs = 2
+    num_tokens = num_reqs * verifier_width
+    builder = object.__new__(compressor_mod.CompressorMetadataBuilder)
+    builder.block_size = 16
+    builder.token_to_req_indices = torch.empty(num_tokens, dtype=torch.int32)
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor(
+            [0, verifier_width, num_tokens], dtype=torch.int32
+        ),
+        query_start_loc_cpu=torch.tensor(
+            [0, verifier_width, num_tokens], dtype=torch.int32
+        ),
+        seq_lens=torch.tensor([100, 200], dtype=torch.int32),
+        num_reqs=num_reqs,
+        num_actual_tokens=num_tokens,
+        max_query_len=verifier_width,
+        max_seq_len=200,
+        block_table_tensor=torch.zeros((num_reqs, 1), dtype=torch.int32),
+        slot_mapping=torch.arange(num_tokens, dtype=torch.int64),
+        causal=False,
+    )
+    monkeypatch.setattr(compressor_mod, "_prefer_two_stage_compressor", lambda: False)
+
+    metadata = builder.build(0, common)
+
+    assert metadata.slot_mapping.shape == (num_tokens,)
+    assert metadata.token_to_req_indices is not None
+    torch.testing.assert_close(
+        metadata.token_to_req_indices,
+        torch.repeat_interleave(
+            torch.arange(num_reqs, dtype=torch.int32),
+            verifier_width,
+        ),
+    )
+
+
 def test_q_chunk_envelope_is_cached() -> None:
     call_count = 0
 
@@ -191,6 +308,57 @@ def test_q_chunk_envelope_is_cached() -> None:
             == _MAX_ROWS
         )
     assert call_count == _MAX_ROWS
+
+
+def test_production_q_chunk_envelope_only_reserves_declared_capacity() -> None:
+    def split_chunks_for_contract(
+        *,
+        rows: int,
+        width: int,
+        max_chunks: int,
+        decode_row_capacity: int | None = None,
+    ) -> int:
+        decode_split_max_rows = max(256, int(decode_row_capacity or 0))
+        chunk_size = 64 if rows <= decode_split_max_rows else 1024
+        return min(max_chunks, math.ceil(width / chunk_size))
+
+    max_rows = 8192
+    width = 4608
+    split_cap = get_compressed_mla_split_cap(width)
+    get_compressed_mla_max_q_chunks.cache_clear()
+
+    legacy = get_compressed_mla_max_q_chunks(
+        max_rows,
+        width,
+        split_cap,
+        split_chunks_for_contract,
+    )
+    mns24 = get_compressed_mla_max_q_chunks(
+        max_rows,
+        width,
+        split_cap,
+        split_chunks_for_contract,
+        decode_row_capacity=144,
+    )
+    mns64 = get_compressed_mla_max_q_chunks(
+        max_rows,
+        width,
+        split_cap,
+        split_chunks_for_contract,
+        decode_row_capacity=384,
+    )
+    mns128 = get_compressed_mla_max_q_chunks(
+        max_rows,
+        width,
+        split_cap,
+        split_chunks_for_contract,
+        decode_row_capacity=768,
+    )
+
+    assert legacy == 40960
+    assert mns24 == legacy
+    assert mns64 == legacy
+    assert mns128 == 55296
 
 
 def _aligned_nbytes(
@@ -233,14 +401,14 @@ def _runtime_plan_nbytes(compressed_mla, *, rows: int, width: int, heads: int) -
     ),
     [
         pytest.param(1, False, 1, (128,), 64.502929688, id="swa-causal"),
-        pytest.param(1, True, 1, (128, 512), 64.502929688, id="swa-dspark"),
+        pytest.param(1, True, 1, (128, 512), 96.627929688, id="swa-dspark"),
         pytest.param(4, False, 1, (2176,), 273.315429688, id="c4-causal"),
         pytest.param(
             4,
             True,
             1,
             (2176, 2560),
-            321.502929688,
+            482.127929688,
             id="c4-dspark",
         ),
         pytest.param(128, False, 1, (4224,), 530.315429688, id="c128-causal"),
@@ -249,7 +417,7 @@ def _runtime_plan_nbytes(compressed_mla, *, rows: int, width: int, heads: int) -
             True,
             1,
             (4224, 4608),
-            578.502929688,
+            867.627929688,
             id="c128-dspark",
         ),
         pytest.param(128, False, 2, (4224,), 1060.627929688, id="c128-dcp2"),
@@ -291,3 +459,53 @@ def test_real_sparkinfer_reserve_dominates_runtime_envelope(
         for rows in range(1, _MAX_ROWS + 1)
     )
     assert reserve_bytes >= runtime_bytes
+
+
+def test_mns64_contract_does_not_grow_production_mnb8192_scratch(
+    monkeypatch,
+) -> None:
+    compressed_mla = pytest.importorskip("sparkinfer.attention.compressed_mla")
+    workspace = _RecordingWorkspaceManager()
+    monkeypatch.setattr(b12x_mod, "current_workspace_manager", lambda: workspace)
+    max_rows = 8192
+    layer = _make_layer(
+        compress_ratio=128,
+        dspark=True,
+        max_num_batched_tokens=max_rows,
+        max_num_seqs=64,
+    )
+
+    layer._reserve_dummy_compressed_mla_scratch(
+        torch.empty((1, _LOCAL_HEADS, 512), dtype=torch.bfloat16)
+    )
+
+    assert workspace.specs is not None
+    candidate_bytes = _aligned_nbytes(workspace.specs)
+    width = 4608
+    split_cap = get_compressed_mla_split_cap(width)
+    max_q_chunks = get_compressed_mla_max_q_chunks(
+        max_rows,
+        width,
+        split_cap,
+        compressed_mla.split_chunks_for_contract,
+    )
+    splits = compressed_mla.split_chunks_for_contract(
+        rows=max_rows,
+        width=width,
+        max_chunks=split_cap,
+    )
+    legacy_plan = compressed_mla.plan(
+        compressed_mla.Caps(
+            device="cpu",
+            num_q_heads=_LOCAL_HEADS,
+            max_q_rows=max_rows,
+            max_width=width,
+            head_dim=512,
+            v_head_dim=512,
+            page_size=_PAGE_SIZE,
+            max_chunks_per_row=splits,
+            max_q_chunks=max_q_chunks,
+        )
+    )
+
+    assert candidate_bytes == _aligned_nbytes(legacy_plan.shapes_and_dtypes())
