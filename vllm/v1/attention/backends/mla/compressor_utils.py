@@ -1,8 +1,57 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
+from functools import cache
+
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
+
+_C128A_TOPK_ALIGNMENT = 128
+_COMPRESSED_MLA_SPLIT_ALIGNMENT = 64
+_DSPARK_SWA_INDEX_ALIGNMENT = 512
+
+
+def get_c128a_topk_width(max_model_len: int, compress_ratio: int) -> int:
+    """Return C128 indexed width padded for FlashMLA B_TOPK divisibility."""
+    compressed_width = cdiv(max_model_len, compress_ratio)
+    return cdiv(compressed_width, _C128A_TOPK_ALIGNMENT) * _C128A_TOPK_ALIGNMENT
+
+
+def get_dspark_swa_index_width(
+    window_size: int,
+    num_speculative_tokens: int,
+) -> int:
+    """Return the padded width of non-causal DSpark SWA indices."""
+    width = max(int(window_size), 0) + max(int(num_speculative_tokens), 0)
+    return cdiv(width, _DSPARK_SWA_INDEX_ALIGNMENT) * _DSPARK_SWA_INDEX_ALIGNMENT
+
+
+def get_compressed_mla_split_cap(width: int) -> int:
+    return max(1, cdiv(max(int(width), 1), _COMPRESSED_MLA_SPLIT_ALIGNMENT))
+
+
+@cache
+def get_compressed_mla_max_q_chunks(
+    max_rows: int,
+    width: int,
+    max_chunks: int,
+    split_chunks_for_contract: Callable[..., int],
+) -> int:
+    """Return the q-chunk cap over every reachable row count."""
+    max_rows = max(int(max_rows), 1)
+    width = max(int(width), 1)
+    max_chunks = max(int(max_chunks), 1)
+    return max(
+        rows
+        * split_chunks_for_contract(
+            rows=rows,
+            width=width,
+            max_chunks=max_chunks,
+        )
+        for rows in range(1, max_rows + 1)
+    )
 
 
 @triton.jit
@@ -48,15 +97,12 @@ def _compressed_slot_mapping_kernel(
         else:
             virtual_block_size = block_size * DCP_WORLD_SIZE
             block_ids = pos_after_compress // virtual_block_size
-            virtual_block_offsets = (
-                pos_after_compress - block_ids * virtual_block_size
-            )
+            virtual_block_offsets = pos_after_compress - block_ids * virtual_block_size
             is_local = (
                 virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
             ) % DCP_WORLD_SIZE == DCP_RANK
             block_offsets = (
-                virtual_block_offsets
-                // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+                virtual_block_offsets // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
             ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
                 virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
             )

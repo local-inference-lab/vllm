@@ -11,7 +11,6 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
-from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -20,16 +19,12 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_c128a_topk_width,
+    get_compressed_slot_mapping,
+)
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
-
-# Pad C128A topk width to this alignment. 128 covers both h_q=64 (B_TOPK=64) and
-# h_q=128 (B_TOPK=128). FlashMLA decode asserts extra_topk % B_TOPK == 0;
-# unaligned widths (e.g. 17 = ceil(2136/128)) crash the sm100 head64 kernel.
-# Padded slots stay -1 and decode_lens caps them via topk_length, so the pad is a
-# no-op at kernel level. Mirrors _SPARSE_PREFILL_TOPK_ALIGNMENT in cache_utils.py.
-_C128A_TOPK_ALIGNMENT = 128
 
 
 class DeepseekV4FlashMLABackend(AttentionBackend):
@@ -191,12 +186,9 @@ class DeepseekV4FlashMLAMetadataBuilder(
 
         # Pre-allocate C128A topk buffers for CUDA graph address stability.
         if self.compress_ratio == 128:
-            c128a_max_compressed = cdiv(
-                self.model_config.max_model_len, self.compress_ratio
-            )
-            c128a_max_compressed = (
-                cdiv(c128a_max_compressed, _C128A_TOPK_ALIGNMENT)
-                * _C128A_TOPK_ALIGNMENT
+            c128a_max_compressed = get_c128a_topk_width(
+                self.model_config.max_model_len,
+                self.compress_ratio,
             )
             # Stored so _build_c128a_metadata passes it as the kernel's
             # max_compressed_tokens, matching the buffer stride. Otherwise the
