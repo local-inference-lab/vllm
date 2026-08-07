@@ -24,6 +24,8 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import copy
+import re
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -291,6 +293,24 @@ class DeepseekV2MoE(nn.Module):
         self.tp_rank = get_tensor_model_parallel_rank()
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+
+        # Heterogeneous expert widths: when the HF config carries
+        # n_routed_experts_per_layer (a per-layer list), override the scalar
+        # for THIS layer (index parsed from prefix) on a shallow config copy,
+        # so every config.n_routed_experts read below sees this layer's width.
+        per_layer_experts = getattr(config, "n_routed_experts_per_layer", None)
+        if per_layer_experts is not None:
+            match = re.search(r"layers\.(\d+)\.", prefix)
+            if match is not None:
+                layer_idx = int(match.group(1))
+                if layer_idx >= len(per_layer_experts):
+                    raise ValueError(
+                        "n_routed_experts_per_layer has "
+                        f"{len(per_layer_experts)} entries but layer "
+                        f"{layer_idx} ({prefix!r}) requires one."
+                    )
+                config = copy.copy(config)
+                config.n_routed_experts = per_layer_experts[layer_idx]
 
         self.ep_group = get_ep_group().device_group
         self.ep_rank = get_ep_group().rank_in_group
@@ -1785,7 +1805,14 @@ class DeepseekV2Model(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts
+            num_experts=(
+                # Heterogeneous widths: the widest layer bounds the
+                # name-mapping table; narrower layers simply never match
+                # the higher expert ids.
+                max(self.config.n_routed_experts_per_layer)
+                if getattr(self.config, "n_routed_experts_per_layer", None)
+                else self.config.n_routed_experts
+            )
             + (
                 self.config.n_shared_experts
                 if rocm_aiter_moe_shared_expert_enabled

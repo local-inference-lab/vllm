@@ -159,6 +159,20 @@ _RANK_SLICED_WEIGHT_RE = re.compile(
     r"(?P<field>trellis|suh|svh|mcg|mul1)$"
 )
 
+
+def _experts_per_layer(metadata, layer_index=None):
+    """Resolve ``experts_per_layer``, which may be a scalar or a per-layer
+    list indexed by model layer (heterogeneous expert widths). Scalar
+    checkpoints behave exactly as before; with a list and no layer context
+    the widest layer is returned."""
+    value = metadata["experts_per_layer"]
+    if isinstance(value, (list, tuple)):
+        if layer_index is None:
+            return max(int(v) for v in value)
+        return int(value[layer_index])
+    return int(value)
+
+
 ShardId = str | int | tuple[int, ...] | None
 
 
@@ -526,7 +540,6 @@ class Exl3Config(QuantizationConfig):
         if not isinstance(payload, dict):
             raise ValueError(f"rank-sliced EXL3 could not load {filename!r}")
 
-        experts = int(self.rank_sliced_metadata["experts_per_layer"])
         first, last = (int(value) for value in self.rank_sliced_metadata["moe_layers"])
         allowed = set(self.rank_sliced_k_values or ())
         by_layer: dict[int, tuple[int, ...]] = {}
@@ -536,6 +549,7 @@ class Exl3Config(QuantizationConfig):
                 raise ValueError(
                     f"rank-sliced EXL3 bitrate map is missing layer {layer_index}"
                 )
+            experts = _experts_per_layer(self.rank_sliced_metadata, layer_index)
             raw = entry.get(field)
             # The GLM-5.2 MTP overlay records all routed experts under tail_tr3
             # instead of repeating a 256-entry K3 vector.
@@ -566,7 +580,7 @@ class Exl3Config(QuantizationConfig):
         if self.rank_sliced_k_values is None:
             if self.bits is None or float(self.bits) != int(self.bits):
                 raise ValueError(f"invalid uniform EXL3 bitrate {self.bits!r}")
-            experts = int(self.rank_sliced_metadata["experts_per_layer"])
+            experts = _experts_per_layer(self.rank_sliced_metadata, layer_index)
             return (int(self.bits),) * experts
         try:
             return self.rank_sliced_bits_by_layer[layer_index]
@@ -1315,9 +1329,26 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     "rank-sliced EXL3 checkpoint TP does not match runtime: "
                     f"checkpoint={checkpoint_tp}, runtime={layer.exl3_tp_size}"
                 )
-            expected_experts = int(
-                self.quant_config.rank_sliced_metadata["experts_per_layer"]
-            )
+            metadata_experts = self.quant_config.rank_sliced_metadata[
+                "experts_per_layer"
+            ]
+            if isinstance(metadata_experts, (list, tuple)):
+                name = str(
+                    getattr(layer, "layer_name", "") or getattr(layer, "prefix", "")
+                )
+                match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", name)
+                if match is not None:
+                    expected_experts = int(metadata_experts[int(match.group(1))])
+                else:
+                    # No layer identity on this module: accept any declared
+                    # width rather than misvalidating against the widest.
+                    expected_experts = (
+                        num_experts
+                        if num_experts in {int(v) for v in metadata_experts}
+                        else -1
+                    )
+            else:
+                expected_experts = int(metadata_experts)
             if expected_experts != num_experts:
                 raise ValueError(
                     "rank-sliced EXL3 expert count does not match the model: "
