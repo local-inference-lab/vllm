@@ -603,3 +603,175 @@ class TestVllmMaxNSequences:
 
         with pytest.raises(ValueError, match="n must be at most 128"):
             SamplingParams(n=129)
+
+
+# ---------------------------------------------------------------------------
+# Gilded Gnosis / SparkInfer runtime environment variable registrations
+# ---------------------------------------------------------------------------
+#
+# The following tests verify that every VLLM_* variable consumed by the GG
+# PCIe all-reduce, B12X/SparkInfer sparse-MLA, NVFP4 MLA, and EXL3 paths —
+# plus every VLLM_* variable exported by the GLM launcher scripts and
+# documented in glm5.2_v20.md — is registered in ``environment_variables`` so
+# ``validate_environ`` does not emit "Unknown vLLM environment variable"
+# warnings during a real deployment.
+#
+# Each test covers default values, explicit overrides, and the negative case
+# (an unregistered VLLM_* name still triggers a warning).
+
+
+def _clear_envs_cache() -> None:
+    """Clear the functools.cache wrapper on ``envs.__getattr__``."""
+    if hasattr(envs.__getattr__, "cache_clear"):
+        envs.__getattr__.cache_clear()
+
+
+# All GG variables registered by this PR.  Each tuple is
+# (env-var-name, override-value, expected-value-after-override).
+_GG_ENV_VARS: list[tuple[str, str, object]] = [
+    # PCIe DMA wire format (consumed by custom_all_reduce.py).
+    ("VLLM_PCIE_DMA_FP8", "ag", "ag"),
+    # C++ custom-allreduce crossover tuning (backend-dependent defaults).
+    ("VLLM_CPP_AR_1STAGE_NCCL_CUTOFF", "128KB", "128KB"),
+    ("VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS", "1024", 1024),
+    # B12X sparse-MLA speculative decode controls.
+    ("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", "16", 16),
+    ("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "1", "1"),
+    # EXL3 online quantization knobs (exported by the GLM launcher).
+    ("VLLM_EXL3_ONLINE_TRELLIS_BITS", "6", 6),
+    ("VLLM_EXL3_ONLINE_CACHE_DIR", "/cache/exl3-online", "/cache/exl3-online"),
+    ("VLLM_EXL3_ONLINE_CACHE_MODE", "readwrite", "readwrite"),
+    ("VLLM_EXL3_PREFILL_CAPACITY", "1024", 1024),
+    ("VLLM_EXL3_ENCODER_SOURCE", "/opt/exllamav3", "/opt/exllamav3"),
+    ("VLLM_EXL3_ENCODER_REVISION", "abc123", "abc123"),
+    # B12X PCIe DMA enable (consumed by the SparkInfer C++ extension).
+    ("VLLM_USE_B12X_PCIE_DMA", "1", True),
+    # Legacy alias for VLLM_CACHE_ROOT.
+    ("VLLM_CACHE_DIR", "/test/vllm-cache", "/test/vllm-cache"),
+]
+
+
+def test_gg_env_vars_are_registered() -> None:
+    """Every GG variable must appear in ``environment_variables``."""
+    for name, _, _ in _GG_ENV_VARS:
+        assert name in environment_variables, f"{name} is not registered"
+
+
+def test_gg_env_vars_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defaults match the consuming code's existing behaviour."""
+    # PCIe DMA FP8: unset → None (delegates to B12X_PCIE_DMA_FP8).
+    monkeypatch.delenv("VLLM_PCIE_DMA_FP8", raising=False)
+    _clear_envs_cache()
+    assert envs.VLLM_PCIE_DMA_FP8 is None
+    # CPP AR cutoffs: unset → None (backend decides).
+    monkeypatch.delenv("VLLM_CPP_AR_1STAGE_NCCL_CUTOFF", raising=False)
+    _clear_envs_cache()
+    assert envs.VLLM_CPP_AR_1STAGE_NCCL_CUTOFF is None
+    monkeypatch.delenv("VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS", raising=False)
+    _clear_envs_cache()
+    assert envs.VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS is None
+    # B12X spec decode max Q: default 8.
+    monkeypatch.delenv("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", raising=False)
+    _clear_envs_cache()
+    assert envs.VLLM_B12X_MLA_SPEC_DECODE_MAX_Q == 8
+    # B12X spec extend as decode: default "auto".
+    monkeypatch.delenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", raising=False)
+    _clear_envs_cache()
+    assert envs.VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE == "auto"
+    # EXL3 online vars: unset → None.
+    for name in (
+        "VLLM_EXL3_ONLINE_TRELLIS_BITS",
+        "VLLM_EXL3_ONLINE_CACHE_DIR",
+        "VLLM_EXL3_ONLINE_CACHE_MODE",
+        "VLLM_EXL3_PREFILL_CAPACITY",
+        "VLLM_EXL3_ENCODER_SOURCE",
+        "VLLM_EXL3_ENCODER_REVISION",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    _clear_envs_cache()
+    assert envs.VLLM_EXL3_ONLINE_TRELLIS_BITS is None
+    assert envs.VLLM_EXL3_ONLINE_CACHE_DIR is None
+    assert envs.VLLM_EXL3_ONLINE_CACHE_MODE is None
+    assert envs.VLLM_EXL3_PREFILL_CAPACITY is None
+    assert envs.VLLM_EXL3_ENCODER_SOURCE is None
+    assert envs.VLLM_EXL3_ENCODER_REVISION is None
+    # B12X PCIe DMA enable: unset → False (bool(int("0"))).
+    monkeypatch.delenv("VLLM_USE_B12X_PCIE_DMA", raising=False)
+    _clear_envs_cache()
+    assert envs.VLLM_USE_B12X_PCIE_DMA is False
+    # Legacy cache dir alias: unset → None.
+    monkeypatch.delenv("VLLM_CACHE_DIR", raising=False)
+    _clear_envs_cache()
+    assert envs.VLLM_CACHE_DIR is None
+
+
+@pytest.mark.parametrize("name,override,expected", _GG_ENV_VARS)
+def test_gg_env_vars_override(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    override: str,
+    expected: object,
+) -> None:
+    """Each GG variable honours an explicit env override."""
+    monkeypatch.setenv(name, override)
+    _clear_envs_cache()
+    assert getattr(envs, name) == expected
+
+
+def test_gg_env_vars_no_unknown_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Setting every GG variable must not produce unknown-var warnings."""
+    # Clear all VLLM_ vars not in the registry, then set all GG vars.
+    for name in list(os.environ):
+        if name.startswith("VLLM_") and name not in environment_variables:
+            monkeypatch.delenv(name, raising=False)
+    for name, override, _ in _GG_ENV_VARS:
+        monkeypatch.setenv(name, override)
+    gg_names = {name for name, _, _ in _GG_ENV_VARS}
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        envs.logger, "warning", lambda msg, *a: warnings.append(msg % a if a else msg)
+    )
+    envs.validate_environ(hard_fail=False)
+    for w in warnings:
+        if "Unknown vLLM environment variable" in w:
+            for gg_name in gg_names:
+                assert gg_name not in w, (
+                    f"Registered GG var triggered unknown-var warning: {w}"
+                )
+
+
+def test_unknown_vllm_env_still_warns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unregistered VLLM_* name must still trigger a warning."""
+    # Clear other unregistered VLLM_ vars so only our sentinel is reported.
+    for name in list(os.environ):
+        if name.startswith("VLLM_") and name not in environment_variables:
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("VLLM_DEFINITELY_NOT_A_REAL_VARIABLE_42", "1")
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        envs.logger, "warning", lambda msg, *a: warnings.append(msg % a if a else msg)
+    )
+    envs.validate_environ(hard_fail=False)
+    assert any(
+        "VLLM_DEFINITELY_NOT_A_REAL_VARIABLE_42" in w
+        and "Unknown vLLM environment variable" in w
+        for w in warnings
+    )
+
+
+def test_gg_env_vars_no_hard_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Setting every GG variable must not raise under hard_fail=True."""
+    # Clear all unregistered VLLM_ vars from the environment (e.g. legacy
+    # launcher exports still present in a container image), then set GG vars.
+    for name in list(os.environ):
+        if name.startswith("VLLM_") and name not in environment_variables:
+            monkeypatch.delenv(name, raising=False)
+    for name, override, _ in _GG_ENV_VARS:
+        monkeypatch.setenv(name, override)
+    envs.validate_environ(hard_fail=True)  # must not raise
