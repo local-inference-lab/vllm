@@ -36,16 +36,23 @@ _B12X_PCIE_EAGER_CHANNEL_ID = "eager:vllm-tp-allreduce"
 
 def _get_pcie_allreduce_backend() -> str:
     backend = envs.VLLM_PCIE_ALLREDUCE_BACKEND.lower()
-    if backend not in {"b12x", "cpp"}:
+    if backend not in {"b12x", "cpp", "flashinfer-ipc"}:
         raise ValueError(
             "Invalid VLLM_PCIE_ALLREDUCE_BACKEND: "
-            f"{backend!r}. Valid values: b12x, cpp."
+            f"{backend!r}. Valid values: b12x, cpp, flashinfer-ipc."
         )
     return backend
 
 
 def _b12x_pcie_allreduce_requested() -> bool:
     return envs.VLLM_ENABLE_PCIE_ALLREDUCE and _get_pcie_allreduce_backend() == "b12x"
+
+
+def _flashinfer_pcie_allreduce_requested() -> bool:
+    return (
+        envs.VLLM_ENABLE_PCIE_ALLREDUCE
+        and _get_pcie_allreduce_backend() == "flashinfer-ipc"
+    )
 
 
 def _is_piecewise_cudagraph_runtime() -> bool:
@@ -119,6 +126,17 @@ def _load_b12x_pcie_dma() -> Any | None:
     except Exception:
         return None
     return PCIeDmaAllReduce
+
+
+@lru_cache(maxsize=1)
+def _load_flashinfer_pcie_oneshot_pool() -> Any | None:
+    try:
+        from vllm.distributed.device_communicators.flashinfer_pcie_all_reduce import (
+            FlashInferPcieIpcAllReducePool,
+        )
+    except Exception:
+        return None
+    return FlashInferPcieIpcAllReducePool
 
 
 def _get_physical_device_numa_node(physical_device_id: int) -> int | None:
@@ -269,6 +287,7 @@ class CustomAllreduce:
         self._cpp_ar_cutoff_size: int | None = None
         self._cpp_ar_ignore_cutoff_max_rows = 0
         self._pcie_cpp_backend = False
+        self._pcie_backend_name: str | None = None
         self._pcie_logged_first_allreduce = False
         self._ptr = 0
 
@@ -304,9 +323,11 @@ class CustomAllreduce:
             return
 
         b12x_pcie_requested = _b12x_pcie_allreduce_requested()
+        flashinfer_pcie_requested = _flashinfer_pcie_allreduce_requested()
+        integrated_pcie_requested = b12x_pcie_requested or flashinfer_pcie_requested
         if (
             world_size not in CustomAllreduce._SUPPORTED_WORLD_SIZES
-            and not b12x_pcie_requested
+            and not integrated_pcie_requested
         ):
             logger.warning(
                 "Custom allreduce is disabled due to an unsupported world"
@@ -363,16 +384,17 @@ class CustomAllreduce:
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
         use_pcie_oneshot = False
-        if b12x_pcie_requested:
+        if integrated_pcie_requested:
             if not current_platform.is_cuda():
                 logger.warning(
-                    "Custom allreduce is disabled because b12x PCIe oneshot "
-                    "allreduce requires CUDA."
+                    "Custom allreduce is disabled because the integrated "
+                    "PCIe oneshot backend requires CUDA."
                 )
                 return
             logger.debug(
-                "b12x PCIe oneshot allreduce requested "
+                "%s PCIe oneshot allreduce requested "
                 "(world_size=%d, physical_device_ids=%s, fully_connected=%s).",
+                _get_pcie_allreduce_backend(),
                 world_size,
                 physical_device_ids,
                 fully_connected,
@@ -439,11 +461,17 @@ class CustomAllreduce:
                     physical_device_ids,
                 )
                 return
-            pool_cls = _load_b12x_pcie_oneshot_pool()
+            pcie_backend = _get_pcie_allreduce_backend()
+            pool_cls = (
+                _load_b12x_pcie_oneshot_pool()
+                if pcie_backend == "b12x"
+                else _load_flashinfer_pcie_oneshot_pool()
+            )
             if pool_cls is None:
                 logger.warning(
-                    "PCIe custom allreduce was requested, but "
-                    "b12x.comm.pcie.OneshotAllReducePool is unavailable."
+                    "%s PCIe custom allreduce was requested, but its runtime "
+                    "is unavailable.",
+                    pcie_backend,
                 )
                 return
             # DMA must accommodate the largest scheduled prefill tensor. The
@@ -520,12 +548,20 @@ class CustomAllreduce:
                 return
             assert pcie_runtime is not None
             self._pcie_runtime = pcie_runtime
+            self._pcie_backend_name = pcie_backend
             # Prefill-size DMA allreduce alongside the oneshot. A deployment
             # preflight can tune its crossover or disable it when lossless DMA
             # never beats NCCL on the selected PCIe topology.
-            dma_min_bytes = _b12x_pcie_dma_min_bytes()
+            dma_min_bytes = (
+                _b12x_pcie_dma_min_bytes() if pcie_backend == "b12x" else None
+            )
             dma_cls = None if dma_min_bytes is None else _load_b12x_pcie_dma()
-            if dma_min_bytes is None:
+            if pcie_backend != "b12x":
+                logger.info(
+                    "FlashInfer PCIe IPC handles only tuned one-shot shapes; "
+                    "larger allreduces stay on PyNCCL."
+                )
+            elif dma_min_bytes is None:
                 logger.info(
                     "b12x PCIe DMA allreduce disabled by "
                     "VLLM_PCIE_DMA_MIN_BYTES=off; large allreduces stay on PyNCCL."
@@ -579,19 +615,21 @@ class CustomAllreduce:
 
             if rank == 0:
                 logger.info(
-                    "Configured b12x PCIe crossovers: "
+                    "Configured %s PCIe crossovers: "
                     "oneshot max=%d, fused max=%d, DMA min=%s.",
+                    pcie_backend,
                     self._pcie_allreduce_max_size,
                     self._pcie_fused_add_rms_norm_max_size,
                     dma_min_bytes if dma_min_bytes is not None else "off",
                 )
             self.disabled = False
             logger.debug(
-                "Using b12x PCIe oneshot allreduce backend "
+                "Using %s PCIe oneshot allreduce backend "
                 "(world_size=%d, allreduce_max_size=%d, "
                 "fused_add_rms_norm_max_size=%d, oneshot_buffer_size=%d, "
                 "dma_buffer_size=%d, "
                 "single_channel=%s).",
+                pcie_backend,
                 world_size,
                 self._pcie_allreduce_max_size,
                 self._pcie_fused_add_rms_norm_max_size,
@@ -815,6 +853,8 @@ class CustomAllreduce:
 
     def backend_name(self) -> str:
         if self._pcie_runtime is not None:
+            if self._pcie_backend_name == "flashinfer-ipc":
+                return "FLASHINFER_PCIE_IPC"
             if self._pcie_dma is not None:
                 return "B12X_PCIE_ONESHOT_DMA"
             return "B12X_PCIE_ONESHOT"

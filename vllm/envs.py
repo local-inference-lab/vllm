@@ -234,7 +234,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
-    VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x", "cpp"] = "cpp"
+    VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x", "cpp", "flashinfer-ipc"] = "cpp"
     VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
     VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
     VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
@@ -1852,7 +1852,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PCIE_ALLREDUCE_BACKEND": env_with_choices(
         "VLLM_PCIE_ALLREDUCE_BACKEND",
         "cpp",
-        ["b12x", "cpp"],
+        ["b12x", "cpp", "flashinfer-ipc"],
     ),
     # Max input size for the b12x PCIe oneshot allreduce dispatch.
     # Accepts raw bytes or a KB/MB suffix (e.g. "84KB").

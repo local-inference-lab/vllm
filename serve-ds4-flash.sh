@@ -144,7 +144,14 @@ export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=${VLLM_MEMORY_PROFILER_ESTIMATE_
 export VLLM_PREFIX_CACHE_RETENTION_INTERVAL=${VLLM_PREFIX_CACHE_RETENTION_INTERVAL:-4096}
 export VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD=${VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD:-1024}
 
-allreduce_mode=${ALLREDUCE_MODE:-b12x}
+allreduce_mode=${ALLREDUCE_MODE:-auto}
+if [[ "${allreduce_mode}" == "auto" ]]; then
+  if [[ "${tp_size}" == "2" ]]; then
+    allreduce_mode=flashinfer-ipc
+  else
+    allreduce_mode=b12x
+  fi
+fi
 b12x_pcie_dma=$(bool_value B12X_PCIE_DMA "${B12X_PCIE_DMA:-0}")
 export VLLM_USE_B12X_PCIE_DMA=${b12x_pcie_dma}
 allreduce_args=()
@@ -153,6 +160,15 @@ case "${allreduce_mode}" in
     export VLLM_ENABLE_PCIE_ALLREDUCE=1
     export VLLM_PCIE_ALLREDUCE_BACKEND=b12x
     export VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE=${VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE:-64KB}
+    export VLLM_ALLOW_CUSTOM_ALLREDUCE_PCIE=0
+    export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+    ;;
+  flashinfer-ipc)
+    export VLLM_ENABLE_PCIE_ALLREDUCE=1
+    export VLLM_PCIE_ALLREDUCE_BACKEND=flashinfer-ipc
+    export VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE=${VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE:-1MB}
+    export VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE=0
+    export VLLM_PCIE_DMA_MIN_BYTES=off
     export VLLM_ALLOW_CUSTOM_ALLREDUCE_PCIE=0
     export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
     ;;
@@ -177,8 +193,8 @@ case "${allreduce_mode}" in
     allreduce_args=(--disable-custom-all-reduce)
     ;;
   *)
-    echo "ALLREDUCE_MODE must be b12x, vllm-custom, vllm-custom-2stage," \
-      "or nccl; got '${allreduce_mode}'" >&2
+    echo "ALLREDUCE_MODE must be auto, b12x, flashinfer-ipc, vllm-custom," \
+      "vllm-custom-2stage, or nccl; got '${allreduce_mode}'" >&2
     exit 2
     ;;
 esac
