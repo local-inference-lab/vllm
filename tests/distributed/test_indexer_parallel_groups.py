@@ -8,6 +8,7 @@ import pytest
 from vllm.distributed import parallel_state
 from vllm.distributed.parallel_state import (
     _build_indexer_replica_group_ranks,
+    _needs_indexer_replica_groups,
     _validate_indexer_shard_count,
 )
 
@@ -52,6 +53,14 @@ def test_build_indexer_groups_cover_dcp1_partial_and_full(
 
     assert dcp_groups == expected_dcp
     assert query_split_groups == expected_query_split
+
+
+@pytest.mark.parametrize(
+    ("indexer_shards", "expected"),
+    [(0, False), (1, True), (2, True), (4, True), (8, False)],
+)
+def test_indexer_replica_group_gate_for_dcp8(indexer_shards, expected):
+    assert _needs_indexer_replica_groups(indexer_shards, 8) is expected
 
 
 def test_build_indexer_replica_groups_stay_inside_each_tp_group():
