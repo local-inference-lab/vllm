@@ -110,6 +110,33 @@ if [[ -n "$(git -C "${SCRIPT_DIR}" status --porcelain=v1 --untracked-files=all)"
   exit 1
 fi
 
+cache_id="fruit-qsrt-${actual_vllm_revision:0:12}-${actual_b12x_revision:0:12}"
+cache_root="/cache/${cache_id}"
+export LOCAL_INFERENCE_CACHE_FINGERPRINT="${cache_id}"
+export XDG_CACHE_HOME="${cache_root}"
+export VLLM_CACHE_ROOT="${cache_root}/vllm"
+export VLLM_CACHE_DIR="${cache_root}/vllm"
+export TRITON_CACHE_DIR="${cache_root}/triton"
+export TORCHINDUCTOR_CACHE_DIR="${cache_root}/torchinductor"
+export TORCH_EXTENSIONS_DIR="${cache_root}/torch-extensions"
+export FLASHINFER_WORKSPACE_BASE="${cache_root}/flashinfer"
+export VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR="${cache_root}/flashinfer-autotune"
+export TVM_FFI_CACHE_DIR="${cache_root}/tvm-ffi"
+export TVM_CACHE_DIR="${cache_root}/tvm"
+export TILELANG_CACHE_DIR="${cache_root}/tilelang"
+export TILELANG_TMP_DIR="${cache_root}/tilelang/tmp"
+export CUTE_DSL_CACHE_DIR="${cache_root}/cute-dsl"
+export B12X_CUTE_COMPILE_CACHE_DIR="${cache_root}/b12x-cute"
+export B12X_COMPILE_CACHE_DIR="${cache_root}/b12x/compile"
+export SPARKINFER_COMPILE_CACHE_DIR="${cache_root}/b12x/compile"
+export DG_JIT_CACHE_DIR="${cache_root}/deep-gemm"
+export MM_SPARSE_ATTN_AOT_CACHE="${cache_root}/minfer/mm-sparse-attn"
+export MINFER_FMHA_CACHE_DIR="${cache_root}/minfer/fmha"
+export CUDA_CACHE_PATH="${cache_root}/cuda"
+export CUPY_CACHE_DIR="${cache_root}/cupy"
+export NUMBA_CACHE_DIR="${cache_root}/numba"
+export VLLM_EXL3_ONLINE_CACHE_DIR="${cache_root}/exl3-online"
+
 "${PYTHON_BIN}" -I -S -c '
 import hashlib
 import runpy
