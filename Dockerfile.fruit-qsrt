@@ -1,7 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG VLLM_BASE_IMAGE
-FROM ${VLLM_BASE_IMAGE}
+FROM docker.io/voipmonitor/vllm@sha256:3230c25ff95f8678a8eeb52a463f0d3b9f96f6ad550418cc51ea12177a55b41c
 
 ARG VLLM_REVISION
 ARG B12X_REVISION
@@ -16,24 +15,27 @@ RUN test -n "${VLLM_REVISION}" \
     && git -C /opt/vllm-fruit checkout --detach "${VLLM_REVISION}" \
     && git clone https://github.com/malaiwah/sparkinfer.git /opt/b12x-fruit \
     && git -C /opt/b12x-fruit checkout --detach "${B12X_REVISION}"
-RUN python3 -m pip install --no-cache-dir \
-        cuda-python \
+RUN python3 -m pip install --no-cache-dir --no-deps \
+        cuda-python==13.2.0 \
         nvidia-cutlass-dsl==4.6.0 \
         nvidia-cutlass-dsl-libs-base==4.6.0 \
         nvidia-cutlass-dsl-libs-core==4.6.0 \
         nvidia-cutlass-dsl-libs-cu12==4.6.0 \
         nvidia-cutlass-dsl-libs-cu13==4.6.0 \
-        'apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2' \
-        'rich>=13' \
-        'transformers>=4.51' \
-        'safetensors>=0.6' \
-    && python3 -m pip install --no-cache-dir --no-deps -e /opt/b12x-fruit
+        apache-tvm-ffi==0.1.10 \
+        rich==15.0.0 \
+        transformers==5.14.1 \
+        safetensors==0.8.0 \
+    && python3 -m pip install --no-cache-dir --no-deps -e /opt/b12x-fruit \
+    && python3 -m pip check
 RUN python3 /opt/vllm-fruit/tools/prepare_fruit_qsrt_image.py \
         --vllm-root /opt/vllm-fruit \
         --b12x-root /opt/b12x-fruit \
         --manifest /opt/fruit-runtime/MANIFEST.sha256
 ENV PYTHON_BIN=/opt/venv/bin/python3
 ENV B12X_ROOT=/opt/b12x-fruit
+ENV GIT_OPTIONAL_LOCKS=0
+ENV VLLM_PLUGINS=""
 ENV PYTHONDONTWRITEBYTECODE=1
 WORKDIR /opt/vllm-fruit
 ENTRYPOINT ["/opt/vllm-fruit/serve-glm52-fruit-qsrt.sh"]
