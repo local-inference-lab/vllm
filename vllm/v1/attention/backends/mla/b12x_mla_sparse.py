@@ -79,7 +79,7 @@ _DECODE_SPLIT_TILE = 64
 _HEAD_ALIGNMENT = 8
 _BF16_BYTES = 2
 _EXTEND_PREWARM_DONE: set[
-    tuple[int | None, int, int, int, int, int, bool, str, bool]
+    tuple[int | None, int, int, int, int | None, int, int, bool, str, bool]
 ] = set()
 _KV_FP8_ROPE_REQUESTED = NVFP4_MLA_CACHE_FORMAT.fp8_rope
 
@@ -2417,6 +2417,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             self.q_head_dim,
             self.kv_lora_rank,
             self._kernel_num_heads,
+            self._ckv_kernel_num_heads if self._ckv_extend_plan is not None else None,
             int(self.topk_tokens),
             int(self.block_size),
             bool(self.need_to_return_lse_for_decode),
@@ -2445,54 +2446,106 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             dtype=torch.uint8,
             device=self.device,
         )
-        for rows in rows_to_warm:
-            rows = int(rows)
-            if rows in seen_rows:
-                continue
-            seen_rows.add(rows)
-            q = torch.zeros(
-                (rows, self._kernel_num_heads, self.q_head_dim),
-                dtype=torch.bfloat16,
+        if self._ckv_extend_plan is not None:
+            # The full-CKV path maps globally merged top-k ids into the
+            # rank-ordered gather buffer before launching attention. Its
+            # DCP/interleave specialization is otherwise first compiled by a
+            # real long prefill, after KV sizing has consumed the spare VRAM.
+            warm_req_ids = torch.zeros(1, dtype=torch.int32, device=self.device)
+            warm_topk = torch.zeros(
+                (1, self.topk_tokens), dtype=torch.int32, device=self.device
+            )
+            warm_rank_req_starts = torch.zeros(
+                (self.dcp_world_size, 1), dtype=torch.int32, device=self.device
+            )
+            warm_rank_req_lens = torch.full(
+                (self.dcp_world_size, 1),
+                self.block_size,
+                dtype=torch.int32,
                 device=self.device,
             )
-            selected_indices = torch.zeros(
-                (rows, self.topk_tokens), dtype=torch.int32, device=self.device
+            warm_page_table = torch.empty_like(warm_topk)
+            warm_valid_counts = torch.empty(1, dtype=torch.int32, device=self.device)
+            _map_global_topk_to_gathered_ckv(
+                warm_req_ids,
+                warm_topk,
+                warm_rank_req_starts,
+                warm_rank_req_lens,
+                warm_page_table,
+                warm_valid_counts,
+                dcp_size=self.dcp_world_size,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+                padded_rank_tokens=self.block_size,
             )
-            cache_seqlens = torch.full(
-                (1,), self.block_size, dtype=torch.int32, device=self.device
+            _mask_page_table_after_nsa_len(warm_page_table, warm_valid_counts)
+
+        plans_to_warm = [
+            (
+                self._extend_plan,
+                self._kernel_num_heads,
+                self.need_to_return_lse_for_decode,
             )
-            nsa_cache_seqlens = torch.ones(
-                (rows,), dtype=torch.int32, device=self.device
+        ]
+        if self._ckv_extend_plan is not None:
+            # Full-CKV gather changes the query-head geometry from the
+            # all-gathered DCP head set to this rank's local heads. CuTe DSL
+            # therefore emits a distinct UnifiedPrefillMG specialization.
+            # Warm it here, before automatic KV sizing, so its persistent
+            # module allocation cannot first appear under a real long prompt.
+            plans_to_warm.append(
+                (self._ckv_extend_plan, self._ckv_kernel_num_heads, False)
             )
-            scratch_storage = torch.empty(
-                (self._scratch_nbytes,), dtype=torch.uint8, device=self.device
-            )
-            binding = self._extend_plan.bind(
-                scratch=scratch_storage,
-                q=q,
-                selected_indices=selected_indices,
-                cache_seqlens_int32=cache_seqlens,
-                nsa_cache_seqlens_int32=nsa_cache_seqlens,
-            )
-            if self.need_to_return_lse_for_decode:
-                self._sparse_mla_extend_forward(
-                    binding=binding,
-                    kv_cache=kv_cache,
-                    sm_scale=self.scale,
-                    v_head_dim=self.kv_lora_rank,
-                    return_lse=True,
-                    lse_scale="natural",
-                    **kernel_format_kwargs,
+
+        for extend_plan, num_heads, return_lse in plans_to_warm:
+            seen_rows.clear()
+            for rows in rows_to_warm:
+                rows = int(rows)
+                if rows in seen_rows:
+                    continue
+                seen_rows.add(rows)
+                q = torch.zeros(
+                    (rows, num_heads, self.q_head_dim),
+                    dtype=torch.bfloat16,
+                    device=self.device,
                 )
-            else:
-                self._sparse_mla_extend_forward(
-                    binding=binding,
-                    kv_cache=kv_cache,
-                    sm_scale=self.scale,
-                    v_head_dim=self.kv_lora_rank,
-                    **kernel_format_kwargs,
+                selected_indices = torch.zeros(
+                    (rows, self.topk_tokens), dtype=torch.int32, device=self.device
                 )
-            self._sync_warmup()
+                cache_seqlens = torch.full(
+                    (1,), self.block_size, dtype=torch.int32, device=self.device
+                )
+                nsa_cache_seqlens = torch.ones(
+                    (rows,), dtype=torch.int32, device=self.device
+                )
+                scratch_storage = torch.empty(
+                    (self._scratch_nbytes,), dtype=torch.uint8, device=self.device
+                )
+                binding = extend_plan.bind(
+                    scratch=scratch_storage,
+                    q=q,
+                    selected_indices=selected_indices,
+                    cache_seqlens_int32=cache_seqlens,
+                    nsa_cache_seqlens_int32=nsa_cache_seqlens,
+                )
+                if return_lse:
+                    self._sparse_mla_extend_forward(
+                        binding=binding,
+                        kv_cache=kv_cache,
+                        sm_scale=self.scale,
+                        v_head_dim=self.kv_lora_rank,
+                        return_lse=True,
+                        lse_scale="natural",
+                        **kernel_format_kwargs,
+                    )
+                else:
+                    self._sparse_mla_extend_forward(
+                        binding=binding,
+                        kv_cache=kv_cache,
+                        sm_scale=self.scale,
+                        v_head_dim=self.kv_lora_rank,
+                        **kernel_format_kwargs,
+                    )
+                self._sync_warmup()
 
     def forward_mqa(
         self,

@@ -29,6 +29,7 @@ _GENERIC_SPARSE_MLA_BACKENDS = frozenset(
         "FLASHINFER_MLA_SPARSE_SM120",
     }
 )
+_B12X_SPARSE_MLA_BACKENDS = frozenset({"B12X_MLA_SPARSE"})
 _INDEXER_PREFILL_CHUNK_METADATA_BACKENDS = frozenset({"DEEPSEEK_V32_INDEXER"})
 
 _SPARSE_PREFILL_METADATA_NUM_PREFILLS = (1, 2, 4, 8)
@@ -140,6 +141,10 @@ def _warm_prefill_chunk_metadata_kernel(
     device: torch.device,
     compress_ratio: int,
     query_len: int,
+    *,
+    dcp_rank: int = 0,
+    dcp_world_size: int = 1,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> None:
     from vllm.v1.attention.backends.mla.indexer import build_prefill_chunk_metadata
 
@@ -189,6 +194,9 @@ def _warm_prefill_chunk_metadata_kernel(
                 block_table,
                 compress_ratio,
                 query_slice=query_slice,
+                dcp_rank=dcp_rank,
+                dcp_world_size=dcp_world_size,
+                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
             )
 
 
@@ -280,10 +288,20 @@ def sparse_mla_triton_warmup(
 ) -> None:
     device = getattr(runner, "device", torch.device("cuda"))
     window_size = _hf_config_int(runner, "sliding_window", 128)
+    dcp_rank = int(getattr(runner, "dcp_rank", 0))
+    dcp_world_size = int(getattr(runner, "dcp_size", 1))
+    cp_kv_cache_interleave_size = int(getattr(runner, "cp_interleave", 1))
 
     _warm_sparse_swa_prefill_metadata_kernel(device, window_size, num_tokens)
     for compress_ratio in compress_ratios:
-        _warm_prefill_chunk_metadata_kernel(device, compress_ratio, num_tokens)
+        _warm_prefill_chunk_metadata_kernel(
+            device,
+            compress_ratio,
+            num_tokens,
+            dcp_rank=dcp_rank,
+            dcp_world_size=dcp_world_size,
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+        )
     for compress_ratio, topk, topk_width, n in combine_topk_swa_cases:
         _warm_combine_topk_swa_indices_kernel(
             device,
@@ -326,6 +344,15 @@ def sparse_mla_triton_warmup_if_needed(worker: "Worker") -> None:
                 runner,
                 num_tokens,
                 compress_ratios=(1,),
+            )
+        elif _has_attention_backend(runner, _B12X_SPARSE_MLA_BACKENDS):
+            _warm_prefill_chunk_metadata_kernel(
+                getattr(runner, "device", torch.device("cuda")),
+                compress_ratio=1,
+                query_len=num_tokens,
+                dcp_rank=int(getattr(runner, "dcp_rank", 0)),
+                dcp_world_size=int(getattr(runner, "dcp_size", 1)),
+                cp_kv_cache_interleave_size=int(getattr(runner, "cp_interleave", 1)),
             )
         elif _has_attention_backend(runner, _INDEXER_PREFILL_CHUNK_METADATA_BACKENDS):
             _warm_prefill_chunk_metadata_kernel(
