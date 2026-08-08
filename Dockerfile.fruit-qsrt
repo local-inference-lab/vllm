@@ -27,11 +27,44 @@ RUN python3 -m pip install --no-cache-dir \
         'rich>=13' \
         'transformers>=4.51' \
         'safetensors>=0.6' \
-    && python3 -m pip install --no-cache-dir --no-deps -e /opt/b12x-fruit \
-    && python3 -m pip check
-RUN python3 -c 'from pathlib import Path; import shutil, vllm; source = Path(vllm.__file__).parent; target = Path("/opt/vllm-fruit/vllm"); extensions = tuple(source.rglob("*.so")); assert extensions, "installed vLLM package has no compiled extensions"; [(target / path.relative_to(source)).parent.mkdir(parents=True, exist_ok=True) or shutil.copy2(path, target / path.relative_to(source)) for path in extensions]' \
-    && PYTHONPATH=/opt/vllm-fruit:/opt/b12x-fruit python3 -P -c \
-        'import b12x, vllm; import vllm._C; assert vllm.__file__.startswith("/opt/vllm-fruit/"); assert b12x.__file__.startswith("/opt/b12x-fruit/")'
+    && python3 -m pip install --no-cache-dir --no-deps -e /opt/b12x-fruit
+RUN python3 - <<'PY'
+from importlib.metadata import PackageNotFoundError, requires, version
+
+from packaging.requirements import Requirement
+
+for raw_requirement in requires("b12x") or ():
+    requirement = Requirement(raw_requirement)
+    if requirement.marker is not None and not requirement.marker.evaluate():
+        continue
+    try:
+        installed = version(requirement.name)
+    except PackageNotFoundError as exc:
+        raise RuntimeError(f"missing B12X dependency: {requirement.name}") from exc
+    if requirement.specifier and installed not in requirement.specifier:
+        raise RuntimeError(
+            f"B12X dependency mismatch: {requirement.name} {installed} "
+            f"does not satisfy {requirement.specifier}"
+        )
+PY
+RUN python3 - <<'PY'
+from pathlib import Path
+import shutil
+
+import vllm
+
+source = Path(vllm.__file__).parent
+target = Path("/opt/vllm-fruit/vllm")
+extensions = tuple(source.rglob("*.so"))
+if not extensions:
+    raise RuntimeError("installed vLLM package has no compiled extensions")
+for path in extensions:
+    destination = target / path.relative_to(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, destination)
+PY
+RUN PYTHONPATH=/opt/vllm-fruit:/opt/b12x-fruit python3 -P -c \
+    'import b12x, vllm; import vllm._C; assert vllm.__file__.startswith("/opt/vllm-fruit/"); assert b12x.__file__.startswith("/opt/b12x-fruit/")'
 ENV PYTHON_BIN=/usr/bin/python3
 ENV B12X_ROOT=/opt/b12x-fruit
 WORKDIR /opt/vllm-fruit
