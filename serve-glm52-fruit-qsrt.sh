@@ -6,6 +6,7 @@ cd "${SCRIPT_DIR}"
 unset PYTHONHOME PYTHONPATH
 export PYTHONNOUSERSITE=1
 export PYTHONSAFEPATH=1
+export PYTHONDONTWRITEBYTECODE=1
 
 PYTHON_BIN="${PYTHON_BIN:-${SCRIPT_DIR}/.venv/bin/python}"
 B12X_ROOT="${B12X_ROOT:-${SCRIPT_DIR}/../b12x-fruit}"
@@ -112,7 +113,64 @@ import hashlib
 import runpy
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+RUNTIME_MANIFEST = Path("/opt/fruit-runtime/MANIFEST.sha256")
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_runtime_manifest(vllm_root, b12x_root):
+    if RUNTIME_MANIFEST.is_symlink() or not RUNTIME_MANIFEST.is_file():
+        raise RuntimeError("Fruit runtime manifest is missing or symbolic")
+    expected = {}
+    for line in RUNTIME_MANIFEST.read_text(encoding="utf-8").splitlines():
+        fields = line.split("  ", 1)
+        if len(fields) != 2:
+            raise RuntimeError("Fruit runtime manifest entry is malformed")
+        digest, name = fields
+        relative = PurePosixPath(name)
+        if (
+            not relative.parts
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or name in expected
+            or relative.parts[0] not in {"vllm", "b12x"}
+        ):
+            raise RuntimeError("Fruit runtime manifest entry is invalid")
+        expected[name] = digest
+    actual = {}
+    for namespace, root in (
+        ("vllm", vllm_root / "vllm"),
+        ("b12x", b12x_root / "b12x"),
+    ):
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                raise RuntimeError(f"Fruit runtime package path is symbolic: {path}")
+            if path.is_dir():
+                continue
+            if not path.is_file():
+                raise RuntimeError(f"Fruit runtime package path is not regular: {path}")
+            name = f"{namespace}/{path.relative_to(root).as_posix()}"
+            actual[name] = path
+    if set(actual) != set(expected):
+        missing = sorted(set(expected) - set(actual))
+        unexpected = sorted(set(actual) - set(expected))
+        raise RuntimeError(
+            f"Fruit runtime inventory mismatch; missing={missing}, "
+            f"unexpected={unexpected}"
+        )
+    for name, path in actual.items():
+        if sha256(path) != expected[name]:
+            raise RuntimeError(f"Fruit runtime file digest mismatch: {name}")
 
 def tracked_tree_sha256(root_value):
     root = Path(root_value).resolve(strict=True)
@@ -131,6 +189,7 @@ expected_b12x = sys.argv[3]
 actual_vllm = sys.argv[4]
 b12x_root = Path(sys.argv[5]).resolve(strict=True)
 vllm_root = Path(sys.argv[6]).resolve(strict=True)
+verify_runtime_manifest(vllm_root, b12x_root)
 publication = runpy.run_path(
     str(
         vllm_root

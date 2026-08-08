@@ -30,8 +30,10 @@ RUN python3 -m pip install --no-cache-dir \
     && python3 -m pip install --no-cache-dir --no-deps -e /opt/b12x-fruit
 RUN python3 /opt/vllm-fruit/tools/prepare_fruit_qsrt_image.py \
         --vllm-root /opt/vllm-fruit \
-        --b12x-root /opt/b12x-fruit
+        --b12x-root /opt/b12x-fruit \
+        --manifest /opt/fruit-runtime/MANIFEST.sha256
 ENV PYTHON_BIN=/opt/venv/bin/python3
 ENV B12X_ROOT=/opt/b12x-fruit
+ENV PYTHONDONTWRITEBYTECODE=1
 WORKDIR /opt/vllm-fruit
 ENTRYPOINT ["/opt/vllm-fruit/serve-glm52-fruit-qsrt.sh"]

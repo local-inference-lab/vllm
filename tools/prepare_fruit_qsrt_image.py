@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import shutil
 import subprocess
@@ -31,6 +32,55 @@ def _validate_b12x_dependencies() -> None:
                 f"B12X dependency mismatch: {requirement.name} {installed} "
                 f"does not satisfy {requirement.specifier}"
             )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _remove_bytecode(root: Path) -> None:
+    for directory in sorted(
+        root.rglob("__pycache__"),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        if directory.is_symlink():
+            raise RuntimeError(f"runtime bytecode directory is a symlink: {directory}")
+        shutil.rmtree(directory)
+
+
+def _write_runtime_manifest(
+    manifest: Path,
+    *,
+    vllm_root: Path,
+    b12x_root: Path,
+) -> int:
+    roots = (("vllm", vllm_root / "vllm"), ("b12x", b12x_root / "b12x"))
+    resolved_manifest = manifest.resolve()
+    if any(resolved_manifest.is_relative_to(root) for _, root in roots):
+        raise ValueError("runtime manifest must be outside the package roots")
+    entries: list[str] = []
+    for namespace, root in roots:
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                raise RuntimeError(f"runtime package path is a symlink: {path}")
+            if path.is_dir():
+                continue
+            if not path.is_file():
+                raise RuntimeError(f"runtime package path is not regular: {path}")
+            relative = path.relative_to(root).as_posix()
+            entries.append(f"{_sha256(path)}  {namespace}/{relative}\n")
+    if not entries:
+        raise RuntimeError("runtime package manifest would be empty")
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    temporary = manifest.with_name(f".{manifest.name}.tmp-{os.getpid()}")
+    temporary.write_text("".join(entries), encoding="utf-8")
+    os.replace(temporary, manifest)
+    return len(entries)
 
 
 def _copy_compiled_extensions(vllm_root: Path) -> int:
@@ -79,6 +129,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vllm-root", required=True, type=Path)
     parser.add_argument("--b12x-root", required=True, type=Path)
+    parser.add_argument("--manifest", required=True, type=Path)
     return parser.parse_args()
 
 
@@ -89,7 +140,17 @@ def main() -> None:
     _validate_b12x_dependencies()
     count = _copy_compiled_extensions(vllm_root)
     _smoke_local_sources(vllm_root, b12x_root)
-    print(f"prepared Fruit QSRT runtime with {count} compiled vLLM extensions")
+    _remove_bytecode(vllm_root / "vllm")
+    _remove_bytecode(b12x_root / "b12x")
+    files = _write_runtime_manifest(
+        args.manifest,
+        vllm_root=vllm_root,
+        b12x_root=b12x_root,
+    )
+    print(
+        f"prepared Fruit QSRT runtime with {count} compiled vLLM extensions "
+        f"and {files} sealed runtime files"
+    )
 
 
 if __name__ == "__main__":
