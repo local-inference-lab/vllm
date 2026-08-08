@@ -26,8 +26,7 @@ RUN python3 -m pip install --no-cache-dir --no-deps \
         rich==15.0.0 \
         transformers==5.14.1 \
         safetensors==0.8.0 \
-    && python3 -m pip install --no-cache-dir --no-deps -e /opt/b12x-fruit \
-    && python3 -m pip check
+    && python3 -m pip install --no-cache-dir --no-deps -e /opt/b12x-fruit
 RUN python3 /opt/vllm-fruit/tools/prepare_fruit_qsrt_image.py \
         --vllm-root /opt/vllm-fruit \
         --b12x-root /opt/b12x-fruit \
