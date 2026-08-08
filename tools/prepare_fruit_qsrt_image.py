@@ -42,17 +42,6 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _remove_bytecode(root: Path) -> None:
-    for directory in sorted(
-        root.rglob("__pycache__"),
-        key=lambda path: len(path.parts),
-        reverse=True,
-    ):
-        if directory.is_symlink():
-            raise RuntimeError(f"runtime bytecode directory is a symlink: {directory}")
-        shutil.rmtree(directory)
-
-
 def _write_runtime_manifest(
     manifest: Path,
     *,
@@ -140,8 +129,6 @@ def main() -> None:
     _validate_b12x_dependencies()
     count = _copy_compiled_extensions(vllm_root)
     _smoke_local_sources(vllm_root, b12x_root)
-    _remove_bytecode(vllm_root / "vllm")
-    _remove_bytecode(b12x_root / "b12x")
     files = _write_runtime_manifest(
         args.manifest,
         vllm_root=vllm_root,
