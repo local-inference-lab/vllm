@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Reader for the canonical TP-independent Kimi-K3 QSRT atom container.
+"""Reader for canonical TP-independent QSRT atom containers.
 
-The checkpoint stores one safetensors tensor with 96 padded physical atom
-rows.  Tensor parallelism selects a contiguous whole-row extent at load time;
-the serialized file never names a TP size or rank.  Runtime loading narrows
-InstantTensor's unopened I/O layout to that extent so no unrelated atom bytes
-cross the host/device boundary.
+Each checkpoint layer stores one padded safetensors atom slab. Tensor
+parallelism selects a contiguous whole-row extent at load time; the serialized
+file never names a TP size or rank. Runtime loading narrows InstantTensor's
+unopened I/O layout to that extent so no unrelated atom bytes cross the
+host/device boundary.
 """
 
 from __future__ import annotations
@@ -21,20 +21,14 @@ from typing import Any
 import torch
 from safetensors import safe_open
 
-SCHEMA = "kquant_kimi_k3_qsrt_atoms_v1"
+KIMI_K3_SCHEMA = "kquant_kimi_k3_qsrt_atoms_v1"
+FRUIT_SCHEMA = "kquant_fruit_qsrt_atoms_v1"
+SUPPORTED_SCHEMAS = frozenset({KIMI_K3_SCHEMA, FRUIT_SCHEMA})
 ENCODING = "qsrt_sqg_e4m3"
 VERSION = 1
-PROFILE_ID = 1
-EXPERTS = 896
-HIDDEN_SIZE = 3584
-INTERMEDIATE_SIZE = 3072
 ATOM_CHANNELS = 32
-ATOM_SLOTS = 96
-ATOM_BUNDLE_BYTES = 129216
-FORMAT_SECTION_BYTES = 4096
-FORMAT_TABLE_BYTES = EXPERTS
-SHARED_SCALE_SECTION_BYTES = 24576
-SHARED_SCALE_BYTES = 3 * HIDDEN_SIZE * torch.float16.itemsize
+ATOMS_PER_PAIR = 8
+STORAGE_ALIGNMENT = 4096
 FORMAT_X4T = 0xFF
 
 FORMAT_TENSOR = "_qsrt_format_section"
@@ -51,10 +45,22 @@ def _metadata_int(metadata: dict[str, str], name: str) -> int:
     return value
 
 
+def _align(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
 @dataclass(frozen=True)
 class QSRTAtomLayerMetadata:
     path: Path
+    schema: str
+    profile_id: int
     layer: int
+    experts: int
+    hidden_size: int
+    intermediate_size: int
+    atom_slots: int
+    atom_bundle_bytes: int
+    rotation_multiplier: int
     format_codes: torch.Tensor
     compressed_expert_ids: torch.Tensor
     x4t_expert_ids: torch.Tensor
@@ -73,36 +79,33 @@ class QSRTAtomLayerMetadata:
 
     @property
     def atom_slot_payload_bytes(self) -> int:
-        return self.compressed_experts * ATOM_BUNDLE_BYTES
+        return self.compressed_experts * self.atom_bundle_bytes
 
 
 def read_qsrt_atom_layer_metadata(
     path: str | Path,
     *,
     layer: int,
+    expected_experts: int,
+    expected_hidden_size: int,
+    expected_intermediate_size: int,
     expected_bits: Sequence[int] | None = None,
 ) -> QSRTAtomLayerMetadata:
-    """Validate the small metadata tensors without reading the atom slab."""
+    """Validate metadata and small tensors without reading the atom slab."""
 
     path = Path(path)
     with safe_open(path, framework="pt", device="cpu") as handle:
         metadata = handle.metadata() or {}
         if set(handle.keys()) != TENSOR_INVENTORY:
             raise ValueError("QSRT atom tensor inventory is noncanonical")
-        expected_metadata: dict[str, str] = {
+        schema = metadata.get("schema")
+        if schema not in SUPPORTED_SCHEMAS:
+            raise ValueError(f"unsupported QSRT atom schema: {schema!r}")
+        expected_metadata = {
             "format": "pt",
-            "schema": SCHEMA,
             "version": str(VERSION),
             "encoding": ENCODING,
             "layer": str(layer),
-            "profile_id": str(PROFILE_ID),
-            "experts": str(EXPERTS),
-            "intermediate_channels": str(INTERMEDIATE_SIZE),
-            "latent_channels": str(HIDDEN_SIZE),
-            "atom_channels": str(ATOM_CHANNELS),
-            "atom_slots": str(ATOM_SLOTS),
-            "atom_bundle_bytes": str(ATOM_BUNDLE_BYTES),
-            "alignment_bytes": "4096",
         }
         for name, expected in expected_metadata.items():
             if metadata.get(name) != expected:
@@ -111,25 +114,84 @@ def read_qsrt_atom_layer_metadata(
                     f"{metadata.get(name)!r} != {expected!r}"
                 )
 
+        profile_id = _metadata_int(metadata, "profile_id")
+        experts = _metadata_int(metadata, "experts")
+        intermediate_size = _metadata_int(metadata, "intermediate_channels")
+        hidden_size = _metadata_int(metadata, "latent_channels")
+        atom_channels = _metadata_int(metadata, "atom_channels")
+        atom_slots = _metadata_int(metadata, "atom_slots")
+        atom_bundle_bytes = _metadata_int(metadata, "atom_bundle_bytes")
+        alignment = _metadata_int(metadata, "alignment_bytes")
+        if profile_id <= 0:
+            raise ValueError("QSRT profile_id must be positive")
+        if experts != expected_experts:
+            raise ValueError(
+                f"QSRT experts mismatch: {experts} != {expected_experts}"
+            )
+        if hidden_size != expected_hidden_size:
+            raise ValueError(
+                f"QSRT latent channels mismatch: "
+                f"{hidden_size} != {expected_hidden_size}"
+            )
+        if intermediate_size != expected_intermediate_size:
+            raise ValueError(
+                f"QSRT intermediate channels mismatch: "
+                f"{intermediate_size} != {expected_intermediate_size}"
+            )
+        if atom_channels != ATOM_CHANNELS:
+            raise ValueError(
+                f"QSRT atom channels must be {ATOM_CHANNELS}, got {atom_channels}"
+            )
+        if atom_slots <= 0 or atom_slots % ATOMS_PER_PAIR:
+            raise ValueError("QSRT atom slots must be a positive multiple of eight")
+        if intermediate_size != atom_slots * atom_channels:
+            raise ValueError("QSRT atom geometry does not cover the intermediate axis")
+        if hidden_size <= 0 or hidden_size % 128:
+            raise ValueError(
+                "QSRT latent channels must be a positive multiple of 128"
+            )
+        expected_bundle_bytes = (
+            3 * (atom_channels * hidden_size * 3 // 8)
+            + 3 * atom_channels * torch.float16.itemsize
+        )
+        if atom_bundle_bytes != expected_bundle_bytes:
+            raise ValueError(
+                f"QSRT atom bundle bytes mismatch: "
+                f"{atom_bundle_bytes} != {expected_bundle_bytes}"
+            )
+        if alignment <= 0 or alignment & (alignment - 1):
+            raise ValueError("QSRT alignment must be a positive power of two")
+
+        pair_count = atom_slots // ATOMS_PER_PAIR
+        if schema == KIMI_K3_SCHEMA:
+            rotation_multiplier = 5
+        else:
+            if _metadata_int(metadata, "pair_count") != pair_count:
+                raise ValueError("QSRT pair_count disagrees with atom geometry")
+            rotation_multiplier = _metadata_int(metadata, "rotation_multiplier")
+            if rotation_multiplier < 0:
+                raise ValueError("QSRT rotation_multiplier must be nonnegative")
+
         compressed_count = _metadata_int(metadata, "compressed_experts")
         x4t_count = _metadata_int(metadata, "x4t_experts")
         slot_payload = _metadata_int(metadata, "atom_slot_payload_bytes")
         slot_stride = _metadata_int(metadata, "atom_slot_stride_bytes")
-        if compressed_count + x4t_count != EXPERTS:
+        if compressed_count + x4t_count != experts:
             raise ValueError("QSRT tier counts do not cover all experts")
-        if slot_payload != compressed_count * ATOM_BUNDLE_BYTES:
+        if slot_payload != compressed_count * atom_bundle_bytes:
             raise ValueError("QSRT atom-slot payload byte count is invalid")
-        if slot_stride < slot_payload or slot_stride % 4096:
+        if slot_stride < slot_payload or slot_stride % alignment:
             raise ValueError("QSRT atom-slot stride is invalid")
 
+        format_section_bytes = _align(experts, alignment)
         format_section = handle.get_tensor(FORMAT_TENSOR)
         if (
             format_section.dtype != torch.uint8
-            or tuple(format_section.shape) != (FORMAT_SECTION_BYTES,)
-            or bool(torch.any(format_section[FORMAT_TABLE_BYTES:] != 0))
+            or tuple(format_section.shape) != (format_section_bytes,)
+            or bool(torch.any(format_section[experts:] != 0))
         ):
             raise ValueError("QSRT format section is malformed")
-        format_codes = format_section[:FORMAT_TABLE_BYTES].clone().contiguous()
+        format_codes = format_section[:experts].clone().contiguous()
         r13 = format_codes >> 4
         r2 = format_codes & 0xF
         compressed_mask = format_codes != FORMAT_X4T
@@ -143,38 +205,64 @@ def read_qsrt_atom_layer_metadata(
         ):
             raise ValueError("QSRT format table tier counts disagree with metadata")
         if expected_bits is not None:
-            if len(expected_bits) != EXPERTS:
-                raise ValueError("hybrid_bit_map must describe all 896 experts")
+            if len(expected_bits) != experts:
+                raise ValueError(
+                    f"hybrid_bit_map must describe all {experts} experts"
+                )
+            if any(bit not in (3, 4) for bit in expected_bits):
+                raise ValueError("QSRT hybrid_bit_map entries must be 3 or 4")
             expected_x4t = torch.tensor(expected_bits, dtype=torch.int16) == 4
             if not torch.equal(expected_x4t, ~compressed_mask):
                 raise ValueError("QSRT format table disagrees with hybrid_bit_map")
 
+        shared_scale_rows = 1 if schema == KIMI_K3_SCHEMA else experts
+        shared_scale_bytes = (
+            3 * shared_scale_rows * hidden_size * torch.float16.itemsize
+        )
+        shared_scale_section_bytes = _align(shared_scale_bytes, alignment)
+        if (
+            schema == FRUIT_SCHEMA
+            and _metadata_int(metadata, "shared_scale_section_bytes")
+            != shared_scale_section_bytes
+        ):
+            raise ValueError("QSRT shared-scale byte count disagrees with geometry")
         shared = handle.get_tensor(SHARED_SCALE_TENSOR)
         if (
             shared.dtype != torch.uint8
-            or tuple(shared.shape) != (SHARED_SCALE_SECTION_BYTES,)
-            or bool(torch.any(shared[SHARED_SCALE_BYTES:] != 0))
+            or tuple(shared.shape) != (shared_scale_section_bytes,)
+            or bool(torch.any(shared[shared_scale_bytes:] != 0))
         ):
             raise ValueError("QSRT shared-scale section is malformed")
         vectors = (
-            shared[:SHARED_SCALE_BYTES]
+            shared[:shared_scale_bytes]
             .clone()
             .view(torch.float16)
-            .reshape(3, HIDDEN_SIZE)
+            .reshape(3, shared_scale_rows, hidden_size)
             .contiguous()
         )
+        if shared_scale_rows == 1:
+            vectors = vectors[:, 0]
         if not bool(torch.all(torch.isfinite(vectors))):
             raise ValueError("QSRT shared scales contain non-finite values")
 
         atom_shape = handle.get_slice(ATOM_TENSOR).get_shape()
-        if atom_shape != [ATOM_SLOTS, slot_stride]:
+        expected_atom_shape = [atom_slots, slot_stride]
+        if atom_shape != expected_atom_shape:
             raise ValueError(
-                f"QSRT atom slab shape {atom_shape} != {[ATOM_SLOTS, slot_stride]}"
+                f"QSRT atom slab shape {atom_shape} != {expected_atom_shape}"
             )
 
     return QSRTAtomLayerMetadata(
         path=path,
+        schema=schema,
+        profile_id=profile_id,
         layer=layer,
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        atom_slots=atom_slots,
+        atom_bundle_bytes=atom_bundle_bytes,
+        rotation_multiplier=rotation_multiplier,
         format_codes=format_codes,
         compressed_expert_ids=compressed_ids.to(torch.int32).contiguous(),
         x4t_expert_ids=x4t_ids.to(torch.int32).contiguous(),
@@ -185,12 +273,16 @@ def read_qsrt_atom_layer_metadata(
     )
 
 
-def balanced_atom_partition(shard_count: int, shard_index: int) -> tuple[int, int]:
-    if not 1 <= shard_count <= ATOM_SLOTS:
-        raise ValueError(f"shard_count must lie in 1..{ATOM_SLOTS}")
+def balanced_atom_partition(
+    atom_slots: int,
+    shard_count: int,
+    shard_index: int,
+) -> tuple[int, int]:
+    if not 1 <= shard_count <= atom_slots:
+        raise ValueError(f"shard_count must lie in 1..{atom_slots}")
     if not 0 <= shard_index < shard_count:
         raise ValueError(f"shard_index must lie in 0..{shard_count - 1}")
-    quotient, remainder = divmod(ATOM_SLOTS, shard_count)
+    quotient, remainder = divmod(atom_slots, shard_count)
     count = quotient + int(shard_index < remainder)
     first = shard_index * quotient + min(shard_index, remainder)
     return first, count
@@ -203,6 +295,7 @@ def _select_instanttensor_extent(
     first_row: int,
     rows: int,
     row_bytes: int,
+    total_rows: int,
 ) -> None:
     """Restrict an unopened InstantTensor handle to one tensor row extent."""
 
@@ -231,7 +324,7 @@ def _select_instanttensor_extent(
     end_file_index, tensor_end = handle.tensor_offsets[tensor_index + 1]
     if (
         file_index != end_file_index
-        or tensor_end - tensor_start != ATOM_SLOTS * row_bytes
+        or tensor_end - tensor_start != total_rows * row_bytes
     ):
         raise RuntimeError("InstantTensor QSRT atom offsets disagree with metadata")
     begin = tensor_start + first_row * row_bytes
@@ -257,21 +350,27 @@ def open_qsrt_atom_extent(
     shard_index: int,
     device: torch.device | str | None,
 ) -> Iterator[tuple[int, torch.Tensor]]:
-    """Yield ``(first_atom_slot, [A,E,129216]u8)`` for one shard.
+    """Yield one shard's ``(first_atom_slot, [A,E,B]u8)`` extent.
 
-    CPU mode exists for focused tests.  CUDA mode uses InstantTensor and keeps
+    CPU mode exists for focused tests. CUDA mode uses InstantTensor and keeps
     the returned tensor valid only for the context lifetime; callers must
     complete preparation before leaving the context.
     """
 
-    first, rows = balanced_atom_partition(shard_count, shard_index)
+    first, rows = balanced_atom_partition(
+        metadata.atom_slots, shard_count, shard_index
+    )
     if device is None or torch.device(device).type == "cpu":
         with safe_open(metadata.path, framework="pt", device="cpu") as handle:
             padded = handle.get_slice(ATOM_TENSOR)[first : first + rows]
             compact = padded[:, : metadata.atom_slot_payload_bytes].contiguous()
             yield (
                 first,
-                compact.reshape(rows, metadata.compressed_experts, ATOM_BUNDLE_BYTES),
+                compact.reshape(
+                    rows,
+                    metadata.compressed_experts,
+                    metadata.atom_bundle_bytes,
+                ),
             )
         return
 
@@ -290,6 +389,7 @@ def open_qsrt_atom_extent(
         first_row=first,
         rows=rows,
         row_bytes=metadata.atom_slot_stride_bytes,
+        total_rows=metadata.atom_slots,
     )
     with opener as handle:
         loaded = dict(handle.tensors())
@@ -300,10 +400,14 @@ def open_qsrt_atom_extent(
         # exits, so carrying padding through the read avoids a second full
         # atom-slab allocation.
         atoms = compact.as_strided(
-            (rows, metadata.compressed_experts, ATOM_BUNDLE_BYTES),
+            (
+                rows,
+                metadata.compressed_experts,
+                metadata.atom_bundle_bytes,
+            ),
             (
                 metadata.atom_slot_stride_bytes,
-                ATOM_BUNDLE_BYTES,
+                metadata.atom_bundle_bytes,
                 1,
             ),
         )
@@ -311,6 +415,9 @@ def open_qsrt_atom_extent(
 
 
 __all__ = [
+    "FRUIT_SCHEMA",
+    "KIMI_K3_SCHEMA",
+    "SUPPORTED_SCHEMAS",
     "QSRTAtomLayerMetadata",
     "balanced_atom_partition",
     "open_qsrt_atom_extent",

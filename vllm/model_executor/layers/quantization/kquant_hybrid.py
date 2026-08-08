@@ -5,8 +5,8 @@
 
 The high-quality expert tier is stored as NVFP4 or MXFP4.  The secondary tier
 is either generic ``exl3_3`` trellis tensors or TP-independent
-``qsrt_sqg_e4m3`` atoms.  Both secondary formats execute through the B12X
-W4A16 trellis path; QSRT's exact endpoint is X4T.
+``qsrt_sqg_e4m3`` atoms. Generic EXL3 uses the B12X W4A16 trellis path;
+QSRT can use W4A16 or Fruit's bounded-M W4A8 path.
 """
 
 import dataclasses
@@ -35,6 +35,9 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization.kquant_qsrt_atoms import (
+    SUPPORTED_SCHEMAS as QSRT_ATOM_SCHEMAS,
+)
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
@@ -53,6 +56,7 @@ _qsrt_repeat_check_reports = 0
 _B12X_TILES = (64, 256, 64, 256)
 # Batches of at most this many tokens take the preplanned TC-decode launch.
 _B12X_DECODE_M = 8
+_B12X_W4A8_MAX_M = 16
 # QSRT fuses checkpoint-order [w1; w3] rows,
 # which are [gate; up] for SiTU; B12X names that physical order ``w31``.
 _QSRT_X4T_W13_LAYOUT = "w31"
@@ -175,11 +179,11 @@ def _b12x_tiles_for_geometry(
 
 
 class _HybridSharedRuntime:
-    """Process-wide b12x W4A16 runtime shared by every hybrid MoE layer.
+    """Process-wide b12x runtime shared by every hybrid MoE layer.
 
-    One preplanned-launch cache and one scratch/route buffer set serve all
-    layers: launches on a single stream never overlap and every
-    ``run_w4a16_moe`` call fully overwrites the buffers it uses.
+    Preplanned launches and caller-owned scratch buffers serve all layers:
+    launches on one stream never overlap, and every run fully overwrites the
+    buffers it uses.
     """
 
     def __init__(self) -> None:
@@ -194,10 +198,15 @@ class _HybridSharedRuntime:
         # H128(h * down_suh); this stable buffer receives its inverse transform.
         self.kquant_logical_mid: torch.Tensor | None = None
         self.trellis_scratch: torch.Tensor | None = None
+        # Prepared-part kernels reuse their FP32 output buffers. Multi-part
+        # layers copy into this stable accumulator before launching the next part.
+        self.trellis_output_accum: torch.Tensor | None = None
         # X4T expands only routed scale rows immediately before W4A16. The
         # output grids are shared across layers on the same CUDA stream.
         self.x4t_w13_scale_scratch: torch.Tensor | None = None
         self.x4t_w2_scale_scratch: torch.Tensor | None = None
+        # Fruit QSRT W4A8 owns one fixed scratch set for each captured M.
+        self.w4a8_scratch: dict[int, Any] = {}
 
 
 class _HybridLayerState:
@@ -239,9 +248,10 @@ class _HybridLayerState:
         # Keeps kernel-format tensors alive: b12x prepared weights VIEW the
         # converted tensors, so dropping them would dangle the views.
         self.keepalive: Any = None
-        # Canonical QSRT layers own compressed experts through a TP-independent
-        # atom safetensors file rather than ordinary expert parameters.
+        # Canonical QSRT layers own compressed experts through an external
+        # TP-independent safetensors artifact.
         self.uses_qsrt_atoms = False
+        self.uses_qsrt = False
         self.trellis_weights: Any = None
         self.trellis_plan: Any = None
         self.runtime_ready = False
@@ -281,6 +291,7 @@ class KQuantHybridConfig(ModelOptNvFp4Config):
         # TP-independent QSRT atom container.
         self.demoted_format: str = "exl3_3"
         self.qsrt: dict[str, Any] | None = None
+        self.qsrt_runtime: str = "w4a16"
         self.trellis_codebook: str = "mcg"
         self.trellis_mcg: int = 0
         self.trellis_mul1_e4m3: int = 0
@@ -391,18 +402,24 @@ class KQuantHybridConfig(ModelOptNvFp4Config):
                     "qsrt_sqg_e4m3 demotion requires a qsrt format descriptor"
                 )
             expected_qsrt = {
-                "schema": "kquant_kimi_k3_qsrt_atoms_v1",
                 "storage_format": "qsrt_atoms_v1",
                 "encoding": "qsrt_sqg_e4m3",
                 "codebook": "sqg_xor_cheb_t12",
                 "artifact_manifest": "qsrt-manifest.json",
             }
+            schema = qsrt.get("schema")
+            if schema not in QSRT_ATOM_SCHEMAS:
+                raise ValueError(f"unsupported QSRT atom schema {schema!r}")
+            config.kept_storage = "x4t"
             for name, expected in expected_qsrt.items():
                 if qsrt.get(name) != expected:
                     raise ValueError(
                         f"QSRT {name} must be {expected!r}, got {qsrt.get(name)!r}"
                     )
-            config.kept_storage = "x4t"
+            runtime = str(qsrt.get("runtime", "w4a16")).lower()
+            if runtime not in {"w4a16", "w4a8"}:
+                raise ValueError(f"unsupported QSRT runtime {runtime!r}")
+            config.qsrt_runtime = runtime
             config.qsrt = dict(qsrt)
             config.trellis_codebook = "sqg_xor_cheb_t12"
         trellis = original_config.get("trellis")
@@ -447,11 +464,12 @@ class KQuantHybridConfig(ModelOptNvFp4Config):
 
 
 class KQuantHybridMoEMethod(FusedMoEMethodBase):
-    """Fused-MoE method serving both hybrid tiers via the b12x W4A16 kernel.
+    """Fused-MoE method serving the hybrid tiers through B12X kernels.
 
     Generic EXL3 tensors are sharded at load time. Canonical QSRT atoms are
-    already organized into directly shardable 32-channel extents. ``apply``
-    returns only the routed-expert contribution.
+    already organized into directly shardable 32-channel extents and may use
+    W4A16 or Fruit's bounded-M W4A8 path. ``apply`` returns only the
+    routed-expert contribution.
     """
 
     def __init__(
@@ -529,28 +547,33 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             **{e: (1, i) for i, e in enumerate(demoted)},
         }
         state = _HybridLayerState(remap, hidden, inter, num_experts, kept_mx)
-        state.uses_qsrt_atoms = bool(
-            mapped_layer and self.quant_config.demoted_format == "qsrt_sqg_e4m3"
+        qsrt_storage = (
+            str((self.quant_config.qsrt or {}).get("storage_format", ""))
+            if mapped_layer and self.quant_config.demoted_format == "qsrt_sqg_e4m3"
+            else ""
         )
+        state.uses_qsrt_atoms = qsrt_storage == "qsrt_atoms_v1"
+        state.uses_qsrt = state.uses_qsrt_atoms
         layer.hybrid_state = state
 
         if state.uses_qsrt_atoms:
-            if hidden != 3584 or inter * tp_size != 3072 or num_experts != 896:
+            global_intermediate = inter * tp_size
+            if (
+                hidden <= 0
+                or hidden % 128
+                or global_intermediate <= 0
+                or global_intermediate % 256
+                or inter % 256
+                or num_experts <= 0
+            ):
                 raise ValueError(
-                    "QSRT serving requires Kimi-K3's global "
-                    "H=3584, I=3072, E=896 geometry"
+                    "QSRT serving requires H divisible by 128 and global/local "
+                    "intermediate sizes divisible by 256"
                 )
-            # Storage can be resharded at whole 32-channel atoms. The current
-            # fused decoder has so far been qualified only for one eight-atom
-            # (256-channel) local extent; this is a runtime gate, not a
-            # serialized TP contract.
-            if inter != 256:
+            if kept and not kept_mx:
                 raise ValueError(
-                    "the current QSRT fused kernel requires an eight-atom "
-                    f"local extent (I=256), got I={inter} at TP={tp_size}"
+                    "QSRT X4T experts require kept_format='mxfp4_e8m0k32'"
                 )
-            if not kept_mx:
-                raise ValueError("QSRT serving requires kept_format='mxfp4_e8m0k32'")
             placeholder = torch.nn.Parameter(
                 torch.empty(
                     (0,),
@@ -912,9 +935,13 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             raise FileNotFoundError(
                 f"QSRT checkpoint is missing {manifest_path}"
             ) from None
+        qsrt_descriptor = self.quant_config.qsrt
+        if not isinstance(qsrt_descriptor, dict):
+            raise RuntimeError("QSRT format descriptor was not initialized")
+        expected_schema = qsrt_descriptor["schema"]
         if (
             manifest.get("codec") != "QSRT"
-            or manifest.get("storage_schema") != "kquant_kimi_k3_qsrt_atoms_v1"
+            or manifest.get("storage_schema") != expected_schema
             or manifest.get("complete") is not True
         ):
             raise ValueError("QSRT manifest identity is invalid or incomplete")
@@ -932,12 +959,19 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             return path
 
         atom_path = manifest_file("qsrt_atoms")
-        x4t_path = manifest_file("x4t")
+        x4t_path = manifest_file("x4t") if state.num_kept else None
         metadata = read_qsrt_atom_layer_metadata(
             atom_path,
             layer=layer_index,
+            expected_experts=state.num_experts,
+            expected_hidden_size=state.hidden_size,
+            expected_intermediate_size=(
+                state.intermediate_size * get_tensor_model_parallel_world_size()
+            ),
             expected_bits=bits,
         )
+        if metadata.schema != expected_schema:
+            raise ValueError("QSRT atom schema disagrees with the format descriptor")
         expected_secondary = tuple(
             expert
             for expert, (tier, _local) in sorted(
@@ -967,32 +1001,66 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 params_dtype=self.moe.in_dtype,
                 num_experts=state.num_secondary,
                 hidden_size=state.hidden_size,
-                intermediate_size=state.intermediate_size,
+                intermediate_size=256,
                 w13_layout="w13",
                 trellis_bits=3,
                 trellis_tile_config=state.tiles,
                 qsrt_storage_format="qsrt_atoms_v1",
             )
+            compressed_ids = metadata.compressed_expert_ids.to(torch.int64)
+            expert_ids = compressed_ids.to(device)
+            format_codes = metadata.format_codes.index_select(
+                0, compressed_ids
+            ).to(device)
+
+            def local_scales(values: torch.Tensor) -> torch.Tensor:
+                if values.ndim == 1:
+                    return values.unsqueeze(0).to(device)
+                if tuple(values.shape) == (state.num_experts, state.hidden_size):
+                    return values.index_select(0, compressed_ids).to(device)
+                if tuple(values.shape) == (state.num_secondary, state.hidden_size):
+                    return values.to(device)
+                raise ValueError("QSRT shared scales disagree with expert geometry")
+
+            gate_suh = local_scales(metadata.gate_suh)
+            up_suh = local_scales(metadata.up_suh)
+            down_svh = local_scales(metadata.down_svh)
             with open_qsrt_atom_extent(
                 metadata,
                 shard_count=tp_size,
                 shard_index=tp_rank,
                 device=device,
             ) as (first_atom_slot, atoms):
-                state.trellis_weights = fused_moe.prepare_weights(
-                    plan=plan,
-                    params_dtype=self.moe.in_dtype,
-                    qsrt_atom_payload=atoms,
-                    qsrt_first_atom_slot=first_atom_slot,
-                    qsrt_layer_index=layer_index,
-                    qsrt_expert_ids=metadata.compressed_expert_ids.to(device),
-                    qsrt_format_codes=metadata.format_codes.index_select(
-                        0, metadata.compressed_expert_ids.to(torch.int64)
-                    ).to(device),
-                    gate_suh=metadata.gate_suh.unsqueeze(0).to(device),
-                    up_suh=metadata.up_suh.unsqueeze(0).to(device),
-                    down_svh=metadata.down_svh.unsqueeze(0).to(device),
-                )
+                local_atom_slots = int(atoms.shape[0])
+                if (
+                    first_atom_slot % 8
+                    or local_atom_slots % 8
+                    or local_atom_slots * 32 != state.intermediate_size
+                ):
+                    raise ValueError(
+                        "QSRT TP partition must contain complete 256-channel "
+                        "atom pairs"
+                    )
+                parts = []
+                for offset in range(0, local_atom_slots, 8):
+                    parts.append(
+                        fused_moe.prepare_weights(
+                            plan=plan,
+                            params_dtype=self.moe.in_dtype,
+                            qsrt_atom_payload=atoms.narrow(0, offset, 8),
+                            qsrt_first_atom_slot=first_atom_slot + offset,
+                            qsrt_layer_index=layer_index,
+                            qsrt_expert_ids=expert_ids,
+                            qsrt_format_codes=format_codes,
+                            qsrt_atom_slots=metadata.atom_slots,
+                            qsrt_experts_per_layer=metadata.experts,
+                            qsrt_rotation_multiplier=metadata.rotation_multiplier,
+                            gate_suh=gate_suh,
+                            up_suh=up_suh,
+                            down_svh=down_svh,
+                        )
+                    )
+                state.trellis_weights = tuple(parts)
 
         if state.num_kept:
             w13_packed: list[torch.Tensor] = []
@@ -1001,6 +1069,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             w13_exceptions: list[torch.Tensor] = []
             w2_fixed: list[torch.Tensor] = []
             w2_exceptions: list[torch.Tensor] = []
+            assert x4t_path is not None
             with X4TLayerReader(
                 x4t_path,
                 shard_count=tp_size,
@@ -1085,9 +1154,10 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             state.num_kept,
         )
 
+
     def process_weights_after_loading(self, layer: "RoutedExperts") -> None:
         """Prepare the kept tier and the selected W4A16 trellis tier."""
-        from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+        from b12x.moe._shared.kernels.w4a16.prepare import (
             W4A16PackedWeights,
             _make_workspace,
             _permute_nvfp4_scales,
@@ -1098,7 +1168,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         hidden, inter = state.hidden_size, state.intermediate_size
         device = (
             torch.device("cuda", torch.accelerator.current_device_index())
-            if state.uses_qsrt_atoms
+            if state.uses_qsrt
             else layer.w13_weight.device
         )
         num_kept, num_secondary = state.num_kept, state.num_secondary
@@ -1115,7 +1185,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         if state.uses_qsrt_atoms:
             self._load_qsrt_atoms(layer, device=device)
         elif num_secondary > 0 and self.quant_config.demoted_format == "exl3_3":
-            from sparkinfer.moe import fused_moe
+            from b12x.moe import fused_moe
 
             # Projection-major native stacks; prepare_weights wraps zero-copy.
             w13 = layer.w13_exl3_trellis.data.permute(1, 0, 2, 3, 4).contiguous()
@@ -1244,10 +1314,10 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         routing and a fused top-k sum; if that compile is unavailable the
         packed launch also serves decode.
         """
-        from sparkinfer.moe._shared.kernels.w4a16.host import (
+        from b12x.moe._shared.kernels.w4a16.host import (
             max_packed_route_slots,
         )
-        from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+        from b12x.moe._shared.kernels.w4a16.kernel import (
             compile_w4a16_fused_moe,
         )
 
@@ -1336,13 +1406,15 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         scratch/buffer set. The first apply is vLLM's eager profile run at
         max_num_batched_tokens, so max_m sizes itself to the serving
         ceiling and nothing compiles during CUDA-graph capture."""
-        from sparkinfer.moe._shared.kernels.w4a16.host import (
+        state: _HybridLayerState = layer.hybrid_state
+        runtime = self.quant_config.shared_runtime
+        if self.quant_config.qsrt_runtime == "w4a8" and state.num_kept:
+            raise RuntimeError("Fruit W4A8 does not support a hybrid kept tier")
+
+        from b12x.moe._shared.kernels.w4a16.host import (
             make_w4a16_packed_buffers,
             max_packed_route_slots,
         )
-
-        state: _HybridLayerState = layer.hybrid_state
-        runtime = self.quant_config.shared_runtime
         if runtime.max_m is None:
             runtime.max_m = max(int(self.moe.max_num_tokens), int(m))
             runtime.topk = int(topk)
@@ -1351,13 +1423,36 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         if state.prep_kept is not None:
             state.launch_kept = self._get_launch_pair(state.prep_kept, state)
         if getattr(state, "trellis_weights", None) is not None:
-            from sparkinfer.moe import fused_moe
+            from b12x.moe import fused_moe
+            trellis_parts = (
+                state.trellis_weights
+                if isinstance(state.trellis_weights, tuple)
+                else (state.trellis_weights,)
+            )
+            primary_trellis = trellis_parts[0]
+            if len(trellis_parts) > 1:
+                if state.emap_secondary is None:
+                    raise RuntimeError("secondary expert map was not prepared")
+                accum_shape = (int(runtime.max_m), state.hidden_size)
+                accum = runtime.trellis_output_accum
+                if (
+                    accum is None
+                    or int(accum.shape[0]) < accum_shape[0]
+                    or int(accum.shape[1]) != accum_shape[1]
+                    or accum.dtype != torch.float32
+                    or accum.device != state.emap_secondary.device
+                ):
+                    runtime.trellis_output_accum = torch.empty(
+                        accum_shape,
+                        dtype=torch.float32,
+                        device=state.emap_secondary.device,
+                    )
 
             key = (
                 "trellis",
                 state.num_secondary,
                 state.hidden_size,
-                state.intermediate_size,
+                primary_trellis.plan.intermediate_size,
                 runtime.topk,
                 runtime.max_m,
             )
@@ -1367,7 +1462,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                     max_tokens=runtime.max_m,
                     num_topk=runtime.topk,
                     device=torch.accelerator.current_device_index(),
-                    weight_plan=state.trellis_weights.plan,
+                    weight_plan=primary_trellis.plan,
                     quant_mode="w4a16",
                     route_num_experts=self.moe.num_experts,
                     # Full-rotation trellis owns one immutable route geometry
@@ -1393,9 +1488,83 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 and runtime.kquant_logical_mid is None
             ):
                 runtime.kquant_logical_mid = torch.empty(
-                    (runtime.max_m * runtime.topk, state.intermediate_size),
+                    (
+                        runtime.max_m * runtime.topk,
+                        primary_trellis.plan.intermediate_size,
+                    ),
                     dtype=torch.float16,
                     device=torch.accelerator.current_device_index(),
+                )
+            if self.quant_config.qsrt_runtime == "w4a8" and not runtime.w4a8_scratch:
+                from b12x.moe._shared.kernels.trellis_w4a8 import (
+                    make_trellis_w4a8_moe_scratch,
+                    run_trellis_w4a8_moe,
+                    view_trellis_w4a8_moe_scratch,
+                )
+
+                prepared_parts = tuple(
+                    part.representation.value for part in trellis_parts
+                )
+                suh_row_counts = {
+                    (
+                        int(part.gate_suh.shape[0]),
+                        int(part.up_suh.shape[0]),
+                    )
+                    for part in prepared_parts
+                }
+                if len(suh_row_counts) != 1:
+                    raise RuntimeError(
+                        "Fruit W4A8 prepared parts disagree on gate/up rotation rows"
+                    )
+                gate_rows, up_rows = next(iter(suh_row_counts))
+                if gate_rows != up_rows or gate_rows not in (
+                    1,
+                    state.num_secondary,
+                ):
+                    raise RuntimeError(
+                        "Fruit W4A8 gate/up rotations must both be shared or "
+                        "both have one row per secondary expert"
+                    )
+                prepared = prepared_parts[0]
+                shared_suh = gate_rows == 1
+                backing = make_trellis_w4a8_moe_scratch(
+                    m=_B12X_W4A8_MAX_M,
+                    topk=runtime.topk,
+                    hidden_size=state.hidden_size,
+                    intermediate_size=primary_trellis.plan.intermediate_size,
+                    device=prepared.w13.device,
+                    shared_suh=shared_suh,
+                )
+                for scratch_m in range(1, _B12X_W4A8_MAX_M + 1):
+                    runtime.w4a8_scratch[scratch_m] = view_trellis_w4a8_moe_scratch(
+                        backing,
+                        m=scratch_m,
+                        topk=runtime.topk,
+                        shared_suh=shared_suh,
+                    )
+                prewarm_input = torch.zeros(
+                    (1, state.hidden_size),
+                    dtype=self.moe.in_dtype,
+                    device=prepared.w13.device,
+                )
+                prewarm_ids = torch.zeros(
+                    (1, runtime.topk),
+                    dtype=torch.int32,
+                    device=prepared.w13.device,
+                )
+                prewarm_weights = torch.zeros(
+                    (1, runtime.topk),
+                    dtype=torch.float32,
+                    device=prepared.w13.device,
+                )
+                run_trellis_w4a8_moe(
+                    prewarm_input,
+                    prepared,
+                    prewarm_weights,
+                    prewarm_ids,
+                    runtime.w4a8_scratch[1],
+                    expert_map=state.emap_secondary,
+                    fast_math=True,
                 )
         if runtime.buffers is None and state.prep_kept is not None:
             prep_any = state.prep_kept
@@ -1446,7 +1615,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         decode: bool,
     ) -> torch.Tensor:
         """Run one tier through its preplanned b12x launch."""
-        from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+        from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
 
         runtime = self.quant_config.shared_runtime
         use_decode = decode and launch_pair[0] is not launch_pair[1]
@@ -1611,31 +1780,90 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             # unmapped NVFP4 MTP head): single-tier launch.
             return self._run_kept(layer, x, weights, topk_ids, decode)
         if getattr(state, "trellis_weights", None) is not None:
-            from sparkinfer.moe import fused_moe
-
             tids = (
                 topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
             )
             if not tids.is_contiguous():
                 tids = tids.contiguous()
-            binding = fused_moe.bind(
-                state.trellis_plan,
-                scratch=runtime.trellis_scratch,
-                a=x if x.is_contiguous() else x.contiguous(),
-                experts=state.trellis_weights,
-                topk_weights=weights,
-                topk_ids=tids,
-                route_expert_map=state.emap_secondary,
+            trellis_parts = (
+                state.trellis_weights
+                if isinstance(state.trellis_weights, tuple)
+                else (state.trellis_weights,)
             )
-            # The unified full-rotation top-k sum emits fp32; downstream
-            # layers expect the model dtype.
-            out_trellis = fused_moe.run(binding=binding)[:m].to(x.dtype)
-            if os.getenv("VLLM_KQUANT_CAPTURE_DIR"):
+            a = x if x.is_contiguous() else x.contiguous()
+            if self.quant_config.qsrt_runtime == "w4a8" and m <= _B12X_W4A8_MAX_M:
+                from b12x.moe._shared.kernels.trellis_w4a8 import (
+                    run_trellis_w4a8_moe,
+                )
+
+                scratch = runtime.w4a8_scratch.get(m)
+                if scratch is None:
+                    raise RuntimeError(f"Fruit W4A8 scratch for m={m} was not prepared")
+                if state.num_kept:
+                    raise RuntimeError("Fruit W4A8 does not support a hybrid kept tier")
+                output_accum = (
+                    runtime.trellis_output_accum if len(trellis_parts) > 1 else None
+                )
+                if len(trellis_parts) > 1 and output_accum is None:
+                    raise RuntimeError("Fruit W4A8 output accumulator was not prepared")
+                part_output = None
+                for index, part in enumerate(trellis_parts):
+                    part_output = run_trellis_w4a8_moe(
+                        a,
+                        part.representation.value,
+                        weights,
+                        tids,
+                        scratch,
+                        expert_map=state.emap_secondary,
+                        fast_math=True,
+                    )[:m]
+                    if output_accum is not None:
+                        if index == 0:
+                            output_accum[:m].copy_(part_output)
+                        else:
+                            output_accum[:m].add_(part_output)
+                if part_output is None:
+                    raise RuntimeError("secondary trellis partition is empty")
+                output = output_accum[:m] if output_accum is not None else part_output
+                return output.to(x.dtype)
+
+            from b12x.moe import fused_moe
+
+            output_accum = (
+                runtime.trellis_output_accum if len(trellis_parts) > 1 else None
+            )
+            if len(trellis_parts) > 1 and output_accum is None:
+                raise RuntimeError("trellis output accumulator was not prepared")
+            binding = None
+            part_output = None
+            for index, part in enumerate(trellis_parts):
+                binding = fused_moe.bind(
+                    state.trellis_plan,
+                    scratch=runtime.trellis_scratch,
+                    a=a,
+                    experts=part,
+                    topk_weights=weights,
+                    topk_ids=tids,
+                    route_expert_map=state.emap_secondary,
+                )
+                part_output = fused_moe.run(binding=binding)[:m]
+                if output_accum is not None:
+                    if index == 0:
+                        output_accum[:m].copy_(part_output)
+                    else:
+                        output_accum[:m].add_(part_output)
+            if part_output is None or binding is None:
+                raise RuntimeError("secondary trellis partition is empty")
+            # Each 256-channel atom pair emits one linear FC2 contribution.
+            # Sum all local pairs in fp32, then cast once to the model dtype.
+            output = output_accum[:m] if output_accum is not None else part_output
+            out_trellis = output.to(x.dtype)
+            if os.getenv("VLLM_KQUANT_CAPTURE_DIR") and len(trellis_parts) == 1:
                 from vllm.model_executor.layers.fused_moe.kquant_capture import (
                     collect_kquant_exl3_mid,
                 )
 
-                prepared = state.trellis_weights.representation.value
+                prepared = trellis_parts[0].representation.value
                 intermediate_rotations = prepared.intermediate_rotations
                 logical_scratch = runtime.kquant_logical_mid
                 if intermediate_rotations is None or logical_scratch is None:
