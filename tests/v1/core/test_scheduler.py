@@ -4348,6 +4348,36 @@ def test_prepend_skipped_requests_order():
     assert waiting_reqs == expected_waiting_reqs
 
 
+def test_skip_reading_prefix_cache_skips_external_connector_lookup():
+    """External KV reads must honor the same request flag as local APC.
+
+    Prompt logprobs require a forward pass over every prompt token, so a
+    connector hit would leave holes in the returned prompt-logprobs tensor.
+    The connector remains active for storing the freshly recomputed KV.
+    """
+    scheduler = create_scheduler(
+        max_num_batched_tokens=64,
+        max_model_len=64,
+        use_kv_connector=True,
+    )
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.return_value = (32, False)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        prompt_logprobs=1,
+    )[0]
+    assert request.skip_reading_prefix_cache
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 32
+    scheduler.connector.get_num_new_matched_tokens.assert_not_called()
+    scheduler.connector.update_state_after_alloc.assert_called_once()
+    assert scheduler.connector.update_state_after_alloc.call_args.args[2] == 0
+
+
 def test_remote_kv_promotion_keeps_fcfs_with_grammar_prefix():
     scheduler = create_scheduler(max_num_seqs=1)
     scheduler.connector = Mock()

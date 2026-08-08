@@ -774,7 +774,16 @@ class Scheduler(SchedulerInterface):
                         ) = self.kv_cache_manager.get_computed_blocks(request)
 
                     # Get externally-cached tokens if using a KVConnector.
-                    if self.connector is not None:
+                    # ``skip_reading_prefix_cache`` applies to every cache
+                    # reader, including external KV connectors. Prompt
+                    # logprobs set this flag because cached KV cannot recover
+                    # the logits for skipped prompt tokens. Keep the connector
+                    # active below so freshly recomputed KV may still be
+                    # stored, but do not admit an external cache hit here.
+                    if (
+                        self.connector is not None
+                        and not request.skip_reading_prefix_cache
+                    ):
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens
