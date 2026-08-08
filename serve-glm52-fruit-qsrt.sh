@@ -9,7 +9,6 @@ export PYTHONSAFEPATH=1
 
 PYTHON_BIN="${PYTHON_BIN:-${SCRIPT_DIR}/.venv/bin/python}"
 B12X_ROOT="${B12X_ROOT:-${SCRIPT_DIR}/../b12x-fruit}"
-SPARKINFER_ROOT="${SPARKINFER_ROOT:-${SCRIPT_DIR}/../sparkinfer}"
 MODEL="${MODEL:-/mnt/vault/llm/fruit-pilot/output/GLM-5.2-SIQ-Fruit-QSRT-exact}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
@@ -18,8 +17,7 @@ if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
 fi
 
 EXPECTED_B12X_REVISION="de50e8622a8695e9829c83ad9f8c96f9b3be573a"
-EXPECTED_KQUANT_REVISION="7cd31ae1a12cf77840f03428b7ebdafda9115ecb"
-EXPECTED_SPARKINFER_REVISION="680d8195b80420296d7fed2688b75406be15eb38"
+EXPECTED_KQUANT_REVISION="40daf85102d56c61d3da3bc60229d84918ee6557"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Missing vLLM Python: ${PYTHON_BIN}" >&2
@@ -84,32 +82,7 @@ if [[ -n "$(git -C "${SCRIPT_DIR}" status --porcelain -- vllm)" ]]; then
   exit 1
 fi
 
-if [[ -L "${SPARKINFER_ROOT}" ]]; then
-  echo "SparkInfer root must not be a symbolic link: ${SPARKINFER_ROOT}" >&2
-  exit 1
-fi
-resolved_sparkinfer="$(readlink -e -- "${SPARKINFER_ROOT}")" || {
-  echo "Unable to resolve SparkInfer root: ${SPARKINFER_ROOT}" >&2
-  exit 1
-}
-if [[ ! -d "${resolved_sparkinfer}/sparkinfer" ]]; then
-  echo "SparkInfer root does not contain the package: ${resolved_sparkinfer}" >&2
-  exit 1
-fi
-SPARKINFER_ROOT="${resolved_sparkinfer}"
-actual_sparkinfer_revision="$(git -C "${SPARKINFER_ROOT}" rev-parse HEAD)" || {
-  echo "Unable to resolve the SparkInfer revision: ${SPARKINFER_ROOT}" >&2
-  exit 1
-}
-if [[ "${actual_sparkinfer_revision}" != "${EXPECTED_SPARKINFER_REVISION}" ]]; then
-  echo "SparkInfer revision mismatch: got ${actual_sparkinfer_revision}, expected ${EXPECTED_SPARKINFER_REVISION}" >&2
-  exit 1
-fi
-if [[ -n "$(git -C "${SPARKINFER_ROOT}" status --porcelain -- sparkinfer)" ]]; then
-  echo "SparkInfer source tree has uncommitted changes: ${SPARKINFER_ROOT}" >&2
-  exit 1
-fi
-export PYTHONPATH="${SCRIPT_DIR}:${B12X_ROOT}:${SPARKINFER_ROOT}"
+export PYTHONPATH="${SCRIPT_DIR}:${B12X_ROOT}"
 
 "${PYTHON_BIN}" -P -c '
 import hashlib
@@ -117,7 +90,6 @@ import sys
 from pathlib import Path
 
 import b12x
-import sparkinfer
 import vllm
 from vllm.model_executor.layers.quantization.kquant_qsrt_atoms import (
     verify_qsrt_publication,
@@ -156,39 +128,26 @@ if runtime.get("b12x_revision") != sys.argv[3]:
     raise RuntimeError("Fruit package B12X revision is unsupported")
 if runtime.get("vllm_revision") != sys.argv[4]:
     raise RuntimeError("Fruit package vLLM revision does not match the runtime")
-if runtime.get("sparkinfer_revision") != sys.argv[8]:
-    raise RuntimeError("Fruit package SparkInfer revision is unsupported")
 b12x_root = Path(sys.argv[5]).resolve(strict=True)
 vllm_root = Path(sys.argv[6]).resolve(strict=True)
-sparkinfer_root = Path(sys.argv[7]).resolve(strict=True)
 if not Path(b12x.__file__).resolve().is_relative_to(b12x_root / "b12x"):
     raise RuntimeError("imported B12X does not come from the sealed source root")
 if not Path(vllm.__file__).resolve().is_relative_to(vllm_root / "vllm"):
     raise RuntimeError("imported vLLM does not come from the sealed source root")
-if not Path(sparkinfer.__file__).resolve().is_relative_to(
-    sparkinfer_root / "sparkinfer"
-):
-    raise RuntimeError("imported SparkInfer does not come from the approved source root")
 if runtime.get("b12x_source_sha256") != source_tree_sha256(b12x_root / "b12x"):
     raise RuntimeError("Fruit package B12X source fingerprint is unsupported")
 if runtime.get("vllm_source_sha256") != source_tree_sha256(vllm_root / "vllm"):
     raise RuntimeError("Fruit package vLLM source fingerprint is unsupported")
-if runtime.get("sparkinfer_source_sha256") != source_tree_sha256(
-    sparkinfer_root / "sparkinfer"
-):
-    raise RuntimeError("Fruit package SparkInfer source fingerprint is unsupported")
 
 import b12x.moe.fused_moe
-import sparkinfer.attention.sparse_mla
+import b12x.attention.sparse_mla
 ' \
   "${MODEL}" \
   "${EXPECTED_KQUANT_REVISION}" \
   "${EXPECTED_B12X_REVISION}" \
   "${actual_vllm_revision}" \
   "${B12X_ROOT}" \
-  "${SCRIPT_DIR}" \
-  "${SPARKINFER_ROOT}" \
-  "${EXPECTED_SPARKINFER_REVISION}"
+  "${SCRIPT_DIR}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_120a}"

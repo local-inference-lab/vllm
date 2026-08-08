@@ -5,11 +5,11 @@
 Counterpart to ``SparseMLASm120Backend`` (FlashInfer V32 v2). Same envelope --
 ``fp8_ds_mla`` KV cache (656 B/token), head_size = 576, paged block_size = 64,
 V32-family models with an ``index_topk`` config (DeepSeek V3.2, GLM-5.1, Kimi
-K2.5) -- but the decode/extend kernels come from SparkInfer's unified SM120
-backend via the ``sparkinfer.attention.sparse_mla`` front door (``run_decode`` /
-``run_extend``). On SM120+ CUDA those front-door functions route to SparkInfer's
+K2.5) -- but the decode/extend kernels come from b12x's unified SM120 backend
+via the ``b12x.attention.sparse_mla`` front door (``run_decode`` /
+``run_extend``). On SM120+ CUDA those front-door functions route to b12x's
 unified MLA implementation automatically (GLM_NSA q_head_dim==576 contract).
-Selecting this backend also selects SparkInfer's sparse indexer/top-k path.
+Selecting this backend also selects b12x's sparse indexer/top-k path.
 
 Scratch philosophy (eager PLAN -> BIND -> KERNEL; no workspace/arena, ever):
 b12x workspaces/arenas are sglang-only and forbidden here. We build a caller-
@@ -978,12 +978,12 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             )
         if self._kv_fp8_rope:
             try:
-                from sparkinfer.attention._shared.mla.kv_cache import (
+                from b12x.attention._shared.mla.kv_cache import (
                     concat_and_cache_nvfp4_mla_fp8_rope,
                 )
             except ImportError as exc:
                 raise RuntimeError(
-                    "KV_FP8_ROPE=1 requires a SparkInfer build with "
+                    "KV_FP8_ROPE=1 requires a b12x build with "
                     "concat_and_cache_nvfp4_mla_fp8_rope package API support"
                 ) from exc
             self._concat_and_cache_nvfp4_mla_fp8_rope = (
@@ -1113,17 +1113,17 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
 
         self._max_batched = int(max_batched)
 
-        # Lazily import SparkInfer only on this opt-in path.
-        from sparkinfer.attention.sparse_mla import (
+        # Lazily import b12x only on this opt-in path.
+        from b12x.attention.sparse_mla import (
             Caps as B12XSparseMLAScratchCaps,
         )
-        from sparkinfer.attention.sparse_mla import (
+        from b12x.attention.sparse_mla import (
             plan as plan_sparse_mla_scratch,
         )
-        from sparkinfer.attention.sparse_mla import (
+        from b12x.attention.sparse_mla import (
             run_decode as sparse_mla_decode_forward,
         )
-        from sparkinfer.attention.sparse_mla import (
+        from b12x.attention.sparse_mla import (
             run_extend as sparse_mla_extend_forward,
         )
 
