@@ -5,23 +5,115 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${SCRIPT_DIR}/.venv/bin/python}"
 B12X_ROOT="${B12X_ROOT:-${SCRIPT_DIR}/../b12x-fruit}"
 MODEL="${MODEL:-/mnt/vault/llm/fruit-pilot/output/GLM-5.2-SIQ-Fruit-QSRT-exact}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
+  echo "Fruit QSRT has only been qualified at tensor parallel size 1" >&2
+  exit 1
+fi
+
+EXPECTED_B12X_REVISION="5fefb62b64d7f544a977d47dedf33bfc65f2f392"
+EXPECTED_KQUANT_REVISION="a9c94ebc1039c77525c7129fcae9a32f4feb4ebc"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Missing vLLM Python: ${PYTHON_BIN}" >&2
   exit 1
 fi
+MODEL="$("${PYTHON_BIN}" -c \
+  'from pathlib import Path; import sys; p = Path(sys.argv[1]); '\
+'p.is_symlink() and sys.exit("MODEL must not be a symbolic link"); '\
+'print(p.resolve(strict=True))' "${MODEL}")"
 if [[ ! -d "${B12X_ROOT}/b12x" ]]; then
   echo "Missing Fruit b12x checkout: ${B12X_ROOT}" >&2
   exit 1
 fi
-for required in qsrt-manifest.json MANIFEST.sha256 QSRT_COMPLETE.json; do
-  if [[ ! -s "${MODEL}/${required}" ]]; then
-    echo "Missing validated Fruit QSRT publication file ${required}: ${MODEL}" >&2
-    exit 1
-  fi
-done
-
 export PYTHONPATH="${SCRIPT_DIR}:${B12X_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+actual_b12x_revision="$(git -C "${B12X_ROOT}" rev-parse HEAD)" || {
+  echo "Unable to resolve the Fruit B12X revision: ${B12X_ROOT}" >&2
+  exit 1
+}
+if [[ "${actual_b12x_revision}" != "${EXPECTED_B12X_REVISION}" ]]; then
+  echo "Fruit B12X revision mismatch: got ${actual_b12x_revision}, expected ${EXPECTED_B12X_REVISION}" >&2
+  exit 1
+fi
+if [[ -n "$(git -C "${B12X_ROOT}" status --porcelain -- b12x)" ]]; then
+  echo "Fruit B12X source tree has uncommitted changes: ${B12X_ROOT}" >&2
+  exit 1
+fi
+actual_vllm_revision="$(git -C "${SCRIPT_DIR}" rev-parse HEAD)" || {
+  echo "Unable to resolve the Fruit vLLM revision: ${SCRIPT_DIR}" >&2
+  exit 1
+}
+if [[ -n "$(git -C "${SCRIPT_DIR}" status --porcelain -- vllm)" ]]; then
+  echo "Fruit vLLM source tree has uncommitted changes: ${SCRIPT_DIR}" >&2
+  exit 1
+fi
+"${PYTHON_BIN}" -c '
+import hashlib
+import sys
+from pathlib import Path
+
+import b12x
+import vllm
+from vllm.model_executor.layers.quantization.kquant_qsrt_atoms import (
+    verify_qsrt_publication,
+)
+
+def source_tree_sha256(root_value):
+    root = Path(root_value).resolve(strict=True)
+    files = []
+    for path in root.rglob("*"):
+        if "__pycache__" in path.parts:
+            continue
+        if path.is_symlink():
+            raise RuntimeError(f"runtime source must not contain symlinks: {path}")
+        if path.is_file():
+            files.append(path)
+    files.sort(key=lambda path: path.relative_to(root).as_posix())
+    if not files:
+        raise RuntimeError(f"runtime source tree is empty: {root}")
+    digest = hashlib.sha256()
+    for path in files:
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        content = path.read_bytes()
+        digest.update(len(relative).to_bytes(4, "little"))
+        digest.update(relative)
+        digest.update(len(content).to_bytes(8, "little"))
+        digest.update(content)
+    return digest.hexdigest()
+
+seal = verify_qsrt_publication(sys.argv[1])
+producer = seal.manifest["producer"]
+encoder = producer["encoder"]
+runtime = producer["runtime"]
+if encoder.get("kquant_revision") != sys.argv[2]:
+    raise RuntimeError("Fruit package KQuant revision is unsupported")
+if runtime.get("b12x_revision") != sys.argv[3]:
+    raise RuntimeError("Fruit package B12X revision is unsupported")
+if runtime.get("vllm_revision") != sys.argv[4]:
+    raise RuntimeError("Fruit package vLLM revision does not match the runtime")
+b12x_root = Path(sys.argv[5]).resolve(strict=True)
+vllm_root = Path(sys.argv[6]).resolve(strict=True)
+if not Path(b12x.__file__).resolve().is_relative_to(b12x_root / "b12x"):
+    raise RuntimeError("imported B12X does not come from the sealed source root")
+if not Path(vllm.__file__).resolve().is_relative_to(vllm_root / "vllm"):
+    raise RuntimeError("imported vLLM does not come from the sealed source root")
+if runtime.get("b12x_source_sha256") != source_tree_sha256(b12x_root / "b12x"):
+    raise RuntimeError("Fruit package B12X source fingerprint is unsupported")
+if runtime.get("vllm_source_sha256") != source_tree_sha256(vllm_root / "vllm"):
+    raise RuntimeError("Fruit package vLLM source fingerprint is unsupported")
+' \
+  "${MODEL}" \
+  "${EXPECTED_KQUANT_REVISION}" \
+  "${EXPECTED_B12X_REVISION}" \
+  "${actual_vllm_revision}" \
+  "${B12X_ROOT}" \
+  "${SCRIPT_DIR}"
+"${PYTHON_BIN}" -c \
+  "import b12x.moe.fused_moe; import sparkinfer.attention.sparse_mla" \
+  >/dev/null || {
+    echo "Fruit QSRT requires both the B12X checkout and SparkInfer attention runtime" >&2
+    exit 1
+  }
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_120a}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-32}"
@@ -37,7 +129,6 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.80}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
-TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 
 cd "${SCRIPT_DIR}"
 exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL}" \

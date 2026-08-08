@@ -10,9 +10,11 @@ QSRT can use W4A16 or Fruit's bounded-M W4A8 path.
 """
 
 import dataclasses
+import importlib
 import json
 import os
 from pathlib import Path
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, cast
 
 import regex as re
@@ -35,6 +37,15 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization.kquant_qsrt_atoms import (
+    ATOM_CHANNELS as QSRT_ATOM_CHANNELS,
+)
+from vllm.model_executor.layers.quantization.kquant_qsrt_atoms import (
+    ATOMS_PER_PAIR as QSRT_ATOMS_PER_PAIR,
+)
+from vllm.model_executor.layers.quantization.kquant_qsrt_atoms import (
+    FRUIT_SCHEMA as FRUIT_QSRT_ATOM_SCHEMA,
+)
 from vllm.model_executor.layers.quantization.kquant_qsrt_atoms import (
     SUPPORTED_SCHEMAS as QSRT_ATOM_SCHEMAS,
 )
@@ -63,6 +74,32 @@ _QSRT_X4T_W13_LAYOUT = "w31"
 _QSRT_X4T_W13_EXCEPTION_TASK_ROWS = 128
 _QSRT_X4T_W2_EXCEPTION_TASK_ROWS = 896
 _QSRT_X4T_W13_EXCEPTION_ROW_ROTATION = 0
+
+
+def _qsrt_backend_module(path: str) -> ModuleType:
+    """Prefer the public B12X namespace and retain SparkInfer-only Kimi installs."""
+
+    failures: list[ModuleNotFoundError] = []
+    for namespace in ("b12x", "sparkinfer"):
+        try:
+            return importlib.import_module(f"{namespace}.{path}")
+        except ModuleNotFoundError as exc:
+            if exc.name not in {namespace, f"{namespace}.{path}"} and not str(
+                exc.name
+            ).startswith(f"{namespace}."):
+                raise
+            failures.append(exc)
+    raise ModuleNotFoundError(
+        f"QSRT runtime requires b12x.{path} or sparkinfer.{path}"
+    ) from failures[-1]
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _stack_exl3_intermediate_rotations(
@@ -205,8 +242,9 @@ class _HybridSharedRuntime:
         # output grids are shared across layers on the same CUDA stream.
         self.x4t_w13_scale_scratch: torch.Tensor | None = None
         self.x4t_w2_scale_scratch: torch.Tensor | None = None
-        # Fruit QSRT W4A8 owns one fixed scratch set for each captured M.
-        self.w4a8_scratch: dict[int, Any] = {}
+        # Fruit QSRT W4A8 scratch is keyed by prepared geometry, layout, and M.
+        self.w4a8_scratch: dict[tuple[int, int, int, bool, int], Any] = {}
+        self.qsrt_publication: Any = None
 
 
 class _HybridLayerState:
@@ -251,9 +289,9 @@ class _HybridLayerState:
         # Canonical QSRT layers own compressed experts through an external
         # TP-independent safetensors artifact.
         self.uses_qsrt_atoms = False
-        self.uses_qsrt = False
         self.trellis_weights: Any = None
         self.trellis_plan: Any = None
+        self.w4a8_scratch_geometry: tuple[int, int, int, bool] | None = None
         self.runtime_ready = False
 
 
@@ -410,15 +448,30 @@ class KQuantHybridConfig(ModelOptNvFp4Config):
             schema = qsrt.get("schema")
             if schema not in QSRT_ATOM_SCHEMAS:
                 raise ValueError(f"unsupported QSRT atom schema {schema!r}")
-            config.kept_storage = "x4t"
             for name, expected in expected_qsrt.items():
                 if qsrt.get(name) != expected:
                     raise ValueError(
                         f"QSRT {name} must be {expected!r}, got {qsrt.get(name)!r}"
                     )
+            if schema == FRUIT_QSRT_ATOM_SCHEMA:
+                if type(qsrt.get("profile_id")) is not int or qsrt["profile_id"] <= 0:
+                    raise ValueError("Fruit QSRT profile_id must be a positive integer")
+                for name in (
+                    "producer_fingerprint",
+                    "encoder_fingerprint",
+                    "source_sha256",
+                ):
+                    if not _is_sha256(qsrt.get(name)):
+                        raise ValueError(f"Fruit QSRT {name} must be a SHA-256 digest")
+                if (
+                    not isinstance(qsrt.get("source_kind"), str)
+                    or not qsrt["source_kind"]
+                ):
+                    raise ValueError("Fruit QSRT source_kind must be nonempty")
             runtime = str(qsrt.get("runtime", "w4a16")).lower()
             if runtime not in {"w4a16", "w4a8"}:
                 raise ValueError(f"unsupported QSRT runtime {runtime!r}")
+            config.kept_storage = "x4t"
             config.qsrt_runtime = runtime
             config.qsrt = dict(qsrt)
             config.trellis_codebook = "sqg_xor_cheb_t12"
@@ -553,7 +606,6 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             else ""
         )
         state.uses_qsrt_atoms = qsrt_storage == "qsrt_atoms_v1"
-        state.uses_qsrt = state.uses_qsrt_atoms
         layer.hybrid_state = state
 
         if state.uses_qsrt_atoms:
@@ -571,9 +623,9 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                     "intermediate sizes divisible by 256"
                 )
             if kept and not kept_mx:
-                raise ValueError(
-                    "QSRT X4T experts require kept_format='mxfp4_e8m0k32'"
-                )
+                raise ValueError("QSRT X4T experts require kept_format='mxfp4_e8m0k32'")
+            if self.quant_config.qsrt_runtime == "w4a8" and kept:
+                raise ValueError("Fruit W4A8 does not support a hybrid kept tier")
             placeholder = torch.nn.Parameter(
                 torch.empty(
                     (0,),
@@ -900,16 +952,19 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
     ) -> None:
         """Load one deployment shard from canonical TP-independent QSRT files."""
 
-        from b12x._lib.quant.x4t_scales import make_x4t_scale_batch
-        from b12x.moe import fused_moe
-        from b12x.moe._shared.kernels.w4a16.prepare import (
-            prepare_w4a16_x4t_weights,
-        )
+        make_x4t_scale_batch = _qsrt_backend_module(
+            "_lib.quant.x4t_scales"
+        ).make_x4t_scale_batch
+        fused_moe = _qsrt_backend_module("moe.fused_moe")
+        prepare_w4a16_x4t_weights = _qsrt_backend_module(
+            "moe._shared.kernels.w4a16.prepare"
+        ).prepare_w4a16_x4t_weights
 
         from vllm.config import get_current_vllm_config
         from vllm.model_executor.layers.quantization.kquant_qsrt_atoms import (
             open_qsrt_atom_extent,
             read_qsrt_atom_layer_metadata,
+            verify_qsrt_publication,
         )
         from vllm.model_executor.layers.quantization.kquant_x4t import (
             X4TLayerReader,
@@ -928,23 +983,34 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             raise ValueError(
                 f"QSRT serving requires a local model directory, got {model_root}"
             )
-        manifest_path = model_root / "qsrt-manifest.json"
-        try:
-            manifest = json.loads(manifest_path.read_text())
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"QSRT checkpoint is missing {manifest_path}"
-            ) from None
         qsrt_descriptor = self.quant_config.qsrt
         if not isinstance(qsrt_descriptor, dict):
             raise RuntimeError("QSRT format descriptor was not initialized")
         expected_schema = qsrt_descriptor["schema"]
-        if (
-            manifest.get("codec") != "QSRT"
-            or manifest.get("storage_schema") != expected_schema
-            or manifest.get("complete") is not True
-        ):
-            raise ValueError("QSRT manifest identity is invalid or incomplete")
+        publication = None
+        if expected_schema == FRUIT_QSRT_ATOM_SCHEMA:
+            publication = self.quant_config.shared_runtime.qsrt_publication
+            resolved_root = model_root.resolve()
+            if publication is None:
+                publication = verify_qsrt_publication(resolved_root)
+                self.quant_config.shared_runtime.qsrt_publication = publication
+            elif publication.root != resolved_root:
+                raise RuntimeError("QSRT shared runtime cannot mix model roots")
+            manifest = publication.manifest
+        else:
+            manifest_path = model_root / "qsrt-manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text())
+            except FileNotFoundError:
+                raise FileNotFoundError(
+                    f"QSRT checkpoint is missing {manifest_path}"
+                ) from None
+            if (
+                manifest.get("codec") != "QSRT"
+                or manifest.get("storage_schema") != expected_schema
+                or manifest.get("complete") is not True
+            ):
+                raise ValueError("QSRT manifest identity is invalid or incomplete")
         layer_entry = (manifest.get("layers") or {}).get(str(layer_index))
         if not isinstance(layer_entry, dict):
             raise ValueError(f"QSRT manifest omits layer {layer_index}")
@@ -954,8 +1020,18 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             if not isinstance(name, str) or not name or Path(name).name != name:
                 raise ValueError(f"QSRT layer {layer_index} has invalid {field}")
             path = model_root / name
-            if not path.is_file():
+            if path.is_symlink() or not path.is_file():
                 raise FileNotFoundError(path)
+            if publication is not None and name not in publication.checksums:
+                raise ValueError(f"QSRT checksum manifest omits {name}")
+            if (
+                publication is not None
+                and field == "qsrt_atoms"
+                and layer_entry.get("sha256") != publication.checksums[name]
+            ):
+                raise ValueError(
+                    f"QSRT layer {layer_index} atom digest disagrees with the seal"
+                )
             return path
 
         atom_path = manifest_file("qsrt_atoms")
@@ -969,6 +1045,26 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 state.intermediate_size * get_tensor_model_parallel_world_size()
             ),
             expected_bits=bits,
+            expected_profile_id=(
+                int(qsrt_descriptor["profile_id"])
+                if expected_schema == FRUIT_QSRT_ATOM_SCHEMA
+                else None
+            ),
+            expected_codebook=(
+                str(qsrt_descriptor["codebook"])
+                if expected_schema == FRUIT_QSRT_ATOM_SCHEMA
+                else None
+            ),
+            expected_source_sha256=(
+                str(qsrt_descriptor["source_sha256"])
+                if expected_schema == FRUIT_QSRT_ATOM_SCHEMA
+                else None
+            ),
+            expected_encoder_fingerprint=(
+                str(qsrt_descriptor["encoder_fingerprint"])
+                if expected_schema == FRUIT_QSRT_ATOM_SCHEMA
+                else None
+            ),
         )
         if metadata.schema != expected_schema:
             raise ValueError("QSRT atom schema disagrees with the format descriptor")
@@ -993,6 +1089,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
 
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
+        pair_channels = QSRT_ATOMS_PER_PAIR * QSRT_ATOM_CHANNELS
         if state.num_secondary:
             plan = fused_moe.plan_weights(
                 quant_modes="w4a16",
@@ -1001,7 +1098,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 params_dtype=self.moe.in_dtype,
                 num_experts=state.num_secondary,
                 hidden_size=state.hidden_size,
-                intermediate_size=256,
+                intermediate_size=pair_channels,
                 w13_layout="w13",
                 trellis_bits=3,
                 trellis_tile_config=state.tiles,
@@ -1009,9 +1106,9 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             )
             compressed_ids = metadata.compressed_expert_ids.to(torch.int64)
             expert_ids = compressed_ids.to(device)
-            format_codes = metadata.format_codes.index_select(
-                0, compressed_ids
-            ).to(device)
+            format_codes = metadata.format_codes.index_select(0, compressed_ids).to(
+                device
+            )
 
             def local_scales(values: torch.Tensor) -> torch.Tensor:
                 if values.ndim == 1:
@@ -1033,21 +1130,23 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             ) as (first_atom_slot, atoms):
                 local_atom_slots = int(atoms.shape[0])
                 if (
-                    first_atom_slot % 8
-                    or local_atom_slots % 8
-                    or local_atom_slots * 32 != state.intermediate_size
+                    first_atom_slot % QSRT_ATOMS_PER_PAIR
+                    or local_atom_slots % QSRT_ATOMS_PER_PAIR
+                    or local_atom_slots * QSRT_ATOM_CHANNELS != state.intermediate_size
                 ):
                     raise ValueError(
-                        "QSRT TP partition must contain complete 256-channel "
-                        "atom pairs"
+                        "QSRT TP partition must contain complete "
+                        f"{pair_channels}-channel atom pairs"
                     )
                 parts = []
-                for offset in range(0, local_atom_slots, 8):
+                for offset in range(0, local_atom_slots, QSRT_ATOMS_PER_PAIR):
                     parts.append(
                         fused_moe.prepare_weights(
                             plan=plan,
                             params_dtype=self.moe.in_dtype,
-                            qsrt_atom_payload=atoms.narrow(0, offset, 8),
+                            qsrt_atom_payload=atoms.narrow(
+                                0, offset, QSRT_ATOMS_PER_PAIR
+                            ),
                             qsrt_first_atom_slot=first_atom_slot + offset,
                             qsrt_layer_index=layer_index,
                             qsrt_expert_ids=expert_ids,
@@ -1154,21 +1253,19 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             state.num_kept,
         )
 
-
     def process_weights_after_loading(self, layer: "RoutedExperts") -> None:
         """Prepare the kept tier and the selected W4A16 trellis tier."""
-        from b12x.moe._shared.kernels.w4a16.prepare import (
-            W4A16PackedWeights,
-            _make_workspace,
-            _permute_nvfp4_scales,
-            _repack_weight,
-        )
+        prepare_module = _qsrt_backend_module("moe._shared.kernels.w4a16.prepare")
+        W4A16PackedWeights = prepare_module.W4A16PackedWeights
+        _make_workspace = prepare_module._make_workspace
+        _permute_nvfp4_scales = prepare_module._permute_nvfp4_scales
+        _repack_weight = prepare_module._repack_weight
 
         state: _HybridLayerState = layer.hybrid_state
         hidden, inter = state.hidden_size, state.intermediate_size
         device = (
             torch.device("cuda", torch.accelerator.current_device_index())
-            if state.uses_qsrt
+            if state.uses_qsrt_atoms
             else layer.w13_weight.device
         )
         num_kept, num_secondary = state.num_kept, state.num_secondary
@@ -1185,7 +1282,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         if state.uses_qsrt_atoms:
             self._load_qsrt_atoms(layer, device=device)
         elif num_secondary > 0 and self.quant_config.demoted_format == "exl3_3":
-            from b12x.moe import fused_moe
+            fused_moe = _qsrt_backend_module("moe.fused_moe")
 
             # Projection-major native stacks; prepare_weights wraps zero-copy.
             w13 = layer.w13_exl3_trellis.data.permute(1, 0, 2, 3, 4).contiguous()
@@ -1314,12 +1411,11 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         routing and a fused top-k sum; if that compile is unavailable the
         packed launch also serves decode.
         """
-        from b12x.moe._shared.kernels.w4a16.host import (
-            max_packed_route_slots,
-        )
-        from b12x.moe._shared.kernels.w4a16.kernel import (
-            compile_w4a16_fused_moe,
-        )
+        host_module = _qsrt_backend_module("moe._shared.kernels.w4a16.host")
+        max_packed_route_slots = host_module.max_packed_route_slots
+        compile_w4a16_fused_moe = _qsrt_backend_module(
+            "moe._shared.kernels.w4a16.kernel"
+        ).compile_w4a16_fused_moe
 
         runtime = self.quant_config.shared_runtime
         assert runtime.max_m is not None
@@ -1411,10 +1507,9 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         if self.quant_config.qsrt_runtime == "w4a8" and state.num_kept:
             raise RuntimeError("Fruit W4A8 does not support a hybrid kept tier")
 
-        from b12x.moe._shared.kernels.w4a16.host import (
-            make_w4a16_packed_buffers,
-            max_packed_route_slots,
-        )
+        host_module = _qsrt_backend_module("moe._shared.kernels.w4a16.host")
+        make_w4a16_packed_buffers = host_module.make_w4a16_packed_buffers
+        max_packed_route_slots = host_module.max_packed_route_slots
         if runtime.max_m is None:
             runtime.max_m = max(int(self.moe.max_num_tokens), int(m))
             runtime.topk = int(topk)
@@ -1423,7 +1518,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         if state.prep_kept is not None:
             state.launch_kept = self._get_launch_pair(state.prep_kept, state)
         if getattr(state, "trellis_weights", None) is not None:
-            from b12x.moe import fused_moe
+            fused_moe = _qsrt_backend_module("moe.fused_moe")
             trellis_parts = (
                 state.trellis_weights
                 if isinstance(state.trellis_weights, tuple)
@@ -1485,6 +1580,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 )
             if (
                 os.getenv("VLLM_KQUANT_CAPTURE_DIR")
+                and len(trellis_parts) == 1
                 and runtime.kquant_logical_mid is None
             ):
                 runtime.kquant_logical_mid = torch.empty(
@@ -1495,77 +1591,89 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                     dtype=torch.float16,
                     device=torch.accelerator.current_device_index(),
                 )
-            if self.quant_config.qsrt_runtime == "w4a8" and not runtime.w4a8_scratch:
-                from b12x.moe._shared.kernels.trellis_w4a8 import (
-                    make_trellis_w4a8_moe_scratch,
-                    run_trellis_w4a8_moe,
-                    view_trellis_w4a8_moe_scratch,
+            if self.quant_config.qsrt_runtime == "w4a8":
+                w4a8_module = _qsrt_backend_module("moe._shared.kernels.trellis_w4a8")
+                make_trellis_w4a8_moe_scratch = (
+                    w4a8_module.make_trellis_w4a8_moe_scratch
+                )
+                run_trellis_w4a8_moe = w4a8_module.run_trellis_w4a8_moe
+                view_trellis_w4a8_moe_scratch = (
+                    w4a8_module.view_trellis_w4a8_moe_scratch
                 )
 
                 prepared_parts = tuple(
                     part.representation.value for part in trellis_parts
                 )
-                suh_row_counts = {
-                    (
-                        int(part.gate_suh.shape[0]),
-                        int(part.up_suh.shape[0]),
-                    )
-                    for part in prepared_parts
+                shared_modes = {
+                    getattr(part, "shared_suh", None) for part in prepared_parts
                 }
-                if len(suh_row_counts) != 1:
-                    raise RuntimeError(
-                        "Fruit W4A8 prepared parts disagree on gate/up rotation rows"
-                    )
-                gate_rows, up_rows = next(iter(suh_row_counts))
-                if gate_rows != up_rows or gate_rows not in (
-                    1,
-                    state.num_secondary,
+                if len(shared_modes) != 1 or not all(
+                    type(mode) is bool for mode in shared_modes
                 ):
                     raise RuntimeError(
-                        "Fruit W4A8 gate/up rotations must both be shared or "
-                        "both have one row per secondary expert"
+                        "Fruit W4A8 prepared parts disagree on shared_suh"
+                    )
+                shared_suh = next(iter(shared_modes))
+                expected_suh_rows = 1 if shared_suh else state.num_secondary
+                if any(
+                    int(part.gate_suh.shape[0]) != expected_suh_rows
+                    or int(part.up_suh.shape[0]) != expected_suh_rows
+                    for part in prepared_parts
+                ):
+                    raise RuntimeError(
+                        "Fruit W4A8 gate/up rotations disagree with shared_suh"
                     )
                 prepared = prepared_parts[0]
-                shared_suh = gate_rows == 1
-                backing = make_trellis_w4a8_moe_scratch(
-                    m=_B12X_W4A8_MAX_M,
-                    topk=runtime.topk,
-                    hidden_size=state.hidden_size,
-                    intermediate_size=primary_trellis.plan.intermediate_size,
-                    device=prepared.w13.device,
-                    shared_suh=shared_suh,
+                scratch_geometry = (
+                    state.hidden_size,
+                    int(primary_trellis.plan.intermediate_size),
+                    int(runtime.topk),
+                    shared_suh,
                 )
-                for scratch_m in range(1, _B12X_W4A8_MAX_M + 1):
-                    runtime.w4a8_scratch[scratch_m] = view_trellis_w4a8_moe_scratch(
-                        backing,
-                        m=scratch_m,
+                state.w4a8_scratch_geometry = scratch_geometry
+                prewarm_key = (*scratch_geometry, 1)
+                if prewarm_key not in runtime.w4a8_scratch:
+                    backing = make_trellis_w4a8_moe_scratch(
+                        m=_B12X_W4A8_MAX_M,
                         topk=runtime.topk,
+                        hidden_size=state.hidden_size,
+                        intermediate_size=primary_trellis.plan.intermediate_size,
+                        device=prepared.w13.device,
                         shared_suh=shared_suh,
                     )
-                prewarm_input = torch.zeros(
-                    (1, state.hidden_size),
-                    dtype=self.moe.in_dtype,
-                    device=prepared.w13.device,
-                )
-                prewarm_ids = torch.zeros(
-                    (1, runtime.topk),
-                    dtype=torch.int32,
-                    device=prepared.w13.device,
-                )
-                prewarm_weights = torch.zeros(
-                    (1, runtime.topk),
-                    dtype=torch.float32,
-                    device=prepared.w13.device,
-                )
-                run_trellis_w4a8_moe(
-                    prewarm_input,
-                    prepared,
-                    prewarm_weights,
-                    prewarm_ids,
-                    runtime.w4a8_scratch[1],
-                    expert_map=state.emap_secondary,
-                    fast_math=True,
-                )
+                    for scratch_m in range(1, _B12X_W4A8_MAX_M + 1):
+                        runtime.w4a8_scratch[(*scratch_geometry, scratch_m)] = (
+                            view_trellis_w4a8_moe_scratch(
+                                backing,
+                                m=scratch_m,
+                                topk=runtime.topk,
+                                shared_suh=shared_suh,
+                            )
+                        )
+                    prewarm_input = torch.zeros(
+                        (1, state.hidden_size),
+                        dtype=self.moe.in_dtype,
+                        device=prepared.w13.device,
+                    )
+                    prewarm_ids = torch.zeros(
+                        (1, runtime.topk),
+                        dtype=torch.int32,
+                        device=prepared.w13.device,
+                    )
+                    prewarm_weights = torch.zeros(
+                        (1, runtime.topk),
+                        dtype=torch.float32,
+                        device=prepared.w13.device,
+                    )
+                    run_trellis_w4a8_moe(
+                        prewarm_input,
+                        prepared,
+                        prewarm_weights,
+                        prewarm_ids,
+                        runtime.w4a8_scratch[prewarm_key],
+                        expert_map=state.emap_secondary,
+                        fast_math=True,
+                    )
         if runtime.buffers is None and state.prep_kept is not None:
             prep_any = state.prep_kept
             device = prep_any.w13.device
@@ -1615,7 +1723,9 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         decode: bool,
     ) -> torch.Tensor:
         """Run one tier through its preplanned b12x launch."""
-        from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+        run_w4a16_moe = _qsrt_backend_module(
+            "moe._shared.kernels.w4a16.kernel"
+        ).run_w4a16_moe
 
         runtime = self.quant_config.shared_runtime
         use_decode = decode and launch_pair[0] is not launch_pair[1]
@@ -1792,13 +1902,19 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             )
             a = x if x.is_contiguous() else x.contiguous()
             if self.quant_config.qsrt_runtime == "w4a8" and m <= _B12X_W4A8_MAX_M:
-                from b12x.moe._shared.kernels.trellis_w4a8 import (
-                    run_trellis_w4a8_moe,
-                )
+                run_trellis_w4a8_moe = _qsrt_backend_module(
+                    "moe._shared.kernels.trellis_w4a8"
+                ).run_trellis_w4a8_moe
 
-                scratch = runtime.w4a8_scratch.get(m)
+                scratch_geometry = state.w4a8_scratch_geometry
+                if scratch_geometry is None:
+                    raise RuntimeError("Fruit W4A8 scratch geometry was not prepared")
+                scratch = runtime.w4a8_scratch.get((*scratch_geometry, m))
                 if scratch is None:
-                    raise RuntimeError(f"Fruit W4A8 scratch for m={m} was not prepared")
+                    raise RuntimeError(
+                        f"Fruit W4A8 scratch for geometry={scratch_geometry}, "
+                        f"m={m} was not prepared"
+                    )
                 if state.num_kept:
                     raise RuntimeError("Fruit W4A8 does not support a hybrid kept tier")
                 output_accum = (
@@ -1825,9 +1941,9 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 if part_output is None:
                     raise RuntimeError("secondary trellis partition is empty")
                 output = output_accum[:m] if output_accum is not None else part_output
-                return output.to(x.dtype)
+                return output.to(dtype=x.dtype, copy=True)
 
-            from b12x.moe import fused_moe
+            fused_moe = _qsrt_backend_module("moe.fused_moe")
 
             output_accum = (
                 runtime.trellis_output_accum if len(trellis_parts) > 1 else None
@@ -1854,11 +1970,19 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                         output_accum[:m].add_(part_output)
             if part_output is None or binding is None:
                 raise RuntimeError("secondary trellis partition is empty")
-            # Each 256-channel atom pair emits one linear FC2 contribution.
-            # Sum all local pairs in fp32, then cast once to the model dtype.
+            # Each atom pair emits one linear FC2 contribution. Sum all local
+            # pairs in fp32, then copy-cast once out of reusable B12X storage.
             output = output_accum[:m] if output_accum is not None else part_output
-            out_trellis = output.to(x.dtype)
-            if os.getenv("VLLM_KQUANT_CAPTURE_DIR") and len(trellis_parts) == 1:
+            out_trellis = output.to(dtype=x.dtype, copy=True)
+            capture_dir = os.getenv("VLLM_KQUANT_CAPTURE_DIR")
+            if capture_dir and len(trellis_parts) > 1:
+                logger.warning_once(
+                    "kquant_hybrid: skipping logical-mid capture for %s because "
+                    "the QSRT layer has %d independently prepared atom pairs",
+                    layer.layer_name,
+                    len(trellis_parts),
+                )
+            if capture_dir and len(trellis_parts) == 1:
                 from vllm.model_executor.layers.fused_moe.kquant_capture import (
                     collect_kquant_exl3_mid,
                 )

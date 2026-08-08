@@ -7,6 +7,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.kquant_hybrid import (
     KQuantHybridConfig,
@@ -14,6 +15,7 @@ from vllm.model_executor.layers.quantization.kquant_hybrid import (
     _b12x_tiles_for_geometry,
     _HybridSharedRuntime,
     _is_dense_layer_ignored,
+    _qsrt_backend_module,
     _read_hybrid_keys,
     _require_rank_local_kept_kernel,
     _stack_exl3_intermediate_rotations,
@@ -40,6 +42,12 @@ def _qsrt_descriptor(**updates):
         "artifact_manifest": "qsrt-manifest.json",
     }
     descriptor.update(updates)
+    if descriptor["schema"] == "kquant_fruit_qsrt_atoms_v1":
+        descriptor.setdefault("profile_id", 1)
+        descriptor.setdefault("producer_fingerprint", "1" * 64)
+        descriptor.setdefault("encoder_fingerprint", "2" * 64)
+        descriptor.setdefault("source_kind", "safetensors_manifest")
+        descriptor.setdefault("source_sha256", "3" * 64)
     return descriptor
 
 
@@ -58,7 +66,6 @@ def _install_fake_b12x(
             "b12x.moe._shared.kernels",
             "b12x.moe._shared.kernels.w4a16",
             "b12x.moe._shared.kernels.w4a16.host",
-            "b12x.moe._shared.kernels.trellis_w4a8",
         )
     }
     for name in (
@@ -71,6 +78,7 @@ def _install_fake_b12x(
         modules[name].__path__ = []
     modules["b12x"].moe = modules["b12x.moe"]
     modules["b12x.moe"].fused_moe = fused_moe
+    modules["b12x.moe.fused_moe"] = fused_moe
     modules["b12x.moe"]._shared = modules["b12x.moe._shared"]
     modules["b12x.moe._shared"].kernels = modules["b12x.moe._shared.kernels"]
     modules["b12x.moe._shared.kernels"].w4a16 = modules[
@@ -106,30 +114,71 @@ def _w4a8_method(runtime: _HybridSharedRuntime) -> KQuantHybridMoEMethod:
     return method
 
 
-def _prepared_part(marker: int) -> SimpleNamespace:
+def _prepared_part(
+    marker: int,
+    *,
+    gate_rows: int = 256,
+    up_rows: int | None = None,
+    hidden_size: int = 1024,
+    intermediate_size: int = 256,
+    shared_suh: bool | None = None,
+) -> SimpleNamespace:
+    up_rows = gate_rows if up_rows is None else up_rows
+    if shared_suh is None:
+        shared_suh = gate_rows == 1
     prepared = SimpleNamespace(
         marker=marker,
-        gate_suh=torch.empty((256, 1024)),
-        up_suh=torch.empty((256, 1024)),
+        gate_suh=torch.empty((gate_rows, hidden_size)),
+        up_suh=torch.empty((up_rows, hidden_size)),
+        shared_suh=shared_suh,
         w13=torch.empty(0),
     )
     return SimpleNamespace(
-        plan=SimpleNamespace(intermediate_size=256),
+        plan=SimpleNamespace(intermediate_size=intermediate_size),
         representation=SimpleNamespace(value=prepared),
     )
 
 
 def _w4a8_state(parts: tuple[SimpleNamespace, ...]) -> SimpleNamespace:
+    prepared = parts[0].representation.value
+    shared_suh = prepared.shared_suh
     return SimpleNamespace(
         emap_secondary=torch.arange(256, dtype=torch.int32),
-        hidden_size=1024,
+        hidden_size=int(prepared.gate_suh.shape[1]),
         num_kept=0,
         num_secondary=256,
         prep_kept=None,
         runtime_ready=True,
         trellis_plan=None,
         trellis_weights=parts,
+        w4a8_scratch_geometry=(
+            int(prepared.gate_suh.shape[1]),
+            int(parts[0].plan.intermediate_size),
+            2,
+            shared_suh,
+        ),
     )
+
+
+def test_qsrt_backend_falls_back_to_sparkinfer(monkeypatch) -> None:
+    expected = ModuleType("sparkinfer.moe.fused_moe")
+    calls: list[str] = []
+
+    def fake_import(name: str):
+        calls.append(name)
+        if name.startswith("b12x."):
+            error = ModuleNotFoundError(name)
+            error.name = name
+            raise error
+        return expected
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid.importlib.import_module",
+        fake_import,
+    )
+
+    assert _qsrt_backend_module("moe.fused_moe") is expected
+    assert calls == ["b12x.moe.fused_moe", "sparkinfer.moe.fused_moe"]
 
 
 @pytest.mark.parametrize(
@@ -196,6 +245,45 @@ def test_config_accepts_fruit_w4a8_runtime() -> None:
     assert config.qsrt == descriptor
 
 
+def test_fruit_w4a8_rejects_kept_experts_before_parameter_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = _qsrt_descriptor(
+        schema="kquant_fruit_qsrt_atoms_v1",
+        runtime="W4A8",
+    )
+    config = KQuantHybridConfig.from_config(
+        _base_config(demoted_format="qsrt_sqg_e4m3", qsrt=descriptor)
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid."
+        "get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid."
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    method = object.__new__(KQuantHybridMoEMethod)
+    method.quant_config = config
+    layer = SimpleNamespace(
+        activation=MoEActivation.SILU,
+        layer_name="model.layers.1.mlp.experts",
+    )
+
+    with pytest.raises(ValueError, match="does not support a hybrid kept tier"):
+        method.create_weights(
+            layer,
+            num_experts=2,
+            hidden_size=256,
+            intermediate_size_per_partition=256,
+            params_dtype=torch.float16,
+        )
+
+    assert not hasattr(layer, "qsrt_atom_placeholder")
+
+
 @pytest.mark.parametrize(
     ("updates", "message"),
     [
@@ -256,8 +344,14 @@ def test_dense_short_exclusions_match_path_components(
     assert _is_dense_layer_ignored(prefix, ignored, {}) is expected
 
 
-def test_w4a8_prepares_per_expert_scratch_and_dispatches_m_view(
+@pytest.mark.parametrize(
+    ("rotation_rows", "shared_suh"),
+    ((256, False), (1, True)),
+)
+def test_w4a8_prepares_geometry_scratch_and_dispatches_m_view(
     monkeypatch: pytest.MonkeyPatch,
+    rotation_rows: int,
+    shared_suh: bool,
 ) -> None:
     monkeypatch.delenv("VLLM_KQUANT_CAPTURE_DIR", raising=False)
     backings = []
@@ -313,7 +407,10 @@ def test_w4a8_prepares_per_expert_scratch_and_dispatches_m_view(
     runtime = _HybridSharedRuntime()
     runtime.trellis_scratch = torch.empty(1, dtype=torch.uint8)
     method = _w4a8_method(runtime)
-    parts = (_prepared_part(0), _prepared_part(1))
+    parts = (
+        _prepared_part(0, gate_rows=rotation_rows),
+        _prepared_part(1, gate_rows=rotation_rows),
+    )
     state = _w4a8_state(parts)
     state.runtime_ready = False
     layer = SimpleNamespace(hybrid_state=state)
@@ -331,21 +428,25 @@ def test_w4a8_prepares_per_expert_scratch_and_dispatches_m_view(
             "hidden_size": 1024,
             "intermediate_size": 256,
             "device": torch.device("cpu"),
-            "shared_suh": False,
+            "shared_suh": shared_suh,
         }
     ]
     assert [view.m for view in view_calls] == list(range(1, 17))
     assert len(backings) == 1
     backing = backings[0]
-    assert backing.gate.numel() == backing.up.numel() == 32
+    expected_backing_rows = 16 if shared_suh else 32
+    assert backing.gate.numel() == backing.up.numel() == expected_backing_rows
     assert all(view.backing is backing for view in view_calls)
-    assert view_calls[1].gate.numel() == view_calls[1].up.numel() == 4
-    assert view_calls[1].gate._base is backing.gate
-    assert view_calls[1].up._base is backing.up
-    assert all(view.topk == 2 and view.shared_suh is False for view in view_calls)
+    expected_view_rows = 2 if shared_suh else 4
+    assert view_calls[1].gate.numel() == expected_view_rows
+    assert view_calls[1].up.numel() == expected_view_rows
+    assert view_calls[1].gate.data_ptr() == backing.gate.data_ptr()
+    assert view_calls[1].up.data_ptr() == backing.up.data_ptr()
+    assert all(view.topk == 2 and view.shared_suh is shared_suh for view in view_calls)
     assert len(run_calls) == 1
     assert run_calls[0][0].marker == 0
-    assert run_calls[0][1] is runtime.w4a8_scratch[1]
+    geometry = (1024, 256, 2, shared_suh)
+    assert run_calls[0][1] is runtime.w4a8_scratch[(*geometry, 1)]
 
     run_calls.clear()
     x = torch.zeros((2, 1024), dtype=torch.float16)
@@ -360,7 +461,100 @@ def test_w4a8_prepares_per_expert_scratch_and_dispatches_m_view(
     assert runtime.trellis_output_accum is output_accum
     torch.testing.assert_close(output, torch.ones_like(output))
     assert [call[0].marker for call in run_calls] == [0, 1]
-    assert all(call[1] is runtime.w4a8_scratch[2] for call in run_calls)
+    assert all(call[1] is runtime.w4a8_scratch[(*geometry, 2)] for call in run_calls)
+
+
+@pytest.mark.parametrize(
+    ("row_shapes", "message"),
+    (
+        (((256, 256), (1, 1)), "disagree on shared_suh"),
+        (((2, 2),), "disagree with shared_suh"),
+        (((1, 256),), "disagree with shared_suh"),
+    ),
+)
+def test_w4a8_rejects_inconsistent_rotation_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    row_shapes: tuple[tuple[int, int], ...],
+    message: str,
+) -> None:
+    plan = SimpleNamespace(
+        scratch_specs=lambda: [SimpleNamespace(shape=(1,), dtype=torch.uint8)]
+    )
+    _install_fake_b12x(
+        monkeypatch,
+        fused_moe=SimpleNamespace(
+            Caps=lambda **kwargs: SimpleNamespace(**kwargs),
+            plan=lambda caps: plan,
+        ),
+        trellis_w4a8=SimpleNamespace(
+            make_trellis_w4a8_moe_scratch=lambda **kwargs: pytest.fail(
+                "invalid rotations must fail before scratch allocation"
+            ),
+            run_trellis_w4a8_moe=lambda *args, **kwargs: None,
+            view_trellis_w4a8_moe_scratch=lambda *args, **kwargs: None,
+        ),
+    )
+    runtime = _HybridSharedRuntime()
+    runtime.trellis_scratch = torch.empty(1, dtype=torch.uint8)
+    method = _w4a8_method(runtime)
+    parts = tuple(
+        _prepared_part(index, gate_rows=gate_rows, up_rows=up_rows)
+        for index, (gate_rows, up_rows) in enumerate(row_shapes)
+    )
+    state = _w4a8_state(parts)
+    state.runtime_ready = False
+
+    with pytest.raises(RuntimeError, match=message):
+        method._ensure_runtime(SimpleNamespace(hybrid_state=state), m=2, topk=2)
+
+
+def test_w4a8_scratch_cache_separates_layer_geometries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_calls = []
+
+    def make_scratch(**kwargs):
+        make_calls.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    plan = SimpleNamespace(
+        scratch_specs=lambda: [SimpleNamespace(shape=(1,), dtype=torch.uint8)]
+    )
+    _install_fake_b12x(
+        monkeypatch,
+        fused_moe=SimpleNamespace(
+            Caps=lambda **kwargs: SimpleNamespace(**kwargs),
+            plan=lambda caps: plan,
+        ),
+        trellis_w4a8=SimpleNamespace(
+            make_trellis_w4a8_moe_scratch=make_scratch,
+            run_trellis_w4a8_moe=lambda *args, **kwargs: torch.empty(0),
+            view_trellis_w4a8_moe_scratch=lambda scratch, **kwargs: scratch,
+        ),
+    )
+    runtime = _HybridSharedRuntime()
+    method = _w4a8_method(runtime)
+    geometries = ((1024, 256), (2048, 512))
+
+    for marker, (hidden_size, intermediate_size) in enumerate(geometries):
+        part = _prepared_part(
+            marker,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+        state = _w4a8_state((part,))
+        state.runtime_ready = False
+        method._ensure_runtime(
+            SimpleNamespace(hybrid_state=state),
+            m=2,
+            topk=2,
+        )
+
+    assert [
+        (call["hidden_size"], call["intermediate_size"]) for call in make_calls
+    ] == list(geometries)
+    for hidden_size, intermediate_size in geometries:
+        assert (hidden_size, intermediate_size, 2, False, 2) in runtime.w4a8_scratch
 
 
 def test_w4a8_tuple_parts_accumulate_in_fp32(
@@ -383,16 +577,14 @@ def test_w4a8_tuple_parts_accumulate_in_fp32(
     runtime = _HybridSharedRuntime()
     runtime.max_m = 32
     runtime.topk = 2
-    runtime.w4a8_scratch[2] = object()
+    runtime.w4a8_scratch[(1024, 256, 2, False, 2)] = object()
     runtime.trellis_output_accum = torch.empty((32, 1024), dtype=torch.float32)
     method = _w4a8_method(runtime)
-    state = _w4a8_state(
-        (_prepared_part(0), _prepared_part(1), _prepared_part(2))
-    )
+    state = _w4a8_state((_prepared_part(0), _prepared_part(1), _prepared_part(2)))
 
     output = method._apply_once(
         SimpleNamespace(hybrid_state=state),
-        torch.zeros((2, 1024), dtype=torch.float16),
+        torch.zeros((2, 1024), dtype=torch.float32),
         torch.ones((2, 2), dtype=torch.float16),
         torch.zeros((2, 2), dtype=torch.int64),
         None,
@@ -401,6 +593,38 @@ def test_w4a8_tuple_parts_accumulate_in_fp32(
 
     assert calls == [0, 1, 2]
     torch.testing.assert_close(output, torch.ones_like(output))
+    assert output.data_ptr() != runtime.trellis_output_accum.data_ptr()
+
+
+def test_w4a8_single_part_returns_owned_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel_output = torch.ones((32, 1024), dtype=torch.float32)
+    _install_fake_b12x(
+        monkeypatch,
+        fused_moe=SimpleNamespace(),
+        trellis_w4a8=SimpleNamespace(
+            run_trellis_w4a8_moe=lambda *args, **kwargs: kernel_output
+        ),
+    )
+    runtime = _HybridSharedRuntime()
+    runtime.max_m = 32
+    runtime.topk = 2
+    runtime.w4a8_scratch[(1024, 256, 2, False, 2)] = object()
+    method = _w4a8_method(runtime)
+    state = _w4a8_state((_prepared_part(0),))
+
+    output = method._apply_once(
+        SimpleNamespace(hybrid_state=state),
+        torch.zeros((2, 1024), dtype=torch.float32),
+        torch.ones((2, 2), dtype=torch.float32),
+        torch.zeros((2, 2), dtype=torch.int32),
+        None,
+        None,
+    )
+
+    torch.testing.assert_close(output, torch.ones_like(output))
+    assert output.data_ptr() != kernel_output.data_ptr()
 
 
 def test_w4a8_above_m_limit_falls_back_to_w4a16(
@@ -434,9 +658,7 @@ def test_w4a8_above_m_limit_falls_back_to_w4a16(
     runtime.trellis_scratch = object()
     runtime.trellis_output_accum = torch.empty((32, 1024), dtype=torch.float32)
     method = _w4a8_method(runtime)
-    state = _w4a8_state(
-        (_prepared_part(0), _prepared_part(1), _prepared_part(2))
-    )
+    state = _w4a8_state((_prepared_part(0), _prepared_part(1), _prepared_part(2)))
     state.trellis_plan = object()
 
     output = method._apply_once(

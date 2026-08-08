@@ -12,6 +12,8 @@ host/device boundary.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -36,6 +38,198 @@ SHARED_SCALE_TENSOR = "_qsrt_shared_scale_section"
 ATOM_TENSOR = "qsrt_atoms"
 TENSOR_INVENTORY = {FORMAT_TENSOR, SHARED_SCALE_TENSOR, ATOM_TENSOR}
 
+_SHA256_DIGITS = frozenset("0123456789abcdef")
+_PUBLICATION_MARKER = "QSRT_COMPLETE.json"
+_CHECKSUM_MANIFEST = "MANIFEST.sha256"
+_PACKAGE_MANIFEST = "qsrt-manifest.json"
+
+
+@dataclass(frozen=True)
+class QSRTPublicationSeal:
+    root: Path
+    manifest: dict[str, Any]
+    descriptor: dict[str, Any]
+    checksums: dict[str, str]
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _json_object(path: Path, *, kind: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{kind} is missing or malformed: {path}") from exc
+    if not isinstance(value, dict):
+        raise TypeError(f"{kind} must be a JSON object: {path}")
+    return value
+
+
+def _sha256_field(value: object, *, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in _SHA256_DIGITS for character in value)
+    ):
+        raise ValueError(f"QSRT publication {name} is not a SHA-256 digest")
+    return value
+
+
+def verify_qsrt_publication(root: str | Path) -> QSRTPublicationSeal:
+    """Authenticate a sealed local QSRT package before any atom extent is read."""
+
+    supplied = Path(root)
+    if supplied.is_symlink():
+        raise ValueError("QSRT model root must not be a symbolic link")
+    try:
+        root = supplied.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"QSRT model root does not exist: {supplied}") from exc
+    if not root.is_dir():
+        raise ValueError("QSRT model root must be a directory")
+
+    marker = _json_object(root / _PUBLICATION_MARKER, kind="QSRT completion marker")
+    expected_marker_fields = {
+        "schema",
+        "package_manifest_sha256",
+        "checksum_manifest_sha256",
+        "model_index_sha256",
+        "source",
+        "base_manifest_sha256",
+        "producer_fingerprint",
+        "encoder_fingerprint",
+    }
+    if (
+        set(marker) != expected_marker_fields
+        or marker.get("schema") != "kquant_qsrt_complete_v2"
+    ):
+        raise ValueError("QSRT completion marker identity is invalid")
+    for name in (
+        "package_manifest_sha256",
+        "checksum_manifest_sha256",
+        "model_index_sha256",
+        "base_manifest_sha256",
+        "producer_fingerprint",
+        "encoder_fingerprint",
+    ):
+        _sha256_field(marker.get(name), name=name)
+    marker_source = marker.get("source")
+    if (
+        not isinstance(marker_source, dict)
+        or set(marker_source) != {"kind", "sha256"}
+        or not isinstance(marker_source.get("kind"), str)
+        or not marker_source["kind"]
+    ):
+        raise ValueError("QSRT completion marker source identity is invalid")
+    _sha256_field(marker_source.get("sha256"), name="source.sha256")
+
+    checksum_path = root / _CHECKSUM_MANIFEST
+    if checksum_path.is_symlink() or not checksum_path.is_file():
+        raise FileNotFoundError(checksum_path)
+    if _sha256(checksum_path) != marker["checksum_manifest_sha256"]:
+        raise ValueError("QSRT checksum manifest does not match the completion marker")
+    checksums: dict[str, str] = {}
+    for line in checksum_path.read_text(encoding="utf-8").splitlines():
+        digest, separator, filename = line.partition("  ")
+        relative = Path(filename)
+        if (
+            separator != "  "
+            or len(digest) != 64
+            or any(character not in _SHA256_DIGITS for character in digest)
+            or not filename
+            or relative.is_absolute()
+            or relative.as_posix() != filename
+            or ".." in relative.parts
+            or filename in checksums
+        ):
+            raise ValueError(f"invalid QSRT checksum entry: {line!r}")
+        path = root / relative
+        if path.is_symlink() or not path.is_file():
+            raise FileNotFoundError(path)
+        if _sha256(path) != digest:
+            raise ValueError(f"QSRT package hash mismatch for {filename}")
+        checksums[filename] = digest
+    published_files: set[str] = set()
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise ValueError(f"QSRT package must not contain symbolic links: {path}")
+        if path.is_file():
+            published_files.add(path.relative_to(root).as_posix())
+    expected_files = set(checksums) | {_CHECKSUM_MANIFEST, _PUBLICATION_MARKER}
+    if published_files != expected_files:
+        raise ValueError("QSRT checksum inventory does not match the package files")
+    required_files = {"config.json", "model.safetensors.index.json", _PACKAGE_MANIFEST}
+    if not required_files.issubset(checksums):
+        raise ValueError("QSRT checksum manifest omits a required identity file")
+    if checksums[_PACKAGE_MANIFEST] != marker["package_manifest_sha256"]:
+        raise ValueError(
+            "QSRT package manifest digest disagrees with completion marker"
+        )
+    if checksums["model.safetensors.index.json"] != marker["model_index_sha256"]:
+        raise ValueError("QSRT model index digest disagrees with completion marker")
+
+    manifest = _json_object(root / _PACKAGE_MANIFEST, kind="QSRT package manifest")
+    producer = manifest.get("producer")
+    source = manifest.get("source")
+    base_model = manifest.get("base_model")
+    if (
+        manifest.get("schema") != "kquant_qsrt_model_manifest_v1"
+        or manifest.get("version") != 1
+        or manifest.get("complete") is not True
+        or not isinstance(producer, dict)
+        or not isinstance(producer.get("encoder"), dict)
+        or not isinstance(source, dict)
+        or not isinstance(base_model, dict)
+    ):
+        raise ValueError("QSRT package manifest identity is invalid or incomplete")
+    expected_source = {
+        "kind": source.get("source_kind"),
+        "sha256": source.get("source_sha256"),
+    }
+    if marker_source != expected_source:
+        raise ValueError(
+            "QSRT package source identity disagrees with completion marker"
+        )
+    if (
+        producer.get("fingerprint") != marker["producer_fingerprint"]
+        or producer["encoder"].get("fingerprint") != marker["encoder_fingerprint"]
+        or base_model.get("manifest_sha256") != marker["base_manifest_sha256"]
+    ):
+        raise ValueError("QSRT producer identity disagrees with completion marker")
+
+    config = _json_object(root / "config.json", kind="QSRT model config")
+    quantization = config.get("quantization_config")
+    descriptor = quantization.get("qsrt") if isinstance(quantization, dict) else None
+    if not isinstance(descriptor, dict):
+        raise ValueError("QSRT model config omits its format descriptor")
+    expected_descriptor = {
+        "schema": manifest.get("storage_schema"),
+        "storage_format": "qsrt_atoms_v1",
+        "encoding": manifest.get("encoding"),
+        "codebook": manifest.get("codebook"),
+        "profile_id": manifest.get("profile_id"),
+        "artifact_manifest": _PACKAGE_MANIFEST,
+        "producer_fingerprint": marker["producer_fingerprint"],
+        "encoder_fingerprint": marker["encoder_fingerprint"],
+        "source_kind": marker_source["kind"],
+        "source_sha256": marker_source["sha256"],
+    }
+    if any(
+        descriptor.get(name) != value for name, value in expected_descriptor.items()
+    ):
+        raise ValueError("QSRT model descriptor disagrees with the sealed manifest")
+    return QSRTPublicationSeal(
+        root=root,
+        manifest=manifest,
+        descriptor=descriptor,
+        checksums=checksums,
+    )
+
 
 def _metadata_int(metadata: dict[str, str], name: str) -> int:
     try:
@@ -54,6 +248,9 @@ class QSRTAtomLayerMetadata:
     path: Path
     schema: str
     profile_id: int
+    codebook: str | None
+    source_sha256: str | None
+    encoder_fingerprint: str | None
     layer: int
     experts: int
     hidden_size: int
@@ -90,8 +287,33 @@ def read_qsrt_atom_layer_metadata(
     expected_hidden_size: int,
     expected_intermediate_size: int,
     expected_bits: Sequence[int] | None = None,
+    expected_profile_id: int | None = None,
+    expected_codebook: str | None = None,
+    expected_source_sha256: str | None = None,
+    expected_encoder_fingerprint: str | None = None,
 ) -> QSRTAtomLayerMetadata:
-    """Validate metadata and small tensors without reading the atom slab."""
+    """Validate one canonical atom layer without reading its payload slab.
+
+    Args:
+        path: Safetensors atom-layer file.
+        layer: Expected model layer index.
+        expected_experts: Expected global expert count.
+        expected_hidden_size: Expected hidden-channel dimension.
+        expected_intermediate_size: Expected global intermediate-channel dimension.
+        expected_bits: Optional per-expert bit-map contract.
+        expected_profile_id: Optional Fruit profile identifier.
+        expected_codebook: Optional reconstruction codebook identifier.
+        expected_source_sha256: Optional authenticated source digest.
+        expected_encoder_fingerprint: Optional encoder provenance fingerprint.
+
+    Returns:
+        Validated metadata and the small format, ID, and scale tensors.
+
+    Raises:
+        ValueError: If metadata, tensor inventory, geometry, alignment, format
+            assignments, identifiers, or small tensor contents are noncanonical.
+        FileNotFoundError: If ``path`` does not identify a readable layer file.
+    """
 
     path = Path(path)
     with safe_open(path, framework="pt", device="cpu") as handle:
@@ -114,7 +336,39 @@ def read_qsrt_atom_layer_metadata(
                     f"{metadata.get(name)!r} != {expected!r}"
                 )
 
-        profile_id = _metadata_int(metadata, "profile_id")
+        profile_value = metadata.get("profile_id")
+        profile_id = (
+            _metadata_int(metadata, "profile_id") if profile_value is not None else None
+        )
+        codebook = metadata.get("codebook")
+        source_sha256 = metadata.get("source_sha256")
+        encoder_fingerprint = metadata.get("encoder_fingerprint")
+        if schema == FRUIT_SCHEMA and (
+            profile_id is None
+            or codebook is None
+            or source_sha256 is None
+            or encoder_fingerprint is None
+        ):
+            raise ValueError("Fruit QSRT identity metadata is incomplete")
+        if profile_id is not None and profile_id <= 0:
+            raise ValueError("QSRT profile_id must be positive")
+        if expected_profile_id is not None and profile_id != expected_profile_id:
+            raise ValueError(
+                f"QSRT profile_id mismatch: {profile_id} != {expected_profile_id}"
+            )
+        for name, actual, expected in (
+            ("codebook", codebook, expected_codebook),
+            ("source_sha256", source_sha256, expected_source_sha256),
+            (
+                "encoder_fingerprint",
+                encoder_fingerprint,
+                expected_encoder_fingerprint,
+            ),
+        ):
+            if expected is not None and actual != expected:
+                raise ValueError(
+                    f"QSRT metadata {name} mismatch: {actual!r} != {expected!r}"
+                )
         experts = _metadata_int(metadata, "experts")
         intermediate_size = _metadata_int(metadata, "intermediate_channels")
         hidden_size = _metadata_int(metadata, "latent_channels")
@@ -122,12 +376,8 @@ def read_qsrt_atom_layer_metadata(
         atom_slots = _metadata_int(metadata, "atom_slots")
         atom_bundle_bytes = _metadata_int(metadata, "atom_bundle_bytes")
         alignment = _metadata_int(metadata, "alignment_bytes")
-        if profile_id <= 0:
-            raise ValueError("QSRT profile_id must be positive")
         if experts != expected_experts:
-            raise ValueError(
-                f"QSRT experts mismatch: {experts} != {expected_experts}"
-            )
+            raise ValueError(f"QSRT experts mismatch: {experts} != {expected_experts}")
         if hidden_size != expected_hidden_size:
             raise ValueError(
                 f"QSRT latent channels mismatch: "
@@ -147,9 +397,7 @@ def read_qsrt_atom_layer_metadata(
         if intermediate_size != atom_slots * atom_channels:
             raise ValueError("QSRT atom geometry does not cover the intermediate axis")
         if hidden_size <= 0 or hidden_size % 128:
-            raise ValueError(
-                "QSRT latent channels must be a positive multiple of 128"
-            )
+            raise ValueError("QSRT latent channels must be a positive multiple of 128")
         expected_bundle_bytes = (
             3 * (atom_channels * hidden_size * 3 // 8)
             + 3 * atom_channels * torch.float16.itemsize
@@ -206,9 +454,7 @@ def read_qsrt_atom_layer_metadata(
             raise ValueError("QSRT format table tier counts disagree with metadata")
         if expected_bits is not None:
             if len(expected_bits) != experts:
-                raise ValueError(
-                    f"hybrid_bit_map must describe all {experts} experts"
-                )
+                raise ValueError(f"hybrid_bit_map must describe all {experts} experts")
             if any(bit not in (3, 4) for bit in expected_bits):
                 raise ValueError("QSRT hybrid_bit_map entries must be 3 or 4")
             expected_x4t = torch.tensor(expected_bits, dtype=torch.int16) == 4
@@ -257,6 +503,9 @@ def read_qsrt_atom_layer_metadata(
         schema=schema,
         profile_id=profile_id,
         layer=layer,
+        codebook=codebook,
+        source_sha256=source_sha256,
+        encoder_fingerprint=encoder_fingerprint,
         experts=experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -357,9 +606,7 @@ def open_qsrt_atom_extent(
     complete preparation before leaving the context.
     """
 
-    first, rows = balanced_atom_partition(
-        metadata.atom_slots, shard_count, shard_index
-    )
+    first, rows = balanced_atom_partition(metadata.atom_slots, shard_count, shard_index)
     if device is None or torch.device(device).type == "cpu":
         with safe_open(metadata.path, framework="pt", device="cpu") as handle:
             padded = handle.get_slice(ATOM_TENSOR)[first : first + rows]
