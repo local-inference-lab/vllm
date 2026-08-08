@@ -57,7 +57,7 @@ def _smoke_local_sources(vllm_root: Path, b12x_root: Path) -> None:
 from pathlib import Path
 import b12x
 import vllm
-import vllm._C
+import vllm._C_stable_libtorch
 assert Path(vllm.__file__).resolve().is_relative_to(Path(VLLM_ROOT) / "vllm")
 assert Path(b12x.__file__).resolve().is_relative_to(Path(B12X_ROOT) / "b12x")
 """
