@@ -802,10 +802,23 @@ class SamplingParams(
                     value=n,
                 )
 
-        # Validate prompt logprobs.
         if num_prompt_logprobs := self.prompt_logprobs:
             if num_prompt_logprobs == -1:
-                num_prompt_logprobs = model_config.get_vocab_size()
+                # prompt_logprobs=-1 means "return all vocab logprobs for every
+                # prompt token." For modern vocab sizes (e.g. GLM-5.2's 154,880)
+                # this allocates a [num_prompt_tokens, vocab_size] tensor that
+                # OOMs the engine (upstream vllm-project/vllm#14239). The V1
+                # _get_prompt_logprobs_dict and V2 PromptLogprobsWorker chunk
+                # the GPU compute_logits call (VLLM_PROMPT_LOGPROBS_CHUNK_SIZE)
+                # but the upfront CPU LogprobsTensors.empty_cpu allocation is
+                # unbounded. Reject outright — the feature is impractical.
+                raise VLLMValidationError(
+                    "prompt_logprobs=-1 (all logprobs) is not supported because "
+                    "it can cause unbounded memory allocation. Specify a "
+                    "concrete value (e.g. prompt_logprobs=20).",
+                    parameter="prompt_logprobs",
+                    value=-1,
+                )
             if num_prompt_logprobs > max_logprobs:
                 raise VLLMValidationError(
                     f"Requested prompt logprobs of {num_prompt_logprobs}, "
