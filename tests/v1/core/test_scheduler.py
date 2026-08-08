@@ -4348,12 +4348,13 @@ def test_prepend_skipped_requests_order():
     assert waiting_reqs == expected_waiting_reqs
 
 
-def test_skip_reading_prefix_cache_skips_external_connector_lookup():
+def test_skip_reading_prefix_cache_rejects_external_connector_hit():
     """External KV reads must honor the same request flag as local APC.
 
     Prompt logprobs require a forward pass over every prompt token, so a
     connector hit would leave holes in the returned prompt-logprobs tensor.
-    The connector remains active for storing the freshly recomputed KV.
+    The connector lookup still runs to establish its request tracker before
+    update_state_after_alloc(), but its hit is not admitted by the scheduler.
     """
     scheduler = create_scheduler(
         max_num_batched_tokens=64,
@@ -4373,7 +4374,7 @@ def test_skip_reading_prefix_cache_skips_external_connector_lookup():
     output = scheduler.schedule()
 
     assert output.num_scheduled_tokens[request.request_id] == 32
-    scheduler.connector.get_num_new_matched_tokens.assert_not_called()
+    scheduler.connector.get_num_new_matched_tokens.assert_called_once_with(request, 0)
     scheduler.connector.update_state_after_alloc.assert_called_once()
     assert scheduler.connector.update_state_after_alloc.call_args.args[2] == 0
 
