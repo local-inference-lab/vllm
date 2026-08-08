@@ -2,8 +2,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
+unset PYTHONHOME PYTHONPATH
+export PYTHONNOUSERSITE=1
+export PYTHONSAFEPATH=1
+
 PYTHON_BIN="${PYTHON_BIN:-${SCRIPT_DIR}/.venv/bin/python}"
 B12X_ROOT="${B12X_ROOT:-${SCRIPT_DIR}/../b12x-fruit}"
+SPARKINFER_ROOT="${SPARKINFER_ROOT:-${SCRIPT_DIR}/../sparkinfer}"
 MODEL="${MODEL:-/mnt/vault/llm/fruit-pilot/output/GLM-5.2-SIQ-Fruit-QSRT-exact}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
@@ -11,22 +17,52 @@ if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
   exit 1
 fi
 
-EXPECTED_B12X_REVISION="5fefb62b64d7f544a977d47dedf33bfc65f2f392"
-EXPECTED_KQUANT_REVISION="a9c94ebc1039c77525c7129fcae9a32f4feb4ebc"
+EXPECTED_B12X_REVISION="de50e8622a8695e9829c83ad9f8c96f9b3be573a"
+EXPECTED_KQUANT_REVISION="053f82e0212574b797410d8bc90ed676d92818cd"
+EXPECTED_SPARKINFER_REVISION="680d8195b80420296d7fed2688b75406be15eb38"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Missing vLLM Python: ${PYTHON_BIN}" >&2
   exit 1
 fi
-MODEL="$("${PYTHON_BIN}" -c \
-  'from pathlib import Path; import sys; p = Path(sys.argv[1]); '\
-'p.is_symlink() and sys.exit("MODEL must not be a symbolic link"); '\
-'print(p.resolve(strict=True))' "${MODEL}")"
-if [[ ! -d "${B12X_ROOT}/b12x" ]]; then
-  echo "Missing Fruit b12x checkout: ${B12X_ROOT}" >&2
+resolved_python="$(readlink -f -- "${PYTHON_BIN}")" || {
+  echo "Unable to resolve vLLM Python: ${PYTHON_BIN}" >&2
+  exit 1
+}
+if [[ ! -f "${resolved_python}" || ! -x "${resolved_python}" ]]; then
+  echo "vLLM Python is not an executable file: ${resolved_python}" >&2
   exit 1
 fi
-export PYTHONPATH="${SCRIPT_DIR}:${B12X_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+PYTHON_BIN="${resolved_python}"
+
+if [[ -L "${B12X_ROOT}" ]]; then
+  echo "Fruit B12X root must not be a symbolic link: ${B12X_ROOT}" >&2
+  exit 1
+fi
+resolved_b12x="$(readlink -e -- "${B12X_ROOT}")" || {
+  echo "Unable to resolve the Fruit B12X root: ${B12X_ROOT}" >&2
+  exit 1
+}
+if [[ ! -d "${resolved_b12x}/b12x" ]]; then
+  echo "Missing Fruit B12X checkout: ${resolved_b12x}" >&2
+  exit 1
+fi
+B12X_ROOT="${resolved_b12x}"
+
+if [[ -L "${MODEL}" ]]; then
+  echo "MODEL must not be a symbolic link: ${MODEL}" >&2
+  exit 1
+fi
+resolved_model="$(readlink -e -- "${MODEL}")" || {
+  echo "Unable to resolve the Fruit model: ${MODEL}" >&2
+  exit 1
+}
+if [[ ! -d "${resolved_model}" ]]; then
+  echo "Fruit model is not a directory: ${resolved_model}" >&2
+  exit 1
+fi
+MODEL="${resolved_model}"
+
 actual_b12x_revision="$(git -C "${B12X_ROOT}" rev-parse HEAD)" || {
   echo "Unable to resolve the Fruit B12X revision: ${B12X_ROOT}" >&2
   exit 1
@@ -47,12 +83,41 @@ if [[ -n "$(git -C "${SCRIPT_DIR}" status --porcelain -- vllm)" ]]; then
   echo "Fruit vLLM source tree has uncommitted changes: ${SCRIPT_DIR}" >&2
   exit 1
 fi
-"${PYTHON_BIN}" -c '
+
+if [[ -L "${SPARKINFER_ROOT}" ]]; then
+  echo "SparkInfer root must not be a symbolic link: ${SPARKINFER_ROOT}" >&2
+  exit 1
+fi
+resolved_sparkinfer="$(readlink -e -- "${SPARKINFER_ROOT}")" || {
+  echo "Unable to resolve SparkInfer root: ${SPARKINFER_ROOT}" >&2
+  exit 1
+}
+if [[ ! -d "${resolved_sparkinfer}/sparkinfer" ]]; then
+  echo "SparkInfer root does not contain the package: ${resolved_sparkinfer}" >&2
+  exit 1
+fi
+SPARKINFER_ROOT="${resolved_sparkinfer}"
+actual_sparkinfer_revision="$(git -C "${SPARKINFER_ROOT}" rev-parse HEAD)" || {
+  echo "Unable to resolve the SparkInfer revision: ${SPARKINFER_ROOT}" >&2
+  exit 1
+}
+if [[ "${actual_sparkinfer_revision}" != "${EXPECTED_SPARKINFER_REVISION}" ]]; then
+  echo "SparkInfer revision mismatch: got ${actual_sparkinfer_revision}, expected ${EXPECTED_SPARKINFER_REVISION}" >&2
+  exit 1
+fi
+if [[ -n "$(git -C "${SPARKINFER_ROOT}" status --porcelain -- sparkinfer)" ]]; then
+  echo "SparkInfer source tree has uncommitted changes: ${SPARKINFER_ROOT}" >&2
+  exit 1
+fi
+export PYTHONPATH="${SCRIPT_DIR}:${B12X_ROOT}:${SPARKINFER_ROOT}"
+
+"${PYTHON_BIN}" -P -c '
 import hashlib
 import sys
 from pathlib import Path
 
 import b12x
+import sparkinfer
 import vllm
 from vllm.model_executor.layers.quantization.kquant_qsrt_atoms import (
     verify_qsrt_publication,
@@ -91,29 +156,40 @@ if runtime.get("b12x_revision") != sys.argv[3]:
     raise RuntimeError("Fruit package B12X revision is unsupported")
 if runtime.get("vllm_revision") != sys.argv[4]:
     raise RuntimeError("Fruit package vLLM revision does not match the runtime")
+if runtime.get("sparkinfer_revision") != sys.argv[8]:
+    raise RuntimeError("Fruit package SparkInfer revision is unsupported")
 b12x_root = Path(sys.argv[5]).resolve(strict=True)
 vllm_root = Path(sys.argv[6]).resolve(strict=True)
+sparkinfer_root = Path(sys.argv[7]).resolve(strict=True)
 if not Path(b12x.__file__).resolve().is_relative_to(b12x_root / "b12x"):
     raise RuntimeError("imported B12X does not come from the sealed source root")
 if not Path(vllm.__file__).resolve().is_relative_to(vllm_root / "vllm"):
     raise RuntimeError("imported vLLM does not come from the sealed source root")
+if not Path(sparkinfer.__file__).resolve().is_relative_to(
+    sparkinfer_root / "sparkinfer"
+):
+    raise RuntimeError("imported SparkInfer does not come from the approved source root")
 if runtime.get("b12x_source_sha256") != source_tree_sha256(b12x_root / "b12x"):
     raise RuntimeError("Fruit package B12X source fingerprint is unsupported")
 if runtime.get("vllm_source_sha256") != source_tree_sha256(vllm_root / "vllm"):
     raise RuntimeError("Fruit package vLLM source fingerprint is unsupported")
+if runtime.get("sparkinfer_source_sha256") != source_tree_sha256(
+    sparkinfer_root / "sparkinfer"
+):
+    raise RuntimeError("Fruit package SparkInfer source fingerprint is unsupported")
+
+import b12x.moe.fused_moe
+import sparkinfer.attention.sparse_mla
 ' \
   "${MODEL}" \
   "${EXPECTED_KQUANT_REVISION}" \
   "${EXPECTED_B12X_REVISION}" \
   "${actual_vllm_revision}" \
   "${B12X_ROOT}" \
-  "${SCRIPT_DIR}"
-"${PYTHON_BIN}" -c \
-  "import b12x.moe.fused_moe; import sparkinfer.attention.sparse_mla" \
-  >/dev/null || {
-    echo "Fruit QSRT requires both the B12X checkout and SparkInfer attention runtime" >&2
-    exit 1
-  }
+  "${SCRIPT_DIR}" \
+  "${SPARKINFER_ROOT}" \
+  "${EXPECTED_SPARKINFER_REVISION}"
+
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_120a}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-32}"
@@ -130,8 +206,7 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 
-cd "${SCRIPT_DIR}"
-exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL}" \
+exec "${PYTHON_BIN}" -P -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --served-model-name "${SERVED_MODEL_NAME}" \
   --host "${HOST}" \
   --port "${PORT}" \

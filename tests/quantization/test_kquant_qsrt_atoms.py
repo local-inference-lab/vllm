@@ -254,6 +254,43 @@ def _reseal_checksum_manifest(root: Path) -> None:
     marker_path.write_text(json.dumps(marker), encoding="utf-8")
 
 
+def _reseal_publication_identity(root: Path) -> None:
+    checksum_path = root / "MANIFEST.sha256"
+    names = [
+        line.partition("  ")[2]
+        for line in checksum_path.read_text(encoding="utf-8").splitlines()
+    ]
+    checksum_path.write_text(
+        "".join(f"{_sha256(root / name)}  {name}\n" for name in names),
+        encoding="utf-8",
+    )
+    marker_path = root / "QSRT_COMPLETE.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["package_manifest_sha256"] = _sha256(root / "qsrt-manifest.json")
+    marker["model_index_sha256"] = _sha256(root / "model.safetensors.index.json")
+    marker["checksum_manifest_sha256"] = _sha256(checksum_path)
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+
+@pytest.mark.parametrize("field", ("codebook", "profile_id"))
+def test_publication_rejects_missing_descriptor_identity(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    manifest, descriptor, _ = _write_test_publication(tmp_path)
+    manifest.pop(field)
+    descriptor.pop(field)
+    (tmp_path / "qsrt-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"quantization_config": {"qsrt": descriptor}}),
+        encoding="utf-8",
+    )
+    _reseal_publication_identity(tmp_path)
+
+    with pytest.raises(ValueError, match="omits a required descriptor field"):
+        verify_qsrt_publication(tmp_path)
+
+
 def test_publication_rejects_relative_symlink_root(tmp_path: Path) -> None:
     root = tmp_path / "model"
     root.mkdir()

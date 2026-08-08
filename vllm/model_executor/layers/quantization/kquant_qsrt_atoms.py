@@ -219,6 +219,8 @@ def verify_qsrt_publication(root: str | Path) -> QSRTPublicationSeal:
         "source_kind": marker_source["kind"],
         "source_sha256": marker_source["sha256"],
     }
+    if any(value is None for value in expected_descriptor.values()):
+        raise ValueError("QSRT package manifest omits a required descriptor field")
     if any(
         descriptor.get(name) != value for name, value in expected_descriptor.items()
     ):
@@ -247,7 +249,7 @@ def _align(value: int, alignment: int) -> int:
 class QSRTAtomLayerMetadata:
     path: Path
     schema: str
-    profile_id: int
+    profile_id: int | None
     codebook: str | None
     source_sha256: str | None
     encoder_fingerprint: str | None

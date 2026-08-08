@@ -79,19 +79,24 @@ _QSRT_X4T_W13_EXCEPTION_ROW_ROTATION = 0
 def _qsrt_backend_module(path: str) -> ModuleType:
     """Prefer the public B12X namespace and retain SparkInfer-only Kimi installs."""
 
-    failures: list[ModuleNotFoundError] = []
+    failures: list[tuple[str, ModuleNotFoundError]] = []
     for namespace in ("b12x", "sparkinfer"):
+        target = f"{namespace}.{path}"
         try:
-            return importlib.import_module(f"{namespace}.{path}")
+            return importlib.import_module(target)
         except ModuleNotFoundError as exc:
-            if exc.name not in {namespace, f"{namespace}.{path}"} and not str(
-                exc.name
-            ).startswith(f"{namespace}."):
+            missing = str(exc.name)
+            if (
+                missing not in {namespace, target}
+                and not target.startswith(f"{missing}.")
+            ):
                 raise
-            failures.append(exc)
+            failures.append((target, exc))
+    details = "; ".join(f"{target}: {failure}" for target, failure in failures)
     raise ModuleNotFoundError(
-        f"QSRT runtime requires b12x.{path} or sparkinfer.{path}"
-    ) from failures[-1]
+        f"QSRT runtime requires b12x.{path} or sparkinfer.{path}; "
+        f"import attempts failed with {details}"
+    ) from failures[-1][1]
 
 
 def _is_sha256(value: object) -> bool:
@@ -471,6 +476,11 @@ class KQuantHybridConfig(ModelOptNvFp4Config):
             runtime = str(qsrt.get("runtime", "w4a16")).lower()
             if runtime not in {"w4a16", "w4a8"}:
                 raise ValueError(f"unsupported QSRT runtime {runtime!r}")
+            if runtime == "w4a8" and schema != FRUIT_QSRT_ATOM_SCHEMA:
+                raise ValueError(
+                    f"QSRT runtime 'w4a8' requires schema "
+                    f"{FRUIT_QSRT_ATOM_SCHEMA!r}, got {schema!r}"
+                )
             config.kept_storage = "x4t"
             config.qsrt_runtime = runtime
             config.qsrt = dict(qsrt)

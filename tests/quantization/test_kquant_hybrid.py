@@ -181,6 +181,47 @@ def test_qsrt_backend_falls_back_to_sparkinfer(monkeypatch) -> None:
     assert calls == ["b12x.moe.fused_moe", "sparkinfer.moe.fused_moe"]
 
 
+def test_qsrt_backend_reports_both_missing_namespaces(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_import(name: str):
+        calls.append(name)
+        error = ModuleNotFoundError(f"No module named {name!r}")
+        error.name = name
+        raise error
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid.importlib.import_module",
+        fake_import,
+    )
+
+    with pytest.raises(ModuleNotFoundError) as captured:
+        _qsrt_backend_module("moe.fused_moe")
+    message = str(captured.value)
+    assert "b12x.moe.fused_moe" in message
+    assert "sparkinfer.moe.fused_moe" in message
+    assert calls == ["b12x.moe.fused_moe", "sparkinfer.moe.fused_moe"]
+
+
+def test_qsrt_backend_preserves_broken_primary_import(monkeypatch) -> None:
+    broken = ModuleNotFoundError("No module named 'b12x.internal.helper'")
+    broken.name = "b12x.internal.helper"
+
+    def fake_import(name: str):
+        if name == "b12x.moe.fused_moe":
+            raise broken
+        pytest.fail("a broken primary backend must not fall back")
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid.importlib.import_module",
+        fake_import,
+    )
+
+    with pytest.raises(ModuleNotFoundError) as captured:
+        _qsrt_backend_module("moe.fused_moe")
+    assert captured.value is broken
+
+
 @pytest.mark.parametrize(
     "raw",
     [
@@ -243,6 +284,15 @@ def test_config_accepts_fruit_w4a8_runtime() -> None:
     )
     assert config.qsrt_runtime == "w4a8"
     assert config.qsrt == descriptor
+
+
+def test_config_rejects_kimi_w4a8_runtime() -> None:
+    descriptor = _qsrt_descriptor(runtime="w4a8")
+
+    with pytest.raises(ValueError, match="runtime 'w4a8' requires schema"):
+        KQuantHybridConfig.from_config(
+            _base_config(demoted_format="qsrt_sqg_e4m3", qsrt=descriptor)
+        )
 
 
 def test_fruit_w4a8_rejects_kept_experts_before_parameter_registration(
@@ -533,6 +583,7 @@ def test_w4a8_scratch_cache_separates_layer_geometries(
         ),
     )
     runtime = _HybridSharedRuntime()
+    runtime.trellis_scratch = torch.empty(1, dtype=torch.uint8)
     method = _w4a8_method(runtime)
     geometries = ((1024, 256), (2048, 512))
 
