@@ -327,6 +327,27 @@ def test_publication_rejects_unmanifested_file(tmp_path: Path) -> None:
         verify_qsrt_publication(tmp_path)
 
 
+def test_publication_accepts_hugging_face_transport_metadata(tmp_path: Path) -> None:
+    manifest, descriptor, _ = _write_test_publication(tmp_path)
+    (tmp_path / ".gitattributes").write_text(
+        "*.safetensors filter=lfs diff=lfs merge=lfs -text\n",
+        encoding="utf-8",
+    )
+    cache = tmp_path / ".cache" / "huggingface" / "download"
+    cache.mkdir(parents=True)
+    (cache / "config.json.metadata").write_text("transport metadata", encoding="utf-8")
+
+    seal = verify_qsrt_publication(tmp_path)
+    assert seal.manifest == manifest
+    assert seal.descriptor == descriptor
+
+    unrelated = tmp_path / ".cache" / "other"
+    unrelated.mkdir()
+    (unrelated / "unsealed.bin").write_bytes(b"unsealed")
+    with pytest.raises(ValueError, match="checksum inventory"):
+        verify_qsrt_publication(tmp_path)
+
+
 def test_publication_rejects_symlinked_payload(tmp_path: Path) -> None:
     root = tmp_path / "model"
     root.mkdir()

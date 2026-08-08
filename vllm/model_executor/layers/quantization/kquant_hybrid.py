@@ -86,9 +86,8 @@ def _qsrt_backend_module(path: str) -> ModuleType:
             return importlib.import_module(target)
         except ModuleNotFoundError as exc:
             missing = str(exc.name)
-            if (
-                missing not in {namespace, target}
-                and not target.startswith(f"{missing}.")
+            if missing not in {namespace, target} and not target.startswith(
+                f"{missing}."
             ):
                 raise
             failures.append((target, exc))
@@ -1745,7 +1744,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             ids = ids.contiguous()
         if use_decode:
             # Direct top-k path: the kernel reads flat LOCAL ids.  Unlike the
-            # packed route builder, SparkInfer's direct launcher cannot safely
+            # packed route builder, the direct B12X launcher cannot safely
             # consume an all-negative tier (and some versions dereference
             # negative routes before applying the router weight).  Replace
             # inactive routes with expert zero and give them an exact-zero

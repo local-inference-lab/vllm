@@ -1603,7 +1603,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         """Project DCP partials from 512 to 256 in borrowed MLA storage."""
         num_tokens = int(attn_out.shape[0])
         self._validate_dcp_prefill_workspace_contract(num_tokens)
-        # SparkInfer's head-major extend output is planned for the configured
+        # B12X's head-major extend output is planned for the configured
         # token capacity, even when the gathered head count needs no padding.
         # A shorter prefill chunk is therefore a pitched view of that allocation.
         # It is safe here because the input is compacted before entering cuBLAS.

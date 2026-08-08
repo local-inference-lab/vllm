@@ -12,6 +12,12 @@ B12X_ROOT="${B12X_ROOT:-${SCRIPT_DIR}/../b12x-fruit}"
 MODEL="${MODEL:-/mnt/vault/llm/fruit-pilot/output/GLM-5.2-SIQ-Fruit-QSRT-exact}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
+if (($#)); then
+  echo "Fruit QSRT launcher accepts no additional vLLM arguments" >&2
+  exit 1
+fi
 if [[ "${MAX_NUM_SEQS}" != "1" ]]; then
   echo "Fruit QSRT has only been qualified at MAX_NUM_SEQS=1" >&2
   exit 1
@@ -20,9 +26,17 @@ if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
   echo "Fruit QSRT has only been qualified at tensor parallel size 1" >&2
   exit 1
 fi
+if [[ "${MAX_MODEL_LEN}" != "4096" ]]; then
+  echo "Fruit QSRT has only been qualified at MAX_MODEL_LEN=4096" >&2
+  exit 1
+fi
+if [[ "${MAX_NUM_BATCHED_TOKENS}" != "4096" ]]; then
+  echo "Fruit QSRT has only been qualified at MAX_NUM_BATCHED_TOKENS=4096" >&2
+  exit 1
+fi
 
-EXPECTED_B12X_REVISION="de50e8622a8695e9829c83ad9f8c96f9b3be573a"
-EXPECTED_KQUANT_REVISION="f1ce7c8f4a9564194ea7067e1a88282a8e39135c"
+EXPECTED_B12X_REVISION="3f3ae2484de9adeba25bf4c0e7b74e029dc9393e"
+EXPECTED_KQUANT_REVISION="815ee6a9523b6051035563cd13d1f2386f7e7211"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Missing vLLM Python: ${PYTHON_BIN}" >&2
@@ -80,78 +94,63 @@ if [[ "${actual_b12x_revision}" != "${EXPECTED_B12X_REVISION}" ]]; then
   echo "Fruit B12X revision mismatch: got ${actual_b12x_revision}, expected ${EXPECTED_B12X_REVISION}" >&2
   exit 1
 fi
-if [[ -n "$(git -C "${B12X_ROOT}" status --porcelain -- b12x)" ]]; then
-  echo "Fruit B12X source tree has uncommitted changes: ${B12X_ROOT}" >&2
+if [[ -n "$(git -C "${B12X_ROOT}" status --porcelain=v1 --untracked-files=all)" ]]; then
+  echo "Fruit B12X checkout has uncommitted files: ${B12X_ROOT}" >&2
   exit 1
 fi
 actual_vllm_revision="$(git -C "${SCRIPT_DIR}" rev-parse HEAD)" || {
   echo "Unable to resolve the Fruit vLLM revision: ${SCRIPT_DIR}" >&2
   exit 1
 }
-if [[ -n "$(git -C "${SCRIPT_DIR}" status --porcelain -- vllm)" ]]; then
-  echo "Fruit vLLM source tree has uncommitted changes: ${SCRIPT_DIR}" >&2
+if [[ -n "$(git -C "${SCRIPT_DIR}" status --porcelain=v1 --untracked-files=all)" ]]; then
+  echo "Fruit vLLM checkout has uncommitted files: ${SCRIPT_DIR}" >&2
   exit 1
 fi
 
-export PYTHONPATH="${SCRIPT_DIR}:${B12X_ROOT}"
-
-"${PYTHON_BIN}" -P -c '
+"${PYTHON_BIN}" -I -S -c '
 import hashlib
+import runpy
+import subprocess
 import sys
 from pathlib import Path
 
-import b12x
-import vllm
-from vllm.model_executor.layers.quantization.kquant_qsrt_atoms import (
-    verify_qsrt_publication,
-)
-
-def source_tree_sha256(root_value):
+def tracked_tree_sha256(root_value):
     root = Path(root_value).resolve(strict=True)
-    files = []
-    for path in root.rglob("*"):
-        if "__pycache__" in path.parts:
-            continue
-        if path.is_symlink():
-            raise RuntimeError(f"runtime source must not contain symlinks: {path}")
-        if path.is_file():
-            files.append(path)
-    files.sort(key=lambda path: path.relative_to(root).as_posix())
-    if not files:
-        raise RuntimeError(f"runtime source tree is empty: {root}")
-    digest = hashlib.sha256()
-    for path in files:
-        relative = path.relative_to(root).as_posix().encode("utf-8")
-        content = path.read_bytes()
-        digest.update(len(relative).to_bytes(4, "little"))
-        digest.update(relative)
-        digest.update(len(content).to_bytes(8, "little"))
-        digest.update(content)
-    return digest.hexdigest()
+    result = subprocess.run(
+        ("git", "-C", str(root), "ls-tree", "-r", "-z", "--full-tree", "HEAD"),
+        check=True,
+        capture_output=True,
+    )
+    if not result.stdout:
+        raise RuntimeError(f"runtime source checkout has no tracked files: {root}")
+    return hashlib.sha256(b"git-ls-tree-v1\0" + result.stdout).hexdigest()
 
-seal = verify_qsrt_publication(sys.argv[1])
+model = sys.argv[1]
+expected_kquant = sys.argv[2]
+expected_b12x = sys.argv[3]
+actual_vllm = sys.argv[4]
+b12x_root = Path(sys.argv[5]).resolve(strict=True)
+vllm_root = Path(sys.argv[6]).resolve(strict=True)
+publication = runpy.run_path(
+    str(
+        vllm_root
+        / "vllm/model_executor/layers/quantization/kquant_qsrt_publication.py"
+    )
+)
+seal = publication["verify_qsrt_publication"](model)
 producer = seal.manifest["producer"]
 encoder = producer["encoder"]
 runtime = producer["runtime"]
-if encoder.get("kquant_revision") != sys.argv[2]:
+if encoder.get("kquant_revision") != expected_kquant:
     raise RuntimeError("Fruit package KQuant revision is unsupported")
-if runtime.get("b12x_revision") != sys.argv[3]:
+if runtime.get("b12x_revision") != expected_b12x:
     raise RuntimeError("Fruit package B12X revision is unsupported")
-if runtime.get("vllm_revision") != sys.argv[4]:
+if runtime.get("vllm_revision") != actual_vllm:
     raise RuntimeError("Fruit package vLLM revision does not match the runtime")
-b12x_root = Path(sys.argv[5]).resolve(strict=True)
-vllm_root = Path(sys.argv[6]).resolve(strict=True)
-if not Path(b12x.__file__).resolve().is_relative_to(b12x_root / "b12x"):
-    raise RuntimeError("imported B12X does not come from the sealed source root")
-if not Path(vllm.__file__).resolve().is_relative_to(vllm_root / "vllm"):
-    raise RuntimeError("imported vLLM does not come from the sealed source root")
-if runtime.get("b12x_source_sha256") != source_tree_sha256(b12x_root / "b12x"):
+if runtime.get("b12x_source_sha256") != tracked_tree_sha256(b12x_root):
     raise RuntimeError("Fruit package B12X source fingerprint is unsupported")
-if runtime.get("vllm_source_sha256") != source_tree_sha256(vllm_root / "vllm"):
+if runtime.get("vllm_source_sha256") != tracked_tree_sha256(vllm_root):
     raise RuntimeError("Fruit package vLLM source fingerprint is unsupported")
-
-import b12x.moe.fused_moe
-import b12x.attention.sparse_mla
 ' \
   "${MODEL}" \
   "${EXPECTED_KQUANT_REVISION}" \
@@ -160,20 +159,38 @@ import b12x.attention.sparse_mla
   "${B12X_ROOT}" \
   "${SCRIPT_DIR}"
 
+export PYTHONPATH="${SCRIPT_DIR}:${B12X_ROOT}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_120a}"
-export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-32}"
-export SAFETENSORS_FAST_GPU="${SAFETENSORS_FAST_GPU:-1}"
-export VLLM_USE_B12X_MOE="${VLLM_USE_B12X_MOE:-1}"
-export VLLM_USE_B12X_SPARSE_INDEXER="${VLLM_USE_B12X_SPARSE_INDEXER:-1}"
-export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+export CUTE_DSL_ARCH="sm_120a"
+export CUDA_DEVICE_MAX_CONNECTIONS="32"
+export SAFETENSORS_FAST_GPU="1"
+export VLLM_USE_B12X_MOE="1"
+export VLLM_USE_B12X_SPARSE_INDEXER="1"
+export VLLM_WORKER_MULTIPROC_METHOD="spawn"
+
+"${PYTHON_BIN}" -P -c '
+import sys
+from pathlib import Path
+
+import b12x
+import vllm
+
+b12x_root = Path(sys.argv[1]).resolve(strict=True)
+vllm_root = Path(sys.argv[2]).resolve(strict=True)
+if not Path(b12x.__file__).resolve().is_relative_to(b12x_root / "b12x"):
+    raise RuntimeError("imported B12X does not come from the sealed source root")
+if not Path(vllm.__file__).resolve().is_relative_to(vllm_root / "vllm"):
+    raise RuntimeError("imported vLLM does not come from the sealed source root")
+
+import b12x.moe.fused_moe
+import b12x.attention.sparse_mla
+' "${B12X_ROOT}" "${SCRIPT_DIR}"
+
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.2-QSRT-Fruit}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.80}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 
 exec "${PYTHON_BIN}" -P -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --served-model-name "${SERVED_MODEL_NAME}" \
@@ -196,5 +213,4 @@ exec "${PYTHON_BIN}" -P -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --tool-call-parser glm47 \
   --enable-auto-tool-choice \
   --reasoning-parser glm45 \
-  --generation-config vllm \
-  "$@"
+  --generation-config vllm

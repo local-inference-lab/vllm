@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1
+
+ARG VLLM_BASE_IMAGE
+FROM ${VLLM_BASE_IMAGE}
+
+ARG VLLM_REVISION
+ARG B12X_REVISION
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+RUN test -n "${VLLM_REVISION}" \
+    && test -n "${B12X_REVISION}" \
+    && git clone https://github.com/malaiwah/vllm-voipmonitor.git /opt/vllm-fruit \
+    && git -C /opt/vllm-fruit checkout --detach "${VLLM_REVISION}" \
+    && git clone https://github.com/malaiwah/sparkinfer.git /opt/b12x-fruit \
+    && git -C /opt/b12x-fruit checkout --detach "${B12X_REVISION}"
+RUN python3 -m pip install --no-cache-dir \
+        cuda-python \
+        nvidia-cutlass-dsl==4.6.0 \
+        nvidia-cutlass-dsl-libs-base==4.6.0 \
+        nvidia-cutlass-dsl-libs-core==4.6.0 \
+        nvidia-cutlass-dsl-libs-cu12==4.6.0 \
+        nvidia-cutlass-dsl-libs-cu13==4.6.0 \
+        'apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2' \
+        'rich>=13' \
+        'transformers>=4.51' \
+        'safetensors>=0.6' \
+    && python3 -m pip install --no-cache-dir --no-deps -e /opt/b12x-fruit \
+    && python3 -m pip check
+RUN python3 -c 'from pathlib import Path; import shutil, vllm; source = Path(vllm.__file__).parent; target = Path("/opt/vllm-fruit/vllm"); extensions = tuple(source.rglob("*.so")); assert extensions, "installed vLLM package has no compiled extensions"; [(target / path.relative_to(source)).parent.mkdir(parents=True, exist_ok=True) or shutil.copy2(path, target / path.relative_to(source)) for path in extensions]' \
+    && PYTHONPATH=/opt/vllm-fruit:/opt/b12x-fruit python3 -P -c \
+        'import b12x, vllm; import vllm._C; assert vllm.__file__.startswith("/opt/vllm-fruit/"); assert b12x.__file__.startswith("/opt/b12x-fruit/")'
+ENV PYTHON_BIN=/usr/bin/python3
+ENV B12X_ROOT=/opt/b12x-fruit
+WORKDIR /opt/vllm-fruit
+ENTRYPOINT ["/opt/vllm-fruit/serve-glm52-fruit-qsrt.sh"]
