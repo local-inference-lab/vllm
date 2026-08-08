@@ -31,6 +31,7 @@ import torch
 from transformers import PretrainedConfig
 
 from vllm.config import get_current_vllm_config_or_none
+import vllm.envs as envs
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -162,6 +163,61 @@ _RANK_SLICED_WEIGHT_RE = re.compile(
 ShardId = str | int | tuple[int, ...] | None
 
 
+_WORLD_WRITABLE = 0o002
+_GROUP_WRITABLE = 0o020
+
+
+def _validate_native_lib_path(path: str, env_var: str) -> None:
+    """Validate a path to a native .so before loading it via ctypes.CDLL.
+
+    The EXL3 ABI shim and the NCCL library are loaded from operator-supplied
+    paths.  Without validation, any process that can set the env var achieves
+    arbitrary native code execution (supply-chain / local privilege boundary).
+    """
+    p = os.path.abspath(path)
+    if not os.path.isfile(p):
+        raise ValueError(
+            f"{env_var} points to a non-existent or non-regular file: {path!r}"
+        )
+    if os.path.islink(path):
+        raise ValueError(
+            f"{env_var} must not be a symlink: {path!r}"
+        )
+    st = os.stat(p)
+    if st.st_mode & (_WORLD_WRITABLE | _GROUP_WRITABLE):
+        raise ValueError(
+            f"{env_var} file must not be group/world-writable "
+            f"(mode {oct(st.st_mode & 0o777)}): {path!r}"
+        )
+    parent = os.path.dirname(p)
+    if parent:
+        pst = os.stat(parent)
+        if pst.st_mode & _WORLD_WRITABLE:
+            raise ValueError(
+                f"{env_var} parent directory must not be world-writable: "
+                f"{parent!r}"
+            )
+
+
+def _validate_ext_search_dir(path: str, env_var: str) -> None:
+    """Validate the directory inserted into sys.path for the EXL3 extension.
+
+    Rejects world-writable directories (e.g. /tmp, /dev/shm) and symlinks so
+    a compromised path entry cannot shadow arbitrary later imports.
+    """
+    if not path:
+        return
+    p = os.path.abspath(path)
+    if not os.path.isdir(p):
+        raise ValueError(
+            f"{env_var} does not resolve to a directory: {path!r}"
+        )
+    st = os.stat(p)
+    if st.st_mode & _WORLD_WRITABLE:
+        raise ValueError(
+            f"{env_var} directory must not be world-writable: {path!r}"
+        )
+
 def _load_exl3_ext() -> Any:
     """Load the existing ExLlamaV3 extension only from an actual CUDA call."""
 
@@ -169,15 +225,25 @@ def _load_exl3_ext() -> Any:
     if _EXL3_EXT is not None:
         return _EXL3_EXT
 
-    shim = os.environ.get("VLLM_EXL3_ABI_SHIM")
+    shim = envs.VLLM_EXL3_ABI_SHIM
     if shim:
+        _validate_native_lib_path(shim, "VLLM_EXL3_ABI_SHIM")
         ctypes.CDLL(shim, mode=ctypes.RTLD_GLOBAL)
+        logger.info("Loaded EXL3 ABI shim from %s", shim)
 
-    ext_path = os.environ.get("VLLM_EXL3_EXT_PATH")
+    ext_path = envs.VLLM_EXL3_EXT_PATH
     if ext_path:
         search_dir = ext_path if os.path.isdir(ext_path) else os.path.dirname(ext_path)
+        _validate_ext_search_dir(search_dir, "VLLM_EXL3_EXT_PATH")
+        # Insert scoped — import immediately, then remove so a compromised
+        # path entry cannot shadow arbitrary later imports.
         if search_dir and search_dir not in sys.path:
             sys.path.insert(0, search_dir)
+            _scoped_path = search_dir
+        else:
+            _scoped_path = None
+    else:
+        _scoped_path = None
 
     try:
         ext = importlib.import_module("exllamav3_ext")
@@ -188,6 +254,9 @@ def _load_exl3_ext() -> Any:
             "PyTorch ABI shim is required)."
         )
         raise RuntimeError(f"Unable to import exllamav3_ext. {hint}") from exc
+    finally:
+        if _scoped_path is not None and _scoped_path in sys.path:
+            sys.path.remove(_scoped_path)
 
     if not hasattr(ext, "exl3_gemm"):
         raise RuntimeError(
@@ -522,6 +591,15 @@ class Exl3Config(QuantizationConfig):
                 "rank-sliced EXL3 bits_per_expert must use 'file.json:field' syntax, "
                 f"got {reference!r}"
             ) from exc
+        # Reject path traversal: the filename must be a bare file name, not a
+        # relative or absolute path.  A malicious model's config.json could
+        # set bits_per_expert to "../../../../etc/passwd:k" to read arbitrary
+        # files via get_hf_file_to_dict → Path(model) / file_name.
+        if os.path.basename(filename) != filename:
+            raise ValueError(
+                "rank-sliced EXL3 bits_per_expert filename must not contain "
+                f"path separators: {filename!r}"
+            )
         payload = get_hf_file_to_dict(filename, model_name, revision=revision)
         if not isinstance(payload, dict):
             raise ValueError(f"rank-sliced EXL3 could not load {filename!r}")
