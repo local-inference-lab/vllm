@@ -11,6 +11,11 @@ PYTHON_BIN="${PYTHON_BIN:-${SCRIPT_DIR}/.venv/bin/python}"
 B12X_ROOT="${B12X_ROOT:-${SCRIPT_DIR}/../b12x-fruit}"
 MODEL="${MODEL:-/mnt/vault/llm/fruit-pilot/output/GLM-5.2-SIQ-Fruit-QSRT-exact}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
+if [[ "${MAX_NUM_SEQS}" != "1" ]]; then
+  echo "Fruit QSRT has only been qualified at MAX_NUM_SEQS=1" >&2
+  exit 1
+fi
 if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
   echo "Fruit QSRT has only been qualified at tensor parallel size 1" >&2
   exit 1
@@ -169,7 +174,6 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.2-QSRT-Fruit}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.80}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 
 exec "${PYTHON_BIN}" -P -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --served-model-name "${SERVED_MODEL_NAME}" \
