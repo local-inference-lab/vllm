@@ -80,6 +80,7 @@ class _FakeMixedTrellisApi:
         self.routed = []
         self.calls = []
         self.allocations = []
+        self.output_dtype = torch.float32
 
     def max_packed_route_slots(self, routed_rows, block_size, experts):
         del block_size, experts
@@ -95,7 +96,7 @@ class _FakeMixedTrellisApi:
         buffers = SimpleNamespace(
             scratch=torch.empty(launch.size_m, dtype=torch.uint8),
             output=torch.empty(
-                (launch.size_m, launch.hidden_size), dtype=torch.float32
+                (launch.size_m, launch.hidden_size), dtype=self.output_dtype
             ),
         )
         self.allocations.append(buffers)
@@ -458,6 +459,27 @@ def test_mixed_prefill_buffers_do_not_cross_target_draft_roles():
         assert len(h.mixed_api.allocations) == 4
 
 
+def test_shared_mixed_prefill_same_dtype_output_is_copied_out():
+    with _Harness() as h:
+        h.mixed_api.output_dtype = torch.bfloat16
+        method = _make_method()
+        first_layer = _make_mixed_layer()
+        second_layer = _make_mixed_layer(tier_ids=((0, 1, 2), (3, 4, 5, 6, 7)))
+        x = torch.zeros((64, HIDDEN), dtype=torch.bfloat16)
+        weights = torch.zeros((64, TOPK), dtype=torch.float32)
+        ids = torch.zeros((64, TOPK), dtype=torch.int64)
+
+        method._mixed_rank_sliced_runtime(first_layer, x, ids)
+        second = method._mixed_rank_sliced_runtime(second_layer, x, ids)
+        out = method._apply_rank_sliced(second_layer, x, weights, ids)
+
+        assert second["prefill"]["buffers_reused"] is True
+        assert (
+            out.untyped_storage().data_ptr()
+            != second["prefill"]["buffers"].output.untyped_storage().data_ptr()
+        )
+
+
 def test_mixed_prefill_buffer_sharing_requires_backend_layout_contract():
     with _Harness() as h:
         h.mixed_api.mixed_trellis_buffer_layout = None
@@ -507,20 +529,37 @@ def test_prefill_trellis_disabled_restores_parity():
         assert h.ext.max_concurrency_calls == 1
 
 
-def test_parity_staging_is_allocated_once_on_first_use():
+def test_reachable_parity_staging_is_allocated_during_eager_planning():
     with _Harness(env={"VLLM_EXL3_TRELLIS_MIN_M": "4"}) as h:
         method = _make_method()
         layer = _make_layer()
 
-        _apply(method, layer, 2)
+        _apply(method, layer, 16)
         runtime = next(iter(exl3_module._RANK_SLICED_RUNTIMES.values()))
         first = runtime["parity_staging"]
+        assert first is not None
+        assert h.ext.max_concurrency_calls == 1
+
+        _apply(method, layer, 2)
         _apply(method, layer, 3)
 
-        assert first is not None
         assert runtime["parity_staging"] is first
         assert h.ext.max_concurrency_calls == 1
 
+
+
+def test_unplanned_parity_path_refuses_late_gpu_allocation():
+    with _Harness(env={"VLLM_EXL3_TRELLIS_MIN_M": "4"}) as h:
+        method = _make_method()
+        layer = _make_layer()
+
+        _apply(method, layer, 16)
+        runtime = next(iter(exl3_module._RANK_SLICED_RUNTIMES.values()))
+        runtime["parity_staging"] = None
+
+        with pytest.raises(RuntimeError, match="refusing a late GPU allocation"):
+            _apply(method, layer, 2)
+        assert h.ext.max_concurrency_calls == 1
 
 
 def test_prefill_block_m_env_override():
@@ -577,7 +616,8 @@ def test_explicit_parity_path_guarded_against_capture():
         else:
             raise AssertionError("parity path must raise during capture")
         runtime = next(iter(exl3_module._RANK_SLICED_RUNTIMES.values()))
-        assert runtime["parity_staging"] is None
+        assert runtime["parity_staging"] is not None
+        assert h.ext.max_concurrency_calls == 1
 
 
 if __name__ == "__main__":

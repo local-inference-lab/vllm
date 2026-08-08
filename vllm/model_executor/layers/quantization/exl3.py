@@ -73,8 +73,9 @@ _B12X_MIXED_TRELLIS_API: Any | None = None
 _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 # Decode buffers are deliberately excluded: CUDA graphs capture their addresses.
-# Prefill runs eagerly, so layers with the exact same backend allocation layout
-# may safely reuse one persistent buffer set within a model instance.
+# A worker executes one model batch at a time and its layers are stream-ordered;
+# prefill therefore lets exact-compatible target layers reuse one persistent
+# buffer set. Target/draft roles remain separate below.
 _MIXED_TRELLIS_PREFILL_BUFFERS: dict[tuple[Any, ...], Any] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
 _MIXED_TRELLIS_ROUTE_BLOCK_SIZE = 8
@@ -2037,21 +2038,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # B12X returns a view of its persistent FP32 output buffer.  The
         # dtype conversion is therefore also the lifetime boundary before
         # a compatible later layer reuses the same prefill storage.
-        output = raw_output.to(x.dtype)
-        persistent_output = getattr(state["buffers"], "output", None)
-        if (
-            state["buffers_reused"]
-            and persistent_output is not None
-            and raw_output.untyped_storage().data_ptr()
-            == persistent_output.untyped_storage().data_ptr()
-            and output.untyped_storage().data_ptr()
-            == persistent_output.untyped_storage().data_ptr()
-        ):
-            output = output.clone()
+        # `copy=True` is dormant for today's FP32 -> BF16 conversion and
+        # protects a future same-dtype backend without extra storage
+        # pointer queries in the hot path.
+        output = raw_output.to(
+            dtype=x.dtype,
+            copy=state["buffers_reused"] and raw_output.dtype == x.dtype,
+        )
         return output
 
     @staticmethod
-    def _rank_sliced_parity_staging(
+    def _allocate_rank_sliced_parity_staging(
         runtime: dict[str, Any],
         device: torch.device,
     ) -> dict[str, Any]:
@@ -2142,7 +2139,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         }
         runtime["parity_staging"] = staging
         logger.info_once(
-            "EXL3 eager parity staging allocated lazily: rows=%d chunk=%d",
+            "EXL3 eager parity staging allocated during runtime planning: "
+            "rows=%d chunk=%d",
             parity_rows,
             chunk,
         )
@@ -2197,6 +2195,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 f"chunk={chunk}, required_rows={max_parity_batch}. Increase "
                 "VLLM_EXL3_PREFILL_CHUNK or lower VLLM_EXL3_TRELLIS_MIN_M."
             )
+        parity_reachable = max_parity_batch > 0 or (
+            max_batched_tokens > max_trellis_m and not prefill_plan_enabled
+        )
         topk = int(topk_ids.shape[1])
         device_index = x.device.index
         key = (
@@ -2284,6 +2285,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "num_experts": num_experts,
             "parity_staging": None,
         }
+        # A reachable parity fallback is allocated during eager runtime planning,
+        # so normal automatic KV sizing counts it in determine_available_memory's
+        # profile pass. The production default (min_m=1 with prefill Trellis)
+        # proves this branch unreachable and keeps the staging allocation at zero.
+        # Serving is not allowed to create this potentially large arena later.
+        if parity_reachable:
+            self._allocate_rank_sliced_parity_staging(runtime, x.device)
         _RANK_SLICED_RUNTIMES[key] = runtime
         prefill_arena_mib = (
             0.0
@@ -2369,7 +2377,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "EXL3 batch exceeds its planned parity capacity: "
                 f"m={m}, capacity={runtime['parity_rows']}"
             )
-        staging = self._rank_sliced_parity_staging(runtime, x.device)
+        staging = runtime["parity_staging"]
+        if staging is None:
+            raise RuntimeError(
+                "EXL3 reached an unplanned eager parity path; refusing a late "
+                "GPU allocation outside memory profiling"
+            )
         ext = staging["ext"]
         xh = staging["xh"][:m]
         xh.copy_(x)
