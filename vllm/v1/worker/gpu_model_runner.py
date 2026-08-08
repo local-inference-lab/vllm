@@ -5698,28 +5698,44 @@ class GPUModelRunner(
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
-
             # Get the "target" tokens for each index. For prompt at index i,
             # the token at prompt index i+1 is the "sampled" token we want
             # to gather the logprob for.
             tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
-
-            # Compute prompt logprobs.
-            logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
-            )
-
-            # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
+            # Compute prompt logprobs in chunks to bound the full-vocabulary
+            # logits tensor memory.  The legacy path materialized
+            # [num_logits, vocab_size] in one shot, which OOMs on
+            # memory-dense profiles (upstream vllm-project/vllm#14239).
+            # Mirrors the chunking in compute_prompt_logprobs_with_chunking
+            # (vllm/v1/worker/gpu/sample/prompt_logprob.py) and the V2
+            # PromptLogprobsWorker path.  V1 is not used in the production
+            # stack (VLLM_USE_V2_MODEL_RUNNER=1), but this keeps the two
+            # paths consistent so the same VLLM_PROMPT_LOGPROBS_CHUNK_SIZE
+            # guard applies to both.
+            chunk_size = envs.VLLM_PROMPT_LOGPROBS_CHUNK_SIZE
+            for chunk_start in range(0, num_logits, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, num_logits)
+                chunk_logits = self.model.compute_logits(
+                    prompt_hidden_states[chunk_start:chunk_end]
+                )
+                chunk_tgt = tgt_token_ids[chunk_start:chunk_end]
+                chunk_logprobs = self.sampler.compute_logprobs(chunk_logits)
+                del chunk_logits
+                token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
+                    chunk_logprobs, num_prompt_logprobs, chunk_tgt
+                )
+                del chunk_logprobs
+                # Transfer GPU->CPU async.
+                dst_slice = slice(start_idx + chunk_start, start_idx + chunk_end)
+                logprobs_tensors.logprob_token_ids[dst_slice].copy_(
+                    token_ids, non_blocking=True
+                )
+                logprobs_tensors.logprobs[dst_slice].copy_(
+                    logprobs, non_blocking=True
+                )
+                logprobs_tensors.selected_token_ranks[dst_slice].copy_(
+                    ranks, non_blocking=True
+                )
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.
