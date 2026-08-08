@@ -17,12 +17,19 @@ if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
 fi
 
 EXPECTED_B12X_REVISION="de50e8622a8695e9829c83ad9f8c96f9b3be573a"
-EXPECTED_KQUANT_REVISION="40daf85102d56c61d3da3bc60229d84918ee6557"
+EXPECTED_KQUANT_REVISION="f1ce7c8f4a9564194ea7067e1a88282a8e39135c"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Missing vLLM Python: ${PYTHON_BIN}" >&2
   exit 1
 fi
+# Preserve the venv launcher basename: resolving its final symlink bypasses
+# pyvenv.cfg discovery and silently switches to the system site-packages.
+python_dir="$(readlink -e -- "$(dirname -- "${PYTHON_BIN}")")" || {
+  echo "Unable to resolve vLLM Python directory: ${PYTHON_BIN}" >&2
+  exit 1
+}
+PYTHON_BIN="${python_dir}/$(basename -- "${PYTHON_BIN}")"
 resolved_python="$(readlink -f -- "${PYTHON_BIN}")" || {
   echo "Unable to resolve vLLM Python: ${PYTHON_BIN}" >&2
   exit 1
@@ -31,7 +38,6 @@ if [[ ! -f "${resolved_python}" || ! -x "${resolved_python}" ]]; then
   echo "vLLM Python is not an executable file: ${resolved_python}" >&2
   exit 1
 fi
-PYTHON_BIN="${resolved_python}"
 
 if [[ -L "${B12X_ROOT}" ]]; then
   echo "Fruit B12X root must not be a symbolic link: ${B12X_ROOT}" >&2
