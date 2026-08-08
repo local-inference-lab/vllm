@@ -813,6 +813,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert sample_hidden_states is not None
             if self.pooling_runner is None:
                 self._dummy_sampler_run(sample_hidden_states)
+                assert hidden_states is not None
+                assert self.prompt_logprobs_worker is not None
+                self.prompt_logprobs_worker.profile_run(
+                    self.model.compute_logits,
+                    hidden_states,
+                    self.model_config.max_logprobs,
+                )
+                logger.info_once(
+                    "Profiled V1 prompt-logprobs workspace with chunk size %d",
+                    self.prompt_logprobs_worker.chunk_size,
+                )
             else:
                 self._dummy_pooler_run(hidden_states)
 

@@ -188,6 +188,7 @@ if TYPE_CHECKING:
     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
+    VLLM_PROMPT_LOGPROBS_CHUNK_SIZE: int = 1024
     VLLM_MLA_DISABLE: bool = False
     VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH: bool = False
     VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW: int = 8
@@ -1551,6 +1552,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")
     ),
+    # Maximum prompt-token rows materialized in the full-vocabulary logits
+    # tensor at once while computing V1 prompt logprobs.
+    "VLLM_PROMPT_LOGPROBS_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_PROMPT_LOGPROBS_CHUNK_SIZE", "1024")
+    ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
     # Physically shorten DSpark's next draft block from the historical
@@ -2292,7 +2298,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Prebuilt exllamav3 extension location and torch-ABI compatibility shim.
     "VLLM_EXL3_EXT_PATH": lambda: os.getenv("VLLM_EXL3_EXT_PATH"),
     "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),
-
 }
 
 
@@ -2438,6 +2443,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_WORKER_MULTIPROC_METHOD",
         "VLLM_ENABLE_V1_MULTIPROCESSING",
         "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
+        "VLLM_PROMPT_LOGPROBS_CHUNK_SIZE",
         "VLLM_CPU_KVCACHE_SPACE",
         "VLLM_CPU_MOE_PREPACK",
         "VLLM_ZENTORCH_WEIGHT_PREPACK",
