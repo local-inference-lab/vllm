@@ -96,6 +96,32 @@ def test_qsrt_launcher_rejects_relative_runtime_evidence_path() -> None:
     assert result.stderr == "VLLM_KQUANT_RUNTIME_EVIDENCE must be an absolute path\n"
 
 
+def test_qsrt_launcher_rejects_relative_kld_capture_path() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    environment = os.environ.copy()
+    environment.pop("PYTHON_BIN", None)
+    environment.pop("B12X_ROOT", None)
+    environment.pop("FRUIT_QSRT_EXPECTED_CANDIDATE_SHA256", None)
+    environment.update(
+        {
+            "FRUIT_QSRT_EXPECTED_COMPLETE_SHA256": "0" * 64,
+            "VLLM_KLD_CAPTURE_DIR": "relative/kld-captures",
+        }
+    )
+
+    result = subprocess.run(
+        ["/bin/bash", "-p", str(repository / "serve-glm52-fruit-qsrt.sh")],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert result.stderr == "VLLM_KLD_CAPTURE_DIR must be an absolute path\n"
+
+
 def test_qsrt_launcher_rejects_python_interpreter_override() -> None:
     repository = Path(__file__).resolve().parents[2]
     environment = os.environ.copy()
@@ -294,6 +320,7 @@ report = {
             "VLLM_USE_B12X_MOE",
         )
     },
+    "kld_capture_dir": os.environ.get("VLLM_KLD_CAPTURE_DIR"),
     "hostile": {
         name: os.environ.get(name)
         for name in (
@@ -406,6 +433,8 @@ marker_name = "QSRT_CANDIDATE.json" if candidate_mode else "QSRT_COMPLETE.json"
     model_source = root / "model-source"
     _write(model_source / "weights.bin", "fixture")
     report = root / "server-report.json"
+    capture_dir = root / "kld-captures"
+    capture_dir.mkdir()
     descendant_pid = root / "descendant.pid"
     python_bin.parent.mkdir(parents=True)
     python_bin.symlink_to(Path(sys.executable).resolve())
@@ -427,6 +456,7 @@ marker_name = "QSRT_CANDIDATE.json" if candidate_mode else "QSRT_COMPLETE.json"
     environment.pop("B12X_ROOT", None)
     environment.pop("FRUIT_QSRT_EXPECTED_COMPLETE_SHA256", None)
     environment.pop("FRUIT_QSRT_EXPECTED_CANDIDATE_SHA256", None)
+    environment.pop("VLLM_KLD_CAPTURE_DIR", None)
     environment.update(
         {
             (
@@ -434,6 +464,7 @@ marker_name = "QSRT_CANDIDATE.json" if candidate_mode else "QSRT_COMPLETE.json"
                 if trust_mode == "candidate"
                 else "FRUIT_QSRT_EXPECTED_COMPLETE_SHA256"
             ): hashlib.sha256(marker_bytes).hexdigest(),
+            "VLLM_KLD_CAPTURE_DIR": str(capture_dir),
             "MODEL": str(model_source),
             "TEST_B12X_REVISION": b12x_revision,
             "TEST_B12X_SOURCE_SHA256": b12x_source_sha256,
@@ -464,6 +495,7 @@ marker_name = "QSRT_CANDIDATE.json" if candidate_mode else "QSRT_COMPLETE.json"
         timeout=30,
     )
     return {
+        "capture_dir": capture_dir,
         "b12x_repository": b12x_repository,
         "descendant_pid": descendant_pid,
         "report": report,
@@ -490,6 +522,9 @@ def test_qsrt_launcher_uses_private_runtime_snapshot_after_live_tree_mutation(
         "HF_HUB_OFFLINE": "1",
         "VLLM_USE_B12X_MOE": "1",
     }
+    capture_dir = secured_launcher_run["capture_dir"]
+    assert isinstance(capture_dir, Path)
+    assert report["kld_capture_dir"] == str(capture_dir.resolve())
     assert report["hostile"] == {
         "B12X_FAKE_TOGGLE": None,
         "TORCH_COMPILE_DISABLE": None,

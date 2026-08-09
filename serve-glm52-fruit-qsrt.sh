@@ -105,6 +105,26 @@ if [[ -n "${VLLM_KQUANT_RUNTIME_EVIDENCE:-}" ]]; then
   VLLM_KQUANT_RUNTIME_EVIDENCE="${evidence_parent}/$(/usr/bin/basename -- "${VLLM_KQUANT_RUNTIME_EVIDENCE}")"
   export VLLM_KQUANT_RUNTIME_EVIDENCE
 fi
+if [[ -n "${VLLM_KLD_CAPTURE_DIR:-}" ]]; then
+  if [[ "${VLLM_KLD_CAPTURE_DIR}" != /* ]]; then
+    echo "VLLM_KLD_CAPTURE_DIR must be an absolute path" >&2
+    exit 1
+  fi
+  if [[ -L "${VLLM_KLD_CAPTURE_DIR}" ]]; then
+    echo "VLLM_KLD_CAPTURE_DIR must not be a symbolic link" >&2
+    exit 1
+  fi
+  capture_dir="$(/usr/bin/readlink -e -- "${VLLM_KLD_CAPTURE_DIR}")" || {
+    echo "VLLM_KLD_CAPTURE_DIR does not exist" >&2
+    exit 1
+  }
+  if [[ ! -d "${capture_dir}" || ! -w "${capture_dir}" ]]; then
+    echo "VLLM_KLD_CAPTURE_DIR must be a writable directory" >&2
+    exit 1
+  fi
+  VLLM_KLD_CAPTURE_DIR="${capture_dir}"
+  export VLLM_KLD_CAPTURE_DIR
+fi
 
 EXPECTED_B12X_REVISION="56d5a9063e7726d6799c87760e2070c38e479677"
 EXPECTED_KQUANT_REVISION="ea07fea0f5e93a0e321c3176bf11b654c645f489"
@@ -383,6 +403,11 @@ RUNTIME_ENV=(
 if [[ -n "${VLLM_KQUANT_RUNTIME_EVIDENCE:-}" ]]; then
   RUNTIME_ENV+=(
     "VLLM_KQUANT_RUNTIME_EVIDENCE=${VLLM_KQUANT_RUNTIME_EVIDENCE}"
+  )
+fi
+if [[ -n "${VLLM_KLD_CAPTURE_DIR:-}" ]]; then
+  RUNTIME_ENV+=(
+    "VLLM_KLD_CAPTURE_DIR=${VLLM_KLD_CAPTURE_DIR}"
   )
 fi
 
