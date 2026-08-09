@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import re
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -1815,6 +1816,13 @@ class DeepseekV2Model(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            # When num_nextn_predict_layers == 0 the MTP layers are never
+            # built, so get_spec_layer_idx_from_weight_name does not divert
+            # their checkpoint tensors and they reach AutoWeightsLoader with
+            # no destination, raising KeyError (e.g.
+            # 'layers.78.eh_proj.weight'). Inert when MTP is enabled.
+            if _skip_disabled_mtp_weight(self.config, name):
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
@@ -2187,6 +2195,20 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
 
 # Compatibility with
 # https://huggingface.co/deepseek-ai/DeepSeek-V3-Base/blob/main/configuration_deepseek.py
+def _skip_disabled_mtp_weight(config, name: str) -> bool:
+    """True when `name` belongs to an MTP layer that this config never builds."""
+
+    try:
+        nextn = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
+        hidden = int(getattr(config, "num_hidden_layers", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if nextn != 0 or hidden <= 0:
+        return False
+    match = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
+    return match is not None and int(match.group(1)) >= hidden
+
+
 def get_spec_layer_idx_from_weight_name(
     config: DeepseekV2Config | DeepseekV3Config, weight_name: str
 ) -> int | None:
