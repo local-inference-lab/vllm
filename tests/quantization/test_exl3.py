@@ -208,6 +208,118 @@ def test_rank_sliced_parameter_preallocates_projection_major_slab(monkeypatch):
     torch.testing.assert_close(param.exl3_tensors[(2, "w3")], w3)
 
 
+def test_rank_sliced_parameter_preallocates_bitrate_group_slabs(monkeypatch):
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    groups = ((0, 2), (1, 3))
+    param = Exl3MoEParameter(
+        weight_loader=lambda *args, **kwargs: None,
+        num_experts=4,
+        shard_ids=("w1", "w3"),
+        preallocate_groups=groups,
+    )
+
+    for expert_id in range(4):
+        bits = 3 if expert_id in groups[0] else 4
+        shape = (2, 2, 16 * bits)
+        for shard_id, offset in (("w1", 0), ("w3", 100)):
+            value = torch.full(
+                shape,
+                expert_id + offset,
+                dtype=torch.int16,
+            )
+            param.load_exl3_weight(
+                value,
+                expert_id=expert_id,
+                shard_id=shard_id,
+            )
+
+    k3 = param.exl3_group_backing(groups[0])
+    k4 = param.exl3_group_backing(groups[1])
+    assert tuple(k3.shape) == (2, 2, 2, 2, 48)
+    assert tuple(k4.shape) == (2, 2, 2, 2, 64)
+    assert param.exl3_tensors[(2, "w1")].data_ptr() == k3[0, 1].data_ptr()
+    assert param.exl3_tensors[(1, "w3")].data_ptr() == k4[1, 0].data_ptr()
+    assert k3[0, 0].unique().item() == 0
+    assert k3[0, 1].unique().item() == 2
+    assert k4[1, 0].unique().item() == 101
+    assert k4[1, 1].unique().item() == 103
+
+    with pytest.raises(ValueError, match="partition all experts"):
+        Exl3MoEParameter(
+            weight_loader=lambda *args, **kwargs: None,
+            num_experts=4,
+            shard_ids=("w1",),
+            preallocate_groups=((0, 1),),
+        )
+
+
+def test_rank_sliced_broadcast_pointer_table_repeats_one_physical_row():
+    slab = torch.ones((1, 128), dtype=torch.float16)
+
+    table = Exl3MoEMethod._pointer_table(slab, num_experts=4)
+
+    assert table.tolist() == [slab.data_ptr()] * 4
+    with pytest.raises(RuntimeError, match="per-expert or broadcast"):
+        Exl3MoEMethod._pointer_table(
+            torch.ones((2, 128), dtype=torch.float16), num_experts=4
+        )
+
+
+def test_rank_sliced_shared_h_create_weights_allocates_one_physical_row(
+    monkeypatch,
+):
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 4
+    )
+    config = Exl3Config()
+    config.maybe_update_config(
+        "unused",
+        SimpleNamespace(
+            hybrid_tr3_tail=_rank_sliced_metadata(
+                rotation_layout="shared_h_v1",
+                shared_h_tensor_schema=(
+                    "model.layers.{L}.mlp.experts.shared_h.{proj}.rank{r}.{suh|svh}"
+                ),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        exl3_module,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+            model_config=SimpleNamespace(runner_type="generate"),
+        ),
+    )
+    layer = torch.nn.Module()
+    layer.layer_name = "model.layers.3.mlp.experts"
+    moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=False, tp_rank=0, tp_size=4),
+        has_bias=False,
+    )
+    method = Exl3MoEMethod(config, moe)
+
+    method.create_weights(
+        layer,
+        num_experts=256,
+        hidden_size=6144,
+        intermediate_size_per_partition=512,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert layer.exl3_shared_h_rotations
+    assert layer.w13_suh.exl3_num_experts == 1
+    assert layer.w2_svh.exl3_num_experts == 1
+    assert layer.w13_svh.exl3_num_experts == 256
+    assert layer.w2_suh.exl3_num_experts == 256
+    assert layer.w13_trellis.exl3_num_experts == 256
+    assert layer.w2_trellis.exl3_num_experts == 256
+
+
 def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
     experts = 2
     hidden = intermediate = 128
@@ -290,18 +402,43 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypat
             exl3_backing=backing,
         )
 
-    w13_tensors = {}
-    w2_tensors = {}
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    tier_groups = ((0, 2), (1, 3))
+    w13_param = Exl3MoEParameter(
+        weight_loader=lambda *args, **kwargs: None,
+        num_experts=experts,
+        shard_ids=("w1", "w3"),
+        preallocate_groups=tier_groups,
+    )
+    w2_param = Exl3MoEParameter(
+        weight_loader=lambda *args, **kwargs: None,
+        num_experts=experts,
+        shard_ids=("w2",),
+        preallocate_groups=tier_groups,
+    )
     for expert, bits in enumerate(bitrates):
         for shard in ("w1", "w3"):
-            w13_tensors[(expert, shard)] = torch.zeros(
-                (hidden // 16, intermediate // 16, 16 * bits),
-                dtype=torch.int16,
+            w13_param.load_exl3_weight(
+                torch.zeros(
+                    (hidden // 16, intermediate // 16, 16 * bits),
+                    dtype=torch.int16,
+                ),
+                expert_id=expert,
+                shard_id=shard,
             )
-        w2_tensors[(expert, "w2")] = torch.zeros(
-            (intermediate // 16, hidden // 16, 16 * bits),
-            dtype=torch.int16,
+        w2_param.load_exl3_weight(
+            torch.zeros(
+                (intermediate // 16, hidden // 16, 16 * bits),
+                dtype=torch.int16,
+            ),
+            expert_id=expert,
+            shard_id="w2",
         )
+    k3_w13_ptr = w13_param.exl3_group_backing(tier_groups[0]).data_ptr()
+    k4_w13_ptr = w13_param.exl3_group_backing(tier_groups[1]).data_ptr()
 
     slabs = {
         "w13_suh": torch.ones((2, experts, hidden), dtype=torch.float16),
@@ -316,8 +453,8 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypat
         exl3_layer_bitrates=bitrates,
         activation=MoEActivation.SILU,
         layer_name="model.layers.3.mlp.experts",
-        w13_trellis=parameter(("w1", "w3"), w13_tensors),
-        w2_trellis=parameter(("w2",), w2_tensors),
+        w13_trellis=w13_param,
+        w2_trellis=w2_param,
     )
     for prefix, shards in (("w13", ("w1", "w3")), ("w2", ("w2",))):
         for suffix in ("suh", "svh", "mcg", "mul1"):
@@ -353,8 +490,14 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypat
 
     method._prepare_mixed_rank_sliced_weights(layer)
 
-    assert [entry["trellis_bits"] for entry in api.prepared] == [3, 4]
-    assert [entry["num_experts"] for entry in api.prepared] == [2, 2]
+    assert [entry["trellis_bits"] for entry in api.prepared] == [3, 3, 4, 4]
+    assert [entry["num_experts"] for entry in api.prepared] == [2] * 4
+    assert [entry["w13"].data_ptr() for entry in api.prepared] == [
+        k3_w13_ptr,
+        k3_w13_ptr,
+        k4_w13_ptr,
+        k4_w13_ptr,
+    ]
     for entry in api.prepared:
         bits = entry["trellis_bits"]
         assert tuple(entry["w13"].shape) == (
@@ -378,6 +521,8 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypat
     assert layer.exl3_mixed_trellis["tier_bits"] == (3, 4)
     assert layer.w13_trellis.exl3_tensors == {}
     assert layer.w2_trellis.exl3_tensors == {}
+    assert layer.w13_trellis.exl3_group_backings == [None, None]
+    assert layer.w2_trellis.exl3_group_backings == [None, None]
     assert layer.w13_suh.exl3_backing is None
     assert layer.w2_svh.exl3_backing is None
 

@@ -1184,8 +1184,9 @@ class Exl3MoEParameter(BasevLLMParameter):
         num_experts: int = 0,
         shard_ids: tuple[str, ...] = (),
         preallocate: bool = False,
+        preallocate_groups: tuple[tuple[int, ...], ...] = (),
     ):
-        del num_experts, shard_ids, preallocate
+        del num_experts, shard_ids, preallocate, preallocate_groups
         data = torch.empty(0, dtype=torch.uint8)
         return super().__new__(cls, data=data, weight_loader=weight_loader)
 
@@ -1196,12 +1197,39 @@ class Exl3MoEParameter(BasevLLMParameter):
         num_experts: int = 0,
         shard_ids: tuple[str, ...] = (),
         preallocate: bool = False,
+        preallocate_groups: tuple[tuple[int, ...], ...] = (),
     ):
         self.exl3_tensors: dict[tuple[int, str], torch.Tensor] = {}
         self.exl3_backing: torch.Tensor | None = None
         self.exl3_num_experts = int(num_experts)
         self.exl3_shard_ids = tuple(shard_ids)
         self.exl3_preallocate = bool(preallocate)
+        self.exl3_preallocate_groups = tuple(
+            tuple(int(expert_id) for expert_id in group) for group in preallocate_groups
+        )
+        self.exl3_group_backings: list[torch.Tensor | None] = [
+            None for _ in self.exl3_preallocate_groups
+        ]
+        self._exl3_group_locations: dict[int, tuple[int, int]] = {}
+        for group_index, group in enumerate(self.exl3_preallocate_groups):
+            if not group:
+                raise ValueError("EXL3 preallocation groups cannot be empty")
+            for group_offset, expert_id in enumerate(group):
+                if expert_id in self._exl3_group_locations:
+                    raise ValueError(
+                        f"EXL3 expert {expert_id} appears in multiple "
+                        "preallocation groups"
+                    )
+                self._exl3_group_locations[expert_id] = (
+                    group_index,
+                    group_offset,
+                )
+        if self.exl3_preallocate_groups and set(self._exl3_group_locations) != set(
+            range(self.exl3_num_experts)
+        ):
+            raise ValueError(
+                "EXL3 preallocation groups must partition all experts exactly once"
+            )
         super().__init__(data=self.data, weight_loader=weight_loader)
 
     def load_exl3_weight(
@@ -1212,6 +1240,48 @@ class Exl3MoEParameter(BasevLLMParameter):
         shard_id: str,
     ) -> None:
         key = (int(expert_id), str(shard_id))
+        if self.exl3_preallocate_groups:
+            if shard_id not in self.exl3_shard_ids:
+                raise ValueError(
+                    f"invalid EXL3 grouped slab shard {shard_id!r}; "
+                    f"expected one of {self.exl3_shard_ids}"
+                )
+            try:
+                group_index, group_offset = self._exl3_group_locations[int(expert_id)]
+            except KeyError as exc:
+                raise ValueError(
+                    f"EXL3 expert {expert_id} has no preallocation group"
+                ) from exc
+            if self.device.type == "meta":
+                raise RuntimeError("rank-sliced EXL3 slabs cannot be allocated on meta")
+            backing = self.exl3_group_backings[group_index]
+            if backing is None:
+                group_size = len(self.exl3_preallocate_groups[group_index])
+                prefix = (
+                    (len(self.exl3_shard_ids), group_size)
+                    if len(self.exl3_shard_ids) > 1
+                    else (group_size,)
+                )
+                backing = torch.empty(
+                    prefix + tuple(loaded_weight.shape),
+                    dtype=loaded_weight.dtype,
+                    device=self.device,
+                )
+                self.exl3_group_backings[group_index] = backing
+            shard_index = self.exl3_shard_ids.index(shard_id)
+            target = (
+                backing[shard_index, group_offset]
+                if len(self.exl3_shard_ids) > 1
+                else backing[group_offset]
+            )
+            if tuple(target.shape) != tuple(loaded_weight.shape):
+                raise ValueError(
+                    "rank-sliced EXL3 tensor shape changed within one grouped slab: "
+                    f"expected={tuple(target.shape)}, got={tuple(loaded_weight.shape)}"
+                )
+            target.copy_(loaded_weight, non_blocking=True)
+            self.exl3_tensors[key] = target
+            return
         if not self.exl3_preallocate:
             self.exl3_tensors[key] = loaded_weight.contiguous()
             return
@@ -1249,6 +1319,32 @@ class Exl3MoEParameter(BasevLLMParameter):
             )
         target.copy_(loaded_weight, non_blocking=True)
         self.exl3_tensors[key] = target
+
+    def exl3_group_backing(self, expert_ids: tuple[int, ...]) -> torch.Tensor:
+        """Return a fully loaded tier slab in the requested expert order."""
+
+        expert_ids = tuple(int(expert_id) for expert_id in expert_ids)
+        try:
+            group_index = self.exl3_preallocate_groups.index(expert_ids)
+        except ValueError as exc:
+            raise ValueError(
+                f"EXL3 grouped slab has no exact expert tier {expert_ids}"
+            ) from exc
+        backing = self.exl3_group_backings[group_index]
+        if backing is None:
+            raise RuntimeError(f"EXL3 grouped slab {expert_ids} was never loaded")
+        expected = len(expert_ids) * len(self.exl3_shard_ids)
+        loaded = sum(
+            (expert_id, shard_id) in self.exl3_tensors
+            for expert_id in expert_ids
+            for shard_id in self.exl3_shard_ids
+        )
+        if loaded != expected:
+            raise RuntimeError(
+                f"EXL3 grouped slab {expert_ids} is incomplete: "
+                f"{loaded}/{expected} tensors"
+            )
+        return backing
 
 
 def _exl3_moe_weight_loader(
@@ -1358,6 +1454,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 str(layer.layer_name)
             )
             layer.exl3_mixed_bitrate = len(set(layer.exl3_layer_bitrates)) > 1
+        mixed_trellis_groups: tuple[tuple[int, ...], ...] = ()
+        if rank_sliced and getattr(layer, "exl3_mixed_bitrate", False):
+            mixed_trellis_groups = tuple(
+                tuple(
+                    expert_id
+                    for expert_id, expert_bits in enumerate(layer.exl3_layer_bitrates)
+                    if int(expert_bits) == bits
+                )
+                for bits in sorted(set(layer.exl3_layer_bitrates))
+            )
         for prefix, shard_ids in (("w13", ("w1", "w3")), ("w2", ("w2",))):
             for suffix in ("suh", "svh", "trellis", "mcg", "mul1"):
                 layer.register_parameter(
@@ -1372,6 +1478,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                             {"suh", "svh"}
                             if getattr(layer, "exl3_mixed_bitrate", False)
                             else {"suh", "svh", "trellis"}
+                        ),
+                        preallocate_groups=(
+                            mixed_trellis_groups if suffix == "trellis" else ()
                         ),
                     ),
                 )
@@ -1614,22 +1723,28 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         tier_ids = []
         for bits, expert_ids in tiers.items():
             expected_last = 16 * bits
-            w13 = torch.stack(
-                tuple(
-                    torch.stack(
-                        tuple(
-                            w13_param.exl3_tensors[(expert_id, shard_id)]
-                            for expert_id in expert_ids
+            if isinstance(w13_param, Exl3MoEParameter):
+                w13 = w13_param.exl3_group_backing(expert_ids)
+                w2 = w2_param.exl3_group_backing(expert_ids)
+            else:
+                # Compatibility for synthetic tests and older reload paths.
+                w13 = torch.stack(
+                    tuple(
+                        torch.stack(
+                            tuple(
+                                w13_param.exl3_tensors[(expert_id, shard_id)]
+                                for expert_id in expert_ids
+                            )
                         )
+                        for shard_id in w13_shards
                     )
-                    for shard_id in w13_shards
-                )
-            ).contiguous()
-            w2 = torch.stack(
-                tuple(
-                    w2_param.exl3_tensors[(expert_id, "w2")] for expert_id in expert_ids
-                )
-            ).contiguous()
+                ).contiguous()
+                w2 = torch.stack(
+                    tuple(
+                        w2_param.exl3_tensors[(expert_id, "w2")]
+                        for expert_id in expert_ids
+                    )
+                ).contiguous()
             expected_w13 = (
                 2,
                 len(expert_ids),
@@ -1708,6 +1823,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 param = getattr(layer, f"{prefix}_{suffix}")
                 param.exl3_tensors.clear()
                 param.exl3_backing = None
+                if isinstance(param, Exl3MoEParameter):
+                    param.exl3_group_backings[:] = [
+                        None for _ in param.exl3_preallocate_groups
+                    ]
         logger.info(
             "EXL3 mixed Trellis %s: tiers=%s",
             layer.layer_name,
