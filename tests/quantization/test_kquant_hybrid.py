@@ -54,6 +54,24 @@ def _qsrt_descriptor(**updates):
     return descriptor
 
 
+def _canonical_fruit_config() -> dict[str, object]:
+    return {
+        "hidden_size": 1024,
+        "moe_intermediate_size": 512,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 8,
+        "num_hidden_layers": 13,
+        "quantization_config": _base_config(
+            hybrid_bit_map={str(layer): [3] * 256 for layer in range(3, 14)},
+            demoted_format="qsrt_sqg_e4m3",
+            qsrt=_qsrt_descriptor(
+                schema="kquant_fruit_qsrt_atoms_v1",
+                runtime="w4a8",
+            ),
+        ),
+    }
+
+
 def _install_fake_b12x(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -230,6 +248,70 @@ def test_qsrt_w4a8_phase_gate(
     assert _is_decode_only_forward(m) is expected
 
 
+@pytest.mark.parametrize("metadata_shape", ("eager", "graph"))
+def test_qsrt_w4a8_phase_gate_normalizes_b12x_spec_decode_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_shape: str,
+) -> None:
+    # MTP verifies one expert token while the sparse-attention metadata
+    # represents the target plus draft rows as a two-token generic extend.
+    metadata = SimpleNamespace(
+        num_decode_tokens=0,
+        num_prefill_tokens=2,
+        is_spec_decode=True,
+    )
+    attn_metadata = (
+        {"attention": metadata}
+        if metadata_shape == "eager"
+        else [{"attention": metadata}, {}]
+    )
+    context = SimpleNamespace(additional_kwargs={}, attn_metadata=attn_metadata)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid."
+        "is_forward_context_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid.get_forward_context",
+        lambda: context,
+    )
+
+    assert _is_decode_only_forward(1)
+
+
+@pytest.mark.parametrize("metadata_shape", ("eager", "graph"))
+def test_qsrt_w4a8_phase_gate_rejects_mixed_spec_decode_and_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_shape: str,
+) -> None:
+    spec_decode = SimpleNamespace(
+        num_decode_tokens=0,
+        num_prefill_tokens=2,
+        is_spec_decode=True,
+    )
+    prompt_prefill = SimpleNamespace(
+        num_decode_tokens=0,
+        num_prefill_tokens=1,
+    )
+    attn_metadata = (
+        {"attention": spec_decode, "prompt_attention": prompt_prefill}
+        if metadata_shape == "eager"
+        else [{"attention": spec_decode}, {"prompt_attention": prompt_prefill}]
+    )
+    context = SimpleNamespace(additional_kwargs={}, attn_metadata=attn_metadata)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid."
+        "is_forward_context_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid.get_forward_context",
+        lambda: context,
+    )
+
+    assert not _is_decode_only_forward(1)
+
+
 def test_qsrt_w4a8_phase_gate_fails_closed_without_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -259,6 +341,94 @@ def test_qsrt_w4a8_dispatch_and_audit_predicate(
     expected: bool,
 ) -> None:
     assert _uses_fruit_w4a8(runtime, m, decode_only) is expected
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected_mode", "expected_decode"),
+    (
+        (
+            SimpleNamespace(
+                num_decode_tokens=0,
+                num_prefill_tokens=2,
+                is_spec_decode=True,
+            ),
+            "w4a8",
+            True,
+        ),
+        (
+            SimpleNamespace(
+                num_decode_tokens=0,
+                num_prefill_tokens=1,
+                is_spec_decode=False,
+            ),
+            "w4a16",
+            False,
+        ),
+    ),
+)
+def test_qsrt_mtp_dispatch_and_evidence_follow_normalized_phase(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: SimpleNamespace,
+    expected_mode: str,
+    expected_decode: bool,
+) -> None:
+    context = SimpleNamespace(
+        additional_kwargs={},
+        attn_metadata={"attention": metadata},
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid."
+        "is_forward_context_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid.get_forward_context",
+        lambda: context,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid."
+        "runtime_evidence_enabled",
+        True,
+    )
+    monkeypatch.delenv("B12X_MOE_REPEAT_CHECK", raising=False)
+    monkeypatch.delenv("VLLM_B12X_MOE_REPEAT_CHECK", raising=False)
+
+    dispatch_phases: list[bool] = []
+    evidence: list[tuple[object, str, bool, int]] = []
+
+    def apply_once(*args, decode_only: bool):
+        dispatch_phases.append(decode_only)
+        return args[1]
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid.record_layer_execution",
+        lambda *args: evidence.append(args),
+    )
+    method = _w4a8_method(_HybridSharedRuntime())
+    monkeypatch.setattr(method, "_apply_once", apply_once)
+    evidence_layer = object()
+    layer = SimpleNamespace(
+        hybrid_state=SimpleNamespace(
+            trellis_weights=(object(),),
+            uses_qsrt_atoms=True,
+            runtime_evidence_layer=evidence_layer,
+        )
+    )
+    x = torch.zeros((1, 1024), dtype=torch.float16)
+
+    assert (
+        method.apply(
+            layer,
+            x,
+            torch.ones((1, 2), dtype=torch.float32),
+            torch.zeros((1, 2), dtype=torch.int32),
+            None,
+            None,
+        )
+        is x
+    )
+    assert dispatch_phases == [expected_decode]
+    assert evidence == [(evidence_layer, expected_mode, expected_decode, 1)]
 
 
 def test_qsrt_backend_reports_both_missing_namespaces(monkeypatch) -> None:
@@ -370,14 +540,19 @@ def test_fruit_publication_anchor_comes_only_from_required_env(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    raw_config = _canonical_fruit_config()
     method = object.__new__(KQuantHybridMoEMethod)
-    method.quant_config = SimpleNamespace(shared_runtime=_HybridSharedRuntime())
+    method.quant_config = KQuantHybridConfig.from_config(
+        raw_config["quantization_config"]
+    )
     model_config = SimpleNamespace(model=str(tmp_path))
     monkeypatch.setattr(
         "vllm.config.get_current_vllm_config",
         lambda: SimpleNamespace(model_config=model_config),
     )
+    monkeypatch.setenv("FRUIT_QSRT_AUTHENTICATED_MODEL_ROOT", str(tmp_path))
     monkeypatch.delenv("FRUIT_QSRT_EXPECTED_COMPLETE_SHA256", raising=False)
+    monkeypatch.delenv("FRUIT_QSRT_EXPECTED_CANDIDATE_SHA256", raising=False)
 
     with pytest.raises(ValueError, match="FRUIT_QSRT_EXPECTED_COMPLETE_SHA256"):
         method._ensure_fruit_publication()
@@ -387,18 +562,115 @@ def test_fruit_publication_anchor_comes_only_from_required_env(
         method._ensure_fruit_publication()
 
     trusted = "a" * 64
-    publication = SimpleNamespace(root=tmp_path.resolve())
-    received: list[tuple[Path, str]] = []
+    publication = SimpleNamespace(
+        root=tmp_path.resolve(),
+        config=raw_config,
+    )
+    received: list[tuple[Path, dict[str, object]]] = []
     monkeypatch.setenv("FRUIT_QSRT_EXPECTED_COMPLETE_SHA256", trusted)
+    runtime_environment = {"MODE": "fixed"}
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid."
+        "active_runtime_environment_from_env",
+        lambda: runtime_environment,
+    )
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.kquant_hybrid.verify_qsrt_publication",
-        lambda root, *, expected_complete_sha256: (
-            received.append((Path(root), expected_complete_sha256)) or publication
-        ),
+        lambda root, **trust: received.append((Path(root), trust)) or publication,
     )
 
     assert method._ensure_fruit_publication() is publication
-    assert received == [(tmp_path, trusted)]
+    assert received == [
+        (
+            tmp_path,
+            {
+                "expected_complete_sha256": trusted,
+                "candidate_mode": False,
+                "expected_candidate_sha256": None,
+                "active_runtime_environment": runtime_environment,
+            },
+        )
+    ]
+
+
+def test_fruit_candidate_publication_requires_exclusive_explicit_trust(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    raw_config = _canonical_fruit_config()
+    method = object.__new__(KQuantHybridMoEMethod)
+    method.quant_config = KQuantHybridConfig.from_config(
+        raw_config["quantization_config"]
+    )
+    model_config = SimpleNamespace(model=str(tmp_path))
+    monkeypatch.setattr(
+        "vllm.config.get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=model_config),
+    )
+    monkeypatch.setenv("FRUIT_QSRT_AUTHENTICATED_MODEL_ROOT", str(tmp_path))
+    monkeypatch.setenv("FRUIT_QSRT_EXPECTED_CANDIDATE_SHA256", "A" * 64)
+    monkeypatch.delenv("FRUIT_QSRT_EXPECTED_COMPLETE_SHA256", raising=False)
+
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        method._ensure_fruit_publication()
+
+    trusted = "b" * 64
+    monkeypatch.setenv("FRUIT_QSRT_EXPECTED_CANDIDATE_SHA256", trusted)
+    monkeypatch.setenv("FRUIT_QSRT_EXPECTED_COMPLETE_SHA256", "a" * 64)
+    with pytest.raises(ValueError, match="exactly one"):
+        method._ensure_fruit_publication()
+
+    monkeypatch.delenv("FRUIT_QSRT_EXPECTED_COMPLETE_SHA256")
+    publication = SimpleNamespace(
+        root=tmp_path.resolve(),
+        config=raw_config,
+    )
+    received: list[tuple[Path, dict[str, object]]] = []
+    runtime_environment = {"MODE": "fixed"}
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid."
+        "active_runtime_environment_from_env",
+        lambda: runtime_environment,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid.verify_qsrt_publication",
+        lambda root, **trust: received.append((Path(root), trust)) or publication,
+    )
+
+    assert method._ensure_fruit_publication() is publication
+    assert received == [
+        (
+            tmp_path,
+            {
+                "expected_complete_sha256": None,
+                "candidate_mode": True,
+                "expected_candidate_sha256": trusted,
+                "active_runtime_environment": runtime_environment,
+            },
+        )
+    ]
+
+
+def test_authenticated_config_controls_fruit_dispatch() -> None:
+    raw_config = _canonical_fruit_config()
+    method = object.__new__(KQuantHybridMoEMethod)
+    method.quant_config = KQuantHybridConfig.from_config(
+        raw_config["quantization_config"]
+    )
+    method._reconcile_authenticated_dispatch(raw_config)
+
+    mutated = {
+        **raw_config,
+        "quantization_config": {
+            **raw_config["quantization_config"],
+            "hybrid_bit_map": {
+                **raw_config["quantization_config"]["hybrid_bit_map"],
+                "3": [4] + [3] * 255,
+            },
+        },
+    }
+    with pytest.raises(RuntimeError, match="authenticated config bytes"):
+        method._reconcile_authenticated_dispatch(mutated)
 
 
 def test_config_rejects_kimi_w4a8_runtime() -> None:
@@ -432,6 +704,7 @@ def test_fruit_w4a8_rejects_kept_experts_before_parameter_registration(
     )
     method = object.__new__(KQuantHybridMoEMethod)
     method.quant_config = config
+    monkeypatch.setattr(method, "_ensure_fruit_publication", lambda: object())
     layer = SimpleNamespace(
         activation=MoEActivation.SILU,
         layer_name="model.layers.1.mlp.experts",
@@ -788,7 +1061,6 @@ def test_w4a8_tuple_parts_accumulate_in_fp32(
 ) -> None:
     values = {0: 2048.0, 1: 1.0, 2: -2048.0}
     calls = []
-    kernel_output = torch.empty((32, 1024), dtype=torch.float32)
 
     def run_w4a8_parts(a, prepared_parts, weights, ids, scratch, **kwargs):
         calls.extend(part.marker for part in prepared_parts)

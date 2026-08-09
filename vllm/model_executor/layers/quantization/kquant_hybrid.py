@@ -20,6 +20,10 @@ from typing import TYPE_CHECKING, Any, cast
 import regex as re
 import torch
 
+from vllm.compilation.kquant_runtime_evidence import (
+    record_layer_execution,
+    runtime_evidence_enabled,
+)
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -51,7 +55,8 @@ from vllm.model_executor.layers.quantization.kquant_qsrt_atoms import (
     SUPPORTED_SCHEMAS as QSRT_ATOM_SCHEMAS,
 )
 from vllm.model_executor.layers.quantization.kquant_qsrt_publication import (
-    expected_complete_sha256_from_env,
+    active_runtime_environment_from_env,
+    publication_trust_from_env,
     verify_qsrt_publication,
 )
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
@@ -91,20 +96,58 @@ def _is_decode_only_forward(m: int) -> bool:
     if isinstance(cached, tuple) and cached[0] == m:
         return bool(cached[1])
     metadata_by_layer = context.attn_metadata
-    if not isinstance(metadata_by_layer, dict) or not metadata_by_layer:
-        result = False
+    phase_counts: set[tuple[int, bool, bool]] = set()
+    valid_metadata = True
+    if isinstance(metadata_by_layer, dict) and metadata_by_layer:
+        metadata_groups = (metadata_by_layer,)
+    elif isinstance(metadata_by_layer, list) and metadata_by_layer:
+        metadata_groups = metadata_by_layer
     else:
-        phase_counts: set[tuple[int, int]] = set()
-        for metadata in metadata_by_layer.values():
+        metadata_groups = ()
+        valid_metadata = False
+
+    for metadata_group in metadata_groups:
+        if not isinstance(metadata_group, dict):
+            valid_metadata = False
+            break
+        for metadata in metadata_group.values():
             num_decode = getattr(metadata, "num_decode_tokens", None)
             num_prefill = getattr(metadata, "num_prefill_tokens", None)
-            if isinstance(num_decode, int) and isinstance(num_prefill, int):
-                phase_counts.add((num_decode, num_prefill))
-        result = (
-            len(phase_counts) == 1
-            and next(iter(phase_counts))[1] == 0
-            and 0 < next(iter(phase_counts))[0] <= m
+            is_spec_decode = getattr(metadata, "is_spec_decode", False)
+            if (
+                not isinstance(num_decode, int)
+                or isinstance(num_decode, bool)
+                or not isinstance(num_prefill, int)
+                or isinstance(num_prefill, bool)
+                or not isinstance(is_spec_decode, bool)
+                or num_decode < 0
+                or num_prefill < 0
+            ):
+                valid_metadata = False
+                break
+
+            # B12xMLASparseMetadata reports multi-token target verification
+            # through the generic prefill counters. Its explicit marker is
+            # authoritative that those rows have completed their prompts.
+            # Preserve unmarked prefill evidence so mixed/contradictory
+            # metadata fails closed when all layer views are reconciled.
+            effective_decode = (
+                num_decode + num_prefill if is_spec_decode else num_decode
+            )
+            has_prompt_prefill = num_prefill > 0 and not is_spec_decode
+            phase_counts.add((effective_decode, has_prompt_prefill, is_spec_decode))
+        if not valid_metadata:
+            break
+    result = (
+        valid_metadata
+        and bool(phase_counts)
+        and all(
+            not has_prompt_prefill
+            and num_decode > 0
+            and (is_spec_decode or num_decode <= m)
+            for num_decode, has_prompt_prefill, is_spec_decode in phase_counts
         )
+    )
     context.additional_kwargs["kquant_qsrt_decode_only"] = (m, result)
     return result
 
@@ -350,6 +393,7 @@ class _HybridLayerState:
         self.trellis_plan: Any = None
         self.w4a8_scratch_geometry: tuple[int, int, int, bool] | None = None
         self.trellis_output_accum_key: tuple[int, int, torch.device] | None = None
+        self.runtime_evidence_layer: int | None = None
         self.runtime_ready = False
 
 
@@ -622,18 +666,79 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         publication = self.quant_config.shared_runtime.qsrt_publication
         from vllm.config import get_current_vllm_config
 
-        model_root = Path(get_current_vllm_config().model_config.model)
-        if publication is not None:
-            if publication.root != model_root.resolve():
-                raise RuntimeError("QSRT shared runtime cannot mix model roots")
-            return publication
-        expected_digest = expected_complete_sha256_from_env()
-        publication = verify_qsrt_publication(
-            model_root,
-            expected_complete_sha256=expected_digest,
-        )
-        self.quant_config.shared_runtime.qsrt_publication = publication
+        model_root = Path(get_current_vllm_config().model_config.model).resolve()
+        authenticated_root = os.environ.get("FRUIT_QSRT_AUTHENTICATED_MODEL_ROOT")
+        if (
+            authenticated_root is None
+            or Path(authenticated_root).resolve() != model_root
+        ):
+            raise RuntimeError(
+                "Fruit QSRT requires the launcher's authenticated private "
+                "model snapshot"
+            )
+        if publication is None:
+            candidate_mode, expected_digest = publication_trust_from_env()
+            active_runtime_environment = active_runtime_environment_from_env()
+            publication = verify_qsrt_publication(
+                model_root,
+                expected_complete_sha256=(None if candidate_mode else expected_digest),
+                candidate_mode=candidate_mode,
+                expected_candidate_sha256=(expected_digest if candidate_mode else None),
+                active_runtime_environment=active_runtime_environment,
+            )
+            self.quant_config.shared_runtime.qsrt_publication = publication
+        elif publication.root != model_root:
+            raise RuntimeError("QSRT shared runtime cannot mix model roots")
+        self._reconcile_authenticated_dispatch(publication.config)
         return publication
+
+    def _reconcile_authenticated_dispatch(
+        self, authenticated_config: dict[str, Any]
+    ) -> None:
+        sealed_quantization = authenticated_config.get("quantization_config")
+        if not isinstance(sealed_quantization, dict):
+            raise RuntimeError("authenticated Fruit config has no quantization_config")
+        sealed_map, sealed_kept = _read_hybrid_keys(sealed_quantization)
+        sealed_qsrt = sealed_quantization.get("qsrt")
+        sealed_demoted = sealed_quantization.get("demoted_format")
+        nested = sealed_quantization.get("quantization")
+        if isinstance(nested, dict):
+            if sealed_qsrt is None:
+                sealed_qsrt = nested.get("qsrt")
+            if sealed_demoted is None:
+                sealed_demoted = nested.get("demoted_format")
+        sealed_runtime = (
+            str(sealed_qsrt.get("runtime", "w4a16")).lower()
+            if isinstance(sealed_qsrt, dict)
+            else None
+        )
+        expected_map = {str(layer): [3] * 256 for layer in range(3, 14)}
+        canonical_qsrt = (
+            isinstance(sealed_qsrt, dict)
+            and sealed_qsrt.get("schema") == FRUIT_QSRT_ATOM_SCHEMA
+            and sealed_qsrt.get("storage_format") == "qsrt_atoms_v1"
+            and sealed_qsrt.get("encoding") == "qsrt_sqg_e4m3"
+            and sealed_qsrt.get("codebook") == "sqg_xor_cheb_t12"
+            and sealed_qsrt.get("profile_id") == 1
+            and sealed_runtime == "w4a8"
+        )
+        if (
+            authenticated_config.get("hidden_size") != 1024
+            or authenticated_config.get("moe_intermediate_size") != 512
+            or authenticated_config.get("n_routed_experts") != 256
+            or authenticated_config.get("num_experts_per_tok") != 8
+            or authenticated_config.get("num_hidden_layers") != 13
+            or sealed_map != expected_map
+            or not canonical_qsrt
+            or sealed_map != self.quant_config.hybrid_bit_map
+            or sealed_kept != self.quant_config.kept_format
+            or sealed_demoted != self.quant_config.demoted_format
+            or sealed_qsrt != self.quant_config.qsrt
+            or sealed_runtime != self.quant_config.qsrt_runtime
+        ):
+            raise RuntimeError(
+                "Fruit quantization dispatch disagrees with authenticated config bytes"
+            )
 
     def create_weights(
         self,
@@ -650,6 +755,10 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 "kquant_hybrid only supports SiLU/SiTU-gated MoE layers, got "
                 f"{layer.activation}."
             )
+        if (self.quant_config.qsrt or {}).get("schema") == FRUIT_QSRT_ATOM_SCHEMA:
+            # Reconcile all allocation/dispatch inputs with the authenticated
+            # snapshot before inspecting the hybrid map or allocating storage.
+            self._ensure_fruit_publication()
         bits = self._layer_bits(layer)
         mapped_layer = bits is not None
         kept_mx = mapped_layer and self.quant_config.kept_format == "mxfp4_e8m0k32"
@@ -680,6 +789,9 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             **{e: (1, i) for i, e in enumerate(demoted)},
         }
         state = _HybridLayerState(remap, hidden, inter, num_experts, kept_mx)
+        layer_match = re.search(r"layers\.(\d+)\b", layer.layer_name)
+        if layer_match is not None:
+            state.runtime_evidence_layer = int(layer_match.group(1))
         qsrt_storage = (
             str((self.quant_config.qsrt or {}).get("storage_format", ""))
             if mapped_layer and self.quant_config.demoted_format == "qsrt_sqg_e4m3"
@@ -707,8 +819,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             if self.quant_config.qsrt_runtime == "w4a8" and kept:
                 raise ValueError("Fruit W4A8 does not support a hybrid kept tier")
             if (self.quant_config.qsrt or {}).get("schema") == FRUIT_QSRT_ATOM_SCHEMA:
-                # Authenticate before checkpoint dispatch can load any weights.
-                self._ensure_fruit_publication()
+                assert self.quant_config.shared_runtime.qsrt_publication is not None
             placeholder = torch.nn.Parameter(
                 torch.empty(
                     (0,),
@@ -2171,6 +2282,9 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             )
             else "w4a16"
         )
+        state: _HybridLayerState = layer.hybrid_state
+        trellis_weights = state.trellis_weights
+        part_count = len(trellis_weights) if isinstance(trellis_weights, tuple) else 1
 
         output = self._apply_once(
             layer,
@@ -2181,6 +2295,13 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             shared_experts_input,
             decode_only=decode_only,
         )
+        if runtime_evidence_enabled and state.uses_qsrt_atoms:
+            record_layer_execution(
+                state.runtime_evidence_layer,
+                executed_mode,
+                decode_only,
+                part_count,
+            )
         repeat_enabled = (
             os.getenv("B12X_MOE_REPEAT_CHECK", "0") == "1"
             or os.getenv("VLLM_B12X_MOE_REPEAT_CHECK", "0") == "1"

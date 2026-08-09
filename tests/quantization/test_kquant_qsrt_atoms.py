@@ -11,12 +11,14 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from vllm.model_executor.layers.quantization import kquant_qsrt_publication
 from vllm.model_executor.layers.quantization.kquant_qsrt_atoms import (
     FRUIT_SCHEMA,
     KIMI_K3_SCHEMA,
     balanced_atom_partition,
     open_qsrt_atom_extent,
     read_qsrt_atom_layer_metadata,
+    snapshot_qsrt_publication,
     verify_qsrt_publication,
 )
 
@@ -172,6 +174,288 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _write_runtime_qualification(root: Path, manifest: dict[str, object]) -> None:
+    tensor_paths = sorted(root.glob("*.safetensors"))
+    tensor_digests = {path.name: _sha256(path) for path in tensor_paths}
+    tensor_set_digest = hashlib.sha256(
+        (json.dumps(tensor_digests, indent=2, sort_keys=True) + "\n").encode()
+    ).hexdigest()
+    revisions = {
+        "vllm_revision": "5" * 40,
+        "b12x_revision": "6" * 40,
+        "kquant_revision": "7" * 40,
+    }
+
+    def runtime(arm: str) -> dict[str, object]:
+        model_options = {
+            "bf16": ["--load-format", "fastsafetensors"],
+            "siq": ["--load-format", "fastsafetensors"],
+            "qsrt": [
+                "--quantization",
+                "kquant_hybrid",
+                "--load-format",
+                "fastsafetensors",
+            ],
+        }
+        runtime_revisions = (
+            revisions
+            if arm == "qsrt"
+            else {
+                "vllm_revision": "c" * 40,
+                "b12x_revision": "d" * 40,
+                "kquant_revision": "e" * 40,
+            }
+        )
+        return {
+            "image": (
+                f"registry.invalid/fruit-final@sha256:{'8' * 64}"
+                if arm == "qsrt"
+                else f"registry.invalid/fruit-r28@sha256:{'b' * 64}"
+            ),
+            **runtime_revisions,
+            "argv": [
+                "vllm",
+                "serve",
+                "/model",
+                "--served-model-name",
+                "GLM-5.2-QSRT-Fruit-Instruct",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "8000",
+                "--tensor-parallel-size",
+                "1",
+                "--pipeline-parallel-size",
+                "1",
+                *model_options[arm],
+                "--attention-backend",
+                "B12X_MLA_SPARSE",
+                "--moe-backend",
+                "b12x",
+                "--kv-cache-dtype",
+                "nvfp4_ds_mla",
+                "--enable-chunked-prefill",
+                "--enable-prefix-caching",
+                "--compilation-config",
+                '{"backend":"inductor","cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,20,24,32,48,64],"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}',
+                "--speculative-config",
+                '{"method":"mtp","num_speculative_tokens":1}',
+                "--gpu-memory-utilization",
+                "0.80",
+                "--max-model-len",
+                "4096",
+                "--max-num-batched-tokens",
+                "4096",
+                "--max-num-seqs",
+                "1",
+                "--tool-call-parser",
+                "glm47",
+                "--enable-auto-tool-choice",
+                "--reasoning-parser",
+                "glm45",
+                "--generation-config",
+                "vllm",
+            ],
+            "environment": dict(kquant_qsrt_publication._FIXED_RUNTIME_ENVIRONMENT),
+            "software": {"torch": "final" if arm == "qsrt" else "r28"},
+            "compilation_backend": "inductor",
+            "cudagraph_mode": "FULL_AND_PIECEWISE",
+        }
+
+    bf16_model = {
+        "repository": "malaiwah/GLM-5.2-SIQ-Fruit-Instruct-bf16",
+        "revision": "678954f65e056a0f508e21eeb9251c655bb9463f",
+        "manifest_sha256": (
+            "8f23aed5e9b12000ed103a76da772a20730ca53ab7e352d6cb94da2709165245"
+        ),
+        "config_sha256": (
+            "1b1ea852c2bea8644774ec795025df2d0247b67131bccc8bf7e1137699518d55"
+        ),
+        "model_index_sha256": (
+            "86e6cc1d8548c7bdbbc117e93b85b8ae249f446de9b48d2195e51f358674ba56"
+        ),
+        "safetensors_bytes": 10_081_800_232,
+        "safetensors_sha256": (
+            "01fb6ad26356fc22f07f2598385b132db59df4eddd92bc005dfc0622284ee12b"
+        ),
+    }
+    siq_model = {
+        "repository": "malaiwah/GLM-5.2-SIQ-Fruit-Instruct",
+        "revision": "48452ef397d8b4a4d6d0c00ea376a2abb3ef6314",
+        "manifest_sha256": (
+            "ac5485e2552f54850eebfecf11e23f3f640c391ed335d06562f91eb34f613639"
+        ),
+        "config_sha256": (
+            "9d137e2b59fff529eb122581b0bce6eb7ace458a0785368d2ba587b4a5c2aa6f"
+        ),
+        "model_index_sha256": (
+            "5808a4b3e75c4a949a1ede42e6c6fb2576089ec1544038b77de24076e99bf3da"
+        ),
+        "safetensors_bytes": 3_102_116_152,
+        "safetensors_sha256": (
+            "9c6c5c2c07eeb3aed026db4f6c5fc208dc04272304ba4f39ea9d23a31f9012b5"
+        ),
+    }
+    qsrt_model = {
+        "repository": "malaiwah/GLM-5.2-QSRT-Fruit-Instruct",
+        "revision": "9" * 40,
+        "manifest_sha256": "a" * 64,
+        "config_sha256": _sha256(root / "config.json"),
+        "model_index_sha256": _sha256(root / "model.safetensors.index.json"),
+        "safetensors_bytes": sum(path.stat().st_size for path in tensor_paths),
+        "safetensors_sha256": tensor_set_digest,
+    }
+
+    def loader(arm: str) -> dict[str, object]:
+        return {
+            "runtime": runtime(arm),
+            "log_line": "loaded",
+            "weight_bytes": 1,
+            "peak_activation_bytes": 0,
+            "non_torch_bytes": 0,
+            "cudagraph_bytes": 1,
+            "kv_cache_bytes": 1,
+            "load_seconds": 1.0,
+            "torch_allocated_bytes": 0,
+            "torch_reserved_bytes": 0,
+            "nvml_used_bytes": 0,
+        }
+
+    runs = [
+        {
+            "prompt_id": "decode",
+            "repetition": repetition,
+            "http_status": 200,
+            "elapsed_seconds": 1.0,
+            "completion_tokens": 1,
+            "tokens_per_second": 1.0,
+            "finish_reason": "stop",
+            "content": "ok",
+        }
+        for repetition in (1, 2, 3)
+    ]
+    fidelity_candidate = {
+        "mean_forward_kl": 0.0,
+        "max_forward_kl": 0.0,
+        "top1_agreement": 1.0,
+        "top10_agreement": 1.0,
+        "per_position": [
+            {
+                "position": 0,
+                "forward_kl": 0.0,
+                "top1_agreement": True,
+                "top10_agreement": True,
+            }
+        ],
+    }
+    qualification = {
+        "schema": "kquant_fruit_runtime_qualification_v1",
+        "version": 1,
+        "complete": True,
+        "publication": {
+            "variant": "instruct",
+            "repository": "malaiwah/GLM-5.2-QSRT-Fruit-Instruct",
+        },
+        "producer": manifest["producer"],
+        "source": manifest["source"],
+        "candidate": {
+            "marker_sha256": "b" * 64,
+            "model_index_sha256": _sha256(root / "model.safetensors.index.json"),
+            "safetensors_sha256": tensor_digests,
+        },
+        "environment": {
+            "gpu_model": "test GPU",
+            "gpu_driver": "test driver",
+            "host": "test host",
+        },
+        "protocol": {
+            "tensor_parallel_size": 1,
+            "max_num_seqs": 1,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "repetitions": 3,
+            "prompt_id": "decode",
+            "prompt": "test",
+            "prompt_token_ids": [1],
+            "launch_order": ["bf16", "siq", "qsrt"],
+        },
+        "runtime_paths": {
+            "schema": "kquant_fruit_runtime_paths_v1",
+            "version": 1,
+            "layers": {
+                **{
+                    str(layer): {
+                        "prefill": {
+                            "mode": "w4a16",
+                            "calls": 1,
+                        },
+                        "decode": {
+                            "mode": "w4a8",
+                            "calls": 1,
+                            "part_count": 2,
+                            "capture_calls": 1,
+                            "replay_calls": 1,
+                        },
+                    }
+                    for layer in range(3, 13)
+                },
+                "13": {
+                    "mtp_decode": {
+                        "mode": "w4a8",
+                        "calls": 1,
+                        "part_count": 2,
+                        "capture_calls": 1,
+                        "replay_calls": 1,
+                    }
+                },
+            },
+            "cudagraph": {
+                "mode": "FULL_AND_PIECEWISE",
+                "capture_count": 1,
+                "replay_count": 1,
+            },
+            "speculative": {
+                "method": "mtp",
+                "num_speculative_tokens": 1,
+                "draft_tokens": 1,
+            },
+        },
+        "loaders": {arm: loader(arm) for arm in ("bf16", "siq", "qsrt")},
+        "models": {"bf16": bf16_model, "siq": siq_model, "qsrt": qsrt_model},
+        "decode": {arm: runs for arm in ("bf16", "siq", "qsrt")},
+        "generation": {
+            "prompts": [
+                {"id": "generation", "prompt": "test", "prompt_token_ids": [1]}
+            ],
+            "results": {
+                arm: [{"prompt_id": "generation", "content": "ok"}]
+                for arm in ("bf16", "siq", "qsrt")
+            },
+        },
+        "fidelity": {
+            "full_vocabulary": True,
+            "positions": [0],
+            "vocab_size": 11,
+            "candidates": {
+                "siq": fidelity_candidate,
+                "qsrt": fidelity_candidate,
+            },
+        },
+    }
+    receipt = root / "evaluation" / "fruit-runtime-qualification.json"
+    receipt.parent.mkdir(exist_ok=True)
+    receipt.write_text(
+        json.dumps(qualification, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest["evaluation"] = {
+        "runtime_qualification": {
+            "file": "evaluation/fruit-runtime-qualification.json",
+            "sha256": _sha256(receipt),
+        }
+    }
+
+
 def _verify_publication(root: Path):
     return verify_qsrt_publication(
         root,
@@ -199,48 +483,117 @@ def _write_test_publication(
         "source_sha256": source_sha256,
         "runtime": "w4a8",
     }
-    (root / "config.json").write_text(
-        json.dumps({"quantization_config": {"qsrt": descriptor}}),
+    hybrid_map = {str(layer): [3] * 256 for layer in range(3, 14)}
+    config = {
+        "hidden_size": 1024,
+        "moe_intermediate_size": 512,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 8,
+        "num_hidden_layers": 13,
+        "quantization_config": {
+            "hybrid_bit_map": hybrid_map,
+            "kept_format": "mxfp4_e8m0k32",
+            "demoted_format": "qsrt_sqg_e4m3",
+            "qsrt": descriptor,
+        },
+    }
+    (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    base_weight = root / "model-00001-of-00001.safetensors"
+    base_weight.write_bytes(b"sealed base weight")
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.weight": base_weight.name}}),
         encoding="utf-8",
     )
-    (root / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {}}), encoding="utf-8"
-    )
+    (root / "tokenizer.json").write_text('{"sealed":true}', encoding="utf-8")
+    layers: dict[str, object] = {}
+    for layer in range(3, 14):
+        atom = root / f"qsrt-layer-{layer:03d}.safetensors"
+        atom.write_bytes(
+            b"sealed atom payload" if layer == 3 else f"layer {layer}".encode()
+        )
+        evidence = root / f"qsrt-layer-{layer:03d}.json"
+        evidence.write_text("{}", encoding="utf-8")
+        layers[str(layer)] = {
+            "qsrt_atoms": atom.name,
+            "bytes": atom.stat().st_size,
+            "sha256": _sha256(atom),
+            "expert_count": 256,
+            "evidence": evidence.name,
+        }
     manifest: dict[str, object] = {
         "schema": "kquant_qsrt_model_manifest_v1",
         "version": 1,
+        "publication": {
+            "variant": "instruct",
+            "repository": "malaiwah/GLM-5.2-QSRT-Fruit-Instruct",
+        },
         "codec": "QSRT",
         "storage_schema": FRUIT_SCHEMA,
         "encoding": "qsrt_sqg_e4m3",
         "codebook": "sqg_xor_cheb_t12",
         "profile_id": 1,
         "complete": True,
+        "geometry": {
+            "layers": list(range(3, 14)),
+            "experts_per_layer": 256,
+            "hidden_size": 1024,
+            "intermediate_size": 512,
+            "topk": 8,
+        },
+        "runtime": {
+            "tensor_parallel": "whole_atom_partition",
+            "validated_tensor_parallel_sizes": [1],
+            "decode": "trellis_w4a8",
+            "decode_max_tokens": 16,
+            "fallback": "trellis_w4a16",
+            "prefill": "trellis_w4a16",
+        },
         "producer": {
             "fingerprint": producer_fingerprint,
-            "encoder": {"fingerprint": encoder_fingerprint},
+            "encoder": {
+                "fingerprint": encoder_fingerprint,
+                "kquant_revision": "7" * 40,
+            },
+            "runtime": {
+                "vllm_revision": "5" * 40,
+                "b12x_revision": "6" * 40,
+            },
         },
         "source": {
             "source_kind": "safetensors_manifest",
             "source_sha256": source_sha256,
         },
         "base_model": {"manifest_sha256": base_manifest_sha256},
-        "layers": {},
+        "layers": layers,
     }
+    _write_runtime_qualification(root, manifest)
     (root / "qsrt-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    payload = root / "qsrt-layer-003.safetensors"
-    payload.write_bytes(b"sealed atom payload")
-    checked = (
-        "config.json",
-        "model.safetensors.index.json",
-        "qsrt-layer-003.safetensors",
-        "qsrt-manifest.json",
+    checked = sorted(
+        [
+            "config.json",
+            "model.safetensors.index.json",
+            "evaluation/fruit-runtime-qualification.json",
+            "qsrt-manifest.json",
+            *[f"qsrt-layer-{layer:03d}.json" for layer in range(3, 14)],
+            "tokenizer.json",
+            "model-00001-of-00001.safetensors",
+            *[f"qsrt-layer-{layer:03d}.safetensors" for layer in range(3, 14)],
+        ]
     )
     (root / "MANIFEST.sha256").write_text(
         "".join(f"{_sha256(root / name)}  {name}\n" for name in checked),
         encoding="utf-8",
     )
     marker = {
-        "schema": "kquant_qsrt_complete_v2",
+        "schema": "kquant_qsrt_complete_v3",
+        "publication": {
+            "variant": "instruct",
+            "repository": "malaiwah/GLM-5.2-QSRT-Fruit-Instruct",
+        },
+        "qualified_candidate_sha256": "b" * 64,
+        "runtime_qualification_sha256": _sha256(
+            root / "evaluation/fruit-runtime-qualification.json"
+        ),
         "package_manifest_sha256": _sha256(root / "qsrt-manifest.json"),
         "checksum_manifest_sha256": _sha256(root / "MANIFEST.sha256"),
         "model_index_sha256": _sha256(root / "model.safetensors.index.json"),
@@ -253,14 +606,207 @@ def _write_test_publication(
         "encoder_fingerprint": encoder_fingerprint,
     }
     (root / "QSRT_COMPLETE.json").write_text(json.dumps(marker), encoding="utf-8")
-    return manifest, descriptor, payload
+    return manifest, descriptor, root / "qsrt-layer-003.safetensors"
+
+
+def _convert_test_publication_to_candidate(root: Path) -> None:
+    (root / "QSRT_COMPLETE.json").unlink()
+    receipt = root / "evaluation" / "fruit-runtime-qualification.json"
+    receipt.unlink()
+    receipt.parent.rmdir()
+    manifest_path = root / "qsrt-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["complete"] = False
+    manifest["evaluation"] = {}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    checksum_path = root / "MANIFEST.sha256"
+    names = [
+        line.partition("  ")[2]
+        for line in checksum_path.read_text(encoding="utf-8").splitlines()
+        if line.partition("  ")[2] != "evaluation/fruit-runtime-qualification.json"
+    ]
+    checksum_path.write_text(
+        "".join(f"{_sha256(root / name)}  {name}\n" for name in names),
+        encoding="utf-8",
+    )
+    complete_fields = {
+        "schema": "kquant_qsrt_candidate_v1",
+        "publication": {
+            "variant": "instruct",
+            "repository": "malaiwah/GLM-5.2-QSRT-Fruit-Instruct",
+        },
+        "package_manifest_sha256": _sha256(manifest_path),
+        "checksum_manifest_sha256": _sha256(checksum_path),
+        "model_index_sha256": _sha256(root / "model.safetensors.index.json"),
+        "source": {
+            "kind": "safetensors_manifest",
+            "sha256": "3" * 64,
+        },
+        "base_manifest_sha256": "4" * 64,
+        "producer_fingerprint": "1" * 64,
+        "encoder_fingerprint": "2" * 64,
+    }
+    (root / "QSRT_CANDIDATE.json").write_text(
+        json.dumps(complete_fields), encoding="utf-8"
+    )
+
+
+def test_active_runtime_environment_requires_canonical_fixed_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = kquant_qsrt_publication._FIXED_RUNTIME_ENVIRONMENT
+    canonical = json.dumps(environment, separators=(",", ":"), sort_keys=True)
+    monkeypatch.setenv("FRUIT_QSRT_RUNTIME_ENVIRONMENT_JSON", canonical)
+    monkeypatch.setenv(
+        "FRUIT_QSRT_RUNTIME_ENVIRONMENT_SHA256",
+        hashlib.sha256(canonical.encode()).hexdigest(),
+    )
+
+    assert kquant_qsrt_publication.active_runtime_environment_from_env() == environment
+
+    hostile = json.dumps(
+        {**environment, "VLLM_USE_V1": "1"},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    monkeypatch.setenv("FRUIT_QSRT_RUNTIME_ENVIRONMENT_JSON", hostile)
+    monkeypatch.setenv(
+        "FRUIT_QSRT_RUNTIME_ENVIRONMENT_SHA256",
+        hashlib.sha256(hostile.encode()).hexdigest(),
+    )
+    with pytest.raises(ValueError, match="fixed deployment contract"):
+        kquant_qsrt_publication.active_runtime_environment_from_env()
+
+
+def test_candidate_requires_explicit_mode_and_independent_digest(
+    tmp_path: Path,
+) -> None:
+    _write_test_publication(tmp_path)
+    _convert_test_publication_to_candidate(tmp_path)
+    candidate_digest = _sha256(tmp_path / "QSRT_CANDIDATE.json")
+
+    with pytest.raises((FileNotFoundError, ValueError)):
+        verify_qsrt_publication(
+            tmp_path,
+            expected_complete_sha256=candidate_digest,
+        )
+    with pytest.raises(ValueError, match="expected candidate marker"):
+        verify_qsrt_publication(tmp_path, candidate_mode=True)
+    with pytest.raises(ValueError, match="trusted digest"):
+        verify_qsrt_publication(
+            tmp_path,
+            candidate_mode=True,
+            expected_candidate_sha256="0" * 64,
+        )
+
+    seal = verify_qsrt_publication(
+        tmp_path,
+        candidate_mode=True,
+        expected_candidate_sha256=candidate_digest,
+    )
+    assert seal.qualification == {}
+    seal.close()
+
+
+def test_production_receipt_binds_qualified_candidate_marker(tmp_path: Path) -> None:
+    _write_test_publication(tmp_path)
+    receipt_path = tmp_path / "evaluation/fruit-runtime-qualification.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["candidate"]["marker_sha256"] = "c" * 64
+    receipt_path.write_text(
+        json.dumps(receipt, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "qsrt-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["evaluation"]["runtime_qualification"]["sha256"] = _sha256(receipt_path)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _reseal_publication_identity(tmp_path)
+
+    with pytest.raises(ValueError, match="candidate identity"):
+        _verify_publication(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "omitted_kv_cache",
+        "mutated_custom_ops",
+        "eager_qsrt",
+        "wrong_variant",
+        "wrong_comparator",
+        "negative_prefix_caching",
+        "negative_chunked_prefill",
+        "unknown_flag",
+        "positional_extra",
+        "duplicate_option",
+        "changed_environment",
+        "same_extra_environment",
+        "production_environment_drift",
+    ),
+)
+def test_publication_rejects_mutated_fixed_qualification_contract(
+    tmp_path: Path, mutation: str
+) -> None:
+    _write_test_publication(tmp_path)
+    receipt_path = tmp_path / "evaluation/fruit-runtime-qualification.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if mutation == "omitted_kv_cache":
+        argv = receipt["loaders"]["bf16"]["runtime"]["argv"]
+        index = argv.index("--kv-cache-dtype")
+        del argv[index : index + 2]
+    elif mutation == "mutated_custom_ops":
+        argv = receipt["loaders"]["siq"]["runtime"]["argv"]
+        index = argv.index("--compilation-config")
+        config = json.loads(argv[index + 1])
+        config["custom_ops"] = []
+        argv[index + 1] = json.dumps(config, separators=(",", ":"), sort_keys=True)
+    elif mutation == "eager_qsrt":
+        receipt["loaders"]["qsrt"]["runtime"]["compilation_backend"] = "eager"
+    elif mutation == "wrong_variant":
+        receipt["publication"]["variant"] = "annealed"
+    elif mutation == "wrong_comparator":
+        receipt["models"]["bf16"]["repository"] = "malaiwah/wrong"
+    elif mutation == "changed_environment":
+        receipt["loaders"]["siq"]["runtime"]["environment"]["CUDA_VISIBLE_DEVICES"] = (
+            "1"
+        )
+    elif mutation == "same_extra_environment":
+        for arm in ("bf16", "siq", "qsrt"):
+            receipt["loaders"][arm]["runtime"]["environment"][
+                "VLLM_FAKE_PRODUCTION_TOGGLE"
+            ] = "1"
+    elif mutation == "production_environment_drift":
+        for arm in ("bf16", "siq", "qsrt"):
+            receipt["loaders"][arm]["runtime"]["environment"]["PYTHONSAFEPATH"] = "0"
+    else:
+        argv = receipt["loaders"]["qsrt"]["runtime"]["argv"]
+        extras = {
+            "negative_prefix_caching": ["--no-enable-prefix-caching"],
+            "negative_chunked_prefill": ["--no-enable-chunked-prefill"],
+            "unknown_flag": ["--unknown-qualification-flag"],
+            "positional_extra": ["unexpected-positional"],
+            "duplicate_option": ["--max-num-seqs", "1"],
+        }
+        argv.extend(extras[mutation])
+    receipt_path.write_text(
+        json.dumps(receipt, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "qsrt-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["evaluation"]["runtime_qualification"]["sha256"] = _sha256(receipt_path)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _reseal_publication_identity(tmp_path)
+
+    with pytest.raises(ValueError):
+        _verify_publication(tmp_path)
 
 
 def test_verifies_complete_qsrt_publication_and_rejects_mutation(
     tmp_path: Path,
 ) -> None:
     manifest, descriptor, payload = _write_test_publication(tmp_path)
-
     seal = _verify_publication(tmp_path)
     assert seal.manifest == manifest
     assert seal.descriptor == descriptor
@@ -269,6 +815,74 @@ def test_verifies_complete_qsrt_publication_and_rejects_mutation(
     with pytest.raises(ValueError, match="package hash mismatch"):
         _verify_publication(tmp_path)
     seal.close()
+
+
+def test_publication_requires_matched_tp1_runtime_receipt(tmp_path: Path) -> None:
+    _write_test_publication(tmp_path)
+    receipt = tmp_path / "evaluation" / "fruit-runtime-qualification.json"
+    qualification = json.loads(receipt.read_text(encoding="utf-8"))
+    qualification["protocol"]["max_num_seqs"] = 2
+    receipt.write_text(
+        json.dumps(qualification, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "qsrt-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["evaluation"]["runtime_qualification"]["sha256"] = _sha256(receipt)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _reseal_publication_identity(tmp_path)
+
+    with pytest.raises(ValueError, match="matched TP1 protocol"):
+        _verify_publication(tmp_path)
+
+
+def test_private_snapshot_is_immune_to_later_source_mutation(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    private = tmp_path / "private"
+    source.mkdir()
+    private.mkdir(mode=0o700)
+    _write_test_publication(source)
+    trusted = _sha256(source / "QSRT_COMPLETE.json")
+
+    seal = snapshot_qsrt_publication(
+        source,
+        private / "model",
+        expected_complete_sha256=trusted,
+    )
+    authenticated_config = seal.config
+    authenticated_atom = seal.authenticated_atom_path("qsrt-layer-003.safetensors")
+    authenticated_tokenizer = (seal.root / "tokenizer.json").read_bytes()
+    authenticated_weight = (seal.root / "model-00001-of-00001.safetensors").read_bytes()
+    source.joinpath("config.json").write_text("{}", encoding="utf-8")
+    source.joinpath("qsrt-layer-003.safetensors").write_bytes(b"mutated")
+
+    source.joinpath("tokenizer.json").write_text("{}", encoding="utf-8")
+    source.joinpath("model-00001-of-00001.safetensors").write_bytes(b"mutated")
+    assert seal.root == (private / "model").resolve()
+    assert seal.config == authenticated_config
+    assert authenticated_atom.read_bytes() == b"sealed atom payload"
+    seal.close()
+    assert (seal.root / "tokenizer.json").read_bytes() == authenticated_tokenizer
+    assert (
+        seal.root / "model-00001-of-00001.safetensors"
+    ).read_bytes() == authenticated_weight
+
+
+def test_private_snapshot_rejects_hard_linked_source_file(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    private = tmp_path / "private"
+    source.mkdir()
+    private.mkdir(mode=0o700)
+    _write_test_publication(source)
+    linked = tmp_path / "linked-config.json"
+    linked.hardlink_to(source / "config.json")
+
+    with pytest.raises(ValueError, match="singly linked"):
+        snapshot_qsrt_publication(
+            source,
+            private / "model",
+            expected_complete_sha256=_sha256(source / "QSRT_COMPLETE.json"),
+        )
 
 
 def test_publication_requires_independent_completion_digest(tmp_path: Path) -> None:
@@ -320,12 +934,17 @@ def test_authenticated_atom_inode_survives_path_replacement(
     original_atom = _write_test_atom_layer(original)
     manifest, _descriptor, published_atom = _write_test_publication(model)
     published_atom.write_bytes(original_atom.read_bytes())
-    manifest["layers"] = {
-        "3": {
-            "qsrt_atoms": published_atom.name,
+    layers = manifest["layers"]
+    assert isinstance(layers, dict)
+    layer_entry = layers["3"]
+    assert isinstance(layer_entry, dict)
+    layer_entry.update(
+        {
+            "bytes": published_atom.stat().st_size,
             "sha256": _sha256(published_atom),
         }
-    }
+    )
+    _write_runtime_qualification(model, manifest)
     (model / "qsrt-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     _reseal_publication_identity(model)
     seal = _verify_publication(model)
@@ -391,7 +1010,7 @@ def test_authenticated_atom_inode_survives_path_replacement(
         opened_paths.append(path)
         return FakeInstantTensorOpen()
 
-    setattr(instanttensor, "safe_open", fake_safe_open)
+    instanttensor.safe_open = fake_safe_open
     monkeypatch.setitem(sys.modules, "instanttensor", instanttensor)
     with open_qsrt_atom_extent(
         metadata,
@@ -430,6 +1049,9 @@ def _reseal_publication_identity(root: Path) -> None:
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     marker["package_manifest_sha256"] = _sha256(root / "qsrt-manifest.json")
     marker["model_index_sha256"] = _sha256(root / "model.safetensors.index.json")
+    marker["runtime_qualification_sha256"] = _sha256(
+        root / "evaluation/fruit-runtime-qualification.json"
+    )
     marker["checksum_manifest_sha256"] = _sha256(checksum_path)
     marker_path.write_text(json.dumps(marker), encoding="utf-8")
 
@@ -443,13 +1065,12 @@ def test_publication_rejects_missing_descriptor_identity(
     manifest.pop(field)
     descriptor.pop(field)
     (tmp_path / "qsrt-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    (tmp_path / "config.json").write_text(
-        json.dumps({"quantization_config": {"qsrt": descriptor}}),
-        encoding="utf-8",
-    )
+    config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    config["quantization_config"]["qsrt"] = descriptor
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
     _reseal_publication_identity(tmp_path)
 
-    with pytest.raises(ValueError, match="omits a required descriptor field"):
+    with pytest.raises(ValueError, match="identity is invalid"):
         _verify_publication(tmp_path)
 
 
@@ -489,25 +1110,27 @@ def test_publication_rejects_unmanifested_file(tmp_path: Path) -> None:
         _verify_publication(tmp_path)
 
 
-def test_publication_accepts_hugging_face_transport_metadata(tmp_path: Path) -> None:
-    manifest, descriptor, _ = _write_test_publication(tmp_path)
-    (tmp_path / ".gitattributes").write_text(
+def test_snapshot_omits_hugging_face_transport_cache(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    private = tmp_path / "private"
+    source.mkdir()
+    private.mkdir(mode=0o700)
+    _write_test_publication(source)
+    (source / ".gitattributes").write_text(
         "*.safetensors filter=lfs diff=lfs merge=lfs -text\n",
         encoding="utf-8",
     )
-    cache = tmp_path / ".cache" / "huggingface" / "download"
+    cache = source / ".cache" / "huggingface" / "download"
     cache.mkdir(parents=True)
     (cache / "config.json.metadata").write_text("transport metadata", encoding="utf-8")
 
-    seal = _verify_publication(tmp_path)
-    assert seal.manifest == manifest
-    assert seal.descriptor == descriptor
-
-    unrelated = tmp_path / ".cache" / "other"
-    unrelated.mkdir()
-    (unrelated / "unsealed.bin").write_bytes(b"unsealed")
-    with pytest.raises(ValueError, match="checksum inventory"):
-        _verify_publication(tmp_path)
+    seal = snapshot_qsrt_publication(
+        source,
+        private / "model",
+        expected_complete_sha256=_sha256(source / "QSRT_COMPLETE.json"),
+    )
+    assert not (seal.root / ".cache" / "huggingface").exists()
+    seal.close()
 
 
 def test_publication_rejects_symlinked_payload(tmp_path: Path) -> None:

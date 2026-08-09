@@ -24,7 +24,7 @@ RUN /opt/venv/bin/python3 -c 'import platform, sys; assert sys.version_info[:2] 
         --no-cache-dir \
         --no-deps \
         -e /opt/b12x-fruit
-RUN python3 /opt/vllm-fruit/tools/prepare_fruit_qsrt_image.py \
+RUN /opt/venv/bin/python3 /opt/vllm-fruit/tools/prepare_fruit_qsrt_image.py \
         --vllm-root /opt/vllm-fruit \
         --b12x-root /opt/b12x-fruit \
         --manifest /opt/fruit-runtime/MANIFEST.sha256
@@ -34,14 +34,8 @@ RUN groupadd --gid 10001 fruit \
     && install -d -m 0750 -o fruit -g fruit /home/fruit /cache \
     && git config --system --add safe.directory /opt/vllm-fruit \
     && git config --system --add safe.directory /opt/b12x-fruit
-ENV PYTHON_BIN=/opt/venv/bin/python3
 ENV HOME=/home/fruit
-ENV HF_HOME=/cache/huggingface
-ENV B12X_ROOT=/opt/b12x-fruit
-ENV GIT_OPTIONAL_LOCKS=0
-ENV VLLM_PLUGINS=""
-ENV PYTHONDONTWRITEBYTECODE=1
 WORKDIR /opt/vllm-fruit
 VOLUME ["/home/fruit", "/cache"]
 USER 10001:10001
-ENTRYPOINT ["/opt/vllm-fruit/serve-glm52-fruit-qsrt.sh"]
+ENTRYPOINT ["/bin/bash", "-p", "/opt/vllm-fruit/serve-glm52-fruit-qsrt.sh"]

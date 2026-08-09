@@ -17,6 +17,12 @@ from vllm.compilation.b12x_capture import (
     guard_b12x_kernel_resolution,
 )
 from vllm.compilation.counter import compilation_counter
+from vllm.compilation.kquant_runtime_evidence import (
+    begin_graph_capture,
+    finish_graph_capture,
+    record_graph_replay,
+    runtime_evidence_enabled,
+)
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
@@ -138,6 +144,7 @@ class CUDAGraphEntry:
     # for cudagraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
+    runtime_evidence_observations: bytes | None = None
 
 
 @dataclasses.dataclass
@@ -329,32 +336,44 @@ class CUDAGraphWrapper:
                     get_offloader().sync_prev_onload()
 
                 # mind-exploding: carefully manage the reference and memory.
-                with (
-                    guard_b12x_kernel_resolution(
-                        "vLLM CUDAGraphWrapper capture after B12X eager warmup"
-                    ),
-                    vllm_cudagraph_capture_scope(),
-                    torch.cuda.graph(
-                        cudagraph,
-                        pool=self.graph_pool,
-                        stream=current_stream(),
-                    ),
-                ):
-                    # `output` is managed by pytorch's cudagraph pool
-                    output = self.runnable(*args, **kwargs)
-                    # Join offloader's copy stream after forward to avoid
-                    # unjoined stream error. The last layer's start_prefetch
-                    # forks copy_stream, but wait_prefetch only happens in
-                    # the next forward pass.
-                    get_offloader().join_after_forward()
-                    if self.cudagraph_options.weak_ref_output:
-                        # by converting it to weak ref,
-                        # the original `output` will immediately be released
-                        # to save memory. It is only safe to do this for
-                        # the last graph in piecewise cuadgraph mode, because
-                        # the output of the last graph will not be used by
-                        # any other cuda graph.
-                        output = weak_ref_tensors(output)
+                evidence_capture_started = (
+                    begin_graph_capture() if runtime_evidence_enabled else False
+                )
+                evidence_capture_succeeded = False
+                try:
+                    with (
+                        guard_b12x_kernel_resolution(
+                            "vLLM CUDAGraphWrapper capture after B12X eager warmup"
+                        ),
+                        vllm_cudagraph_capture_scope(),
+                        torch.cuda.graph(
+                            cudagraph,
+                            pool=self.graph_pool,
+                            stream=current_stream(),
+                        ),
+                    ):
+                        # `output` is managed by pytorch's cudagraph pool
+                        output = self.runnable(*args, **kwargs)
+                        # Join offloader's copy stream after forward to avoid
+                        # unjoined stream error. The last layer's start_prefetch
+                        # forks copy_stream, but wait_prefetch only happens in
+                        # the next forward pass.
+                        get_offloader().join_after_forward()
+                        if self.cudagraph_options.weak_ref_output:
+                            # by converting it to weak ref,
+                            # the original `output` will immediately be released
+                            # to save memory. It is only safe to do this for
+                            # the last graph in piecewise cuadgraph mode, because
+                            # the output of the last graph will not be used by
+                            # any other cuda graph.
+                            output = weak_ref_tensors(output)
+                    evidence_capture_succeeded = True
+                finally:
+                    if runtime_evidence_enabled:
+                        entry.runtime_evidence_observations = finish_graph_capture(
+                            evidence_capture_started,
+                            evidence_capture_succeeded,
+                        )
 
             # here we always use weak ref for the output
             # to save memory
@@ -383,4 +402,6 @@ class CUDAGraphWrapper:
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
         entry.cudagraph.replay()
+        if runtime_evidence_enabled:
+            record_graph_replay(entry.runtime_evidence_observations)
         return entry.output

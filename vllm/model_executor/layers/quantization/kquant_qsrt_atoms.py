@@ -25,6 +25,9 @@ from vllm.model_executor.layers.quantization.kquant_qsrt_publication import (
     QSRTPublicationSeal as QSRTPublicationSeal,
 )
 from vllm.model_executor.layers.quantization.kquant_qsrt_publication import (
+    snapshot_qsrt_publication as snapshot_qsrt_publication,
+)
+from vllm.model_executor.layers.quantization.kquant_qsrt_publication import (
     verify_qsrt_publication as verify_qsrt_publication,
 )
 
