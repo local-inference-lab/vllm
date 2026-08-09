@@ -5,9 +5,11 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.llm_base_proposer import (
+    _mtp_draft_decode_only,
     compute_probs_and_sample_next_token,
 )
 
@@ -38,6 +40,19 @@ def _make_sampling_metadata(batch_size: int) -> SamplingMetadata:
         bad_words_token_ids={},
         logitsprocs=LogitsProcessors(),
     )
+
+
+def test_mtp_draft_decode_phase_uses_active_prompt_state():
+    common = object.__new__(CommonAttentionMetadata)
+    common.num_reqs = 2
+    common.is_prefilling = torch.tensor([False, False, True])
+    assert _mtp_draft_decode_only(common)
+
+    common.is_prefilling[1] = True
+    assert not _mtp_draft_decode_only(common)
+
+    common.is_prefilling = None
+    assert not _mtp_draft_decode_only(common)
 
 
 def test_compute_probs_and_sample_next_token_uses_fp64_exponential_race():

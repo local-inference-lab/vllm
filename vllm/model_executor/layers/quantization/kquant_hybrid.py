@@ -92,6 +92,11 @@ def _is_decode_only_forward(m: int) -> bool:
     if m <= 0 or not is_forward_context_available():
         return False
     context = get_forward_context()
+    explicit_draft_phase = context.additional_kwargs.get(
+        "speculative_draft_decode_only"
+    )
+    if type(explicit_draft_phase) is bool:
+        return explicit_draft_phase
     cached = context.additional_kwargs.get("kquant_qsrt_decode_only")
     if isinstance(cached, tuple) and cached[0] == m:
         return bool(cached[1])

@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
@@ -69,6 +69,17 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _mtp_draft_decode_only(common_attn_metadata: CommonAttentionMetadata) -> bool:
+    """Return whether every active MTP request has completed prompt prefill."""
+    is_prefilling = common_attn_metadata.is_prefilling
+    num_reqs = common_attn_metadata.num_reqs
+    return (
+        is_prefilling is not None
+        and num_reqs > 0
+        and not bool(torch.any(is_prefilling[:num_reqs]))
+    )
 
 
 def _call_accepts_kwarg(method: Any, kwarg: str) -> bool:
@@ -452,9 +463,7 @@ class SpecDecodeBaseProposer:
         spec_step_idx: int,
     ) -> torch.Tensor:
         if self._compute_logits_accepts_spec_step_idx:
-            return self.model.compute_logits(
-                hidden_states, spec_step_idx=spec_step_idx
-            )
+            return self.model.compute_logits(hidden_states, spec_step_idx=spec_step_idx)
         return self.model.compute_logits(hidden_states)
 
     def _model_get_top_tokens(
@@ -463,9 +472,7 @@ class SpecDecodeBaseProposer:
         spec_step_idx: int,
     ) -> torch.Tensor:
         if self._get_top_tokens_accepts_spec_step_idx:
-            return self.model.get_top_tokens(
-                hidden_states, spec_step_idx=spec_step_idx
-            )
+            return self.model.get_top_tokens(hidden_states, spec_step_idx=spec_step_idx)
         return self.model.get_top_tokens(hidden_states)
 
     def _model_forward(
@@ -608,6 +615,11 @@ class SpecDecodeBaseProposer:
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
         )
+        mtp_draft_decode_only = (
+            _mtp_draft_decode_only(common_attn_metadata)
+            if self.method == "mtp"
+            else False
+        )
 
         per_group_attn_metadata, per_layer_attn_metadata = (
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
@@ -642,6 +654,10 @@ class SpecDecodeBaseProposer:
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
         ):
+            if self.method == "mtp":
+                get_forward_context().additional_kwargs[
+                    "speculative_draft_decode_only"
+                ] = mtp_draft_decode_only
             ret_hidden_states = self._model_forward(model_kwargs, spec_step_idx=0)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
