@@ -3515,10 +3515,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             device=layer.w13_trellis.device,
         )
 
-    # Fused-layer budget consumption is per method instance, not process
-    # global: a class attribute leaks the count across model loads in one
-    # process and makes which layers use the fused path order-dependent.
-    _r7_fused_layers = 0
+    # Fused-layer budget consumption is tracked on the shared Exl3Config, not
+    # on the method or the class. vLLM builds one quant_method per MoE layer,
+    # so an instance counter never accumulates and the budget is never
+    # enforced; a class attribute is the opposite failure, leaking the count
+    # across model loads in one process and making the fused/per-expert split
+    # order-dependent. The config is per model load and shared by its layers.
 
     @staticmethod
     def _r7_projection_tiers(layer: RoutedExperts):
@@ -3571,7 +3573,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # exl3_moe_r7_fused, which the loader already selects per layer.
         budget = _r7_fused_layer_budget()
         if budget is not None:
-            if int(getattr(self, "_r7_fused_layers", 0)) >= budget:
+            used = int(getattr(self.quant_config, "_r7_fused_layers", 0))
+            if used >= budget:
                 return False
             # Charged only after this layer's tiers are frozen (see the
             # success path below): a failed packing attempt must not consume
@@ -3631,12 +3634,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         prepared_tiers = []
         prefill_tiers = []
         fc1_counts = []
+        tier_gate_counts = []  # real gate plane count per tier
         # Stack every tier BEFORE preparing any of them. prepare needs a
         # transient full-size counterpart for the phase it is not packing, and
         # that will not fit while the per-expert source tensors are still
         # resident alongside their stacked copies.
         stacks = []
-        tier_gate_counts = []  # glm52-r7-gate-tight: real gate plane count/tier
         for tier_id, bits in enumerate(tier_bits):
             gate_ids = [e for e in range(num_experts) if tiers["gate"][e] == tier_id]
             up_ids = [e for e in range(num_experts) if tiers["up"][e] == tier_id]
@@ -3656,10 +3659,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 [gate|up] buffer at out[base+index], so no padded (2,max) w13 is
                 ever materialised.
                 """
-                template = param.exl3_tensors[(expert_ids[0], shard_id)] if (
-                    expert_ids
-                ) else param.exl3_tensors[(0, shard_id)]
                 if out is None:
+                    if not expert_ids:
+                        raise ValueError("an empty tier requires a preallocated slab")
+                    template = param.exl3_tensors[(expert_ids[0], shard_id)]
                     out = torch.zeros(
                         (slots, *template.shape),
                         dtype=template.dtype,
@@ -3684,15 +3687,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     del src
                 return out
 
-            gate_template = w13_param.exl3_tensors[
-                (gate_ids[0] if gate_ids else 0, "w1")
-            ]
-            # glm52-r7-gate-tight: fill the tight [gate|up] buffer DIRECTLY from
-            # the per-expert sources (each popped as consumed), so no padded
-            # (2,max) buffer is ever resident. The served w13 is exactly
-            # gate_count+up_count planes -> ~0.99 GiB/layer vs 1.18 padded.
-            # prepare_weights, which validates a [2,E] shape and builds a w13
-            # view we discard, gets a shared never-read ballast instead.
+            # Projection-tight w13: exactly gate_count + up_count planes, no
+            # padded (2, max) stack. Safe because the kernel is told the gate
+            # count explicitly (run_mixed_trellis gate_experts), so its
+            # cute.size(w13)//2 up-block base lands at gate_count*stride rather
+            # than being inferred from a padded extent. Padding instead costs
+            # ~1 extra plane per tier per layer, measured at -1.81 GiB of KV
+            # headroom at max_model_len 262144 on 4x96 GB.
+            expected_last = 16 * bits
+            _tmpl_id = gate_ids[0] if gate_ids else 0
+            gate_template = w13_param.exl3_tensors[(_tmpl_id, "w1")]
             gate_n = len(gate_ids)
             up_n = len(up_ids)
             w13 = torch.zeros(
@@ -3703,10 +3707,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             plane(gate_ids, "w1", w13_param, fc1_slots, out=w13, base=0)
             plane(up_ids, "w3", w13_param, fc1_slots, out=w13, base=gate_n)
             w2 = plane(down_ids, "w2", w2_param, fc2_slots)
-            w13_tight = w13
             tier_gate_counts.append(gate_n)
             torch.cuda.empty_cache()
-            expected_last = 16 * bits
             if (
                 int(w13.shape[-1]) != expected_last
                 or int(w2.shape[-1]) != expected_last
@@ -3724,7 +3726,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 slots: int = fc1_slots,
                 fc2_slots: int = fc2_slots,
                 bits: int = bits,
-                w13_tight: torch.Tensor = w13_tight,  # glm52-r7-gate-tight
                 gate_n: int = gate_n,
                 up_n: int = up_n,
             ):
@@ -3787,14 +3788,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     if fc2_slots == slots
                     else _r7_fc1_ballast(slots, w2)
                 )
-                # prepare gets a shared never-read [2,slots] ballast (its w13
-                # view is discarded); the tight [gate|up] buffer is bound below.
+                # prepare validates a padded [2, slots] w13 and builds a view
+                # of it that is discarded here, so it gets a shared never-read
+                # ballast; the served w13 is the tight [gate|up] buffer bound
+                # below. The kernel sizes its w13 descriptor by gate_count
+                # (run_mixed_trellis gate_experts), so cute.size//2 lands the
+                # up-block base at gate_count*stride over that tight buffer.
                 fc1_prepared = call(slots, _r7_w13_ballast(slots, w13), fc1_w2)
-                # glm52-r7-gate-tight: bind the served w13 to the tight [gate|up]
-                # buffer. The kernel sizes its w13 descriptor by gate_count
-                # (companion gate-tight patch), so cute.size//2 lands the
-                # up-block base at gate_count*stride.
-                _tight_view = w13_tight.view(torch.int32).reshape(
+                _tight_view = w13.view(torch.int32).reshape(
                     max(gate_n + up_n, 1),
                     hidden_size // 16,
                     intermediate_size // 16,
@@ -3886,8 +3887,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "tier_bits": tuple(tier_bits),
             # FC1 slot counts: what sizes the launch and the policy signature.
             "tier_ids": tuple(fc1_counts),
-            # glm52-r7-gate-tight: real gate plane count per tier, threaded to
-            # run_mixed_trellis so the w13 descriptor sizes by gate_count.
+            # Real gate plane count per tier, threaded to run_mixed_trellis so
+            # the w13 descriptor sizes by gate_count over the tight buffer.
             "tier_gate_experts": tuple(tier_gate_counts),
             "global_to_combined": global_to_combined,
             "descriptor_map": descriptor_map,
@@ -3900,7 +3901,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "prefill_tile_config": prefill_tile_config,
         }
         if budget is not None:
-            self._r7_fused_layers = int(getattr(self, "_r7_fused_layers", 0)) + 1
+            # Charged only now: this layer's tiers are frozen, so a failed
+            # packing attempt cannot consume budget a later layer could use.
+            self.quant_config._r7_fused_layers = (
+                int(getattr(self.quant_config, "_r7_fused_layers", 0)) + 1
+            )
         layer.exl3_trellis_tile_config = tile_config
         if not hasattr(layer, "exl3_max_num_batched_tokens"):
             layer.exl3_max_num_batched_tokens = int(
