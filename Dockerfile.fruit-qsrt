@@ -6,35 +6,42 @@ ARG VLLM_REVISION
 ARG B12X_REVISION
 
 USER root
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
-    && rm -rf /var/lib/apt/lists/*
 RUN test -n "${VLLM_REVISION}" \
     && test -n "${B12X_REVISION}" \
     && git clone https://github.com/malaiwah/vllm-voipmonitor.git /opt/vllm-fruit \
     && git -C /opt/vllm-fruit checkout --detach "${VLLM_REVISION}" \
     && git clone https://github.com/malaiwah/sparkinfer.git /opt/b12x-fruit \
     && git -C /opt/b12x-fruit checkout --detach "${B12X_REVISION}"
-RUN python3 -m pip install --no-cache-dir --no-deps \
-        cuda-python==13.2.0 \
-        nvidia-cutlass-dsl==4.6.0 \
-        nvidia-cutlass-dsl-libs-base==4.6.0 \
-        nvidia-cutlass-dsl-libs-core==4.6.0 \
-        nvidia-cutlass-dsl-libs-cu12==4.6.0 \
-        nvidia-cutlass-dsl-libs-cu13==4.6.0 \
-        apache-tvm-ffi==0.1.10 \
-        rich==15.0.0 \
-        transformers==5.14.1 \
-        safetensors==0.8.0 \
-    && python3 -m pip install --no-cache-dir --no-deps -e /opt/b12x-fruit
+RUN /opt/venv/bin/python3 -c 'import platform, sys; assert sys.version_info[:2] == (3, 12) and platform.system() == "Linux" and platform.machine() == "x86_64"' \
+    && /opt/venv/bin/python3 -m pip install \
+        --no-cache-dir \
+        --no-deps \
+        --only-binary=:all: \
+        --require-hashes \
+        -r /opt/vllm-fruit/tools/fruit_qsrt_wheels.lock \
+    && /opt/venv/bin/python3 -m pip install \
+        --no-build-isolation \
+        --no-cache-dir \
+        --no-deps \
+        -e /opt/b12x-fruit
 RUN python3 /opt/vllm-fruit/tools/prepare_fruit_qsrt_image.py \
         --vllm-root /opt/vllm-fruit \
         --b12x-root /opt/b12x-fruit \
         --manifest /opt/fruit-runtime/MANIFEST.sha256
+RUN groupadd --gid 10001 fruit \
+    && useradd --uid 10001 --gid 10001 --home-dir /home/fruit \
+        --create-home --no-log-init --shell /usr/sbin/nologin fruit \
+    && install -d -m 0750 -o fruit -g fruit /home/fruit /cache \
+    && git config --system --add safe.directory /opt/vllm-fruit \
+    && git config --system --add safe.directory /opt/b12x-fruit
 ENV PYTHON_BIN=/opt/venv/bin/python3
+ENV HOME=/home/fruit
+ENV HF_HOME=/cache/huggingface
 ENV B12X_ROOT=/opt/b12x-fruit
 ENV GIT_OPTIONAL_LOCKS=0
 ENV VLLM_PLUGINS=""
 ENV PYTHONDONTWRITEBYTECODE=1
 WORKDIR /opt/vllm-fruit
+VOLUME ["/home/fruit", "/cache"]
+USER 10001:10001
 ENTRYPOINT ["/opt/vllm-fruit/serve-glm52-fruit-qsrt.sh"]

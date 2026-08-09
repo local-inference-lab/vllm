@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+CALLER_DIR="$(pwd -P)"
+MODEL="${MODEL:-/model}"
+if [[ "${MODEL}" != /* ]]; then
+  MODEL="${CALLER_DIR}/${MODEL}"
+fi
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 unset PYTHONHOME PYTHONPATH
@@ -12,11 +18,19 @@ export VLLM_PLUGINS=""
 
 PYTHON_BIN="${PYTHON_BIN:-${SCRIPT_DIR}/.venv/bin/python}"
 B12X_ROOT="${B12X_ROOT:-${SCRIPT_DIR}/../b12x-fruit}"
-MODEL="${MODEL:-/mnt/vault/llm/fruit-pilot/output/GLM-5.2-SIQ-Fruit-QSRT-exact}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
+if [[ -z "${FRUIT_QSRT_EXPECTED_COMPLETE_SHA256:-}" ]]; then
+  echo "FRUIT_QSRT_EXPECTED_COMPLETE_SHA256 is required" >&2
+  exit 1
+fi
+if [[ ! "${FRUIT_QSRT_EXPECTED_COMPLETE_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "FRUIT_QSRT_EXPECTED_COMPLETE_SHA256 must be a lowercase SHA-256 digest" >&2
+  exit 1
+fi
+export FRUIT_QSRT_EXPECTED_COMPLETE_SHA256
 if (($#)); then
   echo "Fruit QSRT launcher accepts no additional vLLM arguments" >&2
   exit 1
@@ -38,8 +52,8 @@ if [[ "${MAX_NUM_BATCHED_TOKENS}" != "4096" ]]; then
   exit 1
 fi
 
-EXPECTED_B12X_REVISION="84df431be79d6897fb3872516a7da39139e4905b"
-EXPECTED_KQUANT_REVISION="9731e9d8312b9e52952219861433bb4d129cbc38"
+EXPECTED_B12X_REVISION="89876a54b2e61bc41d844cc9ca5af040c9ad2f07"
+EXPECTED_KQUANT_REVISION="d3355b1b1088c5c9fa2afbcc608cc627a8a42f69"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Missing vLLM Python: ${PYTHON_BIN}" >&2
@@ -139,8 +153,10 @@ export VLLM_EXL3_ONLINE_CACHE_DIR="${cache_root}/exl3-online"
 
 "${PYTHON_BIN}" -I -S -c '
 import hashlib
-import runpy
+import json
+import os
 import subprocess
+import stat
 import sys
 from pathlib import Path, PurePosixPath
 
@@ -153,6 +169,34 @@ def sha256(path):
         while chunk := handle.read(8 << 20):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def read_stable_regular(path, max_bytes):
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink < 1:
+            raise RuntimeError(f"runtime input is not a linked regular file: {path}")
+        if before.st_size > max_bytes:
+            raise RuntimeError(f"runtime input exceeds its size bound: {path}")
+        chunks = []
+        bytes_read = 0
+        while chunk := os.read(descriptor, min(1 << 20, max_bytes + 1 - bytes_read)):
+            chunks.append(chunk)
+            bytes_read += len(chunk)
+            if bytes_read > max_bytes:
+                raise RuntimeError(f"runtime input exceeds its size bound: {path}")
+        after = os.fstat(descriptor)
+        path_after = os.stat(path, follow_symlinks=False)
+    finally:
+        os.close(descriptor)
+    if (
+        bytes_read != before.st_size
+        or source_stat_identity(before) != source_stat_identity(after)
+        or source_stat_identity(after) != source_stat_identity(path_after)
+    ):
+        raise RuntimeError(f"runtime input changed while reading: {path}")
+    return b"".join(chunks)
 
 
 def verify_runtime_manifest(vllm_root, b12x_root):
@@ -201,34 +245,193 @@ def verify_runtime_manifest(vllm_root, b12x_root):
         if sha256(path) != expected[name]:
             raise RuntimeError(f"Fruit runtime file digest mismatch: {name}")
 
+def git_source_output(root, *args):
+    try:
+        return subprocess.run(
+            ("git", "-C", str(root), *args),
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"cannot inspect runtime source tree: {root}") from exc
+
+
+def nul_records(output, description):
+    if not output or output[-1:] != b"\0":
+        raise RuntimeError(f"runtime source has malformed {description}")
+    records = output.split(b"\0")
+    records.pop()
+    if not records or any(not record for record in records):
+        raise RuntimeError(f"runtime source has malformed {description}")
+    return records
+
+
+def tracked_source_index(root):
+    index = {}
+    for record in nul_records(
+        git_source_output(root, "ls-files", "--stage", "-v", "-z"),
+        "Git index",
+    ):
+        if len(record) < 3 or record[1:2] != b" " or b"\t" not in record:
+            raise RuntimeError("runtime source has malformed Git index")
+        tag = record[:1]
+        if tag == b"h":
+            raise RuntimeError("runtime source has assume-unchanged files")
+        if tag in (b"S", b"s"):
+            raise RuntimeError("runtime source has skip-worktree files")
+        if tag != b"H":
+            raise RuntimeError("runtime source has anomalous tracked files")
+        metadata, relative = record[2:].split(b"\t", 1)
+        fields = metadata.split(b" ")
+        if (
+            len(fields) != 3
+            or fields[2] != b"0"
+            or len(fields[1]) != 40
+            or any(byte not in b"0123456789abcdef" for byte in fields[1])
+        ):
+            raise RuntimeError("runtime source has malformed or unmerged Git index")
+        mode, object_id = fields[:2]
+        if mode not in (b"100644", b"100755"):
+            raise RuntimeError("runtime source tracks a non-regular entry")
+        if (
+            not relative
+            or relative.startswith(b"/")
+            or any(part in (b"", b".", b"..") for part in relative.split(b"/"))
+            or relative in index
+        ):
+            raise RuntimeError("runtime source has anomalous tracked paths")
+        index[relative] = (mode, object_id)
+    return index
+
+
+def tracked_source_head(root):
+    head = {}
+    for record in nul_records(
+        git_source_output(root, "ls-tree", "-r", "-z", "--full-tree", "HEAD"),
+        "HEAD tree",
+    ):
+        if b"\t" not in record:
+            raise RuntimeError("runtime source has malformed HEAD tree")
+        metadata, relative = record.split(b"\t", 1)
+        fields = metadata.split(b" ")
+        if (
+            len(fields) != 3
+            or len(fields[2]) != 40
+            or any(byte not in b"0123456789abcdef" for byte in fields[2])
+        ):
+            raise RuntimeError("runtime source has malformed HEAD tree")
+        mode, object_type, object_id = fields
+        if object_type != b"blob" or mode not in (b"100644", b"100755"):
+            raise RuntimeError("runtime source tracks a non-regular entry")
+        if not relative or relative in head:
+            raise RuntimeError("runtime source has anomalous HEAD paths")
+        head[relative] = (mode, object_id)
+    return head
+
+
+def source_stat_identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_uid,
+        value.st_gid,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def require_git_status_clean(root):
+    if git_source_output(
+        root, "status", "--porcelain=v1", "--untracked-files=all"
+    ):
+        raise RuntimeError(f"runtime source checkout is not clean: {root}")
+
+
 def tracked_tree_sha256(root_value):
     root = Path(root_value).resolve(strict=True)
-    result = subprocess.run(
-        ("git", "-C", str(root), "ls-tree", "-r", "-z", "--full-tree", "HEAD"),
-        check=True,
-        capture_output=True,
-    )
-    if not result.stdout:
-        raise RuntimeError(f"runtime source checkout has no tracked files: {root}")
-    return hashlib.sha256(b"git-ls-tree-v1\0" + result.stdout).hexdigest()
+    index = tracked_source_index(root)
+    if index != tracked_source_head(root):
+        raise RuntimeError("runtime source index does not match HEAD")
+    require_git_status_clean(root)
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+    digest = hashlib.sha256(b"kquant-tracked-worktree-sha256-v1\0")
+    root_fd = os.open(root, directory_flags)
+    try:
+        for relative in sorted(index):
+            expected_mode, expected_object_id = index[relative]
+            file_fd = os.open(relative, flags, dir_fd=root_fd)
+            try:
+                before = os.fstat(file_fd)
+                if not stat.S_ISREG(before.st_mode):
+                    raise RuntimeError("tracked runtime source is not regular")
+                actual_mode = b"100755" if before.st_mode & 0o111 else b"100644"
+                if actual_mode != expected_mode:
+                    raise RuntimeError("tracked runtime source mode differs from Git")
+                digest.update(actual_mode)
+                digest.update(len(relative).to_bytes(8, "big"))
+                digest.update(relative)
+                digest.update(before.st_size.to_bytes(8, "big"))
+                blob_digest = hashlib.sha1(
+                    b"blob " + str(before.st_size).encode("ascii") + b"\0"
+                )
+                bytes_read = 0
+                while chunk := os.read(file_fd, 1 << 20):
+                    bytes_read += len(chunk)
+                    digest.update(chunk)
+                    blob_digest.update(chunk)
+                after = os.fstat(file_fd)
+                path_after = os.stat(
+                    relative,
+                    dir_fd=root_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    bytes_read != before.st_size
+                    or source_stat_identity(before) != source_stat_identity(after)
+                    or source_stat_identity(after) != source_stat_identity(path_after)
+                ):
+                    raise RuntimeError("tracked runtime source changed while hashing")
+                if blob_digest.hexdigest().encode("ascii") != expected_object_id:
+                    raise RuntimeError("tracked runtime source bytes differ from Git")
+            finally:
+                os.close(file_fd)
+    finally:
+        os.close(root_fd)
+    require_git_status_clean(root)
+    return digest.hexdigest()
 
 model = sys.argv[1]
-expected_kquant = sys.argv[2]
-expected_b12x = sys.argv[3]
-actual_vllm = sys.argv[4]
-b12x_root = Path(sys.argv[5]).resolve(strict=True)
-vllm_root = Path(sys.argv[6]).resolve(strict=True)
+expected_complete_sha256 = sys.argv[2]
+expected_kquant = sys.argv[3]
+expected_b12x = sys.argv[4]
+actual_vllm = sys.argv[5]
+b12x_root = Path(sys.argv[6]).resolve(strict=True)
+vllm_root = Path(sys.argv[7]).resolve(strict=True)
 verify_runtime_manifest(vllm_root, b12x_root)
-publication = runpy.run_path(
-    str(
-        vllm_root
-        / "vllm/model_executor/layers/quantization/kquant_qsrt_publication.py"
-    )
-)
-seal = publication["verify_qsrt_publication"](model)
-producer = seal.manifest["producer"]
-encoder = producer["encoder"]
-runtime = producer["runtime"]
+model_root = Path(model).resolve(strict=True)
+marker_bytes = read_stable_regular(model_root / "QSRT_COMPLETE.json", 1 << 20)
+if hashlib.sha256(marker_bytes).hexdigest() != expected_complete_sha256:
+    raise RuntimeError("Fruit completion marker disagrees with the external anchor")
+try:
+    marker = json.loads(marker_bytes)
+except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    raise RuntimeError("Fruit completion marker is not valid JSON") from exc
+manifest_bytes = read_stable_regular(model_root / "qsrt-manifest.json", 16 << 20)
+if hashlib.sha256(manifest_bytes).hexdigest() != marker.get(
+    "package_manifest_sha256"
+):
+    raise RuntimeError("Fruit package manifest disagrees with the completion marker")
+try:
+    manifest = json.loads(manifest_bytes)
+    producer = manifest["producer"]
+    encoder = producer["encoder"]
+    runtime = producer["runtime"]
+except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+    raise RuntimeError("Fruit package manifest has invalid producer metadata") from exc
 if encoder.get("kquant_revision") != expected_kquant:
     raise RuntimeError("Fruit package KQuant revision is unsupported")
 if runtime.get("b12x_revision") != expected_b12x:
@@ -241,6 +444,7 @@ if runtime.get("vllm_source_sha256") != tracked_tree_sha256(vllm_root):
     raise RuntimeError("Fruit package vLLM source fingerprint is unsupported")
 ' \
   "${MODEL}" \
+  "${FRUIT_QSRT_EXPECTED_COMPLETE_SHA256}" \
   "${EXPECTED_KQUANT_REVISION}" \
   "${EXPECTED_B12X_REVISION}" \
   "${actual_vllm_revision}" \
@@ -277,7 +481,7 @@ import b12x.attention.sparse_mla
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.2-QSRT-Fruit}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.2-QSRT-Fruit-Instruct}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.80}"
 
 exec "${PYTHON_BIN}" -P -m vllm.entrypoints.cli.main serve "${MODEL}" \

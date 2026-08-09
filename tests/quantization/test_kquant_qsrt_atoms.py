@@ -3,7 +3,9 @@
 
 import hashlib
 import json
+import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 import torch
@@ -23,6 +25,7 @@ def _write_test_atom_layer(
     tmp_path: Path,
     *,
     schema: str = FRUIT_SCHEMA,
+    atom_value: int = 0,
 ) -> Path:
     layer = 3
     experts = 3
@@ -81,8 +84,10 @@ def _write_test_atom_layer(
         {
             "_qsrt_format_section": format_section,
             "_qsrt_shared_scale_section": shared_scale_section,
-            "qsrt_atoms": torch.zeros(
-                (atom_slots, slot_stride_bytes), dtype=torch.uint8
+            "qsrt_atoms": torch.full(
+                (atom_slots, slot_stride_bytes),
+                atom_value,
+                dtype=torch.uint8,
             ),
         },
         path,
@@ -129,6 +134,17 @@ def test_reads_and_partitions_fruit_qsrt_atoms(tmp_path: Path) -> None:
         assert first_atom_slot == 8
         assert atoms.shape == (8, 3, 37_056)
         assert atoms.is_contiguous()
+    with open_qsrt_atom_extent(
+        metadata,
+        shard_count=2,
+        shard_index=0,
+        device="cpu",
+        atom_offset=3,
+        atom_count=2,
+    ) as (first_atom_slot, atoms):
+        assert first_atom_slot == 3
+        assert atoms.shape == (2, 3, 37_056)
+        assert atoms.is_contiguous()
 
 
 def test_reads_kimi_atoms_without_fruit_identity_metadata(
@@ -154,6 +170,13 @@ def test_reads_kimi_atoms_without_fruit_identity_metadata(
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _verify_publication(root: Path):
+    return verify_qsrt_publication(
+        root,
+        expected_complete_sha256=_sha256(root / "QSRT_COMPLETE.json"),
+    )
 
 
 def _write_test_publication(
@@ -238,13 +261,152 @@ def test_verifies_complete_qsrt_publication_and_rejects_mutation(
 ) -> None:
     manifest, descriptor, payload = _write_test_publication(tmp_path)
 
-    seal = verify_qsrt_publication(tmp_path)
+    seal = _verify_publication(tmp_path)
     assert seal.manifest == manifest
     assert seal.descriptor == descriptor
 
     payload.write_bytes(b"mutated atom payload")
     with pytest.raises(ValueError, match="package hash mismatch"):
+        _verify_publication(tmp_path)
+    seal.close()
+
+
+def test_publication_requires_independent_completion_digest(tmp_path: Path) -> None:
+    _write_test_publication(tmp_path)
+    trusted = _sha256(tmp_path / "QSRT_COMPLETE.json")
+
+    with pytest.raises(ValueError, match="expected completion marker"):
         verify_qsrt_publication(tmp_path)
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        verify_qsrt_publication(tmp_path, expected_complete_sha256="A" * 64)
+    with pytest.raises(ValueError, match="trusted digest"):
+        verify_qsrt_publication(
+            tmp_path,
+            expected_complete_sha256="0" * 64,
+        )
+
+    seal = verify_qsrt_publication(
+        tmp_path,
+        expected_complete_sha256=trusted,
+    )
+    seal.close()
+
+
+def test_publication_rejects_self_resealed_substitution(
+    tmp_path: Path,
+) -> None:
+    _manifest, _descriptor, payload = _write_test_publication(tmp_path)
+    trusted = _sha256(tmp_path / "QSRT_COMPLETE.json")
+    payload.write_bytes(b"attacker-controlled replacement")
+    _reseal_publication_identity(tmp_path)
+
+    with pytest.raises(ValueError, match="trusted digest"):
+        verify_qsrt_publication(
+            tmp_path,
+            expected_complete_sha256=trusted,
+        )
+
+
+def test_authenticated_atom_inode_survives_path_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tmp_path / "model"
+    original = tmp_path / "original"
+    replacement = tmp_path / "replacement"
+    model.mkdir()
+    original.mkdir()
+    replacement.mkdir()
+    original_atom = _write_test_atom_layer(original)
+    manifest, _descriptor, published_atom = _write_test_publication(model)
+    published_atom.write_bytes(original_atom.read_bytes())
+    manifest["layers"] = {
+        "3": {
+            "qsrt_atoms": published_atom.name,
+            "sha256": _sha256(published_atom),
+        }
+    }
+    (model / "qsrt-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    _reseal_publication_identity(model)
+    seal = _verify_publication(model)
+
+    metadata = read_qsrt_atom_layer_metadata(
+        published_atom,
+        layer=3,
+        expected_experts=3,
+        expected_hidden_size=1024,
+        expected_intermediate_size=512,
+        expected_bits=[3, 3, 3],
+        publication=seal,
+        published_name=published_atom.name,
+    )
+    replacement_atom = _write_test_atom_layer(replacement, atom_value=7)
+    replacement_atom.replace(published_atom)
+
+    with open_qsrt_atom_extent(
+        metadata,
+        shard_count=2,
+        shard_index=1,
+        device="cpu",
+    ) as (_first, atoms):
+        assert not bool(torch.any(atoms))
+
+    opened_paths: list[str] = []
+
+    class FakeInstantTensorOpen:
+        def __init__(self) -> None:
+            start = 4096
+            end = start + metadata.atom_slots * metadata.atom_slot_stride_bytes
+            self.ordered_tensor_metadatas = []
+            self.tensor_offsets = [(0, start), (0, end)]
+            self.tensor_sizes = [end - start]
+            self.total_tensor_size = end - start
+            self.tensor_name_to_index = {"qsrt_atoms": 0}
+            self.loader_handle = None
+
+        def _determine_buffer_size(self, _value: object) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def tensors(self):
+            rows = self.ordered_tensor_metadatas[0][1]["shape"][0]
+            return [
+                (
+                    "qsrt_atoms",
+                    torch.zeros(
+                        (rows, metadata.atom_slot_stride_bytes),
+                        dtype=torch.uint8,
+                    ),
+                )
+            ]
+
+    instanttensor = ModuleType("instanttensor")
+
+    def fake_safe_open(path: str, **_kwargs):
+        opened_paths.append(path)
+        return FakeInstantTensorOpen()
+
+    setattr(instanttensor, "safe_open", fake_safe_open)
+    monkeypatch.setitem(sys.modules, "instanttensor", instanttensor)
+    with open_qsrt_atom_extent(
+        metadata,
+        shard_count=2,
+        shard_index=1,
+        device="cuda",
+        atom_offset=2,
+        atom_count=3,
+    ) as (first, atoms):
+        assert first == 10
+        assert atoms.shape == (3, 3, 37_056)
+        assert not bool(torch.any(atoms))
+    assert opened_paths == [str(metadata.path)]
+    assert metadata.path.as_posix().startswith("/proc/self/fd/")
+    seal.close()
 
 
 def _reseal_checksum_manifest(root: Path) -> None:
@@ -288,7 +450,7 @@ def test_publication_rejects_missing_descriptor_identity(
     _reseal_publication_identity(tmp_path)
 
     with pytest.raises(ValueError, match="omits a required descriptor field"):
-        verify_qsrt_publication(tmp_path)
+        _verify_publication(tmp_path)
 
 
 def test_publication_rejects_relative_symlink_root(tmp_path: Path) -> None:
@@ -299,7 +461,7 @@ def test_publication_rejects_relative_symlink_root(tmp_path: Path) -> None:
     alias.symlink_to(Path("model"), target_is_directory=True)
 
     with pytest.raises(ValueError, match="must not be a symbolic link"):
-        verify_qsrt_publication(alias)
+        _verify_publication(alias)
 
 
 @pytest.mark.parametrize("bad_name", ("../outside", "/tmp/outside"))
@@ -316,7 +478,7 @@ def test_publication_rejects_checksum_paths_outside_root(
     _reseal_checksum_manifest(tmp_path)
 
     with pytest.raises(ValueError, match="invalid QSRT checksum entry"):
-        verify_qsrt_publication(tmp_path)
+        _verify_publication(tmp_path)
 
 
 def test_publication_rejects_unmanifested_file(tmp_path: Path) -> None:
@@ -324,7 +486,7 @@ def test_publication_rejects_unmanifested_file(tmp_path: Path) -> None:
     (tmp_path / "unsealed.bin").write_bytes(b"unsealed")
 
     with pytest.raises(ValueError, match="checksum inventory"):
-        verify_qsrt_publication(tmp_path)
+        _verify_publication(tmp_path)
 
 
 def test_publication_accepts_hugging_face_transport_metadata(tmp_path: Path) -> None:
@@ -337,7 +499,7 @@ def test_publication_accepts_hugging_face_transport_metadata(tmp_path: Path) -> 
     cache.mkdir(parents=True)
     (cache / "config.json.metadata").write_text("transport metadata", encoding="utf-8")
 
-    seal = verify_qsrt_publication(tmp_path)
+    seal = _verify_publication(tmp_path)
     assert seal.manifest == manifest
     assert seal.descriptor == descriptor
 
@@ -345,7 +507,7 @@ def test_publication_accepts_hugging_face_transport_metadata(tmp_path: Path) -> 
     unrelated.mkdir()
     (unrelated / "unsealed.bin").write_bytes(b"unsealed")
     with pytest.raises(ValueError, match="checksum inventory"):
-        verify_qsrt_publication(tmp_path)
+        _verify_publication(tmp_path)
 
 
 def test_publication_rejects_symlinked_payload(tmp_path: Path) -> None:
@@ -358,7 +520,7 @@ def test_publication_rejects_symlinked_payload(tmp_path: Path) -> None:
     payload.symlink_to(Path("..") / external.name)
 
     with pytest.raises(FileNotFoundError, match=payload.name):
-        verify_qsrt_publication(root)
+        _verify_publication(root)
 
 
 def test_publication_rejects_missing_manifested_file(tmp_path: Path) -> None:
@@ -366,4 +528,4 @@ def test_publication_rejects_missing_manifested_file(tmp_path: Path) -> None:
     payload.unlink()
 
     with pytest.raises(FileNotFoundError, match=payload.name):
-        verify_qsrt_publication(tmp_path)
+        _verify_publication(tmp_path)

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +78,9 @@ class QSRTAtomLayerMetadata:
     up_suh: torch.Tensor
     down_svh: torch.Tensor
     atom_slot_stride_bytes: int
+    publication: QSRTPublicationSeal | None = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def compressed_experts(self) -> int:
@@ -104,6 +107,8 @@ def read_qsrt_atom_layer_metadata(
     expected_codebook: str | None = None,
     expected_source_sha256: str | None = None,
     expected_encoder_fingerprint: str | None = None,
+    publication: QSRTPublicationSeal | None = None,
+    published_name: str | None = None,
 ) -> QSRTAtomLayerMetadata:
     """Validate one canonical atom layer without reading its payload slab.
 
@@ -118,6 +123,9 @@ def read_qsrt_atom_layer_metadata(
         expected_codebook: Optional reconstruction codebook identifier.
         expected_source_sha256: Optional authenticated source digest.
         expected_encoder_fingerprint: Optional encoder provenance fingerprint.
+        publication: Optional authenticated publication seal that owns the atom
+            descriptor.
+        published_name: Atom filename within ``publication``.
 
     Returns:
         Validated metadata and the small format, ID, and scale tensors.
@@ -129,6 +137,12 @@ def read_qsrt_atom_layer_metadata(
     """
 
     path = Path(path)
+    if publication is not None:
+        if published_name is None:
+            raise ValueError("published_name is required with a QSRT publication seal")
+        path = publication.authenticated_atom_path(published_name)
+    elif published_name is not None:
+        raise ValueError("published_name requires a QSRT publication seal")
     with safe_open(path, framework="pt", device="cpu") as handle:
         metadata = handle.metadata() or {}
         if set(handle.keys()) != TENSOR_INVENTORY:
@@ -332,6 +346,7 @@ def read_qsrt_atom_layer_metadata(
         up_suh=vectors[1].contiguous(),
         down_svh=vectors[2].contiguous(),
         atom_slot_stride_bytes=slot_stride,
+        publication=publication,
     )
 
 
@@ -411,15 +426,28 @@ def open_qsrt_atom_extent(
     shard_count: int,
     shard_index: int,
     device: torch.device | str | None,
+    atom_offset: int = 0,
+    atom_count: int | None = None,
 ) -> Iterator[tuple[int, torch.Tensor]]:
-    """Yield one shard's ``(first_atom_slot, [A,E,B]u8)`` extent.
+    """Yield a shard-local ``(first_atom_slot, [A,E,B]u8)`` row extent.
 
-    CPU mode exists for focused tests. CUDA mode uses InstantTensor and keeps
-    the returned tensor valid only for the context lifetime; callers must
-    complete preparation before leaving the context.
+    ``atom_offset`` and ``atom_count`` may narrow the balanced shard before
+    device I/O. CPU mode exists for focused tests. CUDA mode uses
+    InstantTensor and keeps the returned tensor valid only for the context
+    lifetime; callers must complete preparation before leaving the context.
     """
 
-    first, rows = balanced_atom_partition(metadata.atom_slots, shard_count, shard_index)
+    partition_first, partition_rows = balanced_atom_partition(
+        metadata.atom_slots, shard_count, shard_index
+    )
+    if atom_offset < 0 or atom_offset >= partition_rows:
+        raise ValueError(f"atom_offset must lie in 0..{partition_rows - 1}")
+    rows = partition_rows - atom_offset if atom_count is None else atom_count
+    if rows <= 0 or atom_offset + rows > partition_rows:
+        raise ValueError(
+            "atom_count must select a nonempty range inside the balanced shard"
+        )
+    first = partition_first + atom_offset
     if device is None or torch.device(device).type == "cpu":
         with safe_open(metadata.path, framework="pt", device="cpu") as handle:
             padded = handle.get_slice(ATOM_TENSOR)[first : first + rows]
