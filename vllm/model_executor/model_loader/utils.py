@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utilities for selecting and loading models."""
 
+import gc
 import inspect
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
-import gc
 import torch
 from torch import nn
 from typing_extensions import assert_never

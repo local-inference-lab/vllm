@@ -1032,6 +1032,42 @@ def test_rank_sliced_runtime_scope_is_per_owning_model():
     assert exl3_module._runtime_scope_id(draft_config) == draft_scope
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("moe_layers", [3.5, 77]),
+        ("moe_layers", [False, 77]),
+        ("k_values", [3.5, 4]),
+        ("k_values", [True, 4]),
+    ],
+)
+def test_r7_schema_rejects_lossy_integer_coercion(field, value):
+    r7 = {
+        "schema": "r7-complete-v2-checkpoint-v1",
+        "codebook": "mcg",
+        "bits": "mixed_tensor",
+        "moe_layers": [3, 77],
+        "k_values": [3, 4, 5],
+    }
+    r7[field] = value
+    with pytest.raises(ValueError):
+        Exl3Config.from_config({"r7_routed_experts": r7})
+
+
+def test_r7_schema_normalizes_declared_integer_contract():
+    config = Exl3Config.from_config({
+        "r7_routed_experts": {
+            "schema": "r7-complete-v2-checkpoint-v1",
+            "codebook": "mcg",
+            "bits": "mixed_tensor",
+            "moe_layers": [3, 77],
+            "k_values": [5, 3, 4, 3],
+        }
+    })
+    assert config.r7_routed_experts["moe_layers"] == (3, 77)
+    assert config.r7_routed_experts["k_values"] == (3, 4, 5)
+
+
 def test_rank_sliced_runtime_key_differs_across_models_with_same_shape():
     """Two same-shape layers owned by different models get different cache keys."""
 

@@ -2290,6 +2290,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_PREFILL_CAPACITY": lambda: os.getenv("VLLM_EXL3_PREFILL_CAPACITY"),
     "VLLM_EXL3_PREFILL_TRELLIS": lambda: os.getenv("VLLM_EXL3_PREFILL_TRELLIS"),
     "VLLM_EXL3_PREFILL_BLOCK_M": lambda: os.getenv("VLLM_EXL3_PREFILL_BLOCK_M"),
+    "VLLM_EXL3_R7_A1_MIN_ROWS": lambda: os.getenv("VLLM_EXL3_R7_A1_MIN_ROWS"),
+    "VLLM_EXL3_R7_DEBUG": lambda: os.getenv("VLLM_EXL3_R7_DEBUG"),
+    "VLLM_EXL3_R7_FUSED": lambda: os.getenv("VLLM_EXL3_R7_FUSED"),
+    "VLLM_EXL3_R7_FUSED_LAYERS": lambda: os.getenv("VLLM_EXL3_R7_FUSED_LAYERS"),
+    "VLLM_EXL3_R7_ROUTE_BLOCK": lambda: os.getenv("VLLM_EXL3_R7_ROUTE_BLOCK"),
     # Deterministic online EXL3 encoding and its persistent rank-local cache.
     "VLLM_EXL3_ONLINE_TRELLIS_BITS": lambda: os.getenv("VLLM_EXL3_ONLINE_TRELLIS_BITS"),
     "VLLM_EXL3_ENCODER_SOURCE": lambda: os.getenv("VLLM_EXL3_ENCODER_SOURCE"),

@@ -212,6 +212,7 @@ class _Harness:
         )
         exl3_module._RANK_SLICED_RUNTIMES.clear()
         exl3_module._MIXED_TRELLIS_RUNTIMES.clear()
+        exl3_module._MIXED_TRELLIS_BUFFERS.clear()
         return self
 
     def __exit__(self, *exc):
@@ -230,6 +231,7 @@ class _Harness:
                 os.environ[name] = value
         exl3_module._RANK_SLICED_RUNTIMES.clear()
         exl3_module._MIXED_TRELLIS_RUNTIMES.clear()
+        exl3_module._MIXED_TRELLIS_BUFFERS.clear()
         return False
 
     def planned_caps(self):
@@ -377,6 +379,36 @@ def test_mixed_runtime_policy_is_resolved_once(monkeypatch):
         assert first is second
         assert calls == 1
         assert len(h.mixed_api.compiled) == 2
+
+
+def test_mixed_buffer_pool_is_scoped_to_target_or_draft_owner():
+    with _Harness() as h:
+        launch = SimpleNamespace(
+            hidden_size=HIDDEN,
+            intermediate_size=INTERMEDIATE,
+            size_m=32,
+            max_m_blocks=4,
+            tier0_num_experts=4,
+            tier1_num_experts=4,
+            rotation_input_dtype="bf16",
+            route_ids_dtype=torch.int64,
+        )
+        args = (
+            h.mixed_api,
+            launch,
+            torch.device("cpu"),
+            1,
+            32,
+            8,
+            (64, 128, 64, 128),
+            TOPK,
+        )
+        target = exl3_module._shared_mixed_buffers((1, False), *args)
+        target_again = exl3_module._shared_mixed_buffers((1, False), *args)
+        draft = exl3_module._shared_mixed_buffers((1, True), *args)
+
+        assert target_again is target
+        assert draft is not target
 
 
 def test_mixed_runtime_forwards_shared_h_broadcast_contract():

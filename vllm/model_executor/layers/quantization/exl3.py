@@ -595,9 +595,17 @@ def _r7_fused_enabled() -> bool:
 
 
 def _shared_mixed_buffers(
-    mixed_api, launch, device, sms, capacity, block_size_m, tile_config, topk
+    owner_token,
+    mixed_api,
+    launch,
+    device,
+    sms,
+    capacity,
+    block_size_m,
+    tile_config,
+    topk,
 ):
-    """One scratch arena per launch geometry. glm52-r7-sparkinfer."""
+    """One scratch arena per model/draft owner and launch geometry."""
 
     # glm52-r7-gate-tight: max_m_blocks is DELIBERATELY excluded from the key.
     # It derives from each layer's summed tier slots, which differ per layer
@@ -608,6 +616,7 @@ def _shared_mixed_buffers(
     # max_m_blocks seen; the arena is scratch, so a larger one serves any
     # smaller launch.
     key = (
+        owner_token,
         device.index if hasattr(device, "index") else device,
         int(capacity),
         int(block_size_m),
@@ -633,19 +642,24 @@ def _shared_mixed_buffers(
         # every layer's route-block count. Sizing it from the first layer would
         # under-allocate for a later, wider one; growing it thrashed (51
         # allocations, old arenas pinned by the runtimes already holding them).
-        worst = dataclasses.replace(
-            launch,
+        worst_max_m_blocks = (
+            mixed_api.max_packed_route_slots(
+                int(capacity) * int(topk), int(block_size_m), 512
+            )
+            + int(block_size_m)
+            - 1
+        ) // int(block_size_m)
+        overrides = dict(
             tier0_num_experts=256,
             tier1_num_experts=256,
-            max_m_blocks=(
-                mixed_api.max_packed_route_slots(
-                    int(capacity) * int(topk), int(block_size_m), 512
-                )
-                + int(block_size_m)
-                - 1
-            )
-            // int(block_size_m),
+            max_m_blocks=worst_max_m_blocks,
         )
+        if dataclasses.is_dataclass(launch):
+            worst = dataclasses.replace(launch, **overrides)
+        else:
+            # Production uses the dataclass. Retained API tests use a small
+            # namespace carrying the same public fields.
+            worst = SimpleNamespace(**{**vars(launch), **overrides})
         entry = mixed_api.make_mixed_trellis_buffers(
             worst, device=device, sms=sms
         )
@@ -957,27 +971,38 @@ class Exl3Config(QuantizationConfig):
                     "R7 EXL3 requires codebook='mcg' and bits='mixed_tensor'"
                 )
             layers = _r7.get("moe_layers")
-            try:
-                valid_layers = (
-                    isinstance(layers, (list, tuple))
-                    and len(layers) == 2
-                    and int(layers[0]) >= 0
-                    and int(layers[1]) >= int(layers[0])
+            valid_layers = (
+                isinstance(layers, (list, tuple))
+                and len(layers) == 2
+                and all(
+                    isinstance(value, int) and not isinstance(value, bool)
+                    for value in layers
                 )
-            except (TypeError, ValueError):
-                valid_layers = False
+                and layers[0] >= 0
+                and layers[1] >= layers[0]
+            )
             if not valid_layers:
-                raise ValueError("R7 EXL3 moe_layers must be [first, last]")
+                raise ValueError(
+                    "R7 EXL3 moe_layers must be two non-negative JSON integers "
+                    "[first, last] with last >= first"
+                )
             k_values = _r7.get("k_values")
             if not isinstance(k_values, (list, tuple)) or not k_values:
                 raise ValueError("R7 EXL3 k_values must be a non-empty list")
-            try:
-                invalid_k = sorted({int(value) for value in k_values} - {3, 4, 5})
-            except (TypeError, ValueError) as exc:
-                raise ValueError("R7 EXL3 k_values must contain integers") from exc
+            if any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in k_values
+            ):
+                raise ValueError("R7 EXL3 k_values must contain JSON integers")
+            normalized_k = sorted(set(k_values))
+            invalid_k = sorted(set(normalized_k) - {3, 4, 5})
             if invalid_k:
                 raise ValueError(f"R7 EXL3 has unsupported k_values: {invalid_k}")
-            instance.r7_routed_experts = dict(_r7)
+            instance.r7_routed_experts = {
+                **_r7,
+                "moe_layers": tuple(layers),
+                "k_values": tuple(normalized_k),
+            }
         # --- end glm52-mdispatch ---
         return instance
 
@@ -3249,8 +3274,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         tier_signature = policy["tier_signature"]
         broadcast_suh = bool(mixed["broadcast_suh"])
         broadcast_svh = bool(mixed["broadcast_svh"])
+        owner_token = _runtime_owner_token(self.quant_config, layer)
         key = (
-            _runtime_owner_token(self.quant_config, layer),
+            owner_token,
             x.device.index,
             x.dtype,
             topk_ids.dtype,
@@ -3319,8 +3345,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "capacity": capacity,
                 "launch": launch,
                 "buffers": _shared_mixed_buffers(
-                    mixed_api, launch, device, policy["sms"], capacity,
-                    block_size_m, tile_config, topk,
+                    owner_token,
+                    mixed_api,
+                    launch,
+                    device,
+                    policy["sms"],
+                    capacity,
+                    block_size_m,
+                    tile_config,
+                    topk,
                 ),
             }
 
@@ -3388,6 +3421,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             state: dict[str, Any],
             tiers: tuple[Any, Any],
         ) -> torch.Tensor:
+            run_kwargs = {}
+            gate_experts = mixed.get("tier_gate_experts")
+            up_experts = mixed.get("tier_up_experts")
+            if (gate_experts is None) != (up_experts is None):
+                raise RuntimeError(
+                    "projection-tight R7 tiers require paired gate/up counts"
+                )
+            if gate_experts is not None:
+                run_kwargs.update(
+                    gate_experts=gate_experts, up_experts=up_experts
+                )
             return (
                 runtime["mixed_api"]
                 .run_mixed_trellis(
@@ -3401,7 +3445,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     mixed["rotations"],
                     state["launch"],
                     state["buffers"],
-                    gate_experts=mixed.get("tier_gate_experts"),
+                    **run_kwargs,
                 )
                 .to(slice_x.dtype)
             )
@@ -3485,6 +3529,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self._r7_table_from_tensors(layer, group, attr, shard_id)
             for group, attr, shard_id in pointer_specs
         )
+        declared_k = set(
+            getattr(self.quant_config, "r7_routed_experts", {}).get("k_values", ())
+        )
 
         def projection_bits(group: str, shard_id: str) -> torch.Tensor:
             tensors = getattr(layer, f"{group}_trellis").exl3_tensors
@@ -3492,11 +3539,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 int(tensors[(expert_id, shard_id)].shape[2] // 16)
                 for expert_id in range(layer.local_num_experts)
             ]
-            invalid = sorted(set(values) - {3, 4, 5})
+            invalid = sorted(set(values) - declared_k)
             if invalid:
                 raise ValueError(
-                    f"R7 {shard_id} has unsupported bitrates {invalid}; "
-                    "expected only checkpoint-declared K3/K4/K5"
+                    f"R7 {shard_id} has bitrates {invalid} not declared by "
+                    f"r7_routed_experts.k_values={sorted(declared_k)}"
                 )
             return torch.tensor(
                 values,
@@ -3522,8 +3569,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
     # across model loads in one process and making the fused/per-expert split
     # order-dependent. The config is per model load and shared by its layers.
 
-    @staticmethod
-    def _r7_projection_tiers(layer: RoutedExperts):
+    def _r7_projection_tiers(self, layer: RoutedExperts):
         """Split experts into two bitrate tiers per projection.
 
         Returns (tier_bits, {projection: (tier_id_per_expert, ...)}) or None
@@ -3547,11 +3593,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "down": widths("w2", "w2"),
         }
         present = sorted({b for values in projections.values() for b in values})
-        invalid = sorted(set(present) - {3, 4, 5})
+        declared_k = set(
+            getattr(self.quant_config, "r7_routed_experts", {}).get("k_values", ())
+        )
+        invalid = sorted(set(present) - declared_k)
         if invalid:
             raise ValueError(
-                f"R7 routed experts use unsupported bitrates {invalid}; "
-                "expected only checkpoint-declared K3/K4/K5"
+                f"R7 routed experts use bitrates {invalid} not declared by "
+                f"r7_routed_experts.k_values={sorted(declared_k)}"
             )
         if len(present) != 2:
             return None
@@ -3635,6 +3684,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         prefill_tiers = []
         fc1_counts = []
         tier_gate_counts = []  # real gate plane count per tier
+        tier_up_counts = []  # real up plane count per tier
         # Stack every tier BEFORE preparing any of them. prepare needs a
         # transient full-size counterpart for the phase it is not packing, and
         # that will not fit while the per-expert source tensors are still
@@ -3695,19 +3745,39 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             # ~1 extra plane per tier per layer, measured at -1.81 GiB of KV
             # headroom at max_model_len 262144 on 4x96 GB.
             expected_last = 16 * bits
-            _tmpl_id = gate_ids[0] if gate_ids else 0
-            gate_template = w13_param.exl3_tensors[(_tmpl_id, "w1")]
             gate_n = len(gate_ids)
             up_n = len(up_ids)
+            if gate_ids:
+                payload_template = w13_param.exl3_tensors[(gate_ids[0], "w1")]
+            elif up_ids:
+                payload_template = w13_param.exl3_tensors[(up_ids[0], "w3")]
+            else:
+                # This K may occur only in down. Use its dtype/device, but
+                # derive the FC1 geometry instead of borrowing expert 0 from
+                # another K or an already-consumed tier.
+                payload_template = w2_param.exl3_tensors[(down_ids[0], "w2")]
             w13 = torch.zeros(
-                (max(gate_n + up_n, 1), *gate_template.shape),
-                dtype=gate_template.dtype,
-                device=gate_template.device,
+                (
+                    max(gate_n + up_n, 1),
+                    hidden_size // 16,
+                    intermediate_size // 16,
+                    expected_last,
+                ),
+                dtype=payload_template.dtype,
+                device=payload_template.device,
             )
             plane(gate_ids, "w1", w13_param, fc1_slots, out=w13, base=0)
             plane(up_ids, "w3", w13_param, fc1_slots, out=w13, base=gate_n)
-            w2 = plane(down_ids, "w2", w2_param, fc2_slots)
+            if down_ids:
+                w2 = plane(down_ids, "w2", w2_param, fc2_slots)
+            else:
+                w2 = torch.zeros(
+                    (1, intermediate_size // 16, hidden_size // 16, expected_last),
+                    dtype=payload_template.dtype,
+                    device=payload_template.device,
+                )
             tier_gate_counts.append(gate_n)
+            tier_up_counts.append(up_n)
             torch.cuda.empty_cache()
             if (
                 int(w13.shape[-1]) != expected_last
@@ -3890,6 +3960,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             # Real gate plane count per tier, threaded to run_mixed_trellis so
             # the w13 descriptor sizes by gate_count over the tight buffer.
             "tier_gate_experts": tuple(tier_gate_counts),
+            # Real up counts make descriptor bounds independent of FC1 slots.
+            "tier_up_experts": tuple(tier_up_counts),
             "global_to_combined": global_to_combined,
             "descriptor_map": descriptor_map,
             "rotations": rotations,
