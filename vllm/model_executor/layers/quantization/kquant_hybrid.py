@@ -358,6 +358,7 @@ class _HybridLayerState:
         intermediate_size: int,
         num_experts: int,
         kept_mx: bool,
+        kept_exl4: bool,
     ) -> None:
         # global expert id -> (tier, local index); tier 0 = kept, 1 = secondary.
         self.remap = remap
@@ -365,6 +366,7 @@ class _HybridLayerState:
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
         self.kept_mx = kept_mx
+        self.kept_exl4 = kept_exl4
         self.num_kept = sum(1 for tier, _ in remap.values() if tier == 0)
         self.num_secondary = sum(1 for tier, _ in remap.values() if tier == 1)
         self.tiles = _b12x_tiles_for_geometry(hidden_size, intermediate_size)
@@ -387,10 +389,13 @@ class _HybridLayerState:
         # converted tensors, so dropping them would dangle the views.
         self.keepalive: Any = None
         # Canonical QSRT layers own compressed experts through an external
-        # TP-independent safetensors artifact.
+        # TP-independent safetensors artifact. Legacy SIQ layers may instead
+        # partition their inline MCG Trellis tensors into K3 and K4 tiers.
         self.uses_qsrt_atoms = False
         self.trellis_weights: Any = None
         self.trellis_plan: Any = None
+        self.trellis_kept_weights: Any = None
+        self.trellis_kept_plan: Any = None
         self.w4a8_scratch_geometry: tuple[int, int, int, bool] | None = None
         self.trellis_output_accum_key: tuple[int, int, torch.device] | None = None
         self.runtime_evidence_layer: int | None = None
@@ -762,6 +767,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         bits = self._layer_bits(layer)
         mapped_layer = bits is not None
         kept_mx = mapped_layer and self.quant_config.kept_format == "mxfp4_e8m0k32"
+        kept_exl4 = mapped_layer and self.quant_config.kept_format == "exl3_4"
         if bits is None:
             # MoE layer absent from hybrid_bit_map (e.g. an MTP head): its
             # experts are uniform NVFP4; run it through the hybrid path as
@@ -788,7 +794,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             **{e: (0, i) for i, e in enumerate(kept)},
             **{e: (1, i) for i, e in enumerate(demoted)},
         }
-        state = _HybridLayerState(remap, hidden, inter, num_experts, kept_mx)
+        state = _HybridLayerState(remap, hidden, inter, num_experts, kept_mx, kept_exl4)
         layer_match = re.search(r"layers\.(\d+)\b", layer.layer_name)
         if layer_match is not None:
             state.runtime_evidence_layer = int(layer_match.group(1))
@@ -854,14 +860,31 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             if expert_id is None:
                 raise ValueError(f"expert tensor {name!r} is missing expert_id")
             tier, local_id = state.remap[int(expert_id)]
-            if "exl3_" in name:
+            legacy_match = re.search(r"(w13|w2)_rank0\.(trellis|suh|svh|mcg)$", name)
+            if "exl3_" in name or legacy_match is not None:
                 # Native EXL3 tier tensors. TP sharding slices only the
                 # intermediate axis (whole 16-tiles / whole 128-Hadamard
-                # blocks, so slicing is exact).
-                assert tier == 1, f"exl3 tensor for kept expert: {name}"
-                family = "w13" if "w13_" in name else "w2"
-                part = name.rsplit("exl3_", 1)[1]
-                target = getattr(layer, f"{family}_exl3_{part}")
+                # blocks, so slicing is exact). Legacy SIQ names every inline
+                # tensor ``rank0`` and mixes K3/K4 experts in one layer.
+                if legacy_match is not None:
+                    family, part = legacy_match.groups()
+                else:
+                    if tier != 1:
+                        raise ValueError(f"exl3 tensor for kept expert: {name}")
+                    family = "w13" if "w13_" in name else "w2"
+                    part = name.rsplit("exl3_", 1)[1]
+                if part == "mcg":
+                    marker = int(loaded_weight.reshape(()).item())
+                    if marker != self.quant_config.trellis_mcg:
+                        raise ValueError(
+                            "EXL3 MCG marker disagrees with quantization config: "
+                            f"{marker} != {self.quant_config.trellis_mcg}"
+                        )
+                    return True
+                storage = "exl4" if tier == 0 and state.kept_exl4 else "exl3"
+                if tier == 0 and storage != "exl4":
+                    raise ValueError(f"exl3 tensor for kept expert: {name}")
+                target = getattr(layer, f"{family}_{storage}_{part}")
                 lw = loaded_weight
                 if tp_size > 1:
                     if family == "w13":
@@ -942,6 +965,21 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             set_weight_attrs(param, {"weight_loader": hybrid_weight_loader})
             layer.register_parameter(name, param)
 
+        def register_rank0_dispatch(name: str) -> None:
+            dispatcher = torch.nn.Module()
+            for part in ("trellis", "suh", "svh", "mcg"):
+                param = torch.nn.Parameter(
+                    torch.empty(
+                        (0,),
+                        dtype=torch.uint8,
+                        device=torch.accelerator.current_device_index(),
+                    ),
+                    requires_grad=False,
+                )
+                set_weight_attrs(param, {"weight_loader": hybrid_weight_loader})
+                dispatcher.register_parameter(part, param)
+            layer.add_module(name, dispatcher)
+
         num_kept = max(state.num_kept, 1)
         num_secondary = max(state.num_secondary, 1)
         # Names the stock prefix-based expert mapping produces; the scalar
@@ -976,13 +1014,36 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             )
             register("w2_exl3_suh", (num_secondary, inter), torch.float16)
             register("w2_exl3_svh", (h_rows, hidden), torch.float16)
-        register("w13_weight", (num_kept, 2 * inter, hidden // 2))
+        if kept_exl4:
+            tb = 64  # 16 * 4 bits
+            register(
+                "w13_exl4_trellis",
+                (num_kept, 2, hidden // 16, inter // 16, tb),
+                torch.int16,
+            )
+            register("w13_exl4_suh", (num_kept, 2, hidden), torch.float16)
+            register("w13_exl4_svh", (num_kept, 2, inter), torch.float16)
+            register(
+                "w2_exl4_trellis",
+                (num_kept, inter // 16, hidden // 16, tb),
+                torch.int16,
+            )
+            register("w2_exl4_suh", (num_kept, inter), torch.float16)
+            register("w2_exl4_svh", (num_kept, hidden), torch.float16)
+        if exl3:
+            # Stock expert mapping preserves the checkpoint's ``rank0``
+            # component as a child module name; these zero-byte parameters
+            # dispatch the inline tensors into the tier-contiguous storage.
+            register_rank0_dispatch("w13_rank0")
+            register_rank0_dispatch("w2_rank0")
+        inline_kept = 1 if kept_exl4 else num_kept
+        register("w13_weight", (inline_kept, 2 * inter, hidden // 2))
         register("w13_weight_scale", (1,))
-        register("w13_weight_scale_2", (num_kept, 2), torch.float32)
+        register("w13_weight_scale_2", (inline_kept, 2), torch.float32)
         register("w13_input_scale", (1,), torch.float32)
-        register("w2_weight", (num_kept, hidden, inter // 2))
+        register("w2_weight", (inline_kept, hidden, inter // 2))
         register("w2_weight_scale", (1,))
-        register("w2_weight_scale_2", (num_kept,), torch.float32)
+        register("w2_weight_scale_2", (inline_kept,), torch.float32)
         register("w2_input_scale", (1,), torch.float32)
         # Real block-scale storage, filled by the dispatcher (not routed by
         # the expert mapping). MXFP4 kept tier stores ue8m0 scales per 32
@@ -990,8 +1051,8 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         nv_group = 32 if kept_mx else group_size
         nv_dtype = torch.uint8 if kept_mx else torch.float8_e4m3fn
         for name, shape, dtype in (
-            ("w13_nv_scale", (num_kept, 2 * inter, hidden // nv_group), nv_dtype),
-            ("w2_nv_scale", (num_kept, hidden, inter // nv_group), nv_dtype),
+            ("w13_nv_scale", (inline_kept, 2 * inter, hidden // nv_group), nv_dtype),
+            ("w2_nv_scale", (inline_kept, hidden, inter // nv_group), nv_dtype),
         ):
             scale_param = torch.nn.Parameter(
                 torch.zeros(
@@ -1474,60 +1535,71 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             (emap_kept if tier == 0 else emap_secondary)[global_id] = local_id
         state.emap_kept, state.emap_secondary = emap_kept, emap_secondary
 
-        if state.uses_qsrt_atoms:
-            self._load_qsrt_atoms(layer, device=device)
-        elif num_secondary > 0 and self.quant_config.demoted_format == "exl3_3":
+        def prepare_inline_trellis(storage: str, bits: int, count: int):
             fused_moe = _qsrt_backend_module("moe.fused_moe")
-
+            w13_trellis = getattr(layer, f"w13_{storage}_trellis")
+            w13_suh = getattr(layer, f"w13_{storage}_suh")
+            w13_svh = getattr(layer, f"w13_{storage}_svh")
+            w2_trellis = getattr(layer, f"w2_{storage}_trellis")
+            w2_suh = getattr(layer, f"w2_{storage}_suh")
+            w2_svh = getattr(layer, f"w2_{storage}_svh")
             # Projection-major native stacks; prepare_weights wraps zero-copy.
-            w13 = layer.w13_exl3_trellis.data.permute(1, 0, 2, 3, 4).contiguous()
-            w2t = layer.w2_exl3_trellis.data.contiguous()
+            w13 = w13_trellis.data.permute(1, 0, 2, 3, 4).contiguous()
+            w2t = w2_trellis.data.contiguous()
             # B12X consumes the two FC1 output scales before the FC2 input
-            # scale.  This order is observable for SiTU because its up branch
+            # scale. This order is observable for SiTU because its up branch
             # is nonlinear; the latter two blocks cannot be commuted.
             inter_rot = _stack_exl3_intermediate_rotations(
-                layer.w13_exl3_svh.data,
-                layer.w2_exl3_suh.data,
+                w13_svh.data,
+                w2_suh.data,
             )
             wplan = fused_moe.plan_weights(
                 quant_modes="w4a16",
                 source_format="exl3_trellis_mcg",
                 activation=self.moe.activation.value,
                 params_dtype=self.moe.in_dtype,
-                num_experts=num_secondary,
+                num_experts=count,
                 hidden_size=hidden,
                 intermediate_size=inter,
                 w13_layout="w13",
-                trellis_bits=3,
+                trellis_bits=bits,
             )
-            state.trellis_weights = fused_moe.prepare_weights(
+            prepared = fused_moe.prepare_weights(
                 plan=wplan,
                 params_dtype=self.moe.in_dtype,
                 w1_fp4=w13,
                 w2_fp4=w2t,
-                gate_suh=layer.w13_exl3_suh.data[:, 0].contiguous(),
-                up_suh=layer.w13_exl3_suh.data[:, 1].contiguous(),
+                gate_suh=w13_suh.data[:, 0].contiguous(),
+                up_suh=w13_suh.data[:, 1].contiguous(),
                 intermediate_rotations=inter_rot,
-                down_svh=layer.w2_exl3_svh.data.contiguous(),
+                down_svh=w2_svh.data.contiguous(),
                 trellis_mcg=self.quant_config.trellis_mcg,
             )
-            for pname in (
-                "w13_exl3_trellis",
-                "w13_exl3_suh",
-                "w13_exl3_svh",
-                "w2_exl3_trellis",
-                "w2_exl3_suh",
-                "w2_exl3_svh",
+            for param in (
+                w13_trellis,
+                w13_suh,
+                w13_svh,
+                w2_trellis,
+                w2_suh,
+                w2_svh,
             ):
-                p = getattr(layer, pname)
-                p.data = p.data.new_empty((0,))
+                param.data = param.data.new_empty((0,))
+            return prepared
+
+        if state.uses_qsrt_atoms:
+            self._load_qsrt_atoms(layer, device=device)
+        elif num_secondary > 0 and self.quant_config.demoted_format == "exl3_3":
+            state.trellis_weights = prepare_inline_trellis("exl3", 3, num_secondary)
             torch.accelerator.empty_cache()
         elif num_secondary > 0:
             raise ValueError(
                 f"unsupported secondary format {self.quant_config.demoted_format!r}"
             )
 
-        if num_kept > 0 and state.kept_mx and state.prep_kept is None:
+        if num_kept > 0 and state.kept_exl4:
+            state.trellis_kept_weights = prepare_inline_trellis("exl4", 4, num_kept)
+            torch.accelerator.empty_cache()
+        elif num_kept > 0 and state.kept_mx and state.prep_kept is None:
             self._build_kept_mxfp4(layer)
         elif num_kept > 0 and state.prep_kept is None:
             # Kept NVFP4 through the "packed"/e4m3_k16 W4A16 layout. This is
@@ -1907,6 +1979,43 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                         expert_map=state.emap_secondary,
                         fast_math=True,
                     )
+        kept_trellis = getattr(state, "trellis_kept_weights", None)
+        if kept_trellis is not None:
+            fused_moe = _qsrt_backend_module("moe.fused_moe")
+            key = (
+                "trellis-kept",
+                state.num_kept,
+                state.hidden_size,
+                kept_trellis.plan.intermediate_size,
+                runtime.topk,
+                runtime.max_m,
+            )
+            kept_plan = runtime.launches.get(key)
+            if kept_plan is None:
+                kept_plan = fused_moe.plan(
+                    fused_moe.Caps(
+                        max_tokens=runtime.max_m,
+                        num_topk=runtime.topk,
+                        device=torch.accelerator.current_device_index(),
+                        weight_plan=kept_trellis.plan,
+                        quant_mode="w4a16",
+                        route_num_experts=self.moe.num_experts,
+                        w4a16_block_size_m=8,
+                    )
+                )
+                runtime.launches[key] = kept_plan
+            state.trellis_kept_plan = kept_plan
+            spec = kept_plan.scratch_specs()[0]
+            need = int(torch.Size(spec.shape).numel())
+            trellis_scratch = runtime.trellis_scratch
+            if trellis_scratch is None or (
+                trellis_scratch.numel() < need or trellis_scratch.dtype != spec.dtype
+            ):
+                runtime.trellis_scratch = torch.empty(
+                    spec.shape,
+                    dtype=spec.dtype,
+                    device=torch.accelerator.current_device_index(),
+                )
         if runtime.buffers is None and state.prep_kept is not None:
             prep_any = state.prep_kept
             device = prep_any.w13.device
@@ -2087,6 +2196,38 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             shared_experts_input=None,
         )[:result_m]
 
+    def _run_exl4_kept(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the legacy SIQ K4 Trellis partition and detach its output."""
+        state: _HybridLayerState = layer.hybrid_state
+        runtime = self.quant_config.shared_runtime
+        if (
+            state.trellis_kept_weights is None
+            or state.trellis_kept_plan is None
+            or state.emap_kept is None
+            or runtime.trellis_scratch is None
+        ):
+            raise RuntimeError("EXL3 K4 kept partition was not prepared")
+        tids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+        if not tids.is_contiguous():
+            tids = tids.contiguous()
+        fused_moe = _qsrt_backend_module("moe.fused_moe")
+        binding = fused_moe.bind(
+            state.trellis_kept_plan,
+            scratch=runtime.trellis_scratch,
+            a=x if x.is_contiguous() else x.contiguous(),
+            experts=state.trellis_kept_weights,
+            topk_weights=topk_weights,
+            topk_ids=tids,
+            route_expert_map=state.emap_kept,
+        )
+        return fused_moe.run(binding=binding)[: x.shape[0]].to(dtype=x.dtype, copy=True)
+
     def _apply_once(
         self,
         layer: "RoutedExperts",
@@ -2121,8 +2262,10 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         if not weights.is_contiguous():
             weights = weights.contiguous()
         if state.num_secondary == 0:
-            # Uniform kept layer (including all-MXFP4 decoder layers and an
-            # unmapped NVFP4 MTP head): single-tier launch.
+            # Uniform kept layer: legacy SIQ may use K4 Trellis; ordinary
+            # checkpoints use MXFP4/NVFP4.
+            if getattr(state, "trellis_kept_weights", None) is not None:
+                return self._run_exl4_kept(layer, x, weights, topk_ids)
             return self._run_kept(layer, x, weights, topk_ids, decode)
         if getattr(state, "trellis_weights", None) is not None:
             tids = (
@@ -2251,6 +2394,8 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 )
             if state.num_kept == 0:
                 return out_trellis
+            if getattr(state, "trellis_kept_weights", None) is not None:
+                return self._run_exl4_kept(layer, x, weights, tids) + out_trellis
             return self._run_kept(layer, x, weights, topk_ids, decode)[:m] + out_trellis
         raise RuntimeError("secondary trellis weights were not prepared")
 

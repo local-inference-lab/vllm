@@ -506,6 +506,69 @@ def test_config_registration_and_generic_exl3_default() -> None:
     assert config.kept_storage == "inline-mxfp4"
 
 
+def test_legacy_siq_rank0_trellis_loads_k4_and_k3_tiers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = KQuantHybridConfig.from_config(
+        _base_config(
+            hybrid_bit_map={"3": [4, 3]},
+            kept_format="exl3_4",
+            trellis={
+                "codebook": "mcg",
+                "mcg_mult": 3417055213,
+                "shared_su": False,
+            },
+        )
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid."
+        "get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.kquant_hybrid."
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: "cpu")
+    method = object.__new__(KQuantHybridMoEMethod)
+    method.quant_config = config
+    layer = torch.nn.Module()
+    layer.activation = MoEActivation.SILU
+    layer.layer_name = "model.layers.3.mlp.experts"
+
+    method.create_weights(
+        layer,
+        num_experts=2,
+        hidden_size=128,
+        intermediate_size_per_partition=64,
+        params_dtype=torch.float16,
+    )
+
+    assert layer.hybrid_state.kept_exl4 is True
+    assert tuple(layer.w13_exl4_trellis.shape) == (1, 2, 8, 4, 64)
+    assert tuple(layer.w13_exl3_trellis.shape) == (1, 2, 8, 4, 48)
+    loader = layer.w13_rank0.trellis.weight_loader
+    k4 = torch.arange(8 * 4 * 64, dtype=torch.int16).reshape(8, 4, 64)
+    k3 = torch.arange(8 * 4 * 48, dtype=torch.int16).reshape(8, 4, 48)
+    assert loader(
+        layer.w13_rank0.trellis,
+        k4,
+        name_mapped="w13_rank0.trellis",
+        shard_id="w1",
+        expert_id=0,
+    )
+    assert loader(
+        layer.w13_rank0.trellis,
+        k3,
+        name_mapped="w13_rank0.trellis",
+        shard_id="w3",
+        expert_id=1,
+    )
+    torch.testing.assert_close(layer.w13_exl4_trellis[0, 0], k4)
+    torch.testing.assert_close(layer.w13_exl3_trellis[0, 1], k3)
+
+
 @pytest.mark.parametrize(
     "schema",
     [
