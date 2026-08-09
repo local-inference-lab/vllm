@@ -239,7 +239,7 @@ def _write_runtime_qualification(root: Path, manifest: dict[str, object]) -> Non
                 "--compilation-config",
                 '{"backend":"inductor","cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,20,24,32,48,64],"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}',
                 "--speculative-config",
-                '{"method":"mtp","num_speculative_tokens":1}',
+                '{"attention_backend":"B12X_MLA_SPARSE","method":"mtp","num_speculative_tokens":1}',
                 "--gpu-memory-utilization",
                 "0.80",
                 "--max-model-len",
@@ -732,6 +732,7 @@ def test_production_receipt_binds_qualified_candidate_marker(tmp_path: Path) -> 
     (
         "omitted_kv_cache",
         "mutated_custom_ops",
+        "missing_draft_attention_backend",
         "eager_qsrt",
         "wrong_variant",
         "wrong_comparator",
@@ -760,6 +761,12 @@ def test_publication_rejects_mutated_fixed_qualification_contract(
         index = argv.index("--compilation-config")
         config = json.loads(argv[index + 1])
         config["custom_ops"] = []
+        argv[index + 1] = json.dumps(config, separators=(",", ":"), sort_keys=True)
+    elif mutation == "missing_draft_attention_backend":
+        argv = receipt["loaders"]["qsrt"]["runtime"]["argv"]
+        index = argv.index("--speculative-config")
+        config = json.loads(argv[index + 1])
+        del config["attention_backend"]
         argv[index + 1] = json.dumps(config, separators=(",", ":"), sort_keys=True)
     elif mutation == "eager_qsrt":
         receipt["loaders"]["qsrt"]["runtime"]["compilation_backend"] = "eager"

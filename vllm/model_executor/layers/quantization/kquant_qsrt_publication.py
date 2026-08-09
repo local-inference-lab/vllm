@@ -93,6 +93,11 @@ _FIXED_COMPILATION_CONFIG = {
         64,
     ],
 }
+_FIXED_SPECULATIVE_CONFIG = {
+    "attention_backend": "B12X_MLA_SPARSE",
+    "method": "mtp",
+    "num_speculative_tokens": 1,
+}
 _FIXED_RUNTIME_OPTIONS = {
     "--attention-backend": "B12X_MLA_SPARSE",
     "--generation-config": "vllm",
@@ -593,7 +598,7 @@ def _validate_runtime_argv(
     speculative = _runtime_argv_json(
         values["--speculative-config"], "--speculative-config"
     )
-    if speculative != {"method": "mtp", "num_speculative_tokens": 1}:
+    if speculative != _FIXED_SPECULATIVE_CONFIG:
         raise ValueError(
             f"Fruit runtime qualification loaders.{arm} MTP argv is not qualified"
         )
@@ -617,7 +622,9 @@ def _validate_runtime_argv(
         "--compilation-config": json.dumps(
             _FIXED_COMPILATION_CONFIG, separators=(",", ":"), sort_keys=True
         ),
-        "--speculative-config": '{"method":"mtp","num_speculative_tokens":1}',
+        "--speculative-config": json.dumps(
+            _FIXED_SPECULATIVE_CONFIG, separators=(",", ":"), sort_keys=True
+        ),
     }
     normalized = ["vllm", "serve", "<MODEL>"]
     for flag in _RUNTIME_OPTION_ORDER:

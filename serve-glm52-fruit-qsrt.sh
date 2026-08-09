@@ -1029,7 +1029,7 @@ os.execv(sys.argv[2], sys.argv[2:])
   --enable-chunked-prefill \
   --enable-prefix-caching \
   --compilation-config '{"backend":"inductor","cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,20,24,32,48,64]}' \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":1}' \
+  --speculative-config '{"attention_backend":"B12X_MLA_SPARSE","method":"mtp","num_speculative_tokens":1}' \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   --max-model-len "${MAX_MODEL_LEN}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
