@@ -292,8 +292,12 @@ def secured_launcher_run(
     )
     _write(vllm_repository / "serve-glm52-fruit-qsrt.sh", launcher)
     (vllm_repository / "serve-glm52-fruit-qsrt.sh").chmod(0o755)
-    _write(vllm_repository / ".gitignore", ".venv/\n")
+    _write(vllm_repository / ".gitignore", ".venv/\n*.so\n")
     _write(vllm_repository / "vllm/__init__.py", "SOURCE_VALUE = 'verified-vllm'\n")
+    _write(
+        vllm_repository / "vllm/compiled_runtime.so",
+        "verified-extension\n",
+    )
     _write(vllm_repository / "vllm/entrypoints/__init__.py", "")
     _write(vllm_repository / "vllm/entrypoints/cli/__init__.py", "")
     _write(
@@ -310,6 +314,12 @@ import b12x
 import vllm
 
 report = {
+    "compiled_runtime": (
+        Path(vllm.__file__).parent / "compiled_runtime.so"
+    ).read_text(),
+    "compiled_runtime_path": str(
+        Path(vllm.__file__).parent / "compiled_runtime.so"
+    ),
     "b12x_file": b12x.__file__,
     "b12x_value": b12x.SOURCE_VALUE,
     "fixed": {
@@ -401,6 +411,9 @@ marker_name = "QSRT_CANDIDATE.json" if candidate_mode else "QSRT_COMPLETE.json"
 (destination / marker_name).write_bytes(marker_bytes)
 (Path(os.environ["TEST_MUTABLE_VLLM_ROOT"]) / "vllm/__init__.py").write_text(
     "SOURCE_VALUE = 'mutated-vllm'\\n"
+)
+(Path(os.environ["TEST_MUTABLE_VLLM_ROOT"]) / "vllm/compiled_runtime.so").write_text(
+    "mutated-extension\\n"
 )
 (Path(os.environ["TEST_MUTABLE_B12X_ROOT"]) / "b12x/__init__.py").write_text(
     "SOURCE_VALUE = 'mutated-b12x'\\n"
@@ -517,6 +530,7 @@ def test_qsrt_launcher_uses_private_runtime_snapshot_after_live_tree_mutation(
     report = json.loads(report_path.read_text())
     assert report["vllm_value"] == "verified-vllm"
     assert report["b12x_value"] == "verified-b12x"
+    assert report["compiled_runtime"] == "verified-extension\n"
     assert report["fixed"] == {
         "CUDA_VISIBLE_DEVICES": "0",
         "HF_HUB_OFFLINE": "1",
@@ -536,6 +550,7 @@ def test_qsrt_launcher_uses_private_runtime_snapshot_after_live_tree_mutation(
     assert isinstance(b12x_repository, Path)
     assert not Path(report["vllm_file"]).is_relative_to(vllm_repository)
     assert not Path(report["b12x_file"]).is_relative_to(b12x_repository)
+    assert not Path(report["compiled_runtime_path"]).is_relative_to(vllm_repository)
     assert "mutated-vllm" in (vllm_repository / "vllm/__init__.py").read_text()
     assert "mutated-b12x" in (b12x_repository / "b12x/__init__.py").read_text()
 

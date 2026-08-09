@@ -475,7 +475,7 @@ def read_stable_regular(path, max_bytes):
     return b"".join(chunks)
 
 
-def verify_runtime_manifest(vllm_root, b12x_root):
+def runtime_manifest_entries():
     if RUNTIME_MANIFEST.is_symlink() or not RUNTIME_MANIFEST.is_file():
         raise RuntimeError("Fruit runtime manifest is missing or symbolic")
     expected = {}
@@ -492,7 +492,7 @@ def verify_runtime_manifest(vllm_root, b12x_root):
         digest, name = fields
         relative = PurePosixPath(name)
         if (
-            not relative.parts
+            len(relative.parts) < 2
             or len(digest) != 64
             or any(character not in "0123456789abcdef" for character in digest)
             or relative.is_absolute()
@@ -502,11 +502,20 @@ def verify_runtime_manifest(vllm_root, b12x_root):
         ):
             raise RuntimeError("Fruit runtime manifest entry is invalid")
         expected[name] = digest
+    return expected
+
+
+def runtime_package_roots(vllm_root, b12x_root):
+    return {
+        "vllm": vllm_root / "vllm",
+        "b12x": b12x_root / "b12x",
+    }
+
+
+def verify_runtime_manifest(vllm_root, b12x_root):
+    expected = runtime_manifest_entries()
     actual = {}
-    for namespace, root in (
-        ("vllm", vllm_root / "vllm"),
-        ("b12x", b12x_root / "b12x"),
-    ):
+    for namespace, root in runtime_package_roots(vllm_root, b12x_root).items():
         for path in sorted(root.rglob("*")):
             if path.is_symlink():
                 raise RuntimeError(f"Fruit runtime package path is symbolic: {path}")
@@ -526,6 +535,7 @@ def verify_runtime_manifest(vllm_root, b12x_root):
     for name, path in actual.items():
         if sha256(path) != expected[name]:
             raise RuntimeError(f"Fruit runtime file digest mismatch: {name}")
+    return expected
 
 def git_source_output(root, *args):
     try:
@@ -684,6 +694,94 @@ def write_all(descriptor, value):
         offset += written
 
 
+def snapshot_runtime_extensions(
+    vllm_root,
+    b12x_root,
+    vllm_snapshot,
+    b12x_snapshot,
+    expected,
+):
+    source_roots = runtime_package_roots(vllm_root, b12x_root)
+    snapshot_roots = runtime_package_roots(vllm_snapshot, b12x_snapshot)
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+    source_root_fds = {
+        namespace: os.open(root, directory_flags)
+        for namespace, root in source_roots.items()
+    }
+    snapshot_root_fds = {
+        namespace: os.open(root, directory_flags)
+        for namespace, root in snapshot_roots.items()
+    }
+    try:
+        for name, expected_digest in sorted(expected.items()):
+            manifest_path = PurePosixPath(name)
+            namespace = manifest_path.parts[0]
+            package_relative = PurePosixPath(*manifest_path.parts[1:]).as_posix()
+            destination = snapshot_roots[namespace] / package_relative
+            if destination.exists():
+                continue
+            if not package_relative.endswith(".so"):
+                raise RuntimeError(
+                    f"Fruit runtime manifest has an untracked non-extension: {name}"
+                )
+            relative = os.fsencode(package_relative)
+            source_parent_fd, source_fd = open_tracked_file(
+                source_root_fds[namespace],
+                relative,
+                directory_flags,
+                flags,
+            )
+            snapshot_parent_fd = None
+            snapshot_fd = None
+            try:
+                before = os.fstat(source_fd)
+                if not stat.S_ISREG(before.st_mode):
+                    raise RuntimeError("runtime extension source is not regular")
+                snapshot_parent_fd, snapshot_fd = create_snapshot_file(
+                    snapshot_root_fds[namespace],
+                    relative,
+                    0o700 if before.st_mode & 0o111 else 0o600,
+                    directory_flags,
+                )
+                digest = hashlib.sha256()
+                bytes_read = 0
+                while chunk := os.read(source_fd, 1 << 20):
+                    bytes_read += len(chunk)
+                    digest.update(chunk)
+                    write_all(snapshot_fd, chunk)
+                after = os.fstat(source_fd)
+                path_after = os.stat(
+                    relative.rsplit(b"/", 1)[-1],
+                    dir_fd=source_parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    bytes_read != before.st_size
+                    or source_stat_identity(before) != source_stat_identity(after)
+                    or source_stat_identity(after) != source_stat_identity(path_after)
+                ):
+                    raise RuntimeError("runtime extension changed while snapshotting")
+                if digest.hexdigest() != expected_digest:
+                    raise RuntimeError(
+                        f"Fruit runtime file digest mismatch: {name}"
+                    )
+                if os.fstat(snapshot_fd).st_size != bytes_read:
+                    raise RuntimeError("sealed runtime extension has an invalid size")
+            finally:
+                if snapshot_fd is not None:
+                    os.close(snapshot_fd)
+                if snapshot_parent_fd is not None:
+                    os.close(snapshot_parent_fd)
+                os.close(source_fd)
+                os.close(source_parent_fd)
+    finally:
+        for descriptor in snapshot_root_fds.values():
+            os.close(descriptor)
+        for descriptor in source_root_fds.values():
+            os.close(descriptor)
+
+
 def snapshot_tracked_tree(root_value, snapshot):
     root = Path(root_value).resolve(strict=True)
     index = tracked_source_index(root)
@@ -778,8 +876,16 @@ marker_name = "QSRT_CANDIDATE.json" if candidate_mode else "QSRT_COMPLETE.json"
 marker_kind = "candidate" if candidate_mode else "completion"
 b12x_snapshot = runtime_root / "b12x-source"
 vllm_snapshot = runtime_root / "vllm-source"
+expected_runtime = verify_runtime_manifest(vllm_root, b12x_root)
 b12x_source_sha256 = snapshot_tracked_tree(b12x_root, b12x_snapshot)
 vllm_source_sha256 = snapshot_tracked_tree(vllm_root, vllm_snapshot)
+snapshot_runtime_extensions(
+    vllm_root,
+    b12x_root,
+    vllm_snapshot,
+    b12x_snapshot,
+    expected_runtime,
+)
 verify_runtime_manifest(vllm_snapshot, b12x_snapshot)
 publication_tool = (
     vllm_snapshot
