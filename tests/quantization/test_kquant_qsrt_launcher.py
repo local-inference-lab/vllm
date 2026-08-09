@@ -211,7 +211,7 @@ def _publication_bytes(
 ) -> tuple[bytes, bytes]:
     manifest = {
         "producer": {
-            "encoder": {"kquant_revision": "615a8b083b151100c7883e2b216778cae1a8d0f2"},
+            "encoder": {"kquant_revision": "b619442ae55214bb8bf10ce5f3ee71b50ff5e469"},
             "runtime": {
                 "vllm_revision": vllm_revision,
                 "b12x_revision": b12x_revision,
@@ -254,6 +254,20 @@ def secured_launcher_run(
     launcher = (
         Path(__file__).resolve().parents[2] / "serve-glm52-fruit-qsrt.sh"
     ).read_text()
+    launcher = launcher.replace(
+        'process_group_alive() {\n  if [[ -z "${server_pgid}" ]]; then',
+        "process_group_alive() {\n"
+        '  if [[ "${TEST_STICKY_PROCESS_GROUP:-0}" == "1" '
+        '&& -n "${server_pgid}" ]]; then\n'
+        "    return 0\n"
+        "  fi\n"
+        '  if [[ -z "${server_pgid}" ]]; then',
+    )
+    assert "${TEST_STICKY_PROCESS_GROUP:-0}" in launcher
+    launcher = launcher.replace("{1..50}", "{1..2}")
+    launcher = launcher.replace("{1..200}", "{1..2}")
+    launcher = launcher.replace("/usr/bin/sleep 0.1", "/usr/bin/sleep 0.001")
+    launcher = launcher.replace("/usr/bin/sleep 0.05", "/usr/bin/sleep 0.001")
     launcher = re.sub(
         r'EXPECTED_B12X_REVISION="[0-9a-f]{40}"',
         f'EXPECTED_B12X_REVISION="{b12x_revision}"',
@@ -286,6 +300,7 @@ def secured_launcher_run(
   "TEST_MUTABLE_VLLM_ROOT=${TEST_MUTABLE_VLLM_ROOT}"
   "TEST_REPORT=${TEST_REPORT}"
   "TEST_PUBLICATION_ARGS=${TEST_PUBLICATION_ARGS}"
+  "TEST_STICKY_PROCESS_GROUP=${TEST_STICKY_PROCESS_GROUP}"
   "TEST_VLLM_REVISION=${TEST_VLLM_REVISION}"
   "TEST_VLLM_SOURCE_SHA256=${TEST_VLLM_SOURCE_SHA256}"
 )""",
@@ -482,11 +497,12 @@ marker_name = "QSRT_CANDIDATE.json" if candidate_mode else "QSRT_COMPLETE.json"
             "TEST_B12X_REVISION": b12x_revision,
             "TEST_B12X_SOURCE_SHA256": b12x_source_sha256,
             "TEST_DESCENDANT_PID": str(descendant_pid),
-            "TEST_KQUANT_REVISION": "615a8b083b151100c7883e2b216778cae1a8d0f2",
+            "TEST_KQUANT_REVISION": "b619442ae55214bb8bf10ce5f3ee71b50ff5e469",
             "TEST_MUTABLE_B12X_ROOT": str(b12x_repository),
             "TEST_MUTABLE_VLLM_ROOT": str(vllm_repository),
             "TEST_REPORT": str(report),
             "TEST_PUBLICATION_ARGS": str(root / "publication-arguments.json"),
+            "TEST_STICKY_PROCESS_GROUP": "1",
             "TEST_VLLM_REVISION": vllm_revision,
             "TEST_VLLM_SOURCE_SHA256": vllm_source_sha256,
             "B12X_FAKE_TOGGLE": "1",
@@ -510,6 +526,7 @@ marker_name = "QSRT_CANDIDATE.json" if candidate_mode else "QSRT_COMPLETE.json"
     return {
         "capture_dir": capture_dir,
         "b12x_repository": b12x_repository,
+        "cache_parent": cache_parent,
         "descendant_pid": descendant_pid,
         "report": report,
         "result": result,
@@ -586,3 +603,15 @@ def test_qsrt_launcher_kills_process_group_descendants_before_return(
         pytest.fail(
             f"process-group descendant {descendant_pid} survived launcher return"
         )
+
+
+def test_qsrt_launcher_bounds_post_sigkill_process_group_wait(
+    secured_launcher_run: dict[str, object],
+) -> None:
+    result = secured_launcher_run["result"]
+    assert isinstance(result, subprocess.CompletedProcess)
+    assert result.returncode == 0, result.stderr
+    assert "did not reap after SIGKILL" in result.stderr
+    cache_parent = secured_launcher_run["cache_parent"]
+    assert isinstance(cache_parent, Path)
+    assert not tuple(cache_parent.iterdir())

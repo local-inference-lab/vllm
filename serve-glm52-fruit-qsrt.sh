@@ -126,8 +126,8 @@ if [[ -n "${VLLM_KLD_CAPTURE_DIR:-}" ]]; then
   export VLLM_KLD_CAPTURE_DIR
 fi
 
-EXPECTED_B12X_REVISION="56d5a9063e7726d6799c87760e2070c38e479677"
-EXPECTED_KQUANT_REVISION="615a8b083b151100c7883e2b216778cae1a8d0f2"
+EXPECTED_B12X_REVISION="4f59a3da4ac77b276408b9bab88821155d3a2a74"
+EXPECTED_KQUANT_REVISION="b619442ae55214bb8bf10ce5f3ee71b50ff5e469"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Missing vLLM Python: ${PYTHON_BIN}" >&2
@@ -218,6 +218,18 @@ private_root="$(/usr/bin/mktemp -d -p /cache fruit-qsrt.XXXXXXXXXX)" || {
 /usr/bin/chmod 0700 "${private_root}"
 server_pid=""
 server_pgid=""
+server_process_alive() {
+  if [[ -z "${server_pid}" ]]; then
+    return 1
+  fi
+  local proc_stat suffix state
+  proc_stat="/proc/${server_pid}/stat"
+  [[ -r "${proc_stat}" ]] || return 1
+  suffix="$(<"${proc_stat}")" || return 1
+  suffix="${suffix##*) }"
+  read -r state _ <<<"${suffix}" || return 1
+  [[ "${state}" != "Z" ]]
+}
 process_group_alive() {
   if [[ -z "${server_pgid}" ]]; then
     return 1
@@ -236,16 +248,26 @@ process_group_alive() {
 }
 terminate_server_group() {
   if [[ -z "${server_pgid}" ]]; then
-    if [[ -n "${server_pid}" ]] && kill -0 "${server_pid}" 2>/dev/null; then
-      kill -s TERM "${server_pid}" 2>/dev/null || true
-      for _ in {1..50}; do
-        kill -0 "${server_pid}" 2>/dev/null || break
-        /usr/bin/sleep 0.1
-      done
-      if kill -0 "${server_pid}" 2>/dev/null; then
+    if [[ -n "${server_pid}" ]]; then
+      if server_process_alive; then
+        kill -s TERM "${server_pid}" 2>/dev/null || true
+        for _ in {1..50}; do
+          server_process_alive || break
+          /usr/bin/sleep 0.1
+        done
+      fi
+      if server_process_alive; then
         kill -s KILL "${server_pid}" 2>/dev/null || true
       fi
-      wait "${server_pid}" 2>/dev/null || true
+      for _ in {1..200}; do
+        server_process_alive || break
+        /usr/bin/sleep 0.05
+      done
+      if server_process_alive; then
+        echo "vLLM process ${server_pid} did not reap after SIGKILL" >&2
+      else
+        wait "${server_pid}" 2>/dev/null || true
+      fi
     fi
     server_pid=""
     return
@@ -260,12 +282,15 @@ terminate_server_group() {
   if process_group_alive; then
     kill -s KILL -- "-${server_pgid}" 2>/dev/null || true
   fi
-  if [[ -n "${server_pid}" ]]; then
-    wait "${server_pid}" 2>/dev/null || true
-  fi
-  while process_group_alive; do
+  for _ in {1..200}; do
+    process_group_alive || break
     /usr/bin/sleep 0.05
   done
+  if process_group_alive; then
+    echo "vLLM process group ${server_pgid} did not reap after SIGKILL" >&2
+  elif [[ -n "${server_pid}" ]]; then
+    wait "${server_pid}" 2>/dev/null || true
+  fi
   server_pid=""
   server_pgid=""
 }

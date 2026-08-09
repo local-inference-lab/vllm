@@ -805,11 +805,25 @@ class SamplingParams(
         # Validate prompt logprobs.
         if num_prompt_logprobs := self.prompt_logprobs:
             if num_prompt_logprobs == -1:
-                num_prompt_logprobs = model_config.get_vocab_size()
+                raise VLLMValidationError(
+                    "prompt_logprobs=-1 (all logprobs) is not supported because "
+                    "it can cause unbounded memory allocation. Specify a "
+                    "concrete value (e.g. prompt_logprobs=20).",
+                    parameter="prompt_logprobs",
+                    value=-1,
+                )
             if num_prompt_logprobs > max_logprobs:
                 raise VLLMValidationError(
                     f"Requested prompt logprobs of {num_prompt_logprobs}, "
                     f"which is greater than max allowed: {max_logprobs}",
+                    parameter="prompt_logprobs",
+                    value=num_prompt_logprobs,
+                )
+            if num_prompt_logprobs >= model_config.get_vocab_size():
+                raise VLLMValidationError(
+                    "Requested prompt logprobs for the entire vocabulary, which "
+                    "can cause unbounded memory allocation. Specify a smaller "
+                    "concrete value (e.g. prompt_logprobs=20).",
                     parameter="prompt_logprobs",
                     value=num_prompt_logprobs,
                 )

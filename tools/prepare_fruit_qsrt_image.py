@@ -27,7 +27,9 @@ def _validate_b12x_dependencies() -> None:
             installed = version(requirement.name)
         except PackageNotFoundError as exc:
             raise RuntimeError(f"missing B12X dependency: {requirement.name}") from exc
-        if requirement.specifier and installed not in requirement.specifier:
+        if requirement.specifier and not requirement.specifier.contains(
+            installed, prereleases=True
+        ):
             raise RuntimeError(
                 f"B12X dependency mismatch: {requirement.name} {installed} "
                 f"does not satisfy {requirement.specifier}"
@@ -102,6 +104,7 @@ assert Path(b12x.__file__).resolve().is_relative_to(Path(B12X_ROOT) / "b12x")
 """
     environment = dict(os.environ)
     environment["PYTHONPATH"] = os.pathsep.join((str(vllm_root), str(b12x_root)))
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     subprocess.run(
         (
             sys.executable,

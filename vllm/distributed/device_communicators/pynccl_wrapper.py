@@ -35,6 +35,7 @@ from vllm import envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.nccl import find_nccl_library
+from vllm.utils.path_validation import validate_native_lib_path
 
 logger = init_logger(__name__)
 
@@ -328,7 +329,10 @@ class NCCLLibrary:
     path_to_dict_mapping: dict[str, dict[str, Any]] = {}
 
     def __init__(self, so_file: str | None = None):
-        so_file = so_file or find_nccl_library()
+        if so_file is None:
+            so_file = find_nccl_library()
+        else:
+            validate_native_lib_path(so_file, "NCCLLibrary so_file")
 
         try:
             if so_file not in NCCLLibrary.path_to_dict_mapping:

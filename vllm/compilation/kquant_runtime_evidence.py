@@ -86,6 +86,34 @@ class RuntimeEvidence:
     def enabled(self) -> bool:
         return self.path is not None
 
+    def replay_saturated(self, observations: bytes | None) -> bool:
+        """Return whether this replay can add runtime evidence."""
+        if self.path is None:
+            return True
+        assert self.data is not None
+        assert self.lock is not None
+        with self.lock:
+            cudagraph = self.data["cudagraph"]
+            if cudagraph["replay_count"] == 0:
+                return False
+            if observations is None:
+                return True
+            layers = self.data["layers"]
+            assert isinstance(layers, dict)
+            for slot, part_count in enumerate(observations):
+                if not part_count:
+                    continue
+                layer, mode, decode_only = _slot_observation(slot)
+                if 3 <= layer <= 12 and mode == "w4a8" and decode_only:
+                    observation = layers[str(layer)]["decode"]
+                elif layer == 13 and mode == "w4a8" and decode_only:
+                    observation = layers["13"]["mtp_decode"]
+                else:
+                    continue
+                if observation["replay_calls"] == 0:
+                    return False
+            return True
+
     def _write(self) -> None:
         assert self.path is not None
         assert self.data is not None
@@ -305,6 +333,9 @@ def finish_graph_capture(started: bool, succeeded: bool) -> bytes | None:
 
 def record_graph_replay(observations: bytes | None) -> None:
     """Publish after a replay has completed on the host's current device."""
-    if _runtime_evidence.enabled:
-        torch.cuda.synchronize()
-        _runtime_evidence.observe_replay(observations)
+    if not _runtime_evidence.enabled or _runtime_evidence.replay_saturated(
+        observations
+    ):
+        return
+    torch.cuda.synchronize()
+    _runtime_evidence.observe_replay(observations)

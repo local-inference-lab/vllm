@@ -100,6 +100,67 @@ def test_replay_accounting_is_limited_to_captured_layers(tmp_path: Path) -> None
     assert runtime_paths["layers"]["4"]["decode"]["replay_calls"] == 0
 
 
+def test_graph_replay_stops_synchronizing_after_evidence_saturates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence_path = tmp_path / "qsrt-runtime-paths.json"
+    writer = evidence.RuntimeEvidence(evidence_path)
+    monkeypatch.setattr(evidence, "_runtime_evidence", writer)
+    synchronizations: list[None] = []
+    monkeypatch.setattr(
+        evidence.torch.cuda,
+        "synchronize",
+        lambda: synchronizations.append(None),
+    )
+    layer_three = bytes([0] * 10 + [2] + [0] * 10)
+
+    for _ in range(100):
+        evidence.record_graph_replay(layer_three)
+
+    assert len(synchronizations) == 1
+    assert writer.replay_saturated(layer_three)
+
+    layer_four = bytes([0] * 11 + [2] + [0] * 9)
+    writer.observe_capture(layer_four)
+    evidence.record_graph_replay(layer_four)
+
+    assert len(synchronizations) == 2
+    assert writer.replay_saturated(layer_four)
+    runtime_paths = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert runtime_paths["layers"]["4"]["decode"]["replay_calls"] == 1
+
+
+def test_disjoint_captures_before_replay_each_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence_path = tmp_path / "qsrt-runtime-paths.json"
+    writer = evidence.RuntimeEvidence(evidence_path)
+    monkeypatch.setattr(evidence, "_runtime_evidence", writer)
+    synchronizations: list[None] = []
+    monkeypatch.setattr(
+        evidence.torch.cuda,
+        "synchronize",
+        lambda: synchronizations.append(None),
+    )
+    prefill = bytes([2] + [0] * 20)
+    decode = bytes([0] * 10 + [2] + [0] * 10)
+    mtp = bytes([0] * 20 + [2])
+
+    for observations in (prefill, decode, mtp):
+        writer.observe_capture(observations)
+    for observations in (prefill, decode, mtp):
+        evidence.record_graph_replay(observations)
+        evidence.record_graph_replay(observations)
+
+    assert len(synchronizations) == 3
+    runtime_paths = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert runtime_paths["layers"]["3"]["decode"]["replay_calls"] == 1
+    assert runtime_paths["layers"]["13"]["mtp_decode"]["replay_calls"] == 1
+    assert runtime_paths["speculative"]["draft_tokens"] == 1
+
+
 def test_runtime_evidence_counters_are_bounded(tmp_path: Path) -> None:
     evidence_path = tmp_path / "qsrt-runtime-paths.json"
     writer = evidence.RuntimeEvidence(evidence_path)

@@ -497,15 +497,22 @@ class CompletionRequest(OpenAIBaseModel):
             )
 
         if (prompt_logprobs := data.get("prompt_logprobs")) is not None:
-            if data.get("stream") and (prompt_logprobs > 0 or prompt_logprobs == -1):
+            if prompt_logprobs == -1:
+                raise VLLMValidationError(
+                    "`prompt_logprobs=-1` is not supported; specify a bounded "
+                    "non-negative value.",
+                    parameter="prompt_logprobs",
+                    value=prompt_logprobs,
+                )
+            if data.get("stream") and prompt_logprobs > 0:
                 raise VLLMValidationError(
                     "`prompt_logprobs` are not available when `stream=True`.",
                     parameter="prompt_logprobs",
                 )
 
-            if prompt_logprobs < 0 and prompt_logprobs != -1:
+            if prompt_logprobs < 0:
                 raise VLLMValidationError(
-                    "`prompt_logprobs` must be a positive value or -1.",
+                    "`prompt_logprobs` must be a non-negative value.",
                     parameter="prompt_logprobs",
                     value=prompt_logprobs,
                 )

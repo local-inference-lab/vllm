@@ -10,6 +10,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.utils.path_validation import validate_native_lib_path
 
 logger = init_logger(__name__)
 
@@ -21,6 +22,7 @@ def find_nccl_library() -> str:
     """
     so_file = envs.VLLM_NCCL_SO_PATH
     if so_file:
+        validate_native_lib_path(so_file, "VLLM_NCCL_SO_PATH")
         logger.info(
             "Found nccl from environment variable VLLM_NCCL_SO_PATH=%s", so_file
         )
