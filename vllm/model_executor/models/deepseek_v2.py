@@ -2196,7 +2196,19 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
 # Compatibility with
 # https://huggingface.co/deepseek-ai/DeepSeek-V3-Base/blob/main/configuration_deepseek.py
 def _skip_disabled_mtp_weight(config, name: str) -> bool:
-    """True when `name` belongs to an MTP layer that this config never builds."""
+    """Report whether a checkpoint weight targets a disabled MTP layer.
+
+    Args:
+        config: Model config carrying `num_nextn_predict_layers` and
+            `num_hidden_layers`. Malformed values are treated as "cannot
+            decide" rather than raised.
+        name: Checkpoint weight name as it appears in the safetensors index.
+
+    Returns:
+        True when MTP is disabled (`num_nextn_predict_layers == 0`) and
+        `name` addresses a layer at or beyond `num_hidden_layers`, i.e. an
+        MTP-layer tensor with no destination module; False otherwise.
+    """
 
     try:
         nextn = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
