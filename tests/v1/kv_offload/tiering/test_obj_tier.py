@@ -365,6 +365,29 @@ class TestMockObjTierBasic:
         # though the object itself is still present in the mock store.
         assert lookup_and_wait(self.tier, [key(1)], ctx=ctx) == [LookupResult.MISS]
 
+    def test_successful_store_revalidates_cached_lookup(self):
+        """A rewritten object supersedes a failed load's cached MISS."""
+        block_key = key(1)
+        self.tier.submit_store(make_job(1, [block_key], [0]))
+        assert all(r.success for r in drain(self.tier))
+
+        ctx = ReqContext(req_id="restore-source")
+        assert lookup_and_wait(self.tier, [block_key], ctx=ctx) == [LookupResult.HIT]
+        original_check = self.agent.check_xfer_state
+        self.agent.check_xfer_state = lambda h: "ERR"
+        self.tier.submit_load(make_job(2, [block_key], [0]))
+        assert not drain(self.tier)[0].success
+        assert self.tier.lookup(block_key, ctx) == LookupResult.MISS
+
+        overlapping_ctx = ReqContext(req_id="restore-observer")
+        assert self.tier.lookup(block_key, overlapping_ctx) == LookupResult.MISS
+
+        self.agent.check_xfer_state = original_check
+        self.tier.submit_store(make_job(3, [block_key], [0]))
+        assert all(r.success for r in drain(self.tier))
+        assert self.tier.lookup(block_key, ctx) == LookupResult.HIT
+        assert self.tier.lookup(block_key, overlapping_ctx) == LookupResult.HIT
+
     def test_pending_transfer_not_returned_until_done(self):
         # First poll returns PROC; second poll returns DONE.
         call_count = [0]

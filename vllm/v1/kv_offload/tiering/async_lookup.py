@@ -190,6 +190,20 @@ class AsyncLookupManager(ABC):
             if state is not None:
                 state.result = False
 
+    def mark_present(self, keys: Iterable[OffloadKey]) -> None:
+        """Refresh cached states after an authoritative successful store.
+
+        A failed load marks an entry absent so the request can recompute it.
+        Overlapping requests may keep that shared state alive after the
+        recomputed block has been stored again, so waiting for cleanup would
+        leave a stale miss until all of them finish. Only update existing
+        states; a key nobody has looked up does not need a cache entry.
+        """
+        for key in keys:
+            state = self._lookup_state.get(key)
+            if state is not None:
+                state.result = True
+
     def cleanup(self, req_id: str) -> None:
         """Remove entries no longer needed by any active request.
 

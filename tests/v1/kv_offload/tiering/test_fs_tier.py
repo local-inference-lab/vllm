@@ -605,6 +605,29 @@ def test_failed_load_corrects_verdict_and_removes_corrupt_file(
     assert lookup_and_wait(tier, [key(1)], ctx=fresh) == [LookupResult.MISS]
 
 
+def test_successful_store_revalidates_cached_lookup(fs_tier):
+    """A rewritten block supersedes a failed load's cached MISS."""
+    tier, _ = fs_tier
+    block_key = key(1)
+    tier.submit_store(make_job(1, [block_key], [0]))
+    assert all(r.success for r in drain(tier))
+
+    ctx = ReqContext(req_id="restore-source")
+    assert lookup_and_wait(tier, [block_key], ctx=ctx) == [LookupResult.HIT]
+    os.unlink(tier.file_mapper.get_file_name(block_key))
+    tier.submit_load(make_job(2, [block_key], [0], is_promotion=True))
+    assert not drain(tier)[0].success
+    assert tier.lookup(block_key, ctx) == LookupResult.MISS
+
+    overlapping_ctx = ReqContext(req_id="restore-observer")
+    assert tier.lookup(block_key, overlapping_ctx) == LookupResult.MISS
+
+    tier.submit_store(make_job(3, [block_key], [0]))
+    assert all(r.success for r in drain(tier))
+    assert tier.lookup(block_key, ctx) == LookupResult.HIT
+    assert tier.lookup(block_key, overlapping_ctx) == LookupResult.HIT
+
+
 @pytest.mark.parametrize("use_c_ext", [True, False])
 def test_batched_partial_load_failure_keeps_loaded_blocks(
     fs_tier, monkeypatch, use_c_ext
