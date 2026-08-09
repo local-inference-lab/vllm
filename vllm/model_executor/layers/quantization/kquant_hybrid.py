@@ -163,6 +163,17 @@ def _uses_fruit_w4a8(runtime: str, m: int, decode_only: bool) -> bool:
     return runtime == "w4a8" and decode_only and 0 < m <= _B12X_W4A8_MAX_M
 
 
+def _is_mtp_expert_layer(layer_number: int | None) -> bool:
+    """Identify the appended MTP expert layer from the target model geometry."""
+    if layer_number is None:
+        return False
+    from vllm.config import get_current_vllm_config
+
+    hf_config = get_current_vllm_config().model_config.hf_config
+    num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
+    return type(num_hidden_layers) is int and layer_number == num_hidden_layers
+
+
 def _qsrt_backend_module(path: str) -> ModuleType:
     """Prefer the public B12X namespace and retain SparkInfer-only Kimi installs."""
 
@@ -404,6 +415,9 @@ class _HybridLayerState:
         self.w4a8_scratch_geometry: tuple[int, int, int, bool] | None = None
         self.trellis_output_accum_key: tuple[int, int, torch.device] | None = None
         self.runtime_evidence_layer: int | None = None
+        # The appended MTP layer must compile its bounded-M path as decode even
+        # when vLLM profiles or captures it without request-phase metadata.
+        self.is_mtp_layer = False
         self.runtime_ready = False
 
 
@@ -809,6 +823,9 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             else ""
         )
         state.uses_qsrt_atoms = qsrt_storage == "qsrt_atoms_v1"
+        state.is_mtp_layer = state.uses_qsrt_atoms and _is_mtp_expert_layer(
+            state.runtime_evidence_layer
+        )
         layer.hybrid_state = state
 
         if state.uses_qsrt_atoms:
@@ -2422,7 +2439,8 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         has no serving cost unless explicitly enabled for a runtime audit.
         """
         global _qsrt_repeat_check_reports
-        decode_only = _is_decode_only_forward(int(x.shape[0]))
+        state: _HybridLayerState = layer.hybrid_state
+        decode_only = state.is_mtp_layer or _is_decode_only_forward(int(x.shape[0]))
         executed_mode = (
             "w4a8"
             if _uses_fruit_w4a8(
@@ -2432,7 +2450,6 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             )
             else "w4a16"
         )
-        state: _HybridLayerState = layer.hybrid_state
         trellis_weights = state.trellis_weights
         part_count = len(trellis_weights) if isinstance(trellis_weights, tuple) else 1
 

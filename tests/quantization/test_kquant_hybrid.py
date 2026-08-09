@@ -377,7 +377,7 @@ def test_qsrt_w4a8_dispatch_and_audit_predicate(
 
 
 @pytest.mark.parametrize(
-    ("metadata", "expected_mode", "expected_decode"),
+    ("metadata", "is_mtp_layer", "expected_mode", "expected_decode"),
     (
         (
             SimpleNamespace(
@@ -385,6 +385,7 @@ def test_qsrt_w4a8_dispatch_and_audit_predicate(
                 num_prefill_tokens=2,
                 is_spec_decode=True,
             ),
+            False,
             "w4a8",
             True,
         ),
@@ -394,14 +395,26 @@ def test_qsrt_w4a8_dispatch_and_audit_predicate(
                 num_prefill_tokens=1,
                 is_spec_decode=False,
             ),
+            False,
             "w4a16",
             False,
+        ),
+        (
+            SimpleNamespace(
+                num_decode_tokens=0,
+                num_prefill_tokens=1,
+                is_spec_decode=False,
+            ),
+            True,
+            "w4a8",
+            True,
         ),
     ),
 )
 def test_qsrt_mtp_dispatch_and_evidence_follow_normalized_phase(
     monkeypatch: pytest.MonkeyPatch,
     metadata: SimpleNamespace,
+    is_mtp_layer: bool,
     expected_mode: str,
     expected_decode: bool,
 ) -> None:
@@ -445,6 +458,7 @@ def test_qsrt_mtp_dispatch_and_evidence_follow_normalized_phase(
             trellis_weights=(object(),),
             uses_qsrt_atoms=True,
             runtime_evidence_layer=evidence_layer,
+            is_mtp_layer=is_mtp_layer,
         )
     )
     x = torch.zeros((1, 1024), dtype=torch.float16)
