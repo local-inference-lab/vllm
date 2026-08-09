@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm.config import CUDAGraphMode
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -10,6 +11,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.llm_base_proposer import (
     _mtp_draft_decode_only,
+    _mtp_draft_uses_cudagraph,
     compute_probs_and_sample_next_token,
 )
 
@@ -50,9 +52,23 @@ def test_mtp_draft_decode_phase_uses_active_prompt_state():
 
     common.is_prefilling[1] = True
     assert not _mtp_draft_decode_only(common)
+    common.is_prefilling = None
+
+    assert not _mtp_draft_decode_only(common)
+    assert _mtp_draft_decode_only(common, CUDAGraphMode.PIECEWISE)
+
+
+def test_mtp_draft_cudagraphs_exclude_prompt_batches():
+    common = object.__new__(CommonAttentionMetadata)
+    common.num_reqs = 2
+    common.is_prefilling = torch.tensor([False, False])
+    assert _mtp_draft_uses_cudagraph(common)
+
+    common.is_prefilling[1] = True
+    assert not _mtp_draft_uses_cudagraph(common)
 
     common.is_prefilling = None
-    assert not _mtp_draft_decode_only(common)
+    assert _mtp_draft_uses_cudagraph(common)
 
 
 def test_compute_probs_and_sample_next_token_uses_fp64_exponential_race():

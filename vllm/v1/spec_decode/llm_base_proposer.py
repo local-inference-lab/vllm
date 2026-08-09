@@ -71,14 +71,24 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
-def _mtp_draft_decode_only(common_attn_metadata: CommonAttentionMetadata) -> bool:
-    """Return whether every active MTP request has completed prompt prefill."""
+def _mtp_draft_decode_only(
+    common_attn_metadata: CommonAttentionMetadata,
+    cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+) -> bool:
+    """Return whether the active MTP forward is decode-only."""
     is_prefilling = common_attn_metadata.is_prefilling
+    if is_prefilling is None:
+        return cudagraph_runtime_mode != CUDAGraphMode.NONE
     num_reqs = common_attn_metadata.num_reqs
-    return (
-        is_prefilling is not None
-        and num_reqs > 0
-        and not bool(torch.any(is_prefilling[:num_reqs]))
+    return num_reqs > 0 and not bool(torch.any(is_prefilling[:num_reqs]))
+
+
+def _mtp_draft_uses_cudagraph(
+    common_attn_metadata: CommonAttentionMetadata,
+) -> bool:
+    """Use draft graphs only when capture is synthetic or the batch decodes."""
+    return common_attn_metadata.is_prefilling is None or _mtp_draft_decode_only(
+        common_attn_metadata
     )
 
 
@@ -615,18 +625,23 @@ class SpecDecodeBaseProposer:
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
         )
-        mtp_draft_decode_only = (
-            _mtp_draft_decode_only(common_attn_metadata)
-            if self.method == "mtp"
-            else False
-        )
 
         per_group_attn_metadata, per_layer_attn_metadata = (
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
         )
 
+        use_cudagraphs = self.method != "mtp" or _mtp_draft_uses_cudagraph(
+            common_attn_metadata
+        )
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
-            self._determine_batch_execution_and_padding(num_tokens)
+            self._determine_batch_execution_and_padding(
+                num_tokens, use_cudagraphs=use_cudagraphs
+            )
+        )
+        mtp_draft_decode_only = (
+            _mtp_draft_decode_only(common_attn_metadata, cudagraph_runtime_mode)
+            if self.method == "mtp"
+            else False
         )
 
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
