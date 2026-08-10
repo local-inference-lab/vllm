@@ -86,7 +86,11 @@ _QSRT_X4T_W2_EXCEPTION_TASK_ROWS = 896
 _QSRT_X4T_W13_EXCEPTION_ROW_ROTATION = 0
 
 
-def _decode_only_forward_phase(m: int) -> bool | None:
+def _decode_only_forward_phase(
+    m: int,
+    *,
+    is_mtp_layer: bool = False,
+) -> bool | None:
     """Resolve an authoritative decode phase, or ``None`` when unavailable."""
 
     if m <= 0:
@@ -97,7 +101,7 @@ def _decode_only_forward_phase(m: int) -> bool | None:
     explicit_draft_phase = context.additional_kwargs.get(
         "speculative_draft_decode_only"
     )
-    if type(explicit_draft_phase) is bool:
+    if is_mtp_layer and type(explicit_draft_phase) is bool:
         return explicit_draft_phase
     cached = context.additional_kwargs.get("kquant_qsrt_decode_only")
     if isinstance(cached, tuple) and cached[0] == m:
@@ -160,10 +164,10 @@ def _decode_only_forward_phase(m: int) -> bool | None:
     return result
 
 
-def _is_decode_only_forward(m: int) -> bool:
+def _is_decode_only_forward(m: int, *, is_mtp_layer: bool = False) -> bool:
     """Return whether the active forward authoritatively contains only decode."""
 
-    return _decode_only_forward_phase(m) is True
+    return _decode_only_forward_phase(m, is_mtp_layer=is_mtp_layer) is True
 
 
 def _uses_fruit_w4a8(runtime: str, m: int, decode_only: bool) -> bool:
@@ -2449,7 +2453,9 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         """
         global _qsrt_repeat_check_reports
         state: _HybridLayerState = layer.hybrid_state
-        phase = _decode_only_forward_phase(int(x.shape[0]))
+        phase = _decode_only_forward_phase(
+            int(x.shape[0]), is_mtp_layer=state.is_mtp_layer
+        )
         decode_only = state.is_mtp_layer if phase is None else phase
         executed_mode = (
             "w4a8"
