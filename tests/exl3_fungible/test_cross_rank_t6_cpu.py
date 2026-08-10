@@ -364,4 +364,7 @@ def test_t6_digest_matches_the_serving_loops_definition():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-s", "-p", "no:cacheprovider"]))
+    sys.exit(pytest.main([
+        __file__, "-v", "-p", "no:cacheprovider",
+        "--confcutdir", os.path.dirname(os.path.abspath(__file__)),
+    ]))

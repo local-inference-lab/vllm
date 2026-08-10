@@ -389,4 +389,7 @@ def test_stage_rejects_unknown_on_unavailable(segments, tmp_path):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
+    sys.exit(pytest.main([
+        __file__, "-v", "-p", "no:cacheprovider",
+        "--confcutdir", os.path.dirname(os.path.abspath(__file__)),
+    ]))

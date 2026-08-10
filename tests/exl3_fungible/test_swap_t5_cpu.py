@@ -259,4 +259,7 @@ def test_t5_fail_atomic_staging_costs_only_reads(toy_root):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
+    sys.exit(pytest.main([
+        __file__, "-v", "-p", "no:cacheprovider",
+        "--confcutdir", os.path.dirname(os.path.abspath(__file__)),
+    ]))
