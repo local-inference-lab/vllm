@@ -823,6 +823,8 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             else ""
         )
         state.uses_qsrt_atoms = qsrt_storage == "qsrt_atoms_v1"
+        if state.uses_qsrt_atoms and self.quant_config.qsrt_runtime == "w4a8" and kept:
+            raise ValueError("Fruit W4A8 does not support a hybrid kept tier")
         state.is_mtp_layer = state.uses_qsrt_atoms and _is_mtp_expert_layer(
             state.runtime_evidence_layer
         )
@@ -844,8 +846,6 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 )
             if kept and not kept_mx:
                 raise ValueError("QSRT X4T experts require kept_format='mxfp4_e8m0k32'")
-            if self.quant_config.qsrt_runtime == "w4a8" and kept:
-                raise ValueError("Fruit W4A8 does not support a hybrid kept tier")
             if (self.quant_config.qsrt or {}).get("schema") == FRUIT_QSRT_ATOM_SCHEMA:
                 assert self.quant_config.shared_runtime.qsrt_publication is not None
             placeholder = torch.nn.Parameter(

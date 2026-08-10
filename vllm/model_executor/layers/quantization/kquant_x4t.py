@@ -440,10 +440,14 @@ class X4TLayerReader:
     def _load_cuda_extents(self) -> None:
         import instanttensor
 
+        device = self.device
+        if device.index is None:
+            device = torch.device("cuda", torch.accelerator.current_device_index())
+
         opener = instanttensor.safe_open(
             str(self.path),
             framework="pt",
-            device=self.device,
+            device=device,
             load_now=False,
             copy=True,
         )
