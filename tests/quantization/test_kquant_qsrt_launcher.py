@@ -211,7 +211,7 @@ def _publication_bytes(
 ) -> tuple[bytes, bytes]:
     manifest = {
         "producer": {
-            "encoder": {"qsrt_revision": "5c98005ef1909362681721bdc423d6a2ed7582de"},
+            "encoder": {"qsrt_revision": "2113af303f37cedf4b538dcf68eb699d5e31f7df"},
             "runtime": {
                 "vllm_revision": vllm_revision,
                 "b12x_revision": b12x_revision,
@@ -497,7 +497,7 @@ marker_name = "QSRT_CANDIDATE.json" if candidate_mode else "QSRT_COMPLETE.json"
             "TEST_B12X_REVISION": b12x_revision,
             "TEST_B12X_SOURCE_SHA256": b12x_source_sha256,
             "TEST_DESCENDANT_PID": str(descendant_pid),
-            "TEST_QSRT_REVISION": "5c98005ef1909362681721bdc423d6a2ed7582de",
+            "TEST_QSRT_REVISION": "2113af303f37cedf4b538dcf68eb699d5e31f7df",
             "TEST_MUTABLE_B12X_ROOT": str(b12x_repository),
             "TEST_MUTABLE_VLLM_ROOT": str(vllm_repository),
             "TEST_REPORT": str(report),
