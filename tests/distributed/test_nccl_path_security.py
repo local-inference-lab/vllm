@@ -62,6 +62,21 @@ def test_native_lib_path_rejects_group_writable_parent(tmp_path):
         validate_native_lib_path(str(library), "VLLM_NCCL_SO_PATH")
 
 
+def test_native_lib_path_rejects_writable_grandparent(tmp_path):
+    grandparent = tmp_path / "writable"
+    grandparent.mkdir()
+    parent = grandparent / "secure"
+    parent.mkdir()
+    library = parent / "libnccl.so.2"
+    library.write_text("dummy")
+    os.chmod(grandparent, 0o775)  # noqa: S103
+    os.chmod(parent, 0o755)  # noqa: S103
+    os.chmod(library, 0o644)  # noqa: S103
+
+    with pytest.raises(ValueError, match="parent directory chain"):
+        validate_native_lib_path(str(library), "VLLM_NCCL_SO_PATH")
+
+
 def test_native_lib_path_accepts_secure_regular_file(tmp_path):
     library = tmp_path / "libnccl-local-inference.so.2.30.4"
     library.write_text("dummy")

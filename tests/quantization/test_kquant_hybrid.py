@@ -1243,8 +1243,11 @@ def test_w4a8_single_part_returns_owned_output(
     assert output.data_ptr() != kernel_output.data_ptr()
 
 
-def test_w4a8_capture_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("VLLM_KQUANT_CAPTURE_DIR", "/tmp/capture")
+def test_w4a8_capture_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("VLLM_KQUANT_CAPTURE_DIR", str(tmp_path / "capture"))
     _install_fake_b12x(
         monkeypatch,
         fused_moe=SimpleNamespace(),
