@@ -14,9 +14,9 @@ from pathlib import Path
 import torch
 
 _ENVIRONMENT_VARIABLE = "VLLM_KQUANT_RUNTIME_EVIDENCE"
-_SCHEMA = "kquant_fruit_runtime_paths_v1"
+_SCHEMA = "kquant_fruit_runtime_paths_v2"
 _ORDINARY_LAYERS = range(3, 13)
-_CAPTURE_SLOT_COUNT = 21
+_CAPTURE_SLOT_COUNT = 22
 
 
 def _empty_evidence() -> dict[str, object]:
@@ -33,17 +33,23 @@ def _empty_evidence() -> dict[str, object]:
             },
         }
     layers["13"] = {
+        "mtp_prefill": {
+            "mode": "w4a16",
+            "calls": 0,
+            "capture_calls": 0,
+            "replay_calls": 0,
+        },
         "mtp_decode": {
             "mode": "w4a8",
             "calls": 0,
             "part_count": 0,
             "capture_calls": 0,
             "replay_calls": 0,
-        }
+        },
     }
     return {
         "schema": _SCHEMA,
-        "version": 1,
+        "version": 2,
         "layers": layers,
         "cudagraph": {
             "mode": "FULL_AND_PIECEWISE",
@@ -64,8 +70,11 @@ def _capture_slot(layer: int, mode: str, decode_only: bool) -> int | None:
             return layer - 3
         if mode == "w4a8" and decode_only:
             return 10 + layer - 3
-    elif layer == 13 and mode == "w4a8" and decode_only:
-        return 20
+    elif layer == 13:
+        if mode == "w4a8" and decode_only:
+            return 20
+        if mode == "w4a16" and not decode_only:
+            return 21
     return None
 
 
@@ -108,6 +117,8 @@ class RuntimeEvidence:
                     observation = layers[str(layer)]["decode"]
                 elif layer == 13 and mode == "w4a8" and decode_only:
                     observation = layers["13"]["mtp_decode"]
+                elif layer == 13 and mode == "w4a16" and not decode_only:
+                    observation = layers["13"]["mtp_prefill"]
                 else:
                     continue
                 if observation["replay_calls"] == 0:
@@ -178,6 +189,8 @@ class RuntimeEvidence:
             observation = layers[str(layer)]["decode"]
         elif layer == 13 and mode == "w4a8" and decode_only:
             observation = layers["13"]["mtp_decode"]
+        elif layer == 13 and mode == "w4a16" and not decode_only:
+            observation = layers["13"]["mtp_prefill"]
         else:
             return False
         if observation["calls"] == 0:
@@ -278,6 +291,8 @@ def _slot_observation(slot: int) -> tuple[int, str, bool]:
         return 3 + slot - 10, "w4a8", True
     if slot == 20:
         return 13, "w4a8", True
+    if slot == 21:
+        return 13, "w4a16", False
     raise ValueError(f"invalid runtime evidence capture slot: {slot}")
 
 

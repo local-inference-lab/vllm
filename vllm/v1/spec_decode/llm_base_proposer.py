@@ -22,7 +22,11 @@ if TYPE_CHECKING:
 
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    get_forward_context,
+    set_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
@@ -69,6 +73,18 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _mtp_draft_decode_only(
+    common_attn_metadata: CommonAttentionMetadata,
+) -> bool:
+    """Return whether every active MTP request has completed its prompt."""
+
+    is_prefilling = common_attn_metadata.is_prefilling
+    if is_prefilling is None:
+        return False
+    num_reqs = common_attn_metadata.num_reqs
+    return num_reqs > 0 and not bool(torch.any(is_prefilling[:num_reqs]))
 
 
 def _call_accepts_kwarg(method: Any, kwarg: str) -> bool:
@@ -609,10 +625,25 @@ class SpecDecodeBaseProposer:
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
         )
 
-        # Keep MTP on the shared graph dispatcher. Forcing prompt batches off
-        # this path changes short-prompt hidden states and breaks prompt logits.
+        # Prompt and decode share padded shapes but select different QSRT
+        # kernels. Preserve the prompt phase in both the forward context and
+        # graph key instead of disabling graphs or reusing a decode capture.
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(num_tokens)
+        )
+        mtp_draft_decode_only = (
+            _mtp_draft_decode_only(common_attn_metadata)
+            if self.method == "mtp"
+            else None
+        )
+        batch_descriptor = (
+            BatchDescriptor(
+                num_tokens=num_input_tokens,
+                speculative_draft_decode_only=mtp_draft_decode_only,
+            )
+            if cudagraph_runtime_mode != CUDAGraphMode.NONE
+            and mtp_draft_decode_only is not None
+            else None
         )
 
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
@@ -636,10 +667,15 @@ class SpecDecodeBaseProposer:
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
             slot_mapping=self._get_slot_mapping(
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
         ):
+            if mtp_draft_decode_only is not None:
+                get_forward_context().additional_kwargs[
+                    "speculative_draft_decode_only"
+                ] = mtp_draft_decode_only
             ret_hidden_states = self._model_forward(model_kwargs, spec_step_idx=0)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
@@ -1734,29 +1770,57 @@ class SpecDecodeBaseProposer:
             else:
                 slot_mapping_dict = slot_mappings or {}
 
-            with set_forward_context(
-                None,
-                self.vllm_config,
-                num_tokens=num_input_tokens,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                slot_mapping=slot_mapping_dict,
-            ):
-                if self.supports_mm_inputs:
-                    input_ids = None
-                    inputs_embeds = self.inputs_embeds[:num_input_tokens]
-                else:
-                    input_ids = self.input_ids[:num_input_tokens]
-                    inputs_embeds = None
+            mtp_phases: tuple[bool | None, ...]
+            if self.method != "mtp":
+                mtp_phases = (None,)
+            elif is_graph_capturing and cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                # Shapes alone cannot distinguish MTP prompt/prefill from
+                # decode. Capture both graph identities so W4A16 and W4A8
+                # never share a cached executable.
+                mtp_phases = (False, True)
+            else:
+                # Synthetic runs have no request metadata. Fail closed to the
+                # W4A16 prompt/reference path.
+                mtp_phases = (False,)
 
-                kwargs = dict(
-                    input_ids=input_ids,
-                    positions=self._get_positions(num_input_tokens),
-                    inputs_embeds=inputs_embeds,
+            for mtp_draft_decode_only in mtp_phases:
+                batch_descriptor = (
+                    BatchDescriptor(
+                        num_tokens=num_input_tokens,
+                        speculative_draft_decode_only=mtp_draft_decode_only,
+                    )
+                    if cudagraph_runtime_mode != CUDAGraphMode.NONE
+                    and mtp_draft_decode_only is not None
+                    else None
                 )
-                if self.pass_hidden_states_to_model:
-                    kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
-                self.model(**kwargs)
+                with set_forward_context(
+                    None,
+                    self.vllm_config,
+                    num_tokens=num_input_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_descriptor,
+                    slot_mapping=slot_mapping_dict,
+                ):
+                    if mtp_draft_decode_only is not None:
+                        get_forward_context().additional_kwargs[
+                            "speculative_draft_decode_only"
+                        ] = mtp_draft_decode_only
+                    if self.supports_mm_inputs:
+                        input_ids = None
+                        inputs_embeds = self.inputs_embeds[:num_input_tokens]
+                    else:
+                        input_ids = self.input_ids[:num_input_tokens]
+                        inputs_embeds = None
+
+                    kwargs = dict(
+                        input_ids=input_ids,
+                        positions=self._get_positions(num_input_tokens),
+                        inputs_embeds=inputs_embeds,
+                    )
+                    if self.pass_hidden_states_to_model:
+                        kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
+                    self.model(**kwargs)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

@@ -25,6 +25,7 @@ def test_runtime_evidence_aggregates_all_layers_capture_and_replay(
         evidence.record_layer_execution(layer, "w4a16", False, 2)
         evidence.record_layer_execution(layer, "w4a8", True, 2)
     evidence.record_layer_execution(13, "w4a8", True, 2)
+    evidence.record_layer_execution(13, "w4a16", False, 1)
     assert not evidence_path.exists()
 
     observations = evidence.finish_graph_capture(True, True)
@@ -50,8 +51,8 @@ def test_runtime_evidence_aggregates_all_layers_capture_and_replay(
         "cudagraph",
         "speculative",
     }
-    assert runtime_paths["schema"] == "kquant_fruit_runtime_paths_v1"
-    assert runtime_paths["version"] == 1
+    assert runtime_paths["schema"] == "kquant_fruit_runtime_paths_v2"
+    assert runtime_paths["version"] == 2
     assert set(runtime_paths["layers"]) == {str(layer) for layer in range(3, 14)}
     for layer in range(3, 13):
         layer_evidence = runtime_paths["layers"][str(layer)]
@@ -64,13 +65,19 @@ def test_runtime_evidence_aggregates_all_layers_capture_and_replay(
             "replay_calls": 1,
         }
     assert runtime_paths["layers"]["13"] == {
+        "mtp_prefill": {
+            "mode": "w4a16",
+            "calls": 1,
+            "capture_calls": 1,
+            "replay_calls": 1,
+        },
         "mtp_decode": {
             "mode": "w4a8",
             "calls": 1,
             "part_count": 2,
             "capture_calls": 1,
             "replay_calls": 1,
-        }
+        },
     }
     assert runtime_paths["cudagraph"] == {
         "mode": "FULL_AND_PIECEWISE",
@@ -87,7 +94,7 @@ def test_runtime_evidence_aggregates_all_layers_capture_and_replay(
 def test_replay_accounting_is_limited_to_captured_layers(tmp_path: Path) -> None:
     evidence_path = tmp_path / "qsrt-runtime-paths.json"
     writer = evidence.RuntimeEvidence(evidence_path)
-    observations = bytearray(21)
+    observations = bytearray(22)
     observations[10] = 2  # Layer 3 W4A8 decode.
 
     writer.observe_capture(bytes(observations))
@@ -113,7 +120,7 @@ def test_graph_replay_stops_synchronizing_after_evidence_saturates(
         "synchronize",
         lambda: synchronizations.append(None),
     )
-    layer_three = bytes([0] * 10 + [2] + [0] * 10)
+    layer_three = bytes([0] * 10 + [2] + [0] * 11)
 
     for _ in range(100):
         evidence.record_graph_replay(layer_three)
@@ -121,7 +128,7 @@ def test_graph_replay_stops_synchronizing_after_evidence_saturates(
     assert len(synchronizations) == 1
     assert writer.replay_saturated(layer_three)
 
-    layer_four = bytes([0] * 11 + [2] + [0] * 9)
+    layer_four = bytes([0] * 11 + [2] + [0] * 10)
     writer.observe_capture(layer_four)
     evidence.record_graph_replay(layer_four)
 
@@ -144,20 +151,22 @@ def test_disjoint_captures_before_replay_each_publish(
         "synchronize",
         lambda: synchronizations.append(None),
     )
-    prefill = bytes([2] + [0] * 20)
-    decode = bytes([0] * 10 + [2] + [0] * 10)
-    mtp = bytes([0] * 20 + [2])
+    prefill = bytes([2] + [0] * 21)
+    decode = bytes([0] * 10 + [2] + [0] * 11)
+    mtp_decode = bytes([0] * 20 + [2, 0])
+    mtp_prefill = bytes([0] * 21 + [2])
 
-    for observations in (prefill, decode, mtp):
+    for observations in (prefill, decode, mtp_decode, mtp_prefill):
         writer.observe_capture(observations)
-    for observations in (prefill, decode, mtp):
+    for observations in (prefill, decode, mtp_decode, mtp_prefill):
         evidence.record_graph_replay(observations)
         evidence.record_graph_replay(observations)
 
-    assert len(synchronizations) == 3
+    assert len(synchronizations) == 4
     runtime_paths = json.loads(evidence_path.read_text(encoding="utf-8"))
     assert runtime_paths["layers"]["3"]["decode"]["replay_calls"] == 1
     assert runtime_paths["layers"]["13"]["mtp_decode"]["replay_calls"] == 1
+    assert runtime_paths["layers"]["13"]["mtp_prefill"]["replay_calls"] == 1
     assert runtime_paths["speculative"]["draft_tokens"] == 1
 
 
@@ -167,8 +176,9 @@ def test_runtime_evidence_counters_are_bounded(tmp_path: Path) -> None:
 
     for _ in range(100):
         writer.observe_layer(3, "w4a8", True, 2)
-        writer.observe_capture(bytes([0] * 10 + [2] + [0] * 10))
-        writer.observe_replay(bytes([0] * 10 + [2] + [0] * 10))
+        writer.observe_layer(13, "w4a16", False, 1)
+        writer.observe_capture(bytes([0] * 10 + [2] + [0] * 11))
+        writer.observe_replay(bytes([0] * 10 + [2] + [0] * 11))
 
     runtime_paths = json.loads(evidence_path.read_text(encoding="utf-8"))
     assert runtime_paths["layers"]["3"]["decode"] == {
@@ -178,5 +188,6 @@ def test_runtime_evidence_counters_are_bounded(tmp_path: Path) -> None:
         "capture_calls": 1,
         "replay_calls": 1,
     }
+    assert runtime_paths["layers"]["13"]["mtp_prefill"]["calls"] == 1
     assert runtime_paths["cudagraph"]["capture_count"] == 1
     assert runtime_paths["cudagraph"]["replay_count"] == 1

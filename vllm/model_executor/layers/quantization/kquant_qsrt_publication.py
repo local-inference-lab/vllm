@@ -443,10 +443,10 @@ def _validate_builder_runtime_identity(value: object) -> dict[str, Any]:
         ):
             raise ValueError(f"QSRT builder runtime {executable_name} path is invalid")
         _sha256_field(executable["sha256"], name=f"builder runtime {executable_name}")
-    for field in ("python_site_packages", "cuda_home"):
-        path = runtime[field]
+    for field_name in ("python_site_packages", "cuda_home"):
+        path = runtime[field_name]
         if not isinstance(path, str) or not os.path.isabs(path):
-            raise ValueError(f"QSRT builder runtime {field} path is invalid")
+            raise ValueError(f"QSRT builder runtime {field_name} path is invalid")
     toolchain_path = runtime["path"]
     if (
         not isinstance(toolchain_path, str)
@@ -481,12 +481,15 @@ def _validate_builder_bootstrap_identity(value: object) -> dict[str, Any]:
     ):
         raise ValueError("QSRT builder bootstrap identity is invalid")
     _identity_revision(bootstrap["kquant_revision"], name="bootstrap KQuant")
-    for field in (
+    for field_name in (
         "bootstrap_sha256",
         "builder_sha256",
         "kquant_source_sha256",
     ):
-        _sha256_field(bootstrap[field], name=f"builder bootstrap {field}")
+        _sha256_field(
+            bootstrap[field_name],
+            name=f"builder bootstrap {field_name}",
+        )
     _validate_builder_runtime_identity(bootstrap["runtime"])
     return bootstrap
 
@@ -512,7 +515,7 @@ def _validate_encoder_identity(value: object) -> dict[str, Any]:
         raise ValueError("QSRT encoder fingerprint schema is unsupported")
     _identity_revision(encoder["kquant_revision"], name="encoder KQuant")
     _identity_revision(encoder["exllamav3_revision"], name="encoder ExLlamaV3")
-    for field in (
+    for field_name in (
         "kquant_source_sha256",
         "exllamav3_source_sha256",
         "calibration_fingerprint",
@@ -520,7 +523,7 @@ def _validate_encoder_identity(value: object) -> dict[str, Any]:
         "calibration_manifest_sha256",
         "fingerprint",
     ):
-        _sha256_field(encoder[field], name=f"encoder {field}")
+        _sha256_field(encoder[field_name], name=f"encoder {field_name}")
     _validate_builder_bootstrap_identity(encoder["encoding_runtime"])
     fingerprint_payload = {
         "schema": encoder["fingerprint_schema"],
@@ -558,10 +561,16 @@ def _validate_producer_identity(value: object) -> dict[str, Any]:
             "vllm_source_sha256",
         },
     )
-    for field in ("b12x_revision", "vllm_revision"):
-        _identity_revision(runtime[field], name=f"producer runtime {field}")
-    for field in ("b12x_source_sha256", "vllm_source_sha256"):
-        _sha256_field(runtime[field], name=f"producer runtime {field}")
+    for field_name in ("b12x_revision", "vllm_revision"):
+        _identity_revision(
+            runtime[field_name],
+            name=f"producer runtime {field_name}",
+        )
+    for field_name in ("b12x_source_sha256", "vllm_source_sha256"):
+        _sha256_field(
+            runtime[field_name],
+            name=f"producer runtime {field_name}",
+        )
     if (
         encoder["encoding_runtime"] != bootstrap
         or encoder["kquant_revision"] != bootstrap["kquant_revision"]
@@ -970,9 +979,9 @@ def _validate_runtime_qualification(
         keys={"schema", "version", "layers", "cudagraph", "speculative"},
     )
     if (
-        runtime_paths["schema"] != "kquant_fruit_runtime_paths_v1"
+        runtime_paths["schema"] != "kquant_fruit_runtime_paths_v2"
         or type(runtime_paths["version"]) is not int
-        or runtime_paths["version"] != 1
+        or runtime_paths["version"] != 2
     ):
         raise ValueError("Fruit runtime path evidence identity is invalid")
     runtime_layers = _qualification_object(
@@ -991,6 +1000,18 @@ def _validate_runtime_qualification(
             observation["mode"] != "w4a16"
             or type(observation["calls"]) is not int
             or observation["calls"] <= 0
+        ):
+            raise ValueError(f"Fruit runtime path evidence {name} is invalid")
+
+    def validate_mtp_prefill_observation(value: object, *, name: str) -> None:
+        observation = _qualification_object(
+            value,
+            name=name,
+            keys={"mode", "calls", "capture_calls", "replay_calls"},
+        )
+        if observation["mode"] != "w4a16" or any(
+            type(observation[key]) is not int or observation[key] <= 0
+            for key in ("calls", "capture_calls", "replay_calls")
         ):
             raise ValueError(f"Fruit runtime path evidence {name} is invalid")
 
@@ -1036,7 +1057,11 @@ def _validate_runtime_qualification(
     mtp = _qualification_object(
         runtime_layers["13"],
         name="runtime_paths.layers.13",
-        keys={"mtp_decode"},
+        keys={"mtp_prefill", "mtp_decode"},
+    )
+    validate_mtp_prefill_observation(
+        mtp["mtp_prefill"],
+        name="runtime_paths.layers.13.mtp_prefill",
     )
     validate_decode_observation(
         mtp["mtp_decode"],

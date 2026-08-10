@@ -445,8 +445,8 @@ def _write_runtime_qualification(root: Path, manifest: dict[str, object]) -> Non
             "launch_order": ["bf16", "siq", "qsrt"],
         },
         "runtime_paths": {
-            "schema": "kquant_fruit_runtime_paths_v1",
-            "version": 1,
+            "schema": "kquant_fruit_runtime_paths_v2",
+            "version": 2,
             "layers": {
                 **{
                     str(layer): {
@@ -465,13 +465,19 @@ def _write_runtime_qualification(root: Path, manifest: dict[str, object]) -> Non
                     for layer in range(3, 13)
                 },
                 "13": {
+                    "mtp_prefill": {
+                        "mode": "w4a16",
+                        "calls": 1,
+                        "capture_calls": 1,
+                        "replay_calls": 1,
+                    },
                     "mtp_decode": {
                         "mode": "w4a8",
                         "calls": 1,
                         "part_count": 2,
                         "capture_calls": 1,
                         "replay_calls": 1,
-                    }
+                    },
                 },
             },
             "cudagraph": {
@@ -805,6 +811,7 @@ def test_production_receipt_binds_qualified_candidate_marker(tmp_path: Path) -> 
         "same_extra_environment",
         "production_environment_drift",
         "mismatched_runtime_identity",
+        "missing_mtp_prefill",
     ),
 )
 def test_publication_rejects_mutated_fixed_qualification_contract(
@@ -837,6 +844,8 @@ def test_publication_rejects_mutated_fixed_qualification_contract(
         receipt["models"]["bf16"]["repository"] = "malaiwah/wrong"
     elif mutation == "mismatched_runtime_identity":
         receipt["loaders"]["bf16"]["runtime"]["b12x_revision"] = "d" * 40
+    elif mutation == "missing_mtp_prefill":
+        del receipt["runtime_paths"]["layers"]["13"]["mtp_prefill"]
     elif mutation == "changed_environment":
         receipt["loaders"]["siq"]["runtime"]["environment"]["CUDA_VISIBLE_DEVICES"] = (
             "1"
