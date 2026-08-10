@@ -193,6 +193,13 @@ def _load_exl3_online_quantizer() -> Any:
     global _EXL3_ONLINE_QUANTIZER
     if _EXL3_ONLINE_QUANTIZER is not None:
         return _EXL3_ONLINE_QUANTIZER
+    # The encoder's internals import exllamav3_ext by its canonical name.
+    # Load the explicitly configured extension first so a pinned build (a
+    # superset of the stock symbols) owns the module cache; otherwise the
+    # stock import shadows exl3_moe_r7_fused and the R7 fused path refuses
+    # to run alongside the online overlay.
+    if os.environ.get("VLLM_EXL3_EXT_PATH"):
+        _load_exl3_ext()
 
     raw_root = os.environ.get("VLLM_EXL3_ENCODER_SOURCE")
     if raw_root is None or not raw_root.strip():
