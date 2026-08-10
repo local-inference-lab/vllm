@@ -10,9 +10,6 @@ from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.bitsandbytes_loader import BitsAndBytesModelLoader
-from vllm.model_executor.layers.quantization.exl3_fungible.progressive_loader import (
-    ProgressiveModelLoader,
-)
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.model_loader.modelexpress_loader import (
@@ -51,6 +48,22 @@ LoadFormats = Literal[
     "sharded_state",
     "tensorizer",
 ]
+def _progressive_loader_cls(*args, **kwargs):
+    """Lazily resolve the Progressive Tensors loader.
+
+    Importing it eagerly here makes `exl3_fungible.progressive_loader`
+    unimportable on its own: that module needs `model_loader.base_loader`,
+    which initializes this package, which would then import a
+    half-initialized module. Resolving at construction keeps both import
+    orders working.
+    """
+    from vllm.model_executor.layers.quantization.exl3_fungible.progressive_loader import (  # noqa: E501
+        ProgressiveModelLoader,
+    )
+
+    return ProgressiveModelLoader(*args, **kwargs)
+
+
 _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "auto": DefaultModelLoader,
     "hf": DefaultModelLoader,
@@ -61,7 +74,7 @@ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "mistral": DefaultModelLoader,
     "modelexpress": ModelExpressModelLoader,
     "npcache": DefaultModelLoader,
-    "progressive": ProgressiveModelLoader,
+    "progressive": _progressive_loader_cls,
     "pt": DefaultModelLoader,
     "runai_streamer": RunaiModelStreamerLoader,
     "runai_streamer_sharded": ShardedStateLoader,
@@ -159,7 +172,6 @@ __all__ = [
     "ModelExpressModelLoader",
     "DefaultModelLoader",
     "DummyModelLoader",
-    "ProgressiveModelLoader",
     "RunaiModelStreamerLoader",
     "ShardedStateLoader",
     "TensorizerLoader",
