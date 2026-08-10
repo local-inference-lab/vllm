@@ -795,6 +795,18 @@ class Worker(WorkerBase):
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
 
+        # Fungible-quant M1: bind the routing-stats collector to every MoE
+        # router before CUDA-graph capture. Deliberately NOT gated on
+        # enable_return_routed_experts (that flag governs the capturer
+        # above); bind_router chains any capture fn the capturer already
+        # installed. No-op returning None unless VLLM_FQ_ENABLE=1; the
+        # function import keeps cost at zero for the default path.
+        from vllm.model_executor.layers.quantization.exl3_fungible.integration import (  # noqa: E501
+            maybe_init_fq_collector,
+        )
+
+        self.model_runner.fq_collector = maybe_init_fq_collector(self.model_runner)
+
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
         # allocator and are not discarded during sleep/wake cycles.

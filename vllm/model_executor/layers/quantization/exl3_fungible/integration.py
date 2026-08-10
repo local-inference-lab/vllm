@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Fungible-quant M1 integration hook.
+
+Wires the :class:`FqStatsCollector` into the model runner: called from
+``gpu_worker.initialize_from_config`` right after the (optional)
+routed-experts capturer init and BEFORE CUDA-graph capture, so the
+collector's capture fn is recorded into the graphs.
+
+The routed-experts capturer is only bound when
+``enable_return_routed_experts`` is set, so this hook must be its own
+call site — never piggybacked on that flag. ``bind_router`` chains any
+previously bound capture fn, so both orders (capturer bound or not)
+are safe.
+
+Laziness contract: this module imports nothing from vllm at module
+level, and ``maybe_init_fq_collector`` returns before importing
+anything when ``VLLM_FQ_ENABLE`` is off — zero import cost for the
+default path. The vllm symbols are resolved through the two seam
+functions ``_moe_module_types`` / ``_collector_cls`` so CPU tests can
+monkeypatch fakes in without building ``vllm._C``.
+"""
+from __future__ import annotations
+
+import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.exl3_fungible.stats import (
+        FqStatsCollector,
+    )
+
+FQ_ENABLE_ENV = "VLLM_FQ_ENABLE"
+FQ_WINDOW_LEN_ENV = "VLLM_FQ_WINDOW_LEN"
+FQ_WINDOW_STRIDE_ENV = "VLLM_FQ_WINDOW_STRIDE"
+FQ_DECAY_ENV = "VLLM_FQ_DECAY"
+
+
+def _moe_module_types() -> tuple[type, type]:
+    """Lazy isinstance targets ``(MoERunner, BaseRouter)``.
+
+    Monkeypatch seam for CPU tests (inject fake classes); lazy so the
+    env-off path never touches the fused_moe import graph.
+    """
+    from vllm.model_executor.layers.fused_moe.layer import MoERunner
+    from vllm.model_executor.layers.fused_moe.router.base_router import (
+        BaseRouter,
+    )
+    return MoERunner, BaseRouter
+
+
+def _collector_cls() -> "type[FqStatsCollector]":
+    """Lazy :class:`FqStatsCollector`; monkeypatch seam for CPU tests."""
+    from vllm.model_executor.layers.quantization.exl3_fungible.stats import (
+        FqStatsCollector,
+    )
+    return FqStatsCollector
+
+
+def _window_kwargs_from_env() -> dict:
+    """Window knobs from env; unset knobs fall through to the
+    ``FqStatsCollector`` signature defaults (single source of truth)."""
+    kwargs: dict = {}
+    v = os.environ.get(FQ_WINDOW_LEN_ENV)
+    if v is not None:
+        kwargs["window_len"] = int(v)
+    v = os.environ.get(FQ_WINDOW_STRIDE_ENV)
+    if v is not None:
+        kwargs["window_stride"] = int(v)
+    v = os.environ.get(FQ_DECAY_ENV)
+    if v is not None:
+        kwargs["decay"] = float(v)
+    return kwargs
+
+
+def maybe_init_fq_collector(runner) -> "FqStatsCollector | None":
+    """Build and bind the FQ stats collector, if enabled and applicable.
+
+    Returns None (binding nothing, importing nothing heavy) unless
+    ``VLLM_FQ_ENABLE=1`` and the model contains at least one MoERunner
+    with a BaseRouter router. Otherwise binds EVERY such router via
+    ``collector.bind_router`` — which chains a previously installed
+    capture fn (e.g. the routed-experts capturer), so it is safe to
+    call whether or not ``enable_return_routed_experts`` already bound
+    one. Must run before CUDA-graph capture.
+
+    Args:
+        runner: the GPU model runner (needs ``.model.modules()`` and
+            ``.device``).
+    """
+    if os.environ.get(FQ_ENABLE_ENV, "0") != "1":
+        return None
+
+    moe_runner_cls, base_router_cls = _moe_module_types()
+
+    routers: list[tuple[int, object]] = []
+    for module in runner.model.modules():
+        if (isinstance(module, moe_runner_cls)
+                and isinstance(module.router, base_router_cls)):
+            routers.append((module.layer_id, module.router))
+    if not routers:
+        return None
+
+    collector = _collector_cls()(
+        routers[0][1].global_num_experts,
+        device=runner.device,
+        **_window_kwargs_from_env(),
+    )
+    for layer_id, router in routers:
+        collector.bind_router(layer_id, router)
+    return collector
