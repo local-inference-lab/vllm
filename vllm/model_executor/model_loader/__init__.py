@@ -10,6 +10,9 @@ from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.bitsandbytes_loader import BitsAndBytesModelLoader
+from vllm.model_executor.layers.quantization.exl3_fungible.progressive_loader import (
+    ProgressiveModelLoader,
+)
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.model_loader.modelexpress_loader import (
@@ -40,6 +43,7 @@ LoadFormats = Literal[
     "mistral",
     "modelexpress",
     "npcache",
+    "progressive",
     "pt",
     "runai_streamer",
     "runai_streamer_sharded",
@@ -57,6 +61,7 @@ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "mistral": DefaultModelLoader,
     "modelexpress": ModelExpressModelLoader,
     "npcache": DefaultModelLoader,
+    "progressive": ProgressiveModelLoader,
     "pt": DefaultModelLoader,
     "runai_streamer": RunaiModelStreamerLoader,
     "runai_streamer_sharded": ShardedStateLoader,
@@ -154,6 +159,7 @@ __all__ = [
     "ModelExpressModelLoader",
     "DefaultModelLoader",
     "DummyModelLoader",
+    "ProgressiveModelLoader",
     "RunaiModelStreamerLoader",
     "ShardedStateLoader",
     "TensorizerLoader",

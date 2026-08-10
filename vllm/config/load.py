@@ -55,6 +55,10 @@ class LoadConfig:
     - "mistral" will load weights from consolidated safetensors files used by
       Mistral models.
     - "modelexpress" will load weights using ModelExpress.
+    - "progressive" will stream mixed-K EXL3 weights directly from
+      Progressive Tensors segments plus a bitrate policy (fungible quant;
+      configured via VLLM_FQ_MANIFEST_DIR / VLLM_FQ_POLICY), with no
+      assembled checkpoint on disk.
     - Other custom values can be supported via plugins.
     """
     download_dir: str | None = None
