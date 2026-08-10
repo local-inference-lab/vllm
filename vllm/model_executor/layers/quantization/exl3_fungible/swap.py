@@ -33,26 +33,44 @@ quiesced. Rollback is ``apply(plan.inverse())`` — sources are re-read from
 the artifact pair (checkpoint-form tensors are freed post-prepare; the
 artifact pair is the only source of truth for both directions).
 
+Two properties T5 (torn-update fault injection) binds on top of that:
+
+* **The flip is the only visibility point.** Host bookkeeping (the live
+  tier orderings, the generation counter) commits with the map copy, in a
+  ``finally``: an abort at ``memo``/``persist`` leaves device maps and
+  in-memory orderings agreeing on the NEW membership, never a stale host
+  view of freshly flipped maps.
+* **Fail-atomic staging** (``stage(..., fail_atomic=True)``): the pre-swap
+  encodings of both experts are staged alongside the new ones, so an abort
+  *before* the flip restores the overwritten rows inside the same quiesce
+  window. Without it a pre-flip abort leaves the layer genuinely torn (the
+  displaced expert's slot holds its successor's bytes) — recoverable only by
+  re-applying the plan or by reboot (slabs are a cache, never authoritative).
+
 This module is import-light on purpose: no vllm imports, b12x is resolved
 lazily through the ``build_maps_fn`` seam, segment files are parsed with
-plain file IO (the HF-ranged source lands with loader v2 and implements the
-same :class:`FragmentSource` protocol — the per-expert index range proven
-to cover all of an expert's tensors here is exactly the byte range it will
-fetch with one ranged GET).
+plain file IO. :class:`ResolverFragmentSource` adapts loader v2's
+``fragments.FragmentResolver`` (multi-source, trust filtering, sha
+verification, K-fallback ladder) to the same :class:`FragmentSource`
+protocol by duck typing, so swaps stage from HF sources / trusted mirrors
+with boot's verification and this module still imports standalone.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import struct
 import time
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 
 import numpy as np
 import torch
+
+logger = logging.getLogger(__name__)
 
 K3, K4 = 3, 4
 DESCRIPTOR_TIER_SHIFT = 8  # descriptor = (tier << 8) | local, single decode site
@@ -126,6 +144,19 @@ class ExpertStage:
         }
         self.mcg: dict[str, int] = {}
 
+    def slab_rows(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Flat sources for one expert's three slab rows (w13 gate, w13 up,
+        w2 down) — commit-protocol step 1, in order."""
+        return (self.trellis["gate"].view(-1), self.trellis["up"].view(-1),
+                self.trellis["down"].view(-1))
+
+    def rotation_rows(self) -> tuple[torch.Tensor, ...]:
+        """Sources for the four COMBINED table rows of one expert, in commit
+        order: ``rotations.intermediate``, ``gate_suh``, ``up_suh``,
+        ``down_svh`` — step 2."""
+        return (self.inter_rot, self.suh["gate"], self.suh["up"],
+                self.svh["down"])
+
     def dest_tensor(self, proj: str, comp: str) -> torch.Tensor | None:
         """Host tensor a source must fill for (proj, comp); None for mcg."""
         if comp == "trellis":
@@ -152,6 +183,42 @@ class FragmentSource(Protocol):
     def read_expert(self, *, layer: int, k: int, expert: int, rank: int,
                     dest: ExpertStage) -> None:
         ...
+
+
+class FragmentUnavailable(RuntimeError):
+    """A source cannot supply this expert's payload at the requested K.
+
+    Supply-side failure, not corruption: the fragment is missing from every
+    configured source, its attestation is not trusted (10 §4), it failed sha
+    verification, or the fallback ladder substituted a different K — which
+    for a *promotion* means the K4 encode has not landed yet, so the
+    promotion PENDS (07 §Pipeline 1: the swap list only includes promotions
+    whose encodes have landed; pending promotions don't count against caps).
+
+    :meth:`SwapEngine.stage` with ``on_unavailable="drop"`` turns this into a
+    dropped pair instead of a failed interval. Structural failures
+    (unregistered layer, bad residency, geometry mismatch, foreign mcg) are
+    NOT droppable — they stay fatal, fail-closed.
+    """
+
+
+_UNAVAILABLE_ERROR_NAMES = frozenset((
+    "FragmentUnavailable",        # this module
+    "FragmentUnavailableError",   # fragments.py: no source could supply it
+    "FragmentVerificationError",  # fragments.py: sha mismatch
+))
+
+
+def is_unavailable_error(exc: BaseException) -> bool:
+    """Droppable supply-side failure (vs a fatal structural one)?
+
+    Matched by class NAME over the exception's MRO: this module must import
+    standalone (the GPU harness loads swap.py by path, where a relative
+    import of fragments.py does not exist), and third-party sources can then
+    signal "pend this promotion" without importing swap.py either.
+    """
+    return any(cls.__name__ in _UNAVAILABLE_ERROR_NAMES
+               for cls in type(exc).__mro__)
 
 
 class LocalSegmentSource:
@@ -251,6 +318,89 @@ class LocalSegmentSource:
                 if got != nbytes:
                     raise IOError(
                         f"{path.name}: short read on {name}: {got}/{nbytes}")
+
+
+class ResolverFragmentSource:
+    """:class:`FragmentSource` backed by loader v2's ``FragmentResolver``.
+
+    Staging a swap then goes through boot's exact supply chain — local
+    segment dirs → content-addressed cache → the manifest/``VLLM_FQ_SOURCES``
+    chain of HF repos and trusted mirrors — with the same attestation trust
+    filtering and per-fragment sha256 verification (implementation/10 §2/§4).
+    The engine's per-tensor validation (dtype, shape, byte count, layer
+    codebook) still runs on top of whatever the resolver hands back: one
+    ranged GET per expert is sufficient exactly because every tensor of that
+    expert is proven to live inside the indexed expert range.
+
+    The resolver is duck-typed (``resolve`` + ``materialize``) so swap.py
+    keeps its no-imports stance and tests can pass a fake.
+
+    Substitution policy: a fragment the ``VLLM_FQ_K_FALLBACK`` ladder
+    substituted at a different K cannot be written into a K``k`` slab row
+    (different word count) *and* means the requested encode has not landed —
+    :class:`FragmentUnavailable` is raised so the promotion pends (07 §1);
+    the resolver has already queued the encode. ``allow_substituted=True``
+    would only be meaningful with per-pair tier retargeting, which v1
+    (same-cardinality K3/K4 swaps, D1) does not have.
+    """
+
+    def __init__(self, resolver: Any, *, allow_substituted: bool = False,
+                 unavailable_errors: Sequence[type[BaseException]] = ()):
+        self.resolver = resolver
+        self.allow_substituted = bool(allow_substituted)
+        self.unavailable_errors = tuple(unavailable_errors)
+        self.reads = 0
+        self.unavailable = 0
+
+    def _unavailable(self, msg: str, cause: BaseException | None = None):
+        self.unavailable += 1
+        exc = FragmentUnavailable(msg)
+        if cause is not None:
+            exc.__cause__ = cause
+        return exc
+
+    def read_expert(self, *, layer: int, k: int, expert: int, rank: int,
+                    dest: ExpertStage) -> None:
+        if dest.bits != k:
+            raise ValueError(f"stage is K{dest.bits}, requested K{k}")
+        try:
+            fragment = self.resolver.resolve(layer, expert, k)
+        except Exception as exc:  # noqa: BLE001 — classified below
+            if isinstance(exc, self.unavailable_errors) or is_unavailable_error(exc):
+                raise self._unavailable(
+                    f"L{layer}/e{expert} K{k}: resolver refused "
+                    f"({type(exc).__name__}: {exc})", exc) from exc
+            raise
+        got_k = int(getattr(fragment, "k", k))
+        if got_k != k and not self.allow_substituted:
+            raise self._unavailable(
+                f"L{layer}/e{expert} K{k}: resolver substituted K{got_k} "
+                "(requested encode has not landed) — promotion pends")
+        suffix = f".rank{rank}."
+        pairs = self.resolver.materialize(
+            fragment, name_filter=lambda n: suffix in n)
+        tensors = dict(pairs)
+        for proj in _PROJS:
+            for comp in _COMPS:
+                name = tensor_name(layer, expert, proj, rank, comp)
+                src = tensors.get(name)
+                if src is None:
+                    raise KeyError(
+                        f"fragment L{layer}/e{expert} K{got_k} "
+                        f"({getattr(fragment, 'origin', '?')}) is missing "
+                        f"{name} — {len(tensors)} rank{rank} tensors present")
+                if comp == "mcg":
+                    dest.mcg[proj] = int(src.reshape(-1)[0])
+                    continue
+                t = dest.dest_tensor(proj, comp)
+                assert t is not None
+                if src.dtype != t.dtype or tuple(src.shape) != tuple(t.shape):
+                    raise ValueError(
+                        f"fragment L{layer}/e{expert} K{got_k}: {name} is "
+                        f"{src.dtype}{tuple(src.shape)}, stage expects "
+                        f"{t.dtype}{tuple(t.shape)}")
+                t.copy_(src)
+        self.reads += 1
 
 
 # ------------------------------------------------------------------ swap plan
@@ -390,11 +540,31 @@ class _StagedLayer:
     descriptor_host: torch.Tensor
 
 
+@dataclass(frozen=True)
+class DroppedPair:
+    """A plan pair staging could not supply (``on_unavailable="drop"``).
+
+    The pair is left entirely unapplied — both experts keep their current
+    tier, so per-layer K4 cardinality is preserved (D1) and the promotion
+    simply pends until its encode lands (07 §1)."""
+
+    swap: tuple[int, int, int]
+    expert: int
+    k: int
+    reason: str
+
+
 @dataclass
 class StagedBatch:
     """Everything apply() needs, fully resolved on the host pre-quiesce:
     three ordered (dst_view, src_pinned) op lists (commit-protocol steps
-    1–3) plus the post-swap orderings to commit into the layer states."""
+    1–3) plus the post-swap orderings to commit into the layer states.
+
+    ``plan`` is the EFFECTIVE plan (``requested_plan`` minus ``dropped``);
+    callers building the policy document to persist must derive it from
+    ``plan``, never from what they asked for. ``undo_ops`` is the fail-atomic
+    restore batch (pre-swap rows + maps) apply() replays inside the window if
+    it aborts before the visibility flip."""
 
     plan: SwapPlan
     slab_ops: list[tuple[torch.Tensor, torch.Tensor]]
@@ -404,6 +574,14 @@ class StagedBatch:
     bytes_h2d: int
     stage_seconds: float
     mcg: int | None
+    requested_plan: SwapPlan | None = None
+    dropped: tuple[DroppedPair, ...] = ()
+    undo_ops: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+    restored: bool = False
+
+    @property
+    def fail_atomic(self) -> bool:
+        return self.undo_ops is not None
 
 
 @dataclass
@@ -416,6 +594,7 @@ class ApplyReport:
     generation: int
     mcg: int | None = None
     committed_policy_hash: str | None = None
+    dropped: tuple[DroppedPair, ...] = field(default_factory=tuple)
 
 
 # --------------------------------------------------------------- swap engine
@@ -466,6 +645,7 @@ class SwapEngine:
         self._build_maps = build_maps_fn or _default_build_maps
         if pin_memory is None:
             pin_memory = torch.cuda.is_available()
+        self._pin_memory = bool(pin_memory)
 
         for layer_id, state in self.layers.items():
             self._validate_layer(layer_id, state)
@@ -481,14 +661,47 @@ class SwapEngine:
             for _ in range(self.max_pairs)
         ]
         self._map_stages = {
-            layer_id: (
-                torch.empty(state.num_global_experts, dtype=torch.int32,
-                            pin_memory=pin_memory),
-                torch.empty(state.num_global_experts, dtype=torch.int32,
-                            pin_memory=pin_memory),
-            )
+            layer_id: self._new_map_stage(state)
             for layer_id, state in self.layers.items()
         }
+        # Fail-atomic staging (T5): the pre-swap encodings + pre-swap maps.
+        # Allocated on first use — a plan staged without fail_atomic keeps
+        # the 02 §Why-row-writes pinned budget (max_pairs x 7.875 MiB).
+        self._undo_stages: list[tuple[ExpertStage, ExpertStage]] | None = None
+        self._undo_map_stages: dict[
+            int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _new_map_stage(self, state: MixedLayerState
+                       ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.empty(state.num_global_experts, dtype=torch.int32,
+                        pin_memory=self._pin_memory),
+            torch.empty(state.num_global_experts, dtype=torch.int32,
+                        pin_memory=self._pin_memory),
+        )
+
+    def _undo_stage_pair(self, index: int) -> tuple[ExpertStage, ExpertStage]:
+        """(K3, K4) pinned stages holding the PRE-swap payloads of pair
+        ``index`` — the restore sources apply() replays on a pre-flip abort."""
+        if self._undo_stages is None:
+            self._undo_stages = [
+                (ExpertStage(self.tier_bits[0], self.hidden_size,
+                             self.intermediate_size,
+                             pin_memory=self._pin_memory),
+                 ExpertStage(self.tier_bits[1], self.hidden_size,
+                             self.intermediate_size,
+                             pin_memory=self._pin_memory))
+                for _ in range(self.max_pairs)
+            ]
+        return self._undo_stages[index]
+
+    def _undo_map_stage(self, layer_id: int
+                        ) -> tuple[torch.Tensor, torch.Tensor]:
+        stage = self._undo_map_stages.get(layer_id)
+        if stage is None:
+            stage = self._undo_map_stages[layer_id] = self._new_map_stage(
+                self.layers[layer_id])
+        return stage
 
     # ---------------------------------------------------------- validation
 
@@ -565,12 +778,15 @@ class SwapEngine:
 
     # -------------------------------------------------------------- staging
 
-    def _stage_maps_for_layer(self, layer_id: int, tier0_globals: list[int],
-                              tier1_globals: list[int]) -> _StagedLayer:
+    def _stage_maps_for_layer(
+        self, layer_id: int, tier0_globals: list[int],
+        tier1_globals: list[int],
+        into: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> _StagedLayer:
         g2c_cpu, desc_cpu = self._build_maps(
             tier0_globals, tier1_globals, device=torch.device("cpu"))
         self._validate_host_maps(layer_id, len(tier0_globals), g2c_cpu, desc_cpu)
-        g2c_host, desc_host = self._map_stages[layer_id]
+        g2c_host, desc_host = into or self._map_stages[layer_id]
         g2c_host.copy_(g2c_cpu)
         desc_host.copy_(desc_cpu)
         return _StagedLayer(layer_id, list(tier0_globals), list(tier1_globals),
@@ -582,33 +798,90 @@ class SwapEngine:
         w2 = tier.w2.view(torch.int16).view(count, -1)
         return w13, w2
 
-    def stage(self, plan: SwapPlan) -> StagedBatch:
+    def stage(self, plan: SwapPlan, *, fail_atomic: bool = False,
+              on_unavailable: str = "raise") -> StagedBatch:
         """Resolve a plan into device-view/pinned-source op lists (host-only,
-        pre-quiesce: fragment IO, slot resolution, map rebuild)."""
+        pre-quiesce: fragment IO, slot resolution, map rebuild).
+
+        ``fail_atomic``: also stage both experts' PRE-swap encodings and the
+        pre-swap maps, so :meth:`apply` can restore the layer inside the
+        quiesce window if it aborts before the visibility flip (T5). Costs a
+        second read of each expert and doubles pinned staging.
+
+        ``on_unavailable="drop"``: a pair whose fragments no source can
+        supply (missing / untrusted / unverified / substituted-K, i.e.
+        :func:`is_unavailable_error`) is dropped from the batch instead of
+        failing the interval — the promotion pends (07 §1). Both experts keep
+        their tier, so cardinality is preserved. The surviving pairs are
+        :attr:`StagedBatch.plan`; build the policy document to persist from
+        that, not from the requested plan.
+        """
         t_start = time.perf_counter()
+        if on_unavailable not in ("raise", "drop"):
+            raise ValueError(
+                f"on_unavailable must be raise|drop, got {on_unavailable!r}")
         if len(plan) > self.max_pairs:
             raise ValueError(
                 f"plan has {len(plan)} pairs, staging holds {self.max_pairs}")
         k3_bits, k4_bits = self.tier_bits
         slab_ops: list[tuple[torch.Tensor, torch.Tensor]] = []
         rotation_ops: list[tuple[torch.Tensor, torch.Tensor]] = []
+        undo_ops: list[tuple[torch.Tensor, torch.Tensor]] | None = (
+            [] if fail_atomic else None)
+        dropped: list[DroppedPair] = []
+        applied: list[tuple[int, int, int]] = []
         mcg_seen: int | None = self.expected_mcg
         # Scratch orderings so multi-pair layers resolve slots sequentially
-        # without touching live state until commit.
+        # without touching live state until commit; ``pre`` keeps the
+        # pre-swap orderings for the fail-atomic map restore.
         orderings: dict[int, tuple[list[int], list[int]]] = {}
+        pre_orderings: dict[int, tuple[list[int], list[int]]] = {}
+        touched: list[int] = []
+        pair_idx = 0
 
-        for pair_idx, (layer_id, e_out, e_in) in enumerate(plan):
+        for layer_id, e_out, e_in in plan:
             state = self.layers.get(layer_id)
             if state is None:
                 raise KeyError(f"layer {layer_id} is not registered")
             if layer_id not in orderings:
                 orderings[layer_id] = (list(state.tier0_globals),
                                        list(state.tier1_globals))
+                pre_orderings[layer_id] = (list(state.tier0_globals),
+                                           list(state.tier1_globals))
             t0_ids, t1_ids = orderings[layer_id]
             if e_out not in t1_ids or e_in not in t0_ids:
                 raise ValueError(
                     f"invalid swap ({layer_id}, {e_out}, {e_in}): e_out must "
                     f"be resident K{k4_bits}, e_in resident K{k3_bits}")
+
+            # Fragment IO first: a pair that cannot be supplied leaves no
+            # trace (orderings are only mutated once every read landed).
+            out_stage, in_stage = self._stages[pair_idx]
+            reads = [(k3_bits, e_out, out_stage), (k4_bits, e_in, in_stage)]
+            undo_k3 = undo_k4 = None
+            if fail_atomic:
+                undo_k3, undo_k4 = self._undo_stage_pair(pair_idx)
+                # Pre-swap content of the two destination slots.
+                reads += [(k4_bits, e_out, undo_k4), (k3_bits, e_in, undo_k3)]
+            drop: DroppedPair | None = None
+            for k, expert, dest in reads:
+                try:
+                    self.source.read_expert(layer=layer_id, k=k, expert=expert,
+                                            rank=self.rank, dest=dest)
+                except Exception as exc:  # noqa: BLE001 — classified here
+                    if on_unavailable == "drop" and is_unavailable_error(exc):
+                        drop = DroppedPair(
+                            swap=(layer_id, e_out, e_in), expert=expert, k=k,
+                            reason=f"{type(exc).__name__}: {exc}")
+                        break
+                    raise
+            if drop is not None:
+                logger.warning(
+                    "FQ swap L%d e%d->K%d/e%d->K%d dropped: %s",
+                    layer_id, e_out, k3_bits, e_in, k4_bits, drop.reason)
+                dropped.append(drop)
+                continue
+
             # e_in inherits e_out's tier1 slot and vice versa: every other
             # expert's slot (and slab row) is untouched.
             slot1 = t1_ids.index(e_out)
@@ -616,13 +889,14 @@ class SwapEngine:
             t1_ids[slot1] = e_in
             t0_ids[slot0] = e_out
             t0n = len(t0_ids)
+            applied.append((layer_id, e_out, e_in))
+            if layer_id not in touched:
+                touched.append(layer_id)
+            pair_idx += 1
 
-            out_stage, in_stage = self._stages[pair_idx]
-            self.source.read_expert(layer=layer_id, k=k3_bits, expert=e_out,
-                                    rank=self.rank, dest=out_stage)
-            self.source.read_expert(layer=layer_id, k=k4_bits, expert=e_in,
-                                    rank=self.rank, dest=in_stage)
-            for stage, expert in ((out_stage, e_out), (in_stage, e_in)):
+            for stage, expert in ((out_stage, e_out), (in_stage, e_in),
+                                  *(((undo_k4, e_out), (undo_k3, e_in))
+                                    if fail_atomic else ())):
                 for proj, value in stage.mcg.items():
                     if mcg_seen is None:
                         mcg_seen = value
@@ -637,43 +911,53 @@ class SwapEngine:
                         f"mcg {state.mcg}")
 
             # Step-1 ops: slab rows for BOTH experts at their NEW slots.
-            for tier, count, slot, stage in (
-                    (state.tier1, len(t1_ids), slot1, in_stage),
-                    (state.tier0, t0n, slot0, out_stage)):
+            # The undo op for a destination is the SAME view fed the expert
+            # that occupied it pre-swap.
+            for tier, count, slot, stage, undo in (
+                    (state.tier1, len(t1_ids), slot1, in_stage, undo_k4),
+                    (state.tier0, t0n, slot0, out_stage, undo_k3)):
                 w13, w2 = self._slab_rows(tier, count)
-                slab_ops.append((w13[0, slot], stage.trellis["gate"].view(-1)))
-                slab_ops.append((w13[1, slot], stage.trellis["up"].view(-1)))
-                slab_ops.append((w2[slot], stage.trellis["down"].view(-1)))
+                dsts = (w13[0, slot], w13[1, slot], w2[slot])
+                slab_ops.extend(zip(dsts, stage.slab_rows()))
+                if undo_ops is not None:
+                    undo_ops.extend(zip(dsts, undo.slab_rows()))
 
             # Step-2 ops: COMBINED rotation/suh/svh rows at NEW combined
             # slots (tier0 local -> slot, tier1 local -> t0 + slot).
             rot = state.rotations
-            for combined_slot, stage in ((t0n + slot1, in_stage),
-                                         (slot0, out_stage)):
-                rotation_ops.append(
-                    (rot.intermediate[combined_slot], stage.inter_rot))
-                rotation_ops.append(
-                    (rot.gate_suh[combined_slot], stage.suh["gate"]))
-                rotation_ops.append(
-                    (rot.up_suh[combined_slot], stage.suh["up"]))
-                rotation_ops.append(
-                    (rot.down_svh[combined_slot], stage.svh["down"]))
+            for combined_slot, stage, undo in ((t0n + slot1, in_stage, undo_k4),
+                                               (slot0, out_stage, undo_k3)):
+                dsts = (rot.intermediate[combined_slot],
+                        rot.gate_suh[combined_slot],
+                        rot.up_suh[combined_slot],
+                        rot.down_svh[combined_slot])
+                rotation_ops.extend(zip(dsts, stage.rotation_rows()))
+                if undo_ops is not None:
+                    undo_ops.extend(zip(dsts, undo.rotation_rows()))
 
         staged_layers = [
-            self._stage_maps_for_layer(layer_id, t0_ids, t1_ids)
-            for layer_id, (t0_ids, t1_ids) in orderings.items()
+            self._stage_maps_for_layer(layer_id, *orderings[layer_id])
+            for layer_id in touched
         ]
         map_ops: list[tuple[torch.Tensor, torch.Tensor]] = []
         for staged in staged_layers:
             state = self.layers[staged.layer]
             map_ops.append((state.global_to_combined, staged.g2c_host))
             map_ops.append((state.descriptor_map, staged.descriptor_host))
+        if undo_ops is not None:
+            for layer_id in touched:
+                state = self.layers[layer_id]
+                pre = self._stage_maps_for_layer(
+                    layer_id, *pre_orderings[layer_id],
+                    self._undo_map_stage(layer_id))
+                undo_ops.append((state.global_to_combined, pre.g2c_host))
+                undo_ops.append((state.descriptor_map, pre.descriptor_host))
 
         bytes_h2d = sum(
             src.numel() * src.element_size()
             for _, src in (*slab_ops, *rotation_ops, *map_ops))
         return StagedBatch(
-            plan=plan,
+            plan=SwapPlan(applied) if dropped else plan,
             slab_ops=slab_ops,
             rotation_ops=rotation_ops,
             map_ops=map_ops,
@@ -681,6 +965,9 @@ class SwapEngine:
             bytes_h2d=bytes_h2d,
             stage_seconds=time.perf_counter() - t_start,
             mcg=mcg_seen,
+            requested_plan=plan,
+            dropped=tuple(dropped),
+            undo_ops=undo_ops,
         )
 
     # ---------------------------------------------------------------- apply
@@ -709,6 +996,19 @@ class SwapEngine:
         is the T5 torn-update instrumentation seam (called after each of
         COMMIT_STEPS; raising aborts between steps).
 
+        Abort semantics (T5), for an exception from any step or hook:
+
+        * **before the flip** — if the batch was staged ``fail_atomic``, the
+          pre-swap rows and maps are restored inside the same quiesce window
+          (``staged.restored``) and the layer resumes fully-old; otherwise
+          the layer is left torn and the caller must re-apply the plan (roll
+          forward) or restart (slabs are a cache, rebuilt from artifacts).
+        * **at or after the flip** — the swap is committed: live orderings
+          and the generation counter advance with the maps (``finally``), so
+          the layer resumes fully-new and rollback is the normal
+          ``apply(plan.inverse())``. A failed ``memo_hook`` still leaves a
+          stale FusedMoEQuantConfig memo — the caller must retry it.
+
         Rollback: ``apply(plan.inverse(), ...)`` — fragments are re-read
         from the artifact pair by :meth:`stage`.
         """
@@ -716,42 +1016,67 @@ class SwapEngine:
             if plan is None:
                 raise ValueError("apply() needs a plan or a staged batch")
             staged = self.stage(plan)
-        elif plan is not None and staged.plan != plan:
+        elif plan is not None and plan not in (staged.plan,
+                                               staged.requested_plan):
             raise ValueError("staged batch does not match plan")
 
         stream_ctx: AbstractContextManager = (
             torch.cuda.stream(stream) if stream is not None else nullcontext())
         committed_hash: str | None = None
+        flipped = False
         t_window = time.perf_counter()
         with quiesce:
-            with stream_ctx:
-                for dst, src in staged.slab_ops:  # step 1
-                    dst.copy_(src, non_blocking=True)
-                if step_hook is not None:
-                    step_hook("slabs")
-                for dst, src in staged.rotation_ops:  # step 2
-                    dst.copy_(src, non_blocking=True)
-                if step_hook is not None:
-                    step_hook("rotations")
-                for dst, src in staged.map_ops:  # step 3 — visibility flip
-                    dst.copy_(src, non_blocking=True)
-                if step_hook is not None:
-                    step_hook("maps")
+            try:
+                with stream_ctx:
+                    for dst, src in staged.slab_ops:  # step 1
+                        dst.copy_(src, non_blocking=True)
+                    if step_hook is not None:
+                        step_hook("slabs")
+                    for dst, src in staged.rotation_ops:  # step 2
+                        dst.copy_(src, non_blocking=True)
+                    if step_hook is not None:
+                        step_hook("rotations")
+                    for dst, src in staged.map_ops:  # step 3 — visibility flip
+                        dst.copy_(src, non_blocking=True)
+                    flipped = True
+                    if step_hook is not None:
+                        step_hook("maps")
+            except BaseException:
+                if not flipped and staged.undo_ops is not None:
+                    with stream_ctx:
+                        for dst, src in staged.undo_ops:
+                            dst.copy_(src, non_blocking=True)
+                    staged.restored = True
+                    logger.warning(
+                        "FQ swap aborted before the visibility flip; %d "
+                        "pre-swap rows/maps restored inside the quiesce "
+                        "window (layer state is fully-old)",
+                        len(staged.undo_ops))
+                elif not flipped:
+                    logger.error(
+                        "FQ swap aborted before the visibility flip WITHOUT "
+                        "fail-atomic staging — slab rows are torn; re-apply "
+                        "the plan or restart (slabs are a cache)")
+                raise
+            finally:
+                # The flip is the only visibility point: live orderings and
+                # the generation counter commit WITH the maps, so an abort in
+                # step 4/5 cannot leave a stale host view of flipped maps.
+                if flipped:
+                    self.generation += 1
+                    for staged_layer in staged.staged_layers:
+                        state = self.layers[staged_layer.layer]
+                        state.tier0_globals[:] = staged_layer.tier0_globals
+                        state.tier1_globals[:] = staged_layer.tier1_globals
             if memo_hook is not None:  # step 4
                 memo_hook()
             if step_hook is not None:
                 step_hook("memo")
-            self.generation += 1  # step 5
-            if policy_store is not None and policy_doc is not None:
+            if policy_store is not None and policy_doc is not None:  # step 5
                 committed_hash = policy_store.commit(
                     policy_doc, num_experts=policy_num_experts)
             if step_hook is not None:
                 step_hook("persist")
-            # Host bookkeeping: the committed orderings become live state.
-            for staged_layer in staged.staged_layers:
-                state = self.layers[staged_layer.layer]
-                state.tier0_globals[:] = staged_layer.tier0_globals
-                state.tier1_globals[:] = staged_layer.tier1_globals
         window_seconds = time.perf_counter() - t_window
 
         return ApplyReport(
@@ -763,6 +1088,7 @@ class SwapEngine:
             generation=self.generation,
             mcg=staged.mcg,
             committed_policy_hash=committed_hash,
+            dropped=staged.dropped,
         )
 
     # ---------------------------------------------------------- map rebuild

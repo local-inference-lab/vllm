@@ -12,11 +12,39 @@ harness.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import struct
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
+
+_PKG_DIR = (Path(__file__).resolve().parents[2] / "vllm" / "model_executor"
+            / "layers" / "quantization" / "exl3_fungible")
+
+
+def load_tree_module(name: str):
+    """Load one ``exl3_fungible`` module from THIS working tree, by path.
+
+    The gg rootfs carries a copy of the package inside its site-packages that
+    is periodically synced from the tree, so a plain
+    ``from vllm... import swap`` can silently resolve to whatever was last
+    copied there. Tests whose verdict is about tree code load the tree file.
+    Cached under ``fq_<name>_tree`` so every test module that asks gets the
+    SAME module object (class identity matters: ``SwapPlan.__eq__`` and the
+    dataclasses are per-module).
+    """
+    alias = f"fq_{name}_tree"
+    mod = sys.modules.get(alias)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(
+            alias, _PKG_DIR / f"{name}.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[alias] = mod
+        spec.loader.exec_module(mod)
+    return mod
 
 # Mirrors the proven pre-m4 occupancy harness geometry.
 HIDDEN = 128
@@ -92,6 +120,81 @@ def assemble_membership_tensors(checkpoint: dict, tier_globals, k: int) -> dict:
             torch.stack([m["down_suh"] for m in members]),
         ), dim=1).contiguous(),
     }
+
+
+def build_maps_reference(tier0_ids, tier1_ids, *, device):
+    """Pure-torch replica of b12x ``build_tiered_maps`` (T3 proves parity)."""
+    t0n, t1n = len(tier0_ids), len(tier1_ids)
+    g2c = torch.full((t0n + t1n,), -1, dtype=torch.int32)
+    for local, g in enumerate(tier0_ids):
+        g2c[int(g)] = local
+    for local, g in enumerate(tier1_ids):
+        g2c[int(g)] = t0n + local
+    desc = torch.tensor(
+        [*range(t0n), *((1 << 8) | i for i in range(t1n))], dtype=torch.int32)
+    return g2c.to(device), desc.to(device)
+
+
+def cpu_layer_state(fq_swap, checkpoint: dict, t0_globals, t1_globals):
+    """Hand-assembled ``MixedLayerState`` on CPU (fresh-build reference).
+
+    ``fq_swap`` is passed in so the caller controls WHICH swap module the
+    state belongs to (see :func:`load_tree_module`)."""
+    def tier(globals_, k):
+        t = assemble_membership_tensors(checkpoint, globals_, k)
+        return SimpleNamespace(
+            num_experts=len(globals_),
+            w13=t["w13"].view(torch.int32).reshape(-1),
+            w2=t["w2"].view(torch.int32).reshape(-1),
+        ), t
+
+    tier0, r0 = tier(t0_globals, 3)
+    tier1, r1 = tier(t1_globals, 4)
+    rotations = SimpleNamespace(
+        intermediate=torch.cat((r0["intermediate"], r1["intermediate"])),
+        gate_suh=torch.cat((r0["gate_suh"], r1["gate_suh"])),
+        up_suh=torch.cat((r0["up_suh"], r1["up_suh"])),
+        down_svh=torch.cat((r0["down_svh"], r1["down_svh"])),
+    )
+    g2c, desc = build_maps_reference(t0_globals, t1_globals,
+                                     device=torch.device("cpu"))
+    return fq_swap.MixedLayerState(
+        tier0=tier0, tier1=tier1, rotations=rotations,
+        global_to_combined=g2c, descriptor_map=desc,
+        tier0_globals=list(t0_globals), tier1_globals=list(t1_globals))
+
+
+def state_fingerprint(state) -> str:
+    """sha256 over every byte a swap can touch — slabs, combined rotation /
+    suh / svh tables, both maps. Two states with the same fingerprint are
+    indistinguishable to the kernel."""
+    import hashlib
+
+    h = hashlib.sha256()
+    for tier in (state.tier0, state.tier1):
+        for slab in ("w13", "w2"):
+            h.update(getattr(tier, slab).contiguous().view(torch.uint8)
+                     .cpu().numpy().tobytes())
+    for name in ("intermediate", "gate_suh", "up_suh", "down_svh"):
+        h.update(getattr(state.rotations, name).contiguous().view(torch.uint8)
+                 .cpu().numpy().tobytes())
+    for m in (state.global_to_combined, state.descriptor_map):
+        h.update(m.contiguous().cpu().numpy().tobytes())
+    return h.hexdigest()
+
+
+def assert_states_equal(a, b) -> None:
+    assert a.tier0_globals == b.tier0_globals
+    assert a.tier1_globals == b.tier1_globals
+    for name in ("tier0", "tier1"):
+        for slab in ("w13", "w2"):
+            assert torch.equal(getattr(getattr(a, name), slab),
+                               getattr(getattr(b, name), slab)), (name, slab)
+    for name in ("intermediate", "gate_suh", "up_suh", "down_svh"):
+        assert torch.equal(getattr(a.rotations, name),
+                           getattr(b.rotations, name)), name
+    assert torch.equal(a.global_to_combined, b.global_to_combined)
+    assert torch.equal(a.descriptor_map, b.descriptor_map)
 
 
 def _expert_tensors(layer: int, expert: int, payload: dict, rank: int):
