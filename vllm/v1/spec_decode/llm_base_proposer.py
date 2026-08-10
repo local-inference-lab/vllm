@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
@@ -69,27 +69,6 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
-
-
-def _mtp_draft_decode_only(
-    common_attn_metadata: CommonAttentionMetadata,
-    cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-) -> bool:
-    """Return whether the active MTP forward is decode-only."""
-    is_prefilling = common_attn_metadata.is_prefilling
-    if is_prefilling is None:
-        return cudagraph_runtime_mode != CUDAGraphMode.NONE
-    num_reqs = common_attn_metadata.num_reqs
-    return num_reqs > 0 and not bool(torch.any(is_prefilling[:num_reqs]))
-
-
-def _mtp_draft_uses_cudagraph(
-    common_attn_metadata: CommonAttentionMetadata,
-) -> bool:
-    """Use draft graphs only when capture is synthetic or the batch decodes."""
-    return common_attn_metadata.is_prefilling is None or _mtp_draft_decode_only(
-        common_attn_metadata
-    )
 
 
 def _call_accepts_kwarg(method: Any, kwarg: str) -> bool:
@@ -630,18 +609,10 @@ class SpecDecodeBaseProposer:
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
         )
 
-        use_cudagraphs = self.method != "mtp" or _mtp_draft_uses_cudagraph(
-            common_attn_metadata
-        )
+        # Keep MTP on the shared graph dispatcher. Forcing prompt batches off
+        # this path changes short-prompt hidden states and breaks prompt logits.
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
-            self._determine_batch_execution_and_padding(
-                num_tokens, use_cudagraphs=use_cudagraphs
-            )
-        )
-        mtp_draft_decode_only = (
-            _mtp_draft_decode_only(common_attn_metadata, cudagraph_runtime_mode)
-            if self.method == "mtp"
-            else False
+            self._determine_batch_execution_and_padding(num_tokens)
         )
 
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
@@ -669,10 +640,6 @@ class SpecDecodeBaseProposer:
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
         ):
-            if self.method == "mtp":
-                get_forward_context().additional_kwargs[
-                    "speculative_draft_decode_only"
-                ] = mtp_draft_decode_only
             ret_hidden_states = self._model_forward(model_kwargs, spec_step_idx=0)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states

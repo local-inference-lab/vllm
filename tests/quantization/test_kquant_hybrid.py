@@ -324,42 +324,6 @@ def test_qsrt_w4a8_phase_gate_fails_closed_without_context(
     assert not _is_decode_only_forward(1)
 
 
-def test_qsrt_w4a8_phase_gate_scopes_explicit_draft_phase_to_mtp(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    context = SimpleNamespace(
-        additional_kwargs={"speculative_draft_decode_only": True},
-        attn_metadata={
-            "attention": SimpleNamespace(
-                num_decode_tokens=0,
-                num_prefill_tokens=1,
-                is_spec_decode=False,
-            )
-        },
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.kquant_hybrid."
-        "is_forward_context_available",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.kquant_hybrid.get_forward_context",
-        lambda: context,
-    )
-
-    assert not _is_decode_only_forward(1)
-    assert _is_decode_only_forward(1, is_mtp_layer=True)
-    context.additional_kwargs["speculative_draft_decode_only"] = False
-    context.additional_kwargs.pop("kquant_qsrt_decode_only")
-    context.attn_metadata["attention"] = SimpleNamespace(
-        num_decode_tokens=1,
-        num_prefill_tokens=0,
-        is_spec_decode=False,
-    )
-    assert _is_decode_only_forward(1)
-    assert not _is_decode_only_forward(1, is_mtp_layer=True)
-
-
 @pytest.mark.parametrize(
     ("runtime", "m", "decode_only", "expected"),
     (
