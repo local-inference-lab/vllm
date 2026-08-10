@@ -220,6 +220,8 @@ def test_prepare_inputs():
         block_size=BLOCK_SIZE,
         device=device,
     )
+    expected_is_prefilling = torch.tensor([False, True, False])
+    common_attn_metadata.is_prefilling = expected_is_prefilling
 
     # If there are `k` sampled tokens, then `k-1` tokens are draft tokens
     # from the previous iteration, and the last token is the bonus token sampled
@@ -283,6 +285,7 @@ def test_prepare_inputs():
     assert torch.equal(updated_metadata.query_start_loc, expected_cu_num_tokens)
     assert token_indices.shape[0] == expected_cu_num_tokens[-1].item()
     assert torch.equal(token_indices, expected_token_indices)
+    assert torch.equal(updated_metadata.is_prefilling, expected_is_prefilling)
 
 
 def test_prepare_inputs_padded():
@@ -315,6 +318,8 @@ def test_prepare_inputs_padded():
         block_size=BLOCK_SIZE,
         device=device,
     )
+    expected_is_prefilling = torch.tensor([False, True, False])
+    common_attn_metadata.is_prefilling = expected_is_prefilling
 
     # Needed for cu_num_draft_tokens, which is expected to be [3, 6, 9]
     expected_query_start_loc = torch.tensor(
@@ -347,6 +352,7 @@ def test_prepare_inputs_padded():
     assert output_metadata.max_query_len == 3
     assert torch.equal(output_metadata.query_start_loc, expected_query_start_loc)
     assert torch.equal(token_indices_to_sample, expected_token_indices_to_sample)
+    assert torch.equal(output_metadata.is_prefilling, expected_is_prefilling)
 
 
 def test_set_inputs_first_pass_default_eagle():

@@ -1247,6 +1247,7 @@ class SpecDecodeBaseProposer:
             slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
+            is_prefilling=common_attn_metadata.is_prefilling,
         )
 
         return (
@@ -1358,6 +1359,7 @@ class SpecDecodeBaseProposer:
             slot_mapping=common_attn_metadata.slot_mapping[token_indices],
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
+            is_prefilling=common_attn_metadata.is_prefilling,
         )
 
         return spec_common_attn_metadata, token_indices
