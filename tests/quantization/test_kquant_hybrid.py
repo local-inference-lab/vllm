@@ -406,21 +406,22 @@ def test_qsrt_w4a8_dispatch_and_audit_predicate(
                 is_spec_decode=False,
             ),
             True,
-            "w4a8",
-            True,
+            "w4a16",
+            False,
         ),
+        (None, True, "w4a8", True),
     ),
 )
 def test_qsrt_mtp_dispatch_and_evidence_follow_normalized_phase(
     monkeypatch: pytest.MonkeyPatch,
-    metadata: SimpleNamespace,
+    metadata: SimpleNamespace | None,
     is_mtp_layer: bool,
     expected_mode: str,
     expected_decode: bool,
 ) -> None:
     context = SimpleNamespace(
         additional_kwargs={},
-        attn_metadata={"attention": metadata},
+        attn_metadata={} if metadata is None else {"attention": metadata},
     )
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.kquant_hybrid."

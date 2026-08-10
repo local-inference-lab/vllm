@@ -174,6 +174,83 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _canonical_identity_sha256(value: object) -> str:
+    return hashlib.sha256(
+        (json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n").encode()
+    ).hexdigest()
+
+
+def _test_producer_identity() -> dict[str, object]:
+    def executable(path: str) -> dict[str, str]:
+        return {
+            "path": path,
+            "resolved_path": path,
+            "sha256": "e" * 64,
+        }
+
+    builder_runtime = {
+        "schema": "kquant_fruit_builder_external_oci_runtime_v1",
+        "verification_boundary": "external_container_runtime",
+        "external_oci_image_id": f"sha256:{'f' * 64}",
+        "python": executable("/usr/bin/python3"),
+        "python_site_packages": "/opt/venv/lib/python3.12/site-packages",
+        "git": executable("/usr/bin/git"),
+        "cc": executable("/usr/bin/gcc"),
+        "cxx": executable("/usr/bin/g++"),
+        "ninja": executable("/usr/bin/ninja"),
+        "cuda_home": "/usr/local/cuda-13.2",
+        "nvcc": executable("/usr/local/cuda/bin/nvcc"),
+        "path": "/usr/local/cuda/bin:/usr/bin",
+    }
+    bootstrap = {
+        "schema": "kquant_fruit_builder_bootstrap_identity_v5",
+        "bootstrap_sha256": "0" * 64,
+        "builder_sha256": "1" * 64,
+        "kquant_revision": "7" * 40,
+        "kquant_source_sha256": "9" * 64,
+        "rate_sweep_authority": "external_sha256",
+        "runtime_qualification_authority": "external_sha256",
+        "runtime": builder_runtime,
+    }
+    encoder: dict[str, object] = {
+        "kquant_revision": "7" * 40,
+        "kquant_source_sha256": "9" * 64,
+        "exllamav3_revision": "8" * 40,
+        "exllamav3_source_sha256": "a" * 64,
+        "calibration_fingerprint": "b" * 64,
+        "calibration_capture_id": "c" * 64,
+        "calibration_manifest_sha256": "d" * 64,
+        "encoding_runtime": bootstrap,
+        "fingerprint_schema": "kquant_fruit_qsrt_encoder_source_v4",
+    }
+    encoder["fingerprint"] = _canonical_identity_sha256(
+        {
+            "schema": encoder["fingerprint_schema"],
+            "kquant_revision": encoder["kquant_revision"],
+            "kquant_source_sha256": encoder["kquant_source_sha256"],
+            "exllamav3_source_sha256": encoder["exllamav3_source_sha256"],
+            "exllamav3_revision": encoder["exllamav3_revision"],
+            "calibration_fingerprint": encoder["calibration_fingerprint"],
+            "calibration_capture_id": encoder["calibration_capture_id"],
+            "calibration_manifest_sha256": encoder["calibration_manifest_sha256"],
+            "encoding_runtime": encoder["encoding_runtime"],
+        }
+    )
+    producer: dict[str, object] = {
+        "schema": "kquant_fruit_qsrt_producer_v2",
+        "bootstrap": bootstrap,
+        "encoder": encoder,
+        "runtime": {
+            "b12x_revision": "6" * 40,
+            "b12x_source_sha256": "2" * 64,
+            "vllm_revision": "5" * 40,
+            "vllm_source_sha256": "3" * 64,
+        },
+    }
+    producer["fingerprint"] = _canonical_identity_sha256(producer)
+    return producer
+
+
 def _write_runtime_qualification(root: Path, manifest: dict[str, object]) -> None:
     tensor_paths = sorted(root.glob("*.safetensors"))
     tensor_digests = {path.name: _sha256(path) for path in tensor_paths}
@@ -197,21 +274,9 @@ def _write_runtime_qualification(root: Path, manifest: dict[str, object]) -> Non
                 "fastsafetensors",
             ],
         }
-        runtime_revisions = (
-            revisions
-            if arm == "qsrt"
-            else {
-                "vllm_revision": "c" * 40,
-                "b12x_revision": "d" * 40,
-                "kquant_revision": "e" * 40,
-            }
-        )
+        runtime_revisions = revisions
         return {
-            "image": (
-                f"registry.invalid/fruit-final@sha256:{'8' * 64}"
-                if arm == "qsrt"
-                else f"registry.invalid/fruit-r28@sha256:{'b' * 64}"
-            ),
+            "image": f"registry.invalid/fruit-final@sha256:{'8' * 64}",
             **runtime_revisions,
             "argv": [
                 "vllm",
@@ -257,7 +322,7 @@ def _write_runtime_qualification(root: Path, manifest: dict[str, object]) -> Non
                 "vllm",
             ],
             "environment": dict(kquant_qsrt_publication._FIXED_RUNTIME_ENVIRONMENT),
-            "software": {"torch": "final" if arm == "qsrt" else "r28"},
+            "software": {"torch": "final"},
             "compilation_backend": "inductor",
             "cudagraph_mode": "FULL_AND_PIECEWISE",
         }
@@ -466,8 +531,13 @@ def _verify_publication(root: Path):
 def _write_test_publication(
     root: Path,
 ) -> tuple[dict[str, object], dict[str, object], Path]:
-    producer_fingerprint = "1" * 64
-    encoder_fingerprint = "2" * 64
+    producer = _test_producer_identity()
+    producer_fingerprint = producer["fingerprint"]
+    encoder = producer["encoder"]
+    assert isinstance(producer_fingerprint, str)
+    assert isinstance(encoder, dict)
+    encoder_fingerprint = encoder["fingerprint"]
+    assert isinstance(encoder_fingerprint, str)
     source_sha256 = "3" * 64
     base_manifest_sha256 = "4" * 64
     descriptor: dict[str, object] = {
@@ -548,17 +618,7 @@ def _write_test_publication(
             "fallback": "trellis_w4a16",
             "prefill": "trellis_w4a16",
         },
-        "producer": {
-            "fingerprint": producer_fingerprint,
-            "encoder": {
-                "fingerprint": encoder_fingerprint,
-                "kquant_revision": "7" * 40,
-            },
-            "runtime": {
-                "vllm_revision": "5" * 40,
-                "b12x_revision": "6" * 40,
-            },
-        },
+        "producer": producer,
         "source": {
             "source_kind": "safetensors_manifest",
             "source_sha256": source_sha256,
@@ -643,8 +703,8 @@ def _convert_test_publication_to_candidate(root: Path) -> None:
             "sha256": "3" * 64,
         },
         "base_manifest_sha256": "4" * 64,
-        "producer_fingerprint": "1" * 64,
-        "encoder_fingerprint": "2" * 64,
+        "producer_fingerprint": manifest["producer"]["fingerprint"],
+        "encoder_fingerprint": manifest["producer"]["encoder"]["fingerprint"],
     }
     (root / "QSRT_CANDIDATE.json").write_text(
         json.dumps(complete_fields), encoding="utf-8"
@@ -744,6 +804,7 @@ def test_production_receipt_binds_qualified_candidate_marker(tmp_path: Path) -> 
         "changed_environment",
         "same_extra_environment",
         "production_environment_drift",
+        "mismatched_runtime_identity",
     ),
 )
 def test_publication_rejects_mutated_fixed_qualification_contract(
@@ -774,6 +835,8 @@ def test_publication_rejects_mutated_fixed_qualification_contract(
         receipt["publication"]["variant"] = "annealed"
     elif mutation == "wrong_comparator":
         receipt["models"]["bf16"]["repository"] = "malaiwah/wrong"
+    elif mutation == "mismatched_runtime_identity":
+        receipt["loaders"]["bf16"]["runtime"]["b12x_revision"] = "d" * 40
     elif mutation == "changed_environment":
         receipt["loaders"]["siq"]["runtime"]["environment"]["CUDA_VISIBLE_DEVICES"] = (
             "1"
@@ -807,6 +870,30 @@ def test_publication_rejects_mutated_fixed_qualification_contract(
     _reseal_publication_identity(tmp_path)
 
     with pytest.raises(ValueError):
+        _verify_publication(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("encoder_source", "producer_runtime_source", "unknown_encoder_field"),
+)
+def test_publication_rejects_unfingerprinted_producer_provenance(
+    tmp_path: Path, mutation: str
+) -> None:
+    _write_test_publication(tmp_path)
+    manifest_path = tmp_path / "qsrt-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    producer = manifest["producer"]
+    if mutation == "encoder_source":
+        producer["encoder"]["kquant_source_sha256"] = "f" * 64
+    elif mutation == "producer_runtime_source":
+        producer["runtime"]["b12x_source_sha256"] = "f" * 64
+    else:
+        producer["encoder"]["unknown_provenance"] = "f" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _reseal_publication_identity(tmp_path)
+
+    with pytest.raises(ValueError, match="fingerprint|invalid keys"):
         _verify_publication(tmp_path)
 
 
