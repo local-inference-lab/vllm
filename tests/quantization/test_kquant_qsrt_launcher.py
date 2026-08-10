@@ -211,7 +211,7 @@ def _publication_bytes(
 ) -> tuple[bytes, bytes]:
     manifest = {
         "producer": {
-            "encoder": {"kquant_revision": "bb57cc7254d62176e787f952a39c15ece5fe3805"},
+            "encoder": {"qsrt_revision": "6d1da5e00f0e3b3e75d4737255df51e0a192968b"},
             "runtime": {
                 "vllm_revision": vllm_revision,
                 "b12x_revision": b12x_revision,
@@ -295,7 +295,7 @@ def secured_launcher_run(
   "TEST_B12X_REVISION=${TEST_B12X_REVISION}"
   "TEST_B12X_SOURCE_SHA256=${TEST_B12X_SOURCE_SHA256}"
   "TEST_DESCENDANT_PID=${TEST_DESCENDANT_PID}"
-  "TEST_KQUANT_REVISION=${TEST_KQUANT_REVISION}"
+  "TEST_QSRT_REVISION=${TEST_QSRT_REVISION}"
   "TEST_MUTABLE_B12X_ROOT=${TEST_MUTABLE_B12X_ROOT}"
   "TEST_MUTABLE_VLLM_ROOT=${TEST_MUTABLE_VLLM_ROOT}"
   "TEST_REPORT=${TEST_REPORT}"
@@ -402,7 +402,7 @@ Path(os.environ["TEST_PUBLICATION_ARGS"]).write_text(
 shutil.copytree(source, destination)
 manifest = {
     "producer": {
-        "encoder": {"kquant_revision": os.environ["TEST_KQUANT_REVISION"]},
+        "encoder": {"qsrt_revision": os.environ["TEST_QSRT_REVISION"]},
         "runtime": {
             "vllm_revision": os.environ["TEST_VLLM_REVISION"],
             "b12x_revision": os.environ["TEST_B12X_REVISION"],
@@ -497,7 +497,7 @@ marker_name = "QSRT_CANDIDATE.json" if candidate_mode else "QSRT_COMPLETE.json"
             "TEST_B12X_REVISION": b12x_revision,
             "TEST_B12X_SOURCE_SHA256": b12x_source_sha256,
             "TEST_DESCENDANT_PID": str(descendant_pid),
-            "TEST_KQUANT_REVISION": "bb57cc7254d62176e787f952a39c15ece5fe3805",
+            "TEST_QSRT_REVISION": "6d1da5e00f0e3b3e75d4737255df51e0a192968b",
             "TEST_MUTABLE_B12X_ROOT": str(b12x_repository),
             "TEST_MUTABLE_VLLM_ROOT": str(vllm_repository),
             "TEST_REPORT": str(report),

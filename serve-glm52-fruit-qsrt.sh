@@ -126,8 +126,8 @@ if [[ -n "${VLLM_KLD_CAPTURE_DIR:-}" ]]; then
   export VLLM_KLD_CAPTURE_DIR
 fi
 
-EXPECTED_B12X_REVISION="1e886ab4e0a560e5bc326adfed93ba6680653f63"
-EXPECTED_KQUANT_REVISION="bb57cc7254d62176e787f952a39c15ece5fe3805"
+EXPECTED_B12X_REVISION="f4064d06f029240040a128388f32c861a535ad68"
+EXPECTED_QSRT_REVISION="6d1da5e00f0e3b3e75d4737255df51e0a192968b"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Missing vLLM Python: ${PYTHON_BIN}" >&2
@@ -886,7 +886,7 @@ def snapshot_tracked_tree(root_value, snapshot):
 model_source = sys.argv[1]
 model = sys.argv[2]
 expected_marker_sha256 = sys.argv[3]
-expected_kquant = sys.argv[4]
+expected_qsrt = sys.argv[4]
 expected_b12x = sys.argv[5]
 actual_vllm = sys.argv[6]
 b12x_root = Path(sys.argv[7]).resolve(strict=True)
@@ -953,8 +953,8 @@ try:
     runtime = producer["runtime"]
 except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
     raise RuntimeError("Fruit package manifest has invalid producer metadata") from exc
-if encoder.get("kquant_revision") != expected_kquant:
-    raise RuntimeError("Fruit package KQuant revision is unsupported")
+if encoder.get("qsrt_revision") != expected_qsrt:
+    raise RuntimeError("Fruit package QSRT revision is unsupported")
 if runtime.get("b12x_revision") != expected_b12x:
     raise RuntimeError("Fruit package B12X revision is unsupported")
 if runtime.get("vllm_revision") != actual_vllm:
@@ -967,7 +967,7 @@ if runtime.get("vllm_source_sha256") != vllm_source_sha256:
   "${model_source}" \
   "${MODEL}" \
   "${QSRT_EXPECTED_MARKER_SHA256}" \
-  "${EXPECTED_KQUANT_REVISION}" \
+  "${EXPECTED_QSRT_REVISION}" \
   "${EXPECTED_B12X_REVISION}" \
   "${actual_vllm_revision}" \
   "${B12X_ROOT}" \

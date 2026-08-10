@@ -21,11 +21,11 @@ _CANDIDATE_MARKER = "QSRT_CANDIDATE.json"
 _CHECKSUM_MANIFEST = "MANIFEST.sha256"
 _PACKAGE_MANIFEST = "qsrt-manifest.json"
 _RUNTIME_QUALIFICATION = "evaluation/fruit-runtime-qualification.json"
-_RUNTIME_QUALIFICATION_SCHEMA = "kquant_fruit_runtime_qualification_v1"
-_PRODUCER_SCHEMA = "kquant_fruit_qsrt_producer_v2"
-_ENCODER_FINGERPRINT_SCHEMA = "kquant_fruit_qsrt_encoder_source_v4"
-_BUILDER_BOOTSTRAP_SCHEMA = "kquant_fruit_builder_bootstrap_identity_v5"
-_BUILDER_RUNTIME_SCHEMA = "kquant_fruit_builder_external_oci_runtime_v1"
+_RUNTIME_QUALIFICATION_SCHEMA = "qsrt_fruit_runtime_qualification_v1"
+_PRODUCER_SCHEMA = "qsrt_fruit_qsrt_producer_v2"
+_ENCODER_FINGERPRINT_SCHEMA = "qsrt_fruit_qsrt_encoder_source_v4"
+_BUILDER_BOOTSTRAP_SCHEMA = "qsrt_fruit_builder_bootstrap_identity_v5"
+_BUILDER_RUNTIME_SCHEMA = "qsrt_fruit_builder_external_oci_runtime_v1"
 _FRUIT_REPOSITORY = "malaiwah/GLM-5.2-QSRT-Fruit-Instruct"
 _RUNTIME_ARMS = frozenset({"bf16", "siq", "qsrt"})
 _FRUIT_LAYERS = tuple(range(3, 14))
@@ -467,8 +467,8 @@ def _validate_builder_bootstrap_identity(value: object) -> dict[str, Any]:
             "schema",
             "bootstrap_sha256",
             "builder_sha256",
-            "kquant_revision",
-            "kquant_source_sha256",
+            "qsrt_revision",
+            "qsrt_source_sha256",
             "rate_sweep_authority",
             "runtime_qualification_authority",
             "runtime",
@@ -480,11 +480,11 @@ def _validate_builder_bootstrap_identity(value: object) -> dict[str, Any]:
         or bootstrap["runtime_qualification_authority"] != "external_sha256"
     ):
         raise ValueError("QSRT builder bootstrap identity is invalid")
-    _identity_revision(bootstrap["kquant_revision"], name="bootstrap KQuant")
+    _identity_revision(bootstrap["qsrt_revision"], name="bootstrap QSRT")
     for field_name in (
         "bootstrap_sha256",
         "builder_sha256",
-        "kquant_source_sha256",
+        "qsrt_source_sha256",
     ):
         _sha256_field(
             bootstrap[field_name],
@@ -499,8 +499,8 @@ def _validate_encoder_identity(value: object) -> dict[str, Any]:
         value,
         name="encoder",
         keys={
-            "kquant_revision",
-            "kquant_source_sha256",
+            "qsrt_revision",
+            "qsrt_source_sha256",
             "exllamav3_revision",
             "exllamav3_source_sha256",
             "calibration_fingerprint",
@@ -513,10 +513,10 @@ def _validate_encoder_identity(value: object) -> dict[str, Any]:
     )
     if encoder["fingerprint_schema"] != _ENCODER_FINGERPRINT_SCHEMA:
         raise ValueError("QSRT encoder fingerprint schema is unsupported")
-    _identity_revision(encoder["kquant_revision"], name="encoder KQuant")
+    _identity_revision(encoder["qsrt_revision"], name="encoder QSRT")
     _identity_revision(encoder["exllamav3_revision"], name="encoder ExLlamaV3")
     for field_name in (
-        "kquant_source_sha256",
+        "qsrt_source_sha256",
         "exllamav3_source_sha256",
         "calibration_fingerprint",
         "calibration_capture_id",
@@ -527,8 +527,8 @@ def _validate_encoder_identity(value: object) -> dict[str, Any]:
     _validate_builder_bootstrap_identity(encoder["encoding_runtime"])
     fingerprint_payload = {
         "schema": encoder["fingerprint_schema"],
-        "kquant_revision": encoder["kquant_revision"],
-        "kquant_source_sha256": encoder["kquant_source_sha256"],
+        "qsrt_revision": encoder["qsrt_revision"],
+        "qsrt_source_sha256": encoder["qsrt_source_sha256"],
         "exllamav3_source_sha256": encoder["exllamav3_source_sha256"],
         "exllamav3_revision": encoder["exllamav3_revision"],
         "calibration_fingerprint": encoder["calibration_fingerprint"],
@@ -573,8 +573,8 @@ def _validate_producer_identity(value: object) -> dict[str, Any]:
         )
     if (
         encoder["encoding_runtime"] != bootstrap
-        or encoder["kquant_revision"] != bootstrap["kquant_revision"]
-        or encoder["kquant_source_sha256"] != bootstrap["kquant_source_sha256"]
+        or encoder["qsrt_revision"] != bootstrap["qsrt_revision"]
+        or encoder["qsrt_source_sha256"] != bootstrap["qsrt_source_sha256"]
     ):
         raise ValueError("QSRT encoder and bootstrap identities disagree")
     _sha256_field(producer["fingerprint"], name="producer fingerprint")
@@ -979,7 +979,7 @@ def _validate_runtime_qualification(
         keys={"schema", "version", "layers", "cudagraph", "speculative"},
     )
     if (
-        runtime_paths["schema"] != "kquant_fruit_runtime_paths_v2"
+        runtime_paths["schema"] != "qsrt_fruit_runtime_paths_v2"
         or type(runtime_paths["version"]) is not int
         or runtime_paths["version"] != 2
     ):
@@ -1178,7 +1178,7 @@ def _validate_runtime_qualification(
                 "image",
                 "vllm_revision",
                 "b12x_revision",
-                "kquant_revision",
+                "qsrt_revision",
                 "argv",
                 "environment",
                 "software",
@@ -1199,13 +1199,13 @@ def _validate_runtime_qualification(
         b12x_revision = _qualification_revision(
             runtime["b12x_revision"], name=f"loaders.{arm}.b12x_revision"
         )
-        kquant_revision = _qualification_revision(
-            runtime["kquant_revision"], name=f"loaders.{arm}.kquant_revision"
+        qsrt_revision = _qualification_revision(
+            runtime["qsrt_revision"], name=f"loaders.{arm}.qsrt_revision"
         )
         if arm == "qsrt" and (
             vllm_revision != runtime_identity.get("vllm_revision")
             or b12x_revision != runtime_identity.get("b12x_revision")
-            or kquant_revision != encoder_identity.get("kquant_revision")
+            or qsrt_revision != encoder_identity.get("qsrt_revision")
         ):
             raise ValueError("Fruit runtime qualification runtime revisions are stale")
         if (
@@ -1239,7 +1239,7 @@ def _validate_runtime_qualification(
             image,
             vllm_revision,
             b12x_revision,
-            kquant_revision,
+            qsrt_revision,
             tuple(sorted(runtime["software"].items())),
         )
         if matched_runtime_identity is None:
@@ -1576,7 +1576,7 @@ def verify_qsrt_publication(
             | {"qualified_candidate_sha256", "runtime_qualification_sha256"}
         )
         expected_schema = (
-            "kquant_qsrt_candidate_v1" if candidate_mode else "kquant_qsrt_complete_v3"
+            "qsrt_candidate_v1" if candidate_mode else "qsrt_complete_v3"
         )
         if (
             set(marker) != expected_marker_fields
@@ -1703,11 +1703,11 @@ def verify_qsrt_publication(
             }
         )
         if (
-            manifest.get("schema") != "kquant_qsrt_model_manifest_v1"
+            manifest.get("schema") != "qsrt_model_manifest_v1"
             or manifest.get("version") != 1
             or publication != {"variant": "instruct", "repository": _FRUIT_REPOSITORY}
             or manifest.get("codec") != "QSRT"
-            or manifest.get("storage_schema") != "kquant_fruit_qsrt_atoms_v1"
+            or manifest.get("storage_schema") != "qsrt_fruit_qsrt_atoms_v1"
             or manifest.get("encoding") != "qsrt_sqg_e4m3"
             or manifest.get("codebook") != "sqg_xor_cheb_t12"
             or manifest.get("profile_id") != 1

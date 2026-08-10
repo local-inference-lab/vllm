@@ -51,7 +51,7 @@ def test_runtime_evidence_aggregates_all_layers_capture_and_replay(
         "cudagraph",
         "speculative",
     }
-    assert runtime_paths["schema"] == "kquant_fruit_runtime_paths_v2"
+    assert runtime_paths["schema"] == "qsrt_fruit_runtime_paths_v2"
     assert runtime_paths["version"] == 2
     assert set(runtime_paths["layers"]) == {str(layer) for layer in range(3, 14)}
     for layer in range(3, 13):

@@ -189,7 +189,7 @@ def _test_producer_identity() -> dict[str, object]:
         }
 
     builder_runtime = {
-        "schema": "kquant_fruit_builder_external_oci_runtime_v1",
+        "schema": "qsrt_fruit_builder_external_oci_runtime_v1",
         "verification_boundary": "external_container_runtime",
         "external_oci_image_id": f"sha256:{'f' * 64}",
         "python": executable("/usr/bin/python3"),
@@ -203,31 +203,31 @@ def _test_producer_identity() -> dict[str, object]:
         "path": "/usr/local/cuda/bin:/usr/bin",
     }
     bootstrap = {
-        "schema": "kquant_fruit_builder_bootstrap_identity_v5",
+        "schema": "qsrt_fruit_builder_bootstrap_identity_v5",
         "bootstrap_sha256": "0" * 64,
         "builder_sha256": "1" * 64,
-        "kquant_revision": "7" * 40,
-        "kquant_source_sha256": "9" * 64,
+        "qsrt_revision": "7" * 40,
+        "qsrt_source_sha256": "9" * 64,
         "rate_sweep_authority": "external_sha256",
         "runtime_qualification_authority": "external_sha256",
         "runtime": builder_runtime,
     }
     encoder: dict[str, object] = {
-        "kquant_revision": "7" * 40,
-        "kquant_source_sha256": "9" * 64,
+        "qsrt_revision": "7" * 40,
+        "qsrt_source_sha256": "9" * 64,
         "exllamav3_revision": "8" * 40,
         "exllamav3_source_sha256": "a" * 64,
         "calibration_fingerprint": "b" * 64,
         "calibration_capture_id": "c" * 64,
         "calibration_manifest_sha256": "d" * 64,
         "encoding_runtime": bootstrap,
-        "fingerprint_schema": "kquant_fruit_qsrt_encoder_source_v4",
+        "fingerprint_schema": "qsrt_fruit_qsrt_encoder_source_v4",
     }
     encoder["fingerprint"] = _canonical_identity_sha256(
         {
             "schema": encoder["fingerprint_schema"],
-            "kquant_revision": encoder["kquant_revision"],
-            "kquant_source_sha256": encoder["kquant_source_sha256"],
+            "qsrt_revision": encoder["qsrt_revision"],
+            "qsrt_source_sha256": encoder["qsrt_source_sha256"],
             "exllamav3_source_sha256": encoder["exllamav3_source_sha256"],
             "exllamav3_revision": encoder["exllamav3_revision"],
             "calibration_fingerprint": encoder["calibration_fingerprint"],
@@ -237,7 +237,7 @@ def _test_producer_identity() -> dict[str, object]:
         }
     )
     producer: dict[str, object] = {
-        "schema": "kquant_fruit_qsrt_producer_v2",
+        "schema": "qsrt_fruit_qsrt_producer_v2",
         "bootstrap": bootstrap,
         "encoder": encoder,
         "runtime": {
@@ -260,7 +260,7 @@ def _write_runtime_qualification(root: Path, manifest: dict[str, object]) -> Non
     revisions = {
         "vllm_revision": "5" * 40,
         "b12x_revision": "6" * 40,
-        "kquant_revision": "7" * 40,
+        "qsrt_revision": "7" * 40,
     }
 
     def runtime(arm: str) -> dict[str, object]:
@@ -414,7 +414,7 @@ def _write_runtime_qualification(root: Path, manifest: dict[str, object]) -> Non
         ],
     }
     qualification = {
-        "schema": "kquant_fruit_runtime_qualification_v1",
+        "schema": "qsrt_fruit_runtime_qualification_v1",
         "version": 1,
         "complete": True,
         "publication": {
@@ -445,7 +445,7 @@ def _write_runtime_qualification(root: Path, manifest: dict[str, object]) -> Non
             "launch_order": ["bf16", "siq", "qsrt"],
         },
         "runtime_paths": {
-            "schema": "kquant_fruit_runtime_paths_v2",
+            "schema": "qsrt_fruit_runtime_paths_v2",
             "version": 2,
             "layers": {
                 **{
@@ -597,7 +597,7 @@ def _write_test_publication(
             "evidence": evidence.name,
         }
     manifest: dict[str, object] = {
-        "schema": "kquant_qsrt_model_manifest_v1",
+        "schema": "qsrt_model_manifest_v1",
         "version": 1,
         "publication": {
             "variant": "instruct",
@@ -651,7 +651,7 @@ def _write_test_publication(
         encoding="utf-8",
     )
     marker = {
-        "schema": "kquant_qsrt_complete_v3",
+        "schema": "qsrt_complete_v3",
         "publication": {
             "variant": "instruct",
             "repository": "malaiwah/GLM-5.2-QSRT-Fruit-Instruct",
@@ -696,7 +696,7 @@ def _convert_test_publication_to_candidate(root: Path) -> None:
         encoding="utf-8",
     )
     complete_fields = {
-        "schema": "kquant_qsrt_candidate_v1",
+        "schema": "qsrt_candidate_v1",
         "publication": {
             "variant": "instruct",
             "repository": "malaiwah/GLM-5.2-QSRT-Fruit-Instruct",
@@ -894,7 +894,7 @@ def test_publication_rejects_unfingerprinted_producer_provenance(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     producer = manifest["producer"]
     if mutation == "encoder_source":
-        producer["encoder"]["kquant_source_sha256"] = "f" * 64
+        producer["encoder"]["qsrt_source_sha256"] = "f" * 64
     elif mutation == "producer_runtime_source":
         producer["runtime"]["b12x_source_sha256"] = "f" * 64
     else:

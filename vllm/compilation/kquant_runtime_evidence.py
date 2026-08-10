@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 
 _ENVIRONMENT_VARIABLE = "VLLM_KQUANT_RUNTIME_EVIDENCE"
-_SCHEMA = "kquant_fruit_runtime_paths_v2"
+_SCHEMA = "qsrt_fruit_runtime_paths_v2"
 _ORDINARY_LAYERS = range(3, 13)
 _CAPTURE_SLOT_COUNT = 22
 

@@ -38,14 +38,14 @@ def _base_config(**updates):
 
 def _qsrt_descriptor(**updates):
     descriptor = {
-        "schema": "kquant_kimi_k3_qsrt_atoms_v1",
+        "schema": "qsrt_kimi_k3_qsrt_atoms_v1",
         "storage_format": "qsrt_atoms_v1",
         "encoding": "qsrt_sqg_e4m3",
         "codebook": "sqg_xor_cheb_t12",
         "artifact_manifest": "qsrt-manifest.json",
     }
     descriptor.update(updates)
-    if descriptor["schema"] == "kquant_fruit_qsrt_atoms_v1":
+    if descriptor["schema"] == "qsrt_fruit_qsrt_atoms_v1":
         descriptor.setdefault("profile_id", 1)
         descriptor.setdefault("producer_fingerprint", "1" * 64)
         descriptor.setdefault("encoder_fingerprint", "2" * 64)
@@ -65,7 +65,7 @@ def _canonical_fruit_config() -> dict[str, object]:
             hybrid_bit_map={str(layer): [3] * 256 for layer in range(3, 14)},
             demoted_format="qsrt_sqg_e4m3",
             qsrt=_qsrt_descriptor(
-                schema="kquant_fruit_qsrt_atoms_v1",
+                schema="qsrt_fruit_qsrt_atoms_v1",
                 runtime="w4a8",
             ),
         ),
@@ -623,8 +623,8 @@ def test_legacy_siq_rank0_trellis_loads_k4_and_k3_tiers(
 @pytest.mark.parametrize(
     "schema",
     [
-        "kquant_kimi_k3_qsrt_atoms_v1",
-        "kquant_fruit_qsrt_atoms_v1",
+        "qsrt_kimi_k3_qsrt_atoms_v1",
+        "qsrt_fruit_qsrt_atoms_v1",
     ],
 )
 def test_config_accepts_tp_independent_qsrt(schema: str) -> None:
@@ -640,7 +640,7 @@ def test_config_accepts_tp_independent_qsrt(schema: str) -> None:
 
 def test_config_accepts_fruit_w4a8_runtime() -> None:
     descriptor = _qsrt_descriptor(
-        schema="kquant_fruit_qsrt_atoms_v1",
+        schema="qsrt_fruit_qsrt_atoms_v1",
         runtime="W4A8",
     )
     config = KQuantHybridConfig.from_config(
@@ -800,7 +800,7 @@ def test_fruit_w4a8_rejects_kept_experts_before_parameter_registration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     descriptor = _qsrt_descriptor(
-        schema="kquant_fruit_qsrt_atoms_v1",
+        schema="qsrt_fruit_qsrt_atoms_v1",
         runtime="W4A8",
     )
     config = KQuantHybridConfig.from_config(

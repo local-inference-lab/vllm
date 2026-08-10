@@ -31,8 +31,8 @@ from vllm.model_executor.layers.quantization.kquant_qsrt_publication import (
     verify_qsrt_publication as verify_qsrt_publication,
 )
 
-KIMI_K3_SCHEMA = "kquant_kimi_k3_qsrt_atoms_v1"
-FRUIT_SCHEMA = "kquant_fruit_qsrt_atoms_v1"
+KIMI_K3_SCHEMA = "qsrt_kimi_k3_qsrt_atoms_v1"
+FRUIT_SCHEMA = "qsrt_fruit_qsrt_atoms_v1"
 SUPPORTED_SCHEMAS = frozenset({KIMI_K3_SCHEMA, FRUIT_SCHEMA})
 ENCODING = "qsrt_sqg_e4m3"
 VERSION = 1
