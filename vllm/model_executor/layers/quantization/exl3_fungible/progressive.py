@@ -278,6 +278,7 @@ def progressive_weights_iterator(
     *,
     tp_rank: int | None = None,
     log: Callable[[str], None] | None = None,
+    actual_bits_out: dict[int, list[int]] | None = None,
 ):
     """Yield ``(name, cpu_tensor)`` exactly as an assembled checkpoint would.
 
@@ -286,6 +287,14 @@ def progressive_weights_iterator(
     per-expert K.  When ``tp_rank`` is given, only that rank's slice of the
     rank-sliced expert tensors is yielded (the model drops foreign ranks
     anyway; filtering here avoids materializing them at all).
+
+    With ``VLLM_FQ_K_FALLBACK`` active the resolver may substitute a
+    fallback K for a missing/untrusted fragment; the per-layer tier line and
+    ``bits_digest`` are computed from the ACTUALLY loaded Ks (reality, not
+    the requested policy), substitutions are called out on the line, and
+    ``actual_bits_out`` (when given) receives the per-layer actually-loaded
+    bits vectors — feed it to :func:`write_tier_bitmap` so the hybrid
+    metadata records the loaded Ks.
     """
     import mmap as _mmap
 
@@ -326,16 +335,25 @@ def progressive_weights_iterator(
         for layer in sorted(expert_layers):
             expected_names = expert_layers[layer]
             bits = spec.bits_by_layer[layer]
+            actual_bits = [int(b) for b in bits]
+            substitutions: list[tuple[int, int, int]] = []
             seen: set[str] = set()
             counts: dict[int, int] = {}
             for expert, k in enumerate(bits):
-                counts[k] = counts.get(k, 0) + 1
-                for name, tensor in resolver.expert_tensors(
-                    layer, expert, int(k), name_filter=_rank_ok
+                fragment = resolver.resolve(layer, expert, int(k))
+                actual_k = int(fragment.k)
+                actual_bits[expert] = actual_k
+                if actual_k != int(k):
+                    substitutions.append((expert, int(k), actual_k))
+                counts[actual_k] = counts.get(actual_k, 0) + 1
+                for name, tensor in resolver.materialize(
+                    fragment, name_filter=_rank_ok
                 ):
                     seen.add(name)
                     expert_tensor_count += 1
                     yield name, tensor
+            if actual_bits_out is not None:
+                actual_bits_out[layer] = list(actual_bits)
             if seen != expected_names:
                 missing = sorted(expected_names - seen)[:4]
                 extra = sorted(seen - expected_names)[:4]
@@ -344,11 +362,17 @@ def progressive_weights_iterator(
                     f"match the source shard tensor set "
                     f"(missing={missing}, unexpected={extra})"
                 )
+            sub_note = ""
+            if substitutions:
+                sub_note = " substituted=" + ",".join(
+                    f"e{expert}:K{requested}->K{got}"
+                    for expert, requested, got in substitutions
+                )
             _emit(
                 f"FQ progressive layer {layer}: tiers="
                 f"{tuple(sorted(counts.items()))} "
-                f"bits_digest={_bits_digest(bits)} "
-                f"tensors={len(seen)}"
+                f"bits_digest={_bits_digest(actual_bits)} "
+                f"tensors={len(seen)}{sub_note}"
             )
 
     stats = dict(resolver.stats)
@@ -357,7 +381,9 @@ def progressive_weights_iterator(
         f"policy={spec.policy_digest[:12]} k_values={spec.k_values} "
         f"dense_bytes={dense_bytes} expert_tensors={expert_tensor_count} "
         f"fragments(local={stats['local']}, cache={stats['cache']}, "
-        f"fetched={stats['fetched']}, bytes_fetched={stats['bytes_fetched']}) "
+        f"fetched={stats['fetched']}, bytes_fetched={stats['bytes_fetched']}, "
+        f"substituted={stats.get('fallback_substituted', 0)}, "
+        f"encode_queued={stats.get('encode_queued', 0)}) "
         f"wall={time.perf_counter() - t_start:.2f}s"
     )
 
@@ -365,12 +391,25 @@ def progressive_weights_iterator(
 # --------------------------------------------------------------- metadata
 
 
-def write_tier_bitmap(policy: dict, out_path: str | Path) -> Path:
-    """Write the per-layer expert bitrate map the exl3 loader dereferences."""
+def write_tier_bitmap(
+    policy: dict,
+    out_path: str | Path,
+    *,
+    actual_bits: dict[int, list[int]] | None = None,
+) -> Path:
+    """Write the per-layer expert bitrate map the exl3 loader dereferences.
+
+    ``actual_bits`` (e.g. the ``actual_bits_out`` collected from
+    :func:`progressive_weights_iterator`) overrides the policy's bits so the
+    hybrid metadata records the ACTUALLY loaded Ks after fallback
+    substitution."""
     out_path = Path(out_path)
+    source = (
+        actual_bits if actual_bits is not None else policy["bits_per_expert"]
+    )
     bitmap = {
-        layer: {"bits_per_expert": [int(b) for b in bits]}
-        for layer, bits in policy["bits_per_expert"].items()
+        str(layer): {"bits_per_expert": [int(b) for b in bits]}
+        for layer, bits in source.items()
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(out_path.suffix + f".tmp{os.getpid()}")
