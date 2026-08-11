@@ -1088,6 +1088,15 @@ class FragmentResolver:
                 layer, expert, k, self.fallback_ladder(k), strict=False,
                 chain_out=chain_out,
             )
+        except (SystemExit, KeyboardInterrupt):
+            # SHUTDOWN IS NOT A FRAGMENT FAILURE. vLLM's multiproc executor
+            # raises SystemExit from its SIGTERM handler, and it lands wherever
+            # the worker happens to be — typically mid-socket-read here, since
+            # a progressive boot spends most of its time in one. Catching
+            # BaseException swallowed it and logged "fragment unavailable,
+            # keeping the incumbent tier", so a worker asked to stop instead
+            # kept loading with silently degraded tiers. Let it through.
+            raise
         except BaseException:  # noqa: BLE001 — the whole point of this seam
             self.stats["resolve_error"] += 1
             logger.exception(

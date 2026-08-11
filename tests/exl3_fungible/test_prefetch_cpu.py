@@ -255,3 +255,17 @@ def test_request_count_for_a_realistic_mixed_layer():
 def test_all_four_tiers_in_one_layer_each_over_threshold():
     bits = [2] * 64 + [3] * 64 + [4] * 64 + [5] * 64
     assert _needed(bits) == [2, 3, 4, 5]
+
+
+# ------------------------------------------------- shutdown is not a failure
+def test_resolve_best_lets_systemexit_through():
+    """vLLM's multiproc executor raises SystemExit from its SIGTERM handler,
+    and on a progressive boot it lands mid-socket-read inside the resolver.
+    Catching BaseException swallowed it and logged 'fragment unavailable,
+    keeping the incumbent tier' — so a worker told to stop kept loading with
+    silently degraded tiers instead of exiting."""
+    import inspect
+    src = inspect.getsource(FR.FragmentResolver.resolve_best)
+    assert "SystemExit" in src, "resolve_best must re-raise shutdown signals"
+    # and the re-raise must come BEFORE the broad catch, or it never runs
+    assert src.index("SystemExit") < src.index("except BaseException")

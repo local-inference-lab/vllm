@@ -1186,6 +1186,11 @@ def build_router(*, environ: Mapping[str, str] | None = None) -> Any:
                                  separators=(",", ":"), default=str),))
         except AdminError:
             raise
+        except (SystemExit, KeyboardInterrupt):
+            # Shutdown is not an RPC failure: mapping it to an AdminError
+            # would report "the heatmap RPC failed" to a caller while the
+            # engine is actually terminating.
+            raise
         except BaseException as exc:  # noqa: BLE001
             raise _map_rpc_exception(exc) from None
         if raw is None:
