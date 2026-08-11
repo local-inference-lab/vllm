@@ -78,6 +78,7 @@ FQ_MAX_SWAPS_TOTAL_ENV = "VLLM_FQ_MAX_SWAPS_TOTAL"
 FQ_DWELL_ENV = "VLLM_FQ_DWELL_STEPS"
 FQ_HYSTERESIS_ENV = "VLLM_FQ_HYSTERESIS"
 FQ_JACCARD_FLOOR_ENV = "VLLM_FQ_JACCARD_FLOOR"
+FQ_DUMP_STATS_ENV = "VLLM_FQ_DUMP_STATS"
 
 APPLY_DRYRUN, APPLY_RELOAD, APPLY_ATOMIC = "dryrun", "reload", "atomic"
 
@@ -302,6 +303,11 @@ class FungibleQuantState:
         self._last_composition: dict | None = None
         self._table_every = int(
             os.environ.get('VLLM_FQ_TABLE_EVERY_INTERVALS', '10'))
+        # Per-expert routing mass/count dump. The decision record keeps
+        # only the swaps it chose; reconstructing WHICH experts the
+        # traffic actually favoured -- e.g. to compare our selection
+        # against a human-built mixed quant -- needs the raw ranking.
+        self._dump_stats_path = os.environ.get(FQ_DUMP_STATS_ENV)
         self._collector_layer_map = self._map_collector_layers()
 
         self.tier_of = np.asarray(
@@ -460,6 +466,8 @@ class FungibleQuantState:
                 title=f'expert composition @ interval {self._intervals_run}',
                 diff_only=True)
         stats = self._read_stats()
+        if self._dump_stats_path and self.rank in (0, None):
+            self._dump_stats(stats)
         dwell = self._real_steps - self._entered_step
 
         swaps = P.decide(stats, self.eps, self.tier_of, pins=self.pins,
@@ -578,6 +586,28 @@ class FungibleQuantState:
             self.store._atomic_write(
                 self.store.root / "history"
                 / f"{self._step:08d}-proposed.json", proposed_doc)
+
+    def _dump_stats(self, stats: dict) -> None:
+        """Append one JSON line of per-expert routing signal.
+
+        Rank 0 only and best-effort: this is analysis telemetry, and a
+        full disk must not take down inference.
+        """
+        try:
+            rec = {
+                "step": int(self._step),
+                "interval": int(self._intervals_run),
+                "layers": [int(x) for x in self.layers],
+                "tier_of": self.tier_of.tolist(),
+            }
+            for key in ("count", "mass"):
+                arr = stats.get(key)
+                if arr is not None:
+                    rec[key] = np.asarray(arr).tolist()
+            with open(self._dump_stats_path, 'a') as fh:
+                fh.write(json.dumps(rec) + '\n')
+        except Exception:  # noqa: BLE001
+            logger.exception("FQ stats dump failed (continuing)")
 
     def _export_occupancy(self) -> None:
         for row, layer in enumerate(self.layers):
