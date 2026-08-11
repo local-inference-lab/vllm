@@ -19,6 +19,7 @@ Configuration: ``VLLM_FQ_MANIFEST_DIR`` (+ ``VLLM_FQ_POLICY`` /
 """
 from __future__ import annotations
 
+import os
 import time
 
 from torch import nn
@@ -104,6 +105,7 @@ class ProgressiveModelLoader(BaseModelLoader):
                     "cache will be used. Set FQ_ALLOW_NETWORK=1 to override.")
         except Exception:  # noqa: BLE001 — posture logging must not fail a boot
             pass
+        self._preflight_memory(spec, resolver, tp_rank)
         start = time.perf_counter()
         model.load_weights(
             progressive_weights_iterator(
@@ -117,3 +119,88 @@ class ProgressiveModelLoader(BaseModelLoader):
             "Loading weights took %.2f seconds (progressive)",
             time.perf_counter() - start,
         )
+        self._reclaim_allocator()
+
+    # ------------------------------------------------------------ memory
+
+    def _preflight_memory(self, spec, resolver, tp_rank) -> None:
+        """Reject an oversized policy before paying for the load.
+
+        A mixed-K footprint is fixed by the tier bitmap, so this is arithmetic.
+        We learned that the expensive way: a policy 5.72 GiB over budget was
+        only caught after a 62-minute load, by the KV allocator reporting
+        ``Available KV cache memory: -3.1 GiB``.
+        """
+        if os.environ.get("VLLM_FQ_BUDGET_PREFLIGHT", "1") == "0":
+            return
+        try:
+            import torch
+
+            from .memory_preflight import _env_bytes, check_or_raise, project
+            from .progressive import measure_footprint_inputs
+
+            free, total = torch.cuda.mem_get_info()
+            expert_bytes_by_k, dense_bytes = measure_footprint_inputs(
+                spec, resolver, tp_rank=tp_rank)
+            if not expert_bytes_by_k:
+                logger.warning("FQ memory preflight skipped: no fragment "
+                               "could be sized")
+                return
+            util = float(os.environ.get("VLLM_FQ_BUDGET_UTIL", "0"))
+            if not util:
+                from vllm.config import get_current_vllm_config
+                util = get_current_vllm_config().cache_config \
+                    .gpu_memory_utilization
+            proj = project(
+                spec.bits_by_layer,
+                expert_bytes_by_k,
+                dense_bytes,
+                device_total_bytes=total,
+                gpu_memory_utilization=util,
+                # Measured on this box: a flat-K3 TP4 boot leaves 5.27 GiB of
+                # allocator + activation + graph residue. Overridable because
+                # it is the one term that is a calibration, not a measurement
+                # of THIS policy.
+                runtime_overhead_bytes=_env_bytes(
+                    "VLLM_FQ_BUDGET_OVERHEAD", int(5.5 * (1 << 30))),
+                min_kv_bytes=_env_bytes(
+                    "VLLM_FQ_BUDGET_MIN_KV", 4 * (1 << 30)),
+            )
+            check_or_raise(proj, expert_bytes_by_k, logger.info)
+        except ImportError:
+            logger.warning("FQ memory preflight unavailable", exc_info=True)
+
+    @staticmethod
+    def _reclaim_allocator() -> None:
+        """Return the streaming residue to the driver before KV profiling.
+
+        Progressive loading stages tens of thousands of small per-expert
+        buffers. PyTorch's caching allocator keeps those blocks RESERVED after
+        they are freed, but vLLM sizes the KV cache from what the DRIVER
+        reports free -- so the residue is charged against KV even though
+        nothing holds it. Measured on a TP4 GLM-5.2 boot: progressive left
+        9.19 GiB of non-weight residue where the equivalent flat load left
+        5.27 GiB, i.e. 3.92 GiB of KV cache silently consumed by an allocator
+        bookkeeping artifact.
+        """
+        try:
+            import gc
+
+            import torch
+
+            if not torch.cuda.is_available():
+                return
+            before_r = torch.cuda.memory_reserved()
+            before_a = torch.cuda.memory_allocated()
+            gc.collect()
+            torch.cuda.empty_cache()
+            after_r = torch.cuda.memory_reserved()
+            logger.info(
+                "FQ post-load reclaim: reserved %.2f -> %.2f GiB "
+                "(freed %.2f GiB of allocator residue; allocated %.2f GiB "
+                "is the real weight footprint)",
+                before_r / (1 << 30), after_r / (1 << 30),
+                (before_r - after_r) / (1 << 30), before_a / (1 << 30),
+            )
+        except ImportError:
+            pass

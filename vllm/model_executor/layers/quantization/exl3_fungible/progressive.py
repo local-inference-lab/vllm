@@ -272,6 +272,61 @@ def _shard_tensor(mm, body_offset: int, entry: dict):
         ).view(shape)
 
 
+def measure_footprint_inputs(
+    spec: ProgressiveSpec,
+    resolver: FragmentResolver,
+    *,
+    tp_rank: int | None = None,
+) -> tuple[dict[int, int], int]:
+    """Measure ``(expert_bytes_by_k, dense_bytes)`` for this rank.
+
+    Both numbers come from real headers, never from a bits-per-weight model:
+    the fixed-size ``suh``/``svh``/``mcg`` companions make K4 ~1.33x K3 rather
+    than the 1.33x a naive model predicts, and the gap is GiB-scale.
+
+    One sample fragment per distinct K is enough -- every expert of a given K
+    has identical shapes -- so this costs a handful of cached header reads.
+    """
+    def _rank_ok(name: str) -> bool:
+        if tp_rank is None:
+            return True
+        m = _RANK_SEG_RE.search(name)
+        return m is None or int(m.group(1)) == tp_rank
+
+    # Dense side: everything the stream will yield that is not a routed
+    # expert of a policy layer, counted the way the stream counts it.
+    dense_bytes = 0
+    for shard in spec.shard_files():
+        header, _ = read_safetensors_header(shard)
+        header.pop("__metadata__", None)
+        for name, entry in header.items():
+            m = EXPERT_RE.match(name)
+            if m is not None and int(m.group(1)) in spec.bits_by_layer:
+                continue
+            if not _rank_ok(name):
+                continue
+            start, end = entry["data_offsets"]
+            dense_bytes += end - start
+
+    # Expert side: one probe per distinct K actually referenced.
+    wanted: dict[int, tuple[int, int]] = {}
+    for layer, bits in spec.bits_by_layer.items():
+        for expert, k in enumerate(bits):
+            wanted.setdefault(int(k), (layer, expert))
+    expert_bytes_by_k: dict[int, int] = {}
+    for k, (layer, expert) in sorted(wanted.items()):
+        frag = resolver.resolve_best(layer, expert, k)
+        if frag is None:
+            continue
+        # Size the fragment as LOADED (frag.k), not as requested: a silently
+        # substituted lower K would otherwise inflate the projection and
+        # reject a policy that actually fits.
+        expert_bytes_by_k[int(frag.k)] = sum(
+            t.end - t.start for t in frag.tensors if _rank_ok(t.name)
+        )
+    return expert_bytes_by_k, dense_bytes
+
+
 def progressive_weights_iterator(
     spec: ProgressiveSpec,
     resolver: FragmentResolver,
