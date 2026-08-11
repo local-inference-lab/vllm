@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 __all__ = [
+    "active_plan",
+    "set_active_plan",
     "ConvergenceState",
     "Deficit",
     "ConvergencePlan",
@@ -424,3 +426,112 @@ class LayerConvergenceWorker:
     def done(self) -> bool:
         return self.plan.state.is_final or (
             self.plan.state is ConvergenceState.STALLED)
+
+
+class NotInstalled(RuntimeError):
+    """A convergence attempt resolved fragments but did not install them."""
+
+
+def installed_tiers(rpc_result) -> dict[int, int] | None:
+    """Extract per-expert installed tiers from an fq_converge_layers result.
+
+    The ONE rule this enforces: a result that does not affirm ``installed``
+    yields None, never a tier map. Reading the tiers off a resolve-only
+    result and repaying them would drive the plan to state=converged,
+    drift_bits=0 on a model whose weights never changed -- fabricated
+    evidence, and precisely what ConvergenceState exists to prevent.
+
+    Absent/false/malformed all mean "not installed". A telemetry contract
+    that fails open is not a contract.
+    """
+    if not isinstance(rpc_result, dict):
+        return None
+    if rpc_result.get("installed") is not True:
+        return None
+    layers = rpc_result.get("layers")
+    if not isinstance(layers, dict):
+        return None
+    out: dict[int, int] = {}
+    for expert, k in layers.items():
+        try:
+            out[int(expert)] = int(k)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def bind_reload_rpc(collective_rpc, *, timeout: float | None = None):
+    """Build a ``reload_fn`` for LayerConvergenceWorker from a worker RPC.
+
+    ``collective_rpc(method, args=...)`` is vLLM's executor seam. All TP ranks
+    rebuild the same layer, so every rank must affirm the install: one rank
+    silently skipping it would leave the model inconsistent across ranks
+    while the plan reported convergence.
+    """
+
+    def reload_fn(layer: int, want: dict[int, int]):
+        results = collective_rpc(
+            "fq_converge_layers", args=({int(layer): dict(want)},))
+        if not results:
+            return None
+        per_rank = [installed_tiers(_rank_layer(r, layer)) for r in results]
+        if any(x is None for x in per_rank):
+            return None            # some rank did not install: repay nothing
+        first = per_rank[0]
+        for other in per_rank[1:]:
+            if other != first:
+                return None        # ranks disagree: treat as not converged
+        return first
+
+    return reload_fn
+
+
+def _rank_layer(rank_result, layer: int):
+    """Narrow one rank's whole-RPC result to the layer we asked about."""
+    if not isinstance(rank_result, dict):
+        return None
+    layers = rank_result.get("layers")
+    if not isinstance(layers, dict):
+        return rank_result
+    for key in (layer, str(layer)):
+        if key in layers:
+            return {"installed": rank_result.get("installed"),
+                    "layers": layers[key]}
+    return {"installed": rank_result.get("installed"), "layers": {}}
+
+
+# --------------------------------------------------------------- the registry
+# The loader BUILDS a plan on every progressive boot, but nothing passed
+# convergence_out, so the plan was populated, logged once and garbage
+# collected -- the accounting existed and was unreachable, which means the
+# "weights are still converging" telemetry did not exist at runtime at all.
+# One process-wide slot is the seam: the loader publishes, admin/metrics and
+# the repay worker read.
+_ACTIVE: "ConvergencePlan | None" = None
+_ACTIVE_LOCK = threading.Lock()
+
+
+def set_active_plan(plan) -> None:
+    """Publish the plan for this process. Last boot wins (a reload replaces
+    the previous posture rather than accumulating stale deficits)."""
+    global _ACTIVE
+    with _ACTIVE_LOCK:
+        _ACTIVE = plan
+
+
+def active_plan():
+    """The current plan, or None if this process never booted progressively."""
+    with _ACTIVE_LOCK:
+        return _ACTIVE
+
+
+def convergence_snapshot() -> dict:
+    """Scrape-ready state, safe to call on a process that never booted
+    progressively -- an absent plan is reported as such rather than as
+    'converged', because 'no information' and 'nothing left to do' are
+    different answers and only one of them is reassuring."""
+    plan = active_plan()
+    if plan is None:
+        return {"state": "unknown", "is_final": False,
+                "reason": "no progressive boot in this process"}
+    return plan.snapshot()

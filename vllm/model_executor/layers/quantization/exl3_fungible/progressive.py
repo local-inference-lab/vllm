@@ -554,6 +554,13 @@ def progressive_weights_iterator(
                 _emit(_plan.describe())
             if convergence_out is not None:
                 convergence_out.append(_plan)
+            # Publish process-wide: without this the plan is unreachable and
+            # the convergence telemetry does not exist at runtime.
+            try:
+                from .convergence import set_active_plan
+                set_active_plan(_plan)
+            except ImportError:
+                pass
         finally:
             # Never leave the prefetch thread running past the stream: a
             # cancelled boot would otherwise keep pulling segments nobody

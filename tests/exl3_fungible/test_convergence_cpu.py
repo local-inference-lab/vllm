@@ -538,3 +538,156 @@ def test_optin_still_governs_whether_missing_experts_are_deferred():
     assert "if unavailable and _opportunistic:" in src
     assert "if _opportunistic:\n                # ONCE" in src or \
            "_plan.gate()" in src
+
+
+# ============================ the install contract ============================
+# The defect these pin, found reviewing my own code: fq_converge_layers
+# RESOLVES fragments and never installs them, and LayerConvergenceWorker fed
+# its return straight into repay(). The plan would have marched to
+# state=converged, drift_bits=0, converged_ratio=1.0 on a model whose weights
+# never changed. Worse than not having the feature: it manufactures evidence.
+
+def test_resolve_only_result_yields_no_tiers():
+    assert CV.installed_tiers(
+        {"installed": False, "layers": {0: 4}}) is None
+
+
+def test_missing_installed_flag_is_treated_as_not_installed():
+    """A telemetry contract that fails open is not a contract."""
+    assert CV.installed_tiers({"layers": {0: 4}}) is None
+
+
+@pytest.mark.parametrize("bad", [None, [], "ok", {"installed": "yes"},
+                                 {"installed": 1}, {"installed": True}])
+def test_malformed_results_never_yield_tiers(bad):
+    """`installed: 1` and `installed: "yes"` are NOT True -- an identity check,
+    because a truthy-but-wrong payload is exactly how this fails silently."""
+    assert CV.installed_tiers(bad) is None
+
+
+def test_installed_result_yields_the_tiers():
+    assert CV.installed_tiers(
+        {"installed": True, "layers": {"0": "4", 1: 3}}) == {0: 4, 1: 3}
+
+
+def test_worker_does_not_repay_on_a_resolve_only_result():
+    """End to end: the plan must stay CONVERGING, not flip to CONVERGED."""
+    p = _plan()
+    for e in range(4):
+        p.observe(5, e, actual_k=3, target_k=4)
+
+    def resolve_only(layer, want):
+        return CV.installed_tiers(
+            {"installed": False, "layers": {e: 4 for e in want}})
+
+    out = CV.LayerConvergenceWorker(p, resolve_only).step()
+    assert out["repaid"] == 0
+    assert p.pending_count == 4
+    assert p.drift_bits == 4
+    assert p.state is CV.ConvergenceState.CONVERGING
+    assert p.state.is_final is False
+
+
+def test_every_rank_must_affirm_the_install():
+    """All TP ranks rebuild the same layer. One rank silently skipping it
+    would leave the model inconsistent across ranks while the plan reported
+    convergence."""
+    calls = []
+
+    def rpc(method, args=None):
+        calls.append(method)
+        return [
+            {"installed": True, "layers": {5: {0: 4}}},
+            {"installed": False, "layers": {5: {0: 4}}},   # rank 1 did not
+        ]
+
+    fn = CV.bind_reload_rpc(rpc)
+    assert fn(5, {0: 4}) is None
+    assert calls == ["fq_converge_layers"]
+
+
+def test_ranks_disagreeing_on_the_tier_is_not_convergence():
+    def rpc(method, args=None):
+        return [
+            {"installed": True, "layers": {5: {0: 4}}},
+            {"installed": True, "layers": {5: {0: 3}}},    # different tier
+        ]
+
+    assert CV.bind_reload_rpc(rpc)(5, {0: 4}) is None
+
+
+def test_unanimous_install_is_accepted():
+    def rpc(method, args=None):
+        return [{"installed": True, "layers": {5: {0: 4, 1: 4}}}] * 4
+
+    assert CV.bind_reload_rpc(rpc)(5, {0: 4, 1: 4}) == {0: 4, 1: 4}
+
+
+def test_empty_rpc_result_is_a_failure():
+    assert CV.bind_reload_rpc(lambda m, args=None: [])(5, {0: 4}) is None
+
+
+def test_the_shipped_rpc_reports_installed_false():
+    """Guard on the real worker extension: while the device-side install is
+    unimplemented, the RPC must say so rather than imply success."""
+    # parents[4] is $HOME: .../tests/exl3_fungible/<file> -> tests -> gg-vllm
+    # -> src -> HOME. Getting this off by one made the guard SKIP, and a
+    # guard that silently skips is not a guard.
+    candidates = [
+        Path(__file__).resolve().parents[4] / "protensors-work"
+        / "vllm-voipmonitor" / "research" / "fungible-quant" / "tools"
+        / "fq_reload.py",
+        Path.home() / "gg-extra" / "fq_reload.py",
+    ]
+    src = next((c for c in candidates if c.exists()), None)
+    assert src is not None, f"worker extension not found in {candidates}"
+    text = src.read_text()
+    i = text.index("def fq_converge_layers")
+    body = text[i:text.index("\ndef ", i)]
+    assert '"installed": False' in body, (
+        "the RPC must not imply an install it does not perform")
+
+
+# ------------------------------------------------------- reachability of state
+def test_loader_publishes_the_plan_process_wide():
+    """The loader BUILT a plan on every boot and nothing passed
+    convergence_out, so it was populated, logged once and garbage collected.
+    The accounting existed and was unreachable -- which means the 'weights are
+    still converging' telemetry did not exist at runtime at all."""
+    assert "set_active_plan(_plan)" in _progressive_src()
+
+
+def test_snapshot_without_a_boot_is_unknown_not_converged():
+    """'No information' and 'nothing left to do' are different answers, and
+    only one of them is reassuring."""
+    CV.set_active_plan(None)
+    snap = CV.convergence_snapshot()
+    assert snap["state"] == "unknown"
+    assert snap["is_final"] is False
+
+
+def test_snapshot_reflects_the_published_plan():
+    p = _plan()
+    p.observe(3, 0, actual_k=2, target_k=4)
+    CV.set_active_plan(p)
+    try:
+        snap = CV.convergence_snapshot()
+        assert snap["state"] == "converging"
+        assert snap["drift_bits"] == 2
+        assert snap["is_final"] is False
+    finally:
+        CV.set_active_plan(None)
+
+
+def test_a_second_boot_replaces_rather_than_accumulates():
+    """A reload replaces the posture; stale deficits from the previous boot
+    must not linger and understate convergence."""
+    first, second = _plan(), _plan()
+    first.observe(3, 0, actual_k=2, target_k=4)
+    CV.set_active_plan(first)
+    CV.set_active_plan(second)
+    try:
+        assert CV.active_plan() is second
+        assert CV.convergence_snapshot()["drift_bits"] == 0
+    finally:
+        CV.set_active_plan(None)
