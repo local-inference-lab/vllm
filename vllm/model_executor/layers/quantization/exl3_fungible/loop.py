@@ -982,8 +982,14 @@ class FungibleQuantState:
         if self.apply_fn is None:
             if self.cfg.apply_mode == APPLY_ATOMIC and not self._atomic_warned:
                 logger.warning(
-                    "FQ apply_mode=atomic without a bound apply_fn — "
-                    "recording proposals only (M4 live wiring pending)")
+                    "FQ apply_mode=atomic with no apply backend bound — "
+                    "recording proposals only. This is the DEFAULT since "
+                    "inline apply deadlocked a TP serve (stage() does "
+                    "synchronous fragment IO inside the step, per-rank, so "
+                    "the ranks desynchronise and the shm broadcast starves). "
+                    "The swap engine itself is proven; what is missing is "
+                    "out-of-step coordination. VLLM_FQ_LIVE_APPLY=1 binds it "
+                    "anyway for experiments.")
                 self._atomic_warned = True
             elif self.cfg.apply_mode == APPLY_RELOAD:
                 logger.warning(
