@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+from collections import Counter
 import hashlib
 import json
 import logging
@@ -291,6 +292,16 @@ class Fragment:
     @property
     def substituted(self) -> bool:
         return self.requested_k is not None and self.requested_k != self.k
+
+
+class SegmentHeaderMismatch(RuntimeError):
+    """A segment header arrived truncated.
+
+    Its own type because it is a TRANSPORT fault, not a bad artifact: the
+    right response is to retry, not to reject the source. Raised before the
+    bytes are parsed or cached, so a body cut mid-header (or an error page
+    served with 200) cannot become a poisoned header cache entry.
+    """
 
 
 class _SegmentIndexEntry:
@@ -630,6 +641,8 @@ class _DownloadMonitor:
         self.every = every
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._sizes: dict[str, int] = {}
+        self._done_bytes = 0
 
     @classmethod
     def ensure(cls, root: Path) -> "_DownloadMonitor":
@@ -662,21 +675,44 @@ class _DownloadMonitor:
             pass
         return total, count
 
+    def _progress(self) -> tuple[int, int]:
+        """(monotonic bytes downloaded, files in flight).
+
+        Summing the in-flight files alone is NOT progress: a completed file
+        leaves the .incomplete set, so the sum DROPS and the rate reads 0
+        MiB/s next to gigabytes of real transfer -- observed live as
+        "3 in flight, 1.8 GiB this boot, 0 MiB/s". Carry the bytes of files
+        that vanished into a completed total so the series only ever rises.
+        """
+        seen: dict[str, int] = {}
+        count = 0
+        try:
+            for f in self.root.rglob("*.incomplete"):
+                try:
+                    seen[str(f)] = f.stat().st_size
+                    count += 1
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        for path, size in self._sizes.items():
+            if path not in seen:
+                self._done_bytes += size
+        self._sizes = seen
+        return self._done_bytes + sum(seen.values()), count
+
     def _run(self) -> None:
-        prev, t_prev = self._scan()[0], time.monotonic()
-        cumulative = 0
+        prev, t_prev = self._progress()[0], time.monotonic()
         while not self._stop.wait(self.every):
-            cur, n = self._scan()
+            cur, n = self._progress()
             now = time.monotonic()
             delta, dt = cur - prev, max(now - t_prev, 1e-9)
             if n == 0 and delta <= 0:
                 prev, t_prev = cur, now
                 continue
-            if delta > 0:
-                cumulative += delta
             logger.info(
                 "FQ downloads: %d in flight, %.1f GiB this boot, %.0f MiB/s",
-                n, cumulative / (1 << 30), max(delta, 0) / dt / (1 << 20))
+                n, cur / (1 << 30), max(delta, 0) / dt / (1 << 20))
             prev, t_prev = cur, now
 
 
@@ -811,7 +847,13 @@ class FragmentResolver:
         self._encode_queue = encode_queue
         self._encode_queue_ready = encode_queue is not None
 
-        self.stats = {
+        # Counter, not dict: `self.stats[k] += 1` on an
+        # undeclared key raised KeyError from the SUCCESS path
+        # of the prefetch fast-path, so every expert served
+        # from a prefetched segment was reported as a source
+        # rejection and fell down the K ladder. Telemetry must
+        # never be able to fail the thing it measures.
+        self.stats = Counter({
             "local": 0,
             "cache": 0,
             "fetched": 0,
@@ -832,6 +874,7 @@ class FragmentResolver:
             "segments_prefetched": 0,
             "segments_released": 0,
             "segments_shared": 0,
+            "bytes_from_prefetch": 0,
             "unavailable": 0,
             # hardening counters: a broken local dir / unreadable cache entry
             # / unwritable cache must degrade the attempt, never the engine
@@ -839,7 +882,7 @@ class FragmentResolver:
             "cache_error": 0,
             "cache_write_error": 0,
             "resolve_error": 0,
-        }
+        })
         # (dir, layer, k) -> _LocalSegment | None
         self._local_segments: dict[tuple[Path, int, int], _LocalSegment | None] = {}
         # (layer, k) -> {expert_str: sha} from LOCAL dirs only
@@ -1678,11 +1721,24 @@ class FragmentResolver:
                     pass
         if header is None:
             raw = source.read_range(entry.file, 0, entry.body_offset)
+            if len(raw) != entry.body_offset:
+                # A short read here is not a fragment problem, it is a
+                # TRANSPORT problem, and it must not be cached or parsed. A
+                # truncated or substituted body (an error page served with
+                # 200, a connection cut mid-header) parses into a header that
+                # disagrees with the index, and the disagreement then surfaces
+                # 19,200 times as a bare `KeyError` from expert_range with no
+                # indication that the network was the cause.
+                raise SegmentHeaderMismatch(
+                    f"{entry.file}: header read returned {len(raw)} bytes, "
+                    f"expected {entry.body_offset} — transport truncation, "
+                    f"not a bad segment")
             header, _ = parse_segment_header_bytes(raw)
             self._cache_store(
                 header_cache, json.dumps(header, separators=(",", ":")).encode()
             )
         tables = _expert_tables_from_header(header, entry)
+
         self._remote_headers[entry.sha256] = (header, tables)
         return tables
 

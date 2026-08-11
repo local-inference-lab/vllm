@@ -617,3 +617,74 @@ def test_resolver_has_a_lock_for_its_memo_dicts(tmp_path):
     """Prefetch runs on a thread pool now; the memo dicts were written for a
     single thread."""
     assert hasattr(_resolver(tmp_path), "_memo_lock")
+
+
+def test_download_progress_is_monotonic_across_completions(tmp_path):
+    """Summing in-flight files is NOT progress. A completed file leaves the
+    .incomplete set, so the sum DROPS -- observed live as
+    'FQ downloads: 3 in flight, 1.8 GiB this boot, 0 MiB/s' while gigabytes
+    were genuinely transferring."""
+    root = tmp_path / "segments"
+    dl = root / ".cache" / "huggingface" / "download"
+    dl.mkdir(parents=True)
+    mon = FR._DownloadMonitor(root, every=0.05)
+
+    a = dl / "a.incomplete"
+    a.write_bytes(b"x" * 1000)
+    total1, n1 = mon._progress()
+    assert (total1, n1) == (1000, 1)
+
+    a.write_bytes(b"x" * 3000)                 # grew
+    total2, _ = mon._progress()
+    assert total2 == 3000
+
+    a.unlink()                                  # completed and renamed away
+    total3, n3 = mon._progress()
+    assert n3 == 0
+    assert total3 == 3000, f"progress went backwards: {total3}"
+
+    (dl / "b.incomplete").write_bytes(b"y" * 500)   # next file starts
+    total4, _ = mon._progress()
+    assert total4 == 3500, "completed bytes were dropped from the total"
+
+
+# ------------------------------------------- telemetry must not fail the fetch
+def test_every_incremented_stats_key_is_declared():
+    """THE regression. `self.stats["bytes_from_prefetch"] += len(payload)` was
+    added with the prefetch fast-path but never declared, and it sits on the
+    SUCCESS branch -- right after range_from_prefetched returns bytes. So a
+    KeyError fired exactly when the optimisation WORKED, was caught as a
+    source rejection, and dropped the expert down the K ladder: the better
+    prefetch performed, the more experts degraded to K2. 190 of them, on a
+    real boot, before anything said why."""
+    import re
+    src = (Path(__file__).resolve().parents[2] / "vllm" / "model_executor"
+           / "layers" / "quantization" / "exl3_fungible"
+           / "fragments.py").read_text()
+    used = set(re.findall(r'self\.stats\[\s*"([a-z0-9_]+)"\s*\]\s*\+?=', src))
+    init = src[src.index("self.stats = Counter({"):]
+    declared = set(re.findall(r'"([a-z0-9_]+)"\s*:\s*0', init[:init.index("})")]))
+    missing = sorted(used - declared)
+    assert not missing, f"incremented but never declared: {missing}"
+
+
+def test_stats_is_a_counter_so_a_missing_key_cannot_raise():
+    """Belt as well as braces: telemetry must never be able to fail the thing
+    it measures, even if a future counter is added without declaring it."""
+    src = (Path(__file__).resolve().parents[2] / "vllm" / "model_executor"
+           / "layers" / "quantization" / "exl3_fungible"
+           / "fragments.py").read_text()
+    assert "self.stats = Counter({" in src
+
+
+def test_undeclared_counter_increments_instead_of_raising(tmp_path):
+    r = _resolver(tmp_path)
+    r.stats["a_counter_nobody_declared"] += 5      # must not raise
+    assert r.stats["a_counter_nobody_declared"] == 5
+
+
+def test_declared_counters_still_report_zero(tmp_path):
+    """A Counter must not make declared metrics vanish from a scrape."""
+    r = _resolver(tmp_path)
+    assert r.stats["bytes_from_prefetch"] == 0
+    assert "segments_prefetched" in r.stats
