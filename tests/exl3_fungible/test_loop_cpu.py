@@ -246,16 +246,28 @@ def test_metrics_increment(tmp_path):
                   {"layer": "3", "tier": "k4"}) == 2.0
     assert sample(registry, "fq_tier_occupancy",
                   {"layer": "3", "tier": "k3"}) == 6.0
-    assert sample(registry, "fq_swaps_total", {"layer": "3"}) == 0.0
+    assert sample(registry, "fq_swap_proposals_total", {"layer": "3"}) == 0.0
+    assert sample(registry, "fq_swaps_applied_total", {"layer": "3"}) == 0.0
     assert sample(registry, "fq_rollbacks_total") == 0.0
+    # No apply backend is bound in dryrun, and the gauge must say so: an
+    # operator seeing proposals climb needs one glance to know whether any of
+    # them can become a change.
+    assert sample(registry, "fq_apply_bound") == 0.0
 
     drive_hot_interval(state, routers)
-    assert sample(registry, "fq_swaps_total", {"layer": "3"}) == 1.0
-    assert sample(registry, "fq_swaps_total", {"layer": "4"}) == 1.0
+    assert sample(registry, "fq_swap_proposals_total", {"layer": "3"}) == 1.0
+    assert sample(registry, "fq_swap_proposals_total", {"layer": "4"}) == 1.0
     assert sample(registry, "fq_policy_age_steps") == 4.0
+    # THE distinction. A live serve decided 64 swaps across 39 layers with no
+    # apply backend bound and exported them under a single "fq_swaps_total",
+    # so the dashboard read as a working fungible loop while nothing whatever
+    # was installed. Proposals must never imply applications.
+    assert sample(registry, "fq_swaps_applied_total", {"layer": "3"}) == 0.0
+    assert sample(registry, "fq_swaps_applied_total", {"layer": "4"}) == 0.0
 
     drive_hot_interval(state, routers)
-    assert sample(registry, "fq_swaps_total", {"layer": "3"}) == 2.0
+    assert sample(registry, "fq_swap_proposals_total", {"layer": "3"}) == 2.0
+    assert sample(registry, "fq_swaps_applied_total", {"layer": "3"}) == 0.0
     assert sample(registry, "fq_jaccard") == 1.0  # same desired set again
     # Dryrun: occupancy tracks the RUNNING policy, which never moved.
     assert sample(registry, "fq_tier_occupancy",

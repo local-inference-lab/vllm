@@ -377,11 +377,29 @@ class FqMetrics:
     def __init__(self, registry=None):
         import prometheus_client as pc
         kw = {} if registry is None else {"registry": registry}
-        self.swaps_total = pc.Counter(
-            "fq_swaps_total",
-            "Fungible-quant expert tier swaps decided per MoE layer "
-            "(proposals in dryrun mode, applied swaps otherwise).",
+        # PROPOSED and APPLIED are separate series on purpose. One counter
+        # covering both read "fq_swaps_total{layer=3} 2.0" on a serve where
+        # the apply path was not wired at all: 64 swaps decided, zero
+        # installed, and a dashboard that said the fungible loop was working.
+        # A metric an operator cannot distinguish from success IS a false
+        # success.
+        self.swap_proposals_total = pc.Counter(
+            "fq_swap_proposals_total",
+            "Fungible-quant expert tier swaps DECIDED per MoE layer. A "
+            "proposal is not a change: compare against "
+            "fq_swaps_applied_total.",
             ["layer"], **kw)
+        self.swaps_applied_total = pc.Counter(
+            "fq_swaps_applied_total",
+            "Fungible-quant expert tier swaps ACTUALLY INSTALLED per MoE "
+            "layer, counted only after the apply backend confirmed.",
+            ["layer"], **kw)
+        self.apply_bound = pc.Gauge(
+            "fq_apply_bound",
+            "1 when an apply backend is bound, 0 when the loop can only "
+            "record proposals. Zero here means no proposal can ever become "
+            "a change, however many are decided.",
+            multiprocess_mode="mostrecent", **kw)
         self.rollbacks_total = pc.Counter(
             "fq_rollbacks_total",
             "Fungible-quant probe-triggered policy rollbacks.", **kw)
@@ -551,7 +569,10 @@ class FungibleQuantState:
 
         if self.metrics is not None and self.is_lead:
             for layer in self.layers:
-                self.metrics.swaps_total.labels(layer=str(layer)).inc(0)
+                self.metrics.swap_proposals_total.labels(
+                    layer=str(layer)).inc(0)
+                self.metrics.swaps_applied_total.labels(
+                    layer=str(layer)).inc(0)
             self._export_occupancy()
             self._export_budget()
 
@@ -840,7 +861,8 @@ class FungibleQuantState:
 
         if self.is_lead:
             self._persist(record, proposed_doc, swaps or promotions)
-            self._export_metrics(record, swaps, jac)
+            self._export_metrics(record, swaps, jac,
+                                 applied=bool(record.get("applied")))
         return record
 
     # ---------------------------------------------------------------- apply
@@ -1097,12 +1119,16 @@ class FungibleQuantState:
         self._last_composition = cur
 
     def _export_metrics(self, record: dict, swaps: list,
-                        jac: float | None) -> None:
+                        jac: float | None, applied: bool = False) -> None:
         if self.metrics is None:
             return
         for layer, _, _ in swaps:
-            self.metrics.swaps_total.labels(
+            self.metrics.swap_proposals_total.labels(
                 layer=str(self.layers[layer])).inc()
+            if applied:
+                self.metrics.swaps_applied_total.labels(
+                    layer=str(self.layers[layer])).inc()
+        self.metrics.apply_bound.set(1 if self.apply_fn is not None else 0)
         if jac is not None:
             self.metrics.jaccard.set(jac)
         self.metrics.policy_age_steps.set(self._step - self._policy_step)

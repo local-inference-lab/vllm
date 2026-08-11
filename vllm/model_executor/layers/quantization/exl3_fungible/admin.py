@@ -1285,7 +1285,11 @@ def _bump_metrics(state: Any, swaps: Sequence[tuple[int, int, int]], *,
     if metrics is not None and getattr(state, "is_lead", True):
         try:
             for layer, _, _ in swaps:
-                metrics.swaps_total.labels(layer=str(int(layer))).inc()
+                # A forced admin swap IS installed by the time we get here.
+                metrics.swap_proposals_total.labels(
+                    layer=str(int(layer))).inc()
+                metrics.swaps_applied_total.labels(
+                    layer=str(int(layer))).inc()
             metrics.policy_age_steps.set(
                 int(getattr(state, "_step", 0))
                 - int(getattr(state, "_policy_step", 0)))
