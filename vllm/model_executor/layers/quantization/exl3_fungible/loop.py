@@ -326,6 +326,10 @@ class FungibleQuantState:
         self._intervals_run = 0
         self._prev_desired: np.ndarray | None = None  # [L,E] bool
         self._atomic_warned = False
+        # Apply attempts the backend refused/crashed on. A missing fragment
+        # at the required K is the expected cause: the incumbent tiering
+        # stays live and the next interval retries.
+        self.apply_failures = 0
 
         if eps is None:
             eps = self._resolve_eps()
@@ -515,6 +519,7 @@ class FungibleQuantState:
 
         applied = self._maybe_apply(proposed_doc, proposed_tier, swaps)
         record["applied"] = applied
+        record["apply_failures"] = int(self.apply_failures)
 
         if self.is_lead:
             self._persist(record, proposed_doc, swaps)
@@ -540,7 +545,17 @@ class FungibleQuantState:
     def _maybe_apply(self, proposed_doc: dict, proposed_tier: np.ndarray,
                      swaps: list) -> bool:
         """dryrun: never. reload/atomic: only through a bound apply_fn
-        (M3's fq_reload path / M4's swap engine); record-only otherwise."""
+        (M3's fq_reload path / M4's swap engine); record-only otherwise.
+
+        The apply backend is treated as untrusted: a fragment that is not
+        available at the required K, an unreachable mirror, an aborted
+        stage — anything it raises is caught here and downgraded to "not
+        applied". The incumbent tiering stays live and authoritative
+        (``tier_of``/``policy_doc``/``store`` are only advanced on a clean
+        ``True``), the rest of the interval still explains and persists its
+        decision, and the next interval retries. Staging is host-only and
+        happens before the swap engine's quiesce window, so a supply
+        failure cannot have left a layer half-updated."""
         if self.cfg.apply_mode == APPLY_DRYRUN or not swaps:
             return False
         if self.apply_fn is None:
@@ -556,7 +571,16 @@ class FungibleQuantState:
                     "(fq_assemble + fq_reload swap) from the persisted "
                     "proposal JSON")
             return False
-        ok = bool(self.apply_fn(proposed_doc, swaps))
+        try:
+            ok = bool(self.apply_fn(proposed_doc, swaps))
+        except Exception:  # noqa: BLE001 — a supply failure is not a crash
+            self.apply_failures += 1
+            logger.exception(
+                "FQ apply failed at step %d (%d swaps) — keeping the "
+                "incumbent tiering and retrying next interval "
+                "(apply_failures=%d)",
+                self._step, len(swaps), self.apply_failures)
+            return False
         if ok:
             swapped = self.tier_of != proposed_tier
             self.tier_of = proposed_tier

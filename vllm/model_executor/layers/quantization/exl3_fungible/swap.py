@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import struct
 import time
 from contextlib import AbstractContextManager, nullcontext
@@ -77,6 +78,10 @@ DESCRIPTOR_TIER_SHIFT = 8  # descriptor = (tier << 8) | local, single decode sit
 
 _PROJS = ("gate", "up", "down")
 _COMPS = ("trellis", "suh", "svh", "mcg")
+
+# Default policy for a pair whose fragments no source can supply:
+# "raise" (fail-closed, the default) or "drop" (pend the promotion).
+FQ_ON_UNAVAILABLE_ENV = "VLLM_FQ_ON_UNAVAILABLE"
 # safetensors dtype tag -> (torch dtype, itemsize)
 _ST_DTYPES = {
     "I16": (torch.int16, 2),
@@ -342,13 +347,37 @@ class ResolverFragmentSource:
     the resolver has already queued the encode. ``allow_substituted=True``
     would only be meaningful with per-pair tier retargeting, which v1
     (same-cardinality K3/K4 swaps, D1) does not have.
+
+    Never-raise path: when the resolver exposes ``resolve_best`` (the real
+    :class:`~.fragments.FragmentResolver` does) it is preferred over
+    ``resolve``. ``resolve_best`` cannot throw — a missing fragment, an
+    unreachable mirror, a corrupt local segment dir and even an internal
+    resolver bug all come back as ``None``/a substituted K, which this
+    adapter turns into :class:`FragmentUnavailable`. Combined with
+    ``stage(on_unavailable="drop")`` that means a weight which is not
+    available at the required bitrate costs the interval one pending
+    promotion, never the engine.
     """
 
     def __init__(self, resolver: Any, *, allow_substituted: bool = False,
-                 unavailable_errors: Sequence[type[BaseException]] = ()):
+                 unavailable_errors: Sequence[type[BaseException]] = (),
+                 prefer_best: bool = True):
         self.resolver = resolver
         self.allow_substituted = bool(allow_substituted)
         self.unavailable_errors = tuple(unavailable_errors)
+        best = getattr(resolver, "resolve_best", None)
+        self.prefer_best = bool(prefer_best) and callable(best)
+        # A third-party resolver may implement resolve_best without the
+        # decision-chain out-parameter; only pass it when it is declared.
+        self._best_takes_chain = False
+        if self.prefer_best:
+            try:
+                import inspect
+
+                self._best_takes_chain = (
+                    "chain_out" in inspect.signature(best).parameters)
+            except (TypeError, ValueError):
+                self._best_takes_chain = False
         self.reads = 0
         self.unavailable = 0
 
@@ -363,14 +392,27 @@ class ResolverFragmentSource:
                     dest: ExpertStage) -> None:
         if dest.bits != k:
             raise ValueError(f"stage is K{dest.bits}, requested K{k}")
-        try:
-            fragment = self.resolver.resolve(layer, expert, k)
-        except Exception as exc:  # noqa: BLE001 — classified below
-            if isinstance(exc, self.unavailable_errors) or is_unavailable_error(exc):
+        if self.prefer_best:
+            chain: list[str] = []
+            fragment = (
+                self.resolver.resolve_best(layer, expert, k, chain_out=chain)
+                if self._best_takes_chain
+                else self.resolver.resolve_best(layer, expert, k))
+            if fragment is None:
                 raise self._unavailable(
                     f"L{layer}/e{expert} K{k}: resolver refused "
-                    f"({type(exc).__name__}: {exc})", exc) from exc
-            raise
+                    f"({'; '.join(chain) or 'no source has it'}) — the "
+                    "encode is queued, the promotion pends")
+        else:
+            try:
+                fragment = self.resolver.resolve(layer, expert, k)
+            except Exception as exc:  # noqa: BLE001 — classified below
+                if isinstance(exc, self.unavailable_errors) or \
+                        is_unavailable_error(exc):
+                    raise self._unavailable(
+                        f"L{layer}/e{expert} K{k}: resolver refused "
+                        f"({type(exc).__name__}: {exc})", exc) from exc
+                raise
         got_k = int(getattr(fragment, "k", k))
         if got_k != k and not self.allow_substituted:
             raise self._unavailable(
@@ -799,7 +841,7 @@ class SwapEngine:
         return w13, w2
 
     def stage(self, plan: SwapPlan, *, fail_atomic: bool = False,
-              on_unavailable: str = "raise") -> StagedBatch:
+              on_unavailable: str | None = None) -> StagedBatch:
         """Resolve a plan into device-view/pinned-source op lists (host-only,
         pre-quiesce: fragment IO, slot resolution, map rebuild).
 
@@ -815,8 +857,23 @@ class SwapEngine:
         their tier, so cardinality is preserved. The surviving pairs are
         :attr:`StagedBatch.plan`; build the policy document to persist from
         that, not from the requested plan.
+
+        The default comes from ``VLLM_FQ_ON_UNAVAILABLE`` (``raise``|``drop``)
+        and is ``raise`` when unset — fail-closed, so an operator who never
+        asked for pending promotions sees a supply problem. A live serve that
+        must never lose an interval to a missing encode sets
+        ``VLLM_FQ_ON_UNAVAILABLE=drop`` once, and every staging path inherits
+        it without each call site having to remember.
+
+        Either way staging is host-only and happens entirely BEFORE
+        :meth:`apply` opens the quiesce window: an unavailable fragment can
+        cost a pair or an interval, but it can never tear a layer.
         """
         t_start = time.perf_counter()
+        if on_unavailable is None:
+            on_unavailable = (
+                os.environ.get(FQ_ON_UNAVAILABLE_ENV) or "raise"
+            ).strip().lower()
         if on_unavailable not in ("raise", "drop"):
             raise ValueError(
                 f"on_unavailable must be raise|drop, got {on_unavailable!r}")

@@ -75,24 +75,58 @@ _PROJS = ("gate_proj", "up_proj", "down_proj")
 
 
 class EncodeQueue:
-    """Persisted JSONL queue of lazy-encode requests, dedup by (L, E, K)."""
+    """Persisted JSONL queue of lazy-encode requests, dedup by (L, E, K).
+
+    Loading is total: the queue is telemetry written by a live serve with
+    plain appends, so it can be found torn (a half-written last line after
+    a kill -9), truncated, byte-garbage, or replaced by a directory. None
+    of that may raise — an unreadable queue degrades to an empty one and
+    the serve keeps running. ``corrupt_lines`` counts what was skipped so
+    the drain worker can report it.
+    """
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
         # insertion-ordered: position in this dict == queue position - 1
         self._entries: dict[tuple[int, int, int], dict] = {}
-        if self.path.exists():
-            for line in self.path.read_text().splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    continue
-                key = self._key(entry)
-                if key is not None and key not in self._entries:
-                    self._entries[key] = entry
+        self.corrupt_lines = 0
+        for line in self._read_lines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                self.corrupt_lines += 1
+                continue
+            key = self._key(entry)
+            if key is None:
+                self.corrupt_lines += 1
+                continue
+            if key not in self._entries:
+                self._entries[key] = entry
+        if self.corrupt_lines:
+            print(
+                f"warning: encode queue {self.path}: skipped "
+                f"{self.corrupt_lines} unparseable line(s)",
+                file=sys.stderr,
+            )
+
+    def _read_lines(self) -> list[str]:
+        """Queue file lines, or [] for anything unreadable."""
+        try:
+            if not self.path.is_file():
+                return []
+            # errors="replace": a torn append can leave a partial UTF-8
+            # sequence; that line must be skipped, not kill the reader.
+            return self.path.read_text(errors="replace").splitlines()
+        except OSError:
+            print(
+                f"warning: encode queue {self.path} unreadable — "
+                "continuing with an empty queue",
+                file=sys.stderr,
+            )
+            return []
 
     @staticmethod
     def _key(entry: dict) -> tuple[int, int, int] | None:
@@ -219,20 +253,39 @@ def _capture_check(
     return False, f"capture missing layer_{layer:03d}"
 
 
+class _LenientFields(dict):
+    """``str.format_map`` mapping that leaves unknown fields untouched."""
+
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
 def render_cmd(
     template: str,
     entry: dict,
     bf16_dir: str | Path | None,
     capture_dir: str | Path | None,
 ) -> str:
-    return template.format(
-        layer=int(entry["layer"]),
-        layer03=f"{int(entry['layer']):03d}",
+    """Render the encoder command for one queue entry.
+
+    Lenient on purpose: an operator template naming a placeholder we do not
+    provide renders it back verbatim instead of raising, so one typo in
+    ``VLLM_FQ_ENCODER_CMD`` cannot abort a whole drain (the printed command
+    still shows the mistake)."""
+    layer = int(entry["layer"])
+    fields = _LenientFields(
+        layer=layer,
+        layer03=f"{layer:03d}",
         expert=int(entry["expert"]),
         k=int(entry["k"]),
         bf16_dir=bf16_dir or "",
         capture_dir=capture_dir or "",
     )
+    try:
+        return template.format_map(fields)
+    except (IndexError, ValueError) as exc:
+        # positional {} / malformed format spec: unusable but not fatal
+        return f"<unrenderable encoder template: {type(exc).__name__}: {exc}>"
 
 
 # -------------------------------------------------------------------- drain
@@ -270,15 +323,21 @@ def drain(
     failed = 0
     done: list[dict] = []
     for i, entry in enumerate(entries, 1):
-        tag = (
-            f"#{i} L{entry['layer']}/e{entry['expert']} K{entry['k']} "
-            f"reason={entry.get('reason', '?')}"
-        )
-        ok_bf16, msg_bf16 = _bf16_check(
-            bf16_dir, int(entry["layer"]), int(entry["expert"])
-        )
-        ok_cap, msg_cap = _capture_check(capture_dir, int(entry["layer"]))
-        cmd = render_cmd(template, entry, bf16_dir, capture_dir)
+        try:
+            tag = (
+                f"#{i} L{entry['layer']}/e{entry['expert']} K{entry['k']} "
+                f"reason={entry.get('reason', '?')}"
+            )
+            ok_bf16, msg_bf16 = _bf16_check(
+                bf16_dir, int(entry["layer"]), int(entry["expert"])
+            )
+            ok_cap, msg_cap = _capture_check(capture_dir, int(entry["layer"]))
+            cmd = render_cmd(template, entry, bf16_dir, capture_dir)
+        except Exception as exc:  # noqa: BLE001 — one entry, not the drain
+            failed += 1
+            out(f"#{i} SKIPPED unusable entry {entry!r}: "
+                f"{type(exc).__name__}: {exc}")
+            continue
         if not (ok_bf16 and ok_cap):
             failed += 1
             out(f"{tag} BLOCKED {msg_bf16}; {msg_cap}")
@@ -287,7 +346,12 @@ def drain(
             out(f"{tag} DRY-RUN OK {msg_bf16} {msg_cap} cmd: {cmd}")
             continue
         out(f"{tag} ENCODE {cmd}")
-        result = runner(shlex.split(cmd))
+        try:
+            result = runner(shlex.split(cmd))
+        except Exception as exc:  # noqa: BLE001 — a dead encoder is a failure
+            failed += 1
+            out(f"{tag} FAILED {type(exc).__name__}: {exc}")
+            continue
         rc = getattr(result, "returncode", result)
         if rc == 0:
             done.append(entry)

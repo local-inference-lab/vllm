@@ -41,6 +41,23 @@ Operator knobs (this milestone):
   returned :class:`Fragment` records both ``k`` (actually loaded) and
   ``requested_k``; every substitution/miss is enqueued on the persisted
   lazy-encode queue (:mod:`.lazy_encode`).  Boot never blocks on encodes.
+  Unset (or ``auto``) means :meth:`FragmentResolver.resolve_best` derives the
+  ladder itself — the nearest *lower* Ks this deployment can actually supply,
+  nearest first (``VLLM_FQ_K_FALLBACK_UP=1`` also allows upward substitution,
+  off by default: a higher K costs memory and, on SM120, K5 does not serve as
+  a mixed tier at all).  ``off``/``none`` disables substitution entirely.
+
+Two resolution entry points, deliberately different about failure:
+
+* :meth:`FragmentResolver.resolve` — strict. Uses only the *explicit*
+  ``VLLM_FQ_K_FALLBACK`` ladder and raises
+  :class:`FragmentUnavailableError` when nothing supplies the fragment. This
+  is the auditing/tooling contract (and what the trust tests pin).
+* :meth:`FragmentResolver.resolve_best` — **never raises**. Requested K, else
+  the nearest available lower K (logged loudly, encode queued), else
+  ``None`` so the caller can keep the incumbent tier. Every serving path
+  (boot stream, live swap staging) goes through this one: a fragment that is
+  missing at the required bitrate must never take an engine down.
 
 Every :meth:`FragmentResolver.resolve` emits one structured decision line
 (INFO on substitution/fallback, DEBUG on plain success, WARNING on failure)::
@@ -81,10 +98,15 @@ FQ_LOCAL_SEGMENTS_ENV = "VLLM_FQ_LOCAL_SEGMENTS"
 FQ_TRUST_PREDICATES_ENV = "VLLM_FQ_TRUST_PREDICATES"
 FQ_TRUST_SIGNERS_ENV = "VLLM_FQ_TRUST_SIGNERS"
 FQ_K_FALLBACK_ENV = "VLLM_FQ_K_FALLBACK"
+FQ_K_FALLBACK_UP_ENV = "VLLM_FQ_K_FALLBACK_UP"
 
 DEFAULT_CACHE_DIR = "~/.cache/vllm/fq"
 DEFAULT_TRUST_PREDICATES = ("repack-of", "encode-of", "derived-from")
 SOURCES_MODES = ("prepend", "replace", "append")
+# Ks to consider when nothing in the deployment advertises a K set at all.
+DEFAULT_K_UNIVERSE = (2, 3, 4, 5, 6)
+_INDEX_K_RE = re.compile(r"^index-k(\d+)\.json$")
+_TRUE = ("1", "true", "yes", "on")
 
 EXPERT_RE = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(\w+_proj)\.rank(\d+)\.(\w+)$"
@@ -502,16 +524,34 @@ class FragmentResolver:
         self.trust_enabled = bool(self.trust_signers)
 
         # -- lazy-encode fallback ladder
-        fallback_raw = environ.get(FQ_K_FALLBACK_ENV) or ""
-        try:
-            self.k_fallback: tuple[int, ...] = tuple(
-                int(part) for part in fallback_raw.split(",") if part.strip()
-            )
-        except ValueError as exc:
-            raise ValueError(
-                f"{FQ_K_FALLBACK_ENV} must be a comma list of Ks, got "
-                f"{fallback_raw!r}"
-            ) from exc
+        # mode: "explicit" (operator listed the Ks), "auto" (derive the
+        # nearest-lower ladder from what this deployment can supply) or
+        # "off" (no substitution at all).  ``k_fallback`` stays the EXPLICIT
+        # list: strict resolve() only ever honours that, so tooling and the
+        # trust tests keep their fail-closed contract.
+        fallback_raw = environ.get(FQ_K_FALLBACK_ENV)
+        token = (fallback_raw or "").strip().lower()
+        self.k_fallback: tuple[int, ...] = ()
+        if fallback_raw is None or token in ("", "auto"):
+            self.k_fallback_mode = "auto"
+        elif token in ("off", "none"):
+            self.k_fallback_mode = "off"
+        else:
+            self.k_fallback_mode = "explicit"
+            try:
+                self.k_fallback = tuple(
+                    int(part)
+                    for part in fallback_raw.split(",") if part.strip()
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"{FQ_K_FALLBACK_ENV} must be a comma list of Ks (or "
+                    f"auto|off), got {fallback_raw!r}"
+                ) from exc
+        self.k_fallback_up = (
+            (environ.get(FQ_K_FALLBACK_UP_ENV) or "0").strip().lower() in _TRUE
+        )
+        self._local_k_universe: tuple[int, ...] | None = None
         self._encode_queue = encode_queue
         self._encode_queue_ready = encode_queue is not None
 
@@ -534,6 +574,12 @@ class FragmentResolver:
             "fallback_substituted": 0,
             "encode_queued": 0,
             "unavailable": 0,
+            # hardening counters: a broken local dir / unreadable cache entry
+            # / unwritable cache must degrade the attempt, never the engine
+            "local_error": 0,
+            "cache_error": 0,
+            "cache_write_error": 0,
+            "resolve_error": 0,
         }
         # (dir, layer, k) -> _LocalSegment | None
         self._local_segments: dict[tuple[Path, int, int], _LocalSegment | None] = {}
@@ -567,13 +613,26 @@ class FragmentResolver:
         if key in self._local_segments:
             return self._local_segments[key]
         seg: _LocalSegment | None = None
-        index_path = base / f"index-k{k}.json"
-        seg_path = base / self._seg_name(layer, k)
-        if index_path.exists() and seg_path.exists():
-            index = json.loads(index_path.read_text())
-            entry = index.get(str(layer))
-            if entry is not None:
-                seg = _LocalSegment(seg_path, _SegmentIndexEntry(entry))
+        try:
+            index_path = base / f"index-k{k}.json"
+            seg_path = base / self._seg_name(layer, k)
+            if index_path.exists() and seg_path.exists():
+                index = json.loads(index_path.read_text())
+                entry = (index.get(str(layer))
+                         if isinstance(index, dict) else None)
+                if entry is not None:
+                    seg = _LocalSegment(seg_path, _SegmentIndexEntry(entry))
+        except Exception:  # noqa: BLE001 — a broken local dir is a MISS
+            # Truncated index-k{K}.json, index/segment body-offset skew, an
+            # unreadable segment: this dir cannot supply the fragment, but
+            # the cache / sources / fallback ladder still can.  Memoized as
+            # None so the warning fires once per (dir, layer, K).
+            self.stats["local_error"] += 1
+            logger.warning(
+                "FQ local segment dir %s unusable for L%d K%d — treating as "
+                "a miss", base, layer, k, exc_info=True,
+            )
+            seg = None
         self._local_segments[key] = seg
         return seg
 
@@ -585,9 +644,16 @@ class FragmentResolver:
             shas = {}
             for base in self.local_dirs:
                 p = base / self._att_name(layer, k)
-                if p.exists():
-                    shas = _attestation_expert_shas(p.read_text())
-                    break
+                try:
+                    if p.exists():
+                        shas = _attestation_expert_shas(p.read_text())
+                        break
+                except OSError:  # unreadable attestation: try the next dir
+                    self.stats["local_error"] += 1
+                    logger.warning(
+                        "FQ attestation %s unreadable — skipping", p,
+                        exc_info=True,
+                    )
             self._local_sha_maps[key] = shas
         return shas
 
@@ -613,7 +679,7 @@ class FragmentResolver:
             return None  # unknown, not definitive: don't memoize
         text = source.read_text(self._att_name(layer, k))
         if text is not None:
-            self._atomic_write(path, text.encode())
+            self._cache_store(path, text.encode())
         self._att_texts[key] = text
         return text
 
@@ -757,6 +823,20 @@ class FragmentResolver:
         tmp.write_bytes(data)
         os.replace(tmp, path)
 
+    def _cache_store(self, path: Path, data: bytes) -> bool:
+        """Best-effort cache write: a full or read-only cache dir must never
+        throw away a fragment that was already fetched and verified."""
+        try:
+            self._atomic_write(path, data)
+            return True
+        except OSError:
+            self.stats["cache_write_error"] += 1
+            logger.warning(
+                "FQ cache write failed (%s) — serving uncached", path,
+                exc_info=True,
+            )
+            return False
+
     def _check_sha(
         self, payload: Any, expected: str | None, what: str
     ) -> str:
@@ -771,17 +851,114 @@ class FragmentResolver:
 
     # ------------------------------------------------------------ resolve
 
+    # -------------------------------------------------- fallback ladder
+
+    def k_universe(self) -> tuple[int, ...]:
+        """Bitrates this deployment could plausibly supply.
+
+        Manifest ``k_values`` plus every ``index-k{K}.json`` in a local
+        segment dir plus every K already consulted on a source; a deployment
+        that advertises nothing falls back to :data:`DEFAULT_K_UNIVERSE`.
+        Pure discovery — no network, no payload reads."""
+        if self._local_k_universe is None:
+            ks: set[int] = set()
+            for value in self.manifest.get("k_values") or ():
+                try:
+                    ks.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+            for base in self.local_dirs:
+                try:
+                    names = [p.name for p in base.glob("index-k*.json")]
+                except OSError:  # unreadable dir: it advertises nothing
+                    continue
+                for name in names:
+                    m = _INDEX_K_RE.match(name)
+                    if m is not None:
+                        ks.add(int(m.group(1)))
+            self._local_k_universe = tuple(sorted(ks))
+        ks = set(self._local_k_universe)
+        ks.update(k for _name, k in self._remote_indexes)
+        return tuple(sorted(ks)) or DEFAULT_K_UNIVERSE
+
+    def fallback_ladder(self, k: int) -> tuple[int, ...]:
+        """Substitute Ks to try for a missed ``k``, best first.
+
+        ``VLLM_FQ_K_FALLBACK`` verbatim when the operator listed one; empty
+        when it is ``off``; otherwise the auto ladder: nearest LOWER K first
+        (a lower bitrate always fits the memory the higher one needed), then
+        — only with ``VLLM_FQ_K_FALLBACK_UP=1`` — the nearest higher."""
+        if self.k_fallback_mode == "off":
+            return ()
+        if self.k_fallback_mode == "explicit":
+            return tuple(x for x in self.k_fallback if x != k)
+        universe = self.k_universe()
+        ladder = tuple(sorted((x for x in universe if x < k), reverse=True))
+        if self.k_fallback_up:
+            ladder += tuple(sorted(x for x in universe if x > k))
+        return ladder
+
+    # ------------------------------------------------------------ resolve
+
     def resolve(self, layer: int, expert: int, k: int) -> Fragment:
-        """Resolve one fragment through local dirs -> cache -> sources, then
-        the ``VLLM_FQ_K_FALLBACK`` ladder; emits one decision line per call
-        and enqueues a lazy encode on every substitution/miss."""
-        chain: list[str] = []
+        """Strict resolve: local dirs -> cache -> sources, then the EXPLICIT
+        ``VLLM_FQ_K_FALLBACK`` ladder; emits one decision line per call and
+        enqueues a lazy encode on every substitution/miss.
+
+        Raises :class:`FragmentUnavailableError` (or the first verification
+        error) when nothing supplies the fragment. Serving paths want
+        :meth:`resolve_best` instead — this one is the strict, auditable
+        contract for tooling."""
+        fragment = self._resolve_ladder(
+            layer, expert, k,
+            tuple(x for x in self.k_fallback if x != k),
+            strict=True,
+        )
+        assert fragment is not None  # strict=True never returns None
+        return fragment
+
+    def resolve_best(
+        self, layer: int, expert: int, k: int, *,
+        chain_out: list[str] | None = None,
+    ) -> Fragment | None:
+        """Best available fragment for ``(layer, expert)`` — **never raises**.
+
+        Order: the requested ``k``; else the nearest available lower K of
+        :meth:`fallback_ladder` (logged loudly, ``requested_k`` recorded, an
+        encode queued); else ``None`` so the caller keeps the incumbent tier.
+        Any unexpected failure inside the resolver is caught and reported as
+        ``None`` too: a missing weight must never reach an engine loop.
+
+        ``chain_out``, when given, receives the per-attempt decision
+        segments so a caller can quote the actual reason ("REJECT
+        no-attestation", "REJECT error:URLError", ...) in its own message."""
+        try:
+            return self._resolve_ladder(
+                layer, expert, k, self.fallback_ladder(k), strict=False,
+                chain_out=chain_out,
+            )
+        except BaseException:  # noqa: BLE001 — the whole point of this seam
+            self.stats["resolve_error"] += 1
+            logger.exception(
+                "FQ resolve_best L%d/e%d K%d crashed — reporting the "
+                "fragment as unavailable and keeping the incumbent tier",
+                layer, expert, k,
+            )
+            if chain_out is not None:
+                chain_out.append("RESOLVER ERROR")
+            return None
+
+    def _resolve_ladder(
+        self, layer: int, expert: int, k: int, ladder: tuple[int, ...], *,
+        strict: bool, chain_out: list[str] | None = None,
+    ) -> Fragment | None:
+        chain: list[str] = chain_out if chain_out is not None else []
         errors: list[Exception] = []
         fragment = self._resolve_k(layer, expert, k, chain, errors)
 
         substituted = False
         if fragment is None:
-            for fallback_k in self.k_fallback:
+            for fallback_k in ladder:
                 if fallback_k == k:
                     continue
                 mark = len(chain)
@@ -817,6 +994,11 @@ class FragmentResolver:
                 self.stats["fallback_substituted"] += 1
                 chain[-1] += queue_note
                 self._log_chain(logging.INFO, layer, expert, k, chain)
+                logger.warning(
+                    "FQ DEGRADED L%d/e%d: K%d unavailable, serving K%d "
+                    "instead (origin=%s)%s", layer, expert, k, fragment.k,
+                    fragment.origin, queue_note,
+                )
             else:
                 self._log_chain(logging.DEBUG, layer, expert, k, chain)
             return fragment
@@ -824,6 +1006,13 @@ class FragmentResolver:
         self.stats["unavailable"] += 1
         chain.append(f"UNAVAILABLE{queue_note}")
         self._log_chain(logging.WARNING, layer, expert, k, chain)
+        if not strict:
+            logger.error(
+                "FQ UNAVAILABLE L%d/e%d K%d: no source and no fallback K "
+                "could supply it%s — keeping the incumbent tier",
+                layer, expert, k, queue_note,
+            )
+            return None
         if errors:
             raise errors[0]
         raise FragmentUnavailableError(
@@ -832,6 +1021,53 @@ class FragmentResolver:
             f"{FQ_SOURCES_ENV} / {FQ_K_FALLBACK_ENV} or drain the "
             "lazy-encode queue)"
         )
+
+    # ------------------------------------------------------------- probe
+
+    def probe(self, layer: int, expert: int, k: int, *,
+              network: bool = True) -> bool:
+        """Could ``(layer, expert, k)`` be supplied? No payload transfer.
+
+        Local segment dirs and the content-addressed cache always count;
+        source *indexes* count when ``network`` is on (one small JSON per
+        (source, K), memoized). Used by the boot-time availability
+        projection so the tier bitmap only ever declares Ks that exist."""
+        for base in self.local_dirs:
+            seg = self._local_segment(base, layer, k)
+            if seg is not None and expert in seg.tables:
+                return True
+        try:
+            expected = self._cache_expected_sha(layer, k, expert)
+            if expected is not None and self._cache_fragment_path(
+                    expected).exists():
+                return True
+        except Exception:  # noqa: BLE001 — probing is best-effort
+            pass
+        if not network:
+            return False
+        for source in self.sources:
+            try:
+                index = self._remote_index(source, k)
+            except Exception:  # noqa: BLE001 — a down mirror proves nothing
+                continue
+            if not isinstance(index, dict):
+                continue
+            entry = index.get(str(layer))
+            if isinstance(entry, dict) and str(expert) in (
+                    entry.get("experts") or {}):
+                return True
+        return False
+
+    def available_k(self, layer: int, expert: int, k: int, *,
+                    network: bool = True) -> int | None:
+        """The K :meth:`resolve_best` would actually serve, or ``None``."""
+        if self.probe(layer, expert, k, network=network):
+            return k
+        for candidate in self.fallback_ladder(k):
+            if candidate != k and self.probe(
+                    layer, expert, candidate, network=network):
+                return candidate
+        return None
 
     @staticmethod
     def _log_chain(
@@ -884,11 +1120,23 @@ class FragmentResolver:
         chain.append(f"local({len(self.local_dirs)} dirs) MISS")
 
         # 2. fragment cache (content-addressed by trusted expected sha)
-        expected = self._cache_expected_sha(layer, k, expert)
+        try:
+            expected = self._cache_expected_sha(layer, k, expert)
+        except Exception:  # noqa: BLE001 — a broken cache is never fatal
+            self.stats["cache_error"] += 1
+            logger.warning("FQ cache lookup failed for L%d/e%d K%d",
+                           layer, expert, k, exc_info=True)
+            expected = None
         if expected is not None:
             cached = self._cache_fragment_path(expected)
-            if cached.exists():
-                payload = cached.read_bytes()
+            try:
+                payload = cached.read_bytes() if cached.exists() else None
+            except OSError:  # evicted/unreadable under us: fall through
+                self.stats["cache_error"] += 1
+                logger.warning("FQ cache entry %s unreadable", cached,
+                               exc_info=True)
+                payload = None
+            if payload is not None:
                 try:
                     self._check_sha(
                         payload,
@@ -936,12 +1184,28 @@ class FragmentResolver:
         if cached is not None:
             return cached[1]
         header_cache = self._cache_path("headers", f"{entry.sha256}.json")
+        header: dict | None = None
         if header_cache.exists():
-            header = json.loads(header_cache.read_text())
-        else:
+            try:
+                header = json.loads(header_cache.read_text())
+            except (ValueError, OSError):
+                # A poisoned cache entry (torn write, truncated file) must
+                # self-heal rather than pin this segment as unreadable
+                # forever: drop it and go back to the source.
+                self.stats["cache_error"] += 1
+                logger.warning(
+                    "FQ cached segment header %s is unreadable — discarding "
+                    "and re-fetching", header_cache, exc_info=True,
+                )
+                header = None
+                try:
+                    header_cache.unlink()
+                except OSError:
+                    pass
+        if header is None:
             raw = source.read_range(entry.file, 0, entry.body_offset)
             header, _ = parse_segment_header_bytes(raw)
-            self._atomic_write(
+            self._cache_store(
                 header_cache, json.dumps(header, separators=(",", ":")).encode()
             )
         tables = _expert_tables_from_header(header, entry)
@@ -951,18 +1215,31 @@ class FragmentResolver:
     def _tensor_table_for(
         self, layer: int, expert: int, k: int
     ) -> list[FragmentTensor] | None:
-        """Tensor table for a cached payload, from any cached segment header."""
+        """Tensor table for a cached payload, from any cached segment header.
+
+        Best-effort by construction: a mirror that is down, an index that no
+        longer parses or a header cache entry evicted between the ``exists``
+        probe and the read must degrade to "no table" (the caller then walks
+        the source chain), never propagate — this runs on the boot and live
+        swap paths."""
         for source in self.sources:
             try:
                 index = self._remote_index(source, k)
-            except Exception:  # noqa: BLE001
+                if not isinstance(index, dict) or str(layer) not in index:
+                    continue
+                entry = _SegmentIndexEntry(index[str(layer)])
+                header_cache = self._cache_path(
+                    "headers", f"{entry.sha256}.json")
+                if (entry.sha256 in self._remote_headers
+                        or header_cache.exists()):
+                    return self._remote_tables(source, entry).get(expert)
+            except Exception:  # noqa: BLE001 — try the next mirror
+                self.stats["source_error"] += 1
+                logger.warning(
+                    "FQ tensor-table lookup failed on %s for L%d K%d",
+                    getattr(source, "name", source), layer, k, exc_info=True,
+                )
                 continue
-            if index is None or str(layer) not in index:
-                continue
-            entry = _SegmentIndexEntry(index[str(layer)])
-            header_cache = self._cache_path("headers", f"{entry.sha256}.json")
-            if entry.sha256 in self._remote_headers or header_cache.exists():
-                return self._remote_tables(source, entry).get(expert)
         return None
 
     def _try_source(
@@ -971,8 +1248,20 @@ class FragmentResolver:
         """One source's attempt: trust filter -> ranged fetch -> sha check.
 
         Returns ``(fragment | None, decision segment, remembered error)``;
-        never raises — a rejected/broken source only fails itself."""
+        never raises — a rejected/broken source only fails itself. The outer
+        guard makes that literal rather than aspirational."""
         name = getattr(source, "name", str(source))
+        try:
+            return self._try_source_inner(source, layer, expert, k, name)
+        except Exception as exc:  # noqa: BLE001 — contract: never raises
+            self.stats["source_error"] += 1
+            logger.warning("FQ source %s raised for L%d/e%d K%d",
+                           name, layer, expert, k, exc_info=True)
+            return None, f"{name} REJECT error:{type(exc).__name__}", None
+
+    def _try_source_inner(
+        self, source: Any, layer: int, expert: int, k: int, name: str
+    ) -> tuple[Fragment | None, str, Exception | None]:
         try:
             index = self._remote_index(source, k)
         except Exception as exc:  # noqa: BLE001 — mirror down, try the next
@@ -1040,7 +1329,7 @@ class FragmentResolver:
                 self._count_reject("sha-mismatch")
                 return None, f"{name} REJECT sha-mismatch", exc
 
-        self._atomic_write(self._cache_fragment_path(sha), payload)
+        self._cache_store(self._cache_fragment_path(sha), payload)
         try:
             tensors = self._remote_tables(source, entry).get(expert)
         except Exception as exc:  # noqa: BLE001
@@ -1074,6 +1363,33 @@ class FragmentResolver:
         return self.materialize(
             self.resolve(layer, expert, k), name_filter=name_filter
         )
+
+    def best_tensors(
+        self,
+        layer: int,
+        expert: int,
+        k: int,
+        *,
+        name_filter: Callable[[str], bool] | None = None,
+    ) -> tuple[int, list[tuple[str, Any]]] | None:
+        """``(actual_k, [(name, tensor)])`` via :meth:`resolve_best`, or None.
+
+        The never-raising counterpart of :meth:`expert_tensors`: nothing in
+        here reaches an engine loop, and the caller is told which K it
+        actually got so tier metadata can record reality."""
+        fragment = self.resolve_best(layer, expert, k)
+        if fragment is None:
+            return None
+        try:
+            return fragment.k, self.materialize(
+                fragment, name_filter=name_filter)
+        except Exception:  # noqa: BLE001 — malformed payload == unavailable
+            self.stats["resolve_error"] += 1
+            logger.exception(
+                "FQ materialize L%d/e%d K%d failed — treating the fragment "
+                "as unavailable", layer, expert, fragment.k,
+            )
+            return None
 
     def materialize(
         self,
@@ -1112,3 +1428,65 @@ class FragmentResolver:
                 ).view(ft.shape)
             out.append((ft.name, tensor))
         return out
+
+
+# ------------------------------------------------- boot-time projection
+
+
+def project_bits_to_available(
+    resolver: FragmentResolver,
+    bits_by_layer: dict[int, Any],
+    *,
+    network: bool = True,
+    log: Callable[[str], None] | None = None,
+) -> tuple[
+    dict[int, list[int]],
+    list[tuple[int, int, int, int]],
+    list[tuple[int, int, int]],
+]:
+    """Project a policy's per-expert Ks onto what can actually be supplied.
+
+    A progressive boot is only crash-free if the tier bitmap the model was
+    configured with agrees with the Ks the resolver ends up streaming: the
+    bitmap sizes the slabs, so a fragment substituted at a *different* K
+    would fail a shape check deep inside the weight loader. Running this
+    projection BEFORE the bitmap is written closes that gap — the policy
+    only ever asks for Ks that exist, so :meth:`FragmentResolver.resolve`
+    cannot miss at boot and no substitution is needed at stream time.
+
+    Returns ``(projected, substitutions, missing)`` where ``substitutions``
+    is ``[(layer, expert, requested_k, available_k)]`` and ``missing`` is
+    ``[(layer, expert, requested_k)]`` for experts no K can supply — those
+    keep their requested K in ``projected`` (there is nothing better to say)
+    and are the operator's cue to drain the lazy-encode queue.
+    """
+    projected: dict[int, list[int]] = {}
+    substitutions: list[tuple[int, int, int, int]] = []
+    missing: list[tuple[int, int, int]] = []
+    for layer, bits in bits_by_layer.items():
+        layer = int(layer)
+        row = [int(b) for b in bits]
+        for expert, k in enumerate(row):
+            got = resolver.available_k(layer, expert, k, network=network)
+            if got == k:
+                continue
+            if got is None:
+                missing.append((layer, expert, k))
+                continue
+            row[expert] = got
+            substitutions.append((layer, expert, k, got))
+        projected[layer] = row
+    if log is not None:
+        for layer, expert, want, got in substitutions:
+            log(f"FQ projection L{layer}/e{expert}: K{want} unavailable "
+                f"-> K{got}")
+        for layer, expert, want in missing:
+            log(
+                f"FQ projection L{layer}/e{expert}: K{want} unavailable at "
+                "EVERY K — encode it (lazy_encode --drain) or add a source"
+            )
+        log(
+            f"FQ projection: {len(substitutions)} expert(s) demoted, "
+            f"{len(missing)} unsatisfiable"
+        )
+    return projected, substitutions, missing
