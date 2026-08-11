@@ -151,7 +151,29 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
     ``_maybe_apply`` returned False before touching a weight — 64 swaps
     decided across 39 layers, zero installed.
 
-    GATED ON EAGER EXECUTION, deliberately. ``admin.apply_retier`` can pass
+    DISABLED BY DEFAULT, because the first live attempt DEADLOCKED THE ENGINE.
+
+        16:55:42  FQ decide step=100 interval=1 swaps=64   <- first live apply
+        16:55:50  generation throughput 10.4 tokens/s
+        16:56:00  0.0 tokens/s
+        16:56:43  No available shared memory broadcast block found in 60s
+
+    The reasoning that led here was about CUDA-graph replay, and that was the
+    wrong hazard. ``engine.stage()`` reads hundreds of MB of fragments
+    SYNCHRONOUSLY, inside the model runner's step, INDEPENDENTLY ON EVERY TP
+    RANK. Four ranks doing unequal amounts of IO at an implicit collective
+    boundary drift apart, and the shared-memory broadcast starves. Eager
+    execution does not help: this is TP lockstep, not graph safety.
+
+    The admin path does not have this problem because it is coordinated from
+    OUTSIDE the step -- the router drains, then dispatches to every rank via
+    collective_rpc, then gathers. That is the shape an automatic apply needs
+    too: propose inside the step, apply outside it, together.
+
+    Until that exists, ``VLLM_FQ_LIVE_APPLY=1`` binds this anyway for
+    experiments on a serve nobody is depending on. It is not a supported mode.
+
+    GATED ON EAGER EXECUTION as well, for when it is re-enabled. ``admin.apply_retier`` can pass
     ``quiesce=nullcontext()`` because the HTTP request drains the engine
     first (``drain_mode="wait"``). The loop has no such drain: it decides
     inside the runner's step. With ``enforce_eager`` nothing is replaying and
@@ -166,7 +188,10 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
     import logging
 
     log = logging.getLogger(__name__)
-    mode = os.environ.get(FQ_LIVE_APPLY_ENV, "auto").strip().lower()
+    # DEFAULT OFF. "auto" (bind whenever eager) deadlocked a live TP4 serve on
+    # its first apply -- see the block comment below. Inline apply is opt-in
+    # until it is coordinated across ranks.
+    mode = os.environ.get(FQ_LIVE_APPLY_ENV, "off").strip().lower()
     if mode in ("0", "off", "false"):
         log.info("FQ live apply disabled by %s=%s — proposals only",
                  FQ_LIVE_APPLY_ENV, mode)
