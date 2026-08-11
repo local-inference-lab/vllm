@@ -48,6 +48,9 @@ import numpy as np
 
 from vllm.model_executor.layers.quantization.exl3_fungible import policy as P
 from vllm.model_executor.layers.quantization.exl3_fungible import (
+    occupancy_table as OT,
+)
+from vllm.model_executor.layers.quantization.exl3_fungible import (
     decision_log as DL,
 )
 from vllm.model_executor.layers.quantization.exl3_fungible.stats import (
@@ -294,6 +297,11 @@ class FungibleQuantState:
         # Policy layer rows: sorted numeric layer ids from the document.
         self.layers = sorted(int(k) for k in policy_doc["bits_per_expert"])
         self.num_experts = collector.num_experts
+        # Operator-facing composition table: remembered so each print
+        # can show what moved since the last one.
+        self._last_composition: dict | None = None
+        self._table_every = int(
+            os.environ.get('VLLM_FQ_TABLE_EVERY_INTERVALS', '10'))
         self._collector_layer_map = self._map_collector_layers()
 
         self.tier_of = np.asarray(
@@ -321,6 +329,13 @@ class FungibleQuantState:
             for layer in self.layers:
                 self.metrics.swaps_total.labels(layer=str(layer)).inc(0)
             self._export_occupancy()
+
+        # The composition the checkpoint actually booted with. Printed in
+        # full (not diff-only): there is nothing to diff against yet, and an
+        # operator needs the starting shape on record in the log so a later
+        # diff can be interpreted without re-deriving it.
+        self.log_composition(title="expert composition at startup",
+                             diff_only=False)
 
     # ---------------------------------------------------------------- setup
 
@@ -439,6 +454,11 @@ class FungibleQuantState:
         """One observe->decide->explain->persist cycle; returns the
         decision record."""
         self._intervals_run += 1
+        if (self._table_every > 0
+                and self._intervals_run % self._table_every == 0):
+            self.log_composition(
+                title=f'expert composition @ interval {self._intervals_run}',
+                diff_only=True)
         stats = self._read_stats()
         dwell = self._real_steps - self._entered_step
 
@@ -565,6 +585,40 @@ class FungibleQuantState:
                 self.metrics.tier_occupancy.labels(
                     layer=str(layer), tier=f"k{tier}").set(
                         int((self.tier_of[row] == tier).sum()))
+
+    def _occupancy_map(self) -> dict[int, dict[int, int]]:
+        """``{layer: {k: expert_count}}`` for the operator-facing table."""
+        out: dict[int, dict[int, int]] = {}
+        for row, layer in enumerate(self.layers):
+            counts: dict[int, int] = {}
+            for tier in OT.TIERS:
+                n = int((self.tier_of[row] == tier).sum())
+                if n or tier in (P.K3, P.K4):
+                    counts[tier] = n
+            out[int(layer)] = counts
+        return out
+
+    def log_composition(self, *, title: str, diff_only: bool) -> None:
+        """Print the layer x K-tier matrix to the engine log.
+
+        A scrape target answers "what is the occupancy" but not "what changed
+        since I last looked", and an operator cannot eyeball Prometheus at
+        3am. Rank 0 only: all TP ranks hold the same policy, so N identical
+        90-row tables would be pure noise.
+        """
+        if self.rank not in (0, None):
+            return
+        cur = self._occupancy_map()
+        try:
+            text = OT.render(cur, self._last_composition, title=title,
+                             num_experts=int(self.num_experts),
+                             diff_only=diff_only)
+        except Exception:  # noqa: BLE001 - telemetry must never kill a serve
+            logger.exception("FQ composition table failed to render")
+            return
+        for line in text.splitlines():
+            logger.info("%s", line)
+        self._last_composition = cur
 
     def _export_metrics(self, record: dict, swaps: list,
                         jac: float | None) -> None:

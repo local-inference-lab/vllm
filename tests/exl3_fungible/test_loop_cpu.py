@@ -42,7 +42,10 @@ except ImportError:  # standalone: load by path with a stub package
 
     _pkg = types.ModuleType(_pkg_name)
     sys.modules[_pkg_name] = _pkg
-    for _sub in ("policy", "stats", "store", "decision_log", "loop"):
+    # occupancy_table must precede loop: loop imports it, and a stub package
+    # missing the attribute falls through to the real vllm import chain.
+    for _sub in ("policy", "stats", "store", "decision_log",
+                 "occupancy_table", "loop"):
         _mod = _load(f"{_pkg_name}.{_sub}", _dir / f"{_sub}.py")
         setattr(_pkg, _sub, _mod)
     P, S, FL = _pkg.policy, _pkg.store, _pkg.loop
@@ -472,3 +475,95 @@ def test_maybe_init_fq_state_degrades_to_collector(monkeypatch, tmp_path):
     got2 = fq_integration.maybe_init_fq_state(runner2)
     assert isinstance(got2, FL.FungibleQuantState)
     got2.step(is_dummy=True)  # runner call contract holds
+
+
+# ------------------------------------------------------- composition table
+class _CaptureLog:
+    """Capture loop.py's own logger.
+
+    vLLM configures its loggers with propagate=False, so pytest's caplog
+    (which listens on the root logger) sees nothing — the table was being
+    emitted correctly while the assertion read an empty string.
+    """
+
+    def __init__(self):
+        self.lines = []
+
+    def __enter__(self):
+        import logging
+
+        class _H(logging.Handler):
+            def __init__(self, sink):
+                super().__init__()
+                self.sink = sink
+
+            def emit(self, record):
+                self.sink.append(record.getMessage())
+
+        self._h = _H(self.lines)
+        self._logger = FL.logger
+        self._prev = self._logger.level
+        self._logger.addHandler(self._h)
+        self._logger.setLevel("INFO")
+        return self
+
+    def __exit__(self, *exc):
+        self._logger.removeHandler(self._h)
+        self._logger.setLevel(self._prev)
+        return False
+
+    @property
+    def text(self):
+        return "\n".join(self.lines)
+
+
+def test_composition_table_printed_at_startup(tmp_path):
+    """The boot shape must be on record, in full, before anything moves."""
+    with _CaptureLog() as cap:
+        make_state(tmp_path)
+    assert "expert composition at startup" in cap.text
+    assert "mean bits/expert" in cap.text
+    for layer in LAYERS:
+        assert any(line.strip().startswith(str(layer))
+                   for line in cap.text.splitlines()), f"layer {layer} missing"
+
+
+def test_composition_table_periodic_is_diff_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_FQ_TABLE_EVERY_INTERVALS", "1")
+    state, routers = make_state(tmp_path, interval=4)
+    with _CaptureLog() as cap:
+        drive_hot_interval(state, routers)
+    assert "expert composition @ interval" in cap.text
+    # dryrun proposes without mutating membership, so the table must report
+    # "nothing moved" explicitly rather than printing an empty table that
+    # would read as broken telemetry
+    assert ("no tier changes" in cap.text
+            or "unchanged layers omitted" in cap.text)
+
+
+def test_composition_table_can_be_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_FQ_TABLE_EVERY_INTERVALS", "0")
+    state, routers = make_state(tmp_path, interval=4)
+    with _CaptureLog() as cap:
+        drive_hot_interval(state, routers)
+    assert "expert composition @ interval" not in cap.text
+
+
+def test_composition_table_reflects_a_real_membership_change(tmp_path):
+    """A mutated membership must show up as a signed per-tier delta."""
+    state, _ = make_state(tmp_path)
+    state.log_composition(title="before", diff_only=False)
+    state.tier_of[0][5] = P.K4          # promote expert 5 in the first layer
+    with _CaptureLog() as cap:
+        state.log_composition(title="after", diff_only=True)
+    assert "-1 K3" in cap.text and "+1 K4" in cap.text
+
+
+def test_composition_table_failure_never_kills_the_serve(tmp_path,
+                                                         monkeypatch):
+    """Telemetry is not allowed to take down inference."""
+    state, _ = make_state(tmp_path)
+    monkeypatch.setattr(FL.OT, "render",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("boom")))
+    state.log_composition(title="x", diff_only=False)  # must not raise
