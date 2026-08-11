@@ -191,7 +191,7 @@ def _tracked_source_sha256(repository: Path) -> str:
         mode, _, stage = metadata.split()
         assert stage == "0"
         entries.append((relative.encode(), mode.encode()))
-    digest = hashlib.sha256(b"kquant-tracked-worktree-sha256-v1\0")
+    digest = hashlib.sha256(b"qsrt-tracked-worktree-sha256-v1\0")
     for relative, mode in sorted(entries):
         content = (repository / relative.decode()).read_bytes()
         digest.update(mode)

@@ -816,7 +816,7 @@ def snapshot_tracked_tree(root_value, snapshot):
     snapshot.mkdir(mode=0o700)
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
-    digest = hashlib.sha256(b"kquant-tracked-worktree-sha256-v1\0")
+    digest = hashlib.sha256(b"qsrt-tracked-worktree-sha256-v1\0")
     root_fd = os.open(root, directory_flags)
     snapshot_root_fd = os.open(snapshot, directory_flags)
     try:
