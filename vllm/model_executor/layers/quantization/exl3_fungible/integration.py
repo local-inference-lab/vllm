@@ -279,49 +279,54 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
             return False
 
     def apply_fn(proposed_doc, swaps) -> bool:
-        key = _plan_key(swaps)
-        staged = _pending.get("staged") if _pending.get("key") == key else None
+        fut = _pending.get("future")
 
-        if staged is None:
-            # New plan: start staging OUT OF BAND and decline this interval.
-            # The same plan is re-proposed while the routing signal holds, so
-            # the next interval picks up the finished batch.
-            if _pending.get("future") is not None and _pending.get("key") == key:
-                ready = _pending["future"].done()
-            else:
-                if len(swaps) > int(engine.max_pairs):
-                    log.error(
-                        "FQ live apply: plan has %d pairs but staging holds "
-                        "%d — raise the loop cap or max_pairs together; "
-                        "skipping", len(swaps), int(engine.max_pairs))
-                    return False
-                plan = _swap.SwapPlan([
-                    (int(state.layers[row]), int(e_out), int(e_in))
-                    for row, e_out, e_in in swaps])
-                _pending.clear()
-                _pending["key"] = key
-                _pending["future"] = _stager.submit(
-                    engine.stage, plan, fail_atomic=True,
-                    on_unavailable="drop")
-                log.info("FQ live apply: staging %d swap(s) off-step",
-                         len(swaps))
-                ready = False
-            if ready:
-                try:
-                    _pending["staged"] = _pending["future"].result()
-                except Exception:  # noqa: BLE001
-                    log.exception("FQ live apply: staging failed")
-                    _pending.clear()
-                    return False
-                staged = _pending["staged"]
-            else:
-                # Vote anyway so every rank takes the same branch.
-                _all_ranks_ready(False)
+        if fut is None:
+            # Nothing in flight: start staging THIS plan and decline the
+            # interval. Staging is the slow part and it does not belong in
+            # the step.
+            if len(swaps) > int(engine.max_pairs):
+                log.error(
+                    "FQ live apply: plan has %d pairs but staging holds %d — "
+                    "raise the loop cap or max_pairs together; skipping",
+                    len(swaps), int(engine.max_pairs))
                 return False
+            plan = _swap.SwapPlan([
+                (int(state.layers[row]), int(e_out), int(e_in))
+                for row, e_out, e_in in swaps])
+            _pending["key"] = _plan_key(swaps)
+            _pending["future"] = _stager.submit(
+                engine.stage, plan, fail_atomic=True, on_unavailable="drop")
+            log.info("FQ live apply: staging %d swap(s) off-step", len(swaps))
+            _all_ranks_ready(False)     # keep the collective in lockstep
+            return False
 
-        # Every rank must agree before a single weight moves.
+        if not fut.done():
+            _all_ranks_ready(False)
+            return False
+
+        # Staging finished. Apply it EVEN IF the newest proposal has drifted.
+        #
+        # The first version keyed the staged batch on the exact plan and
+        # discarded it whenever the proposal changed. The proposal changes
+        # every interval — the desired set moves by an expert or two — so the
+        # batch was thrown away and re-staged forever: 40 staging events, 0
+        # applies, and hundreds of MB of fragment IO per interval for nothing.
+        #
+        # A staged batch is a valid improvement, not a contract. One interval
+        # of staleness costs at most a couple of experts; the engine still
+        # validates cardinality, and the next interval re-proposes from
+        # current stats anyway.
+        try:
+            staged = fut.result()
+        except Exception:  # noqa: BLE001
+            log.exception("FQ live apply: staging failed")
+            _pending.clear()
+            _all_ranks_ready(False)
+            return False
+
         if not _all_ranks_ready(True):
-            log.info("FQ live apply: staged locally, waiting for all ranks")
+            log.info("FQ live apply: staged here, waiting for all ranks")
             return False
 
         dropped = tuple(getattr(staged, "dropped", ()) or ())
@@ -329,7 +334,8 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
             log.warning("FQ live apply: %d pair(s) dropped for missing "
                         "fragments", len(dropped))
         eff = getattr(staged, "plan", None)
-        if eff is not None and not getattr(eff, "swaps", ()):
+        n = len(getattr(eff, "swaps", ()) or ())
+        if not n:
             _pending.clear()
             return False
         import contextlib
@@ -341,7 +347,6 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
             policy_doc=dict(proposed_doc),
         )
         ok = bool(getattr(report, "ok", True))
-        n = len(getattr(eff, "swaps", swaps))
         log.info("FQ live apply: %d swap(s) %s", n,
                  "INSTALLED" if ok else "REFUSED")
         _pending.clear()
