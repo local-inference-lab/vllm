@@ -58,6 +58,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -1795,6 +1796,33 @@ def memory_model_from_engine(engine: Any) -> MemoryModel | None:
         return None
 
 
+_LAYER_IN_NAME = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+
+def _module_layer_id(module: Any) -> int | None:
+    """The MoE layer index of a module carrying ``exl3_mixed_trellis``.
+
+    ``layer_id`` first, but it is NOT present on the module we need: exl3.py
+    attaches the mixed-trellis dict to the fused-experts module, and
+    fused_moe/layer.py identifies that module by ``layer_name = prefix``
+    ("model.layers.10.mlp.experts") with no numeric id. Requiring ``layer_id``
+    therefore skipped every mixed layer on a real serve and
+    :func:`build_swap_engine` returned None, so POST /fq/retier answered
+    "fq_not_active — the serve is uniform-K" on a checkpoint with 75 mixed
+    layers. The router modules the stats collector binds DO carry ``layer_id``,
+    which is why the collector worked and the swap engine did not.
+    """
+    layer_id = getattr(module, "layer_id", None)
+    if layer_id is not None:
+        return int(layer_id)
+    name = getattr(module, "layer_name", None) or getattr(
+        module, "prefix", None)
+    if not name:
+        return None
+    m = _LAYER_IN_NAME.search(str(name))
+    return int(m.group(1)) if m else None
+
+
 def build_swap_engine(model_runner: Any, *, rank: int = 0,
                       max_pairs: int = DEFAULT_MAX_ITEMS,
                       environ: Mapping[str, str] | None = None) -> Any:
@@ -1815,7 +1843,7 @@ def build_swap_engine(model_runner: Any, *, rank: int = 0,
         mixed = getattr(module, "exl3_mixed_trellis", None)
         if mixed is None:
             continue
-        layer_id = getattr(module, "layer_id", None)
+        layer_id = _module_layer_id(module)
         if layer_id is None:
             continue
         layers[int(layer_id)] = SW.MixedLayerState.from_exl3_mixed_trellis(

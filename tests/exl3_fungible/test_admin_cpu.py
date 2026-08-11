@@ -1420,3 +1420,52 @@ def test_worker_describe_reports_state(tmp_path, gates_on):
 def test_fq_worker_admin_mixin_matches_the_module_functions():
     for name in ("fq_admin_describe", "fq_admin_plan", "fq_admin_apply"):
         assert callable(getattr(A.FqWorkerAdmin, name))
+
+
+# --------------------------------------------------------------------------
+# Layer-id discovery for the swap engine.
+#
+# POST /fq/retier answered "fq_not_active — the serve is uniform-K" on a live
+# GLM-5.2 with 75 mixed layers, because build_swap_engine required layer_id on
+# the module carrying exl3_mixed_trellis. exl3.py attaches that dict to the
+# fused-experts module, which fused_moe/layer.py names via
+# layer_name = "model.layers.10.mlp.experts" and gives no numeric id. The
+# router modules the stats collector binds DO carry layer_id, which is exactly
+# why the collector worked and the swap engine silently found nothing.
+
+
+class _Mod:
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+def test_layer_id_preferred_when_present():
+    assert A._module_layer_id(_Mod(layer_id=7, layer_name="whatever")) == 7
+
+
+def test_layer_id_parsed_from_the_fused_experts_layer_name():
+    """The case that actually broke."""
+    m = _Mod(layer_name="model.layers.10.mlp.experts")
+    assert A._module_layer_id(m) == 10
+
+
+def test_layer_id_parsed_from_prefix_when_that_is_the_only_name():
+    assert A._module_layer_id(_Mod(prefix="model.layers.3.mlp.experts")) == 3
+
+
+def test_two_digit_and_boundary_layers_parse():
+    for n in (0, 3, 9, 10, 49, 77, 78):
+        m = _Mod(layer_name=f"model.layers.{n}.mlp.experts")
+        assert A._module_layer_id(m) == n
+
+
+def test_unnamed_module_is_skipped_not_guessed():
+    assert A._module_layer_id(_Mod()) is None
+    assert A._module_layer_id(_Mod(layer_name="model.embed_tokens")) is None
+
+
+def test_a_number_elsewhere_in_the_name_is_not_a_layer_id():
+    """"layers.N" must be matched as a path segment; a bare digit anywhere
+    would happily read an expert index as a layer."""
+    assert A._module_layer_id(_Mod(layer_name="model.experts.12.w13")) is None
