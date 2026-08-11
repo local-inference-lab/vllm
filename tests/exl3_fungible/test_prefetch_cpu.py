@@ -736,3 +736,79 @@ def test_keep_layers_retains_the_file_AND_the_prefetch_handle(tmp_path,
     assert seg.exists(), "kept layer was unlinked"
     assert r._prefetched.get((4, 4)) == seg, (
         "handle dropped: a later swap would re-download instead of slicing")
+
+
+# ------------------------------ transient faults must not permanently degrade
+class _FlakyOpen:
+    """Fails `fail_times` with a transient error, then succeeds."""
+
+    def __init__(self, payload: bytes, fail_times: int, exc=None):
+        import urllib.error
+        self.payload = payload
+        self.left = fail_times
+        self.calls = 0
+        self.exc = exc or urllib.error.URLError("Network is unreachable")
+
+    def __call__(self, relpath, headers):
+        self.calls += 1
+        if self.left > 0:
+            self.left -= 1
+            raise self.exc
+        import io
+        return io.BytesIO(self.payload)
+
+
+def test_attestation_fetch_retries_a_transient_network_error(monkeypatch):
+    """Ranged reads retried; whole-object reads did NOT, and the asymmetry
+    was expensive. One blip fetching an ATTESTATION is indistinguishable from
+    'this source has no attestation', so the expert is permanently degraded a
+    tier. Observed live: URLError(Errno 101) -> 'FQ DEGRADED L5/e2: K4
+    unavailable, serving K3 instead'."""
+    src = FR.HfSource("org/repo")
+    flaky = _FlakyOpen(b'{"ok": true}', fail_times=2)
+    monkeypatch.setattr(FR.HfSource, "_open", flaky)
+    monkeypatch.setattr(FR.HfSource, "_BACKOFF", 0.0)
+    assert src.read_json("index-k3.json") == {"ok": True}
+    assert flaky.calls == 3, "did not retry the transient failure"
+
+
+def test_read_text_retries_too(monkeypatch):
+    src = FR.HfSource("org/repo")
+    flaky = _FlakyOpen(b"line", fail_times=1)
+    monkeypatch.setattr(FR.HfSource, "_open", flaky)
+    monkeypatch.setattr(FR.HfSource, "_BACKOFF", 0.0)
+    assert src.read_text("attestations/layer-005.k4.jsonl") == "line"
+
+
+def test_a_404_is_a_miss_and_is_not_retried(monkeypatch):
+    """Absence is an answer, not a fault; retrying it wastes four backoffs
+    per expert."""
+    import urllib.error
+    src = FR.HfSource("org/repo")
+    calls = {"n": 0}
+
+    def not_found(self, relpath, headers):   # bound: a plain function gets self
+        calls["n"] += 1
+        raise urllib.error.HTTPError(relpath, 404, "nope", {}, None)
+
+    monkeypatch.setattr(FR.HfSource, "_open", not_found)
+    assert src.read_json("missing.json") is None
+    assert calls["n"] == 1
+
+
+def test_offline_is_not_retried_on_whole_object_reads(monkeypatch):
+    src = FR.HfSource("org/repo")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.delenv("FQ_ALLOW_NETWORK", raising=False)
+    with pytest.raises(FR.OfflineError):
+        src.read_json("index-k3.json")
+
+
+def test_exhausted_retries_raise_rather_than_report_absence(monkeypatch):
+    """The dangerous failure would be returning None: that reads as 'no
+    attestation' and silently downgrades the expert."""
+    src = FR.HfSource("org/repo")
+    monkeypatch.setattr(FR.HfSource, "_open", _FlakyOpen(b"x", fail_times=99))
+    monkeypatch.setattr(FR.HfSource, "_BACKOFF", 0.0)
+    with pytest.raises(OSError, match="after 4 attempts"):
+        src.read_json("index-k3.json")

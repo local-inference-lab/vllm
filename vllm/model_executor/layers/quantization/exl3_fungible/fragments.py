@@ -444,27 +444,51 @@ class HfSource:
         req = urllib.request.Request(self._url(relpath), headers=headers)
         return urllib.request.urlopen(req, timeout=self.timeout)
 
-    def read_json(self, relpath: str) -> dict | None:
+    def _read_all(self, relpath: str) -> bytes | None:
+        """Fetch a whole small object, retrying the retryable.
+
+        Ranged reads already retried; these did NOT, and the asymmetry was
+        expensive. A single transient blip while fetching an ATTESTATION is
+        indistinguishable, to the caller, from "this source has no
+        attestation" -- so the expert is permanently degraded a tier for the
+        lifetime of the process. Observed live:
+
+            REJECT at att_decision: URLError(Errno 101 Network is unreachable)
+            FQ DEGRADED L5/e2: K4 unavailable, serving K3 instead
+
+        A transient fault must not cause a permanent downgrade.
+        """
+        import http.client
         import urllib.error
 
-        try:
-            with self._open(relpath, {}) as r:
-                return json.loads(r.read())
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                return None
-            raise
+        last: Exception | None = None
+        for attempt in range(self._RETRIES):
+            try:
+                with self._open(relpath, {}) as r:
+                    return r.read()
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    return None        # a genuine MISS, not a fault
+                raise
+            except OfflineError:
+                raise                  # configuration, not a fault
+            except (http.client.IncompleteRead,
+                    http.client.RemoteDisconnected, urllib.error.URLError,
+                    TimeoutError, ConnectionError, OSError) as exc:
+                last = exc
+                if attempt + 1 < self._RETRIES:
+                    time.sleep(self._BACKOFF * (2 ** attempt))
+        raise OSError(
+            f"{self.name}: {relpath} failed after {self._RETRIES} attempts: "
+            f"{type(last).__name__}: {last}")
+
+    def read_json(self, relpath: str) -> dict | None:
+        raw = self._read_all(relpath)
+        return None if raw is None else json.loads(raw)
 
     def read_text(self, relpath: str) -> str | None:
-        import urllib.error
-
-        try:
-            with self._open(relpath, {}) as r:
-                return r.read().decode()
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                return None
-            raise
+        raw = self._read_all(relpath)
+        return None if raw is None else raw.decode()
 
     # A progressive boot issues one ranged read PER EXPERT — 19,200 of them for
     # GLM-5.2. At that volume a transient failure is not an edge case, it is a
