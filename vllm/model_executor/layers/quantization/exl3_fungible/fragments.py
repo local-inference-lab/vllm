@@ -847,6 +847,10 @@ class FragmentResolver:
         # (source_name, layer, k) -> attestation text | None (None=definitive)
         # (layer, k) -> whole prefetched segment on disk, for uniform layers
         self._prefetched: dict[tuple[int, int], Path] = {}
+        self._reject_traced: set = set()
+        # Prefetch runs on a thread pool now; the memo dicts below
+        # were written for a single thread.
+        self._memo_lock = threading.RLock()
         self._att_texts: dict[tuple[str, int, int], str | None] = {}
         # (source_name, layer, k) -> (shas | None, reject reason | None)
         self._att_evals: dict[
@@ -1712,6 +1716,25 @@ class FragmentResolver:
                 continue
         return None
 
+    def _reject(self, name: str, exc: Exception, where: str) -> str:
+        """A rejection string that can actually be diagnosed.
+
+        `REJECT error:KeyError` names the exception TYPE and discards its
+        argument -- so a boot that degraded 190 experts to K2 produced 270
+        identical, contentless lines and the cause had to be reverse-
+        engineered from the source. The key IS the diagnosis. Also emit one
+        traceback per (source, site) so the first occurrence is debuggable
+        without flooding a 75-layer boot with 19,200 stacks.
+        """
+        detail = str(exc).strip().replace("\n", " ")[:160]
+        seen_key = (name, where, type(exc).__name__)
+        if seen_key not in self._reject_traced:
+            self._reject_traced.add(seen_key)
+            logger.warning("FQ %s REJECT at %s: %s: %s", name, where,
+                           type(exc).__name__, detail, exc_info=True)
+        out = f"{name} REJECT error:{type(exc).__name__}"
+        return f"{out}({detail})" if detail else out
+
     def _try_source(
         self, source: Any, layer: int, expert: int, k: int
     ) -> tuple[Fragment | None, str, Exception | None]:
@@ -1727,7 +1750,7 @@ class FragmentResolver:
             self.stats["source_error"] += 1
             logger.warning("FQ source %s raised for L%d/e%d K%d",
                            name, layer, expert, k, exc_info=True)
-            return None, f"{name} REJECT error:{type(exc).__name__}", None
+            return None, self._reject(name, exc, "try_source"), None
 
     def _try_source_inner(
         self, source: Any, layer: int, expert: int, k: int, name: str
@@ -1736,7 +1759,7 @@ class FragmentResolver:
             index = self._remote_index(source, k)
         except Exception as exc:  # noqa: BLE001 — mirror down, try the next
             self.stats["source_error"] += 1
-            return None, f"{name} REJECT error:{type(exc).__name__}", None
+            return None, self._reject(name, exc, "remote_index"), None
         if index is None or str(layer) not in index:
             self.stats["source_miss"] += 1
             return None, f"{name} MISS", None
@@ -1750,7 +1773,7 @@ class FragmentResolver:
                 shas, reason = self._att_decision(source, layer, k)
             except Exception as exc:  # noqa: BLE001
                 self.stats["source_error"] += 1
-                return None, f"{name} REJECT error:{type(exc).__name__}", None
+                return None, self._reject(name, exc, "att_decision"), None
             if shas is None:
                 if self.trust_enabled:
                     self._count_reject(reason or "no-attestation")
@@ -1793,7 +1816,7 @@ class FragmentResolver:
                 payload = source.read_range(entry.file, start, stop)
         except Exception as exc:  # noqa: BLE001
             self.stats["source_error"] += 1
-            return None, f"{name} REJECT error:{type(exc).__name__}", None
+            return None, self._reject(name, exc, "expert_range/read_range"), None
         self.stats["bytes_fetched"] += len(payload)
         if self.verify == "off" and expected is None:
             sha = hashlib.sha256(payload).hexdigest()
@@ -1813,7 +1836,7 @@ class FragmentResolver:
             tensors = self._remote_tables(source, entry).get(expert)
         except Exception as exc:  # noqa: BLE001
             self.stats["source_error"] += 1
-            return None, f"{name} REJECT error:{type(exc).__name__}", None
+            return None, self._reject(name, exc, "remote_tables"), None
         if tensors is None:
             self.stats["source_miss"] += 1
             return None, f"{name} MISS", None

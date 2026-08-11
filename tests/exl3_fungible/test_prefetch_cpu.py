@@ -574,3 +574,46 @@ def test_monitor_thread_is_daemon_so_it_cannot_hang_shutdown():
         finally:
             m.stop()
             FR._DownloadMonitor._instance = None
+
+
+# ------------------------------------------------------ diagnosable rejections
+def test_reject_message_carries_the_exception_argument(tmp_path):
+    """`REJECT error:KeyError` named the TYPE and threw away the argument. A
+    boot that degraded 190 experts to K2 produced 270 identical contentless
+    lines, and the cause had to be reverse-engineered from the source. The key
+    IS the diagnosis."""
+    r = _resolver(tmp_path)
+    msg = r._reject("hf:org/repo", KeyError("expert 50 not in segment index "
+                                            "for layer-004.k4.safetensors"),
+                    "remote_tables")
+    assert "KeyError" in msg
+    assert "expert 50" in msg, f"argument dropped: {msg}"
+    assert "layer-004.k4.safetensors" in msg
+
+
+def test_reject_traces_once_per_site_not_per_expert(tmp_path):
+    """19,200 experts must not produce 19,200 stacks."""
+    r = _resolver(tmp_path)
+    for _ in range(5):
+        r._reject("hf:x", KeyError("k"), "remote_tables")
+    assert len(r._reject_traced) == 1
+    r._reject("hf:x", KeyError("k"), "att_decision")
+    assert len(r._reject_traced) == 2
+
+
+def test_reject_detail_is_bounded(tmp_path):
+    """A huge repr must not flood a boot log line."""
+    r = _resolver(tmp_path)
+    msg = r._reject("hf:x", ValueError("y" * 5000), "remote_index")
+    assert len(msg) < 300
+
+
+def test_reject_survives_an_exception_with_no_message(tmp_path):
+    r = _resolver(tmp_path)
+    assert "KeyError" in r._reject("hf:x", KeyError(), "remote_index")
+
+
+def test_resolver_has_a_lock_for_its_memo_dicts(tmp_path):
+    """Prefetch runs on a thread pool now; the memo dicts were written for a
+    single thread."""
+    assert hasattr(_resolver(tmp_path), "_memo_lock")
