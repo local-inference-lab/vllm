@@ -294,6 +294,10 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
             plan = _swap.SwapPlan([
                 (int(state.layers[row]), int(e_out), int(e_in))
                 for row, e_out, e_in in swaps])
+            # Keep the global->row mapping: the loop indexes tier_of by ROW
+            # and must be told what was installed in its own coordinates.
+            _pending["rows"] = {int(l): int(r)
+                                for r, l in enumerate(state.layers)}
             _pending["key"] = _plan_key(swaps)
             _pending["future"] = _stager.submit(
                 engine.stage, plan, fail_atomic=True, on_unavailable="drop")
@@ -368,8 +372,17 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
         ok = bool(getattr(report, "ok", True))
         log.info("FQ live apply: %d swap(s) %s", n,
                  "INSTALLED" if ok else "REFUSED")
+        rows = _pending.get("rows") or {}
         _pending.clear()
-        return ok
+        if not ok:
+            return False
+        # Report what the DEVICE took, in the loop's row coordinates. Returning
+        # a bare True would let the loop record this interval's proposal as the
+        # new incumbent even though an older batch was installed — and the next
+        # interval would then propose a swap off an expert that is not
+        # resident, which stage() rejects outright.
+        return [(rows[int(l)], int(e_out), int(e_in))
+                for l, e_out, e_in in eff.swaps if int(l) in rows]
 
     state.apply_fn = apply_fn
     log.info("FQ live apply BOUND: %d mixed layers, rank %d — decisions will "

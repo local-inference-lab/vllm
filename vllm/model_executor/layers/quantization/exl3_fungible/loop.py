@@ -1016,7 +1016,16 @@ class FungibleQuantState:
                     "proposal JSON")
             return False
         try:
-            ok = bool(self.apply_fn(proposed_doc, swaps))
+            # apply_fn may return the swaps it ACTUALLY installed instead of
+            # a bare bool. That matters: an asynchronous backend can install a
+            # batch staged an interval earlier, which is NOT the same set as
+            # `swaps`. Trusting `proposed_tier` in that case makes tier_of
+            # describe a device state that never existed, and the very next
+            # interval proposes a move off an expert that is not there:
+            #   ValueError: invalid swap (5, 82, 3): e_out must be resident K4
+            result = self.apply_fn(proposed_doc, swaps)
+            ok = bool(result)
+            installed = result if isinstance(result, (list, tuple)) else None
         except Exception:  # noqa: BLE001 — a supply failure is not a crash
             self.apply_failures += 1
             logger.exception(
@@ -1026,6 +1035,20 @@ class FungibleQuantState:
                 self._step, len(swaps), self.apply_failures)
             return False
         if ok:
+            if installed is not None:
+                # Rebuild the incumbent from what the device actually took, so
+                # tier_of and the layer states cannot drift apart.
+                applied_tier = self.tier_of.copy()
+                for row, e_out, e_in in installed:
+                    applied_tier[int(row), int(e_out)] = K3
+                    applied_tier[int(row), int(e_in)] = K4
+                if not np.array_equal(applied_tier, proposed_tier):
+                    logger.info(
+                        "FQ apply installed %d swap(s) that differ from this "
+                        "interval's proposal — adopting the INSTALLED "
+                        "membership, not the proposed one", len(installed))
+                proposed_tier = applied_tier
+                proposed_doc = self._doc_for(applied_tier, list(installed))
             swapped = self.tier_of != proposed_tier
             self.tier_of = proposed_tier
             self._entered_step = np.where(

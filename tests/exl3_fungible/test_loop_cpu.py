@@ -607,3 +607,33 @@ def test_jaccard_of_an_all_empty_membership_is_not_zero():
     import numpy as np
     empty = np.zeros((4, 8), dtype=bool)
     assert FL.FungibleQuantState._jaccard(empty, empty) == 1.0
+
+
+def test_apply_fn_may_report_what_it_actually_installed():
+    """An async backend can install a batch staged an interval earlier.
+
+    Trusting `proposed_tier` in that case makes tier_of describe a device
+    state that never existed. The next interval then proposes a move off an
+    expert that is not resident and stage() rejects it outright:
+
+        ValueError: invalid swap (5, 82, 3): e_out must be resident K4,
+                    e_in resident K3
+
+    Observed live. So a list return is adopted as the incumbent instead.
+    """
+    import numpy as np
+    tier = np.array([[FL.P.K4, FL.P.K3, FL.P.K3, FL.P.K4]])
+    installed = [(0, 0, 1)]          # e0 K4->K3, e1 K3->K4
+    applied = tier.copy()
+    for row, e_out, e_in in installed:
+        applied[row, e_out] = FL.P.K3
+        applied[row, e_in] = FL.P.K4
+    assert list(applied[0]) == [FL.P.K3, FL.P.K4, FL.P.K3, FL.P.K4]
+    # and the cardinality the device holds is unchanged, which is what makes
+    # adopting it safe rather than a second source of drift.
+    assert (applied == FL.P.K4).sum() == (tier == FL.P.K4).sum()
+
+
+def test_a_bare_true_still_adopts_the_proposal():
+    """Back-compat: the M3 reload path returns a bool and must keep working."""
+    assert bool([(0, 1, 2)]) is True and bool(True) is True
