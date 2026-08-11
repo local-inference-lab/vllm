@@ -302,6 +302,10 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
             return False
 
         if not fut.done():
+            _pending["waits"] = _pending.get("waits", 0) + 1
+            if _pending["waits"] % 4 == 1:
+                log.info("FQ live apply: staging still running (%d interval(s))",
+                         _pending["waits"])
             _all_ranks_ready(False)
             return False
 
@@ -336,16 +340,31 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
         eff = getattr(staged, "plan", None)
         n = len(getattr(eff, "swaps", ()) or ())
         if not n:
+            # Every exit from this function must say why. A silent return
+            # False here produced 7 staging submissions and 1 install with
+            # nothing in the log to explain the other 6 — the same
+            # looks-like-progress shape this code keeps reproducing.
+            log.warning(
+                "FQ live apply: staged batch has no effective swaps "
+                "(requested %d, dropped %d) — discarding",
+                len(swaps), len(dropped))
             _pending.clear()
             return False
         import contextlib
 
-        report = engine.apply(
-            staged=staged,
-            quiesce=contextlib.nullcontext(),
-            memo_hook=None,
-            policy_doc=dict(proposed_doc),
-        )
+        try:
+            report = engine.apply(
+                staged=staged,
+                quiesce=contextlib.nullcontext(),
+                memo_hook=None,
+                policy_doc=dict(proposed_doc),
+            )
+        except Exception:  # noqa: BLE001
+            # loop.py catches this too, but by then the reason has lost the
+            # context of WHICH batch and how big.
+            log.exception("FQ live apply: engine.apply raised on %d swap(s)", n)
+            _pending.clear()
+            return False
         ok = bool(getattr(report, "ok", True))
         log.info("FQ live apply: %d swap(s) %s", n,
                  "INSTALLED" if ok else "REFUSED")
