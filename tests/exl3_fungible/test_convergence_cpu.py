@@ -336,3 +336,93 @@ def test_missing_convergence_module_does_not_break_the_loader():
     """The loader must still work if this module is absent (older rootfs)."""
     src = _progressive_src()
     assert "except ImportError" in src
+
+
+# ------------------------------------------------------------- the repay loop
+def test_worker_repays_deficits_through_the_injected_swap():
+    p = _plan()
+    for e in range(3):
+        p.observe(3, e, actual_k=2, target_k=3)
+    calls = []
+
+    def swap(layer, expert, target_k):
+        calls.append((layer, expert, target_k))
+        return target_k
+
+    w = CV.ConvergenceWorker(p, swap)
+    out = w.step()
+    assert out["repaid"] == 3 and out["pending"] == 0
+    assert p.state is CV.ConvergenceState.CONVERGED
+    assert len(calls) == 3
+
+
+def test_worker_respects_the_batch_so_a_tick_is_bounded():
+    """19,200 deficits must not be attempted inside one engine tick."""
+    p = _plan()
+    for e in range(100):
+        p.observe(3, e, actual_k=2, target_k=3)
+    out = CV.ConvergenceWorker(p, lambda *a: 3, batch=16).step()
+    assert out["attempted"] == 16 and out["pending"] == 84
+
+
+def test_a_swap_that_raises_does_not_bring_down_a_serving_engine():
+    p = _plan()
+    p.observe(3, 0, actual_k=2, target_k=3)
+
+    def boom(*a):
+        raise RuntimeError("fetch exploded")
+
+    out = CV.ConvergenceWorker(p, boom).step()
+    assert out["failed"] == 1 and out["repaid"] == 0
+    assert p.pending_count == 1          # still owed, will retry
+
+
+def test_worker_stops_spinning_on_written_off_deficits():
+    """A segment that does not exist yet must not be retried every tick
+    forever -- that is a busy loop against the Hub."""
+    p = _plan()
+    p.observe(3, 0, actual_k=2, target_k=3)
+    w = CV.ConvergenceWorker(p, lambda *a: None, max_attempts=3)
+    for _ in range(3):
+        w.step()
+    assert p.state is CV.ConvergenceState.STALLED
+    before = p.snapshot()
+    assert w.step()["attempted"] == 0, "kept retrying a written-off deficit"
+    assert p.snapshot()["experts_pending"] == before["experts_pending"]
+
+
+def test_partial_climb_is_kept_not_counted_as_repaid():
+    p = _plan()
+    p.observe(3, 0, actual_k=2, target_k=4)
+    out = CV.ConvergenceWorker(p, lambda l, e, k: 3).step()
+    assert out["repaid"] == 0
+    assert p.pending_count == 1 and p.drift_bits == 1
+
+
+def test_worker_reports_drift_so_a_scrape_sees_convergence_moving():
+    p = _plan()
+    p.observe(3, 0, actual_k=2, target_k=4)
+    p.observe(3, 1, actual_k=2, target_k=4)
+    w = CV.ConvergenceWorker(p, lambda l, e, k: k, batch=1)
+    assert w.step()["drift_bits"] == 2
+    assert w.step()["drift_bits"] == 0
+
+
+def test_done_is_false_while_work_remains():
+    p = _plan()
+    p.observe(3, 0, actual_k=2, target_k=3)
+    w = CV.ConvergenceWorker(p, lambda *a: 3)
+    assert w.done() is False
+    w.step()
+    assert w.done() is True
+
+
+def test_priority_reaches_the_worker():
+    p = _plan()
+    p.observe(3, 0, actual_k=2, target_k=3)
+    p.observe(9, 7, actual_k=2, target_k=3)
+    order = []
+    CV.ConvergenceWorker(
+        p, lambda l, e, k: (order.append((l, e)), k)[1], batch=1,
+        priority=lambda d: 100.0 if d.key() == (9, 7) else 1.0).step()
+    assert order == [(9, 7)]

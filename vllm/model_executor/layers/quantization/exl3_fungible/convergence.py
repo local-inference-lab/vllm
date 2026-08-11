@@ -285,3 +285,66 @@ class ConvergencePlan:
             f"drift={s['drift_bits']} tier-steps across "
             f"{s['layers_affected']} layers). "
             f"SERVED WEIGHTS ARE NOT FINAL.")
+
+
+class ConvergenceWorker:
+    """Repays the deficits an opportunistic boot accepted.
+
+    Deliberately takes ``swap_fn`` rather than reaching for the engine: the
+    swap path already exists (M4 atomic swap / fq_reload), and the thing that
+    was missing was never the mechanism but the BOOKKEEPING -- knowing which
+    experts owe an upgrade, in what order, and when to stop trying.
+
+    ``swap_fn(layer, expert, target_k) -> int | None`` returns the K actually
+    installed (which may be an intermediate rung of the ladder), or None if it
+    could not be satisfied right now.
+    """
+
+    def __init__(self, plan: ConvergencePlan, swap_fn, *, batch: int = 16,
+                 max_attempts: int = 3, priority=None):
+        self.plan = plan
+        self.swap_fn = swap_fn
+        self.batch = max(1, int(batch))
+        self.max_attempts = max_attempts
+        self.priority = priority
+
+    def step(self) -> dict:
+        """Repay up to ``batch`` deficits. Safe to call from a loop tick.
+
+        Never raises: convergence is best-effort by construction, and an
+        engine that is serving must not be brought down by an upgrade that
+        could have been retried on the next tick.
+        """
+        repaid = failed = attempted = 0
+        giving_up = {d.key() for d in self.plan.give_up(self.max_attempts)}
+        for d in self.plan.pending(priority=self.priority):
+            if attempted >= self.batch:
+                break
+            if d.key() in giving_up:
+                continue          # already written off; do not spin on it
+            attempted += 1
+            try:
+                got = self.swap_fn(d.layer, d.expert, d.target_k)
+            except Exception:  # noqa: BLE001 — a serving engine must survive
+                got = None
+            if got is None:
+                self.plan.fail(d.layer, d.expert)
+                failed += 1
+            elif self.plan.repay(d.layer, d.expert, int(got)):
+                repaid += 1
+            else:
+                # climbed a rung but not to target: progress, still pending
+                repaid += 0
+        return {
+            "attempted": attempted,
+            "repaid": repaid,
+            "failed": failed,
+            "pending": self.plan.pending_count,
+            "state": self.plan.state.value,
+            "drift_bits": self.plan.drift_bits,
+        }
+
+    def done(self) -> bool:
+        """True when there is nothing left worth attempting."""
+        return self.plan.state.is_final or self.plan.state is (
+            ConvergenceState.STALLED)
