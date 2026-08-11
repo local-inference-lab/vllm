@@ -416,6 +416,24 @@ class FqMetrics:
             "fq_policy_age_steps",
             "Engine steps since the running policy was committed.",
             multiprocess_mode="mostrecent", **kw)
+        # Staging and quiesce cost. These three decide how fast the loop can
+        # converge and how much serving it disturbs, and all three were
+        # computed but never surfaced: staging turned out to be the binding
+        # constraint (IO-bound, ~10.5 MB/s of small ranged reads) and that was
+        # only discovered by differencing log timestamps.
+        self.stage_seconds = pc.Gauge(
+            "fq_stage_seconds",
+            "Wall time to stage the last swap batch (fragment IO, off-step).",
+            multiprocess_mode="mostrecent", **kw)
+        self.stage_bytes = pc.Gauge(
+            "fq_stage_bytes",
+            "Host-to-device bytes in the last staged swap batch.",
+            multiprocess_mode="mostrecent", **kw)
+        self.apply_window_seconds = pc.Gauge(
+            "fq_apply_window_seconds",
+            "Quiesce window of the last committed apply — the only interval "
+            "in which serving is actually disturbed.",
+            multiprocess_mode="mostrecent", **kw)
         self.tier_occupancy = pc.Gauge(
             "fq_tier_occupancy",
             "Experts resident per (layer, K tier) under the running policy.",

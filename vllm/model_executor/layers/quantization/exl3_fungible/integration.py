@@ -366,6 +366,33 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
             _all_ranks_ready(False)
             return False
 
+        # Staging cost, stated in bytes and MB/s rather than left to be
+        # inferred. StagedBatch has carried `bytes_h2d` and `stage_seconds`
+        # since M4 and nothing ever logged them, so the only way to learn that
+        # staging — not the policy — rate-limits convergence was to difference
+        # timestamps by hand across a live log. It is IO-bound and slow:
+        # measured 45 s warm and 229 s cold for 64 swaps, ~1.2 GB in ~2,300
+        # small ranged reads over ~40 segment files (~10.5 MB/s), against
+        # 142-149 MiB/s for the loader's whole-segment reads. Anything that
+        # gates how fast the loop can converge belongs in the log.
+        _secs = float(getattr(staged, "stage_seconds", 0.0) or 0.0)
+        _bytes = int(getattr(staged, "bytes_h2d", 0) or 0)
+        log.info("FQ live apply: staged %d pair(s), %.1f MiB in %.1f s "
+                 "(%.1f MiB/s)", len(getattr(getattr(staged, "plan", None),
+                                             "swaps", ()) or ()),
+                 _bytes / 2**20, _secs,
+                 (_bytes / 2**20 / _secs) if _secs > 0 else float("nan"))
+        _m = getattr(state, "metrics", None)
+        if _m is not None:
+            for _name, _val in (("stage_seconds", _secs),
+                                ("stage_bytes", float(_bytes))):
+                _g = getattr(_m, _name, None)
+                if _g is not None:
+                    try:
+                        _g.set(_val)
+                    except Exception:  # noqa: BLE001 — telemetry never fails a swap
+                        pass
+
         if not _all_ranks_ready(True):
             log.info("FQ live apply: staged here, waiting for all ranks")
             return False
@@ -403,8 +430,19 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
             _pending.clear()
             return False
         ok = bool(getattr(report, "ok", True))
-        log.info("FQ live apply: %d swap(s) %s", n,
-                 "INSTALLED" if ok else "REFUSED")
+        # The quiesce window is the ONLY interval in which serving is actually
+        # disturbed, so it is the number a reviewer will ask for first. Report
+        # it on the same line as the outcome.
+        _win = float(getattr(report, "window_seconds", 0.0) or 0.0)
+        log.info("FQ live apply: %d swap(s) %s (quiesce window %.3f s)", n,
+                 "INSTALLED" if ok else "REFUSED", _win)
+        _m = getattr(state, "metrics", None)
+        _g = getattr(_m, "apply_window_seconds", None) if _m else None
+        if _g is not None:
+            try:
+                _g.set(_win)
+            except Exception:  # noqa: BLE001 — telemetry never fails a swap
+                pass
         rows = _pending.get("rows") or {}
         _pending.clear()
         if not ok:
