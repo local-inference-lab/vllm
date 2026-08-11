@@ -76,6 +76,7 @@ PyNaCl or ``cryptography`` lazily, only when trust filtering is active.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import logging
@@ -83,6 +84,7 @@ import mmap
 import os
 import re
 import struct
+import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -756,6 +758,7 @@ class FragmentResolver:
             "encode_queued": 0,
             "segments_prefetched": 0,
             "segments_released": 0,
+            "segments_shared": 0,
             "unavailable": 0,
             # hardening counters: a broken local dir / unreadable cache entry
             # / unwritable cache must degrade the attempt, never the engine
@@ -1008,8 +1011,10 @@ class FragmentResolver:
                     continue
                 entry = _SegmentIndexEntry(index[str(layer)])
                 dest = self._cache_path("segments", f"{entry.sha256}.seg")
-                if dest.exists() and dest.stat().st_size > 0:
-                    self._prefetched[(layer, k)] = dest
+                ready = self._segment_ready(dest, entry.file)
+                if ready is not None:
+                    self._prefetched[(layer, k)] = ready
+                    self._claim_segment(ready)
                     return f"cached {entry.file}"
                 got = getattr(source, "prefetch_whole", None)
                 if got is None:
@@ -1024,9 +1029,19 @@ class FragmentResolver:
                         done / (1 << 30), (total or done) / (1 << 30), pct,
                         rate / (1 << 20))
 
-                path = got(entry.file, dest, _report)
+                # Only ONE rank downloads. The others block here, then find
+                # the file already present on the re-check below.
+                with self._segment_lock(dest):
+                    again = self._segment_ready(dest, entry.file)
+                    if again is not None:
+                        self._prefetched[(layer, k)] = again
+                        self._claim_segment(again)
+                        self.stats["segments_shared"] += 1
+                        return f"shared {entry.file} (fetched by another rank)"
+                    path = got(entry.file, dest, _report)
                 if path is not None:
                     self._prefetched[(layer, k)] = path
+                    self._claim_segment(path)
                     self.stats["segments_prefetched"] += 1
                     return (f"prefetched {entry.file} "
                             f"({path.stat().st_size} B) from "
@@ -1035,6 +1050,104 @@ class FragmentResolver:
                 self.stats["source_error"] += 1
                 continue
         return None
+
+    # ----------------------------------------------------- cross-rank sharing
+    # Every TP rank runs its OWN progressive_weights_iterator over the SAME
+    # policy, so all of them want the same segment objects at the same time --
+    # observed as four .part files racing for one file, i.e. 4x the bytes and
+    # 4x the transient disk. With prefetch depth x width that becomes ~24
+    # concurrent fetches of ~6 distinct files. One rank downloads; the rest
+    # wait on the lock and then find it already there.
+    @contextlib.contextmanager
+    def _segment_lock(self, dest: Path, timeout: float = 1800.0):
+        import fcntl
+        lock = dest.with_name(dest.name + ".lock")
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(lock, "a+")
+        deadline = time.monotonic() + timeout
+        held = False
+        try:
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        # Losing the lock must never fail a boot: fall through
+                        # and fetch our own copy. The rename is atomic, so a
+                        # duplicate download is wasteful, not incorrect.
+                        logger.warning(
+                            "FQ segment lock timeout on %s — fetching our own "
+                            "copy", dest.name)
+                        break
+                    time.sleep(0.5)
+            yield held
+        finally:
+            if held:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            fh.close()
+
+    def _segment_ready(self, dest: Path, relpath: str) -> "Path | None":
+        """An already-complete copy, under either name.
+
+        The urllib path renames to ``dest``; hf_hub_download with local_dir
+        writes to ``dest.parent/relpath``. Checking only ``dest`` would make
+        every rank re-download a file the HF client had already placed.
+        """
+        for cand in (dest, dest.parent / relpath):
+            try:
+                if cand.exists() and cand.stat().st_size > 0:
+                    return cand
+            except OSError:
+                continue
+        return None
+
+    def _users_dir(self, dest: Path) -> Path:
+        return dest.with_name(dest.name + ".users")
+
+    def _claim_segment(self, dest: Path) -> None:
+        """Mark this process as a user of ``dest`` so another rank's
+        release_layer() cannot unlink a segment we are still reading."""
+        try:
+            d = self._users_dir(dest)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / str(os.getpid())).touch()
+        except OSError:
+            pass
+
+    def _drop_segment_claim(self, dest: Path) -> bool:
+        """Release our claim; return True if NO live user remains.
+
+        Stale markers from killed ranks are pruned by checking /proc, so a
+        preempted worker cannot pin a segment on disk forever.
+        """
+        d = self._users_dir(dest)
+        try:
+            (d / str(os.getpid())).unlink()
+        except OSError:
+            pass
+        if not d.exists():
+            # Never claimed (single-process use, or a caller that populated
+            # _prefetched directly). No claim means no other holder -- NOT
+            # "unknown, so refuse", which would make the segment unfreeable
+            # and defeat the eviction entirely.
+            return True
+        try:
+            for marker in d.iterdir():
+                if marker.name.isdigit() and Path("/proc", marker.name).exists():
+                    return False
+                try:
+                    marker.unlink()          # stale: owner is gone
+                except OSError:
+                    return False
+            d.rmdir()
+        except OSError:
+            return False
+        return True
 
     def release_layer(self, layer: int) -> int:
         """Drop the whole-segment objects prefetched for ``layer``.
@@ -1066,8 +1179,15 @@ class FragmentResolver:
                 resolved = Path(path).resolve()
                 if not resolved.is_relative_to(root):
                     continue           # shared HF cache: not ours to unlink
+                if not self._drop_segment_claim(resolved):
+                    continue           # another rank is still reading it
                 size = resolved.stat().st_size
                 resolved.unlink()
+                for aux in (resolved.with_name(resolved.name + ".lock"),):
+                    try:
+                        aux.unlink()
+                    except OSError:
+                        pass
                 freed += size
                 self.stats["segments_released"] += 1
             except OSError:

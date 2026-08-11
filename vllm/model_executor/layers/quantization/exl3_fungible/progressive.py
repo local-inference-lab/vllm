@@ -411,10 +411,11 @@ def progressive_weights_iterator(
             _want = [(k, n) for k, n in sorted(_need.items()) if n >= _bulk_min]
             if _want:
                 if layer in _inflight:
-                    logger.info(
-                        "FQ progressive L%d: waiting on background prefetch "
-                        "(%s)", layer,
-                        ", ".join(f"{n} experts want K{k}" for k, n in _want))
+                    _emit(
+                        f"FQ progressive L{layer}: waiting on background "
+                        f"prefetch ("
+                        + ", ".join(f"{n} experts want K{k}"
+                                    for k, n in _want) + ")")
                     for _fut in _inflight.pop(layer):
                         _fut.result()
                 else:
@@ -422,10 +423,10 @@ def progressive_weights_iterator(
                         _note = getattr(resolver, "prefetch_layer",
                                         lambda *a: None)(layer, _k)
                         if _note:
-                            logger.info(
-                                "FQ progressive L%d: %d experts want K%d -> "
-                                "%s (1 fetch instead of %d ranged reads)",
-                                layer, _n, _k, _note, _n)
+                            _emit(
+                                f"FQ progressive L{layer}: {_n} experts want "
+                                f"K{_k} -> {_note} (1 fetch instead of {_n} "
+                                f"ranged reads)")
             # Start the NEXT layer downloading while this one streams to GPU.
             for _ahead in range(1, _depth + 1):
                 if _idx + _ahead < len(_sorted_layers):

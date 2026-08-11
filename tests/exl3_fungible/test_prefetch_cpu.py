@@ -384,3 +384,127 @@ def test_hf_download_lands_in_our_cache_so_it_can_be_evicted():
     src = inspect.getsource(FR.HfSource.prefetch_whole)
     assert "local_dir" in src
     assert "FQ_PREFETCH_HF_SHARED" in src, "the opt-out must exist"
+
+
+# --------------------------------------------- cross-rank sharing (TP ranks)
+def test_all_tp_ranks_want_the_SAME_segments():
+    """The premise, from a real TP4 boot log: every rank emitted
+    `FQ progressive layer 3: tiers=((3, 206), (4, 50)) bits_digest=d704612a2fdb`
+    -- identical composition, so identical segment objects. Four ranks racing
+    one file was 4x the bytes and 4x the transient disk."""
+    per_rank = [((3, 206), (4, 50))] * 4
+    assert len(set(per_rank)) == 1
+
+
+def test_segment_lock_serialises_downloads(tmp_path):
+    """Second holder must block while the first has the lock."""
+    import threading
+    r = _resolver(tmp_path)
+    dest = r.cache_dir / "segments" / "abc.seg"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    entered = threading.Event()
+    release = threading.Event()
+    order = []
+
+    def first():
+        with r._segment_lock(dest):
+            order.append("first-in")
+            entered.set()
+            release.wait(5)
+            order.append("first-out")
+
+    t = threading.Thread(target=first)
+    t.start()
+    assert entered.wait(5)
+    r2 = _resolver(tmp_path)
+
+    def second():
+        with r2._segment_lock(dest):
+            order.append("second-in")
+
+    t2 = threading.Thread(target=second)
+    t2.start()
+    t2.join(0.5)
+    assert "second-in" not in order, "lock did not exclude the second holder"
+    release.set()
+    t.join(5)
+    t2.join(5)
+    assert order == ["first-in", "first-out", "second-in"]
+
+
+def test_lock_timeout_falls_through_rather_than_failing_the_boot(tmp_path):
+    """A wedged rank must not hang a boot forever; a duplicate download is
+    wasteful, not incorrect, because the rename is atomic."""
+    r = _resolver(tmp_path)
+    dest = r.cache_dir / "segments" / "abc.seg"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with r._segment_lock(dest):
+        r2 = _resolver(tmp_path)
+        with r2._segment_lock(dest, timeout=0.2) as held:
+            assert held is False        # fell through, did not raise
+
+
+def test_segment_ready_finds_the_hf_local_dir_name(tmp_path):
+    """hf_hub_download with local_dir writes to dest.parent/relpath, NOT to
+    dest. Checking only dest made every rank re-download a file the HF client
+    had already placed."""
+    r = _resolver(tmp_path)
+    dest = r.cache_dir / "segments" / "sha.seg"
+    hf = dest.parent / "layer-003.k3.safetensors"
+    hf.parent.mkdir(parents=True, exist_ok=True)
+    hf.write_bytes(b"payload")
+    assert r._segment_ready(dest, "layer-003.k3.safetensors") == hf
+    assert r._segment_ready(dest, "other.safetensors") is None
+
+
+def test_release_does_not_unlink_while_another_rank_holds_it(tmp_path):
+    """The race this refcount exists for: rank 0 finishing layer 3 must not
+    delete a segment rank 2 is still reading -- that would silently demote
+    rank 2 to 18.2 s-per-expert ranged reads."""
+    seg = tmp_path / "cache" / "segments" / "shared.seg"
+    seg.parent.mkdir(parents=True, exist_ok=True)
+    seg.write_bytes(b"z" * 512)
+    rank0, rank2 = _resolver(tmp_path), _resolver(tmp_path)
+    rank0._claim_segment(seg)
+    # a live OTHER pid also holds it (pid 1 always exists)
+    (rank0._users_dir(seg) / "1").touch()
+    rank0._prefetched[(3, 3)] = seg
+    rank0.release_layer(3)
+    assert seg.exists(), "unlinked a segment another rank still holds"
+    # once the other claim is gone, the next release frees it
+    (rank2._users_dir(seg) / "1").unlink()
+    rank2._prefetched[(3, 3)] = seg
+    rank2.release_layer(3)
+    assert not seg.exists()
+
+
+def test_stale_claim_from_a_killed_rank_does_not_pin_disk(tmp_path):
+    """This box is preemptible. A killed worker's marker must not keep a
+    segment resident forever."""
+    seg = tmp_path / "cache" / "segments" / "s.seg"
+    seg.parent.mkdir(parents=True, exist_ok=True)
+    seg.write_bytes(b"q" * 64)
+    r = _resolver(tmp_path)
+    r._claim_segment(seg)
+    (r._users_dir(seg) / "999999").touch()   # pid that cannot exist
+    r._prefetched[(5, 3)] = seg
+    r.release_layer(5)
+    assert not seg.exists(), "a dead rank's marker pinned the segment"
+
+
+def test_progressive_uses_emit_not_a_module_logger():
+    """progressive.py has NO module logger -- it uses a local _emit() because
+    the CPU tests load this file standalone. Two logger.info() calls added for
+    download verbosity raised `NameError: name 'logger' is not defined` inside
+    the weight iterator and killed all four TP workers mid-boot."""
+    import re
+    src = _progressive_src()
+    bare = re.findall(r"(?<![\w.])logger\.\w+\(", src)
+    assert not bare, f"progressive.py has no logger; found {bare}"
+
+
+def test_download_verbosity_still_present():
+    """...but the fix must not be 'delete the logging'."""
+    src = _progressive_src()
+    assert "waiting on background" in src
+    assert "1 fetch instead of" in src
