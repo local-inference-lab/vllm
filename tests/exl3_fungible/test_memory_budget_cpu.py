@@ -142,15 +142,17 @@ def test_fraction_without_a_device_names_the_problem():
 def test_measured_glm52_points_fit_the_affine_trellis_model():
     eb = P.ExpertBytes.from_measurements(
         P.MEASURED_GLM52_TP4_PER_RANK, provenance="test")
-    # The two measurements come back exactly.
-    assert eb.bytes_for(3) == 3_542_028
-    assert eb.bytes_for(4) == 4_721_676
+    # The two measurements come back exactly. See
+    # test_the_reference_constants_match_the_real_glm52_geometry for where
+    # these two numbers come from — the checkpoint's own tensor table.
+    assert eb.bytes_for(3) == 3_578_892
+    assert eb.bytes_for(4) == 4_758_540
     # ...and the promotion cost the operator measured.
     assert eb.promotion_cost(3, 4) == 1_179_648
     assert eb.promotion_cost(4, 3) == -1_179_648
     # K2/K5 are EVALUATED from the same line, not guessed.
-    assert eb.bytes_for(2) == 2 * 1_179_648 + 3_084 == 2_362_380
-    assert eb.bytes_for(5) == 5 * 1_179_648 + 3_084 == 5_901_324
+    assert eb.bytes_for(2) == 2 * 1_179_648 + 39_948 == 2_399_244
+    assert eb.bytes_for(5) == 5 * 1_179_648 + 39_948 == 5_938_188
 
 
 def test_all_rank_figures_are_four_times_the_per_rank_ones():
@@ -1054,3 +1056,294 @@ def test_the_loop_never_commits_a_promotion_the_backend_was_not_given(
     # The proposal is still audited: it lands in history/ for the
     # "raise n_k4_per_layer and restart" path.
     assert list((store.root / "history").glob("*-proposed.json"))
+
+
+# =========================================== adversarial review round 2
+# Headroom must not be able to STARVE the swaps it rides alongside.
+
+
+# Realistic MoE traffic: every expert is routed to, two are hot. That is
+# what makes plan_promotions fire — with the sparse DEFAULT_TOKENS the
+# only positive-scoring K3 experts are the ones the swap list already
+# touches, so no promotion is ever planned and the starvation is hidden.
+BROAD_TOKENS = [[e, (e + 1) % E] for e in range(E)] + [[4, 5]] * 6
+
+
+def test_headroom_promotions_do_not_starve_the_paired_swaps(tmp_path):
+    """A byte ceiling with headroom must not stop the executable swaps.
+
+    ``_maybe_apply`` cannot execute an unpaired promotion (D1). Refusing
+    the WHOLE interval because one was proposed freezes the serve: the
+    planner re-proposes a promotion every interval for as long as the
+    ceiling leaves room, nothing is applied, so the occupancy — and hence
+    the headroom — never changes. One ERROR is logged (once), and after
+    that a byte-budgeted serve silently never re-tiers again.
+
+    The byte-neutral 1-for-1 trades are exactly what the backend CAN do,
+    so they must go through; only the promotions are dropped.
+    """
+    seen = []
+
+    def apply_fn(doc, swaps):
+        seen.append(list(swaps))
+        return True
+
+    cfg = FL.FqLoopConfig(interval_steps=4, dwell_steps=0, jaccard_floor=0.0,
+                          apply_mode=FL.APPLY_ATOMIC)
+    collector, routers = make_collector()
+    store = S.PolicyStore(tmp_path, "m" * 64)
+    store.commit(boot_doc(), num_experts=E)
+    state = FL.FungibleQuantState(
+        collector, boot_doc(), config=cfg, eps=eps_hot4(), store=store,
+        budget=simple_budget(BOOT_BYTES + 500), apply_fn=apply_fn)
+    before = np.array(state.tier_of, copy=True)
+
+    drive(state, routers, tokens=BROAD_TOKENS)
+
+    rec = json.loads(next(
+        (store.root / "decisions").glob("*.json")).read_text())
+    assert rec["totals"]["promotions"] > 0, "fixture must plan promotions"
+    assert rec["totals"]["executed"] > 0, "fixture must also decide swaps"
+
+    assert seen and seen[0] == [(sw["layer"], sw["expert_out"],
+                                 sw["expert_in"]) for sw in rec["swaps"]], (
+        "the interval's paired swaps were withheld from the backend because "
+        f"promotions rode along: apply_fn calls={seen}")
+    assert rec["applied"] is True
+    assert rec["promotions_applied"] is False
+    assert not (state.tier_of == before).all()
+
+
+def test_only_the_swaps_are_committed_never_the_promotions(tmp_path):
+    """The applied document must not contain the promoted experts.
+
+    The promotions still have to be auditable, so the FULL proposal keeps
+    landing in history/ — but current.json, tier_of and the gauges may
+    only ever show the swaps-only membership.
+    """
+    seen = []
+    cfg = FL.FqLoopConfig(interval_steps=4, dwell_steps=0, jaccard_floor=0.0,
+                          apply_mode=FL.APPLY_ATOMIC)
+    collector, routers = make_collector()
+    store = S.PolicyStore(tmp_path, "m" * 64)
+    store.commit(boot_doc(), num_experts=E)
+    state = FL.FungibleQuantState(
+        collector, boot_doc(), config=cfg, eps=eps_hot4(), store=store,
+        budget=simple_budget(BOOT_BYTES + 500),
+        apply_fn=lambda doc, swaps: (seen.append(doc), True)[1])
+
+    drive(state, routers, tokens=BROAD_TOKENS)
+    rec = json.loads(next(
+        (store.root / "decisions").glob("*.json")).read_text())
+    assert rec["totals"]["promotions"] > 0
+
+    # Cardinality is untouched everywhere the device can see it.
+    assert (P.n_k4_of(state.tier_of) == 2).all()
+    committed = store.load_current(num_experts=E)
+    for lid in LAYERS:
+        assert sum(b == P.K4 for b in
+                   committed["bits_per_expert"][str(lid)]) == 2
+        assert committed["budget"]["n_k4_per_layer"][str(lid)] == 2
+    assert seen and all(
+        sum(b == P.K4 for b in doc["bits_per_expert"][str(LAYERS[0])]) == 2
+        for doc in seen)
+    # ... while the proposal WITH the promotions is archived for the
+    # "raise n_k4_per_layer and restart" path.
+    proposals = list((store.root / "history").glob("*-proposed.json"))
+    assert proposals, "a proposal carrying promotions must be archived"
+    grown = json.loads(proposals[0].read_text())
+    assert sum(sum(b == P.K4 for b in row)
+               for row in grown["bits_per_expert"].values()) > 4
+
+
+def test_a_budgeted_serve_keeps_re_tiering_interval_after_interval(tmp_path):
+    """The anti-freeze property, end to end over several intervals.
+
+    Same traffic, three configurations: no ceiling, a zero-headroom
+    ceiling, and a ceiling with headroom. All three must keep handing
+    swaps to the backend; the one with headroom must not be the odd one
+    out.
+    """
+    def run(limit):
+        seen = []
+        cfg = FL.FqLoopConfig(interval_steps=4, dwell_steps=0,
+                              jaccard_floor=0.0, apply_mode=FL.APPLY_ATOMIC)
+        collector, routers = make_collector()
+        state = FL.FungibleQuantState(
+            collector, boot_doc(), config=cfg,
+            eps={P.K3: np.full((2, E), 1.0), P.K4: np.zeros((2, E))},
+            budget=simple_budget(limit),
+            apply_fn=lambda doc, swaps: seen.append(list(swaps)) or True)
+        for it in range(5):
+            hot = [(2 + it) % E, (3 + it) % E]
+            toks = ([[e, (e + 1) % E] for e in range(E)]
+                    + [[hot[0], hot[1]]] * 6)
+            drive(state, routers, tokens=toks)
+        return len(seen)
+
+    unbounded = run(None)
+    zero_headroom = run(BOOT_BYTES)
+    with_headroom = run(BOOT_BYTES + 500)
+    assert unbounded > 0 and zero_headroom == unbounded
+    assert with_headroom == unbounded, (
+        f"a ceiling with headroom applied {with_headroom} interval(s) where "
+        f"an unbounded budget applied {unbounded} — headroom must not "
+        f"disable re-tiering")
+
+
+def test_apply_refuses_a_membership_whose_cardinality_moved(tmp_path):
+    """D1 backstop inside ``_maybe_apply`` itself.
+
+    The backend is only ever handed a swap list, so a membership whose
+    per-layer K4 count changed is unreachable for it. Guard structurally,
+    not by trusting every caller to have split the promotions out.
+    """
+    seen = []
+    cfg = FL.FqLoopConfig(interval_steps=4, dwell_steps=0, jaccard_floor=0.0,
+                          apply_mode=FL.APPLY_ATOMIC)
+    collector, _ = make_collector()
+    state = FL.FungibleQuantState(
+        collector, boot_doc(), config=cfg, eps=eps_hot4(),
+        budget=simple_budget(None),
+        apply_fn=lambda doc, swaps: seen.append(list(swaps)) or True)
+    before = np.array(state.tier_of, copy=True)
+
+    grown = P.apply_promotions(state.tier_of, [(0, 5)])
+    assert state._maybe_apply(state._doc_for(grown, []), grown, [(0, 0, 4)],
+                              []) is False
+    assert seen == []
+    assert (state.tier_of == before).all()
+
+
+def test_a_document_never_advertises_a_ceiling_nobody_enforces():
+    """Dropping ``VLLM_FQ_MEMORY_BUDGET`` must clear the byte fields.
+
+    A policy committed under a ceiling records ``mode=max_bytes`` plus the
+    ceiling and the byte model. Restart WITHOUT the env var and the loop
+    inherits that budget block: ``setdefault("mode", ...)`` leaves
+    ``max_bytes`` in place, so every document the run emits advertises a
+    limit that is not being enforced, sourced from a byte model that is
+    not in use.
+    """
+    stale = dict(boot_doc())
+    stale["budget"] = dict(
+        stale["budget"], mode="max_bytes", max_bytes_per_rank=999_999,
+        bytes_per_expert_per_rank={"3": 300, "4": 400},
+        bytes_source="yesterday's checkpoint")
+    collector, _ = make_collector()
+    state = FL.FungibleQuantState(
+        collector, stale,
+        config=FL.FqLoopConfig(interval_steps=4, dwell_steps=0),
+        eps=eps_hot4(), budget=simple_budget(None))
+
+    emitted = state._doc_for(state.tier_of, [])["budget"]
+    assert state.budget.limit_bytes is None
+    assert emitted["mode"] == "fixed_cardinality"
+    for key in ("max_bytes_per_rank", "bytes_per_expert_per_rank",
+                "bytes_source"):
+        assert key not in emitted, f"stale {key} survived into a new document"
+
+
+def glm52_expert_tensor_table(k, rank=0):
+    """One expert, one rank, of the REAL assembled GLM-5.2 checkpoint.
+
+    Transcribed from the safetensors header of
+    ``glm52-k3-assembled/model-layer-003.safetensors`` (H=6144,
+    moe_intermediate 2048 -> 512 per rank at TP4): three
+    ``[H/16, I/16, 16*K]`` int16 trellis slabs plus the K-independent
+    rotations and mcg scalars. Every byte count below is that tensor's
+    own ``data_offsets`` span.
+    """
+    tre = 384 * 32 * (16 * k) * 2                      # 1,179,648 per K
+    base = f"model.layers.3.mlp.experts.0.{{}}.rank{rank}"
+    out = []
+    for proj, shape in (("gate_proj", (384, 32, 16 * k)),
+                        ("up_proj", (384, 32, 16 * k)),
+                        ("down_proj", (32, 384, 16 * k))):
+        b = base.format(proj)
+        out.append((f"{b}.trellis", tre, shape))
+        out.append((f"{b}.mcg", 4, ()))
+    out += [
+        (base.format("gate_proj") + ".suh", 12288, (6144,)),
+        (base.format("gate_proj") + ".svh", 1024, (512,)),
+        (base.format("up_proj") + ".suh", 12288, (6144,)),
+        (base.format("up_proj") + ".svh", 1024, (512,)),
+        (base.format("down_proj") + ".suh", 1024, (512,)),
+        (base.format("down_proj") + ".svh", 12288, (6144,)),
+    ]
+    return out
+
+
+def test_the_reference_constants_match_the_real_glm52_geometry():
+    """The built-in fallback must describe the checkpoint it names.
+
+    ``ExpertBytes`` has two constructors for the SAME quantity: the
+    tensor table (what the runtime derives from the loaded checkpoint)
+    and the hard-coded reference measurement (the fallback when the
+    checkpoint cannot be read). If they disagree on GLM-5.2, one of them
+    is lying about GLM-5.2, and the fallback is the one an operator
+    cannot inspect.
+
+    The earlier constants (K3 3,542,028 / K4 4,721,676) omitted the three
+    12,288 B suh/svh vectors — 36,864 B per expert per rank, which over
+    76 layers x 256 experts is 0.67 GiB of pool that
+    ``fq_memory_used_bytes`` simply did not see. The slope was unaffected
+    (the rotations carry no K), so a promotion-cost test cannot catch it:
+    the fixed term needs its own anchor.
+    """
+    derived = P.ExpertBytes.from_tensor_table(
+        glm52_expert_tensor_table(3), provenance="glm52-k3-assembled")
+    reference = P.reference_expert_bytes(per_rank=True)
+
+    assert derived.trellis_bytes_per_k == 1_179_648
+    assert derived.fixed_bytes == 39_948
+    assert (reference.trellis_bytes_per_k, reference.fixed_bytes) == (
+        derived.trellis_bytes_per_k, derived.fixed_bytes), (
+        "the built-in GLM-5.2 reference disagrees with GLM-5.2's own "
+        f"tensor table: reference K3={reference.bytes_for(3)} vs measured "
+        f"{derived.bytes_for(3)}")
+    for k in (2, 3, 4, 5):
+        assert reference.bytes_for(k) == derived.bytes_for(k)
+    assert reference.bytes_for(3) == 3_578_892
+    assert reference.bytes_for(4) == 4_758_540
+
+
+def test_the_reference_k5_figure_is_confirmed_by_a_real_k5_checkpoint():
+    """K2/K5 are EVALUATED from the affine model, so anchor K5 for real.
+
+    ``glm52-mixed-k3k5`` carries real K5 experts and they measure
+    5,938,188 B per rank. Deriving the model from the K3 checkpoint alone
+    must reproduce that — otherwise the "last dim is 16*K, everything
+    else is K-independent" assumption is wrong and every off-ladder byte
+    figure this module prints is invented.
+    """
+    from_k3 = P.ExpertBytes.from_tensor_table(
+        glm52_expert_tensor_table(3), provenance="glm52-k3-assembled")
+    from_k5 = P.ExpertBytes.from_tensor_table(
+        glm52_expert_tensor_table(5), provenance="glm52-mixed-k3k5")
+    assert from_k5.bytes_for(5) == 5_938_188      # measured, K5 experts
+    assert from_k3.bytes_for(5) == from_k5.bytes_for(5)
+    assert (from_k3.trellis_bytes_per_k, from_k3.fixed_bytes) == (
+        from_k5.trellis_bytes_per_k, from_k5.fixed_bytes)
+    assert P.reference_expert_bytes().bytes_for(5) == 5_938_188
+    assert P.reference_expert_bytes(per_rank=False).bytes_for(5) == 4 * 5_938_188
+
+
+def test_a_rank_of_the_reference_model_matches_the_admin_geometry_model():
+    """``admin.MemoryModel`` derives the same bytes from H and I.
+
+    Two byte models for one quantity in one package will drift. Pin them
+    together on the real GLM-5.2 geometry (H=6144, I=512 per rank): the
+    slope is identical by construction (3*H*I/8) and the constant terms
+    may differ only by the 3 x 4 B mcg scalars, which the shape-derived
+    model does not know about.
+    """
+    hidden, inter = 6144, 2048 // 4
+    unit = 3 * hidden * inter // 8
+    rotations = 6 * (hidden + inter)
+    eb = P.reference_expert_bytes()
+    assert eb.trellis_bytes_per_k == unit
+    assert eb.fixed_bytes - rotations == 12, (
+        f"the reference fixed term ({eb.fixed_bytes} B) and the geometry "
+        f"model's rotations ({rotations} B) differ by more than the 3 mcg "
+        f"scalars")

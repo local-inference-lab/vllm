@@ -450,20 +450,43 @@ class ExpertBytes:
                    f"{provenance} (K{k} tensor table, {seen} tensors)", (k,))
 
 
-# Measured on the live GLM-5.2 serve (TP4, SM120), one MoE expert:
-#   K3 = 14,168,112 B across all 4 ranks -> 3,542,028 B per rank
-#   K4 = 18,886,704 B across all 4 ranks -> 4,721,676 B per rank
+# Measured on the assembled GLM-5.2 checkpoint (H=6144, moe_intermediate
+# 2048 -> 512 per rank at TP4, SM120) by summing the safetensors
+# ``data_offsets`` spans of ONE (expert, rank) — the same quantity
+# ``from_tensor_table`` computes, so the two constructors of this class
+# agree on the same checkpoint:
+#
+#   3 x trellis   [384,32,16K] / [32,384,16K] int16   1,179,648 B per K
+#   gate suh/svh  (6144,) + (512,)                   12,288 + 1,024 B
+#   up   suh/svh  (6144,) + (512,)                   12,288 + 1,024 B
+#   down suh/svh  (512,)  + (6144,)                   1,024 + 12,288 B
+#   3 x mcg       ()                                          12 B
+#                                                  fixed  39,948 B
+#
+#   K3 = 14,315,568 B across all 4 ranks -> 3,578,892 B per rank
+#   K4 = 19,034,160 B across all 4 ranks -> 4,758,540 B per rank
+#
 # so a K3->K4 promotion costs 1,179,648 B per rank. Those two points fit
-# the affine model above exactly (slope 1,179,648 B/K, fixed 3,084 B),
+# the affine model above exactly (slope 1,179,648 B/K, fixed 39,948 B),
 # and K2/K5 are then EVALUATED from it rather than guessed:
-#   K2 = 2,362,380 B/rank (9,449,520 across TP4)
-#   K5 = 5,901,324 B/rank (23,605,296 across TP4)
+#   K2 = 2,399,244 B/rank (9,596,976 across TP4)
+#   K5 = 5,938,188 B/rank (23,752,752 across TP4)
+# The K5 figure is not merely evaluated — glm52-mixed-k3k5 carries real
+# K5 experts and they measure 5,938,188 B/rank exactly, which is the
+# affine model confirmed on a third bitrate.
+#
 # The same construction was validated end-to-end against two real
 # checkpoints of the small GLM-5.2-arch proxy: deriving the model from
 # fruit-k3's header alone predicts fruit-k4's measured 814,128 B/expert
 # to the byte (see test_memory_budget_cpu.py).
-MEASURED_GLM52_TP4_PER_RANK: dict[int, int] = {K3: 3_542_028, K4: 4_721_676}
-MEASURED_GLM52_TP4_ALL_RANKS: dict[int, int] = {K3: 14_168_112, K4: 18_886_704}
+#
+# An earlier revision of these constants (K3 3,542,028 / K4 4,721,676)
+# dropped the three 12,288 B suh/svh vectors, understating every expert
+# by 36,864 B per rank — 0.67 GiB per rank across 76 x 256 experts. The
+# slope survived that error because it is K-independent overhead, which
+# is exactly why the fixed term needs a test of its own.
+MEASURED_GLM52_TP4_PER_RANK: dict[int, int] = {K3: 3_578_892, K4: 4_758_540}
+MEASURED_GLM52_TP4_ALL_RANKS: dict[int, int] = {K3: 14_315_568, K4: 19_034_160}
 
 
 def reference_expert_bytes(*, per_rank: bool = True) -> ExpertBytes:

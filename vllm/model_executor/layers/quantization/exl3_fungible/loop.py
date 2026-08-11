@@ -750,9 +750,14 @@ class FungibleQuantState:
                 logger.warning("FQ budget step=%d: %s", self._step,
                                P.rejection_message(rej))
 
-        proposed_tier = P.apply_promotions(
-            P.apply_swaps(self.tier_of, swaps), promotions,
-            self.budget.high_k)
+        # Two memberships, kept apart on purpose. The PROPOSAL includes the
+        # headroom promotions and is what gets explained, logged and
+        # archived; the swaps-only membership is the executable part (a
+        # 1-for-1 K3<->K4 trade), and it is the only thing the apply
+        # backend may ever be handed — see _maybe_apply.
+        swaps_tier = P.apply_swaps(self.tier_of, swaps)
+        proposed_tier = P.apply_promotions(swaps_tier, promotions,
+                                           self.budget.high_k)
         proposed_doc = self._doc_for(proposed_tier, swaps)
         proposed_sha = policy_hash(proposed_doc)
 
@@ -795,9 +800,23 @@ class FungibleQuantState:
             record["budget"]["headroom_promotions"],
             record["decision_sha"][:16])
 
-        applied = self._maybe_apply(proposed_doc, proposed_tier,
-                                    swaps, promotions)
+        # Unpaired promotions can never be executed live, but the paired
+        # swaps decided in the SAME interval can. Discarding those too
+        # would freeze the serve: promotions are re-proposed every
+        # interval for as long as any headroom exists, nothing is applied,
+        # so the occupancy — and therefore the headroom — never changes.
+        # Apply the executable subset from a swaps-only document.
+        if promotions:
+            applied = self._maybe_apply(self._doc_for(swaps_tier, swaps),
+                                        swaps_tier, swaps, promotions)
+        else:
+            applied = self._maybe_apply(proposed_doc, proposed_tier,
+                                        swaps, promotions)
         record["applied"] = applied
+        # ``applied`` covers the swap list only. Promotions are structurally
+        # inapplicable, so say so rather than leaving a reader to infer that
+        # record["promotions"] went live alongside record["swaps"].
+        record["promotions_applied"] = False
         record["apply_failures"] = int(self.apply_failures)
 
         if self.is_lead:
@@ -829,7 +848,16 @@ class FungibleQuantState:
                 for k, v in self.budget.expert_bytes.table().items()}
             budget["bytes_source"] = self.budget.expert_bytes.provenance
         else:
-            budget.setdefault("mode", "fixed_cardinality")
+            # The inherited document may have been committed under a byte
+            # ceiling that is NOT configured on this run (the operator
+            # dropped VLLM_FQ_MEMORY_BUDGET and restarted). Carrying its
+            # mode/ceiling forward would have every document this loop
+            # emits advertise a limit nothing is enforcing, so the byte
+            # fields are cleared rather than left to setdefault.
+            budget["mode"] = "fixed_cardinality"
+            for key in ("max_bytes_per_rank", "bytes_per_expert_per_rank",
+                        "bytes_source"):
+                budget.pop(key, None)
         doc["budget"] = budget
         doc["provenance"] = {
             "proposed_by": f"fq-loop/{self.cfg.apply_mode}",
@@ -870,18 +898,37 @@ class FungibleQuantState:
             # apply_fn is handed the SWAP LIST, so a promotion would never
             # reach it anyway — advancing tier_of/policy_doc/store past it
             # would make the loop, the gauges and the committed policy all
-            # claim a tier the device never received. Refuse instead: the
-            # proposal is still explained and persisted to history/, which
-            # is exactly the "raise n_k4_per_layer and restart" path.
+            # claim a tier the device never received.
+            #
+            # The promotions are therefore DROPPED (still explained and
+            # persisted to history/, which is exactly the "raise
+            # n_k4_per_layer and restart" path) — but only the promotions.
+            # The interval's paired swaps are byte-neutral and
+            # cardinality-preserving, so they stay applicable; refusing
+            # them as well would stall the serve permanently, because a
+            # promotion is re-proposed every interval for as long as the
+            # ceiling leaves headroom and nothing ever consumes it.
             if not self._promotion_apply_warned:
                 logger.error(
                     "FQ budget: %d headroom promotion(s) proposed at step %d "
                     "but runtime cardinality growth cannot be applied live "
-                    "(fixed-capacity slabs, D1) — recording the proposal and "
-                    "applying NOTHING this interval. Raise "
-                    "budget.n_k4_per_layer in the policy and restart to bank "
-                    "the headroom.", len(promotions), self._step)
+                    "(fixed-capacity slabs, D1) — dropping them and applying "
+                    "only the %d paired swap(s). Raise budget.n_k4_per_layer "
+                    "in the policy and restart to bank the headroom.",
+                    len(promotions), self._step, len(swaps))
                 self._promotion_apply_warned = True
+            if not swaps:
+                return False
+        # Last line of defence for D1, independent of what the caller
+        # passed: the backend is only ever given a swap list, so a
+        # membership whose per-layer K4 cardinality moved is one it cannot
+        # reach. Refuse rather than commit a policy the device never got.
+        if not np.array_equal(P.n_k4_of(proposed_tier), self.n_k4):
+            logger.error(
+                "FQ apply refused at step %d: proposed membership changes the "
+                "per-layer K4 cardinality (%s -> %s), which the swap backend "
+                "cannot execute (D1)", self._step, list(map(int, self.n_k4)),
+                list(map(int, P.n_k4_of(proposed_tier))))
             return False
         if self.apply_fn is None:
             if self.cfg.apply_mode == APPLY_ATOMIC and not self._atomic_warned:
@@ -931,7 +978,12 @@ class FungibleQuantState:
         decisions.mkdir(exist_ok=True)
         self.store._atomic_write(
             decisions / f"{self._step:08d}.json", record)
-        if swaps and not record["applied"]:
+        # A proposal carrying promotions is ALWAYS archived, even when the
+        # interval's swaps were applied: the promotions themselves never
+        # are, and history/ is the only record of the "raise
+        # n_k4_per_layer and restart" recommendation.
+        unapplied_growth = bool(record.get("totals", {}).get("promotions"))
+        if swaps and (unapplied_growth or not record["applied"]):
             # The dryrun contract: the proposal lands in history/ for
             # audit and for the out-of-band M3 reload path, while
             # current.json (the running policy) stays untouched.
