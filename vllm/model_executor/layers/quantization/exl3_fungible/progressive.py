@@ -318,11 +318,16 @@ def progressive_weights_iterator(
         ordered = sorted(header.items(), key=lambda kv: kv[1]["data_offsets"][0])
 
         expert_layers: dict[int, set[str]] = {}
-        f = open(shard, "rb")
-        # The mapping must outlive this generator: yielded tensors are
-        # zero-copy views that the quant method only devices-copies in
-        # process_weights_after_loading. GC owns the lifetime.
-        mm = _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ)
+        # The MAPPING must outlive this generator: yielded tensors are
+        # zero-copy views that the quant method only device-copies in
+        # process_weights_after_loading, so GC owns its lifetime (every
+        # torch.frombuffer view holds a reference to the memoryview, which
+        # holds the mmap).  The file OBJECT must not: mmap(2) keeps its own
+        # duplicate of the descriptor, so scoping the open halves what the
+        # load window costs per shard and stops the close from depending on
+        # the old binding's refcount dropping at the next iteration.
+        with open(shard, "rb") as f:
+            mm = _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ)
         for name, entry in ordered:
             m = EXPERT_RE.match(name)
             if m is not None and int(m.group(1)) in spec.bits_by_layer:
