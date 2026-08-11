@@ -865,3 +865,40 @@ def test_reflink_falls_back_rather_than_failing(tmp_path, monkeypatch):
     dst = tmp_path / "c.bin"
     assert FR.FragmentResolver.reflink_or_copy(src, dst) == "plain copy"
     assert dst.read_bytes() == src.read_bytes()
+
+
+# ------------------------------------------- the unbounded fragment cache
+def test_fragment_cache_is_opt_outable():
+    assert FR.FragmentResolver.cache_fragments({}) is True
+    assert FR.FragmentResolver.cache_fragments(
+        {"VLLM_FQ_FRAGMENT_CACHE": "0"}) is False
+
+
+def test_prefetched_slices_are_not_re_cached():
+    """The per-expert fragment cache has NO eviction and a progressive boot
+    writes every expert through it: ~14 MiB x 256 = ~3.5 GiB per layer,
+    ~264 GiB for GLM-5.2. Measured live at 69 GiB by layer 21 of 75 on a box
+    with a 180 GiB floor -- it would have exhausted the disk mid-boot.
+
+    A slice of a prefetched segment is pure duplication: the segment IS the
+    cache, and it is already bounded by release_layer."""
+    import re
+    src = (Path(__file__).resolve().parents[2] / "vllm" / "model_executor"
+           / "layers" / "quantization" / "exl3_fungible"
+           / "fragments.py").read_text()
+    i = src.index("_cache_store(self._cache_fragment_path(sha), payload)")
+    guard = src[max(0, i - 400):i]
+    assert "if not from_prefetch" in guard, (
+        "prefetched slices must not be written to the fragment cache")
+
+
+def test_from_prefetch_is_set_only_on_the_slice_path():
+    src = (Path(__file__).resolve().parents[2] / "vllm" / "model_executor"
+           / "layers" / "quantization" / "exl3_fungible"
+           / "fragments.py").read_text()
+    assert "from_prefetch = False" in src
+    assert "from_prefetch = True" in src
+    # and the flag must be reset per expert, not leak across iterations
+    i = src.index("from_prefetch = False")
+    j = src.index("payload = None", max(0, i - 200))
+    assert abs(i - j) < 120, "from_prefetch must reset alongside payload"

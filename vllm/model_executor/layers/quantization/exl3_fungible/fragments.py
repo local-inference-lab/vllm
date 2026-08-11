@@ -917,6 +917,7 @@ class FragmentResolver:
             "segments_released": 0,
             "segments_shared": 0,
             "segments_local": 0,
+            "fragment_cache_skipped": 0,
             "bytes_from_prefetch": 0,
             "unavailable": 0,
             # hardening counters: a broken local dir / unreadable cache entry
@@ -1323,6 +1324,19 @@ class FragmentResolver:
         except OSError:
             return False
         return True
+
+    @staticmethod
+    def cache_fragments(environ=None) -> bool:
+        """Whether to keep a per-expert copy of every fetched payload.
+
+        On by default for the swap path, which benefits from re-reading an
+        expert without a refetch. Set VLLM_FQ_FRAGMENT_CACHE=0 on a
+        disk-constrained box: this store has no eviction and a full
+        progressive boot writes the whole model through it.
+        """
+        env = environ if environ is not None else os.environ
+        return str(env.get("VLLM_FQ_FRAGMENT_CACHE", "1")).strip().lower() \
+            not in ("0", "false", "no", "off")
 
     @staticmethod
     def reflink_or_copy(src: Path, dst: Path) -> str:
@@ -1979,12 +1993,14 @@ class FragmentResolver:
             start = entry.body_offset + lo
             stop = entry.body_offset + hi
             payload = None
+            from_prefetch = False
             cached = self._prefetched.get((layer, k))
             if cached is not None:
                 slicer = getattr(source, "range_from_prefetched", None)
                 if slicer is not None:
                     payload = slicer(cached, start, stop)
                     if payload is not None:
+                        from_prefetch = True
                         self.stats["bytes_from_prefetch"] += len(payload)
             if payload is None:
                 payload = source.read_range(entry.file, start, stop)
@@ -2005,7 +2021,22 @@ class FragmentResolver:
                 self._count_reject("sha-mismatch")
                 return None, f"{name} REJECT sha-mismatch", exc
 
-        self._cache_store(self._cache_fragment_path(sha), payload)
+        # DO NOT re-cache a slice of an object we already hold.
+        #
+        # The per-expert fragment cache has no eviction, and a progressive
+        # boot writes EVERY expert through it: ~14 MiB x 256 experts = ~3.5
+        # GiB per layer, ~264 GiB for GLM-5.2. Measured live at 69 GiB by
+        # layer 21 of 75, on a box with a 180 GiB floor -- it would have
+        # exhausted the disk before the boot finished.
+        #
+        # When the payload was sliced out of a prefetched whole segment the
+        # cache entry is pure duplication: the SEGMENT is the cache, and it
+        # is already bounded by release_layer. Caching the slice as well
+        # stores the same bytes twice and keeps the second copy forever.
+        if not from_prefetch and self.cache_fragments():
+            self._cache_store(self._cache_fragment_path(sha), payload)
+        elif from_prefetch:
+            self.stats["fragment_cache_skipped"] += 1
         try:
             tensors = self._remote_tables(source, entry).get(expert)
         except Exception as exc:  # noqa: BLE001
