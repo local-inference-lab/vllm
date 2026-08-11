@@ -870,9 +870,17 @@ class FungibleQuantState:
     def _doc_for(self, tier: np.ndarray, swaps: list) -> dict:
         doc = {k: v for k, v in self.policy_doc.items()
                if k not in ("bits_per_expert", "provenance", "budget")}
-        doc["bits_per_expert"] = {
-            str(layer): [int(b) for b in tier[row]]
-            for row, layer in enumerate(self.layers)}
+        # Same hazard as admin.build_target_doc: rebuilding bits_per_expert
+        # from self.layers alone silently drops every layer outside the
+        # decision domain (MTP layer 78 on GLM-5.2 — required by the loader's
+        # bitrate map, unbindable by the collector). The proposed document
+        # would then cover fewer layers than the running one and the swap
+        # engine would refuse it as "policies cover different layers".
+        bpe = {str(k): list(v) for k, v in
+               (self.policy_doc.get("bits_per_expert") or {}).items()}
+        for row, layer in enumerate(self.layers):
+            bpe[str(layer)] = [int(b) for b in tier[row]]
+        doc["bits_per_expert"] = bpe
         # The declared cardinality is RECOMPUTED from the proposed tiers,
         # not copied: promotions change occupancy, and store.validate_policy
         # enforces cap == n. The byte ceiling rides along so a persisted

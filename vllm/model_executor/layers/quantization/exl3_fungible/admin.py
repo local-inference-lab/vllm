@@ -1061,9 +1061,19 @@ def build_target_doc(policy_doc: Mapping[str, Any], *, layers: Sequence[int],
     doc = {k: v for k, v in policy_doc.items()
            if k not in ("bits_per_expert", "provenance", "pinned")}
     tier = np.asarray(new_tier)
-    doc["bits_per_expert"] = {
-        str(layer): [int(b) for b in tier[row]]
-        for row, layer in enumerate(layers)}
+    # START from the running document and overwrite only the rows this change
+    # owns. Building bits_per_expert from `layers` alone DROPS every layer the
+    # decision domain does not cover -- on GLM-5.2 that is MTP layer 78, which
+    # the progressive loader requires in the bitrate map but the stats
+    # collector cannot bind. The resulting document described 75 layers
+    # against a running document of 76, and SwapPlan.from_policies refused it
+    # with "policies cover different layers" -- an accurate message about a
+    # document we had malformed ourselves.
+    bpe = {str(k): list(v) for k, v in
+           (policy_doc.get("bits_per_expert") or {}).items()}
+    for row, layer in enumerate(layers):
+        bpe[str(layer)] = [int(b) for b in tier[row]]
+    doc["bits_per_expert"] = bpe
     doc["pinned"] = {str(k): v for k, v in pinned.items()}
     doc["provenance"] = dict(provenance)
     return doc

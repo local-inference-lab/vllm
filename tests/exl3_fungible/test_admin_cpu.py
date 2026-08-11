@@ -1469,3 +1469,45 @@ def test_a_number_elsewhere_in_the_name_is_not_a_layer_id():
     """"layers.N" must be matched as a path segment; a bare digit anywhere
     would happily read an expert index as a layer."""
     assert A._module_layer_id(_Mod(layer_name="model.experts.12.w13")) is None
+
+
+# --------------------------------------------------------------------------
+# Layers outside the decision domain must survive a re-tier.
+#
+# GLM-5.2's MTP layer 78 is in the progressive loader's bitrate map (the
+# loader refuses to boot without it) but cannot be bound by the stats
+# collector, so state.layers covers 75 layers while policy_doc covers 76.
+# Rebuilding bits_per_expert from state.layers alone dropped layer 78, and
+# SwapPlan.from_policies then refused the change with "policies cover
+# different layers" — an accurate complaint about a document we malformed.
+
+
+def _doc_with_extra_layer():
+    return {
+        "schema": "fq-policy/2",
+        "bits_per_expert": {"3": [3, 3, 4, 4], "4": [3, 4, 3, 4],
+                            "78": [3, 3, 3, 3]},
+        "budget": {"mode": "fixed_cardinality"},
+    }
+
+
+def test_build_target_doc_preserves_layers_outside_the_decision_domain():
+    doc = _doc_with_extra_layer()
+    new_tier = np.array([[4, 3, 4, 3], [3, 4, 3, 4]])
+    out = A.build_target_doc(doc, layers=[3, 4], new_tier=new_tier,
+                             pinned={}, provenance={})
+    assert set(out["bits_per_expert"]) == {"3", "4", "78"}, \
+        "layer 78 was dropped — the swap engine will refuse this document"
+    assert out["bits_per_expert"]["78"] == [3, 3, 3, 3], \
+        "an uninstrumented layer must be carried through UNCHANGED"
+    assert out["bits_per_expert"]["3"] == [4, 3, 4, 3]
+
+
+def test_build_target_doc_does_not_alias_the_running_document():
+    """Carrying rows through must copy them: mutating the target document
+    must never reach back into the policy the engine is still running."""
+    doc = _doc_with_extra_layer()
+    out = A.build_target_doc(doc, layers=[3], new_tier=np.array([[4, 3, 4, 3]]),
+                             pinned={}, provenance={})
+    out["bits_per_expert"]["78"][0] = 9
+    assert doc["bits_per_expert"]["78"] == [3, 3, 3, 3]
