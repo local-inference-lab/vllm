@@ -153,11 +153,14 @@ ONLINE_QUANT_SHORTHAND_NAMES: tuple[str, ...] = (
 )
 
 
-# Checkpoint formats that support overlaying online quantization on BF16 projections
-# which the checkpoint explicitly leaves unquantized (shared experts via
-# `shared_experts`, other dense linears via `linear`).
-_MODELOPT_ONLINE_OVERLAY_NAMES = frozenset(
-    {
+# Checkpoint formats that support overlaying online quantization on projections
+# which the checkpoint explicitly leaves in BF16 (shared experts via
+# `shared_experts`, other dense linears via `linear`). Each checkpoint backend
+# still owns the layer-level dispatch, so serialized weights always take
+# precedence over this overlay.
+_CHECKPOINT_ONLINE_OVERLAY_WEIGHTS = {
+    name: frozenset({kMxfp8Dynamic, kFp8Static128BlockSym})
+    for name in {
         "modelopt",
         "modelopt_fp4",
         "modelopt_mxfp8",
@@ -165,16 +168,15 @@ _MODELOPT_ONLINE_OVERLAY_NAMES = frozenset(
         "mxfp4",
         "nvfp4_nf3_hybrid",
     }
-)
+}
+_CHECKPOINT_ONLINE_OVERLAY_WEIGHTS["exl3"] = frozenset({kMxfp8Dynamic})
 
 
-_MODELOPT_ONLINE_OVERLAY_WEIGHTS = frozenset({kMxfp8Dynamic, kFp8Static128BlockSym})
-
-
-def _is_modelopt_online_overlay(
+def _is_checkpoint_online_overlay(
     quantization: str | None, args: QuantizationConfigArgs
 ) -> bool:
-    if quantization not in _MODELOPT_ONLINE_OVERLAY_NAMES or args.moe is not None:
+    supported_weights = _CHECKPOINT_ONLINE_OVERLAY_WEIGHTS.get(quantization)
+    if supported_weights is None or args.moe is not None:
         return False
     specs = [s for s in (args.linear, args.shared_experts) if s is not None]
     if not specs:
@@ -183,8 +185,7 @@ def _is_modelopt_online_overlay(
         # `ignore` only filters the dense-linear overlay.
         return False
     return all(
-        spec.weight in _MODELOPT_ONLINE_OVERLAY_WEIGHTS and spec.activation is None
-        for spec in specs
+        spec.weight in supported_weights and spec.activation is None for spec in specs
     )
 
 
@@ -192,28 +193,39 @@ def resolve_quantization_config(
     quantization: str | None,
     quantization_config: dict[str, Any] | QuantizationConfigArgs | None,
 ) -> QuantizationConfigArgs | None:
-    """Resolve `--quantization` shorthand and `--quantization-config` into a
-    QuantizationConfigArgs.
+    """Resolve quantization CLI settings into structured arguments.
 
     `quantization` may be a CLI shorthand that desugars into a base config via
     `_ONLINE_SHORTHANDS`. `quantization_config` is a dict or pre-built args
     object. When both are online settings, fields explicitly set in
-    `quantization_config` take precedence over the shorthand. ModelOpt accepts
-    online overlays for BF16 dense/shared-expert projections.
+    `quantization_config` take precedence over the shorthand. Selected
+    checkpoint formats accept online overlays for BF16 dense/shared-expert
+    projections.
+
+    Args:
+        quantization: Quantization method name or online shorthand.
+        quantization_config: Explicit online quantization fields, if any.
+
+    Returns:
+        The resolved quantization arguments, or ``None`` when no online
+        configuration was requested.
+
+    Raises:
+        ValueError: If an explicit configuration cannot overlay the selected
+            checkpoint quantization method.
     """
     if isinstance(quantization_config, dict):
         quantization_config = QuantizationConfigArgs(**quantization_config)
 
     if quantization is not None and quantization not in ONLINE_QUANT_SHORTHAND_NAMES:
-        if quantization_config is not None and not _is_modelopt_online_overlay(
+        if quantization_config is not None and not _is_checkpoint_online_overlay(
             quantization, quantization_config
         ):
             raise ValueError(
                 f"quantization_config is only supported when quantization is "
                 f"one of {sorted(ONLINE_QUANT_SHORTHAND_NAMES)}, or when "
-                f"using the ModelOpt online overlay (weight='mxfp8' or "
-                f"weight='fp8_per_block_static' on 'shared_experts' and/or "
-                f"'linear', optional 'ignore'), "
+                f"using a supported checkpoint online overlay on "
+                f"'shared_experts' and/or 'linear' (optional 'ignore'), "
                 f"got quantization={quantization!r}"
             )
         return quantization_config
