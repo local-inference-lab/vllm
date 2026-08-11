@@ -119,7 +119,7 @@ class ProgressiveModelLoader(BaseModelLoader):
             "Loading weights took %.2f seconds (progressive)",
             time.perf_counter() - start,
         )
-        self._reclaim_allocator()
+        self._reclaim_allocator(spec, tp_rank)
 
     # ------------------------------------------------------------ memory
 
@@ -136,7 +136,9 @@ class ProgressiveModelLoader(BaseModelLoader):
         try:
             import torch
 
-            from .memory_preflight import _env_bytes, check_or_raise, project
+            from .memory_preflight import (_env_bytes, check_or_raise,
+                                           project, project_expert_bytes,
+                                           render)
             from .progressive import measure_footprint_inputs
 
             free, total = torch.cuda.mem_get_info()
@@ -146,6 +148,41 @@ class ProgressiveModelLoader(BaseModelLoader):
                 logger.warning("FQ memory preflight skipped: no fragment "
                                "could be sized")
                 return
+
+            # vLLM constructs the model -- allocating every parameter at its
+            # final sharded shape, which for a mixed-K checkpoint means the
+            # tier bitmap has already been honoured -- BEFORE calling us to
+            # fill those parameters in. So the true per-rank weight footprint
+            # is not something to reconstruct from file headers; it is sitting
+            # in the allocator right now, exact.
+            #
+            # Reconstructing it is in fact wrong: non-expert tensors carry no
+            # .rankN. suffix in the source shards because vLLM shards them
+            # internally at load, so summing their file bytes charges one rank
+            # for all four (35.19 GiB instead of ~12.14 GiB on GLM-5.2 TP4 --
+            # a 23 GiB error, enough to reject a policy that fits comfortably).
+            measured = torch.cuda.memory_allocated()
+            projected_experts, _ = project_expert_bytes(
+                spec.bits_by_layer, expert_bytes_by_k)
+            # Stash for the post-load calibration write.
+            self._last_expert_bytes = projected_experts
+            calibrated = self._read_dense_calibration(spec, tp_rank)
+            if measured >= projected_experts:
+                dense_bytes = measured - projected_experts
+                source = "measured (allocator, post-construction)"
+            elif calibrated is not None:
+                # Measured on a PREVIOUS boot of this same model/TP/dense
+                # source: total weight footprint minus that boot's expert
+                # bytes. The dense term does not depend on the policy, so one
+                # successful boot calibrates every later projection exactly.
+                dense_bytes = calibrated
+                source = "calibrated from a previous boot"
+            else:
+                # Parameters are not resident yet -- fall back to headers and
+                # say so, because the dense term is then an upper bound that
+                # over-charges a TP rank.
+                source = ("header upper bound -- dense term counts all TP "
+                          "ranks; treat a near-miss as inconclusive")
             util = float(os.environ.get("VLLM_FQ_BUDGET_UTIL", "0"))
             if not util:
                 from vllm.config import get_current_vllm_config
@@ -166,12 +203,81 @@ class ProgressiveModelLoader(BaseModelLoader):
                 min_kv_bytes=_env_bytes(
                     "VLLM_FQ_BUDGET_MIN_KV", 4 * (1 << 30)),
             )
+            logger.info("FQ memory preflight: weight source = %s", source)
+            if not source.startswith("measured"):
+                # Refusing a boot on a number we know is inflated would be a
+                # worse failure than the one this check exists to prevent:
+                # it would block policies that fit. Report, do not enforce.
+                for line in render(proj, expert_bytes_by_k):
+                    logger.info(line)
+                if not proj["fits"]:
+                    logger.warning(
+                        "FQ memory preflight: projection is an UPPER BOUND "
+                        "and does not fit -- proceeding anyway; the engine's "
+                        "own KV sizing has the final say.")
+                return
             check_or_raise(proj, expert_bytes_by_k, logger.info)
         except ImportError:
             logger.warning("FQ memory preflight unavailable", exc_info=True)
 
+    _last_expert_bytes: int | None = None
+
     @staticmethod
-    def _reclaim_allocator() -> None:
+    def _calibration_path(spec, tp_rank):
+        """Where this (dense source, TP rank) records its dense footprint.
+
+        Keyed by rank because TP sharding is not uniform across ranks for
+        every tensor, and by dense source because that is what determines the
+        non-expert bytes.
+        """
+        import hashlib
+        from pathlib import Path
+
+        key = hashlib.blake2b(
+            f"{spec.dense_source}|tp{tp_rank}".encode(), digest_size=8
+        ).hexdigest()
+        root = os.environ.get("VLLM_FQ_CACHE") or os.path.expanduser(
+            "~/.cache/fq")
+        return Path(root) / "calibration" / f"dense-{key}.json"
+
+    def _read_dense_calibration(self, spec, tp_rank) -> int | None:
+        override = os.environ.get("VLLM_FQ_BUDGET_DENSE")
+        if override:
+            from .memory_preflight import _env_bytes
+            return _env_bytes("VLLM_FQ_BUDGET_DENSE", 0)
+        try:
+            import json
+            return int(json.loads(
+                self._calibration_path(spec, tp_rank).read_text()
+            )["dense_bytes"])
+        except (OSError, ValueError, KeyError):
+            return None
+
+    def _write_dense_calibration(self, spec, tp_rank, dense_bytes: int) -> None:
+        """Record the dense footprint a successful boot actually used.
+
+        Written only from a boot that got all the way through load_weights, so
+        the number reflects a configuration that really ran.
+        """
+        try:
+            import json
+            p = self._calibration_path(spec, tp_rank)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps({
+                "dense_bytes": int(dense_bytes),
+                "dense_source": str(spec.dense_source),
+                "tp_rank": tp_rank,
+            }))
+            tmp.replace(p)  # atomic: a torn file would poison every later boot
+            logger.info(
+                "FQ memory preflight: calibrated dense footprint %.2f GiB "
+                "for tp_rank=%s -- future boots will project exactly",
+                dense_bytes / (1 << 30), tp_rank)
+        except (OSError, ValueError):
+            logger.warning("FQ dense calibration not written", exc_info=True)
+
+    def _reclaim_allocator(self, spec=None, tp_rank=None) -> None:
         """Return the streaming residue to the driver before KV profiling.
 
         Progressive loading stages tens of thousands of small per-expert
@@ -202,5 +308,13 @@ class ProgressiveModelLoader(BaseModelLoader):
                 before_r / (1 << 30), after_r / (1 << 30),
                 (before_r - after_r) / (1 << 30), before_a / (1 << 30),
             )
+            # allocated == the real per-rank weight footprint now that every
+            # parameter is filled. Subtracting the policy's expert bytes
+            # leaves the policy-independent dense term, which is exactly what
+            # the next boot's projection is missing.
+            if spec is not None and self._last_expert_bytes is not None:
+                dense = before_a - self._last_expert_bytes
+                if dense > 0:
+                    self._write_dense_calibration(spec, tp_rank, dense)
         except ImportError:
             pass
