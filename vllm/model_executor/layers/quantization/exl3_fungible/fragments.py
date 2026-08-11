@@ -84,6 +84,7 @@ import mmap
 import os
 import re
 import struct
+import threading
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -607,6 +608,78 @@ class HfSource:
             f"{self._RETRIES} attempts: {type(last).__name__}: {last}")
 
 
+
+class _DownloadMonitor:
+    """Aggregate download progress for the boot log.
+
+    hf_hub_download gives us ONE completion callback, not incremental ones, so
+    the primary fetch path was a silent log -- exactly the "staring at a log
+    that is not progressing" problem the per-file progress was meant to solve,
+    just moved. Rather than reach into hub internals for per-file byte counts,
+    watch the .incomplete files the client leaves in the cache and report the
+    aggregate. For an operator that is the better line anyway: four ranks
+    times several objects would interleave into noise, while one line answers
+    "is it moving, how fast, how many in flight".
+    """
+
+    _instance = None
+    _lock = threading.Lock()
+
+    def __init__(self, root: Path, every: float = 15.0):
+        self.root = Path(root)
+        self.every = every
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @classmethod
+    def ensure(cls, root: Path) -> "_DownloadMonitor":
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls(root)
+                cls._instance.start()
+            return cls._instance
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="fq-dl-monitor", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _scan(self) -> tuple[int, int]:
+        total = count = 0
+        try:
+            for f in self.root.rglob("*.incomplete"):
+                try:
+                    total += f.stat().st_size
+                    count += 1
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return total, count
+
+    def _run(self) -> None:
+        prev, t_prev = self._scan()[0], time.monotonic()
+        cumulative = 0
+        while not self._stop.wait(self.every):
+            cur, n = self._scan()
+            now = time.monotonic()
+            delta, dt = cur - prev, max(now - t_prev, 1e-9)
+            if n == 0 and delta <= 0:
+                prev, t_prev = cur, now
+                continue
+            if delta > 0:
+                cumulative += delta
+            logger.info(
+                "FQ downloads: %d in flight, %.1f GiB this boot, %.0f MiB/s",
+                n, cumulative / (1 << 30), max(delta, 0) / dt / (1 << 20))
+            prev, t_prev = cur, now
+
+
 class FragmentResolver:
     """Resolve (layer, expert, K) fragments: local dirs -> sources -> error.
 
@@ -1019,6 +1092,7 @@ class FragmentResolver:
                 got = getattr(source, "prefetch_whole", None)
                 if got is None:
                     continue           # local dirs need no prefetch
+                _DownloadMonitor.ensure(dest.parent)
 
                 def _report(done, total, rate, _f=entry.file, _l=layer,
                             _k=k):

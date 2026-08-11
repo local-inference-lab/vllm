@@ -417,7 +417,9 @@ def progressive_weights_iterator(
                         + ", ".join(f"{n} experts want K{k}"
                                     for k, n in _want) + ")")
                     for _fut in _inflight.pop(layer):
-                        _fut.result()
+                        _note = _fut.result()
+                        if _note:
+                            _emit(f"FQ progressive L{layer}: {_note}")
                 else:
                     for _k, _n in _want:
                         _note = getattr(resolver, "prefetch_layer",

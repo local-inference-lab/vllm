@@ -508,3 +508,69 @@ def test_download_verbosity_still_present():
     src = _progressive_src()
     assert "waiting on background" in src
     assert "1 fetch instead of" in src
+
+
+# ------------------------------------------------- download-progress visibility
+def test_async_prefetch_logs_its_result(tmp_path):
+    """Background prefetch is now the COMMON path, and it discarded
+    prefetch_layer's return value -- so 'cached', 'shared (fetched by another
+    rank)' and 'prefetched ... from <source>' never reached the log. Only the
+    sync fallback reported anything."""
+    src = _progressive_src()
+    assert "_note = _fut.result()" in src, (
+        "the async path must surface the prefetch note, not discard it")
+
+
+def test_download_monitor_reports_aggregate_progress(tmp_path):
+    """hf_hub_download gives ONE completion callback, not incremental ones, so
+    the primary path was a silent log. Watch the client's .incomplete files."""
+    root = tmp_path / "segments"
+    dl = root / ".cache" / "huggingface" / "download"
+    dl.mkdir(parents=True)
+    mon = FR._DownloadMonitor(root, every=0.05)
+    assert mon._scan() == (0, 0)
+    (dl / "a.incomplete").write_bytes(b"x" * 1024)
+    (dl / "b.incomplete").write_bytes(b"y" * 2048)
+    total, count = mon._scan()
+    assert (total, count) == (3072, 2), "must sum bytes across in-flight files"
+
+
+def test_monitor_ignores_completed_files(tmp_path):
+    """A finished download is not 'in flight'."""
+    root = tmp_path / "segments"
+    dl = root / ".cache" / "huggingface" / "download"
+    dl.mkdir(parents=True)
+    (dl / "done.safetensors").write_bytes(b"z" * 4096)
+    assert FR._DownloadMonitor(root, every=0.05)._scan() == (0, 0)
+
+
+def test_monitor_survives_a_missing_root(tmp_path):
+    """It is telemetry; it must never fail a boot."""
+    assert FR._DownloadMonitor(tmp_path / "nope", every=0.05)._scan() == (0, 0)
+
+
+def test_monitor_is_a_singleton_per_process():
+    """Four TP ranks are four processes, but N resolvers in ONE process must
+    not spawn N threads all logging the same numbers."""
+    FR._DownloadMonitor._instance = None
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        a = FR._DownloadMonitor.ensure(Path(d))
+        b = FR._DownloadMonitor.ensure(Path(d))
+        try:
+            assert a is b
+        finally:
+            a.stop()
+            FR._DownloadMonitor._instance = None
+
+
+def test_monitor_thread_is_daemon_so_it_cannot_hang_shutdown():
+    FR._DownloadMonitor._instance = None
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        m = FR._DownloadMonitor.ensure(Path(d))
+        try:
+            assert m._thread is not None and m._thread.daemon
+        finally:
+            m.stop()
+            FR._DownloadMonitor._instance = None
