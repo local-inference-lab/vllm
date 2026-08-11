@@ -623,14 +623,26 @@ class HfSource:
 class _DownloadMonitor:
     """Aggregate download progress for the boot log.
 
-    hf_hub_download gives us ONE completion callback, not incremental ones, so
-    the primary fetch path was a silent log -- exactly the "staring at a log
-    that is not progressing" problem the per-file progress was meant to solve,
-    just moved. Rather than reach into hub internals for per-file byte counts,
-    watch the .incomplete files the client leaves in the cache and report the
-    aggregate. For an operator that is the better line anyway: four ranks
-    times several objects would interleave into noise, while one line answers
-    "is it moving, how fast, how many in flight".
+    Two earlier signals were wrong, both for instructive reasons:
+
+    * hf_hub_download gives ONE completion callback, so per-file progress
+      never fired on the primary path.
+    * Watching the growth of the client's ``.incomplete`` staging files does
+      not work with Xet, which PREALLOCATES them: the size never changes
+      during transfer, so every delta was zero and the log read
+      ``3 in flight, 12.1 GiB this boot, 0 MiB/s`` forever, with four ranks
+      cycling four constant totals.
+
+    So measure what is unambiguous instead: bytes DELIVERED, as completed
+    segment objects appear in our cache. That is monotonic by construction
+    (sizes are remembered even after release_layer unlinks the file), it
+    cannot be faked by preallocation, and it is what an operator actually
+    wants to know.
+
+    Because delivery is granular (~GB at a time) the instantaneous rate is
+    bursty, so the headline figure is the AVERAGE since the first byte --
+    which is stable and never reads zero while a boot is making progress --
+    with a recent-window rate beside it.
     """
 
     _instance = None
@@ -641,16 +653,14 @@ class _DownloadMonitor:
         self.every = every
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._sizes: dict[str, int] = {}
-        self._done_bytes = 0
-        # EXCLUDE what was already there. A killed boot leaves .incomplete
-        # files behind, and counting them as in-flight makes a HEALTHY boot
-        # report a frozen byte total at 0 MiB/s -- observed live: two corpses
-        # from an hour-old attempt summed to 880 MB and swamped the real
-        # transfer, which was running at 308 MiB/s.
+        # path -> size, never removed: release_layer unlinking a segment is
+        # not un-delivering it.
+        self._delivered: dict[str, int] = {}
+        self._t0: float | None = None
+        self._recent: float = 0.0
         self._preexisting: set[str] = set()
         try:
-            self._preexisting = {str(f) for f in self.root.rglob("*.incomplete")}
+            self._preexisting = {str(f) for f in self.root.rglob("*.safetensors")}
         except OSError:
             pass
 
@@ -672,46 +682,32 @@ class _DownloadMonitor:
     def stop(self) -> None:
         self._stop.set()
 
-    def _scan(self) -> tuple[int, int]:
-        total = count = 0
+    def _in_flight(self) -> int:
+        """Staging files that exist right now -- a COUNT only.
+
+        Deliberately not their size: Xet preallocates, so those bytes say
+        nothing about progress.
+        """
         try:
-            for f in self.root.rglob("*.incomplete"):
-                try:
-                    total += f.stat().st_size
-                    count += 1
-                except OSError:
-                    continue
+            return sum(1 for f in self.root.rglob("*.incomplete")
+                       if str(f) not in self._preexisting)
         except OSError:
-            pass
-        return total, count
+            return 0
 
     def _progress(self) -> tuple[int, int]:
-        """(monotonic bytes downloaded, files in flight).
-
-        Summing the in-flight files alone is NOT progress: a completed file
-        leaves the .incomplete set, so the sum DROPS and the rate reads 0
-        MiB/s next to gigabytes of real transfer -- observed live as
-        "3 in flight, 1.8 GiB this boot, 0 MiB/s". Carry the bytes of files
-        that vanished into a completed total so the series only ever rises.
-        """
-        seen: dict[str, int] = {}
-        count = 0
+        """(bytes delivered so far, staging files in flight)."""
         try:
-            for f in self.root.rglob("*.incomplete"):
-                if str(f) in self._preexisting:
-                    continue          # a corpse from an earlier boot
+            for f in self.root.rglob("*.safetensors"):
+                key = str(f)
+                if key in self._preexisting or key in self._delivered:
+                    continue
                 try:
-                    seen[str(f)] = f.stat().st_size
-                    count += 1
+                    self._delivered[key] = f.stat().st_size
                 except OSError:
                     continue
         except OSError:
             pass
-        for path, size in self._sizes.items():
-            if path not in seen:
-                self._done_bytes += size
-        self._sizes = seen
-        return self._done_bytes + sum(seen.values()), count
+        return sum(self._delivered.values()), self._in_flight()
 
     def _run(self) -> None:
         prev, t_prev = self._progress()[0], time.monotonic()
@@ -719,16 +715,22 @@ class _DownloadMonitor:
             cur, n = self._progress()
             now = time.monotonic()
             delta, dt = cur - prev, max(now - t_prev, 1e-9)
-            if n == 0 and delta <= 0:
+            if cur <= 0 and n == 0:
                 prev, t_prev = cur, now
                 continue
-            # NOTE: with Xet enabled a large share of the transfer lands in
-            # the shared xet chunk cache rather than in these staging files,
-            # so this is a LOWER BOUND on real throughput, not a total.
+            if cur > 0 and self._t0 is None:
+                self._t0 = t_prev
+            inst = max(delta, 0) / dt
+            # EMA so one granular completion does not read as a spike and the
+            # gap after it does not read as a stall.
+            self._recent = inst if self._recent == 0 else (
+                0.6 * self._recent + 0.4 * inst)
+            avg = (cur / max(now - self._t0, 1e-9)) if self._t0 else 0.0
             logger.info(
-                "FQ downloads: %d in flight, >=%.1f GiB this boot, "
-                ">=%.0f MiB/s", n, cur / (1 << 30),
-                max(delta, 0) / dt / (1 << 20))
+                "FQ downloads: %d in flight, %.1f GiB delivered, "
+                "%.0f MiB/s avg (recent %.0f MiB/s)",
+                n, cur / (1 << 30), avg / (1 << 20),
+                self._recent / (1 << 20))
             prev, t_prev = cur, now
 
 
@@ -1286,6 +1288,25 @@ class FragmentResolver:
             return False
         return True
 
+    @staticmethod
+    def keep_layers(environ=None) -> bool:
+        """Retain whole downloaded layer objects for later re-tiering.
+
+        Opt-in, because the cost is real: bounded-by-depth becomes
+        bounded-by-model, and a full GLM-5.2 pass is hundreds of GB. Worth it
+        when you intend to promote/demote experts at runtime and want those
+        swaps to be local slices rather than downloads.
+
+        VLLM_FQ_KEEP_LAYERS is the documented name; VLLM_FQ_PREFETCH_KEEP is
+        kept as an alias so existing runs do not silently change behaviour.
+        """
+        env = environ if environ is not None else os.environ
+        for name in ("VLLM_FQ_KEEP_LAYERS", "VLLM_FQ_PREFETCH_KEEP"):
+            if str(env.get(name, "")).strip().lower() in ("1", "true", "yes",
+                                                          "on"):
+                return True
+        return False
+
     def release_layer(self, layer: int) -> int:
         """Drop the whole-segment objects prefetched for ``layer``.
 
@@ -1301,7 +1322,14 @@ class FragmentResolver:
         people's cache entries is not ours to do. Set VLLM_FQ_PREFETCH_KEEP=1
         to retain everything (faster repeat boots, if disk is free).
         """
-        if os.environ.get("VLLM_FQ_PREFETCH_KEEP", "0") == "1":
+        if self.keep_layers():
+            # KEEP: the whole layer objects stay on disk AND stay in
+            # _prefetched, so a later K3->K4 promotion (or a K4->K3
+            # demotion) slices the new expert out of a local file instead of
+            # re-fetching ~2.5 GB over the network. That is the difference
+            # between a swap that costs milliseconds and one that costs a
+            # download, which is what makes runtime re-tiering practical
+            # rather than merely possible.
             return 0
         freed = 0
         try:

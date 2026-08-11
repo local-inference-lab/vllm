@@ -521,32 +521,15 @@ def test_async_prefetch_logs_its_result(tmp_path):
         "the async path must surface the prefetch note, not discard it")
 
 
-def test_download_monitor_reports_aggregate_progress(tmp_path):
-    """hf_hub_download gives ONE completion callback, not incremental ones, so
-    the primary path was a silent log. Watch the client's .incomplete files."""
-    root = tmp_path / "segments"
-    dl = root / ".cache" / "huggingface" / "download"
-    dl.mkdir(parents=True)
-    mon = FR._DownloadMonitor(root, every=0.05)
-    assert mon._scan() == (0, 0)
-    (dl / "a.incomplete").write_bytes(b"x" * 1024)
-    (dl / "b.incomplete").write_bytes(b"y" * 2048)
-    total, count = mon._scan()
-    assert (total, count) == (3072, 2), "must sum bytes across in-flight files"
 
 
-def test_monitor_ignores_completed_files(tmp_path):
-    """A finished download is not 'in flight'."""
-    root = tmp_path / "segments"
-    dl = root / ".cache" / "huggingface" / "download"
-    dl.mkdir(parents=True)
-    (dl / "done.safetensors").write_bytes(b"z" * 4096)
-    assert FR._DownloadMonitor(root, every=0.05)._scan() == (0, 0)
+
+
 
 
 def test_monitor_survives_a_missing_root(tmp_path):
     """It is telemetry; it must never fail a boot."""
-    assert FR._DownloadMonitor(tmp_path / "nope", every=0.05)._scan() == (0, 0)
+    assert FR._DownloadMonitor(tmp_path / "nope", every=0.05)._progress() == (0, 0)
 
 
 def test_monitor_is_a_singleton_per_process():
@@ -619,33 +602,7 @@ def test_resolver_has_a_lock_for_its_memo_dicts(tmp_path):
     assert hasattr(_resolver(tmp_path), "_memo_lock")
 
 
-def test_download_progress_is_monotonic_across_completions(tmp_path):
-    """Summing in-flight files is NOT progress. A completed file leaves the
-    .incomplete set, so the sum DROPS -- observed live as
-    'FQ downloads: 3 in flight, 1.8 GiB this boot, 0 MiB/s' while gigabytes
-    were genuinely transferring."""
-    root = tmp_path / "segments"
-    dl = root / ".cache" / "huggingface" / "download"
-    dl.mkdir(parents=True)
-    mon = FR._DownloadMonitor(root, every=0.05)
 
-    a = dl / "a.incomplete"
-    a.write_bytes(b"x" * 1000)
-    total1, n1 = mon._progress()
-    assert (total1, n1) == (1000, 1)
-
-    a.write_bytes(b"x" * 3000)                 # grew
-    total2, _ = mon._progress()
-    assert total2 == 3000
-
-    a.unlink()                                  # completed and renamed away
-    total3, n3 = mon._progress()
-    assert n3 == 0
-    assert total3 == 3000, f"progress went backwards: {total3}"
-
-    (dl / "b.incomplete").write_bytes(b"y" * 500)   # next file starts
-    total4, _ = mon._progress()
-    assert total4 == 3500, "completed bytes were dropped from the total"
 
 
 # ------------------------------------------- telemetry must not fail the fetch
@@ -690,19 +647,92 @@ def test_declared_counters_still_report_zero(tmp_path):
     assert "segments_prefetched" in r.stats
 
 
-def test_monitor_ignores_corpses_from_a_previous_boot(tmp_path):
-    """A killed boot leaves .incomplete files behind. Counting them as
-    in-flight made a HEALTHY boot report a frozen total at 0 MiB/s: two
-    corpses from an hour-old attempt summed to 880 MB and swamped a transfer
-    genuinely running at 308 MiB/s. Diagnosing that cost real time."""
+
+
+# ------------------------------------------- download progress (delivered bytes)
+def _mon(root):
+    return FR._DownloadMonitor(root, every=0.05)
+
+
+def test_progress_counts_delivered_segments_not_staging_size(tmp_path):
+    """Xet PREALLOCATES its .incomplete staging files, so their size never
+    changes during transfer. Watching that growth produced
+    '3 in flight, 12.1 GiB this boot, 0 MiB/s' forever -- four ranks cycling
+    four constant totals while the box pulled at 300+ MiB/s. Delivery is the
+    only signal preallocation cannot fake."""
     root = tmp_path / "segments"
     dl = root / ".cache" / "huggingface" / "download"
     dl.mkdir(parents=True)
-    (dl / "corpse.incomplete").write_bytes(b"x" * 880)   # pre-existing
+    m = _mon(root)
 
-    mon = FR._DownloadMonitor(root, every=0.05)          # baseline taken here
-    assert mon._progress() == (0, 0), "counted a corpse as in-flight"
+    big = dl / "preallocated.incomplete"
+    big.write_bytes(b"\0" * 4096)              # full size from the start
+    total, n = m._progress()
+    assert total == 0, "preallocated staging bytes must not count as progress"
+    assert n == 1, "but it IS in flight, and the count says so"
 
-    (dl / "live.incomplete").write_bytes(b"y" * 100)
-    total, n = mon._progress()
-    assert (total, n) == (100, 1), "live file must be counted alone"
+    (root / "layer-003.k3.safetensors").write_bytes(b"x" * 1000)
+    total, _ = m._progress()
+    assert total == 1000
+
+
+def test_delivered_survives_release_layer_unlinking_the_file(tmp_path):
+    """release_layer unlinking a segment is not un-delivering it; the series
+    must never go backwards."""
+    root = tmp_path / "segments"
+    root.mkdir(parents=True)
+    m = _mon(root)
+    f = root / "layer-003.k3.safetensors"
+    f.write_bytes(b"x" * 2048)
+    assert m._progress()[0] == 2048
+    f.unlink()
+    assert m._progress()[0] == 2048, "delivered bytes went backwards"
+
+
+def test_preexisting_segments_are_not_counted_as_this_boots_traffic(tmp_path):
+    root = tmp_path / "segments"
+    root.mkdir(parents=True)
+    (root / "old.safetensors").write_bytes(b"z" * 999)
+    m = _mon(root)                              # baseline taken here
+    assert m._progress()[0] == 0
+    (root / "new.safetensors").write_bytes(b"n" * 10)
+    assert m._progress()[0] == 10
+
+
+def test_a_segment_counted_once_not_on_every_scan(tmp_path):
+    root = tmp_path / "segments"
+    root.mkdir(parents=True)
+    m = _mon(root)
+    (root / "a.safetensors").write_bytes(b"x" * 500)
+    assert [m._progress()[0] for _ in range(3)] == [500, 500, 500]
+
+
+# ------------------------------------------------------------- keep layers
+def test_keep_layers_is_opt_in():
+    assert FR.FragmentResolver.keep_layers({}) is False
+
+
+@pytest.mark.parametrize("name", ["VLLM_FQ_KEEP_LAYERS", "VLLM_FQ_PREFETCH_KEEP"])
+def test_both_names_work(name):
+    """The old name stays an alias so existing runs do not silently change
+    behaviour."""
+    assert FR.FragmentResolver.keep_layers({name: "1"}) is True
+
+
+def test_keep_layers_retains_the_file_AND_the_prefetch_handle(tmp_path,
+                                                              monkeypatch):
+    """The point of keeping is the NEXT re-tiering: a K3->K4 promotion should
+    slice the new expert out of the local whole-layer object rather than
+    re-fetch ~2.5 GB. That needs the file on disk AND the _prefetched handle
+    that makes range_from_prefetched reachable -- keeping only the file would
+    leave the swap path fetching over the network anyway."""
+    monkeypatch.setenv("VLLM_FQ_KEEP_LAYERS", "1")
+    r = _resolver(tmp_path)
+    seg = r.cache_dir / "segments" / "layer-004.k4.safetensors"
+    seg.parent.mkdir(parents=True, exist_ok=True)
+    seg.write_bytes(b"w" * 4096)
+    r._prefetched[(4, 4)] = seg
+    assert r.release_layer(4) == 0
+    assert seg.exists(), "kept layer was unlinked"
+    assert r._prefetched.get((4, 4)) == seg, (
+        "handle dropped: a later swap would re-download instead of slicing")
