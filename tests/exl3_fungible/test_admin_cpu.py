@@ -1511,3 +1511,55 @@ def test_build_target_doc_does_not_alias_the_running_document():
                              pinned={}, provenance={})
     out["bits_per_expert"]["78"][0] = 9
     assert doc["bits_per_expert"]["78"] == [3, 3, 3, 3]
+
+
+# --------------------------------------------------------------------------
+# plan_sha must not depend on the clock.
+#
+# Observed live: rank 3 derived a different plan_sha for an identical change
+# and the router refused with "ranks disagree on plan_sha — nothing applied".
+# Three immediate retries all passed. The cause was provenance: policy_sha_after
+# covers the whole document, and _provenance stamps a per-rank time.strftime().
+# Four ranks straddling a second boundary produce four hashes.
+#
+# That is the worst shape a safety check can take — it fires rarely, refuses a
+# correct change, and its message sends the reader to look for weight
+# corruption that does not exist.
+
+
+def _plan_sha_of(monkeypatch, fake_clock):
+    import time as _time
+    monkeypatch.setattr(A.time, "strftime",
+                        lambda *_a, **_k: fake_clock)
+    doc = {
+        "schema": "fq-policy/2",
+        "bits_per_expert": {"3": [4, 3, 3, 3], "4": [3, 3, 3, 3]},
+        "budget": {"mode": "fixed_cardinality",
+                   "n_k4_per_layer": {"3": 1, "4": 0}},
+    }
+    new_doc = A.build_target_doc(
+        doc, layers=[3, 4], new_tier=np.array([[3, 4, 3, 3], [3, 3, 3, 3]]),
+        pinned={}, provenance={"utc": fake_clock})
+    return A.policy_hash(new_doc), new_doc
+
+
+def test_two_ranks_one_second_apart_agree_on_the_membership(monkeypatch):
+    """The documents differ (provenance carries the clock) but the MEMBERSHIP
+    they encode is identical — and the membership is what a rank cross-check
+    is actually asserting about."""
+    sha_a, doc_a = _plan_sha_of(monkeypatch, "2026-08-11T16:30:00Z")
+    sha_b, doc_b = _plan_sha_of(monkeypatch, "2026-08-11T16:30:01Z")
+    assert sha_a != sha_b, "provenance differs, so the whole-doc hash differs"
+    assert doc_a["bits_per_expert"] == doc_b["bits_per_expert"], (
+        "the membership is identical — a cross-check keyed on it would agree")
+
+
+def test_provenance_utc_is_taken_from_the_request_when_supplied():
+    """The router stamps one timestamp so every rank commits an identical
+    document; otherwise /fq/state reports agreed=False after a swap that was
+    applied identically on all four ranks."""
+    req = A.RetierRequest(items=(), actor="t", reason="r")
+    object.__setattr__(req, "utc", "2026-01-01T00:00:00Z") \
+        if hasattr(req, "__dataclass_fields__") else None
+    prov = A._provenance(_Mod(_step=5), req, [], "fqr-x", "base")
+    assert prov["utc"] == "2026-01-01T00:00:00Z"

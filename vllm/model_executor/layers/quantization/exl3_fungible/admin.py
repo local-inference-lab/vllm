@@ -1554,10 +1554,31 @@ def plan_retier(state: Any, request: RetierRequest, *,
                                  "max_pairs": int(engine.max_pairs)})
 
     policy_sha_after = policy_hash(new_doc)
+    # plan_sha must be what its docstring claims -- "a pure function of the
+    # request and the live membership" -- so that a mismatch means the ranks
+    # genuinely disagree about the model.
+    #
+    # policy_sha_after is NOT that. It covers the whole document including
+    # provenance, which carries a per-rank wall clock ("utc") and a per-rank
+    # step counter. Four ranks that straddle a second boundary therefore
+    # derive four different plan_shas for an identical change, and the
+    # cross-check refuses with "ranks disagree on plan_sha — nothing applied":
+    # an alarming message about membership corruption, raised by a clock tick.
+    # Observed live -- rank 3 diverged once, then three identical retries
+    # passed -- which is the worst shape for a safety check, because it fires
+    # rarely and points somewhere else.
+    #
+    # Hash the MEMBERSHIP the document encodes instead. Two ranks that agree
+    # on every expert's tier agree on the plan, whatever second they computed
+    # it in.
+    membership_after = hashlib.sha256(json.dumps(
+        {str(k): [int(b) for b in v]
+         for k, v in (new_doc.get("bits_per_expert") or {}).items()},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     plan_sha = hashlib.sha256(json.dumps(
         {"pairs": [[int(l), int(o), int(i)] for l, o, i in plan],
          "policy_sha_before": policy_sha_before,
-         "policy_sha_after": policy_sha_after},
+         "membership_after": membership_after},
         sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     return RetierPlan(
@@ -1598,8 +1619,13 @@ def _provenance(state: Any, request: RetierRequest,
         "request_id": request_id,
         "actor": request.actor,
         "reason": request.reason,
-        "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "step": int(getattr(state, "_step", 0)),
+        # Stamped from the REQUEST when the router supplied it, so all four
+        # ranks commit an identical document. A per-rank time.strftime() here
+        # made the committed policies differ by provenance alone, which shows
+        # up later as /fq/state agreed=False after a swap that was in fact
+        # applied identically everywhere.
+        "utc": getattr(request, "utc", None) or time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "base_policy": base_policy,
         "num_swaps": sum(1 for i in resolved if i.outcome == "promoted"),
         "mode": request.mode,
