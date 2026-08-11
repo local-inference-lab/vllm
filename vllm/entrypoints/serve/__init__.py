@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 from fastapi import FastAPI
 
 from vllm.logger import init_logger
@@ -59,3 +61,17 @@ def register_vllm_dev_api_routers(app: FastAPI):
     from .dev.sleep.api_router import attach_router as attach_sleep_router
 
     attach_sleep_router(app)
+
+    # Fungible-quant admin API (forced expert re-tiering). Doubly gated:
+    # dev mode gets us here, and attach_router itself returns False unless
+    # VLLM_FQ_ADMIN_API=1 is also set, so POST /fq/retier — which mutates
+    # live model weights — can never appear on a serve by accident. The
+    # import is inside the guard so the default path pays nothing.
+    if os.environ.get("VLLM_FQ_ADMIN_API", os.environ.get(
+        "VLLM_FQ_ADMIN_ENABLE", "0"
+    )) in ("1", "true", "True"):
+        from vllm.model_executor.layers.quantization.exl3_fungible.admin import (  # noqa: E501
+            attach_router as attach_fq_admin_router,
+        )
+
+        attach_fq_admin_router(app)

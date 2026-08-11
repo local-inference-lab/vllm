@@ -818,6 +818,35 @@ class Worker(WorkerBase):
         ):
             self.model_runner._init_kv_zero_meta()
 
+    # ---------------------------------------------------------- FQ admin
+    # Reachable by name through EngineClient.collective_rpc (the method is
+    # resolved on the worker object). Thin lazy-import delegates so the FQ
+    # package's laziness contract holds: nothing fungible-quant is imported
+    # unless somebody actually calls one of these. All logic lives in
+    # exl3_fungible/admin.py, where it is CPU-testable. JSON strings in and
+    # out, matching the /collective_rpc convention.
+
+    def fq_admin_describe(self, request_json: str = "{}") -> str:
+        from vllm.model_executor.layers.quantization.exl3_fungible.admin import (  # noqa: E501
+            worker_describe,
+        )
+
+        return worker_describe(self, request_json)
+
+    def fq_admin_plan(self, request_json: str) -> str:
+        from vllm.model_executor.layers.quantization.exl3_fungible.admin import (  # noqa: E501
+            worker_plan,
+        )
+
+        return worker_plan(self, request_json)
+
+    def fq_admin_apply(self, plan_json: str) -> str:
+        from vllm.model_executor.layers.quantization.exl3_fungible.admin import (  # noqa: E501
+            worker_apply,
+        )
+
+        return worker_apply(self, plan_json)
+
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
