@@ -337,7 +337,41 @@ def progressive_weights_iterator(
             dense_bytes += entry["data_offsets"][1] - entry["data_offsets"][0]
             yield name, _shard_tensor(mm, body_offset, entry)
 
-        for layer in sorted(expert_layers):
+        # PIPELINE THE FETCH BEHIND THE LOAD.
+        # This function is a generator consumed by model.load_weights(), so
+        # per-expert reads were naturally streamed: fetch -> yield -> GPU load,
+        # overlapped. Bulk prefetch broke that by downloading a whole ~2.5 GB
+        # segment synchronously before yielding anything, stalling the GPU for
+        # minutes per layer. Prefetch layer N+1 in a background thread while
+        # layer N's tensors are still streaming, so the download hides behind
+        # work the GPU is doing anyway.
+        import concurrent.futures as _cf
+        _sorted_layers = sorted(expert_layers)
+        _pool = _cf.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="fq-prefetch")
+        _inflight: dict[int, object] = {}
+
+        def _bulk_ks(_layer):
+            from collections import Counter
+            _b = spec.bits_by_layer.get(_layer) or []
+            _min = int(os.environ.get("VLLM_FQ_BULK_MIN", "16"))
+            return [k for k, n in Counter(int(x) for x in _b).items()
+                    if n >= _min]
+
+        def _prefetch_layer_async(_layer):
+            if _layer in _inflight:
+                return
+            _ks = _bulk_ks(_layer)
+            if not _ks:
+                return
+            _fn = getattr(resolver, "prefetch_layer", None)
+            if _fn is None:
+                return
+            _inflight[_layer] = _pool.submit(
+                lambda: [_fn(_layer, _k) for _k in _ks])
+
+        try:
+          for _idx, layer in enumerate(_sorted_layers):
             expected_names = expert_layers[layer]
             bits = spec.bits_by_layer[layer]
             actual_bits = [int(b) for b in bits]
@@ -361,16 +395,26 @@ def progressive_weights_iterator(
             from collections import Counter
             _need = Counter(int(x) for x in bits)
             _bulk_min = int(os.environ.get("VLLM_FQ_BULK_MIN", "16"))
-            for _k, _n in sorted(_need.items()):
-                if _n < _bulk_min:
-                    continue
-                _note = getattr(resolver, "prefetch_layer", lambda *a: None)(
-                    layer, _k)
-                if _note:
+            _want = [(k, n) for k, n in sorted(_need.items()) if n >= _bulk_min]
+            if _want:
+                if layer in _inflight:
                     logger.info(
-                        "FQ progressive L%d: %d experts want K%d -> %s "
-                        "(1 fetch instead of %d ranged reads)",
-                        layer, _n, _k, _note, _n)
+                        "FQ progressive L%d: waiting on background prefetch "
+                        "(%s)", layer,
+                        ", ".join(f"{n} experts want K{k}" for k, n in _want))
+                    _inflight.pop(layer).result()
+                else:
+                    for _k, _n in _want:
+                        _note = getattr(resolver, "prefetch_layer",
+                                        lambda *a: None)(layer, _k)
+                        if _note:
+                            logger.info(
+                                "FQ progressive L%d: %d experts want K%d -> "
+                                "%s (1 fetch instead of %d ranged reads)",
+                                layer, _n, _k, _note, _n)
+            # Start the NEXT layer downloading while this one streams to GPU.
+            if _idx + 1 < len(_sorted_layers):
+                _prefetch_layer_async(_sorted_layers[_idx + 1])
 
             unavailable: list[int] = []
             for expert, k in enumerate(bits):
@@ -439,6 +483,13 @@ def progressive_weights_iterator(
                 f"bits_digest={_bits_digest(actual_bits)} "
                 f"tensors={len(seen)}{sub_note}"
             )
+        finally:
+            # Never leave the prefetch thread running past the stream: a
+            # cancelled boot would otherwise keep pulling segments nobody
+            # will load.
+            for _f in _inflight.values():
+                _f.cancel()
+            _pool.shutdown(wait=False, cancel_futures=True)
 
     stats = dict(resolver.stats)
     _emit(

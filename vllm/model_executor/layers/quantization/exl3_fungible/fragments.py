@@ -468,21 +468,74 @@ class HfSource:
     # Deliberately NOT automatic: a layer that needs a single K4 expert would
     # otherwise drag ~2.5 GB to use ~9 MB. The caller asks, because only the
     # caller knows the policy.
-    def prefetch_whole(self, relpath: str, dest: "Path") -> "Path | None":
-        """Fetch an entire segment once into ``dest``; return it, or None."""
+    def prefetch_whole(self, relpath: str, dest: "Path",
+                       progress=None) -> "Path | None":
+        """Fetch an entire segment once; return a readable path, or None.
+
+        Prefers ``huggingface_hub.hf_hub_download`` when available: it brings
+        connection reuse, resume, Xet dedup and — with ``hf_transfer``
+        installed — parallel chunked transfer, none of which a single urllib
+        stream gets. We only use ``hf_hub_url`` for URL construction on the
+        RANGED path (arbitrary byte ranges are outside what hf_hub_download
+        offers), but a whole-file pull is exactly its job.
+
+        It also returns a path in the HF cache, which we use in place rather
+        than copying: a 2.5 GB segment should not exist twice on disk.
+        """
         import shutil
         import tempfile
         if dest.exists() and dest.stat().st_size > 0:
             return dest
+        if self.offline():
+            return None
+        if os.environ.get("FQ_PREFETCH_VIA_HF", "1") == "1":
+            try:
+                from huggingface_hub import hf_hub_download
+                token = (os.environ.get("HF_TOKEN")
+                         or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
+                path = hf_hub_download(
+                    repo_id=self.repo_id, filename=relpath,
+                    revision=self.revision, token=token)
+                got = Path(path)
+                if got.exists() and got.stat().st_size > 0:
+                    if progress is not None:
+                        sz = got.stat().st_size
+                        progress(sz, sz, float("inf"))
+                    return got          # use the HF cache copy in place
+            except Exception:  # noqa: BLE001 — fall back to the urllib path
+                logger.debug("hf_hub_download unavailable for %s; "
+                             "falling back to a plain stream", relpath,
+                             exc_info=True)
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = None
         try:
             with self._open(relpath, {}) as r:
+                total = int(r.headers.get("Content-Length") or 0)
                 fd, tmpname = tempfile.mkstemp(dir=str(dest.parent),
                                                suffix=".part")
                 tmp = Path(tmpname)
+                # Copy in chunks with periodic progress instead of one opaque
+                # copyfileobj. A 2.5 GB segment is minutes of a silent log,
+                # and an operator staring at a stalled-looking boot cannot
+                # tell a slow download from a hung one.
+                import time as _t
+                t0 = _t.monotonic()
+                done = 0
+                nxt = 256 << 20          # report every 256 MiB
                 with open(fd, "wb") as fh:
-                    shutil.copyfileobj(r, fh, length=8 << 20)
+                    while True:
+                        chunk = r.read(8 << 20)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        done += len(chunk)
+                        if progress is not None and done >= nxt:
+                            el = max(_t.monotonic() - t0, 1e-9)
+                            progress(done, total, done / el)
+                            nxt += 256 << 20
+                if progress is not None:
+                    el = max(_t.monotonic() - t0, 1e-9)
+                    progress(done, total or done, done / el)
             tmp.replace(dest)          # atomic: a torn file must never be read
             tmp = None
             return dest
@@ -949,7 +1002,17 @@ class FragmentResolver:
                 got = getattr(source, "prefetch_whole", None)
                 if got is None:
                     continue           # local dirs need no prefetch
-                path = got(entry.file, dest)
+
+                def _report(done, total, rate, _f=entry.file, _l=layer,
+                            _k=k):
+                    pct = (100.0 * done / total) if total else 0.0
+                    logger.info(
+                        "FQ fetch L%d K%d %s: %.1f/%.1f GiB (%.0f%%) at "
+                        "%.0f MiB/s", _l, _k, _f,
+                        done / (1 << 30), (total or done) / (1 << 30), pct,
+                        rate / (1 << 20))
+
+                path = got(entry.file, dest, _report)
                 if path is not None:
                     self._prefetched[(layer, k)] = path
                     self.stats["segments_prefetched"] += 1
