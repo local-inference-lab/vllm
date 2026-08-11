@@ -116,6 +116,8 @@ def maybe_init_fq_state(runner):
             loop as fq_loop,
         )
         state = fq_loop.build_from_env(collector, rank=rank)
+        if state is not None:
+            _bind_apply_fn(state, runner, rank)
     except Exception:
         import logging
 
@@ -123,6 +125,106 @@ def maybe_init_fq_state(runner):
             "FQ loop init failed — falling back to collector-only")
         return collector
     return state if state is not None else collector
+
+
+#: Live apply is gated on the runtime the swap is proven safe in.
+FQ_LIVE_APPLY_ENV = "VLLM_FQ_LIVE_APPLY"
+
+
+def _graphs_are_live(runner) -> bool:
+    """True when a captured CUDA graph may replay over the expert slabs."""
+    try:
+        cfg = runner.vllm_config
+        if bool(getattr(cfg.model_config, "enforce_eager", False)):
+            return False
+        mode = getattr(cfg.compilation_config, "cudagraph_mode", None)
+        return not (mode is None or str(mode).endswith("NONE"))
+    except Exception:  # noqa: BLE001 — unknown runtime is the unsafe one
+        return True
+
+
+def _bind_apply_fn(state, runner, rank: int) -> None:
+    """Give the loop the swap backend it has been deciding without.
+
+    Until now ``build_from_env`` never passed ``apply_fn``, so every interval
+    logged "recording proposals only (M4 live wiring pending)" and
+    ``_maybe_apply`` returned False before touching a weight — 64 swaps
+    decided across 39 layers, zero installed.
+
+    GATED ON EAGER EXECUTION, deliberately. ``admin.apply_retier`` can pass
+    ``quiesce=nullcontext()`` because the HTTP request drains the engine
+    first (``drain_mode="wait"``). The loop has no such drain: it decides
+    inside the runner's step. With ``enforce_eager`` nothing is replaying and
+    device work ordered on the same stream is ordered after the previous
+    forward, so a nullcontext is honest. With CUDA graphs captured, a replay
+    holds device pointers into the very slabs being rewritten — that needs a
+    real drain, which does not exist yet.
+
+    So: bind under eager, refuse loudly under graphs, and let an operator
+    override only on purpose.
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+    mode = os.environ.get(FQ_LIVE_APPLY_ENV, "auto").strip().lower()
+    if mode in ("0", "off", "false"):
+        log.info("FQ live apply disabled by %s=%s — proposals only",
+                 FQ_LIVE_APPLY_ENV, mode)
+        return
+    if mode == "auto" and _graphs_are_live(runner):
+        log.warning(
+            "FQ live apply NOT bound: CUDA graphs are captured and the loop "
+            "has no drain, so a replay could read slabs mid-rewrite. The loop "
+            "will record proposals only. Run with --enforce-eager, or set "
+            "%s=1 to override deliberately.", FQ_LIVE_APPLY_ENV)
+        return
+
+    from vllm.model_executor.layers.quantization.exl3_fungible import (
+        admin as _admin,
+    )
+    from vllm.model_executor.layers.quantization.exl3_fungible import (
+        swap as _swap,
+    )
+
+    engine = _admin.build_swap_engine(runner, rank=rank)
+    if engine is None:
+        log.warning("FQ live apply NOT bound: no mixed-trellis layers "
+                    "registered — a uniform-K serve has nothing to swap")
+        return
+
+    def apply_fn(proposed_doc, swaps) -> bool:
+        # The loop indexes layers by ROW; the engine keys by GLOBAL layer id.
+        plan = _swap.SwapPlan([
+            (int(state.layers[row]), int(e_out), int(e_in))
+            for row, e_out, e_in in swaps])
+        # fail_atomic stages the pre-swap rows so an abort before the
+        # visibility flip restores inside the same window. drop lets a pair
+        # whose fragments cannot be supplied pend instead of losing the
+        # interval; cardinality is preserved either way.
+        staged = engine.stage(plan, fail_atomic=True, on_unavailable="drop")
+        dropped = tuple(getattr(staged, "dropped", ()) or ())
+        if dropped:
+            log.warning("FQ live apply: %d pair(s) dropped for missing "
+                        "fragments, %d applied", len(dropped),
+                        len(getattr(staged, "plan", plan).swaps))
+        if not getattr(getattr(staged, "plan", plan), "swaps", ()):
+            return False
+        import contextlib
+
+        report = engine.apply(
+            staged=staged,
+            quiesce=contextlib.nullcontext(),
+            memo_hook=None,          # correct for the mixed runtime
+            policy_doc=dict(proposed_doc),
+        )
+        ok = bool(getattr(report, "ok", True))
+        log.info("FQ live apply: %d swap(s) %s", len(plan.swaps),
+                 "installed" if ok else "REFUSED")
+        return ok
+
+    state.apply_fn = apply_fn
+    log.info("FQ live apply BOUND: %d mixed layers, rank %d — decisions will "
+             "now change weights", len(getattr(engine, "layers", {})), rank)
 
 
 def maybe_init_fq_collector(runner) -> "FqStatsCollector | None":

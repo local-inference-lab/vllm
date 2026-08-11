@@ -1563,3 +1563,52 @@ def test_provenance_utc_is_taken_from_the_request_when_supplied():
         if hasattr(req, "__dataclass_fields__") else None
     prov = A._provenance(_Mod(_step=5), req, [], "fqr-x", "base")
     assert prov["utc"] == "2026-01-01T00:00:00Z"
+
+
+# --------------------------------------------------------------------------
+# Live-apply gating (M4-W).
+#
+# admin.apply_retier can pass quiesce=nullcontext() because the HTTP request
+# drains the engine first. The LOOP has no drain — it decides inside the
+# runner's step — so a nullcontext is only honest when nothing can be
+# replaying. Under captured CUDA graphs a replay holds device pointers into
+# the slabs being rewritten, so the loop must refuse to bind rather than
+# quietly race.
+
+
+class _Cfg:
+    def __init__(self, eager, cg_mode):
+        self.model_config = _Mod(enforce_eager=eager)
+        self.compilation_config = _Mod(cudagraph_mode=cg_mode)
+
+
+def test_eager_runtime_is_safe_to_bind():
+    from vllm.model_executor.layers.quantization.exl3_fungible import (
+        integration as I,
+    )
+    assert I._graphs_are_live(_Mod(vllm_config=_Cfg(True, "FULL"))) is False
+
+
+def test_captured_graphs_are_not_safe_to_bind():
+    from vllm.model_executor.layers.quantization.exl3_fungible import (
+        integration as I,
+    )
+    assert I._graphs_are_live(
+        _Mod(vllm_config=_Cfg(False, "CUDAGraphMode.FULL_AND_PIECEWISE"))
+    ) is True
+
+
+def test_cudagraph_mode_none_is_safe_even_without_enforce_eager():
+    from vllm.model_executor.layers.quantization.exl3_fungible import (
+        integration as I,
+    )
+    assert I._graphs_are_live(
+        _Mod(vllm_config=_Cfg(False, "CUDAGraphMode.NONE"))) is False
+
+
+def test_an_unreadable_runtime_is_treated_as_unsafe():
+    """Fail closed: if we cannot tell whether graphs are live, they are."""
+    from vllm.model_executor.layers.quantization.exl3_fungible import (
+        integration as I,
+    )
+    assert I._graphs_are_live(_Mod()) is True
