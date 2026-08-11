@@ -643,6 +643,16 @@ class _DownloadMonitor:
         self._thread: threading.Thread | None = None
         self._sizes: dict[str, int] = {}
         self._done_bytes = 0
+        # EXCLUDE what was already there. A killed boot leaves .incomplete
+        # files behind, and counting them as in-flight makes a HEALTHY boot
+        # report a frozen byte total at 0 MiB/s -- observed live: two corpses
+        # from an hour-old attempt summed to 880 MB and swamped the real
+        # transfer, which was running at 308 MiB/s.
+        self._preexisting: set[str] = set()
+        try:
+            self._preexisting = {str(f) for f in self.root.rglob("*.incomplete")}
+        except OSError:
+            pass
 
     @classmethod
     def ensure(cls, root: Path) -> "_DownloadMonitor":
@@ -688,6 +698,8 @@ class _DownloadMonitor:
         count = 0
         try:
             for f in self.root.rglob("*.incomplete"):
+                if str(f) in self._preexisting:
+                    continue          # a corpse from an earlier boot
                 try:
                     seen[str(f)] = f.stat().st_size
                     count += 1
@@ -710,9 +722,13 @@ class _DownloadMonitor:
             if n == 0 and delta <= 0:
                 prev, t_prev = cur, now
                 continue
+            # NOTE: with Xet enabled a large share of the transfer lands in
+            # the shared xet chunk cache rather than in these staging files,
+            # so this is a LOWER BOUND on real throughput, not a total.
             logger.info(
-                "FQ downloads: %d in flight, %.1f GiB this boot, %.0f MiB/s",
-                n, cur / (1 << 30), max(delta, 0) / dt / (1 << 20))
+                "FQ downloads: %d in flight, >=%.1f GiB this boot, "
+                ">=%.0f MiB/s", n, cur / (1 << 30),
+                max(delta, 0) / dt / (1 << 20))
             prev, t_prev = cur, now
 
 

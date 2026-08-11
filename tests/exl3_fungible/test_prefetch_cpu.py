@@ -688,3 +688,21 @@ def test_declared_counters_still_report_zero(tmp_path):
     r = _resolver(tmp_path)
     assert r.stats["bytes_from_prefetch"] == 0
     assert "segments_prefetched" in r.stats
+
+
+def test_monitor_ignores_corpses_from_a_previous_boot(tmp_path):
+    """A killed boot leaves .incomplete files behind. Counting them as
+    in-flight made a HEALTHY boot report a frozen total at 0 MiB/s: two
+    corpses from an hour-old attempt summed to 880 MB and swamped a transfer
+    genuinely running at 308 MiB/s. Diagnosing that cost real time."""
+    root = tmp_path / "segments"
+    dl = root / ".cache" / "huggingface" / "download"
+    dl.mkdir(parents=True)
+    (dl / "corpse.incomplete").write_bytes(b"x" * 880)   # pre-existing
+
+    mon = FR._DownloadMonitor(root, every=0.05)          # baseline taken here
+    assert mon._progress() == (0, 0), "counted a corpse as in-flight"
+
+    (dl / "live.incomplete").write_bytes(b"y" * 100)
+    total, n = mon._progress()
+    assert (total, n) == (100, 1), "live file must be counted alone"
