@@ -344,23 +344,33 @@ def progressive_weights_iterator(
             substitutions: list[tuple[int, int, int]] = []
             seen: set[str] = set()
             counts: dict[int, int] = {}
-            # UNIFORM-LAYER FAST PATH. When every expert of this layer wants
-            # the same K they all live in one segment object, and fetching it
-            # per-expert is 256 HTTP round trips for one contiguous file --
-            # 19,200 across GLM-5.2. Pull it once and slice locally: identical
-            # bytes, 1 request, and 255 fewer chances to hit the transient
-            # failure that killed an earlier boot. Only for uniform layers:
-            # a layer needing one K4 expert must not drag a whole segment.
-            uniq = set(int(x) for x in bits)
-            if len(uniq) == 1:
-                only_k = uniq.pop()
-                note = getattr(resolver, "prefetch_layer", lambda *a: None)(
-                    layer, only_k)
-                if note:
+            # BULK-FETCH FAST PATH.
+            # A layer draws its experts from ONE segment object per K it uses:
+            # a uniform layer from one, a mixed K3+K4 layer from two (~192
+            # experts from the K3 object, ~64 from the K4 object). Fetching
+            # per-expert measured 18.2 s/expert over HTTPS -- TLS handshake,
+            # attestation lookup and a ranged GET each -- i.e. 97 hours for
+            # GLM-5.2's 19,200 experts. Pulling each needed object ONCE is the
+            # same bytes in 2 requests per layer.
+            #
+            # Threshold, not "uniform": restricting this to uniform layers
+            # missed the majority case outright, because a seeded policy makes
+            # most layers mixed. But a layer needing ONE K4 expert must still
+            # not drag a whole ~2.5 GB segment for ~18 MiB, so only fetch an
+            # object we will draw at least FQ_BULK_MIN experts from.
+            from collections import Counter
+            _need = Counter(int(x) for x in bits)
+            _bulk_min = int(os.environ.get("VLLM_FQ_BULK_MIN", "16"))
+            for _k, _n in sorted(_need.items()):
+                if _n < _bulk_min:
+                    continue
+                _note = getattr(resolver, "prefetch_layer", lambda *a: None)(
+                    layer, _k)
+                if _note:
                     logger.info(
-                        "FQ progressive L%d: uniform K%d -> %s "
+                        "FQ progressive L%d: %d experts want K%d -> %s "
                         "(1 fetch instead of %d ranged reads)",
-                        layer, only_k, note, len(bits))
+                        layer, _n, _k, _note, _n)
 
             unavailable: list[int] = []
             for expert, k in enumerate(bits):

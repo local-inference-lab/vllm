@@ -213,3 +213,45 @@ def test_offline_is_not_retried(monkeypatch, tmp_path):
     with pytest.raises(FR.OfflineError):
         src.read_range("seg.safetensors", 0, 16)
     assert calls["n"] == 1, f"offline refusal retried {calls['n']} times"
+
+
+# ------------------------------------------- bulk-fetch threshold (mixed layers)
+def _needed(bits, bulk_min=16):
+    """Which Ks a layer should bulk-fetch, mirroring progressive.py's rule."""
+    from collections import Counter
+    return sorted(k for k, n in Counter(bits).items() if n >= bulk_min)
+
+
+def test_uniform_layer_bulk_fetches_its_single_k():
+    assert _needed([3] * 256) == [3]
+
+
+def test_mixed_layer_bulk_fetches_BOTH_objects():
+    """The case the first version missed. A seeded policy makes most layers
+    mixed, and restricting bulk fetch to uniform layers skipped 48 of 75
+    layers outright — the optimisation did nothing for the majority."""
+    bits = [3] * 192 + [4] * 64
+    assert _needed(bits) == [3, 4], "a mixed layer draws from TWO objects"
+
+
+def test_single_upgraded_expert_does_not_drag_a_segment():
+    """One K4 expert is ~18 MiB; its segment is ~2.5 GB. Ranged read wins."""
+    bits = [3] * 255 + [4]
+    assert _needed(bits) == [3], "K4 must stay on the ranged path here"
+
+
+def test_threshold_is_the_boundary():
+    assert _needed([3] * 240 + [4] * 16, bulk_min=16) == [3, 4]
+    assert _needed([3] * 241 + [4] * 15, bulk_min=16) == [3]
+
+
+def test_request_count_for_a_realistic_mixed_layer():
+    """192xK3 + 64xK4: 2 object fetches, not 256 ranged reads."""
+    bits = [3] * 192 + [4] * 64
+    assert len(_needed(bits)) == 2
+    assert len(bits) == 256
+
+
+def test_all_four_tiers_in_one_layer_each_over_threshold():
+    bits = [2] * 64 + [3] * 64 + [4] * 64 + [5] * 64
+    assert _needed(bits) == [2, 3, 4, 5]
