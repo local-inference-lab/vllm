@@ -728,9 +728,26 @@ class FungibleQuantState:
 
     @staticmethod
     def _jaccard(a: np.ndarray, b: np.ndarray) -> float:
+        """Mean per-layer Jaccard over layers that HAVE a desired set.
+
+        A layer whose n_k4 is 0 has an empty desired set in both snapshots.
+        The old code clamped the union to 1, scoring that layer 0.0 and
+        averaging it in — so 27 of GLM-5.2's 75 layers, which cannot hold a
+        K4 expert at all and therefore cannot churn, dragged the mean from
+        0.879 down to 0.562 against a 0.950 floor. The guard was measuring
+        the stability of sets that do not exist, and blocked every swap for
+        it.
+
+        Empty-vs-empty is not "maximally unstable"; it is no evidence. Skip
+        those rows and average the rest. If NO layer has a desired set there
+        is nothing to guard, so report perfect agreement rather than zero.
+        """
         inter = (a & b).sum(axis=1).astype(np.float64)
-        union = np.maximum((a | b).sum(axis=1), 1).astype(np.float64)
-        return float((inter / union).mean())
+        union = (a | b).sum(axis=1).astype(np.float64)
+        live = union > 0
+        if not live.any():
+            return 1.0
+        return float((inter[live] / union[live]).mean())
 
     @staticmethod
     def decision_sha(swaps: list[tuple[int, int, int]]) -> str:

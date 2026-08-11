@@ -579,3 +579,31 @@ def test_composition_table_failure_never_kills_the_serve(tmp_path,
                         lambda *a, **k: (_ for _ in ()).throw(
                             RuntimeError("boom")))
     state.log_composition(title="x", diff_only=False)  # must not raise
+
+
+def test_jaccard_ignores_layers_with_no_desired_set():
+    """A layer that cannot hold a K4 expert cannot churn.
+
+    GLM-5.2's fitted policy gives 27 of 75 layers n_k4 = 0. Their desired set
+    is empty in every snapshot. Clamping the union to 1 scored each of them
+    0.0 and averaged them in, dragging the router-shift guard from 0.879 to
+    0.562 against a 0.950 floor — so the guard blocked every swap on the
+    strength of layers that had nothing to say.
+    """
+    import numpy as np
+    live_a = np.array([[True, True, False, False]])
+    live_b = np.array([[True, False, True, False]])   # jaccard 1/3
+    empty = np.zeros((3, 4), dtype=bool)              # three n_k4 == 0 layers
+
+    a = np.concatenate([live_a, empty])
+    b = np.concatenate([live_b, empty])
+    got = FL.FungibleQuantState._jaccard(a, b)
+    assert got == pytest.approx(1 / 3), (
+        "empty layers must be skipped, not scored 0.0 and averaged in")
+
+
+def test_jaccard_of_an_all_empty_membership_is_not_zero():
+    """Nothing to guard is not the same as maximally unstable."""
+    import numpy as np
+    empty = np.zeros((4, 8), dtype=bool)
+    assert FL.FungibleQuantState._jaccard(empty, empty) == 1.0
