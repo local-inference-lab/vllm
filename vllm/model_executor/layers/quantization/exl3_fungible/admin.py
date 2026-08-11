@@ -2029,6 +2029,98 @@ def worker_tune(worker: Any, request_json: str = "{}") -> str:
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 
+def _device_layer_view(engine: Any, layer: int) -> dict:
+    """Read membership from the two tensors the mixed kernel indexes."""
+    if engine is None or int(layer) not in engine.layers:
+        raise AdminError(
+            "layer_not_registered",
+            f"layer {layer} has no live mixed-trellis device maps",
+            status=404,
+            details={"layer": int(layer), "source": "device"},
+        )
+    live = engine.layers[int(layer)]
+    try:
+        global_to_combined = [
+            int(x) for x in live.global_to_combined.detach().to(
+                device="cpu").tolist()
+        ]
+        descriptor_map = [
+            int(x) for x in live.descriptor_map.detach().to(
+                device="cpu").tolist()
+        ]
+    except Exception as exc:  # noqa: BLE001
+        raise AdminError(
+            "device_map_unreadable",
+            f"layer {layer} device maps could not be read: {exc}",
+            status=500,
+            details={"layer": int(layer), "source": "device"},
+        ) from exc
+
+    num_experts = len(global_to_combined)
+    if (len(descriptor_map) != num_experts
+            or sorted(global_to_combined) != list(range(num_experts))):
+        raise AdminError(
+            "device_map_invalid",
+            f"layer {layer} device maps are not a bijection over "
+            f"{num_experts} experts",
+            status=500,
+            details={"layer": int(layer), "source": "device"},
+        )
+    tier_bits = tuple(int(x) for x in getattr(engine, "tier_bits", ()))
+    if len(tier_bits) != 2:
+        raise AdminError(
+            "device_map_invalid",
+            f"layer {layer} engine has invalid tier bits {tier_bits}",
+            status=500,
+            details={"layer": int(layer), "source": "device"},
+        )
+
+    experts = []
+    locals_by_tier: list[list[int]] = [[], []]
+    for expert, combined in enumerate(global_to_combined):
+        descriptor = descriptor_map[combined]
+        tier_index = descriptor >> SW.DESCRIPTOR_TIER_SHIFT
+        local = descriptor & ((1 << SW.DESCRIPTOR_TIER_SHIFT) - 1)
+        if tier_index not in (0, 1):
+            raise AdminError(
+                "device_map_invalid",
+                f"layer {layer} expert {expert} names tier {tier_index}",
+                status=500,
+                details={"layer": int(layer), "expert": expert,
+                         "descriptor": descriptor, "source": "device"},
+            )
+        locals_by_tier[tier_index].append(local)
+        experts.append({
+            "expert": expert,
+            "k": tier_bits[tier_index],
+            "tier_index": tier_index,
+            "tier_local": local,
+            "combined_slot": combined,
+        })
+    for tier_index, locals_ in enumerate(locals_by_tier):
+        if sorted(locals_) != list(range(len(locals_))):
+            raise AdminError(
+                "device_map_invalid",
+                f"layer {layer} tier {tier_index} local slots are not "
+                "contiguous and unique",
+                status=500,
+                details={"layer": int(layer), "tier_index": tier_index,
+                         "source": "device"},
+            )
+
+    membership = [row["k"] for row in experts]
+    membership_sha = hashlib.sha256(json.dumps(
+        membership, separators=(",", ":")).encode()).hexdigest()
+    return {
+        "layer": int(layer),
+        "source": "device",
+        "experts": experts,
+        "n_k4": sum(k == P.K4 for k in membership),
+        "membership_sha": membership_sha,
+    }
+
+
+
 
 def worker_describe(worker: Any, request_json: str = "{}") -> str:
     """Read-only view of this rank's FQ state (``GET /fq/state``)."""
@@ -2036,6 +2128,14 @@ def worker_describe(worker: Any, request_json: str = "{}") -> str:
         _require_gates()
         query = json.loads(request_json or "{}")
         state = _loop_state(worker)
+        source = str(query.get("source", "loop")).strip().lower()
+        if source not in ("loop", "device"):
+            raise AdminError(
+                "invalid_source",
+                f"source must be loop|device, got {source!r}",
+                status=400,
+                details={"source": source},
+            )
         engine = None
         with contextlib.suppress(AdminError):
             engine = _bound_engine(worker, state)
@@ -2077,7 +2177,13 @@ def worker_describe(worker: Any, request_json: str = "{}") -> str:
             }
         layer = query.get("layer")
         if layer is not None:
-            payload["layer"] = _layer_view(state, int(layer))
+            if source == "device":
+                payload["layer"] = _device_layer_view(
+                    engine, int(layer))
+                payload["device_membership_sha"] = payload["layer"][
+                    "membership_sha"]
+            else:
+                payload["layer"] = _layer_view(state, int(layer))
         return _ok(payload)
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
@@ -2113,7 +2219,7 @@ def _layer_view(state: Any, layer: int) -> dict:
         rank_of = {e: i for i, e in enumerate(order)}
         for row_dict in experts:
             row_dict["score_rank"] = rank_of[row_dict["expert"]]
-    return {"layer": int(layer), "experts": experts,
+    return {"layer": int(layer), "source": "loop", "experts": experts,
             "n_k4": int((tier == P.K4).sum())}
 
 
@@ -2423,13 +2529,25 @@ def build_router(*, environ: Mapping[str, str] | None = None) -> Any:
         blocked = _guard(raw_request)
         if blocked is not None:
             return _fail(blocked)
+        source = str(raw_request.query_params.get("source", "loop"))
         try:
-            results = await _collective(raw_request, "fq_admin_describe",
-                                        {"layer": int(layer)})
+            results = await _collective(
+                raw_request, "fq_admin_describe",
+                {"layer": int(layer), "source": source})
         except AdminError as exc:
             return _fail(exc)
         record_admin_outcome("layer")
-        return JSONResponse(content=results[0].get("layer", {}))
+        view = dict(results[0].get("layer", {}))
+        if source.strip().lower() == "device":
+            view.update({
+                "ranks": len(results),
+                "agreed": _agree(results, "device_membership_sha"),
+                "per_rank": [{
+                    "rank": result.get("rank"),
+                    "membership_sha": result.get("device_membership_sha"),
+                } for result in results],
+            })
+        return JSONResponse(content=view)
 
     @router.post("/retier")
     async def fq_retier(raw_request: Request):

@@ -1416,6 +1416,52 @@ def test_worker_describe_reports_state(tmp_path, gates_on):
     assert out["memory"]["unit_bytes_per_k_per_rank"] == (
         3 * HIDDEN * INTERMEDIATE // 8)
 
+def test_worker_describe_can_read_kernel_device_maps(tmp_path, gates_on):
+    state, _ = make_state(tmp_path)
+    engine = FakeEngine()
+    tier1 = [1, 2, 3, 8]
+    tier0 = [e for e in range(E) if e not in tier1]
+    combined = tier0 + tier1
+    global_to_combined = torch.empty(E, dtype=torch.int32)
+    for slot, expert in enumerate(combined):
+        global_to_combined[expert] = slot
+    descriptor_map = torch.tensor(
+        [*range(len(tier0)),
+         *((1 << SW.DESCRIPTOR_TIER_SHIFT) | i
+           for i in range(len(tier1)))],
+        dtype=torch.int32,
+    )
+    live = type("Live", (), {
+        "global_to_combined": global_to_combined,
+        "descriptor_map": descriptor_map,
+    })()
+    engine.layers = {23: live}
+    engine.tier_bits = (P.K3, P.K4)
+    worker = FakeWorker(state, engine)
+
+    out = json.loads(A.worker_describe(
+        worker, json.dumps({"layer": 23, "source": "device"})))
+
+    assert out["ok"] is True
+    assert out["layer"]["source"] == "device"
+    device_k = {row["expert"]: row["k"]
+                for row in out["layer"]["experts"]}
+    assert device_k[0] == P.K3
+    assert device_k[8] == P.K4
+    assert out["layer"]["n_k4"] == N_K4
+    assert out["device_membership_sha"] == out["layer"]["membership_sha"]
+
+
+def test_worker_describe_refuses_unknown_state_source(tmp_path, gates_on):
+    state, _ = make_state(tmp_path)
+    out = json.loads(A.worker_describe(
+        FakeWorker(state, FakeEngine()),
+        json.dumps({"layer": 23, "source": "wishful"})))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "invalid_source"
+
+
+
 
 def test_fq_worker_admin_mixin_matches_the_module_functions():
     for name in ("fq_admin_describe", "fq_admin_plan", "fq_admin_apply"):
