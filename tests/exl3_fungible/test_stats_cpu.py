@@ -121,14 +121,17 @@ def test_summary_shape():
 
 def test_capture_fn_source_has_no_host_ops():
     """Static discipline check: the capture path must never call host-sync
-    ops (graph-safety contract, 01 §2)."""
+    ops (graph-safety contract, 01 §2). Both variants — count-only and
+    the weighted gate-mass path — are checked."""
     c = make_collector()
     c.bind_router(0, FakeRouter())
-    src = inspect.getsource(c.make_capture_fn.__code__.co_consts[
-        [i for i, k in enumerate(c.make_capture_fn.__code__.co_consts)
-         if getattr(k, "co_name", "") == "_capture"][0]])
-    for banned in (".item(", ".cpu(", ".tolist(", ".numpy(", "print("):
-        assert banned not in src, f"host op {banned} in capture path"
+    bodies = [k for k in c.make_capture_fn.__code__.co_consts
+              if getattr(k, "co_name", "") == "_capture"]
+    assert len(bodies) == 2, "expected count-only and weighted variants"
+    for body in bodies:
+        src = inspect.getsource(body)
+        for banned in (".item(", ".cpu(", ".tolist(", ".numpy(", "print("):
+            assert banned not in src, f"host op {banned} in capture path"
 
 
 def test_out_of_range_ids_are_dropped_not_scattered():
@@ -150,7 +153,12 @@ def test_out_of_range_ids_are_dropped_not_scattered():
 
 
 def test_weighted_capture_redirects_oor_to_overflow_slot():
-    """The scatter (weighted) path keeps the explicit overflow slot."""
+    """The scatter (weighted) mass path keeps the explicit overflow slot.
+
+    Count is the same histc in both modes (so enabling mass cannot move
+    the count signal), which drops OOR ids outright; mass has to scatter,
+    so it redirects them to the overflow slot at index E instead.
+    """
     c = make_collector()
     ids = torch.tensor([[0, 8], [-1, 300]], dtype=torch.int64)
     w = torch.tensor([[0.5, 0.1], [0.1, 0.1]])
@@ -158,6 +166,7 @@ def test_weighted_capture_redirects_oor_to_overflow_slot():
     fn = c.make_capture_fn(0, topk_weights_getter=lambda: w)
     fn(ids)
     assert c.count_buf[0][:8].tolist() == [1, 0, 0, 0, 0, 0, 0, 0]
-    assert c.count_buf[0][8] == 3, "three OOR ids redirected to overflow"
+    assert c.count_buf[0][8] == 0, "histc drops OOR ids from the count"
     assert abs(c.mass_buf[0][0].item() - 0.5) < 1e-6
-    assert abs(c.mass_buf[0][8].item() - 0.3) < 1e-6
+    assert abs(c.mass_buf[0][8].item() - 0.3) < 1e-6, \
+        "three OOR gate weights redirected to the overflow slot"

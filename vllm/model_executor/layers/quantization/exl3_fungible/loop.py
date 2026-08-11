@@ -616,6 +616,12 @@ class FungibleQuantState:
 
         Rank 0 only and best-effort: this is analysis telemetry, and a
         full disk must not take down inference.
+
+        ``mass_is_real`` says whether "mass" is REAL gate mass or just a
+        copy of "count" (the collector aliases it when gate-weight
+        capture is off). Without it the alias is only detectable by the
+        arrays happening to be identical — which a uniform router would
+        also produce.
         """
         try:
             rec = {
@@ -623,6 +629,8 @@ class FungibleQuantState:
                 "interval": int(self._intervals_run),
                 "layers": [int(x) for x in self.layers],
                 "tier_of": self.tier_of.tolist(),
+                "mass_is_real": bool(getattr(
+                    self.collector, "mass_is_real", lambda: False)()),
             }
             for key in ("count", "mass"):
                 arr = stats.get(key)

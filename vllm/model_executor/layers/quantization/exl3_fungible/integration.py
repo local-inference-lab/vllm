@@ -34,6 +34,12 @@ FQ_ENABLE_ENV = "VLLM_FQ_ENABLE"
 FQ_WINDOW_LEN_ENV = "VLLM_FQ_WINDOW_LEN"
 FQ_WINDOW_STRIDE_ENV = "VLLM_FQ_WINDOW_STRIDE"
 FQ_DECAY_ENV = "VLLM_FQ_DECAY"
+# Opt-in: record REAL gate mass (sum of routing weights) as well as hit
+# counts. Off by default because it adds a guarded scatter_add_ to the
+# per-layer capture path; the count-only default is one histc
+# (PERFORMANCE.md: M1 gate is <0.5% decode overhead). With it off, mass
+# is aliased to count and the collector reports mass_is_real() == False.
+FQ_GATE_MASS_ENV = "VLLM_FQ_GATE_MASS"
 
 
 def _moe_module_types() -> tuple[type, type]:
@@ -81,6 +87,8 @@ def _window_kwargs_from_env() -> dict:
     v = os.environ.get(FQ_DECAY_ENV)
     if v is not None:
         kwargs["decay"] = float(v)
+    if os.environ.get(FQ_GATE_MASS_ENV, "0") == "1":
+        kwargs["record_mass"] = True
     return kwargs
 
 
@@ -152,4 +160,14 @@ def maybe_init_fq_collector(runner) -> "FqStatsCollector | None":
     )
     for layer_id, router in routers:
         collector.bind_router(layer_id, router)
+    # State the resolved mass mode in the engine log: "mass" is present in
+    # every stats artifact either way, and an operator must not have to
+    # diff it against "count" to discover which one they got.
+    import logging
+
+    logging.getLogger(__name__).info(
+        "FQ stats: bound %d MoE routers, %d experts, gate mass %s (%s=%s)",
+        len(routers), collector.num_experts,
+        "RECORDED" if collector.mass_is_real() else "ALIASED TO COUNT",
+        FQ_GATE_MASS_ENV, os.environ.get(FQ_GATE_MASS_ENV, "0"))
     return collector
