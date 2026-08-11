@@ -1040,8 +1040,8 @@ class FungibleQuantState:
                 # tier_of and the layer states cannot drift apart.
                 applied_tier = self.tier_of.copy()
                 for row, e_out, e_in in installed:
-                    applied_tier[int(row), int(e_out)] = K3
-                    applied_tier[int(row), int(e_in)] = K4
+                    applied_tier[int(row), int(e_out)] = P.K3
+                    applied_tier[int(row), int(e_in)] = P.K4
                 if not np.array_equal(applied_tier, proposed_tier):
                     logger.info(
                         "FQ apply installed %d swap(s) that differ from this "
