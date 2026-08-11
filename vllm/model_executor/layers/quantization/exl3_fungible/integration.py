@@ -186,7 +186,18 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
         swap as _swap,
     )
 
-    engine = _admin.build_swap_engine(runner, rank=rank)
+    # Size the staging buffers to the LOOP's cap, not the admin API's.
+    # build_swap_engine defaults max_pairs to DEFAULT_MAX_ITEMS (32), which is
+    # an operator-facing batch limit for hand-driven POST /fq/retier. The loop
+    # proposes up to max_swaps_total (64) in one interval, so every interval
+    # died on:
+    #     ValueError: plan has 64 pairs, staging holds 32
+    # The loop degraded correctly -- "keeping the incumbent tiering and
+    # retrying next interval" -- but it could never succeed, so the serve
+    # would have retried forever while looking busy.
+    _cap = int(getattr(getattr(state, "cfg", None), "max_swaps_total", 0) or 0)
+    engine = _admin.build_swap_engine(
+        runner, rank=rank, max_pairs=max(_cap, _admin.DEFAULT_MAX_ITEMS))
     if engine is None:
         log.warning("FQ live apply NOT bound: no mixed-trellis layers "
                     "registered — a uniform-K serve has nothing to swap")
@@ -201,6 +212,15 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
         # visibility flip restores inside the same window. drop lets a pair
         # whose fragments cannot be supplied pend instead of losing the
         # interval; cardinality is preserved either way.
+        if len(plan.swaps) > int(engine.max_pairs):
+            # Configuration error, not a runtime condition: say which two
+            # knobs disagree rather than surfacing a buffer-size ValueError.
+            log.error(
+                "FQ live apply: plan has %d pairs but staging holds %d — "
+                "raise VLLM_FQ_MAX_SWAPS_TOTAL/max_pairs together or lower "
+                "the loop cap; skipping this interval",
+                len(plan.swaps), int(engine.max_pairs))
+            return False
         staged = engine.stage(plan, fail_atomic=True, on_unavailable="drop")
         dropped = tuple(getattr(staged, "dropped", ()) or ())
         if dropped:
