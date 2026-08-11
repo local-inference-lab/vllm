@@ -279,6 +279,7 @@ def progressive_weights_iterator(
     tp_rank: int | None = None,
     log: Callable[[str], None] | None = None,
     actual_bits_out: dict[int, list[int]] | None = None,
+    convergence_out: list | None = None,
 ):
     """Yield ``(name, cpu_tensor)`` exactly as an assembled checkpoint would.
 
@@ -355,6 +356,20 @@ def progressive_weights_iterator(
         #   width: a mixed layer needs TWO objects (its K3 and its K4). Pulling
         #     them one after the other leaves the link idle between files even
         #     with hf_transfer chunking inside each.
+        # OPPORTUNISTIC TIME-TO-SERVE (opt-in). Boot on whatever tiers the
+        # primed cache holds and converge afterwards, instead of making
+        # time-to-serve a function of the slowest fetch.
+        _plan = None
+        try:
+            from .convergence import ConvergencePlan, k_bounds, \
+                opportunistic_enabled
+            if opportunistic_enabled():
+                _lo, _hi = k_bounds()
+                _plan = ConvergencePlan(k_min=_lo, k_max=_hi)
+                _emit(f"FQ opportunistic boot ENABLED (accepting K{_lo}..K"
+                      f"{_hi}); served weights converge to policy at runtime")
+        except ImportError:
+            _plan = None
         _depth = max(1, int(os.environ.get("VLLM_FQ_PREFETCH_DEPTH", "3")))
         _pool = _cf.ThreadPoolExecutor(
             max_workers=_depth * 2, thread_name_prefix="fq-prefetch")
@@ -449,9 +464,13 @@ def progressive_weights_iterator(
                     # at the end of the layer with the full list — an operator
                     # needs to know how much is missing, not just the first.
                     unavailable.append(expert)
+                    if _plan is not None:
+                        _plan.observe_missing(layer, expert)
                     continue
                 actual_k = int(fragment.k)
                 actual_bits[expert] = actual_k
+                if _plan is not None:
+                    _plan.observe(layer, expert, actual_k, int(k))
                 if actual_k != int(k):
                     substitutions.append((expert, int(k), actual_k))
                 counts[actual_k] = counts.get(actual_k, 0) + 1
@@ -463,7 +482,13 @@ def progressive_weights_iterator(
                     yield name, tensor
             if actual_bits_out is not None:
                 actual_bits_out[layer] = list(actual_bits)
-            if unavailable:
+            if unavailable and _plan is not None:
+                # Opportunistic mode: completeness is the gate, adequacy is
+                # not. A missing expert still fails -- via _plan.gate() once
+                # the whole model is loaded, so the operator sees the full
+                # extent rather than the first layer that tripped.
+                pass
+            elif unavailable:
                 # Raise BEFORE the name-set parity check: parity will also
                 # fail (the missing experts contribute no tensors) but reports
                 # a symptom -- "stream does not match the source shard tensor
@@ -505,6 +530,15 @@ def progressive_weights_iterator(
             # Without this the boot keeps every segment it ever touched --
             # bounded only by the model size, not by the prefetch depth.
             getattr(resolver, "release_layer", lambda _l: 0)(layer)
+
+          if _plan is not None:
+            # ONCE, after every layer has streamed: an operator needs the
+            # full extent of what is missing, not the first layer that
+            # tripped over it.
+            _plan.gate()
+            _emit(_plan.describe())
+            if convergence_out is not None:
+                convergence_out.append(_plan)
         finally:
             # Never leave the prefetch thread running past the stream: a
             # cancelled boot would otherwise keep pulling segments nobody
