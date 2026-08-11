@@ -94,8 +94,19 @@ def test_flat_k3_matches_the_measured_boot():
 # constant of this system.
 #
 # MEASURED, at util 0.95 / eager / max_model_len 8192:
-#   budget 90.81 - weights 79.08 - KV 3.67 = 8.06 GiB of real overhead.
-OVERHEAD_MEASURED = 8.06
+#   budget 90.22 - weights 79.08 - KV 3.67 = 7.47 GiB of real overhead.
+#
+# The budget is the DEVICE total torch.cuda.mem_get_info reports (90.22 GiB
+# at util 0.95), not nvidia-smi's 90.81: using the latter over-charges the
+# projection by 0.6 GiB, which is a fifth of the KV cache on this box.
+OVERHEAD_MEASURED = 7.47
+DEVICE_BUDGET_GIB = 90.22
+# The loader calibrated dense at 11.40 GiB while sizing 19,456 experts (76
+# layers, including the MTP layer 78 that the DECISION domain excludes). These
+# tests model the 75-layer decision domain, so layer 78's experts move into
+# the dense term: 11.40 + 0.76 = 12.16 GiB. Same total footprint either way,
+# and the split has to be stated or the two views look like a discrepancy.
+DENSE_CALIBRATED = int(12.16 * GIB)
 # Retained only so the tests below still describe the boot that failed.
 OVERHEAD_WITH_RESIDUE = 9.19
 OVERHEAD_AFTER_RECLAIM = 5.27
@@ -128,21 +139,46 @@ def test_reclaiming_the_residue_alone_would_not_have_rescued_it_either():
     assert not p["fits"]
 
 
+def _project_device(n_k4, overhead=OVERHEAD_MEASURED, min_kv=2.0):
+    """Project against the device budget the loader itself sees."""
+    return project(
+        _bits(n_k4), SIZES, DENSE_CALIBRATED,
+        device_total_bytes=int(DEVICE_BUDGET_GIB * GIB),
+        gpu_memory_utilization=1.0,
+        runtime_overhead_bytes=int(overhead * GIB),
+        min_kv_bytes=int(min_kv * GIB),
+    )
+
+
 def test_measured_overhead_reproduces_the_observed_kv():
     """Known-answer against the boot that actually served: the fitted policy
-    (2,658 K4) at util 0.95 with the MEASURED 8.06 GiB overhead must land on
-    the 3.67 GiB of KV the engine reported."""
-    p = _project(2_658, util=0.95, overhead=OVERHEAD_MEASURED)
+    (2,658 K4) with the MEASURED overhead must land on the 3.67 GiB of KV the
+    engine reported."""
+    p = _project_device(2_658)
     assert p["weight_bytes"] / GIB == pytest.approx(79.08, abs=0.05)
     assert p["projected_kv_bytes"] / GIB == pytest.approx(3.67, abs=0.10)
+    assert p["fits"]
 
 
-def test_the_envelope_that_actually_fits_is_far_below_the_seeded_one():
-    """Under MEASURED overhead, clearing a 4 GiB KV floor needs ~2,350
-    promotions -- not the 5,206 the seeded policy asked for. The demo envelope
-    is set by the card, not by the 3.42bpw coder quant's shape."""
-    assert not _project(2_658, util=0.95, overhead=OVERHEAD_MEASURED)["fits"]
-    assert _project(2_300, util=0.95, overhead=OVERHEAD_MEASURED)["fits"]
+def test_the_floor_admits_the_boot_that_served_and_rejects_the_one_that_died():
+    """The floor's whole job. A 4 GiB floor -- which I picked out of the air --
+    would have rejected the policy that serves fine at 3.67 GiB / 73,024
+    tokens, while still catching the seeded policy that reached -3.1 GiB."""
+    assert _project_device(2_658, min_kv=2.0)["fits"]
+    assert not _project_device(2_658, min_kv=4.0)["fits"]   # the bad floor
+    assert not _project_device(5_126, min_kv=2.0)["fits"]   # the real failure
+
+
+def test_the_promotion_ceiling_this_card_actually_allows():
+    """Against the DEVICE budget and a defensible 2 GiB floor, the ceiling is
+    ~4,200 promotions: the fitted policy's 2,658 clears it comfortably and the
+    seeded 5,126 does not. An earlier claim of ~2,300 was wrong twice over --
+    it used nvidia-smi's total instead of the device budget, and a 4 GiB floor
+    I had invented rather than measured."""
+    assert _project_device(4_100)["fits"]
+    assert not _project_device(4_300)["fits"]
+    assert _project_device(2_658)["fits"]
+    assert not _project_device(5_126)["fits"]
 
 
 def test_remedy_is_expressed_in_experts_not_bytes():

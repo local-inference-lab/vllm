@@ -239,7 +239,7 @@ class ProgressiveModelLoader(BaseModelLoader):
                     "VLLM_FQ_BUDGET_MIN_KV", 4 * (1 << 30)),
             )
             logger.info("FQ memory preflight: weight source = %s", source)
-            if not source.startswith("measured"):
+            if not source.startswith(("measured", "calibrated")):
                 # Refusing a boot on a number we know is inflated would be a
                 # worse failure than the one this check exists to prevent:
                 # it would block policies that fit. Report, do not enforce.
