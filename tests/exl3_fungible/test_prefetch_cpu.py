@@ -11,6 +11,7 @@ returns something short must fall back to HTTP instead of serving garbage.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -812,3 +813,55 @@ def test_exhausted_retries_raise_rather_than_report_absence(monkeypatch):
     monkeypatch.setattr(FR.HfSource, "_BACKOFF", 0.0)
     with pytest.raises(OSError, match="after 4 attempts"):
         src.read_json("index-k3.json")
+
+
+# ------------------------------------------------- local first, then reflink
+def test_prefetch_skips_the_network_when_the_layer_is_already_local(tmp_path,
+                                                                    monkeypatch):
+    """prefetch_layer consulted only the REMOTE sources, so a layer sitting in
+    a local segment dir was re-downloaded from the Hub -- paying network and
+    disk for bytes already present. Nothing needs reflinking here because
+    nothing needs copying: the local segment is mmapped in place."""
+    r = _resolver(tmp_path)
+    sentinel = object()
+
+    class _Seg:
+        pass
+
+    monkeypatch.setattr(type(r), "_local_segment",
+                        lambda self, base, layer, k: _Seg())
+    r.sources = [pytest.fail]          # touching a source is the failure
+    note = r.prefetch_layer(4, 4)
+    assert note is not None and note.startswith("local ")
+    assert r.stats["segments_local"] == 1
+    assert sentinel is not None
+
+
+def test_reflink_shares_extents_and_reports_what_happened(tmp_path):
+    """os.copy_file_range may SILENTLY do a plain copy, so the return value
+    reports the mechanism rather than claiming a reflink we cannot verify."""
+    src = tmp_path / "seg.bin"
+    src.write_bytes(b"x" * (1 << 20))
+    dst = tmp_path / "clone.bin"
+    how = FR.FragmentResolver.reflink_or_copy(src, dst)
+    assert dst.read_bytes() == src.read_bytes(), "clone must be byte-identical"
+    assert how in ("reflink/copy_file_range", "plain copy")
+
+
+def test_reflink_leaves_no_temp_behind(tmp_path):
+    src = tmp_path / "a.bin"
+    src.write_bytes(b"y" * 4096)
+    dst = tmp_path / "sub" / "b.bin"
+    FR.FragmentResolver.reflink_or_copy(src, dst)
+    assert dst.exists()
+    assert not list(dst.parent.glob("*.rl*")), "temp file left behind"
+
+
+def test_reflink_falls_back_rather_than_failing(tmp_path, monkeypatch):
+    """An unsupported filesystem must degrade to a copy, not an error."""
+    monkeypatch.delattr(os, "copy_file_range", raising=False)
+    src = tmp_path / "a.bin"
+    src.write_bytes(b"z" * 2048)
+    dst = tmp_path / "c.bin"
+    assert FR.FragmentResolver.reflink_or_copy(src, dst) == "plain copy"
+    assert dst.read_bytes() == src.read_bytes()

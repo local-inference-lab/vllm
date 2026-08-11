@@ -916,6 +916,7 @@ class FragmentResolver:
             "segments_prefetched": 0,
             "segments_released": 0,
             "segments_shared": 0,
+            "segments_local": 0,
             "bytes_from_prefetch": 0,
             "unavailable": 0,
             # hardening counters: a broken local dir / unreadable cache entry
@@ -1166,6 +1167,17 @@ class FragmentResolver:
         256 ranged reads into one object fetch. Returns a short description of
         what happened, for the boot log; never raises.
         """
+        # LOCAL FIRST. prefetch_layer only ever consulted self.sources (the
+        # remote mirrors), so a layer sitting in a local segment dir was
+        # re-downloaded from the Hub -- paying network AND disk for bytes
+        # already present. Nothing to reflink here because nothing needs
+        # copying at all: the local segment is mmapped in place.
+        for base in self.local_dirs:
+            seg = self._local_segment(base, layer, k)
+            if seg is not None:
+                self.stats["segments_local"] += 1
+                return f"local {base}/{self._seg_name(layer, k)} (no fetch)"
+
         for source in self.sources:
             try:
                 index = self._remote_index(source, k)
@@ -1311,6 +1323,44 @@ class FragmentResolver:
         except OSError:
             return False
         return True
+
+    @staticmethod
+    def reflink_or_copy(src: Path, dst: Path) -> str:
+        """Materialise ``dst`` from ``src``, sharing extents when the kernel
+        and filesystem allow.
+
+        Same mechanism fq_assemble --reflink uses (os.copy_file_range, which
+        XFS-with-reflink and btrfs turn into an extent share): a 3.7 GB mixed
+        checkpoint assembled in 3.8 s that way. The honest caveat carried over
+        from that tool: copy_file_range may SILENTLY perform a plain copy, so
+        the return value reports what actually happened rather than claiming a
+        reflink we cannot verify.
+        """
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        size = src.stat().st_size
+        tmp = dst.with_suffix(dst.suffix + f".rl{os.getpid()}")
+        try:
+            with open(src, "rb") as fi, open(tmp, "wb") as fo:
+                remaining = size
+                while remaining:
+                    sent = os.copy_file_range(fi.fileno(), fo.fileno(),
+                                              remaining)
+                    if not sent:
+                        break
+                    remaining -= sent
+                if remaining:
+                    raise OSError(f"short copy_file_range: {remaining} left")
+            os.replace(tmp, dst)
+            return "reflink/copy_file_range"
+        except (OSError, AttributeError):
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            import shutil
+            shutil.copyfile(src, dst)
+            return "plain copy"
 
     @staticmethod
     def keep_layers(environ=None) -> bool:
