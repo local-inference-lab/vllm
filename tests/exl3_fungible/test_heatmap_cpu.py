@@ -1076,3 +1076,195 @@ def test_headers_carry_the_sample_identity():
     assert len(body["server_boot_id"]) == 8
     assert body["encoding"]["layout"] == "layer-major"
     assert body["encoding"]["byte_order"] == "little"
+
+
+# ============================================================ adversarial review
+# Added by the M5 heatmap adversarial review. Each of these fails against the
+# pre-review code; see runs/m5-serve/heatmap/REVIEW.md.
+
+
+_CAPTURED: dict = {}
+
+
+class RecordingRouter(FakeRouter):
+    """Keeps the capture fn so a test can drive it like the real router."""
+
+    def __init__(self, layer_id):
+        self.layer_id = layer_id
+
+    def set_capture_fn(self, fn):
+        self.capture_fn = fn
+        _CAPTURED[self.layer_id] = fn
+
+
+def test_tp_ranks_are_replicas_so_the_merge_must_not_sum_the_real_collector():
+    """ATTACK 1, proved against ``stats.FqStatsCollector`` itself.
+
+    ``integration.maybe_init_fq_collector`` sizes the collector to
+    ``global_num_experts`` and histograms the GATE's ``topk_ids``
+    (stats.py:211-231). Under TP the gate is replicated, so every rank
+    observes the SAME routing events: four ranks are four copies of one
+    number, not four quarters of it. The endpoint must therefore return
+    1x, never 4x.
+    """
+    E, LID, RANKS = 8, 0, 4
+    torch.manual_seed(0)
+    batches = [torch.randint(0, E, (16, 2)) for _ in range(6)]
+
+    colls = []
+    for _ in range(RANKS):
+        _CAPTURED.clear()
+        coll = FqStatsCollector(E, window_len=4, window_stride=2, decay=0.9,
+                                device="cpu")
+        coll.bind_router(LID, RecordingRouter(LID))
+        for b in batches:                      # the SAME batches on every rank
+            _CAPTURED[LID](b)
+            coll.step()
+        colls.append(coll)
+
+    ref = colls[0].decayed(LID)[0]
+    assert float(ref.sum()) > 0, "the fixture must record something"
+    for r, coll in enumerate(colls[1:], 1):
+        assert torch.equal(coll.decayed(LID)[0], ref), (
+            f"rank {r} is not a replica of rank 0 — the merge premise is "
+            "false and rank0-canonical would be wrong")
+
+    # ...and the endpoint over those four REAL collectors returns 1x.
+    workers = [FakeWorker(FakeLoopState(c, [LID], np.full((1, E), 3)), rank=r)
+               for r, c in enumerate(colls)]
+    client, _, _, _ = make_client(enabled_env(), workers)
+    _, body = get_json(client, "/fq/heatmap")
+    got = H.decode_floats(body["count"], "bf16", E).astype(np.float64)
+    truth = ref.numpy().astype(np.float64)
+    assert np.abs(got - truth).max() <= 0.005 * max(1.0, float(truth.max()))
+    assert np.abs(got - RANKS * truth).min() > 0, "the endpoint SUMMED the ranks"
+    assert body["ranks"]["merge_rule"] == "rank0-canonical"
+
+
+def test_cumulative_restarts_instead_of_freezing_when_the_ring_rewinds():
+    """A zeroed collector rewinds ``_windows_rolled``; the accumulator must
+    not report a pre-zero total for traffic that no longer exists."""
+    coll = _cum_collector(window_len=4, stride=2)
+    acc = H._CumAccumulator()
+    acc.integrate(coll, [0], [0], coll._windows_rolled, coll._win_pos,
+                  coll._step)
+    _drive(coll, [0], 3.0, 6)
+    acc.integrate(coll, [0], [0], coll._windows_rolled, coll._win_pos,
+                  coll._step)
+    assert acc.cum.max() > 0 and acc.rolled == coll._windows_rolled
+
+    # somebody zeroed the collector: rolled goes back to 0
+    coll._count_win[0].zero_()
+    coll._win_pos = 0
+    coll._windows_rolled = 0
+    acc.integrate(coll, [0], [0], 0, 0, 777)
+    assert acc.cum.max() == 0, "cum kept a total for traffic that is gone"
+    assert acc.since_step == 777, "cum_since_step must move to the restart"
+    assert acc.rolled == 0, "the accumulator stayed pinned to the old ring"
+
+    # and it starts counting again immediately rather than staying frozen
+    _drive(coll, [0], 2.0, 4)
+    acc.integrate(coll, [0], [0], coll._windows_rolled, coll._win_pos, 800)
+    assert acc.cum.max() > 0, "the accumulator never resumed"
+
+
+def test_zero_collector_rebases_the_cumulative_on_the_same_call(monkeypatch):
+    """ATTACK: ``op=zero_collector`` must not leave ``cum_count`` reporting a
+    pre-zero total on the very next poll."""
+    monkeypatch.setenv(H.HEATMAP_ALLOW_COLLECTOR_ZERO_ENV, "1")
+    coll = FqStatsCollector(4, window_len=4, window_stride=2, device="cpu")
+    coll.bind_router(0, FakeRouter())
+    _drive(coll, [0], 3.0, 8)
+    worker = FakeWorker(FakeLoopState(coll, [0], np.full((1, 4), 3)), rank=0)
+
+    first = json.loads(H.worker_sample(
+        worker, '{"op":"sample","include":["cum"]}'))
+    assert first["ok"] is True
+    _drive(coll, [0], 3.0, 4)
+    second = json.loads(H.worker_sample(
+        worker, '{"op":"sample","include":["cum"]}'))
+    assert H.decode_u32(second["cum_count"], 4).max() > 0
+
+    env = enabled_env(**{H.HEATMAP_ALLOW_COLLECTOR_ZERO_ENV: "1"})
+    client, _, _, _ = make_client(env, [worker])
+    assert client.post("/fq/heatmap/reset",
+                       json={"scope": "collector"}).status_code == 200
+
+    after = json.loads(H.worker_sample(
+        worker, '{"op":"sample","include":["cum"]}'))
+    assert H.decode_u32(after["cum_count"], 4).max() == 0, (
+        "cum_count survived a collector zero and now describes traffic that "
+        "no longer exists in the ring")
+    assert after["cum_since_step"] == coll._step
+
+
+# ------------------------------------------------- adversarial review (M5)
+# Added by the heatmap feature review. Each of these FAILS on the code as it
+# stood before the fix in the same commit.
+
+
+def test_reduce_all_still_takes_rank_0_when_results_arrive_out_of_order():
+    """``?reduce=all`` makes EVERY rank canonical, so "first canonical entry"
+    is only rank 0 while the executor happens to answer in rank order.
+
+    ``_rank_results`` preserves whatever order it is handed
+    (``admin.py:2106-2115``), so a reordering executor would put another
+    rank's arrays in a body stamped ``merge_rule: rank0-canonical``. Pick by
+    RANK, not by position.
+    """
+    rec = load_record()
+    # rank 2 is given a distinguishable histogram
+    workers = build_state(rec, ranks=4, rank_perturb={2: 1234.0})
+
+    class Reversing(FakeEngineClient):
+        async def collective_rpc(self, method, timeout=None, args=(),
+                                 kwargs=None):
+            out = await FakeEngineClient.collective_rpc(
+                self, method, timeout=timeout, args=args, kwargs=kwargs)
+            return list(reversed(out))          # rank 3 first, rank 0 last
+
+    client, _, _, _ = make_client(
+        enabled_env(), engine=Reversing(workers))
+    _, body = get_json(client, "/fq/heatmap?reduce=all")
+    assert body["ranks"]["canonical"] == 0, body["ranks"]
+    assert body["ranks"]["merge_rule"] == "rank0-canonical"
+
+    truth = np.asarray(rec["count"], dtype=np.float64).reshape(-1)
+    got = H.decode_floats(body["count"], "bf16", truth.size).astype(np.float64)
+    # rank 0's array, not rank 3's and certainly not a sum of the four
+    assert np.abs(got - truth).max() <= 0.005 * float(truth.max())
+    assert np.abs(got - 4.0 * truth).max() > float(truth.max())
+
+
+def test_the_worker_gate_is_env_only_the_token_does_not_reach_it():
+    """Pins the REAL reach of ``_require_gates``, so its docstring cannot
+    drift back into claiming it defends ``VLLM_FQ_HEATMAP_TOKEN``.
+
+    The token is an HTTP header checked at the router; nothing of the HTTP
+    request survives into ``collective_rpc``. Anyone who can reach
+    ``POST /collective_rpc`` can therefore read the matrix without it — and
+    can already call any other worker method, which is strictly more reach.
+    The destructive scope is NOT in that position: it has its own env gate.
+    """
+    import os
+
+    os.environ[H.HEATMAP_TOKEN_ENV] = "hunter2"
+    try:
+        workers = build_state()
+        # the route refuses without the header ...
+        client, _, _, _ = make_client(
+            enabled_env(**{H.HEATMAP_TOKEN_ENV: "hunter2"}), workers)
+        assert client.get("/fq/heatmap").status_code == 403
+        # ... and the worker method, reached directly, does NOT.
+        out = json.loads(H.worker_sample(workers[0], '{"op":"sample"}'))
+        assert out["ok"] is True, (
+            "if this now fails the worker learned about the token — update "
+            "the _require_gates docstring and the spec together")
+        assert out["count"], "the bypass returned the arrays"
+        # the destructive scope stays shut: it is env-gated, not token-gated
+        zeroed = json.loads(
+            H.worker_sample(workers[0], '{"op":"zero_collector"}'))
+        assert zeroed["ok"] is False
+        assert zeroed["error"]["code"] == "collector_zero_not_allowed"
+    finally:
+        os.environ.pop(H.HEATMAP_TOKEN_ENV, None)

@@ -153,16 +153,30 @@ def gate_reason(environ: Mapping[str, str] | None = None) -> str:
 
 
 def _require_gates(environ: Mapping[str, str] | None = None) -> None:
-    """The gates, enforced at the WORKER as well as at the router.
+    """The ENV gates, enforced at the WORKER as well as at the router.
 
     ``register_vllm_dev_api_routers`` also attaches vLLM's own
     ``POST /collective_rpc``, which forwards an arbitrary ``method`` name
     to every worker, and ``Worker.fq_heatmap_sample`` is an
     unconditional method. Without this check ``VLLM_SERVER_DEV_MODE=1``
     alone would be enough to read the routing matrix — and, worse, to
-    reach ``op=zero_collector`` — bypassing ``VLLM_FQ_HEATMAP`` and the
-    token entirely. Worker processes inherit the server environment, so
-    the same env is visible here.
+    reach ``op=zero_collector``. Worker processes inherit the server
+    environment, so the same env is visible here.
+
+    **This does NOT enforce ``VLLM_FQ_HEATMAP_TOKEN``**, and cannot: the
+    token is an HTTP header checked at the router, and nothing of the
+    HTTP request survives into ``collective_rpc``. So on a serve with
+    ``VLLM_SERVER_DEV_MODE=1`` + ``VLLM_FQ_HEATMAP=1`` + a token set,
+    ``POST /collective_rpc {"method": "fq_heatmap_sample"}`` still
+    returns the matrix without the token
+    (``test_the_worker_gate_is_env_only_the_token_does_not_reach_it``).
+    That is not a hole this surface can close: ``/collective_rpc``
+    forwards ANY worker method, so anyone who can reach it already has
+    strictly more reach than the heatmap token grants. Treat the token
+    as protecting the heatmap ROUTE, not the worker method, and do not
+    expose ``/collective_rpc`` to anyone who must not read the matrix.
+    The destructive scope stays behind its own env gate
+    (:func:`collector_zero_allowed`), which this path does honour.
     """
     if not heatmap_enabled(environ):
         raise AdminError("fq_heatmap_disabled", gate_reason(environ),
@@ -412,7 +426,18 @@ class _CumAccumulator:
             return
         window_len = int(collector.window_len)
         n_new = int(rolled) - int(self.rolled)
-        if n_new <= 0:
+        if n_new < 0:
+            # The ring REWOUND under us: ``op=zero_collector`` sets
+            # ``_windows_rolled = 0`` (this module's own destructive
+            # scope), and a re-created collector starts at 0 too.
+            # Returning here would pin the cumulative at its pre-zero
+            # total for however long it takes ``rolled`` to climb back
+            # past it — a frozen number that still looks like a running
+            # one — and then resume as if nothing had happened. Start
+            # over and let ``cum_since_step`` say where from.
+            self.rebase(rolled, step, layers, num_experts)
+            return
+        if n_new == 0:
             return
         if n_new > window_len:
             self.dropped_slots += n_new - window_len
@@ -491,6 +516,14 @@ def _select_rows(all_layers: Sequence[int],
     if not rows:
         raise AdminError("bad_layers", "empty layer selection", status=400)
     return rows, ids
+
+
+def _as_rank(value: Any) -> int:
+    """A rank from a worker payload, or -1 when it is absent/unparseable."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
 
 
 def _rank_of(worker: Any, state: Any) -> int:
@@ -791,6 +824,16 @@ def _worker_do_zero_collector(worker: Any) -> dict:
         collector._mass_win[lid].zero_()
     collector._win_pos = 0
     collector._windows_rolled = 0
+    # The cumulative accumulator integrates the slots that rolled BETWEEN
+    # polls, off ``_windows_rolled``. Rewinding that counter without
+    # rebasing here would leave ``cum_count`` reporting a total for
+    # traffic that no longer exists anywhere, frozen until ``rolled``
+    # climbs back past its old value. ``integrate`` also detects the
+    # rewind on its own; doing it at the source means ``cum_since_step``
+    # is right on the very next sample rather than one sample late.
+    _CUM.rebase(0, int(getattr(collector, "_step", 0)),
+                _row_layers(state, collector, has_loop),
+                int(collector.num_experts))
     rank = _rank_of(worker, state)
     logger.warning(
         "FQ heatmap: COLLECTOR ZEROED on rank %d (%s=1). The policy loop "
@@ -1165,8 +1208,20 @@ def build_router(*, environ: Mapping[str, str] | None = None) -> Any:
         are replicas of one gate, so summing would report 4x the traffic.
         """
         global _LAST_DIVERGENCE_LOG_MS
-        canonical = next((r for r in results if r.get("canonical")),
-                         results[0])
+        # Rank 0 FIRST, then any canonical rank, then whatever came back.
+        # ``?reduce=all`` makes EVERY rank mark itself canonical (each one
+        # ships its arrays), so "the first canonical entry" is only rank 0
+        # while the executor happens to return results in rank order —
+        # ``_rank_results`` preserves whatever order it is handed. Picking
+        # by rank keeps ``merge_rule: rank0-canonical`` true of the arrays
+        # in the envelope, not just of the label on them.
+        canonical = next(
+            (r for r in results
+             if r.get("canonical") and _as_rank(r.get("rank")) == 0),
+            None)
+        if canonical is None:
+            canonical = next((r for r in results if r.get("canonical")),
+                             results[0])
         agree = _agree(results, "digest")
         warns: list[str] = []
         if not agree:
