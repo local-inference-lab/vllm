@@ -520,6 +520,7 @@ class FungibleQuantState:
         self._intervals_run = 0
         self._prev_desired: np.ndarray | None = None  # [L,E] bool
         self._atomic_warned = False
+        self._promotion_apply_warned = False
         # Apply attempts the backend refused/crashed on. A missing fragment
         # at the required K is the expected cause: the incumbent tiering
         # stays live and the next interval retries.
@@ -743,7 +744,7 @@ class FungibleQuantState:
                     stats, self.eps, P.apply_swaps(self.tier_of, swaps),
                     self.budget, pins=self.pins, dwell=dwell,
                     cfg=self._decide_cfg(),
-                    exclude=[(l, e_in) for l, _, e_in in swaps])
+                    exclude=P.swap_touched(swaps))
                 rejections = rejections + prej
             for rej in rejections:
                 logger.warning("FQ budget step=%d: %s", self._step,
@@ -854,6 +855,33 @@ class FungibleQuantState:
         failure cannot have left a layer half-updated."""
         promotions = promotions or []
         if self.cfg.apply_mode == APPLY_DRYRUN or not (swaps or promotions):
+            return False
+        if promotions:
+            # An unpaired promotion CHANGES the per-layer cardinality, and
+            # nothing downstream can execute that: SwapPlan.from_memberships
+            # refuses a cardinality change (D1), SwapEngine._validate_layer
+            # derives the slab word counts from the tier-1 globals fixed at
+            # prepare time, and the mixed-kernel memo key carries the
+            # per-tier COUNTS, so a count change forces a recompile that is
+            # refused under CUDA-graph capture. admin.check_cardinality
+            # answers the same request with 501; the loop must not quietly
+            # do what the admin API refuses to pretend it can do.
+            #
+            # apply_fn is handed the SWAP LIST, so a promotion would never
+            # reach it anyway — advancing tier_of/policy_doc/store past it
+            # would make the loop, the gauges and the committed policy all
+            # claim a tier the device never received. Refuse instead: the
+            # proposal is still explained and persisted to history/, which
+            # is exactly the "raise n_k4_per_layer and restart" path.
+            if not self._promotion_apply_warned:
+                logger.error(
+                    "FQ budget: %d headroom promotion(s) proposed at step %d "
+                    "but runtime cardinality growth cannot be applied live "
+                    "(fixed-capacity slabs, D1) — recording the proposal and "
+                    "applying NOTHING this interval. Raise "
+                    "budget.n_k4_per_layer in the policy and restart to bank "
+                    "the headroom.", len(promotions), self._step)
+                self._promotion_apply_warned = True
             return False
         if self.apply_fn is None:
             if self.cfg.apply_mode == APPLY_ATOMIC and not self._atomic_warned:

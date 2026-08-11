@@ -573,9 +573,19 @@ def make_state(tmp_path=None, *, limit=None, metrics=None, interval=4,
     return state, routers
 
 
-def drive(state, routers, steps=None):
+DEFAULT_TOKENS = [[4, 4], [4, 1], [4, 0]]
+# Same traffic, except one hit goes to e5 instead of a second e4. That
+# gives the promotion planner a candidate that ``decide`` did NOT just
+# demote — see test_a_demoted_expert_is_not_re_promoted_in_the_same_
+# interval. Under DEFAULT_TOKENS the only expert with a positive score
+# outside the swap pair is e1, the one the swap demotes, so a promotion
+# there would be pure churn.
+PROMOTABLE_TOKENS = [[4, 5], [4, 1], [4, 0]]
+
+
+def drive(state, routers, steps=None, tokens=None):
     for _ in range(steps or state.cfg.interval_steps):
-        t = torch.tensor([[4, 4], [4, 1], [4, 0]], dtype=torch.int64)
+        t = torch.tensor(tokens or DEFAULT_TOKENS, dtype=torch.int64)
         for r in routers.values():
             r.capture_fn(t)
         state.step()
@@ -630,7 +640,7 @@ def test_interval_rejects_promotions_over_budget_and_logs_the_numbers(
     # Headroom for exactly one K3->K4 promotion (100 B each), plus 50 B.
     state, routers = make_state(tmp_path, limit=BOOT_BYTES + 150)
     with fq_caplog.at_level(logging.WARNING):
-        drive(state, routers)
+        drive(state, routers, tokens=PROMOTABLE_TOKENS)
 
     rec = json.loads(next(
         (state.store.root / "decisions").glob("*.json")).read_text())
@@ -671,7 +681,7 @@ def test_a_zero_headroom_budget_admits_swaps_but_no_promotions(tmp_path):
 
 def test_proposal_with_promotions_declares_the_new_cardinality(tmp_path):
     state, routers = make_state(tmp_path, limit=BOOT_BYTES + 150)
-    drive(state, routers)
+    drive(state, routers, tokens=PROMOTABLE_TOKENS)
     proposal = json.loads(next(
         (state.store.root / "history").glob("*-proposed.json")).read_text())
     caps = proposal["budget"]["n_k4_per_layer"]
@@ -913,3 +923,134 @@ def test_state_accepts_a_cardinality_budget_from_env(monkeypatch):
     assert state.budget.limit_bytes == 5400
     assert state.budget.used_bytes(state.tier_of) == BOOT_BYTES   # 5200
     assert state.budget.promotions_headroom(state.tier_of) == 2
+
+
+# ================================================ adversarial review (M5)
+# Three defects found by reviewing the memory-budget work against the
+# apply path it feeds. Each test fails on the code as first written.
+
+
+def test_an_over_budget_pool_can_still_make_byte_neutral_trades():
+    """An occupancy already past the ceiling must not be FROZEN.
+
+    Every swap the engine can execute on the K3/K4 ladder is byte-neutral
+    (apply_swaps only accepts a K4 leaving and a K3 entering), and a
+    demotion never happens except paired with a promotion. So if a
+    zero-delta swap is refused while over budget, the pool can neither
+    re-tier nor shrink: the serve is stuck at whatever composition it
+    booted with, forever, with one WARNING per proposal.
+
+    Reachable without any exotic input: a ceiling one byte under the boot
+    footprint, which is what an operator gets by rounding "78g" down, or
+    by falling back to the built-in REFERENCE byte model on a checkpoint
+    whose experts are slightly larger.
+    """
+    b = simple_budget()
+    tier = np.array([[4, 4, 3, 3, 3, 3]])              # 400*2 + 300*4 = 2000
+    used = int(b.used_bytes(tier))
+    over = P.MemoryBudget(b.expert_bytes, used - 1)    # one byte over
+
+    assert P.swap_byte_delta(tier, 0, 0, 2, over) == 0
+    kept, rej = P.budget_filter([(0, 0, 2)], tier, over)
+    assert kept == [(0, 0, 2)], "a zero-delta swap must never be refused"
+    assert rej == []
+    # ... and the guard still bites on anything that actually grows.
+    grow = np.array([[4, 4, 2, 3, 3, 3]])              # e2 sits at K2
+    kept2, rej2 = P.budget_filter(
+        [(0, 0, 2)], grow,
+        P.MemoryBudget(b.expert_bytes, int(b.used_bytes(grow))))
+    assert kept2 == [] and len(rej2) == 1
+    assert rej2[0]["overshoot_bytes"] == 100
+
+
+def test_a_demoted_expert_is_not_re_promoted_in_the_same_interval():
+    """``decide`` demotes e0; ``plan_promotions`` must not pick it back up.
+
+    The weakest K4 incumbent is routinely still stronger than the best K3
+    expert elsewhere, so a promotion planner ranking on raw score puts it
+    straight back. That is worse than churn: the swap list says
+    ``e0 -> K3`` while the proposed membership keeps e0 at K4, so the
+    instruction handed to the apply backend contradicts the state the
+    loop records against it.
+    """
+    L, E = 1, 6
+    tier = np.array([[4, 4, 3, 3, 3, 3]])
+    # e2 is the best K3 (promoted), e0 the weakest K4 (demoted), and e0
+    # still outscores e3/e4/e5 — the trap.
+    count = np.array([[10.0, 100.0, 100.0, 1.0, 1.0, 1.0]])
+    stats = {"count": count, "mass": np.ones((L, E))}
+    eps = {P.K3: np.full((L, E), 1.0), P.K4: np.zeros((L, E))}
+    cfg = {"n_k4": 2, "hysteresis": 1.0, "dwell_steps": 0,
+           "max_swaps_per_layer": 2, "max_swaps_total": 64}
+
+    assert P.decide(stats, eps, tier, cfg=cfg) == [(0, 0, 2)]
+
+    b = simple_budget()
+    budget = P.MemoryBudget(b.expert_bytes,
+                            int(b.used_bytes(tier)) + 2 * 100)
+    swaps, promos, _ = P.decide_with_budget(stats, eps, tier, budget, cfg=cfg)
+    assert swaps == [(0, 0, 2)]
+    demoted = {(l, e_out) for l, e_out, _ in swaps}
+    assert not (demoted & set(promos)), (
+        f"expert(s) {sorted(demoted & set(promos))} were demoted and "
+        f"re-promoted in one interval; promotions={promos}")
+    # The proposed membership must agree with the swap list on e0.
+    final = P.apply_promotions(P.apply_swaps(tier, swaps), promos)
+    assert final[0, 0] == P.K3
+    # The headroom is still spent — on experts the swap list did not touch.
+    assert len(promos) == 2 and (0, 0) not in promos and (0, 2) not in promos
+
+
+def test_the_loop_never_commits_a_promotion_the_backend_was_not_given(
+        tmp_path):
+    """``_maybe_apply`` hands the backend the SWAP LIST only.
+
+    An unpaired promotion changes the per-layer cardinality, which
+    ``SwapPlan.from_memberships`` refuses (D1) and which
+    ``admin.check_cardinality`` answers with 501 as structurally
+    impossible. Before the fix the loop called ``apply_fn(doc, [])`` for a
+    pure-promotion interval, took the backend's "nothing to do" True, and
+    advanced ``tier_of`` / ``policy_doc`` / the store to a composition the
+    device had never been asked to reach — the gauges, the occupancy
+    table and the committed policy all then reported a K4 expert that was
+    physically still K3.
+    """
+    seen = []
+
+    def apply_fn(doc, swaps):
+        seen.append(list(swaps))
+        return True
+
+    # eps makes the incumbents (e0, e1) the best experts, so decide()
+    # proposes no swap, while the rest still score > 0 -> pure promotions.
+    e3 = np.full((2, E), 0.05)
+    e3[:, 0] = 5.0
+    e3[:, 1] = 5.0
+    cfg = FL.FqLoopConfig(interval_steps=4, dwell_steps=0, jaccard_floor=0.0,
+                          apply_mode=FL.APPLY_ATOMIC)
+    collector, routers = make_collector()
+    store = S.PolicyStore(tmp_path, "m" * 64)
+    store.commit(boot_doc(), num_experts=E)
+    state = FL.FungibleQuantState(
+        collector, boot_doc(), config=cfg, eps={P.K3: e3, P.K4: np.zeros((2, E))},
+        store=store, budget=simple_budget(BOOT_BYTES + 250), apply_fn=apply_fn)
+    before = np.array(state.tier_of, copy=True)
+    before_sha = state.policy_sha
+
+    drive(state, routers)
+    rec = json.loads(next(
+        (store.root / "decisions").glob("*.json")).read_text())
+
+    assert rec["totals"]["promotions"] > 0, "fixture must plan promotions"
+    assert rec["totals"]["executed"] == 0
+    assert rec["applied"] is False
+    assert seen == [], (
+        "apply_fn was called with a swap list that does not contain the "
+        f"promotions: {seen}")
+    assert (state.tier_of == before).all()
+    assert state.policy_sha == before_sha
+    assert (np.asarray(store.load_current(num_experts=E)["bits_per_expert"]
+                       [str(LAYERS[0])]) == before[0]).all()
+    # The proposal is still audited: it lands in history/ for the
+    # "raise n_k4_per_layer and restart" path.
+    assert list((store.root / "history").glob("*-proposed.json"))

@@ -346,6 +346,27 @@ def test_query_plus_body_is_mixed_input():
     assert e.value.code == "mixed_input"
 
 
+@pytest.mark.parametrize("smuggled", [
+    "dry_run", "mode", "pin", "expect_policy_sha", "timeout_s", "actor",
+    "reason",
+])
+def test_query_string_cannot_silently_drop_a_safety_flag(smuggled):
+    """A dropped query parameter is a 400, never a different action.
+
+    ``?layer=23&expert=250&adjust_k=-1&dry_run=true`` is the obvious
+    spelling of the operator's "will this work?" button. Filtering the
+    unrecognised keys away made it a real, unbracketed weight mutation
+    answering ``applied: true`` — and did the same to
+    ``expect_policy_sha`` (the optimistic-concurrency guard) and to the
+    ``actor``/``reason`` the audit record is attributed with.
+    """
+    with pytest.raises(A.AdminError) as e:
+        req(None, query={"layer": "23", "expert": "250", "adjust_k": "-1",
+                         smuggled: "true"})
+    assert e.value.code == "unknown_field"
+    assert smuggled in e.value.details["unknown"]
+
+
 # --------------------------------------------------------- item resolution
 
 
@@ -860,6 +881,25 @@ def test_occupancy_diff_is_emitted_after_a_change(tmp_path):
     assert any("L23: e0 K4->K3" in line for line in logged)
 
 
+def test_render_retier_table_never_raises_on_the_other_swap_convention():
+    """The pair list is telemetry; telemetry must not take a serve down.
+
+    ``adopt_policy`` runs AFTER the visibility flip, and its swaps are
+    ``(model layer id, ...)``. ``policy.decide``/``decision_log.explain``
+    speak ``(row, ...)`` — the module invites ``loop._maybe_apply`` to be
+    pointed here later, and the loop has the other convention. A row
+    index that is not also a layer id used to escape the never-raise
+    guard as a bare KeyError, after the weights had already moved.
+    """
+    state, _ = make_state()
+    occ = A.occupancy_map(state)
+    text = A.render_retier_table(
+        occ, occ, [(0, 0, 8)],                       # row 0, i.e. layer 23
+        before_tier=state.tier_of, after_tier=state.tier_of,
+        layers=state.layers, title="t", num_experts=E)
+    assert text == ""
+
+
 def test_forced_change_is_attributable_and_persisted(tmp_path):
     state, _ = make_state(tmp_path)
     body = balanced_body(actor="michel",
@@ -1089,6 +1129,23 @@ def test_token_gate():
     assert ok.status_code == 200
 
 
+def test_token_gate_survives_a_non_ascii_header():
+    """A 0x80..0xff byte in the token header is a 403, not a 500.
+
+    Starlette decodes request headers as latin-1, and
+    ``hmac.compare_digest`` raises TypeError on ``str`` operands with
+    non-ASCII code points. One byte from an unauthenticated caller turned
+    the rejection into an unhandled exception, a stack trace in the log
+    and a 500 body.
+    """
+    client, engine, _ = make_client(enabled_env(**{A.ADMIN_TOKEN_ENV: "s3"}))
+    resp = client.request("POST", "/fq/retier", json=balanced_body(),
+                          headers=[(b"x-fq-admin-token", b"\xe9")])
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "fq_admin_forbidden"
+    assert "fq_admin_plan" not in engine.events
+
+
 def test_pause_and_resume_bracket_the_apply():
     client, engine, _ = make_client(enabled_env())
     client.post("/fq/retier", json=balanced_body())
@@ -1130,6 +1187,44 @@ def test_rank_divergence_in_phase_one_never_applies():
     assert resp.json()["error"]["code"] == "rank_divergence"
     assert "fq_admin_apply" not in engine.events
     assert "pause" not in engine.events
+
+
+def test_partial_cross_rank_apply_is_reported_as_partial():
+    """One rank failing an apply the others committed is NOT "nothing ran".
+
+    ``collective_rpc`` is not atomic across ranks. Reporting only the
+    first failure handed the operator that rank's ``torn: true,
+    flipped: false`` — "nothing was applied" — while the other ranks had
+    committed the trade and advanced their loop state, i.e. the ranks are
+    now serving different weights and the response says the opposite.
+    """
+    torn = {"ok": False, "error": {
+        "code": "apply_failed", "http_status": 500,
+        "message": "SwapEngine.apply raised: cuda launch failed",
+        "details": {"flipped": False, "restored": False, "torn": True}}}
+
+    class Split(FakeEngineClient):
+        async def collective_rpc(self, method, timeout=None, args=(),
+                                 kwargs=None):
+            self.events.append(method)
+            if method == "fq_admin_apply":
+                return [json.dumps(APPLY_OK), json.dumps(APPLY_OK),
+                        json.dumps(torn), json.dumps(APPLY_OK)]
+            return [json.dumps(PLAN_OK) for _ in range(4)]
+
+    client, engine, _ = make_client(enabled_env(), Split())
+    resp = client.post("/fq/retier", json=balanced_body())
+    assert resp.status_code == 500
+    err = resp.json()["error"]
+    assert err["code"] == "partial_apply", err
+    assert err["details"]["ranks_ok"] == 3
+    assert err["details"]["ranks_total"] == 4
+    assert err["details"]["first_error"] == "apply_failed"
+    assert [r["ok"] for r in err["details"]["per_rank"]] == [
+        True, True, False, True]
+    # It must say the weights may now differ, not that nothing happened.
+    assert "differ" in err["message"]
+    assert "resume" in engine.events
 
 
 def test_worker_error_is_forwarded_with_its_status():
@@ -1212,7 +1307,59 @@ class FakeWorker:
         state.swap_engine = engine
 
 
-def test_worker_plan_and_apply_round_trip(tmp_path):
+@pytest.fixture
+def gates_on(monkeypatch):
+    """Both gates, in the real ``os.environ`` the worker functions read.
+
+    The worker entry points are reachable through vLLM's own generic
+    ``POST /collective_rpc`` (attached by dev mode alone), so they check
+    the gates themselves rather than trusting the router to have done it.
+    """
+    monkeypatch.setenv(A.DEV_MODE_ENV, "1")
+    monkeypatch.setenv(A.ADMIN_API_ENV, "1")
+
+
+def test_worker_entry_points_are_gated_without_the_fq_flag(tmp_path,
+                                                           monkeypatch):
+    """Dev mode ALONE must not be able to move a weight.
+
+    ``register_vllm_dev_api_routers`` attaches ``POST /collective_rpc``
+    (vllm/entrypoints/serve/dev/rpc/api_router.py) whenever
+    VLLM_SERVER_DEV_MODE is set, and it forwards an arbitrary ``method``
+    name to every worker. ``Worker.fq_admin_apply`` is an unconditional
+    method, so without a worker-side gate
+    ``{"method": "fq_admin_apply", "args": ["<payload>"]}`` re-tiers live
+    experts with one of the two gates set and never consults
+    VLLM_FQ_ADMIN_TOKEN.
+    """
+    monkeypatch.setenv(A.DEV_MODE_ENV, "1")
+    monkeypatch.delenv(A.ADMIN_API_ENV, raising=False)
+    monkeypatch.delenv(A.ADMIN_ENABLE_ENV, raising=False)
+    monkeypatch.setenv(A.ADMIN_TOKEN_ENV, "hunter2")
+
+    state, _ = make_state(tmp_path)
+    engine = FakeEngine()
+    engine.source = type("S", (), {"resolver": FakeResolver()})()
+    worker = FakeWorker(state, engine)
+    tier_before = np.array(state.tier_of, copy=True)
+    sha_before = state.policy_sha
+    payload = json.dumps({"request": req(balanced_body()).canonical(),
+                          "request_id": "fqr-attacker"})
+
+    for fn, arg in ((A.worker_apply, payload), (A.worker_plan, payload),
+                    (A.worker_describe, "{}")):
+        out = json.loads(fn(worker, arg))
+        assert out["ok"] is False, fn.__name__
+        assert out["error"]["code"] == "fq_admin_disabled", fn.__name__
+        assert out["error"]["http_status"] == 404
+        assert A.ADMIN_API_ENV in out["error"]["message"]
+
+    assert engine.staged == [] and engine.applied == []
+    assert np.array_equal(tier_before, state.tier_of)
+    assert state.policy_sha == sha_before
+
+
+def test_worker_plan_and_apply_round_trip(tmp_path, gates_on):
     state, _ = make_state(tmp_path)
     engine = FakeEngine()
     engine.source = type("S", (), {"resolver": FakeResolver()})()
@@ -1233,7 +1380,7 @@ def test_worker_plan_and_apply_round_trip(tmp_path):
     assert state.policy_sha == applied["policy_sha_after"]
 
 
-def test_worker_apply_refuses_a_diverging_plan_sha(tmp_path):
+def test_worker_apply_refuses_a_diverging_plan_sha(tmp_path, gates_on):
     state, _ = make_state(tmp_path)
     engine = FakeEngine()
     engine.source = type("S", (), {"resolver": FakeResolver()})()
@@ -1246,7 +1393,7 @@ def test_worker_apply_refuses_a_diverging_plan_sha(tmp_path):
     assert engine.applied == []
 
 
-def test_worker_without_fq_state_is_404():
+def test_worker_without_fq_state_is_404(gates_on):
     worker = type("W", (), {"model_runner": type("R", (), {
         "fq_collector": None})()})()
     out = json.loads(A.worker_describe(worker))
@@ -1255,7 +1402,7 @@ def test_worker_without_fq_state_is_404():
     assert out["error"]["http_status"] == 404
 
 
-def test_worker_describe_reports_state(tmp_path):
+def test_worker_describe_reports_state(tmp_path, gates_on):
     state, _ = make_state(tmp_path)
     engine = FakeEngine()
     worker = FakeWorker(state, engine)

@@ -27,10 +27,16 @@ Gating — OFF by default, twice over:
    require saying so explicitly. (``VLLM_FQ_ADMIN_ENABLE`` is accepted as
    an alias, which is the name the spec used.)
 
-Both are checked at attach time (the routes do not exist otherwise) and
-again on every request (defence in depth: a 404 ``fq_admin_disabled``
-rather than a live mutation if something ever attaches the router by
-another path).
+Both are checked in three places, because the router is not the only way
+in: at attach time (the routes do not exist otherwise), on every request
+in the router's ``_guard``, and — the one that actually matters — in
+``worker_describe``/``worker_plan``/``worker_apply``. Dev mode also
+attaches vLLM's generic ``POST /collective_rpc``, which forwards any
+``method`` name to every worker, and ``Worker.fq_admin_apply`` is an
+unconditional method; without the worker-side check
+``VLLM_SERVER_DEV_MODE`` alone would mutate live weights and
+``VLLM_FQ_ADMIN_TOKEN`` would never be consulted. See
+:func:`_require_gates`.
 
 Fixed cardinality is not negotiable here. Occupancy == capacity is
 enforced in four independent places (``store.validate_policy``,
@@ -402,9 +408,30 @@ def parse_request(body: Mapping[str, Any] | None, *,
     Accepts the single-item query-string shorthand the operator wrote
     (``?layer=23&expert=250&adjust_k=-1``) when there is no body; a body
     and query params together is ``400 mixed_input`` rather than a guess.
+
+    Anything else in the query string is a ``400 unknown_field``, never a
+    silent drop. Filtering it away instead made
+    ``?layer=23&expert=250&adjust_k=-1&dry_run=true`` — the obvious
+    spelling of the operator's "will this work?" button — perform a real,
+    unbracketed weight mutation and answer ``applied: true``. The same
+    silence disarmed ``expect_policy_sha`` (the optimistic-concurrency
+    guard), ``mode``, ``pin``, ``timeout_s`` and the ``actor``/``reason``
+    that make the audit record attributable.
     """
-    query = {k: v for k, v in (query or {}).items()
-             if k in ("layer", "expert", "adjust_k", "k", "delta_k")}
+    query = dict(query or {})
+    unknown_query = sorted(set(query) - _ITEM_FIELDS)
+    if unknown_query:
+        raise AdminError(
+            "unknown_field",
+            f"unrecognised query parameter(s) {unknown_query}. The "
+            f"query-string shorthand carries one item and nothing else "
+            f"({sorted(_ITEM_FIELDS)}); everything that changes what the "
+            f"request DOES — dry_run, mode, pin, expect_policy_sha, "
+            f"timeout_s, actor, reason — must go in the JSON body, or it "
+            f"would be silently ignored.",
+            details={"unknown": unknown_query,
+                     "allowed_query": sorted(_ITEM_FIELDS),
+                     "allowed_body": sorted(_REQUEST_FIELDS)})
     if query and body:
         raise AdminError("mixed_input",
                          "send either the query-string shorthand or a JSON "
@@ -1093,6 +1120,13 @@ def render_retier_table(before: Mapping[int, Mapping[int, int]],
     So: render the touched layers in full (their shape is what the
     operator wants confirmed), then name the pairs underneath, since the
     pairs are the only place the change is visible at all.
+
+    ``swaps`` are ``(model layer id, e_out, e_in)`` — NOT the ``(row,
+    e_out, e_in)`` triples ``policy.decide``/``decision_log.explain``
+    speak in. Both conventions exist in this package, so the whole body
+    is inside the never-raise guard: a caller that passes rows would
+    otherwise reach ``rows[0] -> KeyError`` and take the serve down from
+    a logging helper, after the weights had already moved.
     """
     touched = sorted({int(l) for l, _, _ in swaps})
     try:
@@ -1102,34 +1136,34 @@ def render_retier_table(before: Mapping[int, Mapping[int, int]],
                 {l: before[l] for l in touched if l in before},
                 title=title, num_experts=int(num_experts), diff_only=False)
         else:
-            text = OT.render(after, before, title=title,
+            return OT.render(after, before, title=title,
                              num_experts=int(num_experts), diff_only=True)
+
+        rows = {int(l): i for i, l in enumerate(layers)}
+        before_tier = np.asarray(before_tier)
+        after_tier = np.asarray(after_tier)
+        lines = [text,
+                 "  moved (fixed cardinality: the per-tier COUNTS above are "
+                 "invariant by",
+                 "  construction, so a 1-for-1 trade cannot show up as a "
+                 "delta — these are",
+                 f"  the {len(swaps)} pair(s) that actually moved):"]
+        for layer, e_out, e_in in swaps:
+            row = rows[int(layer)]
+            lines.append(
+                f"    L{int(layer)}: e{int(e_out)} "
+                f"K{int(before_tier[row, e_out])}->"
+                f"K{int(after_tier[row, e_out])}"
+                f"  <->  e{int(e_in)} "
+                f"K{int(before_tier[row, e_in])}->"
+                f"K{int(after_tier[row, e_in])}")
+        omitted = len(layers) - len(touched)
+        if omitted > 0:
+            lines.append(f"  ({omitted} untouched layer(s) omitted)")
+        return "\n".join(lines)
     except Exception:  # noqa: BLE001 — telemetry must never kill a serve
         logger.exception("FQ admin: occupancy table failed to render")
         return ""
-    if not touched:
-        return text
-
-    rows = {int(l): i for i, l in enumerate(layers)}
-    before_tier = np.asarray(before_tier)
-    after_tier = np.asarray(after_tier)
-    lines = [text,
-             "  moved (fixed cardinality: the per-tier COUNTS above are "
-             "invariant by",
-             "  construction, so a 1-for-1 trade cannot show up as a delta — "
-             "these are",
-             f"  the {len(swaps)} pair(s) that actually moved):"]
-    for layer, e_out, e_in in swaps:
-        row = rows[int(layer)]
-        lines.append(
-            f"    L{int(layer)}: e{int(e_out)} "
-            f"K{int(before_tier[row, e_out])}->K{int(after_tier[row, e_out])}"
-            f"  <->  e{int(e_in)} "
-            f"K{int(before_tier[row, e_in])}->K{int(after_tier[row, e_in])}")
-    omitted = len(layers) - len(touched)
-    if omitted > 0:
-        lines.append(f"  ({omitted} untouched layer(s) omitted)")
-    return "\n".join(lines)
 
 
 def adopt_policy(state: Any, new_doc: Mapping[str, Any],
@@ -1865,6 +1899,7 @@ def _err(exc: BaseException) -> str:
 def worker_describe(worker: Any, request_json: str = "{}") -> str:
     """Read-only view of this rank's FQ state (``GET /fq/state``)."""
     try:
+        _require_gates()
         query = json.loads(request_json or "{}")
         state = _loop_state(worker)
         engine = None
@@ -1951,6 +1986,7 @@ def _layer_view(state: Any, layer: int) -> dict:
 def worker_plan(worker: Any, request_json: str) -> str:
     """Phase 1 on this rank: resolve + guard, mutate nothing."""
     try:
+        _require_gates()
         payload = json.loads(request_json)
         state = _loop_state(worker)
         engine = _bound_engine(worker, state)
@@ -1973,6 +2009,10 @@ def worker_apply(worker: Any, plan_json: str) -> str:
     ``plan_sha`` cross-check turns any disagreement into a refusal instead
     of divergent weights.
     """
+    try:
+        _require_gates()
+    except AdminError as exc:
+        return _err(exc)
     if not _WORKER_BUSY.acquire(blocking=False):
         return _err(AdminError(
             "retier_in_flight",
@@ -2012,6 +2052,33 @@ def _resolver_of(engine: Any) -> Any:
     return getattr(source, "resolver", None)
 
 
+def _require_gates(environ: Mapping[str, str] | None = None) -> None:
+    """The second gate, enforced at the WORKER, not only at the router.
+
+    The router is not the only way in. ``register_vllm_dev_api_routers``
+    also attaches vLLM's own ``POST /collective_rpc``
+    (``vllm/entrypoints/serve/dev/rpc/api_router.py``), which forwards an
+    arbitrary ``method`` name straight to every worker — and
+    ``Worker.fq_admin_apply`` is an unconditional method on ``Worker``. So
+    ``VLLM_SERVER_DEV_MODE=1`` alone was enough to mutate live weights
+    through ``{"method": "fq_admin_apply", "args": ["<payload>"]}``,
+    bypassing ``VLLM_FQ_ADMIN_API`` *and* ``VLLM_FQ_ADMIN_TOKEN``
+    entirely. Both gates are re-checked here so "OFF by default, twice
+    over" is true of every entry point rather than only of the one this
+    module owns.
+
+    Worker processes inherit the server's environment (the multiproc
+    executor forks/spawns from it; the Ray path copies all of
+    ``os.environ`` via ``ray_env_utils.get_env_vars_to_copy``), so this
+    never refuses a request the router would have allowed.
+    """
+    if not admin_enabled(environ):
+        raise AdminError("fq_admin_disabled", gate_reason(environ),
+                         status=404,
+                         details={"dev_mode": dev_mode_enabled(environ),
+                                  "admin_flag_env": ADMIN_API_ENV})
+
+
 class FqWorkerAdmin:
     """``--worker-extension-cls`` mixin, for trees without the core hooks.
 
@@ -2048,10 +2115,33 @@ def _rank_results(raw: Sequence[Any]) -> list[dict]:
 
 
 def _first_error(results: Sequence[Mapping[str, Any]]) -> AdminError | None:
+    """The first rank's refusal — with the OTHER ranks' verdicts attached.
+
+    A collective call is not atomic across ranks. Returning only the
+    first failure threw away the fact that the others succeeded, so a TP4
+    apply where rank 2 dies reported that one rank's ``torn: true,
+    flipped: false`` — "nothing was applied" — while ranks 0/1/3 had
+    committed the trade and advanced their loop state. ``per_rank`` and
+    ``ranks_ok`` make the split visible; the caller decides how loud to
+    be about it.
+    """
+    err = None
     for res in results:
         if not res.get("ok", False):
-            return AdminError.from_wire(res.get("error") or {})
-    return None
+            err = AdminError.from_wire(res.get("error") or {})
+            break
+    if err is None:
+        return None
+    err.details["per_rank"] = [
+        {"index": i, "ok": bool(res.get("ok", False)),
+         "code": (res.get("error") or {}).get("code") if not res.get("ok")
+         else None,
+         "generation": res.get("generation"),
+         "policy_sha_after": res.get("policy_sha_after")}
+        for i, res in enumerate(results)]
+    err.details["ranks_ok"] = sum(1 for r in results if r.get("ok", False))
+    err.details["ranks_total"] = len(results)
+    return err
 
 
 def _agree(results: Sequence[Mapping[str, Any]], key: str) -> bool:
@@ -2118,7 +2208,14 @@ def build_router(*, environ: Mapping[str, str] | None = None) -> Any:
             import hmac
 
             sent = request.headers.get("X-FQ-Admin-Token", "")
-            if not hmac.compare_digest(sent, token):
+            # compare_digest refuses str operands with non-ASCII code
+            # points (TypeError). Starlette decodes headers as latin-1, so
+            # a single 0x80..0xff byte in the header turned an
+            # unauthenticated 403 into an unhandled 500 with a traceback.
+            # Compare bytes: same constant-time property, total function.
+            if not hmac.compare_digest(sent.encode("utf-8", "surrogateescape"),
+                                       token.encode("utf-8",
+                                                    "surrogateescape")):
                 return AdminError(
                     "fq_admin_forbidden",
                     f"X-FQ-Admin-Token missing or wrong ({ADMIN_TOKEN_ENV} is "
@@ -2286,6 +2383,28 @@ def build_router(*, environ: Mapping[str, str] | None = None) -> Any:
                                             apply_payload,
                                             timeout=request.timeout_s)
             except AdminError as exc:
+                # A collective apply is not atomic ACROSS ranks. If some
+                # rank committed the trade and another did not, the ranks
+                # are now serving different weights, and reporting the
+                # loser's "nothing was applied" would be a lie that reads
+                # like reassurance.
+                applied_ranks = int(exc.details.get("ranks_ok") or 0)
+                if applied_ranks:
+                    total = exc.details.get("ranks_total", "?")
+                    logger.error(
+                        "FQ ADMIN request=%s PARTIALLY applied: %s of %s "
+                        "rank(s) committed, the rest refused (%s) — the "
+                        "ranks' weights now differ",
+                        request_id, applied_ranks, total, exc.code)
+                    exc = AdminError(
+                        "partial_apply",
+                        f"{applied_ranks} of {total} rank(s) committed this "
+                        f"re-tier and {exc.code} on the rest — the ranks' "
+                        f"weights may now differ; GET /fq/state to compare "
+                        f"policy_sha per rank and consider a restart. "
+                        f"First failure: {exc.message}",
+                        status=500, details=dict(exc.details,
+                                                 first_error=exc.code))
                 return _fail(exc)
             finally:
                 if paused:

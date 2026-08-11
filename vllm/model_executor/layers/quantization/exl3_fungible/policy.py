@@ -764,6 +764,16 @@ def budget_filter(swaps: list, tier_of, budget: MemoryBudget | None,
     Applied to the ORDERED list cumulatively, so the surviving prefix is
     affordable *together*, not merely one at a time.
 
+    A swap that does not GROW the pool (``delta <= 0``) is always
+    admitted, including when the occupancy is already over the ceiling.
+    Refusing those would be a deadlock, not a guard: every executable
+    swap on the K3/K4 ladder is byte-neutral, so an over-budget pool
+    would never be allowed to re-tier again — and, because demotions
+    only ever happen paired with a promotion, its occupancy could never
+    come back down either. The ceiling is a bound on growth; a
+    non-increasing move cannot violate it any harder than the state it
+    started from.
+
     Returns ``(kept, rejections)``; each rejection is a
     :meth:`BudgetVerdict.as_dict` carrying budget/current/requested/
     overshoot.
@@ -777,7 +787,7 @@ def budget_filter(swaps: list, tier_of, budget: MemoryBudget | None,
     for l, e_out, e_in in swaps:
         delta = swap_byte_delta(tier_of, l, e_out, e_in, budget)
         requested = used + delta
-        if requested <= budget.limit_bytes:
+        if delta <= 0 or requested <= budget.limit_bytes:
             used = requested
             kept.append((l, e_out, e_in))
         else:
@@ -792,6 +802,27 @@ def budget_filter(swaps: list, tier_of, budget: MemoryBudget | None,
                 kind="swap", layer=int(l), expert_in=int(e_in),
                 expert_out=int(e_out)).as_dict())
     return kept, rejections
+
+
+def swap_touched(swaps: Iterable[tuple[int, int, int]]
+                 ) -> list[tuple[int, int]]:
+    """Every ``(layer, expert)`` an ordered swap list moves — BOTH sides.
+
+    ``plan_promotions`` must exclude all of them, not just the entering
+    ones. ``decide`` demotes the weakest K4 resident, but "weakest of the
+    incumbents" is routinely still stronger than the best K3 expert
+    elsewhere, so a promotion planner ranking on raw score will pick that
+    expert straight back up in the SAME interval. The result is not
+    merely churn: the emitted swap list says ``e_out -> K3`` while the
+    proposed membership says ``e_out`` is still K4, so the instruction
+    handed to the apply backend contradicts the state the loop then
+    records. One expert moves once per interval, or not at all.
+    """
+    out: list[tuple[int, int]] = []
+    for l, e_out, e_in in swaps:
+        out.append((int(l), int(e_out)))
+        out.append((int(l), int(e_in)))
+    return out
 
 
 def apply_promotions(tier_of, promotions: Iterable[tuple[int, int]],
@@ -916,7 +947,7 @@ def decide_with_budget(
     swaps, rejections = budget_filter(swaps, tier_of, budget)
     promotions: list[tuple[int, int]] = []
     if allow_promotions:
-        touched = [(l, e_in) for l, _, e_in in swaps]
+        touched = swap_touched(swaps)
         promotions, prej = plan_promotions(
             stats, eps, apply_swaps(tier_of, swaps), budget, pins=pins,
             dwell=dwell, cfg=cfg, exclude=touched)
