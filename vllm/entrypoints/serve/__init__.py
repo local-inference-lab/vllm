@@ -75,3 +75,18 @@ def register_vllm_dev_api_routers(app: FastAPI):
         )
 
         attach_fq_admin_router(app)
+
+    # Fungible-quant activation-matrix API (GET /fq/heatmap). Read-only,
+    # so it carries its OWN gate and its own optional token rather than
+    # riding on the admin one: a dashboard should be able to watch expert
+    # routing without holding the credential that mutates live weights.
+    # Same double-gate shape as the block above; attach_router returns
+    # False (and never raises) unless VLLM_FQ_HEATMAP=1 as well.
+    if os.environ.get("VLLM_FQ_HEATMAP", os.environ.get(
+        "VLLM_FQ_HEATMAP_API", "0"
+    )) in ("1", "true", "True"):
+        from vllm.model_executor.layers.quantization.exl3_fungible.heatmap import (  # noqa: E501
+            attach_router as attach_fq_heatmap_router,
+        )
+
+        attach_fq_heatmap_router(app)

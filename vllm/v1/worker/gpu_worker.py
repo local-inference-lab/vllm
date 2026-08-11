@@ -847,6 +847,21 @@ class Worker(WorkerBase):
 
         return worker_apply(self, plan_json)
 
+    def fq_heatmap_sample(self, request_json: str = "{}") -> str:
+        """One rank's slice of the routing activation matrix.
+
+        Read-only telemetry behind its own env gate (VLLM_FQ_HEATMAP),
+        re-checked inside worker_sample so reaching this method through
+        dev mode's POST /collective_rpc does not bypass the gate. Same
+        laziness contract and JSON-string convention as the fq_admin_*
+        delegates above.
+        """
+        from vllm.model_executor.layers.quantization.exl3_fungible.heatmap import (  # noqa: E501
+            worker_sample,
+        )
+
+        return worker_sample(self, request_json)
+
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
