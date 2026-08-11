@@ -126,6 +126,14 @@ _ST_TO_TORCH_NAME = {
 }
 
 
+class OfflineError(OSError):
+    """Raised instead of a network call when HF_HUB_OFFLINE is set.
+
+    Subclasses OSError so the existing transient-error handling treats it as
+    a source MISS rather than a crash — offline is a configuration, not a
+    fault."""
+
+
 class FragmentUnavailableError(RuntimeError):
     """No local dir, cache entry, trusted source, or fallback K could supply
     the fragment; the miss is enqueued for lazy encode (:mod:`.lazy_encode`)
@@ -378,9 +386,42 @@ class HfSource:
                 f"{self.revision}/{relpath}"
             )
 
+    @staticmethod
+    def offline() -> bool:
+        """True when the operator has asked for no network.
+
+        Honours the ECOSYSTEM-STANDARD ``HF_HUB_OFFLINE`` (and vLLM's
+        ``VLLM_NO_USAGE_STATS``-style truthiness) rather than inventing our
+        own knob, because an operator who sets it expects it to bind
+        everything that talks to the Hub. We do NOT go through
+        ``huggingface_hub`` for payload reads — only ``hf_hub_url`` to build a
+        URL, then raw urllib — so the library's own offline handling never
+        applied to us. Without this check, ``HF_HUB_OFFLINE=1`` silently still
+        hit the network, which is the worst kind of wrong for an air-gapped or
+        reproducibility-audited run.
+
+        ``FQ_ALLOW_NETWORK=1`` is the explicit override for the case where a
+        caller wants Hub access despite the global flag.
+        """
+        if os.environ.get("FQ_ALLOW_NETWORK", "").strip().lower() in (
+                "1", "true", "yes", "on"):
+            return False
+        for var in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+            if os.environ.get(var, "").strip().lower() in (
+                    "1", "true", "yes", "on"):
+                return True
+        return False
+
     def _open(self, relpath: str, headers: dict[str, str]):
         import urllib.request
 
+        if self.offline():
+            # Raise the same shape a 404 does so every caller already handles
+            # it as "this source has nothing", falling through to local dirs,
+            # the primed cache, and then the K ladder.
+            raise OfflineError(
+                f"{self.name}: HF_HUB_OFFLINE is set; refusing to fetch "
+                f"{relpath}. Prime the cache, or set FQ_ALLOW_NETWORK=1.")
         token = os.environ.get("HF_TOKEN") or os.environ.get(
             "HUGGING_FACE_HUB_TOKEN"
         )
@@ -486,6 +527,8 @@ class HfSource:
                         f"{self.name}/{relpath}: ranged read [{start},{end}) "
                         f"returned {len(data)} bytes")
                 return data
+            except OfflineError:
+                raise                      # a configuration, not a blip
             except urllib.error.HTTPError:
                 raise                      # 404/403: a real answer, not a blip
             except (http.client.IncompleteRead, http.client.RemoteDisconnected,

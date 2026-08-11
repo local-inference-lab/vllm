@@ -145,3 +145,71 @@ def test_uniformity_predicate(bits, uniform):
     """The guard that stops a layer needing one K4 expert from dragging a
     whole segment."""
     assert (len(set(bits)) == 1) is uniform
+
+
+# --------------------------------------------------------------- offline mode
+def test_hf_hub_offline_blocks_every_network_read(monkeypatch):
+    """HF_HUB_OFFLINE must actually bind us.
+
+    We never route payload reads through huggingface_hub — only hf_hub_url to
+    build a string, then raw urllib — so the library's own offline handling
+    never applied. Before this, HF_HUB_OFFLINE=1 silently still hit the
+    network, which is the worst kind of wrong for an air-gapped or
+    reproducibility-audited run.
+    """
+    src = FR.HfSource("org/repo")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    assert FR.HfSource.offline() is True
+    for call in (lambda: src.read_json("index-k3.json"),
+                 lambda: src.read_text("a.jsonl"),
+                 lambda: src.read_range("seg.safetensors", 0, 16)):
+        with pytest.raises(FR.OfflineError):
+            call()
+
+
+@pytest.mark.parametrize("val,off", [
+    ("1", True), ("true", True), ("YES", True), ("on", True),
+    ("0", False), ("", False), ("false", False),
+])
+def test_offline_truthiness(monkeypatch, val, off):
+    monkeypatch.delenv("FQ_ALLOW_NETWORK", raising=False)
+    monkeypatch.setenv("HF_HUB_OFFLINE", val)
+    assert FR.HfSource.offline() is off
+
+
+def test_transformers_offline_also_honoured(monkeypatch):
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.delenv("FQ_ALLOW_NETWORK", raising=False)
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    assert FR.HfSource.offline() is True
+
+
+def test_explicit_override_wins(monkeypatch):
+    """An operator who wants Hub access despite the global flag can say so."""
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("FQ_ALLOW_NETWORK", "1")
+    assert FR.HfSource.offline() is False
+
+
+def test_offline_error_is_an_oserror_so_callers_treat_it_as_a_miss():
+    """Offline is a configuration, not a fault: the existing source-error
+    handling must degrade to 'this source has nothing' and let the K ladder
+    and the primed cache take over, not abort a boot."""
+    assert issubclass(FR.OfflineError, OSError)
+
+
+def test_offline_is_not_retried(monkeypatch, tmp_path):
+    """Retrying a configuration wastes four backoff sleeps per expert."""
+    src = FR.HfSource("org/repo")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    calls = {"n": 0}
+    real_open = FR.HfSource._open
+
+    def counting_open(self, relpath, headers):
+        calls["n"] += 1
+        return real_open(self, relpath, headers)
+
+    monkeypatch.setattr(FR.HfSource, "_open", counting_open)
+    with pytest.raises(FR.OfflineError):
+        src.read_range("seg.safetensors", 0, 16)
+    assert calls["n"] == 1, f"offline refusal retried {calls['n']} times"

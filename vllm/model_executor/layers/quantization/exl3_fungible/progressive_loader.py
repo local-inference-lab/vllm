@@ -90,6 +90,20 @@ class ProgressiveModelLoader(BaseModelLoader):
             spec.k_values,
             tp_rank,
         )
+        # State the network posture BEFORE the nine-minute compile, not after
+        # a failure. A run that silently fetched when the operator asked for
+        # offline is not reproducible; a run that cannot fetch should say so
+        # while there is still time to prime the cache.
+        try:
+            from vllm.model_executor.layers.quantization.exl3_fungible.\
+                fragments import HfSource
+            if HfSource.offline():
+                logger.warning(
+                    "Progressive boot: OFFLINE (HF_HUB_OFFLINE set) — Hub "
+                    "sources disabled; only local segment dirs and the primed "
+                    "cache will be used. Set FQ_ALLOW_NETWORK=1 to override.")
+        except Exception:  # noqa: BLE001 — posture logging must not fail a boot
+            pass
         start = time.perf_counter()
         model.load_weights(
             progressive_weights_iterator(
