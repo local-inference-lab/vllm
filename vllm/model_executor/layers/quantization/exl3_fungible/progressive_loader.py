@@ -37,6 +37,39 @@ logger = init_logger(__name__)
 
 _EXTRA_CONFIG_KEYS = {"manifest_dir", "policy", "dense_source"}
 
+# Set by the last progressive load_weights on this worker, consumed by
+# record_weight_footprint once the weights are actually resident. Module-level
+# rather than threaded through vLLM's worker API, which has no seam for it.
+_LAST_LOAD: dict = {}
+
+
+def _remember_load(loader, spec, tp_rank) -> None:
+    _LAST_LOAD.update(loader=loader, spec=spec, tp_rank=tp_rank)
+
+
+def record_weight_footprint(allocated_bytes: int) -> None:
+    """Calibrate the dense term from a load that actually completed.
+
+    ``allocated_bytes`` is the true per-rank weight footprint, measured after
+    process_weights_after_loading. Subtracting the policy's expert bytes
+    leaves the policy-INDEPENDENT dense term -- which is what the preflight
+    cannot compute from headers, because non-expert tensors carry no .rankN.
+    suffix and summing their file bytes charges one rank for all four.
+    """
+    loader = _LAST_LOAD.get("loader")
+    if loader is None or loader._last_expert_bytes is None:
+        return
+    dense = allocated_bytes - loader._last_expert_bytes
+    if dense <= 0:
+        logger.warning(
+            "FQ calibration skipped: footprint %.2f GiB is below the policy's "
+            "own expert bytes %.2f GiB -- measured too early to be the real "
+            "footprint", allocated_bytes / (1 << 30),
+            loader._last_expert_bytes / (1 << 30))
+        return
+    loader._write_dense_calibration(
+        _LAST_LOAD["spec"], _LAST_LOAD["tp_rank"], dense)
+
 
 class ProgressiveModelLoader(BaseModelLoader):
     """Stream mixed-K EXL3 weights from Progressive Tensors segments."""
@@ -119,7 +152,9 @@ class ProgressiveModelLoader(BaseModelLoader):
             "Loading weights took %.2f seconds (progressive)",
             time.perf_counter() - start,
         )
-        self._reclaim_allocator(spec, tp_rank)
+        # Reclaim + calibration happen in gpu_worker AFTER
+        # process_weights_after_loading -- see record_weight_footprint.
+        _remember_load(self, spec, tp_rank)
 
     # ------------------------------------------------------------ memory
 

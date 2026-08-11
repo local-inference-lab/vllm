@@ -456,6 +456,17 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
+        # FQ: return the loader's staging residue to the driver BEFORE KV
+        # sizing. This must run HERE, not inside the progressive loader:
+        # load_weights returns with only 35.11 GiB resident because the EXL3
+        # quant method device-copies in process_weights_after_loading, which
+        # model_runner.load_model() has only just finished. Reclaiming at the
+        # earlier point freed 0.39 GiB of the ~3.9 GiB actually stranded --
+        # and every stranded byte is charged against the KV cache, because
+        # vLLM sizes KV from what the DRIVER reports free while the caching
+        # allocator holds freed blocks as reserved.
+        self._fq_reclaim_after_load()
+
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,
@@ -463,6 +474,48 @@ class Worker(WorkerBase):
                 self.device,
                 self.model_runner.get_model(),
             )
+
+    def _fq_reclaim_after_load(self) -> None:
+        """Free allocator residue left by progressive loading, and calibrate.
+
+        Two outputs, both measured rather than assumed:
+          - reserved-before/after, so the recovery is a number in the log
+            instead of a claim in a commit message;
+          - the true per-rank weight footprint, which is what the next boot's
+            memory preflight needs in order to project exactly rather than
+            reconstruct from file headers (which over-charges one rank for all
+            four TP ranks' non-expert tensors).
+
+        Guarded to a no-op unless the progressive loader ran: a normal
+        checkpoint load has no per-expert staging to reclaim.
+        """
+        import os
+
+        if os.environ.get("VLLM_FQ_RECLAIM", "1") == "0":
+            return
+        if getattr(self.vllm_config.load_config, "load_format", None) != \
+                "progressive":
+            return
+        try:
+            import gc
+
+            import torch
+
+            before_r = torch.cuda.memory_reserved()
+            allocated = torch.cuda.memory_allocated()
+            gc.collect()
+            torch.cuda.empty_cache()
+            after_r = torch.cuda.memory_reserved()
+            logger.info(
+                "FQ reclaim (post process_weights_after_loading): reserved "
+                "%.2f -> %.2f GiB, freed %.2f GiB; weight footprint %.2f GiB",
+                before_r / (1 << 30), after_r / (1 << 30),
+                (before_r - after_r) / (1 << 30), allocated / (1 << 30))
+            from vllm.model_executor.layers.quantization.exl3_fungible.\
+                progressive_loader import record_weight_footprint
+            record_weight_footprint(allocated)
+        except Exception:  # noqa: BLE001 — never fail a boot to save memory
+            logger.warning("FQ post-load reclaim skipped", exc_info=True)
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
