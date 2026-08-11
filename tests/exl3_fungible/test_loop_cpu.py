@@ -8,6 +8,7 @@ decision determinism, eps loading, env config, and boot-glue policy
 resolution/rehydration. No GPU, no built vllm required.
 """
 import json
+import logging
 
 import numpy as np
 import pytest
@@ -659,3 +660,66 @@ def test_apply_fn_may_report_what_it_actually_installed(tmp_path):
 def test_a_bare_true_still_adopts_the_proposal():
     """Back-compat: the M3 reload path returns a bool and must keep working."""
     assert bool([(0, 1, 2)]) is True and bool(True) is True
+
+
+class _Capture(logging.Handler):
+    """vLLM loggers set propagate=False, so caplog never sees them."""
+
+    def __init__(self):
+        super().__init__(level=logging.INFO)
+        self.lines: list[str] = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+    def __enter__(self):
+        FL.logger.addHandler(self)
+        self._prev = FL.logger.level
+        FL.logger.setLevel(logging.INFO)
+        return self
+
+    def __exit__(self, *exc):
+        FL.logger.removeHandler(self)
+        FL.logger.setLevel(self._prev)
+        return False
+
+    @property
+    def text(self):
+        return "\n".join(self.lines)
+
+
+def test_composition_reports_membership_not_just_counts(tmp_path):
+    """A paired swap must be visible in the log.
+
+    The counts table cannot show one: D1 fixed cardinality makes every
+    per-tier count invariant under a K3<->K4 exchange, so the table reported
+    "no tier changes across 75 layers" at every interval of a live run in
+    which 256 experts had moved — verified independently by diffing the
+    committed policy against the boot policy file. An instrument that goes
+    silent precisely when the thing it watches happens is worse than none.
+    """
+    state, routers = make_state(tmp_path, interval=4, apply_mode="reload")
+    state.apply_fn = lambda doc, swaps: True
+    before = np.array(state.tier_of, copy=True)
+    state.log_composition(title="before", diff_only=False)  # seeds the baseline
+
+    drive_hot_interval(state, routers)
+    with _Capture() as cap:
+        state.log_composition(title="after", diff_only=False)
+
+    n_moved = int((before != state.tier_of).sum())
+    assert n_moved, "fixture did not actually move an expert"
+    assert "membership:" in cap.text, f"no membership line:\n{cap.text}"
+    assert f"{n_moved} expert(s) moved" in cap.text, (
+        f"expected {n_moved} moved, log said:\n{cap.text}")
+    # Cardinality is unchanged — which is exactly why counts alone are blind.
+    assert (state.tier_of == P.K4).sum() == (before == P.K4).sum()
+
+
+def test_composition_says_unchanged_when_nothing_moved(tmp_path):
+    """The quiet case must be stated, not inferred from silence."""
+    state, _ = make_state(tmp_path, interval=4, apply_mode="reload")
+    state.log_composition(title="first", diff_only=False)
+    with _Capture() as cap:
+        state.log_composition(title="second", diff_only=False)
+    assert "membership: unchanged" in cap.text, cap.text

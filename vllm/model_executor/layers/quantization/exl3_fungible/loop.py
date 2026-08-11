@@ -1190,6 +1190,36 @@ class FungibleQuantState:
             logger.info("%s", line)
         self._last_composition = cur
 
+        # Membership diff, because the table above CANNOT show a swap.
+        #
+        # `_occupancy_map` reports per-tier COUNTS, and D1 fixed cardinality
+        # makes every count invariant under a K3<->K4 exchange. So the table
+        # printed "no tier changes across 75 layers" at every single interval
+        # of a run in which 256 experts demonstrably moved (verified by
+        # diffing the committed policy against the boot policy file). It was
+        # literally true and the worst kind of instrument: it reads as
+        # evidence that nothing happened.
+        #
+        # Counts still answer "what is the occupancy", so they stay; this adds
+        # the question they cannot answer.
+        prev = getattr(self, "_last_tier_of", None)
+        curr = np.array(self.tier_of, copy=True)
+        if prev is not None and getattr(prev, "shape", None) == curr.shape:
+            moved = prev != curr
+            n_moved = int(moved.sum())
+            if n_moved:
+                rows = np.flatnonzero(moved.any(axis=1))
+                sample = ", ".join(f"L{int(self.layers[r])}:{int(moved[r].sum())}"
+                                   for r in rows[:6])
+                logger.info(
+                    "  membership: %d expert(s) moved across %d layer(s) "
+                    "since the last table (%s%s)",
+                    n_moved, int(rows.size), sample,
+                    ", ..." if rows.size > 6 else "")
+            else:
+                logger.info("  membership: unchanged since the last table")
+        self._last_tier_of = curr
+
     def _export_metrics(self, record: dict, swaps: list,
                         jac: float | None, applied: bool = False) -> None:
         if self.metrics is None:
