@@ -359,13 +359,25 @@ def progressive_weights_iterator(
         # OPPORTUNISTIC TIME-TO-SERVE (opt-in). Boot on whatever tiers the
         # primed cache holds and converge afterwards, instead of making
         # time-to-serve a function of the slowest fetch.
+        # ALWAYS account. The K ladder degrades an expert whenever a
+        # fragment is unavailable -- that has been true since long before
+        # opportunistic mode existed -- and until now the degradation was
+        # recorded nowhere an operator or a repay loop could act on. One
+        # transient URLError left L5/e2 serving K3 instead of K4 for the
+        # lifetime of the process, with nothing tracking it.
+        #
+        # So the plan is unconditional; the opt-in governs only whether the
+        # boot is PERMITTED to proceed past missing experts, never whether a
+        # degradation is noticed.
         _plan = None
+        _opportunistic = False
         try:
             from .convergence import ConvergencePlan, k_bounds, \
                 opportunistic_enabled
-            if opportunistic_enabled():
-                _lo, _hi = k_bounds()
-                _plan = ConvergencePlan(k_min=_lo, k_max=_hi)
+            _lo, _hi = k_bounds()
+            _plan = ConvergencePlan(k_min=_lo, k_max=_hi)
+            _opportunistic = opportunistic_enabled()
+            if _opportunistic:
                 _emit(f"FQ opportunistic boot ENABLED (accepting K{_lo}..K"
                       f"{_hi}); served weights converge to policy at runtime")
         except ImportError:
@@ -482,7 +494,7 @@ def progressive_weights_iterator(
                     yield name, tensor
             if actual_bits_out is not None:
                 actual_bits_out[layer] = list(actual_bits)
-            if unavailable and _plan is not None:
+            if unavailable and _opportunistic:
                 # Opportunistic mode: completeness is the gate, adequacy is
                 # not. A missing expert still fails -- via _plan.gate() once
                 # the whole model is loaded, so the operator sees the full
@@ -532,11 +544,14 @@ def progressive_weights_iterator(
             getattr(resolver, "release_layer", lambda _l: 0)(layer)
 
           if _plan is not None:
-            # ONCE, after every layer has streamed: an operator needs the
-            # full extent of what is missing, not the first layer that
-            # tripped over it.
-            _plan.gate()
-            _emit(_plan.describe())
+            if _opportunistic:
+                # ONCE, after every layer has streamed: an operator needs the
+                # full extent of what is missing, not the first layer that
+                # tripped over it. (Without the opt-in, a missing expert
+                # already failed at its own layer above.)
+                _plan.gate()
+            if _plan.pending_count or _opportunistic:
+                _emit(_plan.describe())
             if convergence_out is not None:
                 convergence_out.append(_plan)
         finally:

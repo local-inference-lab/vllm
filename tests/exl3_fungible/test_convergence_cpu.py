@@ -315,16 +315,29 @@ def test_loader_reports_missing_experts_to_the_plan():
 
 def test_gate_runs_once_after_all_layers_not_per_layer():
     """Gating inside the layer loop would fail on the FIRST layer with a
-    missing expert and report that layer's count as the whole extent."""
-    src = _progressive_src()
-    # the CALL, not a comment that mentions it
-    calls = [ln for ln in src.splitlines()
-             if ln.strip().startswith("_plan.gate()")]
-    assert len(calls) == 1, f"expected exactly one gate call, got {calls}"
-    indent = len(calls[0]) - len(calls[0].lstrip())
-    # the per-layer loop body sits deeper than this; 12 is the post-loop level
-    assert indent <= 12, f"gate is inside the layer loop (indent {indent})"
+    missing expert and report that layer's count as the whole extent.
 
+    Checked structurally rather than by indentation: the gate legitimately
+    gained a nesting level when it moved under the opt-in, and an indent
+    heuristic called that a regression when nothing had moved.
+    """
+    import ast
+
+    tree = ast.parse(_progressive_src())
+
+    def calls_gate(node):
+        return any(
+            isinstance(n, ast.Attribute) and n.attr == "gate"
+            for n in ast.walk(node))
+
+    loops = [n for n in ast.walk(tree)
+             if isinstance(n, ast.For)
+             and any(isinstance(x, ast.Name) and x.id == "_sorted_layers"
+                     for x in ast.walk(n.iter))]
+    assert loops, "could not find the per-layer loop"
+    for loop in loops:
+        assert not calls_gate(loop), "gate() runs inside the layer loop"
+    assert calls_gate(tree), "gate() is not called at all"
 
 def test_opportunistic_is_off_unless_env_says_otherwise():
     src = _progressive_src()
@@ -426,3 +439,102 @@ def test_priority_reaches_the_worker():
         p, lambda l, e, k: (order.append((l, e)), k)[1], batch=1,
         priority=lambda d: 100.0 if d.key() == (9, 7) else 1.0).step()
     assert order == [(9, 7)]
+
+
+# ------------------------------------------- layer-granular repayment (reload)
+def test_deficits_group_by_layer_worst_first():
+    """Convergence is layer-granular whether we like it or not: a degraded
+    boot never ALLOCATED the K4 slab, and the swap engine only moves experts
+    between slabs that already exist. So the layer is rebuilt, and repaying 40
+    deficits in one layer must cost one reload, not forty."""
+    p = _plan()
+    for e in range(3):
+        p.observe(9, e, actual_k=2, target_k=3)      # layer 9: gap 3 total
+    p.observe(4, 0, actual_k=2, target_k=5)          # layer 4: gap 3
+    p.observe(7, 0, actual_k=3, target_k=4)          # layer 7: gap 1
+    groups = CV.group_by_layer(p.pending())
+    assert [g[0] for g in groups][:1] in ([4], [9]), "worst layer must lead"
+    assert dict((l, len(ds)) for l, ds in groups)[9] == 3
+
+
+def test_group_by_layer_caps_the_batch():
+    p = _plan()
+    for layer in range(10):
+        p.observe(layer, 0, actual_k=2, target_k=3)
+    assert len(CV.group_by_layer(p.pending(), batch_layers=3)) == 3
+
+
+def test_layer_worker_repays_a_whole_layer_in_one_reload():
+    p = _plan()
+    for e in range(40):
+        p.observe(5, e, actual_k=3, target_k=4)
+    calls = []
+
+    def reload_fn(layer, want):
+        calls.append((layer, len(want)))
+        return {e: 4 for e in want}
+
+    out = CV.LayerConvergenceWorker(p, reload_fn).step()
+    assert calls == [(5, 40)], "40 deficits must cost ONE reload"
+    assert out["repaid"] == 40 and out["pending"] == 0
+
+
+def test_layer_worker_survives_a_reload_that_raises():
+    p = _plan()
+    p.observe(5, 0, actual_k=3, target_k=4)
+
+    def boom(layer, want):
+        raise RuntimeError("quiesce failed")
+
+    out = CV.LayerConvergenceWorker(p, boom).step()
+    assert out["failed"] == 1 and p.pending_count == 1
+
+
+def test_partial_layer_repay_is_recorded_per_expert():
+    """A reload may satisfy some experts and not others -- the segment for one
+    of them may still not exist."""
+    p = _plan()
+    for e in range(3):
+        p.observe(5, e, actual_k=3, target_k=4)
+    out = CV.LayerConvergenceWorker(p, lambda l, w: {0: 4, 1: 4}).step()
+    assert out["repaid"] == 2 and out["failed"] == 1
+    assert p.pending_count == 1
+
+
+def test_layer_worker_skips_written_off_deficits():
+    p = _plan()
+    p.observe(5, 0, actual_k=3, target_k=4)
+    w = CV.LayerConvergenceWorker(p, lambda l, x: None, max_attempts=3)
+    for _ in range(3):
+        w.step()
+    assert p.state is CV.ConvergenceState.STALLED
+    assert w.step()["layers_attempted"] == 0
+
+
+def test_reload_returning_none_is_a_failure_not_a_silent_success():
+    p = _plan()
+    p.observe(5, 0, actual_k=3, target_k=4)
+    out = CV.LayerConvergenceWorker(p, lambda l, w: None).step()
+    assert out["repaid"] == 0 and out["failed"] == 1
+
+
+# ------------------------------------------------ fallbacks recorded ALWAYS
+def test_loader_builds_the_plan_unconditionally():
+    """The K ladder degrades an expert whenever a fragment is unavailable, and
+    that was recorded nowhere a repay loop could act on unless the operator
+    had opted into opportunistic mode. One transient URLError left L5/e2 at K3
+    for the process lifetime with nothing tracking it."""
+    src = _progressive_src()
+    i = src.index("_plan = ConvergencePlan(")
+    j = src.rindex("if ", 0, i)
+    assert "opportunistic_enabled()" not in src[j:i], (
+        "plan construction must not be gated on the opt-in")
+
+
+def test_optin_still_governs_whether_missing_experts_are_deferred():
+    """The opt-in governs whether the boot may PROCEED past missing experts —
+    never whether a degradation is noticed."""
+    src = _progressive_src()
+    assert "if unavailable and _opportunistic:" in src
+    assert "if _opportunistic:\n                # ONCE" in src or \
+           "_plan.gate()" in src

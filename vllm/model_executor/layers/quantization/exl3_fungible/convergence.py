@@ -348,3 +348,79 @@ class ConvergenceWorker:
         """True when there is nothing left worth attempting."""
         return self.plan.state.is_final or self.plan.state is (
             ConvergenceState.STALLED)
+
+
+def group_by_layer(deficits, batch_layers: int = 4) -> list[tuple[int, list]]:
+    """Group deficits by layer, worst layer first, capped at ``batch_layers``.
+
+    Convergence is layer-granular whether we like it or not. A degraded boot
+    never ALLOCATED the K4 slab for the expert it downgraded, and the swap
+    engine only moves experts between slabs that already exist -- pairwise,
+    because cardinality is fixed. So an expert cannot be promoted into
+    capacity that was never reserved; the layer has to be rebuilt.
+
+    That makes per-expert repayment the wrong unit: repaying 40 deficits in
+    one layer costs one reload, and repaying them one at a time costs forty.
+    """
+    by_layer: dict[int, list] = {}
+    for d in deficits:
+        by_layer.setdefault(d.layer, []).append(d)
+    ordered = sorted(by_layer.items(),
+                     key=lambda kv: (-sum(x.gap for x in kv[1]), kv[0]))
+    return ordered[:max(1, int(batch_layers))]
+
+
+class LayerConvergenceWorker:
+    """Repays deficits a LAYER at a time via an injected reload callable.
+
+    ``reload_fn(layer, {expert: target_k}) -> dict | None`` rebuilds that
+    layer's device state at the requested tiers and returns the tiers actually
+    installed (or None if it could not run). Bound to fq_reload's collective
+    RPC in production; injected in tests.
+    """
+
+    def __init__(self, plan: ConvergencePlan, reload_fn, *,
+                 batch_layers: int = 4, max_attempts: int = 3, priority=None):
+        self.plan = plan
+        self.reload_fn = reload_fn
+        self.batch_layers = max(1, int(batch_layers))
+        self.max_attempts = max_attempts
+        self.priority = priority
+
+    def step(self) -> dict:
+        """Repay up to ``batch_layers`` layers. Never raises."""
+        wrote_off = {d.key() for d in self.plan.give_up(self.max_attempts)}
+        pending = [d for d in self.plan.pending(priority=self.priority)
+                   if d.key() not in wrote_off]
+        layers = group_by_layer(pending, self.batch_layers)
+        repaid = failed = 0
+        for layer, deficits in layers:
+            want = {d.expert: d.target_k for d in deficits}
+            try:
+                got = self.reload_fn(layer, want)
+            except Exception:  # noqa: BLE001 — a serving engine must survive
+                got = None
+            if not got:
+                for d in deficits:
+                    self.plan.fail(d.layer, d.expert)
+                failed += len(deficits)
+                continue
+            for d in deficits:
+                k = got.get(d.expert)
+                if k is None:
+                    self.plan.fail(d.layer, d.expert)
+                    failed += 1
+                elif self.plan.repay(d.layer, d.expert, int(k)):
+                    repaid += 1
+        return {
+            "layers_attempted": len(layers),
+            "repaid": repaid,
+            "failed": failed,
+            "pending": self.plan.pending_count,
+            "state": self.plan.state.value,
+            "drift_bits": self.plan.drift_bits,
+        }
+
+    def done(self) -> bool:
+        return self.plan.state.is_final or (
+            self.plan.state is ConvergenceState.STALLED)
