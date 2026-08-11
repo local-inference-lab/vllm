@@ -76,13 +76,21 @@ def test_blocked_tallies_dwell():
     assert rec["totals"]["executed"] == 0
 
 
-def test_log_lines_emitted(caplog):
+def test_log_lines_emitted(caplog, monkeypatch):
     stats, eps, tier, cfg = scenario()
     swaps = P.decide(stats, eps, tier, cfg=cfg)
     rec = DL.explain(stats, eps, tier, swaps, cfg=cfg, step=7,
                      policy_sha_before="c" * 64, policy_sha_after="d" * 64)
-    with caplog.at_level(logging.INFO):
-        DL.log_decision(rec)
+    # When DL is the real package module its logger sits under the "vllm"
+    # hierarchy, whose root vllm configures with propagate=False — attach
+    # caplog's handler directly so it sees the records either way.
+    DL.logger.addHandler(caplog.handler)
+    monkeypatch.setattr(DL.logger, "level", logging.INFO)
+    try:
+        with caplog.at_level(logging.INFO):
+            DL.log_decision(rec)
+    finally:
+        DL.logger.removeHandler(caplog.handler)
     text = caplog.text
     assert "FQ interval step=7" in text
     assert "FQ swap L" in text and "e4" in text

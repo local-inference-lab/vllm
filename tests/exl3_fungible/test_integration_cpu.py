@@ -134,7 +134,7 @@ def test_env_on_binds_all_routers_and_chains(fakes):
     # Fire the bound fns: stats recorded AND the previous fn still fires.
     ids = torch.tensor([[0, 1], [1, 7]], dtype=torch.int32)
     routers[1].capture_fn(ids)
-    assert collector.count_buf[1].tolist() == [1, 2, 0, 0, 0, 0, 0, 1]
+    assert collector.count_buf[1][:8].tolist() == [1, 2, 0, 0, 0, 0, 0, 1]
     assert seen == [ids.shape], "previously bound capture fn must chain"
     routers[0].capture_fn(torch.tensor([[4]]))
     assert collector.count_buf[0][4] == 1

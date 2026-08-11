@@ -73,6 +73,39 @@ def _window_kwargs_from_env() -> dict:
     return kwargs
 
 
+def maybe_init_fq_state(runner):
+    """Build the full M2 loop (collector + policy/decision state machine).
+
+    The model runner's step sites call ``.step(is_dummy=...)`` on
+    whatever this returns; :class:`FungibleQuantState` and
+    :class:`FqStatsCollector` share that contract, so the M1 call sites
+    need no change. Degrades stepwise: env off / no MoE -> None; loop
+    boot failure (no policy source, bad store, ...) -> bare collector
+    (M1 observability only), never a dead engine.
+    """
+    collector = maybe_init_fq_collector(runner)
+    if collector is None:
+        return None
+    try:
+        import torch.distributed as dist
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+    except Exception:
+        rank = 0
+    try:
+        from vllm.model_executor.layers.quantization.exl3_fungible import (
+            loop as fq_loop,
+        )
+        state = fq_loop.build_from_env(collector, rank=rank)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "FQ loop init failed — falling back to collector-only")
+        return collector
+    return state if state is not None else collector
+
+
 def maybe_init_fq_collector(runner) -> "FqStatsCollector | None":
     """Build and bind the FQ stats collector, if enabled and applicable.
 

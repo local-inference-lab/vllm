@@ -53,7 +53,7 @@ def test_capture_counts_and_chains_previous_fn():
     ids = torch.tensor([[0, 1], [1, 7]], dtype=torch.int32)
     router.capture_fn(ids)
 
-    assert c.count_buf[0].tolist() == [1, 2, 0, 0, 0, 0, 0, 1]
+    assert c.count_buf[0][:8].tolist() == [1, 2, 0, 0, 0, 0, 0, 1]
     assert seen == [ids.shape], "previous capture fn must still fire"
 
 
@@ -129,3 +129,35 @@ def test_capture_fn_source_has_no_host_ops():
          if getattr(k, "co_name", "") == "_capture"][0]])
     for banned in (".item(", ".cpu(", ".tolist(", ".numpy(", "print("):
         assert banned not in src, f"host op {banned} in capture path"
+
+
+def test_out_of_range_ids_are_dropped_not_scattered():
+    """Padding sentinels / garbage ids must NEVER index device memory
+    out of range (illegal memory access — observed live on the first M2
+    dryrun boot). The histc capture path drops them; valid ids still
+    count, and the windowed stats stay clean."""
+    router = FakeRouter()
+    c = make_collector()
+    c.bind_router(0, router)
+    router.capture_fn(torch.tensor([[0, 8], [-1, 300]], dtype=torch.int64))
+    assert c.count_buf[0][:8].tolist() == [1, 0, 0, 0, 0, 0, 0, 0]
+    assert c.count_buf[0].sum() == 1, "OOR ids contribute nothing"
+    c.step()
+    c.step()  # roll (stride 2)
+    cnt, mass = c.decayed(0)
+    assert cnt.shape[0] == 8 and cnt.sum() == 1.0
+    assert mass.tolist() == cnt.tolist(), "no weights getter: mass==count"
+
+
+def test_weighted_capture_redirects_oor_to_overflow_slot():
+    """The scatter (weighted) path keeps the explicit overflow slot."""
+    c = make_collector()
+    ids = torch.tensor([[0, 8], [-1, 300]], dtype=torch.int64)
+    w = torch.tensor([[0.5, 0.1], [0.1, 0.1]])
+    c.bind_router(0, FakeRouter())
+    fn = c.make_capture_fn(0, topk_weights_getter=lambda: w)
+    fn(ids)
+    assert c.count_buf[0][:8].tolist() == [1, 0, 0, 0, 0, 0, 0, 0]
+    assert c.count_buf[0][8] == 3, "three OOR ids redirected to overflow"
+    assert abs(c.mass_buf[0][0].item() - 0.5) < 1e-6
+    assert abs(c.mass_buf[0][8].item() - 0.3) < 1e-6
