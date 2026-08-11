@@ -1964,6 +1964,72 @@ def _err(exc: BaseException) -> str:
         sort_keys=True, separators=(",", ":"), default=str)
 
 
+#: Loop knobs an operator may retune WITHOUT a restart, with the bounds that
+#: make each one safe. Anything not listed here needs a boot, deliberately:
+#: n_k4 is baked into the slab shapes, and apply_mode changes the contract.
+TUNABLE: dict[str, tuple[float, float, str]] = {
+    "jaccard_floor": (0.0, 1.0, "router-shift guard"),
+    "hysteresis": (1.0, 10.0, "score ratio needed to displace an incumbent"),
+    "dwell_steps": (0, 10_000_000, "min steps an expert holds its tier"),
+    "max_swaps_per_layer": (0, 256, "per-layer cap per interval"),
+    "max_swaps_total": (0, 4096, "global cap per interval"),
+}
+
+
+def worker_tune(worker: Any, request_json: str = "{}") -> str:
+    """Retune loop knobs in place (``POST /fq/tune``).
+
+    The floor that blocks a swap should not need a 6-minute reboot to change.
+    Measuring a threshold, then having to restart the thing you measured it
+    on, loses the state that produced the measurement — which is how a
+    calibration ends up unverified.
+
+    Bounded and validated per key; unknown keys are REFUSED rather than
+    ignored, because a silently-dropped tuning request looks exactly like one
+    that had no effect.
+    """
+    try:
+        _require_gates()
+    except AdminError as exc:
+        return _err(exc)
+    try:
+        req = json.loads(request_json) or {}
+        state = _loop_state(worker)
+        cfg = getattr(state, "cfg", None)
+        if cfg is None:
+            raise AdminError("fq_not_active",
+                             "no fungible-quant loop on this worker",
+                             status=404)
+        unknown = sorted(set(req) - set(TUNABLE))
+        if unknown:
+            raise AdminError(
+                "unknown_knob",
+                f"not tunable at runtime: {unknown}. Tunable: "
+                f"{sorted(TUNABLE)}. Anything else changes a shape or a "
+                f"contract and needs a restart.",
+                status=400, details={"tunable": sorted(TUNABLE)})
+        applied, before = {}, {}
+        for k, v in req.items():
+            lo, hi, _ = TUNABLE[k]
+            fv = float(v)
+            if not (lo <= fv <= hi):
+                raise AdminError(
+                    "out_of_range",
+                    f"{k}={fv} outside [{lo}, {hi}]",
+                    status=400)
+            old = getattr(cfg, k, None)
+            before[k] = old
+            setattr(cfg, k, type(old)(fv) if old is not None else fv)
+            applied[k] = getattr(cfg, k)
+        if applied:
+            logging.getLogger(__name__).warning(
+                "FQ loop retuned at runtime: %s (was %s)", applied, before)
+        return _ok({"applied": applied, "before": before,
+                    "rank": int(getattr(state, "rank", 0) or 0)})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
 def worker_describe(worker: Any, request_json: str = "{}") -> str:
     """Read-only view of this rank's FQ state (``GET /fq/state``)."""
     try:
@@ -2328,6 +2394,29 @@ def build_router(*, environ: Mapping[str, str] | None = None) -> Any:
                           str(_env(environ).get(ADMIN_TOKEN_ENV, "")).strip()),
                       "auto_balance": False,
                       "growth_supported": False}})
+
+    @router.post("/tune")
+    async def fq_tune(raw_request: Request):
+        """Retune the loop on every rank, or on none of them."""
+        blocked = _guard(raw_request)
+        if blocked is not None:
+            return _fail(blocked)
+        try:
+            body = await raw_request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        try:
+            results = await _collective(raw_request, "fq_admin_tune", body)
+        except AdminError as exc:
+            return _fail(exc)
+        record_admin_outcome("tune")
+        return JSONResponse(content={
+            "ranks": len(results),
+            "agreed": _agree(results, "applied"),
+            "applied": results[0].get("applied") if results else {},
+            "per_rank": results,
+            "tunable": {k: {"min": lo, "max": hi, "what": what}
+                        for k, (lo, hi, what) in TUNABLE.items()}})
 
     @router.get("/layer/{layer}")
     async def fq_layer(layer: int, raw_request: Request):

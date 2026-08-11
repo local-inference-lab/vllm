@@ -1612,3 +1612,75 @@ def test_an_unreadable_runtime_is_treated_as_unsafe():
         integration as I,
     )
     assert I._graphs_are_live(_Mod()) is True
+
+
+# --------------------------------------------------------------------------
+# Runtime tuning (POST /fq/tune).
+#
+# Measuring a threshold and then having to restart the serve you measured it
+# on loses the state that produced the measurement — which is how a
+# calibration ends up unverified. The jaccard floor was observed oscillating
+# at 0.923-0.950 against a 0.950 floor; changing it should not cost a boot.
+
+
+class _Cfg2:
+    def __init__(self):
+        self.jaccard_floor = 0.95
+        self.hysteresis = 1.25
+        self.max_swaps_total = 64
+
+
+class _State:
+    def __init__(self):
+        self.cfg = _Cfg2()
+        self.rank = 0
+        self.tier_of = np.zeros((2, 4), dtype=np.int64)
+
+
+class _Worker:
+    def __init__(self):
+        self.model_runner = _Mod(fq_collector=_State())
+
+
+def _tune(payload, monkeypatch):
+    monkeypatch.setenv("VLLM_SERVER_DEV_MODE", "1")
+    monkeypatch.setenv("VLLM_FQ_ADMIN_API", "1")
+    return json.loads(A.worker_tune(_Worker(), json.dumps(payload)))
+
+
+def test_tune_applies_and_reports_the_previous_value(monkeypatch):
+    r = _tune({"jaccard_floor": 0.80}, monkeypatch)
+    assert r["ok"] is True, r
+    assert r["applied"]["jaccard_floor"] == pytest.approx(0.80)
+    assert r["before"]["jaccard_floor"] == pytest.approx(0.95)
+
+
+def test_tune_preserves_the_declared_type(monkeypatch):
+    """max_swaps_total is an int; a JSON float must not turn it into one."""
+    r = _tune({"max_swaps_total": 32}, monkeypatch)
+    assert r["ok"] is True
+    assert isinstance(r["applied"]["max_swaps_total"], int)
+
+
+def test_tune_refuses_an_unknown_knob_rather_than_ignoring_it(monkeypatch):
+    """A silently-dropped tuning request looks exactly like one that had no
+    effect — which is the failure mode this project keeps producing."""
+    r = _tune({"n_k4": 99}, monkeypatch)
+    assert r["ok"] is False
+    assert r["error"]["code"] == "unknown_knob"
+    assert "jaccard_floor" in str(r["error"])
+
+
+def test_tune_refuses_out_of_range(monkeypatch):
+    r = _tune({"jaccard_floor": 1.5}, monkeypatch)
+    assert r["ok"] is False
+    assert r["error"]["code"] == "out_of_range"
+
+
+def test_tune_rejects_the_whole_request_if_any_key_is_bad(monkeypatch):
+    """Partial application would leave the ranks disagreeing about config."""
+    w = _Worker()
+    monkeypatch.setenv("VLLM_SERVER_DEV_MODE", "1")
+    monkeypatch.setenv("VLLM_FQ_ADMIN_API", "1")
+    A.worker_tune(w, json.dumps({"jaccard_floor": 0.7, "bogus": 1}))
+    assert w.model_runner.fq_collector.cfg.jaccard_floor == pytest.approx(0.95)

@@ -879,6 +879,19 @@ class Worker(WorkerBase):
     # exl3_fungible/admin.py, where it is CPU-testable. JSON strings in and
     # out, matching the /collective_rpc convention.
 
+    def fq_admin_tune(self, request_json: str = "{}") -> str:
+        """Retune loop knobs in place — bounded, validated, no restart.
+
+        The whole point of re-tiering at runtime is not having to reboot to
+        change the model's posture. Having to reboot to change the THRESHOLD
+        that governs re-tiering was the same problem one level up.
+        """
+        from vllm.model_executor.layers.quantization.exl3_fungible.admin import (  # noqa: E501
+            worker_tune,
+        )
+
+        return worker_tune(self, request_json)
+
     def fq_admin_describe(self, request_json: str = "{}") -> str:
         from vllm.model_executor.layers.quantization.exl3_fungible.admin import (  # noqa: E501
             worker_describe,
