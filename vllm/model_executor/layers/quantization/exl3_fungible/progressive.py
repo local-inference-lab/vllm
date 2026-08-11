@@ -347,9 +347,18 @@ def progressive_weights_iterator(
         # work the GPU is doing anyway.
         import concurrent.futures as _cf
         _sorted_layers = sorted(expert_layers)
+        # DEPTH and WIDTH, both configurable.
+        #   depth: how many layers ahead to pull. One layer of lookahead only
+        #     covers the download if it is faster than the GPU load; with a
+        #     real network it usually is not, and the loader goes back to
+        #     waiting. Cost is disk+RAM: depth x ~3.7 GB resident.
+        #   width: a mixed layer needs TWO objects (its K3 and its K4). Pulling
+        #     them one after the other leaves the link idle between files even
+        #     with hf_transfer chunking inside each.
+        _depth = max(1, int(os.environ.get("VLLM_FQ_PREFETCH_DEPTH", "3")))
         _pool = _cf.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="fq-prefetch")
-        _inflight: dict[int, object] = {}
+            max_workers=_depth * 2, thread_name_prefix="fq-prefetch")
+        _inflight: dict[int, list] = {}
 
         def _bulk_ks(_layer):
             from collections import Counter
@@ -367,8 +376,12 @@ def progressive_weights_iterator(
             _fn = getattr(resolver, "prefetch_layer", None)
             if _fn is None:
                 return
-            _inflight[_layer] = _pool.submit(
-                lambda: [_fn(_layer, _k) for _k in _ks])
+            # One task PER (layer, K) so a mixed layer's two objects
+            # download concurrently instead of back to back.
+            _inflight[_layer] = [_pool.submit(_fn, _layer, _k) for _k in _ks]
+
+        for _pre in _sorted_layers[:_depth + 1]:
+            _prefetch_layer_async(_pre)
 
         try:
           for _idx, layer in enumerate(_sorted_layers):
@@ -402,7 +415,8 @@ def progressive_weights_iterator(
                         "FQ progressive L%d: waiting on background prefetch "
                         "(%s)", layer,
                         ", ".join(f"{n} experts want K{k}" for k, n in _want))
-                    _inflight.pop(layer).result()
+                    for _fut in _inflight.pop(layer):
+                        _fut.result()
                 else:
                     for _k, _n in _want:
                         _note = getattr(resolver, "prefetch_layer",
@@ -413,8 +427,9 @@ def progressive_weights_iterator(
                                 "%s (1 fetch instead of %d ranged reads)",
                                 layer, _n, _k, _note, _n)
             # Start the NEXT layer downloading while this one streams to GPU.
-            if _idx + 1 < len(_sorted_layers):
-                _prefetch_layer_async(_sorted_layers[_idx + 1])
+            for _ahead in range(1, _depth + 1):
+                if _idx + _ahead < len(_sorted_layers):
+                    _prefetch_layer_async(_sorted_layers[_idx + _ahead])
 
             unavailable: list[int] = []
             for expert, k in enumerate(bits):
@@ -483,12 +498,17 @@ def progressive_weights_iterator(
                 f"bits_digest={_bits_digest(actual_bits)} "
                 f"tensors={len(seen)}{sub_note}"
             )
+            # This layer is on the GPU now; its segments are dead weight.
+            # Without this the boot keeps every segment it ever touched --
+            # bounded only by the model size, not by the prefetch depth.
+            getattr(resolver, "release_layer", lambda _l: 0)(layer)
         finally:
             # Never leave the prefetch thread running past the stream: a
             # cancelled boot would otherwise keep pulling segments nobody
             # will load.
-            for _f in _inflight.values():
-                _f.cancel()
+            for _futs in _inflight.values():
+                for _f in _futs:
+                    _f.cancel()
             _pool.shutdown(wait=False, cancel_futures=True)
 
     stats = dict(resolver.stats)

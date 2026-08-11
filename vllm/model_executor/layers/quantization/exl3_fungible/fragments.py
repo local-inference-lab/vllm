@@ -493,9 +493,19 @@ class HfSource:
                 from huggingface_hub import hf_hub_download
                 token = (os.environ.get("HF_TOKEN")
                          or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
+                # local_dir puts the blob in OUR cache instead of the shared
+                # HF cache. That costs cross-boot dedup but buys the thing we
+                # actually need: the file is ours, so release_layer() may
+                # unlink it. Left in the shared cache, a 75-layer boot pulls
+                # the whole model in with nothing ever reclaiming it -- on a
+                # box already at 86% that is a disk-exhaustion bug wearing an
+                # optimisation's clothes. Opt back in with FQ_PREFETCH_HF_SHARED=1.
+                _kw = {}
+                if os.environ.get("FQ_PREFETCH_HF_SHARED", "0") != "1":
+                    _kw["local_dir"] = str(dest.parent)
                 path = hf_hub_download(
                     repo_id=self.repo_id, filename=relpath,
-                    revision=self.revision, token=token)
+                    revision=self.revision, token=token, **_kw)
                 got = Path(path)
                 if got.exists() and got.stat().st_size > 0:
                     if progress is not None:
@@ -744,6 +754,8 @@ class FragmentResolver:
             "reject_sha_mismatch": 0,
             "fallback_substituted": 0,
             "encode_queued": 0,
+            "segments_prefetched": 0,
+            "segments_released": 0,
             "unavailable": 0,
             # hardening counters: a broken local dir / unreadable cache entry
             # / unwritable cache must degrade the attempt, never the engine
@@ -1023,6 +1035,47 @@ class FragmentResolver:
                 self.stats["source_error"] += 1
                 continue
         return None
+
+    def release_layer(self, layer: int) -> int:
+        """Drop the whole-segment objects prefetched for ``layer``.
+
+        Prefetch had no eviction: ``_prefetched`` grew monotonically and
+        nothing unlinked, so a full progressive boot left every segment it
+        touched on disk -- hundreds of GB, unbounded, regardless of how far
+        ahead we prefetch. Depth controls lookahead; only this controls
+        FOOTPRINT. Called once a layer's tensors have streamed to the GPU, it
+        makes resident bytes O(depth) instead of O(model).
+
+        Only unlinks paths inside our own cache dir: a file the shared HF
+        cache owns may be in use by another process, and deleting other
+        people's cache entries is not ours to do. Set VLLM_FQ_PREFETCH_KEEP=1
+        to retain everything (faster repeat boots, if disk is free).
+        """
+        if os.environ.get("VLLM_FQ_PREFETCH_KEEP", "0") == "1":
+            return 0
+        freed = 0
+        try:
+            root = self.cache_dir.resolve()
+        except OSError:
+            return 0
+        for key in [k for k in self._prefetched if k[0] == layer]:
+            path = self._prefetched.pop(key, None)
+            if path is None:
+                continue
+            try:
+                resolved = Path(path).resolve()
+                if not resolved.is_relative_to(root):
+                    continue           # shared HF cache: not ours to unlink
+                size = resolved.stat().st_size
+                resolved.unlink()
+                freed += size
+                self.stats["segments_released"] += 1
+            except OSError:
+                continue
+        if freed:
+            logger.info("FQ progressive L%d: released %.1f GiB of prefetched "
+                        "segments", layer, freed / (1 << 30))
+        return freed
 
     def _cache_path(self, kind: str, name: str) -> Path:
         return self.cache_dir / kind / name

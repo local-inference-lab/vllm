@@ -34,6 +34,15 @@ except ImportError:  # standalone: load by path
 PAYLOAD = bytes(range(256)) * 512      # 128 KiB of known bytes
 
 
+def _progressive_src() -> str:
+    """Read progressive.py as TEXT. Importing it pulls in torch, which the
+    CPU test venv does not have (it lives in the GG rootfs) -- and these are
+    guard tests over code shape, so the text is exactly what we want."""
+    return (Path(__file__).resolve().parents[2] / "vllm" / "model_executor"
+            / "layers" / "quantization" / "exl3_fungible"
+            / "progressive.py").read_text()
+
+
 class FakeHTTP:
     """Minimal stand-in for the HF source: counts requests, can be flaky."""
 
@@ -269,3 +278,109 @@ def test_resolve_best_lets_systemexit_through():
     assert "SystemExit" in src, "resolve_best must re-raise shutdown signals"
     # and the re-raise must come BEFORE the broad catch, or it never runs
     assert src.index("SystemExit") < src.index("except BaseException")
+
+
+# ------------------------------------------- parallelism (depth x width)
+def test_mixed_layer_fetches_its_two_objects_CONCURRENTLY():
+    """A mixed layer draws from two segment objects. Submitting them as one
+    task ran them back to back, leaving the link idle between files even with
+    hf_transfer chunking inside each. One task PER (layer, K)."""
+    src = _progressive_src()
+    assert "_pool.submit(_fn, _layer, _k) for _k in _ks" in src, (
+        "the two Ks of a mixed layer must be submitted as separate tasks")
+    assert "_cf.wait_for_all" not in src, "stray module attribute assignment"
+
+
+def test_prefetch_depth_is_more_than_one_layer():
+    """One layer of lookahead only hides the download if it is faster than the
+    GPU load; with a real network it usually is not."""
+    src = _progressive_src()
+    assert "VLLM_FQ_PREFETCH_DEPTH" in src
+    assert "for _ahead in range(1, _depth + 1)" in src, (
+        "must keep `depth` layers in flight, not exactly one")
+
+
+def test_pipeline_is_primed_before_the_first_layer():
+    """Otherwise layer 0 fetches its Ks sequentially on the main thread with
+    nothing in flight yet -- the slowest possible start."""
+    src = _progressive_src()
+    assert "_sorted_layers[:_depth + 1]" in src
+
+
+# ------------------------------------------------------- bounded footprint
+def _resolver(tmp_path):
+    return FR.FragmentResolver(tmp_path / "manifest", sources=[],
+                              cache_dir=tmp_path / "cache")
+
+
+def test_release_layer_unlinks_our_own_prefetched_segments(tmp_path):
+    """Prefetch had NO eviction: _prefetched grew monotonically and nothing
+    unlinked, so a 75-layer boot left every segment it touched on disk. Depth
+    bounds lookahead; only release bounds FOOTPRINT."""
+    r = _resolver(tmp_path)
+    seg = r.cache_dir / "segments" / "abc.seg"
+    seg.parent.mkdir(parents=True, exist_ok=True)
+    seg.write_bytes(b"x" * 4096)
+    r._prefetched[(7, 3)] = seg
+    freed = r.release_layer(7)
+    assert freed == 4096
+    assert not seg.exists()
+    assert (7, 3) not in r._prefetched
+
+
+def test_release_layer_leaves_the_SHARED_hf_cache_alone(tmp_path):
+    """A blob the shared HF cache owns may be in use by another process."""
+    r = _resolver(tmp_path)
+    foreign = tmp_path / "hf-cache" / "blobs" / "deadbeef"
+    foreign.parent.mkdir(parents=True, exist_ok=True)
+    foreign.write_bytes(b"y" * 128)
+    r._prefetched[(9, 4)] = foreign
+    r.release_layer(9)
+    assert foreign.exists(), "unlinked a file outside our cache dir"
+
+
+def test_release_layer_only_touches_the_named_layer(tmp_path):
+    r = _resolver(tmp_path)
+    keep = r.cache_dir / "segments" / "keep.seg"
+    drop = r.cache_dir / "segments" / "drop.seg"
+    keep.parent.mkdir(parents=True, exist_ok=True)
+    keep.write_bytes(b"k")
+    drop.write_bytes(b"d")
+    r._prefetched[(3, 3)] = drop
+    r._prefetched[(4, 3)] = keep
+    r.release_layer(3)
+    assert not drop.exists() and keep.exists()
+    assert list(r._prefetched) == [(4, 3)]
+
+
+def test_keep_env_disables_eviction(tmp_path, monkeypatch):
+    """Repeat boots on a roomy box should be able to retain everything."""
+    monkeypatch.setenv("VLLM_FQ_PREFETCH_KEEP", "1")
+    r = _resolver(tmp_path)
+    seg = r.cache_dir / "segments" / "abc.seg"
+    seg.parent.mkdir(parents=True, exist_ok=True)
+    seg.write_bytes(b"z" * 16)
+    r._prefetched[(1, 3)] = seg
+    assert r.release_layer(1) == 0
+    assert seg.exists()
+
+
+def test_release_layer_survives_an_already_deleted_file(tmp_path):
+    r = _resolver(tmp_path)
+    r._prefetched[(2, 3)] = r.cache_dir / "segments" / "gone.seg"
+    assert r.release_layer(2) == 0          # no exception
+
+
+def test_progressive_releases_each_layer_after_it_streams():
+    src = _progressive_src()
+    assert "release_layer" in src, (
+        "layers must be released as they finish, or footprint is O(model)")
+
+
+def test_hf_download_lands_in_our_cache_so_it_can_be_evicted():
+    """hf_hub_download's default is the SHARED cache, which we must not
+    unlink -- so the file would be immortal. local_dir makes it ours."""
+    import inspect
+    src = inspect.getsource(FR.HfSource.prefetch_whole)
+    assert "local_dir" in src
+    assert "FQ_PREFETCH_HF_SHARED" in src, "the opt-out must exist"
