@@ -151,7 +151,11 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
     ``_maybe_apply`` returned False before touching a weight — 64 swaps
     decided across 39 layers, zero installed.
 
-    DISABLED BY DEFAULT, because the first live attempt DEADLOCKED THE ENGINE.
+    Staging runs OFF-STEP and readiness is agreed by all_reduce, which is what
+    makes this safe; see the block comment on apply_fn. The history below is
+    why it is built that way.
+
+    The first live attempt DEADLOCKED THE ENGINE.
 
         16:55:42  FQ decide step=100 interval=1 swaps=64   <- first live apply
         16:55:50  generation throughput 10.4 tokens/s
@@ -170,8 +174,11 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
     collective_rpc, then gathers. That is the shape an automatic apply needs
     too: propose inside the step, apply outside it, together.
 
-    Until that exists, ``VLLM_FQ_LIVE_APPLY=1`` binds this anyway for
-    experiments on a serve nobody is depending on. It is not a supported mode.
+    That is now built: staging happens in a background thread and every rank
+    votes before a single weight moves, so no rank can apply a batch another
+    rank has not finished. ``VLLM_FQ_LIVE_APPLY`` defaults to ``off`` for one
+    more cycle while the second instance validates it under CUDA graphs; set
+    ``1`` to enable.
 
     GATED ON EAGER EXECUTION as well, for when it is re-enabled. ``admin.apply_retier`` can pass
     ``quiesce=nullcontext()`` because the HTTP request drains the engine
@@ -221,6 +228,12 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
     # retrying next interval" -- but it could never succeed, so the serve
     # would have retried forever while looking busy.
     _cap = int(getattr(getattr(state, "cfg", None), "max_swaps_total", 0) or 0)
+    import concurrent.futures as _fut
+    # One worker: the engine holds one staged batch at a time anyway, and a
+    # second concurrent stage would race it.
+    _stager = _fut.ThreadPoolExecutor(max_workers=1,
+                                      thread_name_prefix="fq-stage")
+
     engine = _admin.build_swap_engine(
         runner, rank=rank, max_pairs=max(_cap, _admin.DEFAULT_MAX_ITEMS))
     if engine is None:
@@ -228,43 +241,110 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
                     "registered — a uniform-K serve has nothing to swap")
         return
 
-    def apply_fn(proposed_doc, swaps) -> bool:
-        # The loop indexes layers by ROW; the engine keys by GLOBAL layer id.
-        plan = _swap.SwapPlan([
-            (int(state.layers[row]), int(e_out), int(e_in))
-            for row, e_out, e_in in swaps])
-        # fail_atomic stages the pre-swap rows so an abort before the
-        # visibility flip restores inside the same window. drop lets a pair
-        # whose fragments cannot be supplied pend instead of losing the
-        # interval; cardinality is preserved either way.
-        if len(plan.swaps) > int(engine.max_pairs):
-            # Configuration error, not a runtime condition: say which two
-            # knobs disagree rather than surfacing a buffer-size ValueError.
-            log.error(
-                "FQ live apply: plan has %d pairs but staging holds %d — "
-                "raise VLLM_FQ_MAX_SWAPS_TOTAL/max_pairs together or lower "
-                "the loop cap; skipping this interval",
-                len(plan.swaps), int(engine.max_pairs))
+    # ------------------------------------------------------------------
+    # Async staging + collective readiness gate.
+    #
+    # Inline staging deadlocked TP: engine.stage() reads hundreds of MB of
+    # fragments, per-rank, at unequal speed, INSIDE the step — so the ranks
+    # drift apart at a collective boundary and the shm broadcast starves.
+    #
+    # Split it. Staging is host-only and order-independent, so it runs in a
+    # background thread. The apply itself is device copies from already-pinned
+    # memory plus a map flip: short, and identical work on every rank.
+    #
+    # The danger in splitting is worse than the deadlock: if rank A finishes
+    # staging and rank B does not, A applies and B does not, and the ranks now
+    # hold DIFFERENT WEIGHTS silently. So readiness is agreed with an
+    # all_reduce(MIN) — a tiny collective at a deterministic point, which
+    # preserves lockstep instead of breaking it. Either every rank applies
+    # this interval or none does.
+    _pending: dict = {}
+
+    def _plan_key(swaps) -> str:
+        return ",".join(f"{int(a)}:{int(b)}:{int(c)}" for a, b, c in swaps)
+
+    def _all_ranks_ready(local_ready: bool) -> bool:
+        try:
+            import torch
+            import torch.distributed as dist
+            if not dist.is_available() or not dist.is_initialized():
+                return local_ready
+            t = torch.tensor([1 if local_ready else 0], dtype=torch.int32,
+                             device="cuda")
+            dist.all_reduce(t, op=dist.ReduceOp.MIN)
+            return bool(int(t.item()))
+        except Exception:  # noqa: BLE001 — a failed vote is a NO, never a yes
+            log.warning("FQ live apply: readiness all_reduce failed — "
+                        "treating as not ready", exc_info=True)
             return False
-        staged = engine.stage(plan, fail_atomic=True, on_unavailable="drop")
+
+    def apply_fn(proposed_doc, swaps) -> bool:
+        key = _plan_key(swaps)
+        staged = _pending.get("staged") if _pending.get("key") == key else None
+
+        if staged is None:
+            # New plan: start staging OUT OF BAND and decline this interval.
+            # The same plan is re-proposed while the routing signal holds, so
+            # the next interval picks up the finished batch.
+            if _pending.get("future") is not None and _pending.get("key") == key:
+                ready = _pending["future"].done()
+            else:
+                if len(swaps) > int(engine.max_pairs):
+                    log.error(
+                        "FQ live apply: plan has %d pairs but staging holds "
+                        "%d — raise the loop cap or max_pairs together; "
+                        "skipping", len(swaps), int(engine.max_pairs))
+                    return False
+                plan = _swap.SwapPlan([
+                    (int(state.layers[row]), int(e_out), int(e_in))
+                    for row, e_out, e_in in swaps])
+                _pending.clear()
+                _pending["key"] = key
+                _pending["future"] = _stager.submit(
+                    engine.stage, plan, fail_atomic=True,
+                    on_unavailable="drop")
+                log.info("FQ live apply: staging %d swap(s) off-step",
+                         len(swaps))
+                ready = False
+            if ready:
+                try:
+                    _pending["staged"] = _pending["future"].result()
+                except Exception:  # noqa: BLE001
+                    log.exception("FQ live apply: staging failed")
+                    _pending.clear()
+                    return False
+                staged = _pending["staged"]
+            else:
+                # Vote anyway so every rank takes the same branch.
+                _all_ranks_ready(False)
+                return False
+
+        # Every rank must agree before a single weight moves.
+        if not _all_ranks_ready(True):
+            log.info("FQ live apply: staged locally, waiting for all ranks")
+            return False
+
         dropped = tuple(getattr(staged, "dropped", ()) or ())
         if dropped:
             log.warning("FQ live apply: %d pair(s) dropped for missing "
-                        "fragments, %d applied", len(dropped),
-                        len(getattr(staged, "plan", plan).swaps))
-        if not getattr(getattr(staged, "plan", plan), "swaps", ()):
+                        "fragments", len(dropped))
+        eff = getattr(staged, "plan", None)
+        if eff is not None and not getattr(eff, "swaps", ()):
+            _pending.clear()
             return False
         import contextlib
 
         report = engine.apply(
             staged=staged,
             quiesce=contextlib.nullcontext(),
-            memo_hook=None,          # correct for the mixed runtime
+            memo_hook=None,
             policy_doc=dict(proposed_doc),
         )
         ok = bool(getattr(report, "ok", True))
-        log.info("FQ live apply: %d swap(s) %s", len(plan.swaps),
-                 "installed" if ok else "REFUSED")
+        n = len(getattr(eff, "swaps", swaps))
+        log.info("FQ live apply: %d swap(s) %s", n,
+                 "INSTALLED" if ok else "REFUSED")
+        _pending.clear()
         return ok
 
     state.apply_fn = apply_fn
