@@ -1,20 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
+import weakref
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 import vllm.model_executor.layers.quantization.exl3 as exl3_module
+import vllm.model_executor.layers.quantization.online.fp8 as fp8_module
 import vllm.model_executor.parameter as parameter_module
 from vllm.config import CompilationMode
-from vllm.model_executor.layers.fused_moe import MoEActivation
+from vllm.config.quantization import QuantizationConfigArgs
+from vllm.model_executor.layers.fused_moe import MoEActivation, RoutedExperts
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.exl3 import (
     Exl3Config,
+    Exl3LinearMethod,
     Exl3MoEMethod,
     Exl3MoEParameter,
+    Exl3OnlineLinearMethod,
+)
+from vllm.model_executor.layers.quantization.exl3_online_cache import (
+    Exl3OnlineCacheResult,
 )
 from vllm.model_executor.models import glm4_moe
 
@@ -33,6 +44,244 @@ def _rank_sliced_metadata(**overrides):
     }
     metadata.update(overrides)
     return metadata
+
+
+def _set_online_overlay(monkeypatch, args: QuantizationConfigArgs) -> object:
+    current = SimpleNamespace(
+        model_config=SimpleNamespace(
+            quantization_config=args,
+            enforce_eager=True,
+        )
+    )
+    sentinel = object()
+    monkeypatch.setattr(exl3_module, "get_current_vllm_config_or_none", lambda: current)
+    monkeypatch.setattr(exl3_module, "Mxfp8OnlineLinearMethod", lambda: sentinel)
+    return sentinel
+
+
+def _mock_linear() -> Mock:
+    return Mock(spec=LinearBase)
+
+
+def test_exl3_online_overlay_quantizes_only_bf16_dense_and_shared(monkeypatch):
+    config = Exl3Config(
+        tensor_storage={"model.layers.3.self_attn.q_b_proj": {"quant_format": "exl3"}}
+    )
+    sentinel = _set_online_overlay(
+        monkeypatch,
+        QuantizationConfigArgs(linear="mxfp8", shared_experts="mxfp8"),
+    )
+
+    serialized = config.get_quant_method(
+        _mock_linear(), "model.layers.3.self_attn.q_b_proj"
+    )
+    dense_bf16 = config.get_quant_method(
+        _mock_linear(), "model.layers.3.self_attn.kv_b_proj"
+    )
+    shared_bf16 = config.get_quant_method(
+        _mock_linear(), "model.layers.3.mlp.shared_experts.down_proj"
+    )
+
+    assert isinstance(serialized, Exl3LinearMethod)
+    assert dense_bf16 is sentinel
+    assert shared_bf16 is sentinel
+
+
+def test_exl3_linear_overlay_does_not_select_shared_experts(monkeypatch):
+    config = Exl3Config()
+    sentinel = _set_online_overlay(monkeypatch, QuantizationConfigArgs(linear="mxfp8"))
+
+    dense = config.get_quant_method(
+        _mock_linear(), "model.layers.3.self_attn.kv_b_proj"
+    )
+    shared = config.get_quant_method(
+        _mock_linear(), "model.layers.3.mlp.shared_experts.down_proj"
+    )
+
+    assert dense is sentinel
+    assert isinstance(shared, UnquantizedLinearMethod)
+
+
+def test_exl3_online_overlay_honors_unfused_ignore_names(monkeypatch):
+    config = Exl3Config()
+    config.packed_modules_mapping = {
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"]
+    }
+    sentinel = _set_online_overlay(
+        monkeypatch,
+        QuantizationConfigArgs(
+            linear="mxfp8",
+            ignore=["re:.*\\.q_a_proj$", "re:.*kv_a_proj_with_mqa"],
+        ),
+    )
+
+    ignored = config.get_quant_method(
+        _mock_linear(), "model.layers.3.self_attn.fused_qkv_a_proj"
+    )
+    kept = config.get_quant_method(_mock_linear(), "model.layers.3.self_attn.kv_b_proj")
+
+    assert isinstance(ignored, UnquantizedLinearMethod)
+    assert kept is sentinel
+
+
+def test_exl3_online_overlay_rejects_split_packed_quantization(monkeypatch):
+    config = Exl3Config()
+    config.packed_modules_mapping = {
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"]
+    }
+    _set_online_overlay(
+        monkeypatch,
+        QuantizationConfigArgs(linear="mxfp8", ignore=["re:.*\\.q_a_proj$"]),
+    )
+
+    with pytest.raises(ValueError, match="different quantization schemes"):
+        config.get_quant_method(
+            _mock_linear(), "model.layers.3.self_attn.fused_qkv_a_proj"
+        )
+
+
+def test_exl3_online_overlay_rejects_mixed_packed_storage(monkeypatch):
+    config = Exl3Config(
+        tensor_storage={"model.layers.3.self_attn.q_a_proj": {"quant_format": "exl3"}}
+    )
+    config.packed_modules_mapping = {
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"]
+    }
+    _set_online_overlay(monkeypatch, QuantizationConfigArgs(linear="mxfp8"))
+
+    with pytest.raises(ValueError, match="mixes EXL3 and BF16 source shards"):
+        config.get_quant_method(
+            _mock_linear(), "model.layers.3.self_attn.fused_qkv_a_proj"
+        )
+
+
+def test_exl3_online_overlay_never_quantizes_bf16_lm_head(monkeypatch):
+    config = Exl3Config()
+    _set_online_overlay(monkeypatch, QuantizationConfigArgs(linear="mxfp8"))
+    lm_head = type("ParallelLMHead", (torch.nn.Module,), {})()
+
+    method = config.get_quant_method(lm_head, "lm_head")
+
+    assert isinstance(method, UnquantizedLinearMethod)
+
+
+def test_exl3_online_overlay_preserves_rank_sliced_routed_experts(monkeypatch):
+    config = Exl3Config()
+    config.rank_sliced_metadata = _rank_sliced_metadata()
+    _set_online_overlay(
+        monkeypatch,
+        QuantizationConfigArgs(linear="mxfp8", shared_experts="mxfp8"),
+    )
+    routed = Mock(spec=RoutedExperts)
+    routed.moe_config = object()
+
+    method = config.get_quant_method(routed, "model.layers.3.mlp.experts")
+
+    assert isinstance(method, Exl3MoEMethod)
+
+
+def test_exl3_online_trellis_selects_cached_k6_method(monkeypatch):
+    config = Exl3Config()
+    config._online_model_identity = "model"  # noqa: SLF001
+    config._online_encoder_identity = "encoder"  # noqa: SLF001
+    _set_online_overlay(monkeypatch, QuantizationConfigArgs(linear="mxfp8"))
+    monkeypatch.setattr(
+        fp8_module,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16)),
+    )
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_TRELLIS_BITS", "6")
+
+    method = config.get_quant_method(_mock_linear(), "model.layers.3.self_attn.o_proj")
+
+    assert isinstance(method, Exl3OnlineLinearMethod)
+    assert method.bits == 6
+    assert method.model_identity == "model"
+    assert method.encoder_identity == "encoder"
+
+
+def test_online_trellis_cache_off_does_not_require_hub_commit(tmp_path, monkeypatch):
+    config = Exl3Config()
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_CACHE_MODE", "off")
+    monkeypatch.setenv("VLLM_EXL3_ENCODER_SOURCE", str(tmp_path))
+
+    config._configure_online_cache_identity(  # noqa: SLF001
+        "org/model", hf_config=None, revision=None
+    )
+
+    assert config._online_model_identity == "cache-disabled"  # noqa: SLF001
+    assert config._online_encoder_identity == "cache-disabled"  # noqa: SLF001
+
+
+def test_online_trellis_encoder_requires_quantize_entrypoint(tmp_path, monkeypatch):
+    encoder = tmp_path / "encoder"
+    quantizer = encoder / "modules" / "quant" / "exl3_lib"
+    quantizer.mkdir(parents=True)
+    (quantizer / "quantize.py").write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setenv("VLLM_EXL3_ENCODER_SOURCE", str(encoder))
+    monkeypatch.setattr(exl3_module, "_EXL3_ONLINE_QUANTIZER", None)
+    monkeypatch.setattr(
+        exl3_module.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="has no quantize_exl3"):
+        exl3_module._load_exl3_online_quantizer()
+    for name in tuple(exl3_module.sys.modules):
+        if name == "_vllm_exl3_encoder" or name.startswith("_vllm_exl3_encoder."):
+            monkeypatch.delitem(exl3_module.sys.modules, name, raising=False)
+
+
+def test_exl3_online_trellis_cache_hit_skips_encoder(monkeypatch):
+    monkeypatch.setattr(
+        fp8_module,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16)),
+    )
+    method = Exl3OnlineLinearMethod(
+        bits=6,
+        prefix="model.layers.3.self_attn.o_proj",
+        model_identity="model",
+        encoder_identity="encoder",
+    )
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight",
+        torch.nn.Parameter(torch.zeros((256, 128), dtype=torch.float16)),
+    )
+    layer.exl3_online_input_size = 128
+    layer.exl3_online_output_size = 256
+    tensors = {
+        "trellis": torch.zeros((8, 16, 96), dtype=torch.int16),
+        "suh": torch.ones(128, dtype=torch.float16),
+        "svh": torch.ones(256, dtype=torch.float16),
+    }
+    captured = {}
+
+    def cache_hit(key, *, device, quantize):
+        del quantize
+        captured["key"] = key
+        captured["device"] = device
+        return Exl3OnlineCacheResult(tensors, 0.25, True, None)
+
+    monkeypatch.setattr(exl3_module, "load_or_quantize", cache_hit)
+    monkeypatch.setattr(
+        exl3_module,
+        "_load_exl3_online_quantizer",
+        lambda: pytest.fail("cache hit must not import the encoder"),
+    )
+    monkeypatch.setattr(exl3_module, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(exl3_module, "get_tensor_model_parallel_rank", lambda: 2)
+    monkeypatch.setattr(method, "_warm_decode_shapes", lambda layer: None)
+
+    method.process_weights_after_loading(layer)
+
+    assert captured["key"].tp_world_size == 4
+    assert captured["key"].tp_rank == 2
+    assert captured["device"] == torch.device("cpu")
+    assert layer.weight.numel() == 0
+    assert layer.exl3_online_trellis_weight is tensors["trellis"]
 
 
 def test_rank_sliced_checkpoint_selects_exl3_override():
@@ -92,6 +341,8 @@ def test_glm_model_retains_quant_config_for_weight_loading(monkeypatch):
         ({"codebook": "mul1"}, "MCG codebook"),
         ({"moe_layers": [77, 3]}, "moe_layers"),
         ({"tensor_schema": "unsupported"}, "tensor schema"),
+        ({"rotation_layout": "implicit_magic"}, "rotation_layout"),
+        ({"rotation_layout": "shared_h_v1"}, "shared_h_tensor_schema"),
     ],
 )
 def test_rank_sliced_metadata_fails_closed(overrides, message):
@@ -116,6 +367,28 @@ def test_rank_sliced_metadata_admits_only_declared_moe_layers():
     assert (
         config.codebook_for_prefix("model.layers.10.mlp.experts.0.gate_proj") == "mcg"
     )
+
+
+def test_rank_sliced_shared_h_metadata_is_explicit_and_legacy_defaults_unchanged():
+    legacy = Exl3Config()
+    legacy.maybe_update_config(
+        "unused", SimpleNamespace(hybrid_tr3_tail=_rank_sliced_metadata())
+    )
+    shared = Exl3Config()
+    shared.maybe_update_config(
+        "unused",
+        SimpleNamespace(
+            hybrid_tr3_tail=_rank_sliced_metadata(
+                rotation_layout="shared_h_v1",
+                shared_h_tensor_schema=(
+                    "model.layers.{L}.mlp.experts.shared_h.{proj}.rank{r}.{suh|svh}"
+                ),
+            )
+        ),
+    )
+
+    assert legacy.rank_sliced_rotation_layout == "per_expert_v1"
+    assert shared.rank_sliced_rotation_layout == "shared_h_v1"
 
 
 def test_mixed_rank_sliced_metadata_hydrates_per_layer_bitrates(monkeypatch):
@@ -179,6 +452,49 @@ def test_rank_sliced_weight_name_keeps_only_local_tp_rank(monkeypatch):
     )
 
 
+def test_rank_sliced_shared_h_names_map_once_and_fail_closed(monkeypatch):
+    config = Exl3Config()
+    config.maybe_update_config(
+        "unused",
+        SimpleNamespace(
+            hybrid_tr3_tail=_rank_sliced_metadata(
+                rotation_layout="shared_h_v1",
+                shared_h_tensor_schema=(
+                    "model.layers.{L}.mlp.experts.shared_h.{proj}.rank{r}.{suh|svh}"
+                ),
+            )
+        ),
+    )
+    monkeypatch.setattr(exl3_module, "get_tensor_model_parallel_rank", lambda: 2)
+    prefix = "model.layers.3.mlp.experts"
+
+    assert (
+        config.normalize_rank_sliced_weight_name(
+            f"{prefix}.shared_h.gate_proj.rank2.suh"
+        )
+        == f"{prefix}.0.gate_proj.suh"
+    )
+    assert (
+        config.normalize_rank_sliced_weight_name(
+            f"{prefix}.shared_h.down_proj.rank1.svh"
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="requires suh"):
+        config.normalize_rank_sliced_weight_name(
+            f"{prefix}.shared_h.gate_proj.rank2.svh"
+        )
+    with pytest.raises(ValueError, match="must store H-side rotations"):
+        config.normalize_rank_sliced_weight_name(f"{prefix}.7.down_proj.rank2.svh")
+
+    legacy = Exl3Config()
+    legacy.maybe_update_config(
+        "unused", SimpleNamespace(hybrid_tr3_tail=_rank_sliced_metadata())
+    )
+    with pytest.raises(ValueError, match="does not declare"):
+        legacy.normalize_rank_sliced_weight_name(f"{prefix}.shared_h.up_proj.rank2.suh")
+
+
 def test_rank_sliced_parameter_preallocates_projection_major_slab(monkeypatch):
     monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -206,6 +522,70 @@ def test_rank_sliced_parameter_preallocates_projection_major_slab(monkeypatch):
     )
     torch.testing.assert_close(param.exl3_tensors[(1, "w1")], w1)
     torch.testing.assert_close(param.exl3_tensors[(2, "w3")], w3)
+
+
+def test_rank_sliced_broadcast_pointer_table_repeats_one_physical_row():
+    slab = torch.ones((1, 128), dtype=torch.float16)
+
+    table = Exl3MoEMethod._pointer_table(slab, num_experts=4)
+
+    assert table.tolist() == [slab.data_ptr()] * 4
+    with pytest.raises(RuntimeError, match="per-expert or broadcast"):
+        Exl3MoEMethod._pointer_table(
+            torch.ones((2, 128), dtype=torch.float16), num_experts=4
+        )
+
+
+def test_rank_sliced_shared_h_create_weights_allocates_one_physical_row(
+    monkeypatch,
+):
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 4
+    )
+    config = Exl3Config()
+    config.maybe_update_config(
+        "unused",
+        SimpleNamespace(
+            hybrid_tr3_tail=_rank_sliced_metadata(
+                rotation_layout="shared_h_v1",
+                shared_h_tensor_schema=(
+                    "model.layers.{L}.mlp.experts.shared_h.{proj}.rank{r}.{suh|svh}"
+                ),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        exl3_module,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+            model_config=SimpleNamespace(runner_type="generate"),
+        ),
+    )
+    layer = torch.nn.Module()
+    layer.layer_name = "model.layers.3.mlp.experts"
+    moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=False, tp_rank=0, tp_size=4),
+        has_bias=False,
+    )
+    method = Exl3MoEMethod(config, moe)
+
+    method.create_weights(
+        layer,
+        num_experts=256,
+        hidden_size=6144,
+        intermediate_size_per_partition=512,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert layer.exl3_shared_h_rotations
+    assert layer.w13_suh.exl3_num_experts == 1
+    assert layer.w2_svh.exl3_num_experts == 1
+    assert layer.w13_svh.exl3_num_experts == 256
+    assert layer.w2_suh.exl3_num_experts == 256
+    assert layer.w13_trellis.exl3_num_experts == 256
+    assert layer.w2_trellis.exl3_num_experts == 256
 
 
 def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
@@ -278,7 +658,66 @@ def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
     assert api.prepare_kwargs["trellis_mcg"] is marker
 
 
-def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypatch):
+def test_rank_sliced_weights_pass_shared_h_rows_without_expansion(monkeypatch):
+    experts = 3
+    hidden = intermediate = 128
+    bits = 3
+    slabs = {
+        "w13_trellis": torch.zeros(
+            (2, experts, hidden // 16, intermediate // 16, 16 * bits),
+            dtype=torch.int16,
+        ),
+        "w2_trellis": torch.zeros(
+            (experts, intermediate // 16, hidden // 16, 16 * bits),
+            dtype=torch.int16,
+        ),
+        "w13_suh": torch.ones((2, 1, hidden), dtype=torch.float16),
+        "w13_svh": torch.ones((2, experts, intermediate), dtype=torch.float16),
+        "w2_suh": torch.ones((experts, intermediate), dtype=torch.float16),
+        "w2_svh": torch.ones((1, hidden), dtype=torch.float16),
+    }
+
+    class FakeFusedMoe:
+        @staticmethod
+        def plan_weights(**kwargs):
+            return SimpleNamespace(source_format=kwargs["source_format"])
+
+        @staticmethod
+        def prepare_weights(**kwargs):
+            return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(
+        exl3_module, "_load_b12x_fused_moe", lambda: FakeFusedMoe()
+    )
+    method = object.__new__(Exl3MoEMethod)
+    method.quant_config = SimpleNamespace(bits=float(bits))
+    method._rank_sliced_backing = lambda _layer, name: slabs[name]
+    marker = torch.tensor(0xCBAC1FED - (1 << 32), dtype=torch.int32)
+    layer = SimpleNamespace(
+        local_num_experts=experts,
+        exl3_hidden_size=hidden,
+        exl3_intermediate_size_per_partition=intermediate,
+        exl3_params_dtype=torch.float16,
+        exl3_layer_bitrates=(bits,) * experts,
+        exl3_mixed_bitrate=False,
+        exl3_shared_h_rotations=True,
+        activation=MoEActivation.SILU,
+        w13_mcg=SimpleNamespace(exl3_tensors={(0, "w1"): marker}),
+    )
+
+    method._prepare_rank_sliced_weights(layer)
+
+    prepared = layer.exl3_trellis_weights
+    assert tuple(prepared.gate_suh.shape) == (1, hidden)
+    assert tuple(prepared.up_suh.shape) == (1, hidden)
+    assert tuple(prepared.down_svh.shape) == (1, hidden)
+    assert all(tuple(table.shape) == (experts,) for table in layer.exl3_pointer_tables)
+
+
+@pytest.mark.parametrize("shared_h", [False, True])
+def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(
+    monkeypatch, shared_h
+):
     experts = 4
     hidden = intermediate = 128
     bitrates = (3, 4, 3, 4)
@@ -304,15 +743,18 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypat
         )
 
     slabs = {
-        "w13_suh": torch.ones((2, experts, hidden), dtype=torch.float16),
+        "w13_suh": torch.ones(
+            (2, 1 if shared_h else experts, hidden), dtype=torch.float16
+        ),
         "w13_svh": torch.ones((2, experts, intermediate), dtype=torch.float16),
         "w2_suh": torch.ones((experts, intermediate), dtype=torch.float16),
-        "w2_svh": torch.ones((experts, hidden), dtype=torch.float16),
+        "w2_svh": torch.ones((1 if shared_h else experts, hidden), dtype=torch.float16),
     }
     layer = SimpleNamespace(
         local_num_experts=experts,
         exl3_hidden_size=hidden,
         exl3_intermediate_size_per_partition=intermediate,
+        exl3_params_dtype=torch.float16,
         exl3_layer_bitrates=bitrates,
         activation=MoEActivation.SILU,
         layer_name="model.layers.3.mlp.experts",
@@ -353,8 +795,8 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypat
 
     method._prepare_mixed_rank_sliced_weights(layer)
 
-    assert [entry["trellis_bits"] for entry in api.prepared] == [3, 4]
-    assert [entry["num_experts"] for entry in api.prepared] == [2, 2]
+    assert [entry["trellis_bits"] for entry in api.prepared] == [3, 3, 4, 4]
+    assert [entry["num_experts"] for entry in api.prepared] == [2] * 4
     for entry in api.prepared:
         bits = entry["trellis_bits"]
         assert tuple(entry["w13"].shape) == (
@@ -373,9 +815,29 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypat
     assert [entry["tile_config"] for entry in api.prepared] == [
         (128, 128, 128, 128),
         (128, 128, 128, 128),
+        (128, 128, 128, 128),
+        (128, 128, 128, 128),
     ]
     assert layer.exl3_mixed_trellis["tier_ids"] == ((0, 2), (1, 3))
     assert layer.exl3_mixed_trellis["tier_bits"] == (3, 4)
+    assert len(layer.exl3_mixed_trellis["tiers"]) == 2
+    assert len(layer.exl3_mixed_trellis["prefill_tiers"]) == 2
+    rotations = layer.exl3_mixed_trellis["rotations"]
+    expected_h_rows = 1 if shared_h else experts
+    assert rotations.gate_suh.shape[0] == expected_h_rows
+    assert rotations.up_suh.shape[0] == expected_h_rows
+    assert rotations.down_svh.shape[0] == expected_h_rows
+    assert layer.exl3_mixed_trellis["broadcast_suh"] is shared_h
+    assert layer.exl3_mixed_trellis["broadcast_svh"] is shared_h
+    for entry in api.prepared:
+        expected_tier_rows = 1 if shared_h else 2
+        assert entry["gate_suh"].shape[0] == expected_tier_rows
+        assert entry["up_suh"].shape[0] == expected_tier_rows
+        assert entry["down_svh"].shape[0] == expected_tier_rows
+        assert (
+            entry["gate_suh"].untyped_storage().data_ptr()
+            == rotations.gate_suh.untyped_storage().data_ptr()
+        )
     assert layer.w13_trellis.exl3_tensors == {}
     assert layer.w2_trellis.exl3_tensors == {}
     assert layer.w13_suh.exl3_backing is None
@@ -388,6 +850,150 @@ def test_mixed_trellis_buffer_accounting_ignores_metadata() -> None:
     second = SimpleNamespace(alias=shared.view(2, 4), label="prefill")
 
     assert exl3_module._unique_tensor_storage_bytes(first, second) == 8
+
+
+def test_prepared_dense_weight_is_owned_by_source_tensor(monkeypatch) -> None:
+    class FakeApi:
+        def __init__(self):
+            self.calls = 0
+
+        def prepare_weight(self, trellis, suh, svh, **kwargs):
+            del kwargs
+            self.calls += 1
+            return SimpleNamespace(trellis=trellis, suh=suh, svh=svh)
+
+    api = FakeApi()
+    monkeypatch.setattr(exl3_module, "_load_b12x_trellis_linear", lambda: api)
+    trellis = torch.empty((8, 8, 96), dtype=torch.int16)
+    suh = torch.empty(128, dtype=torch.float16)
+    svh = torch.empty(128, dtype=torch.float16)
+
+    first = exl3_module._b12x_trellis_weight(trellis, suh, svh, torch.float16)
+    second = exl3_module._b12x_trellis_weight(trellis, suh, svh, torch.float16)
+    assert first is second
+    assert api.calls == 1
+
+    source_ref = weakref.ref(trellis)
+    del first, second, trellis
+    gc.collect()
+    assert source_ref() is None
+
+
+def test_mixed_trellis_dispatches_decode_and_one_grid_prefill(monkeypatch):
+    class FakeMixedApi:
+        def __init__(self):
+            self.calls = []
+
+        def run_mixed_trellis(self, x, *args):
+            launch = args[7]
+            self.calls.append((int(x.shape[0]), args[0], args[1], launch))
+            return torch.full_like(x, launch.value)
+
+    mixed_api = FakeMixedApi()
+    decode_tiers = (object(), object())
+    prefill_tiers = (object(), object())
+    runtime = {
+        "mixed_api": mixed_api,
+        "decode": {
+            "launch": SimpleNamespace(value=1),
+            "buffers": object(),
+        },
+        "prefill": {
+            "launch": SimpleNamespace(value=3),
+            "buffers": object(),
+        },
+        "max_decode_m": 8,
+        "max_batched_tokens": 16,
+        "prefill_capacity": 8,
+    }
+    layer = SimpleNamespace(
+        exl3_mixed_trellis={
+            "tiers": decode_tiers,
+            "prefill_tiers": prefill_tiers,
+            "global_to_combined": object(),
+            "descriptor_map": object(),
+            "rotations": object(),
+        }
+    )
+    method = object.__new__(Exl3MoEMethod)
+    monkeypatch.setattr(
+        method, "_mixed_rank_sliced_runtime", lambda layer, x, ids: runtime
+    )
+    weights = torch.ones((16, 2), dtype=torch.float32)
+    ids = torch.zeros((16, 2), dtype=torch.int64)
+
+    decode = method._apply_mixed_rank_sliced(
+        layer, torch.zeros((4, 4)), weights[:4], ids[:4]
+    )
+    prefill = method._apply_mixed_rank_sliced(layer, torch.zeros((16, 4)), weights, ids)
+
+    torch.testing.assert_close(decode, torch.ones_like(decode))
+    torch.testing.assert_close(prefill, torch.full_like(prefill, 3))
+    assert [call[0] for call in mixed_api.calls] == [4, 8, 8]
+    assert mixed_api.calls[0][1:3] == decode_tiers
+    assert all(call[1:3] == prefill_tiers for call in mixed_api.calls[1:])
+
+
+@pytest.mark.parametrize(
+    "tier_signature",
+    [
+        ((3, 192), (4, 64)),
+        ((3, 206), (4, 50)),
+        ((3, 148), (4, 108)),
+    ],
+)
+def test_mixed_trellis_prefill_block_policy_qualified_partitions(
+    tier_signature,
+) -> None:
+    common = {
+        "configured_block_m": 64,
+        "explicit_override": False,
+        "hidden_size": 6144,
+        "intermediate_size": 512,
+        "tier_signature": tier_signature,
+        "topk": 8,
+        "device_major": 12,
+        "prefill_tile_config": (128, 128, 32, 512),
+    }
+
+    assert exl3_module._resolve_mixed_trellis_prefill_block_m(**common) == 32
+    assert (
+        exl3_module._resolve_mixed_trellis_prefill_block_m(
+            **{**common, "explicit_override": True}
+        )
+        == 64
+    )
+
+
+def test_mixed_trellis_prefill_block_policy_rejects_unqualified_partition() -> None:
+    common = {
+        "configured_block_m": 64,
+        "explicit_override": False,
+        "hidden_size": 6144,
+        "intermediate_size": 512,
+        "tier_signature": ((3, 192), (4, 64)),
+        "topk": 8,
+        "device_major": 12,
+        "prefill_tile_config": (128, 128, 32, 512),
+    }
+    assert (
+        exl3_module._resolve_mixed_trellis_prefill_block_m(
+            **{**common, "tier_signature": ((3, 128), (4, 128))}
+        )
+        == 64
+    )
+    assert (
+        exl3_module._resolve_mixed_trellis_prefill_block_m(
+            **{**common, "tier_signature": ((4, 256),)}
+        )
+        == 64
+    )
+    assert (
+        exl3_module._resolve_mixed_trellis_prefill_block_m(
+            **{**common, "device_major": 11}
+        )
+        == 64
+    )
 
 
 @pytest.mark.parametrize(
