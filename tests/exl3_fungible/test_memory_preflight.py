@@ -76,10 +76,27 @@ def test_flat_k3_matches_the_measured_boot():
     assert p["fits"]
 
 
-# The failing boot carried 9.19 GiB of non-weight residue, not the 5.27 GiB a
-# flat load leaves: progressive staging left 3.92 GiB stranded in the caching
-# allocator. That is a separate defect (fixed by the post-load reclaim), and
-# these two tests keep the two causes from being confused for each other.
+# RETRACTED HYPOTHESIS, kept as a cautionary constant.
+#
+# The failing boot carried 9.19 GiB of non-weight overhead against the 5.27 GiB
+# implied by an earlier flat-K3 run, and I attributed the 3.92 GiB gap to
+# progressive staging stranded in the caching allocator. Direct measurement
+# refuted it. With the reclaim moved to the correct hook -- after
+# process_weights_after_loading, where the footprint really is 79.17 GiB --
+# gc + empty_cache freed EXACTLY 0.00 GiB:
+#
+#   FQ reclaim: reserved 79.39 -> 79.39 GiB, freed 0.00 GiB;
+#               weight footprint 79.17 GiB
+#
+# reserved exceeds allocated by 0.22 GiB, so there is no residue to reclaim.
+# The two runs differed in configuration (max_model_len 32768 vs 8192, graph
+# capture on vs off), not in allocator behaviour, and 5.27 was never a
+# constant of this system.
+#
+# MEASURED, at util 0.95 / eager / max_model_len 8192:
+#   budget 90.81 - weights 79.08 - KV 3.67 = 8.06 GiB of real overhead.
+OVERHEAD_MEASURED = 8.06
+# Retained only so the tests below still describe the boot that failed.
 OVERHEAD_WITH_RESIDUE = 9.19
 OVERHEAD_AFTER_RECLAIM = 5.27
 
@@ -100,21 +117,32 @@ def test_util_095_does_not_rescue_the_failing_policy():
     assert not p["fits"]
 
 
-def test_reclaiming_the_residue_alone_does_not_rescue_it_either():
-    """Freeing all 3.92 GiB of allocator residue lifts KV to +0.82 GiB --
-    real progress, still far under a usable floor. Both fixes are needed;
-    neither substitutes for the other."""
+def test_reclaiming_the_residue_alone_would_not_have_rescued_it_either():
+    """Hypothetical, and now known to be unavailable: even if all 3.92 GiB had
+    been reclaimable, KV reaches only +0.82 GiB -- still under any usable
+    floor. The policy was always the binding constraint; the residue theory
+    was never going to save it. Measurement later showed there is no residue
+    at all (see OVERHEAD_MEASURED)."""
     p = _project(5_206, overhead=OVERHEAD_AFTER_RECLAIM)
     assert p["projected_kv_bytes"] / GIB == pytest.approx(0.82, abs=0.05)
     assert not p["fits"]
 
 
-def test_both_fixes_together_admit_a_trimmed_policy():
-    """With the residue reclaimed and util at 0.95, the envelope that fits is
-    ~3,000 promotions, not 5,206 -- the number the demo must be sized to."""
-    p = _project(3_000, util=0.95, overhead=OVERHEAD_AFTER_RECLAIM)
-    assert p["fits"]
-    assert p["projected_kv_bytes"] / GIB > 4.0
+def test_measured_overhead_reproduces_the_observed_kv():
+    """Known-answer against the boot that actually served: the fitted policy
+    (2,658 K4) at util 0.95 with the MEASURED 8.06 GiB overhead must land on
+    the 3.67 GiB of KV the engine reported."""
+    p = _project(2_658, util=0.95, overhead=OVERHEAD_MEASURED)
+    assert p["weight_bytes"] / GIB == pytest.approx(79.08, abs=0.05)
+    assert p["projected_kv_bytes"] / GIB == pytest.approx(3.67, abs=0.10)
+
+
+def test_the_envelope_that_actually_fits_is_far_below_the_seeded_one():
+    """Under MEASURED overhead, clearing a 4 GiB KV floor needs ~2,350
+    promotions -- not the 5,206 the seeded policy asked for. The demo envelope
+    is set by the card, not by the 3.42bpw coder quant's shape."""
+    assert not _project(2_658, util=0.95, overhead=OVERHEAD_MEASURED)["fits"]
+    assert _project(2_300, util=0.95, overhead=OVERHEAD_MEASURED)["fits"]
 
 
 def test_remedy_is_expressed_in_experts_not_bytes():
