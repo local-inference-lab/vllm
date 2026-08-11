@@ -331,3 +331,78 @@ def test_policy_persist_on_commit(toy_root, tmp_path):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ------------------------------------------- publishing orderings to the module
+
+
+def _mixed_dict(ckpt, t0_globals, t1_globals):
+    """A stand-in for GG's ``layer.exl3_mixed_trellis`` (exl3.py)."""
+    s = _cpu_state(ckpt, t0_globals, t1_globals)
+    return {
+        "tiers": (s.tier0, s.tier1),
+        "tier_ids": (list(t0_globals), list(t1_globals)),
+        "tier_bits": (3, 4),
+        "global_to_combined": s.global_to_combined,
+        "descriptor_map": s.descriptor_map,
+        "rotations": s.rotations,
+    }
+
+
+def test_committed_apply_publishes_orderings_to_the_module(toy_root):
+    """A second engine built AFTER a swap must see the swap.
+
+    ``from_exl3_mixed_trellis`` copies the orderings, so every engine keeps a
+    private host view over one shared set of device maps. Before publish(),
+    the module kept its BOOT ``tier_ids`` forever: engine A installed swaps,
+    engine B (built later by the admin API) still believed the boot
+    membership, and B rejected perfectly valid follow-on plans with
+    "e_out must be resident K4" — against a device where it WAS.
+    """
+    root, ckpt = toy_root
+    mixed = _mixed_dict(ckpt, T0_GLOBALS, T1_GLOBALS)
+    state_a = fq_swap.MixedLayerState.from_exl3_mixed_trellis(mixed)
+    engine_a = _make_engine(root, state_a)
+
+    engine_a.apply(fq_swap.SwapPlan([(toy.LAYER_ID, 3, 0)]),
+                   quiesce=nullcontext())
+
+    # The module advertises what the device now holds, not what it booted with.
+    assert list(mixed["tier_ids"][0]) == state_a.tier0_globals
+    assert list(mixed["tier_ids"][1]) == state_a.tier1_globals
+    assert 0 in mixed["tier_ids"][1] and 3 not in mixed["tier_ids"][1]
+
+    # An engine built later agrees, and can stage the follow-on swap that
+    # a stale view refuses.
+    state_b = fq_swap.MixedLayerState.from_exl3_mixed_trellis(mixed)
+    assert state_b.tier0_globals == state_a.tier0_globals
+    assert state_b.tier1_globals == state_a.tier1_globals
+    _make_engine(root, state_b).stage(
+        fq_swap.SwapPlan([(toy.LAYER_ID, 0, 3)]))
+
+
+def test_stale_second_engine_is_what_the_fix_prevents(toy_root):
+    """Pin the failure mode itself, so a regression is unmistakable."""
+    root, ckpt = toy_root
+    mixed = _mixed_dict(ckpt, T0_GLOBALS, T1_GLOBALS)
+    state_a = fq_swap.MixedLayerState.from_exl3_mixed_trellis(mixed)
+    # Simulate the pre-fix engine: a private view that never publishes.
+    state_a.source = None
+    _make_engine(root, state_a).apply(
+        fq_swap.SwapPlan([(toy.LAYER_ID, 3, 0)]), quiesce=nullcontext())
+
+    stale = fq_swap.MixedLayerState.from_exl3_mixed_trellis(mixed)
+    assert stale.tier1_globals != state_a.tier1_globals
+    with pytest.raises(ValueError, match="resident"):
+        _make_engine(root, stale).stage(
+            fq_swap.SwapPlan([(toy.LAYER_ID, 0, 3)]))
+
+
+def test_publish_is_a_noop_without_a_source():
+    """Hand-built states (tests, and any non-module caller) stay valid."""
+    s = fq_swap.MixedLayerState(
+        tier0=None, tier1=None, rotations=None,
+        global_to_combined=torch.zeros(4, dtype=torch.int32),
+        descriptor_map=torch.zeros(4, dtype=torch.int32),
+        tier0_globals=[0, 1], tier1_globals=[2, 3])
+    assert s.publish() is False

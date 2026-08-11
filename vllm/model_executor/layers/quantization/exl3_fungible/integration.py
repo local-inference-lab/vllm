@@ -234,12 +234,45 @@ def _bind_apply_fn(state, runner, rank: int) -> None:
     _stager = _fut.ThreadPoolExecutor(max_workers=1,
                                       thread_name_prefix="fq-stage")
 
-    engine = _admin.build_swap_engine(
-        runner, rank=rank, max_pairs=max(_cap, _admin.DEFAULT_MAX_ITEMS))
+    # ONE engine per worker, shared with the admin API through
+    # `state.swap_engine`.
+    #
+    # This used to build its own. MixedLayerState COPIES the tier orderings
+    # out of the module, and a committed apply updated only the copy — so the
+    # loop's engine and the admin's engine (built lazily by
+    # admin._bound_engine) tracked the same layers with two independent host
+    # views, over one set of device maps. The loop installed 64 swaps; the
+    # other engine never heard about it; every later plan was validated
+    # against a stale ordering and died:
+    #
+    #     ValueError: invalid swap (3, 51, 60): e_out must be resident K4
+    #
+    # while GET /fq/layer/3 — which reads the LOOP's map — cheerfully
+    # confirmed e51 was K4. Both were telling the truth about different
+    # bookkeeping. The loop then re-proposed the identical plan every
+    # interval, forever, staging ~300 MB of fragments each time.
+    #
+    # Sizing: the admin path defaults max_pairs to DEFAULT_MAX_ITEMS (32), an
+    # operator-facing batch limit for hand-driven POST /fq/retier, while the
+    # loop proposes up to max_swaps_total (64). Sharing one engine means the
+    # buffer must satisfy BOTH, so a cached engine that is too small is
+    # replaced rather than inherited.
+    _want = max(_cap, _admin.DEFAULT_MAX_ITEMS)
+    engine = getattr(state, "swap_engine", None)
+    if engine is not None and int(getattr(engine, "max_pairs", 0)) < _want:
+        log.info("FQ live apply: rebuilding the shared swap engine — cached "
+                 "one holds %d pairs, the loop proposes up to %d",
+                 int(getattr(engine, "max_pairs", 0)), _want)
+        engine = None
+    if engine is None:
+        engine = _admin.build_swap_engine(runner, rank=rank, max_pairs=_want)
     if engine is None:
         log.warning("FQ live apply NOT bound: no mixed-trellis layers "
                     "registered — a uniform-K serve has nothing to swap")
         return
+    # Publish it so admin._bound_engine reuses this one instead of minting a
+    # second view of the same layers.
+    state.swap_engine = engine
 
     # ------------------------------------------------------------------
     # Async staging + collective readiness gate.

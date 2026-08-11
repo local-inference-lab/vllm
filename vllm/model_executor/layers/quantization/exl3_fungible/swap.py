@@ -66,7 +66,8 @@ import time
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
+from typing import (Any, Callable, Iterator, Mapping, MutableMapping,
+                    Protocol, Sequence)
 
 import numpy as np
 import torch
@@ -549,6 +550,9 @@ class MixedLayerState:
     tier0_globals: list[int]
     tier1_globals: list[int]
     mcg: int | None = None
+    #: The ``layer.exl3_mixed_trellis`` dict this state was adapted from, so a
+    #: committed apply can publish the new orderings back to it. See publish().
+    source: MutableMapping[str, Any] | None = None
 
     @classmethod
     def from_exl3_mixed_trellis(cls, mixed: Mapping[str, Any]) -> "MixedLayerState":
@@ -566,7 +570,38 @@ class MixedLayerState:
             descriptor_map=mixed["descriptor_map"],
             tier0_globals=list(tier0_ids),
             tier1_globals=list(tier1_ids),
+            source=mixed if isinstance(mixed, MutableMapping) else None,
         )
+
+    def publish(self) -> bool:
+        """Write the committed orderings back to ``layer.exl3_mixed_trellis``.
+
+        Without this, ``tier_ids`` on the module keeps its BOOT value forever
+        while the device maps advance with every apply — so the module lies to
+        anything that reads it later.
+
+        That is not hypothetical. ``from_exl3_mixed_trellis`` COPIES the
+        orderings, so two SwapEngines over the same layer each track their own
+        host-side view. The admin API built one (cached on
+        ``state.swap_engine``) and the interval loop built another; the loop
+        installed 64 swaps through its engine, the module never heard about it,
+        and the next plan validated against a stale ordering:
+
+            ValueError: invalid swap (3, 51, 60): e_out must be resident K4
+
+        with the loop's own tier map insisting e51 WAS K4. It was — on the
+        device and in the loop, but not in the engine that happened to answer.
+        The engine is now shared (integration.py reuses ``state.swap_engine``),
+        which fixes the live path; this publishes the truth so that a rebuilt
+        engine — a later admin call, a reload, a future caller we have not
+        written yet — starts from what the device actually holds rather than
+        from boot.
+        """
+        if self.source is None:
+            return False
+        self.source["tier_ids"] = (list(self.tier0_globals),
+                                   list(self.tier1_globals))
+        return True
 
     @property
     def num_global_experts(self) -> int:
@@ -1125,6 +1160,9 @@ class SwapEngine:
                         state = self.layers[staged_layer.layer]
                         state.tier0_globals[:] = staged_layer.tier0_globals
                         state.tier1_globals[:] = staged_layer.tier1_globals
+                        # Same visibility point as the maps: the module must
+                        # not survive the flip still advertising boot tiers.
+                        state.publish()
             if memo_hook is not None:  # step 4
                 memo_hook()
             if step_hook is not None:
@@ -1172,3 +1210,4 @@ class SwapEngine:
             state.descriptor_map.copy_(staged.descriptor_host, non_blocking=True)
         state.tier0_globals[:] = staged.tier0_globals
         state.tier1_globals[:] = staged.tier1_globals
+        state.publish()
