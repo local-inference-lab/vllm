@@ -514,8 +514,62 @@ class Worker(WorkerBase):
             from vllm.model_executor.layers.quantization.exl3_fungible.\
                 progressive_loader import record_weight_footprint
             record_weight_footprint(allocated)
+            self._fq_trim_host_heap()
         except Exception:  # noqa: BLE001 — never fail a boot to save memory
             logger.warning("FQ post-load reclaim skipped", exc_info=True)
+
+    @staticmethod
+    def _fq_trim_host_heap() -> None:
+        """Return the progressive loader's host-side heap to the OS.
+
+        The GPU reclaim above has a host-side twin that was missing, and it is
+        far larger. Measured on a live TP4 serve, per rank, while SERVING:
+
+            [heap]          228.7 GiB      Anonymous     230.3 GiB
+            Private_Dirty   232.0 GiB      GPU footprint  66.92 GiB
+
+        ~3.5x the resident model, x4 ranks = ~924 GiB of a 1280 GiB cgroup,
+        leaving 118 GiB of headroom. Two concurrent boots therefore cannot
+        fit, and two workers were OOM-killed before this was understood
+        (memory.events: oom 16, oom_kill 2).
+
+        It is retention, not a leak — RSS is flat, and the bytes are in the
+        glibc MAIN heap, which only shrinks from the top: one live allocation
+        near the boot-time high-water mark pins everything beneath it. brk
+        cannot give it back, but malloc_trim() releases the free pages inside
+        the heap via MADV_DONTNEED, which is exactly this case.
+
+        Measured and logged rather than asserted, like its GPU counterpart —
+        an unverified "reclaim" that frees nothing is a claim, and this
+        project has already retracted one of those.
+        """
+        import ctypes
+
+        def _rss_kb() -> int:
+            try:
+                with open("/proc/self/status") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            return int(line.split()[1])
+            except OSError:
+                pass
+            return 0
+
+        before = _rss_kb()
+        try:
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            libc.malloc_trim.argtypes = [ctypes.c_size_t]
+            libc.malloc_trim.restype = ctypes.c_int
+            returned = int(libc.malloc_trim(0))
+        except Exception:  # noqa: BLE001 — musl and friends have no malloc_trim
+            logger.info("FQ host heap trim unavailable (no glibc malloc_trim)")
+            return
+        after = _rss_kb()
+        logger.info(
+            "FQ host heap trim: RSS %.2f -> %.2f GiB, freed %.2f GiB "
+            "(malloc_trim returned %d)",
+            before / (1 << 20), after / (1 << 20),
+            (before - after) / (1 << 20), returned)
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
