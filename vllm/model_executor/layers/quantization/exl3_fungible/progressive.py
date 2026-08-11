@@ -344,8 +344,40 @@ def progressive_weights_iterator(
             substitutions: list[tuple[int, int, int]] = []
             seen: set[str] = set()
             counts: dict[int, int] = {}
+            # UNIFORM-LAYER FAST PATH. When every expert of this layer wants
+            # the same K they all live in one segment object, and fetching it
+            # per-expert is 256 HTTP round trips for one contiguous file --
+            # 19,200 across GLM-5.2. Pull it once and slice locally: identical
+            # bytes, 1 request, and 255 fewer chances to hit the transient
+            # failure that killed an earlier boot. Only for uniform layers:
+            # a layer needing one K4 expert must not drag a whole segment.
+            uniq = set(int(x) for x in bits)
+            if len(uniq) == 1:
+                only_k = uniq.pop()
+                note = getattr(resolver, "prefetch_layer", lambda *a: None)(
+                    layer, only_k)
+                if note:
+                    logger.info(
+                        "FQ progressive L%d: uniform K%d -> %s "
+                        "(1 fetch instead of %d ranged reads)",
+                        layer, only_k, note, len(bits))
+
+            unavailable: list[int] = []
             for expert, k in enumerate(bits):
-                fragment = resolver.resolve(layer, expert, int(k))
+                # resolve_best NEVER raises. resolve() does, and BOOT is
+                # precisely when a fragment is most likely to be missing and
+                # the least acceptable place to die: one absent expert out of
+                # 19,200 killed the whole engine
+                # (FragmentUnavailableError -> WorkerProc init failed).
+                # A transient network REJECT on one expert must degrade that
+                # expert, not the model.
+                fragment = resolver.resolve_best(layer, expert, int(k))
+                if fragment is None:
+                    # Nothing at any K. Record it, keep going, and fail once
+                    # at the end of the layer with the full list — an operator
+                    # needs to know how much is missing, not just the first.
+                    unavailable.append(expert)
+                    continue
                 actual_k = int(fragment.k)
                 actual_bits[expert] = actual_k
                 if actual_k != int(k):
@@ -359,6 +391,24 @@ def progressive_weights_iterator(
                     yield name, tensor
             if actual_bits_out is not None:
                 actual_bits_out[layer] = list(actual_bits)
+            if unavailable:
+                # Raise BEFORE the name-set parity check: parity will also
+                # fail (the missing experts contribute no tensors) but reports
+                # a symptom -- "stream does not match the source shard tensor
+                # set" -- when the operator needs the cause and its scale.
+                # Same import seam the rest of this module uses: the
+                # CPU tests load these files standalone, so a relative
+                # import has no parent package to resolve against.
+                FragmentUnavailableError = type(resolver).__module__ \
+                    and __import__(type(resolver).__module__,
+                                   fromlist=['FragmentUnavailableError']
+                                   ).FragmentUnavailableError
+                raise FragmentUnavailableError(
+                    f"progressive layer {layer}: {len(unavailable)} expert(s) "
+                    f"have no fragment at ANY K: "
+                    f"{unavailable[:16]}"
+                    f"{'...' if len(unavailable) > 16 else ''}. Check "
+                    f"VLLM_FQ_MANIFEST_DIR / VLLM_FQ_SOURCES reachability.")
             if seen != expected_names:
                 missing = sorted(expected_names - seen)[:4]
                 extra = sorted(seen - expected_names)[:4]

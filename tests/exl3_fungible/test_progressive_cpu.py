@@ -162,12 +162,37 @@ def test_rank_filter(tmp_path):
     assert "model.layers.3.mlp.gate.weight" in tensors
 
 
-def test_missing_segment_k_fails_loudly(tmp_path):
+def test_missing_segment_k_degrades_instead_of_killing_the_boot(tmp_path):
+    """A requested K with no fragment must fall back, not abort the engine.
+
+    This asserts the OPPOSITE of what it used to. The old contract raised on
+    the first miss, and on the real model that meant one absent expert out of
+    19,200 (a transient IncompleteRead on layer 3 expert 19) took down the
+    whole engine at boot — the least acceptable place to die, since boot is
+    exactly when fragments are most likely to be missing. Degrading to the
+    nearest available K and logging it is the point of the K ladder.
+    """
     seg_dir = make_manifest_dir(tmp_path, layers=(3,), ks=(3,))  # no k4
     spec = make_spec(tmp_path, make_policy({"3": [4, 3, 3, 3]}),
                      seg_dir=seg_dir)
     resolver = spec.make_resolver(cache_dir=tmp_path / "cache", environ={})
-    with pytest.raises(Exception, match="k4"):
+    out = list(pg.progressive_weights_iterator(spec, resolver))
+    assert out, "expected a weight stream, not an empty one"
+    # expert 0 asked for k4, only k3 exists -> it is served at k3
+    names = [n for n, _ in out]
+    assert any("experts.0." in n for n in names), (
+        "the degraded expert must still be materialized")
+
+
+def test_no_fragment_at_any_k_still_fails_loudly(tmp_path):
+    """Degrading is not the same as pretending. If NOTHING can supply an
+    expert at any K, that is unservable and must be reported, naming how many
+    experts are affected rather than just the first."""
+    seg_dir = make_manifest_dir(tmp_path, layers=(3,), ks=())  # nothing at all
+    spec = make_spec(tmp_path, make_policy({"3": [4, 3, 3, 3]}),
+                     seg_dir=seg_dir)
+    resolver = spec.make_resolver(cache_dir=tmp_path / "cache", environ={})
+    with pytest.raises(Exception, match="no fragment at ANY K|ANY K"):
         list(pg.progressive_weights_iterator(spec, resolver))
 
 

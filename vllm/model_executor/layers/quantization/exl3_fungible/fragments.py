@@ -411,17 +411,92 @@ class HfSource:
                 return None
             raise
 
+    # A progressive boot issues one ranged read PER EXPERT — 19,200 of them for
+    # GLM-5.2. At that volume a transient failure is not an edge case, it is a
+    # certainty: one `IncompleteRead` on layer 3 expert 19 was enough to abort a
+    # whole engine start. Retry the retryable, with backoff; leave 404 and
+    # friends to the caller, which treats them as a genuine MISS.
+    _RETRIES = 4
+    _BACKOFF = 0.4
+
+    # Whole-segment prefetch. A UNIFORM layer needs every expert out of the
+    # same segment file, which as per-expert ranged reads is 256 HTTP requests
+    # for one contiguous object -- 19,200 across GLM-5.2's 75 layers. Pulling
+    # the object once and slicing locally is the same bytes in 1 request, and
+    # it removes 255 independent chances to hit a transient failure.
+    # Deliberately NOT automatic: a layer that needs a single K4 expert would
+    # otherwise drag ~2.5 GB to use ~9 MB. The caller asks, because only the
+    # caller knows the policy.
+    def prefetch_whole(self, relpath: str, dest: "Path") -> "Path | None":
+        """Fetch an entire segment once into ``dest``; return it, or None."""
+        import shutil
+        import tempfile
+        if dest.exists() and dest.stat().st_size > 0:
+            return dest
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = None
+        try:
+            with self._open(relpath, {}) as r:
+                fd, tmpname = tempfile.mkstemp(dir=str(dest.parent),
+                                               suffix=".part")
+                tmp = Path(tmpname)
+                with open(fd, "wb") as fh:
+                    shutil.copyfileobj(r, fh, length=8 << 20)
+            tmp.replace(dest)          # atomic: a torn file must never be read
+            tmp = None
+            return dest
+        except Exception:  # noqa: BLE001 — prefetch is an optimisation
+            return None
+        finally:
+            if tmp is not None and tmp.exists():
+                tmp.unlink()
+
+    def range_from_prefetched(self, cached: "Path", start: int,
+                              end: int) -> bytes | None:
+        """Slice a prefetched segment, or None if it cannot serve the range."""
+        try:
+            size = cached.stat().st_size
+            if end > size:
+                return None            # truncated/stale: fall back to HTTP
+            with open(cached, "rb") as fh:
+                fh.seek(start)
+                data = fh.read(end - start)
+            return data if len(data) == end - start else None
+        except OSError:
+            return None
+
     def read_range(self, relpath: str, start: int, end: int) -> bytes:
-        with self._open(
-            relpath, {"Range": f"bytes={start}-{end - 1}"}
-        ) as r:
-            data = r.read()
-        if len(data) != end - start:
-            raise IOError(
-                f"{self.name}/{relpath}: ranged read [{start},{end}) returned "
-                f"{len(data)} bytes"
-            )
-        return data
+        import http.client
+        import time
+        import urllib.error
+
+        want = end - start
+        last: Exception | None = None
+        for attempt in range(self._RETRIES):
+            try:
+                with self._open(
+                    relpath, {"Range": f"bytes={start}-{end - 1}"}
+                ) as r:
+                    data = r.read()
+                if len(data) != want:
+                    # A short read is itself the transient failure mode here
+                    # (truncated chunked transfer), so it retries rather than
+                    # being reported as corruption.
+                    raise IOError(
+                        f"{self.name}/{relpath}: ranged read [{start},{end}) "
+                        f"returned {len(data)} bytes")
+                return data
+            except urllib.error.HTTPError:
+                raise                      # 404/403: a real answer, not a blip
+            except (http.client.IncompleteRead, http.client.RemoteDisconnected,
+                    urllib.error.URLError, TimeoutError, ConnectionError,
+                    IOError) as exc:
+                last = exc
+                if attempt + 1 < self._RETRIES:
+                    time.sleep(self._BACKOFF * (2 ** attempt))
+        raise IOError(
+            f"{self.name}/{relpath}: ranged read [{start},{end}) failed after "
+            f"{self._RETRIES} attempts: {type(last).__name__}: {last}")
 
 
 class FragmentResolver:
@@ -586,6 +661,8 @@ class FragmentResolver:
         # (layer, k) -> {expert_str: sha} from LOCAL dirs only
         self._local_sha_maps: dict[tuple[int, int], dict[str, str]] = {}
         # (source_name, layer, k) -> attestation text | None (None=definitive)
+        # (layer, k) -> whole prefetched segment on disk, for uniform layers
+        self._prefetched: dict[tuple[int, int], Path] = {}
         self._att_texts: dict[tuple[str, int, int], str | None] = {}
         # (source_name, layer, k) -> (shas | None, reject reason | None)
         self._att_evals: dict[
@@ -809,6 +886,37 @@ class FragmentResolver:
         if created:
             self.stats["encode_queued"] += 1
         return position, created
+
+    def prefetch_layer(self, layer: int, k: int) -> str | None:
+        """Pull the whole K``k`` segment for ``layer`` from the first source
+        that has it. Call this when the layer is UNIFORM at ``k`` -- it turns
+        256 ranged reads into one object fetch. Returns a short description of
+        what happened, for the boot log; never raises.
+        """
+        for source in self.sources:
+            try:
+                index = self._remote_index(source, k)
+                if not isinstance(index, dict) or str(layer) not in index:
+                    continue
+                entry = _SegmentIndexEntry(index[str(layer)])
+                dest = self._cache_path("segments", f"{entry.sha256}.seg")
+                if dest.exists() and dest.stat().st_size > 0:
+                    self._prefetched[(layer, k)] = dest
+                    return f"cached {entry.file}"
+                got = getattr(source, "prefetch_whole", None)
+                if got is None:
+                    continue           # local dirs need no prefetch
+                path = got(entry.file, dest)
+                if path is not None:
+                    self._prefetched[(layer, k)] = path
+                    self.stats["segments_prefetched"] += 1
+                    return (f"prefetched {entry.file} "
+                            f"({path.stat().st_size} B) from "
+                            f"{getattr(source, 'name', source)}")
+            except Exception:  # noqa: BLE001 — an optimisation must not fail a boot
+                self.stats["source_error"] += 1
+                continue
+        return None
 
     def _cache_path(self, kind: str, name: str) -> Path:
         return self.cache_dir / kind / name
@@ -1309,9 +1417,18 @@ class FragmentResolver:
 
         try:
             lo, hi = entry.expert_range(expert)
-            payload = source.read_range(
-                entry.file, entry.body_offset + lo, entry.body_offset + hi
-            )
+            start = entry.body_offset + lo
+            stop = entry.body_offset + hi
+            payload = None
+            cached = self._prefetched.get((layer, k))
+            if cached is not None:
+                slicer = getattr(source, "range_from_prefetched", None)
+                if slicer is not None:
+                    payload = slicer(cached, start, stop)
+                    if payload is not None:
+                        self.stats["bytes_from_prefetch"] += len(payload)
+            if payload is None:
+                payload = source.read_range(entry.file, start, stop)
         except Exception as exc:  # noqa: BLE001
             self.stats["source_error"] += 1
             return None, f"{name} REJECT error:{type(exc).__name__}", None

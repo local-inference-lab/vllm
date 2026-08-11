@@ -488,7 +488,26 @@ class FungibleQuantState:
         self.policy_doc = policy_doc
         self.policy_sha = policy_hash(policy_doc)
         # Policy layer rows: sorted numeric layer ids from the document.
-        self.layers = sorted(int(k) for k in policy_doc["bits_per_expert"])
+        # A policy legitimately covers layers the collector does not
+        # instrument. GLM-5.2's layer 78 is the MTP layer: the EXL3 loader
+        # REQUIRES a bitrate entry for it ("rank-sliced EXL3 bitrate map is
+        # missing layer 78") because it is a real MoE layer in the
+        # checkpoint, but it is not bound as a main-model MoERunner so the
+        # collector never sees it. Refusing to start on that mismatch made
+        # the two requirements unsatisfiable at once. Restrict the DECISION
+        # domain to instrumented layers and say so; the loader keeps its
+        # full map.
+        _policy_layers = sorted(int(k) for k in policy_doc["bits_per_expert"])
+        _bound = set(collector.count_buf)
+        if _bound and not _bound.issuperset(_policy_layers):
+            _skip = [x for x in _policy_layers if x not in _bound]
+            if _skip and len(_skip) < len(_policy_layers):
+                logger.warning(
+                    "FQ loop: %d policy layer(s) are not instrumented by the "
+                    "collector and are excluded from decisions: %s",
+                    len(_skip), _skip)
+                _policy_layers = [x for x in _policy_layers if x in _bound]
+        self.layers = _policy_layers
         self.num_experts = collector.num_experts
         # Operator-facing composition table: remembered so each print
         # can show what moved since the last one.
