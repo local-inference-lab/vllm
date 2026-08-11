@@ -41,8 +41,19 @@ def _moe_module_types() -> tuple[type, type]:
 
     Monkeypatch seam for CPU tests (inject fake classes); lazy so the
     env-off path never touches the fused_moe import graph.
+
+    ``MoERunner`` is imported from its defining module first: upstream moved
+    it to ``fused_moe.runner.moe_runner`` and left ``fused_moe.layer`` as a
+    re-export, which is exactly the kind of compatibility shim that gets
+    dropped in a later cleanup. Falling back the other way keeps us working on
+    both old and new trees instead of binding to the shim.
     """
-    from vllm.model_executor.layers.fused_moe.layer import MoERunner
+    try:
+        from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+            MoERunner,
+        )
+    except ImportError:  # older trees: only the re-export exists
+        from vllm.model_executor.layers.fused_moe.layer import MoERunner
     from vllm.model_executor.layers.fused_moe.router.base_router import (
         BaseRouter,
     )
