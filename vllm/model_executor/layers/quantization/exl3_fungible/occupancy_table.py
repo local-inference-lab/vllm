@@ -26,6 +26,80 @@ from collections.abc import Mapping
 TIERS: tuple[int, ...] = (2, 3, 4, 5)
 
 
+def format_bytes(n: int | float | None) -> str:
+    """Binary-unit byte size, matching how the budget knob is spelled."""
+    if n is None:
+        return "unbounded"
+    neg = "-" if n < 0 else ""
+    n = abs(float(n))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024.0 or unit == "TiB":
+            return (f"{neg}{int(n)} {unit}" if unit == "B"
+                    else f"{neg}{n:.2f} {unit}")
+        n /= 1024.0
+    return f"{neg}{n:.2f} TiB"  # pragma: no cover - loop always returns
+
+
+def budget_lines(budget: Mapping | None) -> list[str]:
+    """Footer for the composition table: ceiling, actual use, headroom.
+
+    ``budget`` is :meth:`policy.MemoryBudget.summary` output. The
+    per-expert byte figures and — importantly — WHERE THEY CAME FROM are
+    printed with it: a headroom number is only as trustworthy as the
+    geometry it was computed from, so the source never travels separately
+    from the number.
+    """
+    if not budget:
+        return []
+    used = int(budget.get("used_bytes", 0))
+    limit = budget.get("limit_bytes")
+    out: list[str] = []
+    if limit is None:
+        out.append(f"  memory: {format_bytes(used)} used "
+                   f"(no byte budget set — fixed cardinality only)")
+    else:
+        limit = int(limit)
+        pct = (100.0 * used / limit) if limit else 0.0
+        head = budget.get("headroom_bytes")
+        promos = budget.get("headroom_promotions")
+        if head is not None and head < 0:
+            out.append(
+                f"  memory budget: {format_bytes(limit)} | used "
+                f"{format_bytes(used)} ({pct:.1f}%) | OVER BUDGET by "
+                f"{format_bytes(-head)}")
+        else:
+            out.append(
+                f"  memory budget: {format_bytes(limit)} | used "
+                f"{format_bytes(used)} ({pct:.1f}%) | headroom "
+                f"{format_bytes(head)}"
+                + ("" if promos is None
+                   else f" = {promos} more K3->K4 promotions"))
+    per_k = budget.get("per_k_bytes") or {}
+    if per_k:
+        cells = " ".join(f"K{k}={int(v)}" for k, v in sorted(
+            (int(a), b) for a, b in per_k.items()))
+        out.append(f"  bytes/expert/rank: {cells}")
+    src = budget.get("source")
+    if src:
+        flag = "REFERENCE (not this checkpoint!) " if budget.get(
+            "is_reference") else ""
+        out.append(f"  byte model: {flag}{src}")
+    return out
+
+
+def _budget_oneline(budget: Mapping | None) -> str:
+    """Compact form for the paths that return a single line."""
+    if not budget:
+        return ""
+    limit = budget.get("limit_bytes")
+    used = format_bytes(int(budget.get("used_bytes", 0)))
+    if limit is None:
+        return f", {used} used, no byte budget"
+    promos = budget.get("headroom_promotions")
+    return (f", {used}/{format_bytes(int(limit))} used"
+            + ("" if promos is None else f", headroom {promos} promotions"))
+
+
 def _fmt_delta(cur: Mapping[int, int], prev: Mapping[int, int] | None) -> str:
     if prev is None:
         return ""
@@ -45,15 +119,20 @@ def render(
     title: str = "expert composition",
     diff_only: bool = False,
     max_rows: int = 128,
+    budget: Mapping | None = None,
 ) -> str:
     """Render ``{layer: {k: count}}`` as a table.
 
     ``previous`` enables the change column. ``diff_only`` restricts rows to
     layers whose composition actually moved (the totals line always covers
     every layer, changed or not, so the summary stays truthful).
+    ``budget`` (``policy.MemoryBudget.summary`` output) appends the memory
+    ceiling, the footprint the shown occupancy actually costs, and the
+    remaining promotion headroom.
     """
     if not occupancy:
-        return f"FQ {title}: no MoE layers instrumented"
+        return (f"FQ {title}: no MoE layers instrumented"
+                + _budget_oneline(budget))
 
     layers = sorted(int(x) for x in occupancy.keys())
     norm: dict[int, dict[int, int]] = {
@@ -77,7 +156,7 @@ def render(
         if not shown:
             # Say it plainly. A silent "no table" reads as "telemetry broke".
             return (f"FQ {title}: no tier changes across {len(layers)} layers "
-                    f"(totals {_totals_str(norm)})")
+                    f"(totals {_totals_str(norm)})" + _budget_oneline(budget))
         omitted_note = (f"  ({len(layers) - len(shown)} unchanged layers "
                         f"omitted)")
     truncated = 0
@@ -123,6 +202,7 @@ def render(
             pm = sum(k * ptot[k] for k in TIERS) / sum(ptot.values())
             extra = f" ({mean_bits - pm:+.4f})"
         lines.append(f"  mean bits/expert: {mean_bits:.4f}{extra}")
+    lines.extend(budget_lines(budget))
     return "\n".join(lines)
 
 

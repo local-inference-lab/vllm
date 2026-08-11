@@ -31,9 +31,22 @@ Determinism: ``policy.decide`` is a pure function of its inputs; each
 rank logs a T6-style ``decision sha`` over the swap list so cross-rank
 agreement is auditable from the serve log alone.
 
+Memory budget (``VLLM_FQ_MEMORY_BUDGET``): the fixed-cardinality budget
+is only a PROXY for memory. A byte ceiling — absolute, a fraction of
+device memory, or the equivalent experts/bpw per layer — is resolved at
+init, enforced as Guard 5 when proposing, and reported as headroom on
+``fq_memory_budget_bytes`` / ``fq_memory_used_bytes`` /
+``fq_promotions_headroom`` plus the composition table. Every byte figure
+is computed from the ACTUAL tier occupancy using per-expert sizes read
+off the loaded checkpoint's tensor shapes; see ``policy.ExpertBytes``.
+
 Hot-path contract (PERFORMANCE.md): ``step()`` between intervals is a
 few integer ops on top of ``collector.step()``; all tensor reads, numpy
 work, file IO and metric updates happen only on interval boundaries.
+The budget adds nothing between intervals: the byte model is built once
+at init (one safetensors HEADER read, no payload), and per-interval
+accounting is one reduction over the [L,E] tier array plus integer
+arithmetic per candidate.
 """
 from __future__ import annotations
 
@@ -41,6 +54,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import struct
 from pathlib import Path
 from typing import Any, Callable
 
@@ -79,6 +94,16 @@ FQ_DWELL_ENV = "VLLM_FQ_DWELL_STEPS"
 FQ_HYSTERESIS_ENV = "VLLM_FQ_HYSTERESIS"
 FQ_JACCARD_FLOOR_ENV = "VLLM_FQ_JACCARD_FLOOR"
 FQ_DUMP_STATS_ENV = "VLLM_FQ_DUMP_STATS"
+# Ceiling on the per-device expert pool. Accepts an absolute size
+# ("78g", "80000000000"), a fraction of device memory ("0.80", "80%")
+# mirroring --gpu-memory-utilization, or the cardinality spellings of the
+# same ceiling ("24/layer", "3.5bpw") — all resolved to bytes.
+# Unset -> no byte ceiling; the fixed-cardinality budget alone applies.
+FQ_MEMORY_BUDGET_ENV = "VLLM_FQ_MEMORY_BUDGET"
+# Operator override for the per-expert byte model, as measured K points:
+# "k3=3542028,k4=4721676" (per rank). Only needed when the checkpoint's
+# real geometry cannot be read at boot.
+FQ_EXPERT_BYTES_ENV = "VLLM_FQ_EXPERT_BYTES"
 
 APPLY_DRYRUN, APPLY_RELOAD, APPLY_ATOMIC = "dryrun", "reload", "atomic"
 
@@ -100,6 +125,8 @@ class FqLoopConfig:
         policy_path: str | None = None,
         eps_root: str | None = None,
         cache_root: str | None = None,
+        memory_budget: str | int | float | None = None,
+        expert_bytes: str | None = None,
     ) -> None:
         if apply_mode not in (APPLY_DRYRUN, APPLY_RELOAD, APPLY_ATOMIC):
             raise ValueError(f"unknown {FQ_APPLY_MODE_ENV}: {apply_mode!r}")
@@ -116,6 +143,10 @@ class FqLoopConfig:
         self.policy_path = policy_path
         self.eps_root = eps_root
         self.cache_root = cache_root or os.path.expanduser("~/.cache/vllm")
+        # Kept as the raw spec: resolving a fraction needs the device,
+        # which is not knowable at config-parse time.
+        self.memory_budget = memory_budget
+        self.expert_bytes = expert_bytes
 
     @classmethod
     def from_env(cls) -> "FqLoopConfig":
@@ -138,6 +169,8 @@ class FqLoopConfig:
         kwargs["policy_path"] = env(FQ_POLICY_ENV)
         kwargs["eps_root"] = env(FQ_EPS_ROOT_ENV)
         kwargs["cache_root"] = env(FQ_CACHE_ROOT_ENV)
+        kwargs["memory_budget"] = env(FQ_MEMORY_BUDGET_ENV)
+        kwargs["expert_bytes"] = env(FQ_EXPERT_BYTES_ENV)
         return cls(**kwargs)
 
 
@@ -195,6 +228,145 @@ def uniform_eps_stub(num_layers: int, num_experts: int) -> dict[int, np.ndarray]
     }
 
 
+# ------------------------------------------------------------ memory budget
+# The byte budget is only as honest as the per-expert byte figures it is
+# computed from, so this section is written to prefer REAL geometry from
+# the loaded checkpoint over any constant, and to state which one it got.
+
+_EXPERT_TENSOR_RE = re.compile(
+    r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(\w+_proj)\.rank(\d+)\.(\w+)$")
+
+
+def device_total_bytes() -> int | None:
+    """Total bytes of the current CUDA device, or None off-GPU.
+
+    Monkeypatch seam for CPU tests; a fractional ``VLLM_FQ_MEMORY_BUDGET``
+    resolves against this.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return int(torch.cuda.mem_get_info()[1])
+    except Exception:  # noqa: BLE001 — telemetry-grade probe, never fatal
+        logger.debug("FQ budget: device memory unreadable", exc_info=True)
+        return None
+
+
+def _read_safetensors_header(path: Path) -> dict:
+    """Header dict of a safetensors file (8-byte length prefix + JSON).
+
+    Inlined rather than imported from ``fragments`` to keep this module's
+    import graph unchanged; it is 4 lines and the format is frozen.
+    """
+    with open(path, "rb") as f:
+        (hlen,) = struct.unpack("<Q", f.read(8))
+        return json.loads(f.read(hlen))
+
+
+def expert_bytes_from_checkpoint(artifact_dir: str | Path
+                                 ) -> "P.ExpertBytes | None":
+    """Derive the per-expert byte model from the checkpoint's REAL shapes.
+
+    Reads one assembled layer's safetensors header (header only — no
+    payload, no allocation) and takes the tensor table of a single
+    (expert, rank). Byte counts come from each tensor's own
+    ``data_offsets``, so they are the true spans, and the bitrate is read
+    off the trellis last dim (``16 * K``). Returns None when the artifact
+    dir has no readable layer file — the caller then has to say out loud
+    that it is falling back to a reference constant.
+    """
+    root = Path(artifact_dir)
+    for path in sorted(root.glob("model-layer-*.safetensors"))[:4]:
+        try:
+            header = _read_safetensors_header(path)
+        except Exception:  # noqa: BLE001
+            logger.debug("FQ budget: unreadable header %s", path, exc_info=True)
+            continue
+        best: tuple[int, int] | None = None
+        ranks: set[int] = set()
+        for name in header:
+            m = _EXPERT_TENSOR_RE.match(name)
+            if m is None:
+                continue
+            expert, rank = int(m.group(2)), int(m.group(4))
+            ranks.add(rank)
+            if best is None or (expert, rank) < best:
+                best = (expert, rank)
+        if best is None:
+            continue
+        expert, rank = best
+        entries = []
+        for name, t in header.items():
+            m = _EXPERT_TENSOR_RE.match(name)
+            if m is None or int(m.group(2)) != expert or int(m.group(4)) != rank:
+                continue
+            lo, hi = t["data_offsets"]
+            entries.append((name, int(hi) - int(lo), tuple(t["shape"])))
+        try:
+            return P.ExpertBytes.from_tensor_table(
+                entries,
+                provenance=f"derived from loaded tensor shapes: {path.name} "
+                           f"expert {expert} rank {rank} of "
+                           f"{len(ranks)} rank(s)")
+        except ValueError:
+            logger.warning("FQ budget: %s expert %d rank %d does not fit the "
+                           "affine trellis byte model", path.name, expert,
+                           rank, exc_info=True)
+            return None
+    return None
+
+
+def parse_expert_bytes_spec(spec: str) -> "P.ExpertBytes":
+    """``"k3=3542028,k4=4721676"`` -> an operator-declared byte model."""
+    points: dict[int, int] = {}
+    for part in str(spec).replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        key, sep, val = part.partition("=")
+        key = key.strip().lower().lstrip("k")
+        if not sep or not key.isdigit():
+            raise ValueError(
+                f"unparseable {FQ_EXPERT_BYTES_ENV} entry {part!r}: want "
+                f"'k3=3542028,k4=4721676' (bytes per expert per rank)")
+        points[int(key)] = int(val.strip())
+    return P.ExpertBytes.from_measurements(
+        points, provenance=f"operator-declared {FQ_EXPERT_BYTES_ENV}={spec}")
+
+
+def resolve_expert_bytes(*, spec: str | None = None,
+                         artifact_dir: str | None = None,
+                         enforcing: bool = True) -> "P.ExpertBytes":
+    """Per-expert byte model, most trustworthy source first.
+
+    1. an explicit operator declaration (``VLLM_FQ_EXPERT_BYTES``),
+    2. the loaded checkpoint's own tensor shapes,
+    3. the built-in GLM-5.2/TP4 reference measurement — flagged
+       ``is_reference`` and said out loud, because it describes a
+       different checkpoint and may not match this one.
+
+    ``enforcing`` is True when a byte ceiling is actually gating
+    decisions; the fallback is then a WARNING rather than an INFO,
+    because a wrong constant would be silently deciding what stays
+    resident.
+    """
+    if spec:
+        return parse_expert_bytes_spec(spec)
+    if artifact_dir:
+        eb = expert_bytes_from_checkpoint(artifact_dir)
+        if eb is not None:
+            return eb
+    eb = P.reference_expert_bytes()
+    (logger.warning if enforcing else logger.info)(
+        "FQ budget: could not read per-expert byte sizes from the loaded "
+        "checkpoint (%s unset/unreadable) — falling back to the %s. Set %s "
+        "(e.g. k3=3542028,k4=4721676) if this checkpoint's geometry differs.",
+        FQ_ARTIFACT_DIR_ENV, eb.provenance, FQ_EXPERT_BYTES_ENV)
+    return eb
+
+
 # ------------------------------------------------------------------ metrics
 class FqMetrics:
     """03-testing-validation §Instrumentation, prometheus_client-native
@@ -230,6 +402,25 @@ class FqMetrics:
             "fq_tier_occupancy",
             "Experts resident per (layer, K tier) under the running policy.",
             ["layer", "tier"], multiprocess_mode="mostrecent", **kw)
+        self.memory_budget_bytes = pc.Gauge(
+            "fq_memory_budget_bytes",
+            "Configured per-device byte ceiling for the fungible-quant "
+            "expert pool (VLLM_FQ_MEMORY_BUDGET). 0 means no byte budget "
+            "is configured and only the fixed-cardinality budget applies.",
+            multiprocess_mode="mostrecent", **kw)
+        self.memory_used_bytes = pc.Gauge(
+            "fq_memory_used_bytes",
+            "Per-device bytes the CURRENT expert tier occupancy actually "
+            "costs, computed from the live layer x K matrix and the "
+            "per-expert byte model (see fq_memory_budget_bytes).",
+            multiprocess_mode="mostrecent", **kw)
+        self.promotions_headroom = pc.Gauge(
+            "fq_promotions_headroom",
+            "How many further K3->K4 expert promotions fit under the byte "
+            "ceiling at the current occupancy. Negative means the pool is "
+            "already over budget; -1 with fq_memory_budget_bytes == 0 "
+            "means unbounded (no byte budget configured).",
+            multiprocess_mode="mostrecent", **kw)
         # Materialize the counters at 0 so they are scrapeable before the
         # first increment (multiprocess files are created on first touch).
         self.rollbacks_total.inc(0)
@@ -283,6 +474,7 @@ class FungibleQuantState:
         rank: int = 0,
         is_lead: bool = True,
         apply_fn: Callable[[dict, list], bool] | None = None,
+        budget: "P.MemoryBudget | None" = None,
     ) -> None:
         self.collector = collector
         self.cfg = config or FqLoopConfig.from_env()
@@ -315,6 +507,8 @@ class FungibleQuantState:
              for layer in self.layers], dtype=np.int64)
         self.n_k4 = P.n_k4_of(self.tier_of)
         self.pins = self._pins_from_doc(policy_doc)
+        self.budget = budget if budget is not None else self._resolve_budget()
+        self._log_budget()
 
         # Step machinery. ``_step`` counts every engine step including
         # dummy ones (collector._step semantics: rank lockstep); dwell is
@@ -339,6 +533,7 @@ class FungibleQuantState:
             for layer in self.layers:
                 self.metrics.swaps_total.labels(layer=str(layer)).inc(0)
             self._export_occupancy()
+            self._export_budget()
 
         # The composition the checkpoint actually booted with. Printed in
         # full (not diff-only): there is nothing to diff against yet, and an
@@ -384,6 +579,48 @@ class FungibleQuantState:
             for e in experts:
                 pins[row, e] = self.tier_of[row, e]
         return pins
+
+    def _resolve_budget(self) -> P.MemoryBudget:
+        """Build the memory budget from env + the checkpoint's geometry.
+
+        A malformed ``VLLM_FQ_MEMORY_BUDGET`` is allowed to propagate: the
+        integration seam catches loop-init failures and degrades to a
+        collector-only serve, which performs no swaps and therefore
+        cannot grow past a ceiling. Failing OPEN on a memory budget — by
+        quietly dropping it — would be the unsafe choice.
+        """
+        expert_bytes = resolve_expert_bytes(
+            spec=self.cfg.expert_bytes, artifact_dir=self.cfg.artifact_dir,
+            enforcing=bool(self.cfg.memory_budget))
+        return P.MemoryBudget.from_spec(
+            self.cfg.memory_budget, expert_bytes,
+            num_layers=len(self.layers), num_experts=self.num_experts,
+            device_total_bytes=device_total_bytes())
+
+    def _log_budget(self) -> None:
+        summary = self.budget.summary(self.tier_of)
+        if self.budget.limit_bytes is None:
+            logger.info(
+                "FQ memory budget: none (%s unset) — fixed cardinality only; "
+                "current pool %d B/rank; %s", FQ_MEMORY_BUDGET_ENV,
+                summary["used_bytes"], self.budget.expert_bytes.describe())
+            return
+        n_high = self.budget.n_high_per_layer(len(self.layers),
+                                              self.num_experts)
+        logger.info(
+            "FQ memory budget: %d B/rank (%s) | used %d B | headroom %d B = "
+            "%s more K3->K4 promotions | equivalent fixed cardinality "
+            "<= %s K4/layer over %d layers | %s",
+            self.budget.limit_bytes, self.cfg.memory_budget,
+            summary["used_bytes"], summary["headroom_bytes"],
+            summary["headroom_promotions"], n_high, len(self.layers),
+            self.budget.expert_bytes.describe())
+        if summary["headroom_bytes"] is not None and summary["headroom_bytes"] < 0:
+            logger.error(
+                "FQ memory budget: the BOOT policy is already %d B over the "
+                "%d B ceiling — no promotion will be admitted until the "
+                "occupancy comes down", -summary["headroom_bytes"],
+                self.budget.limit_bytes)
 
     def _resolve_eps(self) -> dict[int, np.ndarray]:
         if self.cfg.eps_root:
@@ -492,7 +729,29 @@ class FungibleQuantState:
                 self.cfg.jaccard_floor, len(swaps))
             swaps = []
 
-        proposed_tier = P.apply_swaps(self.tier_of, swaps)
+        # Guard 5 — the byte ceiling. A 1-for-1 K3<->K4 trade is
+        # byte-neutral so this normally passes everything through; when
+        # the ceiling leaves room, the surplus is spent on unpaired
+        # promotions, which is the thing fixed cardinality cannot express.
+        promotions: list[tuple[int, int]] = []
+        rejections: list[dict] = []
+        if self.budget.limit_bytes is not None:
+            swaps, rejections = P.budget_filter(swaps, self.tier_of,
+                                                self.budget)
+            if not jaccard_held:
+                promotions, prej = P.plan_promotions(
+                    stats, self.eps, P.apply_swaps(self.tier_of, swaps),
+                    self.budget, pins=self.pins, dwell=dwell,
+                    cfg=self._decide_cfg(),
+                    exclude=[(l, e_in) for l, _, e_in in swaps])
+                rejections = rejections + prej
+            for rej in rejections:
+                logger.warning("FQ budget step=%d: %s", self._step,
+                               P.rejection_message(rej))
+
+        proposed_tier = P.apply_promotions(
+            P.apply_swaps(self.tier_of, swaps), promotions,
+            self.budget.high_k)
         proposed_doc = self._doc_for(proposed_tier, swaps)
         proposed_sha = policy_hash(proposed_doc)
 
@@ -500,9 +759,23 @@ class FungibleQuantState:
             stats, self.eps, self.tier_of, swaps, pins=self.pins,
             dwell=dwell, cfg=self._decide_cfg(), step=self._step,
             policy_sha_before=self.policy_sha,
-            policy_sha_after=proposed_sha if swaps else self.policy_sha)
+            policy_sha_after=(proposed_sha if (swaps or promotions)
+                              else self.policy_sha))
         record["apply_mode"] = self.cfg.apply_mode
         record["applied"] = False
+        # Budget state travels WITH the decision: a reviewer reading the
+        # persisted JSON must be able to see the ceiling, what the pool
+        # actually costs, what was refused, and by how much.
+        record["budget"] = self.budget.summary(self.tier_of)
+        record["budget"]["proposed_bytes"] = self.budget.used_bytes(
+            proposed_tier)
+        record["budget"]["rejections"] = rejections
+        record["promotions"] = [{"layer": int(self.layers[l]),
+                                 "layer_row": int(l), "expert": int(e),
+                                 "to_k": int(self.budget.high_k)}
+                                for l, e in promotions]
+        record["totals"]["promotions"] = len(promotions)
+        record["totals"]["budget_rejections"] = len(rejections)
         # decide()/explain() speak in row indices; record the row->model
         # layer id mapping so the persisted JSON is self-describing.
         record["layer_ids"] = [int(x) for x in self.layers]
@@ -513,16 +786,21 @@ class FungibleQuantState:
 
         DL.log_decision(record)
         logger.info(
-            "FQ decide rank=%d step=%d interval=%d swaps=%d sha=%s",
+            "FQ decide rank=%d step=%d interval=%d swaps=%d promotions=%d "
+            "budget_rejections=%d used=%d B headroom=%s sha=%s",
             self.rank, self._step, self._intervals_run, len(swaps),
+            len(promotions), len(rejections),
+            record["budget"]["used_bytes"],
+            record["budget"]["headroom_promotions"],
             record["decision_sha"][:16])
 
-        applied = self._maybe_apply(proposed_doc, proposed_tier, swaps)
+        applied = self._maybe_apply(proposed_doc, proposed_tier,
+                                    swaps, promotions)
         record["applied"] = applied
         record["apply_failures"] = int(self.apply_failures)
 
         if self.is_lead:
-            self._persist(record, proposed_doc, swaps)
+            self._persist(record, proposed_doc, swaps or promotions)
             self._export_metrics(record, swaps, jac)
         return record
 
@@ -530,10 +808,28 @@ class FungibleQuantState:
 
     def _doc_for(self, tier: np.ndarray, swaps: list) -> dict:
         doc = {k: v for k, v in self.policy_doc.items()
-               if k not in ("bits_per_expert", "provenance")}
+               if k not in ("bits_per_expert", "provenance", "budget")}
         doc["bits_per_expert"] = {
             str(layer): [int(b) for b in tier[row]]
             for row, layer in enumerate(self.layers)}
+        # The declared cardinality is RECOMPUTED from the proposed tiers,
+        # not copied: promotions change occupancy, and store.validate_policy
+        # enforces cap == n. The byte ceiling rides along so a persisted
+        # proposal records the budget it was decided under.
+        budget = dict(self.policy_doc.get("budget") or {})
+        budget["n_k4_per_layer"] = {
+            str(layer): int((tier[row] == P.K4).sum())
+            for row, layer in enumerate(self.layers)}
+        if self.budget.limit_bytes is not None:
+            budget["mode"] = "max_bytes"
+            budget["max_bytes_per_rank"] = int(self.budget.limit_bytes)
+            budget["bytes_per_expert_per_rank"] = {
+                str(k): int(v)
+                for k, v in self.budget.expert_bytes.table().items()}
+            budget["bytes_source"] = self.budget.expert_bytes.provenance
+        else:
+            budget.setdefault("mode", "fixed_cardinality")
+        doc["budget"] = budget
         doc["provenance"] = {
             "proposed_by": f"fq-loop/{self.cfg.apply_mode}",
             "step": int(self._step),
@@ -543,7 +839,7 @@ class FungibleQuantState:
         return doc
 
     def _maybe_apply(self, proposed_doc: dict, proposed_tier: np.ndarray,
-                     swaps: list) -> bool:
+                     swaps: list, promotions: list | None = None) -> bool:
         """dryrun: never. reload/atomic: only through a bound apply_fn
         (M3's fq_reload path / M4's swap engine); record-only otherwise.
 
@@ -556,7 +852,8 @@ class FungibleQuantState:
         decision, and the next interval retries. Staging is host-only and
         happens before the swap engine's quiesce window, so a supply
         failure cannot have left a layer half-updated."""
-        if self.cfg.apply_mode == APPLY_DRYRUN or not swaps:
+        promotions = promotions or []
+        if self.cfg.apply_mode == APPLY_DRYRUN or not (swaps or promotions):
             return False
         if self.apply_fn is None:
             if self.cfg.apply_mode == APPLY_ATOMIC and not self._atomic_warned:
@@ -589,6 +886,10 @@ class FungibleQuantState:
             self.policy_doc = proposed_doc
             self.policy_sha = policy_hash(proposed_doc)
             self._policy_step = self._step
+            # Promotions change the running cardinality; decide() refuses
+            # a membership that disagrees with cfg["n_k4"], so the budget
+            # must follow the occupancy it actually applied.
+            self.n_k4 = P.n_k4_of(self.tier_of)
             if self.store is not None and self.is_lead:
                 self.store.commit(proposed_doc, num_experts=self.num_experts)
         return ok
@@ -648,6 +949,19 @@ class FungibleQuantState:
                     layer=str(layer), tier=f"k{tier}").set(
                         int((self.tier_of[row] == tier).sum()))
 
+    def _export_budget(self) -> None:
+        """fq_memory_budget_bytes / fq_memory_used_bytes /
+        fq_promotions_headroom, from the ACTUAL live occupancy."""
+        summary = self.budget.summary(self.tier_of)
+        self.metrics.memory_budget_bytes.set(
+            0 if summary["limit_bytes"] is None else summary["limit_bytes"])
+        self.metrics.memory_used_bytes.set(summary["used_bytes"])
+        # -1 is the documented "unbounded" sentinel; a real over-budget
+        # pool reports its own (negative) promotion count instead.
+        self.metrics.promotions_headroom.set(
+            -1 if summary["headroom_promotions"] is None
+            else summary["headroom_promotions"])
+
     def _occupancy_map(self) -> dict[int, dict[int, int]]:
         """``{layer: {k: expert_count}}`` for the operator-facing table."""
         out: dict[int, dict[int, int]] = {}
@@ -674,7 +988,8 @@ class FungibleQuantState:
         try:
             text = OT.render(cur, self._last_composition, title=title,
                              num_experts=int(self.num_experts),
-                             diff_only=diff_only)
+                             diff_only=diff_only,
+                             budget=self.budget.summary(self.tier_of))
         except Exception:  # noqa: BLE001 - telemetry must never kill a serve
             logger.exception("FQ composition table failed to render")
             return
@@ -693,6 +1008,7 @@ class FungibleQuantState:
             self.metrics.jaccard.set(jac)
         self.metrics.policy_age_steps.set(self._step - self._policy_step)
         self._export_occupancy()
+        self._export_budget()
 
 
 # ------------------------------------------------------------------ boot glue
@@ -770,8 +1086,9 @@ def build_from_env(
         rank=rank, is_lead=is_lead)
     logger.info(
         "FQ loop: armed — mode=%s interval=%d dwell=%d hysteresis=%.2f "
-        "caps=(%d/layer, %d total) layers=%s policy=%s",
+        "caps=(%d/layer, %d total) memory_budget=%s layers=%s policy=%s",
         cfg.apply_mode, cfg.interval_steps, cfg.dwell_steps, cfg.hysteresis,
-        cfg.max_swaps_per_layer, cfg.max_swaps_total, state.layers,
-        state.policy_sha[:16])
+        cfg.max_swaps_per_layer, cfg.max_swaps_total,
+        state.budget.limit_bytes if state.budget.limit_bytes is not None
+        else "none", state.layers, state.policy_sha[:16])
     return state
