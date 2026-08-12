@@ -830,6 +830,20 @@ def get_draft_quant_config(vllm_config: VllmConfig) -> "QuantizationConfig | Non
     return quant_config
 
 
+_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+
+def _parse_layer_index(prefix: str) -> int | None:
+    """Parse the global model layer index from a weight or module prefix.
+
+    Matches ``layers.<N>`` where ``layers`` is preceded by start-of-string or
+    a dot (so ``sublayers.3`` is rejected) and ``<N>`` is followed by a dot or
+    end-of-string, so a prefix that ends at ``layers.3`` still parses. Returns
+    the index, or ``None`` when no layer index is present.
+    """
+    match = _LAYER_INDEX_RE.search(prefix)
+    return int(match.group(1)) if match is not None else None
+
 def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
     """
     Extract the layer index from the module name.

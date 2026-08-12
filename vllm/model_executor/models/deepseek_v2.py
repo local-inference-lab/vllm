@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import copy
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -87,6 +88,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.utils import (
+    _parse_layer_index,
     AutoWeightsLoader,
     extract_layer_index,
     sequence_parallel_chunk,
@@ -276,6 +278,36 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
+def _layer_routed_expert_count(prefix: str, config) -> int:
+    """Return the routed-expert count for the model layer in ``prefix``.
+
+    Honors ``n_routed_experts_per_layer`` (a per-layer list indexed by the
+    GLOBAL model layer number, dense layers included) for heterogeneous
+    expert widths; uniform configs fall back to the scalar
+    ``n_routed_experts`` unchanged.
+
+    Raises:
+        ValueError: ``n_routed_experts_per_layer`` is set but no layer index
+            can be parsed from ``prefix``, or the index is out of range.
+    """
+    per_layer = getattr(config, "n_routed_experts_per_layer", None)
+    if per_layer is None:
+        return config.n_routed_experts
+    layer_idx = _parse_layer_index(prefix)
+    if layer_idx is None:
+        raise ValueError(
+            "n_routed_experts_per_layer is set but the layer index cannot "
+            f"be parsed from prefix {prefix!r}"
+        )
+    if layer_idx >= len(per_layer):
+        raise ValueError(
+            "n_routed_experts_per_layer has "
+            f"{len(per_layer)} entries but layer {layer_idx} ({prefix!r}) "
+            "requires one."
+        )
+    return int(per_layer[layer_idx])
+
+
 class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
@@ -291,6 +323,18 @@ class DeepseekV2MoE(nn.Module):
         self.tp_rank = get_tensor_model_parallel_rank()
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+
+        # Heterogeneous expert widths: when the HF config carries
+        # n_routed_experts_per_layer (a per-layer list), override the scalar
+        # for THIS layer (index parsed from prefix) on a shallow config copy,
+        # so every config.n_routed_experts read below sees this layer's width.
+        # _layer_routed_expert_count raises loudly for an unparseable prefix
+        # or out-of-range index rather than silently falling back to the
+        # global scalar (which would build the layer with the wrong width).
+        if getattr(config, "n_routed_experts_per_layer", None) is not None:
+            layer_count = _layer_routed_expert_count(prefix, config)
+            config = copy.copy(config)
+            config.n_routed_experts = layer_count
 
         self.ep_group = get_ep_group().device_group
         self.ep_rank = get_ep_group().rank_in_group
@@ -1785,7 +1829,14 @@ class DeepseekV2Model(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts
+            num_experts=(
+                # Heterogeneous widths: the widest layer bounds the
+                # name-mapping table; narrower layers simply never match
+                # the higher expert ids.
+                max(self.config.n_routed_experts_per_layer)
+                if getattr(self.config, "n_routed_experts_per_layer", None)
+                else self.config.n_routed_experts
+            )
             + (
                 self.config.n_shared_experts
                 if rocm_aiter_moe_shared_expert_enabled
@@ -1910,6 +1961,15 @@ class DeepseekV2Model(nn.Module):
                         f"not divisible by num_chunks {num_chunks}"
                     )
                     chunk_size = total // num_chunks
+                    # B5: the fused shared-expert slot for THIS layer sits at
+                    # <this layer's routed-expert count> + j, NOT the global
+                    # scalar. The per-layer FusedMoE is built with
+                    # num_experts=<layer width>, so using the global scalar
+                    # would map shared-expert weights into the wrong slot (or
+                    # a non-existent one) on heterogeneous checkpoints.
+                    shared_expert_offset = _layer_routed_expert_count(
+                        name, self.config
+                    )
 
                 for j in range(num_chunks):
                     chunk_name = name
@@ -1927,7 +1987,7 @@ class DeepseekV2Model(nn.Module):
                         # can route it
                         chunk_name = name.replace(
                             "mlp.shared_experts",
-                            f"mlp.experts.{self.config.n_routed_experts + j}",
+                            f"mlp.experts.{shared_expert_offset + j}",
                         )
 
                     # Use expert_params_mapping to locate the destination
