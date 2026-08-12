@@ -125,7 +125,13 @@ if [[ -n "${kv_offloading_size}" \
   exit 2
 fi
 native_l2_enabled=0
-if [[ -n "${native_l2_path}" || -n "${native_l2_size}" ]]; then
+# A zero capacity disables filesystem L2 even when a deployment supplies a
+# reusable default path. Positive capacities require the complete L1/L2
+# contract below.
+if [[ -n "${native_l2_size}" \
+  && "${native_l2_size}" =~ ^0*([.]0*)?$ ]]; then
+  :
+elif [[ -n "${native_l2_path}" || -n "${native_l2_size}" ]]; then
   if [[ -z "${native_l2_path}" || -z "${native_l2_size}" ]]; then
     echo "NATIVE_L2_PATH and NATIVE_L2_GB must be set together" >&2
     exit 2

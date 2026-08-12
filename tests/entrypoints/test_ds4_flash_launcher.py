@@ -289,6 +289,25 @@ def test_ds4_launcher_zero_kv_offload_stays_disabled(tmp_path: Path) -> None:
     assert "--kv-offloading-size" not in output
 
 
+def test_ds4_launcher_zero_native_l2_stays_disabled_with_path(
+    tmp_path: Path,
+) -> None:
+    """Verify that a zero L2 capacity permits a reusable default path.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
+    output = _dry_run(
+        tmp_path,
+        NATIVE_L2_GB="0",
+        NATIVE_L2_PATH="/cache/native-l2",
+    )
+
+    assert "native_l2=0" in output
+    assert "--kv-transfer-config" not in output
+    assert "OffloadingConnector" not in output
+
+
 def test_ds4_launcher_rejects_invalid_kv_offload_size(tmp_path: Path) -> None:
     """Verify rejection of a nonnumeric native-offload size.
 
