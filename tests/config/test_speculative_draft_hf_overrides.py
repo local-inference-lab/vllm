@@ -136,43 +136,74 @@ def test_composed_override_is_picklable():
 
 
 @pytest.mark.cpu_test
-def test_mtp_same_model_inherits_target_revisions():
+@pytest.mark.parametrize("method", ["mtp", "dspark"])
+def test_in_checkpoint_draft_inherits_target_identity(method):
     spec = SimpleNamespace(
-        method="mtp",
+        method=method,
         model="org/model",
         revision=None,
         code_revision=None,
+        quantization=None,
         target_model_config=SimpleNamespace(
             model="org/model",
             revision="weights-commit",
             code_revision="code-commit",
+            quantization="deepseek_v4_fp8",
         ),
     )
 
-    SpeculativeConfig._inherit_target_revision_for_mtp(spec)
+    SpeculativeConfig._inherit_target_identity_for_in_checkpoint_draft(spec)
 
     assert spec.revision == "weights-commit"
     assert spec.code_revision == "code-commit"
+    assert spec.quantization == "deepseek_v4_fp8"
 
 
 @pytest.mark.cpu_test
-def test_mtp_explicit_draft_revisions_are_preserved():
+@pytest.mark.parametrize("method", ["mtp", "dspark"])
+def test_in_checkpoint_draft_preserves_explicit_identity(method):
     spec = SimpleNamespace(
-        method="mtp",
+        method=method,
         model="org/model",
         revision="draft-weights",
         code_revision="draft-code",
+        quantization="draft-quantization",
         target_model_config=SimpleNamespace(
             model="org/model",
             revision="target-weights",
             code_revision="target-code",
+            quantization="target-quantization",
         ),
     )
 
-    SpeculativeConfig._inherit_target_revision_for_mtp(spec)
+    SpeculativeConfig._inherit_target_identity_for_in_checkpoint_draft(spec)
 
     assert spec.revision == "draft-weights"
     assert spec.code_revision == "draft-code"
+    assert spec.quantization == "draft-quantization"
+
+
+@pytest.mark.cpu_test
+def test_external_dspark_keeps_its_own_identity():
+    spec = SimpleNamespace(
+        method="dspark",
+        model="org/dspark",
+        revision=None,
+        code_revision=None,
+        quantization=None,
+        target_model_config=SimpleNamespace(
+            model="org/target",
+            revision="target-weights",
+            code_revision="target-code",
+            quantization="target-quantization",
+        ),
+    )
+
+    SpeculativeConfig._inherit_target_identity_for_in_checkpoint_draft(spec)
+
+    assert spec.revision is None
+    assert spec.code_revision is None
+    assert spec.quantization is None
 
 
 @pytest.mark.cpu_test
