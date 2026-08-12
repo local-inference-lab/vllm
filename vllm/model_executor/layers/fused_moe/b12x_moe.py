@@ -762,6 +762,20 @@ def _normalize_b12x_moe_topk_weights(topk_weights: torch.Tensor) -> torch.Tensor
     return topk_weights
 
 
+def _normalize_b12x_moe_padding_routes(topk_ids: torch.Tensor) -> torch.Tensor:
+    """Map vLLM padding sentinels to an expert index accepted by B12X.
+
+    The vLLM top-k kernels assign every padded route an expert ID of ``-1``
+    and a weight of zero. B12X indexes prepared expert storage directly and
+    therefore requires IDs in ``[0, num_experts)``. Mapping the sentinel to
+    expert zero preserves the zero contribution while keeping the operation
+    allocation-free and CUDA-graph-capturable.
+    """
+    if envs.VLLM_MOE_SKIP_PADDING:
+        topk_ids.clamp_min_(0)
+    return topk_ids
+
+
 def _normalize_modelopt_expert_scale(scale: torch.Tensor) -> torch.Tensor:
     if scale.dim() == 2:
         if scale.size(1) not in (1, 2):
@@ -1589,6 +1603,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         ):
             swiglu_limit = None
         topk_ids = _normalize_b12x_moe_topk_ids(topk_ids)
+        topk_ids = _normalize_b12x_moe_padding_routes(topk_ids)
         topk_weights = _normalize_b12x_moe_topk_weights(topk_weights)
         plan = _plan_b12x_moe_fp4_scratch(
             tokens=int(hidden_states.shape[0]),

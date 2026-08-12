@@ -198,6 +198,21 @@ def test_b12x_moe_run_binds_only_the_prepared_expert_owner(monkeypatch) -> None:
     }
 
 
+@pytest.mark.parametrize("skip_padding", [False, True])
+def test_b12x_moe_padding_route_normalization_is_in_place(
+    monkeypatch, skip_padding: bool
+) -> None:
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1" if skip_padding else "0")
+    topk_ids = torch.tensor([[-1, -1], [2, 7]], dtype=torch.int32)
+    data_ptr = topk_ids.data_ptr()
+
+    normalized = b12x_moe._normalize_b12x_moe_padding_routes(topk_ids)
+
+    assert normalized.data_ptr() == data_ptr
+    expected = [[0, 0], [2, 7]] if skip_padding else [[-1, -1], [2, 7]]
+    assert normalized.tolist() == expected
+
+
 def test_b12x_source_release_leaves_prepared_owner_as_storage_owner() -> None:
     layer = torch.nn.Module()
     layer.w13_weight = torch.nn.Parameter(
