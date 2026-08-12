@@ -487,13 +487,29 @@ class Exl3Config(QuantizationConfig):
         self.rank_sliced_metadata = dict(metadata)
         bits_field = metadata["bits"]
         if isinstance(bits_field, str) and bits_field.strip().lower() == "mixed":
-            k_values = tuple(
-                sorted({int(value) for value in metadata.get("k_values", ())})
-            )
-            if not k_values or any(value not in (3, 4, 5, 6) for value in k_values):
+            raw_k_values = metadata.get("k_values", ())
+            # Validate integrality BEFORE the int() comprehension below: a
+            # fractional value (e.g. 2.5 or "2.5") must surface the dedicated
+            # message rather than a bare "invalid literal for int()" from the
+            # sorted({...}) conversion. float()-first also handles JSON strings.
+            if any(float(value) != int(float(value)) for value in raw_k_values):
                 raise ValueError(
-                    "mixed rank-sliced EXL3 requires k_values within 3..6, got "
+                    "mixed rank-sliced EXL3 k_values must be integers, got "
+                    f"{raw_k_values!r}"
+                )
+            k_values = tuple(sorted({int(value) for value in raw_k_values}))
+            if not k_values or any(value not in (2, 3, 4, 5, 6) for value in k_values):
+                raise ValueError(
+                    "mixed rank-sliced EXL3 requires k_values within 2..6, got "
                     f"{metadata.get('k_values')!r}"
+                )
+            # The mixed-Trellis runtime is hard-coded to exactly two tiers
+            # (_prepare_mixed_rank_sliced_weights + api.build_tiered_maps), so
+            # reject a 3+ tier config at load time instead of failing later.
+            if len(k_values) > 2:
+                raise ValueError(
+                    "mixed rank-sliced EXL3 supports at most two bitrates "
+                    f"(two-tier runtime), got {len(k_values)}: {k_values}"
                 )
             if not isinstance(metadata.get("bits_per_expert"), str):
                 raise ValueError(
@@ -545,6 +561,11 @@ class Exl3Config(QuantizationConfig):
                 raise ValueError(
                     "rank-sliced EXL3 bitrate map must contain one entry per expert: "
                     f"layer={layer_index}, field={field!r}, expected={experts}"
+                )
+            if any(int(v) != float(v) for v in raw):
+                raise ValueError(
+                    "rank-sliced EXL3 bitrate map must contain integers, got "
+                    f"layer={layer_index}, field={field!r}, values={raw!r}"
                 )
             bitrates = tuple(int(value) for value in raw)
             unexpected = sorted(set(bitrates).difference(allowed))
@@ -1729,9 +1750,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 f"{layer_bitrates!r}"
             )
         bits = int(layer_bitrates[0])
-        if bits not in (3, 4, 5, 6):
+        if bits not in (2, 3, 4, 5, 6):
             raise ValueError(
-                f"rank-sliced EXL3 requires an integral 3/4/5/6 bitrate, got {bits!r}"
+                f"rank-sliced EXL3 requires an integral 2/3/4/5/6 bitrate, got {bits!r}"
             )
 
         w13 = self._rank_sliced_backing(layer, "w13_trellis")
