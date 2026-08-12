@@ -26,7 +26,6 @@ launch with an expert map.
 """
 
 import dataclasses
-import os
 from typing import TYPE_CHECKING, Any
 
 import regex as re
@@ -221,9 +220,6 @@ def _apply_nf3_codebook_override(levels: list[float]) -> None:
         )
         kernel_module._NF3_CODEBOOK = codebook
         prepare_module._NF3_CODEBOOK = codebook
-    os.environ["SPARKINFER_NF3_CODEBOOK"] = ",".join(
-        f"{value:.10g}" for value in codebook
-    )
 
 
 def _b12x_tiles_for_geometry(
