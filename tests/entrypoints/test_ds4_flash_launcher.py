@@ -46,11 +46,29 @@ def test_ds4_launcher_defaults_to_0731_fixed_k7(tmp_path: Path) -> None:
 
     assert "mode=dspark depth=fixed" in output
     assert "model=deepseek-ai/DeepSeek-V4-Flash-0731" in output
-    assert "9e165c30e2704aec5d9d593cce3eebd58bbef1cb" in output
+    revision = "9e165c30e2704aec5d9d593cce3eebd58bbef1cb"
+    assert f"--revision {revision}" in output
+    assert f"--tokenizer-revision {revision}" in output
     assert 'num_speculative_tokens\\":7' in output
     assert "max_seqs=16 graph=128" in output
     assert "--max-model-len 131072" in output
     assert "--gpu-memory-utilization 0.975" in output
+
+
+def test_ds4_launcher_accepts_distinct_tokenizer_revision(tmp_path: Path) -> None:
+    """Verify that a tokenizer snapshot can be pinned independently.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
+    output = _dry_run(
+        tmp_path,
+        MODEL_REVISION="weights-commit",
+        TOKENIZER_REVISION="tokenizer-commit",
+    )
+
+    assert "--revision weights-commit" in output
+    assert "--tokenizer-revision tokenizer-commit" in output
 
 
 def test_ds4_launcher_dynamic_depth_enables_capacity_mode(tmp_path: Path) -> None:
@@ -61,9 +79,26 @@ def test_ds4_launcher_dynamic_depth_enables_capacity_mode(tmp_path: Path) -> Non
     """
     output = _dry_run(tmp_path, DSPARK_DEPTH_MODE="dynamic")
 
-    assert "mode=dspark depth=dynamic" in output
+    assert "mode=dspark depth=dynamic capacity_activation=auto" in output
     assert 'dspark_capacity_verification_mode\\":\\"varlen' in output
     assert 'dspark_sps_curve\\":\\"auto' in output
+
+
+def test_ds4_launcher_accepts_explicit_capacity_activation_threshold(
+    tmp_path: Path,
+) -> None:
+    """Verify that a numeric capacity threshold overrides profile selection.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
+    output = _dry_run(
+        tmp_path,
+        DSPARK_DEPTH_MODE="dynamic",
+        DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE="4",
+    )
+
+    assert "mode=dspark depth=dynamic capacity_activation=4" in output
 
 
 def test_ds4_launcher_uses_speculative_attention_backend_field(
