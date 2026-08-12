@@ -12,10 +12,7 @@ from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
-from vllm.v1.worker.gpu.cudagraph_utils import (
-    BatchExecutionDescriptor,
-    get_uniform_token_count,
-)
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
@@ -25,6 +22,7 @@ from vllm.v1.worker.gpu.spec_decode.speculator import (
     CUDAGraphCapturePhase,
     DraftModelSpeculator,
 )
+from vllm.v1.worker.utils import get_uniform_decode_token_count
 
 logger = init_logger(__name__)
 
@@ -252,13 +250,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 self.max_num_reqs,
             )
 
-        # Uniform decode query lengths enable FULL graph replay.
-        uniform_token_count = get_uniform_token_count(
+        # FULL graph replay is valid only when every request is decoding.
+        uniform_token_count = get_uniform_decode_token_count(
             num_reqs,
             # Use the actual number of tokens without padding added by
             # the target model during FULL cudagraph.
             num_tokens,
             max_query_len,
+            input_batch.has_prefill,
         )
         with record_function_or_nullcontext("vllm:v2/speculator/prefill/dispatch"):
             rebuild_prefill_attn_metadata = getattr(

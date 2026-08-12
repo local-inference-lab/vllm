@@ -51,3 +51,15 @@ def test_make_dummy_distributes_remainder(num_reqs: int, num_tokens: int):
     assert torch.equal(
         batch.query_start_loc.cpu(), torch.from_numpy(batch.query_start_loc_np)
     )
+
+
+def test_has_prefill_reflects_request_state():
+    """FULL decode graph eligibility must observe every scheduled request."""
+    buffers = InputBuffers(
+        max_num_reqs=2, max_num_tokens=16, device=torch.device(DEVICE)
+    )
+    batch = InputBatch.make_dummy(num_reqs=2, num_tokens=16, input_buffers=buffers)
+
+    assert not batch.has_prefill
+    batch.is_prefilling_np[1] = True
+    assert batch.has_prefill
