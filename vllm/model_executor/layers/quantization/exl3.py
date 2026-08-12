@@ -1174,6 +1174,17 @@ class Exl3LinearMethod(LinearMethodBase):
         return output[..., :logical_n]
 
 
+# Canonical dtype for each EXL3 tensor suffix that may be loaded into a slab.
+# Derived from the kernel boundary (see _validate_moe_shapes) rather than from
+# untrusted checkpoint tensors, so a malformed checkpoint cannot coerce the slab
+# backing dtype via the first tensor it happens to load.  mcg/mul1 markers are
+# int32 but are never slab-preallocated, so they are intentionally absent.
+_EXL3_SLAB_DTYPE: dict[str, torch.dtype] = {
+    "trellis": torch.int16,
+    "suh": torch.float16,
+    "svh": torch.float16,
+}
+
 class Exl3MoEParameter(BasevLLMParameter):
     """EXL3 tensors keyed by expert/projection, optionally in one GPU slab."""
 
@@ -1185,11 +1196,11 @@ class Exl3MoEParameter(BasevLLMParameter):
         shard_ids: tuple[str, ...] = (),
         preallocate: bool = False,
         preallocate_groups: tuple[tuple[int, ...], ...] = (),
+        suffix: str = "",
     ):
-        del num_experts, shard_ids, preallocate, preallocate_groups
+        del num_experts, shard_ids, preallocate, preallocate_groups, suffix
         data = torch.empty(0, dtype=torch.uint8)
         return super().__new__(cls, data=data, weight_loader=weight_loader)
-
     def __init__(
         self,
         *,
@@ -1198,12 +1209,14 @@ class Exl3MoEParameter(BasevLLMParameter):
         shard_ids: tuple[str, ...] = (),
         preallocate: bool = False,
         preallocate_groups: tuple[tuple[int, ...], ...] = (),
+        suffix: str = "",
     ):
         self.exl3_tensors: dict[tuple[int, str], torch.Tensor] = {}
         self.exl3_backing: torch.Tensor | None = None
         self.exl3_num_experts = int(num_experts)
         self.exl3_shard_ids = tuple(shard_ids)
         self.exl3_preallocate = bool(preallocate)
+        self.exl3_suffix = str(suffix)
         self.exl3_preallocate_groups = tuple(
             tuple(int(expert_id) for expert_id in group) for group in preallocate_groups
         )
@@ -1254,6 +1267,10 @@ class Exl3MoEParameter(BasevLLMParameter):
                 ) from exc
             if self.device.type == "meta":
                 raise RuntimeError("rank-sliced EXL3 slabs cannot be allocated on meta")
+            # Schema-derived dtype for this suffix (trellis->int16, suh/svh->
+            # float16); authoritative over the untrusted first tensor so a
+            # malformed checkpoint cannot pin the slab dtype.
+            expected_dtype = _EXL3_SLAB_DTYPE.get(self.exl3_suffix)
             backing = self.exl3_group_backings[group_index]
             if backing is None:
                 group_size = len(self.exl3_preallocate_groups[group_index])
@@ -1262,9 +1279,20 @@ class Exl3MoEParameter(BasevLLMParameter):
                     if len(self.exl3_shard_ids) > 1
                     else (group_size,)
                 )
+                # Allocated with torch.empty: the backing is uninitialized until
+                # every (expert, shard) slot is copy_'d in.  The `loaded ==
+                # expected` completeness check in exl3_group_backing is what
+                # prevents a direct reader of exl3_group_backings[i] from seeing
+                # garbage, so any future caller must go through that accessor
+                # rather than indexing the backing directly.
+                slab_dtype = (
+                    expected_dtype
+                    if expected_dtype is not None
+                    else loaded_weight.dtype
+                )
                 backing = torch.empty(
                     prefix + tuple(loaded_weight.shape),
-                    dtype=loaded_weight.dtype,
+                    dtype=slab_dtype,
                     device=self.device,
                 )
                 self.exl3_group_backings[group_index] = backing
@@ -1278,6 +1306,18 @@ class Exl3MoEParameter(BasevLLMParameter):
                 raise ValueError(
                     "rank-sliced EXL3 tensor shape changed within one grouped slab: "
                     f"expected={tuple(target.shape)}, got={tuple(loaded_weight.shape)}"
+                )
+            # C15: reject a dtype mismatch before copy_, which would otherwise
+            # silently cast (e.g. an int32 trellis tensor among int16 ones) and
+            # let a malformed checkpoint pass _validate_moe_shapes.  When the
+            # suffix has a canonical dtype it is authoritative; otherwise we
+            # enforce consistency against the first tensor (target.dtype).
+            want_dtype = expected_dtype if expected_dtype is not None else target.dtype
+            if loaded_weight.dtype != want_dtype:
+                raise ValueError(
+                    f"EXL3 grouped slab {self.exl3_suffix!r} (expert {expert_id}, "
+                    f"shard {shard_id!r}) dtype is {loaded_weight.dtype}, "
+                    f"expected {want_dtype}"
                 )
             target.copy_(loaded_weight, non_blocking=True)
             self.exl3_tensors[key] = target
@@ -1295,15 +1335,21 @@ class Exl3MoEParameter(BasevLLMParameter):
             )
         if self.device.type == "meta":
             raise RuntimeError("rank-sliced EXL3 slabs cannot be allocated on meta")
+        expected_dtype = _EXL3_SLAB_DTYPE.get(self.exl3_suffix)
         if self.exl3_backing is None:
             prefix = (
                 (len(self.exl3_shard_ids), self.exl3_num_experts)
                 if len(self.exl3_shard_ids) > 1
                 else (self.exl3_num_experts,)
             )
+            slab_dtype = (
+                expected_dtype
+                if expected_dtype is not None
+                else loaded_weight.dtype
+            )
             self.exl3_backing = torch.empty(
                 prefix + tuple(loaded_weight.shape),
-                dtype=loaded_weight.dtype,
+                dtype=slab_dtype,
                 device=self.device,
             )
         shard_index = self.exl3_shard_ids.index(shard_id)
@@ -1317,11 +1363,31 @@ class Exl3MoEParameter(BasevLLMParameter):
                 "rank-sliced EXL3 tensor shape changed within one slab: "
                 f"expected={tuple(target.shape)}, got={tuple(loaded_weight.shape)}"
             )
+        # C15: reject a dtype mismatch before copy_, which would otherwise
+        # silently cast (e.g. a float32 scale among float16 ones) and let a
+        # malformed checkpoint pass _validate_moe_shapes.  When the suffix has
+        # a canonical dtype it is authoritative; otherwise we enforce
+        # consistency against the first tensor (target.dtype).
+        want_dtype = expected_dtype if expected_dtype is not None else target.dtype
+        if loaded_weight.dtype != want_dtype:
+            raise ValueError(
+                f"EXL3 slab {self.exl3_suffix!r} (expert {expert_id}, "
+                f"shard {shard_id!r}) dtype is {loaded_weight.dtype}, "
+                f"expected {want_dtype}"
+            )
         target.copy_(loaded_weight, non_blocking=True)
         self.exl3_tensors[key] = target
 
     def exl3_group_backing(self, expert_ids: tuple[int, ...]) -> torch.Tensor:
-        """Return a fully loaded tier slab in the requested expert order."""
+        """Return a fully loaded tier slab in the requested expert order.
+
+        Layout contract: the backing is shard-major, group-offset-minor, in
+        ``exl3_shard_ids`` order — i.e. ``backing[shard_index, group_offset]``
+        (or ``backing[group_offset]`` for a single shard) where ``shard_index``
+        is the position in ``exl3_shard_ids`` and ``group_offset`` is the
+        expert's position within its preallocation group.  The mixed-rank-sliced
+        loader relies on this exact ordering to stack tiers correctly.
+        """
 
         expert_ids = tuple(int(expert_id) for expert_id in expert_ids)
         try:
@@ -1482,6 +1548,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                         preallocate_groups=(
                             mixed_trellis_groups if suffix == "trellis" else ()
                         ),
+                        suffix=suffix,
                     ),
                 )
 

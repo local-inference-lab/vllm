@@ -256,6 +256,115 @@ def test_rank_sliced_parameter_preallocates_bitrate_group_slabs(monkeypatch):
         )
 
 
+def test_grouped_slab_rejects_mismatched_trellis_dtype(monkeypatch):
+    """C15: an int32 trellis tensor among int16 ones must raise, not silently cast."""
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    groups = ((0, 2), (1, 3))
+    param = Exl3MoEParameter(
+        weight_loader=lambda *args, **kwargs: None,
+        num_experts=4,
+        shard_ids=("w1", "w3"),
+        preallocate_groups=groups,
+        suffix="trellis",
+    )
+    # First (correct) int16 tensor pins the slab dtype to the schema value.
+    param.load_exl3_weight(
+        torch.zeros((2, 2, 48), dtype=torch.int16),
+        expert_id=0,
+        shard_id="w1",
+    )
+    # A later int32 tensor must be rejected instead of being truncated to int16
+    # by target.copy_ and then passing _validate_moe_shapes.
+    with pytest.raises(
+        ValueError, match="dtype is torch.int32, expected torch.int16"
+    ):
+        param.load_exl3_weight(
+            torch.zeros((2, 2, 48), dtype=torch.int32),
+            expert_id=2,
+            shard_id="w1",
+        )
+
+
+def test_grouped_slab_rejects_wrong_first_tensor_dtype(monkeypatch):
+    """C15: the schema-derived dtype catches a malformed first tensor too."""
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    param = Exl3MoEParameter(
+        weight_loader=lambda *args, **kwargs: None,
+        num_experts=2,
+        shard_ids=("w1",),
+        preallocate_groups=((0, 1),),
+        suffix="trellis",
+    )
+    with pytest.raises(
+        ValueError, match="dtype is torch.int32, expected torch.int16"
+    ):
+        param.load_exl3_weight(
+            torch.zeros((2, 2, 48), dtype=torch.int32),
+            expert_id=0,
+            shard_id="w1",
+        )
+
+
+def test_projection_slab_rejects_mismatched_scale_dtype(monkeypatch):
+    """C15: a float32 scale among float16 scales must raise, not silently cast."""
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    param = Exl3MoEParameter(
+        weight_loader=lambda *args, **kwargs: None,
+        num_experts=3,
+        shard_ids=("w1", "w3"),
+        preallocate=True,
+        suffix="suh",
+    )
+    param.load_exl3_weight(
+        torch.zeros(8, dtype=torch.float16),
+        expert_id=1,
+        shard_id="w1",
+    )
+    with pytest.raises(
+        ValueError, match="dtype is torch.float32, expected torch.float16"
+    ):
+        param.load_exl3_weight(
+            torch.zeros(8, dtype=torch.float32),
+            expert_id=2,
+            shard_id="w3",
+        )
+
+
+def test_grouped_slab_accepts_consistent_dtype(monkeypatch):
+    """C15: a homogeneous-dtype grouped slab still loads (regression guard)."""
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    groups = ((0, 1),)
+    param = Exl3MoEParameter(
+        weight_loader=lambda *args, **kwargs: None,
+        num_experts=2,
+        shard_ids=("w1", "w3"),
+        preallocate_groups=groups,
+        suffix="trellis",
+    )
+    for expert_id in range(2):
+        for shard_id in ("w1", "w3"):
+            param.load_exl3_weight(
+                torch.full((2, 2, 48), expert_id, dtype=torch.int16),
+                expert_id=expert_id,
+                shard_id=shard_id,
+            )
+    slab = param.exl3_group_backing(groups[0])
+    assert tuple(slab.shape) == (2, 2, 2, 2, 48)
+    assert slab.dtype == torch.int16
+
+
 def test_rank_sliced_broadcast_pointer_table_repeats_one_physical_row():
     slab = torch.ones((1, 128), dtype=torch.float16)
 
