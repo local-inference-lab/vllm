@@ -1,57 +1,70 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Path validation helpers for operator-supplied native library paths.
-
-Used by callers that load shared libraries (``.so``) via ``ctypes.CDLL``
-from paths taken from environment variables (e.g. ``VLLM_NCCL_SO_PATH``,
-``VLLM_EXL3_ABI_SHIM``). Without validation, any process that can set
-the env var achieves arbitrary native code execution (supply-chain /
-local privilege boundary).
-"""
+"""Validation helpers for operator-supplied native library paths."""
 
 import os
+import stat
 
-_WORLD_WRITABLE = 0o002
-_GROUP_WRITABLE = 0o020
+_GROUP_WRITABLE = stat.S_IWGRP
+_WORLD_WRITABLE = stat.S_IWOTH
 
 
-def validate_native_lib_path(path: str, env_var: str) -> None:
-    """Validate a path to a native .so before loading it via ctypes.CDLL.
+def validate_native_lib_path(path: str, env_var: str) -> str:
+    """Validate a native library path and return the path to load.
 
-    Checks:
-      - The path resolves to a regular file (not a directory or device node).
-      - The path is not a symlink (prevents symlink-swap attacks).
-      - The file is not group/world-writable (prevents in-place replacement
-        by an unprivileged user).
-      - The parent directory is not world-writable (prevents an attacker
-        from creating a new .so in the same directory).
+    The returned value MUST be the one handed to ``ctypes.CDLL``. Validating
+    one path and loading another re-opens the bypass this function closes.
 
     Args:
-        path: The filesystem path to validate.
-        env_var: The name of the env var the path came from, used in error
-            messages for operator diagnostics.
+        path: Operator-supplied path from ``env_var``.
+        env_var: Environment variable name, used in error messages.
+
+    Returns:
+        The canonical absolute path that passed validation.
 
     Raises:
-        ValueError: If any check fails.
+        ValueError: The path is relative, contains a symlink component, is not
+            a regular file, or it/an ancestor is group- or world-writable.
     """
-    p = os.path.abspath(path)
-    if not os.path.isfile(p):
+    if not os.path.isabs(path):
+        # A bare soname makes dlopen search its own path, so the inode that
+        # was validated is not necessarily the inode that gets loaded.
+        raise ValueError(f"{env_var} must be an absolute path: {path!r}")
+
+    resolved = os.path.realpath(path)
+    if resolved != os.path.normpath(path):
+        # realpath differs => at least one component is a symlink. islink()
+        # only inspects the final component, so it cannot catch this.
         raise ValueError(
-            f"{env_var} points to a non-existent or non-regular file: {path!r}"
+            f"{env_var} must not contain a symlink component: "
+            f"{path!r} resolves to {resolved!r}"
         )
-    if os.path.islink(path):
-        raise ValueError(f"{env_var} must not be a symlink: {path!r}")
-    st = os.stat(p)
-    if st.st_mode & (_WORLD_WRITABLE | _GROUP_WRITABLE):
+
+    st = os.lstat(resolved)
+    if stat.S_ISLNK(st.st_mode):
+        raise ValueError(f"{env_var} must not be a symlink: {resolved!r}")
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"{env_var} must be a regular file: {resolved!r}")
+    if st.st_mode & (_GROUP_WRITABLE | _WORLD_WRITABLE):
         raise ValueError(
-            f"{env_var} file must not be group/world-writable "
-            f"(mode {oct(st.st_mode & 0o777)}): {path!r}"
+            f"{env_var} must not be group/world-writable: {resolved!r}"
         )
-    parent = os.path.dirname(p)
-    if parent:
-        pst = os.stat(parent)
-        if pst.st_mode & _WORLD_WRITABLE:
+
+    # Walk every ancestor: a writable directory anywhere on the chain lets an
+    # attacker replace a component and redirect the load.
+    parent = os.path.dirname(resolved)
+    while True:
+        pst = os.lstat(parent)
+        writable = pst.st_mode & (_GROUP_WRITABLE | _WORLD_WRITABLE)
+        # The sticky bit (/tmp) stops non-owners from replacing entries.
+        if writable and not (pst.st_mode & stat.S_ISVTX):
             raise ValueError(
-                f"{env_var} parent directory must not be world-writable: "
-                f"{parent!r}"
+                f"{env_var} ancestor directory must not be "
+                f"group/world-writable: {parent!r}"
             )
+        nxt = os.path.dirname(parent)
+        if nxt == parent:
+            break
+        parent = nxt
+
+    return resolved
