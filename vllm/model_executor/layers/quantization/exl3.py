@@ -24,6 +24,7 @@ import importlib
 import os
 import re
 import sys
+from collections.abc import Iterable
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -158,6 +159,33 @@ _RANK_SLICED_WEIGHT_RE = re.compile(
     r"^(?P<prefix>.+)\.rank(?P<rank>\d+)\."
     r"(?P<field>trellis|suh|svh|mcg|mul1)$"
 )
+
+
+def normalize_rank_sliced_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    quant_config: Any,
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Drop non-local TP payloads and strip the serialized ``.rank{r}`` segment.
+
+    Thin generator wrapper around
+    ``quant_config.normalize_rank_sliced_weight_name`` that handles the
+    ``getattr`` fallback: when ``quant_config`` has no such method (e.g. a
+    non-EXL3 checkpoint) the weights are yielded unchanged. Weights whose name
+    normalizes to ``None`` (a non-local TP rank) are dropped.
+
+    This deduplicates the per-model loader boilerplate that previously appeared
+    as inline copies in ``qwen3_5.py`` and ``qwen3_5_mtp.py``.
+    """
+    rank_sliced_name = getattr(
+        quant_config, "normalize_rank_sliced_weight_name", None
+    )
+    if rank_sliced_name is None:
+        return weights
+    return (
+        (new_name, loaded_weight)
+        for name, loaded_weight in weights
+        if (new_name := rank_sliced_name(name)) is not None
+    )
 
 ShardId = str | int | tuple[int, ...] | None
 

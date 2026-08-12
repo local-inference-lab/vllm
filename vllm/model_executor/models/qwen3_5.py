@@ -38,6 +38,9 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.exl3 import (
+    normalize_rank_sliced_weights,
+)
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
@@ -287,21 +290,7 @@ class Qwen3_5Model(Qwen3NextModel):
         # as deepseek_v2.load_weights does; otherwise the expert-mapping
         # string surgery produces `...experts.w13_rank0.trellis` and the
         # parameter lookup fails.
-        rank_sliced_name = getattr(
-            self.quant_config,
-            "normalize_rank_sliced_weight_name",
-            None,
-        )
-        if rank_sliced_name is not None:
-
-            def _normalize_rank_sliced(weights):
-                for name, loaded_weight in weights:
-                    name = rank_sliced_name(name)
-                    if name is None:
-                        continue
-                    yield name, loaded_weight
-
-            weights = _normalize_rank_sliced(weights)
+        weights = normalize_rank_sliced_weights(weights, self.quant_config)
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=mapper)
 
