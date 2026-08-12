@@ -2145,6 +2145,101 @@ def test_v1_profile_rolls_back_distinct_target_and_draft_channels(monkeypatch):
     assert events[-1] == ("rollback", checkpoint)
 
 
+@pytest.mark.parametrize("dummy_run_fails", [False, True])
+def test_single_request_prefill_profile_uses_serving_shape_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    dummy_run_fails: bool,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.vllm_config = object()
+    runner.max_num_tokens = 8192
+    runner.is_pooling_model = False
+    runner.encoder_cache = {"temporary": object()}
+    events: list[object] = []
+
+    runner._init_minimal_kv_cache_for_profiling = lambda: events.append("init-kv")
+
+    def dummy_run(*args, **kwargs):
+        events.append(("dummy-run", args, kwargs))
+        if dummy_run_fails:
+            raise RuntimeError("expected prefill failure")
+        return torch.empty(1), torch.empty(1)
+
+    runner._dummy_run = dummy_run
+    runner._dummy_sampler_run = lambda hidden_states: events.append(
+        ("sampler", hidden_states)
+    )
+    runner._sync_device = lambda: events.append("sync")
+    runner._cleanup_profiling_kv_cache = lambda: events.append("cleanup")
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_current_vllm_config",
+        lambda _: nullcontext(),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+
+    if dummy_run_fails:
+        with pytest.raises(RuntimeError, match="expected prefill failure"):
+            runner.profile_single_request_prefill()
+    else:
+        runner.profile_single_request_prefill()
+
+    assert events[0] == "init-kv"
+    assert events[1] == (
+        "dummy-run",
+        (8192,),
+        {
+            "force_attention": True,
+            "skip_eplb": True,
+            "is_profile": True,
+            "include_mm_inputs": False,
+            "single_request_prefill": True,
+        },
+    )
+    assert events[-1] == "cleanup"
+    assert runner.encoder_cache == {}
+    if not dummy_run_fails:
+        assert events[-2] == "sync"
+
+
+def test_dummy_sampler_profiles_configured_speculative_width(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(multimodal_config=None)
+    )
+    runner.model = SimpleNamespace(
+        compute_logits=lambda hidden_states: torch.zeros(hidden_states.shape[0], 16)
+    )
+    runner.sampler = Mock(logprobs_mode="raw_logits")
+    runner.sampler.return_value = torch.empty(0)
+    runner.speculative_config = SimpleNamespace(
+        rejection_sample_method="standard",
+        draft_sample_method="greedy",
+    )
+    runner.num_spec_tokens = 5
+    runner.rejection_sampler = Mock()
+    make_dummy = Mock(return_value=object())
+    monkeypatch.setattr(
+        gpu_model_runner_module.SpecDecodeMetadata,
+        "make_dummy",
+        make_dummy,
+    )
+
+    runner._dummy_sampler_run(torch.zeros(3, 8))
+
+    make_dummy.assert_called_once_with([[0] * 5 for _ in range(3)], runner.device)
+    rejection_logits = runner.rejection_sampler.call_args.args[2]
+    assert rejection_logits.shape == (18, 16)
+
+
 @pytest.mark.parametrize("cleanup_fails", [False, True])
 def test_v1_profile_restores_state_when_capture_or_cleanup_fails(
     monkeypatch,

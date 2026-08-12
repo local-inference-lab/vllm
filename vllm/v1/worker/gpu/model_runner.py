@@ -758,6 +758,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         uniform_query_len: int | None = None,
         skip_eplb: bool = False,
         is_profile: bool = False,
+        single_request_prefill: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if self.is_encoder_only:
@@ -770,7 +771,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Create a dummy scheduler output.
         num_reqs = min(num_tokens, self.max_num_reqs)
-        if uniform_decode:
+        if single_request_prefill:
+            if uniform_decode:
+                raise ValueError(
+                    "single_request_prefill and uniform_decode are mutually exclusive"
+                )
+            num_reqs = 1
+        elif uniform_decode:
             if uniform_query_len is not None:
                 # Sub-depth uniform decode (SPS curve profiling): dispatch a
                 # capacity-pruned verify shape, e.g. one request at a query
@@ -900,6 +907,49 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return hidden_states, sample_hidden_states
 
     @torch.inference_mode()
+    def _make_dummy_spec_decode_batch(self, num_reqs: int) -> InputBatch:
+        """Construct a verifier batch at the configured speculative width."""
+        assert self.num_speculative_steps > 0
+        assert self.decode_query_len > self.num_speculative_steps
+
+        num_logits_per_req = self.decode_query_len
+        num_logits = num_reqs * num_logits_per_req
+        input_batch = InputBatch.make_dummy(
+            num_reqs,
+            num_logits,
+            self.input_buffers,
+            max_req_tokens=num_logits_per_req,
+        )
+
+        num_draft_tokens_per_req = np.full(
+            num_reqs, self.num_speculative_steps, dtype=np.int32
+        )
+        cu_num_logits_np = np.arange(
+            0, num_logits + 1, num_logits_per_req, dtype=np.int32
+        )
+        local_pos = torch.arange(
+            num_logits_per_req, dtype=torch.int32, device=self.device
+        ).repeat(num_reqs)
+
+        input_batch.num_draft_tokens = int(num_draft_tokens_per_req.sum())
+        input_batch.num_draft_tokens_per_req = num_draft_tokens_per_req
+        input_batch.valid_num_draft_tokens_per_req = num_draft_tokens_per_req
+        input_batch.expanded_idx_mapping = input_batch.idx_mapping.repeat_interleave(
+            num_logits_per_req
+        )
+        input_batch.expanded_local_pos = local_pos
+        input_batch.positions.copy_(local_pos)
+        input_batch.logits_indices = torch.arange(
+            num_logits, dtype=torch.int64, device=self.device
+        )
+        input_batch.cu_num_logits_np = cu_num_logits_np
+        input_batch.cu_num_logits = torch.from_numpy(cu_num_logits_np).to(
+            device=self.device
+        )
+        input_batch.is_padding.fill_(False)
+        return input_batch
+
+    @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
         num_reqs = hidden_states.shape[0]
         logits = self.model.compute_logits(hidden_states)
@@ -912,6 +962,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # during actual execution.
         assert self.sampler is not None
         self.sampler(logits, dummy_input_batch)
+
+        if self.rejection_sampler is None or self.num_speculative_steps == 0:
+            return
+
+        assert self.speculator is not None
+        del logits
+        verify_hidden_states = hidden_states.repeat_interleave(
+            self.decode_query_len, dim=0
+        )
+        verify_logits = self.model.compute_logits(verify_hidden_states)
+        dummy_spec_batch = self._make_dummy_spec_decode_batch(num_reqs)
+        self.rejection_sampler(
+            verify_logits,
+            dummy_spec_batch,
+            self.speculator.draft_logits,
+        )
 
     @torch.inference_mode()
     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:
@@ -969,6 +1035,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         del hidden_states, sample_hidden_states
         self.reset_encoder_cache()
         gc.collect()
+
+    @torch.inference_mode()
+    def profile_single_request_prefill(self) -> None:
+        """Profile the maximum text-prefill shape before sizing the KV cache.
+
+        The ordinary V2 profile omits attention and distributes
+        ``max_num_batched_tokens`` across ``max_num_seqs`` requests. Sparse
+        attention can initialize persistent metadata buffers and reach a larger
+        transient peak when one request consumes the complete token budget.
+        A temporary minimal KV cache exposes that serving path while dummy slot
+        mappings suppress cache writes.
+        """
+        with set_current_vllm_config(self.vllm_config):
+            self._init_minimal_kv_cache_for_profiling()
+
+        hidden_states: torch.Tensor | None = None
+        sample_hidden_states: torch.Tensor | None = None
+        try:
+            hidden_states, sample_hidden_states = self._dummy_run(
+                self.max_num_tokens,
+                skip_eplb=True,
+                is_profile=True,
+                single_request_prefill=True,
+            )
+            if self.is_last_pp_rank:
+                assert hidden_states is not None
+                assert sample_hidden_states is not None
+                if self.pooling_runner is None:
+                    self._dummy_sampler_run(sample_hidden_states)
+                else:
+                    self._dummy_pooler_run(hidden_states)
+            torch.accelerator.synchronize()
+        finally:
+            hidden_states = None
+            sample_hidden_states = None
+            self.reset_encoder_cache()
+            self._cleanup_cudagraph_memory_profile()
 
     def post_kv_cache_wake_up(self) -> None:
         self.block_tables.init_block_table_layout_tensors()

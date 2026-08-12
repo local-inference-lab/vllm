@@ -6492,7 +6492,7 @@ class GPUModelRunner(
             else:
                 raise e
         if self.speculative_config:
-            draft_token_ids = [[0] for _ in range(num_reqs)]
+            draft_token_ids = [[0] * self.num_spec_tokens for _ in range(num_reqs)]
             dummy_spec_decode_metadata = SpecDecodeMetadata.make_dummy(
                 draft_token_ids, self.device
             )
@@ -6695,6 +6695,42 @@ class GPUModelRunner(
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
+
+    @torch.inference_mode()
+    def profile_single_request_prefill(self) -> None:
+        """Profile the maximum text-prefill shape before sizing the KV cache.
+
+        The ordinary profile distributes ``max_num_batched_tokens`` across
+        ``max_num_seqs`` requests. Sparse-attention metadata and communication
+        workspaces can have a larger peak for one request containing the entire
+        token budget. A temporary KV cache makes that attention path available;
+        dummy slot mappings suppress cache writes, so minimal storage is enough.
+        """
+        with set_current_vllm_config(self.vllm_config):
+            self._init_minimal_kv_cache_for_profiling()
+
+        model_output: tuple[torch.Tensor, torch.Tensor] | None = None
+        sampler_output: Any = None
+        try:
+            model_output = self._dummy_run(
+                self.max_num_tokens,
+                force_attention=True,
+                skip_eplb=True,
+                is_profile=True,
+                include_mm_inputs=False,
+                single_request_prefill=True,
+            )
+            hidden_states, last_hidden_states = model_output
+            if get_pp_group().is_last_rank:
+                if self.is_pooling_model:
+                    sampler_output = self._dummy_pooler_run(hidden_states)
+                else:
+                    sampler_output = self._dummy_sampler_run(last_hidden_states)
+            self._sync_device()
+        finally:
+            del model_output, sampler_output
+            self.encoder_cache.clear()
+            self._cleanup_profiling_kv_cache()
 
     def _init_minimal_kv_cache_for_profiling(self) -> None:
         from vllm.v1.core.kv_cache_utils import (
