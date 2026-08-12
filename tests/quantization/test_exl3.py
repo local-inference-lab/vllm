@@ -575,7 +575,9 @@ def test_mixed_rank_sliced_with_k2_hydrates_per_layer_bitrates(monkeypatch):
 
 
 def test_uniform_k2_rank_sliced_metadata():
-    """K2 is accepted as a uniform rank-sliced bitrate."""
+    """Uniform K2 hydrates the bitrate vector, and the uniform branch's only
+    bitrate guard -- the integrality check in rank_sliced_layer_bitrates --
+    rejects a fractional uniform bitrate instead of silently truncating it."""
     config = Exl3Config()
     config.maybe_update_config(
         "unused",
@@ -584,19 +586,35 @@ def test_uniform_k2_rank_sliced_metadata():
             _commit_hash="revision",
         ),
     )
-    assert config.bits == 2.0
     assert config.rank_sliced_k_values is None
+    # The uniform branch carries no load-time range check, but the bitrate
+    # accessor must still emit an integral tier vector for K2.
     assert config.rank_sliced_layer_bitrates("model.layers.3.mlp.experts") == (
         2, 2, 2, 2,
     ) * 64  # 256 experts
 
+    # A fractional uniform bitrate (e.g. 2.5) has no dedicated load-time
+    # validation, so the guard that actually fires lives in the accessor.
+    frac_config = Exl3Config()
+    frac_config.maybe_update_config(
+        "unused",
+        SimpleNamespace(
+            hybrid_tr3_tail=_rank_sliced_metadata(bits=2.5),
+            _commit_hash="revision",
+        ),
+    )
+    with pytest.raises(ValueError, match="invalid uniform EXL3 bitrate"):
+        frac_config.rank_sliced_layer_bitrates("model.layers.3.mlp.experts")
 
-def test_fractional_k_values_rejected():
-    """Fractional k_values (e.g. 2.5) are rejected, not silently truncated."""
+
+@pytest.mark.parametrize("k_values", ([2.5, 3], ["2.5", 3]))
+def test_fractional_k_values_rejected(k_values):
+    """Fractional k_values (float or JSON string) are rejected with the
+    dedicated 'must be integers' message, not a bare int() ValueError."""
     metadata = _rank_sliced_metadata(
         bits="mixed",
         bits_per_expert="tier_bitmap.json:k",
-        k_values=[2.5, 3],
+        k_values=k_values,
         experts_per_layer=4,
         moe_layers=[77, 78],
     )
@@ -606,3 +624,62 @@ def test_fractional_k_values_rejected():
             "unused",
             SimpleNamespace(hybrid_tr3_tail=metadata, _commit_hash="revision"),
         )
+
+
+def test_rank_sliced_weights_admit_k2_at_prepare_boundary(monkeypatch):
+    """K2 (2 bpw) passes the _prepare_rank_sliced_weights bitrate guard and
+    reaches the b12x fused-MoE API with trellis_bits=2 rather than raising.
+
+    This is the guard that actually gates kernel dispatch (``if bits not in
+    (2, 3, 4, 5, 6)``); it had no test before this change.
+    """
+    experts = 2
+    hidden = intermediate = 128
+    bits = 2
+    slabs = {
+        "w13_trellis": torch.zeros(
+            (2, experts, hidden // 16, intermediate // 16, 16 * bits),
+            dtype=torch.int16,
+        ),
+        "w2_trellis": torch.zeros(
+            (experts, intermediate // 16, hidden // 16, 16 * bits),
+            dtype=torch.int16,
+        ),
+        "w13_suh": torch.ones((2, experts, hidden), dtype=torch.float16),
+        "w13_svh": torch.ones((2, experts, intermediate), dtype=torch.float16),
+        "w2_suh": torch.ones((experts, intermediate), dtype=torch.float16),
+        "w2_svh": torch.ones((experts, hidden), dtype=torch.float16),
+    }
+
+    class FakeFusedMoe:
+        def __init__(self):
+            self.plan_kwargs = None
+
+        def plan_weights(self, **kwargs):
+            self.plan_kwargs = kwargs
+            return SimpleNamespace(source_format=kwargs["source_format"])
+
+        def prepare_weights(self, **kwargs):
+            return SimpleNamespace(plan=kwargs["plan"])
+
+    api = FakeFusedMoe()
+    monkeypatch.setattr(exl3_module, "_load_b12x_fused_moe", lambda: api)
+    method = object.__new__(Exl3MoEMethod)
+    method.quant_config = SimpleNamespace(bits=float(bits))
+    method._rank_sliced_backing = lambda _layer, name: slabs[name]
+    marker = torch.tensor(0xCBAC1FED - (1 << 32), dtype=torch.int32)
+    layer = SimpleNamespace(
+        local_num_experts=experts,
+        exl3_hidden_size=hidden,
+        exl3_intermediate_size_per_partition=intermediate,
+        exl3_params_dtype=torch.float16,
+        exl3_layer_bitrates=(bits,) * experts,
+        exl3_mixed_bitrate=False,
+        activation=MoEActivation.SILU,
+        w13_mcg=SimpleNamespace(exl3_tensors={(0, "w1"): marker}),
+    )
+
+    method._prepare_rank_sliced_weights(layer)
+
+    # The dispatch guard admits 2; the b12x API receives trellis_bits=2.
+    assert api.plan_kwargs["trellis_bits"] == 2

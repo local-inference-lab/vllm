@@ -488,18 +488,28 @@ class Exl3Config(QuantizationConfig):
         bits_field = metadata["bits"]
         if isinstance(bits_field, str) and bits_field.strip().lower() == "mixed":
             raw_k_values = metadata.get("k_values", ())
-            k_values = tuple(
-                sorted({int(value) for value in raw_k_values})
-            )
-            if any(int(value) != float(value) for value in raw_k_values):
+            # Validate integrality BEFORE the int() comprehension below: a
+            # fractional value (e.g. 2.5 or "2.5") must surface the dedicated
+            # message rather than a bare "invalid literal for int()" from the
+            # sorted({...}) conversion. float()-first also handles JSON strings.
+            if any(float(value) != int(float(value)) for value in raw_k_values):
                 raise ValueError(
                     "mixed rank-sliced EXL3 k_values must be integers, got "
                     f"{raw_k_values!r}"
                 )
+            k_values = tuple(sorted({int(value) for value in raw_k_values}))
             if not k_values or any(value not in (2, 3, 4, 5, 6) for value in k_values):
                 raise ValueError(
                     "mixed rank-sliced EXL3 requires k_values within 2..6, got "
                     f"{metadata.get('k_values')!r}"
+                )
+            # The mixed-Trellis runtime is hard-coded to exactly two tiers
+            # (_prepare_mixed_rank_sliced_weights + api.build_tiered_maps), so
+            # reject a 3+ tier config at load time instead of failing later.
+            if len(k_values) > 2:
+                raise ValueError(
+                    "mixed rank-sliced EXL3 supports at most two bitrates "
+                    f"(two-tier runtime), got {len(k_values)}: {k_values}"
                 )
             if not isinstance(metadata.get("bits_per_expert"), str):
                 raise ValueError(
