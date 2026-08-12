@@ -360,6 +360,15 @@ class Exl3Config(QuantizationConfig):
         self.rank_sliced_k_values: tuple[int, ...] | None = None
         self.rank_sliced_bits_by_layer: dict[int, tuple[int, ...]] = {}
 
+    def get_supported_lora_modules(self) -> list[str]:
+        """Return module names that support EXL3 LoRA cartridge adapters.
+
+        MSRT (Multi-Stage Rescaled Trellis) cartridges add full-rank trellis-
+        quantized residual weights as LoRA-like adapters. They are applied to
+        MoE expert projections via additional exl3_gemm passes.
+        """
+        return ["gate_proj", "up_proj", "down_proj"]
+
     def get_name(self) -> str:
         return "exl3"
 
@@ -1729,9 +1738,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 f"{layer_bitrates!r}"
             )
         bits = int(layer_bitrates[0])
-        if bits not in (3, 4, 5, 6):
+        if bits not in (2, 3, 4, 5, 6):
             raise ValueError(
-                f"rank-sliced EXL3 requires an integral 3/4/5/6 bitrate, got {bits!r}"
+                f"rank-sliced EXL3 requires an integral 2/3/4/5/6 bitrate, got {bits!r}"
             )
 
         w13 = self._rank_sliced_backing(layer, "w13_trellis")
