@@ -50,6 +50,7 @@ class _FakeFusedMoeApi:
     def __init__(self):
         self.planned = []
         self.bound = []
+        self.routed = []
 
     def Caps(self, **kwargs):
         return kwargs
@@ -60,11 +61,20 @@ class _FakeFusedMoeApi:
         return plan
 
     def bind(self, plan, *, scratch, a, experts, topk_weights, topk_ids):
-        del scratch, experts, topk_weights, topk_ids
+        del scratch, experts
         self.bound.append((plan, int(a.shape[0])))
-        return SimpleNamespace(plan=plan, m=int(a.shape[0]))
+        return SimpleNamespace(
+            plan=plan,
+            m=int(a.shape[0]),
+            route_expert_map=None,
+            a=a,
+            output=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
 
     def run(self, *, binding):
+        self.routed.append((binding.topk_weights.clone(), binding.topk_ids.clone()))
         if binding.route_expert_map is not None:
             tier_output = binding.a.to(torch.float32).mul(0.5)
             if binding.output is not None:

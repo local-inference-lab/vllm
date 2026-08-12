@@ -1887,6 +1887,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         mixed = layer.exl3_mixed_trellis
         max_decode_m = _positive_env_int("VLLM_EXL3_TRELLIS_MAX_M", 32)
         max_batched_tokens = int(layer.exl3_max_num_batched_tokens)
+        prefill_capacity = _positive_env_int(
+            "VLLM_EXL3_PREFILL_CAPACITY", max_batched_tokens
+        )
+        if prefill_capacity > max_batched_tokens:
+            raise ValueError(
+                "VLLM_EXL3_PREFILL_CAPACITY cannot exceed max_num_batched_tokens: "
+                f"{prefill_capacity} > {max_batched_tokens}"
+            )
         if max_decode_m > max_batched_tokens:
             max_decode_m = max_batched_tokens
         topk = int(topk_ids.shape[1])
@@ -1930,10 +1938,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             capacity: int,
             *,
             share_prefill_buffers: bool = False,
+            moe_block_size: int = _MIXED_TRELLIS_ROUTE_BLOCK_SIZE,
+            force_tile_config: Any = None,
         ) -> dict[str, Any]:
+            if force_tile_config is None:
+                force_tile_config = mixed["tile_config"]
             route_slots = api.max_packed_route_slots(
                 capacity * topk,
-                _MIXED_TRELLIS_ROUTE_BLOCK_SIZE,
+                moe_block_size,
                 total_experts,
             )
             launch = api.compile_mixed_trellis(
@@ -1945,14 +1957,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 tier0_bits=tier_signature[0][0],
                 tier1_bits=tier_signature[1][0],
                 top_k=topk,
-                max_m_blocks=(route_slots + _MIXED_TRELLIS_ROUTE_BLOCK_SIZE - 1)
-                // _MIXED_TRELLIS_ROUTE_BLOCK_SIZE,
-                moe_block_size=_MIXED_TRELLIS_ROUTE_BLOCK_SIZE,
+                max_m_blocks=(route_slots + moe_block_size - 1)
+                // moe_block_size,
+                moe_block_size=moe_block_size,
                 sms=int(props.multi_processor_count),
                 max_shared_mem=int(props.shared_memory_per_block_optin),
-                force_tile_config=mixed["tile_config"],
+                force_tile_config=force_tile_config,
                 rotation_input_dtype=("bf16" if x.dtype == torch.bfloat16 else "fp16"),
                 route_ids_dtype=topk_ids.dtype,
+                broadcast_suh=mixed["broadcast_suh"],
+                broadcast_svh=mixed["broadcast_svh"],
             )
             if share_prefill_buffers:
                 buffers, buffers_reused = _mixed_trellis_prefill_buffers(
@@ -1978,8 +1992,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         decode = make_state(max_decode_m)
         prefill = (
-            make_state(max_batched_tokens, share_prefill_buffers=True)
-            if max_batched_tokens > max_decode_m
+            make_state(
+                prefill_capacity,
+                share_prefill_buffers=True,
+                moe_block_size=_positive_env_int(
+                    "VLLM_EXL3_PREFILL_BLOCK_M", 64
+                ),
+                force_tile_config=mixed["prefill_tile_config"],
+            )
+            if prefill_capacity > max_decode_m
             else decode
         )
 
@@ -1989,6 +2010,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "prefill": prefill,
             "max_decode_m": max_decode_m,
             "max_batched_tokens": max_batched_tokens,
+            "prefill_capacity": prefill_capacity,
         }
         _MIXED_TRELLIS_RUNTIMES[key] = runtime
         buffer_bytes = _unique_tensor_storage_bytes(
@@ -2019,22 +2041,44 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "mixed-bitrate EXL3 batch exceeds planned capacity: "
                 f"m={m}, capacity={runtime['max_batched_tokens']}"
             )
-        state = (
-            runtime["decode"] if m <= runtime["max_decode_m"] else runtime["prefill"]
-        )
         mixed = layer.exl3_mixed_trellis
-        raw_output = runtime["api"].run_mixed_trellis(
-            x,
-            mixed["tiers"][0],
-            mixed["tiers"][1],
-            topk_weights,
-            topk_ids,
-            mixed["global_to_combined"],
-            mixed["descriptor_map"],
-            mixed["rotations"],
-            state["launch"],
-            state["buffers"],
-        )
+        is_decode = m <= runtime["max_decode_m"]
+        state = runtime["decode"] if is_decode else runtime["prefill"]
+        tier0, tier1 = (
+            mixed["tiers"][0], mixed["tiers"][1]
+        ) if is_decode else mixed["prefill_tiers"]
+        prefill_capacity = runtime["prefill_capacity"]
+        if is_decode or prefill_capacity >= m:
+            raw_output = runtime["api"].run_mixed_trellis(
+                x,
+                tier0,
+                tier1,
+                topk_weights,
+                topk_ids,
+                mixed["global_to_combined"],
+                mixed["descriptor_map"],
+                mixed["rotations"],
+                state["launch"],
+                state["buffers"],
+            )
+        else:
+            chunks = []
+            for start in range(0, m, prefill_capacity):
+                end = min(start + prefill_capacity, m)
+                chunk = runtime["api"].run_mixed_trellis(
+                    x[start:end],
+                    tier0,
+                    tier1,
+                    topk_weights[start:end],
+                    topk_ids[start:end],
+                    mixed["global_to_combined"],
+                    mixed["descriptor_map"],
+                    mixed["rotations"],
+                    state["launch"],
+                    state["buffers"],
+                )
+                chunks.append(chunk.clone())
+            raw_output = torch.cat(chunks)
         # B12X returns a view of its persistent FP32 output buffer.  The
         # dtype conversion is therefore also the lifetime boundary before
         # a compatible later layer reuses the same prefill storage.
@@ -2182,6 +2226,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # and making the capacity guard in _apply_rank_sliced unreachable. The
         # planned capacity is a property of the layer, not of one forward pass.
         max_batched_tokens = int(layer.exl3_max_num_batched_tokens)
+        prefill_capacity = _positive_env_int(
+            "VLLM_EXL3_PREFILL_CAPACITY", max_batched_tokens
+        )
+        if prefill_capacity > max_batched_tokens:
+            raise ValueError(
+                "VLLM_EXL3_PREFILL_CAPACITY cannot exceed max_num_batched_tokens: "
+                f"{prefill_capacity} > {max_batched_tokens}"
+            )
         prefill_plan_enabled = prefill_trellis and max_batched_tokens > max_trellis_m
         parity_rows = (
             min(chunk, max_batched_tokens)
@@ -2264,7 +2316,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             prefill_plan, prefill_scratch = _plan_with_scratch(
                 max_batched_tokens, prefill_block_m
             )
-
         hidden_size = int(layer.exl3_hidden_size)
         intermediate_size = int(layer.exl3_intermediate_size_per_partition)
         num_experts = int(layer.local_num_experts)
@@ -2277,6 +2328,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "min_trellis_m": min_trellis_m,
             "max_trellis_m": max_trellis_m,
             "max_batched_tokens": max_batched_tokens,
+            "prefill_capacity": prefill_capacity,
             "parity_rows": parity_rows,
             "topk": topk,
             "chunk": chunk,
@@ -2349,16 +2401,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     "EXL3 batch exceeds its planned capacity: "
                     f"m={m}, capacity={runtime['max_batched_tokens']}"
                 )
-            binding = runtime["api"].bind(
-                runtime["prefill_plan"],
-                scratch=runtime["prefill_scratch"],
-                a=x,
-                experts=layer.exl3_trellis_weights,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-            )
-            output = runtime["api"].run(binding=binding)
-            return output.to(x.dtype)
+            prefill_capacity = runtime["prefill_capacity"]
+            outputs = []
+            for start in range(0, m, prefill_capacity):
+                end = min(start + prefill_capacity, m)
+                binding = runtime["api"].bind(
+                    runtime["prefill_plan"],
+                    scratch=runtime["prefill_scratch"],
+                    a=x[start:end],
+                    experts=layer.exl3_trellis_weights,
+                    topk_weights=topk_weights[start:end],
+                    topk_ids=topk_ids[start:end],
+                )
+                outputs.append(runtime["api"].run(binding=binding))
+            return torch.cat(outputs).to(x.dtype)
 
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
