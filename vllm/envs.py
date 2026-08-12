@@ -191,6 +191,8 @@ if TYPE_CHECKING:
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_PROMPT_LOGPROBS_CHUNK_SIZE: int = 1024
+    VLLM_MAX_PROMPT_LOGPROBS: int = 20
+    VLLM_MAX_LOGPROBS: int = 20
     VLLM_MLA_DISABLE: bool = False
     VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH: bool = False
     VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW: int = 8
@@ -1572,6 +1574,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tensor at once while computing V1 prompt logprobs.
     "VLLM_PROMPT_LOGPROBS_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_PROMPT_LOGPROBS_CHUNK_SIZE", "1024")
+    ),
+    # Maximum number of prompt logprobs that may be requested per prompt
+    # token. Caps the [num_prompt_tokens, prompt_logprobs] allocation to
+    # prevent OOM (upstream vllm-project/vllm#14239). The sentinel -1 (all
+    # vocab logprobs) is resolved to vocab_size before the cap is applied,
+    # so it is effectively rejected for any real vocabulary.
+    "VLLM_MAX_PROMPT_LOGPROBS": lambda: int(
+        os.getenv("VLLM_MAX_PROMPT_LOGPROBS", "20")
+    ),
+    # Maximum number of sample (output) logprobs per token. Same OOM
+    # rationale as VLLM_MAX_PROMPT_LOGPROBS but for the sampling logprobs
+    # path (logprobs / top_logprobs).
+    "VLLM_MAX_LOGPROBS": lambda: int(
+        os.getenv("VLLM_MAX_LOGPROBS", "20")
     ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),

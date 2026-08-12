@@ -505,16 +505,34 @@ class CompletionRequest(OpenAIBaseModel):
 
             if prompt_logprobs < 0 and prompt_logprobs != -1:
                 raise VLLMValidationError(
-                    "`prompt_logprobs` must be a positive value or -1.",
+                    "`prompt_logprobs` must be non-negative or -1 (all "
+                    "logprobs, subject to VLLM_MAX_PROMPT_LOGPROBS cap).",
                     parameter="prompt_logprobs",
                     value=prompt_logprobs,
                 )
-        if (logprobs := data.get("logprobs")) is not None and logprobs < 0:
-            raise VLLMValidationError(
-                "`logprobs` must be a positive value.",
-                parameter="logprobs",
-                value=logprobs,
-            )
+            if prompt_logprobs > 0 and prompt_logprobs > envs.VLLM_MAX_PROMPT_LOGPROBS:
+                raise VLLMValidationError(
+                    f"`prompt_logprobs`={prompt_logprobs} exceeds the "
+                    f"maximum allowed: {envs.VLLM_MAX_PROMPT_LOGPROBS} "
+                    f"(VLLM_MAX_PROMPT_LOGPROBS).",
+                    parameter="prompt_logprobs",
+                    value=prompt_logprobs,
+                )
+        if (logprobs := data.get("logprobs")) is not None:
+            if logprobs < 0 and logprobs != -1:
+                raise VLLMValidationError(
+                    "`logprobs` must be non-negative or -1 (all logprobs, "
+                    "subject to VLLM_MAX_LOGPROBS cap).",
+                    parameter="logprobs",
+                    value=logprobs,
+                )
+            if logprobs > 0 and logprobs > envs.VLLM_MAX_LOGPROBS:
+                raise VLLMValidationError(
+                    f"`logprobs`={logprobs} exceeds the maximum allowed: "
+                    f"{envs.VLLM_MAX_LOGPROBS} (VLLM_MAX_LOGPROBS).",
+                    parameter="logprobs",
+                    value=logprobs,
+                )
 
         return data
 
