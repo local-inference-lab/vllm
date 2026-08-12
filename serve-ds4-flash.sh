@@ -7,6 +7,11 @@ set -euo pipefail
 
 unset NCCL_GRAPH_FILE NCCL_GRAPH_DUMP_FILE VLLM_B12X_MLA_EXTEND_MAX_CHUNKS
 
+# All distributed workers launched by this entrypoint share one host. Keep
+# process-group bootstrap local unless a multi-node wrapper selects an interface.
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-lo}"
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-lo}"
+
 bool_value() {
   local name=$1 value=${2,,}
   case "${value}" in
@@ -630,6 +635,8 @@ printf 'DS4 launch: mode=%s depth=%s capacity_activation=%s backend=%s allreduce
   "${graph_cap}" "${load_format}" "${INSTANTTENSOR_BACKEND}" \
   "${native_l2_enabled}" \
   "${PYTORCH_CUDA_ALLOC_CONF:-<unset>}" "${model}" >&2
+printf 'Process-group interfaces: GLOO_SOCKET_IFNAME=%s NCCL_SOCKET_IFNAME=%s\n' \
+  "${GLOO_SOCKET_IFNAME}" "${NCCL_SOCKET_IFNAME}" >&2
 printf 'Command:' >&2
 printf ' %q' "${command[@]}" >&2
 printf '\n' >&2

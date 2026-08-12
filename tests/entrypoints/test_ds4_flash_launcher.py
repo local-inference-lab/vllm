@@ -53,6 +53,30 @@ def test_ds4_launcher_defaults_to_0731_fixed_k7(tmp_path: Path) -> None:
     assert "max_seqs=16 graph=128" in output
     assert "--max-model-len 131072" in output
     assert "--gpu-memory-utilization 0.975" in output
+    assert (
+        "Process-group interfaces: GLOO_SOCKET_IFNAME=lo "
+        "NCCL_SOCKET_IFNAME=lo" in output
+    )
+
+
+def test_ds4_launcher_preserves_explicit_process_group_interfaces(
+    tmp_path: Path,
+) -> None:
+    """Verify that a multi-node wrapper can select bootstrap interfaces.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
+    output = _dry_run(
+        tmp_path,
+        GLOO_SOCKET_IFNAME="bond0",
+        NCCL_SOCKET_IFNAME="ib0",
+    )
+
+    assert (
+        "Process-group interfaces: GLOO_SOCKET_IFNAME=bond0 "
+        "NCCL_SOCKET_IFNAME=ib0" in output
+    )
 
 
 def test_ds4_launcher_accepts_distinct_tokenizer_revision(tmp_path: Path) -> None:
