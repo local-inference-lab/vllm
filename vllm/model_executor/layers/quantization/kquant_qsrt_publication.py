@@ -299,32 +299,58 @@ def publication_trust_from_env() -> tuple[bool, str]:
 
 
 def active_runtime_environment_from_env() -> dict[str, str]:
-    """Authenticate the launcher's canonical runtime environment contract."""
+    """Verify the live process environment matches the canonical Fruit contract.
 
-    raw = os.environ.get("FRUIT_QSRT_RUNTIME_ENVIRONMENT_JSON")
-    digest = _sha256_field(
-        os.environ.get("FRUIT_QSRT_RUNTIME_ENVIRONMENT_SHA256"),
-        name="FRUIT_QSRT_RUNTIME_ENVIRONMENT_SHA256",
-    )
-    if not isinstance(raw, str) or hashlib.sha256(raw.encode()).hexdigest() != digest:
+    This inspects the REAL ``os.environ`` rather than a launcher-supplied JSON
+    payload hashed against a launcher-supplied digest: that pair was
+    self-satisfying, since whoever could set
+    ``FRUIT_QSRT_RUNTIME_ENVIRONMENT_JSON`` could also set
+    ``FRUIT_QSRT_RUNTIME_ENVIRONMENT_SHA256``. The private root and root id are
+    anchored on ``FRUIT_QSRT_AUTHENTICATED_MODEL_ROOT`` (``<PRIVATE_ROOT>/model``)
+    and ``LOCAL_INFERENCE_CACHE_FINGERPRINT`` (``<PRIVATE_ROOT_ID>``) read from
+    the live environment; every other contract variable is then required to be
+    present in the live environment with the canonically-substituted value. The
+    canonical placeholder map is returned so downstream code can compare it
+    against the sealed qualification receipt. This is a coherence check against
+    the running process's environment, not cryptographic authentication of an
+    external payload.
+    """
+
+    authenticated_root = os.environ.get("FRUIT_QSRT_AUTHENTICATED_MODEL_ROOT")
+    if not isinstance(authenticated_root, str) or not authenticated_root:
         raise ValueError(
-            "Fruit active runtime environment does not match its trusted digest"
+            "FRUIT_QSRT_AUTHENTICATED_MODEL_ROOT is not set in the live "
+            "environment"
         )
-    try:
-        environment = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError("Fruit active runtime environment is not valid JSON") from exc
-    canonical = json.dumps(
-        environment,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    if raw != canonical or environment != _FIXED_RUNTIME_ENVIRONMENT:
+    if not authenticated_root.endswith("/model"):
         raise ValueError(
-            "Fruit active runtime environment is not the fixed deployment contract"
+            "FRUIT_QSRT_AUTHENTICATED_MODEL_ROOT must be a '<PRIVATE_ROOT>/model' "
+            f"path: {authenticated_root!r}"
         )
-    return environment
+    private_root = authenticated_root[: -len("/model")]
+
+    private_root_id = os.environ.get("LOCAL_INFERENCE_CACHE_FINGERPRINT")
+    if not isinstance(private_root_id, str) or not private_root_id:
+        raise ValueError(
+            "LOCAL_INFERENCE_CACHE_FINGERPRINT is not set in the live environment"
+        )
+
+    for key, template in _FIXED_RUNTIME_ENVIRONMENT.items():
+        expected = template.replace("<PRIVATE_ROOT>", private_root).replace(
+            "<PRIVATE_ROOT_ID>", private_root_id
+        )
+        actual = os.environ.get(key)
+        if actual is None:
+            raise ValueError(
+                f"Fruit runtime environment variable {key!r} is not set in the "
+                "live environment"
+            )
+        if actual != expected:
+            raise ValueError(
+                f"Fruit runtime environment variable {key!r} does not match the "
+                "canonical deployment contract"
+            )
+    return dict(_FIXED_RUNTIME_ENVIRONMENT)
 
 
 def _read_descriptor(descriptor: int) -> bytes:
@@ -346,6 +372,17 @@ def _sha256_descriptor(descriptor: int) -> str:
 
 
 def _open_beneath(root_descriptor: int, relative: Path) -> int:
+    # Defend standalone: an absolute path (parts[0] == os.sep) makes
+    # os.open(..., dir_fd=...) ignore dir_fd and escape the root, and a ".."
+    # component traverses above it. Current callers pre-validate, but the
+    # helper must be safe by itself.
+    if relative.is_absolute():
+        raise ValueError(f"_open_beneath requires a relative path: {relative!r}")
+    if any(component == ".." for component in relative.parts):
+        raise ValueError(
+            f"_open_beneath must not contain parent-directory references: "
+            f"{relative!r}"
+        )
     directory = os.dup(root_descriptor)
     try:
         for component in relative.parts[:-1]:

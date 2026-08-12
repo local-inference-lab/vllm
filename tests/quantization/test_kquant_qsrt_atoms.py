@@ -720,27 +720,30 @@ def _convert_test_publication_to_candidate(root: Path) -> None:
 def test_active_runtime_environment_requires_canonical_fixed_map(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    environment = kquant_qsrt_publication._FIXED_RUNTIME_ENVIRONMENT
-    canonical = json.dumps(environment, separators=(",", ":"), sort_keys=True)
-    monkeypatch.setenv("FRUIT_QSRT_RUNTIME_ENVIRONMENT_JSON", canonical)
-    monkeypatch.setenv(
-        "FRUIT_QSRT_RUNTIME_ENVIRONMENT_SHA256",
-        hashlib.sha256(canonical.encode()).hexdigest(),
+    contract = kquant_qsrt_publication._FIXED_RUNTIME_ENVIRONMENT
+    private_root = "/private/fruit"
+    private_root_id = "root-id-abc"
+    for key, template in contract.items():
+        monkeypatch.setenv(
+            key,
+            template.replace("<PRIVATE_ROOT>", private_root).replace(
+                "<PRIVATE_ROOT_ID>", private_root_id
+            ),
+        )
+
+    assert (
+        kquant_qsrt_publication.active_runtime_environment_from_env() == contract
     )
 
-    assert kquant_qsrt_publication.active_runtime_environment_from_env() == environment
+    # A live variable diverging from the canonical contract is rejected.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    with pytest.raises(ValueError, match="canonical deployment contract"):
+        kquant_qsrt_publication.active_runtime_environment_from_env()
 
-    hostile = json.dumps(
-        {**environment, "VLLM_USE_V1": "1"},
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    monkeypatch.setenv("FRUIT_QSRT_RUNTIME_ENVIRONMENT_JSON", hostile)
-    monkeypatch.setenv(
-        "FRUIT_QSRT_RUNTIME_ENVIRONMENT_SHA256",
-        hashlib.sha256(hostile.encode()).hexdigest(),
-    )
-    with pytest.raises(ValueError, match="fixed deployment contract"):
+    # A missing live variable is rejected.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.delenv("HF_HOME", raising=False)
+    with pytest.raises(ValueError, match="is not set in the live environment"):
         kquant_qsrt_publication.active_runtime_environment_from_env()
 
 
