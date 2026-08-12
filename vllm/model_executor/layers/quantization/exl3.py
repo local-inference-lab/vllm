@@ -53,6 +53,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.models.utils import _parse_layer_index
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
@@ -162,13 +163,27 @@ _RANK_SLICED_WEIGHT_RE = re.compile(
 
 def _experts_per_layer(metadata, layer_index=None):
     """Resolve ``experts_per_layer``, which may be a scalar or a per-layer
-    list indexed by model layer (heterogeneous expert widths). Scalar
-    checkpoints behave exactly as before; with a list and no layer context
-    the widest layer is returned."""
+    list indexed by the GLOBAL model layer number (dense layers included) for
+    heterogeneous expert widths. Scalar checkpoints behave exactly as before;
+    with a list and no layer context the widest layer is returned.
+
+    Args:
+        metadata: rank-sliced EXL3 metadata dict carrying ``experts_per_layer``.
+        layer_index: global model layer index. ``None`` is only valid for the
+            scalar case or when the caller explicitly wants the widest layer.
+
+    Raises:
+        ValueError: ``layer_index`` is out of range for the per-layer list.
+    """
     value = metadata["experts_per_layer"]
     if isinstance(value, (list, tuple)):
         if layer_index is None:
             return max(int(v) for v in value)
+        if layer_index < 0 or layer_index >= len(value):
+            raise ValueError(
+                f"experts_per_layer has {len(value)} entries but layer index "
+                f"{layer_index} is out of range"
+            )
         return int(value[layer_index])
     return int(value)
 
@@ -571,12 +586,11 @@ class Exl3Config(QuantizationConfig):
         self.rank_sliced_bits_by_layer = by_layer
 
     def rank_sliced_layer_bitrates(self, layer_name: str) -> tuple[int, ...]:
-        match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_name)
-        if match is None:
+        layer_index = _parse_layer_index(layer_name)
+        if layer_index is None:
             raise ValueError(
                 f"cannot resolve rank-sliced EXL3 layer index from {layer_name!r}"
             )
-        layer_index = int(match.group(1))
         if self.rank_sliced_k_values is None:
             if self.bits is None or float(self.bits) != int(self.bits):
                 raise ValueError(f"invalid uniform EXL3 bitrate {self.bits!r}")
@@ -729,11 +743,11 @@ class Exl3Config(QuantizationConfig):
         self, prefix: str, layer: torch.nn.Module | None = None
     ) -> bool:
         if self.rank_sliced_metadata is not None:
-            match = re.search(r"layers\.(\d+)\b", prefix)
-            if match is None:
+            layer_index = _parse_layer_index(prefix)
+            if layer_index is None:
                 return False
             first, last = (int(v) for v in self.rank_sliced_metadata["moe_layers"])
-            return first <= int(match.group(1)) <= last
+            return first <= layer_index <= last
         # Use the layer's checkpoint projection names (the same fields
         # _validate_codebooks keys off) so remapped-projection MoE
         # checkpoints are still detected; fall back to the defaults when the
@@ -757,11 +771,11 @@ class Exl3Config(QuantizationConfig):
 
     def codebook_for_prefix(self, prefix: str) -> str | None:
         if self.rank_sliced_metadata is not None:
-            match = re.search(r"layers\.(\d+)\b", prefix)
-            if match is None:
+            layer_index = _parse_layer_index(prefix)
+            if layer_index is None:
                 return None
             first, last = (int(v) for v in self.rank_sliced_metadata["moe_layers"])
-            return "mcg" if first <= int(match.group(1)) <= last else None
+            return "mcg" if first <= layer_index <= last else None
         entry = self._storage_entry(prefix)
         if entry is None:
             return None
@@ -1336,17 +1350,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 name = str(
                     getattr(layer, "layer_name", "") or getattr(layer, "prefix", "")
                 )
-                match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", name)
-                if match is not None:
-                    expected_experts = int(metadata_experts[int(match.group(1))])
-                else:
-                    # No layer identity on this module: accept any declared
-                    # width rather than misvalidating against the widest.
-                    expected_experts = (
-                        num_experts
-                        if num_experts in {int(v) for v in metadata_experts}
-                        else -1
+                layer_index = _parse_layer_index(name)
+                if layer_index is None:
+                    # No layer identity on this module: refuse to guess.
+                    # Silently accepting any declared width (or a -1 sentinel)
+                    # lets a mismatched checkpoint load unchecked.
+                    raise ValueError(
+                        "cannot determine layer index for "
+                        f"{name!r}; rank-sliced EXL3 with per-layer expert "
+                        "widths requires a 'layers.<N>' module name."
                     )
+                expected_experts = _experts_per_layer(
+                    self.quant_config.rank_sliced_metadata, layer_index
+                )
             else:
                 expected_experts = int(metadata_experts)
             if expected_experts != num_experts:
