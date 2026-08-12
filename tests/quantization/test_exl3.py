@@ -539,3 +539,70 @@ def test_draft_role_stamp_wins_over_name() -> None:
     assert not exl3_mod._is_draft_layer(
         SimpleNamespace(layer_name="model.layers.30.mlp.experts")
     )
+
+
+def test_mixed_rank_sliced_with_k2_hydrates_per_layer_bitrates(monkeypatch):
+    """K2 is accepted in mixed rank-sliced k_values (MSRT base tier)."""
+    metadata = _rank_sliced_metadata(
+        bits="mixed",
+        bits_per_expert="tier_bitmap.json:k",
+        k_values=[2, 3],
+        experts_per_layer=4,
+        moe_layers=[77, 78],
+    )
+    payload = {
+        "77": {"k": [2, 3, 2, 3]},
+        "78": {"k": [2, 2, 2, 2]},
+    }
+    monkeypatch.setattr(
+        exl3_module,
+        "get_hf_file_to_dict",
+        lambda filename, model_name, revision=None: payload,
+    )
+    config = Exl3Config()
+    config.maybe_update_config(
+        "unused",
+        SimpleNamespace(hybrid_tr3_tail=metadata, _commit_hash="revision"),
+    )
+    assert config.bits is None
+    assert config.rank_sliced_k_values == (2, 3)
+    assert config.rank_sliced_layer_bitrates("model.layers.77.mlp.experts") == (
+        2, 3, 2, 3,
+    )
+    assert config.rank_sliced_layer_bitrates("model.layers.78.mlp.experts") == (
+        2, 2, 2, 2,
+    )
+
+
+def test_uniform_k2_rank_sliced_metadata():
+    """K2 is accepted as a uniform rank-sliced bitrate."""
+    config = Exl3Config()
+    config.maybe_update_config(
+        "unused",
+        SimpleNamespace(
+            hybrid_tr3_tail=_rank_sliced_metadata(bits=2.0),
+            _commit_hash="revision",
+        ),
+    )
+    assert config.bits == 2.0
+    assert config.rank_sliced_k_values is None
+    assert config.rank_sliced_layer_bitrates("model.layers.3.mlp.experts") == (
+        2, 2, 2, 2,
+    ) * 64  # 256 experts
+
+
+def test_fractional_k_values_rejected():
+    """Fractional k_values (e.g. 2.5) are rejected, not silently truncated."""
+    metadata = _rank_sliced_metadata(
+        bits="mixed",
+        bits_per_expert="tier_bitmap.json:k",
+        k_values=[2.5, 3],
+        experts_per_layer=4,
+        moe_layers=[77, 78],
+    )
+    config = Exl3Config()
+    with pytest.raises(ValueError, match="must be integers"):
+        config.maybe_update_config(
+            "unused",
+            SimpleNamespace(hybrid_tr3_tail=metadata, _commit_hash="revision"),
+        )

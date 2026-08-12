@@ -487,9 +487,15 @@ class Exl3Config(QuantizationConfig):
         self.rank_sliced_metadata = dict(metadata)
         bits_field = metadata["bits"]
         if isinstance(bits_field, str) and bits_field.strip().lower() == "mixed":
+            raw_k_values = metadata.get("k_values", ())
             k_values = tuple(
-                sorted({int(value) for value in metadata.get("k_values", ())})
+                sorted({int(value) for value in raw_k_values})
             )
+            if any(int(value) != float(value) for value in raw_k_values):
+                raise ValueError(
+                    "mixed rank-sliced EXL3 k_values must be integers, got "
+                    f"{raw_k_values!r}"
+                )
             if not k_values or any(value not in (2, 3, 4, 5, 6) for value in k_values):
                 raise ValueError(
                     "mixed rank-sliced EXL3 requires k_values within 2..6, got "
@@ -545,6 +551,11 @@ class Exl3Config(QuantizationConfig):
                 raise ValueError(
                     "rank-sliced EXL3 bitrate map must contain one entry per expert: "
                     f"layer={layer_index}, field={field!r}, expected={experts}"
+                )
+            if any(int(v) != float(v) for v in raw):
+                raise ValueError(
+                    "rank-sliced EXL3 bitrate map must contain integers, got "
+                    f"layer={layer_index}, field={field!r}, values={raw!r}"
                 )
             bitrates = tuple(int(value) for value in raw)
             unexpected = sorted(set(bitrates).difference(allowed))
