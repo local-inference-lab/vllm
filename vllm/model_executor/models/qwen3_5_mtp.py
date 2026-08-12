@@ -14,6 +14,9 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.exl3 import (
+    normalize_rank_sliced_weights,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -295,6 +298,13 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Rank-sliced EXL3 drafts reuse the target's hydrated quant config
+        # (the proposer copies it into the draft VllmConfig). Strip the
+        # `.rank{r}` segment / drop non-local ranks before the mtp.->model.
+        # prefix remap, mirroring Qwen3_5Model.load_weights; the rank segment
+        # is a name suffix, so the two rewrites cannot collide.
+        weights = normalize_rank_sliced_weights(weights, self.quant_config)
+
         def remap_weight_names(weights):
             for name, weight in weights:
                 if name.startswith("mtp."):

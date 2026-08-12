@@ -38,6 +38,9 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.exl3 import (
+    normalize_rank_sliced_weights,
+)
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
@@ -279,6 +282,15 @@ class Qwen3_5Model(Qwen3NextModel):
             mapper = mapper | WeightsMapper(
                 orig_to_new_substr={"mlp.shared_expert.": f"mlp.experts.{num_routed}."}
             )
+        # Rank-sliced EXL3 checkpoints ship one tensor per TP rank
+        # (`...experts.{E}.{proj}.rank{r}.{trellis|suh|svh|mcg}`) while
+        # Exl3MoEMethod registers fused per-projection params (w13_trellis,
+        # ...). Strip the `.rank{r}` segment / drop non-local ranks BEFORE
+        # AutoWeightsLoader descends into RoutedExperts.load_weights, exactly
+        # as deepseek_v2.load_weights does; otherwise the expert-mapping
+        # string surgery produces `...experts.w13_rank0.trellis` and the
+        # parameter lookup fails.
+        weights = normalize_rank_sliced_weights(weights, self.quant_config)
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=mapper)
 
