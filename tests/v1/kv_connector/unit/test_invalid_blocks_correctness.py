@@ -56,6 +56,62 @@ def recompute_scheduler():
     return create_scheduler(vllm_config)
 
 
+def test_hybrid_cache_invalid_block_truncates_all_groups():
+    """A failed hybrid-cache group invalidates the shared logical position."""
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.block_size = 16
+    scheduler.kv_cache_manager = Mock()
+
+    request = Mock(spec=Request)
+    request.request_id = "hybrid-request"
+    request.num_computed_tokens = 64
+    scheduler.kv_cache_manager.get_block_ids.return_value = (
+        [1, 2, 3, 4],
+        [11, 12, 13, 14],
+    )
+
+    affected, affected_tokens, evicted = scheduler._update_requests_with_invalid_blocks(
+        [request],
+        invalid_block_ids={12},
+        num_scheduled_tokens={},
+    )
+
+    assert affected == {request.request_id}
+    assert request.num_computed_tokens == 16
+    assert affected_tokens == 48
+    assert evicted == {2, 3, 4, 12, 13, 14}
+
+
+def test_hybrid_cache_shared_invalid_block_is_recomputed_once():
+    """Shared failed blocks retain the existing single-recompute contract."""
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.block_size = 16
+    scheduler.kv_cache_manager = Mock()
+
+    first_request = Mock(spec=Request)
+    first_request.request_id = "first-request"
+    first_request.num_computed_tokens = 48
+    second_request = Mock(spec=Request)
+    second_request.request_id = "second-request"
+    second_request.num_computed_tokens = 48
+    scheduler.kv_cache_manager.get_block_ids.side_effect = (
+        ([1, 2, 3], [11, 12, 13]),
+        ([21, 22, 23], [31, 12, 33]),
+    )
+
+    affected, affected_tokens, evicted = scheduler._update_requests_with_invalid_blocks(
+        [first_request, second_request],
+        invalid_block_ids={12},
+        num_scheduled_tokens={},
+    )
+
+    assert affected == {first_request.request_id, second_request.request_id}
+    assert first_request.num_computed_tokens == 16
+    assert second_request.num_computed_tokens == 48
+    assert affected_tokens == 32
+    assert evicted == {2, 3, 12, 13}
+
+
 def test_sync_recompute_blocks_not_freed_for_running_requests(
     recompute_scheduler: Scheduler,
 ):
