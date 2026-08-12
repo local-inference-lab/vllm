@@ -75,6 +75,25 @@ def _hf_config_int(runner: "GPUModelRunner", name: str, default: int) -> int:
     return int(getattr(hf_config, name, default) or default)
 
 
+def _dcp_params(runner: "GPUModelRunner") -> tuple[int, int, int]:
+    """Return ``(dcp_rank, dcp_world_size, cp_kv_cache_interleave_size)``.
+
+    Both the V1 (``gpu_model_runner``) and V2 (``gpu/model_runner``) runners
+    derive DCP shape from ``parallel_config``. The V2 runner also exposes
+    ``dcp_size``/``cp_interleave`` aliases, but the V1 production runner only
+    defines ``dcp_world_size`` and reads the interleave from the config
+    directly. Reading the runner-specific aliases therefore silently fell back
+    to DCP1 on V1 (compiling the wrong Triton specialization); reading the
+    shared ``parallel_config`` source fixes that and surfaces a missing
+    attribute as an error instead of a silent degradation.
+    """
+    parallel_config = runner.vllm_config.parallel_config
+    dcp_world_size = int(parallel_config.decode_context_parallel_size)
+    cp_kv_cache_interleave_size = int(parallel_config.cp_kv_cache_interleave_size)
+    dcp_rank = int(runner.dcp_rank)
+    return dcp_rank, dcp_world_size, cp_kv_cache_interleave_size
+
+
 def _attention_backend_name(backend: object) -> str | None:
     get_name = getattr(backend, "get_name", None)
     if get_name is None:
@@ -288,9 +307,7 @@ def sparse_mla_triton_warmup(
 ) -> None:
     device = getattr(runner, "device", torch.device("cuda"))
     window_size = _hf_config_int(runner, "sliding_window", 128)
-    dcp_rank = int(getattr(runner, "dcp_rank", 0))
-    dcp_world_size = int(getattr(runner, "dcp_size", 1))
-    cp_kv_cache_interleave_size = int(getattr(runner, "cp_interleave", 1))
+    dcp_rank, dcp_world_size, cp_kv_cache_interleave_size = _dcp_params(runner)
 
     _warm_sparse_swa_prefill_metadata_kernel(device, window_size, num_tokens)
     for compress_ratio in compress_ratios:
@@ -346,13 +363,16 @@ def sparse_mla_triton_warmup_if_needed(worker: "Worker") -> None:
                 compress_ratios=(1,),
             )
         elif _has_attention_backend(runner, _B12X_SPARSE_MLA_BACKENDS):
+            dcp_rank, dcp_world_size, cp_kv_cache_interleave_size = _dcp_params(
+                runner
+            )
             _warm_prefill_chunk_metadata_kernel(
                 getattr(runner, "device", torch.device("cuda")),
                 compress_ratio=1,
                 query_len=num_tokens,
-                dcp_rank=int(getattr(runner, "dcp_rank", 0)),
-                dcp_world_size=int(getattr(runner, "dcp_size", 1)),
-                cp_kv_cache_interleave_size=int(getattr(runner, "cp_interleave", 1)),
+                dcp_rank=dcp_rank,
+                dcp_world_size=dcp_world_size,
+                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
             )
         elif _has_attention_backend(runner, _INDEXER_PREFILL_CHUNK_METADATA_BACKENDS):
             _warm_prefill_chunk_metadata_kernel(
