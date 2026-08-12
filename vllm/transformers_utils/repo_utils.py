@@ -59,9 +59,11 @@ def resolve_revision(
     Resolving the commit hash once prevents repeated HTTP calls downstream and
     avoids races if the branch moves while the model is loading.
 
-    `HfApi.resolve_revision` returns a `ResolvedRevision`: a `str` equal to the
-    requested revision that also carries the commit hash, so downstream error
-    messages stay readable and offline loads reuse the cached `refs/` entry.
+    `HfApi.resolve_revision` returns a `ResolvedRevision` string subclass. Its
+    underlying string is the requested revision while its `resolved` attribute
+    holds the immutable commit hash. Normalize that object to a plain commit
+    hash before it crosses a multiprocessing boundary: the external subclass
+    does not preserve its underlying string value through pickle round-trips.
 
     Returns:
         The resolved revision, or `revision` unchanged if it cannot be resolved
@@ -71,12 +73,13 @@ def resolve_revision(
         return revision
 
     try:
-        return hf_api().resolve_revision(
+        resolved = hf_api().resolve_revision(
             repo_id,
             revision=revision,
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             token=token,
         )
+        return str(getattr(resolved, "resolved", resolved))
     except Exception:
         logger.debug(
             "Failed to resolve revision for %s; falling back to %s.",

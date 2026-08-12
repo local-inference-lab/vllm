@@ -2,19 +2,34 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import pickle
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
-from huggingface_hub import _CACHED_NO_EXIST
+from huggingface_hub import _CACHED_NO_EXIST, ResolvedRevision
 
 from vllm.transformers_utils.repo_utils import (
     any_pattern_in_repo_files,
     get_hf_file_to_dict,
     is_mistral_model_repo,
     list_filtered_repo_files,
+    resolve_revision,
 )
+
+
+def test_resolve_revision_returns_picklable_commit_hash():
+    commit = "9e165c30e2704aec5d9d593cce3eebd58bbef1cb"
+    hub_revision = ResolvedRevision(resolved=commit, initial="main")
+
+    with patch("vllm.transformers_utils.repo_utils.hf_api") as mock_hf_api:
+        mock_hf_api.return_value.resolve_revision.return_value = hub_revision
+        resolved = resolve_revision("example/model", revision="main")
+
+    assert type(resolved) is str
+    assert resolved == commit
+    assert pickle.loads(pickle.dumps(resolved)) == commit
 
 
 @pytest.mark.parametrize(
