@@ -8,6 +8,7 @@ import torch
 
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import _warmup_layer_mhc
 from vllm.models.deepseek_v4.nvidia import dspark as dspark_module
+from vllm.models.deepseek_v4.nvidia import mtp as mtp_module
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4DecoderLayer
 
 
@@ -24,6 +25,93 @@ def test_b12x_mhc_requires_fused_norm_weight() -> None:
     norm_weight = torch.ones(4)
 
     assert layer._require_b12x_mhc_norm_weight(norm_weight) is norm_weight
+
+
+def test_b12x_mhc_only_accepts_rank_two_initial_state() -> None:
+    layer = _make_b12x_layer()
+    layer._use_b12x_mhc = True
+
+    assert layer._can_run_b12x_mhc(torch.empty(2, 4))
+    assert not layer._can_run_b12x_mhc(torch.empty(2, 4, 4))
+
+    layer._use_b12x_mhc = False
+    assert not layer._can_run_b12x_mhc(torch.empty(2, 4))
+
+
+def test_mtp_expanded_state_keeps_non_broadcast_mhc_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HiddenProjection(torch.nn.Module):
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return hidden_states
+
+    class EmbeddingProjection(torch.nn.Module):
+        def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+            return torch.zeros_like(embeddings)
+
+    class ExpandedStateBlock(torch.nn.Module):
+        use_sequence_parallel = False
+
+        def _can_run_b12x_mhc(self, hidden_states: torch.Tensor) -> bool:
+            assert hidden_states.dim() == 3
+            return False
+
+        def forward(
+            self,
+            *,
+            positions: torch.Tensor,
+            x: torch.Tensor,
+            input_ids: torch.Tensor | None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            del positions, input_ids
+            tokens, hc_mult, _ = x.shape
+            post_mix = torch.zeros(tokens, hc_mult)
+            res_mix = torch.zeros(tokens, hc_mult, hc_mult)
+            return x, x.clone(), post_mix, res_mix
+
+    layer = object.__new__(mtp_module.DeepSeekV4MultiTokenPredictorLayer)
+    torch.nn.Module.__init__(layer)
+    layer.hc_mult = 4
+    layer.config = SimpleNamespace(hidden_size=4)
+    layer.enorm = SimpleNamespace(
+        weight=SimpleNamespace(data=torch.ones(4)), variance_epsilon=1e-6
+    )
+    layer.hnorm = SimpleNamespace(weight=SimpleNamespace(data=torch.ones(4)))
+    layer.h_proj = HiddenProjection()
+    layer.e_proj = EmbeddingProjection()
+    layer.mtp_block = ExpandedStateBlock()
+
+    monkeypatch.setattr(
+        mtp_module,
+        "fused_mtp_input_rmsnorm",
+        lambda embeddings, positions, hidden_states, *args: (
+            embeddings,
+            hidden_states,
+        ),
+    )
+    post_calls: list[torch.Tensor] = []
+
+    def mhc_post(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+    ) -> torch.Tensor:
+        del hidden_states, post_mix, res_mix
+        post_calls.append(residual)
+        return residual
+
+    monkeypatch.setattr(mtp_module, "mhc_post_tilelang", mhc_post)
+
+    output = layer(
+        input_ids=torch.arange(2),
+        positions=torch.arange(2),
+        previous_hidden_states=torch.ones(2, 16),
+        inputs_embeds=torch.ones(2, 4),
+    )
+
+    assert output.shape == (2, 16)
+    assert len(post_calls) == 1
 
 
 def test_b12x_forward_broadcasts_initial_residual() -> None:

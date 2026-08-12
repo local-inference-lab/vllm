@@ -1048,6 +1048,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         del tokens
         return self._use_b12x_mhc
 
+    def _can_run_b12x_mhc(self, x: torch.Tensor) -> bool:
+        """Return whether ``x`` satisfies the B12X mHC input contract.
+
+        B12X ``run_pre`` accepts a rank-2 hidden state and broadcasts it into
+        the hyperconnection residual. DeepSeek V4 MTP already supplies that
+        residual as a rank-3 tensor, so it must retain the non-broadcast
+        TileLang path.
+        """
+        return x.dim() == 2 and self._should_run_b12x_mhc(int(x.shape[0]))
+
     def refresh_b12x_mhc_bf16_weights(self) -> None:
         if not self._use_b12x_mhc:
             return
@@ -1334,11 +1344,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self._should_run_b12x_mhc(int(x.shape[0])):
+        if self._can_run_b12x_mhc(x):
             attn_norm_weight = self.attn_norm.weight.data
             attn_norm_eps = self.attn_norm.variance_epsilon
             if residual is None:
-                assert x.dim() == 2
                 assert self.hc_attn_fn_broadcast is not None
                 residual, post_mix, res_mix, x = self.hc_pre(
                     x,

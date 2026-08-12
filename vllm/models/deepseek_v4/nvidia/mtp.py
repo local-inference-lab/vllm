@@ -177,10 +177,11 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(
             inputs_embeds
         ).unsqueeze(-2)
+        use_b12x_mhc = self.mtp_block._can_run_b12x_mhc(hidden_states)
         hidden_states, residual, post_mix, res_mix = self.mtp_block(
             positions=positions, x=hidden_states, input_ids=None
         )
-        if self.mtp_block._should_run_b12x_mhc(int(hidden_states.shape[0])):
+        if use_b12x_mhc:
             from b12x.norm.mhc import run_post as b12x_mhc_post
 
             hidden_states = b12x_mhc_post(
