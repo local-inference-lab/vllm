@@ -231,6 +231,36 @@ class TestMissingInvokeEnd:
         assert "Done." in collect_content(results)
 
 
+class TestToolEndAbsorption:
+    def test_duplicate_tool_end_is_not_streamed_as_content(
+        self, mock_tokenizer, mock_request
+    ):
+        parser = DeepSeekV4Parser(mock_tokenizer)
+        chunks = [
+            DSML_TOOL_START,
+            DSML_INVOKE_PREFIX
+            + "get_weather"
+            + DSML_INVOKE_NAME_END
+            + "\n"
+            + _param("location", "true", "NYC")
+            + "\n"
+            + DSML_INVOKE_END
+            + "\n</",
+            "｜DSML｜tool_calls></",
+            "｜DSML｜tool_calls></think>",
+            "Done.",
+        ]
+
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+
+        assert collect_function_name(results) == "get_weather"
+        assert json.loads(collect_tool_arguments(results)) == {"location": "NYC"}
+        content = collect_content(results)
+        assert content == "Done."
+        assert "DSML" not in content
+        assert "</think>" not in content
+
+
 # ── Thinking mode initial state ──────────────────────────────────────
 
 
