@@ -73,6 +73,11 @@ if TYPE_CHECKING:
     VLLM_DCP_PROJECT_BEFORE_MERGE: bool = False
     VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS: int = 1024
     VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE: bool = False
+    # Short speculative extends may use the B12X sparse-MLA decode kernel.
+    # The backend owns validation because its defaults depend on the active
+    # speculative configuration.
+    VLLM_B12X_MLA_SPEC_DECODE_MAX_Q: int = 8
+    VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE: str = "auto"
     VLLM_DCP_A2A_MAX_TOKENS: int = 0
     VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
     VLLM_DCP_SHARD_DRAFT: str | None = None
@@ -87,8 +92,6 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
     VLLM_B12X_MLA_CKV_PREFETCH_DEPTH: int = 1
     VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB: int = 1024
-    VLLM_B12X_MLA_SPEC_DECODE_MAX_Q: int = 8
-    VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE: str = "auto"
     VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
     VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
     VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
@@ -243,10 +246,17 @@ if TYPE_CHECKING:
     VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
     VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA: bool = True
     VLLM_PCIE_ONESHOT_SINGLE_CHANNEL: bool = False
+    # Wire format for large B12X PCIe DMA allreduces. Unset delegates to the
+    # B12X compatibility variable and the extension's lossless default.
     VLLM_PCIE_DMA_FP8: str | None = None
+    # C++ custom-allreduce crossover tuning. Defaults are backend-dependent,
+    # so the communicator remains the source of truth when these are unset.
     VLLM_CPP_AR_1STAGE_NCCL_CUTOFF: str | None = None
     VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS: int | None = None
+    # Enable B12X PCIe DMA for large allreduces. Consumed by the B12X/SparkInfer
+    # C++ extension; registered here so the launcher export does not warn.
     VLLM_USE_B12X_PCIE_DMA: bool = False
+    # Legacy alias for VLLM_CACHE_ROOT; exported by the GLM launcher.
     VLLM_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -348,6 +358,15 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+
+    # EXL3 online quantization and encoder knobs (exported by the GLM
+    # launcher; consumed by the exllamav3 extension / build scripts).
+    VLLM_EXL3_ONLINE_TRELLIS_BITS: int | None = None
+    VLLM_EXL3_ONLINE_CACHE_DIR: str | None = None
+    VLLM_EXL3_ONLINE_CACHE_MODE: str | None = None
+    VLLM_EXL3_PREFILL_CAPACITY: int | None = None
+    VLLM_EXL3_ENCODER_SOURCE: str | None = None
+    VLLM_EXL3_ENCODER_REVISION: str | None = None
 
 
 def get_default_cache_root():
@@ -1166,6 +1185,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
             )
         )
     ),
+    # Short speculative extends may use the B12X sparse-MLA decode kernel.
+    # The backend owns validation because its defaults depend on the active
+    # speculative configuration.
+    "VLLM_B12X_MLA_SPEC_DECODE_MAX_Q": lambda: int(
+        os.getenv("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", "8")
+    ),
+    "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE": lambda: os.getenv(
+        "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "auto"
+    ),
     # Token cap for the low-latency DCP A2A exchange (0 = uncapped). Batches
     # with more tokens than this bypass the one-shot A2A/B12X path, which is
     # latency-optimal for small decode batches but loses to pipelined NCCL
@@ -1232,15 +1260,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reduced automatically when its ring would exceed this budget.
     "VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB", "1024")
-    ),
-    # Short speculative extends may use the B12X sparse-MLA decode kernel.
-    # Backend validation remains authoritative because eligibility also
-    # depends on the active speculative configuration.
-    "VLLM_B12X_MLA_SPEC_DECODE_MAX_Q": lambda: int(
-        os.getenv("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", "8")
-    ),
-    "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE": lambda: os.getenv(
-        "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "auto"
     ),
     # Diagnostic flag retained for local experiments. MiniMax M3 compile is
     # fail-closed in the model until the no-break path is validated.
@@ -2331,6 +2350,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Prebuilt exllamav3 extension location and torch-ABI compatibility shim.
     "VLLM_EXL3_EXT_PATH": lambda: os.getenv("VLLM_EXL3_EXT_PATH"),
     "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),
+    # EXL3 online quantization knobs (exported by the GLM launcher for the
+    # exl3-b6 preset; consumed by the exllamav3 extension / build scripts).
+    # A present-but-blank value means "unset": Compose/Kubernetes render an
+    # unset variable as the empty string, and int("") would crash engine
+    # startup with an opaque ValueError.  Matches _positive_env_int in
+    # exl3.py, which carries the same comment.
+    "VLLM_EXL3_ONLINE_TRELLIS_BITS": lambda: (
+        int(value)
+        if (value := os.getenv("VLLM_EXL3_ONLINE_TRELLIS_BITS")) is not None
+        and value.strip()
+        else None
+    ),
+    "VLLM_EXL3_ONLINE_CACHE_DIR": lambda: os.getenv("VLLM_EXL3_ONLINE_CACHE_DIR"),
+    "VLLM_EXL3_ONLINE_CACHE_MODE": lambda: os.getenv("VLLM_EXL3_ONLINE_CACHE_MODE"),
+    # EXL3 routed-expert prefill-arena bound (unset = MAX_BATCHED_TOKENS).
+    # NOTE: the runtime consumer in PR #270 reads this straight from
+    # os.environ via _positive_env_int, so two parsers exist today.  Whichever
+    # of #186/#270 lands second must delete the duplicate and route through
+    # this registry entry so the two cannot drift.
+    "VLLM_EXL3_PREFILL_CAPACITY": lambda: (
+        int(value)
+        if (value := os.getenv("VLLM_EXL3_PREFILL_CAPACITY")) is not None
+        and value.strip()
+        else None
+    ),
+    # EXL3 encoder source path and pinned revision (used by online K6 builds).
+    "VLLM_EXL3_ENCODER_SOURCE": lambda: os.getenv("VLLM_EXL3_ENCODER_SOURCE"),
+    "VLLM_EXL3_ENCODER_REVISION": lambda: os.getenv("VLLM_EXL3_ENCODER_REVISION"),
 }
 
 
