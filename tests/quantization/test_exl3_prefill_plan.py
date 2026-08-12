@@ -51,7 +51,7 @@ class _FakeFusedMoeApi:
         self.planned = []
         self.bound = []
         self.routed = []
-
+        self._output = None  # persistent output arena, mirroring the real backend
     def Caps(self, **kwargs):
         return kwargs
 
@@ -81,7 +81,15 @@ class _FakeFusedMoeApi:
                 binding.output.copy_(tier_output)
                 return binding.output
             return tier_output
-        return binding.a.to(torch.float32)
+        # Mirror the real B12X backend: write into one persistent output arena
+        # and return a *view*. Callers that accumulate chunks must clone each
+        # view before the next bind()/run() overwrites the arena.
+        m = int(binding.a.shape[0])
+        if self._output is None or self._output.shape[0] < m:
+            self._output = torch.empty((m, HIDDEN), dtype=torch.float32)
+        out = self._output[:m]
+        out.copy_(binding.a)
+        return out
 
 
 class _FakeMixedTrellisApi:
@@ -132,6 +140,16 @@ class _FakeMixedTrellisApi:
         output = buffers.output[: x.shape[0]]
         output.copy_(x)
         return output
+
+    def prepare_weights(self, **kwargs):
+        return SimpleNamespace(prepared=True, **kwargs)
+
+    def build_tiered_maps(self, tier_ids_0, tier_ids_1, *, device):
+        del device
+        return (object(), object())
+
+    def combine_trellis_rotations(self, *tiers):
+        return object()
 
 
 
@@ -628,6 +646,147 @@ def test_explicit_parity_path_guarded_against_capture():
         runtime = next(iter(exl3_module._RANK_SLICED_RUNTIMES.values()))
         assert runtime["parity_staging"] is not None
         assert h.ext.max_concurrency_calls == 1
+
+
+def _make_backed_param(shard_ids, num_experts, per_expert_shape, dtype=torch.float16):
+    if len(shard_ids) > 1:
+        backing = torch.empty(
+            (len(shard_ids), num_experts) + tuple(per_expert_shape), dtype=dtype
+        )
+    else:
+        backing = torch.empty(
+            (num_experts,) + tuple(per_expert_shape), dtype=dtype
+        )
+    tensors = {}
+    for expert_id in range(num_experts):
+        for shard_id in shard_ids:
+            shard_index = shard_ids.index(shard_id)
+            if len(shard_ids) > 1:
+                tensors[(expert_id, shard_id)] = backing[shard_index, expert_id]
+            else:
+                tensors[(expert_id, shard_id)] = backing[expert_id]
+    return SimpleNamespace(
+        exl3_shard_ids=tuple(shard_ids),
+        exl3_backing=backing,
+        exl3_tensors=tensors,
+    )
+
+
+def _make_producer_layer(broadcast_rotations=False):
+    """Build a layer whose backing slabs are valid for _prepare_mixed_rank_sliced_weights."""
+    bitrates = (3, 3, 3, 3, 4, 4, 4, 4)
+    rot_experts = 1 if broadcast_rotations else EXPERTS
+    layer = SimpleNamespace(
+        exl3_max_num_batched_tokens=MAX_BATCHED,
+        exl3_hidden_size=HIDDEN,
+        exl3_intermediate_size_per_partition=INTERMEDIATE,
+        local_num_experts=EXPERTS,
+        exl3_layer_bitrates=bitrates,
+        activation=SimpleNamespace(value="swiglu"),
+        layer_name="test.mixed.layer",
+    )
+    # Trellis weight params: per-expert tensors with tier-dependent last dim.
+    w13_tensors = {}
+    w2_tensors = {}
+    for expert_id, bits in enumerate(bitrates):
+        last = 16 * bits
+        w13_tensors[(expert_id, "w1")] = torch.empty(
+            HIDDEN // 16, INTERMEDIATE // 16, last, dtype=torch.uint8
+        )
+        w13_tensors[(expert_id, "w3")] = torch.empty(
+            HIDDEN // 16, INTERMEDIATE // 16, last, dtype=torch.uint8
+        )
+        w2_tensors[(expert_id, "w2")] = torch.empty(
+            INTERMEDIATE // 16, HIDDEN // 16, last, dtype=torch.uint8
+        )
+    layer.w13_trellis = SimpleNamespace(
+        exl3_shard_ids=("w1", "w3"), exl3_backing=None, exl3_tensors=w13_tensors
+    )
+    layer.w2_trellis = SimpleNamespace(
+        exl3_shard_ids=("w2",), exl3_backing=None, exl3_tensors=w2_tensors
+    )
+    # Rotation params: backed slabs with view aliases.
+    layer.w13_suh = _make_backed_param(("w1", "w3"), rot_experts, (HIDDEN,))
+    layer.w13_svh = _make_backed_param(("w1", "w3"), rot_experts, (INTERMEDIATE,))
+    layer.w2_suh = _make_backed_param(("w2",), rot_experts, (INTERMEDIATE,))
+    layer.w2_svh = _make_backed_param(("w2",), rot_experts, (HIDDEN,))
+    # Dummy params referenced by the clearing loop.
+    for name in ("w13_mcg", "w13_mul1", "w2_mcg", "w2_mul1"):
+        setattr(layer, name, SimpleNamespace(exl3_tensors={}, exl3_backing=None))
+    return layer
+
+
+def test_mixed_prepare_populates_required_keys():
+    """B1: _prepare_mixed_rank_sliced_weights must produce all four keys
+    that the runtime consumers read (broadcast_suh, broadcast_svh,
+    prefill_tiers, prefill_tile_config)."""
+    with _Harness() as h:
+        method = _make_method()
+        layer = _make_producer_layer()
+        method._prepare_mixed_rank_sliced_weights(layer)
+        mixed = layer.exl3_mixed_trellis
+        for key in (
+            "broadcast_suh",
+            "broadcast_svh",
+            "prefill_tiers",
+            "prefill_tile_config",
+        ):
+            assert key in mixed, f"missing key {key!r} in exl3_mixed_trellis"
+        assert mixed["broadcast_suh"] is False
+        assert mixed["broadcast_svh"] is False
+        assert len(mixed["prefill_tiers"]) == 2
+        assert mixed["prefill_tiers"] == mixed["tiers"]
+        assert mixed["prefill_tile_config"] == mixed["tile_config"]
+
+
+def test_mixed_prepare_broadcast_rotations():
+    """B1: broadcast rotation slabs (shape[0] == 1) set the broadcast flags."""
+    with _Harness() as h:
+        method = _make_method()
+        layer = _make_producer_layer(broadcast_rotations=True)
+        method._prepare_mixed_rank_sliced_weights(layer)
+        mixed = layer.exl3_mixed_trellis
+        assert mixed["broadcast_suh"] is True
+        assert mixed["broadcast_svh"] is True
+
+
+@pytest.mark.parametrize(
+    ("rows", "capacity", "expected_slices"),
+    (
+        # equal-sized chunks
+        (256, 128, [128, 128]),
+        # short final chunk
+        (200, 128, [128, 72]),
+        # single chunk
+        (100, 128, [100]),
+    ),
+)
+def test_uniform_prefill_chunks_clone_persistent_output(
+    rows, capacity, expected_slices
+):
+    """B2: the uniform prefill path must clone each chunk because the fake
+    backend (like the real one) returns a view of one persistent output
+    arena.  Without the clone, torch.cat yields N copies of the last chunk."""
+    with _Harness(env={"VLLM_EXL3_PREFILL_CAPACITY": str(capacity)}) as h:
+        method = _make_method()
+        layer = _make_layer()
+        x = torch.arange(rows, dtype=torch.bfloat16).unsqueeze(1).expand(
+            -1, HIDDEN
+        )
+        weights = torch.arange(rows * TOPK, dtype=torch.float32).reshape(
+            rows, TOPK
+        )
+        ids = torch.arange(rows * TOPK, dtype=torch.int64).reshape(rows, TOPK)
+        ids = ids.remainder(EXPERTS)
+
+        out = method._apply_rank_sliced(layer, x, weights, ids)
+
+        assert [bound[1] for bound in h.api.bound] == expected_slices
+        assert out.shape == (rows, HIDDEN)
+        assert out.dtype == torch.bfloat16
+        # Correctness: each row must match the input.  Without the clone the
+        # persistent arena is overwritten and earlier rows are corrupted.
+        assert torch.equal(out, x)
 
 
 if __name__ == "__main__":

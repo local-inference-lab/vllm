@@ -72,10 +72,19 @@ _B12X_FUSED_MOE_API: Any | None = None
 _B12X_MIXED_TRELLIS_API: Any | None = None
 _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
-# Decode buffers are deliberately excluded: CUDA graphs capture their addresses.
-# A worker executes one model batch at a time and its layers are stream-ordered;
-# prefill therefore lets exact-compatible target layers reuse one persistent
-# buffer set. Target/draft roles remain separate below.
+# Prefill buffer cache (process-lifetime global).
+#
+# Lifetime: entries are created lazily on first use and never evicted for the
+# lifetime of the worker process (tests clear it explicitly).  Each entry owns
+# GPU tensors sized for one prefill launch, so the total resident memory grows
+# with the number of distinct (model scope, device, layout) combinations.
+#
+# Safety assumption: reuse is safe only because vLLM executes one model batch at
+# a time and, within a forward, layers run strictly sequentially and
+# stream-ordered — one layer's prefill completes (and the output is copied out
+# or converted) before the next layer touches the same buffer set.  Decode
+# buffers are deliberately excluded because CUDA graphs capture their addresses.
+# Target/draft roles are kept separate via the owner-token key below.
 _MIXED_TRELLIS_PREFILL_BUFFERS: dict[tuple[Any, ...], Any] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
 _MIXED_TRELLIS_ROUTE_BLOCK_SIZE = 8
@@ -1622,6 +1631,28 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             return (128, 128, 64, 256)
         return (128, 128, 128, 128)
 
+    @staticmethod
+    def _mixed_trellis_prefill_tile_config(
+        hidden_size: int, intermediate_size: int
+    ):
+        # Prefill reuses the checkpoint's one-grid tile geometry so the large-M
+        # reduction order matches the stock reference.  Kept separate from
+        # _mixed_trellis_tile_config (decode) so the two can diverge if a future
+        # kernel ABI picks a different prefill tile.
+        return Exl3MoEMethod._mixed_trellis_tile_config(
+            hidden_size, intermediate_size
+        )
+
+    @staticmethod
+    def _select_rotation_rows(
+        rotations: torch.Tensor, expert_ids: torch.Tensor
+    ) -> torch.Tensor:
+        # Broadcast rotations (shape[0] == 1) are shared across all experts;
+        # return as-is instead of index_selecting (which would be out of range).
+        if int(rotations.shape[0]) == 1:
+            return rotations
+        return rotations.index_select(0, expert_ids).contiguous()
+
     def _prepare_mixed_rank_sliced_weights(self, layer: RoutedExperts) -> None:
         api = _load_b12x_mixed_trellis()
         num_experts = int(layer.local_num_experts)
@@ -1663,6 +1694,18 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         down_svh = self._rank_sliced_backing(layer, "w2_svh")
         device = gate_suh.device
         tile_config = self._mixed_trellis_tile_config(hidden_size, intermediate_size)
+        prefill_tile_config = self._mixed_trellis_prefill_tile_config(
+            hidden_size, intermediate_size
+        )
+        # broadcast_suh/svh tell compile_mixed_trellis whether the rotation
+        # slabs are shared across all experts (shape[0] == 1) or per-expert.
+        broadcast_suh = int(gate_suh.shape[0]) == 1
+        if broadcast_suh != (int(up_suh.shape[0]) == 1):
+            raise ValueError(
+                "mixed EXL3 gate/up SUH rotations must both be per-expert "
+                "or both broadcast"
+            )
+        broadcast_svh = int(down_svh.shape[0]) == 1
         prepared_tiers = []
         tier_ids = []
         for bits, expert_ids in tiers.items():
@@ -1704,17 +1747,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 )
 
             index = torch.tensor(expert_ids, dtype=torch.long, device=device)
-            tier_gate_suh = gate_suh.index_select(0, index).contiguous()
-            tier_up_suh = up_suh.index_select(0, index).contiguous()
+            tier_gate_suh = self._select_rotation_rows(gate_suh, index)
+            tier_up_suh = self._select_rotation_rows(up_suh, index)
             intermediate_rotations = torch.cat(
                 (
-                    gate_svh.index_select(0, index),
-                    up_svh.index_select(0, index),
-                    down_suh.index_select(0, index),
+                    self._select_rotation_rows(gate_svh, index),
+                    self._select_rotation_rows(up_svh, index),
+                    self._select_rotation_rows(down_suh, index),
                 ),
                 dim=1,
             ).contiguous()
-            tier_down_svh = down_svh.index_select(0, index).contiguous()
+            tier_down_svh = self._select_rotation_rows(down_svh, index)
             prepared_tiers.append(
                 api.prepare_weights(
                     w13=w13,
@@ -1739,17 +1782,33 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
             tier_ids.append(expert_ids)
 
+        # Prefill tiers use the prefill tile geometry.  When it matches the
+        # decode tile_config the prepared objects are identical, so reuse them
+        # instead of doubling memory.  If the geometries diverge, a second
+        # prepare_weights pass per tier with prefill_tile_config goes here.
+        if prefill_tile_config == tile_config:
+            prefill_tiers = tuple(prepared_tiers)
+        else:
+            raise NotImplementedError(
+                "distinct prefill tile geometry requires a second "
+                "prepare_weights pass per tier"
+            )
+
         global_to_combined, descriptor_map = api.build_tiered_maps(
             tier_ids[0], tier_ids[1], device=device
         )
         layer.exl3_mixed_trellis = {
             "tiers": tuple(prepared_tiers),
+            "prefill_tiers": prefill_tiers,
             "tier_ids": tuple(tier_ids),
             "tier_bits": tuple(tiers),
             "global_to_combined": global_to_combined,
             "descriptor_map": descriptor_map,
             "rotations": api.combine_trellis_rotations(*prepared_tiers),
+            "broadcast_suh": broadcast_suh,
+            "broadcast_svh": broadcast_svh,
             "tile_config": tile_config,
+            "prefill_tile_config": prefill_tile_config,
         }
         layer.exl3_trellis_tile_config = tile_config
 
@@ -2079,15 +2138,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 )
                 chunks.append(chunk.clone())
             raw_output = torch.cat(chunks)
-        # B12X returns a view of its persistent FP32 output buffer.  The
-        # dtype conversion is therefore also the lifetime boundary before
-        # a compatible later layer reuses the same prefill storage.
-        # `copy=True` is dormant for today's FP32 -> BF16 conversion and
-        # protects a future same-dtype backend without extra storage
-        # pointer queries in the hot path.
+        # B12X returns a view of its persistent output buffer, which survives
+        # across forward passes regardless of whether the buffer set was reused
+        # from another layer.  The .to() conversion to x.dtype naturally breaks
+        # the alias when dtypes differ (FP32 -> BF16); when they match the
+        # copy= below forces a materialisation so a later layer reusing the
+        # same storage cannot corrupt this output.
         output = raw_output.to(
             dtype=x.dtype,
-            copy=state["buffers_reused"] and raw_output.dtype == x.dtype,
+            copy=raw_output.dtype == x.dtype,
         )
         return output
 
@@ -2314,7 +2373,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         prefill_scratch = None
         if prefill_plan_enabled:
             prefill_plan, prefill_scratch = _plan_with_scratch(
-                max_batched_tokens, prefill_block_m
+                prefill_capacity, prefill_block_m
             )
         hidden_size = int(layer.exl3_hidden_size)
         intermediate_size = int(layer.exl3_intermediate_size_per_partition)
@@ -2413,7 +2472,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     topk_weights=topk_weights[start:end],
                     topk_ids=topk_ids[start:end],
                 )
-                outputs.append(runtime["api"].run(binding=binding))
+                # The backend may return a view of the persistent prefill
+                # scratch arena; clone before the next bind()/run() reuses it.
+                outputs.append(runtime["api"].run(binding=binding).clone())
             return torch.cat(outputs).to(x.dtype)
 
         if torch.cuda.is_current_stream_capturing():
