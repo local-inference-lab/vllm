@@ -61,6 +61,7 @@ def test_hybrid_cache_invalid_block_truncates_all_groups():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.block_size = 16
     scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.group_block_sizes = (16, 16)
 
     request = Mock(spec=Request)
     request.request_id = "hybrid-request"
@@ -87,6 +88,7 @@ def test_hybrid_cache_shared_invalid_block_is_recomputed_once():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.block_size = 16
     scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.group_block_sizes = (16, 16)
 
     first_request = Mock(spec=Request)
     first_request.request_id = "first-request"
@@ -110,6 +112,60 @@ def test_hybrid_cache_shared_invalid_block_is_recomputed_once():
     assert second_request.num_computed_tokens == 48
     assert affected_tokens == 32
     assert evicted == {2, 3, 12, 13}
+
+
+def test_hybrid_cache_aligns_recovery_across_different_block_sizes():
+    """Recovery starts where every hybrid-cache group has a block boundary."""
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.block_size = 32
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.group_block_sizes = (16, 32)
+
+    request = Mock(spec=Request)
+    request.request_id = "different-block-sizes"
+    request.num_computed_tokens = 96
+    scheduler.kv_cache_manager.get_block_ids.return_value = (
+        [1, 2, 3, 4, 5, 6],
+        [11, 12, 13],
+    )
+
+    affected, affected_tokens, evicted = scheduler._update_requests_with_invalid_blocks(
+        [request],
+        invalid_block_ids={4},
+        num_scheduled_tokens={},
+    )
+
+    assert affected == {request.request_id}
+    assert request.num_computed_tokens == 32
+    assert affected_tokens == 64
+    assert evicted == {3, 4, 5, 6, 12, 13}
+
+
+def test_hybrid_cache_ignores_invalid_blocks_after_external_prefix():
+    """A block used only by scheduled local tokens is not a load failure."""
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.block_size = 32
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.group_block_sizes = (16, 32)
+
+    request = Mock(spec=Request)
+    request.request_id = "local-suffix"
+    request.num_computed_tokens = 64
+    scheduler.kv_cache_manager.get_block_ids.return_value = (
+        [1, 2, 3, 4],
+        [11, 12],
+    )
+
+    affected, affected_tokens, evicted = scheduler._update_requests_with_invalid_blocks(
+        [request],
+        invalid_block_ids={3, 12},
+        num_scheduled_tokens={request.request_id: 32},
+    )
+
+    assert affected == set()
+    assert request.num_computed_tokens == 64
+    assert affected_tokens == 0
+    assert evicted == set()
 
 
 def test_sync_recompute_blocks_not_freed_for_running_requests(

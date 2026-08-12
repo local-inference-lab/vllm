@@ -2911,8 +2911,6 @@ class Scheduler(SchedulerInterface):
         # it. This set tracks blocks already marked for recomputation.
         marked_invalid_block_ids: set[int] = set()
         for request in requests:
-            is_affected = False
-            marked_invalid_block = False
             req_id = request.request_id
             req_block_ids_by_group = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
@@ -2921,64 +2919,62 @@ class Scheduler(SchedulerInterface):
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
 
-            req_num_computed_blocks = (
-                req_num_computed_tokens + self.block_size - 1
-            ) // self.block_size
-            # KV cache groups currently use the same logical block positions.
-            # A failed load in any group invalidates that position for the
-            # request, and recomputation must evict all groups from there on.
-            logical_block_ids = zip(
-                *(group[:req_num_computed_blocks] for group in req_block_ids_by_group)
-            )
-            for idx, block_ids in enumerate(logical_block_ids):
-                invalid_ids = invalid_block_ids.intersection(block_ids)
-                if not invalid_ids:
-                    continue
+            invalid_blocks: list[tuple[int, int]] = []
+            for group_block_ids, group_block_size in zip(
+                req_block_ids_by_group,
+                self.kv_cache_manager.group_block_sizes,
+                strict=True,
+            ):
+                req_num_group_blocks = (
+                    req_num_computed_tokens + group_block_size - 1
+                ) // group_block_size
+                for block_idx, block_id in enumerate(
+                    group_block_ids[:req_num_group_blocks]
+                ):
+                    if block_id not in invalid_block_ids:
+                        continue
+                    block_start = block_idx * group_block_size
+                    # Recompute from a boundary shared by every KV cache group.
+                    # This avoids retaining a partially invalid larger block.
+                    recovery_boundary = block_start // self.block_size * self.block_size
+                    invalid_blocks.append((recovery_boundary, block_id))
 
-                is_affected = True
+            if not invalid_blocks:
+                continue
 
-                unmarked_invalid_ids = invalid_ids - marked_invalid_block_ids
-                marked_invalid_block_ids.update(invalid_ids)
-                if not unmarked_invalid_ids:
-                    # This invalid block is shared with a previous request
-                    # and was already marked for recomputation.
-                    # This means this request can still consider this block
-                    # as computed when rescheduled.
-                    # Currently this only applies to sync loading; Async
-                    # loading does not yet support block sharing
-                    continue
+            affected_req_ids.add(req_id)
+            request_invalid_ids = {block_id for _, block_id in invalid_blocks}
+            unmarked_invalid_ids = request_invalid_ids - marked_invalid_block_ids
+            marked_invalid_block_ids.update(request_invalid_ids)
 
-                if marked_invalid_block:
-                    # This request has already marked an invalid block for
-                    # recomputation and updated its num_computed_tokens.
-                    continue
-
-                marked_invalid_block = True
-                # Truncate the computed tokens at the first failed block
-                request.num_computed_tokens = idx * self.block_size
-                num_affected_tokens = (
-                    req_num_computed_tokens - request.num_computed_tokens
+            if not unmarked_invalid_ids:
+                # Every failed block is shared with an earlier request that
+                # owns its recomputation. Discard only tokens scheduled after
+                # the external prefix so this request can reuse that work.
+                total_affected_tokens += (
+                    request.num_computed_tokens - req_num_computed_tokens
                 )
-                total_affected_tokens += num_affected_tokens
+                request.num_computed_tokens = req_num_computed_tokens
+                continue
 
-                # collect invalid block and all downstream dependent blocks
-                if evict_blocks:
-                    for group_block_ids in req_block_ids_by_group:
-                        blocks_to_evict.update(group_block_ids[idx:])
+            recovery_boundary = min(
+                boundary
+                for boundary, block_id in invalid_blocks
+                if block_id in unmarked_invalid_ids
+            )
+            request.num_computed_tokens = recovery_boundary
+            total_affected_tokens += req_num_computed_tokens - recovery_boundary
 
-            if is_affected:
-                if not marked_invalid_block:
-                    # All invalid blocks of this request are shared with
-                    # previous requests and will be recomputed by them.
-                    # Revert to considering only cached tokens as computed.
-                    # Currently this only applies to sync loading; Async
-                    # loading does not yet support block sharing
-                    total_affected_tokens += (
-                        request.num_computed_tokens - req_num_computed_tokens
-                    )
-                    request.num_computed_tokens = req_num_computed_tokens
-
-                affected_req_ids.add(request.request_id)
+            if evict_blocks:
+                # Every group restarts at a complete physical block. The
+                # scheduler block size is the LCM of effective group sizes.
+                for group_block_ids, group_block_size in zip(
+                    req_block_ids_by_group,
+                    self.kv_cache_manager.group_block_sizes,
+                    strict=True,
+                ):
+                    first_block = recovery_boundary // group_block_size
+                    blocks_to_evict.update(group_block_ids[first_block:])
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
