@@ -37,6 +37,12 @@ from vllm.compilation.b12x_capture import (
     b12x_cuda_graph_wrapper_prewarm_enabled,
     guard_b12x_kernel_resolution,
 )
+from vllm.compilation.kquant_runtime_evidence import (
+    begin_graph_capture,
+    finish_graph_capture,
+    record_graph_replay,
+    runtime_evidence_enabled,
+)
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
@@ -246,6 +252,7 @@ class _BreakableEntry:
     capture: BreakableCUDAGraphCapture | None = None
     output: Any = None
     input_addresses: list[int] | None = None
+    runtime_evidence_observations: bytes | None = None
 
 
 class BreakableCUDAGraphWrapper:
@@ -394,23 +401,35 @@ class BreakableCUDAGraphWrapper:
             get_offloader().sync_prev_onload()
 
         capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
-        with (
-            guard_b12x_kernel_resolution(
-                "vLLM BreakableCUDAGraphWrapper capture after B12X eager warmup"
-            ),
-            vllm_cudagraph_capture_scope(),
-            capture,
-        ):
-            output = self.runnable(*args, **kwargs)
-            # Join the offloader's copy stream while we still hold the last
-            # segment open, so the join is captured into the graph (otherwise
-            # we get an "unjoined stream" error on subsequent forwards).
-            get_offloader().join_after_forward()
-            # Convert output to a weak ref *inside* the capture context so the
-            # strong ref is dropped before the last segment closes, letting
-            # the cudagraph pool reclaim/reuse that memory immediately for
-            # the next batch descriptor's capture.
-            output = weak_ref_tensors(output)
+        evidence_capture_started = (
+            begin_graph_capture() if runtime_evidence_enabled else False
+        )
+        evidence_capture_succeeded = False
+        try:
+            with (
+                guard_b12x_kernel_resolution(
+                    "vLLM BreakableCUDAGraphWrapper capture after B12X eager warmup"
+                ),
+                vllm_cudagraph_capture_scope(),
+                capture,
+            ):
+                output = self.runnable(*args, **kwargs)
+                # Join the offloader's copy stream while we still hold the last
+                # segment open, so the join is captured into the graph (otherwise
+                # we get an "unjoined stream" error on subsequent forwards).
+                get_offloader().join_after_forward()
+                # Convert output to a weak ref *inside* the capture context so the
+                # strong ref is dropped before the last segment closes, letting
+                # the cudagraph pool reclaim/reuse that memory immediately for
+                # the next batch descriptor's capture.
+                output = weak_ref_tensors(output)
+            evidence_capture_succeeded = True
+        finally:
+            if runtime_evidence_enabled:
+                entry.runtime_evidence_observations = finish_graph_capture(
+                    evidence_capture_started,
+                    evidence_capture_succeeded,
+                )
 
         entry.capture = capture
         entry.output = weak_ref_tensors(output)
@@ -442,4 +461,6 @@ class BreakableCUDAGraphWrapper:
         get_offloader().sync_prev_onload()
         assert entry.capture is not None
         entry.capture.replay()
+        if runtime_evidence_enabled:
+            record_graph_replay(entry.runtime_evidence_observations)
         return entry.output

@@ -12,7 +12,7 @@ from vllm import _custom_ops as ops
 from vllm.v1.attention.backends.mla import b12x_mla_sparse
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseImpl
 
-_WRITER_MODULE = "sparkinfer.attention._shared.mla.kv_cache"
+_WRITER_MODULE = "b12x.attention._shared.mla.kv_cache"
 _WRITER_NAME = "concat_and_cache_nvfp4_mla_fp8_rope"
 
 
@@ -75,29 +75,29 @@ def _install_fake_writer_package(
     monkeypatch: pytest.MonkeyPatch,
     writer,
 ) -> None:
-    sparkinfer_module = types.ModuleType("sparkinfer")
-    sparkinfer_module.__path__ = []
-    attention_module = types.ModuleType("sparkinfer.attention")
+    b12x_module = types.ModuleType("b12x")
+    b12x_module.__path__ = []
+    attention_module = types.ModuleType("b12x.attention")
     attention_module.__path__ = []
-    shared_module = types.ModuleType("sparkinfer.attention._shared")
+    shared_module = types.ModuleType("b12x.attention._shared")
     shared_module.__path__ = []
-    mla_module = types.ModuleType("sparkinfer.attention._shared.mla")
+    mla_module = types.ModuleType("b12x.attention._shared.mla")
     mla_module.__path__ = []
     kv_cache_module = types.ModuleType(_WRITER_MODULE)
 
-    sparkinfer_module.attention = attention_module
+    b12x_module.attention = attention_module
     attention_module._shared = shared_module
     shared_module.mla = mla_module
     mla_module.kv_cache = kv_cache_module
     if writer is not None:
         setattr(kv_cache_module, _WRITER_NAME, writer)
 
-    monkeypatch.setitem(sys.modules, "sparkinfer", sparkinfer_module)
-    monkeypatch.setitem(sys.modules, "sparkinfer.attention", attention_module)
-    monkeypatch.setitem(sys.modules, "sparkinfer.attention._shared", shared_module)
+    monkeypatch.setitem(sys.modules, "b12x", b12x_module)
+    monkeypatch.setitem(sys.modules, "b12x.attention", attention_module)
+    monkeypatch.setitem(sys.modules, "b12x.attention._shared", shared_module)
     monkeypatch.setitem(
         sys.modules,
-        "sparkinfer.attention._shared.mla",
+        "b12x.attention._shared.mla",
         mla_module,
     )
     monkeypatch.setitem(sys.modules, _WRITER_MODULE, kv_cache_module)
@@ -298,7 +298,7 @@ def test_enabled_mode_missing_public_writer_fails_closed(
     with pytest.raises(
         RuntimeError,
         match=(
-            "KV_FP8_ROPE=1 requires a SparkInfer build with "
+            "KV_FP8_ROPE=1 requires a b12x build with "
             "concat_and_cache_nvfp4_mla_fp8_rope package API support"
         ),
     ):

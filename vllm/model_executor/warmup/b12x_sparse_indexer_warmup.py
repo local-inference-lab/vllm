@@ -52,7 +52,7 @@ def _fused_decode_warmup_rows(
     max_pages: int,
     device: torch.device,
 ) -> tuple[int, ...]:
-    from sparkinfer.attention.nsa_indexer.fused_indexer import (
+    from b12x.attention.nsa_indexer.fused_indexer import (
         fused_indexer_decode_warmup_rows,
     )
 

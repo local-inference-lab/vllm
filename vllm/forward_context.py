@@ -56,6 +56,11 @@ class BatchDescriptor:
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
     """
+    speculative_draft_decode_only: bool | None = None
+    """
+    MTP draft phase used to specialize CUDA graphs that select different
+    quantized kernels for prompt/prefill and decode. None outside that path.
+    """
 
 
 def _compute_sp_num_tokens(

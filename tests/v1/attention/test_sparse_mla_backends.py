@@ -1007,11 +1007,10 @@ def test_sparse_backend_decode_correctness(
 
         if use_fp8_ds_mla_quantization:
             # The SM100 FlashInfer/FlashMLA kernels read ue8m0 (power-of-2) block
-            # scales, so the reference truncates scales to match. SparkInfer's
-            # GLM_NSA
+            # scales, so the reference truncates scales to match. b12x's GLM_NSA
             # kernel instead keeps the raw e4m3 K with the inline arbitrary-FP32
-            # group scale (it is incompatible with ue8m0 block-scaling), so for
-            # B12x the reference must dequantize with the true FP32 scales.
+            # group scale (it is incompatible with ue8m0 block-scaling), so the
+            # b12x reference must dequantize with the true FP32 scales.
             uses_pow2_scales = torch.cuda.get_device_capability()[
                 0
             ] >= 10 and backend_cls not in (
@@ -1248,7 +1247,7 @@ def test_b12x_sparse_spec_decode_causality(
     if not current_platform.has_device_capability(120):
         pytest.skip("B12xMLASparseBackend requires SM 12.0 (consumer Blackwell)")
 
-    sparse_mla = pytest.importorskip("sparkinfer.attention.sparse_mla")
+    sparse_mla = pytest.importorskip("b12x.attention.sparse_mla")
     calls = {"decode": 0, "extend": 0}
 
     def track_path(name, fn):

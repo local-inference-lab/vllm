@@ -32,7 +32,7 @@ def server():
         "--enforce-eager",
         "--max-model-len",
         "4080",
-        "--max-logprobs",  # test prompt_logprobs equal to -1
+        "--max-logprobs",  # permit the sampled-logprobs full-vocabulary test
         "151936",
     ]
 
@@ -100,7 +100,7 @@ async def test_prompt_logprobs(client: openai.AsyncOpenAI):
     completion = await client.chat.completions.create(
         model=MODEL_NAME,
         messages=messages,
-        extra_body={"prompt_logprobs": -1},
+        extra_body={"prompt_logprobs": 20},
     )
 
     assert completion.prompt_logprobs is not None

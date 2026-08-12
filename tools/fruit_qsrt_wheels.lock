@@ -1,0 +1,41 @@
+# Python 3.12 / Linux x86_64 wheels. Hashes are for the named PyPI artifacts.
+
+# cuda_python-13.2.0-py3-none-any.whl
+cuda-python==13.2.0 \
+    --hash=sha256:2f092b0ec13a860115fa595411889ee939ad203450ea4f91e9461b174ea7b084
+
+# nvidia_cutlass_dsl-4.6.0-py3-none-any.whl
+nvidia-cutlass-dsl==4.6.0 \
+    --hash=sha256:e3e0e4d8df20d82c8401fa013f4d82021f41daa5fca3d24b55d4a677f2308ca8
+
+# nvidia_cutlass_dsl_libs_base-4.6.0-cp312-cp312-manylinux_2_28_x86_64.whl
+nvidia-cutlass-dsl-libs-base==4.6.0 \
+    --hash=sha256:e41cd5db4de4b535c30ae9ca4412b957800a62560019ae91fa51cf3ea89bf254
+
+# nvidia_cutlass_dsl_libs_core-4.6.0-py3-none-any.whl
+nvidia-cutlass-dsl-libs-core==4.6.0 \
+    --hash=sha256:f9ea6d313a03cb11fa177da32e8747ad0cac51358850810f36aa6c4736192c27
+
+# nvidia_cutlass_dsl_libs_cu12-4.6.0-cp312-cp312-manylinux_2_28_x86_64.whl
+nvidia-cutlass-dsl-libs-cu12==4.6.0 \
+    --hash=sha256:abc341ff0fce40ed0bdadf160f6afac07fb9d01768d4daebd1628c330b3e4210
+
+# nvidia_cutlass_dsl_libs_cu13-4.6.0-cp312-cp312-manylinux_2_28_x86_64.whl
+nvidia-cutlass-dsl-libs-cu13==4.6.0 \
+    --hash=sha256:4799fabc4bd1f7825ff00101ae0054c5cfb6769aefd6d9694f6da8c0f07e12c3
+
+# apache_tvm_ffi-0.1.10-cp312-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
+apache-tvm-ffi==0.1.10 \
+    --hash=sha256:96b69030c722572e13e30182733adfa2d604258e988b3f6630a16f397c7f9288
+
+# rich-15.0.0-py3-none-any.whl
+rich==15.0.0 \
+    --hash=sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb
+
+# transformers-5.14.1-py3-none-any.whl
+transformers==5.14.1 \
+    --hash=sha256:9db974c4079ede2d1a3ea7ca5a240df33f2cc26fc2b36ba64c5f2a4f43b6e725
+
+# safetensors-0.8.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+safetensors==0.8.0 \
+    --hash=sha256:fd6f3f93c9a0a7cc2788ee63fb763353d4bd2e89b0751bc78fcf7dda00bea774
