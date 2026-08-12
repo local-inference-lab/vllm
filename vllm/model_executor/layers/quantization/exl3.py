@@ -19,10 +19,10 @@ one or initialize CUDA.
 
 from __future__ import annotations
 
-import ctypes
 import importlib
 import os
 import re
+import stat
 import sys
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -31,6 +31,7 @@ import torch
 from transformers import PretrainedConfig
 
 from vllm.config import get_current_vllm_config_or_none
+import vllm.envs as envs
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -54,6 +55,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.parameter import BasevLLMParameter
+from vllm.utils.path_validation import validate_native_lib_path
 from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
 if TYPE_CHECKING:
@@ -162,6 +164,67 @@ _RANK_SLICED_WEIGHT_RE = re.compile(
 ShardId = str | int | tuple[int, ...] | None
 
 
+_WORLD_WRITABLE = 0o002
+_GROUP_WRITABLE = 0o020
+
+
+def _validate_ext_search_dir(path: str, env_var: str) -> None:
+    """Validate the directory inserted into sys.path for the EXL3 extension.
+
+    Enforced controls:
+      * the path must resolve to an existing directory;
+      * the resolved path must equal its lexical abspath (no symlink
+        component anywhere on the chain) and ``lstat`` must not report the
+        final component as a symlink;
+      * neither the directory nor any ancestor may be group- or
+        world-writable (sticky-bit directories like /tmp are allowed).
+
+    These together stop a compromised path entry from being swapped for an
+    attacker-controlled module after validation, and from shadowing arbitrary
+    later imports.
+    """
+    if not path:
+        return
+    if not os.path.isabs(path):
+        raise ValueError(
+            f"{env_var} must be an absolute path: {path!r}"
+        )
+    resolved = os.path.realpath(path)
+    if resolved != os.path.normpath(path):
+        raise ValueError(
+            f"{env_var} must not contain a symlink component: "
+            f"{path!r} resolves to {resolved!r}"
+        )
+    st = os.lstat(resolved)
+    if stat.S_ISLNK(st.st_mode):
+        raise ValueError(
+            f"{env_var} must not be a symlink: {resolved!r}"
+        )
+    if not stat.S_ISDIR(st.st_mode):
+        raise ValueError(
+            f"{env_var} does not resolve to a directory: {path!r}"
+        )
+    if st.st_mode & (_GROUP_WRITABLE | _WORLD_WRITABLE):
+        raise ValueError(
+            f"{env_var} directory must not be group/world-writable: "
+            f"{resolved!r}"
+        )
+    # Walk ancestors: a writable directory anywhere on the chain lets an
+    # attacker swap a component and redirect the import.
+    parent = os.path.dirname(resolved)
+    while True:
+        pst = os.lstat(parent)
+        writable = pst.st_mode & (_GROUP_WRITABLE | _WORLD_WRITABLE)
+        if writable and not (pst.st_mode & stat.S_ISVTX):
+            raise ValueError(
+                f"{env_var} ancestor directory must not be "
+                f"group/world-writable: {parent!r}"
+            )
+        nxt = os.path.dirname(parent)
+        if nxt == parent:
+            break
+        parent = nxt
+
 def _load_exl3_ext() -> Any:
     """Load the existing ExLlamaV3 extension only from an actual CUDA call."""
 
@@ -169,15 +232,28 @@ def _load_exl3_ext() -> Any:
     if _EXL3_EXT is not None:
         return _EXL3_EXT
 
-    shim = os.environ.get("VLLM_EXL3_ABI_SHIM")
+    shim = envs.VLLM_EXL3_ABI_SHIM
     if shim:
-        ctypes.CDLL(shim, mode=ctypes.RTLD_GLOBAL)
+        # Validate and load the *canonical* resolved path: validating one path
+        # and loading another re-opens the bypass validate_native_lib_path
+        # closes.
+        shim_canonical = validate_native_lib_path(shim, "VLLM_EXL3_ABI_SHIM")
+        ctypes.CDLL(shim_canonical, mode=ctypes.RTLD_GLOBAL)
+        logger.info("Loaded EXL3 ABI shim from %s", shim_canonical)
 
-    ext_path = os.environ.get("VLLM_EXL3_EXT_PATH")
+    ext_path = envs.VLLM_EXL3_EXT_PATH
     if ext_path:
         search_dir = ext_path if os.path.isdir(ext_path) else os.path.dirname(ext_path)
+        _validate_ext_search_dir(search_dir, "VLLM_EXL3_EXT_PATH")
+        # Insert scoped — import immediately, then remove so a compromised
+        # path entry cannot shadow arbitrary later imports.
         if search_dir and search_dir not in sys.path:
             sys.path.insert(0, search_dir)
+            _scoped_path = search_dir
+        else:
+            _scoped_path = None
+    else:
+        _scoped_path = None
 
     try:
         ext = importlib.import_module("exllamav3_ext")
@@ -188,6 +264,9 @@ def _load_exl3_ext() -> Any:
             "PyTorch ABI shim is required)."
         )
         raise RuntimeError(f"Unable to import exllamav3_ext. {hint}") from exc
+    finally:
+        if _scoped_path is not None and _scoped_path in sys.path:
+            sys.path.remove(_scoped_path)
 
     if not hasattr(ext, "exl3_gemm"):
         raise RuntimeError(
@@ -522,6 +601,22 @@ class Exl3Config(QuantizationConfig):
                 "rank-sliced EXL3 bits_per_expert must use 'file.json:field' syntax, "
                 f"got {reference!r}"
             ) from exc
+        # Reject path traversal: the filename must be a bare file name, not a
+        # relative or absolute path.  A malicious model's config.json could
+        # set bits_per_expert to "../../../../etc/passwd:k" to read arbitrary
+        # files via get_hf_file_to_dict → Path(model) / file_name.
+        # basename('..') == '..' and basename('.') == '.' both pass the naive
+        # identity test, so reject those (and the empty string) explicitly,
+        # along with any platform path separator.
+        if (not filename
+                or filename in (".", "..")
+                or os.sep in filename
+                or (os.altsep is not None and os.altsep in filename)
+                or os.path.basename(filename) != filename):
+            raise ValueError(
+                "rank-sliced EXL3 bits_per_expert filename must be a bare "
+                f"file name with no path components: {filename!r}"
+            )
         payload = get_hf_file_to_dict(filename, model_name, revision=revision)
         if not isinstance(payload, dict):
             raise ValueError(f"rank-sliced EXL3 could not load {filename!r}")
