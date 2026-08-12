@@ -6,7 +6,7 @@ from functools import cache
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, next_power_of_2
 
 _C128A_TOPK_ALIGNMENT = 128
 _COMPRESSED_MLA_SPLIT_ALIGNMENT = 64
@@ -25,6 +25,27 @@ def get_c128a_topk_width(max_model_len: int, compress_ratio: int) -> int:
     """
     compressed_width = cdiv(max_model_len, compress_ratio)
     return cdiv(compressed_width, _C128A_TOPK_ALIGNMENT) * _C128A_TOPK_ALIGNMENT
+
+
+def get_c128a_active_topk_width(
+    max_seq_len: int,
+    compress_ratio: int,
+    capacity: int,
+) -> int:
+    """Return the active C128 index width for one scheduler step.
+
+    Only complete compression groups produce selectable records. The metadata
+    kernel uses a power-of-two width, with the FlashMLA alignment as its lower
+    bound and the preallocated metadata buffer width as its upper bound.
+    """
+    complete_records = max(int(max_seq_len), 0) // compress_ratio
+    return min(
+        max(
+            next_power_of_2(max(complete_records, 1)),
+            _C128A_TOPK_ALIGNMENT,
+        ),
+        capacity,
+    )
 
 
 def get_dspark_swa_index_width(

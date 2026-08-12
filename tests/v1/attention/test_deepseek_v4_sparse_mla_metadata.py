@@ -11,7 +11,81 @@ from vllm.models.deepseek_v4.sparse_mla import (
     build_c128a_topk_metadata,
 )
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_c128a_active_topk_width,
+)
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+
+@pytest.mark.parametrize(
+    ("max_seq_len", "capacity", "expected"),
+    [
+        (0, 8192, 128),
+        (16384, 8192, 128),
+        (16385, 8192, 128),
+        (16512, 8192, 256),
+        (524288, 8192, 4096),
+        (1048576, 4096, 4096),
+    ],
+)
+def test_c128a_active_topk_width(
+    max_seq_len: int,
+    capacity: int,
+    expected: int,
+) -> None:
+    assert get_c128a_active_topk_width(max_seq_len, 128, capacity) == expected
+
+
+def test_c128a_metadata_builder_uses_shared_active_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.models.deepseek_v4.sparse_mla as sparse_mla
+
+    builder = object.__new__(DeepseekV4FlashMLAMetadataBuilder)
+    builder.compress_ratio = 128
+    builder.deepseek_v4_decode_threshold = 6
+    builder.c128a_max_compressed = 8192
+    builder.kv_cache_spec = SimpleNamespace(block_size=256)
+    builder.c128a_global_decode_buffer = torch.empty((1, 8192), dtype=torch.int32)
+    builder.c128a_decode_lens_buffer = torch.empty(1, dtype=torch.int32)
+    builder.c128a_prefill_buffer = torch.empty((1, 8192), dtype=torch.int32)
+
+    common = SimpleNamespace(
+        positions=torch.tensor([16383], dtype=torch.int64),
+        max_seq_len=16384,
+        block_table_tensor=torch.zeros((1, 1), dtype=torch.int32),
+        slot_mapping=torch.zeros(1, dtype=torch.int64),
+    )
+    req_id_per_token = torch.zeros(1, dtype=torch.int32)
+    observed: dict[str, int] = {}
+
+    monkeypatch.setattr(
+        sparse_mla,
+        "split_decodes_and_prefills",
+        lambda *_args, **_kwargs: (1, 0, 1, 0),
+    )
+
+    def fake_build(*_args, max_compressed_tokens: int, **_kwargs):
+        observed["width"] = max_compressed_tokens
+        return (
+            torch.zeros((1, max_compressed_tokens), dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+            torch.empty((0, max_compressed_tokens), dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(sparse_mla, "build_c128a_topk_metadata", fake_build)
+
+    result = builder._build_c128a_metadata(
+        common,
+        req_id_per_token,
+        actual_num_query_tokens=1,
+        dcp_world_size=1,
+        dcp_rank=0,
+        cp_kv_cache_interleave_size=1,
+    )
+
+    assert observed["width"] == 128
+    assert result["c128a_global_decode_topk_indices"].shape == (1, 1, 128)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

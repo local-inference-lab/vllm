@@ -20,6 +20,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_c128a_active_topk_width,
     get_c128a_topk_width,
     get_compressed_slot_mapping,
 )
@@ -311,11 +312,9 @@ class DeepseekV4FlashMLAMetadataBuilder(
         assert cm.positions is not None, (
             "positions is required for C128A metadata build"
         )
-        active_topk_width = min(
-            max(
-                triton.next_power_of_2(max(cm.max_seq_len // self.compress_ratio, 1)),
-                _C128A_TOPK_ALIGNMENT,
-            ),
+        active_topk_width = get_c128a_active_topk_width(
+            cm.max_seq_len,
+            self.compress_ratio,
             self.c128a_max_compressed,
         )
         block_size = self.kv_cache_spec.block_size // self.compress_ratio
