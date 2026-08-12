@@ -46,6 +46,7 @@ from vllm.sampling_params import (
     StructuredOutputsParams,
     ThinkingTokenBudget,
 )
+import vllm.envs as envs
 from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
@@ -794,14 +795,32 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
             if prompt_logprobs < 0 and prompt_logprobs != -1:
                 raise VLLMValidationError(
-                    "`prompt_logprobs` must be a positive value or -1.",
+                    "`prompt_logprobs` must be non-negative or -1 (all "
+                    "logprobs, subject to VLLM_MAX_PROMPT_LOGPROBS cap).",
+                    parameter="prompt_logprobs",
+                    value=prompt_logprobs,
+                )
+            if prompt_logprobs > 0 and prompt_logprobs > envs.VLLM_MAX_PROMPT_LOGPROBS:
+                raise VLLMValidationError(
+                    f"`prompt_logprobs`={prompt_logprobs} exceeds the "
+                    f"maximum allowed: {envs.VLLM_MAX_PROMPT_LOGPROBS} "
+                    f"(VLLM_MAX_PROMPT_LOGPROBS).",
                     parameter="prompt_logprobs",
                     value=prompt_logprobs,
                 )
         if (top_logprobs := data.get("top_logprobs")) is not None:
             if top_logprobs < 0 and top_logprobs != -1:
                 raise VLLMValidationError(
-                    "`top_logprobs` must be a positive value or -1.",
+                    "`top_logprobs` must be non-negative or -1 (all "
+                    "logprobs, subject to VLLM_MAX_LOGPROBS cap).",
+                    parameter="top_logprobs",
+                    value=top_logprobs,
+                )
+            if top_logprobs > 0 and top_logprobs > envs.VLLM_MAX_LOGPROBS:
+                raise VLLMValidationError(
+                    f"`top_logprobs`={top_logprobs} exceeds the "
+                    f"maximum allowed: {envs.VLLM_MAX_LOGPROBS} "
+                    f"(VLLM_MAX_LOGPROBS).",
                     parameter="top_logprobs",
                     value=top_logprobs,
                 )

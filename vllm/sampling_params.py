@@ -271,10 +271,12 @@ class SamplingParams(
     likely tokens, as well as the chosen tokens. Note that the implementation
     follows the OpenAI API: The API will always return the log probability of
     the sampled token, so there may be up to `logprobs+1` elements in the
-    response. When set to -1, return all `vocab_size` log probabilities."""
+    response. When set to -1, returns all `vocab_size` log probabilities,
+    subject to the ``VLLM_MAX_LOGPROBS`` cap (default 20)."""
     prompt_logprobs: int | None = None
     """Number of log probabilities to return per prompt token.
-    When set to -1, return all `vocab_size` log probabilities."""
+    When set to -1, returns all `vocab_size` log probabilities, subject to
+    the ``VLLM_MAX_PROMPT_LOGPROBS`` cap (default 20)."""
     logprob_token_ids: list[int] | None = None
     """Specific token IDs to return logprobs for. More efficient than
     logprobs=-1 when you only need logprobs for a small set of tokens.
@@ -587,7 +589,8 @@ class SamplingParams(
             )
         if self.logprobs is not None and self.logprobs != -1 and self.logprobs < 0:
             raise VLLMValidationError(
-                f"logprobs must be non-negative or -1, got {self.logprobs}.",
+                f"logprobs must be non-negative or -1 (all logprobs, "
+                f"capped by VLLM_MAX_LOGPROBS), got {self.logprobs}.",
                 parameter="logprobs",
                 value=self.logprobs,
             )
@@ -597,7 +600,8 @@ class SamplingParams(
             and self.prompt_logprobs < 0
         ):
             raise VLLMValidationError(
-                f"prompt_logprobs must be non-negative or -1, got "
+                f"prompt_logprobs must be non-negative or -1 (all logprobs, "
+                f"capped by VLLM_MAX_PROMPT_LOGPROBS), got "
                 f"{self.prompt_logprobs}.",
                 parameter="prompt_logprobs",
                 value=self.prompt_logprobs,
@@ -761,10 +765,19 @@ class SamplingParams(
         if num_logprobs := self.logprobs:
             if num_logprobs == -1:
                 num_logprobs = model_config.get_vocab_size()
-            if num_logprobs > max_logprobs:
+            # Hard cap from env var, immune to max_logprobs=-1 configuration.
+            # Without this, an operator who sets max_logprobs=-1 (unlimited)
+            # makes the allowed maximum the full vocabulary size, so
+            # logprobs=vocab_size passes the > check and allocates the
+            # identical full-vocabulary tensor that -1 would have.
+            cap = envs.VLLM_MAX_LOGPROBS
+            effective_max = min(max_logprobs, cap)
+            if num_logprobs > effective_max:
                 raise VLLMValidationError(
                     f"Requested sample logprobs of {num_logprobs}, "
-                    f"which is greater than max allowed: {max_logprobs}",
+                    f"which is greater than max allowed: {effective_max} "
+                    f"(model max_logprobs={model_config.max_logprobs}, "
+                    f"VLLM_MAX_LOGPROBS={cap})",
                     parameter="logprobs",
                     value=num_logprobs,
                 )
@@ -804,25 +817,21 @@ class SamplingParams(
 
         if num_prompt_logprobs := self.prompt_logprobs:
             if num_prompt_logprobs == -1:
-                # prompt_logprobs=-1 means "return all vocab logprobs for every
-                # prompt token." For modern vocab sizes (e.g. GLM-5.2's 154,880)
-                # this allocates a [num_prompt_tokens, vocab_size] tensor that
-                # OOMs the engine (upstream vllm-project/vllm#14239). The V1
-                # _get_prompt_logprobs_dict and V2 PromptLogprobsWorker chunk
-                # the GPU compute_logits call (VLLM_PROMPT_LOGPROBS_CHUNK_SIZE)
-                # but the upfront CPU LogprobsTensors.empty_cpu allocation is
-                # unbounded. Reject outright — the feature is impractical.
-                raise VLLMValidationError(
-                    "prompt_logprobs=-1 (all logprobs) is not supported because "
-                    "it can cause unbounded memory allocation. Specify a "
-                    "concrete value (e.g. prompt_logprobs=20).",
-                    parameter="prompt_logprobs",
-                    value=-1,
-                )
-            if num_prompt_logprobs > max_logprobs:
+                # Resolve the sentinel to its effective value before capping.
+                num_prompt_logprobs = model_config.get_vocab_size()
+            # Hard cap from env var, immune to max_logprobs=-1 configuration.
+            # Without this, an operator who sets max_logprobs=-1 (unlimited)
+            # makes the allowed maximum the full vocabulary size, so
+            # prompt_logprobs=vocab_size passes the > check and allocates the
+            # identical full-vocabulary tensor that -1 would have.
+            cap = envs.VLLM_MAX_PROMPT_LOGPROBS
+            effective_max = min(max_logprobs, cap)
+            if num_prompt_logprobs > effective_max:
                 raise VLLMValidationError(
                     f"Requested prompt logprobs of {num_prompt_logprobs}, "
-                    f"which is greater than max allowed: {max_logprobs}",
+                    f"which is greater than max allowed: {effective_max} "
+                    f"(model max_logprobs={model_config.max_logprobs}, "
+                    f"VLLM_MAX_PROMPT_LOGPROBS={cap})",
                     parameter="prompt_logprobs",
                     value=num_prompt_logprobs,
                 )
