@@ -423,6 +423,45 @@ class LLMEngine:
     ) -> list[_R]:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
 
+    def _prepare_for_exl3_weight_switch(self) -> None:
+        if self.has_unfinished_requests():
+            raise RuntimeError(
+                "EXL3 cartridge switching requires a quiescent LLMEngine"
+            )
+        if not self.reset_prefix_cache(
+            reset_running_requests=True, reset_connector=True
+        ):
+            raise RuntimeError("Unable to clear prefix cache before weight switch")
+        self.reset_mm_cache()
+        self.reset_encoder_cache()
+
+    def load_exl3_cartridge(self, adapter_path: str) -> list[int]:
+        """Load one cartridge while quiescent and invalidate model caches."""
+        self._prepare_for_exl3_weight_switch()
+        try:
+            prepared = self.collective_rpc(
+                "prepare_exl3_cartridge",
+                args=(adapter_path,),
+            )
+            activated = self.collective_rpc("activate_exl3_cartridge")
+            if activated != prepared or sum(prepared) == 0:
+                raise RuntimeError(
+                    f"EXL3 cartridge prepare/activate mismatch: "
+                    f"{prepared} != {activated}"
+                )
+            return prepared
+        except Exception:
+            try:
+                self.collective_rpc("deactivate_exl3_cartridge")
+            except Exception:
+                logger.exception("Failed to deactivate EXL3 cartridge after load error")
+            raise
+
+    def deactivate_exl3_cartridge(self) -> list[int]:
+        """Select the base model while quiescent and invalidate caches."""
+        self._prepare_for_exl3_weight_switch()
+        return self.collective_rpc("deactivate_exl3_cartridge")
+
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         return self.collective_rpc("apply_model", args=(func,))
 

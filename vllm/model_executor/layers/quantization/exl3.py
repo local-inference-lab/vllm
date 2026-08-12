@@ -222,12 +222,8 @@ def _load_b12x_mixed_trellis() -> Any:
     if _B12X_MIXED_TRELLIS_API is not None:
         return _B12X_MIXED_TRELLIS_API
     try:
-        module = importlib.import_module(
-            "b12x.moe._shared.kernels.w4a16.mixed_trellis"
-        )
-        prepare = importlib.import_module(
-            "b12x.moe._shared.kernels.w4a16.prepare"
-        )
+        module = importlib.import_module("b12x.moe._shared.kernels.w4a16.mixed_trellis")
+        prepare = importlib.import_module("b12x.moe._shared.kernels.w4a16.prepare")
         host = importlib.import_module("b12x.moe._shared.kernels.w4a16.host")
     except Exception as exc:
         raise RuntimeError(
@@ -348,6 +344,7 @@ class Exl3Config(QuantizationConfig):
         codebook: str | None = None,
         version: str | None = None,
         tensor_storage: dict[str, Any] | None = None,
+        cartridge_runtime: bool = False,
     ) -> None:
         super().__init__()
         self.bits = bits
@@ -355,19 +352,15 @@ class Exl3Config(QuantizationConfig):
         self.codebook = codebook
         self.version = version
         self.tensor_storage = tensor_storage or {}
+        if not isinstance(cartridge_runtime, bool):
+            raise TypeError(
+                f"EXL3 cartridge_runtime must be a boolean, got {cartridge_runtime!r}"
+            )
+        self.cartridge_runtime = cartridge_runtime
         self._eager_checked = False
         self.rank_sliced_metadata: dict[str, Any] | None = None
         self.rank_sliced_k_values: tuple[int, ...] | None = None
         self.rank_sliced_bits_by_layer: dict[int, tuple[int, ...]] = {}
-
-    def get_supported_lora_modules(self) -> list[str]:
-        """Return module names that support EXL3 LoRA cartridge adapters.
-
-        MSRT (Multi-Stage Rescaled Trellis) cartridges add full-rank trellis-
-        quantized residual weights as LoRA-like adapters. They are applied to
-        MoE expert projections via additional exl3_gemm passes.
-        """
-        return ["gate_proj", "up_proj", "down_proj"]
 
     def get_name(self) -> str:
         return "exl3"
@@ -393,6 +386,7 @@ class Exl3Config(QuantizationConfig):
             codebook=config.get("codebook"),
             version=config.get("version"),
             tensor_storage=config.get("tensor_storage"),
+            cartridge_runtime=config.get("cartridge_runtime", False),
         )
 
     @classmethod
@@ -1336,6 +1330,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             scheduler_config = (
                 vllm_config.scheduler_config if vllm_config is not None else None
             )
+            if self.quant_config.cartridge_runtime:
+                assert vllm_config is not None
+                if vllm_config.parallel_config.data_parallel_size != 1:
+                    raise NotImplementedError(
+                        "EXL3 cartridge runtime currently requires data_parallel_size=1"
+                    )
             # No silent fallback: a wrong capacity here puts the target and the
             # rank-sliced MTP draft on different plans with no error, which is
             # exactly the class of mismatch that corrupts only at scale.
@@ -1362,6 +1362,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             # which also covers speculators that bypass load_eagle_model.
             layer.exl3_is_draft = (
                 getattr(vllm_config.model_config, "runner_type", None) == "draft"
+            )
+            layer.exl3_cartridge_enabled = (
+                self.quant_config.cartridge_runtime and not layer.exl3_is_draft
             )
             layer.exl3_layer_bitrates = self.quant_config.rank_sliced_layer_bitrates(
                 str(layer.layer_name)
@@ -1415,7 +1418,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self._validate_moe_shapes(layer)
 
         if self.quant_config.rank_sliced_metadata is not None:
+            cartridge_enabled = bool(layer.exl3_cartridge_enabled)
+            if cartridge_enabled and layer.exl3_mixed_bitrate:
+                raise NotImplementedError(
+                    "EXL3 cartridge runtime currently requires a uniform "
+                    "rank-sliced base checkpoint"
+                )
             self._prepare_rank_sliced_weights(layer)
+            if cartridge_enabled:
+                from .exl3_lora_cartridge import (
+                    prepare_exl3_cudagraph_cartridge_runtime,
+                )
+
+                prepare_exl3_cudagraph_cartridge_runtime(layer)
             return
 
     def _validate_codebooks(self, layer: RoutedExperts) -> None:
@@ -2376,6 +2391,18 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         weights = topk_weights.reshape_as(ids).to(torch.float32).contiguous()
         if self.quant_config.rank_sliced_metadata is not None:
             output = self._apply_rank_sliced(layer, x_2d, weights, ids)
+            if bool(layer.exl3_cartridge_enabled):
+                from .exl3_lora_cartridge import (
+                    apply_exl3_cudagraph_cartridge,
+                )
+
+                output = apply_exl3_cudagraph_cartridge(
+                    output,
+                    x_2d,
+                    weights,
+                    ids,
+                    layer,
+                )
             return output.reshape(*original_shape, output.shape[-1])
 
         x_2d = x_2d.to(torch.float16)

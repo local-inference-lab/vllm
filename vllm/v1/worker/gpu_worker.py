@@ -1227,6 +1227,30 @@ class Worker(WorkerBase):
     def pin_lora(self, lora_id: int) -> bool:
         return self.model_runner.pin_lora(lora_id)
 
+    def prepare_exl3_cartridge(self, adapter_path: str) -> int:
+        """Materialize an inactive EXL3 cartridge through collective RPC."""
+        from vllm.model_executor.layers.quantization.exl3_lora_cartridge import (
+            prepare_exl3_cartridge_into_model,
+        )
+
+        return prepare_exl3_cartridge_into_model(self.model_runner.model, adapter_path)
+
+    def activate_exl3_cartridge(self) -> int:
+        """Commit a prepared EXL3 cartridge through collective RPC."""
+        from vllm.model_executor.layers.quantization.exl3_lora_cartridge import (
+            activate_exl3_cartridge,
+        )
+
+        return activate_exl3_cartridge(self.model_runner.model)
+
+    def deactivate_exl3_cartridge(self) -> int:
+        """Deactivate a model-wide EXL3 cartridge through collective RPC."""
+        from vllm.model_executor.layers.quantization.exl3_lora_cartridge import (
+            deactivate_exl3_cartridge,
+        )
+
+        return deactivate_exl3_cartridge(self.model_runner.model)
+
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.
         return

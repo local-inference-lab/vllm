@@ -174,6 +174,18 @@ class WorkerBase:
     def list_loras(self) -> set[int]:
         raise NotImplementedError
 
+    def prepare_exl3_cartridge(self, adapter_path: str) -> int:
+        """Materialize an inactive model-wide EXL3 cartridge."""
+        raise NotImplementedError
+
+    def activate_exl3_cartridge(self) -> int:
+        """Activate the prepared model-wide EXL3 cartridge."""
+        raise NotImplementedError
+
+    def deactivate_exl3_cartridge(self) -> int:
+        """Deactivate the model-wide EXL3 cartridge."""
+        raise NotImplementedError
+
     @property
     def vocab_size(self) -> int:
         """Get vocabulary size from model configuration."""

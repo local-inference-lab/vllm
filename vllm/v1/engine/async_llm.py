@@ -110,6 +110,7 @@ class AsyncLLM(EngineClient):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.observability_config = vllm_config.observability_config
+        self._exl3_cartridge_lock = asyncio.Lock()
 
         tracing_endpoint = self.observability_config.otlp_traces_endpoint
         if tracing_endpoint is not None:
@@ -974,6 +975,68 @@ class AsyncLLM(EngineClient):
         return await self.engine_core.collective_rpc_async(
             method, timeout, args, kwargs
         )
+
+    async def load_exl3_cartridge(self, adapter_path: str) -> list[int]:
+        """Serialize and atomically load one model-wide EXL3 cartridge."""
+        async with self._exl3_cartridge_lock:
+            return await self._load_exl3_cartridge(adapter_path)
+
+    async def _load_exl3_cartridge(self, adapter_path: str) -> list[int]:
+        """Quiesce serving, clear caches, and load one EXL3 cartridge."""
+        resume_needed = not await self.is_paused()
+        try:
+            await self.pause_generation(mode="wait", clear_cache=True)
+            try:
+                prepared = await self.collective_rpc(
+                    "prepare_exl3_cartridge",
+                    args=(adapter_path,),
+                )
+                activated = await self.collective_rpc("activate_exl3_cartridge")
+                if activated != prepared or sum(prepared) == 0:
+                    raise RuntimeError(
+                        f"EXL3 cartridge prepare/activate mismatch: "
+                        f"{prepared} != {activated}"
+                    )
+                return prepared
+            except BaseException:
+                rollback = asyncio.create_task(
+                    self.collective_rpc("deactivate_exl3_cartridge")
+                )
+                try:
+                    await asyncio.shield(rollback)
+                except asyncio.CancelledError:
+                    await rollback
+                except Exception:
+                    logger.exception(
+                        "Failed to deactivate EXL3 cartridge after load error"
+                    )
+                raise
+        finally:
+            if resume_needed:
+                resume = asyncio.create_task(self.resume_generation())
+                try:
+                    await asyncio.shield(resume)
+                except asyncio.CancelledError:
+                    await resume
+
+    async def deactivate_exl3_cartridge(self) -> list[int]:
+        """Serialize model-wide EXL3 cartridge deactivation."""
+        async with self._exl3_cartridge_lock:
+            return await self._deactivate_exl3_cartridge()
+
+    async def _deactivate_exl3_cartridge(self) -> list[int]:
+        """Quiesce serving, clear caches, and select the base model."""
+        resume_needed = not await self.is_paused()
+        try:
+            await self.pause_generation(mode="wait", clear_cache=True)
+            return await self.collective_rpc("deactivate_exl3_cartridge")
+        finally:
+            if resume_needed:
+                resume = asyncio.create_task(self.resume_generation())
+                try:
+                    await asyncio.shield(resume)
+                except asyncio.CancelledError:
+                    await resume
 
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""
