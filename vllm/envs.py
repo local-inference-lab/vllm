@@ -92,8 +92,6 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
     VLLM_B12X_MLA_CKV_PREFETCH_DEPTH: int = 1
     VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB: int = 1024
-    VLLM_B12X_MLA_SPEC_DECODE_MAX_Q: int = 8
-    VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE: str = "auto"
     VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
     VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
     VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
@@ -1193,8 +1191,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MLA_SPEC_DECODE_MAX_Q": lambda: int(
         os.getenv("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", "8")
     ),
-    "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE": lambda: (
-        os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "auto").strip().lower()
+    "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE": lambda: os.getenv(
+        "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "auto"
     ),
     # Token cap for the low-latency DCP A2A exchange (0 = uncapped). Batches
     # with more tokens than this bypass the one-shot A2A/B12X path, which is
@@ -2354,17 +2352,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),
     # EXL3 online quantization knobs (exported by the GLM launcher for the
     # exl3-b6 preset; consumed by the exllamav3 extension / build scripts).
+    # A present-but-blank value means "unset": Compose/Kubernetes render an
+    # unset variable as the empty string, and int("") would crash engine
+    # startup with an opaque ValueError.  Matches _positive_env_int in
+    # exl3.py, which carries the same comment.
     "VLLM_EXL3_ONLINE_TRELLIS_BITS": lambda: (
         int(value)
         if (value := os.getenv("VLLM_EXL3_ONLINE_TRELLIS_BITS")) is not None
+        and value.strip()
         else None
     ),
     "VLLM_EXL3_ONLINE_CACHE_DIR": lambda: os.getenv("VLLM_EXL3_ONLINE_CACHE_DIR"),
     "VLLM_EXL3_ONLINE_CACHE_MODE": lambda: os.getenv("VLLM_EXL3_ONLINE_CACHE_MODE"),
     # EXL3 routed-expert prefill-arena bound (unset = MAX_BATCHED_TOKENS).
+    # NOTE: the runtime consumer in PR #270 reads this straight from
+    # os.environ via _positive_env_int, so two parsers exist today.  Whichever
+    # of #186/#270 lands second must delete the duplicate and route through
+    # this registry entry so the two cannot drift.
     "VLLM_EXL3_PREFILL_CAPACITY": lambda: (
         int(value)
         if (value := os.getenv("VLLM_EXL3_PREFILL_CAPACITY")) is not None
+        and value.strip()
         else None
     ),
     # EXL3 encoder source path and pinned revision (used by online K6 builds).

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+from collections.abc import Iterator
 from unittest.mock import patch
 
 import pytest
@@ -626,6 +627,21 @@ def _clear_envs_cache() -> None:
         envs.__getattr__.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _clear_envs_cache_around_tests() -> Iterator[None]:
+    """Clear the envs attribute cache before AND after each test.
+
+    ``envs.__getattr__`` is wrapped in ``functools.cache`` once the cache is
+    enabled, so a value read under one test's monkeypatch (e.g.
+    ``VLLM_EXL3_PREFILL_CAPACITY == 1024``) survives monkeypatch teardown and
+    poisons later tests.  Clearing on both sides of every test guarantees no
+    cached value can leak across tests, regardless of execution order.
+    """
+    _clear_envs_cache()
+    yield
+    _clear_envs_cache()
+
+
 # All GG variables registered by this PR.  Each tuple is
 # (env-var-name, override-value, expected-value-after-override).
 _GG_ENV_VARS: list[tuple[str, str, object]] = [
@@ -775,3 +791,25 @@ def test_gg_env_vars_no_hard_fail(
     for name, override, _ in _GG_ENV_VARS:
         monkeypatch.setenv(name, override)
     envs.validate_environ(hard_fail=True)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["VLLM_EXL3_ONLINE_TRELLIS_BITS", "VLLM_EXL3_PREFILL_CAPACITY"],
+)
+@pytest.mark.parametrize("blank", ["", "   ", "\t"])
+def test_gg_env_vars_blank_is_unset(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    blank: str,
+) -> None:
+    """A present-but-blank int var means "unset" (C16 regression).
+
+    Compose and Kubernetes render an unset variable as the empty string, so
+    ``int("")`` would crash engine startup with an opaque ValueError.  The
+    parser must treat any blank/whitespace-only value as unset and return
+    ``None`` instead, matching ``_positive_env_int`` in exl3.py.
+    """
+    monkeypatch.setenv(name, blank)
+    _clear_envs_cache()
+    assert getattr(envs, name) is None
