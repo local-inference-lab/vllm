@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import re
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -111,6 +112,7 @@ from .interfaces import (
 )
 from .utils import (
     PPMissingLayer,
+    _nonnegative_layer_count,
     get_pp_missing_layer_names,
     get_spec_layer_idx_from_weight_name,
     is_pp_missing_parameter,
@@ -1836,6 +1838,13 @@ class DeepseekV2Model(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            # When num_nextn_predict_layers == 0 the MTP layers are never
+            # built, so get_spec_layer_idx_from_weight_name does not divert
+            # their checkpoint tensors and they reach AutoWeightsLoader with
+            # no destination, raising KeyError (e.g.
+            # 'layers.78.eh_proj.weight'). Inert when MTP is enabled.
+            if _skip_disabled_mtp_weight(self.config, name):
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
@@ -2204,6 +2213,31 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     pass
+
+
+def _skip_disabled_mtp_weight(config, name: str) -> bool:
+    """Report whether a checkpoint weight targets a disabled MTP layer.
+
+    Args:
+        config: Model config carrying `num_nextn_predict_layers` and
+            `num_hidden_layers`. Malformed values are treated as "cannot
+            decide" rather than raised.
+        name: Checkpoint weight name as it appears in the safetensors index.
+
+    Returns:
+        True when MTP is disabled (`num_nextn_predict_layers == 0`) and
+        `name` addresses a layer at or beyond `num_hidden_layers`, i.e. an
+        MTP-layer tensor with no destination module; False otherwise.
+    """
+
+    nextn = _nonnegative_layer_count(config, "num_nextn_predict_layers")
+    hidden = _nonnegative_layer_count(config, "num_hidden_layers")
+    if nextn is None or hidden is None:
+        return False
+    if nextn != 0 or hidden <= 0:
+        return False
+    match = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
+    return match is not None and int(match.group(1)) >= hidden
 
 
 def _should_use_nextn_moe_layer(

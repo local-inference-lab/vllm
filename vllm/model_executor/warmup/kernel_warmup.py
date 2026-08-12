@@ -23,6 +23,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor import (
     warmup_b12x_tensor_fp8_linear,
 )
 from vllm.model_executor.layers.fused_moe.b12x_moe import warmup_b12x_moe_dynamic
+from vllm.model_executor.layers.quantization.exl3 import (
+    warmup_exl3_mixed_trellis_route_pack,
+)
 from vllm.model_executor.warmup.b12x_sparse_indexer_warmup import (
     warmup_b12x_sparse_indexer,
 )
@@ -464,6 +467,16 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> bool
         max_tokens=max(moe_token_counts),
         token_counts=moe_token_counts,
     )
+    free_before_exl3_warmup = torch.cuda.mem_get_info()[0]
+    warmed_exl3_route_pack = warmup_exl3_mixed_trellis_route_pack(worker.get_model())
+    if warmed_exl3_route_pack:
+        free_after_exl3_warmup = torch.cuda.mem_get_info()[0]
+        logger.info(
+            "Warmed up %d EXL3 mixed-Trellis route-pack variant(s); "
+            "free-memory delta %.1f MiB.",
+            warmed_exl3_route_pack,
+            (free_before_exl3_warmup - free_after_exl3_warmup) / (1 << 20),
+        )
 
     minimax_m3_msa_warmup(worker)
 
