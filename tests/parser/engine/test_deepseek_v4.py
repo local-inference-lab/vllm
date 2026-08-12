@@ -246,8 +246,8 @@ class TestToolEndAbsorption:
             + "\n"
             + DSML_INVOKE_END
             + "\n</",
-            "｜DSML｜tool_calls></",
-            "｜DSML｜tool_calls></think>",
+            DSML_TOOL_END.removeprefix("</") + "</",
+            DSML_TOOL_END.removeprefix("</") + "</think>",
             "Done.",
         ]
 
