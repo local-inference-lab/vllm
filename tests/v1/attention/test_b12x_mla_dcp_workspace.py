@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -10,11 +12,44 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
     _can_use_b12x_dcp_prefill_workspace,
     _estimate_dcp_ag_rs_transient_bytes,
+    _get_dcp_batch_metadata,
     _should_allocate_sparse_profile_workspace,
 )
 from vllm.utils.multi_stream_utils import vllm_cudagraph_capture_scope
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseImpl
 from vllm.v1.attention.ops import common
+
+
+def test_dcp_batch_metadata_uses_nested_dense_decode_metadata():
+    seq_lens = torch.tensor([11, 17], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 1, 2, 4], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        decode=SimpleNamespace(seq_lens=seq_lens),
+        num_decodes=2,
+        num_reqs=3,
+        query_start_loc=query_start_loc,
+    )
+
+    actual_seq_lens, actual_query_start_loc = _get_dcp_batch_metadata(metadata)
+
+    assert actual_seq_lens is seq_lens
+    assert torch.equal(actual_query_start_loc, query_start_loc[:3])
+
+
+def test_dcp_batch_metadata_uses_every_sparse_mla_request():
+    seq_lens = torch.tensor([11, 17, 29], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 4, 9, 15], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        seq_lens=seq_lens,
+        num_decodes=0,
+        num_reqs=3,
+        query_start_loc=query_start_loc,
+    )
+
+    actual_seq_lens, actual_query_start_loc = _get_dcp_batch_metadata(metadata)
+
+    assert torch.equal(actual_seq_lens, seq_lens)
+    assert torch.equal(actual_query_start_loc, query_start_loc)
 
 
 def test_ckv_prefetch_reset_drops_old_cache_generation(monkeypatch):
