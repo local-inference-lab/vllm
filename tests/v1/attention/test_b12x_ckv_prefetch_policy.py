@@ -241,6 +241,22 @@ def test_ckv_prefetch_target_and_draft_lifecycles_are_isolated(monkeypatch):
     assert draft_state.pending_layers == {}
 
 
+def test_ckv_prefetch_capture_and_runtime_builders_share_workspace_state():
+    pool = _CKVPrefetchWorkspacePool(torch.device("cpu"), 64, 2)
+    capture_registry = _CKVPrefetchStateRegistry(pool)
+    runtime_registry = _CKVPrefetchStateRegistry(pool)
+    workspace_buffer = torch.empty(16, dtype=torch.uint8)
+
+    capture_state = capture_registry.for_workspace(workspace_buffer)
+    capture_ring = capture_state.get_ckv_workspace(64)
+    runtime_state = runtime_registry.for_workspace(workspace_buffer)
+
+    assert runtime_state is capture_state
+    assert runtime_state.get_ckv_workspace(64) is capture_ring
+    assert capture_registry.states is runtime_registry.states
+    assert pool._leased_slots == {0}
+
+
 def test_ckv_prefetch_lazily_owns_one_stream_per_workspace_lane(monkeypatch):
     monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
