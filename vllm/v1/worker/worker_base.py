@@ -174,6 +174,38 @@ class WorkerBase:
     def list_loras(self) -> set[int]:
         raise NotImplementedError
 
+    def clear_exl3_cartridge_cudagraphs(self) -> None:
+        """Release graphs before changing the EXL3 cartridge topology."""
+        raise NotImplementedError
+
+    def has_exl3_cartridge(self) -> bool:
+        """Return whether this worker owns a dense cartridge runtime."""
+        raise NotImplementedError
+
+    def stage_exl3_cartridge(self, adapter_path: str, stage_id: str) -> int:
+        """Verify a model-wide EXL3 cartridge before serving is paused."""
+        raise NotImplementedError
+
+    def prepare_staged_exl3_cartridge(self, stage_id: str) -> int:
+        """Materialize an inactive, previously verified EXL3 cartridge."""
+        raise NotImplementedError
+
+    def discard_staged_exl3_cartridge(self, stage_id: str) -> None:
+        """Release one verified EXL3 cartridge staging area."""
+        raise NotImplementedError
+
+    def activate_exl3_cartridge(self) -> int:
+        """Activate the prepared model-wide EXL3 cartridge."""
+        raise NotImplementedError
+
+    def deactivate_exl3_cartridge(self) -> int:
+        """Deactivate the model-wide EXL3 cartridge."""
+        raise NotImplementedError
+
+    def capture_exl3_cartridge_cudagraphs(self) -> int:
+        """Recapture graphs after changing the EXL3 cartridge topology."""
+        raise NotImplementedError
+
     @property
     def vocab_size(self) -> int:
         """Get vocabulary size from model configuration."""

@@ -423,6 +423,19 @@ class LLMEngine:
     ) -> list[_R]:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
 
+    def load_exl3_cartridge(self, adapter_path: str) -> list[int]:
+        """Reject sync hot-swap because request admission cannot be serialized."""
+        del adapter_path
+        raise NotImplementedError(
+            "EXL3 cartridge switching is supported only by AsyncLLM"
+        )
+
+    def deactivate_exl3_cartridge(self) -> list[int]:
+        """Reject sync hot-swap because request admission cannot be serialized."""
+        raise NotImplementedError(
+            "EXL3 cartridge switching is supported only by AsyncLLM"
+        )
+
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         return self.collective_rpc("apply_model", args=(func,))
 

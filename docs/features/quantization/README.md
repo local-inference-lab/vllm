@@ -73,6 +73,71 @@ th:not(:first-child) {
 
     For the most up-to-date information on hardware support and quantization methods, please refer to [vllm/model_executor/layers/quantization](../../../vllm/model_executor/layers/quantization) or consult with the vLLM development team.
 
+## EXL3 MSRT cartridges
+
+EXL3 MSRT cartridges hot-swap additive, trellis-quantized routed-expert
+residuals without materializing dense expert weights. They are not LoRA
+adapters and cannot be loaded through the LoRA manager.
+
+The base checkpoint must advertise the closed `exl3-msrt-base/1` rank-sliced
+EXL3 profile. Runtime loading remains an operator policy: set
+`VLLM_ENABLE_EXL3_CARTRIDGE=1` independently of checkpoint metadata. The
+adapter path must name a
+directory containing `adapter_config.json` conforming to
+[`fq-cartridge-adapter/3`](https://github.com/malaiwah/progressive-tensors/blob/f8b5c491574bf2a7efa13d588a009d5ea8843e69/schemas/fq-cartridge-adapter-3.schema.json)
+and every digest-pinned safetensors shard listed by that manifest. Loading
+fails before the serving pause when the manifest is missing, its recomputed
+per-layer compatibility fingerprint does not match the loaded base tensors, a
+shard digest or declared byte size changed, the MCG layout differs, or the
+declared TP topology,
+stage order, bitrate, expert count, projection set, or tensor geometry is
+incompatible.
+
+The runtime supports one model-wide active cartridge. It supports a manifest-
+declared full artifact sliced locally by TP workers, or a rank-sharded artifact
+whose explicit ranks and world size exactly match the runtime (including a
+rank-sharded world size of one). Pipeline, data, and expert parallelism, the V2
+model runner, and simultaneous vLLM LoRA adapters are not supported. The
+ExLlamaV3 extension must export `exl3_moe_additive_fused` with
+`EXL3_MOE_ADDITIVE_ABI_VERSION = 1`.
+
+`fq-cartridge-adapter/3` is a closed schema: unknown fields are rejected and
+any schema change requires a new version. `producer_verified_signer` is
+unauthenticated producer provenance; vLLM does not use it as a trust decision.
+Dynamic cartridge loading is a trusted-admin operation and should use local,
+trusted storage. Verification timeouts are cooperative between regular-file
+reads; remote or FUSE filesystems can still block inside the operating system.
+
+Async engine users call:
+
+```python
+await async_llm.load_exl3_cartridge("/srv/cartridges/k4like")
+await async_llm.deactivate_exl3_cartridge()
+```
+
+The synchronous `LLMEngine` API is unsupported because it cannot serialize
+request admission with this model-wide graph transition. Each model worker
+copies and digest-verifies its shards into private staging before generation is
+paused; the drained transaction consumes only those verified bytes.
+
+The server endpoints are development APIs and are registered only with
+`VLLM_SERVER_DEV_MODE=1`:
+
+```bash
+curl -X POST http://localhost:8000/load_exl3_cartridge \
+  -H 'content-type: application/json' \
+  -d '{"adapter_path":"/srv/cartridges/k4like"}'
+curl http://localhost:8000/exl3_cartridge_status
+curl -X POST http://localhost:8000/deactivate_exl3_cartridge
+```
+
+Load and deactivation pause admission, drain in-flight requests, release the
+old CUDA graphs, switch packed tensors, recapture, and then resume. A failed
+load restores the compressed base path. The adapter path must resolve to the
+same files on every worker. These development endpoints are unauthenticated,
+can read worker-local paths, mutate model output, and consume GPU memory; do
+not expose them to untrusted clients.
+
 ## Out-of-Tree Quantization Plugins
 
 vLLM supports registering custom, out-of-tree quantization methods using the `@register_quantization_config` decorator. This allows you to implement and use your own quantization schemes without modifying the vLLM codebase.

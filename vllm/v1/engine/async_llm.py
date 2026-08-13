@@ -4,6 +4,7 @@ import asyncio
 import os
 import socket
 import time
+import uuid
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
@@ -53,6 +54,27 @@ from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
 
 logger = init_logger(__name__)
+
+
+def _uniform_positive_worker_counts(counts: object) -> bool:
+    return (
+        isinstance(counts, list)
+        and bool(counts)
+        and all(type(count) is int and count > 0 for count in counts)
+        and len(set(counts)) == 1
+    )
+
+
+async def _finish_shielded(coro):
+    """Finish critical cleanup before propagating task cancellation."""
+    task = asyncio.create_task(coro)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        finally:
+            raise
 
 
 class InputStreamError(Exception):
@@ -110,6 +132,10 @@ class AsyncLLM(EngineClient):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.observability_config = vllm_config.observability_config
+        # Serialize all scheduler pause/resume controls with cartridge graph
+        # transitions. A concurrent public resume must never reopen request
+        # admission while fixed-address cartridge buffers are being replaced.
+        self._engine_mutation_lock = asyncio.Lock()
 
         tracing_endpoint = self.observability_config.otlp_traces_endpoint
         if tracing_endpoint is not None:
@@ -772,6 +798,20 @@ class AsyncLLM(EngineClient):
             clear_cache: Whether to clear KV cache and prefix cache after
                 draining. Set to ``False`` to preserve cache for faster resume.
         """
+        async with self._engine_mutation_lock:
+            await self._pause_generation(
+                mode=mode,
+                wait_for_inflight_requests=wait_for_inflight_requests,
+                clear_cache=clear_cache,
+            )
+
+    async def _pause_generation(
+        self,
+        *,
+        mode: PauseMode = "abort",
+        wait_for_inflight_requests: bool | None = None,
+        clear_cache: bool = True,
+    ) -> None:
         if wait_for_inflight_requests:
             warnings.warn(
                 "The `wait_for_inflight_requests` parameter in "
@@ -794,6 +834,10 @@ class AsyncLLM(EngineClient):
 
     async def resume_generation(self) -> None:
         """Resume generation after :meth:`pause_generation`."""
+        async with self._engine_mutation_lock:
+            await self._resume_generation()
+
+    async def _resume_generation(self) -> None:
         await self.engine_core.resume_scheduler_async()
 
     async def is_paused(self) -> bool:
@@ -974,6 +1018,163 @@ class AsyncLLM(EngineClient):
         return await self.engine_core.collective_rpc_async(
             method, timeout, args, kwargs
         )
+
+    async def _select_exl3_base_and_recapture(self) -> list[int]:
+        await self.collective_rpc("clear_exl3_cartridge_cudagraphs")
+        updated = await self.collective_rpc("deactivate_exl3_cartridge")
+        await self.collective_rpc("capture_exl3_cartridge_cudagraphs")
+        return updated
+
+    async def load_exl3_cartridge(self, adapter_path: str) -> list[int]:
+        """Serialize cartridge load; failures restore the compressed base."""
+        async with self._engine_mutation_lock:
+            return await self._load_exl3_cartridge(adapter_path)
+
+    async def _load_exl3_cartridge(self, adapter_path: str) -> list[int]:
+        """Quiesce serving, switch model topology, and recapture graphs."""
+        stage_id = uuid.uuid4().hex
+        resume_needed = False
+        primary_error: BaseException | None = None
+        try:
+            staged = await self.collective_rpc(
+                "stage_exl3_cartridge",
+                timeout=16 * 60,
+                args=(adapter_path, stage_id),
+            )
+            if not _uniform_positive_worker_counts(staged):
+                raise RuntimeError(
+                    "EXL3 cartridge staging returned inconsistent worker counts: "
+                    f"{staged}"
+                )
+            resume_needed = not await self.is_paused()
+            await self._pause_generation(mode="wait", clear_cache=True)
+            try:
+                await self.collective_rpc("clear_exl3_cartridge_cudagraphs")
+                prepared = await self.collective_rpc(
+                    "prepare_staged_exl3_cartridge",
+                    args=(stage_id,),
+                )
+                activated = await self.collective_rpc("activate_exl3_cartridge")
+                if (
+                    not _uniform_positive_worker_counts(prepared)
+                    or not _uniform_positive_worker_counts(activated)
+                    or prepared != staged
+                    or activated != prepared
+                ):
+                    raise RuntimeError(
+                        f"EXL3 cartridge prepare/activate mismatch: "
+                        f"{prepared} != {activated}"
+                    )
+                await self.collective_rpc("capture_exl3_cartridge_cudagraphs")
+                return prepared
+            except BaseException:
+                rollback = asyncio.create_task(self._select_exl3_base_and_recapture())
+                try:
+                    await asyncio.shield(rollback)
+                except asyncio.CancelledError:
+                    try:
+                        await rollback
+                    except Exception as restore_error:
+                        resume_needed = False
+                        self.shutdown()
+                        raise EngineDeadError() from restore_error
+                except Exception as restore_error:
+                    resume_needed = False
+                    self.shutdown()
+                    raise EngineDeadError() from restore_error
+                raise
+        except asyncio.CancelledError as error:
+            primary_error = error
+            raise
+        except Exception as error:  # noqa: BLE001 - cleanup must still run
+            primary_error = error
+            raise
+        finally:
+            cleanup_error: Exception | None = None
+            cancellation_error: asyncio.CancelledError | None = None
+            try:
+                await _finish_shielded(
+                    self.collective_rpc(
+                        "discard_staged_exl3_cartridge", args=(stage_id,)
+                    )
+                )
+            except asyncio.CancelledError as error:
+                cancellation_error = error
+            except Exception as error:  # noqa: BLE001 - resume still must run
+                cleanup_error = error
+            if resume_needed:
+                try:
+                    await _finish_shielded(self._resume_generation())
+                except asyncio.CancelledError as error:
+                    if cancellation_error is None:
+                        cancellation_error = error
+                except Exception as error:  # noqa: BLE001 - aggregate cleanup
+                    if cleanup_error is None:
+                        cleanup_error = error
+                    else:
+                        logger.error(
+                            "EXL3 cartridge resume failed after staging cleanup "
+                            "also failed",
+                            exc_info=(type(error), error, error.__traceback__),
+                        )
+            if cancellation_error is not None and not isinstance(
+                primary_error, asyncio.CancelledError
+            ):
+                if cleanup_error is not None:
+                    logger.error(
+                        "EXL3 cartridge cleanup failed while propagating "
+                        "transaction cancellation",
+                        exc_info=(
+                            type(cleanup_error),
+                            cleanup_error,
+                            cleanup_error.__traceback__,
+                        ),
+                    )
+                raise cancellation_error
+            if cleanup_error is not None:
+                if primary_error is None:
+                    raise cleanup_error
+                logger.error(
+                    "EXL3 cartridge cleanup failed while propagating the primary "
+                    "transaction error",
+                    exc_info=(
+                        type(cleanup_error),
+                        cleanup_error,
+                        cleanup_error.__traceback__,
+                    ),
+                )
+
+    async def deactivate_exl3_cartridge(self) -> list[int]:
+        """Serialize model-wide EXL3 cartridge deactivation."""
+        async with self._engine_mutation_lock:
+            return await self._deactivate_exl3_cartridge()
+
+    async def _deactivate_exl3_cartridge(self) -> list[int]:
+        """Quiesce serving, release the cartridge, and recapture base graphs."""
+        active = await self.collective_rpc("has_exl3_cartridge")
+        if not any(active):
+            return [0] * len(active)
+        resume_needed = not await self.is_paused()
+        try:
+            await self._pause_generation(mode="wait", clear_cache=True)
+            transition = asyncio.create_task(self._select_exl3_base_and_recapture())
+            try:
+                return await asyncio.shield(transition)
+            except asyncio.CancelledError:
+                try:
+                    await transition
+                except Exception as transition_error:
+                    resume_needed = False
+                    self.shutdown()
+                    raise EngineDeadError() from transition_error
+                raise
+            except Exception as transition_error:
+                resume_needed = False
+                self.shutdown()
+                raise EngineDeadError() from transition_error
+        finally:
+            if resume_needed:
+                await _finish_shielded(self._resume_generation())
 
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""

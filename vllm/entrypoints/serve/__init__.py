@@ -42,6 +42,12 @@ def register_vllm_dev_api_routers(app: FastAPI):
 
     attach_cache_router(app)
 
+    from .dev.cartridge.api_router import (
+        attach_router as attach_cartridge_router,
+    )
+
+    attach_cartridge_router(app)
+
     from .dev.rlhf.api_router import attach_router as attach_rlhf_router
 
     attach_rlhf_router(app)

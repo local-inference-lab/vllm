@@ -3,11 +3,14 @@
 
 import sys
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 
 import vllm.v1.worker.gpu_worker as gpu_worker_module
+from vllm.config import CUDAGraphMode
+from vllm.config.compilation import CompilationMode
+from vllm.config.utils import Range
 from vllm.multimodal.video import (
     PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES,
     PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES,
@@ -104,6 +107,62 @@ def test_failed_kernel_warmup_is_retryable(monkeypatch: pytest.MonkeyPatch):
 
     assert calls == 2
     assert worker._kernel_warmup_complete is True
+
+
+@pytest.mark.parametrize(
+    ("cudagraph_mode", "expected_sizes"),
+    [
+        (CUDAGraphMode.NONE, [32, 16, 8, 64]),
+        (CUDAGraphMode.FULL, [32, 8, 64]),
+    ],
+)
+def test_compile_warmup_sizes_respect_cudagraph_mode(
+    cudagraph_mode: CUDAGraphMode,
+    expected_sizes: list[int],
+):
+    worker = object.__new__(Worker)
+    worker.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            mode=CompilationMode.VLLM_COMPILE,
+            compile_sizes=[32, 16],
+            cudagraph_mode=cudagraph_mode,
+            cudagraph_capture_sizes=[16],
+            get_compile_ranges=lambda: [
+                Range(1, 8),
+                Range(9, 16),
+                Range(17, 32),
+                Range(33, 64),
+            ],
+        )
+    )
+
+    assert worker._get_compile_warmup_sizes() == expected_sizes
+
+
+def test_cartridge_recapture_uses_shared_warmup_contract():
+    worker = object.__new__(Worker)
+    worker.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            mode=CompilationMode.VLLM_COMPILE,
+            compile_sizes=[32, 16],
+            cudagraph_mode=CUDAGraphMode.FULL,
+            cudagraph_capture_sizes=[16],
+            get_compile_ranges=lambda: [Range(1, 8)],
+        )
+    )
+    worker.model_runner = SimpleNamespace(
+        _dummy_run=Mock(),
+        capture_model=Mock(return_value=123),
+    )
+    worker._warmup_kernels_once = Mock()
+
+    assert worker.capture_exl3_cartridge_cudagraphs() == 123
+    assert worker.model_runner._dummy_run.call_args_list == [
+        call(32, skip_eplb=True, remove_lora=False),
+        call(8, skip_eplb=True, remove_lora=False),
+    ]
+    worker._warmup_kernels_once.assert_called_once_with()
+    worker.model_runner.capture_model.assert_called_once_with()
 
 
 def test_memory_profile_replays_model_after_kernel_warmup(

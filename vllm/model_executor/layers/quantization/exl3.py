@@ -20,7 +20,9 @@ one or initialize CUDA.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import importlib
+import json
 import os
 import re
 import sys
@@ -30,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from transformers import PretrainedConfig
 
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -154,8 +157,37 @@ def _runtime_scope_id(quant_config: Any) -> int:
 
 
 _RANK_SLICED_FORMAT = "exl3-trellis"
+_RANK_SLICED_RUNTIME_PROFILE = "exl3-msrt-base/1"
+_RANK_SLICED_PROFILE_FIELDS = frozenset(
+    {
+        "format",
+        "runtime_profile",
+        "bits",
+        "codebook",
+        "moe_layers",
+        "moe_layer_coverage",
+        "tensor_schema",
+        "tensor_parallel",
+        "mcg_multiplier",
+        "compatibility_sha256",
+        "compatibility_by_layer",
+        "experts_per_layer",
+    }
+)
+_RANK_SLICED_FULL_TP = {
+    "storage_layout": "full-rank",
+    "storage_world_size": 1,
+    "storage_ranks": [0],
+    "runtime_partitioning": "slice-full-rank",
+    "slice_alignment": _HADAMARD_BLOCK,
+    "axis_by_projection": {
+        "gate_proj": "output",
+        "up_proj": "output",
+        "down_proj": "input",
+    },
+}
 _RANK_SLICED_WEIGHT_RE = re.compile(
-    r"^(?P<prefix>.+)\.rank(?P<rank>\d+)\."
+    r"^(?P<prefix>.+)\.rank(?P<rank>[0-9]+)\."
     r"(?P<field>trellis|suh|svh|mcg|mul1)$"
 )
 
@@ -222,12 +254,8 @@ def _load_b12x_mixed_trellis() -> Any:
     if _B12X_MIXED_TRELLIS_API is not None:
         return _B12X_MIXED_TRELLIS_API
     try:
-        module = importlib.import_module(
-            "b12x.moe._shared.kernels.w4a16.mixed_trellis"
-        )
-        prepare = importlib.import_module(
-            "b12x.moe._shared.kernels.w4a16.prepare"
-        )
+        module = importlib.import_module("b12x.moe._shared.kernels.w4a16.mixed_trellis")
+        prepare = importlib.import_module("b12x.moe._shared.kernels.w4a16.prepare")
         host = importlib.import_module("b12x.moe._shared.kernels.w4a16.host")
     except Exception as exc:
         raise RuntimeError(
@@ -359,6 +387,7 @@ class Exl3Config(QuantizationConfig):
         self.rank_sliced_metadata: dict[str, Any] | None = None
         self.rank_sliced_k_values: tuple[int, ...] | None = None
         self.rank_sliced_bits_by_layer: dict[int, tuple[int, ...]] = {}
+        self._rank_sliced_compatibility_tensors: dict[str, dict[str, Any]] = {}
 
     def get_name(self) -> str:
         return "exl3"
@@ -456,8 +485,9 @@ class Exl3Config(QuantizationConfig):
             "experts_per_layer",
             "moe_layers",
             "tensor_schema",
-            "tp",
         }
+        if metadata.get("runtime_profile") != _RANK_SLICED_RUNTIME_PROFILE:
+            required.add("tp")
         missing = sorted(required.difference(metadata))
         if missing:
             raise ValueError(
@@ -484,6 +514,92 @@ class Exl3Config(QuantizationConfig):
                 "unsupported rank-sliced EXL3 tensor schema: "
                 f"{metadata['tensor_schema']!r}"
             )
+        runtime_profile = metadata.get("runtime_profile")
+        if (
+            runtime_profile is not None
+            and runtime_profile != _RANK_SLICED_RUNTIME_PROFILE
+        ):
+            raise ValueError(
+                f"unsupported rank-sliced EXL3 runtime_profile: {runtime_profile!r}"
+            )
+        if runtime_profile == _RANK_SLICED_RUNTIME_PROFILE:
+            if set(metadata) != _RANK_SLICED_PROFILE_FIELDS:
+                raise ValueError(
+                    "rank-sliced EXL3 runtime profile fields do not match the "
+                    "closed exl3-msrt-base/1 contract"
+                )
+            bits = metadata.get("bits")
+            if (
+                isinstance(bits, bool)
+                or not isinstance(bits, (int, float))
+                or float(bits) != int(bits)
+                or int(bits) not in (2, 3, 4, 5, 6)
+            ):
+                raise ValueError(
+                    "cartridge-capable rank-sliced EXL3 requires one uniform "
+                    "integral K in 2..6"
+                )
+            if metadata.get("mcg_multiplier") != _MCG_SENTINEL:
+                raise ValueError(
+                    "cartridge-capable rank-sliced EXL3 requires the canonical "
+                    f"MCG multiplier {_MCG_SENTINEL}"
+                )
+            if metadata.get("tensor_parallel") != _RANK_SLICED_FULL_TP:
+                raise ValueError(
+                    "rank-sliced EXL3 runtime profile requires the canonical "
+                    "full-rank tensor_parallel storage contract"
+                )
+            if "tp" in metadata:
+                raise ValueError(
+                    "rank-sliced EXL3 runtime profiles use tensor_parallel storage "
+                    "metadata; the legacy tp field must be absent"
+                )
+            coverage = metadata.get("moe_layer_coverage")
+            if (
+                not isinstance(coverage, list)
+                or not coverage
+                or any(
+                    isinstance(index, bool) or not isinstance(index, int) or index < 0
+                    for index in coverage
+                )
+                or coverage != sorted(set(coverage))
+                or coverage[0] != int(layers[0])
+                or coverage[-1] != int(layers[1])
+            ):
+                raise ValueError(
+                    "rank-sliced EXL3 moe_layer_coverage must be sorted, unique, "
+                    "and agree with moe_layers"
+                )
+            compatibility_by_layer = metadata.get("compatibility_by_layer")
+            if (
+                not isinstance(compatibility_by_layer, dict)
+                or set(compatibility_by_layer) != {str(index) for index in coverage}
+                or any(
+                    re.fullmatch(r"[0-9a-f]{64}", str(digest)) is None
+                    for digest in compatibility_by_layer.values()
+                )
+            ):
+                raise ValueError(
+                    "rank-sliced EXL3 compatibility_by_layer must cover every "
+                    "declared MoE layer"
+                )
+            compatibility_root = metadata.get("compatibility_sha256")
+            root_payload = {
+                "schema": "fq-msrt-base-compatibility/2",
+                "k": int(bits),
+                "layers": compatibility_by_layer,
+            }
+            encoded_root = json.dumps(
+                root_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode()
+            if hashlib.sha256(encoded_root).hexdigest() != compatibility_root:
+                raise ValueError(
+                    "rank-sliced EXL3 compatibility_sha256 does not match its "
+                    "compatibility_by_layer map"
+                )
         self.rank_sliced_metadata = dict(metadata)
         bits_field = metadata["bits"]
         if isinstance(bits_field, str) and bits_field.strip().lower() == "mixed":
@@ -527,10 +643,20 @@ class Exl3Config(QuantizationConfig):
             raise ValueError(f"rank-sliced EXL3 could not load {filename!r}")
 
         experts = int(self.rank_sliced_metadata["experts_per_layer"])
-        first, last = (int(value) for value in self.rank_sliced_metadata["moe_layers"])
+        coverage = self.rank_sliced_metadata.get("moe_layer_coverage")
+        layer_indices = (
+            tuple(int(value) for value in coverage)
+            if isinstance(coverage, list)
+            else tuple(
+                range(
+                    int(self.rank_sliced_metadata["moe_layers"][0]),
+                    int(self.rank_sliced_metadata["moe_layers"][1]) + 1,
+                )
+            )
+        )
         allowed = set(self.rank_sliced_k_values or ())
         by_layer: dict[int, tuple[int, ...]] = {}
-        for layer_index in range(first, last + 1):
+        for layer_index in layer_indices:
             entry = payload.get(str(layer_index))
             if not isinstance(entry, dict):
                 raise ValueError(
@@ -557,7 +683,7 @@ class Exl3Config(QuantizationConfig):
         self.rank_sliced_bits_by_layer = by_layer
 
     def rank_sliced_layer_bitrates(self, layer_name: str) -> tuple[int, ...]:
-        match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_name)
+        match = re.search(r"(?:^|\.)layers\.([0-9]+)(?:\.|$)", layer_name)
         if match is None:
             raise ValueError(
                 f"cannot resolve rank-sliced EXL3 layer index from {layer_name!r}"
@@ -715,9 +841,12 @@ class Exl3Config(QuantizationConfig):
         self, prefix: str, layer: torch.nn.Module | None = None
     ) -> bool:
         if self.rank_sliced_metadata is not None:
-            match = re.search(r"layers\.(\d+)\b", prefix)
+            match = re.search(r"layers\.([0-9]+)\b", prefix)
             if match is None:
                 return False
+            coverage = self.rank_sliced_metadata.get("moe_layer_coverage")
+            if isinstance(coverage, list):
+                return int(match.group(1)) in coverage
             first, last = (int(v) for v in self.rank_sliced_metadata["moe_layers"])
             return first <= int(match.group(1)) <= last
         # Use the layer's checkpoint projection names (the same fields
@@ -743,9 +872,12 @@ class Exl3Config(QuantizationConfig):
 
     def codebook_for_prefix(self, prefix: str) -> str | None:
         if self.rank_sliced_metadata is not None:
-            match = re.search(r"layers\.(\d+)\b", prefix)
+            match = re.search(r"layers\.([0-9]+)\b", prefix)
             if match is None:
                 return None
+            coverage = self.rank_sliced_metadata.get("moe_layer_coverage")
+            if isinstance(coverage, list):
+                return "mcg" if int(match.group(1)) in coverage else None
             first, last = (int(v) for v in self.rank_sliced_metadata["moe_layers"])
             return "mcg" if first <= int(match.group(1)) <= last else None
         entry = self._storage_entry(prefix)
@@ -768,9 +900,125 @@ class Exl3Config(QuantizationConfig):
         match = _RANK_SLICED_WEIGHT_RE.match(name)
         if match is None:
             return name
-        if int(match.group("rank")) != get_tensor_model_parallel_rank():
+        storage_rank = (
+            0
+            if self.rank_sliced_supports_dynamic_tp()
+            else get_tensor_model_parallel_rank()
+        )
+        if int(match.group("rank")) != storage_rank:
             return None
         return f"{match.group('prefix')}.{match.group('field')}"
+
+    def rank_sliced_supports_dynamic_tp(self) -> bool:
+        """Return whether rank0 payloads may be sliced for the runtime TP size."""
+        metadata = self.rank_sliced_metadata or {}
+        return (
+            metadata.get("runtime_profile") == _RANK_SLICED_RUNTIME_PROFILE
+            and metadata.get("tensor_parallel") == _RANK_SLICED_FULL_TP
+        )
+
+    def record_rank_sliced_compatibility_tensor(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+    ) -> None:
+        """Record one full logical base tensor before runtime TP slicing."""
+        if not self.rank_sliced_supports_dynamic_tp():
+            return
+        dtype_tokens = {
+            torch.float16: "F16",
+            torch.bfloat16: "BF16",
+            torch.float32: "F32",
+            torch.int16: "I16",
+            torch.int32: "I32",
+            torch.int64: "I64",
+        }
+        try:
+            dtype = dtype_tokens[tensor.dtype]
+        except KeyError as exc:
+            raise ValueError(
+                f"unsupported EXL3 compatibility tensor dtype {tensor.dtype}"
+            ) from exc
+        logical_name = re.sub(r"\.rank0(?=\.)", "", name)
+        payload = (
+            tensor.detach()
+            .contiguous()
+            .view(-1)
+            .view(torch.uint8)
+            .cpu()
+            .numpy()
+            .tobytes()
+        )
+        record = {
+            "name": logical_name,
+            "dtype": dtype,
+            "shape": list(tensor.shape),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        previous = self._rank_sliced_compatibility_tensors.setdefault(
+            logical_name, record
+        )
+        if previous != record:
+            raise ValueError(
+                f"EXL3 logical base tensor {logical_name!r} was loaded inconsistently"
+            )
+
+    def verified_rank_sliced_layer_compatibility_sha256(self, layer_name: str) -> str:
+        """Recompute one layer's TP-invariant base identity from loaded bytes."""
+        metadata = self.rank_sliced_metadata or {}
+        layer_match = re.search(r"(?:^|\.)layers\.([0-9]+)(?:\.|$)", layer_name)
+        if layer_match is None:
+            raise ValueError(f"cannot resolve EXL3 layer index from {layer_name!r}")
+        layer_index = int(layer_match.group(1))
+        compatibility_by_layer = metadata.get("compatibility_by_layer")
+        expected = (
+            compatibility_by_layer.get(str(layer_index))
+            if isinstance(compatibility_by_layer, dict)
+            else None
+        )
+        if (
+            not isinstance(expected, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected) is None
+        ):
+            raise ValueError(
+                f"rank-sliced EXL3 base has no compatibility identity for layer "
+                f"{layer_index}"
+            )
+        bits = metadata.get("bits")
+        if isinstance(bits, bool) or not isinstance(bits, (int, float)):
+            raise ValueError(
+                "cartridge-capable EXL3 base requires one uniform integral bitrate"
+            )
+        k = int(bits)
+        if float(bits) != k or k not in (2, 3, 4, 5, 6):
+            raise ValueError(
+                "cartridge-capable EXL3 base requires one uniform K in 2..6"
+            )
+        prefix = f"model.layers.{layer_index}."
+        records = [
+            record
+            for name, record in self._rank_sliced_compatibility_tensors.items()
+            if name.startswith(prefix)
+        ]
+        payload = {
+            "schema": "fq-msrt-base-layer-compatibility/1",
+            "k": k,
+            "layer": layer_index,
+            "tensors": sorted(records, key=lambda record: record["name"]),
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode()
+        actual = hashlib.sha256(encoded).hexdigest()
+        if actual != expected:
+            raise ValueError(
+                "loaded EXL3 base layer tensors do not match compatibility digest: "
+                f"metadata={expected}, loaded={actual}"
+            )
+        return actual
 
 
 class Exl3Parameter(BasevLLMParameter):
@@ -1184,8 +1432,20 @@ class Exl3MoEParameter(BasevLLMParameter):
         num_experts: int = 0,
         shard_ids: tuple[str, ...] = (),
         preallocate: bool = False,
+        quant_config: Exl3Config | None = None,
+        tp_slice: tuple[int, int, int, bool] | None = None,
+        logical_component: str | None = None,
+        logical_layer_name: str | None = None,
     ):
-        del num_experts, shard_ids, preallocate
+        del (
+            num_experts,
+            shard_ids,
+            preallocate,
+            quant_config,
+            tp_slice,
+            logical_component,
+            logical_layer_name,
+        )
         data = torch.empty(0, dtype=torch.uint8)
         return super().__new__(cls, data=data, weight_loader=weight_loader)
 
@@ -1196,21 +1456,75 @@ class Exl3MoEParameter(BasevLLMParameter):
         num_experts: int = 0,
         shard_ids: tuple[str, ...] = (),
         preallocate: bool = False,
+        quant_config: Exl3Config | None = None,
+        tp_slice: tuple[int, int, int, bool] | None = None,
+        logical_component: str | None = None,
+        logical_layer_name: str | None = None,
     ):
         self.exl3_tensors: dict[tuple[int, str], torch.Tensor] = {}
         self.exl3_backing: torch.Tensor | None = None
         self.exl3_num_experts = int(num_experts)
         self.exl3_shard_ids = tuple(shard_ids)
         self.exl3_preallocate = bool(preallocate)
+        self.exl3_quant_config = quant_config
+        self.exl3_tp_slice = tp_slice
+        self.exl3_logical_component = logical_component
+        self.exl3_logical_layer_name = logical_layer_name
         super().__init__(data=self.data, weight_loader=weight_loader)
 
     def load_exl3_weight(
         self,
         loaded_weight: torch.Tensor,
         *,
+        weight_name: str = "",
         expert_id: int,
         shard_id: str,
     ) -> None:
+        if self.exl3_quant_config is not None:
+            if (
+                self.exl3_logical_component is None
+                or self.exl3_logical_layer_name is None
+            ):
+                raise RuntimeError("EXL3 compatibility tensor lacks a component name")
+            projection = {
+                "w1": "gate_proj",
+                "w3": "up_proj",
+                "w2": "down_proj",
+            }[shard_id]
+            layer_match = re.search(
+                r"(?:^|\.)layers\.([0-9]+)(?:\.|$)",
+                self.exl3_logical_layer_name,
+            )
+            if layer_match is None:
+                raise ValueError(
+                    "cannot canonicalize EXL3 compatibility layer name "
+                    f"{self.exl3_logical_layer_name!r}"
+                )
+            canonical_name = (
+                f"model.layers.{layer_match.group(1)}.mlp.experts.{expert_id}."
+                f"{projection}.rank0."
+                f"{self.exl3_logical_component}"
+            )
+            self.exl3_quant_config.record_rank_sliced_compatibility_tensor(
+                canonical_name, loaded_weight
+            )
+        if self.exl3_tp_slice is not None:
+            dim, start, size, packed = self.exl3_tp_slice
+            if packed:
+                loaded_weight = Exl3LinearMethod._slice_exl3_tensor(
+                    loaded_weight,
+                    dim=dim,
+                    start=start,
+                    size=size,
+                )
+            else:
+                if start < 0 or size <= 0 or start + size > loaded_weight.shape[dim]:
+                    raise ValueError(
+                        "rank-sliced EXL3 TP rotation slice exceeds the full tensor: "
+                        f"shape={tuple(loaded_weight.shape)}, dim={dim}, "
+                        f"start={start}, size={size}"
+                    )
+                loaded_weight = loaded_weight.narrow(dim, start, size).contiguous()
         key = (int(expert_id), str(shard_id))
         if not self.exl3_preallocate:
             self.exl3_tensors[key] = loaded_weight.contiguous()
@@ -1259,9 +1573,9 @@ def _exl3_moe_weight_loader(
     expert_id: int,
     return_success: bool = False,
 ) -> bool | None:
-    del weight_name
     param.load_exl3_weight(
         loaded_weight,
+        weight_name=weight_name,
         expert_id=expert_id,
         shard_id=shard_id,
     )
@@ -1307,13 +1621,31 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_hidden_size = hidden_size
         layer.exl3_intermediate_size_per_partition = intermediate_size_per_partition
         layer.exl3_params_dtype = params_dtype
+        layer.exl3_base_compatibility_sha256 = (
+            self.quant_config.rank_sliced_metadata or {}
+        ).get("compatibility_sha256")
+        layer.exl3_base_compatibility_by_layer = (
+            self.quant_config.rank_sliced_metadata or {}
+        ).get("compatibility_by_layer")
+        layer.exl3_quant_config = self.quant_config
+        layer.exl3_base_compatibility_verified = False
         rank_sliced = self.quant_config.rank_sliced_metadata is not None
+        dynamic_tp = False
         if rank_sliced:
-            checkpoint_tp = int(self.quant_config.rank_sliced_metadata["tp"])
-            if checkpoint_tp != layer.exl3_tp_size:
+            dynamic_tp = self.quant_config.rank_sliced_supports_dynamic_tp()
+            checkpoint_tp = int(
+                self.quant_config.rank_sliced_metadata.get("tp", layer.exl3_tp_size)
+            )
+            if not dynamic_tp and checkpoint_tp != layer.exl3_tp_size:
                 raise ValueError(
                     "rank-sliced EXL3 checkpoint TP does not match runtime: "
                     f"checkpoint={checkpoint_tp}, runtime={layer.exl3_tp_size}"
+                )
+            if dynamic_tp and intermediate_size_per_partition % _HADAMARD_BLOCK:
+                raise ValueError(
+                    "rank-sliced EXL3 runtime TP partitions must be "
+                    f"{_HADAMARD_BLOCK}-aligned, got "
+                    f"{intermediate_size_per_partition}"
                 )
             expected_experts = int(
                 self.quant_config.rank_sliced_metadata["experts_per_layer"]
@@ -1354,12 +1686,38 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.exl3_is_draft = (
                 getattr(vllm_config.model_config, "runner_type", None) == "draft"
             )
+            layer.exl3_cartridge_capable = (
+                dynamic_tp
+                and envs.VLLM_ENABLE_EXL3_CARTRIDGE
+                and not layer.exl3_is_draft
+            )
+            layer.exl3_cartridge_enabled = False
             layer.exl3_layer_bitrates = self.quant_config.rank_sliced_layer_bitrates(
                 str(layer.layer_name)
             )
             layer.exl3_mixed_bitrate = len(set(layer.exl3_layer_bitrates)) > 1
         for prefix, shard_ids in (("w13", ("w1", "w3")), ("w2", ("w2",))):
             for suffix in ("suh", "svh", "trellis", "mcg", "mul1"):
+                tp_slice = None
+                if rank_sliced and dynamic_tp:
+                    start = layer.exl3_tp_rank * intermediate_size_per_partition
+                    if (prefix, suffix) in {
+                        ("w13", "svh"),
+                        ("w2", "suh"),
+                    }:
+                        tp_slice = (
+                            0,
+                            start,
+                            intermediate_size_per_partition,
+                            False,
+                        )
+                    elif suffix == "trellis":
+                        tp_slice = (
+                            1 if prefix == "w13" else 0,
+                            start,
+                            intermediate_size_per_partition,
+                            True,
+                        )
                 layer.register_parameter(
                     f"{prefix}_{suffix}",
                     Exl3MoEParameter(
@@ -1373,6 +1731,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                             if getattr(layer, "exl3_mixed_bitrate", False)
                             else {"suh", "svh", "trellis"}
                         ),
+                        quant_config=self.quant_config if rank_sliced else None,
+                        tp_slice=tp_slice,
+                        logical_component=suffix if rank_sliced else None,
+                        logical_layer_name=str(layer.layer_name),
                     ),
                 )
 
@@ -1393,6 +1755,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 + (" ..." if len(missing) > 32 else "")
             )
         self._validate_codebooks(layer)
+        if self.quant_config.rank_sliced_supports_dynamic_tp():
+            layer.exl3_base_layer_compatibility_sha256 = (
+                self.quant_config.verified_rank_sliced_layer_compatibility_sha256(
+                    str(layer.layer_name)
+                )
+            )
+            layer.exl3_base_compatibility_verified = True
         if self.quant_config.rank_sliced_metadata is None:
             self._shard_tensors_for_tensor_parallel(layer)
         device = layer.w13_trellis.device
@@ -1406,6 +1775,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self._validate_moe_shapes(layer)
 
         if self.quant_config.rank_sliced_metadata is not None:
+            cartridge_capable = bool(layer.exl3_cartridge_capable)
+            if cartridge_capable and layer.exl3_mixed_bitrate:
+                raise NotImplementedError(
+                    "EXL3 cartridge runtime currently requires a uniform "
+                    "rank-sliced base checkpoint"
+                )
             self._prepare_rank_sliced_weights(layer)
             return
 
@@ -1729,9 +2104,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 f"{layer_bitrates!r}"
             )
         bits = int(layer_bitrates[0])
-        if bits not in (3, 4, 5, 6):
+        if bits not in (2, 3, 4, 5, 6):
             raise ValueError(
-                f"rank-sliced EXL3 requires an integral 3/4/5/6 bitrate, got {bits!r}"
+                f"rank-sliced EXL3 requires an integral 2/3/4/5/6 bitrate, got {bits!r}"
             )
 
         w13 = self._rank_sliced_backing(layer, "w13_trellis")
@@ -2266,6 +2641,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         out32.zero_()
         chunk = int(runtime["chunk"])
         pointer_args = layer.exl3_pointer_tables
+        layer_bitrates = tuple(int(value) for value in layer.exl3_layer_bitrates)
+        if not layer_bitrates or len(set(layer_bitrates)) != 1:
+            raise ValueError(
+                "EXL3 parity fallback requires one uniform base bitrate, got "
+                f"{layer_bitrates!r}"
+            )
+        base_bits = layer_bitrates[0]
         if m > chunk and hasattr(ext, "exl3_moe_fused"):
             ext.exl3_moe_fused(
                 xh,
@@ -2282,9 +2664,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 runtime["ig"],
                 runtime["iu"],
                 0,
-                3,
-                3,
-                3,
+                base_bits,
+                base_bits,
+                base_bits,
                 *pointer_args,
                 True,
                 False,
@@ -2293,7 +2675,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 True,
                 False,
                 0.0,
-                0,
+                min(m * int(runtime["topk"]), int(layer.local_num_experts)),
             )
             return out32.to(x.dtype)
 
@@ -2325,9 +2707,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 runtime["ig"],
                 runtime["iu"],
                 0,
-                3,
-                3,
-                3,
+                base_bits,
+                base_bits,
+                base_bits,
                 *pointer_args,
                 True,
                 False,
@@ -2336,6 +2718,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 True,
                 False,
                 0.0,
+                min(route_count, int(layer.local_num_experts)),
             )
         return out32.to(x.dtype)
 
@@ -2366,7 +2749,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         ids = topk_ids.reshape(x_2d.shape[0], -1).contiguous()
         weights = topk_weights.reshape_as(ids).to(torch.float32).contiguous()
         if self.quant_config.rank_sliced_metadata is not None:
-            output = self._apply_rank_sliced(layer, x_2d, weights, ids)
+            if bool(layer.exl3_cartridge_enabled):
+                from .exl3_lora_cartridge import (
+                    apply_exl3_cudagraph_cartridge,
+                )
+
+                output = apply_exl3_cudagraph_cartridge(
+                    x_2d,
+                    weights,
+                    ids,
+                    layer,
+                )
+            else:
+                output = self._apply_rank_sliced(layer, x_2d, weights, ids)
             return output.reshape(*original_shape, output.shape[-1])
 
         x_2d = x_2d.to(torch.float16)
