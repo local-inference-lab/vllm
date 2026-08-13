@@ -473,11 +473,54 @@ def test_unified_parser_get_structural_tag_disables_reasoning(
         tool_choice="auto",
     )
     parser = TestParser(MagicMock(), tools=sample_tools_strict)
-    parser.reasoning_parser = MagicMock(adjust_request=lambda request: request)
+    parser.reasoning_parser = MagicMock(
+        thinking_enabled=False,
+        adjust_request=lambda request: request,
+    )
 
     parser.adjust_request(request)
 
     assert captured == [False]
+
+
+@pytest.mark.parametrize(
+    ("reasoning_enabled", "expected_grammar_from_parser"),
+    [(False, False), (True, True)],
+)
+def test_unified_parser_activates_reasoning_aware_grammar_at_token_zero(
+    sample_tools_strict: list[ChatCompletionToolsParam],
+    reasoning_enabled: bool,
+    expected_grammar_from_parser: bool,
+):
+    class TestParser(DelegatingParser):
+        pass
+
+    request = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=sample_tools_strict,
+        tool_choice="required",
+    )
+    reasoning_parser = MagicMock()
+    reasoning_parser.thinking_enabled = reasoning_enabled
+    reasoning_parser.adjust_request.side_effect = lambda request: request
+    tool_parser = MagicMock()
+    tool_parser.structural_tag_model = "deepseek_v4"
+    tool_parser.get_structural_tag.return_value = SimpleNamespace(
+        model_dump=lambda: {"type": "structural_tag"}
+    )
+    tool_parser.adjust_request.side_effect = lambda request: request
+
+    parser = TestParser(MagicMock())
+    parser.reasoning_parser = reasoning_parser
+    parser.tool_parser = tool_parser
+
+    result = parser.adjust_request(request)
+
+    assert result._grammar_from_parser is expected_grammar_from_parser
+    tool_parser.get_structural_tag.assert_called_once_with(
+        request, reasoning=reasoning_enabled
+    )
 
 
 def test_xgrammar_function_parameters_are_preserved(
