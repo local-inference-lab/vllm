@@ -1270,11 +1270,24 @@ class Worker(WorkerBase):
     def capture_exl3_cartridge_cudagraphs(self) -> int:
         """Recapture graphs after changing the EXL3 cartridge topology."""
         try:
-            self.model_runner._dummy_run(
-                self.model_runner.max_num_tokens,
-                is_profile=True,
-                skip_eplb=True,
-            )
+            if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
+                compile_sizes = self.vllm_config.compilation_config.compile_sizes or []
+                capture_sizes = (
+                    self.vllm_config.compilation_config.cudagraph_capture_sizes or []
+                )
+                warmup_sizes = [
+                    size
+                    for size in compile_sizes
+                    if isinstance(size, int) and size not in capture_sizes
+                ]
+                for (
+                    compile_range
+                ) in self.vllm_config.compilation_config.get_compile_ranges():
+                    if not any(size in compile_range for size in capture_sizes):
+                        warmup_sizes.append(compile_range.end)
+                for size in sorted(set(warmup_sizes), reverse=True):
+                    self.model_runner._dummy_run(size, skip_eplb=True)
+            self._warmup_kernels_once()
             return self.model_runner.capture_model()
         except BaseException:
             lock_workspace()

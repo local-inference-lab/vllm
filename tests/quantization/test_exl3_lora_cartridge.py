@@ -13,12 +13,12 @@ from safetensors.torch import save_file
 
 import vllm.model_executor.layers.quantization.exl3 as exl3_module
 from vllm.config import CUDAGraphMode
+from vllm.config.compilation import CompilationMode
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.exl3 import Exl3Config, Exl3MoEMethod
 from vllm.model_executor.layers.quantization.exl3_lora_cartridge import (
     Exl3CUDAGraphCartridgeRuntime,
     Exl3LoraCartridge,
-    apply_exl3_cartridge,
     apply_exl3_cudagraph_cartridge,
     deactivate_exl3_cartridge,
     load_cartridge_from_adapter,
@@ -36,6 +36,7 @@ CPU = torch.device("cpu")
 
 
 def _runtime_layer(device: torch.device = CPU):
+    pointers = tuple(torch.zeros(2, dtype=torch.int64, device=device) for _ in range(9))
     return SimpleNamespace(
         local_num_experts=2,
         exl3_hidden_size=4,
@@ -43,6 +44,11 @@ def _runtime_layer(device: torch.device = CPU):
         exl3_params_dtype=torch.float16,
         exl3_cartridge_capable=True,
         exl3_cartridge_enabled=False,
+        exl3_tp_size=1,
+        exl3_max_num_batched_tokens=16,
+        exl3_layer_bitrates=(2, 2),
+        exl3_pointer_tables=pointers,
+        top_k=1,
         w13_trellis=SimpleNamespace(device=device),
         activation=SimpleNamespace(value="silu"),
         layer_name="model.layers.3.mlp.experts",
@@ -53,22 +59,32 @@ def _loader_layer():
     layer = _runtime_layer()
     layer.exl3_hidden_size = 16
     layer.exl3_intermediate_size_per_partition = 16
+    rotations = {
+        (0, "w1"): torch.ones(128, dtype=torch.float16),
+        (0, "w3"): torch.ones(128, dtype=torch.float16),
+    }
+    layer.w13_suh = SimpleNamespace(exl3_tensors=rotations)
+    layer.w13_svh = SimpleNamespace(exl3_tensors=rotations)
+    down_rotations = {(0, "w2"): torch.ones(128, dtype=torch.float16)}
+    layer.w2_suh = SimpleNamespace(exl3_tensors=down_rotations)
+    layer.w2_svh = SimpleNamespace(exl3_tensors=down_rotations)
     return layer
 
 
-def _cartridge(device: torch.device = CPU):
-    cartridge = Exl3LoraCartridge(1, 2, device)
-    for expert_id in range(2):
-        for shard_id in ("w1", "w3", "w2"):
-            cartridge.set_stage_tensors(
-                0,
-                expert_id,
-                shard_id,
-                torch.zeros(1, 1, 16, dtype=torch.int16),
-                torch.ones(1, dtype=torch.float16),
-                torch.ones(1, dtype=torch.float16),
-                1.0,
-            )
+def _cartridge(device: torch.device = CPU, num_stages: int = 1):
+    cartridge = Exl3LoraCartridge(num_stages, 2, device)
+    for stage_idx in range(num_stages):
+        for expert_id in range(2):
+            for shard_id in ("w1", "w3", "w2"):
+                cartridge.set_stage_tensors(
+                    stage_idx,
+                    expert_id,
+                    shard_id,
+                    torch.zeros(1, 1, 16, dtype=torch.int16),
+                    torch.ones(1, dtype=torch.float16),
+                    torch.ones(1, dtype=torch.float16),
+                    float(stage_idx + 1),
+                )
     cartridge.active = True
     return cartridge
 
@@ -87,13 +103,30 @@ def test_runtime_rejects_tensor_parallel_weights():
         prepare_exl3_cudagraph_cartridge_runtime(layer)
 
 
-def test_runtime_preserves_fp16_dense_kernel_contract():
+def test_runtime_allocates_packed_kernel_workspaces_without_dense_weights():
     layer = _runtime_layer()
     layer.exl3_params_dtype = torch.bfloat16
     runtime = prepare_exl3_cudagraph_cartridge_runtime(layer)
     assert runtime.dtype == torch.float16
-    assert runtime.w13.dtype == torch.float16
-    assert runtime.w2.dtype == torch.float16
+    assert runtime._packed_tensors == ()
+    assert not hasattr(runtime, "w13")
+    assert not hasattr(runtime, "w2")
+    assert runtime.xh.shape == (16, 4)
+    assert runtime.ig.shape[-2:] == (16, 2)
+
+
+def test_runtime_rejects_extension_without_additive_entrypoint():
+    layer = _runtime_layer()
+    layer.w13_trellis = SimpleNamespace(device=torch.device("cuda"))
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
+            "_load_exl3_ext",
+            return_value=SimpleNamespace(),
+        ),
+        pytest.raises(RuntimeError, match="exl3_moe_additive_fused"),
+    ):
+        Exl3CUDAGraphCartridgeRuntime(layer)
 
 
 def test_runtime_rejects_activation_before_materialization():
@@ -119,102 +152,76 @@ def test_cartridge_validates_indices_and_scale():
         cartridge.set_stage_tensors(0, 0, "w1", *tensors, 0.0)
 
 
-def test_apply_cartridge_sums_stages_with_scale():
-    base_output = torch.zeros(4, 2, dtype=torch.float16)
-    inputs = torch.randn(4, 4, dtype=torch.float16)
-    cartridge = Exl3LoraCartridge(2, 1, torch.device("cpu"))
-    for stage, scale in enumerate((2.0, 4.0)):
-        cartridge.set_stage_tensors(
-            stage,
-            0,
-            "w1",
-            torch.zeros(1, 1, 16, dtype=torch.int16),
-            torch.ones(4, dtype=torch.float16),
-            torch.ones(2, dtype=torch.float16),
-            scale,
-        )
-    cartridge.active = True
-
-    with patch(
-        "vllm.model_executor.layers.quantization.exl3_lora_cartridge._exl3_gemm",
-        return_value=torch.full((4, 16), 8.0, dtype=torch.float16),
-    ) as gemm:
-        result = apply_exl3_cartridge(
-            base_output, inputs, None, "w13", 0, "w1", cartridge
-        )
-
-    assert torch.equal(result, torch.full((4, 2), 6.0, dtype=torch.float32))
-    assert gemm.call_count == 2
-    assert gemm.call_args.args[0].shape == (4, 16)
-
-
-def test_runtime_materializes_exact_combined_projection_weights():
+def test_runtime_retains_packed_stages_and_builds_kernel_metadata():
     layer = _runtime_layer()
     runtime = Exl3CUDAGraphCartridgeRuntime(layer)
     cartridge = _cartridge()
 
-    def base_projection(_layer, group, inputs, _expert_id, shard_id):
-        value = {"w1": 1.0, "w3": 2.0, "w2": 3.0}[shard_id]
-        width = 4 if group == "w2" else 2
-        return torch.full((inputs.shape[0], width), value, dtype=torch.float16)
+    runtime.materialize(layer, cartridge)
 
-    def residual_projection(inputs, trellis, *_args, **_kwargs):
-        return torch.ones((inputs.shape[0], trellis.shape[1] * 16), dtype=torch.float16)
-
-    with (
-        patch.object(
-            __import__(
-                "vllm.model_executor.layers.quantization.exl3_lora_cartridge",
-                fromlist=["Exl3MoEMethod"],
-            ).Exl3MoEMethod,
-            "_apply_expert",
-            side_effect=base_projection,
-        ),
-        patch(
-            "vllm.model_executor.layers.quantization.exl3_lora_cartridge._exl3_gemm",
-            side_effect=residual_projection,
-        ),
-    ):
-        runtime.materialize(layer, cartridge)
-
-    assert torch.equal(runtime.w13[:, :2], torch.full((2, 2, 4), 2.0))
-    assert torch.equal(runtime.w13[:, 2:], torch.full((2, 2, 4), 3.0))
-    assert torch.equal(runtime.w2, torch.full((2, 4, 2), 4.0))
-    assert runtime.active.item() == 0.0
+    assert len(runtime.pointer_args) == 9
+    assert len(runtime._packed_tensors) == 15
+    assert all(table.shape == (1, 2) for table in runtime.pointer_args[:6])
+    assert all(table.shape == (1,) for table in runtime.pointer_args[6:])
+    assert runtime.max_residual_bits == 1
+    gate_scales, up_scales, down_scales = runtime.pointer_args[3:6]
+    expected_scales = torch.ones(1, 2, dtype=torch.float32)
+    assert torch.equal(gate_scales, expected_scales)
+    assert torch.equal(up_scales, expected_scales)
+    assert torch.equal(down_scales, expected_scales)
+    assert runtime._active is False
 
 
-def test_runtime_rejects_nonfinite_materialized_weights():
+def test_runtime_builds_multistage_extension_metadata():
+    layer = _runtime_layer()
+    runtime = Exl3CUDAGraphCartridgeRuntime(layer)
+    runtime.materialize(layer, _cartridge(num_stages=2))
+
+    pointers = runtime.pointer_args[:3]
+    scales = runtime.pointer_args[3:6]
+    bitrates = runtime.pointer_args[6:]
+    assert all(table.shape == (2, 2) for table in pointers)
+    assert all(
+        torch.equal(
+            table,
+            torch.tensor([[1.0, 1.0], [0.5, 0.5]], dtype=torch.float32),
+        )
+        for table in scales
+    )
+    assert all(
+        torch.equal(table, torch.tensor([1, 1], dtype=torch.int32))
+        for table in bitrates
+    )
+
+
+def test_runtime_zero_scales_sparse_stage_entries():
+    layer = _runtime_layer()
+    cartridge = _cartridge(num_stages=2)
+    for shard_id in ("w1", "w3", "w2"):
+        del cartridge.stages[1][(1, shard_id)]
+    runtime = Exl3CUDAGraphCartridgeRuntime(layer)
+    runtime.materialize(layer, cartridge)
+
+    for pointers, scales in zip(runtime.pointer_args[:3], runtime.pointer_args[3:6]):
+        assert pointers[1, 1].item() == pointers[1, 0].item()
+        assert torch.equal(
+            scales,
+            torch.tensor([[1.0, 1.0], [0.5, 0.0]], dtype=torch.float32),
+        )
+
+
+def test_runtime_rejects_nonfinite_inverse_scale():
     layer = _runtime_layer()
     runtime = Exl3CUDAGraphCartridgeRuntime(layer)
     cartridge = _cartridge()
     for stage in cartridge.stages:
         for tensors in stage.values():
-            tensors["scale"] = 1e-30
+            tensors["scale"] = 1e-40
 
-    def base_projection(_layer, group, inputs, _expert_id, _shard_id):
-        width = 4 if group == "w2" else 2
-        return torch.zeros((inputs.shape[0], width), dtype=torch.float16)
-
-    with (
-        patch.object(
-            __import__(
-                "vllm.model_executor.layers.quantization.exl3_lora_cartridge",
-                fromlist=["Exl3MoEMethod"],
-            ).Exl3MoEMethod,
-            "_apply_expert",
-            side_effect=base_projection,
-        ),
-        patch(
-            "vllm.model_executor.layers.quantization.exl3_lora_cartridge._exl3_gemm",
-            side_effect=lambda inputs, *_args, **_kwargs: torch.ones(
-                (inputs.shape[0], 16), dtype=torch.float16
-            ),
-        ),
-        pytest.raises(ValueError, match="non-finite weights"),
-    ):
+    with pytest.raises(ValueError, match="inverse scale is not finite in FP32"):
         runtime.materialize(layer, cartridge)
 
-    assert runtime.active.item() is False
+    assert runtime._active is False
 
 
 @pytest.mark.parametrize(
@@ -383,55 +390,57 @@ def test_active_rank_sliced_layer_skips_compressed_base_path():
 
 def test_graph_path_routes_original_ids_once():
     layer = _runtime_layer()
-    prepare_exl3_cudagraph_cartridge_runtime(layer)
-    dense = torch.full((3, 4), torch.nan, dtype=torch.float16)
+    runtime = prepare_exl3_cudagraph_cartridge_runtime(layer)
+    runtime.pointer_args = tuple(torch.zeros(2, dtype=torch.int64) for _ in range(9))
+    runtime._materialized = True
+    runtime.activate()
     inputs = torch.zeros(3, 4, dtype=torch.float16)
     weights = torch.ones(3, 1, dtype=torch.float32)
     ids = torch.tensor([[1], [0], [1]], dtype=torch.long)
 
-    with patch(
-        "vllm.model_executor.layers.quantization.exl3_lora_cartridge.fused_experts",
-        return_value=dense,
-    ) as fused:
-        output = apply_exl3_cudagraph_cartridge(inputs, weights, ids, layer)
+    def run_additive(*args):
+        args[1].fill_(torch.nan)
+
+    additive = MagicMock(side_effect=run_additive)
+    runtime.ext = SimpleNamespace(exl3_moe_additive_fused=additive)
+    output = apply_exl3_cudagraph_cartridge(inputs, weights, ids, layer)
 
     assert torch.isnan(output).all()
-    fused.assert_called_once()
-    assert torch.equal(fused.call_args.args[4], ids)
+    additive.assert_called_once()
+    assert torch.equal(additive.call_args.args[2], ids)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_dense_cartridge_replays_with_fixed_weights_in_one_cuda_graph():
-    device = torch.device("cuda")
-    layer = _loader_layer()
-    layer.w13_trellis.device = device
+def test_graph_path_accepts_empty_route_batch():
+    layer = _runtime_layer()
     runtime = prepare_exl3_cudagraph_cartridge_runtime(layer)
-    inputs = torch.ones(3, 16, dtype=torch.float16, device=device)
-    weights = torch.ones(3, 1, dtype=torch.float32, device=device)
-    ids = torch.zeros(3, 1, dtype=torch.long, device=device)
-
-    runtime.w13.fill_(0.1)
-    runtime.w2.fill_(0.1)
     runtime._materialized = True
     runtime.activate()
-    w13_pointer = runtime.w13.data_ptr()
-    w2_pointer = runtime.w2.data_ptr()
+    runtime.ext = SimpleNamespace(exl3_moe_additive_fused=MagicMock())
 
-    graph = torch.cuda.CUDAGraph()
-    torch.cuda.synchronize()
-    with torch.cuda.graph(graph):
-        output = apply_exl3_cudagraph_cartridge(inputs, weights, ids, layer)
-    graph.replay()
-    torch.cuda.synchronize()
-    initial = output.clone()
+    output = apply_exl3_cudagraph_cartridge(
+        torch.empty(0, 4, dtype=torch.float16),
+        torch.empty(0, 1, dtype=torch.float32),
+        torch.empty(0, 1, dtype=torch.long),
+        layer,
+    )
 
-    runtime.w13.fill_(0.2)
-    runtime.w2.fill_(0.2)
-    graph.replay()
-    torch.cuda.synchronize()
-    assert not torch.equal(output, initial)
-    assert runtime.w13.data_ptr() == w13_pointer
-    assert runtime.w2.data_ptr() == w2_pointer
+    assert output.shape == (0, 4)
+    runtime.ext.exl3_moe_additive_fused.assert_not_called()
+
+
+def test_packed_runtime_retains_trellis_storage_after_cartridge_clear():
+    layer = _runtime_layer()
+    runtime = Exl3CUDAGraphCartridgeRuntime(layer)
+    cartridge = _cartridge()
+    source_trellis = cartridge.get_stage_tensors(0, 0, "w1")["trellis"]
+    assert isinstance(source_trellis, torch.Tensor)
+
+    runtime.materialize(layer, cartridge)
+    pointer = source_trellis.data_ptr()
+    cartridge.clear()
+
+    assert any(tensor.data_ptr() == pointer for tensor in runtime._packed_tensors)
+    assert runtime.pointer_args[0][0, 0].item() == pointer
 
 
 def test_loader_filters_layer_and_sorts_stage_numbers(tmp_path):
@@ -469,6 +478,21 @@ def test_loader_filters_layer_and_sorts_stage_numbers(tmp_path):
     stage1 = cartridge.get_stage_tensors(1, 0, "w1")
     assert stage0 is not None and stage0["scale"] == 2.0
     assert stage1 is not None and stage1["scale"] == 10.0
+
+
+def test_loader_rejects_rotations_that_differ_from_base(tmp_path):
+    path = tmp_path / "different-rotations.safetensors"
+    tensors = {}
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        prefix = f"model.layers.3.mlp.experts.0.{projection}.rank0"
+        tensors[f"{prefix}.trellis_res1"] = torch.zeros(8, 8, 32, dtype=torch.int16)
+        tensors[f"{prefix}.suh_res1"] = torch.ones(128, dtype=torch.float16)
+        tensors[f"{prefix}.svh_res1"] = torch.ones(128, dtype=torch.float16)
+    tensors["model.layers.3.mlp.experts.0.gate_proj.rank0.suh_res1"].zero_()
+    save_file(tensors, path)
+
+    with pytest.raises(ValueError, match="rotations must match"):
+        load_cartridge_from_adapter(str(path), _loader_layer(), 1, CPU)
 
 
 def test_loader_rejects_incomplete_projection(tmp_path):
@@ -538,11 +562,12 @@ def test_loader_rejects_malformed_target_key(tmp_path):
         load_cartridge_from_adapter(str(path), _loader_layer(), 2, CPU)
 
 
-def test_model_loader_preflights_every_layer_before_materializing():
+def test_model_loader_streams_layers_and_rolls_back_if_later_layer_is_missing():
     layers = [_runtime_layer(), _runtime_layer()]
     layers[1].layer_name = "model.layers.4.mlp.experts"
     for layer in layers:
         prepare_exl3_cudagraph_cartridge_runtime(layer)
+    first_runtime = layers[0]._exl3_cartridge_runtime
     model = SimpleNamespace(modules=lambda: iter(layers))
 
     with (
@@ -551,12 +576,13 @@ def test_model_loader_preflights_every_layer_before_materializing():
             "load_cartridge_from_adapter",
             side_effect=[_cartridge(), None],
         ),
-        patch.object(layers[0]._exl3_cartridge_runtime, "materialize") as materialize,
+        patch.object(first_runtime, "materialize") as materialize,
         pytest.raises(ValueError, match="has no tensors"),
     ):
         load_exl3_cartridge_into_model(model, "cartridge.safetensors")
 
-    materialize.assert_not_called()
+    materialize.assert_called_once()
+    assert all(not hasattr(layer, "_exl3_cartridge_runtime") for layer in layers)
 
 
 def test_model_loader_deactivates_every_layer_after_materialization_failure():
@@ -566,7 +592,7 @@ def test_model_loader_deactivates_every_layer_after_materialization_failure():
     model = SimpleNamespace(modules=lambda: iter(layers))
 
     def activate(_layer, _cartridge):
-        runtimes[0].active.fill_(1)
+        runtimes[0]._active = True
 
     with (
         patch(
@@ -584,7 +610,7 @@ def test_model_loader_deactivates_every_layer_after_materialization_failure():
     ):
         load_exl3_cartridge_into_model(model, "cartridge.safetensors")
 
-    assert all(runtime.active.item() == 0.0 for runtime in runtimes)
+    assert all(not runtime._active for runtime in runtimes)
 
 
 def test_model_loader_skips_layers_without_cartridge_capability():
@@ -654,19 +680,28 @@ def test_model_loader_activates_every_layer_only_after_materialization():
     ):
         assert load_exl3_cartridge_into_model(model, "cartridge.safetensors") == 2
 
-    assert all(runtime.active.item() == 1.0 for runtime in runtimes)
+    assert all(runtime._active for runtime in runtimes)
 
 
 def test_worker_cartridge_operations_use_collective_rpc_target_model():
     model = SimpleNamespace()
+    compilation_config = SimpleNamespace(
+        mode=CompilationMode.VLLM_COMPILE,
+        compile_sizes=[32, 16],
+        cudagraph_capture_sizes=[16],
+        get_compile_ranges=lambda: [],
+    )
     model_runner = SimpleNamespace(
         model=model,
         clear_cudagraphs=MagicMock(),
         capture_model=MagicMock(return_value=123),
         _dummy_run=MagicMock(),
-        max_num_tokens=16,
     )
-    worker = SimpleNamespace(model_runner=model_runner)
+    worker = SimpleNamespace(
+        model_runner=model_runner,
+        vllm_config=SimpleNamespace(compilation_config=compilation_config),
+        _warmup_kernels_once=MagicMock(),
+    )
     with (
         patch(
             "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
@@ -700,7 +735,8 @@ def test_worker_cartridge_operations_use_collective_rpc_target_model():
 
     model_runner.clear_cudagraphs.assert_called_once_with()
     model_runner.capture_model.assert_called_once_with()
-    model_runner._dummy_run.assert_called_once_with(16, is_profile=True, skip_eplb=True)
+    model_runner._dummy_run.assert_called_once_with(32, skip_eplb=True)
+    worker._warmup_kernels_once.assert_called_once_with()
     has_cartridge.assert_called_once_with(model)
     prepare.assert_called_once_with(model, "cartridge.safetensors")
     activate.assert_called_once_with(model)
@@ -710,12 +746,15 @@ def test_worker_cartridge_operations_use_collective_rpc_target_model():
 
 
 def test_worker_relocks_workspace_after_recapture_failure():
+    model_runner = SimpleNamespace(
+        capture_model=MagicMock(side_effect=RuntimeError("capture failed"))
+    )
     worker = SimpleNamespace(
-        model_runner=SimpleNamespace(
-            _dummy_run=MagicMock(),
-            max_num_tokens=16,
-            capture_model=MagicMock(side_effect=RuntimeError("capture failed")),
-        )
+        model_runner=model_runner,
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(mode=CompilationMode.NONE)
+        ),
+        _warmup_kernels_once=MagicMock(),
     )
     with (
         patch("vllm.v1.worker.gpu_worker.lock_workspace") as lock,

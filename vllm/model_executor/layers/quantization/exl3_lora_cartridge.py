@@ -8,17 +8,17 @@ trellis-quantized residuals for the gate, up, and down expert projections.
 Applying those residuals projection-by-projection is exact but cannot be added
 after a fused MoE call: gate and up residuals must be present before SiLU.
 
-For rank-sliced EXL3, this module lazily materializes the combined
-base+cartridge expert matrices into fixed-address GPU buffers. Cartridge load
-quiesces the engine, drops the base CUDA graphs, allocates the dense buffers,
-and captures cartridge graphs. Deactivation performs the inverse transition
-and releases the buffers before recapturing the compressed base path.
+For rank-sliced EXL3, this module keeps cartridge trellises compressed on the
+GPU and builds stable pointer tables for the additive routed-expert kernel.
+Cartridge load quiesces the engine, drops the base CUDA graphs, allocates the
+packed tensors, and captures cartridge graphs. Deactivation performs the
+inverse transition and releases the cartridge tensors before recapturing the
+compressed base path.
 
-The runtime is opt-in because an active cartridge's dense shadow weights
-consume substantially more GPU memory. Inactive cartridge support has no
-shadow buffers, dense-MoE work, or alternate graph path. Set
-``cartridge_runtime: true`` in the EXL3 quantization configuration to allow
-the quiescent recapture transaction. Use
+The runtime is opt-in. Inactive cartridge support has no cartridge buffers,
+alternate graph path, or runtime overhead. Set ``cartridge_runtime: true`` in
+the EXL3 quantization configuration to allow the quiescent recapture
+transaction. Use
 ``llm_engine.load_exl3_cartridge(path)`` and
 ``llm_engine.deactivate_exl3_cartridge()``; both dispatch through the worker
 control plane to every model worker.
@@ -36,10 +36,20 @@ from typing import Any
 
 import torch
 
-from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
-from vllm.model_executor.layers.quantization.exl3 import Exl3MoEMethod, _exl3_gemm
+from vllm.model_executor.layers.quantization.exl3 import _load_exl3_ext
 
 logger = logging.getLogger(__name__)
+
+
+def _load_additive_exl3_ext() -> Any:
+    ext = _load_exl3_ext()
+    if not hasattr(ext, "exl3_moe_additive_fused"):
+        raise RuntimeError(
+            "packed EXL3 cartridges require an ExLlamaV3 extension that "
+            "exports exl3_moe_additive_fused"
+        )
+    return ext
+
 
 _CARTRIDGE_KEY_RE = re.compile(
     r"^(?P<layer>.+\.experts)\."
@@ -128,11 +138,7 @@ class Exl3LoraCartridge:
 
 
 class Exl3CUDAGraphCartridgeRuntime:
-    """Fixed-address dense shadow weights used by active CUDA graphs.
-
-    There is one runtime per routed-expert layer while a cartridge is loaded.
-    ``w13`` and ``w2`` remain fixed for the lifetime of those captured graphs.
-    """
+    """Fixed-address packed cartridge tensors and additive MoE workspaces."""
 
     def __init__(self, layer: Any):
         tp_size = int(getattr(layer, "exl3_tp_size", 1))
@@ -140,48 +146,86 @@ class Exl3CUDAGraphCartridgeRuntime:
             raise NotImplementedError(
                 "EXL3 cartridge runtime currently requires tensor_parallel_size=1"
             )
-        num_experts = int(layer.local_num_experts)
-        hidden_size = int(layer.exl3_hidden_size)
-        intermediate_size = int(layer.exl3_intermediate_size_per_partition)
-        dtype = torch.float16
-        device = layer.w13_trellis.device
-
-        self.w13 = torch.zeros(
-            (num_experts, 2 * intermediate_size, hidden_size),
-            dtype=dtype,
-            device=device,
+        self.num_experts = int(layer.local_num_experts)
+        self.hidden_size = int(layer.exl3_hidden_size)
+        self.intermediate_size = int(layer.exl3_intermediate_size_per_partition)
+        self.topk = int(layer.top_k)
+        self.dtype = torch.float16
+        self.device = layer.w13_trellis.device
+        self.chunk = min(128, int(layer.exl3_max_num_batched_tokens))
+        self.ext = _load_additive_exl3_ext() if self.device.type == "cuda" else None
+        if self.ext is not None:
+            if not hasattr(self.ext, "exl3_moe_max_concurrency"):
+                raise RuntimeError(
+                    "The EXL3 extension lacks packed cartridge entry point "
+                    "exl3_moe_max_concurrency"
+                )
+            concurrency = int(self.ext.exl3_moe_max_concurrency(self.device.index or 0))
+        else:
+            concurrency = 1
+        self.xh = torch.empty(
+            (self.chunk, self.hidden_size), dtype=self.dtype, device=self.device
         )
-        self.w2 = torch.zeros(
-            (num_experts, hidden_size, intermediate_size),
-            dtype=dtype,
-            device=device,
+        self.out32 = torch.empty(
+            (self.chunk, self.hidden_size), dtype=torch.float32, device=self.device
         )
-        self.active = torch.zeros((), dtype=torch.bool, device=device)
-        self.num_experts = num_experts
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.dtype = dtype
-        self.device = device
+        self.tg = torch.empty(
+            (concurrency, self.chunk, self.hidden_size),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.tu = torch.empty_like(self.tg)
+        self.ig = torch.empty(
+            (concurrency, self.chunk, self.intermediate_size),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.iu = torch.empty_like(self.ig)
+        self.expert_count = torch.empty(
+            self.num_experts + 1, dtype=torch.int64, device=self.device
+        )
+        self.expert_offsets = torch.empty_like(self.expert_count)
+        self.token_sorted = torch.empty(
+            self.chunk * self.topk, dtype=torch.int64, device=self.device
+        )
+        self.weight_sorted = torch.empty(
+            self.chunk * self.topk, dtype=self.dtype, device=self.device
+        )
+        self.expert_map = torch.arange(
+            self.num_experts, dtype=torch.int64, device=self.device
+        )
+        self._active = False
         self._materialized = False
+        self._packed_tensors: tuple[torch.Tensor, ...] = ()
+        self.pointer_args: tuple[torch.Tensor, ...] = ()
+        self.max_residual_bits = 0
+        layer_bitrates = tuple(getattr(layer, "exl3_layer_bitrates", ()))
+        if len(set(layer_bitrates)) != 1:
+            raise ValueError("packed cartridge runtime requires a uniform base bitrate")
+        self.base_bits = int(layer_bitrates[0])
+
+    @staticmethod
+    def _pointer_table(tensors: list[torch.Tensor]) -> torch.Tensor:
+        return torch.tensor(
+            [tensor.data_ptr() for tensor in tensors],
+            dtype=torch.int64,
+            device=tensors[0].device,
+        )
 
     def deactivate(self) -> None:
-        """Select the rank-sliced base path without changing graph pointers."""
-        self.active.zero_()
+        """Select the rank-sliced base path."""
+        self._active = False
 
     def activate(self) -> None:
-        """Select the fully materialized dense cartridge path."""
+        """Select the prepared packed cartridge path."""
         if not self._materialized:
             raise RuntimeError("cannot activate an unmaterialized EXL3 cartridge")
-        self.active.fill_(True)
+        self._active = True
 
     @torch.inference_mode()
     def materialize(self, layer: Any, cartridge: Exl3LoraCartridge) -> None:
-        """Decode exact base+cartridge matrices into the shadow buffers.
-
-        Identity activations turn each EXL3 GEMM into a matrix materialization.
-        Base and residual outputs are summed before transposition, preserving
-        the exact projection-level MSRT semantics across the SiLU boundary.
-        """
+        """Retain packed stages and construct fixed-address kernel metadata."""
+        del layer
         if cartridge.num_experts != self.num_experts:
             raise ValueError(
                 "cartridge expert count does not match runtime: "
@@ -192,55 +236,158 @@ class Exl3CUDAGraphCartridgeRuntime:
 
         self._materialized = False
         self.deactivate()
-        hidden_identity = torch.eye(
-            self.hidden_size, dtype=torch.float16, device=self.device
+        projection_tensors: dict[str, list[torch.Tensor]] = {
+            "w1": [],
+            "w3": [],
+            "w2": [],
+        }
+        projection_scales: dict[str, list[float]] = {
+            "w1": [],
+            "w3": [],
+            "w2": [],
+        }
+        projection_bits: dict[str, list[int]] = {
+            "w1": [],
+            "w3": [],
+            "w2": [],
+        }
+        retained: list[torch.Tensor] = []
+        for stage_idx in range(cartridge.num_stages):
+            for shard_id in ("w1", "w3", "w2"):
+                stage_tensors = [
+                    cartridge.get_stage_tensors(stage_idx, expert_id, shard_id)
+                    for expert_id in range(self.num_experts)
+                ]
+                present_trellises = [
+                    tensors["trellis"]
+                    for tensors in stage_tensors
+                    if tensors is not None
+                ]
+                if present_trellises:
+                    fallback = present_trellises[0]
+                    stage_bits = {
+                        trellis.shape[2] // 16 for trellis in present_trellises
+                    }
+                    if len(stage_bits) != 1:
+                        raise ValueError(
+                            "packed cartridge stage bitrate must be uniform across "
+                            f"experts: stage={stage_idx}, projection={shard_id}, "
+                            f"bitrates={sorted(stage_bits)}"
+                        )
+                    stage_bit = stage_bits.pop()
+                elif projection_tensors[shard_id]:
+                    fallback = projection_tensors[shard_id][0]
+                    stage_bit = fallback.shape[2] // 16
+                else:
+                    raise ValueError(
+                        "packed cartridge stage has no fallback tensor: "
+                        f"stage={stage_idx}, projection={shard_id}"
+                    )
+
+                for expert_id, tensors in enumerate(stage_tensors):
+                    if tensors is None:
+                        projection_tensors[shard_id].append(fallback)
+                        projection_scales[shard_id].append(0.0)
+                        continue
+                    trellis = tensors["trellis"]
+                    scale = tensors["scale"]
+                    assert isinstance(trellis, torch.Tensor)
+                    assert isinstance(scale, float)
+                    projection_tensors[shard_id].append(trellis)
+                    inverse_scale = 1.0 / scale
+                    if (
+                        not math.isfinite(inverse_scale)
+                        or inverse_scale > torch.finfo(torch.float32).max
+                    ):
+                        raise ValueError(
+                            "packed cartridge inverse scale is not finite in FP32: "
+                            f"stage={stage_idx}, expert={expert_id}, "
+                            f"projection={shard_id}, scale={scale}"
+                        )
+                    projection_scales[shard_id].append(inverse_scale)
+                    retained.append(trellis)
+                projection_bits[shard_id].append(stage_bit)
+
+        table_shape = (cartridge.num_stages, self.num_experts)
+        pointer_tables = tuple(
+            self._pointer_table(projection_tensors[shard_id]).view(table_shape)
+            for shard_id in ("w1", "w3", "w2")
         )
-        intermediate_identity = torch.eye(
-            self.intermediate_size, dtype=torch.float16, device=self.device
+        scale_tables = tuple(
+            torch.tensor(
+                projection_scales[shard_id],
+                dtype=torch.float32,
+                device=self.device,
+            ).view(table_shape)
+            for shard_id in ("w1", "w3", "w2")
         )
-
-        for expert_id in range(self.num_experts):
-            for shard_id, offset in (("w1", 0), ("w3", self.intermediate_size)):
-                base = Exl3MoEMethod._apply_expert(
-                    layer, "w13", hidden_identity, expert_id, shard_id
-                )
-                combined = apply_exl3_cartridge(
-                    base,
-                    hidden_identity,
-                    layer,
-                    "w13",
-                    expert_id,
-                    shard_id,
-                    cartridge,
-                )
-                self.w13[expert_id, offset : offset + self.intermediate_size].copy_(
-                    combined.T.to(self.dtype)
-                )
-
-            base = Exl3MoEMethod._apply_expert(
-                layer, "w2", intermediate_identity, expert_id, "w2"
+        bit_tables = tuple(
+            torch.tensor(
+                projection_bits[shard_id],
+                dtype=torch.int32,
+                device=self.device,
             )
-            combined = apply_exl3_cartridge(
-                base,
-                intermediate_identity,
-                layer,
-                "w2",
-                expert_id,
-                "w2",
-                cartridge,
-            )
-            self.w2[expert_id].copy_(combined.T.to(self.dtype))
-
-        for weights in (self.w13, self.w2):
-            minimum, maximum = torch.aminmax(weights)
-            if not torch.isfinite(minimum).item() or not torch.isfinite(maximum).item():
-                raise ValueError(
-                    "materialized EXL3 cartridge contains non-finite weights"
-                )
+            for shard_id in ("w1", "w3", "w2")
+        )
+        self.pointer_args = pointer_tables + scale_tables + bit_tables
+        self.max_residual_bits = max(
+            bits for projection in projection_bits.values() for bits in projection
+        )
+        self._packed_tensors = tuple(retained) + self.pointer_args
         self._materialized = True
 
-        # Activation is a separate model-wide commit step. Keeping this runtime
-        # inactive until every layer materializes prevents mixed-model states.
+    def apply(
+        self,
+        layer: Any,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self._materialized or not self._active:
+            raise RuntimeError("packed EXL3 cartridge runtime is not active")
+        if self.ext is None:
+            raise RuntimeError("packed EXL3 cartridge execution requires CUDA")
+        if x.shape[0] == 0:
+            return torch.empty_like(x)
+        outputs: list[torch.Tensor] = []
+        for start in range(0, x.shape[0], self.chunk):
+            rows = min(self.chunk, x.shape[0] - start)
+            xh = self.xh[:rows]
+            xh.copy_(x[start : start + rows])
+            out32 = self.out32[:rows]
+            out32.zero_()
+            route_count = rows * self.topk
+            self.ext.exl3_moe_additive_fused(
+                xh,
+                out32,
+                topk_ids[start : start + rows],
+                topk_weights[start : start + rows],
+                self.expert_map,
+                self.expert_count,
+                self.expert_offsets,
+                self.token_sorted[:route_count],
+                self.weight_sorted[:route_count],
+                self.tg,
+                self.tu,
+                self.ig,
+                self.iu,
+                0,
+                self.base_bits,
+                self.base_bits,
+                self.base_bits,
+                *layer.exl3_pointer_tables,
+                *self.pointer_args,
+                self.max_residual_bits,
+                True,
+                False,
+                True,
+                False,
+                True,
+                False,
+                0.0,
+            )
+            outputs.append(out32.to(x.dtype))
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
 
 
 def prepare_exl3_cudagraph_cartridge_runtime(
@@ -254,80 +401,19 @@ def prepare_exl3_cudagraph_cartridge_runtime(
     return runtime
 
 
-def apply_exl3_cartridge(
-    base_output: torch.Tensor,
-    x: torch.Tensor,
-    layer: Any,
-    group: str,
-    expert_id: int,
-    shard_id: str,
-    cartridge: Exl3LoraCartridge | None,
-) -> torch.Tensor:
-    """Add every residual stage to one projection output."""
-    del layer, group
-    if cartridge is None or not cartridge.active:
-        return base_output
-
-    output = base_output.float()
-    for stage_idx in range(cartridge.num_stages):
-        stage_tensors = cartridge.get_stage_tensors(stage_idx, expert_id, shard_id)
-        if stage_tensors is None:
-            continue
-
-        trellis = stage_tensors["trellis"]
-        suh = stage_tensors["suh"]
-        svh = stage_tensors["svh"]
-        scale = stage_tensors["scale"]
-        assert isinstance(trellis, torch.Tensor)
-        assert isinstance(suh, torch.Tensor)
-        assert isinstance(svh, torch.Tensor)
-        assert isinstance(scale, float)
-
-        packed_k = trellis.shape[0] * 16
-        if x.shape[-1] > packed_k:
-            raise ValueError(
-                f"MSRT cartridge input width {x.shape[-1]} exceeds packed K={packed_k}"
-            )
-        padded_x = x
-        if x.shape[-1] < packed_k:
-            padded_x = torch.nn.functional.pad(x, (0, packed_k - x.shape[-1]))
-        # Rank-sliced EXL3 metadata and the fq-cartridge/1 producer both
-        # require MCG; cartridge files do not override the base codebook.
-        correction = _exl3_gemm(padded_x, trellis, suh, svh, True, False)
-        logical_n = base_output.shape[-1]
-        if correction.shape[-1] < logical_n:
-            raise ValueError(
-                "MSRT cartridge packed output width "
-                f"{correction.shape[-1]} is below logical N={logical_n}"
-            )
-        output = output + correction[..., :logical_n].float() * (1.0 / scale)
-
-    return output
-
-
 def apply_exl3_cudagraph_cartridge(
     x: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     layer: Any,
 ) -> torch.Tensor:
-    """Run the dense cartridge path captured for the active topology."""
+    """Run the packed additive path captured for the active topology."""
     runtime = getattr(layer, "_exl3_cartridge_runtime", None)
     if not isinstance(runtime, Exl3CUDAGraphCartridgeRuntime):
         raise RuntimeError(
             "EXL3 cartridge runtime was not prepared before CUDA graph capture"
         )
-
-    return fused_experts(
-        x.to(runtime.dtype),
-        runtime.w13,
-        runtime.w2,
-        topk_weights,
-        topk_ids,
-        activation=layer.activation,
-        apply_router_weight_on_input=False,
-        global_num_experts=runtime.num_experts,
-    ).to(x.dtype)
+    return runtime.apply(layer, x, topk_weights, topk_ids)
 
 
 def _stage_sort_key(label: str) -> tuple[str, int]:
@@ -387,6 +473,27 @@ def _validate_stage_tensors(
             )
         if not torch.isfinite(tensor).all().item():
             raise ValueError(f"MSRT cartridge {name} contains non-finite values")
+
+
+def _validate_base_rotations(
+    layer: Any,
+    expert_id: int,
+    shard_id: str,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+) -> None:
+    group = "w2" if shard_id == "w2" else "w13"
+    key = (expert_id, shard_id)
+    for name, cartridge_tensor in (("suh", suh), ("svh", svh)):
+        parameter = getattr(layer, f"{group}_{name}")
+        base_tensor = parameter.exl3_tensors[key]
+        if cartridge_tensor.device != base_tensor.device:
+            cartridge_tensor = cartridge_tensor.to(base_tensor.device)
+        if not torch.equal(cartridge_tensor, base_tensor):
+            raise ValueError(
+                "MSRT cartridge rotations must match the rank-sliced EXL3 base: "
+                f"expert={expert_id}, projection={shard_id}, tensor={name}"
+            )
 
 
 def load_cartridge_from_adapter(
@@ -469,6 +576,7 @@ def load_cartridge_from_adapter(
             suh = handle.get_tensor(companion_keys["suh"])
             svh = handle.get_tensor(companion_keys["svh"])
             _validate_stage_tensors(layer, shard_id, trellis, suh, svh)
+            _validate_base_rotations(layer, expert_id, shard_id, suh, svh)
             scale = 1.0
             if companion_keys["scale"] in key_set:
                 scale_tensor = handle.get_tensor(companion_keys["scale"])
@@ -511,8 +619,8 @@ def load_cartridge_from_adapter(
 
 @torch.inference_mode()
 def prepare_exl3_cartridge_into_model(model: torch.nn.Module, adapter_path: str) -> int:
-    """Lazily allocate and materialize a cartridge without activating it."""
-    prepared: list[tuple[Any, Exl3CUDAGraphCartridgeRuntime, Exl3LoraCartridge]] = []
+    """Load each layer into packed storage without a dense or staging peak."""
+    prepared_count = 0
     try:
         for layer in model.modules():
             runtime = getattr(layer, "_exl3_cartridge_runtime", None)
@@ -530,25 +638,17 @@ def prepare_exl3_cartridge_into_model(model: torch.nn.Module, adapter_path: str)
                 raise ValueError(
                     f"Cartridge {adapter_path} has no tensors for {layer.layer_name}"
                 )
-            prepared.append((layer, runtime, cartridge))
-        if not prepared:
-            return 0
-
-        prepared_count = len(prepared)
-        for _, runtime, _ in prepared:
             runtime.deactivate()
-        for layer, runtime, cartridge in prepared:
             cartridge.to(runtime.device)
             try:
                 runtime.materialize(layer, cartridge)
             finally:
                 cartridge.clear()
+            prepared_count += 1
         return prepared_count
     except Exception:
         deactivate_exl3_cartridge(model)
         raise
-    finally:
-        prepared.clear()
 
 
 @torch.inference_mode()
@@ -580,7 +680,7 @@ def load_exl3_cartridge_into_model(model: torch.nn.Module, adapter_path: str) ->
 
 
 def has_exl3_cartridge(model: torch.nn.Module) -> bool:
-    """Return whether this worker owns any dense cartridge runtime."""
+    """Return whether this worker owns any packed cartridge runtime."""
     return any(
         isinstance(
             getattr(layer, "_exl3_cartridge_runtime", None),
@@ -592,7 +692,7 @@ def has_exl3_cartridge(model: torch.nn.Module) -> bool:
 
 @torch.inference_mode()
 def deactivate_exl3_cartridge(model: torch.nn.Module) -> int:
-    """Select the compressed base path and release every dense runtime."""
+    """Select the compressed base path and release every cartridge runtime."""
     updated = 0
     for layer in model.modules():
         runtime = getattr(layer, "_exl3_cartridge_runtime", None)
@@ -608,7 +708,6 @@ __all__ = [
     "Exl3CUDAGraphCartridgeRuntime",
     "Exl3LoraCartridge",
     "activate_exl3_cartridge",
-    "apply_exl3_cartridge",
     "apply_exl3_cudagraph_cartridge",
     "deactivate_exl3_cartridge",
     "has_exl3_cartridge",
