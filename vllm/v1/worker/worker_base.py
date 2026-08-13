@@ -174,6 +174,14 @@ class WorkerBase:
     def list_loras(self) -> set[int]:
         raise NotImplementedError
 
+    def clear_exl3_cartridge_cudagraphs(self) -> None:
+        """Release graphs before changing the EXL3 cartridge topology."""
+        raise NotImplementedError
+
+    def has_exl3_cartridge(self) -> bool:
+        """Return whether this worker owns a dense cartridge runtime."""
+        raise NotImplementedError
+
     def prepare_exl3_cartridge(self, adapter_path: str) -> int:
         """Materialize an inactive model-wide EXL3 cartridge."""
         raise NotImplementedError
@@ -184,6 +192,10 @@ class WorkerBase:
 
     def deactivate_exl3_cartridge(self) -> int:
         """Deactivate the model-wide EXL3 cartridge."""
+        raise NotImplementedError
+
+    def capture_exl3_cartridge_cudagraphs(self) -> int:
+        """Recapture graphs after changing the EXL3 cartridge topology."""
         raise NotImplementedError
 
     @property

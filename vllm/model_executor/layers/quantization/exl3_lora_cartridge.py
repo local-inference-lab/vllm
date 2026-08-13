@@ -8,20 +8,18 @@ trellis-quantized residuals for the gate, up, and down expert projections.
 Applying those residuals projection-by-projection is exact but cannot be added
 after a fused MoE call: gate and up residuals must be present before SiLU.
 
-For rank-sliced EXL3, this module materializes the combined base+cartridge
-expert matrices into fixed-address GPU buffers. The normal rank-sliced kernel
-remains the inactive path. A graph-capturable dense fused-MoE call computes the
-active path, and a device scalar selects its output. Loading or removing a
-cartridge only mutates preallocated buffers and the scalar, so captured graph
-pointers and topology remain unchanged.
+For rank-sliced EXL3, this module lazily materializes the combined
+base+cartridge expert matrices into fixed-address GPU buffers. Cartridge load
+quiesces the engine, drops the base CUDA graphs, allocates the dense buffers,
+and captures cartridge graphs. Deactivation performs the inverse transition
+and releases the buffers before recapturing the compressed base path.
 
-The runtime is opt-in because dense shadow weights consume substantially more
-GPU memory and the graph-stable inactive path still launches a null-routed
-dense MoE alongside the compressed base path. This reduces steady-state
-throughput and the transient memory profiled for KV-cache sizing. Set
-``cartridge_runtime: true`` in the EXL3 quantization configuration before
-engine construction so the buffers exist before CUDA graph capture.
-Use ``llm_engine.load_exl3_cartridge(path)`` and
+The runtime is opt-in because an active cartridge's dense shadow weights
+consume substantially more GPU memory. Inactive cartridge support has no
+shadow buffers, dense-MoE work, or alternate graph path. Set
+``cartridge_runtime: true`` in the EXL3 quantization configuration to allow
+the quiescent recapture transaction. Use
+``llm_engine.load_exl3_cartridge(path)`` and
 ``llm_engine.deactivate_exl3_cartridge()``; both dispatch through the worker
 control plane to every model worker.
 
@@ -130,12 +128,10 @@ class Exl3LoraCartridge:
 
 
 class Exl3CUDAGraphCartridgeRuntime:
-    """Fixed-address dense shadow weights used by captured CUDA graphs.
+    """Fixed-address dense shadow weights used by active CUDA graphs.
 
-    There is one runtime per routed-expert layer. ``w13`` and ``w2`` are
-    allocated before graph capture and never rebound. ``active`` is a scalar on
-    the same device; changing it does not alter Python control flow or graph
-    topology.
+    There is one runtime per routed-expert layer while a cartridge is loaded.
+    ``w13`` and ``w2`` remain fixed for the lifetime of those captured graphs.
     """
 
     def __init__(self, layer: Any):
@@ -310,38 +306,28 @@ def apply_exl3_cartridge(
 
 
 def apply_exl3_cudagraph_cartridge(
-    base_output: torch.Tensor,
     x: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     layer: Any,
 ) -> torch.Tensor:
-    """Run and device-select the graph-stable dense cartridge path.
-
-    Both paths and the device-side selection are present during capture, while
-    the scalar controls which result becomes visible at replay time.
-    """
+    """Run the dense cartridge path captured for the active topology."""
     runtime = getattr(layer, "_exl3_cartridge_runtime", None)
     if not isinstance(runtime, Exl3CUDAGraphCartridgeRuntime):
         raise RuntimeError(
             "EXL3 cartridge runtime was not prepared before CUDA graph capture"
         )
 
-    # Preserve graph topology while inactive, but collapse dense routing to one
-    # expert so the discarded shadow path reads one expert's weights, not every
-    # routed expert's weights.
-    dense_topk_ids = topk_ids * runtime.active
-    dense_output = fused_experts(
+    return fused_experts(
         x.to(runtime.dtype),
         runtime.w13,
         runtime.w2,
         topk_weights,
-        dense_topk_ids,
+        topk_ids,
         activation=layer.activation,
         apply_router_weight_on_input=False,
         global_num_experts=runtime.num_experts,
-    ).to(base_output.dtype)
-    return torch.where(runtime.active, dense_output, base_output)
+    ).to(x.dtype)
 
 
 def _stage_sort_key(label: str) -> tuple[str, int]:
@@ -525,43 +511,44 @@ def load_cartridge_from_adapter(
 
 @torch.inference_mode()
 def prepare_exl3_cartridge_into_model(model: torch.nn.Module, adapter_path: str) -> int:
-    """Materialize a cartridge into every layer without activating it."""
+    """Lazily allocate and materialize a cartridge without activating it."""
     prepared: list[tuple[Any, Exl3CUDAGraphCartridgeRuntime, Exl3LoraCartridge]] = []
-    for layer in model.modules():
-        runtime = getattr(layer, "_exl3_cartridge_runtime", None)
-        if not isinstance(runtime, Exl3CUDAGraphCartridgeRuntime):
-            continue
-        cartridge = load_cartridge_from_adapter(
-            adapter_path,
-            layer,
-            runtime.num_experts,
-            torch.device("cpu"),
-        )
-        if cartridge is None:
-            raise ValueError(
-                f"Cartridge {adapter_path} has no tensors for {layer.layer_name}"
-            )
-        prepared.append((layer, runtime, cartridge))
-    if not prepared:
-        return 0
-
-    prepared_count = len(prepared)
-    for _, runtime, _ in prepared:
-        runtime.deactivate()
     try:
+        for layer in model.modules():
+            runtime = getattr(layer, "_exl3_cartridge_runtime", None)
+            if not isinstance(runtime, Exl3CUDAGraphCartridgeRuntime):
+                if not bool(getattr(layer, "exl3_cartridge_capable", False)):
+                    continue
+                runtime = prepare_exl3_cudagraph_cartridge_runtime(layer)
+            cartridge = load_cartridge_from_adapter(
+                adapter_path,
+                layer,
+                runtime.num_experts,
+                torch.device("cpu"),
+            )
+            if cartridge is None:
+                raise ValueError(
+                    f"Cartridge {adapter_path} has no tensors for {layer.layer_name}"
+                )
+            prepared.append((layer, runtime, cartridge))
+        if not prepared:
+            return 0
+
+        prepared_count = len(prepared)
+        for _, runtime, _ in prepared:
+            runtime.deactivate()
         for layer, runtime, cartridge in prepared:
             cartridge.to(runtime.device)
             try:
                 runtime.materialize(layer, cartridge)
             finally:
                 cartridge.clear()
+        return prepared_count
     except Exception:
-        for _, runtime, _ in prepared:
-            runtime.deactivate()
+        deactivate_exl3_cartridge(model)
         raise
     finally:
         prepared.clear()
-    return prepared_count
 
 
 @torch.inference_mode()
@@ -572,6 +559,7 @@ def activate_exl3_cartridge(model: torch.nn.Module) -> int:
         runtime = getattr(layer, "_exl3_cartridge_runtime", None)
         if isinstance(runtime, Exl3CUDAGraphCartridgeRuntime):
             runtime.activate()
+            layer.exl3_cartridge_enabled = True
             updated += 1
     return updated
 
@@ -591,14 +579,27 @@ def load_exl3_cartridge_into_model(model: torch.nn.Module, adapter_path: str) ->
     return updated
 
 
+def has_exl3_cartridge(model: torch.nn.Module) -> bool:
+    """Return whether this worker owns any dense cartridge runtime."""
+    return any(
+        isinstance(
+            getattr(layer, "_exl3_cartridge_runtime", None),
+            Exl3CUDAGraphCartridgeRuntime,
+        )
+        for layer in model.modules()
+    )
+
+
 @torch.inference_mode()
 def deactivate_exl3_cartridge(model: torch.nn.Module) -> int:
-    """Select the rank-sliced base path in every prepared layer."""
+    """Select the compressed base path and release every dense runtime."""
     updated = 0
     for layer in model.modules():
         runtime = getattr(layer, "_exl3_cartridge_runtime", None)
         if isinstance(runtime, Exl3CUDAGraphCartridgeRuntime):
             runtime.deactivate()
+            layer.exl3_cartridge_enabled = False
+            del layer._exl3_cartridge_runtime
             updated += 1
     return updated
 
@@ -610,6 +611,7 @@ __all__ = [
     "apply_exl3_cartridge",
     "apply_exl3_cudagraph_cartridge",
     "deactivate_exl3_cartridge",
+    "has_exl3_cartridge",
     "load_cartridge_from_adapter",
     "load_exl3_cartridge_into_model",
     "prepare_exl3_cartridge_into_model",

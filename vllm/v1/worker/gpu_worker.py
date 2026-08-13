@@ -83,7 +83,7 @@ from vllm.v1.worker.startup_plan import (
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
-from vllm.v1.worker.workspace import init_workspace_manager
+from vllm.v1.worker.workspace import init_workspace_manager, lock_workspace
 
 from ...model_executor.model_loader import TensorizerLoader
 from .gpu.warmup import warmup_kernels
@@ -1227,6 +1227,18 @@ class Worker(WorkerBase):
     def pin_lora(self, lora_id: int) -> bool:
         return self.model_runner.pin_lora(lora_id)
 
+    def clear_exl3_cartridge_cudagraphs(self) -> None:
+        """Release graphs before changing the EXL3 cartridge topology."""
+        self.model_runner.clear_cudagraphs()
+
+    def has_exl3_cartridge(self) -> bool:
+        """Return whether this worker owns a dense cartridge runtime."""
+        from vllm.model_executor.layers.quantization.exl3_lora_cartridge import (
+            has_exl3_cartridge,
+        )
+
+        return has_exl3_cartridge(self.model_runner.model)
+
     def prepare_exl3_cartridge(self, adapter_path: str) -> int:
         """Materialize an inactive EXL3 cartridge through collective RPC."""
         from vllm.model_executor.layers.quantization.exl3_lora_cartridge import (
@@ -1244,12 +1256,29 @@ class Worker(WorkerBase):
         return activate_exl3_cartridge(self.model_runner.model)
 
     def deactivate_exl3_cartridge(self) -> int:
-        """Deactivate a model-wide EXL3 cartridge through collective RPC."""
+        """Release a model-wide EXL3 cartridge through collective RPC."""
         from vllm.model_executor.layers.quantization.exl3_lora_cartridge import (
             deactivate_exl3_cartridge,
         )
 
-        return deactivate_exl3_cartridge(self.model_runner.model)
+        updated = deactivate_exl3_cartridge(self.model_runner.model)
+        if updated:
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
+        return updated
+
+    def capture_exl3_cartridge_cudagraphs(self) -> int:
+        """Recapture graphs after changing the EXL3 cartridge topology."""
+        try:
+            self.model_runner._dummy_run(
+                self.model_runner.max_num_tokens,
+                is_profile=True,
+                skip_eplb=True,
+            )
+            return self.model_runner.capture_model()
+        except BaseException:
+            lock_workspace()
+            raise
 
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.

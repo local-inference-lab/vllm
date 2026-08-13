@@ -976,17 +976,24 @@ class AsyncLLM(EngineClient):
             method, timeout, args, kwargs
         )
 
+    async def _select_exl3_base_and_recapture(self) -> list[int]:
+        await self.collective_rpc("clear_exl3_cartridge_cudagraphs")
+        updated = await self.collective_rpc("deactivate_exl3_cartridge")
+        await self.collective_rpc("capture_exl3_cartridge_cudagraphs")
+        return updated
+
     async def load_exl3_cartridge(self, adapter_path: str) -> list[int]:
-        """Serialize and atomically load one model-wide EXL3 cartridge."""
+        """Serialize cartridge load; failures restore the compressed base."""
         async with self._exl3_cartridge_lock:
             return await self._load_exl3_cartridge(adapter_path)
 
     async def _load_exl3_cartridge(self, adapter_path: str) -> list[int]:
-        """Quiesce serving, clear caches, and load one EXL3 cartridge."""
+        """Quiesce serving, switch model topology, and recapture graphs."""
         resume_needed = not await self.is_paused()
         try:
             await self.pause_generation(mode="wait", clear_cache=True)
             try:
+                await self.collective_rpc("clear_exl3_cartridge_cudagraphs")
                 prepared = await self.collective_rpc(
                     "prepare_exl3_cartridge",
                     args=(adapter_path,),
@@ -997,19 +1004,23 @@ class AsyncLLM(EngineClient):
                         f"EXL3 cartridge prepare/activate mismatch: "
                         f"{prepared} != {activated}"
                     )
+                await self.collective_rpc("capture_exl3_cartridge_cudagraphs")
                 return prepared
             except BaseException:
-                rollback = asyncio.create_task(
-                    self.collective_rpc("deactivate_exl3_cartridge")
-                )
+                rollback = asyncio.create_task(self._select_exl3_base_and_recapture())
                 try:
                     await asyncio.shield(rollback)
                 except asyncio.CancelledError:
-                    await rollback
-                except Exception:
-                    logger.exception(
-                        "Failed to deactivate EXL3 cartridge after load error"
-                    )
+                    try:
+                        await rollback
+                    except Exception as restore_error:
+                        resume_needed = False
+                        self.shutdown()
+                        raise EngineDeadError() from restore_error
+                except Exception as restore_error:
+                    resume_needed = False
+                    self.shutdown()
+                    raise EngineDeadError() from restore_error
                 raise
         finally:
             if resume_needed:
@@ -1025,11 +1036,28 @@ class AsyncLLM(EngineClient):
             return await self._deactivate_exl3_cartridge()
 
     async def _deactivate_exl3_cartridge(self) -> list[int]:
-        """Quiesce serving, clear caches, and select the base model."""
+        """Quiesce serving, release the cartridge, and recapture base graphs."""
+        active = await self.collective_rpc("has_exl3_cartridge")
+        if not any(active):
+            return [0] * len(active)
         resume_needed = not await self.is_paused()
         try:
             await self.pause_generation(mode="wait", clear_cache=True)
-            return await self.collective_rpc("deactivate_exl3_cartridge")
+            transition = asyncio.create_task(self._select_exl3_base_and_recapture())
+            try:
+                return await asyncio.shield(transition)
+            except asyncio.CancelledError:
+                try:
+                    await transition
+                except Exception as transition_error:
+                    resume_needed = False
+                    self.shutdown()
+                    raise EngineDeadError() from transition_error
+                raise
+            except Exception as transition_error:
+                resume_needed = False
+                self.shutdown()
+                raise EngineDeadError() from transition_error
         finally:
             if resume_needed:
                 resume = asyncio.create_task(self.resume_generation())

@@ -436,9 +436,10 @@ class LLMEngine:
         self.reset_encoder_cache()
 
     def load_exl3_cartridge(self, adapter_path: str) -> list[int]:
-        """Load one cartridge while quiescent and invalidate model caches."""
+        """Load one cartridge and restore the compressed base on failure."""
         self._prepare_for_exl3_weight_switch()
         try:
+            self.collective_rpc("clear_exl3_cartridge_cudagraphs")
             prepared = self.collective_rpc(
                 "prepare_exl3_cartridge",
                 args=(adapter_path,),
@@ -449,18 +450,30 @@ class LLMEngine:
                     f"EXL3 cartridge prepare/activate mismatch: "
                     f"{prepared} != {activated}"
                 )
+            self.collective_rpc("capture_exl3_cartridge_cudagraphs")
             return prepared
-        except Exception:
+        except BaseException:
             try:
+                self.collective_rpc("clear_exl3_cartridge_cudagraphs")
                 self.collective_rpc("deactivate_exl3_cartridge")
-            except Exception:
-                logger.exception("Failed to deactivate EXL3 cartridge after load error")
+                self.collective_rpc("capture_exl3_cartridge_cudagraphs")
+            except BaseException as restore_error:
+                self.engine_core.shutdown()
+                raise RuntimeError(
+                    "Failed to restore EXL3 base graphs; engine was shut down"
+                ) from restore_error
             raise
 
     def deactivate_exl3_cartridge(self) -> list[int]:
-        """Select the base model while quiescent and invalidate caches."""
+        """Release one cartridge while quiescent and recapture base graphs."""
+        active = self.collective_rpc("has_exl3_cartridge")
+        if not any(active):
+            return [0] * len(active)
         self._prepare_for_exl3_weight_switch()
-        return self.collective_rpc("deactivate_exl3_cartridge")
+        self.collective_rpc("clear_exl3_cartridge_cudagraphs")
+        updated = self.collective_rpc("deactivate_exl3_cartridge")
+        self.collective_rpc("capture_exl3_cartridge_cudagraphs")
+        return updated
 
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         return self.collective_rpc("apply_model", args=(func,))

@@ -12,6 +12,7 @@ import torch
 from safetensors.torch import save_file
 
 import vllm.model_executor.layers.quantization.exl3 as exl3_module
+from vllm.config import CUDAGraphMode
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.exl3 import Exl3Config, Exl3MoEMethod
 from vllm.model_executor.layers.quantization.exl3_lora_cartridge import (
@@ -19,12 +20,16 @@ from vllm.model_executor.layers.quantization.exl3_lora_cartridge import (
     Exl3LoraCartridge,
     apply_exl3_cartridge,
     apply_exl3_cudagraph_cartridge,
+    deactivate_exl3_cartridge,
     load_cartridge_from_adapter,
     load_exl3_cartridge_into_model,
+    prepare_exl3_cartridge_into_model,
     prepare_exl3_cudagraph_cartridge_runtime,
 )
 from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.llm_engine import LLMEngine
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
 
 CPU = torch.device("cpu")
@@ -36,6 +41,8 @@ def _runtime_layer(device: torch.device = CPU):
         exl3_hidden_size=4,
         exl3_intermediate_size_per_partition=2,
         exl3_params_dtype=torch.float16,
+        exl3_cartridge_capable=True,
+        exl3_cartridge_enabled=False,
         w13_trellis=SimpleNamespace(device=device),
         activation=SimpleNamespace(value="silu"),
         layer_name="model.layers.3.mlp.experts",
@@ -208,10 +215,40 @@ def test_runtime_rejects_nonfinite_materialized_weights():
         runtime.materialize(layer, cartridge)
 
     assert runtime.active.item() is False
-    assert not runtime._materialized
 
 
-def test_cartridge_runtime_rejects_data_parallel_creation(monkeypatch):
+@pytest.mark.parametrize(
+    ("parallel_config", "use_v2_model_runner", "lora_config", "error"),
+    [
+        (
+            SimpleNamespace(data_parallel_size=2, tensor_parallel_size=1),
+            False,
+            None,
+            "data_parallel_size=1",
+        ),
+        (
+            SimpleNamespace(data_parallel_size=1, tensor_parallel_size=2),
+            False,
+            None,
+            "tensor_parallel_size=1",
+        ),
+        (
+            SimpleNamespace(data_parallel_size=1, tensor_parallel_size=1),
+            True,
+            None,
+            "V2 model runner",
+        ),
+        (
+            SimpleNamespace(data_parallel_size=1, tensor_parallel_size=1),
+            False,
+            SimpleNamespace(),
+            "LoRA adapters",
+        ),
+    ],
+)
+def test_cartridge_runtime_rejects_unsupported_execution_config(
+    monkeypatch, parallel_config, use_v2_model_runner, lora_config, error
+):
     method = object.__new__(Exl3MoEMethod)
     method.moe = SimpleNamespace(
         moe_parallel_config=SimpleNamespace(use_ep=False, tp_rank=0, tp_size=1),
@@ -222,13 +259,15 @@ def test_cartridge_runtime_rejects_data_parallel_creation(monkeypatch):
         cartridge_runtime=True,
     )
     config = SimpleNamespace(
-        parallel_config=SimpleNamespace(data_parallel_size=2),
+        parallel_config=parallel_config,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
         model_config=SimpleNamespace(runner_type="generate"),
+        use_v2_model_runner=use_v2_model_runner,
+        lora_config=lora_config,
     )
     monkeypatch.setattr(exl3_module, "get_current_vllm_config_or_none", lambda: config)
 
-    with pytest.raises(NotImplementedError, match="data_parallel_size=1"):
+    with pytest.raises(NotImplementedError, match=error):
         method.create_weights(
             SimpleNamespace(layer_name="model.layers.3.mlp.experts"),
             num_experts=2,
@@ -238,7 +277,13 @@ def test_cartridge_runtime_rejects_data_parallel_creation(monkeypatch):
         )
 
 
-def test_create_weights_stamps_draft_layer_cartridge_disabled(monkeypatch):
+@pytest.mark.parametrize(
+    ("runner_type", "cartridge_capable"),
+    [("draft", False), ("generate", True)],
+)
+def test_create_weights_stamps_cartridge_capability_without_enabling(
+    monkeypatch, runner_type, cartridge_capable
+):
     method = object.__new__(Exl3MoEMethod)
     method.moe = SimpleNamespace(
         moe_parallel_config=SimpleNamespace(use_ep=False, tp_rank=0, tp_size=1),
@@ -250,9 +295,11 @@ def test_create_weights_stamps_draft_layer_cartridge_disabled(monkeypatch):
         rank_sliced_layer_bitrates=MagicMock(return_value=(2, 2)),
     )
     config = SimpleNamespace(
-        parallel_config=SimpleNamespace(data_parallel_size=1),
+        parallel_config=SimpleNamespace(data_parallel_size=1, tensor_parallel_size=1),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
-        model_config=SimpleNamespace(runner_type="draft"),
+        use_v2_model_runner=False,
+        lora_config=None,
+        model_config=SimpleNamespace(runner_type=runner_type),
     )
     monkeypatch.setattr(exl3_module, "get_current_vllm_config_or_none", lambda: config)
     monkeypatch.setattr(exl3_module, "Exl3MoEParameter", MagicMock())
@@ -269,7 +316,8 @@ def test_create_weights_stamps_draft_layer_cartridge_disabled(monkeypatch):
         params_dtype=torch.float16,
     )
 
-    assert layer.exl3_is_draft is True
+    assert layer.exl3_is_draft is (runner_type == "draft")
+    assert layer.exl3_cartridge_capable is cartridge_capable
     assert layer.exl3_cartridge_enabled is False
 
 
@@ -302,10 +350,40 @@ def test_rank_sliced_draft_layer_skips_cartridge_path():
     cartridge.assert_not_called()
 
 
-def test_graph_path_uses_device_scalar_without_host_branch():
+def test_active_rank_sliced_layer_skips_compressed_base_path():
+    method = object.__new__(Exl3MoEMethod)
+    method.quant_config = SimpleNamespace(rank_sliced_metadata={"tp": 1})
+    method._apply_rank_sliced = MagicMock()
+    layer = SimpleNamespace(
+        activation=MoEActivation.SILU,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+        exl3_cartridge_enabled=True,
+    )
+    x = torch.ones(2, 4, dtype=torch.float16)
+    weights = torch.ones(2, 1, dtype=torch.float32)
+    ids = torch.zeros(2, 1, dtype=torch.long)
+
+    with patch(
+        "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
+        "apply_exl3_cudagraph_cartridge",
+        return_value=torch.ones(2, 4, dtype=torch.float16),
+    ) as cartridge:
+        output = method.apply(layer, x, weights, ids, None, None)
+
+    assert output.shape == (2, 4)
+    method._apply_rank_sliced.assert_not_called()
+    cartridge.assert_called_once()
+    call_x, call_weights, call_ids, call_layer = cartridge.call_args.args
+    assert torch.equal(call_x, x)
+    assert torch.equal(call_weights, weights)
+    assert torch.equal(call_ids, ids)
+    assert call_layer is layer
+
+
+def test_graph_path_routes_original_ids_once():
     layer = _runtime_layer()
-    runtime = prepare_exl3_cudagraph_cartridge_runtime(layer)
-    base = torch.full((3, 4), 2.0, dtype=torch.float16)
+    prepare_exl3_cudagraph_cartridge_runtime(layer)
     dense = torch.full((3, 4), torch.nan, dtype=torch.float16)
     inputs = torch.zeros(3, 4, dtype=torch.float16)
     weights = torch.ones(3, 1, dtype=torch.float32)
@@ -315,59 +393,45 @@ def test_graph_path_uses_device_scalar_without_host_branch():
         "vllm.model_executor.layers.quantization.exl3_lora_cartridge.fused_experts",
         return_value=dense,
     ) as fused:
-        runtime.deactivate()
-        inactive = apply_exl3_cudagraph_cartridge(base, inputs, weights, ids, layer)
-        runtime.active.fill_(1)
-        active = apply_exl3_cudagraph_cartridge(base, inputs, weights, ids, layer)
+        output = apply_exl3_cudagraph_cartridge(inputs, weights, ids, layer)
 
-    assert torch.equal(inactive, base)
-    assert torch.isnan(active).all()
-    assert fused.call_count == 2
-    assert torch.equal(fused.call_args_list[0].args[4], torch.zeros_like(ids))
-    assert torch.equal(fused.call_args_list[1].args[4], ids)
+    assert torch.isnan(output).all()
+    fused.assert_called_once()
+    assert torch.equal(fused.call_args.args[4], ids)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_device_activation_replays_real_fused_moe_in_one_cuda_graph():
+def test_dense_cartridge_replays_with_fixed_weights_in_one_cuda_graph():
     device = torch.device("cuda")
     layer = _loader_layer()
     layer.w13_trellis.device = device
     runtime = prepare_exl3_cudagraph_cartridge_runtime(layer)
-    base = torch.full((3, 16), 2.0, dtype=torch.float16, device=device)
     inputs = torch.ones(3, 16, dtype=torch.float16, device=device)
     weights = torch.ones(3, 1, dtype=torch.float32, device=device)
     ids = torch.zeros(3, 1, dtype=torch.long, device=device)
 
     runtime.w13.fill_(0.1)
     runtime.w2.fill_(0.1)
-    apply_exl3_cudagraph_cartridge(base, inputs, weights, ids, layer)
+    runtime._materialized = True
+    runtime.activate()
     w13_pointer = runtime.w13.data_ptr()
     w2_pointer = runtime.w2.data_ptr()
 
     graph = torch.cuda.CUDAGraph()
-    runtime.deactivate()
     torch.cuda.synchronize()
     with torch.cuda.graph(graph):
-        output = apply_exl3_cudagraph_cartridge(base, inputs, weights, ids, layer)
+        output = apply_exl3_cudagraph_cartridge(inputs, weights, ids, layer)
     graph.replay()
     torch.cuda.synchronize()
-    assert torch.equal(output, base)
+    initial = output.clone()
 
     runtime.w13.fill_(0.2)
-    runtime._materialized = True
     runtime.w2.fill_(0.2)
-    runtime.activate()
     graph.replay()
     torch.cuda.synchronize()
-    assert not torch.equal(output, base)
+    assert not torch.equal(output, initial)
     assert runtime.w13.data_ptr() == w13_pointer
     assert runtime.w2.data_ptr() == w2_pointer
-
-    runtime.w13.fill_(torch.nan)
-    runtime.deactivate()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(output, base)
 
 
 def test_loader_filters_layer_and_sorts_stage_numbers(tmp_path):
@@ -523,6 +587,50 @@ def test_model_loader_deactivates_every_layer_after_materialization_failure():
     assert all(runtime.active.item() == 0.0 for runtime in runtimes)
 
 
+def test_model_loader_skips_layers_without_cartridge_capability():
+    layer = _runtime_layer()
+    layer.exl3_cartridge_capable = False
+    model = SimpleNamespace(modules=lambda: iter((layer,)))
+
+    with patch(
+        "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
+        "load_cartridge_from_adapter"
+    ) as load:
+        assert prepare_exl3_cartridge_into_model(model, "cartridge.safetensors") == 0
+
+    load.assert_not_called()
+    assert not hasattr(layer, "_exl3_cartridge_runtime")
+
+
+def test_model_loader_allocates_and_releases_runtime_lazily():
+    layer = _runtime_layer()
+    model = SimpleNamespace(modules=lambda: iter((layer,)))
+
+    def mark_materialized(runtime, _layer, _cartridge):
+        runtime._materialized = True
+
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
+            "load_cartridge_from_adapter",
+            return_value=_cartridge(),
+        ),
+        patch.object(
+            Exl3CUDAGraphCartridgeRuntime,
+            "materialize",
+            autospec=True,
+            side_effect=mark_materialized,
+        ),
+    ):
+        assert load_exl3_cartridge_into_model(model, "cartridge.safetensors") == 1
+
+    assert isinstance(layer._exl3_cartridge_runtime, Exl3CUDAGraphCartridgeRuntime)
+    assert layer.exl3_cartridge_enabled is True
+    assert deactivate_exl3_cartridge(model) == 1
+    assert not hasattr(layer, "_exl3_cartridge_runtime")
+    assert layer.exl3_cartridge_enabled is False
+
+
 def test_model_loader_activates_every_layer_only_after_materialization():
     layers = [_runtime_layer(), _runtime_layer()]
     layers[1].layer_name = "model.layers.4.mlp.experts"
@@ -551,8 +659,20 @@ def test_model_loader_activates_every_layer_only_after_materialization():
 
 def test_worker_cartridge_operations_use_collective_rpc_target_model():
     model = SimpleNamespace()
-    worker = SimpleNamespace(model_runner=SimpleNamespace(model=model))
+    model_runner = SimpleNamespace(
+        model=model,
+        clear_cudagraphs=MagicMock(),
+        capture_model=MagicMock(return_value=123),
+        _dummy_run=MagicMock(),
+        max_num_tokens=16,
+    )
+    worker = SimpleNamespace(model_runner=model_runner)
     with (
+        patch(
+            "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
+            "has_exl3_cartridge",
+            return_value=True,
+        ) as has_cartridge,
         patch(
             "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
             "prepare_exl3_cartridge_into_model",
@@ -568,46 +688,144 @@ def test_worker_cartridge_operations_use_collective_rpc_target_model():
             "deactivate_exl3_cartridge",
             return_value=10,
         ) as deactivate,
+        patch("torch.accelerator.synchronize") as synchronize,
+        patch("torch.accelerator.empty_cache") as empty_cache,
     ):
+        Worker.clear_exl3_cartridge_cudagraphs(worker)
+        assert Worker.has_exl3_cartridge(worker) is True
         assert Worker.prepare_exl3_cartridge(worker, "cartridge.safetensors") == 10
         assert Worker.activate_exl3_cartridge(worker) == 10
         assert Worker.deactivate_exl3_cartridge(worker) == 10
+        assert Worker.capture_exl3_cartridge_cudagraphs(worker) == 123
 
+    model_runner.clear_cudagraphs.assert_called_once_with()
+    model_runner.capture_model.assert_called_once_with()
+    model_runner._dummy_run.assert_called_once_with(16, is_profile=True, skip_eplb=True)
+    has_cartridge.assert_called_once_with(model)
     prepare.assert_called_once_with(model, "cartridge.safetensors")
     activate.assert_called_once_with(model)
     deactivate.assert_called_once_with(model)
+    synchronize.assert_called_once_with()
+    empty_cache.assert_called_once_with()
+
+
+def test_worker_relocks_workspace_after_recapture_failure():
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            _dummy_run=MagicMock(),
+            max_num_tokens=16,
+            capture_model=MagicMock(side_effect=RuntimeError("capture failed")),
+        )
+    )
+    with (
+        patch("vllm.v1.worker.gpu_worker.lock_workspace") as lock,
+        pytest.raises(RuntimeError, match="capture failed"),
+    ):
+        Worker.capture_exl3_cartridge_cudagraphs(worker)
+
+    lock.assert_called_once_with()
+
+
+def test_gpu_runner_clear_cudagraphs_releases_every_graph_owner():
+    runner = object.__new__(GPUModelRunner)
+    runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL)
+    runner.encoder_cudagraph_manager = MagicMock()
+    with (
+        patch(
+            "vllm.v1.worker.gpu_model_runner.CUDAGraphWrapper.clear_all_graphs"
+        ) as clear_graphs,
+        patch(
+            "vllm.v1.worker.gpu_model_runner.BreakableCUDAGraphWrapper.clear_all_graphs"
+        ) as clear_breakable,
+        patch("vllm.v1.worker.gpu_model_runner.unlock_workspace") as unlock,
+        patch("torch.accelerator.synchronize") as synchronize,
+        patch("torch.accelerator.empty_cache") as empty_cache,
+    ):
+        GPUModelRunner.clear_cudagraphs(runner)
+
+    clear_graphs.assert_called_once_with()
+    clear_breakable.assert_called_once_with()
+    runner.encoder_cudagraph_manager.clear.assert_called_once_with()
+    unlock.assert_called_once_with()
+    synchronize.assert_called_once_with()
+    empty_cache.assert_called_once_with()
 
 
 def test_engine_cartridge_operations_dispatch_to_every_worker():
     engine = SimpleNamespace(
         _prepare_for_exl3_weight_switch=MagicMock(),
-        collective_rpc=MagicMock(side_effect=[[10], [10], [10]]),
+        collective_rpc=MagicMock(
+            side_effect=[None, [10], [10], 123, [True], None, [10], 123]
+        ),
     )
 
     assert LLMEngine.load_exl3_cartridge(engine, "cartridge.safetensors") == [10]
     assert LLMEngine.deactivate_exl3_cartridge(engine) == [10]
     assert engine.collective_rpc.call_args_list == [
+        (("clear_exl3_cartridge_cudagraphs",), {}),
         (("prepare_exl3_cartridge",), {"args": ("cartridge.safetensors",)}),
         (("activate_exl3_cartridge",), {}),
+        (("capture_exl3_cartridge_cudagraphs",), {}),
+        (("has_exl3_cartridge",), {}),
+        (("clear_exl3_cartridge_cudagraphs",), {}),
         (("deactivate_exl3_cartridge",), {}),
+        (("capture_exl3_cartridge_cudagraphs",), {}),
     ]
+
+
+def test_engine_cartridge_deactivate_is_noop_without_runtime():
+    engine = SimpleNamespace(
+        _prepare_for_exl3_weight_switch=MagicMock(),
+        collective_rpc=MagicMock(return_value=[False, False]),
+    )
+
+    assert LLMEngine.deactivate_exl3_cartridge(engine) == [0, 0]
+    engine.collective_rpc.assert_called_once_with("has_exl3_cartridge")
+    engine._prepare_for_exl3_weight_switch.assert_not_called()
 
 
 def test_engine_cartridge_load_rolls_back_every_worker_on_commit_failure():
     engine = SimpleNamespace(
         _prepare_for_exl3_weight_switch=MagicMock(),
         collective_rpc=MagicMock(
-            side_effect=[[10, 10], RuntimeError("commit failed"), [10, 10]]
+            side_effect=[
+                None,
+                [10, 10],
+                RuntimeError("commit failed"),
+                None,
+                [10, 10],
+                123,
+            ]
         ),
     )
 
     with pytest.raises(RuntimeError, match="commit failed"):
         LLMEngine.load_exl3_cartridge(engine, "cartridge.safetensors")
 
-    assert engine.collective_rpc.call_args_list[-1] == (
-        ("deactivate_exl3_cartridge",),
-        {},
+    assert [call.args[0] for call in engine.collective_rpc.call_args_list[-3:]] == [
+        "clear_exl3_cartridge_cudagraphs",
+        "deactivate_exl3_cartridge",
+        "capture_exl3_cartridge_cudagraphs",
+    ]
+
+
+def test_engine_shuts_down_when_base_graph_restore_fails():
+    engine = SimpleNamespace(
+        _prepare_for_exl3_weight_switch=MagicMock(),
+        collective_rpc=MagicMock(
+            side_effect=[
+                None,
+                RuntimeError("load failed"),
+                RuntimeError("restore failed"),
+            ]
+        ),
+        engine_core=SimpleNamespace(shutdown=MagicMock()),
     )
+
+    with pytest.raises(RuntimeError, match="engine was shut down"):
+        LLMEngine.load_exl3_cartridge(engine, "cartridge.safetensors")
+
+    engine.engine_core.shutdown.assert_called_once_with()
 
 
 def test_sync_engine_weight_switch_requires_cache_invalidation():
@@ -650,15 +868,79 @@ def test_async_load_clears_caches_and_rolls_back_on_cancellation():
         engine.is_paused = AsyncMock(return_value=False)
         engine.pause_generation = AsyncMock()
         engine.resume_generation = AsyncMock()
-        engine.collective_rpc = AsyncMock(side_effect=[asyncio.CancelledError(), [2]])
+        engine.collective_rpc = AsyncMock(
+            side_effect=[asyncio.CancelledError(), None, [2], 123]
+        )
 
         with pytest.raises(asyncio.CancelledError):
             await AsyncLLM._load_exl3_cartridge(engine, "cartridge.safetensors")
 
         engine.pause_generation.assert_awaited_once_with(mode="wait", clear_cache=True)
-        assert engine.collective_rpc.await_args_list[-1].args == (
+        assert [call.args[0] for call in engine.collective_rpc.await_args_list] == [
+            "clear_exl3_cartridge_cudagraphs",
+            "clear_exl3_cartridge_cudagraphs",
             "deactivate_exl3_cartridge",
-        )
+            "capture_exl3_cartridge_cudagraphs",
+        ]
         engine.resume_generation.assert_awaited_once_with()
+
+    asyncio.run(run())
+
+
+def test_async_deactivate_recaptures_before_resuming():
+    async def run():
+        engine = object.__new__(AsyncLLM)
+        engine.is_paused = AsyncMock(return_value=False)
+        engine.pause_generation = AsyncMock()
+        engine.resume_generation = AsyncMock()
+        engine.collective_rpc = AsyncMock(side_effect=[[True], None, [2], 123])
+
+        assert await AsyncLLM._deactivate_exl3_cartridge(engine) == [2]
+        assert [call.args[0] for call in engine.collective_rpc.await_args_list] == [
+            "has_exl3_cartridge",
+            "clear_exl3_cartridge_cudagraphs",
+            "deactivate_exl3_cartridge",
+            "capture_exl3_cartridge_cudagraphs",
+        ]
+        engine.pause_generation.assert_awaited_once_with(mode="wait", clear_cache=True)
+        engine.resume_generation.assert_awaited_once_with()
+
+    asyncio.run(run())
+
+
+def test_async_deactivate_is_noop_without_runtime():
+    async def run():
+        engine = object.__new__(AsyncLLM)
+        engine.is_paused = AsyncMock()
+        engine.pause_generation = AsyncMock()
+        engine.collective_rpc = AsyncMock(return_value=[False, False])
+
+        assert await AsyncLLM._deactivate_exl3_cartridge(engine) == [0, 0]
+        engine.collective_rpc.assert_awaited_once_with("has_exl3_cartridge")
+        engine.is_paused.assert_not_awaited()
+        engine.pause_generation.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_async_load_shuts_down_when_base_graph_restore_fails():
+    async def run():
+        engine = object.__new__(AsyncLLM)
+        engine.is_paused = AsyncMock(return_value=False)
+        engine.pause_generation = AsyncMock()
+        engine.resume_generation = AsyncMock()
+        engine.shutdown = MagicMock()
+        engine.collective_rpc = AsyncMock(
+            side_effect=[
+                RuntimeError("load failed"),
+                RuntimeError("restore failed"),
+            ]
+        )
+
+        with pytest.raises(EngineDeadError):
+            await AsyncLLM._load_exl3_cartridge(engine, "cartridge.safetensors")
+
+        engine.shutdown.assert_called_once_with()
+        engine.resume_generation.assert_not_awaited()
 
     asyncio.run(run())
