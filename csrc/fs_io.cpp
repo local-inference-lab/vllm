@@ -33,6 +33,23 @@ inline int ensure_parent_dirs(const std::string& path) {
   return ec ? ec.value() : 0;
 }
 
+// Publish a complete content-addressed file without replacing an inode that
+// another writer already made visible. link(2) is atomic and returns EEXIST
+// when a concurrent writer wins, including across processes.
+inline int publish_file_if_absent(const char* tmp_path, const char* dest_path) {
+  if (link(tmp_path, dest_path) != 0) {
+    const int err = errno;
+    if (err != EEXIST) {
+      return err;
+    }
+  }
+
+  if (unlink(tmp_path) != 0 && errno != ENOENT) {
+    return errno;
+  }
+  return 0;
+}
+
 // Core single-block store: src/size are raw pointer + byte count. Returns 0
 // on success, or the errno of the failing step on failure -- captured
 // before any subsequent cleanup call can overwrite it. On failure, the temp
@@ -68,8 +85,7 @@ inline int _store_block(const char* tmp_path, const char* dest_path,
     return err;
   }
 
-  if (rename(tmp_path, dest_path) != 0) {
-    const int err = errno;
+  if (const int err = publish_file_if_absent(tmp_path, dest_path); err != 0) {
     unlink(tmp_path);
     return err;
   }
@@ -190,6 +206,31 @@ static PyObject* batch_lookup(PyObject* /*self*/, PyObject* args) {
     PyList_SetItem(result, i, PyBool_FromLong(exists_flags[i]));
   }
   return result;
+}
+
+/// @brief Publish one complete file without replacing an existing destination.
+/// @param tmp_path  private completed file that remains hidden from readers.
+/// @param dest_path immutable content-addressed destination.
+/// @note Releases the GIL. EEXIST is success because another writer published
+///       the same content key.
+static PyObject* publish_file_if_absent_py(PyObject* /*self*/, PyObject* args) {
+  const char* tmp_path = nullptr;
+  const char* dest_path = nullptr;
+  if (!PyArg_ParseTuple(args, "ss", &tmp_path, &dest_path)) {
+    return nullptr;
+  }
+
+  int err = 0;
+  {
+    Py_BEGIN_ALLOW_THREADS err = publish_file_if_absent(tmp_path, dest_path);
+    Py_END_ALLOW_THREADS
+  }
+  if (err != 0) {
+    errno = err;
+    return PyErr_SetFromErrnoWithFilename(PyExc_OSError, dest_path);
+  }
+
+  Py_RETURN_NONE;
 }
 
 /// @brief Store a batch of blocks, each from its own buffer, to disk.
@@ -342,6 +383,11 @@ static PyMethodDef fs_io_C_methods[] = {
      "batch_lookup(paths: list[str]) -> list[bool]\n"
      "\n"
      "Check file existence for a batch of paths."},
+    {"_publish_file_if_absent", publish_file_if_absent_py, METH_VARARGS,
+     "_publish_file_if_absent(tmp_path: str, dest_path: str) -> None\n"
+     "\n"
+     "Publish a complete private file without replacing an existing "
+     "content-addressed destination."},
     {"batch_store_block", batch_store_block, METH_VARARGS,
      "batch_store_block(tmp_paths: list[str], dest_paths: list[str],\n"
      "                  buffers: list[bytes-like],\n"

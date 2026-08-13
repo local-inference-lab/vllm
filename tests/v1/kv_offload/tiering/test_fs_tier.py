@@ -37,6 +37,7 @@ from vllm.v1.kv_offload.config import (
 )
 from vllm.v1.kv_offload.tiering.base import TransferJob
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+from vllm.v1.kv_offload.tiering.fs import io as fs_io
 from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierManager,
 )
@@ -227,6 +228,53 @@ def test_store_creates_file_and_lookup_succeeds(fs_tier):
     assert lookup_and_wait(tier, [key(1)]) == [LookupResult.HIT]
     dest = tier.file_mapper.get_file_name(key(1))
     assert os.path.exists(dest), f"Expected file at {dest}"
+
+
+def test_python_store_preserves_first_published_inode(tmp_path, monkeypatch):
+    """A writer that finishes later must not replace a published cache block."""
+    destination = tmp_path / "blocks" / "shared.bin"
+    delayed_at_publish = threading.Event()
+    first_published = threading.Event()
+    real_link = os.link
+    errors: list[Exception] = []
+
+    def ordered_link(source: str, target: str) -> None:
+        if threading.current_thread().name == "delayed-writer":
+            delayed_at_publish.set()
+            assert first_published.wait(timeout=5)
+        real_link(source, target)
+        if threading.current_thread().name == "first-writer":
+            first_published.set()
+
+    monkeypatch.setattr(fs_io.os, "link", ordered_link)
+
+    def store(value: int) -> None:
+        try:
+            data = bytearray([value]) * mmap.PAGESIZE
+            fs_io._store_block(
+                str(destination),
+                memoryview(data),
+                0,
+                len(data),
+                use_o_direct=False,
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    delayed = threading.Thread(target=store, args=(0xA5,), name="delayed-writer")
+    delayed.start()
+    assert delayed_at_publish.wait(timeout=5)
+
+    first = threading.Thread(target=store, args=(0x5A,), name="first-writer")
+    first.start()
+    first.join(timeout=5)
+    delayed.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not delayed.is_alive()
+    assert not errors
+    assert destination.read_bytes() == bytes([0x5A]) * mmap.PAGESIZE
+    assert not list(destination.parent.glob("*.tmp"))
 
 
 def test_store_then_load_roundtrip(fs_tier):
@@ -471,6 +519,61 @@ def test_store_load_data_integrity(fs_tier, monkeypatch, use_c_ext, batch_size):
         assert torch.allclose(tensor[bid], expected[i]), (
             f"Block {bid} data mismatch after store+load"
         )
+
+
+def test_c_publish_preserves_first_writer_content_and_inode(tmp_path):
+    """C publication must preserve the first complete file for a shared key."""
+    try:
+        from vllm.fs_io_C import _publish_file_if_absent as publish_file_C
+    except ImportError:
+        pytest.skip("fs_io_C extension not built")
+
+    writer_count = 16
+    destination = tmp_path / "shared.bin"
+    start = threading.Barrier(writer_count + 1)
+    first_published = threading.Event()
+    authoritative_inodes: list[int] = []
+    observed_inodes: list[int] = []
+    errors: list[OSError | threading.BrokenBarrierError | TimeoutError] = []
+
+    temp_paths = [tmp_path / f"writer-{writer}.tmp" for writer in range(writer_count)]
+    for writer, temp_path in enumerate(temp_paths):
+        temp_path.write_bytes(bytes([writer + 1]) * mmap.PAGESIZE)
+
+    def publish(writer: int) -> None:
+        try:
+            start.wait(timeout=5)
+            if writer != 0 and not first_published.wait(timeout=5):
+                raise TimeoutError("first writer did not publish")
+            publish_file_C(str(temp_paths[writer]), str(destination))
+            inode = destination.stat().st_ino
+            if writer == 0:
+                authoritative_inodes.append(inode)
+                first_published.set()
+            else:
+                observed_inodes.append(inode)
+        except (OSError, threading.BrokenBarrierError, TimeoutError) as exc:
+            errors.append(exc)
+            first_published.set()
+
+    threads = [
+        threading.Thread(target=publish, args=(writer,))
+        for writer in range(writer_count)
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=5)
+
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert not errors
+    assert len(authoritative_inodes) == 1
+    assert set(observed_inodes) == {authoritative_inodes[0]}
+    assert destination.stat().st_ino == authoritative_inodes[0]
+    assert destination.read_bytes() == bytes([1]) * mmap.PAGESIZE
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_store_load_roundtrip_without_o_direct(tmp_path, monkeypatch):
