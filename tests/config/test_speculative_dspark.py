@@ -41,6 +41,7 @@ def test_deepseek_v4_dspark_preserves_specialized_fp8_quantization(
         num_hidden_layers=1,
         num_attention_heads=1,
         num_key_value_heads=1,
+        o_groups=1,
         vocab_size=32,
         torch_dtype="bfloat16",
         quantization_config={
