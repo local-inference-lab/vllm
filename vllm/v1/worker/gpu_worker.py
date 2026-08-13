@@ -803,35 +803,41 @@ class Worker(WorkerBase):
         ):
             self.model_runner._init_kv_zero_meta()
 
+    def _get_compile_warmup_sizes(self) -> list[int]:
+        """Return compile sizes requiring an eager warmup run.
+
+        Returns:
+            Compile sizes not covered by CUDA-graph capture, plus one size for
+            each otherwise-uncovered compile range.
+        """
+        compilation_config = self.vllm_config.compilation_config
+        if compilation_config.mode != CompilationMode.VLLM_COMPILE:
+            return []
+
+        compile_sizes = compilation_config.compile_sizes
+        warmup_sizes = compile_sizes.copy() if compile_sizes is not None else []
+        cudagraph_capture_sizes: list[int] = []
+        if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            configured_capture_sizes = compilation_config.cudagraph_capture_sizes
+            cudagraph_capture_sizes = (
+                [] if configured_capture_sizes is None else configured_capture_sizes
+            )
+            warmup_sizes = [
+                size for size in warmup_sizes if size not in cudagraph_capture_sizes
+            ]
+
+        covered_sizes = set(cudagraph_capture_sizes)
+        covered_sizes.update(size for size in warmup_sizes if isinstance(size, int))
+        for compile_range in compilation_config.get_compile_ranges():
+            if not any(size in compile_range for size in covered_sizes):
+                warmup_sizes.append(compile_range.end)
+
+        return [size for size in warmup_sizes if isinstance(size, int)]
+
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
-        warmup_sizes: list[int] = []
-
-        if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
-            # warm up sizes that are not in cudagraph capture sizes,
-            # but users still want to compile for better performance,
-            # e.g. for the max-num-batched token size in chunked prefill.
-            compile_sizes = self.vllm_config.compilation_config.compile_sizes
-            warmup_sizes = compile_sizes.copy() if compile_sizes is not None else []  # type: ignore[assignment]
-            cg_capture_sizes: list[int] = []
-
-            if self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-                cg_sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes
-                cg_capture_sizes = [] if cg_sizes is None else cg_sizes
-                warmup_sizes = [x for x in warmup_sizes if x not in cg_capture_sizes]
-
-            compile_ranges = self.vllm_config.compilation_config.get_compile_ranges()
-            # For each compile_range, if none of the batch sizes
-            # in warmup_sizes or cudagraph_capture_sizes are in the range,
-            # add the end of the range to ensure compilation/warmup.
-            all_sizes = set(cg_capture_sizes)
-            all_sizes.update([x for x in warmup_sizes if isinstance(x, int)])
-            for compile_range in compile_ranges:
-                if not any(x in compile_range for x in all_sizes):
-                    warmup_sizes.append(compile_range.end)
-
         # We skip EPLB here since we don't want to record dummy metrics
-        for size in sorted(warmup_sizes, reverse=True):
+        for size in sorted(self._get_compile_warmup_sizes(), reverse=True):
             logger.info("Compile and warming up model for size %d", size)
             self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
@@ -1239,13 +1245,66 @@ class Worker(WorkerBase):
 
         return has_exl3_cartridge(self.model_runner.model)
 
-    def prepare_exl3_cartridge(self, adapter_path: str) -> int:
-        """Materialize an inactive EXL3 cartridge through collective RPC."""
+    def stage_exl3_cartridge(self, adapter_path: str, stage_id: str) -> int:
+        """Verify an EXL3 cartridge before the engine is paused."""
         from vllm.model_executor.layers.quantization.exl3_lora_cartridge import (
-            prepare_exl3_cartridge_into_model,
+            _load_additive_exl3_ext,
+            stage_exl3_cartridge_adapter,
         )
 
-        return prepare_exl3_cartridge_into_model(self.model_runner.model, adapter_path)
+        parallel = self.vllm_config.parallel_config
+        if parallel.data_parallel_size != 1:
+            raise NotImplementedError(
+                "EXL3 cartridge runtime currently requires data_parallel_size=1"
+            )
+        if parallel.pipeline_parallel_size != 1:
+            raise NotImplementedError(
+                "EXL3 cartridge runtime currently requires pipeline_parallel_size=1"
+            )
+        if self.vllm_config.use_v2_model_runner:
+            raise NotImplementedError(
+                "EXL3 cartridge runtime does not support the V2 model runner"
+            )
+        if self.vllm_config.lora_config is not None:
+            raise NotImplementedError(
+                "EXL3 cartridge runtime cannot be combined with LoRA adapters"
+            )
+        _load_additive_exl3_ext()
+        stages = getattr(self, "_exl3_cartridge_stages", None)
+        if stages is None:
+            stages = {}
+            self._exl3_cartridge_stages = stages
+        if stage_id in stages:
+            raise ValueError(f"duplicate EXL3 cartridge stage id {stage_id!r}")
+        staged = stage_exl3_cartridge_adapter(self.model_runner.model, adapter_path)
+        stages[stage_id] = staged
+        assert staged.state is not None
+        return len(staged.local_layer_names)
+
+    def prepare_staged_exl3_cartridge(self, stage_id: str) -> int:
+        """Materialize a verified EXL3 cartridge through collective RPC."""
+        from vllm.model_executor.layers.quantization.exl3_lora_cartridge import (
+            prepare_staged_exl3_cartridge_into_model,
+        )
+
+        stages = getattr(self, "_exl3_cartridge_stages", {})
+        try:
+            staged = stages.pop(stage_id)
+        except KeyError as exc:
+            raise ValueError(f"unknown EXL3 cartridge stage id {stage_id!r}") from exc
+        try:
+            return prepare_staged_exl3_cartridge_into_model(
+                self.model_runner.model, staged
+            )
+        finally:
+            staged.close()
+
+    def discard_staged_exl3_cartridge(self, stage_id: str) -> None:
+        """Release one verified EXL3 cartridge staging area."""
+        stages = getattr(self, "_exl3_cartridge_stages", {})
+        staged = stages.pop(stage_id, None)
+        if staged is not None:
+            staged.close()
 
     def activate_exl3_cartridge(self) -> int:
         """Commit a prepared EXL3 cartridge through collective RPC."""
@@ -1270,23 +1329,8 @@ class Worker(WorkerBase):
     def capture_exl3_cartridge_cudagraphs(self) -> int:
         """Recapture graphs after changing the EXL3 cartridge topology."""
         try:
-            if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
-                compile_sizes = self.vllm_config.compilation_config.compile_sizes or []
-                capture_sizes = (
-                    self.vllm_config.compilation_config.cudagraph_capture_sizes or []
-                )
-                warmup_sizes = [
-                    size
-                    for size in compile_sizes
-                    if isinstance(size, int) and size not in capture_sizes
-                ]
-                for (
-                    compile_range
-                ) in self.vllm_config.compilation_config.get_compile_ranges():
-                    if not any(size in compile_range for size in capture_sizes):
-                        warmup_sizes.append(compile_range.end)
-                for size in sorted(set(warmup_sizes), reverse=True):
-                    self.model_runner._dummy_run(size, skip_eplb=True)
+            for size in sorted(self._get_compile_warmup_sizes(), reverse=True):
+                self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
             self._warmup_kernels_once()
             return self.model_runner.capture_model()
         except BaseException:

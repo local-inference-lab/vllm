@@ -38,6 +38,19 @@ def test_load_cartridge_requires_adapter_path():
     assert response.status_code == 400
 
 
+def test_load_cartridge_rejects_invalid_utf8_json():
+    client = _client(AsyncMock())
+
+    response = client.post(
+        "/load_exl3_cartridge",
+        content=b'{"adapter_path":"\xff"}',
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid JSON request body"}
+
+
 def test_load_cartridge_maps_value_error_to_bad_request():
     engine = AsyncMock()
     engine.load_exl3_cartridge.side_effect = ValueError("bad cartridge")
@@ -48,7 +61,8 @@ def test_load_cartridge_maps_value_error_to_bad_request():
     )
 
     assert response.status_code == 400
-    assert "bad cartridge" in response.json()["error"]
+    assert response.json()["error"] == "EXL3 cartridge validation failed"
+    assert "bad cartridge" not in response.text
 
 
 def test_deactivate_cartridge_returns_updated_layers():

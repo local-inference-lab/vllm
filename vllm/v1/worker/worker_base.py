@@ -182,8 +182,16 @@ class WorkerBase:
         """Return whether this worker owns a dense cartridge runtime."""
         raise NotImplementedError
 
-    def prepare_exl3_cartridge(self, adapter_path: str) -> int:
-        """Materialize an inactive model-wide EXL3 cartridge."""
+    def stage_exl3_cartridge(self, adapter_path: str, stage_id: str) -> int:
+        """Verify a model-wide EXL3 cartridge before serving is paused."""
+        raise NotImplementedError
+
+    def prepare_staged_exl3_cartridge(self, stage_id: str) -> int:
+        """Materialize an inactive, previously verified EXL3 cartridge."""
+        raise NotImplementedError
+
+    def discard_staged_exl3_cartridge(self, stage_id: str) -> None:
+        """Release one verified EXL3 cartridge staging area."""
         raise NotImplementedError
 
     def activate_exl3_cartridge(self) -> int:

@@ -295,6 +295,7 @@ if TYPE_CHECKING:
     VLLM_SYMM_MEM_PCIE_SAFE_BARRIER: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
+    VLLM_ENABLE_EXL3_CARTRIDGE: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
     VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT: bool = False
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
@@ -2070,6 +2071,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # See vllm/v1/worker/startup_plan.py.
     "VLLM_ENABLE_STARTUP_PLAN": lambda: bool(
         int(os.getenv("VLLM_ENABLE_STARTUP_PLAN", "0"))
+    ),
+    "VLLM_ENABLE_EXL3_CARTRIDGE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_EXL3_CARTRIDGE", "0"))
     ),
     # Valid values are container,code_interpreter,web_search_preview
     # ex VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS=container,code_interpreter

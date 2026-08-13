@@ -423,57 +423,18 @@ class LLMEngine:
     ) -> list[_R]:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
 
-    def _prepare_for_exl3_weight_switch(self) -> None:
-        if self.has_unfinished_requests():
-            raise RuntimeError(
-                "EXL3 cartridge switching requires a quiescent LLMEngine"
-            )
-        if not self.reset_prefix_cache(
-            reset_running_requests=True, reset_connector=True
-        ):
-            raise RuntimeError("Unable to clear prefix cache before weight switch")
-        self.reset_mm_cache()
-        self.reset_encoder_cache()
-
     def load_exl3_cartridge(self, adapter_path: str) -> list[int]:
-        """Load one cartridge and restore the compressed base on failure."""
-        self._prepare_for_exl3_weight_switch()
-        try:
-            self.collective_rpc("clear_exl3_cartridge_cudagraphs")
-            prepared = self.collective_rpc(
-                "prepare_exl3_cartridge",
-                args=(adapter_path,),
-            )
-            activated = self.collective_rpc("activate_exl3_cartridge")
-            if activated != prepared or sum(prepared) == 0:
-                raise RuntimeError(
-                    f"EXL3 cartridge prepare/activate mismatch: "
-                    f"{prepared} != {activated}"
-                )
-            self.collective_rpc("capture_exl3_cartridge_cudagraphs")
-            return prepared
-        except BaseException:
-            try:
-                self.collective_rpc("clear_exl3_cartridge_cudagraphs")
-                self.collective_rpc("deactivate_exl3_cartridge")
-                self.collective_rpc("capture_exl3_cartridge_cudagraphs")
-            except BaseException as restore_error:
-                self.engine_core.shutdown()
-                raise RuntimeError(
-                    "Failed to restore EXL3 base graphs; engine was shut down"
-                ) from restore_error
-            raise
+        """Reject sync hot-swap because request admission cannot be serialized."""
+        del adapter_path
+        raise NotImplementedError(
+            "EXL3 cartridge switching is supported only by AsyncLLM"
+        )
 
     def deactivate_exl3_cartridge(self) -> list[int]:
-        """Release one cartridge while quiescent and recapture base graphs."""
-        active = self.collective_rpc("has_exl3_cartridge")
-        if not any(active):
-            return [0] * len(active)
-        self._prepare_for_exl3_weight_switch()
-        self.collective_rpc("clear_exl3_cartridge_cudagraphs")
-        updated = self.collective_rpc("deactivate_exl3_cartridge")
-        self.collective_rpc("capture_exl3_cartridge_cudagraphs")
-        return updated
+        """Reject sync hot-swap because request admission cannot be serialized."""
+        raise NotImplementedError(
+            "EXL3 cartridge switching is supported only by AsyncLLM"
+        )
 
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         return self.collective_rpc("apply_model", args=(func,))
