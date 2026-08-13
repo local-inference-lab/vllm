@@ -81,8 +81,6 @@ def _cartridge(device: torch.device = CPU, num_stages: int = 1):
                     expert_id,
                     shard_id,
                     torch.zeros(1, 1, 16, dtype=torch.int16),
-                    torch.ones(1, dtype=torch.float16),
-                    torch.ones(1, dtype=torch.float16),
                     float(stage_idx + 1),
                 )
     cartridge.active = True
@@ -137,11 +135,7 @@ def test_runtime_rejects_activation_before_materialization():
 
 def test_cartridge_validates_indices_and_scale():
     cartridge = Exl3LoraCartridge(1, 2, torch.device("cpu"))
-    tensors = (
-        torch.zeros(1, 1, 16, dtype=torch.int16),
-        torch.ones(1, dtype=torch.float16),
-        torch.ones(1, dtype=torch.float16),
-    )
+    tensors = (torch.zeros(1, 1, 16, dtype=torch.int16),)
     with pytest.raises(IndexError, match="stage index"):
         cartridge.set_stage_tensors(1, 0, "w1", *tensors, 1.0)
     with pytest.raises(IndexError, match="expert index"):
@@ -455,8 +449,6 @@ def test_loader_filters_layer_and_sorts_stage_numbers(tmp_path):
                     f"{prefix}.trellis_res{value}": torch.full(
                         (8, 8, 32), value, dtype=torch.int16
                     ),
-                    f"{prefix}.suh_res{value}": torch.ones(128, dtype=torch.float16),
-                    f"{prefix}.svh_res{value}": torch.ones(128, dtype=torch.float16),
                     f"{prefix}.scale_res{value}": torch.tensor(float(value)),
                 }
             )
@@ -480,30 +472,12 @@ def test_loader_filters_layer_and_sorts_stage_numbers(tmp_path):
     assert stage1 is not None and stage1["scale"] == 10.0
 
 
-def test_loader_rejects_rotations_that_differ_from_base(tmp_path):
-    path = tmp_path / "different-rotations.safetensors"
-    tensors = {}
-    for projection in ("gate_proj", "up_proj", "down_proj"):
-        prefix = f"model.layers.3.mlp.experts.0.{projection}.rank0"
-        tensors[f"{prefix}.trellis_res1"] = torch.zeros(8, 8, 32, dtype=torch.int16)
-        tensors[f"{prefix}.suh_res1"] = torch.ones(128, dtype=torch.float16)
-        tensors[f"{prefix}.svh_res1"] = torch.ones(128, dtype=torch.float16)
-    tensors["model.layers.3.mlp.experts.0.gate_proj.rank0.suh_res1"].zero_()
-    save_file(tensors, path)
-
-    with pytest.raises(ValueError, match="rotations must match"):
-        load_cartridge_from_adapter(str(path), _loader_layer(), 1, CPU)
-
-
 def test_loader_rejects_incomplete_projection(tmp_path):
     path = tmp_path / "broken.safetensors"
     save_file(
         {
             "model.layers.3.mlp.experts.0.gate_proj.rank0.trellis_res1": (
                 torch.zeros(8, 8, 32, dtype=torch.int16)
-            ),
-            "model.layers.3.mlp.experts.0.gate_proj.rank0.suh_res1": (
-                torch.ones(128, dtype=torch.float16)
             ),
         },
         path,
@@ -522,8 +496,6 @@ def test_loader_rejects_invalid_trellis_shape(tmp_path):
         tensors[f"{tensor_prefix}.trellis_res1"] = torch.zeros(
             8, 8, 15 if projection == "gate_proj" else 32, dtype=torch.int16
         )
-        tensors[f"{tensor_prefix}.suh_res1"] = torch.ones(128, dtype=torch.float16)
-        tensors[f"{tensor_prefix}.svh_res1"] = torch.ones(128, dtype=torch.float16)
     save_file(tensors, path)
 
     with pytest.raises(ValueError, match="Invalid MSRT cartridge trellis"):
@@ -539,8 +511,6 @@ def test_loader_rejects_oversized_packed_dimensions(tmp_path):
         tensors[f"{tensor_prefix}.trellis_res1"] = torch.zeros(
             16, 8, 32, dtype=torch.int16
         )
-        tensors[f"{tensor_prefix}.suh_res1"] = torch.ones(256, dtype=torch.float16)
-        tensors[f"{tensor_prefix}.svh_res1"] = torch.ones(128, dtype=torch.float16)
     save_file(tensors, path)
 
     with pytest.raises(ValueError, match="128-aligned logical shape"):

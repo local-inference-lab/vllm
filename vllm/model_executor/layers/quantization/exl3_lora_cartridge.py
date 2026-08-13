@@ -61,7 +61,7 @@ _CARTRIDGE_COMPANION_KEY_RE = re.compile(
     r"^(?P<layer>.+\.experts)\."
     r"(?P<expert>\d+)\."
     r"(?P<projection>gate_proj|up_proj|down_proj)\."
-    r"rank(?P<rank>\d+)\.(?:suh|svh|scale|mcg|mul1)_(?P<label>.+)$"
+    r"rank(?P<rank>\d+)\.(?:scale|mcg|mul1)_(?P<label>.+)$"
 )
 _SHARD_MAP = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
 
@@ -70,8 +70,8 @@ class Exl3LoraCartridge:
     """MSRT residual tensors for one routed-expert layer.
 
     Each stage is keyed by ``(expert_id, shard_id)`` and stores packed trellis
-    indices, input/output Hadamard vectors, and the positive rescaling factor
-    used by the MCG-only rank-sliced encoder.
+    indices and the positive rescaling factor used by the MCG-only rank-sliced
+    encoder; residuals reuse the base layer's own suh/svh.
     """
 
     def __init__(self, num_stages: int, num_experts: int, device: torch.device):
@@ -93,8 +93,6 @@ class Exl3LoraCartridge:
         expert_id: int,
         shard_id: str,
         trellis: torch.Tensor,
-        suh: torch.Tensor,
-        svh: torch.Tensor,
         scale: float,
     ) -> None:
         """Set one stage of one expert projection."""
@@ -110,8 +108,6 @@ class Exl3LoraCartridge:
             )
         self.stages[stage_idx][(expert_id, shard_id)] = {
             "trellis": trellis.to(self.device).contiguous(),
-            "suh": suh.to(self.device).contiguous(),
-            "svh": svh.to(self.device).contiguous(),
             "scale": float(scale),
         }
 
@@ -125,10 +121,9 @@ class Exl3LoraCartridge:
         """Move source tensors to one device without changing stage metadata."""
         for stage in self.stages:
             for tensors in stage.values():
-                for name in ("trellis", "suh", "svh"):
-                    tensor = tensors[name]
-                    assert isinstance(tensor, torch.Tensor)
-                    tensors[name] = tensor.to(device).contiguous()
+                tensor = tensors["trellis"]
+                assert isinstance(tensor, torch.Tensor)
+                tensors["trellis"] = tensor.to(device).contiguous()
         self.device = device
 
     def clear(self) -> None:
@@ -333,6 +328,15 @@ class Exl3CUDAGraphCartridgeRuntime:
         self.max_residual_bits = max(
             bits for projection in projection_bits.values() for bits in projection
         )
+        computed_max_residual_bits = max(
+            int(table.max().item()) for table in bit_tables
+        )
+        if computed_max_residual_bits != self.max_residual_bits:
+            raise ValueError(
+                "packed cartridge max_residual_bits does not match its "
+                f"per-stage bit tables: {self.max_residual_bits} != "
+                f"{computed_max_residual_bits}"
+            )
         self._packed_tensors = tuple(retained) + self.pointer_args
         self._materialized = True
 
@@ -426,13 +430,13 @@ def _stage_sort_key(label: str) -> tuple[str, int]:
     return label, -1
 
 
-def _validate_stage_tensors(
-    layer: Any,
-    shard_id: str,
-    trellis: torch.Tensor,
-    suh: torch.Tensor,
-    svh: torch.Tensor,
-) -> None:
+def _validate_stage_trellis(layer: Any, shard_id: str, trellis: torch.Tensor) -> None:
+    """Validate an MSRT residual trellis against this layer's base shape.
+
+    A cartridge does not carry its own suh/svh: MSRT residuals are quantized
+    in the same regularized rotation space as the rank-sliced base, so the
+    base's own suh/svh apply unchanged to every stage.
+    """
     hidden_size = int(layer.exl3_hidden_size)
     intermediate_size = int(layer.exl3_intermediate_size_per_partition)
     input_size, output_size = (
@@ -461,39 +465,6 @@ def _validate_stage_tensors(
             f"K={input_size}, N={output_size}; use K in "
             "{1,2,3,4,5,6} and dtype=torch.int16"
         )
-    for name, tensor, expected_size in (
-        ("suh", suh, packed_k),
-        ("svh", svh, packed_n),
-    ):
-        if tensor.dtype != torch.float16 or tensor.shape != (expected_size,):
-            raise ValueError(
-                f"Invalid MSRT cartridge {name}: shape={tuple(tensor.shape)}, "
-                f"dtype={tensor.dtype}, expected=({expected_size},), "
-                "dtype=torch.float16"
-            )
-        if not torch.isfinite(tensor).all().item():
-            raise ValueError(f"MSRT cartridge {name} contains non-finite values")
-
-
-def _validate_base_rotations(
-    layer: Any,
-    expert_id: int,
-    shard_id: str,
-    suh: torch.Tensor,
-    svh: torch.Tensor,
-) -> None:
-    group = "w2" if shard_id == "w2" else "w13"
-    key = (expert_id, shard_id)
-    for name, cartridge_tensor in (("suh", suh), ("svh", svh)):
-        parameter = getattr(layer, f"{group}_{name}")
-        base_tensor = parameter.exl3_tensors[key]
-        if cartridge_tensor.device != base_tensor.device:
-            cartridge_tensor = cartridge_tensor.to(base_tensor.device)
-        if not torch.equal(cartridge_tensor, base_tensor):
-            raise ValueError(
-                "MSRT cartridge rotations must match the rank-sliced EXL3 base: "
-                f"expert={expert_id}, projection={shard_id}, tensor={name}"
-            )
 
 
 def load_cartridge_from_adapter(
@@ -505,9 +476,10 @@ def load_cartridge_from_adapter(
     """Load the stages belonging to one routed-expert layer.
 
     Expected tensor names are
-    ``{layer}.<expert>.<projection>.rank0.{trellis,suh,svh,scale}_<label>``.
-    Keys for other layers are ignored rather than accidentally overwriting the
-    same expert/shard entries.
+    ``{layer}.<expert>.<projection>.rank0.{trellis,scale}_<label>``.  A
+    cartridge does not carry its own suh/svh: MSRT residuals reuse the base
+    layer's own regularized rotations.  Keys for other layers are ignored
+    rather than accidentally overwriting the same expert/shard entries.
     """
     from safetensors import safe_open
 
@@ -558,28 +530,12 @@ def load_cartridge_from_adapter(
                 )
             shard_id = _SHARD_MAP[projection]
             prefix = trellis_key[: -len(f"trellis_{label}")]
-            companion_keys = {
-                "suh": f"{prefix}suh_{label}",
-                "svh": f"{prefix}svh_{label}",
-                "scale": f"{prefix}scale_{label}",
-            }
-            missing = [
-                key_name
-                for key_name in (companion_keys["suh"], companion_keys["svh"])
-                if key_name not in key_set
-            ]
-            if missing:
-                raise ValueError(
-                    f"Incomplete MSRT cartridge entry {trellis_key}: missing {missing}"
-                )
+            scale_key = f"{prefix}scale_{label}"
             trellis = handle.get_tensor(trellis_key)
-            suh = handle.get_tensor(companion_keys["suh"])
-            svh = handle.get_tensor(companion_keys["svh"])
-            _validate_stage_tensors(layer, shard_id, trellis, suh, svh)
-            _validate_base_rotations(layer, expert_id, shard_id, suh, svh)
+            _validate_stage_trellis(layer, shard_id, trellis)
             scale = 1.0
-            if companion_keys["scale"] in key_set:
-                scale_tensor = handle.get_tensor(companion_keys["scale"])
+            if scale_key in key_set:
+                scale_tensor = handle.get_tensor(scale_key)
                 if scale_tensor.numel() != 1:
                     raise ValueError(
                         f"MSRT cartridge scale must be scalar, got "
@@ -591,8 +547,6 @@ def load_cartridge_from_adapter(
                 expert_id,
                 shard_id,
                 trellis,
-                suh,
-                svh,
                 scale,
             )
             shards_by_stage_expert.setdefault((label, expert_id), set()).add(shard_id)
