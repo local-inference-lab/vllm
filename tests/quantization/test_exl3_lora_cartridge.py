@@ -542,8 +542,20 @@ def test_model_loader_streams_layers_and_rolls_back_if_later_layer_is_missing():
 
     with (
         patch(
+            "safetensors.safe_open",
+            return_value=MagicMock(
+                __enter__=MagicMock(return_value=MagicMock()),
+                __exit__=MagicMock(return_value=False),
+            ),
+        ),
+        patch(
             "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
-            "load_cartridge_from_adapter",
+            "_index_cartridge_keys",
+            return_value={},
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
+            "_build_cartridge_from_entries",
             side_effect=[_cartridge(), None],
         ),
         patch.object(first_runtime, "materialize") as materialize,
@@ -566,8 +578,20 @@ def test_model_loader_deactivates_every_layer_after_materialization_failure():
 
     with (
         patch(
+            "safetensors.safe_open",
+            return_value=MagicMock(
+                __enter__=MagicMock(return_value=MagicMock()),
+                __exit__=MagicMock(return_value=False),
+            ),
+        ),
+        patch(
             "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
-            "load_cartridge_from_adapter",
+            "_index_cartridge_keys",
+            return_value={},
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
+            "_build_cartridge_from_entries",
             side_effect=[_cartridge(), _cartridge()],
         ),
         patch.object(runtimes[0], "materialize", side_effect=activate),
@@ -588,13 +612,27 @@ def test_model_loader_skips_layers_without_cartridge_capability():
     layer.exl3_cartridge_capable = False
     model = SimpleNamespace(modules=lambda: iter((layer,)))
 
-    with patch(
-        "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
-        "load_cartridge_from_adapter"
-    ) as load:
+    with (
+        patch(
+            "safetensors.safe_open",
+            return_value=MagicMock(
+                __enter__=MagicMock(return_value=MagicMock()),
+                __exit__=MagicMock(return_value=False),
+            ),
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
+            "_index_cartridge_keys",
+            return_value={},
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
+            "_build_cartridge_from_entries"
+        ) as build,
+    ):
         assert prepare_exl3_cartridge_into_model(model, "cartridge.safetensors") == 0
 
-    load.assert_not_called()
+    build.assert_not_called()
     assert not hasattr(layer, "_exl3_cartridge_runtime")
 
 
@@ -607,8 +645,20 @@ def test_model_loader_allocates_and_releases_runtime_lazily():
 
     with (
         patch(
+            "safetensors.safe_open",
+            return_value=MagicMock(
+                __enter__=MagicMock(return_value=MagicMock()),
+                __exit__=MagicMock(return_value=False),
+            ),
+        ),
+        patch(
             "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
-            "load_cartridge_from_adapter",
+            "_index_cartridge_keys",
+            return_value={},
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
+            "_build_cartridge_from_entries",
             return_value=_cartridge(),
         ),
         patch.object(
@@ -641,8 +691,20 @@ def test_model_loader_activates_every_layer_only_after_materialization():
 
     with (
         patch(
+            "safetensors.safe_open",
+            return_value=MagicMock(
+                __enter__=MagicMock(return_value=MagicMock()),
+                __exit__=MagicMock(return_value=False),
+            ),
+        ),
+        patch(
             "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
-            "load_cartridge_from_adapter",
+            "_index_cartridge_keys",
+            return_value={},
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.exl3_lora_cartridge."
+            "_build_cartridge_from_entries",
             side_effect=[_cartridge(), _cartridge()],
         ),
         patch.object(runtimes[0], "materialize", side_effect=mark_materialized),

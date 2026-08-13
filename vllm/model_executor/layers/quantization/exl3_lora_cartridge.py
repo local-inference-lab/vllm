@@ -356,11 +356,27 @@ class Exl3CUDAGraphCartridgeRuntime:
         outputs: list[torch.Tensor] = []
         for start in range(0, x.shape[0], self.chunk):
             rows = min(self.chunk, x.shape[0] - start)
-            xh = self.xh[:rows]
-            xh.copy_(x[start : start + rows])
+            chunk_x = x[start : start + rows]
+            if x.dtype == self.dtype and chunk_x.is_contiguous():
+                # Under CUDA-graph capture/replay this chunk's slice of `x`
+                # already sits at a fixed address (it is itself the output of
+                # an earlier op in the same captured graph); copying it into
+                # the fixed self.xh landing buffer is then pure overhead.
+                xh = chunk_x
+            else:
+                xh = self.xh[:rows]
+                xh.copy_(chunk_x)
             out32 = self.out32[:rows]
             out32.zero_()
             route_count = rows * self.topk
+            # Upper bound on distinct experts this chunk can hit. The kernel's
+            # ticket scheduler already loops over every expert with tokens
+            # regardless of grid shape (correctness never depends on this
+            # value), so an upper bound is always safe; it only narrows the
+            # host-side group_size/num_groups launch split to avoid
+            # over-subscribing SMs when few experts can possibly be active,
+            # e.g. every single-token decode step.
+            num_active = min(route_count, self.num_experts)
             self.ext.exl3_moe_additive_fused(
                 xh,
                 out32,
@@ -389,7 +405,12 @@ class Exl3CUDAGraphCartridgeRuntime:
                 True,
                 False,
                 0.0,
+                num_active,
             )
+            # out32 is fp32 because the kernel's multi-expert scatter-add
+            # (top_k > 1 contributions to one token) uses atomicAdd, which
+            # requires fp32; this cast-copy is architecturally required, not
+            # an avoidable inefficiency like the input copy above.
             outputs.append(out32.to(x.dtype))
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
 
@@ -467,6 +488,97 @@ def _validate_stage_trellis(layer: Any, shard_id: str, trellis: torch.Tensor) ->
         )
 
 
+def _index_cartridge_keys(
+    keys: tuple[str, ...],
+) -> dict[str, list[tuple[str, re.Match[str]]]]:
+    """Group every trellis key by its owning layer in one pass.
+
+    Scanning is O(total keys) once, rather than re-scanning the full key
+    list once per layer. Also validates, in the same pass, that every key
+    is either a recognized trellis key or a recognized companion (scale,
+    mcg, mul1) key; anything else raises immediately.
+    """
+    by_layer: dict[str, list[tuple[str, re.Match[str]]]] = {}
+    for key in keys:
+        match = _CARTRIDGE_KEY_RE.match(key)
+        if match is not None:
+            by_layer.setdefault(match.group("layer"), []).append((key, match))
+            continue
+        if _CARTRIDGE_COMPANION_KEY_RE.match(key) is None:
+            raise ValueError(f"Malformed MSRT cartridge key {key!r}")
+    return by_layer
+
+
+def _build_cartridge_from_entries(
+    handle: Any,
+    entries: list[tuple[str, re.Match[str]]],
+    layer: Any,
+    num_experts: int,
+    device: torch.device,
+) -> Exl3LoraCartridge | None:
+    """Construct one layer's cartridge from its pre-filtered trellis keys."""
+    if not entries:
+        return None
+
+    key_set = {key for key, _ in entries} | set(handle.keys())
+    labels = sorted(
+        {match.group("label") for _, match in entries},
+        key=_stage_sort_key,
+    )
+    label_to_stage = {label: index for index, label in enumerate(labels)}
+    cartridge = Exl3LoraCartridge(len(labels), num_experts, device)
+    shards_by_stage_expert: dict[tuple[str, int], set[str]] = {}
+
+    for trellis_key, match in entries:
+        rank = int(match.group("rank"))
+        if rank != 0:
+            raise ValueError(
+                f"MSRT cartridge only supports rank0 tensors, got rank{rank}"
+            )
+        expert_id = int(match.group("expert"))
+        projection = match.group("projection")
+        label = match.group("label")
+        if not 0 <= expert_id < num_experts:
+            raise ValueError(
+                f"MSRT cartridge expert {expert_id} is outside [0, {num_experts})"
+            )
+        shard_id = _SHARD_MAP[projection]
+        prefix = trellis_key[: -len(f"trellis_{label}")]
+        scale_key = f"{prefix}scale_{label}"
+        trellis = handle.get_tensor(trellis_key)
+        _validate_stage_trellis(layer, shard_id, trellis)
+        scale = 1.0
+        if scale_key in key_set:
+            scale_tensor = handle.get_tensor(scale_key)
+            if scale_tensor.numel() != 1:
+                raise ValueError(
+                    f"MSRT cartridge scale must be scalar, got "
+                    f"shape={tuple(scale_tensor.shape)}"
+                )
+            scale = float(scale_tensor.item())
+        cartridge.set_stage_tensors(
+            label_to_stage[label],
+            expert_id,
+            shard_id,
+            trellis,
+            scale,
+        )
+        shards_by_stage_expert.setdefault((label, expert_id), set()).add(shard_id)
+
+    required_shards = {"w1", "w2", "w3"}
+    incomplete = {
+        key: sorted(required_shards - shards)
+        for key, shards in shards_by_stage_expert.items()
+        if shards != required_shards
+    }
+    if incomplete:
+        raise ValueError(
+            f"Incomplete MSRT cartridge expert stages; missing shards: {incomplete}"
+        )
+    cartridge.active = True
+    return cartridge
+
+
 def load_cartridge_from_adapter(
     adapter_path: str,
     layer: Any,
@@ -480,88 +592,27 @@ def load_cartridge_from_adapter(
     cartridge does not carry its own suh/svh: MSRT residuals reuse the base
     layer's own regularized rotations.  Keys for other layers are ignored
     rather than accidentally overwriting the same expert/shard entries.
+
+    Loading many layers from the same file: prefer opening the file once
+    and calling ``_index_cartridge_keys``/``_build_cartridge_from_entries``
+    directly (see ``prepare_exl3_cartridge_into_model``), which scans the
+    key list once instead of once per layer.
     """
     from safetensors import safe_open
 
     layer_name = str(layer.layer_name)
-    entries: list[tuple[str, re.Match[str]]] = []
     with safe_open(adapter_path, framework="pt") as handle:
-        keys = tuple(handle.keys())
-        key_set = set(keys)
-        for key in keys:
-            match = _CARTRIDGE_KEY_RE.match(key)
-            if match is not None and match.group("layer") == layer_name:
-                entries.append((key, match))
-                continue
-            companion = _CARTRIDGE_COMPANION_KEY_RE.match(key)
-            if key.startswith(f"{layer_name}.") and (
-                companion is None or companion.group("layer") != layer_name
-            ):
-                raise ValueError(f"Malformed MSRT cartridge key {key!r}")
-
-        if not entries:
-            logger.warning(
-                "No MSRT cartridge tensors for %s in %s",
-                layer_name,
-                adapter_path,
-            )
-            return None
-
-        labels = sorted(
-            {match.group("label") for _, match in entries},
-            key=_stage_sort_key,
+        by_layer = _index_cartridge_keys(tuple(handle.keys()))
+        cartridge = _build_cartridge_from_entries(
+            handle, by_layer.get(layer_name, []), layer, num_experts, device
         )
-        label_to_stage = {label: index for index, label in enumerate(labels)}
-        cartridge = Exl3LoraCartridge(len(labels), num_experts, device)
-        shards_by_stage_expert: dict[tuple[str, int], set[str]] = {}
-
-        for trellis_key, match in entries:
-            rank = int(match.group("rank"))
-            if rank != 0:
-                raise ValueError(
-                    f"MSRT cartridge only supports rank0 tensors, got rank{rank}"
-                )
-            expert_id = int(match.group("expert"))
-            projection = match.group("projection")
-            label = match.group("label")
-            if not 0 <= expert_id < num_experts:
-                raise ValueError(
-                    f"MSRT cartridge expert {expert_id} is outside [0, {num_experts})"
-                )
-            shard_id = _SHARD_MAP[projection]
-            prefix = trellis_key[: -len(f"trellis_{label}")]
-            scale_key = f"{prefix}scale_{label}"
-            trellis = handle.get_tensor(trellis_key)
-            _validate_stage_trellis(layer, shard_id, trellis)
-            scale = 1.0
-            if scale_key in key_set:
-                scale_tensor = handle.get_tensor(scale_key)
-                if scale_tensor.numel() != 1:
-                    raise ValueError(
-                        f"MSRT cartridge scale must be scalar, got "
-                        f"shape={tuple(scale_tensor.shape)}"
-                    )
-                scale = float(scale_tensor.item())
-            cartridge.set_stage_tensors(
-                label_to_stage[label],
-                expert_id,
-                shard_id,
-                trellis,
-                scale,
-            )
-            shards_by_stage_expert.setdefault((label, expert_id), set()).add(shard_id)
-
-        required_shards = {"w1", "w2", "w3"}
-        incomplete = {
-            key: sorted(required_shards - shards)
-            for key, shards in shards_by_stage_expert.items()
-            if shards != required_shards
-        }
-        if incomplete:
-            raise ValueError(
-                f"Incomplete MSRT cartridge expert stages; missing shards: {incomplete}"
-            )
-    cartridge.active = True
+    if cartridge is None:
+        logger.warning(
+            "No MSRT cartridge tensors for %s in %s",
+            layer_name,
+            adapter_path,
+        )
+        return None
     logger.info(
         "Loaded %d-stage MSRT cartridge for %s from %s",
         cartridge.num_stages,
@@ -573,32 +624,48 @@ def load_cartridge_from_adapter(
 
 @torch.inference_mode()
 def prepare_exl3_cartridge_into_model(model: torch.nn.Module, adapter_path: str) -> int:
-    """Load each layer into packed storage without a dense or staging peak."""
+    """Load each layer into packed storage without a dense or staging peak.
+
+    Opens the cartridge file once and indexes its keys once, rather than
+    reopening the file and rescanning every key per layer.
+    """
+    from safetensors import safe_open
+
     prepared_count = 0
     try:
-        for layer in model.modules():
-            runtime = getattr(layer, "_exl3_cartridge_runtime", None)
-            if not isinstance(runtime, Exl3CUDAGraphCartridgeRuntime):
-                if not bool(getattr(layer, "exl3_cartridge_capable", False)):
-                    continue
-                runtime = prepare_exl3_cudagraph_cartridge_runtime(layer)
-            cartridge = load_cartridge_from_adapter(
-                adapter_path,
-                layer,
-                runtime.num_experts,
-                torch.device("cpu"),
-            )
-            if cartridge is None:
-                raise ValueError(
-                    f"Cartridge {adapter_path} has no tensors for {layer.layer_name}"
+        with safe_open(adapter_path, framework="pt") as handle:
+            by_layer = _index_cartridge_keys(tuple(handle.keys()))
+            for layer in model.modules():
+                runtime = getattr(layer, "_exl3_cartridge_runtime", None)
+                if not isinstance(runtime, Exl3CUDAGraphCartridgeRuntime):
+                    if not bool(getattr(layer, "exl3_cartridge_capable", False)):
+                        continue
+                    runtime = prepare_exl3_cudagraph_cartridge_runtime(layer)
+                layer_name = str(layer.layer_name)
+                cartridge = _build_cartridge_from_entries(
+                    handle,
+                    by_layer.get(layer_name, []),
+                    layer,
+                    runtime.num_experts,
+                    torch.device("cpu"),
                 )
-            runtime.deactivate()
-            cartridge.to(runtime.device)
-            try:
-                runtime.materialize(layer, cartridge)
-            finally:
-                cartridge.clear()
-            prepared_count += 1
+                if cartridge is None:
+                    raise ValueError(
+                        f"Cartridge {adapter_path} has no tensors for {layer_name}"
+                    )
+                logger.info(
+                    "Loaded %d-stage MSRT cartridge for %s from %s",
+                    cartridge.num_stages,
+                    layer_name,
+                    adapter_path,
+                )
+                runtime.deactivate()
+                cartridge.to(runtime.device)
+                try:
+                    runtime.materialize(layer, cartridge)
+                finally:
+                    cartridge.clear()
+                prepared_count += 1
         return prepared_count
     except Exception:
         deactivate_exl3_cartridge(model)
