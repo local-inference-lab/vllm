@@ -2495,8 +2495,13 @@ class VllmConfig:
     def validate_nvfp4_kv_cache_with_mla(self) -> "VllmConfig":
         if self.model_config is None:
             return self
+        cache_dtype = self.cache_config.cache_dtype
+        # nvfp4_ds_mla is a distinct packed MLA record implemented by the
+        # B12X sparse-MLA backend. Generic NVFP4 cache layouts remain invalid
+        # because they store full attention heads rather than MLA latents.
         if (
-            self.cache_config.cache_dtype.startswith("nvfp4")
+            cache_dtype.startswith("nvfp4")
+            and cache_dtype != "nvfp4_ds_mla"
             and self.model_config.use_mla
         ):
             raise ValueError(

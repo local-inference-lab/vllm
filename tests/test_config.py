@@ -1374,6 +1374,28 @@ def test_validate_mamba_align_subblock_prefill():
     VllmConfig.validate_block_size(config)
 
 
+@pytest.mark.parametrize("cache_dtype", ["nvfp4", "nvfp4_4over6"])
+def test_generic_nvfp4_kv_cache_rejects_mla(cache_dtype: str):
+    """Generic NVFP4 records do not encode MLA latent-cache geometry."""
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+        model_config=SimpleNamespace(use_mla=True),
+    )
+
+    with pytest.raises(ValueError, match="nvfp4 KV cache is not supported with MLA"):
+        VllmConfig.validate_nvfp4_kv_cache_with_mla(config)
+
+
+def test_b12x_nvfp4_ds_mla_cache_accepts_mla():
+    """The B12X packed latent record is an MLA-specific cache format."""
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype="nvfp4_ds_mla"),
+        model_config=SimpleNamespace(use_mla=True),
+    )
+
+    assert VllmConfig.validate_nvfp4_kv_cache_with_mla(config) is config
+
+
 @pytest.mark.parametrize(
     ("model_id", "compilation_config", "optimization_level"),
     [
