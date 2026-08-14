@@ -89,6 +89,8 @@ def test_mla_post_load_preallocates_quantized_absorbed_weights(monkeypatch):
     layer.kv_cache_dtype = "auto"
     layer.quant_config = None
     layer.layer_name = "test"
+    materialized_devices = []
+    layer.dcp_manager = SimpleNamespace(materialize=materialized_devices.append)
     dequantized = torch.arange(28.0, dtype=torch.float32).reshape(14, 2)
     events = []
     preallocated = []
@@ -124,6 +126,7 @@ def test_mla_post_load_preallocates_quantized_absorbed_weights(monkeypatch):
     assert layer.W_UK_T.data_ptr() == preallocated[1].data_ptr()
     assert layer.W_UV.device == layer.kv_b_proj.qweight.device
     assert layer.W_UK_T.device == layer.kv_b_proj.qweight.device
+    assert materialized_devices == [layer.kv_b_proj.qweight.device]
 
 
 @pytest.mark.cpu_test

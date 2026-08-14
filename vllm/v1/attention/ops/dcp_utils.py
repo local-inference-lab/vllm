@@ -614,23 +614,55 @@ class MLADCPManager:
         self.max_num_tokens = get_dcp_workspace_max_num_tokens(vllm_config)
         self.use_a2a = parallel_config.dcp_comm_backend == "a2a"
         self.padded_num_heads = padded_num_heads
-
-        self.combine = self._init_combine(
+        self._combine_args = (
             num_heads,
             output_head_dim,
             output_dtype,
             is_lse_base_on_e,
             use_pcp,
         )
+        self._query_gather_args = (
+            num_heads,
+            query_head_dim,
+            query_dtype,
+        )
+        self._use_pcp = use_pcp
+        self._configure_collectives(allow_direct=self.device.type != "meta")
+
+    def _configure_collectives(self, *, allow_direct: bool) -> None:
+        self.combine = self._init_combine(
+            *self._combine_args,
+            allow_direct=allow_direct,
+        )
         self.query_gather = (
             None
-            if use_pcp
+            if self._use_pcp
             else self._init_query_gather(
-                num_heads,
-                query_head_dim,
-                query_dtype,
+                *self._query_gather_args,
+                allow_direct=allow_direct,
             )
         )
+
+    def materialize(self, device: torch.device) -> None:
+        """Allocate direct collective workspaces after weights reach a device.
+
+        InstantTensor constructs model layers on the meta device. Symmetric
+        memory requires a physical CUDA device, so direct workspaces must be
+        selected only after model loading has materialized the layer weights.
+        """
+        device = torch.device(device)
+        if device.type == "meta":
+            return
+        if self.device.type != "meta":
+            if self.device != device:
+                raise RuntimeError(
+                    "MLA DCP collectives are already materialized on "
+                    f"{self.device}, but the layer weights are on {device}."
+                )
+            return
+
+        self.device = device
+        self._configure_collectives(allow_direct=True)
 
     def _init_combine(
         self,
@@ -639,9 +671,11 @@ class MLADCPManager:
         dtype: torch.dtype,
         is_lse_base_on_e: bool,
         use_pcp: bool,
+        *,
+        allow_direct: bool = True,
     ) -> DCPCombine:
         direct_workspace = None
-        if self.use_a2a:
+        if self.use_a2a and allow_direct:
             direct_workspace = get_direct_dcp_a2a_workspace(
                 self.group,
                 self.device,
@@ -676,16 +710,22 @@ class MLADCPManager:
         num_heads: int,
         head_dim: int,
         dtype: torch.dtype,
+        *,
+        allow_direct: bool = True,
     ) -> Callable[[torch.Tensor], torch.Tensor]:
-        direct_workspace = get_direct_dcp_q_gather_workspace(
-            self.group,
-            self.device,
-            self.max_num_tokens,
-            num_heads,
-            head_dim,
-            dtype,
-            self.num_ubatches,
-            self.padded_num_heads,
+        direct_workspace = (
+            get_direct_dcp_q_gather_workspace(
+                self.group,
+                self.device,
+                self.max_num_tokens,
+                num_heads,
+                head_dim,
+                dtype,
+                self.num_ubatches,
+                self.padded_num_heads,
+            )
+            if allow_direct
+            else None
         )
         if direct_workspace is not None:
             logger.info_once("Using direct symmetric-memory DCP query gather for MLA.")
