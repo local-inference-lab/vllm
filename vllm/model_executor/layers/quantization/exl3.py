@@ -744,6 +744,91 @@ def _resolve_prefill_capacity(max_batched_tokens: int) -> int:
     return prefill_capacity
 
 
+# ---------------------------------------------------------------------------
+# Prefill dispatch: reconstruct + hgemm above a row threshold.
+#
+# `exl3_gemm` is decode-shaped: it decodes the trellis once per output tile, so its
+# cost grows with M, while a dense GEMM against a materialised weight does not.
+# exllamav3's own `LinearEXL3.reconstruct_hgemm` switches path above 1024 rows for
+# exactly this reason. Measured with the extension `VLLM_EXL3_EXT_PATH` loads, on a
+# real Qwen3.8-27B EXL3 checkpoint (unfused sequence, reconstruct cost included):
+#
+#   geometry                 m=32   m=128   m=512   m=2048
+#   5120x17408   K5          0.30x   1.06x   2.61x   4.10x
+#   17408x5120   K6          0.35x   1.28x   3.10x   4.35x
+#   5120x248320  K6 (head)   0.32x   1.19x   3.23x   5.21x
+#
+# The threshold decision MUST be opaque to Dynamo. A Python-level `rows >= N` branch
+# around the two calls is resolved once at trace time - with vLLM's single compiled
+# range the profile run bakes in the prefill branch, the decode CUDA graphs then
+# capture reconstruct+hgemm, and decode throughput collapses (measured: 56.5 -> 22.6
+# tok/s at C1). Keeping both paths inside one custom op moves the choice to runtime.
+_EXL3_RECONSTRUCT_SLICE_N = 32768
+_EXL3_RECONSTRUCT_SCRATCH: dict[tuple[int, int, int], torch.Tensor] = {}
+
+
+def _prefill_reconstruct_rows() -> int:
+    """Row count at or above which reconstruct+hgemm replaces exl3_gemm (0 = off)."""
+    raw = os.environ.get("VLLM_EXL3_PREFILL_RECONSTRUCT_M")
+    if raw is None:
+        return 128
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_EXL3_PREFILL_RECONSTRUCT_M must be an integer row count "
+            f"(0 disables the reconstruct path), got {raw!r}"
+        ) from exc
+    return max(0, value)
+
+
+def _reconstruct_scratch(device: torch.device, k: int, n: int) -> torch.Tensor:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (index, k, n)
+    buf = _EXL3_RECONSTRUCT_SCRATCH.get(key)
+    if buf is None:
+        # One buffer per (device, K, N-chunk), reused by every layer of the same
+        # geometry, so peak scratch is bounded by the largest chunk rather than by
+        # the number of layers: 336 MB for a 5120x32768 chunk in fp16.
+        buf = torch.empty((k, n), dtype=torch.float16, device=device)
+        _EXL3_RECONSTRUCT_SCRATCH[key] = buf
+    return buf
+
+
+def _reconstruct_hgemm_into(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    mcg: bool,
+    mul1: bool,
+) -> None:
+    """Materialise the weight and use a dense GEMM.
+
+    Same trellis, codebook and scales as `exl3_gemm`; only the summation order
+    differs, so outputs agree to ~3e-3 of output magnitude in fp16. Release receipts
+    check end-to-end distribution parity rather than relying on that bound.
+    """
+    ext = _load_exl3_ext()
+    bits = trellis.shape[2] // 16
+    k = trellis.shape[0] * 16
+    n = trellis.shape[1] * 16
+    x_had = torch.empty_like(x)
+    ext.had_r_128(x, x_had, suh, None, 1.0)
+    chunk = min(n, _EXL3_RECONSTRUCT_SLICE_N)
+    weight = _reconstruct_scratch(x.device, k, chunk)
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        view = weight[:, : end - start]
+        if n <= chunk:
+            ext.reconstruct(view, trellis, bits, mcg, mul1)
+        else:
+            ext.reconstruct_slice(view, trellis, bits, mcg, mul1, start)
+        ext.hgemm(x_had, view, output[:, start:end])
+    ext.had_r_128(output, output, None, svh, 1.0)
+
+
 @torch.library.custom_op(
     "vllm::exl3_gemm",
     mutates_args=(),
@@ -765,6 +850,12 @@ def _exl3_gemm(
         dtype=torch.float16,
         device=x.device,
     )
+    # Runtime dispatch, inside the opaque op: the trellis kernel wins at decode row
+    # counts and loses by 4-5x at prefill row counts. See the table above.
+    threshold = _prefill_reconstruct_rows()
+    if threshold and x.shape[0] >= threshold:
+        _reconstruct_hgemm_into(output, x, trellis, suh, svh, mcg, mul1)
+        return output
     x_had = torch.empty_like(x)
     ext.exl3_gemm(
         x,
