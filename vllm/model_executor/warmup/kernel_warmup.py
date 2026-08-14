@@ -271,6 +271,42 @@ def kernel_warmup(worker: "Worker"):
         cudagraph_capture_sizes=mhc_warmup_token_sizes,
     )
 
+    # The first profile pass creates the EXL3 mixed-Trellis runtimes. Warm
+    # every route-pack capacity now so their persistent CUDA modules are
+    # included in the second memory profile and exist before graph capture.
+    exl3_models = [worker.get_model()]
+    get_draft_model = getattr(worker, "get_draft_model", None)
+    draft_model = get_draft_model() if callable(get_draft_model) else None
+    if draft_model is not None and draft_model is not exl3_models[0]:
+        exl3_models.append(draft_model)
+    uses_mixed_exl3 = any(
+        any(
+            isinstance(
+                getattr(
+                    getattr(module, "routed_experts", module),
+                    "exl3_mixed_trellis",
+                    None,
+                ),
+                dict,
+            )
+            for module in model.modules()
+        )
+        for model in exl3_models
+    )
+    if uses_mixed_exl3:
+        from vllm.model_executor.layers.quantization.exl3 import (
+            warmup_exl3_mixed_trellis_route_pack,
+        )
+
+        warmed_exl3 = sum(
+            warmup_exl3_mixed_trellis_route_pack(model) for model in exl3_models
+        )
+        if warmed_exl3:
+            logger.info(
+                "Warmed up %d EXL3 mixed-Trellis route-pack variants.",
+                warmed_exl3,
+            )
+
     warmed_dcp_a2a = _warmup_b12x_dcp_a2a(worker)
     if warmed_dcp_a2a:
         logger.info(

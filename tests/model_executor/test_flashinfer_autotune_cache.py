@@ -237,6 +237,27 @@ def test_b12x_dcp_warmup_finds_generic_mla_attention(monkeypatch) -> None:
     ]
 
 
+def test_kernel_dispatcher_warms_mixed_exl3_route_pack(monkeypatch) -> None:
+    from vllm.model_executor.layers.quantization import exl3
+
+    model = torch.nn.Module()
+    holder = torch.nn.Module()
+    holder.routed_experts = SimpleNamespace(exl3_mixed_trellis={})
+    model.add_module("holder", holder)
+    worker = _flashinfer_autotune_worker(model)
+    _patch_flashinfer_autotune_deps(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        exl3,
+        "warmup_exl3_mixed_trellis_route_pack",
+        lambda candidate: calls.append(candidate) or 2,
+    )
+
+    kernel_warmup.kernel_warmup(worker)
+
+    assert calls == [model]
+
+
 def test_kernel_warmup_runs_b12x_mxfp8_linear_warmup(monkeypatch) -> None:
     calls = []
     model = torch.nn.Linear(2, 2)

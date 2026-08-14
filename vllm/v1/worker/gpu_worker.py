@@ -456,6 +456,17 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
+        # FQ: return the loader's staging residue to the driver BEFORE KV
+        # sizing. This must run HERE, not inside the progressive loader:
+        # load_weights returns with only 35.11 GiB resident because the EXL3
+        # quant method device-copies in process_weights_after_loading, which
+        # model_runner.load_model() has only just finished. Reclaiming at the
+        # earlier point freed 0.39 GiB of the ~3.9 GiB actually stranded --
+        # and every stranded byte is charged against the KV cache, because
+        # vLLM sizes KV from what the DRIVER reports free while the caching
+        # allocator holds freed blocks as reserved.
+        self._fq_reclaim_after_load()
+
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,
@@ -463,6 +474,102 @@ class Worker(WorkerBase):
                 self.device,
                 self.model_runner.get_model(),
             )
+
+    def _fq_reclaim_after_load(self) -> None:
+        """Free allocator residue left by progressive loading, and calibrate.
+
+        Two outputs, both measured rather than assumed:
+          - reserved-before/after, so the recovery is a number in the log
+            instead of a claim in a commit message;
+          - the true per-rank weight footprint, which is what the next boot's
+            memory preflight needs in order to project exactly rather than
+            reconstruct from file headers (which over-charges one rank for all
+            four TP ranks' non-expert tensors).
+
+        Guarded to a no-op unless the progressive loader ran: a normal
+        checkpoint load has no per-expert staging to reclaim.
+        """
+        import os
+
+        if os.environ.get("VLLM_FQ_RECLAIM", "1") == "0":
+            return
+        if getattr(self.vllm_config.load_config, "load_format", None) != \
+                "progressive":
+            return
+        try:
+            import gc
+
+            import torch
+
+            before_r = torch.cuda.memory_reserved()
+            allocated = torch.cuda.memory_allocated()
+            gc.collect()
+            torch.cuda.empty_cache()
+            after_r = torch.cuda.memory_reserved()
+            logger.info(
+                "FQ reclaim (post process_weights_after_loading): reserved "
+                "%.2f -> %.2f GiB, freed %.2f GiB; weight footprint %.2f GiB",
+                before_r / (1 << 30), after_r / (1 << 30),
+                (before_r - after_r) / (1 << 30), allocated / (1 << 30))
+            from vllm.model_executor.layers.quantization.exl3_fungible.\
+                progressive_loader import record_weight_footprint
+            record_weight_footprint(allocated)
+            self._fq_trim_host_heap()
+        except Exception:  # noqa: BLE001 — never fail a boot to save memory
+            logger.warning("FQ post-load reclaim skipped", exc_info=True)
+
+    @staticmethod
+    def _fq_trim_host_heap() -> None:
+        """Return the progressive loader's host-side heap to the OS.
+
+        The GPU reclaim above has a host-side twin that was missing, and it is
+        far larger. Measured on a live TP4 serve, per rank, while SERVING:
+
+            [heap]          228.7 GiB      Anonymous     230.3 GiB
+            Private_Dirty   232.0 GiB      GPU footprint  66.92 GiB
+
+        ~3.5x the resident model, x4 ranks = ~924 GiB of a 1280 GiB cgroup,
+        leaving 118 GiB of headroom. Two concurrent boots therefore cannot
+        fit, and two workers were OOM-killed before this was understood
+        (memory.events: oom 16, oom_kill 2).
+
+        It is retention, not a leak — RSS is flat, and the bytes are in the
+        glibc MAIN heap, which only shrinks from the top: one live allocation
+        near the boot-time high-water mark pins everything beneath it. brk
+        cannot give it back, but malloc_trim() releases the free pages inside
+        the heap via MADV_DONTNEED, which is exactly this case.
+
+        Measured and logged rather than asserted, like its GPU counterpart —
+        an unverified "reclaim" that frees nothing is a claim, and this
+        project has already retracted one of those.
+        """
+        import ctypes
+
+        def _rss_kb() -> int:
+            try:
+                with open("/proc/self/status") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            return int(line.split()[1])
+            except OSError:
+                pass
+            return 0
+
+        before = _rss_kb()
+        try:
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            libc.malloc_trim.argtypes = [ctypes.c_size_t]
+            libc.malloc_trim.restype = ctypes.c_int
+            returned = int(libc.malloc_trim(0))
+        except Exception:  # noqa: BLE001 — musl and friends have no malloc_trim
+            logger.info("FQ host heap trim unavailable (no glibc malloc_trim)")
+            return
+        after = _rss_kb()
+        logger.info(
+            "FQ host heap trim: RSS %.2f -> %.2f GiB, freed %.2f GiB "
+            "(malloc_trim returned %d)",
+            before / (1 << 20), after / (1 << 20),
+            (before - after) / (1 << 20), returned)
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
@@ -795,6 +902,21 @@ class Worker(WorkerBase):
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
 
+        # Fungible-quant M1+M2: bind the routing-stats collector to every
+        # MoE router before CUDA-graph capture and wrap it in the decision
+        # loop state machine. Deliberately NOT gated on
+        # enable_return_routed_experts (that flag governs the capturer
+        # above); bind_router chains any capture fn the capturer already
+        # installed. No-op returning None unless VLLM_FQ_ENABLE=1; the
+        # function import keeps cost at zero for the default path. The
+        # returned object (loop state or bare collector) shares the
+        # step(is_dummy=...) contract the runner's step sites rely on.
+        from vllm.model_executor.layers.quantization.exl3_fungible.integration import (  # noqa: E501
+            maybe_init_fq_state,
+        )
+
+        self.model_runner.fq_collector = maybe_init_fq_state(self.model_runner)
+
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
         # allocator and are not discarded during sleep/wake cycles.
@@ -802,6 +924,63 @@ class Worker(WorkerBase):
             self.model_runner, "_init_kv_zero_meta"
         ):
             self.model_runner._init_kv_zero_meta()
+
+    # ---------------------------------------------------------- FQ admin
+    # Reachable by name through EngineClient.collective_rpc (the method is
+    # resolved on the worker object). Thin lazy-import delegates so the FQ
+    # package's laziness contract holds: nothing fungible-quant is imported
+    # unless somebody actually calls one of these. All logic lives in
+    # exl3_fungible/admin.py, where it is CPU-testable. JSON strings in and
+    # out, matching the /collective_rpc convention.
+
+    def fq_admin_tune(self, request_json: str = "{}") -> str:
+        """Retune loop knobs in place — bounded, validated, no restart.
+
+        The whole point of re-tiering at runtime is not having to reboot to
+        change the model's posture. Having to reboot to change the THRESHOLD
+        that governs re-tiering was the same problem one level up.
+        """
+        from vllm.model_executor.layers.quantization.exl3_fungible.admin import (  # noqa: E501
+            worker_tune,
+        )
+
+        return worker_tune(self, request_json)
+
+    def fq_admin_describe(self, request_json: str = "{}") -> str:
+        from vllm.model_executor.layers.quantization.exl3_fungible.admin import (  # noqa: E501
+            worker_describe,
+        )
+
+        return worker_describe(self, request_json)
+
+    def fq_admin_plan(self, request_json: str) -> str:
+        from vllm.model_executor.layers.quantization.exl3_fungible.admin import (  # noqa: E501
+            worker_plan,
+        )
+
+        return worker_plan(self, request_json)
+
+    def fq_admin_apply(self, plan_json: str) -> str:
+        from vllm.model_executor.layers.quantization.exl3_fungible.admin import (  # noqa: E501
+            worker_apply,
+        )
+
+        return worker_apply(self, plan_json)
+
+    def fq_heatmap_sample(self, request_json: str = "{}") -> str:
+        """One rank's slice of the routing activation matrix.
+
+        Read-only telemetry behind its own env gate (VLLM_FQ_HEATMAP),
+        re-checked inside worker_sample so reaching this method through
+        dev mode's POST /collective_rpc does not bypass the gate. Same
+        laziness contract and JSON-string convention as the fq_admin_*
+        delegates above.
+        """
+        from vllm.model_executor.layers.quantization.exl3_fungible.heatmap import (  # noqa: E501
+            worker_sample,
+        )
+
+        return worker_sample(self, request_json)
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:

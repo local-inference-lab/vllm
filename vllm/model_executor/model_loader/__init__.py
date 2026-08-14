@@ -40,6 +40,7 @@ LoadFormats = Literal[
     "mistral",
     "modelexpress",
     "npcache",
+    "progressive",
     "pt",
     "runai_streamer",
     "runai_streamer_sharded",
@@ -47,6 +48,22 @@ LoadFormats = Literal[
     "sharded_state",
     "tensorizer",
 ]
+def _progressive_loader_cls(*args, **kwargs):
+    """Lazily resolve the Progressive Tensors loader.
+
+    Importing it eagerly here makes `exl3_fungible.progressive_loader`
+    unimportable on its own: that module needs `model_loader.base_loader`,
+    which initializes this package, which would then import a
+    half-initialized module. Resolving at construction keeps both import
+    orders working.
+    """
+    from vllm.model_executor.layers.quantization.exl3_fungible.progressive_loader import (  # noqa: E501
+        ProgressiveModelLoader,
+    )
+
+    return ProgressiveModelLoader(*args, **kwargs)
+
+
 _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "auto": DefaultModelLoader,
     "hf": DefaultModelLoader,
@@ -57,6 +74,7 @@ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "mistral": DefaultModelLoader,
     "modelexpress": ModelExpressModelLoader,
     "npcache": DefaultModelLoader,
+    "progressive": _progressive_loader_cls,
     "pt": DefaultModelLoader,
     "runai_streamer": RunaiModelStreamerLoader,
     "runai_streamer_sharded": ShardedStateLoader,

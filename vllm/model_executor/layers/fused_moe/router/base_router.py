@@ -180,11 +180,25 @@ class BaseRouter(FusedMoERouter):
         super().__init__(eplb_state=eplb_state)
         self.top_k = top_k
         self.global_num_experts = global_num_experts
-        self.capture_fn: Callable[[torch.Tensor], None] | None = None
+        self.capture_fn: Callable[..., None] | None = None
+        # A capture fn may opt in to also receiving the pre-EPLB gate
+        # weights by carrying a truthy ``wants_topk_weights`` attribute; it
+        # is then called as ``fn(topk_ids, topk_weights)``. The default
+        # one-argument contract is unchanged. Resolved once here / in
+        # set_capture_fn so the routing hot path reads a plain bool.
+        self.capture_fn_wants_weights = False
 
-    def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
-        """Set a capture callback for logical routed expert IDs."""
+    def set_capture_fn(self, capture_fn: Callable[..., None] | None) -> None:
+        """Set a capture callback for logical routed expert IDs.
+
+        Callbacks tagged with ``wants_topk_weights = True`` additionally
+        receive the pre-EPLB ``topk_weights`` as a second positional
+        argument (gate mass for the fungible-quant collector).
+        """
         self.capture_fn = capture_fn
+        self.capture_fn_wants_weights = bool(
+            getattr(capture_fn, "wants_topk_weights", False)
+        )
 
     def _validate_eplb_state(self) -> None:
         """Validate that EPLB state is properly initialized if EPLB is enabled."""
@@ -292,9 +306,15 @@ class BaseRouter(FusedMoERouter):
             hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
         )
 
-        # Capture logical ids before EPLB mapping.
+        # Capture logical ids before EPLB mapping. topk_weights is a local
+        # here and is not stored on the router, so a capture fn that needs
+        # routing mass (not just hit counts) can only get it by being
+        # handed it at this call site.
         if self.capture_fn is not None:
-            self.capture_fn(topk_ids)
+            if self.capture_fn_wants_weights:
+                self.capture_fn(topk_ids, topk_weights)
+            else:
+                self.capture_fn(topk_ids)
 
         # Step 3: Apply EPLB mapping
         topk_ids = self._apply_eplb_mapping(topk_ids)

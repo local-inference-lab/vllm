@@ -28,6 +28,9 @@ class TestWorkerExtension:
         """Test method that does not return anything"""
         return
 
+    def fq_admin_apply(self, payload: str) -> str:
+        raise AssertionError(f"generic RPC must not dispatch FQ admin: {payload}")
+
 
 @pytest.fixture(scope="module")
 def server():
@@ -56,6 +59,14 @@ def test_get_model_name(server):
     results = response.json()
     assert "results" in results
     assert results["results"] == [MODEL_NAME]
+
+
+def test_fq_admin_methods_are_blocked(server):
+    response = requests.post(
+        server.url_for("collective_rpc"),
+        json={"method": "fq_admin_apply", "args": ["{}"]},
+    )
+    assert response.status_code == 403
 
 
 def test_return_none(server):

@@ -4767,6 +4767,11 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
 
+        # Fungible-quant M1: advance the stats window once per engine step,
+        # same cadence as EPLB's step above.
+        if getattr(self, "fq_collector", None) is not None:
+            self.fq_collector.step()
+
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
@@ -6254,6 +6259,15 @@ class GPUModelRunner(
         # ranks execute the rearrangement in synchronization.
         if not skip_eplb:
             self.eplb_step(is_dummy=True, is_profile=is_profile)
+
+        # Fungible-quant M1: dummy batches still fire the router capture fn,
+        # so always discard their stats (EPLB dummy-step semantics: zero
+        # without recording). Unlike eplb_step this is host-local — no
+        # collective — so it is safe outside the skip_eplb gate, and running
+        # it there keeps eager warmup/profile garbage out of the first
+        # window.
+        if getattr(self, "fq_collector", None) is not None:
+            self.fq_collector.step(is_dummy=True)
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
         logit_indices_device = torch.from_numpy(logit_indices).to(
