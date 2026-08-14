@@ -561,6 +561,17 @@ class FungibleQuantState:
             [policy_doc["bits_per_expert"][str(layer)]
              for layer in self.layers], dtype=np.int64)
         self.n_k4 = P.n_k4_of(self.tier_of)
+        # The online score/policy objective is calibrated specifically for
+        # K3->K4 error reduction. Other binary pairs remain fully observable
+        # and operator-swappable, but must not be fed through that policy as
+        # though K2 were K3.
+        self._auto_decisions_supported = (
+            set(int(k) for k in np.unique(self.tier_of)) <= {P.K3, P.K4})
+        if not self._auto_decisions_supported:
+            logger.warning(
+                "FQ loop: automatic decisions disabled for tier set %s; "
+                "collector and admin re-tiering remain active",
+                sorted(int(k) for k in np.unique(self.tier_of)))
         self.pins = self._pins_from_doc(policy_doc)
         self.budget = budget if budget is not None else self._resolve_budget()
         self._log_budget()
@@ -705,7 +716,8 @@ class FungibleQuantState:
         self._step += 1
         if not is_dummy:
             self._real_steps += 1
-        if self._step % self.cfg.interval_steps:
+        if (self._step % self.cfg.interval_steps
+                or not self._auto_decisions_supported):
             return
         try:
             self.run_interval()

@@ -35,6 +35,14 @@ async def collective_rpc(raw_request: Request):
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="Missing 'method' in request body",
         )
+    if str(method).startswith("fq_admin_"):
+        raise HTTPException(
+            status_code=HTTPStatus.FORBIDDEN.value,
+            detail=(
+                "FQ admin worker methods require the authenticated /fq API "
+                "and cannot be called through generic collective RPC"
+            ),
+        )
     # For security reason, only serialized string args/kwargs are passed.
     # User-defined `method` is responsible for deserialization if needed.
     args: list[str] = body.get("args", [])

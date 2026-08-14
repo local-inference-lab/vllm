@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fungible-quant atomic swap engine (M4) — 02-swap-engine.md row-write variant.
 
-Moves experts between the K3 (tier0) and K4 (tier1) arms of a b12x
-mixed-trellis MoE layer at runtime by rewriting slab rows, combined
+Moves experts between the lower (tier0) and higher (tier1) arms of a b12x
+binary mixed-trellis MoE layer at runtime by rewriting slab rows, combined
 rotation/suh/svh rows and the two routing maps in place — no reallocation,
 no recompile, CUDA-graph-safe (maps are launch arguments read as data,
-pre-M4 checks 1–2).
+pre-M4 checks 1–2). SM120 supports the K2/K3, K2/K4, and K3/K4 pairs;
+K5 exceeds the measured shared-memory limit.
 
 Design consequences bound by runs/pre-m4-checks/report.md:
 
@@ -74,7 +75,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-K3, K4 = 3, 4
+K2, K3, K4 = 2, 3, 4
+SERVABLE_TIER_BITS = (K2, K3, K4)
 DESCRIPTOR_TIER_SHIFT = 8  # descriptor = (tier << 8) | local, single decode site
 
 _PROJS = ("gate", "up", "down")
@@ -451,8 +453,9 @@ class ResolverFragmentSource:
 
 class SwapPlan:
     """Ordered swap list ``[(layer, e_out, e_in), ...]`` between two
-    same-cardinality memberships (policy.py conventions: ``e_out`` K4→K3,
-    ``e_in`` K3→K4; deterministic order; ``inverse`` composes to identity)."""
+    same-cardinality binary-tier memberships. ``e_out`` moves from the
+    higher tier to the lower tier and ``e_in`` moves from lower to higher;
+    ordering is deterministic and ``inverse`` composes to identity."""
 
     def __init__(self, swaps: Sequence[tuple[int, int, int]]):
         self.swaps = tuple(
@@ -469,11 +472,13 @@ class SwapPlan:
 
     @classmethod
     def from_memberships(cls, old: Any, new: Any) -> "SwapPlan":
-        """Diff two ``[L, E]`` membership arrays over {3, 4} into a plan.
+        """Diff two ``[L, E]`` binary-tier membership arrays into a plan.
 
-        Same K4 cardinality per layer is required (D1 — project() first).
-        Pairing is deterministic: leaving and entering experts are matched
-        in ascending id order, layers ascending.
+        Same higher-tier cardinality per layer is required (D1 — project()
+        first). Pairing is deterministic: leaving and entering experts are
+        matched in ascending id order, layers ascending. Tier values are
+        inferred per layer, so the same algebra serves K2/K3, K2/K4, and
+        K3/K4 without changing the plan representation.
         """
         old = np.asarray(old)
         new = np.asarray(new)
@@ -481,8 +486,24 @@ class SwapPlan:
             raise ValueError(f"membership shapes differ: {old.shape} vs {new.shape}")
         swaps: list[tuple[int, int, int]] = []
         for l in range(old.shape[0]):
-            outs = np.nonzero((old[l] == K4) & (new[l] == K3))[0]
-            ins = np.nonzero((old[l] == K3) & (new[l] == K4))[0]
+            tiers = sorted({
+                *(int(x) for x in np.unique(old[l])),
+                *(int(x) for x in np.unique(new[l])),
+            })
+            bad = [k for k in tiers if k not in SERVABLE_TIER_BITS]
+            if bad:
+                raise ValueError(
+                    f"layer {l}: tier(s) {bad} are not servable; "
+                    f"supported bits are {SERVABLE_TIER_BITS}")
+            if len(tiers) > 2:
+                raise ValueError(
+                    f"layer {l}: memberships span {len(tiers)} tiers "
+                    f"{tiers}; binary mixed-trellis requires exactly one pair")
+            if len(tiers) < 2:
+                continue
+            low_k, high_k = tiers
+            outs = np.nonzero((old[l] == high_k) & (new[l] == low_k))[0]
+            ins = np.nonzero((old[l] == low_k) & (new[l] == high_k))[0]
             if len(outs) != len(ins):
                 raise ValueError(
                     f"layer {l}: cardinality changes ({len(outs)} out, "
@@ -540,6 +561,7 @@ class MixedLayerState:
     (the only live copy — consequence 2); the two maps are the live launch
     arguments. ``tier0_globals``/``tier1_globals`` are the local→global slot
     orderings (b12x ``tier_ids``), mutated only by a committed apply().
+    ``tier_bits`` records the lower/higher binary pair backing those slots.
     """
 
     tier0: Any
@@ -550,6 +572,7 @@ class MixedLayerState:
     tier0_globals: list[int]
     tier1_globals: list[int]
     mcg: int | None = None
+    tier_bits: tuple[int, int] = (K3, K4)
     #: The ``layer.exl3_mixed_trellis`` dict this state was adapted from, so a
     #: committed apply can publish the new orderings back to it. See publish().
     source: MutableMapping[str, Any] | None = None
@@ -557,9 +580,12 @@ class MixedLayerState:
     @classmethod
     def from_exl3_mixed_trellis(cls, mixed: Mapping[str, Any]) -> "MixedLayerState":
         """Adapt GG's ``layer.exl3_mixed_trellis`` dict (exl3.py)."""
-        if tuple(mixed["tier_bits"]) != (K3, K4):
+        tier_bits = tuple(int(k) for k in mixed["tier_bits"])
+        if (len(tier_bits) != 2 or tier_bits[0] >= tier_bits[1]
+                or any(k not in SERVABLE_TIER_BITS for k in tier_bits)):
             raise ValueError(
-                f"v1 swaps K3/K4 tiers only, got {tuple(mixed['tier_bits'])}")
+                f"runtime swaps require one increasing binary pair drawn "
+                f"from {SERVABLE_TIER_BITS}, got {tier_bits}")
         tier0, tier1 = mixed["tiers"]
         tier0_ids, tier1_ids = mixed["tier_ids"]
         return cls(
@@ -570,6 +596,7 @@ class MixedLayerState:
             descriptor_map=mixed["descriptor_map"],
             tier0_globals=list(tier0_ids),
             tier1_globals=list(tier1_ids),
+            tier_bits=tier_bits,
             source=mixed if isinstance(mixed, MutableMapping) else None,
         )
 
@@ -715,6 +742,11 @@ class SwapEngine:
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size)
         self.tier_bits = (int(tier_bits[0]), int(tier_bits[1]))
+        if (self.tier_bits[0] >= self.tier_bits[1]
+                or any(k not in SERVABLE_TIER_BITS for k in self.tier_bits)):
+            raise ValueError(
+                f"tier_bits must be one increasing pair drawn from "
+                f"{SERVABLE_TIER_BITS}, got {self.tier_bits}")
         self.rank = int(rank)
         self.max_pairs = int(max_pairs)
         self.expected_mcg = expected_mcg
@@ -727,9 +759,9 @@ class SwapEngine:
         for layer_id, state in self.layers.items():
             self._validate_layer(layer_id, state)
 
-        # Pre-allocated pinned staging: one (K3, K4) stage pair per swap
-        # pair, one host map pair per registered layer (map contents are
-        # rebuilt per layer, not per pair).
+        # Pre-allocated pinned staging: one (lower, higher) stage pair per
+        # swap pair, one host map pair per registered layer (map contents
+        # are rebuilt per layer, not per pair).
         self._stages = [
             (ExpertStage(self.tier_bits[0], self.hidden_size,
                          self.intermediate_size, pin_memory=pin_memory),
@@ -783,6 +815,10 @@ class SwapEngine:
     # ---------------------------------------------------------- validation
 
     def _validate_layer(self, layer_id: int, state: MixedLayerState) -> None:
+        if tuple(state.tier_bits) != self.tier_bits:
+            raise ValueError(
+                f"layer {layer_id}: state tier_bits={tuple(state.tier_bits)} "
+                f"!= engine tier_bits={self.tier_bits}")
         h16 = self.hidden_size // 16
         i16 = self.intermediate_size // 16
         t0, t1 = len(state.tier0_globals), len(state.tier1_globals)
@@ -915,7 +951,7 @@ class SwapEngine:
         if len(plan) > self.max_pairs:
             raise ValueError(
                 f"plan has {len(plan)} pairs, staging holds {self.max_pairs}")
-        k3_bits, k4_bits = self.tier_bits
+        low_bits, high_bits = self.tier_bits
         slab_ops: list[tuple[torch.Tensor, torch.Tensor]] = []
         rotation_ops: list[tuple[torch.Tensor, torch.Tensor]] = []
         undo_ops: list[tuple[torch.Tensor, torch.Tensor]] | None = (
@@ -944,17 +980,19 @@ class SwapEngine:
             if e_out not in t1_ids or e_in not in t0_ids:
                 raise ValueError(
                     f"invalid swap ({layer_id}, {e_out}, {e_in}): e_out must "
-                    f"be resident K{k4_bits}, e_in resident K{k3_bits}")
+                    f"be resident K{high_bits}, e_in resident K{low_bits}")
 
             # Fragment IO first: a pair that cannot be supplied leaves no
             # trace (orderings are only mutated once every read landed).
             out_stage, in_stage = self._stages[pair_idx]
-            reads = [(k3_bits, e_out, out_stage), (k4_bits, e_in, in_stage)]
-            undo_k3 = undo_k4 = None
+            reads = [(low_bits, e_out, out_stage),
+                     (high_bits, e_in, in_stage)]
+            undo_low = undo_high = None
             if fail_atomic:
-                undo_k3, undo_k4 = self._undo_stage_pair(pair_idx)
+                undo_low, undo_high = self._undo_stage_pair(pair_idx)
                 # Pre-swap content of the two destination slots.
-                reads += [(k4_bits, e_out, undo_k4), (k3_bits, e_in, undo_k3)]
+                reads += [(high_bits, e_out, undo_high),
+                          (low_bits, e_in, undo_low)]
             drop: DroppedPair | None = None
             for k, expert, dest in reads:
                 try:
@@ -970,7 +1008,7 @@ class SwapEngine:
             if drop is not None:
                 logger.warning(
                     "FQ swap L%d e%d->K%d/e%d->K%d dropped: %s",
-                    layer_id, e_out, k3_bits, e_in, k4_bits, drop.reason)
+                    layer_id, e_out, low_bits, e_in, high_bits, drop.reason)
                 dropped.append(drop)
                 continue
 
@@ -987,7 +1025,7 @@ class SwapEngine:
             pair_idx += 1
 
             for stage, expert in ((out_stage, e_out), (in_stage, e_in),
-                                  *(((undo_k4, e_out), (undo_k3, e_in))
+                                  *(((undo_high, e_out), (undo_low, e_in))
                                     if fail_atomic else ())):
                 for proj, value in stage.mcg.items():
                     if mcg_seen is None:
@@ -1006,8 +1044,8 @@ class SwapEngine:
             # The undo op for a destination is the SAME view fed the expert
             # that occupied it pre-swap.
             for tier, count, slot, stage, undo in (
-                    (state.tier1, len(t1_ids), slot1, in_stage, undo_k4),
-                    (state.tier0, t0n, slot0, out_stage, undo_k3)):
+                    (state.tier1, len(t1_ids), slot1, in_stage, undo_high),
+                    (state.tier0, t0n, slot0, out_stage, undo_low)):
                 w13, w2 = self._slab_rows(tier, count)
                 dsts = (w13[0, slot], w13[1, slot], w2[slot])
                 slab_ops.extend(zip(dsts, stage.slab_rows()))
@@ -1017,8 +1055,9 @@ class SwapEngine:
             # Step-2 ops: COMBINED rotation/suh/svh rows at NEW combined
             # slots (tier0 local -> slot, tier1 local -> t0 + slot).
             rot = state.rotations
-            for combined_slot, stage, undo in ((t0n + slot1, in_stage, undo_k4),
-                                               (slot0, out_stage, undo_k3)):
+            for combined_slot, stage, undo in (
+                    (t0n + slot1, in_stage, undo_high),
+                    (slot0, out_stage, undo_low)):
                 dsts = (rot.intermediate[combined_slot],
                         rot.gate_suh[combined_slot],
                         rot.up_suh[combined_slot],

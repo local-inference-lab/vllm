@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU tests for the progressive weights stream + boot metadata synthesis."""
+import hashlib
 import json
 import struct
 
@@ -108,12 +109,166 @@ def make_spec(tmp_path, policy, *, seg_dir=None, dense=None):
     )
 
 
+def test_committed_policy_overrides_boot_policy_on_restart(tmp_path):
+    seg_dir = make_manifest_dir(tmp_path, layers=(3,), ks=(2, 4))
+    dense = make_dense_source(tmp_path, source_k=2)
+    manifest_hash = hashlib.sha256(
+        (seg_dir / "fq-manifest.json").read_bytes()).hexdigest()
+    boot = make_policy({"3": [4, 2, 2, 2]})
+    boot["manifest"] = manifest_hash
+    committed = make_policy({"3": [2, 4, 2, 2]})
+    committed["manifest"] = manifest_hash
+    policy_path = tmp_path / "boot-policy.json"
+    policy_path.write_text(json.dumps(boot))
+    policy_cache = tmp_path / "policy-cache"
+    current = (
+        policy_cache / "fq" / "policy" / manifest_hash / "current.json"
+    )
+    current.parent.mkdir(parents=True)
+    current.write_text(json.dumps(committed))
+
+    spec = pg.ProgressiveSpec.from_env(
+        dense,
+        environ={
+            pg.FQ_CACHE_ENV: str(tmp_path / "fragment-cache"),
+            "VLLM_FQ_CACHE_ROOT": str(policy_cache),
+        },
+        overrides={
+            "manifest_dir": str(seg_dir),
+            "policy": str(policy_path),
+            "dense_source": str(dense),
+        },
+    )
+
+    assert spec.policy["bits_per_expert"] == committed["bits_per_expert"]
+    assert spec.policy_path is None
+    tensors, _ = stream(spec, tmp_path)
+    for expert, k in enumerate(committed["bits_per_expert"]["3"]):
+        name = (
+            f"model.layers.3.mlp.experts.{expert}.gate_proj.rank0.trellis"
+        )
+        assert tuple(tensors[name].shape) == (2, 2, 16 * k)
+
+
+def test_committed_policy_uses_loop_default_cache_not_fragment_cache(
+    tmp_path, monkeypatch
+):
+    seg_dir = make_manifest_dir(tmp_path, layers=(3,), ks=(2, 4))
+    dense = make_dense_source(tmp_path, source_k=2)
+    manifest_hash = hashlib.sha256(
+        (seg_dir / "fq-manifest.json").read_bytes()).hexdigest()
+    boot = make_policy({"3": [4, 2, 2, 2]})
+    boot["manifest"] = manifest_hash
+    committed = make_policy({"3": [2, 4, 2, 2]})
+    committed["manifest"] = manifest_hash
+    policy_path = tmp_path / "boot-policy.json"
+    policy_path.write_text(json.dumps(boot))
+    home = tmp_path / "home"
+    current = (
+        home / ".cache" / "vllm" / "fq" / "policy"
+        / manifest_hash / "current.json"
+    )
+    current.parent.mkdir(parents=True)
+    current.write_text(json.dumps(committed))
+    monkeypatch.setenv("HOME", str(home))
+
+    spec = pg.ProgressiveSpec.from_env(
+        dense,
+        environ={pg.FQ_CACHE_ENV: str(tmp_path / "fragment-cache")},
+        overrides={
+            "manifest_dir": str(seg_dir),
+            "policy": str(policy_path),
+            "dense_source": str(dense),
+        },
+    )
+
+    assert spec.policy["bits_per_expert"] == committed["bits_per_expert"]
+    assert spec.policy_path is None
+
+
+def test_policy_store_only_boot_uses_manifest_file_digest(tmp_path):
+    seg_dir = make_manifest_dir(tmp_path, layers=(3,), ks=(2, 4))
+    dense = make_dense_source(tmp_path, source_k=2)
+    manifest_hash = hashlib.sha256(
+        (seg_dir / "fq-manifest.json").read_bytes()).hexdigest()
+    committed = make_policy({"3": [2, 4, 2, 2]})
+    committed["manifest"] = manifest_hash
+    policy_cache = tmp_path / "policy-cache"
+    current = (
+        policy_cache / "fq" / "policy" / manifest_hash / "current.json"
+    )
+    current.parent.mkdir(parents=True)
+    current.write_text(json.dumps(committed))
+
+    spec = pg.ProgressiveSpec.from_env(
+        dense,
+        environ={"VLLM_FQ_CACHE_ROOT": str(policy_cache)},
+        overrides={
+            "manifest_dir": str(seg_dir),
+            "dense_source": str(dense),
+        },
+    )
+
+    assert spec.policy["bits_per_expert"] == committed["bits_per_expert"]
+    assert spec.policy_path is None
+
+
+def test_boot_policy_rejects_unsafe_manifest_identity(tmp_path):
+    seg_dir = make_manifest_dir(tmp_path, layers=(3,), ks=(2, 4))
+    dense = make_dense_source(tmp_path, source_k=2)
+    policy = make_policy({"3": [2, 4, 2, 2]})
+    policy["manifest"] = "../../outside"
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(policy))
+
+    with pytest.raises(ValueError, match="invalid policy manifest identity"):
+        pg.ProgressiveSpec.from_env(
+            dense,
+            environ={"VLLM_FQ_CACHE_ROOT": str(tmp_path / "policy-cache")},
+            overrides={
+                "manifest_dir": str(seg_dir),
+                "policy": str(policy_path),
+                "dense_source": str(dense),
+            },
+        )
+
+
 def stream(spec, tmp_path, tp_rank=None):
     resolver = spec.make_resolver(cache_dir=tmp_path / "cache", environ={})
     logs = []
     out = list(pg.progressive_weights_iterator(
         spec, resolver, tp_rank=tp_rank, log=logs.append))
     return dict(out), logs
+
+
+def test_boot_policy_projects_fallback_before_bitmap_sizing(tmp_path):
+    seg_dir = make_manifest_dir(tmp_path, layers=(3,), ks=(3,))
+    policy = make_policy({"3": [4, 3, 3, 4]})
+    spec = make_spec(tmp_path, policy, seg_dir=seg_dir)
+    resolver = spec.make_resolver(
+        cache_dir=tmp_path / "cache", environ={}
+    )
+
+    effective, substitutions = pg.project_boot_policy(policy, resolver)
+
+    assert effective["bits_per_expert"] == {"3": [3, 3, 3, 3]}
+    assert effective["budget"]["n_k4_per_layer"] == {"3": 0}
+    assert len(substitutions) == 2
+    assert effective["provenance"]["boot_projection"]["substitutions"] == 2
+
+
+def test_boot_projection_refuses_a_third_runtime_tier():
+    class Resolver:
+        @staticmethod
+        def available_k(layer, expert, k, *, network=True):
+            del layer, network
+            return 3 if expert == 1 and k == 4 else k
+
+    with pytest.raises(ValueError, match="non-binary mixed layers"):
+        pg.project_boot_policy(
+            make_policy({"3": [2, 4, 4, 2]}),
+            Resolver(),
+        )
 
 
 def test_mixed_stream_matches_policy(tmp_path):

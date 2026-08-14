@@ -14,8 +14,8 @@ between tiers. The target ``fq-policy/2`` document is built, handed to
 :meth:`SwapPlan.from_policies` (which already does pairing, ordering and
 the same-cardinality check) and then to :meth:`SwapEngine.apply` (which
 already does the six-step commit protocol and persists the policy as
-step 5 inside the quiesce window). ``swap.py``, ``store.py``,
-``policy.py``, ``fragments.py`` and ``occupancy_table.py`` are unchanged.
+step 5 inside the quiesce window). The swap/store primitives remain the
+single source of truth for every supported binary tier pair.
 
 Gating — OFF by default, twice over:
 
@@ -57,12 +57,13 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -90,6 +91,7 @@ ADMIN_API_ENV = "VLLM_FQ_ADMIN_API"
 ADMIN_ENABLE_ENV = "VLLM_FQ_ADMIN_ENABLE"
 ADMIN_TOKEN_ENV = "VLLM_FQ_ADMIN_TOKEN"
 ADMIN_MAX_ITEMS_ENV = "VLLM_FQ_ADMIN_MAX_ITEMS"
+ADMIN_MAX_BODY_BYTES_ENV = "VLLM_FQ_ADMIN_MAX_BODY_BYTES"
 ADMIN_MEM_BUDGET_ENV = "VLLM_FQ_ADMIN_MEM_BUDGET_BYTES"
 ADMIN_MEM_HEADROOM_ENV = "VLLM_FQ_ADMIN_MEM_HEADROOM_BYTES"
 ADMIN_MIN_FREE_SLOTS_ENV = "VLLM_FQ_ADMIN_MIN_FREE_SLOTS"
@@ -97,16 +99,21 @@ ADMIN_DRAIN_TIMEOUT_ENV = "VLLM_FQ_ADMIN_DRAIN_TIMEOUT_S"
 ADMIN_ALLOW_AUTO_BALANCE_ENV = "VLLM_FQ_ADMIN_ALLOW_AUTO_BALANCE"
 
 DEFAULT_MAX_ITEMS = 32
+DEFAULT_MAX_BODY_BYTES = 1 << 20
+MAX_ACTOR_CHARS = 128
+MAX_REASON_CHARS = 2048
+MAX_POLICY_SHA_CHARS = 128
+MAX_UTC_CHARS = 64
+MAX_TIMEOUT_S = 3600.0
 DEFAULT_MEM_HEADROOM_BYTES = 1 << 30
 DEFAULT_MIN_FREE_SLOTS = 2
 DEFAULT_DRAIN_TIMEOUT_S = 120.0
 
-#: The tiers the v1 swap engine can actually serve as a MIXED pair.
-#: ``MixedLayerState.from_exl3_mixed_trellis`` refuses anything but (3, 4),
-#: and K5 as a mixed tier does not fit SM120 shared memory at all
-#: (109568 > 101376; K4 is exactly 101376, zero headroom) — see
-#: runs/m5-serve/k5-shared-memory-limit.md.
-SERVABLE_TIERS: tuple[int, ...] = (P.K3, P.K4)
+#: Bit widths that may participate in an SM120 binary mixed pair. The
+#: running engine narrows this set to the exact pair prepared at boot.
+#: K5 is excluded: its mixed kernel needs 109568 bytes of shared memory
+#: against the measured 101376-byte opt-in limit.
+SERVABLE_TIERS: tuple[int, ...] = SW.SERVABLE_TIER_BITS
 
 MODE_STRICT_PAIR = "strict_pair"
 MODE_AUTO_BALANCE = "auto_balance"
@@ -116,7 +123,7 @@ PIN_HOLD, PIN_NONE, PIN_RELEASE = "hold", "none", "release"
 
 _REQUEST_FIELDS = frozenset({
     "items", "mode", "dry_run", "pin", "drain_mode", "reset_prefix_cache",
-    "expect_policy_sha", "timeout_s", "actor", "reason",
+    "expect_policy_sha", "timeout_s", "actor", "reason", "utc",
 })
 _ITEM_FIELDS = frozenset({"layer", "expert", "adjust_k", "k", "delta_k"})
 
@@ -217,6 +224,20 @@ def _fmt_bytes(n: int) -> str:
     return f"{sign}{a} B"
 
 
+def _bounded_text(value: Any, name: str, max_chars: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise AdminError("bad_json", f"{name} must be a string")
+    if len(value) > max_chars:
+        raise AdminError(
+            "bad_json",
+            f"{name} exceeds {max_chars} characters",
+            details={"field": name, "max_chars": max_chars},
+        )
+    return value
+
+
 # ------------------------------------------------------------------ requests
 
 
@@ -244,6 +265,9 @@ class RetierRequest:
     timeout_s: float = DEFAULT_DRAIN_TIMEOUT_S
     actor: str | None = None
     reason: str | None = None
+    # The API coordinator overwrites this before broadcasting the request.
+    # One timestamp in every rank's provenance keeps policy_doc byte-identical.
+    utc: str | None = None
 
     def canonical(self) -> dict:
         return {
@@ -263,6 +287,7 @@ class RetierRequest:
             "timeout_s": self.timeout_s,
             "actor": self.actor,
             "reason": self.reason,
+            "utc": self.utc,
         }
 
     @classmethod
@@ -287,11 +312,13 @@ class RetierRequest:
             timeout_s=float(doc.get("timeout_s", DEFAULT_DRAIN_TIMEOUT_S)),
             actor=doc.get("actor"),
             reason=doc.get("reason"),
+            utc=doc.get("utc"),
         )
 
 
 _AMBIGUOUS_MSG = (
-    'adjust_k={n} is not a valid absolute tier (ladder is K3/K4). For a '
+    'adjust_k={n} is not a valid absolute tier (servable bits are K2/K3/K4; '
+    'the running model narrows these to its prepared binary pair). For a '
     'relative +{n}, send the string "+{n}", or use the explicit field '
     'delta_k: {n}.'
 )
@@ -518,15 +545,29 @@ def parse_request(body: Mapping[str, Any] | None, *,
         timeout_s = float(timeout_s)
     except (TypeError, ValueError):
         raise AdminError("bad_json", "timeout_s must be a number") from None
+    if not math.isfinite(timeout_s) or not 0 < timeout_s <= MAX_TIMEOUT_S:
+        raise AdminError(
+            "bad_json",
+            f"timeout_s must be finite and in (0, {MAX_TIMEOUT_S:g}]",
+            details={"timeout_s": timeout_s},
+        )
 
+    actor = _bounded_text(body.get("actor"), "actor", MAX_ACTOR_CHARS)
+    if not actor:
+        actor = _bounded_text(actor_header, "X-FQ-Actor", MAX_ACTOR_CHARS)
     return RetierRequest(
         items=items, mode=mode, dry_run=bool(body.get("dry_run", False)),
         pin=pin, drain_mode=drain_mode,
         reset_prefix_cache=bool(body.get("reset_prefix_cache", False)),
-        expect_policy_sha=body.get("expect_policy_sha"),
+        expect_policy_sha=_bounded_text(
+            body.get("expect_policy_sha"),
+            "expect_policy_sha",
+            MAX_POLICY_SHA_CHARS,
+        ),
         timeout_s=timeout_s,
-        actor=body.get("actor") or actor_header,
-        reason=body.get("reason"))
+        actor=actor,
+        reason=_bounded_text(body.get("reason"), "reason", MAX_REASON_CHARS),
+        utc=_bounded_text(body.get("utc"), "utc", MAX_UTC_CHARS))
 
 
 # ------------------------------------------------------------- resolved items
@@ -554,6 +595,7 @@ class ResolvedItem:
 def resolve_items(request: RetierRequest, *, layers: Sequence[int],
                   tier_of: Any, num_experts: int,
                   registered_layers: Sequence[int] | None = None,
+                  servable_tiers: Sequence[int] | None = None,
                   ) -> list[ResolvedItem]:
     """Turn parsed items into (k_from, k_to) against the **live** state.
 
@@ -561,6 +603,18 @@ def resolve_items(request: RetierRequest, *, layers: Sequence[int],
     client sent — so a stale client view cannot silently mis-target.
     """
     tier_of = np.asarray(tier_of)
+    if servable_tiers is None:
+        servable_tiers = sorted({int(k) for k in tier_of.reshape(-1)})
+    active_tiers = tuple(int(k) for k in servable_tiers)
+    if (len(active_tiers) != 2 or active_tiers[0] >= active_tiers[1]
+            or any(k not in SERVABLE_TIERS for k in active_tiers)):
+        raise AdminError(
+            "tier_not_servable",
+            f"running membership does not expose one supported increasing "
+            f"binary tier pair: {active_tiers}",
+            status=501,
+            details={"running_tiers": list(active_tiers),
+                     "servable_tiers": list(SERVABLE_TIERS)})
     rows = {int(l): i for i, l in enumerate(layers)}
     registered = None if registered_layers is None else set(
         int(x) for x in registered_layers)
@@ -596,21 +650,20 @@ def resolve_items(request: RetierRequest, *, layers: Sequence[int],
             outcome = "promoted"
         else:
             outcome = "demoted"
-        if outcome != "noop" and k_to not in SERVABLE_TIERS:
+        if outcome != "noop" and k_to not in active_tiers:
             raise AdminError(
                 "tier_not_servable",
-                f"L{item.layer}/e{item.expert}: K{k_to} cannot be served as a "
-                f"mixed tier. Two independent reasons: (a) the v1 swap engine "
-                f"is a two-tier engine — MixedLayerState.from_exl3_mixed_"
-                f"trellis refuses anything but "
-                f"{tuple(SERVABLE_TIERS)}; (b) on SM120 a K5 mixed tier needs "
-                f"109568 bytes of shared memory against a 101376 opt-in limit "
-                f"(K4 is exactly 101376, zero headroom) — see "
-                f"runs/m5-serve/k5-shared-memory-limit.md.",
+                f"L{item.layer}/e{item.expert}: K{k_to} is not in the "
+                f"running mixed pair {active_tiers}. Runtime re-tiering can "
+                f"only exchange experts between the two slabs prepared at "
+                f"boot. K5 is additionally impossible on SM120: it needs "
+                f"109568 bytes of shared memory against a 101376-byte "
+                f"opt-in limit.",
                 status=501,
                 details={"layer": item.layer, "expert": item.expert,
                          "k_from": k_from, "k_to": k_to,
-                         "ladder": list(SERVABLE_TIERS)})
+                         "running_tiers": list(active_tiers),
+                         "servable_tiers": list(SERVABLE_TIERS)})
         out.append(ResolvedItem(
             layer=item.layer, expert=item.expert, requested=item.requested,
             interpretation=item.interpretation, k_from=k_from, k_to=k_to,
@@ -636,14 +689,14 @@ def check_cardinality(resolved: Sequence[ResolvedItem], *, mode: str,
             "unbudgeted — it is structurally impossible. (1) The tier slabs "
             "are sized at prepare time: SwapEngine._validate_layer derives "
             "the slab word counts from len(tierN_globals) and refuses a "
-            "mismatch, so one more K4 expert means reallocating tier1.w13/w2. "
-            "(2) The mixed-kernel memo key carries per-tier expert COUNTS "
-            "(tier_signature), so changing a count forces "
-            "compile_mixed_trellis, which is refused under CUDA-graph capture "
-            "and which on SM120 re-enters the tile-fit trap that blocks K5. "
+            "mismatch, so one more higher-tier expert means reallocating "
+            "tier1.w13/w2. (2) The mixed-kernel memo key carries per-tier "
+            "expert COUNTS (tier_signature), so changing a count forces "
+            "compile_mixed_trellis, which is refused under CUDA-graph capture. "
             "(3) The bytes are not there: the KV-cache pool is sized from "
-            "post-load free memory at startup. Raise n_k4_per_layer in the "
-            "policy and restart — the committed policy steers the next boot.",
+            "post-load free memory at startup. Raise the high-tier capacity "
+            "in the policy and restart — the committed policy steers the "
+            "next boot.",
             status=501,
             details={"mode": mode, "growth_supported": False})
     if mode == MODE_AUTO_BALANCE:
@@ -888,14 +941,7 @@ def check_pin_starvation(new_doc: Mapping[str, Any], *,
                          touched_layers: Sequence[int] | None = None,
                          min_free_slots: int | None = None,
                          environ: Mapping[str, str] | None = None) -> dict:
-    """Refuse a pin set that would wedge the next ``policy.decide``.
-
-    ``policy.decide`` raises ``"layer {l}: pins incompatible with budget"``
-    when ``pin4.sum() > n_k4[l]`` or ``E - pin3.sum() < n_k4[l]`` — and
-    ``step()``'s blanket handler would swallow it, so the loop would
-    silently stop deciding. Keep at least ``max_swaps_per_layer`` worth of
-    room on both sides so the loop always has an interval's work available.
-    """
+    """Keep enough unpinned residents in both prepared tiers for a trade."""
     if min_free_slots is None:
         min_free_slots = _env_int(environ, ADMIN_MIN_FREE_SLOTS_ENV,
                                   DEFAULT_MIN_FREE_SLOTS)
@@ -909,33 +955,50 @@ def check_pin_starvation(new_doc: Mapping[str, Any], *,
     free_slots: dict[str, int] = {}
     for layer in check:
         row = rows[layer]
-        n_k4 = int(caps.get(str(layer), int((new_tier[row] == P.K4).sum())))
+        tiers = sorted({int(k) for k in new_tier[row]})
+        if len(tiers) != 2:
+            free_slots[str(layer)] = 0
+            continue
+        low_k, high_k = tiers
+        high_capacity = int((new_tier[row] == high_k).sum())
+        if high_k == P.K4:
+            high_capacity = int(caps.get(str(layer), high_capacity))
         val = pinned.get(str(layer))
-        if val == "all":
-            ids = list(range(int(num_experts)))
-        else:
-            ids = [int(e) for e in (val or ())]
-        pin4 = sum(1 for e in ids if int(new_tier[row, e]) == P.K4)
-        pin3 = sum(1 for e in ids if int(new_tier[row, e]) == P.K3)
-        k4_free = n_k4 - pin4
-        k3_free = (int(num_experts) - pin3) - n_k4
-        free_slots[str(layer)] = int(min(k4_free, k3_free))
-        if k4_free < min_free_slots or k3_free < min_free_slots:
+        ids = (list(range(int(num_experts))) if val == "all"
+               else [int(e) for e in (val or ())])
+        pinned_high = sum(
+            1 for e in ids if int(new_tier[row, e]) == high_k)
+        pinned_low = sum(
+            1 for e in ids if int(new_tier[row, e]) == low_k)
+        high_free = high_capacity - pinned_high
+        low_free = (int(num_experts) - high_capacity) - pinned_low
+        free_slots[str(layer)] = int(min(high_free, low_free))
+        if high_free < min_free_slots or low_free < min_free_slots:
+            details = {
+                "layer": layer,
+                "tier_bits": tiers,
+                "high_tier_capacity": high_capacity,
+                "pinned_high": pinned_high,
+                "pinned_low": pinned_low,
+                "free_high_slots": high_free,
+                "free_low_slots": low_free,
+                f"free_k{high_k}_slots": high_free,
+                f"free_k{low_k}_slots": low_free,
+                "min_free_slots": min_free_slots,
+                "min_free_slots_env": ADMIN_MIN_FREE_SLOTS_ENV,
+            }
+            if high_k == P.K4:
+                details["n_k4_per_layer"] = high_capacity
+                details["pinned_k4"] = pinned_high
             raise AdminError(
                 "pin_would_starve_layer",
-                f"layer {layer}: after this pin change the decision loop "
-                f"would have {k4_free} free K4 slot(s) and {k3_free} free K3 "
-                f"slot(s), below the required {min_free_slots} "
-                f"({ADMIN_MIN_FREE_SLOTS_ENV}). policy.decide would refuse "
-                f"the layer outright ('pins incompatible with budget') and "
-                f"the loop would stop deciding. Send pin=\"release\" for some "
-                f"experts in this layer, or pin=\"none\" for this request.",
-                status=409,
-                details={"layer": layer, "n_k4_per_layer": n_k4,
-                         "pinned_k4": pin4, "pinned_k3": pin3,
-                         "free_k4_slots": k4_free, "free_k3_slots": k3_free,
-                         "min_free_slots": min_free_slots,
-                         "min_free_slots_env": ADMIN_MIN_FREE_SLOTS_ENV})
+                f"layer {layer}: after this pin change the prepared K{high_k} "
+                f"and K{low_k} tiers would have {high_free} and {low_free} "
+                f"free slot(s), below the required {min_free_slots} "
+                f"({ADMIN_MIN_FREE_SLOTS_ENV}). Send pin=\"release\" for "
+                f"some experts in this layer, or pin=\"none\" for this "
+                f"request.",
+                status=409, details=details)
     return free_slots
 
 
@@ -1496,7 +1559,9 @@ def plan_retier(state: Any, request: RetierRequest, *,
         registered = sorted(int(x) for x in engine.layers)
     resolved = resolve_items(
         request, layers=state.layers, tier_of=state.tier_of,
-        num_experts=int(state.num_experts), registered_layers=registered)
+        num_experts=int(state.num_experts), registered_layers=registered,
+        servable_tiers=(getattr(engine, "tier_bits", None)
+                        if engine is not None else None))
     effective = [i for i in resolved if i.outcome != "noop"]
 
     caps = (dict(state.policy_doc).get("budget") or {}).get("n_k4_per_layer")
@@ -1619,13 +1684,10 @@ def _provenance(state: Any, request: RetierRequest,
         "request_id": request_id,
         "actor": request.actor,
         "reason": request.reason,
-        # Stamped from the REQUEST when the router supplied it, so all four
-        # ranks commit an identical document. A per-rank time.strftime() here
-        # made the committed policies differ by provenance alone, which shows
-        # up later as /fq/state agreed=False after a swap that was in fact
-        # applied identically everywhere.
-        "utc": getattr(request, "utc", None) or time.strftime(
-            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        # The coordinator stamps one timestamp before broadcasting. Using a
+        # worker-local clock here makes policy_doc (and therefore policy_sha)
+        # diverge whenever ranks straddle a second boundary.
+        "utc": request.utc,
         "base_policy": base_policy,
         "num_swaps": sum(1 for i in resolved if i.outcome == "promoted"),
         "mode": request.mode,
@@ -1897,9 +1959,15 @@ def build_swap_engine(model_runner: Any, *, rank: int = 0,
 
     spec = ProgressiveSpec.from_env(environ=dict(_env(environ)))
     source = SW.ResolverFragmentSource(spec.make_resolver())
+    tier_pairs = {tuple(state.tier_bits) for state in layers.values()}
+    if len(tier_pairs) != 1:
+        raise ValueError(
+            f"mixed layers disagree on prepared tier pair: "
+            f"{sorted(tier_pairs)}")
+    tier_bits = next(iter(tier_pairs))
     return SW.SwapEngine(
         layers, source, hidden_size=hidden, intermediate_size=intermediate,
-        tier_bits=(P.K3, P.K4), rank=int(rank), max_pairs=int(max_pairs))
+        tier_bits=tier_bits, rank=int(rank), max_pairs=int(max_pairs))
 
 
 def _loop_state(worker: Any) -> Any:
@@ -2159,7 +2227,8 @@ def worker_describe(worker: Any, request_json: str = "{}") -> str:
             "occupancy": {str(k): {str(kk): vv for kk, vv in v.items()}
                           for k, v in occupancy_map(state).items()},
             "pinned": _pinned_from_doc(state.policy_doc),
-            "servable_tiers": list(SERVABLE_TIERS),
+            "servable_tiers": list(
+                getattr(engine, "tier_bits", SERVABLE_TIERS)),
             "engine_bound": engine is not None,
             "registered_layers": (sorted(int(x) for x in engine.layers)
                                   if engine is not None else []),
@@ -2556,10 +2625,21 @@ def build_router(*, environ: Mapping[str, str] | None = None) -> Any:
             return _fail(blocked)
         t0 = time.perf_counter()
         try:
+            raw_body = await raw_request.body()
+            max_body_bytes = _env_int(
+                environ, ADMIN_MAX_BODY_BYTES_ENV, DEFAULT_MAX_BODY_BYTES
+            )
+            if len(raw_body) > max_body_bytes:
+                raise AdminError(
+                    "request_too_large",
+                    f"request body exceeds {max_body_bytes} bytes",
+                    status=413,
+                    details={"bytes": len(raw_body), "max_bytes": max_body_bytes},
+                )
             body = None
-            if (await raw_request.body()).strip():
+            if raw_body.strip():
                 try:
-                    body = await raw_request.json()
+                    body = json.loads(raw_body)
                 except Exception:  # noqa: BLE001
                     raise AdminError("bad_json",
                                      "body is not valid JSON") from None
@@ -2570,6 +2650,12 @@ def build_router(*, environ: Mapping[str, str] | None = None) -> Any:
         except AdminError as exc:
             return _fail(exc)
 
+        # Ignore any caller-supplied timestamp. This is internal provenance:
+        # stamp it once here, then carry it in canonical() to every rank.
+        request = replace(
+            request,
+            utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        )
         request_id = new_request_id()
         logger.warning(
             "FQ ADMIN retier request=%s actor=%s mode=%s items=%d layers=%s "

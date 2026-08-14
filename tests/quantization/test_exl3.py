@@ -92,6 +92,14 @@ def test_glm_model_retains_quant_config_for_weight_loading(monkeypatch):
         ({"codebook": "mul1"}, "MCG codebook"),
         ({"moe_layers": [77, 3]}, "moe_layers"),
         ({"tensor_schema": "unsupported"}, "tensor schema"),
+        (
+            {
+                "bits": "mixed",
+                "bits_per_expert": "tier_bitmap.json:k",
+                "k_values": [1, 4],
+            },
+            "within 2..6",
+        ),
     ],
 )
 def test_rank_sliced_metadata_fails_closed(overrides, message):
@@ -122,12 +130,12 @@ def test_mixed_rank_sliced_metadata_hydrates_per_layer_bitrates(monkeypatch):
     metadata = _rank_sliced_metadata(
         bits="mixed",
         bits_per_expert="tier_bitmap.json:k",
-        k_values=[3, 4],
+        k_values=[2, 4],
         experts_per_layer=4,
         moe_layers=[77, 78],
     )
     payload = {
-        "77": {"k": [3, 4, 3, 4]},
+        "77": {"k": [2, 4, 2, 4]},
         # The checkpoint's MTP overlay records a uniform K3 tail this way.
         "78": {"tail_tr3": [0, 1, 2, 3]},
     }
@@ -144,11 +152,11 @@ def test_mixed_rank_sliced_metadata_hydrates_per_layer_bitrates(monkeypatch):
     )
 
     assert config.bits is None
-    assert config.rank_sliced_k_values == (3, 4)
+    assert config.rank_sliced_k_values == (2, 4)
     assert config.rank_sliced_layer_bitrates("model.layers.77.mlp.experts") == (
-        3,
+        2,
         4,
-        3,
+        2,
         4,
     )
     assert config.rank_sliced_layer_bitrates("model.layers.78.mlp.experts") == (
@@ -208,10 +216,10 @@ def test_rank_sliced_parameter_preallocates_projection_major_slab(monkeypatch):
     torch.testing.assert_close(param.exl3_tensors[(2, "w3")], w3)
 
 
-def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
+@pytest.mark.parametrize("bits", [2, 3])
+def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch, bits):
     experts = 2
     hidden = intermediate = 128
-    bits = 3
     slabs = {
         "w13_trellis": torch.zeros(
             (2, experts, hidden // 16, intermediate // 16, 16 * bits),
@@ -278,10 +286,13 @@ def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
     assert api.prepare_kwargs["trellis_mcg"] is marker
 
 
-def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypatch):
+@pytest.mark.parametrize("low_bits", [2, 3])
+def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(
+    monkeypatch, low_bits
+):
     experts = 4
     hidden = intermediate = 128
-    bitrates = (3, 4, 3, 4)
+    bitrates = (low_bits, 4, low_bits, 4)
 
     def parameter(shard_ids=(), tensors=None, backing=None):
         return SimpleNamespace(
@@ -328,10 +339,25 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypat
     class FakeMixedApi:
         def __init__(self):
             self.prepared = []
+            self.compiled = []
 
         def prepare_weights(self, **kwargs):
             self.prepared.append(kwargs)
             return SimpleNamespace(**kwargs)
+
+        @staticmethod
+        def max_packed_route_slots(routes, block_size, total_experts):
+            del block_size, total_experts
+            return routes
+
+        def compile_mixed_trellis(self, **kwargs):
+            self.compiled.append(kwargs)
+            return SimpleNamespace()
+
+        @staticmethod
+        def make_mixed_trellis_buffers(launch, *, device, sms):
+            del launch, device, sms
+            return SimpleNamespace()
 
         @staticmethod
         def build_tiered_maps(tier0, tier1, *, device):
@@ -351,9 +377,10 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypat
     method = object.__new__(Exl3MoEMethod)
     method._rank_sliced_backing = lambda _layer, name: slabs[name]
 
+    method.quant_config = SimpleNamespace()
     method._prepare_mixed_rank_sliced_weights(layer)
 
-    assert [entry["trellis_bits"] for entry in api.prepared] == [3, 4]
+    assert [entry["trellis_bits"] for entry in api.prepared] == [low_bits, 4]
     assert [entry["num_experts"] for entry in api.prepared] == [2, 2]
     for entry in api.prepared:
         bits = entry["trellis_bits"]
@@ -375,11 +402,30 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypat
         (128, 128, 128, 128),
     ]
     assert layer.exl3_mixed_trellis["tier_ids"] == ((0, 2), (1, 3))
-    assert layer.exl3_mixed_trellis["tier_bits"] == (3, 4)
+    assert layer.exl3_mixed_trellis["tier_bits"] == (low_bits, 4)
     assert layer.w13_trellis.exl3_tensors == {}
     assert layer.w2_trellis.exl3_tensors == {}
     assert layer.w13_suh.exl3_backing is None
     assert layer.w2_svh.exl3_backing is None
+    layer.exl3_max_num_batched_tokens = 4
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties",
+        lambda _device: SimpleNamespace(
+            multi_processor_count=188,
+            shared_memory_per_block_optin=101376,
+        ),
+    )
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: False
+    )
+    exl3_module._MIXED_TRELLIS_RUNTIMES.clear()
+    method._mixed_rank_sliced_runtime(
+        layer,
+        torch.zeros((1, hidden), dtype=torch.float16),
+        torch.zeros((1, 2), dtype=torch.int64),
+    )
+    assert {(call["tier0_bits"], call["tier1_bits"])
+            for call in api.compiled} == {(low_bits, 4)}
 
 
 def test_mixed_trellis_buffer_accounting_ignores_metadata() -> None:

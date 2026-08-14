@@ -42,6 +42,7 @@ try:
         DEFAULT_CACHE_DIR,
         FragmentResolver,
         read_safetensors_header,
+        project_bits_to_available,
     )
 except ImportError:  # standalone execution (tests / CLI without built vllm)
     import importlib.util as _ilu
@@ -59,6 +60,7 @@ except ImportError:  # standalone execution (tests / CLI without built vllm)
     FQ_CACHE_ENV = _mod.FQ_CACHE_ENV
     DEFAULT_CACHE_DIR = _mod.DEFAULT_CACHE_DIR
     FragmentResolver = _mod.FragmentResolver
+    project_bits_to_available = _mod.project_bits_to_available
     read_safetensors_header = _mod.read_safetensors_header
 
 FQ_MANIFEST_DIR_ENV = "VLLM_FQ_MANIFEST_DIR"
@@ -128,17 +130,29 @@ class ProgressiveSpec:
 
         policy_path: Path | None = None
         policy_ref = overrides.get("policy") or environ.get(FQ_POLICY_ENV)
+        # A committed live policy is the restart source of truth. Loading the
+        # explicit boot policy first reconstructs yesterday's slabs while the
+        # loop rehydrates current.json, so its tier_of immediately disagrees
+        # with the device after any successful live re-tier.
+        policy = None
+        if policy_ref is None and manifest_path.is_file():
+            manifest_identity = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            policy = cls._policy_from_store(manifest_identity, environ)
         if policy_ref:
             policy_path = Path(policy_ref)
-            policy = json.loads(policy_path.read_text())
-        else:
-            policy = cls._policy_from_store(manifest_path, environ)
-            if policy is None:
-                raise ValueError(
-                    "load_format=progressive found no policy: set "
-                    f"{FQ_POLICY_ENV} to a fq-policy JSON or commit one to "
-                    "the PolicyStore for this manifest"
-                )
+            boot_policy = json.loads(policy_path.read_text())
+            policy = cls._policy_from_store(
+                str(boot_policy.get("manifest") or ""), environ)
+            if policy is not None:
+                policy_path = None
+            else:
+                policy = boot_policy
+        if policy is None:
+            raise ValueError(
+                "load_format=progressive found no policy: set "
+                f"{FQ_POLICY_ENV} to a fq-policy JSON or commit one to "
+                "the PolicyStore for this manifest"
+            )
 
         bpe = policy.get("bits_per_expert")
         if not isinstance(bpe, dict) or not bpe:
@@ -200,11 +214,19 @@ class ProgressiveSpec:
 
     @staticmethod
     def _policy_from_store(
-        manifest_path: Path, environ: dict[str, str]
+        manifest_identity: str, environ: dict[str, str]
     ) -> dict | None:
-        """PolicyStore fallback: current.json keyed by the manifest hash."""
-        if not manifest_path.exists():
+        """Load current.json using a safe manifest identity."""
+        if not manifest_identity:
             return None
+        if (
+            len(manifest_identity) > 128
+            or manifest_identity in (".", "..")
+            or re.fullmatch(r"[A-Za-z0-9._-]+", manifest_identity) is None
+        ):
+            raise ValueError(
+                f"invalid policy manifest identity {manifest_identity!r}"
+            )
         try:
             from vllm.model_executor.layers.quantization.exl3_fungible.store import (
                 PolicyStore,
@@ -221,11 +243,16 @@ class ProgressiveSpec:
             _sys.modules[_spec.name] = _mod
             _spec.loader.exec_module(_mod)
             PolicyStore = _mod.PolicyStore
-        manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        # ``fq-manifest.json`` is rewritten as segment inventory grows, while
+        # fq-policy/2 pins the immutable release identity used by PolicyStore.
+        # The policy loop stores under ~/.cache/vllm by default. Fragment
+        # payloads have a separate ~/.cache/vllm/fq default and must not
+        # redirect restart recovery unless the policy root is explicit.
         cache_root = Path(
-            environ.get(FQ_CACHE_ENV) or os.path.expanduser(DEFAULT_CACHE_DIR)
+            environ.get("VLLM_FQ_CACHE_ROOT")
+            or os.path.expanduser("~/.cache/vllm")
         )
-        store = PolicyStore(cache_root, manifest_hash)
+        store = PolicyStore(cache_root, manifest_identity)
         return store.load_current()
 
     def make_resolver(self, **kwargs: Any) -> FragmentResolver:
@@ -641,6 +668,67 @@ def progressive_weights_iterator(
 # --------------------------------------------------------------- metadata
 
 
+def project_boot_policy(
+    policy: dict,
+    resolver: FragmentResolver,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> tuple[dict, list[tuple[int, int, int, int]]]:
+    """Resolve fallback Ks before their bitmap sizes model parameters."""
+    projected, substitutions, missing = project_bits_to_available(
+        resolver, policy["bits_per_expert"], log=log
+    )
+    if missing:
+        raise ValueError(
+            "progressive boot cannot supply any tier for "
+            f"{len(missing)} expert(s), first={missing[:8]}"
+        )
+    bad_layers = {
+        int(layer): sorted({int(k) for k in bits})
+        for layer, bits in projected.items()
+        if len({int(k) for k in bits}) > 2
+    }
+    if bad_layers:
+        raise ValueError(
+            "fallback projection would create non-binary mixed layers: "
+            f"{bad_layers}; provide the requested fragments or choose a "
+            "binary policy that matches available tiers"
+        )
+
+    effective = json.loads(json.dumps(policy))
+    effective["bits_per_expert"] = {
+        str(layer): [int(k) for k in bits]
+        for layer, bits in projected.items()
+    }
+    budget = dict(effective.get("budget") or {})
+    if "n_k4_per_layer" in budget:
+        budget["n_k4_per_layer"] = {
+            str(layer): sum(int(k) == 4 for k in bits)
+            for layer, bits in projected.items()
+        }
+    effective["budget"] = budget
+    if substitutions:
+        provenance = dict(effective.get("provenance") or {})
+        encoded = json.dumps(
+            substitutions, separators=(",", ":"), sort_keys=True
+        ).encode()
+        provenance["boot_projection"] = {
+            "substitutions": len(substitutions),
+            "selection_sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+        effective["provenance"] = provenance
+    return effective, substitutions
+
+
+def write_effective_policy(policy: dict, out_path: str | Path) -> Path:
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(out_path.suffix + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(policy, sort_keys=True, indent=1) + "\n")
+    os.replace(tmp, out_path)
+    return out_path
+
+
 def write_tier_bitmap(
     policy: dict,
     out_path: str | Path,
@@ -730,6 +818,14 @@ def main(argv: list[str] | None = None) -> int:
         help="tier bitmap path (default: <cache>/boot/<policy digest>.json)",
     )
     p.add_argument(
+        "--effective-policy-out",
+        default=None,
+        help=(
+            "write the pre-resolved boot policy here; required when fallback "
+            "changes any K so the loader and live loop share device truth"
+        ),
+    )
+    p.add_argument(
         "--extra-overrides",
         default=None,
         help="JSON dict merged into the emitted overrides",
@@ -746,22 +842,39 @@ def main(argv: list[str] | None = None) -> int:
         if v
     }
     spec = ProgressiveSpec.from_env(overrides=overrides_in)
+    import sys
+
+    resolver = spec.make_resolver()
+    effective, substitutions = project_boot_policy(
+        spec.policy, resolver, log=lambda msg: print(msg, file=sys.stderr)
+    )
+    if substitutions and not args.effective_policy_out:
+        raise ValueError(
+            "fallback changed the boot bitmap; pass --effective-policy-out "
+            "and launch with VLLM_FQ_POLICY set to that file"
+        )
+    if args.effective_policy_out:
+        write_effective_policy(effective, args.effective_policy_out)
+
     bitmap_path = args.bitmap_out
+    effective_digest = _policy_digest(effective)
     if bitmap_path is None:
         cache_root = Path(
             os.environ.get(FQ_CACHE_ENV) or os.path.expanduser(DEFAULT_CACHE_DIR)
         )
-        bitmap_path = cache_root / "boot" / f"{spec.policy_digest[:16]}.tier_bitmap.json"
-    write_tier_bitmap(spec.policy, bitmap_path)
+        bitmap_path = (
+            cache_root / "boot"
+            / f"{effective_digest[:16]}.tier_bitmap.json"
+        )
+    write_tier_bitmap(effective, bitmap_path)
     extra = json.loads(args.extra_overrides) if args.extra_overrides else None
     overrides = synthesize_hf_overrides(
-        spec.dense_source, spec.policy, bitmap_path, extra=extra
+        spec.dense_source, effective, bitmap_path, extra=extra
     )
-    import sys
 
     print(json.dumps(overrides, separators=(",", ":")))
     print(f"tier bitmap: {bitmap_path}", file=sys.stderr)
-    print(f"policy digest: {spec.policy_digest}", file=sys.stderr)
+    print(f"policy digest: {effective_digest}", file=sys.stderr)
     return 0
 
 

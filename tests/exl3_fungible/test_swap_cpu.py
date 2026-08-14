@@ -74,6 +74,16 @@ def test_plan_from_memberships_deterministic_and_ordered():
     assert plan.layers() == (0, 1)
 
 
+def test_plan_supports_k2_k4_memberships():
+    old = np.array([[4, 2, 2, 4], [2, 4, 4, 2]])
+    new = np.array([[2, 4, 2, 4], [4, 4, 2, 2]])
+    plan = fq_swap.SwapPlan.from_memberships(old, new)
+    assert plan.swaps == ((0, 0, 1), (1, 2, 0))
+    with pytest.raises(ValueError, match="binary mixed-trellis"):
+        fq_swap.SwapPlan.from_memberships(
+            [[2, 3, 4]], [[2, 3, 4]])
+
+
 def test_plan_inverse_restores_membership():
     rng = np.random.default_rng(7)
     L, En, n4 = 5, 16, 6
@@ -172,7 +182,7 @@ def test_segment_source_fail_closed(toy_root):
 # ------------------------------------------------- engine apply, CPU tensors
 
 
-def _cpu_state(ckpt, t0_globals, t1_globals):
+def _cpu_state(ckpt, t0_globals, t1_globals, tier_bits=(3, 4)):
     """Hand-assembled layer state on CPU (fresh-build reference shape)."""
     def tier(globals_, k):
         t = toy.assemble_membership_tensors(ckpt, globals_, k)
@@ -182,8 +192,8 @@ def _cpu_state(ckpt, t0_globals, t1_globals):
             w2=t["w2"].view(torch.int32).reshape(-1),
         ), t
 
-    tier0, r0 = tier(t0_globals, 3)
-    tier1, r1 = tier(t1_globals, 4)
+    tier0, r0 = tier(t0_globals, tier_bits[0])
+    tier1, r1 = tier(t1_globals, tier_bits[1])
     rotations = SimpleNamespace(
         intermediate=torch.cat((r0["intermediate"], r1["intermediate"])),
         gate_suh=torch.cat((r0["gate_suh"], r1["gate_suh"])),
@@ -195,10 +205,12 @@ def _cpu_state(ckpt, t0_globals, t1_globals):
     return fq_swap.MixedLayerState(
         tier0=tier0, tier1=tier1, rotations=rotations,
         global_to_combined=g2c, descriptor_map=desc,
-        tier0_globals=list(t0_globals), tier1_globals=list(t1_globals))
+        tier0_globals=list(t0_globals), tier1_globals=list(t1_globals),
+        tier_bits=tuple(tier_bits))
 
 
 def _make_engine(root, state, **kw):
+    kw.setdefault("tier_bits", state.tier_bits)
     return fq_swap.SwapEngine(
         {toy.LAYER_ID: state}, fq_swap.LocalSegmentSource(root),
         hidden_size=toy.HIDDEN, intermediate_size=toy.INTERMEDIATE,
@@ -243,6 +255,66 @@ def test_apply_matches_fresh_build_and_rolls_back(toy_root):
     engine.apply(plan.inverse(), quiesce=nullcontext())
     assert engine.generation == 2
     _assert_states_equal(state, pristine)
+
+
+def test_k2_k4_apply_matches_fresh_build_and_rolls_back(tmp_path):
+    ckpt = toy.make_toy_checkpoint(E, ks=(2, 4))
+    toy.write_toy_segments(tmp_path, ckpt, ks=(2, 4))
+    state = _cpu_state(
+        ckpt, T0_GLOBALS, T1_GLOBALS, tier_bits=(2, 4))
+    pristine = _cpu_state(
+        ckpt, T0_GLOBALS, T1_GLOBALS, tier_bits=(2, 4))
+    engine = _make_engine(tmp_path, state)
+    plan = fq_swap.SwapPlan([(toy.LAYER_ID, 1, 4)])
+
+    report = engine.apply(plan, quiesce=nullcontext())
+    assert report.pairs == 1 and report.generation == 1
+    expected = _cpu_state(
+        ckpt, [0, 2, 1, 5, 6], [3, 4, 7], tier_bits=(2, 4))
+    _assert_states_equal(state, expected)
+
+    engine.apply(plan.inverse(), quiesce=nullcontext())
+    _assert_states_equal(state, pristine)
+
+
+def test_k2_k4_fail_atomic_abort_is_never_torn(tmp_path):
+    ckpt = toy.make_toy_checkpoint(E, ks=(2, 4))
+    toy.write_toy_segments(tmp_path, ckpt, ks=(2, 4))
+    plan = fq_swap.SwapPlan([(toy.LAYER_ID, 1, 4)])
+    pristine = _cpu_state(
+        ckpt, T0_GLOBALS, T1_GLOBALS, tier_bits=(2, 4))
+    committed = _cpu_state(
+        ckpt, [0, 2, 1, 5, 6], [3, 4, 7], tier_bits=(2, 4))
+
+    class InjectedFailure(RuntimeError):
+        pass
+
+    for abort_at in fq_swap.COMMIT_STEPS:
+        state = _cpu_state(
+            ckpt, T0_GLOBALS, T1_GLOBALS, tier_bits=(2, 4))
+        engine = _make_engine(tmp_path, state)
+        staged = engine.stage(plan, fail_atomic=True)
+
+        def fail_after(step, *, expected=abort_at):
+            if step == expected:
+                raise InjectedFailure(step)
+
+        with pytest.raises(InjectedFailure, match=abort_at):
+            engine.apply(
+                staged=staged,
+                quiesce=nullcontext(),
+                step_hook=fail_after,
+            )
+
+        expected = (
+            pristine
+            if abort_at in ("slabs", "rotations")
+            else committed
+        )
+        _assert_states_equal(state, expected)
+        assert engine.generation == (
+            0 if abort_at in ("slabs", "rotations") else 1
+        )
 
 
 def test_apply_multi_pair_same_layer(toy_root):

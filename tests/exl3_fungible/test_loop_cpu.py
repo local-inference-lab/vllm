@@ -149,6 +149,31 @@ def test_interval_fires_on_schedule(monkeypatch):
     assert fired == [4, 8]
 
 
+def test_k2_k4_collects_but_skips_k3_k4_auto_policy():
+    doc = boot_doc()
+    doc["bits_per_expert"] = {
+        key: [4, 4, 2, 2, 2, 2, 2, 2]
+        for key in doc["bits_per_expert"]
+    }
+    collector, routers = make_collector()
+    state = FL.FungibleQuantState(
+        collector, doc,
+        config=FL.FqLoopConfig(
+            interval_steps=1, dwell_steps=0, jaccard_floor=0.0),
+        eps=eps_hot4())
+
+    for _ in range(2):
+        route(routers, [[4, 4], [4, 1]])
+        state.step()
+    assert state._real_steps == 2
+    assert state._intervals_run == 0
+    assert state._auto_decisions_supported is False
+    for layer in LAYERS:
+        count, _ = collector.decayed(layer)
+        assert count[4].item() == 6
+        assert count[1].item() == 2
+
+
 def test_interval_exception_does_not_propagate(monkeypatch):
     state, routers = make_state(interval=2)
     monkeypatch.setattr(state, "run_interval",
@@ -412,12 +437,16 @@ def test_build_from_env_policy_path_and_rehydration(tmp_path, monkeypatch):
     assert state is not None
     assert state.layers == LAYERS
     assert (state.store.root / "current.json").exists()
-    boot_sha = state.policy_sha
+    committed = json.loads(json.dumps(boot_doc()))
+    committed["bits_per_expert"]["3"] = [2, 4, 2, 2, 4, 2, 2, 2]
+    state.store.commit(committed, num_experts=collector.num_experts)
 
-    # Second boot rehydrates the committed policy (D8), same identity.
+    # Second boot rehydrates the committed K2/K4 policy, not the boot file.
     collector2, _ = make_collector()
     state2 = FL.build_from_env(collector2)
-    assert state2.policy_sha == boot_sha
+    assert state2.policy_sha == S.policy_hash(committed)
+    assert state2.tier_of[0].tolist() == [2, 4, 2, 2, 4, 2, 2, 2]
+    assert state2.policy_doc == committed
     # Non-lead ranks compute but never persist.
     state3 = FL.build_from_env(make_collector()[0], rank=1)
     assert state3.store is None and state3.is_lead is False

@@ -242,6 +242,7 @@ def _load_b12x_mixed_trellis() -> Any:
         max_packed_route_slots=host.max_packed_route_slots,
         prepare_weights=prepare.prepare_trellis256_moe_weights,
         run_mixed_trellis=module.run_mixed_trellis,
+        warmup_mixed_trellis_route_pack=module.warmup_mixed_trellis_route_pack,
     )
     _B12X_MIXED_TRELLIS_API = api
     return api
@@ -490,9 +491,9 @@ class Exl3Config(QuantizationConfig):
             k_values = tuple(
                 sorted({int(value) for value in metadata.get("k_values", ())})
             )
-            if not k_values or any(value not in (3, 4, 5, 6) for value in k_values):
+            if not k_values or any(value not in (2, 3, 4, 5, 6) for value in k_values):
                 raise ValueError(
-                    "mixed rank-sliced EXL3 requires k_values within 3..6, got "
+                    "mixed rank-sliced EXL3 requires k_values within 2..6, got "
                     f"{metadata.get('k_values')!r}"
                 )
             if not isinstance(metadata.get("bits_per_expert"), str):
@@ -537,17 +538,20 @@ class Exl3Config(QuantizationConfig):
                     f"rank-sliced EXL3 bitrate map is missing layer {layer_index}"
                 )
             raw = entry.get(field)
+            allowed_for_layer = allowed
             # The GLM-5.2 MTP overlay records all routed experts under tail_tr3
-            # instead of repeating a 256-entry K3 vector.
+            # instead of repeating a 256-entry K3 vector. This fixed K3 overlay
+            # is outside the re-tierable pair declared by k_values.
             if raw is None and len(entry.get("tail_tr3", ())) == experts:
                 raw = [3] * experts
+                allowed_for_layer = allowed | {3}
             if not isinstance(raw, list) or len(raw) != experts:
                 raise ValueError(
                     "rank-sliced EXL3 bitrate map must contain one entry per expert: "
                     f"layer={layer_index}, field={field!r}, expected={experts}"
                 )
             bitrates = tuple(int(value) for value in raw)
-            unexpected = sorted(set(bitrates).difference(allowed))
+            unexpected = sorted(set(bitrates).difference(allowed_for_layer))
             if unexpected:
                 raise ValueError(
                     f"rank-sliced EXL3 layer {layer_index} uses undeclared bitrates "
@@ -1729,9 +1733,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 f"{layer_bitrates!r}"
             )
         bits = int(layer_bitrates[0])
-        if bits not in (3, 4, 5, 6):
+        if bits not in (2, 3, 4, 5, 6):
             raise ValueError(
-                f"rank-sliced EXL3 requires an integral 3/4/5/6 bitrate, got {bits!r}"
+                f"rank-sliced EXL3 requires an integral 2/3/4/5/6 bitrate, got "
+                f"{bits!r}"
             )
 
         w13 = self._rank_sliced_backing(layer, "w13_trellis")
@@ -1856,6 +1861,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         runtime = _MIXED_TRELLIS_RUNTIMES.get(key)
         if runtime is not None:
+            mixed["runtime"] = runtime
             return runtime
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -1921,6 +1927,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "max_batched_tokens": max_batched_tokens,
         }
         _MIXED_TRELLIS_RUNTIMES[key] = runtime
+        mixed["runtime"] = runtime
         buffer_bytes = _unique_tensor_storage_bytes(
             decode["buffers"], prefill["buffers"]
         )
@@ -2444,4 +2451,60 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         return output[..., :logical_n]
 
 
-__all__ = ["Exl3Config", "Exl3LinearMethod", "Exl3MoEMethod"]
+def warmup_exl3_mixed_trellis_route_pack(model: torch.nn.Module) -> int:
+    """Materialize mixed-Trellis route-pack modules before KV sizing.
+
+    The first profile pass creates every layer's immutable mixed-Trellis
+    runtime. Route packing itself has power-of-two capacity specializations,
+    however, so profiling only the maximum batch leaves smaller decode,
+    speculative, and final-prefill-chunk modules lazy. Delegate enumeration to
+    B12X while those persistent CUDA allocations can still be measured by the
+    worker's second profile pass.
+    """
+    warmed = 0
+    seen_states: set[tuple[int, int, int]] = set()
+    for module in model.modules():
+        routed_experts = getattr(module, "routed_experts", module)
+        mixed = getattr(routed_experts, "exl3_mixed_trellis", None)
+        if not isinstance(mixed, dict):
+            continue
+
+        runtime = mixed.get("runtime")
+        if runtime is None:
+            layer_name = getattr(routed_experts, "layer_name", "<unknown>")
+            raise RuntimeError(
+                "mixed-bitrate EXL3 route-pack warmup found no runtime for "
+                f"{layer_name}; the eager profile pass must plan the runtime "
+                "before kernel warmup"
+            )
+        api = runtime["api"]
+        warmup = getattr(api, "warmup_mixed_trellis_route_pack", None)
+        if not callable(warmup):
+            raise RuntimeError(
+                "mixed-bitrate EXL3 route-pack warmup requires a matching B12X build"
+            )
+
+        for state_name in ("decode", "prefill"):
+            state = runtime.get(state_name)
+            if state is None:
+                continue
+            state_key = (id(api), id(state["launch"]), id(state["buffers"]))
+            if state_key in seen_states:
+                continue
+            seen_states.add(state_key)
+            warmed += int(
+                warmup(
+                    state["launch"],
+                    state["buffers"],
+                    expert_map=mixed["global_to_combined"],
+                )
+            )
+    return warmed
+
+
+__all__ = [
+    "Exl3Config",
+    "Exl3LinearMethod",
+    "Exl3MoEMethod",
+    "warmup_exl3_mixed_trellis_route_pack",
+]

@@ -38,6 +38,14 @@ def test_commit_and_rehydrate(tmp_path):
     assert doc["bits_per_expert"]["3"] == [4, 4, 3, 3]
 
 
+def test_commit_and_rehydrate_k2_k4_policy(tmp_path):
+    s = st.PolicyStore(tmp_path, "m0")
+    doc = make_doc()
+    doc["bits_per_expert"]["3"] = [4, 4, 2, 2]
+    s.commit(doc, num_experts=4)
+    assert s.load_current(num_experts=4)["bits_per_expert"]["3"] == [4, 4, 2, 2]
+
+
 def test_history_rotation_bounded(tmp_path):
     s = st.PolicyStore(tmp_path, "m0")
     for i in range(st.HISTORY_KEEP + 4):
@@ -65,8 +73,12 @@ def test_validation_rejects_bad_docs(tmp_path):
     s = st.PolicyStore(tmp_path, "m0")
     bad = make_doc()
     bad["bits_per_expert"]["3"][0] = 5
-    with pytest.raises(ValueError, match=r"non-\{3,4\}"):
+    with pytest.raises(ValueError, match=r"non-\{2,3,4\}"):
         s.commit(bad, num_experts=4)
+    three_tiers = make_doc(e=6)
+    three_tiers["bits_per_expert"]["3"] = [2, 3, 3, 4, 4, 4]
+    with pytest.raises(ValueError, match="binary pair"):
+        s.commit(three_tiers, num_experts=6)
     topo = make_doc()
     topo["rank"] = 0
     with pytest.raises(ValueError, match="topology-neutral"):

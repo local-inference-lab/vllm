@@ -11,7 +11,9 @@ alongside under ``stats/`` keyed by the policy hash they informed.
 
 Policies are keyed by logical expert id only — no rank/world_size/tp/device
 fields (D4). ``n_k4_per_layer`` is capacity-fixed at startup (D1); a policy
-whose counts differ is applied by projection (policy.project) only.
+whose counts differ is applied by projection (policy.project) only. Mixed
+serves are binary: each layer may use at most two of the SM120-servable
+K2/K3/K4 tiers.
 """
 from __future__ import annotations
 
@@ -42,9 +44,15 @@ def validate_policy(doc: dict, *, num_experts: int | None = None) -> None:
         if num_experts is not None and len(bits) != num_experts:
             raise ValueError(
                 f"layer {layer}: {len(bits)} entries != {num_experts} experts")
-        bad = [b for b in bits if b not in (3, 4)]
+        bad = [b for b in bits if b not in (2, 3, 4)]
         if bad:
-            raise ValueError(f"layer {layer}: non-{{3,4}} bits {bad[:4]}")
+            raise ValueError(
+                f"layer {layer}: non-{{2,3,4}} bits {bad[:4]}")
+        tiers = sorted({int(b) for b in bits})
+        if len(tiers) > 2:
+            raise ValueError(
+                f"layer {layer}: mixed policy has {len(tiers)} tiers "
+                f"{tiers}; the kernel and swap engine require a binary pair")
         if layer in caps and sum(b == 4 for b in bits) != caps[layer]:
             raise ValueError(
                 f"layer {layer}: K4 occupancy != declared n_k4_per_layer "

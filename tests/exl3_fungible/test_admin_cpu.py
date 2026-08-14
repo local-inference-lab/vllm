@@ -110,6 +110,15 @@ def boot_doc():
     }
 
 
+def k2k4_doc():
+    doc = boot_doc()
+    doc["bits_per_expert"] = {
+        key: [4] * N_K4 + [2] * (E - N_K4)
+        for key in doc["bits_per_expert"]
+    }
+    return doc
+
+
 def make_state(tmp_path=None, *, doc=None, metrics=None, rank=0):
     doc = doc or boot_doc()
     collector = FqStatsCollector(E, window_len=8, window_stride=2, decay=0.9,
@@ -145,11 +154,13 @@ class FakeEngine:
     uses this is what the admin layer decided BEFORE the engine is reached.
     """
 
-    def __init__(self, layers=None, *, max_pairs=32, fail_apply=None):
+    def __init__(self, layers=None, *, max_pairs=32, fail_apply=None,
+                 tier_bits=(P.K3, P.K4)):
         self.layers = {lid: object() for lid in (layers or LAYERS)}
         self.max_pairs = max_pairs
         self.hidden_size = HIDDEN
         self.intermediate_size = INTERMEDIATE
+        self.tier_bits = tuple(tier_bits)
         self.generation = 0
         self.source = None
         self.staged = []
@@ -247,6 +258,7 @@ def balanced_body(**kw):
 
 @pytest.mark.parametrize("sent,interpretation,k,delta", [
     (-1, "relative", None, -1),          # negative number: no negative K
+    (2, "absolute", 2, None),
     (3, "absolute", 3, None),            # "absolute like adjust_k=3"
     (4, "absolute", 4, None),
     ("+1", "relative", None, 1),         # explicit sign survives JSON
@@ -260,7 +272,7 @@ def test_adjust_k_table(sent, interpretation, k, delta):
                                                            delta)
 
 
-@pytest.mark.parametrize("sent", [1, 0, 2, 5])
+@pytest.mark.parametrize("sent", [1, 0, 5])
 def test_adjust_k_positive_outside_ladder_is_ambiguous(sent):
     with pytest.raises(A.AdminError) as e:
         req({"items": [{"layer": 23, "expert": 0, "adjust_k": sent}]})
@@ -327,6 +339,28 @@ def test_too_many_items(monkeypatch):
         req({"items": [{"layer": 23, "expert": i, "adjust_k": -1}
                        for i in range(3)]}, environ=env)
     assert e.value.code == "too_many_items"
+
+
+@pytest.mark.parametrize("timeout_s", [0, -1, float("inf"), float("nan"), 3601])
+def test_timeout_must_be_finite_positive_and_bounded(timeout_s):
+    with pytest.raises(A.AdminError) as e:
+        req(balanced_body(timeout_s=timeout_s))
+    assert e.value.code == "bad_json"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("actor", "a" * (A.MAX_ACTOR_CHARS + 1)),
+        ("reason", "r" * (A.MAX_REASON_CHARS + 1)),
+        ("expect_policy_sha", "s" * (A.MAX_POLICY_SHA_CHARS + 1)),
+        ("actor", {"nested": "object"}),
+    ],
+)
+def test_audit_metadata_is_bounded_scalar_text(field, value):
+    with pytest.raises(A.AdminError) as e:
+        req(balanced_body(**{field: value}))
+    assert e.value.code == "bad_json"
 
 
 def test_query_shorthand_desugars():
@@ -405,7 +439,7 @@ def test_k5_is_refused_with_both_reasons():
             layers=state.layers, tier_of=state.tier_of, num_experts=E)
     assert e.value.code == "tier_not_servable"
     assert e.value.status == 501
-    assert "two-tier engine" in e.value.message
+    assert "running mixed pair" in e.value.message
     assert "109568" in e.value.message and "101376" in e.value.message
 
 
@@ -444,6 +478,33 @@ def test_absolute_and_relative_spellings_agree(tmp_path):
     # Only the provenance (which records the literal spelling, the actor and
     # the timestamp) distinguishes the two documents.
     assert rel.policy_sha_after != absolute.policy_sha_after
+
+
+def test_k2_k4_pair_plans_applies_and_persists(tmp_path):
+    state, _ = make_state(tmp_path, doc=k2k4_doc())
+    engine = FakeEngine(tier_bits=(P.K2, P.K4))
+    request = req({
+        "items": [
+            {"layer": 23, "expert": 0, "k": 2},
+            {"layer": 23, "expert": 8, "k": 4},
+        ],
+        "pin": "none",
+    })
+    plan = A.plan_retier(
+        state, request, engine=engine, resolver=FakeResolver(),
+        memory=memory_model())
+    assert plan.plan == SW.SwapPlan([(23, 0, 8)])
+    assert plan.memory["delta_bytes_per_rank"] == 0
+
+    result = A.apply_retier(state, plan, engine=engine)
+    assert result["applied"] is True
+    row = state.layers.index(23)
+    assert int(state.tier_of[row, 0]) == P.K2
+    assert int(state.tier_of[row, 8]) == P.K4
+    committed = S.PolicyStore(
+        tmp_path, "m" * 64).load_current(num_experts=E)
+    assert committed["bits_per_expert"]["23"] == [
+        int(k) for k in state.tier_of[row]]
 
 
 def test_lone_promotion_is_refused_and_nothing_is_staged(tmp_path):
@@ -1146,6 +1207,19 @@ def test_token_gate_survives_a_non_ascii_header():
     assert "fq_admin_plan" not in engine.events
 
 
+def test_retier_body_size_is_bounded_before_collective_rpc():
+    client, engine, _ = make_client(
+        enabled_env(**{A.ADMIN_MAX_BODY_BYTES_ENV: "128"})
+    )
+    resp = client.post(
+        "/fq/retier",
+        json=balanced_body(reason="r" * 256),
+    )
+    assert resp.status_code == 413
+    assert resp.json()["error"]["code"] == "request_too_large"
+    assert "fq_admin_plan" not in engine.events
+
+
 def test_pause_and_resume_bracket_the_apply():
     client, engine, _ = make_client(enabled_env())
     client.post("/fq/retier", json=balanced_body())
@@ -1380,6 +1454,46 @@ def test_worker_plan_and_apply_round_trip(tmp_path, gates_on):
     assert state.policy_sha == applied["policy_sha_after"]
 
 
+def test_workers_with_different_clocks_commit_identical_policy(
+    tmp_path, monkeypatch, gates_on
+):
+    states = []
+    workers = []
+    for name, rank in (("a", 0), ("b", 1)):
+        state, _ = make_state(tmp_path / name, rank=rank)
+        engine = FakeEngine()
+        engine.source = type("S", (), {"resolver": FakeResolver()})()
+        states.append(state)
+        workers.append(FakeWorker(state, engine))
+
+    request = req(
+        balanced_body(actor="michel", utc="2026-08-14T00:00:00Z")
+    ).canonical()
+    payload = {"request": request, "request_id": "fqr-shared"}
+    plans = []
+    for clock, worker in zip(
+        ("2026-08-14T01:00:00Z", "2026-08-14T01:00:01Z"),
+        workers,
+        strict=True,
+    ):
+        monkeypatch.setattr(A.time, "strftime", lambda *_a, c=clock, **_k: c)
+        plans.append(json.loads(A.worker_plan(worker, json.dumps(payload))))
+
+    for key in ("plan_sha", "membership_sha", "policy_sha_after"):
+        assert plans[0][key] == plans[1][key]
+
+    applied = [
+        json.loads(A.worker_apply(
+            worker,
+            json.dumps({**payload, "plan_sha": plans[0]["plan_sha"]}),
+        ))
+        for worker in workers
+    ]
+    assert all(result["ok"] for result in applied)
+    assert states[0].policy_doc == states[1].policy_doc
+    assert states[0].policy_sha == states[1].policy_sha
+
+
 def test_worker_apply_refuses_a_diverging_plan_sha(tmp_path, gates_on):
     state, _ = make_state(tmp_path)
     engine = FakeEngine()
@@ -1600,15 +1714,26 @@ def test_two_ranks_one_second_apart_agree_on_the_membership(monkeypatch):
         "the membership is identical — a cross-check keyed on it would agree")
 
 
-def test_provenance_utc_is_taken_from_the_request_when_supplied():
-    """The router stamps one timestamp so every rank commits an identical
-    document; otherwise /fq/state reports agreed=False after a swap that was
-    applied identically on all four ranks."""
-    req = A.RetierRequest(items=(), actor="t", reason="r")
-    object.__setattr__(req, "utc", "2026-01-01T00:00:00Z") \
-        if hasattr(req, "__dataclass_fields__") else None
-    prov = A._provenance(_Mod(_step=5), req, [], "fqr-x", "base")
+def test_provenance_utc_survives_the_collective_request_round_trip():
+    """Every rank must build the same policy document from one API timestamp."""
+    req = A.RetierRequest(
+        items=(), actor="t", reason="r", utc="2026-01-01T00:00:00Z")
+    decoded = A.RetierRequest.from_canonical(req.canonical())
+    prov = A._provenance(_Mod(_step=5), decoded, [], "fqr-x", "base")
     assert prov["utc"] == "2026-01-01T00:00:00Z"
+
+
+def test_router_overwrites_caller_utc_once_before_collective(monkeypatch):
+    monkeypatch.setattr(
+        A.time, "strftime", lambda *_a, **_k: "2026-08-12T00:42:00Z")
+    client, engine, _ = make_client(enabled_env())
+    resp = client.post(
+        "/fq/retier",
+        json=balanced_body(utc="caller-cannot-forge-this"),
+    )
+    assert resp.status_code == 200, resp.text
+    sent = json.loads(engine.calls[0][1][0])["request"]
+    assert sent["utc"] == "2026-08-12T00:42:00Z"
 
 
 # --------------------------------------------------------------------------
