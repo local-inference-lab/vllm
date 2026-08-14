@@ -203,8 +203,8 @@ class _Harness:
         exl3_module._load_exl3_ext = lambda: self.ext
         self._saved_capturing = torch.cuda.is_current_stream_capturing
         torch.cuda.is_current_stream_capturing = lambda: False
-        self._saved_current_device = torch.cuda.current_device
-        torch.cuda.current_device = lambda: 0
+        self._saved_current_device = torch.accelerator.current_device_index
+        torch.accelerator.current_device_index = lambda: 0
         self._saved_device_properties = torch.cuda.get_device_properties
         torch.cuda.get_device_properties = lambda device: SimpleNamespace(
             multi_processor_count=1,
@@ -221,7 +221,7 @@ class _Harness:
             exl3_module._load_exl3_ext,
         ) = self._saved_loaders
         torch.cuda.is_current_stream_capturing = self._saved_capturing
-        torch.cuda.current_device = self._saved_current_device
+        torch.accelerator.current_device_index = self._saved_current_device
         torch.cuda.get_device_properties = self._saved_device_properties
         for name, value in self._saved_env.items():
             if value is None:

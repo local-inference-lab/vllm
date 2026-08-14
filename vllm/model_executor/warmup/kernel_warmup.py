@@ -369,10 +369,10 @@ def kernel_warmup(worker: "Worker"):
         max_tokens=max(moe_token_counts),
         token_counts=moe_token_counts,
     )
-    free_before_exl3_warmup = torch.cuda.mem_get_info()[0]
+    free_before_exl3_warmup = torch.accelerator.get_memory_info()[0]
     warmed_exl3_route_pack = warmup_exl3_mixed_trellis_route_pack(worker.get_model())
     if warmed_exl3_route_pack:
-        free_after_exl3_warmup = torch.cuda.mem_get_info()[0]
+        free_after_exl3_warmup = torch.accelerator.get_memory_info()[0]
         logger.info(
             "Warmed up %d EXL3 mixed-Trellis route-pack variant(s); "
             "free-memory delta %.1f MiB.",
