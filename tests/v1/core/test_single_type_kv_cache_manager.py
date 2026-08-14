@@ -63,15 +63,28 @@ def get_chunked_local_attention_manager(
     )
 
 
-def test_sliding_window_records_new_blocks_for_zeroing():
-    block_size = 2
-    spec = SlidingWindowSpec(
-        block_size=block_size,
-        num_kv_heads=1,
-        head_size=1,
-        dtype=torch.float32,
-        sliding_window=4,
-    )
+@pytest.mark.parametrize(
+    "spec",
+    [
+        SlidingWindowSpec(
+            block_size=2,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=4,
+        ),
+        SlidingWindowMLASpec(
+            block_size=2,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=4,
+        ),
+    ],
+    ids=["sliding-window", "sliding-window-mla"],
+)
+def test_sliding_window_records_new_blocks_for_zeroing(spec):
+    block_size = spec.block_size
     block_pool = BlockPool(
         num_gpu_blocks=10, enable_caching=False, hash_block_size=block_size
     )

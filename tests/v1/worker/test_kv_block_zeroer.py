@@ -9,6 +9,7 @@ import torch
 
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
 )
 from vllm.v1.worker import utils as worker_utils
@@ -36,6 +37,13 @@ class _BlockFirstBackend:
             dtype=torch.uint8,
             sliding_window=4,
         ),
+        SlidingWindowMLASpec(
+            block_size=2,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.uint8,
+            sliding_window=4,
+        ),
         ChunkedLocalAttentionSpec(
             block_size=2,
             num_kv_heads=1,
@@ -44,7 +52,7 @@ class _BlockFirstBackend:
             attention_chunk_size=4,
         ),
     ],
-    ids=["sliding-window", "chunked-local"],
+    ids=["sliding-window", "sliding-window-mla", "chunked-local"],
 )
 def test_attention_blocks_are_zeroed(spec):
     device = torch.device("cuda")
