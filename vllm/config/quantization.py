@@ -175,6 +175,8 @@ _CHECKPOINT_ONLINE_OVERLAY_WEIGHTS["exl3"] = frozenset({kMxfp8Dynamic})
 def _is_checkpoint_online_overlay(
     quantization: str | None, args: QuantizationConfigArgs
 ) -> bool:
+    if quantization is None:
+        return False
     supported_weights = _CHECKPOINT_ONLINE_OVERLAY_WEIGHTS.get(quantization)
     if supported_weights is None or args.moe is not None:
         return False

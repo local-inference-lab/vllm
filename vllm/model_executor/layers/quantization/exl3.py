@@ -22,13 +22,13 @@ from __future__ import annotations
 import ctypes
 import importlib
 import os
-import re
 import sys
 import zlib
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
 from transformers import PretrainedConfig
 
@@ -54,6 +54,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
+    QuantizationMethods,
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
@@ -376,12 +377,8 @@ def _load_b12x_mixed_trellis() -> Any:
     if _B12X_MIXED_TRELLIS_API is not None:
         return _B12X_MIXED_TRELLIS_API
     try:
-        module = importlib.import_module(
-            "b12x.moe._shared.kernels.w4a16.mixed_trellis"
-        )
-        prepare = importlib.import_module(
-            "b12x.moe._shared.kernels.w4a16.prepare"
-        )
+        module = importlib.import_module("b12x.moe._shared.kernels.w4a16.mixed_trellis")
+        prepare = importlib.import_module("b12x.moe._shared.kernels.w4a16.prepare")
         host = importlib.import_module("b12x.moe._shared.kernels.w4a16.host")
     except Exception as exc:
         raise RuntimeError(
@@ -592,7 +589,7 @@ def _warm_b12x_trellis_device(
 
     device_index = trellis.device.index
     if device_index is None:
-        device_index = torch.cuda.current_device()
+        device_index = torch.accelerator.current_device_index()
     if device_index in _B12X_TRELLIS_WARMED_DEVICES:
         return
     source = torch.zeros(
@@ -601,7 +598,7 @@ def _warm_b12x_trellis_device(
         device=trellis.device,
     )
     _b12x_trellis_linear(source, trellis, suh, svh)
-    torch.cuda.synchronize(trellis.device)
+    torch.accelerator.synchronize(trellis.device)
     _B12X_TRELLIS_WARMED_DEVICES.add(device_index)
 
 
@@ -719,7 +716,7 @@ class Exl3Config(QuantizationConfig):
         self._online_model_identity: str | None = None
         self._online_encoder_identity: str | None = None
 
-    def get_name(self) -> str:
+    def get_name(self) -> QuantizationMethods:
         return "exl3"
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
@@ -751,7 +748,7 @@ class Exl3Config(QuantizationConfig):
         hf_quant_cfg: dict[str, Any],
         user_quant: str | None,
         hf_config: PretrainedConfig | None = None,
-    ) -> str | None:
+    ) -> QuantizationMethods | None:
         del hf_quant_cfg
         if user_quant is not None and user_quant != "exl3":
             return None
@@ -984,7 +981,10 @@ class Exl3Config(QuantizationConfig):
         if self.rank_sliced_k_values is None:
             if self.bits is None or float(self.bits) != int(self.bits):
                 raise ValueError(f"invalid uniform EXL3 bitrate {self.bits!r}")
-            experts = int(self.rank_sliced_metadata["experts_per_layer"])
+            metadata = self.rank_sliced_metadata
+            if metadata is None:
+                raise RuntimeError("rank-sliced EXL3 metadata was not initialized")
+            experts = int(metadata["experts_per_layer"])
             return (int(self.bits),) * experts
         try:
             return self.rank_sliced_bits_by_layer[layer_index]
@@ -1434,7 +1434,7 @@ class Exl3OnlineLinearMethod(_Fp8OnlineLinearBase):
         )
         device_index = device.index
         if device_index is None:
-            device_index = torch.cuda.current_device()
+            device_index = torch.accelerator.current_device_index()
         signature = (
             device_index,
             layer.exl3_online_input_size,
@@ -1455,7 +1455,7 @@ class Exl3OnlineLinearMethod(_Fp8OnlineLinearBase):
                 layer.exl3_online_suh,
                 layer.exl3_online_svh,
             )
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
         _EXL3_ONLINE_WARMED_SIGNATURES.add(signature)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -2097,23 +2097,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_hidden_size = hidden_size
         layer.exl3_intermediate_size_per_partition = intermediate_size_per_partition
         layer.exl3_params_dtype = params_dtype
-        rank_sliced = self.quant_config.rank_sliced_metadata is not None
+        rank_sliced_metadata = self.quant_config.rank_sliced_metadata
+        rank_sliced = rank_sliced_metadata is not None
         shared_h = (
             rank_sliced
             and self.quant_config.rank_sliced_rotation_layout
             == _SHARED_H_ROTATION_LAYOUT
         )
         layer.exl3_shared_h_rotations = shared_h
-        if rank_sliced:
-            checkpoint_tp = int(self.quant_config.rank_sliced_metadata["tp"])
+        if rank_sliced_metadata is not None:
+            checkpoint_tp = int(rank_sliced_metadata["tp"])
             if checkpoint_tp != layer.exl3_tp_size:
                 raise ValueError(
                     "rank-sliced EXL3 checkpoint TP does not match runtime: "
                     f"checkpoint={checkpoint_tp}, runtime={layer.exl3_tp_size}"
                 )
-            expected_experts = int(
-                self.quant_config.rank_sliced_metadata["experts_per_layer"]
-            )
+            expected_experts = int(rank_sliced_metadata["experts_per_layer"])
             if expected_experts != num_experts:
                 raise ValueError(
                     "rank-sliced EXL3 expert count does not match the model: "
@@ -2135,6 +2134,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     "max_num_batched_tokens to plan its Trellis arena; refusing to "
                     "guess a capacity."
                 )
+            assert vllm_config is not None
             layer.exl3_max_num_batched_tokens = int(
                 scheduler_config.max_num_batched_tokens
             )
@@ -3137,7 +3137,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "The EXL3 extension lacks routed-expert entry points: "
                 + ", ".join(missing_ext)
             )
-        concurrency = int(ext.exl3_moe_max_concurrency(torch.cuda.current_device()))
+        concurrency = int(
+            ext.exl3_moe_max_concurrency(torch.accelerator.current_device_index())
+        )
         hidden_size = int(layer.exl3_hidden_size)
         intermediate_size = int(layer.exl3_intermediate_size_per_partition)
         num_experts = int(layer.local_num_experts)

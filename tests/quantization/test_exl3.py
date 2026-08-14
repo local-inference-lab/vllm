@@ -651,6 +651,7 @@ def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
         "trellis_bits": bits,
         "trellis_tile_config": (64, 128, 64, 128),
     }
+    assert api.prepare_kwargs is not None
     assert api.prepare_kwargs["plan"] is layer.exl3_trellis_weights.plan
     assert api.prepare_kwargs["params_dtype"] == torch.float16
     assert api.prepare_kwargs["w1_fp4"] is slabs["w13_trellis"]
@@ -686,9 +687,7 @@ def test_rank_sliced_weights_pass_shared_h_rows_without_expansion(monkeypatch):
         def prepare_weights(**kwargs):
             return SimpleNamespace(**kwargs)
 
-    monkeypatch.setattr(
-        exl3_module, "_load_b12x_fused_moe", lambda: FakeFusedMoe()
-    )
+    monkeypatch.setattr(exl3_module, "_load_b12x_fused_moe", lambda: FakeFusedMoe())
     method = object.__new__(Exl3MoEMethod)
     method.quant_config = SimpleNamespace(bits=float(bits))
     method._rank_sliced_backing = lambda _layer, name: slabs[name]

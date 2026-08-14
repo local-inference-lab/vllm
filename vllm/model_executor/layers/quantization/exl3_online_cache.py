@@ -151,6 +151,7 @@ def resolve_encoder_identity(
     """Identify the encoder implementation used to produce cached tensors."""
 
     root = Path(package_root).expanduser().resolve()
+    payload: dict[str, object]
     if revision and revision.strip():
         payload = {"root": str(root), "revision": revision.strip()}
     else:
@@ -243,7 +244,7 @@ def _load(path: Path, key: Exl3OnlineCacheKey) -> Exl3OnlineCacheResult:
         tensors = {name: handle.get_tensor(name) for name in handle.keys()}  # noqa: SIM118
     _validate_tensors(tensors, key)
     raw_error = metadata.get("proxy_error")
-    proxy_error = None if raw_error in (None, "") else float(raw_error)
+    proxy_error = float(raw_error) if isinstance(raw_error, str) and raw_error else None
     return Exl3OnlineCacheResult(dict(tensors), proxy_error, True, path)
 
 
