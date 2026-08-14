@@ -74,6 +74,9 @@ from vllm.model_executor.layers.quantization.online.mxfp8 import (
     Mxfp8OnlineLinearMethod,
     is_shared_expert_projection,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import replace_parameter
@@ -1714,7 +1717,7 @@ class Exl3OnlineLinearMethod(_Fp8OnlineLinearBase):
         self.prefix = prefix
         self.model_identity = model_identity
         self.encoder_identity = encoder_identity
-        self.fallback: Mxfp8OnlineLinearMethod | None = None
+        self.fallback: QuantizeMethodBase | None = None
 
     def create_weights(
         self,
@@ -1731,7 +1734,28 @@ class Exl3OnlineLinearMethod(_Fp8OnlineLinearBase):
             input_size_per_partition, output_size_per_partition
         )
         if not layer.exl3_online_trellis:
-            self.fallback = Mxfp8OnlineLinearMethod()
+            # Trellis needs 128-aligned K and N; MXFP8 needs K divisible by 32.
+            # A shard that satisfies neither (e.g. the Qwen3.5/3.6/3.8 vision
+            # tower, K=1152 N=4304) has no online representation at all, so keep
+            # it unquantized instead of raising out of MXFP8 create_weights.
+            if input_size_per_partition % MXFP8_BLOCK_SIZE == 0:
+                self.fallback = Mxfp8OnlineLinearMethod()
+                logger.info_once(
+                    "EXL3 online Trellis retains MXFP8 for 128-unaligned shards "
+                    "(example %s: K=%d, N=%d).",
+                    self.prefix,
+                    input_size_per_partition,
+                    output_size_per_partition,
+                )
+            else:
+                self.fallback = UnquantizedLinearMethod()
+                logger.warning_once(
+                    "EXL3 online overlay keeps %s unquantized: K=%d is neither "
+                    "128-aligned for Trellis nor divisible by %d for MXFP8.",
+                    self.prefix,
+                    input_size_per_partition,
+                    MXFP8_BLOCK_SIZE,
+                )
             self.fallback.create_weights(
                 layer,
                 input_size_per_partition,
@@ -1740,13 +1764,6 @@ class Exl3OnlineLinearMethod(_Fp8OnlineLinearBase):
                 output_size,
                 params_dtype,
                 **extra_weight_attrs,
-            )
-            logger.info_once(
-                "EXL3 online Trellis retains MXFP8 for 128-unaligned shards "
-                "(example %s: K=%d, N=%d).",
-                self.prefix,
-                input_size_per_partition,
-                output_size_per_partition,
             )
             return
 
