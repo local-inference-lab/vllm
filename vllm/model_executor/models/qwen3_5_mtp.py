@@ -83,6 +83,12 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            # The draft head builds a second full embedding table - another 2.543 GB of BF16
+            # on this model, which is why enabling MTP costs far more resident memory than
+            # the draft weights themselves. Same rationale as the target model: hand over the
+            # quantization config so a backend can narrow it.
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.embed_tokens" if prefix else "mtp.embed_tokens",
         )
 
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
