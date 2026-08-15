@@ -1185,9 +1185,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (Eagle-style) drafts.
     "VLLM_DCP_SHARD_DRAFT": lambda: os.getenv("VLLM_DCP_SHARD_DRAFT", None),
     # Requantise the DRAFT model's lm_head to FP8. Draft tokens are proposals the target
-    # verifies, so this can cost acceptance, never correctness. On an MTP drafter the head
-    # is read once per speculative step.
-    "VLLM_DRAFT_LM_HEAD_FP8": lambda: bool(int(os.getenv("VLLM_DRAFT_LM_HEAD_FP8", "0"))),
+    # verifies, so this can cost acceptance, never correctness. On an MTP drafter
+    # the head is read once per speculative step.
+    "VLLM_DRAFT_LM_HEAD_FP8": lambda: bool(
+        int(os.getenv("VLLM_DRAFT_LM_HEAD_FP8", "0"))
+    ),
     # Replicate the target model's sparse-indexer K cache on every DCP rank.
     "VLLM_DCP_REPLICATE_INDEXER_CACHE": lambda: (
         os.getenv("VLLM_DCP_REPLICATE_INDEXER_CACHE", "0").lower()

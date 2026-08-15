@@ -64,14 +64,25 @@ class Fp8DraftHeadMethod:
 ROWS_PER_CHUNK = 4096
 
 
+def _fp8_supported() -> bool:
+    """FP8 GEMM support. Kept narrow on purpose: ROCm needs the FNUZ dtype and a
+    different scale layout, which this path does not implement."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    major, minor = current_platform.get_device_capability()
+    return major * 10 + minor >= 89
+
+
 def _quantize_rowwise(wd: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Row-scaled FP8 copy of ``wd``, built in chunks.
 
     Per-output-row rather than per-tensor: a few high-magnitude vocabulary rows would
     otherwise set one global scale and crush every other token's logit resolution.
 
-    Chunked because promoting a 454 MB head to fp32 whole allocates ~908 MB and the clamp
-    another -- unaffordable on unified memory. Caps the transient at ~100 MB.
+    Chunked because promoting a 454 MB head to fp32 whole allocates ~908 MB and
+    the clamp another. Caps the transient at ~100 MB.
     """
     out = torch.empty_like(wd, dtype=FP8_DTYPE)
     scale = torch.empty(wd.shape[0], 1, dtype=torch.float32, device=wd.device)
@@ -85,20 +96,34 @@ def _quantize_rowwise(wd: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return out, scale
 
 
-def quantize_draft_lm_head_fp8(model: torch.nn.Module) -> int:
-    """Swap every ParallelLMHead in ``model`` to FP8. Returns bytes freed."""
+def quantize_draft_lm_head_fp8(model: torch.nn.Module) -> tuple[int, int]:
+    """Swap every ParallelLMHead in ``model`` to FP8.
+
+    Returns ``(bytes_freed, bytes_per_read_saved)``. They differ: a tied or otherwise
+    still-referenced head keeps its bf16 copy (frees nothing) but the matmul still reads
+    less, so traffic is saved either way.
+    """
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
-    # Tied embeddings share one storage between lm_head and embed_tokens. Quantising stays
-    # safe (separate FP8 tensor, only the matmul swaps) but freeing the bf16 copy would
-    # delete the input embedding. Detect by storage, not by tie_word_embeddings, so a model
-    # that ties without advertising it is still handled.
+    if not _fp8_supported():
+        logger.warning(
+            "VLLM_DRAFT_LM_HEAD_FP8 requested but this device has no FP8 GEMM support; "
+            "leaving the draft head in its original dtype."
+        )
+        return 0, 0
+
+    # remove_duplicate=False is REQUIRED: the default deduplicates, so a tied weight is
+    # yielded once and every head would look untied.
     shared: dict[int, int] = {}
-    for p in model.parameters():
+    for _, p in model.named_parameters(remove_duplicate=False):
         if p is not None and p.device.type != "meta":
             shared[p.data_ptr()] = shared.get(p.data_ptr(), 0) + 1
 
-    freed = 0
+    # Some draft models read lm_head.weight after loading (gemma4_mtp's
+    # _get_full_lm_head_weight); freeing it there would break them.
+    has_weight_reader = hasattr(model, "_get_full_lm_head_weight")
+
+    freed = saved_per_read = 0
     for name, mod in model.named_modules():
         if not isinstance(mod, ParallelLMHead):
             continue
@@ -109,28 +134,26 @@ def quantize_draft_lm_head_fp8(model: torch.nn.Module) -> int:
         wd = w.data
         w_fp8, scale = _quantize_rowwise(wd)
         before = wd.numel() * wd.element_size()
-        after = w_fp8.numel() * w_fp8.element_size() + scale.numel() * scale.element_size()
+        after = (w_fp8.numel() * w_fp8.element_size()
+                 + scale.numel() * scale.element_size())
         mod.quant_method = Fp8DraftHeadMethod(w_fp8, scale)
+        saved_per_read += before - after
 
-        tied = shared.get(wd.data_ptr(), 1) > 1
-        if tied:
-            # Keep bf16: the input embedding still needs it. The traffic saving comes from
-            # the matmul, not from freeing, so it still applies.
+        keep = shared.get(wd.data_ptr(), 1) > 1 or has_weight_reader
+        if keep:
+            # Tied to the input embedding, or read elsewhere after load. The traffic
+            # saving comes from the matmul, so it still applies.
             logger.info(
-                "Draft lm_head %s is tied: using FP8 for the matmul, keeping the bf16 copy "
-                "(%.0f MB not freed)", name, before / 2**20
+                "Draft lm_head %s: FP8 matmul, keeping the bf16 copy (%.0f MB)",
+                name, before / 2**20,
             )
         else:
-            # Freeing makes this net-negative on memory. A later read of `.weight` now fails
-            # loudly rather than silently falling back to bf16 and faking the speedup.
+            # A later read of `.weight` now fails loudly rather than silently falling
+            # back to bf16 and faking the speedup.
             mod.register_parameter("weight", None)
             freed += before - after
         del wd, w
-        logger.info(
-            "Draft lm_head %s requantised to FP8: %.0f MB -> %.0f MB",
-            name, before / 2**20, after / 2**20,
-        )
 
     if freed:
         torch.cuda.empty_cache()
-    return freed
+    return freed, saved_per_read

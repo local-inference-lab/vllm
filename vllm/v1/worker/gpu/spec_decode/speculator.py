@@ -190,15 +190,15 @@ class DraftModelSpeculator(BaseSpeculator):
         self._validate_local_argmax_reduction()
 
         if envs.VLLM_DRAFT_LM_HEAD_FP8:
-            # Draft model only, after loading; the target's head is never reached from here.
+            # Draft model only, after loading; the target's head is not reached.
             from vllm.v1.spec_decode.draft_head_fp8 import quantize_draft_lm_head_fp8
 
-            freed = quantize_draft_lm_head_fp8(self.model)
+            freed, per_read = quantize_draft_lm_head_fp8(self.model)
             logger.info(
-                "VLLM_DRAFT_LM_HEAD_FP8: freed %.0f MB/rank and removed %.0f MB/rank "
-                "of weight traffic per decode step (%d speculative steps)",
+                "VLLM_DRAFT_LM_HEAD_FP8: freed %.0f MB/rank, removed %.0f MB/rank of "
+                "weight traffic per decode step (%d speculative steps)",
                 freed / 2**20,
-                freed * self.num_speculative_steps / 2**20,
+                per_read * self.num_speculative_steps / 2**20,
                 self.num_speculative_steps,
             )
 
