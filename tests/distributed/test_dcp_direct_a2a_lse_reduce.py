@@ -503,6 +503,35 @@ def test_dcp_chunk_workspace_alignment_covers_interleave():
     assert align_mla_chunked_context_workspace_size(config, 8) == 64
 
 
+def test_mla_chunk_workspace_honors_configured_token_limit(monkeypatch):
+    from vllm.model_executor.layers.attention.mla_attention import (
+        MLACommonMetadataBuilder,
+    )
+
+    config = MagicMock()
+    config.model_config.max_model_len = 1_048_576
+    config.scheduler_config.max_num_seqs = 8
+    config.cache_config.block_size = 32
+    config.parallel_config.decode_context_parallel_size = 16
+    config.parallel_config.cp_kv_cache_interleave_size = 1
+
+    monkeypatch.setenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", "4096")
+    assert (
+        MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(config)
+        == 4096
+    )
+
+    monkeypatch.setenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", "0")
+    assert (
+        MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(config)
+        == 64 * 1024
+    )
+
+    monkeypatch.setenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", "-1")
+    with pytest.raises(ValueError, match="must be non-negative"):
+        MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(config)
+
+
 def test_sparse_mla_builder_initializes_dcp_manager(monkeypatch):
     import vllm.model_executor.layers.attention.sparse_mla_attention as sparse_mla
 

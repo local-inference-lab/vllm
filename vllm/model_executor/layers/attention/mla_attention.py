@@ -2160,22 +2160,25 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
 
-        chunked_prefill_workspace_size = min(
-            # Try for 8 full length request or at least 4 pages per-request
-            max(
-                8 * model_config.max_model_len,
-                4 * scheduler_config.max_num_seqs * cache_config.block_size,
-            ),
-            # For long-context models try not to over-allocate limiting
-            # kv-cache space, limiting it to 64k tokens,
-            # which would result in the workspace being:
-            #   2*(576)*(64*1024) = 144mb
-            # (assuming 576 MLA head dim, and fp16)
-            # which would result in up-projected context being
-            #   2*(192*128)*(64*1024) = 3gb
-            # (assuming 192 QK head dim, 128 heads, and fp16)
-            64 * 1024,
-        )
+        configured_workspace_size = envs.VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE
+        if configured_workspace_size < 0:
+            raise ValueError(
+                "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE must be non-negative, "
+                f"got {configured_workspace_size}."
+            )
+        if configured_workspace_size:
+            chunked_prefill_workspace_size = configured_workspace_size
+        else:
+            chunked_prefill_workspace_size = min(
+                # Try for 8 full-length requests or at least 4 pages per request.
+                max(
+                    8 * model_config.max_model_len,
+                    4 * scheduler_config.max_num_seqs * cache_config.block_size,
+                ),
+                # Bound persistent compressed-KV storage and transient dense K/V
+                # projections for long-context models.
+                64 * 1024,
+            )
 
         return align_mla_chunked_context_workspace_size(
             vllm_config,
