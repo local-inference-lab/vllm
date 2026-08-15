@@ -901,7 +901,16 @@ def _prime_exl3_gemm_rows(
     # One arena for the whole shape: a leading-row view of a contiguous buffer
     # is itself contiguous, so the kernel contract holds without reallocating
     # per row count.
-    source = torch.zeros((max(pending), k), dtype=torch.float16, device=device)
+    #
+    # The probe data is randomised, not zeroed: exl3_gemm's autotuner selects a
+    # kernel configuration by *measured time*, and an all-zero activation can time
+    # differently from a real one, so a zero-primed graph run could select a
+    # different configuration than an eager run. Magnitude 0.05 matches
+    # post-RMSNorm activations. Measured: this is a defensibility fix, not a fix
+    # for eager-vs-graph near-tie drift, which is present for BF16 too.
+    source = torch.randn(
+        (max(pending), k), dtype=torch.float16, device=device
+    ).mul_(0.05)
     for m in pending:
         try:
             _exl3_gemm(
