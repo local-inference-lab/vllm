@@ -243,6 +243,13 @@ class Qwen3_5Model(Qwen3NextModel):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            # Hand the quantization config to the embedding so a backend can narrow the
+            # table. It is 2.543 GB of BF16 on this model - second only to the MLP stack -
+            # and on a 32 GB card it is the difference between 196,608 and native 262,144
+            # context. Backends that do not implement embedding() are unaffected: the layer
+            # falls back to UnquantizedEmbeddingMethod when get_quant_method returns None.
+            quant_config=self.quant_config,
+            prefix=f"{prefix}.embed_tokens" if prefix else "embed_tokens",
         )
 
         def get_layer(prefix: str):
