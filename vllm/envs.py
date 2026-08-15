@@ -76,6 +76,7 @@ if TYPE_CHECKING:
     VLLM_DCP_A2A_MAX_TOKENS: int = 0
     VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
     VLLM_DCP_SHARD_DRAFT: str | None = None
+    VLLM_DRAFT_LM_HEAD_FP8: bool = False
     VLLM_DCP_REPLICATE_INDEXER_CACHE: bool = False
     VLLM_DCP_INDEXER_SHARDS: int = 0
     VLLM_DCP_GLOBAL_TOPK: bool = True
@@ -1183,6 +1184,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # target indexer cache and native MTP drafts, replicated for external
     # (Eagle-style) drafts.
     "VLLM_DCP_SHARD_DRAFT": lambda: os.getenv("VLLM_DCP_SHARD_DRAFT", None),
+    # Requantise the DRAFT model's lm_head to FP8. Draft tokens are proposals the target
+    # verifies, so this can cost acceptance, never correctness. On an MTP drafter the head
+    # is read once per speculative step.
+    "VLLM_DRAFT_LM_HEAD_FP8": lambda: bool(int(os.getenv("VLLM_DRAFT_LM_HEAD_FP8", "0"))),
     # Replicate the target model's sparse-indexer K cache on every DCP rank.
     "VLLM_DCP_REPLICATE_INDEXER_CACHE": lambda: (
         os.getenv("VLLM_DCP_REPLICATE_INDEXER_CACHE", "0").lower()

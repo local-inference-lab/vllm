@@ -10,6 +10,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.eplb.eplb_state import EplbState
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -187,6 +188,19 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
         self._validate_local_argmax_reduction()
+
+        if envs.VLLM_DRAFT_LM_HEAD_FP8:
+            # Draft model only, after loading; the target's head is never reached from here.
+            from vllm.v1.spec_decode.draft_head_fp8 import quantize_draft_lm_head_fp8
+
+            freed = quantize_draft_lm_head_fp8(self.model)
+            logger.info(
+                "VLLM_DRAFT_LM_HEAD_FP8: freed %.0f MB/rank and removed %.0f MB/rank "
+                "of weight traffic per decode step (%d speculative steps)",
+                freed / 2**20,
+                freed * self.num_speculative_steps / 2**20,
+                self.num_speculative_steps,
+            )
 
         all_attn_layers = set[str](
             get_layers_from_vllm_config(
