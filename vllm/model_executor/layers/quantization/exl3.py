@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from transformers import PretrainedConfig
 
-from vllm.config import get_current_vllm_config_or_none
+from vllm.config import CUDAGraphMode, get_current_vllm_config_or_none
 from vllm.config.quantization import QuantizationConfigArgs
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -74,6 +74,9 @@ from vllm.model_executor.layers.quantization.online.mxfp8 import (
     Mxfp8OnlineLinearMethod,
     is_shared_expert_projection,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import replace_parameter
@@ -96,6 +99,12 @@ _B12X_MIXED_TRELLIS_API: Any | None = None
 _B12X_TRELLIS_LINEAR_API: Any | None = None
 _EXL3_ONLINE_QUANTIZER: Any | None = None
 _EXL3_ONLINE_WARMED_SIGNATURES: set[tuple[int, int, int, int]] = set()
+# Serialized dense shapes whose exl3_gemm autotuning already ran eagerly,
+# keyed by (device_index, m, k, n, bits, codebook). The extension hashes its
+# own autotune cache over the same shape fields and the codebook selector, not
+# over weight pointers, so priming one shard primes every later shard with the
+# same geometry.
+_EXL3_GEMM_PRIMED_SIGNATURES: set[tuple[int, int, int, int, int, int]] = set()
 _B12X_TRELLIS_WARMED_DEVICES: set[int] = set()
 # The dense W4A16 kernel caps its temporary accumulation arena at
 # SMs * 4 * block_m * 256 fp32 elements.  SM120/SM121 devices supported by
@@ -789,6 +798,152 @@ def _exl3_gemm_fake(
     )
 
 
+def _graph_decode_enabled() -> bool:
+    """Return whether serialized dense EXL3 may run under CUDA graphs.
+
+    Off by default. ``exl3_gemm`` autotunes with timing launches on the first
+    call per shape bucket and those launches fault inside CUDA-graph capture,
+    so graphs are only permitted when the operator opts into the pre-capture
+    priming pass with ``VLLM_EXL3_GRAPH_DECODE=1``.
+    """
+
+    return os.environ.get("VLLM_EXL3_GRAPH_DECODE", "0") == "1"
+
+
+def _uniform_decode_query_len(vllm_config: Any) -> int:
+    """Rows one request contributes to a uniform decode batch."""
+
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    num_spec = getattr(speculative_config, "num_speculative_tokens", None)
+    return 1 + int(num_spec) if num_spec else 1
+
+
+def _graph_decode_capture_rows(vllm_config: Any) -> tuple[int, ...]:
+    """Return every row count a decode-only CUDA graph can replay.
+
+    ``cudagraph_capture_sizes`` is already final except for the spec-decode
+    alignment that ``CompilationConfig.adjust_cudagraph_sizes_for_spec_decode``
+    applies while the KV cache is initialized, i.e. after weights are loaded.
+    Priming therefore covers the superset that alignment can produce: every
+    configured size, that size rounded up to the uniform decode query length
+    (and to the sequence-parallel multiple when that pass binds captured
+    sizes), the small interactive request counts alignment always adds, and the
+    per-request row counts an MTP/draft layer sees for those sizes.
+    """
+
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    sizes = getattr(compilation_config, "cudagraph_capture_sizes", None)
+    if not sizes:
+        return ()
+    configured_max = getattr(compilation_config, "max_cudagraph_capture_size", None)
+    max_size = int(configured_max) if configured_max else max(int(s) for s in sizes)
+    rows = {int(size) for size in sizes if 0 < int(size) <= max_size}
+    query_len = _uniform_decode_query_len(vllm_config)
+    if query_len > 1:
+        multiples = [query_len]
+        pass_config = getattr(compilation_config, "pass_config", None)
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
+        if tp_size > 1 and getattr(pass_config, "enable_sp", False):
+            multiples.append(max(query_len, tp_size))
+        for multiple in multiples:
+            for size in tuple(rows):
+                rounded = -(-size // multiple) * multiple
+                if rounded <= max_size:
+                    rows.add(rounded)
+        rows.update(
+            query_len * requests
+            for requests in range(1, 33)
+            if query_len * requests <= max_size
+        )
+        # A draft/MTP layer consumes one row per request, not per drafted token.
+        rows.update(size // query_len for size in tuple(rows) if size >= query_len)
+    return tuple(sorted(rows))
+
+
+def _prime_exl3_gemm_rows(
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    *,
+    has_mcg: bool,
+    has_mul1: bool,
+    rows: tuple[int, ...],
+    owner: str,
+) -> None:
+    """Autotune one serialized shard for every capturable row count.
+
+    exllamav3_ext hashes its autotune cache over the m bucket, k, n, K and the
+    codebook selector, so one zero-filled eager launch per row count here
+    removes every timing launch the same shape would otherwise attempt inside
+    CUDA-graph capture, and materializes the extension's per-device lock arena
+    outside capture. This is the serialized counterpart of
+    ``Exl3OnlineLinearMethod._warm_decode_shapes``.
+    """
+
+    device = trellis.device
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    k = int(trellis.shape[0]) * 16
+    n = int(trellis.shape[1]) * 16
+    bits = int(trellis.shape[2]) // 16
+    # Mirrors the extension's codebook selector: mcg=1, mul1=2, otherwise 0.
+    codebook = 1 if has_mcg else 2 if has_mul1 else 0
+    pending = [
+        int(m)
+        for m in rows
+        if (device_index, int(m), k, n, bits, codebook)
+        not in _EXL3_GEMM_PRIMED_SIGNATURES
+    ]
+    if not pending:
+        return
+    # One arena for the whole shape: a leading-row view of a contiguous buffer
+    # is itself contiguous, so the kernel contract holds without reallocating
+    # per row count.
+    #
+    # The probe data is randomised, not zeroed: exl3_gemm's autotuner selects a
+    # kernel configuration by *measured time*, and an all-zero activation can time
+    # differently from a real one, so a zero-primed graph run could select a
+    # different configuration than an eager run. Magnitude 0.05 matches
+    # post-RMSNorm activations. Measured: this is a defensibility fix, not a fix
+    # for eager-vs-graph near-tie drift, which is present for BF16 too.
+    source = torch.randn(
+        (max(pending), k), dtype=torch.float16, device=device
+    ).mul_(0.05)
+    for m in pending:
+        try:
+            _exl3_gemm(
+                source.narrow(0, 0, m),
+                trellis,
+                suh,
+                svh,
+                has_mcg,
+                has_mul1,
+            )
+        except Exception as exc:
+            raise ValueError(
+                "The EXL3 quantization backend requires eager execution: "
+                "pass --enforce-eager (enforce_eager=True) or unset "
+                "VLLM_EXL3_GRAPH_DECODE. exl3_gemm autotuning could not be "
+                f"primed for {owner} at m={m}, K={k}, N={n}, bits={bits}, so "
+                "CUDA-graph capture of that shape would fault."
+            ) from exc
+        _EXL3_GEMM_PRIMED_SIGNATURES.add((device_index, m, k, n, bits, codebook))
+    torch.cuda.synchronize(device)
+    logger.info_once(
+        "EXL3 graph-decode priming: autotuned exl3_gemm for %d capture row "
+        "counts (m=%d..%d) at K=%d, N=%d, bits=%d, codebook=%d.",
+        len(pending),
+        pending[0],
+        pending[-1],
+        k,
+        n,
+        bits,
+        codebook,
+    )
+
+
 def _b12x_trellis_weight(
     trellis: torch.Tensor,
     suh: torch.Tensor,
@@ -967,6 +1122,10 @@ class Exl3Config(QuantizationConfig):
         self.version = version
         self.tensor_storage = tensor_storage or {}
         self._eager_checked = False
+        # Row counts a decode-only CUDA graph can replay, once the relaxation
+        # in _require_enforce_eager has granted graph decode. None means the
+        # serialized path stays eager and nothing is primed.
+        self.graph_decode_rows: tuple[int, ...] | None = None
         self.rank_sliced_metadata: dict[str, Any] | None = None
         self.rank_sliced_rotation_layout = _PER_EXPERT_ROTATION_LAYOUT
         self.rank_sliced_k_values: tuple[int, ...] | None = None
@@ -1347,6 +1506,52 @@ class Exl3Config(QuantizationConfig):
                 "overriding tie_word_embeddings so vLLM instantiates it."
             )
 
+    def _graph_decode_refusal(self, vllm_config: Any) -> str | None:
+        """Return why graph decode is refused for this run, or None to allow.
+
+        Only decode-only capture is admissible. The capture-size list bounds
+        every row count a decode graph replays, so those shapes can be primed
+        before capture, while a mode that also captures mixed prefill batches
+        would autotune inside capture at token counts the scheduler picks at
+        runtime.
+        """
+
+        if not _graph_decode_enabled():
+            return (
+                "VLLM_EXL3_GRAPH_DECODE is not 1, so the pre-capture exl3_gemm "
+                "priming pass is disabled"
+            )
+        compilation_config = getattr(vllm_config, "compilation_config", None)
+        mode = getattr(compilation_config, "cudagraph_mode", None)
+        if mode is None:
+            return "compilation_config.cudagraph_mode is unset"
+        if not bool(mode):
+            # CUDAGraphMode.NONE never captures, so nothing needs priming.
+            return None
+        if mode.mixed_mode() != CUDAGraphMode.NONE:
+            return (
+                f"cudagraph_mode={mode} also captures mixed prefill batches, "
+                "whose token counts are not enumerable before capture; select "
+                "decode-only capture with "
+                "--compilation-config '{\"cudagraph_mode\": \"FULL_DECODE_ONLY\"}'"
+            )
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        if getattr(parallel_config, "use_ubatching", False):
+            return (
+                "microbatched execution (DBO/ubatching) splits every captured "
+                "size across ubatches, so the row counts reaching a shard are "
+                "not the capture sizes this priming pass covers"
+            )
+        rows = _graph_decode_capture_rows(vllm_config)
+        if not rows:
+            return (
+                f"cudagraph_mode={mode} is decode-only but "
+                "compilation_config.cudagraph_capture_sizes is empty, so no "
+                "row count can be primed"
+            )
+        self.graph_decode_rows = rows
+        return None
+
     def _require_enforce_eager(self) -> None:
         if self.rank_sliced_metadata is not None:
             # The routed-expert fast path is eagerly planned before graph
@@ -1354,22 +1559,55 @@ class Exl3Config(QuantizationConfig):
             return
         # exllamav3_ext's exl3_gemm autotunes with timing launches on the first
         # call per (m-bucket, k, n, K) shape hash; under CUDA-graph capture
-        # those launches fault, and m-bucketing means a warmup pass cannot
-        # reliably cover every bucket. Fail fast at build time instead of
-        # faulting mid-capture.
+        # those launches fault. Decode-only capture is the one mode whose row
+        # counts are enumerable, so it can be primed exhaustively during weight
+        # loading (see Exl3LinearMethod._prime_graph_decode_shapes). Everything
+        # else fails fast at build time instead of faulting mid-capture.
         if self._eager_checked:
             return
         self._eager_checked = True
         vllm_config = get_current_vllm_config_or_none()
         if vllm_config is None:
             return
-        if not vllm_config.model_config.enforce_eager:
+        if vllm_config.model_config.enforce_eager:
+            return
+        refusal = self._graph_decode_refusal(vllm_config)
+        if refusal is not None:
             raise ValueError(
                 "The EXL3 quantization backend requires eager execution: "
                 "pass --enforce-eager (enforce_eager=True). exl3_gemm "
                 "autotunes with timing launches on first use per shape "
-                "bucket, which is incompatible with CUDA-graph capture."
+                "bucket, which is incompatible with CUDA-graph capture. "
+                f"Graph decode was not permitted because {refusal}."
             )
+        if self.graph_decode_rows:
+            logger.info_once(
+                "EXL3 graph decode enabled by VLLM_EXL3_GRAPH_DECODE: "
+                "cudagraph_mode=%s captures decode only; priming exl3_gemm for "
+                "%d row counts (m=%d..%d) during weight loading.",
+                vllm_config.compilation_config.cudagraph_mode,
+                len(self.graph_decode_rows),
+                self.graph_decode_rows[0],
+                self.graph_decode_rows[-1],
+            )
+
+    def _require_eager_moe_experts(self, prefix: str) -> None:
+        """Refuse graph decode for the dense correctness MoE path.
+
+        Non-rank-sliced routed experts issue one exl3_gemm per expert with a
+        row count only the router knows, so no priming pass can cover them.
+        """
+
+        if not self.graph_decode_rows:
+            return
+        raise ValueError(
+            "The EXL3 quantization backend requires eager execution for "
+            f"non-rank-sliced routed experts ({prefix or 'experts'}): pass "
+            "--enforce-eager (enforce_eager=True) or unset "
+            "VLLM_EXL3_GRAPH_DECODE. Graph decode primes dense linear shards "
+            "at the CUDA-graph capture sizes, but per-expert GEMM row counts "
+            "are chosen by the router at runtime and cannot be primed."
+        )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -1389,6 +1627,7 @@ class Exl3Config(QuantizationConfig):
         if isinstance(layer, RoutedExperts):
             if not self._moe_prefix_is_exl3(prefix, layer):
                 return None
+            self._require_eager_moe_experts(prefix)
             return Exl3MoEMethod(self, layer.moe_config)
         return None
 
@@ -1714,7 +1953,7 @@ class Exl3OnlineLinearMethod(_Fp8OnlineLinearBase):
         self.prefix = prefix
         self.model_identity = model_identity
         self.encoder_identity = encoder_identity
-        self.fallback: Mxfp8OnlineLinearMethod | None = None
+        self.fallback: QuantizeMethodBase | None = None
 
     def create_weights(
         self,
@@ -1731,7 +1970,28 @@ class Exl3OnlineLinearMethod(_Fp8OnlineLinearBase):
             input_size_per_partition, output_size_per_partition
         )
         if not layer.exl3_online_trellis:
-            self.fallback = Mxfp8OnlineLinearMethod()
+            # Trellis needs 128-aligned K and N; MXFP8 needs K divisible by 32.
+            # A shard that satisfies neither (e.g. the Qwen3.5/3.6/3.8 vision
+            # tower, K=1152 N=4304) has no online representation at all, so keep
+            # it unquantized instead of raising out of MXFP8 create_weights.
+            if input_size_per_partition % MXFP8_BLOCK_SIZE == 0:
+                self.fallback = Mxfp8OnlineLinearMethod()
+                logger.info_once(
+                    "EXL3 online Trellis retains MXFP8 for 128-unaligned shards "
+                    "(example %s: K=%d, N=%d).",
+                    self.prefix,
+                    input_size_per_partition,
+                    output_size_per_partition,
+                )
+            else:
+                self.fallback = UnquantizedLinearMethod()
+                logger.warning_once(
+                    "EXL3 online overlay keeps %s unquantized: K=%d is neither "
+                    "128-aligned for Trellis nor divisible by %d for MXFP8.",
+                    self.prefix,
+                    input_size_per_partition,
+                    MXFP8_BLOCK_SIZE,
+                )
             self.fallback.create_weights(
                 layer,
                 input_size_per_partition,
@@ -1740,13 +2000,6 @@ class Exl3OnlineLinearMethod(_Fp8OnlineLinearBase):
                 output_size,
                 params_dtype,
                 **extra_weight_attrs,
-            )
-            logger.info_once(
-                "EXL3 online Trellis retains MXFP8 for 128-unaligned shards "
-                "(example %s: K=%d, N=%d).",
-                self.prefix,
-                input_size_per_partition,
-                output_size_per_partition,
             )
             return
 
@@ -2036,6 +2289,44 @@ class Exl3LinearMethod(LinearMethodBase):
                 torch.float16,
             )
             _warm_b12x_trellis_device(trellis, suh, svh)
+
+        self._prime_graph_decode_shapes(layer)
+
+    def _prime_graph_decode_shapes(self, layer: torch.nn.Module) -> None:
+        """Autotune every capturable decode shape while still executing eagerly.
+
+        This is the serialized counterpart of
+        ``Exl3OnlineLinearMethod._warm_decode_shapes``: the online path warms
+        rows 1..6 because that is its entire decode window, whereas a captured
+        decode graph replays exactly the configured capture sizes. No-op unless
+        ``_require_enforce_eager`` granted graph decode.
+        """
+
+        rows = self.quant_config.graph_decode_rows
+        if not rows:
+            return
+        owner = getattr(layer, "prefix", layer.__class__.__name__)
+        for shard_id in layer.exl3_shard_ids:
+            trellis = layer.trellis.exl3_tensors[shard_id]
+            has_mcg = shard_id in layer.mcg.exl3_tensors
+            has_mul1 = shard_id in layer.mul1.exl3_tensors
+            if _b12x_trellis_k6_supported(
+                trellis,
+                has_mcg=has_mcg,
+                has_mul1=has_mul1,
+            ):
+                # The native K6 path picks its kernel from the shape alone and
+                # is already prepared and warmed above.
+                continue
+            _prime_exl3_gemm_rows(
+                trellis,
+                layer.suh.exl3_tensors[shard_id],
+                layer.svh.exl3_tensors[shard_id],
+                has_mcg=has_mcg,
+                has_mul1=has_mul1,
+                rows=rows,
+                owner=f"{owner}[{shard_id!r}]",
+            )
 
     def apply(
         self,
