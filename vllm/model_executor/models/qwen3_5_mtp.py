@@ -83,6 +83,11 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            # The draft table is materialized during model construction, then aliased to the
+            # target embedding after loading. Pass the quantization config so embedding-aware
+            # backends also handle this transient construction consistently.
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.embed_tokens" if prefix else "mtp.embed_tokens",
         )
 
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
