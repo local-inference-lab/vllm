@@ -79,7 +79,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.model_executor.parameter import BasevLLMParameter
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
 if TYPE_CHECKING:
@@ -795,6 +795,137 @@ def _reconstruct_scratch(device: torch.device, k: int, n: int) -> torch.Tensor:
     return buf
 
 
+_EXL3_FP8_SCRATCH: dict[tuple[int, int, int], torch.Tensor] = {}
+_EXL3_FP8_WEIGHT_SCALE: dict[tuple[int, int], torch.Tensor] = {}
+_E4M3_MAX = 448.0
+
+
+def _prefill_fp8_enabled() -> bool:
+    """Whether the prefill GEMM may run in FP8 (off by default).
+
+    An FP8 matmul is 1.5-1.8x faster than fp16 on these shapes (SM120, measured), and
+    the reconstruct kernel can emit the column-major FP8 operand directly, so the win
+    is not eaten by a conversion pass. It costs numerics: both operands are narrowed to
+    E4M3, on the prefill path only - decode keeps the exact trellis kernel.
+    """
+    return os.environ.get("VLLM_EXL3_PREFILL_FP8", "0") == "1"
+
+
+def _fp8_scratch(device: torch.device, n: int, k: int) -> torch.Tensor:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (index, n, k)
+    buf = _EXL3_FP8_SCRATCH.get(key)
+    if buf is None:
+        buf = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=device)
+        _EXL3_FP8_SCRATCH[key] = buf
+    return buf
+
+
+def _fp8_weight_scale(
+    trellis: torch.Tensor, bits: int, mcg: bool, mul1: bool
+) -> torch.Tensor:
+    """Per-output-channel E4M3 scales for a trellis, measured once and cached.
+
+    Per-tensor scaling was measured and rejected: on this 27B model it cost +0.0139 mean
+    KLD against the fp16 prefill path, which is worse than official FP8. E4M3 carries three
+    mantissa bits, so one scale for a whole matrix spends most of them representing the
+    dynamic range of the loudest channel. One scale per column restores the ordinary
+    row-wise FP8 contract and costs a single float load per output row in the kernel.
+
+    The reconstructed matrix is the raw decoded weight - suh and svh act on the activation
+    and the output - so these scales are a property of the tensor and are computed once at
+    first prefill use.
+    """
+    key = (trellis.data_ptr(), bits)
+    scale = _EXL3_FP8_WEIGHT_SCALE.get(key)
+    if scale is None:
+        ext = _load_exl3_ext()
+        k = trellis.shape[0] * 16
+        n = trellis.shape[1] * 16
+        probe = _reconstruct_scratch(trellis.device, k, min(n, _EXL3_RECONSTRUCT_SLICE_N))
+        chunk = probe.shape[1]
+        scale = torch.empty((n,), dtype=torch.float32, device=trellis.device)
+        for start in range(0, n, chunk):
+            width = min(chunk, n - start)
+            view = probe[:, :width]
+            if n <= chunk:
+                ext.reconstruct(view, trellis, bits, mcg, mul1)
+            else:
+                ext.reconstruct_slice(view, trellis, bits, mcg, mul1, start)
+            amax = view.abs().amax(dim=0).float().clamp_(min=1e-6)
+            scale[start:start + width] = amax / _E4M3_MAX
+        _EXL3_FP8_WEIGHT_SCALE[key] = scale
+    return scale
+
+
+def _reconstruct_fp8_mm_into(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    mcg: bool,
+    mul1: bool,
+) -> bool:
+    """FP8 variant of the prefill path. Returns False if this shape cannot use it.
+
+    Row-wise scaling on both operands: one scale per token on the activation and one per
+    output channel on the weight. Per-tensor scaling was measured first and is not viable -
+    it cost +0.0139 mean KLD, more than the whole quantization budget of this checkpoint.
+    """
+    ext = _load_exl3_ext()
+    if not hasattr(ext, "reconstruct_fp8_slice"):
+        return False
+    bits = trellis.shape[2] // 16
+    k = trellis.shape[0] * 16
+    n = trellis.shape[1] * 16
+    chunk = min(n, _EXL3_RECONSTRUCT_SLICE_N)
+    if chunk % 128 or k % 16:
+        return False
+
+    scale_b_all = _fp8_weight_scale(trellis, bits, mcg, mul1)
+    if scale_b_all.numel() != n:
+        return False
+
+    x_had = torch.empty_like(x)
+    ext.had_r_128(x, x_had, suh, None, 1.0)
+    rows = x_had.shape[0]
+    row_amax = x_had.abs().amax(dim=1, keepdim=True).float().clamp_(min=1e-6)
+    scale_a_rows = row_amax / _E4M3_MAX
+    # _scaled_mm needs both extents padded to a multiple of 16; prefill chunks usually are,
+    # a prompt remainder is not, so pad rather than fall back to the slower path.
+    padded = (rows + 15) // 16 * 16
+    x8 = torch.empty((padded, k), dtype=torch.float8_e4m3fn, device=x.device)
+    x8[:rows].copy_(x_had / scale_a_rows)
+    scale_a = torch.ones((padded, 1), dtype=torch.float32, device=x.device)
+    scale_a[:rows].copy_(scale_a_rows)
+    if padded != rows:
+        x8[rows:].zero_()
+
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        w8 = _fp8_scratch(x.device, end - start, k)
+        scale_b = scale_b_all[start:end].contiguous()
+        ext.reconstruct_fp8_slice(
+            w8, trellis, bits, mcg, mul1, start, 1.0, scale_b.reciprocal()
+        )
+        # out_dtype MUST be bfloat16 here. With row-wise scales and out_dtype=float16 this
+        # torch build returns silently wrong results - no error, ~6x relative error, and in
+        # serving it produced KLD 10.8 with 0.1 % top-1. bfloat16 output matches an fp32
+        # reference to 0.040 relative, the same as per-tensor scaling. The copy back into the
+        # fp16 output buffer converts.
+        part = torch._scaled_mm(
+            x8,
+            w8.t(),
+            scale_a=scale_a,
+            scale_b=scale_b.view(1, -1),
+            out_dtype=torch.bfloat16,
+        )
+        output[:, start:end].copy_(part[:rows])
+    ext.had_r_128(output, output, None, svh, 1.0)
+    return True
+
+
 def _reconstruct_hgemm_into(
     output: torch.Tensor,
     x: torch.Tensor,
@@ -854,6 +985,10 @@ def _exl3_gemm(
     # counts and loses by 4-5x at prefill row counts. See the table above.
     threshold = _prefill_reconstruct_rows()
     if threshold and x.shape[0] >= threshold:
+        if _prefill_fp8_enabled() and _reconstruct_fp8_mm_into(
+            output, x, trellis, suh, svh, mcg, mul1
+        ):
+            return output
         _reconstruct_hgemm_into(output, x, trellis, suh, svh, mcg, mul1)
         return output
     x_had = torch.empty_like(x)
@@ -1135,7 +1270,28 @@ def _b12x_trellis_linear_out(
     c_tmp: torch.Tensor,
     rotated_f16: torch.Tensor,
 ) -> None:
-    """Execute dense Trellis into graph-owned output and scratch tensors."""
+    """Execute dense Trellis into graph-owned output and scratch tensors.
+
+    B12X's native K6 kernel is a *decode* kernel and it is excellent at that: measured on
+    SM120 it beats reconstruct+GEMM by ~5x at m=1-8. At prefill row counts the ordering
+    reverses, because the trellis is streamed per output tile instead of materialised once:
+    at m=2048 reconstruct+FP8 is 2.07x faster on down_proj, 1.91x on attention in_proj and
+    1.76x on the head.
+
+    The K6/MCG shards therefore need the same runtime dispatch that PR #316 gave the generic
+    `exl3_gemm` path - and it has to live inside this opaque op, because a Python-level row
+    test around the two calls is resolved once at trace time and would bake the prefill
+    branch into the decode graphs.
+    """
+
+    threshold = _prefill_reconstruct_rows()
+    if threshold and x.shape[0] >= threshold:
+        if _prefill_fp8_enabled() and _reconstruct_fp8_mm_into(
+            output, x, trellis, suh, svh, True, False
+        ):
+            return
+        _reconstruct_hgemm_into(output, x, trellis, suh, svh, True, False)
+        return
 
     api = _load_b12x_trellis_linear()
     weight = _b12x_trellis_weight(trellis, suh, svh, x.dtype)
@@ -1719,7 +1875,12 @@ class Exl3Config(QuantizationConfig):
                 return None
             self._require_eager_moe_experts(prefix)
             return Exl3MoEMethod(self, layer.moe_config)
+        if layer.__class__.__name__ == "VocabParallelEmbedding":
+            if method := _get_embedding_overlay_method():
+                return method
+            return None
         return None
+
 
     def _get_bf16_online_linear_method(
         self, layer: torch.nn.Module, prefix: str
@@ -1996,6 +2157,107 @@ class Exl3Config(QuantizationConfig):
         if int(match.group("rank")) != get_tensor_model_parallel_rank():
             return None
         return f"{match.group('prefix')}.{match.group('field')}"
+
+
+
+_EMBED_OVERLAY_BITS_ENV = "VLLM_EXL3_EMBED_BITS"
+
+
+def _get_embedding_overlay_method() -> QuantizeMethodBase | None:
+    """Quantize the input embedding table, off by default.
+
+    On Qwen3.8-27B the table is 248,320 x 5,120 in BF16 = 2.543 GB resident, second only to
+    the MLP stack, and it is pure lookup: no matmul, no accumulation, one row per token. That
+    makes it the cheapest large saving available, and on a 32 GB card it is the difference
+    between 196,608 and native 262,144 context - the measured KV shortfall there is 0.63 GiB
+    and int8 frees 1.18 GiB.
+
+    int8 rather than FP8: both halve the table, but E4M3 carries three mantissa bits against
+    int8's seven, so per-row symmetric int8 is roughly an order of magnitude more accurate for
+    the same bytes. There is no tensor-core path to exploit here - the operation is a gather -
+    so FP8's throughput advantage does not apply.
+
+    ``VLLM_EXL3_EMBED_BITS=8`` enables it. The head is untied on this architecture, so this
+    touches inputs only.
+    """
+    raw = os.environ.get(_EMBED_OVERLAY_BITS_ENV)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        bits = int(raw)
+    except ValueError:
+        raise ValueError(f"{_EMBED_OVERLAY_BITS_ENV} must be 8 or 16, got {raw!r}") from None
+    if bits == 16:
+        return None
+    if bits != 8:
+        raise ValueError(f"{_EMBED_OVERLAY_BITS_ENV} supports 8 (int8) or 16 (off), got {bits}")
+    return Exl3Int8EmbeddingMethod()
+
+
+class Exl3Int8EmbeddingMethod(QuantizeMethodBase):
+    """Per-row symmetric int8 storage for the input embedding table.
+
+    The checkpoint keeps BF16, so nothing about the artifact changes; the table is narrowed
+    once after loading and the BF16 copy is released. Each row carries its own scale, which is
+    what keeps the error small: a row is one token's vector, and rows differ in magnitude far
+    more than elements within a row do.
+    """
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        weight = torch.nn.Parameter(
+            torch.empty(
+                sum(output_partition_sizes),
+                input_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        layer.register_parameter("weight", weight)
+        set_weight_attrs(weight, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        weight = layer.weight.data
+        if weight.dtype == torch.int8:
+            return
+        out_dtype = weight.dtype
+        amax = weight.abs().amax(dim=1, keepdim=True).float().clamp_(min=1e-8)
+        scale = (amax / 127.0).to(torch.float32)
+        packed = torch.round(weight.float() / scale).clamp_(-127, 127).to(torch.int8)
+        layer.register_buffer("weight_int8", packed)
+        layer.register_buffer("weight_scale", scale.squeeze(1).to(out_dtype))
+        layer.exl3_embed_out_dtype = out_dtype
+        # Release the BF16 table: it is 2.543 GB on this model and nothing reads it again.
+        layer.weight = torch.nn.Parameter(
+            torch.empty(0, dtype=out_dtype, device=weight.device), requires_grad=False
+        )
+        del weight
+        torch.cuda.empty_cache()
+        logger.info(
+            "EXL3 int8 embedding overlay: %d x %d rows narrowed, %.3f GB -> %.3f GB",
+            packed.shape[0],
+            packed.shape[1],
+            packed.numel() * 2 / 1e9,
+            (packed.numel() + packed.shape[0] * 2) / 1e9,
+        )
+
+    def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
+        raise NotImplementedError("the embedding overlay implements embedding(), not apply()")
+
+    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        rows = layer.weight_int8.index_select(0, input_.flatten())
+        scales = layer.weight_scale.index_select(0, input_.flatten()).unsqueeze(-1)
+        out = rows.to(layer.exl3_embed_out_dtype) * scales
+        return out.view(*input_.shape, layer.weight_int8.shape[1])
 
 
 class Exl3Parameter(BasevLLMParameter):
