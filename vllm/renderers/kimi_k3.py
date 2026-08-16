@@ -67,12 +67,30 @@ def _apply_k3_thinking_kwargs(kwargs: dict[str, Any]) -> None:
 
 
 def _is_prose_only_assistant(message: Mapping[str, Any]) -> bool:
+    """Return whether a message contains only assistant prose.
+
+    Args:
+        message: Chat message to classify.
+
+    Returns:
+        ``True`` when the message is an assistant message with string content
+        and no tool calls.
+    """
     if message.get("role") != "assistant" or message.get("tool_calls"):
         return False
     return isinstance(message.get("content"), str)
 
 
 def _is_toolcall_only_assistant(message: Mapping[str, Any]) -> bool:
+    """Return whether a message contains only assistant tool calls.
+
+    Args:
+        message: Chat message to classify.
+
+    Returns:
+        ``True`` when the message is an assistant message with tool calls and
+        no non-whitespace prose.
+    """
     if message.get("role") != "assistant" or not message.get("tool_calls"):
         return False
     content = message.get("content")
@@ -80,8 +98,8 @@ def _is_toolcall_only_assistant(message: Mapping[str, Any]) -> bool:
 
 
 def _merge_k3_split_assistant_turns(
-    conversation: list[ConversationMessage],
-) -> list[ConversationMessage]:
+    messages: list[ChatCompletionMessageParam],
+) -> list[ChatCompletionMessageParam]:
     """Merge adjacent (prose-only, tool_calls-only) assistant pairs.
 
     OpenAI-compatible gateways may split one logical assistant turn into a
@@ -94,15 +112,22 @@ def _merge_k3_split_assistant_turns(
     message: prose in the response channel and calls in the tools section.
 
     Only the exact split shape is merged. Pairs where both halves carry
-    reasoning fields are left untouched (no reasoning is ever discarded).
-    Returns a new list; caller-owned message dicts are not mutated.
+    reasoning fields are left untouched, so distinct reasoning payloads remain
+    distinct turns.
+
+    Args:
+        messages: Validated request messages before content parsing.
+
+    Returns:
+        A new message list with eligible adjacent assistant pairs merged.
+        Caller-owned message dictionaries are not mutated.
     """
-    merged: list[ConversationMessage] = []
+    merged: list[ChatCompletionMessageParam] = []
     index = 0
-    while index < len(conversation):
-        message: Mapping[str, Any] = conversation[index]
+    while index < len(messages):
+        message: Mapping[str, Any] = messages[index]
         nxt: Mapping[str, Any] | None = (
-            conversation[index + 1] if index + 1 < len(conversation) else None
+            messages[index + 1] if index + 1 < len(messages) else None
         )
         if (
             nxt is not None
@@ -119,10 +144,10 @@ def _merge_k3_split_assistant_turns(
                 value = message.get(key)
                 if value and not unified.get(key):
                     unified[key] = value
-            merged.append(cast(ConversationMessage, unified))
+            merged.append(cast(ChatCompletionMessageParam, unified))
             index += 2
             continue
-        merged.append(conversation[index])
+        merged.append(messages[index])
         index += 1
     return merged
 
@@ -240,17 +265,16 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
         messages: list[ChatCompletionMessageParam],
         params: ChatParams,
     ) -> tuple[list[ConversationMessage], DictPrompt]:
+        merged_messages = _merge_k3_split_assistant_turns(messages)
         conversation, mm_data, mm_uuids = parse_chat_messages(
-            messages,
+            merged_messages,
             self.model_config,
             content_format="string",
             media_io_kwargs=_merge_k3_media_io_kwargs(params.media_io_kwargs),
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
 
-        rendered_conversation = _normalize_k3_tool_messages(
-            _merge_k3_split_assistant_turns(conversation)
-        )
+        rendered_conversation = _normalize_k3_tool_messages(conversation)
         prompt = parse_dec_only_prompt(
             self._apply_chat_template(rendered_conversation, params)
         )
@@ -266,17 +290,16 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
         messages: list[ChatCompletionMessageParam],
         params: ChatParams,
     ) -> tuple[list[ConversationMessage], DictPrompt]:
+        merged_messages = _merge_k3_split_assistant_turns(messages)
         conversation, mm_data, mm_uuids = await parse_chat_messages_async(
-            messages,
+            merged_messages,
             self.model_config,
             content_format="string",
             media_io_kwargs=_merge_k3_media_io_kwargs(params.media_io_kwargs),
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
 
-        rendered_conversation = _normalize_k3_tool_messages(
-            _merge_k3_split_assistant_turns(conversation)
-        )
+        rendered_conversation = _normalize_k3_tool_messages(conversation)
         token_ids = await self._apply_chat_template_async(rendered_conversation, params)
         prompt = parse_dec_only_prompt(token_ids)
         if mm_data is not None:

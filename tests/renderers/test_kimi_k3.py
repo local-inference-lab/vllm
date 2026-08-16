@@ -441,48 +441,51 @@ def test_render_messages_keeps_assistant_pair_when_second_has_prose():
 
 
 def test_render_messages_keeps_pair_when_both_have_reasoning():
-    # parse_chat_messages drops nonstandard keys, so the reasoning guard is
-    # exercised at the merge-helper level where gateway dicts arrive intact.
-    from vllm.renderers.kimi_k3 import _merge_k3_split_assistant_turns
+    tokenizer = StubTokenizer([1, 2, 3])
+    renderer = _make_renderer(tokenizer)
 
-    conversation = [
-        {"role": "user", "content": "go"},
-        {
-            "role": "assistant",
-            "content": "prose",
-            "reasoning_content": "thought A",
-        },
-        {
-            "role": "assistant",
-            "content": None,
-            "reasoning_content": "thought B",
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "lookup", "arguments": "{}"},
-                }
-            ],
-        },
-    ]
-
-    merged = _merge_k3_split_assistant_turns(conversation)
+    conversation, _ = renderer.render_messages(
+        [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": "prose",
+                "reasoning": "thought A",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning": "thought B",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+        ChatParams(),
+    )
 
     assistant_messages = [
-        message for message in merged if message["role"] == "assistant"
+        message for message in conversation if message["role"] == "assistant"
     ]
     assert len(assistant_messages) == 2
+    assert assistant_messages[0]["reasoning"] == "thought A"
+    assert assistant_messages[1]["reasoning"] == "thought B"
 
 
 def test_render_messages_merge_preserves_single_reasoning():
-    from vllm.renderers.kimi_k3 import _merge_k3_split_assistant_turns
+    tokenizer = StubTokenizer([1, 2, 3])
+    renderer = _make_renderer(tokenizer)
 
-    conversation = [
+    messages = [
         {"role": "user", "content": "go"},
         {
             "role": "assistant",
             "content": "prose",
-            "reasoning_content": "thought A",
+            "reasoning": "thought A",
         },
         {
             "role": "assistant",
@@ -497,21 +500,52 @@ def test_render_messages_merge_preserves_single_reasoning():
         },
     ]
 
-    merged = _merge_k3_split_assistant_turns(conversation)
+    conversation, _ = renderer.render_messages(messages, ChatParams())
 
     assistant_messages = [
-        message for message in merged if message["role"] == "assistant"
+        message for message in conversation if message["role"] == "assistant"
     ]
     assert len(assistant_messages) == 1
     assert assistant_messages[0]["content"] == "prose"
+    assert assistant_messages[0]["reasoning"] == "thought A"
     assert assistant_messages[0]["reasoning_content"] == "thought A"
     assert assistant_messages[0]["tool_calls"]
     # Inputs are not mutated by the merge.
-    assert conversation[1] == {
+    assert messages[1] == {
         "role": "assistant",
         "content": "prose",
-        "reasoning_content": "thought A",
+        "reasoning": "thought A",
     }
+
+
+@pytest.mark.asyncio
+async def test_render_messages_async_merge_preserves_single_reasoning():
+    renderer = _make_renderer(StubTokenizer([1, 2, 3]))
+
+    conversation, _ = await renderer.render_messages_async(
+        [
+            {"role": "assistant", "content": "prose", "reasoning": "thought A"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+        ChatParams(),
+    )
+
+    assistant_messages = [
+        message for message in conversation if message["role"] == "assistant"
+    ]
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0]["reasoning"] == "thought A"
+    assert assistant_messages[0]["tool_calls"]
 
 
 @pytest.mark.asyncio
