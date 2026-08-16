@@ -861,19 +861,29 @@ def _warm_b12x_trellis_device(
     _B12X_TRELLIS_WARMED_DEVICES.add(device_index)
 
 
-def _b12x_trellis_c_tmp_elements(rows: int, columns: int) -> int:
-    """Return graph-safe dense-W4A16 scratch capacity for one static shape."""
+def _b12x_trellis_c_tmp_elements(
+    rows: int,
+    in_features: int,
+    out_features: int,
+) -> int:
+    """Return graph-safe dense-Trellis scratch for one static shape."""
 
     rows = int(rows)
-    columns = int(columns)
-    if rows <= 128:
-        # The cooperative K6 small-M kernel does not consume W4A16 scratch.
+    in_features = int(in_features)
+    out_features = int(out_features)
+    api = _load_b12x_trellis_linear()
+    small_m_scratch = getattr(api, "k6_mcg_small_m_scratch_elements", None)
+    if rows <= 16 and small_m_scratch is not None:
+        return int(small_m_scratch(in_features, out_features))
+    if rows <= 128 and small_m_scratch is None:
+        # B12X packages without the explicit scratch query expose an unpaired
+        # cooperative K6 ABI that owns no caller-provided split-K scratch.
         return 1
     padded_rows = max(
         ((rows + 47) // 48) * 48,
         ((rows + 63) // 64) * 64,
     )
-    return min(columns * padded_rows, _B12X_TRELLIS_C_TMP_CAP)
+    return min(out_features * padded_rows, _B12X_TRELLIS_C_TMP_CAP)
 
 
 @torch.library.custom_op(
@@ -932,7 +942,13 @@ def _b12x_trellis_linear(
     )
     gemm_output = torch.empty_like(output)
     c_tmp = torch.empty(
-        (_b12x_trellis_c_tmp_elements(x.shape[0], output.shape[1]),),
+        (
+            _b12x_trellis_c_tmp_elements(
+                x.shape[0],
+                trellis.shape[0] * 16,
+                output.shape[1],
+            ),
+        ),
         dtype=torch.float32,
         device=x.device,
     )

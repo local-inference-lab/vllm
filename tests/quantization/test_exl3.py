@@ -1053,6 +1053,41 @@ def test_prepared_dense_weight_is_owned_by_source_tensor(monkeypatch) -> None:
     assert source_ref() is None
 
 
+def test_b12x_trellis_scratch_uses_explicit_small_m_contract(monkeypatch) -> None:
+    calls = []
+    api = SimpleNamespace(
+        k6_mcg_small_m_scratch_elements=lambda size_k, size_n: (
+            calls.append((size_k, size_n)) or 131072
+        )
+    )
+    monkeypatch.setattr(exl3_module, "_load_b12x_trellis_linear", lambda: api)
+
+    assert exl3_module._b12x_trellis_c_tmp_elements(8, 2048, 4096) == 131072
+    assert calls == [(2048, 4096)]
+
+
+def test_b12x_trellis_scratch_uses_generic_contract_above_small_m(
+    monkeypatch,
+) -> None:
+    api = SimpleNamespace(k6_mcg_small_m_scratch_elements=Mock())
+    monkeypatch.setattr(exl3_module, "_load_b12x_trellis_linear", lambda: api)
+
+    assert exl3_module._b12x_trellis_c_tmp_elements(17, 2048, 4096) == 262144
+    api.k6_mcg_small_m_scratch_elements.assert_not_called()
+
+
+def test_b12x_trellis_scratch_without_query_uses_allocation_free_abi(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        exl3_module,
+        "_load_b12x_trellis_linear",
+        lambda: SimpleNamespace(),
+    )
+
+    assert exl3_module._b12x_trellis_c_tmp_elements(8, 2048, 4096) == 1
+
+
 def test_mixed_trellis_dispatches_decode_and_one_grid_prefill(monkeypatch):
     class FakeMixedApi:
         def __init__(self):
