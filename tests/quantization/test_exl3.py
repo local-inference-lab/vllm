@@ -1093,22 +1093,24 @@ def test_mixed_trellis_dispatches_decode_and_one_grid_prefill(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        def run_mixed_trellis(self, x, *args):
-            launch = args[7]
-            self.calls.append((int(x.shape[0]), args[0], args[1], launch))
-            return torch.full_like(x, launch.value)
+        def run_bound_mixed_trellis(self, x, topk_weights, topk_ids, binding, buffers):
+            del topk_weights, topk_ids, buffers
+            self.calls.append((int(x.shape[0]), *binding.tiers, binding.launch))
+            return torch.full_like(x, binding.launch.value)
 
     mixed_api = FakeMixedApi()
     decode_tiers = (object(), object())
     prefill_tiers = (object(), object())
+    decode_launch = SimpleNamespace(value=1)
+    prefill_launch = SimpleNamespace(value=3)
     runtime = {
         "mixed_api": mixed_api,
         "decode": {
-            "launch": SimpleNamespace(value=1),
+            "launch": decode_launch,
             "buffers": object(),
         },
         "prefill": {
-            "launch": SimpleNamespace(value=3),
+            "launch": prefill_launch,
             "buffers": object(),
         },
         "max_decode_m": 8,
@@ -1122,6 +1124,14 @@ def test_mixed_trellis_dispatches_decode_and_one_grid_prefill(monkeypatch):
             "global_to_combined": object(),
             "descriptor_map": object(),
             "rotations": object(),
+            "runtime_bindings": {
+                id(decode_launch): SimpleNamespace(
+                    tiers=decode_tiers, launch=decode_launch
+                ),
+                id(prefill_launch): SimpleNamespace(
+                    tiers=prefill_tiers, launch=prefill_launch
+                ),
+            },
         }
     )
     method = object.__new__(Exl3MoEMethod)

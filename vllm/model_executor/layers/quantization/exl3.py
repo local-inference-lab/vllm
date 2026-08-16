@@ -438,6 +438,7 @@ def _load_b12x_mixed_trellis() -> Any:
             module, "build_projection_tiered_maps", None
         ),
         combine_trellis_rotations=module.combine_trellis_rotations,
+        bind_mixed_trellis=getattr(module, "bind_mixed_trellis", None),
         bind_mixed_trellis3=getattr(module, "bind_mixed_trellis3", None),
         compile_mixed_trellis=module.compile_mixed_trellis,
         compile_mixed_trellis3=getattr(module, "compile_mixed_trellis3", None),
@@ -447,7 +448,7 @@ def _load_b12x_mixed_trellis() -> Any:
         ),
         max_packed_route_slots=host.max_packed_route_slots,
         prepare_weights=prepare.prepare_trellis256_moe_weights,
-        run_mixed_trellis=module.run_mixed_trellis,
+        run_bound_mixed_trellis=getattr(module, "run_bound_mixed_trellis", None),
         run_bound_mixed_trellis3=getattr(module, "run_bound_mixed_trellis3", None),
         warmup_mixed_trellis_route_pack=module.warmup_mixed_trellis_route_pack,
     )
@@ -3380,8 +3381,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
 
         def bind_layer_states(runtime: dict[str, Any]) -> None:
-            if len(tier_signature) != 3:
-                return
             state_pairs = [(runtime["decode"], mixed["tiers"])]
             if runtime["prefill"] is not None:
                 state_pairs.append((runtime["prefill"], mixed["prefill_tiers"]))
@@ -3389,10 +3388,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             if mixed.get("runtime_binding_key") == binding_key:
                 return
 
-            bind_mixed = runtime["mixed_api"].bind_mixed_trellis3
+            bind_mixed = (
+                runtime["mixed_api"].bind_mixed_trellis3
+                if len(tier_signature) == 3
+                else runtime["mixed_api"].bind_mixed_trellis
+            )
             if bind_mixed is None:
                 raise RuntimeError(
-                    "the installed B12X build lacks three-tier artifact binding"
+                    "the installed B12X build lacks mixed Trellis artifact binding"
                 )
             bind_kwargs = {}
             gate_experts = mixed.get("tier_gate_experts")
@@ -3571,45 +3574,21 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             state: dict[str, Any],
             tiers: tuple[Any, ...],
         ) -> torch.Tensor:
-            if len(tiers) == 3:
-                run_bound = runtime["mixed_api"].run_bound_mixed_trellis3
-                if run_bound is None:
-                    raise RuntimeError(
-                        "the installed B12X build lacks three-tier bound execution"
-                    )
-                return run_bound(
-                    slice_x,
-                    slice_weights,
-                    slice_ids,
-                    mixed["runtime_bindings"][id(state["launch"])],
-                    state["buffers"],
-                ).to(slice_x.dtype)
-
-            run_kwargs = {}
-            gate_experts = mixed.get("tier_gate_experts")
-            up_experts = mixed.get("tier_up_experts")
-            if (gate_experts is None) != (up_experts is None):
+            run_bound = (
+                runtime["mixed_api"].run_bound_mixed_trellis3
+                if len(tiers) == 3
+                else runtime["mixed_api"].run_bound_mixed_trellis
+            )
+            if run_bound is None:
                 raise RuntimeError(
-                    "projection-tight mixed Trellis tiers require paired gate/up counts"
+                    "the installed B12X build lacks bound mixed Trellis execution"
                 )
-            if gate_experts is not None:
-                run_kwargs.update(gate_experts=gate_experts, up_experts=up_experts)
-            run_mixed = runtime["mixed_api"].run_mixed_trellis
-            if run_mixed is None:
-                raise RuntimeError(
-                    "the installed B12X build lacks mixed Trellis execution"
-                )
-            return run_mixed(
+            return run_bound(
                 slice_x,
-                *tiers,
                 slice_weights,
                 slice_ids,
-                mixed["global_to_combined"],
-                mixed["descriptor_map"],
-                mixed["rotations"],
-                state["launch"],
+                mixed["runtime_bindings"][id(state["launch"])],
                 state["buffers"],
-                **run_kwargs,
             ).to(slice_x.dtype)
 
         if m <= runtime["max_decode_m"]:
@@ -3797,17 +3776,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "R7 fused MoE requires the projection-tier B12X API; "
                 "the kernel and loader patches must be installed together"
             )
-        if len(tier_bits) == 3 and any(
-            getattr(mixed_api, name, None) is None
-            for name in (
+        required_mixed_api = (
+            (
                 "bind_mixed_trellis3",
                 "compile_mixed_trellis3",
                 "make_mixed_trellis3_buffers",
                 "run_bound_mixed_trellis3",
             )
-        ):
+            if len(tier_bits) == 3
+            else ("bind_mixed_trellis", "run_bound_mixed_trellis")
+        )
+        if any(getattr(mixed_api, name, None) is None for name in required_mixed_api):
             raise RuntimeError(
-                "R7 K3/K4/K5 layers require native three-tier B12X support"
+                f"R7 {len(tier_bits)}-tier layers require matching bound-execution "
+                "support from B12X"
             )
         trellis_codebook = str(self.quant_config.r7_routed_experts["codebook"]).lower()
         hidden_size = int(layer.exl3_hidden_size)
@@ -3909,7 +3891,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
             # Projection-tight w13: exactly gate_count + up_count planes, no
             # padded (2, max) stack. Safe because the kernel is told the gate
-            # count explicitly (run_mixed_trellis gate_experts), so its
+            # count explicitly through the mixed Trellis binding, so its
             # cute.size(w13)//2 up-block base lands at gate_count*stride rather
             # than being inferred from a padded extent. Padding instead costs
             # ~1 extra plane per tier per layer, measured at -1.81 GiB of KV
@@ -4024,7 +4006,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 # of it that is discarded here, so it gets a shared never-read
                 # ballast; the served w13 is the tight [gate|up] buffer bound
                 # below. The kernel sizes its w13 descriptor by gate_count
-                # (run_mixed_trellis gate_experts), so cute.size//2 lands the
+                # through the mixed Trellis binding, so cute.size//2 lands the
                 # up-block base at gate_count*stride over that tight buffer.
                 fc1_prepared = call(slots, _r7_w13_ballast(slots, w13), fc1_w2)
                 _tight_view = w13.view(torch.int32).reshape(
@@ -4116,7 +4098,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "trellis_codebook": trellis_codebook,
             # FC1 slot counts: what sizes the launch and the policy signature.
             "tier_ids": tuple(fc1_counts),
-            # Real gate plane count per tier, threaded to run_mixed_trellis so
+            # Real gate plane count per tier, threaded into the binding so
             # the w13 descriptor sizes by gate_count over the tight buffer.
             "tier_gate_experts": tuple(tier_gate_counts),
             # Real up counts make descriptor bounds independent of FC1 slots.
