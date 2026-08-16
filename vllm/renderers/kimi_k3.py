@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Mapping
 from typing import Any, cast
 
 from vllm.config import VllmConfig
@@ -24,6 +25,7 @@ from .params import ChatParams
 # and request-level media_io_kwargs still take precedence over this default.
 _K3_MEDIA_IO_DEFAULTS: dict[str, dict[str, Any]] = {"image": {"image_mode": None}}
 _K3_THINKING_EFFORTS = ("low", "high", "max")
+_K3_REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
 
 
 def _merge_k3_media_io_kwargs(
@@ -62,6 +64,67 @@ def _apply_k3_thinking_kwargs(kwargs: dict[str, Any]) -> None:
             parameter="thinking_effort",
             value=thinking_effort,
         )
+
+
+def _is_prose_only_assistant(message: Mapping[str, Any]) -> bool:
+    if message.get("role") != "assistant" or message.get("tool_calls"):
+        return False
+    return isinstance(message.get("content"), str)
+
+
+def _is_toolcall_only_assistant(message: Mapping[str, Any]) -> bool:
+    if message.get("role") != "assistant" or not message.get("tool_calls"):
+        return False
+    content = message.get("content")
+    return content is None or (isinstance(content, str) and not content.strip())
+
+
+def _merge_k3_split_assistant_turns(
+    conversation: list[ConversationMessage],
+) -> list[ConversationMessage]:
+    """Merge adjacent (prose-only, tool_calls-only) assistant pairs.
+
+    OpenAI-compatible gateways may split one logical assistant turn into a
+    prose-only message followed by a tool_calls-only message. K3's XTML
+    encoder renders each list entry as its own ``<|open|>message
+    role="assistant"`` block, so the split shape teaches the model
+    in-context that a prose-only assistant message with no tool section is a
+    normal terminal turn — measurably increasing prose-only stops mid-way
+    through agentic workflows. One logical turn must render as one XTML
+    message: prose in the response channel and calls in the tools section.
+
+    Only the exact split shape is merged. Pairs where both halves carry
+    reasoning fields are left untouched (no reasoning is ever discarded).
+    Returns a new list; caller-owned message dicts are not mutated.
+    """
+    merged: list[ConversationMessage] = []
+    index = 0
+    while index < len(conversation):
+        message: Mapping[str, Any] = conversation[index]
+        nxt: Mapping[str, Any] | None = (
+            conversation[index + 1] if index + 1 < len(conversation) else None
+        )
+        if (
+            nxt is not None
+            and _is_prose_only_assistant(message)
+            and _is_toolcall_only_assistant(nxt)
+            and not (
+                any(message.get(key) for key in _K3_REASONING_KEYS)
+                and any(nxt.get(key) for key in _K3_REASONING_KEYS)
+            )
+        ):
+            unified = dict(nxt)
+            unified["content"] = message.get("content")
+            for key in _K3_REASONING_KEYS:
+                value = message.get(key)
+                if value and not unified.get(key):
+                    unified[key] = value
+            merged.append(cast(ConversationMessage, unified))
+            index += 2
+            continue
+        merged.append(conversation[index])
+        index += 1
+    return merged
 
 
 def _normalize_k3_tool_messages(
@@ -185,7 +248,9 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
 
-        rendered_conversation = _normalize_k3_tool_messages(conversation)
+        rendered_conversation = _normalize_k3_tool_messages(
+            _merge_k3_split_assistant_turns(conversation)
+        )
         prompt = parse_dec_only_prompt(
             self._apply_chat_template(rendered_conversation, params)
         )
@@ -209,7 +274,9 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
 
-        rendered_conversation = _normalize_k3_tool_messages(conversation)
+        rendered_conversation = _normalize_k3_tool_messages(
+            _merge_k3_split_assistant_turns(conversation)
+        )
         token_ids = await self._apply_chat_template_async(rendered_conversation, params)
         prompt = parse_dec_only_prompt(token_ids)
         if mm_data is not None:

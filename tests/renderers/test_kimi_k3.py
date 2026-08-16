@@ -341,6 +341,179 @@ def test_render_messages_ignores_client_supplied_xtml_tool_attrs():
     assert "index" not in conversation[1]
 
 
+def test_render_messages_merges_split_assistant_prose_and_tool_calls():
+    tokenizer = StubTokenizer([1, 2, 3])
+    renderer = _make_renderer(tokenizer)
+
+    conversation, _ = renderer.render_messages(
+        [
+            {"role": "user", "content": "inspect config"},
+            {"role": "assistant", "content": "Checking config now."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ],
+        ChatParams(),
+    )
+
+    assistant_messages = [
+        message for message in conversation if message["role"] == "assistant"
+    ]
+    assert len(assistant_messages) == 1
+    unified = assistant_messages[0]
+    assert unified["content"] == "Checking config now."
+    assert unified["tool_calls"][0]["function"]["name"] == "lookup"
+    # The tool message still resolves against the merged assistant turn.
+    assert conversation[-1]["tool"] == "lookup"
+    assert conversation[-1]["index"] == 1
+    assert tokenizer.conversations[-1] == conversation
+
+
+def test_render_messages_merges_empty_prose_and_tool_calls_pair():
+    tokenizer = StubTokenizer([1, 2, 3])
+    renderer = _make_renderer(tokenizer)
+
+    conversation, _ = renderer.render_messages(
+        [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": ""},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+        ChatParams(),
+    )
+
+    assistant_messages = [
+        message for message in conversation if message["role"] == "assistant"
+    ]
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0]["content"] == ""
+    assert assistant_messages[0]["tool_calls"]
+
+
+def test_render_messages_keeps_assistant_pair_when_second_has_prose():
+    tokenizer = StubTokenizer([1, 2, 3])
+    renderer = _make_renderer(tokenizer)
+
+    conversation, _ = renderer.render_messages(
+        [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "first turn"},
+            {
+                "role": "assistant",
+                "content": "second turn with prose",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+        ChatParams(),
+    )
+
+    assistant_messages = [
+        message for message in conversation if message["role"] == "assistant"
+    ]
+    assert len(assistant_messages) == 2
+    assert assistant_messages[0]["content"] == "first turn"
+    assert assistant_messages[1]["content"] == "second turn with prose"
+
+
+def test_render_messages_keeps_pair_when_both_have_reasoning():
+    # parse_chat_messages drops nonstandard keys, so the reasoning guard is
+    # exercised at the merge-helper level where gateway dicts arrive intact.
+    from vllm.renderers.kimi_k3 import _merge_k3_split_assistant_turns
+
+    conversation = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": "prose",
+            "reasoning_content": "thought A",
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": "thought B",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        },
+    ]
+
+    merged = _merge_k3_split_assistant_turns(conversation)
+
+    assistant_messages = [
+        message for message in merged if message["role"] == "assistant"
+    ]
+    assert len(assistant_messages) == 2
+
+
+def test_render_messages_merge_preserves_single_reasoning():
+    from vllm.renderers.kimi_k3 import _merge_k3_split_assistant_turns
+
+    conversation = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": "prose",
+            "reasoning_content": "thought A",
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        },
+    ]
+
+    merged = _merge_k3_split_assistant_turns(conversation)
+
+    assistant_messages = [
+        message for message in merged if message["role"] == "assistant"
+    ]
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0]["content"] == "prose"
+    assert assistant_messages[0]["reasoning_content"] == "thought A"
+    assert assistant_messages[0]["tool_calls"]
+    # Inputs are not mutated by the merge.
+    assert conversation[1] == {
+        "role": "assistant",
+        "content": "prose",
+        "reasoning_content": "thought A",
+    }
+
+
 @pytest.mark.asyncio
 async def test_render_messages_async_returns_token_prompt():
     renderer = _make_renderer(StubTokenizer([4, 5]))
