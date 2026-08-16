@@ -726,8 +726,31 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
+                    #
+                    # The per-group (divergent) hybrid lookup below reports the
+                    # full-attention group's hit as the local prefix and relies
+                    # on the connector to restore the lagging recurrent (Mamba/
+                    # GDN) state at that boundary -- nixl does this in
+                    # _apply_prefix_caching. A connector that does not restore
+                    # lagging group state (e.g. LMCacheMPConnector) leaves the
+                    # Mamba state block at the resume boundary uninitialized:
+                    # attention KV is valid, the recurrent state is garbage,
+                    # and generation is silently corrupted for content in the
+                    # divergence window (receipts/lmcache-reuse-test.json:
+                    # 14/14 wrong with the connector vs 7/7 correct without,
+                    # at identical reuse geometry). Upstream vLLM gates this
+                    # path on supports_divergent_local_hybrid_hits (PR #48425
+                    # lineage); mirror that: connectors that do not opt in get
+                    # the reconciled min-across-groups hit from
+                    # get_computed_blocks, which only resumes where every
+                    # group's state exists.
                     if (
                         self.connector is not None
+                        and getattr(
+                            self.connector,
+                            "supports_divergent_local_hybrid_hits",
+                            False,
+                        )
                         and self.has_mamba_layers
                         and isinstance(
                             self.kv_cache_manager.coordinator,
