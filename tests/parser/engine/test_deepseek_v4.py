@@ -231,6 +231,54 @@ class TestMissingInvokeEnd:
         assert "Done." in collect_content(results)
 
 
+class TestLegacyDirectDsml:
+    """ASCII-pipe DSML invokes without an outer wrapper remain tool calls."""
+
+    @staticmethod
+    def _legacy_invoke(name: str, value: str) -> str:
+        return (
+            f'<|DSML|invoke name="{name}">\n'
+            f'<|DSML|parameter name="command" string="true">{value}'
+            "</|DSML|parameter>\n</|DSML|invoke>"
+        )
+
+    def test_non_streaming_two_direct_invokes_are_tool_calls(
+        self, mock_tokenizer, mock_request
+    ):
+        text = "Preamble.\n" + self._legacy_invoke("exec", "true")
+        text += "\n" + self._legacy_invoke("exec", "false")
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
+
+        reasoning, content, tool_calls = parser.parse(text, mock_request)
+
+        assert reasoning is None
+        assert content is not None
+        assert content.rstrip() == "Preamble."
+        assert tool_calls is not None
+        assert [call.name for call in tool_calls] == ["exec", "exec"]
+        assert [json.loads(call.arguments) for call in tool_calls] == [
+            {"command": "true"},
+            {"command": "false"},
+        ]
+
+    def test_streaming_split_legacy_markers_do_not_leak(
+        self, mock_tokenizer, mock_request
+    ):
+        text = self._legacy_invoke("exec", "true")
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
+        chunks = [text[i : i + 7] for i in range(0, len(text), 7)]
+
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+
+        assert collect_function_name(results) == "exec"
+        assert json.loads(collect_tool_arguments(results)) == {"command": "true"}
+        assert "DSML" not in collect_content(results)
+
+
 # ── Thinking mode initial state ──────────────────────────────────────
 
 
