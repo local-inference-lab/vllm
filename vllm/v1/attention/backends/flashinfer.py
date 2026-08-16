@@ -3,6 +3,7 @@
 """Attention layer with FlashInfer."""
 
 import inspect
+from collections.abc import Collection
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache, partial
@@ -622,25 +623,39 @@ def persistent_decode_wrapper_eligible(
     pure_decode: bool,
     num_decode_tokens: int,
     decode_cudagraph_max_bs: int,
-    decode_q_len: int,
-    planned_decode_q_len: int,
+    decode_shape: tuple[int, int],
+    planned_decode_shapes: Collection[tuple[int, int]],
+    planning_for_capture: bool,
 ) -> bool:
     """Whether a decode-classified batch may reuse a persistent (CUDA-graph)
     FlashInfer decode wrapper.
 
-    Persistent wrappers are planned once, during graph capture, with a frozen
-    ``q_len_per_req`` of exactly ``planned_decode_q_len`` (1 + num_spec_tokens;
-    1 without speculative decoding). Reuse is only sound when the runtime
-    per-request query length matches that frozen shape — FlashInfer's
-    ``fast_decode_plan`` hard-errors otherwise ("q_len_per_req is part of the
-    frozen cudagraph shape").
+    Persistent wrappers are created and planned during CUDA-graph capture, and
+    are keyed by the exact shape capture planned them with:
+    ``(num_decodes, q_len_per_req)``. Both halves are frozen. FlashInfer
+    refuses to replan a CUDA-graph wrapper for another query length
+    ("q_len_per_req is part of the frozen cudagraph shape"), and a captured
+    graph bakes in the *addresses* of the plan buffers its wrapper held at
+    capture time. The dynamic wrapper (``use_cuda_graph=False``) rebinds
+    ``_paged_kv_indptr_buf`` / ``_paged_kv_last_page_len_buf`` and reallocates
+    ``_qo_indptr_buf`` on every plan, so a graph captured around it replays
+    against freed memory (cudaErrorIllegalAddress). A batch a captured graph
+    will replay must therefore resolve to the very wrapper capture planned,
+    and a shape capture never planned must take the dynamic wrapper.
 
-    WARNING: ``planned_decode_q_len`` is NOT ``reorder_batch_threshold``. With
+    The admitted shapes are recorded by capture instead of derived from
+    ``1 + num_spec_tokens``, because that scalar is not the only FULL-captured
+    decode shape: the V2 speculator's draft-decode graphs run ``q_len == 1``
+    (one token per request per draft step), and a per-batch-size speculative
+    depth schedule captures one verify shape per depth.
+
+    WARNING: the admitted shapes are NOT ``reorder_batch_threshold``. With
     parallel drafting the decode-classification ceiling is
     ``1 + 2 * num_spec_tokens``, which deliberately admits reduced-depth steps
     (spec truncation near ``max_tokens``, short chunked-prefill tails fused
-    with the spec step). Those are valid decode batches, but they must take
-    the dynamic wrapper, which replans for the current shape on every call.
+    with the spec step). Those are valid decode batches, but unless capture
+    planned that exact shape they must take the dynamic wrapper, which replans
+    for the current shape on every call.
 
     Args:
         pure_decode: True when the batch contains no prefill requests.
@@ -648,20 +663,21 @@ def persistent_decode_wrapper_eligible(
         decode_cudagraph_max_bs: Token capacity the persistent wrappers were
             sized for ((1 + num_spec_tokens) * max_num_reqs, capped by
             ``max_cudagraph_capture_size``).
-        decode_q_len: Runtime per-request query length of the active
-            (non-padding) decode requests.
-        planned_decode_q_len: Frozen per-request query length the persistent
-            wrappers were planned with (1 + num_spec_tokens).
+        decode_shape: Runtime ``(num_decodes, q_len_per_req)`` of this batch;
+            the query length is that of the active (non-padding) decode
+            requests.
+        planned_decode_shapes: Shapes capture has planned a persistent wrapper
+            for (the keys of ``_decode_wrappers_cudagraph``).
+        planning_for_capture: True when this build *is* the capture-time build,
+            which is what creates and plans the persistent wrapper.
 
     Returns:
         True when the batch may be routed to the persistent (CUDA-graph)
         decode wrapper; False when it must use the dynamic wrapper.
     """
-    return (
-        pure_decode
-        and num_decode_tokens <= decode_cudagraph_max_bs
-        and decode_q_len == planned_decode_q_len
-    )
+    if not pure_decode or num_decode_tokens > decode_cudagraph_max_bs:
+        return False
+    return planning_for_capture or decode_shape in planned_decode_shapes
 
 
 def decode_q_len_from_indptr(qo_indptr_cpu: torch.Tensor, num_decodes: int) -> int:
@@ -735,18 +751,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if speculative_config is not None
             else 0
         )
-        # The frozen per-request query length persistent decode wrappers are
-        # planned with during capture. See persistent_decode_wrapper_eligible
-        # for why this must never be conflated with reorder_batch_threshold.
-        self._planned_decode_q_len = 1 + num_spec_tokens
+        # Persistent decode wrappers are planned during CUDA-graph capture and
+        # keyed by the shape capture froze them with; see
+        # persistent_decode_wrapper_eligible.
+        self._planning_for_cudagraph_capture = False
         self.enable_cuda_graph = (
             self.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         )
         if self.enable_cuda_graph:
-            # For full cudagraph capture, one `decode_wrapper` for each batch
-            # size is needed for FlashInfer.
+            # For full cudagraph capture, one `decode_wrapper` per captured
+            # (batch size, per-request query length) shape is needed for
+            # FlashInfer.
             self._decode_wrappers_cudagraph: dict[
-                int, BatchDecodeWithPagedKVCacheWrapper
+                tuple[int, int], BatchDecodeWithPagedKVCacheWrapper
             ] = {}
             self._decode_cudagraph_max_bs = (1 + num_spec_tokens) * max_num_reqs
             if self.compilation_config.max_cudagraph_capture_size is not None:
@@ -1092,9 +1109,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
 
-    def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False):
+    def _get_decode_wrapper(
+        self, batch_size: int, decode_q_len: int, use_cudagraph: bool = False
+    ):
         if use_cudagraph:
-            decode_wrapper = self._decode_wrappers_cudagraph.get(batch_size, None)
+            decode_wrapper = self._decode_wrappers_cudagraph.get(
+                (batch_size, decode_q_len), None
+            )
         else:
             decode_wrapper = self._decode_wrapper
 
@@ -1126,7 +1147,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
             # save the decode wrapper
             if use_cudagraph:
-                self._decode_wrappers_cudagraph[batch_size] = decode_wrapper
+                self._decode_wrappers_cudagraph[(batch_size, decode_q_len)] = (
+                    decode_wrapper
+                )
             else:
                 self._decode_wrapper = decode_wrapper
 
@@ -1593,12 +1616,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         pure_decode=pure_decode,
                         num_decode_tokens=num_decode_tokens,
                         decode_cudagraph_max_bs=self._decode_cudagraph_max_bs,
-                        decode_q_len=decode_q_len,
-                        planned_decode_q_len=self._planned_decode_q_len,
+                        decode_shape=(num_decodes, decode_q_len),
+                        planned_decode_shapes=self._decode_wrappers_cudagraph,
+                        planning_for_capture=self._planning_for_cudagraph_capture,
                     )
                 )
 
-                decode_wrapper = self._get_decode_wrapper(num_decodes, use_cudagraph)
+                decode_wrapper = self._get_decode_wrapper(
+                    num_decodes, decode_q_len, use_cudagraph
+                )
                 # Use the persistent buffer with padding length,
                 # instead of the same address but chunked version
                 # in atten_metadata when using cudagraph.
@@ -1631,6 +1657,21 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
+
+    @override
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> FlashInferMetadata:
+        # The capture-time build is what creates and plans the persistent
+        # decode wrappers, and records the (num_decodes, q_len_per_req) shape
+        # they are frozen with, so the replay-time build resolves to the same
+        # wrapper — and therefore to the plan buffer addresses the graph baked
+        # in. See persistent_decode_wrapper_eligible.
+        self._planning_for_cudagraph_capture = True
+        try:
+            return super().build_for_cudagraph_capture(common_attn_metadata)
+        finally:
+            self._planning_for_cudagraph_capture = False
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         if self.kv_cache_spec.dtype != self.vllm_config.model_config.dtype:
