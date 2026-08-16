@@ -192,11 +192,11 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             ),
             # The outer ``tool_calls`` wrapper is optional in legacy DSML.
             (ParserState.CONTENT, "INVOKE_PREFIX"): Transition(
-                ParserState.TOOL_NAME,
+                ParserState.TOOL_DIRECT_NAME,
                 (EventType.TOOL_CALL_START,),
             ),
             (ParserState.CONTENT, "INVOKE_PREFIX_LEGACY"): Transition(
-                ParserState.TOOL_NAME,
+                ParserState.TOOL_DIRECT_NAME,
                 (EventType.TOOL_CALL_START,),
             ),
             (ParserState.REASONING, "TOOL_START_LEGACY"): Transition(
@@ -204,11 +204,11 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                 (EventType.REASONING_END,),
             ),
             (ParserState.REASONING, "INVOKE_PREFIX"): Transition(
-                ParserState.TOOL_NAME,
+                ParserState.TOOL_DIRECT_NAME,
                 (EventType.REASONING_END, EventType.TOOL_CALL_START),
             ),
             (ParserState.REASONING, "INVOKE_PREFIX_LEGACY"): Transition(
-                ParserState.TOOL_NAME,
+                ParserState.TOOL_DIRECT_NAME,
                 (EventType.REASONING_END, EventType.TOOL_CALL_START),
             ),
             (ParserState.TOOL_PREAMBLE, "INVOKE_PREFIX"): Transition(
@@ -223,12 +223,27 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                 ParserState.TOOL_ARGS,
                 (),
             ),
+            (ParserState.TOOL_DIRECT_NAME, "INVOKE_NAME_END"): Transition(
+                ParserState.TOOL_DIRECT_ARGS,
+                (),
+            ),
             (ParserState.TOOL_ARGS, "INVOKE_END"): Transition(
                 ParserState.TOOL_BETWEEN,
                 (EventType.TOOL_CALL_END,),
             ),
             (ParserState.TOOL_ARGS, "INVOKE_END_LEGACY"): Transition(
                 ParserState.TOOL_BETWEEN,
+                (EventType.TOOL_CALL_END,),
+            ),
+            # A direct invoke has no enclosing wrapper. Return to content so
+            # subsequent prose is not suppressed; a later direct invoke can
+            # start another call from CONTENT.
+            (ParserState.TOOL_DIRECT_ARGS, "INVOKE_END"): Transition(
+                ParserState.CONTENT,
+                (EventType.TOOL_CALL_END,),
+            ),
+            (ParserState.TOOL_DIRECT_ARGS, "INVOKE_END_LEGACY"): Transition(
+                ParserState.CONTENT,
                 (EventType.TOOL_CALL_END,),
             ),
             (ParserState.TOOL_ARGS, "TOOL_END"): Transition(
@@ -262,6 +277,8 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             ParserState.REASONING: EventType.REASONING_CHUNK,
             ParserState.TOOL_NAME: EventType.TOOL_NAME,
             ParserState.TOOL_ARGS: EventType.ARG_VALUE_CHUNK,
+            ParserState.TOOL_DIRECT_NAME: EventType.TOOL_NAME,
+            ParserState.TOOL_DIRECT_ARGS: EventType.ARG_VALUE_CHUNK,
         },
         arg_converter=_dsml_arg_converter,
         arg_structural_chars=frozenset(">"),
