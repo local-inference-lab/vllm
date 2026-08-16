@@ -260,6 +260,187 @@ def test_hybrid_mamba_align_partial_hash_hit():
     assert manager.get_blocks("1").blocks[1][1].block_hash_num_tokens == 8
 
 
+def test_dcp8_hybrid_reuses_prefix_at_recurrent_block_boundary():
+    """A DCP-sharded attention block must not coarsen an aligned Mamba hit.
+
+    Kimi K3's production geometry has 1,536-token rank-local blocks and DCP8,
+    so full-attention blocks cover 12,288 logical tokens while recurrent state
+    is materialized every 1,536 tokens. Two prompts sharing 44,449 tokens can
+    therefore safely reuse through token 43,008, rather than falling back to
+    the previous 12,288-token boundary at 36,864.
+    """
+    local_block_size = 1536
+    dcp_world_size = 8
+    global_attention_block_size = local_block_size * dcp_world_size
+    producer_length = 44_449
+    consumer_length = 44_609
+    expected_hit = 43_008
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=local_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=local_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=65_536,
+        enable_caching=True,
+        scheduler_block_size=global_attention_block_size,
+        hash_block_size=local_block_size,
+        dcp_world_size=dcp_world_size,
+    )
+    assert [m.block_size for m in manager.coordinator.single_type_managers] == [
+        global_attention_block_size,
+        local_block_size,
+    ]
+
+    shared_tokens = [i % 251 for i in range(producer_length)]
+    producer = make_request("producer", shared_tokens, local_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(producer)
+    assert num_computed == 0
+
+    # Match the real scheduler: recurrent state is committed one rank-local
+    # block at a time, then the non-aligned prompt tail is computed last.
+    while producer.num_computed_tokens < producer.num_tokens:
+        num_new_tokens = min(
+            local_block_size,
+            producer.num_tokens - producer.num_computed_tokens,
+        )
+        new_blocks = manager.allocate_slots(
+            producer,
+            num_new_tokens,
+            num_new_computed_tokens=(
+                num_computed if producer.num_computed_tokens == 0 else 0
+            ),
+            new_computed_blocks=(
+                computed_blocks if producer.num_computed_tokens == 0 else None
+            ),
+        )
+        assert new_blocks is not None
+        producer.num_computed_tokens += num_new_tokens
+        manager.new_step_starts()
+
+    manager.free(producer)
+    manager.new_step_starts()
+
+    consumer = make_request(
+        "consumer",
+        shared_tokens + [252] * (consumer_length - producer_length),
+        local_block_size,
+        sha256,
+    )
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(consumer)
+
+    assert num_computed == expected_hit
+    assert [len(group) for group in computed_blocks.blocks] == [4, 28]
+
+    new_blocks = manager.allocate_slots(
+        consumer,
+        consumer.num_tokens - num_computed,
+        num_new_computed_tokens=num_computed,
+        new_computed_blocks=computed_blocks,
+    )
+    assert new_blocks is not None
+    copies, _ = manager.take_kv_cache_block_copies()
+    # Only the DCP-sharded attention group resumes inside a physical block;
+    # Mamba lands on an already-materialized full recurrent-state boundary.
+    assert len(copies) == 1
+
+
+def test_dcp_hybrid_keeps_coarse_hits_when_recurrent_state_is_partial():
+    """DCP stays coarse when a hash boundary lacks a full recurrent state."""
+    hash_block_size = 4
+    scheduler_block_size = 8
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=4,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    block_size=8,
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=64,
+        enable_caching=True,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=hash_block_size,
+        dcp_world_size=2,
+    )
+
+    shared_tokens = list(range(13))
+    producer = make_request("producer", shared_tokens, hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(producer)
+    assert num_computed == 0
+
+    while producer.num_computed_tokens < producer.num_tokens:
+        num_new_tokens = min(
+            hash_block_size,
+            producer.num_tokens - producer.num_computed_tokens,
+        )
+        new_blocks = manager.allocate_slots(
+            producer,
+            num_new_tokens,
+            num_new_computed_tokens=(
+                num_computed if producer.num_computed_tokens == 0 else 0
+            ),
+            new_computed_blocks=(
+                computed_blocks if producer.num_computed_tokens == 0 else None
+            ),
+        )
+        assert new_blocks is not None
+        producer.num_computed_tokens += num_new_tokens
+        manager.new_step_starts()
+
+    manager.free(producer)
+    manager.new_step_starts()
+
+    consumer = make_request(
+        "consumer",
+        shared_tokens + [13],
+        hash_block_size,
+        sha256,
+    )
+    _, num_computed, _ = manager.get_computed_blocks(consumer)
+
+    assert num_computed == scheduler_block_size
+
+
 def test_hybrid_mamba_partial_tail_owner_uses_cow_on_continue():
     hash_block_size = 2
     block_size = 2 * hash_block_size

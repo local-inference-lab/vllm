@@ -697,13 +697,34 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     "full-attention, Mamba, and dcp_replicated groups, got: "
                     f"{type(g.kv_cache_spec).__name__}."
                 )
-        # Partial hash hits are limited to full-attention + mamba ("align")
-        # without context parallelism.
-        self.enable_partial_hash_hits = dcp_world_size == 1 and any(
-            isinstance(g.kv_cache_spec, MambaSpec)
-            and g.kv_cache_spec.mamba_cache_mode == "align"
-            and g.kv_cache_spec.block_size > hash_block_size
-            for g in kv_cache_config.kv_cache_groups
+        # Fine-grained hash hits are safe when an aligned Mamba group can
+        # materialize recurrent state at every candidate boundary. Under DCP,
+        # full-attention blocks grow by the shard count while Mamba state stays
+        # replicated. Allow interior attention hits only when every aligned
+        # Mamba manager already has one complete state block per hash unit; this
+        # avoids requiring partial recurrent-state hand-off across DCP ranks.
+        aligned_mamba_managers = [
+            manager
+            for group, manager in zip(
+                kv_cache_config.kv_cache_groups,
+                self.single_type_managers,
+                strict=True,
+            )
+            if isinstance(group.kv_cache_spec, MambaSpec)
+            and group.kv_cache_spec.mamba_cache_mode == "align"
+        ]
+        has_fine_grained_group = any(
+            manager.supports_fine_grained_hash_lookup
+            and manager.block_size > hash_block_size
+            for manager in self.single_type_managers
+        )
+        dcp_mamba_states_are_hash_aligned = all(
+            manager.block_size == hash_block_size for manager in aligned_mamba_managers
+        )
+        self.enable_partial_hash_hits = (
+            bool(aligned_mamba_managers)
+            and has_fine_grained_group
+            and (dcp_world_size == 1 or dcp_mamba_states_are_hash_aligned)
         )
         self.verify_and_split_kv_cache_groups()
 
