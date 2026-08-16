@@ -764,6 +764,21 @@ def _resolve_prefill_capacity(max_batched_tokens: int) -> int:
 # capture reconstruct+hgemm, and decode throughput collapses (measured: 56.5 -> 22.6
 # tok/s at C1). Keeping both paths inside one custom op moves the choice to runtime.
 _EXL3_RECONSTRUCT_SLICE_N = 32768
+# One shared byte arena per device instead of one persistent fp16 buffer per
+# (device, K, N-chunk). The scratch is written by ext.reconstruct/
+# reconstruct_slice and fully consumed by ext.hgemm (or the fp8 scale probe's
+# amax) inside the same eager call on the same stream, and no view of it
+# outlives that call, so at most one geometry's scratch is ever live and the
+# arena only needs the bytes of the largest geometry. On a dense checkpoint
+# with 9 distinct geometries this replaces 790 MiB of persistent buffers with
+# one 170 MiB arena; the recovered bytes land in the KV pool because the
+# buffers allocate during the profiling prefill.
+_EXL3_RECONSTRUCT_ARENA: dict[int, torch.Tensor] = {}
+# Devices whose arena address has been recorded by a CUDA-graph capture. A
+# captured kernel bakes the scratch pointer, so a frozen arena must never be
+# reallocated; geometries that no longer fit fall back to a dedicated
+# persistent buffer below (the pre-arena behaviour, so never worse).
+_EXL3_RECONSTRUCT_ARENA_FROZEN: set[int] = set()
 _EXL3_RECONSTRUCT_SCRATCH: dict[tuple[int, int, int], torch.Tensor] = {}
 
 
@@ -784,15 +799,38 @@ def _prefill_reconstruct_rows() -> int:
 
 def _reconstruct_scratch(device: torch.device, k: int, n: int) -> torch.Tensor:
     index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (index, k, n)
-    buf = _EXL3_RECONSTRUCT_SCRATCH.get(key)
-    if buf is None:
-        # One buffer per (device, K, N-chunk), reused by every layer of the same
-        # geometry, so peak scratch is bounded by the largest chunk rather than by
-        # the number of layers: 336 MB for a 5120x32768 chunk in fp16.
-        buf = torch.empty((k, n), dtype=torch.float16, device=device)
-        _EXL3_RECONSTRUCT_SCRATCH[key] = buf
-    return buf
+    nbytes = 2 * k * n  # fp16
+    capturing = torch.cuda.is_current_stream_capturing()
+    arena = _EXL3_RECONSTRUCT_ARENA.get(index)
+    if arena is None or arena.numel() < nbytes:
+        if capturing or index in _EXL3_RECONSTRUCT_ARENA_FROZEN:
+            # Growing reallocates, and a reallocated arena dangles every
+            # address a captured graph already baked. Give this geometry its
+            # own persistent buffer instead.
+            key = (index, k, n)
+            buf = _EXL3_RECONSTRUCT_SCRATCH.get(key)
+            if buf is None:
+                buf = torch.empty((k, n), dtype=torch.float16, device=device)
+                _EXL3_RECONSTRUCT_SCRATCH[key] = buf
+            return buf
+        arena = torch.empty((nbytes,), dtype=torch.uint8, device=device)
+        _EXL3_RECONSTRUCT_ARENA[index] = arena
+        logger.info(
+            "EXL3 reconstruct scratch arena grew to %.1f MiB "
+            "(device %d, geometry K=%d, chunk=%d)",
+            nbytes / (1 << 20),
+            index,
+            k,
+            n,
+        )
+    if capturing:
+        # A capture is recording the arena's address into a graph: freeze it.
+        _EXL3_RECONSTRUCT_ARENA_FROZEN.add(index)
+    # A leading narrow of a contiguous byte arena starts at storage offset 0,
+    # so the fp16 view keeps the allocator's 512-byte base alignment and has
+    # exactly the shape and strides torch.empty((k, n)) would produce: the
+    # kernels see an identical operand and the outputs stay byte-exact.
+    return arena[:nbytes].view(torch.float16).view(k, n)
 
 
 _EXL3_FP8_SCRATCH: dict[tuple[int, int, int], torch.Tensor] = {}
