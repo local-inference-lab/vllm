@@ -263,6 +263,23 @@ class TestLegacyDirectDsml:
             {"command": "false"},
         ]
 
+    def test_streaming_direct_invoke_returns_to_content(
+        self, mock_tokenizer, mock_request
+    ):
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
+        text = self._legacy_invoke("exec", "true") + "\nCalls completed."
+
+        results = simulate_tool_streaming(parser, mock_request, [text])
+        finish_delta = parser.finish_streaming()
+        content = collect_content(results)
+        if finish_delta and finish_delta.content:
+            content += finish_delta.content
+
+        assert collect_function_name(results) == "exec"
+        assert content.strip() == "Calls completed."
+
     def test_streaming_split_legacy_markers_do_not_leak(
         self, mock_tokenizer, mock_request
     ):

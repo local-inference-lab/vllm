@@ -264,6 +264,8 @@ class StreamingParserEngine:
             ParserState.TOOL_ARGS,
             ParserState.TOOL_NAME,
             ParserState.TOOL_BETWEEN,
+            ParserState.TOOL_DIRECT_NAME,
+            ParserState.TOOL_DIRECT_ARGS,
         ):
             if self.tool_index >= 0:
                 events.append(
@@ -314,6 +316,8 @@ class StreamingParserEngine:
             ParserState.TOOL_NAME,
             ParserState.TOOL_ARGS,
             ParserState.TOOL_BETWEEN,
+            ParserState.TOOL_DIRECT_NAME,
+            ParserState.TOOL_DIRECT_ARGS,
         }
     )
 
@@ -389,7 +393,7 @@ class StreamingParserEngine:
         if self.state == ParserState.MESSAGE_HEADER:
             self._message_header_buffer += text
             return []
-        if self.state == ParserState.TOOL_ARGS:
+        if self.state in (ParserState.TOOL_ARGS, ParserState.TOOL_DIRECT_ARGS):
             if self.config.tool_args_json:
                 return self._feed_args_text(text)
             return [
@@ -419,8 +423,9 @@ class StreamingParserEngine:
         message_header = ""
 
         if (
-            self.state == ParserState.TOOL_ARGS
-            and transition.next_state != ParserState.TOOL_ARGS
+            self.state in (ParserState.TOOL_ARGS, ParserState.TOOL_DIRECT_ARGS)
+            and transition.next_state
+            not in (ParserState.TOOL_ARGS, ParserState.TOOL_DIRECT_ARGS)
             and self._args_buffer
         ):
             events.append(
@@ -457,7 +462,7 @@ class StreamingParserEngine:
                 )
             )
 
-        if self.state == ParserState.TOOL_ARGS:
+        if self.state in (ParserState.TOOL_ARGS, ParserState.TOOL_DIRECT_ARGS):
             self._args_brace_depth = 0
             self._args_in_string = False
             self._args_escape_next = False
