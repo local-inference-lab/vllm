@@ -438,6 +438,7 @@ def _load_b12x_mixed_trellis() -> Any:
             module, "build_projection_tiered_maps", None
         ),
         combine_trellis_rotations=module.combine_trellis_rotations,
+        bind_mixed_trellis3=getattr(module, "bind_mixed_trellis3", None),
         compile_mixed_trellis=module.compile_mixed_trellis,
         compile_mixed_trellis3=getattr(module, "compile_mixed_trellis3", None),
         make_mixed_trellis_buffers=module.make_mixed_trellis_buffers,
@@ -447,7 +448,7 @@ def _load_b12x_mixed_trellis() -> Any:
         max_packed_route_slots=host.max_packed_route_slots,
         prepare_weights=prepare.prepare_trellis256_moe_weights,
         run_mixed_trellis=module.run_mixed_trellis,
-        run_mixed_trellis3=getattr(module, "run_mixed_trellis3", None),
+        run_bound_mixed_trellis3=getattr(module, "run_bound_mixed_trellis3", None),
         warmup_mixed_trellis_route_pack=module.warmup_mixed_trellis_route_pack,
     )
     _B12X_MIXED_TRELLIS_API = api
@@ -3377,8 +3378,50 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             broadcast_suh,
             broadcast_svh,
         )
+
+        def bind_layer_states(runtime: dict[str, Any]) -> None:
+            if len(tier_signature) != 3:
+                return
+            state_pairs = [(runtime["decode"], mixed["tiers"])]
+            if runtime["prefill"] is not None:
+                state_pairs.append((runtime["prefill"], mixed["prefill_tiers"]))
+            binding_key = tuple(id(state["launch"]) for state, _tiers in state_pairs)
+            if mixed.get("runtime_binding_key") == binding_key:
+                return
+
+            bind_mixed = runtime["mixed_api"].bind_mixed_trellis3
+            if bind_mixed is None:
+                raise RuntimeError(
+                    "the installed B12X build lacks three-tier artifact binding"
+                )
+            bind_kwargs = {}
+            gate_experts = mixed.get("tier_gate_experts")
+            up_experts = mixed.get("tier_up_experts")
+            if (gate_experts is None) != (up_experts is None):
+                raise RuntimeError(
+                    "projection-tight mixed Trellis tiers require paired gate/up counts"
+                )
+            if gate_experts is not None:
+                bind_kwargs.update(
+                    gate_experts=gate_experts,
+                    up_experts=up_experts,
+                )
+            mixed["runtime_bindings"] = {
+                id(state["launch"]): bind_mixed(
+                    *tiers,
+                    mixed["global_to_combined"],
+                    mixed["descriptor_map"],
+                    mixed["rotations"],
+                    state["launch"],
+                    **bind_kwargs,
+                )
+                for state, tiers in state_pairs
+            }
+            mixed["runtime_binding_key"] = binding_key
+
         runtime = _MIXED_TRELLIS_RUNTIMES.get(key)
         if runtime is not None:
+            bind_layer_states(runtime)
             mixed["runtime"] = runtime
             return runtime
         if torch.cuda.is_current_stream_capturing():
@@ -3486,6 +3529,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "prefill_capacity": prefill_capacity,
         }
         _MIXED_TRELLIS_RUNTIMES[key] = runtime
+        bind_layer_states(runtime)
         mixed["runtime"] = runtime
         decode_bytes = _unique_tensor_storage_bytes(decode["buffers"])
         prefill_bytes = (
@@ -3527,23 +3571,33 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             state: dict[str, Any],
             tiers: tuple[Any, ...],
         ) -> torch.Tensor:
+            if len(tiers) == 3:
+                run_bound = runtime["mixed_api"].run_bound_mixed_trellis3
+                if run_bound is None:
+                    raise RuntimeError(
+                        "the installed B12X build lacks three-tier bound execution"
+                    )
+                return run_bound(
+                    slice_x,
+                    slice_weights,
+                    slice_ids,
+                    mixed["runtime_bindings"][id(state["launch"])],
+                    state["buffers"],
+                ).to(slice_x.dtype)
+
             run_kwargs = {}
             gate_experts = mixed.get("tier_gate_experts")
             up_experts = mixed.get("tier_up_experts")
             if (gate_experts is None) != (up_experts is None):
                 raise RuntimeError(
-                    "projection-tight R7 tiers require paired gate/up counts"
+                    "projection-tight mixed Trellis tiers require paired gate/up counts"
                 )
             if gate_experts is not None:
                 run_kwargs.update(gate_experts=gate_experts, up_experts=up_experts)
-            run_mixed = (
-                runtime["mixed_api"].run_mixed_trellis3
-                if len(tiers) == 3
-                else runtime["mixed_api"].run_mixed_trellis
-            )
+            run_mixed = runtime["mixed_api"].run_mixed_trellis
             if run_mixed is None:
                 raise RuntimeError(
-                    "the installed B12X build lacks native three-tier Trellis support"
+                    "the installed B12X build lacks mixed Trellis execution"
                 )
             return run_mixed(
                 slice_x,
@@ -3746,9 +3800,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if len(tier_bits) == 3 and any(
             getattr(mixed_api, name, None) is None
             for name in (
+                "bind_mixed_trellis3",
                 "compile_mixed_trellis3",
                 "make_mixed_trellis3_buffers",
-                "run_mixed_trellis3",
+                "run_bound_mixed_trellis3",
             )
         ):
             raise RuntimeError(

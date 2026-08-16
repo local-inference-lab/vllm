@@ -102,6 +102,7 @@ class _FakeMixedTrellisApi:
         self.routed = []
         self.calls = []
         self.calls3 = []
+        self.bindings3 = []
 
     def max_packed_route_slots(self, routed_rows, block_size, experts):
         del block_size, experts
@@ -131,9 +132,20 @@ class _FakeMixedTrellisApi:
         self.routed.append((topk_weights.clone(), topk_ids.clone()))
         return x.to(torch.float32)
 
-    def run_mixed_trellis3(self, *args):
-        x, tier0, tier1, tier2, topk_weights, topk_ids = args[:6]
-        self.calls3.append((int(x.shape[0]), tier0, tier1, tier2))
+    def bind_mixed_trellis3(self, *args, **kwargs):
+        tier0, tier1, tier2 = args[:3]
+        launch = args[6]
+        binding = SimpleNamespace(
+            tiers=(tier0, tier1, tier2),
+            launch=launch,
+            kwargs=kwargs,
+        )
+        self.bindings3.append(binding)
+        return binding
+
+    def run_bound_mixed_trellis3(self, x, topk_weights, topk_ids, binding, buffers):
+        del buffers
+        self.calls3.append((int(x.shape[0]), *binding.tiers))
         self.routed.append((topk_weights.clone(), topk_ids.clone()))
         return x.to(torch.float32)
 
@@ -422,6 +434,35 @@ def test_three_tier_prefill_uses_native_b12x_dispatch():
             torch.cat([route[0] for route in h.mixed_api.routed]), weights
         )
         assert torch.equal(torch.cat([route[1] for route in h.mixed_api.routed]), ids)
+
+
+def test_three_tier_layers_share_launches_but_bind_fixed_artifacts_separately():
+    with _Harness(env={"VLLM_EXL3_PREFILL_CAPACITY": "128"}) as h:
+        method = _make_method()
+        first_layer = _make_mixed3_layer()
+        second_layer = _make_mixed3_layer()
+        x = torch.zeros((16, HIDDEN), dtype=torch.bfloat16)
+        weights = torch.ones((16, TOPK), dtype=torch.float32)
+        ids = torch.zeros((16, TOPK), dtype=torch.int64)
+
+        first_runtime = method._mixed_rank_sliced_runtime(first_layer, x, ids)
+        first_bindings = dict(first_layer.exl3_mixed_trellis["runtime_bindings"])
+        second_runtime = method._mixed_rank_sliced_runtime(second_layer, x, ids)
+        second_bindings = dict(second_layer.exl3_mixed_trellis["runtime_bindings"])
+
+        assert first_runtime is second_runtime
+        assert len(h.mixed_api.compiled3) == 2
+        assert len(h.mixed_api.bindings3) == 4
+        assert first_bindings.keys() == second_bindings.keys()
+        for launch_id in first_bindings:
+            first_binding = first_bindings[launch_id]
+            second_binding = second_bindings[launch_id]
+            assert first_binding is not second_binding
+            assert first_binding.tiers != second_binding.tiers
+
+        method._apply_rank_sliced(first_layer, x, weights, ids)
+        assert len(h.mixed_api.bindings3) == 4
+        assert h.mixed_api.calls3[-1][1:] == first_layer.exl3_mixed_trellis["tiers"]
 
 
 def test_mixed_runtime_policy_is_resolved_once():
