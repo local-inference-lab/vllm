@@ -586,6 +586,20 @@ def _r7_w13_ballast(slots: int, like: torch.Tensor) -> torch.Tensor:
 _R7_BALLAST_POOL: dict[Any, torch.Tensor] = {}
 
 
+def release_r7_ballast() -> bool:
+    """Release shared R7 preparation scratch after every layer is bound.
+
+    Returns:
+        ``True`` when resident scratch was released, or ``False`` when the
+        pool was already empty.
+    """
+
+    if not _R7_BALLAST_POOL:
+        return False
+    _R7_BALLAST_POOL.clear()
+    return True
+
+
 def _r7_ballast_view(planes: int, like: torch.Tensor) -> torch.Tensor:
     """Return a view into the shared, never-read preparation pool.
 
@@ -2722,9 +2736,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             import torch as _t
 
             _out = [
-                f"R7DBG {layer.layer_name} rank={layer.exl3_tp_rank} "
-                f"shared_h={getattr(layer, 'exl3_shared_h_rotations', None)} "
-                f"rank_sliced={_rs} local_experts={layer.local_num_experts}"
+                (
+                    f"R7DBG {layer.layer_name} rank={layer.exl3_tp_rank} "
+                    f"shared_h={getattr(layer, 'exl3_shared_h_rotations', None)} "
+                    f"rank_sliced={_rs} local_experts={layer.local_num_experts}"
+                )
             ]
             for _g, _a, _k in (
                 ("w13", "suh", (0, "w1")),

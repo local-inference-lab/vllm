@@ -132,11 +132,11 @@ def process_weights_after_loading(
     # cache. Released once, here: releasing per layer refragments the heap
     # and OOMs the load. Inert unless the EXL3 R7 path allocated it.
     try:
-        from vllm.model_executor.layers.quantization import exl3 as _exl3_r7
+        from vllm.model_executor.layers.quantization.exl3 import (
+            release_r7_ballast,
+        )
 
-        _r7_pool = getattr(_exl3_r7, "_R7_BALLAST_POOL", None)
-        if _r7_pool:
-            _r7_pool.clear()
+        if release_r7_ballast():
             gc.collect()
             torch.cuda.empty_cache()
     except Exception:  # noqa: BLE001 - never block model load on cleanup

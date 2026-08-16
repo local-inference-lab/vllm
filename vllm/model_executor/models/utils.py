@@ -495,7 +495,15 @@ def maybe_fuse_shared_experts(
 
 
 def _nonnegative_layer_count(config: "ModelConfig", name: str) -> int | None:
-    """Return an integral nonnegative layer count from a model config."""
+    """Return an integral nonnegative layer count from a model config.
+
+    Args:
+        config: Model configuration containing the requested count.
+        name: Configuration attribute to read.
+
+    Returns:
+        The nonnegative integer count, or ``None`` for invalid input.
+    """
 
     value = getattr(config, name, 0)
     if isinstance(value, bool) or value is None:

@@ -64,6 +64,14 @@ def _mock_linear() -> Mock:
     return Mock(spec=LinearBase)
 
 
+def test_release_r7_ballast_is_idempotent():
+    exl3_module.release_r7_ballast()
+    exl3_module._r7_ballast_view(2, torch.zeros(1, 8))
+
+    assert exl3_module.release_r7_ballast()
+    assert not exl3_module.release_r7_ballast()
+
+
 def test_exl3_online_overlay_quantizes_only_bf16_dense_and_shared(monkeypatch):
     config = Exl3Config(
         tensor_storage={"model.layers.3.self_attn.q_b_proj": {"quant_format": "exl3"}}
