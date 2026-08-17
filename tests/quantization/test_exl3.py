@@ -771,7 +771,7 @@ def test_rank_sliced_shared_h_create_weights_allocates_one_physical_row(
     assert layer.w2_trellis.exl3_num_experts == 256
 
 
-def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
+def test_rank_sliced_weights_use_btx_native_owner_contract(monkeypatch):
     experts = 2
     hidden = intermediate = 128
     bits = 3
@@ -799,16 +799,25 @@ def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
             self.plan_kwargs = kwargs
             return SimpleNamespace(source_format=kwargs["source_format"])
 
+        def adopt_btx_weights(self, **kwargs):
+            self.prepare_kwargs = kwargs
+            return SimpleNamespace(plan=kwargs["plan"], native=kwargs["prepared"])
+
+    class FakeNativeTrellis:
+        def __init__(self):
+            self.prepare_kwargs = None
+
         def prepare_weights(self, **kwargs):
             self.prepare_kwargs = kwargs
-            return SimpleNamespace(plan=kwargs["plan"])
+            return SimpleNamespace(**kwargs)
 
     api = FakeFusedMoe()
+    native_api = FakeNativeTrellis()
     monkeypatch.setattr(exl3_module, "_load_b12x_fused_moe", lambda: api)
+    monkeypatch.setattr(exl3_module, "_load_b12x_mixed_trellis", lambda: native_api)
     method = object.__new__(Exl3MoEMethod)
     method.quant_config = SimpleNamespace(bits=float(bits))
     method._rank_sliced_backing = lambda _layer, name: slabs[name]
-    marker = torch.tensor(0xCBAC1FED - (1 << 32), dtype=torch.int32)
     layer = SimpleNamespace(
         local_num_experts=experts,
         exl3_hidden_size=hidden,
@@ -817,14 +826,13 @@ def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
         exl3_layer_bitrates=(bits,) * experts,
         exl3_mixed_bitrate=False,
         activation=MoEActivation.SILU,
-        w13_mcg=SimpleNamespace(exl3_tensors={(0, "w1"): marker}),
     )
 
     method._prepare_rank_sliced_weights(layer)
 
     assert api.plan_kwargs == {
         "quant_modes": "w4a16",
-        "source_format": "exl3_trellis_mcg",
+        "source_format": "btx",
         "activation": "silu",
         "params_dtype": torch.float16,
         "num_experts": experts,
@@ -833,13 +841,17 @@ def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
         "w13_layout": "w13",
         "trellis_bits": bits,
         "trellis_tile_config": (64, 128, 64, 128),
+        "trellis_codebook": "mcg",
+        "trellis_rate_structure": "uniform",
     }
+    assert native_api.prepare_kwargs is not None
+    assert native_api.prepare_kwargs["w13"] is slabs["w13_trellis"]
+    assert native_api.prepare_kwargs["w2"] is slabs["w2_trellis"]
+    assert native_api.prepare_kwargs["w13_layout"] == "trellis_t256_proj"
+    assert native_api.prepare_kwargs["codebook"] == "mcg"
     assert api.prepare_kwargs is not None
     assert api.prepare_kwargs["plan"] is layer.exl3_trellis_weights.plan
-    assert api.prepare_kwargs["params_dtype"] == torch.float16
-    assert api.prepare_kwargs["w1_fp4"] is slabs["w13_trellis"]
-    assert api.prepare_kwargs["w2_fp4"] is slabs["w2_trellis"]
-    assert api.prepare_kwargs["trellis_mcg"] is marker
+    assert api.prepare_kwargs["prepared"] is layer.exl3_trellis_weights.native
 
 
 def test_rank_sliced_weights_pass_shared_h_rows_without_expansion(monkeypatch):
@@ -867,14 +879,21 @@ def test_rank_sliced_weights_pass_shared_h_rows_without_expansion(monkeypatch):
             return SimpleNamespace(source_format=kwargs["source_format"])
 
         @staticmethod
+        def adopt_btx_weights(**kwargs):
+            return SimpleNamespace(plan=kwargs["plan"], native=kwargs["prepared"])
+
+    class FakeNativeTrellis:
+        @staticmethod
         def prepare_weights(**kwargs):
             return SimpleNamespace(**kwargs)
 
     monkeypatch.setattr(exl3_module, "_load_b12x_fused_moe", lambda: FakeFusedMoe())
+    monkeypatch.setattr(
+        exl3_module, "_load_b12x_mixed_trellis", lambda: FakeNativeTrellis()
+    )
     method = object.__new__(Exl3MoEMethod)
     method.quant_config = SimpleNamespace(bits=float(bits))
     method._rank_sliced_backing = lambda _layer, name: slabs[name]
-    marker = torch.tensor(0xCBAC1FED - (1 << 32), dtype=torch.int32)
     layer = SimpleNamespace(
         local_num_experts=experts,
         exl3_hidden_size=hidden,
@@ -884,12 +903,11 @@ def test_rank_sliced_weights_pass_shared_h_rows_without_expansion(monkeypatch):
         exl3_mixed_bitrate=False,
         exl3_shared_h_rotations=True,
         activation=MoEActivation.SILU,
-        w13_mcg=SimpleNamespace(exl3_tensors={(0, "w1"): marker}),
     )
 
     method._prepare_rank_sliced_weights(layer)
 
-    prepared = layer.exl3_trellis_weights
+    prepared = layer.exl3_trellis_weights.native
     assert tuple(prepared.gate_suh.shape) == (1, hidden)
     assert tuple(prepared.up_suh.shape) == (1, hidden)
     assert tuple(prepared.down_svh.shape) == (1, hidden)

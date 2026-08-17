@@ -408,8 +408,8 @@ def _load_b12x_fused_moe() -> Any:
         from b12x.moe import fused_moe
     except Exception as exc:
         raise RuntimeError(
-            "Rank-sliced EXL3 requires the exl3_trellis_mcg source in "
-            "b12x.moe.fused_moe. Install a matching B12X build."
+            "Rank-sliced EXL3 requires the BTX Trellis preparation contract "
+            "in b12x.moe.fused_moe. Install a matching B12X build."
         ) from exc
     _B12X_FUSED_MOE_API = fused_moe
     return fused_moe
@@ -3185,6 +3185,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self._prepare_mixed_rank_sliced_weights(layer)
             return
         api = _load_b12x_fused_moe()
+        native_api = _load_b12x_mixed_trellis()
         num_experts = int(layer.local_num_experts)
         hidden_size = int(layer.exl3_hidden_size)
         intermediate_size = int(layer.exl3_intermediate_size_per_partition)
@@ -3237,10 +3238,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         intermediate_rotations[:, 2 * intermediate_size :].copy_(down_suh)
         tile_config = self._trellis_tile_config(hidden_size, intermediate_size)
-        marker = layer.w13_mcg.exl3_tensors[(0, "w1")]
         weight_plan = api.plan_weights(
             quant_modes="w4a16",
-            source_format="exl3_trellis_mcg",
+            source_format="btx",
             activation=layer.activation.value,
             params_dtype=layer.exl3_params_dtype,
             num_experts=num_experts,
@@ -3249,17 +3249,31 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             w13_layout="w13",
             trellis_bits=bits,
             trellis_tile_config=tile_config,
+            trellis_codebook="mcg",
+            trellis_rate_structure="uniform",
         )
-        layer.exl3_trellis_weights = api.prepare_weights(
-            plan=weight_plan,
-            params_dtype=layer.exl3_params_dtype,
-            w1_fp4=w13,
-            w2_fp4=w2,
+        native_weights = native_api.prepare_weights(
+            w13=w13,
+            w2=w2,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            activation=layer.activation.value,
+            fc1_tile_n=tile_config[1],
+            fc2_tile_n=tile_config[3],
+            params_dtype=torch.float16,
+            w13_layout="trellis_t256_proj",
+            trellis_bits=bits,
+            codebook="mcg",
             gate_suh=gate_suh,
             up_suh=up_suh,
             intermediate_rotations=intermediate_rotations,
             down_svh=down_svh,
-            trellis_mcg=marker,
+            tile_config=tile_config,
+        )
+        layer.exl3_trellis_weights = api.adopt_btx_weights(
+            plan=weight_plan,
+            prepared=native_weights,
         )
 
         slabs = (
