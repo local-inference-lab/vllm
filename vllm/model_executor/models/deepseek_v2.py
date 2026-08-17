@@ -24,6 +24,8 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import operator
+import re
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -1815,6 +1817,13 @@ class DeepseekV2Model(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            # When num_nextn_predict_layers == 0 the MTP layers are never
+            # built, so get_spec_layer_idx_from_weight_name does not divert
+            # their checkpoint tensors and they reach AutoWeightsLoader with
+            # no destination, raising KeyError (e.g.
+            # 'layers.78.eh_proj.weight'). Inert when MTP is enabled.
+            if _skip_disabled_mtp_weight(self.config, name):
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
@@ -2187,19 +2196,57 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
 
 # Compatibility with
 # https://huggingface.co/deepseek-ai/DeepSeek-V3-Base/blob/main/configuration_deepseek.py
+def _nonnegative_layer_count(config, name: str, *, default: int = 0) -> int | None:
+    """Return an integral layer count, or None for malformed config values."""
+
+    value = getattr(config, name, default)
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        value = operator.index(value)
+    except TypeError:
+        return None
+    return value if value >= 0 else None
+
+
+def _skip_disabled_mtp_weight(config, name: str) -> bool:
+    """Report whether a checkpoint weight targets a disabled MTP layer.
+
+    Args:
+        config: Model config carrying `num_nextn_predict_layers` and
+            `num_hidden_layers`. Malformed values are treated as "cannot
+            decide" rather than raised.
+        name: Checkpoint weight name as it appears in the safetensors index.
+
+    Returns:
+        True when MTP is disabled (`num_nextn_predict_layers == 0`) and
+        `name` addresses a layer at or beyond `num_hidden_layers`, i.e. an
+        MTP-layer tensor with no destination module; False otherwise.
+    """
+
+    nextn = _nonnegative_layer_count(config, "num_nextn_predict_layers")
+    hidden = _nonnegative_layer_count(config, "num_hidden_layers")
+    if nextn is None or hidden is None:
+        return False
+    if nextn != 0 or hidden <= 0:
+        return False
+    match = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
+    return match is not None and int(match.group(1)) >= hidden
+
+
 def get_spec_layer_idx_from_weight_name(
     config: DeepseekV2Config | DeepseekV3Config, weight_name: str
 ) -> int | None:
-    if (
-        hasattr(config, "num_nextn_predict_layers")
-        and config.num_nextn_predict_layers > 0
-    ):
-        layer_idx = config.num_hidden_layers
-        for i in range(config.num_nextn_predict_layers):
-            if weight_name.startswith(
-                f"model.layers.{layer_idx + i}."
-            ) or weight_name.startswith(f"layers.{layer_idx + i}."):
-                return layer_idx + i
+    nextn = _nonnegative_layer_count(config, "num_nextn_predict_layers")
+    layer_idx = _nonnegative_layer_count(config, "num_hidden_layers")
+    if nextn is None or layer_idx is None or nextn == 0:
+        return None
+    match = re.match(r"^(?:model\.)?layers\.(\d+)\.", weight_name)
+    if match is None:
+        return None
+    weight_layer_idx = int(match.group(1))
+    if layer_idx <= weight_layer_idx < layer_idx + nextn:
+        return weight_layer_idx
     return None
 
 

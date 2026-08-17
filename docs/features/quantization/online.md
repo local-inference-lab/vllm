@@ -100,7 +100,7 @@ vllm serve <glm-5.2-modelopt-checkpoint> \
 Serialized checkpoint-quantized shared experts are preserved; only excluded
 BF16 projection weights are converted at load time.
 
-### MXFP8 dense linears on ModelOpt checkpoints
+### MXFP8 dense linears on quantized checkpoints
 
 The `linear` field overlays online MXFP8 the same way onto every other
 BF16 dense linear the ModelOpt checkpoint excludes: attention projections,
@@ -142,6 +142,22 @@ vllm serve lukealonso/GLM-5.2-NVFP4 \
   --quantization modelopt_fp4 \
   --quantization-config '{"linear":{"weight":"mxfp8"},"ignore":["re:.*kv_b_proj"]}'
 ```
+
+EXL3 checkpoints can use the same overlay for dense and shared-expert
+projections that are absent from the EXL3 tensor metadata. Serialized EXL3
+dense matrices and routed experts always retain their checkpoint format;
+`moe` overlays are rejected. `lm_head` also remains in its checkpoint format
+or BF16. For example:
+
+```bash
+vllm serve <exl3-checkpoint> \
+  --quantization exl3 \
+  --quantization-config '{"linear":{"weight":"mxfp8"},"shared_experts":{"weight":"mxfp8"},"ignore":["re:.*\\.q_a_proj$","re:.*kv_a_proj_with_mqa","lm_head"]}'
+```
+
+As with ModelOpt, `linear` does not select shared experts. Add the
+`shared_experts` field explicitly when those BF16 projections should also be
+converted. Ignore patterns are matched against unfused checkpoint names.
 
 ### Activation overrides on already-quantized checkpoints
 

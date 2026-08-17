@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utilities for selecting and loading models."""
 
+import gc
 import inspect
 import warnings
 from contextlib import contextmanager
@@ -114,6 +115,22 @@ def process_weights_after_loading(
             # Repacking transients above can leave large amounts of memory in
             # the caching allocator, which starves the OS on UMA devices.
             release_device_memory_under_pressure(target_device)
+
+    # Every fused MoE layer is prepared by now, so no further R7 ballast
+    # request can occur. The pool is never-read scratch that would otherwise
+    # stay resident for the process lifetime at the direct expense of KV
+    # cache. Released once, here: releasing per layer refragments the heap
+    # and OOMs the load. Inert unless the EXL3 R7 path allocated it.
+    try:
+        from vllm.model_executor.layers.quantization import exl3 as _exl3_r7
+
+        _r7_pool = getattr(_exl3_r7, "_R7_BALLAST_POOL", None)
+        if _r7_pool:
+            _r7_pool.clear()
+            gc.collect()
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 - never block model load on cleanup
+        logger.debug("EXL3 R7 ballast release skipped", exc_info=True)
 
     # Initialize post-load attention weights for Attention, MLA, and MM encoder.
     # NOTE: Happens after other modules so we can easily decompress weights.
