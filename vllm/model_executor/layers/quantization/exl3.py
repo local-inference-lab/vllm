@@ -819,6 +819,34 @@ def _b12x_trellis_weight(
     return weight
 
 
+def _b12x_trellis_n_bounds() -> tuple[int, int] | None:
+    """Packed-N window the B12X K6 route should serve; outside it use exl3_gemm.
+
+    At decode row counts the B12X small-M kernel loses to ext.exl3_gemm on two
+    shape classes (graph-replayed CUDA-event timing, RTX PRO 6000 Blackwell SE,
+    real K6/MCG weights): the wide head (5120x248320: 705.1 vs 647.8 us) and
+    tiny-N projections (5120x1024 k/v: 27.8 vs 17.5 us). Eager callsites such
+    as the lm_head also pay the Python dispatch stack per call, which the thin
+    exl3_gemm binding avoids. Measured end-to-end on Qwen3.8-27B hydrated
+    (MTP-3, graph decode, C1): +15.4 % single-stream with the default window
+    (proot-hosted measurement; bare-metal bracket +3..15 %).
+
+    VLLM_EXL3_B12X_N_RANGE is "<lo>-<hi>" in output features; "0" or empty
+    restores the unbounded pre-window behaviour.
+    """
+
+    raw = os.environ.get("VLLM_EXL3_B12X_N_RANGE", "5120-32768").strip()
+    if raw in ("", "0"):
+        return None
+    lo, _, hi = raw.partition("-")
+    try:
+        return int(lo), int(hi)
+    except ValueError as exc:
+        raise ValueError(
+            f"VLLM_EXL3_B12X_N_RANGE must be '<lo>-<hi>' or '0', got {raw!r}"
+        ) from exc
+
+
 def _b12x_trellis_k6_supported(
     trellis: torch.Tensor,
     *,
@@ -827,6 +855,11 @@ def _b12x_trellis_k6_supported(
 ) -> bool:
     """Gate the native path to the exact K6/MCG contract it implements."""
 
+    bounds = _b12x_trellis_n_bounds()
+    if bounds is not None:
+        n_packed = int(trellis.shape[1]) * 16
+        if not bounds[0] <= n_packed <= bounds[1]:
+            return False
     return bool(
         has_mcg
         and not has_mul1
