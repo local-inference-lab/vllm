@@ -3131,7 +3131,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     fc1_tile_n=tile_config[1],
                     fc2_tile_n=tile_config[3],
                     params_dtype=torch.float16,
-                    w13_layout="trellis3_t256_proj",
+                    w13_layout="trellis_t256_proj",
                     trellis_bits=bits,
                     codebook="mcg",
                     gate_suh=tier_gate_suh,
@@ -3973,7 +3973,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 # Padding to a common count costs 49.8 GiB per rank on this
                 # checkpoint.
                 #
-                # For native trellis3_t256 the prepared FC2 fields are trivial:
+                # For native trellis_t256 the prepared FC2 fields are trivial:
                 # prepare.py returns w2=_trellis256_flat_native_view(w2) -- a
                 # dtype view, not a repack -- w2_scale = the shared four-byte
                 # dummy, and w2_global_scale = ones(num_experts). So FC2 is
@@ -3991,7 +3991,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                         fc1_tile_n=cfg[1],
                         fc2_tile_n=cfg[3],
                         params_dtype=torch.float16,
-                        w13_layout="trellis3_t256_proj",
+                        w13_layout="trellis_t256_proj",
                         trellis_bits=bits,
                         codebook=trellis_codebook,
                         # prepare wants tier-local rows (or the broadcast
