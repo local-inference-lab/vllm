@@ -18,6 +18,25 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _warm_vision_position_interpolation(model: torch.nn.Module) -> int:
+    from vllm.model_executor.models.kimi_k25_vit import (
+        Learnable2DInterpPosEmbDivided_fixed,
+        get_rope_shape,
+    )
+
+    warmed = 0
+    for module in model.modules():
+        if not isinstance(module, Learnable2DInterpPosEmbDivided_fixed):
+            continue
+        get_rope_shape(
+            module.weight,
+            interpolation_mode=module.interpolation_mode,
+            shape=(64, 64),
+        )
+        warmed += 1
+    return warmed
+
+
 def _get_kda_layer(worker: Worker) -> KimiK3DeltaAttention | None:
     from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 
@@ -186,6 +205,15 @@ def kimi_k3_triton_warmup(worker: Worker) -> None:
     """Warm Kimi-K3 Triton kernels reachable by this server."""
     if not current_platform.is_cuda():
         return
+
+    warmed_vision_interpolators = _warm_vision_position_interpolation(
+        worker.get_model()
+    )
+    if warmed_vision_interpolators:
+        logger.info(
+            "Warmed up %d Kimi vision position interpolator(s).",
+            warmed_vision_interpolators,
+        )
 
     layer = _get_kda_layer(worker)
     if layer is None:
