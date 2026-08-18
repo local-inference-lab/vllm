@@ -500,6 +500,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_logits=self.max_num_reqs * self.decode_query_len,
                 vocab_size=self.vocab_size,
                 device=self.device,
+                num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
             )
 
         if self.is_pooling_model and self.is_last_pp_rank:
@@ -1606,6 +1607,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch,
                     grammar_output.structured_output_request_ids,
                     grammar_output.grammar_bitmask,
+                    grammar_output.num_spec_tokens,
                 )
 
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
