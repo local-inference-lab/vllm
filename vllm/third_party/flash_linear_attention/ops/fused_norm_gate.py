@@ -23,7 +23,7 @@ from vllm.utils.math_utils import cdiv, next_power_of_2
         "HAS_BIAS": lambda args: args["b"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["T"])
 def layer_norm_gated_fwd_kernel(
     x,  # pointer to the input
     g,  # pointer to the gate

@@ -4,12 +4,15 @@
 """Tests that FusedRMSNormGated decomposes correctly under torch.compile,
 matching the eager triton kernel output."""
 
+from typing import Any, cast
+
 import pytest
 import torch
 
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.fused_norm_gate import (
     FusedRMSNormGated,
+    layer_norm_gated_fwd_kernel,
 )
 from vllm.utils.torch_utils import set_random_seed
 
@@ -21,6 +24,44 @@ NUM_TOKENS = [64, 128]
 ACTIVATIONS = ["swish", "sigmoid"]
 ELEMENTWISE_AFFINE = [True, False]
 SEEDS = [0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_tail_length_reuses_aligned_specialization() -> None:
+    """A non-aligned prefill tail must reuse the startup-warmed kernel."""
+    x = torch.empty(1, dtype=torch.bfloat16, device=DEVICE)
+    rstd = torch.empty(1, dtype=torch.float32, device=DEVICE)
+    kernel = cast(Any, layer_norm_gated_fwd_kernel).fn
+    _, _, _, _, binder = kernel.create_binder()
+
+    def bind(length: int):
+        return binder(
+            x,
+            x,
+            x,
+            x,
+            None,
+            None,
+            None,
+            None,
+            rstd,
+            1e-5,
+            length,
+            1,
+            128,
+            128,
+            16,
+            128,
+            "swish",
+            True,
+            False,
+            False,
+            True,
+            False,
+            False,
+        )[1]
+
+    assert bind(1177) == bind(1536)
 
 
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
