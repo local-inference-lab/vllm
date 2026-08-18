@@ -52,6 +52,10 @@ from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
     should_load_quant_weights,
 )
+from vllm.model_executor.layers.attention.mla_attention import (
+    _preallocate_absorbed_mla_weights,
+    _run_mla_query_bmm,
+)
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -526,6 +530,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         projected into latent space by ``W_UK_T`` and the attention output is
         projected back to ``v`` by ``W_UV`` -- avoiding materializing full K/V.
         """
+        pre_w_uv, pre_w_uk_t = _preallocate_absorbed_mla_weights(self, act_dtype)
         kv_b_proj_weight = get_and_maybe_dequant_weights(
             self.kv_b_proj, out_dtype=act_dtype
         ).T
@@ -542,9 +547,17 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
         # (L, N, V) -> (N, L, V)
-        replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
+        w_uv = W_UV.transpose(0, 1)
+        if pre_w_uv is not None:
+            pre_w_uv.copy_(w_uv)
+            w_uv = pre_w_uv
+        replace_parameter(self, "W_UV", w_uv, prefer_copy=True)
         # (L, N, P) -> (N, P, L)
-        replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
+        w_uk_t = W_UK.permute(1, 2, 0)
+        if pre_w_uk_t is not None:
+            pre_w_uk_t.copy_(w_uk_t)
+            w_uk_t = pre_w_uk_t
+        replace_parameter(self, "W_UK_T", w_uk_t, prefer_copy=True)
 
         quant_method = (
             self.quant_config.get_quant_method(self, prefix=self.layer_name)
@@ -572,6 +585,25 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         out = out.view(-1, self.num_local_heads, self.v_head_dim)
         # (N, B, L) x (N, L, V) -> (N, B, V) written transposed into (B, N, V)
         torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
+
+    def _absorb_decode_query(self, q_nope: torch.Tensor) -> torch.Tensor:
+        """Project the Kimi decode query into MLA latent space.
+
+        The NoPE component is an interleaved head view of the combined
+        NoPE/RoPE projection. Tensor-core cuBLAS batched-GEMM algorithms may
+        issue vector reads beyond the logical matrix when the batch stride is
+        smaller than a matrix's storage span. Materializing head-major storage
+        gives every batch matrix an independent contiguous range.
+        """
+        query = q_nope.transpose(0, 1).contiguous()
+        output = query.new_empty((query.shape[0], query.shape[1], self.kv_lora_rank))
+        _run_mla_query_bmm(
+            query,
+            self.W_UK_T,
+            output,
+            use_safe_op=True,
+        )
+        return output.transpose(0, 1)
 
     def _attn_read_kv_cache(self) -> torch.Tensor:
         """Latent cache as seen by the attention read kernels (decode / context).
@@ -760,7 +792,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
             # BMM1: absorb q_nope into latent space. (N,B,P) x (N,P,L) -> (B,N,L)
-            ql_nope = torch.bmm(mqa_q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
+            ql_nope = self._absorb_decode_query(mqa_q_nope)
             # Fused: concat mqa_q = [ql_nope | q_pe] and insert the decode-token
             # latent into the paged cache (one launch, right before forward_mqa).
             mqa_q = self._decode_concat_cache(

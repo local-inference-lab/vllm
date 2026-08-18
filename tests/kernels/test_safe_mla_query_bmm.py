@@ -75,3 +75,33 @@ def test_safe_mla_query_bmm_cuda_graph_replay():
     expected = torch.bmm(query.contiguous(), weight)
 
     torch.testing.assert_close(output.float(), expected.float(), rtol=5e-2, atol=5e-2)
+
+
+def test_safe_mla_query_bmm_kimi_materialized_query():
+    _require_safe_mla_query_bmm()
+    device = torch.device("cuda")
+    heads = 6
+    tokens = 14
+    q_dim = 128
+    latent_dim = 512
+    torch.manual_seed(2)
+
+    query_storage = torch.randn(
+        tokens, heads, q_dim + 64, dtype=torch.bfloat16, device=device
+    )
+    interleaved_query = query_storage[..., :q_dim].transpose(0, 1)
+    query = interleaved_query.contiguous()
+    weight = torch.randn(heads, q_dim, latent_dim, dtype=torch.bfloat16, device=device)
+    output = torch.empty(heads, tokens, latent_dim, dtype=torch.bfloat16, device=device)
+
+    assert not interleaved_query.is_contiguous()
+    assert query.is_contiguous()
+    torch.ops._C.safe_mla_query_bmm(query, weight, output)
+    expected = torch.bmm(query, weight)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.ops._C.safe_mla_query_bmm(query, weight, output)
+    graph.replay()
+
+    torch.testing.assert_close(output.float(), expected.float(), rtol=5e-2, atol=5e-2)

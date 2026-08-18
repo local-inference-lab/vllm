@@ -419,9 +419,12 @@ def _preallocate_absorbed_mla_weights(
         RuntimeError: If neither the source projection nor reusable absorbed
             weights identify the target device.
     """
-    w_uv_shape = (layer.num_heads, layer.kv_lora_rank, layer.v_head_dim)
+    # Model-specific MLA wrappers may retain the global head count while their
+    # absorbed projection is tensor-parallel and therefore uses local heads.
+    num_heads = getattr(layer, "num_local_heads", layer.num_heads)
+    w_uv_shape = (num_heads, layer.kv_lora_rank, layer.v_head_dim)
     w_uk_t_shape = (
-        layer.num_heads,
+        num_heads,
         layer.qk_nope_head_dim,
         layer.kv_lora_rank,
     )
