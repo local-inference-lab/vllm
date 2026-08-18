@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     VLLM_USE_MODELSCOPE: bool = False
     VLLM_USE_FASTOKENS: bool = False
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
+    VLLM_SHM_BROADCAST_BUSY_LOOP_S: float = 0.002
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
     VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE: int = 256
@@ -762,6 +763,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Interval in seconds to log a warning message when the ring buffer is full
     "VLLM_RINGBUFFER_WARNING_INTERVAL": lambda: int(
         os.environ.get("VLLM_RINGBUFFER_WARNING_INTERVAL", "60")
+    ),
+    # How long a shm message-queue reader keeps busy-polling the ring buffer
+    # after its last successful read before parking on the zmq notification
+    # socket. Spinning wins a few microseconds of wake-up latency; it costs a
+    # core held at max clock for the whole window.
+    #
+    # Raise it on a discrete-GPU server, where a spinning core is thermal noise
+    # and latency is all that matters. Keep it small on packages that share a
+    # thermal budget between CPU and GPU (e.g. NVIDIA GB10): there a reader that
+    # never parks pins a performance core at max clock for the entire decode
+    # phase, and the heat comes straight out of the GPU's headroom.
+    "VLLM_SHM_BROADCAST_BUSY_LOOP_S": lambda: float(
+        os.environ.get("VLLM_SHM_BROADCAST_BUSY_LOOP_S", "0.002")
     ),
     # path to cudatoolkit home directory, under which should be bin, include,
     # and lib directories.
@@ -2420,6 +2434,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
+        "VLLM_SHM_BROADCAST_BUSY_LOOP_S",
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
