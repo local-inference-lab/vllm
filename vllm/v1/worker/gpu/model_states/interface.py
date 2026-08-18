@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -187,6 +188,7 @@ class ModelState(ABC):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        kvarn_mla_block_fills: Sequence[dict[int, int | None] | None] | None = None,
     ) -> dict[str, Any]:
         raise NotImplementedError
 

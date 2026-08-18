@@ -65,6 +65,93 @@ NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
 
 
+def test_profiling_cache_cleanup_resets_shared_backend_state_once(monkeypatch):
+    profiling_workspace = torch.empty(16, dtype=torch.uint8)
+    profiling_slot_map = torch.arange(4, dtype=torch.int32)
+    profiling_caches = [
+        torch.ones(1, dtype=torch.uint8),
+        torch.ones(1, dtype=torch.uint8),
+    ]
+
+    class FakeKVarNImpl:
+        workspace_registry = {"profiling": profiling_workspace}
+        state_mirrors = {"profiling": profiling_slot_map}
+        instances: list["FakeKVarNImpl"] = []
+        reset_calls = 0
+
+        def __init__(self, cache_ref):
+            self.cache_ref = cache_ref
+            self.instances.append(self)
+
+        @classmethod
+        def reset_kv_cache_binding_state(cls):
+            cls.reset_calls += 1
+            assert all(
+                actual_cache is profiling_cache
+                for actual_cache, profiling_cache in zip(
+                    runner.kv_caches, profiling_caches
+                )
+            )
+            assert all(
+                layer.kv_cache is profiling_cache
+                for layer, profiling_cache in zip(layers, profiling_caches)
+            )
+            cls.workspace_registry.clear()
+            cls.state_mirrors.clear()
+            for instance in cls.instances:
+                instance.cache_ref = None
+
+    layers = [
+        SimpleNamespace(impl=FakeKVarNImpl(cache), kv_cache=cache)
+        for cache in profiling_caches
+    ]
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.kv_caches = list(profiling_caches)
+    runner.cross_layers_kv_cache = None
+    runner.cross_layers_attn_backend = None
+    runner.attn_groups = []
+    runner.kv_cache_config = object()
+    runner.cache_config = SimpleNamespace(num_gpu_blocks=len(profiling_caches))
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context={
+            f"layer.{index}": layer for index, layer in enumerate(layers)
+        }
+    )
+
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(gpu_model_runner_module.gc, "collect", lambda: None)
+
+    runner._cleanup_profiling_kv_cache()
+
+    assert FakeKVarNImpl.reset_calls == 1
+    assert FakeKVarNImpl.workspace_registry == {}
+    assert FakeKVarNImpl.state_mirrors == {}
+    assert all(instance.cache_ref is None for instance in FakeKVarNImpl.instances)
+    assert runner.kv_caches == []
+    assert all(layer.kv_cache.numel() == 0 for layer in layers)
+
+    production_workspace = torch.empty(32, dtype=torch.uint8)
+    production_slot_map = torch.arange(8, dtype=torch.int32)
+    FakeKVarNImpl.workspace_registry["production"] = production_workspace
+    FakeKVarNImpl.state_mirrors["production"] = production_slot_map
+    for instance in FakeKVarNImpl.instances:
+        instance.cache_ref = production_workspace
+
+    assert all(
+        workspace is not profiling_workspace
+        for workspace in FakeKVarNImpl.workspace_registry.values()
+    )
+    assert all(
+        slot_map is not profiling_slot_map
+        for slot_map in FakeKVarNImpl.state_mirrors.values()
+    )
+    assert all(
+        instance.cache_ref is production_workspace
+        for instance in FakeKVarNImpl.instances
+    )
+
+
 def initialize_kv_cache(runner: GPUModelRunner):
     """
     Only perform necessary steps in GPUModelRunner.initialize_kv_cache()
