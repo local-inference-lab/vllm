@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
+    combine_topk_swa_indices,
     compute_dcp_global_topk_indices_and_lens,
     compute_global_topk_indices_and_lens,
 )
@@ -64,3 +65,64 @@ def test_dcp_global_topk_ignores_stale_padding_request_index() -> None:
 
     assert indices.cpu().tolist() == [[20, 21, -1, -1], [-1, -1, -1, -1]]
     assert lengths.cpu().tolist() == [2, 0]
+
+
+def test_combine_topk_swa_indices_matches_reference_across_worker_tiles() -> None:
+    """Sparse and sliding-window metadata cover every query token exactly."""
+    device = torch.device("cuda")
+    query_start = torch.tensor([0, 129, 300], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([1024, 2048], dtype=torch.int32, device=device)
+    gather_lens = torch.tensor([512, 1024], dtype=torch.int32, device=device)
+    topk = 8
+    window_size = 8
+    compress_ratio = 4
+    req_stride = 4096
+    swa_offset = 2048
+    topk_indices = torch.arange(
+        300 * topk,
+        dtype=torch.int32,
+        device=device,
+    ).reshape(300, topk)
+
+    actual_indices, actual_lens = combine_topk_swa_indices(
+        topk_indices,
+        query_start,
+        seq_lens,
+        gather_lens,
+        window_size,
+        compress_ratio,
+        topk,
+        req_stride,
+        swa_offset,
+    )
+
+    expected_indices = torch.full_like(actual_indices, -1)
+    expected_lens = torch.empty_like(actual_lens)
+    query_start_cpu = query_start.cpu().tolist()
+    for req_idx, (start, end) in enumerate(
+        zip(query_start_cpu[:-1], query_start_cpu[1:], strict=True)
+    ):
+        query_len = end - start
+        seq_len = int(seq_lens[req_idx].item())
+        gather_start = seq_len - int(gather_lens[req_idx].item())
+        start_pos = seq_len - query_len
+        for token_idx in range(start, end):
+            pos = start_pos + token_idx - start
+            topk_len = min((pos + 1) // compress_ratio, topk)
+            swa_len = min(pos + 1, window_size)
+            expected_indices[token_idx, :topk_len] = (
+                topk_indices[token_idx, :topk_len] + req_stride * req_idx
+            )
+            expected_indices[token_idx, topk_len : topk_len + swa_len] = (
+                torch.arange(
+                    swa_offset + pos - swa_len + 1 - gather_start,
+                    swa_offset + pos + 1 - gather_start,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                + req_stride * req_idx
+            )
+            expected_lens[token_idx] = topk_len + swa_len
+
+    torch.testing.assert_close(actual_indices, expected_indices)
+    torch.testing.assert_close(actual_lens, expected_lens)
