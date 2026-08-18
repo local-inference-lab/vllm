@@ -547,6 +547,9 @@ class CommonAttentionMetadata:
     block_table_tensor: torch.Tensor
     slot_mapping: torch.Tensor
 
+    kvarn_mla_block_fills: dict[int, int | None] | None = None
+    """Exact physical blocks; ``None`` marks a conservatively unknown fill."""
+
     causal: bool | torch.Tensor = True
     max_req_tokens: int = 0
 
@@ -747,6 +750,7 @@ class CommonAttentionMetadata:
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
             replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),
+            kvarn_mla_block_fills=self.kvarn_mla_block_fills,
         )
 
 

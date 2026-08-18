@@ -40,6 +40,8 @@ def _bf16_mla_sparse_kernel(
     BLOCK_DV: tl.constexpr,  # block size for dim_v
     BLOCK_DMODEL: tl.constexpr,  # block size for dim_nope
     BLOCK_DPE: tl.constexpr,  # block size for positional embedding
+    RETURN_LSE: tl.constexpr,
+    RETURN_MAX_LOGITS: tl.constexpr,
     LOGE2: tl.constexpr,
 ):
     cur_q = tl.program_id(0)
@@ -154,9 +156,10 @@ def _bf16_mla_sparse_kernel(
     # rescaling
     acc /= e_sum[:, None]
 
-    max_logits = e_max * LOGE2
-    # calculate lse
-    lse = max_logits + tl.log2(e_sum) * LOGE2
+    if RETURN_LSE or RETURN_MAX_LOGITS:
+        max_logits = e_max * LOGE2
+    if RETURN_LSE:
+        lse = max_logits + tl.log2(e_sum) * LOGE2
 
     # write output
     offs_o = (
@@ -172,8 +175,10 @@ def _bf16_mla_sparse_kernel(
     )
 
     offs_lse = cur_q * stride_lse + cur_head
-    tl.store(softmax_lse_ptr + offs_lse, lse, mask=mask_h)
-    tl.store(max_logits_ptr + offs_lse, max_logits, mask=mask_h)
+    if RETURN_LSE:
+        tl.store(softmax_lse_ptr + offs_lse, lse, mask=mask_h)
+    if RETURN_MAX_LOGITS:
+        tl.store(max_logits_ptr + offs_lse, max_logits, mask=mask_h)
 
 
 # reference implementation of bf16 sparse prefill kernel
@@ -185,10 +190,12 @@ def triton_bf16_mla_sparse_interface(
     d_v: int = 512,
     block_dpe: int = 64,
     out: torch.Tensor | None = None,
+    return_lse: bool = True,
+    return_max_logits: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    out : [num_tokens, num_heads_q, d_v]; when passed in, it is zeroed and
-        written directly (avoids a caller-side copy).
+    out : [num_tokens, num_heads_q, d_v]; when passed in, it is fully
+        overwritten directly (avoids a caller-side allocation and copy).
     max_logits : [num_tokens, num_heads_q]
     lse : logsumexp, [num_tokens, num_heads_q]
 
@@ -237,12 +244,16 @@ def triton_bf16_mla_sparse_interface(
         assert out.dtype == q.dtype, (
             f"out dtype {out.dtype} must match q dtype {q.dtype}"
         )
-        out.zero_()
-    softmax_lse = torch.zeros(
-        (num_tokens, num_heads_q), dtype=torch.float32, device=q.device
+    aux_shape = (num_tokens, num_heads_q)
+    softmax_lse = torch.empty(
+        aux_shape if return_lse else (1,),
+        dtype=torch.float32,
+        device=q.device,
     )
-    max_logits = torch.zeros(
-        (num_tokens, num_heads_q), dtype=torch.float32, device=q.device
+    max_logits = torch.empty(
+        aux_shape if return_max_logits else (1,),
+        dtype=torch.float32,
+        device=q.device,
     )
 
     k = kv
@@ -282,6 +293,8 @@ def triton_bf16_mla_sparse_interface(
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
         LOGE2=LOGE2,
+        RETURN_LSE=return_lse,
+        RETURN_MAX_LOGITS=return_max_logits,
     )
 
     return out, max_logits, softmax_lse
