@@ -814,6 +814,10 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                         )
                     if not has_fused_target:
                         continue
+                # EXL3 may keep the indexer projections split to preserve the
+                # checkpoint's per-projection quantization metadata.
+                if param_name == "wk_weights_proj" and name_mapped not in params_dict:
+                    continue
                 name = name_mapped
 
                 if _try_load_fp8_linear_as_bf16(

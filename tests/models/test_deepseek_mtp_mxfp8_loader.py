@@ -12,6 +12,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     dequant_mxfp8_to_bf16,
 )
 from vllm.model_executor.models.deepseek_mtp import (
+    DeepSeekMTP,
     _get_local_model_path,
     _try_load_fp8_linear_as_bf16,
 )
@@ -85,6 +86,60 @@ def test_mtp_fallback_loader_accepts_mxfp8_weight_scale():
     assert torch.equal(param.data, expected)
     assert "model.layers.78.self_attn.fused_qkv_a_proj.weight" in loaded
     assert pending == {}
+
+
+def test_mtp_indexer_loader_falls_back_to_split_parameters(monkeypatch):
+    prefix = "model.layers.78.mtp_block.self_attn.indexer"
+    wk = torch.nn.Parameter(torch.empty(2, 2, dtype=torch.bfloat16))
+    weights_proj = torch.nn.Parameter(torch.empty(2, 2, dtype=torch.bfloat16))
+
+    def load_parameter(param, loaded_weight):
+        param.data.copy_(loaded_weight)
+
+    wk.weight_loader = load_parameter
+    weights_proj.weight_loader = load_parameter
+    params = {
+        f"{prefix}.wk.weight": wk,
+        f"{prefix}.weights_proj.weight": weights_proj,
+    }
+    model = SimpleNamespace(
+        config=SimpleNamespace(n_routed_experts=0, n_shared_experts=0),
+        quant_config=None,
+        model=SimpleNamespace(mtp_start_layer_idx=78, num_mtp_layers=1),
+        named_parameters=lambda: params.items(),
+        _rewrite_spec_layer_name=lambda _layer, name: name,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.deepseek_mtp."
+        "rocm_aiter_ops.is_fusion_moe_shared_experts_enabled",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.deepseek_mtp.fused_moe_make_expert_params_mapping",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.deepseek_mtp.get_pp_missing_layer_names",
+        lambda _model: set(),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.deepseek_mtp.get_spec_layer_idx_from_weight_name",
+        lambda _config, name: 78 if ".layers.78." in name else None,
+    )
+    wk_weight = torch.full_like(wk, 1)
+    weights_proj_weight = torch.full_like(weights_proj, 2)
+
+    loaded = DeepSeekMTP.load_weights(
+        model,
+        [
+            (f"{prefix}.wk.weight", wk_weight),
+            (f"{prefix}.weights_proj.weight", weights_proj_weight),
+        ],
+    )
+
+    assert torch.equal(wk, wk_weight)
+    assert torch.equal(weights_proj, weights_proj_weight)
+    assert loaded == set(params)
 
 
 def test_mtp_serialized_probe_uses_target_revision_for_same_model(monkeypatch):
