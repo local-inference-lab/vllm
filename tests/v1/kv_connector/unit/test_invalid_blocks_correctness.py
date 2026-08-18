@@ -67,6 +67,121 @@ def recompute_scheduler():
     return create_scheduler(vllm_config)
 
 
+def _create_invalid_block_test_scheduler(
+    scheduler_block_size: int,
+    group_block_sizes: tuple[int, ...],
+) -> Scheduler:
+    """Create the scheduler state required by invalid-block mapping tests."""
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.block_size = scheduler_block_size
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                [f"full_attention_{group_idx}"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            )
+            for group_idx, block_size in enumerate(group_block_sizes)
+        ],
+    )
+    return scheduler
+
+
+def test_hybrid_cache_invalid_block_truncates_and_evicts_all_groups():
+    """A failed hybrid-cache group invalidates the shared logical suffix."""
+    scheduler = _create_invalid_block_test_scheduler(16, (16, 16))
+    scheduler.kv_cache_manager.get_block_ids.return_value = (
+        [1, 2, 3, 4],
+        [11, 12, 13, 14],
+    )
+    scheduler.kv_cache_manager.get_block_ids_for_computed_tokens.return_value = (
+        [1, 2, 3, 4],
+        [11, 12, 13, 14],
+    )
+
+    request = Mock(spec=Request)
+    request.request_id = "hybrid-request"
+    request.num_computed_tokens = 64
+
+    affected, affected_tokens, evicted = scheduler._update_requests_with_invalid_blocks(
+        [request],
+        invalid_block_ids={12},
+        num_scheduled_tokens={},
+    )
+
+    assert affected == {request.request_id}
+    assert request.num_computed_tokens == 16
+    assert affected_tokens == 48
+    assert evicted == {2, 3, 4, 12, 13, 14}
+
+
+def test_hybrid_cache_shared_invalid_block_is_recomputed_once():
+    """A shared failed block contributes one recomputation interval."""
+    scheduler = _create_invalid_block_test_scheduler(16, (16, 16))
+    scheduler.kv_cache_manager.get_block_ids.side_effect = (
+        ([1, 2, 3], [11, 12, 13]),
+        ([21, 22, 23], [31, 12, 33]),
+    )
+    scheduler.kv_cache_manager.get_block_ids_for_computed_tokens.side_effect = (
+        ([1, 2, 3], [11, 12, 13]),
+        ([21, 22, 23], [31, 12, 33]),
+    )
+
+    first_request = Mock(spec=Request)
+    first_request.request_id = "first-request"
+    first_request.num_computed_tokens = 48
+    second_request = Mock(spec=Request)
+    second_request.request_id = "second-request"
+    second_request.num_computed_tokens = 48
+
+    affected, affected_tokens, evicted = scheduler._update_requests_with_invalid_blocks(
+        [first_request, second_request],
+        invalid_block_ids={12},
+        num_scheduled_tokens={},
+    )
+
+    assert affected == {first_request.request_id, second_request.request_id}
+    assert first_request.num_computed_tokens == 16
+    assert second_request.num_computed_tokens == 48
+    assert affected_tokens == 32
+    assert evicted == {2, 3, 12, 13}
+
+
+def test_hybrid_cache_ignores_invalid_blocks_after_external_prefix():
+    """Blocks used only by scheduled local tokens are not load failures."""
+    scheduler = _create_invalid_block_test_scheduler(32, (16, 32))
+    scheduler.kv_cache_manager.get_block_ids.return_value = (
+        [1, 2, 3, 4],
+        [11, 12],
+    )
+    scheduler.kv_cache_manager.get_block_ids_for_computed_tokens.return_value = (
+        [1, 2],
+        [11],
+    )
+
+    request = Mock(spec=Request)
+    request.request_id = "local-suffix"
+    request.num_computed_tokens = 64
+
+    affected, affected_tokens, evicted = scheduler._update_requests_with_invalid_blocks(
+        [request],
+        invalid_block_ids={3, 12},
+        num_scheduled_tokens={request.request_id: 32},
+    )
+
+    assert affected == set()
+    assert request.num_computed_tokens == 64
+    assert affected_tokens == 0
+    assert evicted == set()
+
+
 def test_sync_recompute_blocks_not_freed_for_running_requests(
     recompute_scheduler: Scheduler,
 ):
@@ -774,13 +889,10 @@ def test_sync_recompute_handles_mixed_kv_group_block_sizes():
         model_runner_output,
     )
 
-    invalid_block_start = invalid_block_idx * 32
     expected_recompute_from = (
-        invalid_block_start // scheduler_block_size * scheduler_block_size
+        invalid_block_idx * 32 // scheduler_block_size * scheduler_block_size
     )
 
-    assert invalid_block_start == 96
-    assert expected_recompute_from == 64
     assert request.num_computed_tokens == expected_recompute_from
     assert request.status == RequestStatus.RUNNING
     assert request in scheduler.running
