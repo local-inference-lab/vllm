@@ -466,6 +466,39 @@ class TQFullAttentionSpec(FullAttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class KVarNFullAttentionSpec(FullAttentionSpec):
+    """Full-attention spec with group-sized KVarN tiles."""
+
+    tile_size: int = 0
+    quant_group_size: int = 64
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        if self.tile_size > 0:
+            return (
+                self.num_kv_heads
+                * self.tile_size
+                * (self.block_size // self.quant_group_size)
+            )
+        return super().real_page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        merged = super().merge(specs)
+        assert all(spec.tile_size == specs[0].tile_size for spec in specs), (
+            "All KVarN layers in one cache group must use the same tile size."
+        )
+        assert all(
+            spec.quant_group_size == specs[0].quant_group_size for spec in specs
+        ), "All KVarN layers in one cache group must use the same quantization group."
+        return replace(
+            merged,
+            tile_size=specs[0].tile_size,
+            quant_group_size=specs[0].quant_group_size,
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None
@@ -486,6 +519,18 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.cache_dtype_str == "kvarn_mla_k5_g64":
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNMLAConfig,
+            )
+
+            config = KVarNMLAConfig.from_cache_dtype(self.cache_dtype_str)
+            if self.block_size != config.group:
+                raise ValueError(
+                    "MLA KVarN requires block_size "
+                    f"{config.group}, got {self.block_size}."
+                )
+            return config.tile_bytes
         if self.cache_dtype_str == "nvfp4_ds_mla":
             # NVFP4 MLA latent: 432 B/token (256B E2M1 NoPE + 32B E4M3 group-16
             # scales + 16B pad + 128B BF16 RoPE). Same record for the
@@ -736,6 +781,36 @@ class SlidingWindowSpec(AttentionSpec):
             isinstance(spec, SlidingWindowSpec)
             and spec.sliding_window == self.sliding_window
             and spec.dcp_replicated == self.dcp_replicated
+            for spec in kv_cache_specs.values()
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class KVarNSlidingWindowSpec(SlidingWindowSpec):
+    """Sliding-window spec with group-sized KVarN tiles."""
+
+    tile_size: int = 0
+    quant_group_size: int = 64
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        if self.tile_size > 0:
+            return (
+                self.num_kv_heads
+                * self.tile_size
+                * (self.block_size // self.quant_group_size)
+            )
+        return super().real_page_size_bytes
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(
+            isinstance(spec, KVarNSlidingWindowSpec)
+            and spec.sliding_window == self.sliding_window
+            and spec.dcp_replicated == self.dcp_replicated
+            and spec.tile_size == self.tile_size
+            and spec.quant_group_size == self.quant_group_size
             for spec in kv_cache_specs.values()
         )
 

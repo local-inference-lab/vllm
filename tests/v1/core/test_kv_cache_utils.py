@@ -46,6 +46,7 @@ from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
+    KVarNFullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -1905,6 +1906,172 @@ def test_resolve_kv_cache_block_sizes_ignores_virtual_pcp():
     assert kv_cache_utils.resolve_kv_cache_block_sizes(
         kv_cache_config, vllm_config
     ) == (512, 512)
+
+
+def _make_kvarn_mla_sizing_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=128,
+            max_num_seqs=8,
+            async_scheduling=False,
+        ),
+        speculative_config=None,
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(index_topk=32)),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        kv_transfer_config=None,
+    )
+
+
+def _kvarn_mla_sizing_spec(head_size: int = 576) -> MLAAttentionSpec:
+    return MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=head_size,
+        dtype=torch.uint8,
+        cache_dtype_str="kvarn_mla_k5_g64",
+    )
+
+
+def test_kvarn_mla_workspace_sizing_exact_fit_and_one_page_over() -> None:
+    from vllm.model_executor.layers.quantization.kvarn.config import KVarNMLAConfig
+
+    vllm_config = _make_kvarn_mla_sizing_config()
+    spec = _kvarn_mla_sizing_spec()
+    groups = [KVCacheGroupSpec(["layer.0", "layer.1"], spec)]
+    packed_bytes_per_block = 2 * spec.page_size_bytes
+    workspace_config = KVarNMLAConfig.from_cache_dtype(spec.cache_dtype_str)
+
+    def required_bytes(num_blocks: int) -> int:
+        return (
+            packed_bytes_per_block * num_blocks
+            + workspace_config.workspace_envelope(vllm_config, num_blocks).total_bytes
+        )
+
+    exact_13 = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, required_bytes(13)
+    )
+    one_byte_short_of_14 = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, required_bytes(14) - 1
+    )
+    exact_14 = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, required_bytes(14)
+    )
+
+    assert exact_13.num_blocks == 13
+    assert one_byte_short_of_14.num_blocks == 13
+    assert exact_14.num_blocks == 14
+    assert sum(tensor.size for tensor in exact_14.kv_cache_tensors) + (
+        workspace_config.workspace_envelope(
+            vllm_config, exact_14.num_blocks
+        ).total_bytes
+    ) == required_bytes(14)
+
+
+def test_kvarn_mla_workspace_is_charged_once_for_all_local_layers() -> None:
+    from vllm.model_executor.layers.quantization.kvarn.config import KVarNMLAConfig
+
+    vllm_config = _make_kvarn_mla_sizing_config()
+    spec = _kvarn_mla_sizing_spec()
+    groups = [KVCacheGroupSpec(["layer.0", "layer.1", "layer.2"], spec)]
+    num_blocks = 17
+    packed_bytes = len(groups[0].layer_names) * spec.page_size_bytes * num_blocks
+    workspace_bytes = (
+        KVarNMLAConfig.from_cache_dtype(spec.cache_dtype_str)
+        .workspace_envelope(vllm_config, num_blocks)
+        .total_bytes
+    )
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, packed_bytes + workspace_bytes
+    )
+
+    assert config.num_blocks == num_blocks
+
+
+def test_kvarn_mla_ngram_override_requires_combined_budget() -> None:
+    from vllm.model_executor.layers.quantization.kvarn.config import KVarNMLAConfig
+
+    vllm_config = _make_kvarn_mla_sizing_config()
+    vllm_config.speculative_config = SimpleNamespace(
+        method="ngram", num_speculative_tokens=3
+    )
+    vllm_config.cache_config.num_gpu_blocks_override = 9
+    spec = _kvarn_mla_sizing_spec()
+    groups = [KVCacheGroupSpec(["layer.0"], spec)]
+    workspace_bytes = (
+        KVarNMLAConfig.from_cache_dtype(spec.cache_dtype_str)
+        .workspace_envelope(vllm_config, 9)
+        .total_bytes
+    )
+    required_bytes = 9 * spec.page_size_bytes + workspace_bytes
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, required_bytes
+    )
+    assert config.num_blocks == 9
+
+    with pytest.raises(ValueError, match="num_gpu_blocks_override=9 requires"):
+        kv_cache_utils.get_kv_cache_config_from_groups(
+            vllm_config, groups, required_bytes - 1
+        )
+
+
+def test_kvarn_mla_rejects_incompatible_shared_workspace_geometries() -> None:
+    vllm_config = _make_kvarn_mla_sizing_config()
+    groups = [
+        KVCacheGroupSpec(["layer.0"], _kvarn_mla_sizing_spec()),
+        KVCacheGroupSpec(["layer.1"], _kvarn_mla_sizing_spec(head_size=640)),
+    ]
+
+    with pytest.raises(ValueError, match="multiple incompatible cache geometries"):
+        kv_cache_utils.get_kv_cache_config_from_groups(
+            vllm_config, groups, available_memory=1_000_000_000
+        )
+
+
+def test_non_kvarn_page_count_does_not_reserve_mla_workspace() -> None:
+    vllm_config = _make_kvarn_mla_sizing_config()
+    spec = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+    )
+    groups = [KVCacheGroupSpec(["layer.0", "layer.1"], spec)]
+    bytes_per_block = len(groups[0].layer_names) * spec.page_size_bytes
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=23 * bytes_per_block + bytes_per_block - 1,
+    )
+
+    assert config.num_blocks == 23
+
+
+def test_generic_kvarn_page_count_does_not_reserve_mla_workspace() -> None:
+    vllm_config = _make_kvarn_mla_sizing_config()
+    spec = KVarNFullAttentionSpec(
+        block_size=64,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.uint8,
+        tile_size=11392,
+    )
+    groups = [KVCacheGroupSpec(["layer.0", "layer.1"], spec)]
+    bytes_per_block = len(groups[0].layer_names) * spec.page_size_bytes
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=11 * bytes_per_block + bytes_per_block - 1,
+    )
+
+    assert config.num_blocks == 11
 
 
 def test_replicated_mla_uses_lockstep_pool_capacity_and_contiguous_tensors():
