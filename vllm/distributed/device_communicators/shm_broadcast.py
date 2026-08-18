@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import math
 import pickle
 import sys
 import threading
@@ -113,6 +114,12 @@ class SpinCondition:
     await a notification on the zmq socket after a period of inactivity. This
     allows the readers to spin quickly, hence "SpinCondition".
 
+    `busy_loop_s` is how long a reader keeps spinning after its last successful
+    read before it parks; it defaults to VLLM_SHM_BROADCAST_BUSY_LOOP_S. Set it
+    longer than a burst of messages within one engine step and shorter than the
+    gap between steps: above one step the reader never parks at all, and spins
+    for the whole of a generation.
+
     To support clean shutdown, a separate thread in the reader's process must be
     able to wake the reader so that it can exit. A separate cancel() method is
     implemented with an in-process socket to allow this interruption.
@@ -123,7 +130,7 @@ class SpinCondition:
         is_reader: bool,
         context: zmq.Context,
         notify_address: str,
-        busy_loop_s: float = 1,
+        busy_loop_s: float | None = None,
     ):
         self.is_reader = is_reader
 
@@ -132,7 +139,22 @@ class SpinCondition:
             self.last_read = time.monotonic()
 
             # Time to keep busy-looping on the shm buffer before going idle
-            self.busy_loop_s = busy_loop_s
+            self.busy_loop_s = (
+                busy_loop_s
+                if busy_loop_s is not None
+                else envs.VLLM_SHM_BROADCAST_BUSY_LOOP_S
+            )
+            # Reject incoherent windows before any socket is created. Infinity is
+            # the dangerous one: `current_time <= last_read + inf` is always true,
+            # so the reader stays in sched_yield() forever and never parks -- not
+            # even when idle, which is the case this class was added to fix.
+            # NaN and negatives merely disable spinning, but nothing sane sets
+            # them, so treat the whole class as a configuration error.
+            if not math.isfinite(self.busy_loop_s) or self.busy_loop_s < 0:
+                raise ValueError(
+                    "busy_loop_s must be finite and non-negative, got "
+                    f"{self.busy_loop_s!r} (VLLM_SHM_BROADCAST_BUSY_LOOP_S)"
+                )
 
             # Readers subscribe to write notifications
             self.local_notify_socket: zmq.Socket = context.socket(SUB)
