@@ -19,6 +19,15 @@ logger = init_logger(__name__)
 
 
 def _warm_vision_position_interpolation(model: torch.nn.Module) -> int:
+    """Compile Kimi vision interpolation before KV-cache allocation.
+
+    Args:
+        model: Loaded model whose module tree may contain Kimi vision position
+            embeddings.
+
+    Returns:
+        Number of Kimi vision interpolation modules invoked.
+    """
     from vllm.model_executor.models.kimi_k25_vit import (
         Learnable2DInterpPosEmbDivided_fixed,
         get_rope_shape,
