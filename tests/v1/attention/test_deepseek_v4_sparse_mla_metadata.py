@@ -14,6 +14,63 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 
+def test_c128a_builder_uses_capture_time_row_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.models.deepseek_v4.sparse_mla as sparse_mla
+
+    capacity_width = 256
+    builder = object.__new__(DeepseekV4FlashMLAMetadataBuilder)
+    builder.deepseek_v4_decode_threshold = 1
+    builder.compress_ratio = 128
+    builder.c128a_max_compressed = capacity_width
+    builder.kv_cache_spec = SimpleNamespace(block_size=capacity_width * 128)
+    builder.c128a_global_decode_buffer = torch.empty(2, capacity_width)
+    builder.c128a_decode_lens_buffer = torch.empty(2, dtype=torch.int32)
+    builder.c128a_prefill_buffer = torch.empty(2, capacity_width)
+
+    monkeypatch.setattr(
+        sparse_mla,
+        "split_decodes_and_prefills",
+        lambda *_args, **_kwargs: (2, 0, 2, 0),
+    )
+    observed: dict[str, int] = {}
+
+    def record_width(*_args, max_compressed_tokens: int, **_kwargs):
+        observed["width"] = max_compressed_tokens
+        return (
+            torch.empty(2, capacity_width, dtype=torch.int32),
+            torch.empty(2, dtype=torch.int32),
+            torch.empty(0, capacity_width, dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(sparse_mla, "build_c128a_topk_metadata", record_width)
+    common_metadata = SimpleNamespace(
+        # This active context would select a 128-wide packed row in the
+        # incompatible implementation.
+        max_seq_len=512,
+        positions=torch.arange(2),
+        block_table_tensor=torch.empty(2, 1, dtype=torch.int32),
+        slot_mapping=torch.arange(2),
+    )
+
+    metadata = builder._build_c128a_metadata(
+        common_metadata,
+        req_id_per_token=torch.zeros(2, dtype=torch.int32),
+        actual_num_query_tokens=2,
+        dcp_world_size=1,
+        dcp_rank=0,
+        cp_kv_cache_interleave_size=1,
+    )
+
+    assert observed["width"] == capacity_width
+    assert metadata["c128a_global_decode_topk_indices"].shape == (
+        2,
+        1,
+        capacity_width,
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("dcp_rank", "valid_offset", "expected_slot"),
