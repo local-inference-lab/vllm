@@ -317,38 +317,66 @@ class Exl3OnlineEmbeddingMethod(QuantizeMethodBase):
                 "container; only bits=6 packs to a sub-byte footprint.",
                 self.bits, prefix,
             )
-
         # Per-row symmetric scale. Compute in fp32 to avoid bf16 rounding in
         # the division; the stored scale stays fp16 (negligible size).
-        amax = w.to(torch.float32).abs().amax(dim=1)
+        # Chunked: a full-table fp32 copy is 4.74 GiB for 248320x5120 and
+        # OOMs when quantized weights are large (measured under all-FP6).
         max_q = (1 << (self.bits - 1)) - 1  # 127 for 8, 31 for 6, etc.
+        amax = torch.empty(num_rows, dtype=torch.float32, device=device)
+        _AMAX_CHUNK = 16384
+        for r0 in range(0, num_rows, _AMAX_CHUNK):
+            r1 = min(r0 + _AMAX_CHUNK, num_rows)
+            amax[r0:r1] = w[r0:r1].to(torch.float32).abs().amax(dim=1)
         scale = amax.clamp(min=_EMBED_ONLINE_EPS) / max_q
         scale_fp16 = scale.to(torch.float16)
+        del amax
 
-        q_fp32 = (w.to(torch.float32) / scale.unsqueeze(1)).round()
+        # Chunk the encode over vocab rows: full-table fp32/int32 transients
+        # for a 248320x5120 table are ~4.7+1.3 GiB and OOM the loader at peak
+        # (measured: 1.19 GiB `val` alloc failed with model fully resident).
+        # 16384-row chunks cap transients at ~0.5 GiB.
+        _CHUNK = 16384
         if self.packed:
-            # int6: signed [-32, 31] -> unsigned [0, 63] for packing.
-            q_fp32 = q_fp32.clamp(-32, 31)
-            u = (q_fp32 + 32).to(torch.uint8)  # [V, H]
-            u = u.reshape(num_rows, hidden // 4, 4).to(torch.int32)
-            val = (
-                u[..., 0]
-                | (u[..., 1] << 6)
-                | (u[..., 2] << 12)
-                | (u[..., 3] << 18)
-            )  # int32 [V, H/4]
-            b0 = (val & 0xFF).to(torch.uint8)
-            b1 = ((val >> 8) & 0xFF).to(torch.uint8)
-            b2 = ((val >> 16) & 0xFF).to(torch.uint8)
-            q_weight = (
-                torch.stack((b0, b1, b2), dim=-1)
-                .reshape(num_rows, (hidden // 4) * 3)
-                .contiguous()
+            q_weight = torch.empty(
+                num_rows, (hidden // 4) * 3, dtype=torch.uint8, device=device
             )
         else:
-            # int8 container (native for bits==8, N-bit range otherwise).
-            q_lo = -(1 << (self.bits - 1))
-            q_weight = q_fp32.clamp(q_lo, max_q).to(torch.int8)
+            q_weight = torch.empty(
+                num_rows, hidden, dtype=torch.int8, device=device
+            )
+        q_lo = -(1 << (self.bits - 1))
+        for r0 in range(0, num_rows, _CHUNK):
+            r1 = min(r0 + _CHUNK, num_rows)
+            w_c = w[r0:r1].to(torch.float32)
+            q_fp32 = (w_c / scale[r0:r1].unsqueeze(1)).round()
+            del w_c
+            if self.packed:
+                # int6: signed [-32, 31] -> unsigned [0, 63] for packing.
+                u = (q_fp32.clamp(-32, 31) + 32).to(torch.uint8)
+                del q_fp32
+                u = u.reshape(r1 - r0, hidden // 4, 4).to(torch.int32)
+                val = (
+                    u[..., 0]
+                    | (u[..., 1] << 6)
+                    | (u[..., 2] << 12)
+                    | (u[..., 3] << 18)
+                )  # int32 [chunk, H/4]
+                del u
+                b0 = (val & 0xFF).to(torch.uint8)
+                b1 = ((val >> 8) & 0xFF).to(torch.uint8)
+                b2 = ((val >> 16) & 0xFF).to(torch.uint8)
+                del val
+                q_weight[r0:r1] = (
+                    torch.stack((b0, b1, b2), dim=-1)
+                    .reshape(r1 - r0, (hidden // 4) * 3)
+                )
+                del b0, b1, b2
+            else:
+                # int8 container (native for bits==8, N-bit range otherwise).
+                q_weight[r0:r1] = q_fp32.clamp(q_lo, max_q).to(torch.int8)
+                del q_fp32
+        del scale
+        torch.cuda.empty_cache() if device.type == "cuda" else None
 
         # Free the BF16 table before registering the compact tensors.
         _mem_before = (
@@ -359,6 +387,16 @@ class Exl3OnlineEmbeddingMethod(QuantizeMethodBase):
         del w
         layer.register_buffer("q_weight", q_weight, persistent=False)
         layer.register_buffer("embed_scale", scale_fp16, persistent=False)
+        # 0-row stub keeps `layer.weight` addressable for the MTP embed-sharing
+        # pre-check (llm_base_proposer.py:1573 isinstance + .shape[-1]); both
+        # sharing paths then share the whole MODULE, inheriting q_weight.
+        layer.register_parameter(
+            "weight",
+            Parameter(
+                torch.empty(0, hidden, dtype=torch.bfloat16, device=device),
+                requires_grad=False,
+            ),
+        )
         if device.type == "cuda":
             torch.cuda.empty_cache()
         _mem_after = (
@@ -417,6 +455,45 @@ class Exl3OnlineEmbeddingMethod(QuantizeMethodBase):
             "incompatible with tied word embeddings; the EXL3 stack already "
             "unties lm_head (see tie_word_embeddings override)."
         )
+
+def _install_embed_online_hook() -> None:
+    """Install Exl3OnlineEmbeddingMethod on VocabParallelEmbedding at init time.
+
+    Model code constructs ``embed_tokens = VocabParallelEmbedding(vocab, hidden)``
+    WITHOUT passing quant_config (qwen3_5.py:243-246), so
+    ``Exl3Config.get_quant_method`` is never consulted for the token table.
+    This wraps ``__init__`` to swap the quant method after construction; the
+    BF16 weight created by UnquantizedEmbeddingMethod.create_weights is
+    byte-identical to ours, so the loader path is unchanged.
+    """
+    if _embed_online_bits() is None:
+        return
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+        VocabParallelEmbedding,
+    )
+    if getattr(VocabParallelEmbedding, "_exl3_embed_online_hooked", False):
+        return
+    _orig_init = VocabParallelEmbedding.__init__
+
+    def _hooked_init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        if type(self) is VocabParallelEmbedding and isinstance(
+            self.quant_method, UnquantizedEmbeddingMethod
+        ):
+            bits = _embed_online_bits()
+            if bits is not None:
+                self.quant_method = Exl3OnlineEmbeddingMethod(bits)
+
+    VocabParallelEmbedding.__init__ = _hooked_init
+    VocabParallelEmbedding._exl3_embed_online_hooked = True
+    logger.info_once(
+        "EXL3 embed online hook installed (VLLM_EXL3_EMBED_ONLINE_BITS=%d)",
+        _embed_online_bits(),
+    )
+
+
+_install_embed_online_hook()
 
 
 def _load_online_encoding_with_retry(
