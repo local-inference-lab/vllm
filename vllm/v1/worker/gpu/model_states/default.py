@@ -10,6 +10,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
+    KVarNMLABlockFills,
     build_attn_metadata,
     compute_mm_prefix_ranges,
 )
@@ -131,6 +132,7 @@ class DefaultModelState(ModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        kvarn_mla_block_fills: KVarNMLABlockFills | None = None,
     ) -> dict[str, Any]:
         if cudagraph_mode == CUDAGraphMode.FULL:
             # Use padded sizes - padding is handled by model_runner.prepare_attn.
@@ -190,5 +192,6 @@ class DefaultModelState(ModelState):
             rswa_prefix_lens=input_batch.prompt_lens,
             is_prefilling=is_prefilling,
             max_req_tokens=input_batch.max_req_tokens or 0,
+            kvarn_mla_block_fills=kvarn_mla_block_fills,
         )
         return attn_metadata

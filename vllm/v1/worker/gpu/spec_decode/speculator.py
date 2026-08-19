@@ -18,6 +18,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu.attn_utils import (
+    KVarNMLABlockFills,
     build_attn_metadata,
     init_attn_backend,
 )
@@ -162,6 +163,7 @@ class DraftModelSpeculator(BaseSpeculator):
             self.max_num_reqs + 1, dtype=torch.int32, device="cpu"
         )
 
+        self.kvarn_mla_block_fills: KVarNMLABlockFills | None = None
         self.draft_logits: torch.Tensor | None = None
         if self.speculative_config.draft_sample_method == "probabilistic":
             # Pre-temperature logits, cached from the previous decode step.
@@ -265,6 +267,15 @@ class DraftModelSpeculator(BaseSpeculator):
             for group in kv_cache_config.kv_cache_groups
         )
 
+    def set_kvarn_mla_block_fills(self, block_fills: KVarNMLABlockFills | None) -> None:
+        self.kvarn_mla_block_fills = (
+            tuple(None if fills is None else dict(fills) for fills in block_fills)
+            if block_fills is not None
+            else None
+        )
+        if block_fills is not None and any(fills is not None for fills in block_fills):
+            self.rebuild_prefill_attn_metadata = True
+
     def _build_draft_attn_metadata(
         self,
         num_reqs: int,
@@ -350,6 +361,7 @@ class DraftModelSpeculator(BaseSpeculator):
                 dcp_local_seq_lens=dcp_local_seq_lens,
                 seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
                 max_seq_len_upper_bound=max_seq_len_upper_bound,
+                kvarn_mla_block_fills=self.kvarn_mla_block_fills,
             )
         return attn_metadata
 

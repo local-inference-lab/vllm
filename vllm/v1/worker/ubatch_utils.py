@@ -246,6 +246,7 @@ def _make_metadata_with_slice(
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
         _seq_lens_cpu=seq_lens_cpu,
         _num_computed_tokens_cpu=num_computed_tokens_cpu,
+        kvarn_mla_block_fills=attn_metadata.kvarn_mla_block_fills,
     )
 
 

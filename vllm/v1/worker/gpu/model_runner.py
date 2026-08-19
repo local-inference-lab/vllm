@@ -23,6 +23,7 @@ import sys
 import time
 from collections.abc import Callable
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -87,10 +88,12 @@ from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
+    KVarNMLABlockFills,
     build_slot_mappings_by_layer,
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
+    init_kvarn_mla_live_block_trackers,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import (
@@ -229,6 +232,22 @@ def _profile_batch_phase(input_batch: InputBatch, dummy_run: bool = False) -> st
     return "prefill"
 
 
+@dataclass
+class _KVarNMLARequestState:
+    req_id: str
+    generation: int
+    block_ids: tuple[list[int], ...]
+    num_computed_tokens: int
+    rollback_tokens: int = 0
+    ownership_step: int = 0
+    ownership_start_tokens: int = 0
+    ownership_scheduled_tokens: int = 0
+
+    @property
+    def tracker_key(self) -> str:
+        return f"{self.req_id}:{self.generation}"
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -360,6 +379,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+        self._kvarn_mla_live_block_trackers: dict[int, Any] = {}
+        self._kvarn_mla_requests: dict[str, _KVarNMLARequestState] = {}
+        self._kvarn_mla_generations: dict[str, int] = {}
+        self._kvarn_mla_removed_tracker_keys: set[str] = set()
+        self._kvarn_mla_target_block_fills: KVarNMLABlockFills | None = None
+        self._kvarn_mla_pending_resolution: Callable[[], None] | None = None
         # Constructed in init_attn_backend, once the final verification mode
         # is known (varlen requires full CUDA graph support).
         self.verification_capacity_manager: CapacityBasedVerificationManager | None = (
@@ -705,6 +730,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kernel_block_sizes,
             self.vllm_config,
         )
+        self._kvarn_mla_live_block_trackers = init_kvarn_mla_live_block_trackers(
+            kv_cache_config,
+            self.dcp_size,
+            self.dcp_rank,
+            self.cp_interleave,
+        )
+        self._kvarn_mla_requests.clear()
+        self._kvarn_mla_removed_tracker_keys.clear()
+        self._kvarn_mla_target_block_fills = self._get_kvarn_mla_block_fills()
+        if isinstance(self.speculator, DraftModelSpeculator):
+            self.speculator.set_kvarn_mla_block_fills(
+                self._kvarn_mla_target_block_fills
+            )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
@@ -1201,7 +1239,128 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_block_zeroer.zero_block_ids([0])
         torch.accelerator.synchronize()
 
+    def _get_kvarn_mla_block_fills(self) -> KVarNMLABlockFills | None:
+        if not self._kvarn_mla_live_block_trackers:
+            return None
+        block_fills: list[dict[int, int | None] | None] = [None] * len(
+            self.kv_cache_config.kv_cache_groups
+        )
+        for group_id, tracker in self._kvarn_mla_live_block_trackers.items():
+            block_fills[group_id] = tracker.block_fills(group_id)
+        return tuple(block_fills)
+
+    def _resolve_pending_kvarn_mla_output(self) -> None:
+        """Settle the prior async batch before advancing physical ownership."""
+        pending_resolution = self._kvarn_mla_pending_resolution
+        if pending_resolution is None:
+            return
+        self._kvarn_mla_pending_resolution = None
+        pending_resolution()
+
+    def _update_kvarn_mla_ownership(self, scheduler_output: SchedulerOutput) -> None:
+        if not self._kvarn_mla_live_block_trackers:
+            return
+
+        lookahead = self.num_speculative_steps
+        requests = {
+            request.tracker_key: request
+            for request in self._kvarn_mla_requests.values()
+        }
+        scheduled_tokens: dict[str, int] = {}
+        rollback_tokens: dict[str, int] = {}
+        scheduled_drafts = scheduler_output.scheduled_spec_decode_tokens
+        for (
+            req_id,
+            num_scheduled_tokens,
+        ) in scheduler_output.num_scheduled_tokens.items():
+            request = self._kvarn_mla_requests.get(req_id)
+            if request is None:
+                raise RuntimeError(
+                    f"MLA KVarN ownership state missing for request {req_id!r}"
+                )
+            scheduled_tokens[request.tracker_key] = num_scheduled_tokens + lookahead
+            rollback_tokens[request.tracker_key] = (
+                request.rollback_tokens
+                + len(scheduled_drafts.get(req_id, ()))
+                + lookahead
+            )
+
+        removed = self._kvarn_mla_removed_tracker_keys
+        self._kvarn_mla_removed_tracker_keys = set()
+        scheduled_keys = scheduled_tokens.keys()
+        for tracker in self._kvarn_mla_live_block_trackers.values():
+            if any(key in tracker.pending_blocks for key in scheduled_keys):
+                raise RuntimeError(
+                    "MLA KVarN accepted-token correction was not resolved "
+                    "before the next scheduler step"
+                )
+        for tracker in self._kvarn_mla_live_block_trackers.values():
+            tracker.update(
+                requests,
+                scheduled_tokens,
+                removed,
+                (),
+                rollback_tokens,
+            )
+
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self._kvarn_mla_requests[req_id]
+            request.rollback_tokens = len(scheduled_drafts.get(req_id, ()))
+            request.ownership_step += 1
+            request.ownership_start_tokens = request.num_computed_tokens
+            request.ownership_scheduled_tokens = scheduler_output.num_scheduled_tokens[
+                req_id
+            ]
+
+        self._kvarn_mla_target_block_fills = self._get_kvarn_mla_block_fills()
+        if isinstance(self.speculator, DraftModelSpeculator):
+            self.speculator.set_kvarn_mla_block_fills(
+                self._kvarn_mla_target_block_fills
+            )
+
+    def _make_kvarn_mla_resolution_callback(
+        self, req_ids: list[str]
+    ) -> Callable[[np.ndarray, np.ndarray], None] | None:
+        if not self._kvarn_mla_live_block_trackers or self.num_speculative_steps == 0:
+            return None
+        snapshots = []
+        for req_id in req_ids:
+            request = self._kvarn_mla_requests[req_id]
+            snapshots.append(
+                (
+                    req_id,
+                    request.tracker_key,
+                    request.ownership_step,
+                    request.ownership_start_tokens,
+                    request.ownership_scheduled_tokens,
+                )
+            )
+
+        def resolve(
+            _num_sampled_tokens: np.ndarray,
+            num_rejected_tokens: np.ndarray,
+        ) -> None:
+            for snapshot, num_rejected in zip(snapshots, num_rejected_tokens):
+                req_id, tracker_key, step, start, scheduled = snapshot
+                request = self._kvarn_mla_requests.get(req_id)
+                if (
+                    request is None
+                    or request.tracker_key != tracker_key
+                    or request.ownership_step != step
+                ):
+                    continue
+                actual_end_tokens = start + scheduled - int(num_rejected)
+                for tracker in self._kvarn_mla_live_block_trackers.values():
+                    tracker.resolve_async(tracker_key, request, actual_end_tokens)
+                request.rollback_tokens = 0
+            self._kvarn_mla_pending_resolution = None
+
+        return resolve
+
     def _remove_request(self, req_id: str) -> bool:
+        kvarn_request = self._kvarn_mla_requests.pop(req_id, None)
+        if kvarn_request is not None:
+            self._kvarn_mla_removed_tracker_keys.add(kvarn_request.tracker_key)
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
@@ -1285,6 +1444,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.block_tables.append_block_ids(
                 req_index, new_req_data.block_ids, overwrite=True
             )
+            if self._kvarn_mla_live_block_trackers:
+                generation = self._kvarn_mla_generations.get(req_id, 0) + 1
+                self._kvarn_mla_generations[req_id] = generation
+                self._kvarn_mla_requests[req_id] = _KVarNMLARequestState(
+                    req_id=req_id,
+                    generation=generation,
+                    block_ids=tuple(list(ids) for ids in new_req_data.block_ids),
+                    num_computed_tokens=new_req_data.num_computed_tokens,
+                )
             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
 
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
@@ -1312,10 +1480,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens_np[req_index] = num_computed_tokens
+            if self._kvarn_mla_live_block_trackers:
+                kvarn_request = self._kvarn_mla_requests.get(req_id)
+                if kvarn_request is None:
+                    raise RuntimeError(
+                        f"MLA KVarN ownership state missing for request {req_id!r}"
+                    )
+                kvarn_request.num_computed_tokens = num_computed_tokens
             if req_new_block_ids is not None:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
+                if self._kvarn_mla_live_block_trackers:
+                    assert kvarn_request is not None
+                    for block_ids, new_ids in zip(
+                        kvarn_request.block_ids, req_new_block_ids
+                    ):
+                        block_ids.extend(new_ids)
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(
@@ -1696,6 +1877,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            self._resolve_pending_kvarn_mla_output()
             with record_function_or_nullcontext("vllm:v2/target/update_batch"):
                 # Update the request states.
                 self.update_pp_decode_requests()
@@ -1704,6 +1886,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.add_requests(scheduler_output)
                 self.update_requests(scheduler_output)
                 self.block_tables.apply_staged_writes()
+                self._update_kvarn_mla_ownership(scheduler_output)
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -1879,6 +2062,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     for_capture=(
                         dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL
                     ),
+                    kvarn_mla_block_fills=self._kvarn_mla_target_block_fills,
                 )
 
         input_ids = input_batch.input_ids
@@ -2141,6 +2325,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and self.scheduler_config.async_scheduling
             and self.draft_tokens_handler.needs_host_copy(input_batch)
         )
+        ownership_callback = self._make_kvarn_mla_resolution_callback(
+            input_batch.req_ids
+        )
         # Start async output copy here so that it can overlap with speculator proposal.
         with record_function_or_nullcontext(f"vllm:v2/target/{phase}/async_output"):
             async_output = AsyncOutput(
@@ -2152,7 +2339,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 check_ep_fault=self.check_ep_fault,
                 routed_experts=routed_experts,
                 defer_copy_event=copy_draft_with_output,
+                completion_callback=ownership_callback,
             )
+        if ownership_callback is not None:
+            self._kvarn_mla_pending_resolution = async_output.resolve_completion
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         if self.speculator is not None and self.speculator.supports_mm_inputs:

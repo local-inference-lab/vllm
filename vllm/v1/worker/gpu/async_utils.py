@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+from collections.abc import Callable
+from threading import Lock
 
 import numpy as np
 import torch
@@ -30,6 +32,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         check_ep_fault: bool = False,
         routed_experts: RoutedExpertsTensors | None = None,
         defer_copy_event: bool = False,
+        completion_callback: Callable[[np.ndarray, np.ndarray], None] | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -47,6 +50,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.copy_event = torch.cuda.Event(blocking=True)
         self.copy_event_recorded = False
 
+        self.completion_callback = completion_callback
+        self.completion_lock = Lock() if completion_callback is not None else None
+        self.num_rejected_tokens_np: np.ndarray | None = None
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
 
@@ -63,6 +69,11 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.routed_experts_cpu: RoutedExpertsTensors | None = None
             if routed_experts is not None:
                 self.routed_experts_cpu = routed_experts.to_cpu_nonblocking()
+            if completion_callback is not None:
+                assert sampler_output.num_rejected is not None
+                self.num_rejected_tokens_np = async_copy_to_np(
+                    sampler_output.num_rejected
+                )
             self.prompt_logprobs_dict = {
                 k: v.to_cpu_nonblocking() if v is not None else None
                 for k, v in self.model_runner_output.prompt_logprobs_dict.items()
@@ -92,9 +103,34 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.copy_event.record(self.copy_stream)
             self.copy_event_recorded = True
 
+    def _run_completion_callback(self) -> None:
+        completion_lock = self.completion_lock
+        if completion_lock is None:
+            return
+        with completion_lock:
+            completion_callback = self.completion_callback
+            self.completion_callback = None
+            if completion_callback is None:
+                return
+            assert self.num_rejected_tokens_np is not None
+            completion_callback(self.num_sampled_tokens_np, self.num_rejected_tokens_np)
+
+    def resolve_completion(self) -> None:
+        """Resolve accepted tokens before the next ownership update."""
+        completion_lock = self.completion_lock
+        if completion_lock is None:
+            return
+        with completion_lock:
+            if self.completion_callback is None:
+                return
+        assert self.copy_event_recorded
+        self.copy_event.synchronize()
+        self._run_completion_callback()
+
     def get_output(self) -> ModelRunnerOutput:
         assert self.copy_event_recorded
         self.copy_event.synchronize()
+        self._run_completion_callback()
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.

@@ -70,6 +70,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
+from vllm.model_executor.layers.quantization.kvarn.config import KVarNMLAConfig
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding,
     XDRotaryEmbedding,
@@ -149,6 +150,9 @@ from vllm.v1.attention.backends.linear_attn import (
     BailingLinearAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.mla.kvarn_mla_state import (
+    KVarNMLALiveBlockTracker,
+)
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     create_fast_prefill_custom_backend,
@@ -163,12 +167,15 @@ from vllm.v1.kv_cache_interface import (
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
+    KVarNFullAttentionSpec,
+    KVarNSlidingWindowSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheSpecKind,
     KVQuantMode,
     MambaSpec,
+    MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
@@ -732,6 +739,7 @@ class GPUModelRunner(
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
+        self._kvarn_mla_live_blocks: KVarNMLALiveBlockTracker | None = None
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -1573,6 +1581,18 @@ class GPUModelRunner(
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
+        rollback_tokens = {
+            req_id: optimistic_num_accepted
+            for req_id, optimistic_num_accepted, _ in deferred_spec_decode_corrections
+        }
+        if self._kvarn_mla_live_blocks is not None:
+            self._kvarn_mla_live_blocks.update(
+                self.requests,
+                scheduler_output.num_scheduled_tokens,
+                scheduler_output.finished_req_ids,
+                scheduler_output.preempted_req_ids or (),
+                rollback_tokens,
+            )
 
         # Incrementally update ngram_gpu tensors after batch is stable
         if is_ngram_gpu:
@@ -1606,6 +1626,16 @@ class GPUModelRunner(
                     num_accepted = valid_sampled_token_count[prev_req_index] - 1
                     correction = optimistic_num_accepted - num_accepted
                     req_state.num_computed_tokens -= correction
+                    if self._kvarn_mla_live_blocks is not None:
+                        actual_end_tokens = (
+                            req_state.num_computed_tokens
+                            + scheduler_output.num_scheduled_tokens[req_id]
+                        )
+                        self._kvarn_mla_live_blocks.resolve_async(
+                            req_id,
+                            req_state,
+                            actual_end_tokens,
+                        )
                     cur_req_index = self.input_batch.req_id_to_index.get(req_id)
                     if cur_req_index is None:
                         continue
@@ -2662,6 +2692,11 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+            cm.kvarn_mla_block_fills = (
+                self._kvarn_mla_live_blocks.block_fills(kv_cache_gid)
+                if self._kvarn_mla_live_blocks is not None
+                else None
+            )
 
             if dflash_drafter is not None:
                 dflash_drafter.set_draft_block_table(
@@ -6764,6 +6799,24 @@ class GPUModelRunner(
 
     def _cleanup_profiling_kv_cache(self) -> None:
         torch.accelerator.synchronize()
+        # Attention implementations can retain cache-derived workspaces and
+        # exact-slot mappings outside ``layer.kv_cache``. Reset each backend
+        # hook once while the profiling cache is still fully bound, before
+        # dropping any of the tensors that the hook may need to synchronize.
+        reset_hooks: set[tuple[int, int]] = set()
+        for layer in self.compilation_config.static_forward_context.values():
+            impl = getattr(layer, "impl", None)
+            reset_binding_state = getattr(impl, "reset_kv_cache_binding_state", None)
+            if not callable(reset_binding_state):
+                continue
+            hook_key = (
+                id(getattr(reset_binding_state, "__self__", type(impl))),
+                id(getattr(reset_binding_state, "__func__", reset_binding_state)),
+            )
+            if hook_key in reset_hooks:
+                continue
+            reset_hooks.add(hook_key)
+            reset_binding_state()
         if hasattr(self, "kv_caches") and self.kv_caches:
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
@@ -7763,9 +7816,16 @@ class GPUModelRunner(
                     num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 num_blocks *= kv_cache_spec.block_size // kernel_block_size
                 layer_cache_dtype_str = (
-                    "auto"
-                    if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
-                    else self.cache_config.cache_dtype
+                    self.cache_config.cache_dtype
+                    if isinstance(
+                        kv_cache_spec,
+                        (KVarNFullAttentionSpec, KVarNSlidingWindowSpec),
+                    )
+                    else (
+                        "auto"
+                        if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                        else self.cache_config.cache_dtype
+                    )
                 )
                 cache_dtype_str = (
                     getattr(kv_cache_spec, "cache_dtype_str", None)
@@ -7844,16 +7904,22 @@ class GPUModelRunner(
 
                     # Skipped layers (--kv-cache-dtype-skip-layers) need
                     # the unquantized shape.
-                    layer_cache_dtype_str = (
-                        "auto"
-                        if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
-                        else getattr(
-                            kv_cache_spec,
-                            "cache_dtype_str",
-                            None,
+                    if isinstance(
+                        kv_cache_spec,
+                        (KVarNFullAttentionSpec, KVarNSlidingWindowSpec),
+                    ):
+                        layer_cache_dtype_str = self.cache_config.cache_dtype
+                    else:
+                        layer_cache_dtype_str = (
+                            "auto"
+                            if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                            else getattr(
+                                kv_cache_spec,
+                                "cache_dtype_str",
+                                None,
+                            )
+                            or self.cache_config.cache_dtype
                         )
-                        or self.cache_config.cache_dtype
-                    )
                     cache_dtype_str = (
                         getattr(kv_cache_spec, "cache_dtype_str", None)
                         or layer_cache_dtype_str
@@ -8094,10 +8160,37 @@ class GPUModelRunner(
         """
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self._mamba_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
+        kvarn_mla_groups: dict[int, tuple[int, int, int, int, int, int]] = {}
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            group_spec = group.kv_cache_spec
+            specs = (
+                group_spec.kv_cache_specs.values()
+                if isinstance(group_spec, UniformTypeKVCacheSpecs)
+                else (group_spec,)
+            )
+            for spec in specs:
+                if (
+                    isinstance(spec, MLAAttentionSpec)
+                    and spec.cache_dtype_str == "kvarn_mla_k5_g64"
+                ):
+                    config = KVarNMLAConfig.from_cache_dtype(spec.cache_dtype_str)
+                    kvarn_mla_groups[group_id] = (
+                        config.group,
+                        config.boundary_tokens,
+                        spec.block_size // config.group,
+                        self.dcp_world_size,
+                        self.dcp_rank,
+                        self.parallel_config.cp_kv_cache_interleave_size,
+                    )
+                    break
+        self._kvarn_mla_live_blocks = (
+            KVarNMLALiveBlockTracker(kvarn_mla_groups) if kvarn_mla_groups else None
+        )
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config, self.kv_cache_config
         )

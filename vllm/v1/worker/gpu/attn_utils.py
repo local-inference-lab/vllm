@@ -25,10 +25,13 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    KVarNFullAttentionSpec,
+    KVarNSlidingWindowSpec,
     KVCacheConfig,
     KVCacheSpec,
     KVQuantMode,
     MambaSpec,
+    MLAAttentionSpec,
     TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -59,6 +62,68 @@ class AttentionCGSupportInfo:
         if support.value < self.min_cg_support.value:
             return AttentionCGSupportInfo(support, backend)
         return self
+
+
+KVarNMLABlockFills = Sequence[dict[int, int | None] | None]
+
+
+def _get_kvarn_mla_spec(kv_cache_spec: KVCacheSpec) -> MLAAttentionSpec | None:
+    specs = (
+        kv_cache_spec.kv_cache_specs.values()
+        if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs)
+        else (kv_cache_spec,)
+    )
+    return next(
+        (
+            spec
+            for spec in specs
+            if isinstance(spec, MLAAttentionSpec)
+            and isinstance(spec.cache_dtype_str, str)
+            and spec.cache_dtype_str.startswith("kvarn_mla_")
+        ),
+        None,
+    )
+
+
+def init_kvarn_mla_live_block_trackers(
+    kv_cache_config: KVCacheConfig,
+    dcp_size: int,
+    dcp_rank: int,
+    cp_interleave: int,
+) -> dict[int, Any]:
+    """Create one exact-block ownership tracker per MLA KVarN cache group."""
+    group_configs: dict[int, tuple[int, int, int, int, int, int]] = {}
+    for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+        spec = _get_kvarn_mla_spec(group.kv_cache_spec)
+        if spec is None:
+            continue
+        from vllm.model_executor.layers.quantization.kvarn.config import (
+            KVarNMLAConfig,
+        )
+
+        assert isinstance(spec.cache_dtype_str, str)
+        config = KVarNMLAConfig.from_cache_dtype(spec.cache_dtype_str)
+        group_dcp_size = 1 if getattr(spec, "dcp_replicated", False) else dcp_size
+        group_configs[group_id] = (
+            config.group,
+            config.boundary_tokens,
+            spec.block_size // config.group,
+            group_dcp_size,
+            0 if group_dcp_size == 1 else dcp_rank,
+            cp_interleave,
+        )
+
+    if not group_configs:
+        return {}
+
+    from vllm.v1.attention.backends.mla.kvarn_mla_state import (
+        KVarNMLALiveBlockTracker,
+    )
+
+    return {
+        group_id: KVarNMLALiveBlockTracker({group_id: config})
+        for group_id, config in group_configs.items()
+    }
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -343,7 +408,14 @@ def _reshape_kv_cache(
                     "auto"
                     if cache_dtype != "fp8_ds_mla"
                     and kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
-                    and not isinstance(kv_cache_spec, TQFullAttentionSpec)
+                    and not isinstance(
+                        kv_cache_spec,
+                        (
+                            TQFullAttentionSpec,
+                            KVarNFullAttentionSpec,
+                            KVarNSlidingWindowSpec,
+                        ),
+                    )
                     else cache_dtype
                 )
                 cache_dtype_str = (
@@ -431,7 +503,14 @@ def _align_mixed_attention_kv_cache_views(
             "auto"
             if cache_dtype != "fp8_ds_mla"
             and kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
-            and not isinstance(kv_cache_spec, TQFullAttentionSpec)
+            and not isinstance(
+                kv_cache_spec,
+                (
+                    TQFullAttentionSpec,
+                    KVarNFullAttentionSpec,
+                    KVarNSlidingWindowSpec,
+                ),
+            )
             else cache_dtype
         )
         cache_dtype_str = (
@@ -555,6 +634,7 @@ def build_attn_metadata(
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
     max_req_tokens: int = 0,
+    kvarn_mla_block_fills: KVarNMLABlockFills | None = None,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -596,6 +676,19 @@ def build_attn_metadata(
         group_is_prefilling = common_attn_metadata_extra_kwargs.pop(
             "is_prefilling", is_prefilling
         )
+        group_kvarn_mla_block_fills = (
+            kvarn_mla_block_fills[i]
+            if kvarn_mla_block_fills is not None and i < len(kvarn_mla_block_fills)
+            else (
+                {}
+                if for_cudagraph_capture
+                and _get_kvarn_mla_spec(
+                    kv_cache_config.kv_cache_groups[i].kv_cache_spec
+                )
+                is not None
+                else None
+            )
+        )
         common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
@@ -615,6 +708,7 @@ def build_attn_metadata(
             rswa_prefix_lens=rswa_prefix_lens,
             batch_topology=batch_topology,
             max_req_tokens=max_req_tokens,
+            kvarn_mla_block_fills=group_kvarn_mla_block_fills,
             **common_attn_metadata_extra_kwargs,
         )
         if (
