@@ -30,8 +30,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     _ConnectorMetricName,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    GroupOffloadConfig,
     OffloadingConnectorScheduler,
     RequestOffloadState,
+    SchedulerOffloadConfig,
     get_sliding_window_size_in_chunks,
     is_store_reachable_swa_chunk,
 )
@@ -112,8 +114,8 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
     req_status = scheduler._req_status["req"]
     req_status.group_states[0].block_ids[:] = [11, 12]
     req_status.group_states[1].block_ids[:] = [0, 21]
-    scheduler.manager.prepare_store.side_effect = (
-        lambda keys, req_context: generate_store_output(keys)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
     )
 
     output = SimpleNamespace(partial_tail_offloads={"req": [(1, 99, 28)]})
@@ -2775,6 +2777,7 @@ class TestEagle:
         req = MagicMock()
         req.request_id = "test-req"
         req.num_tokens = num_tokens
+        req.num_prompt_tokens = num_tokens
         req.kv_transfer_params = None
         num_hash_blocks = max(
             len(hashes) * scheduler.config.kv_group_configs[idx].hashes_per_chunk
@@ -2800,6 +2803,267 @@ class TestEagle:
                 scheduler.config.kv_group_configs[idx].group_idx, hashes
             )
         return state
+
+    @staticmethod
+    def _make_mixed_block_scheduler() -> OffloadingConnectorScheduler:
+        """Build a scaled target/DCP plus sliding-window draft geometry."""
+        groups = (
+            GroupOffloadConfig(
+                group_idx=0,
+                tokens_per_block=16,
+                tokens_per_chunk=16,
+                hashes_per_chunk=4,
+                kv_event_group_spec=MagicMock(),
+                sliding_window_size_in_chunks=None,
+            ),
+            GroupOffloadConfig(
+                group_idx=1,
+                tokens_per_block=4,
+                tokens_per_chunk=4,
+                hashes_per_chunk=1,
+                kv_event_group_spec=MagicMock(),
+                sliding_window_size_in_chunks=2,
+                is_eagle_group=True,
+            ),
+        )
+        scheduler = object.__new__(OffloadingConnectorScheduler)
+        scheduler.config = SchedulerOffloadConfig(
+            kv_group_configs=groups,
+            blocks_per_chunk=1,
+            tokens_per_hash=4,
+            num_workers=1,
+            offload_prompt_only=False,
+            supports_partial_tail=False,
+            finished_replay_tail_alignment_tokens=4,
+            replay_alignment_tokens=None,
+        )
+        scheduler.manager = MagicMock(spec=OffloadingManager)
+        scheduler.manager.on_new_request.return_value = RequestOffloadingContext(
+            policy=OffloadPolicy.BLOCK_LEVEL
+        )
+        scheduler._events_tracker = MagicMock()
+        scheduler._connector_stats = OffloadingConnectorStats()
+        scheduler._replay_reserve_tokens = 4
+        scheduler._partial_tail_block_size = 0
+        scheduler._lookup_groups = (0, 1)
+        scheduler._sliding_window_groups = (1,)
+        scheduler._mamba_align_size = None
+        scheduler._cow_source_groups = frozenset()
+        scheduler._chunks_being_loaded = None
+        scheduler._req_status = {}
+        scheduler._current_batch_load_jobs = {}
+        scheduler._current_batch_jobs_to_flush = set()
+        scheduler._current_batch_allocated_block_ids = set()
+        scheduler._block_id_to_pending_jobs = {}
+        scheduler._jobs = {}
+        scheduler._job_counter = 0
+        return scheduler
+
+    def test_finished_replay_tail_extends_mixed_block_hit(self):
+        """A draft boundary identifies stable data inside a target page.
+
+        The scaled geometry represents a 12,288-token DCP target block and a
+        768-token draft block. A 27-token prompt has one complete 16-token
+        target block. The completed-request tail restores through token 20
+        after confirming the draft key through token 24.
+        """
+        scheduler = self._make_mixed_block_scheduler()
+        assert scheduler.config.finished_replay_tail_alignment_tokens == 4
+
+        req_status = self._make_req_status(
+            scheduler,
+            num_tokens=27,
+            offload_keys_per_group=[[3], [0, 1, 2, 3, 4, 5]],
+        )
+        scheduler.manager.lookup.return_value = LookupResult.HIT
+
+        assert scheduler._lookup(req_status) == 20
+        assert req_status.partial_tail_boundary == 20
+
+    def test_finished_replay_tail_requires_eagle_stability_key(
+        self,
+    ):
+        """A missing post-boundary draft key keeps the complete target hit."""
+        scheduler = self._make_mixed_block_scheduler()
+        req_status = self._make_req_status(
+            scheduler,
+            num_tokens=27,
+            offload_keys_per_group=[[3], [0, 1, 2, 3, 4, 5]],
+        )
+
+        def lookup(key, req_context):
+            if get_offload_group_idx(key) == 1 and get_offload_block_hash(key) == b"5":
+                return LookupResult.MISS
+            return LookupResult.HIT
+
+        scheduler.manager.lookup.side_effect = lookup
+
+        assert scheduler._lookup(req_status) == 16
+        assert req_status.partial_tail_boundary is None
+
+    def test_finished_replay_tail_rejects_full_attention_hole(self):
+        """A missing interior draft key prevents partial-target replay."""
+        scheduler = self._make_mixed_block_scheduler()
+        scheduler.config = scheduler.config._replace(
+            kv_group_configs=(
+                scheduler.config.kv_group_configs[0],
+                scheduler.config.kv_group_configs[1]._replace(
+                    sliding_window_size_in_chunks=None
+                ),
+            )
+        )
+        req_status = self._make_req_status(
+            scheduler,
+            num_tokens=35,
+            offload_keys_per_group=[[3, 7], list(range(8))],
+        )
+
+        def lookup(key, req_context):
+            group_idx = get_offload_group_idx(key)
+            block_hash = get_offload_block_hash(key)
+            if group_idx == 0 and block_hash == b"7":
+                return LookupResult.MISS
+            if group_idx == 1 and block_hash == b"5":
+                return LookupResult.MISS
+            return LookupResult.HIT
+
+        scheduler.manager.lookup.side_effect = lookup
+
+        # The ordinary full-attention EAGLE lookup drops its trailing
+        # 4-token chunk, so the safe fallback is 12 rather than the target
+        # group's 16-token complete boundary.
+        assert scheduler._lookup(req_status) == 12
+        assert req_status.partial_tail_boundary is None
+
+    def test_finished_replay_tail_returns_tokens_after_local_hit(self):
+        """The connector API returns a delta beyond an existing GPU hit."""
+        scheduler = self._make_mixed_block_scheduler()
+        req_status = self._make_req_status(
+            scheduler,
+            num_tokens=27,
+            num_computed_tokens=8,
+            offload_keys_per_group=[[3], [0, 1, 2, 3, 4, 5]],
+        )
+        scheduler.manager.lookup.return_value = LookupResult.HIT
+
+        assert scheduler._lookup_finished_replay_tail(req_status, 8) == 12
+        assert req_status.partial_tail_boundary == 20
+
+    def test_finished_replay_tail_store_uses_final_target_page(
+        self,
+    ):
+        """Only the larger group's incomplete physical page is exported."""
+        scheduler = self._make_mixed_block_scheduler()
+        request = MagicMock()
+        request.request_id = "tail-store"
+        request.kv_transfer_params = None
+        request.num_prompt_tokens = 27
+        request.num_tokens = 28
+        request.status = RequestStatus.FINISHED_STOPPED
+        request.block_hashes = [BlockHash(str(i).encode()) for i in range(7)]
+        request.all_token_ids = list(range(28))
+        request.lora_request = None
+        request.is_finished.return_value = True
+        scheduler.on_new_request(request)
+        req_status = scheduler._req_status[request.request_id]
+        req_status.group_states[0].block_ids[:] = [11, 12]
+        req_status.group_states[1].block_ids[:] = [21, 22, 23, 24, 25, 26, 27]
+        scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+            generate_store_output(keys)
+        )
+
+        jobs = scheduler._build_finished_replay_tail_store_jobs(
+            SimpleNamespace(finished_req_ids=[request.request_id])
+        )
+
+        assert len(jobs) == 1
+        [job_id] = jobs
+        src_spec = jobs[job_id].src_spec
+        assert isinstance(src_spec, GPULoadStoreSpec)
+        assert src_spec.block_ids.tolist() == [12]
+        assert src_spec.group_sizes == [1, 0]
+        assert src_spec.block_indices == [1, 0]
+        assert scheduler._block_id_to_pending_jobs == {12: {job_id}}
+
+    def test_finished_replay_tail_load_maps_partial_and_aligned_groups(
+        self,
+    ):
+        """Loading a replay tail maps the target page and draft window."""
+        scheduler = self._make_mixed_block_scheduler()
+        request = MagicMock()
+        request.request_id = "tail-load"
+        request.kv_transfer_params = None
+        request.num_prompt_tokens = 27
+        request.num_tokens = 27
+        request.block_hashes = [BlockHash(str(i).encode()) for i in range(7)]
+        request.all_token_ids = list(range(27))
+        request.lora_request = None
+        scheduler.on_new_request(request)
+        req_status = scheduler._req_status[request.request_id]
+        req_status.update_offload_keys()
+        scheduler.manager.lookup.return_value = LookupResult.HIT
+        assert scheduler._lookup(req_status) == 20
+
+        scheduler.update_state_after_alloc(
+            request,
+            KVCacheBlocks(
+                (
+                    [KVCacheBlock(31), KVCacheBlock(32)],
+                    [
+                        KVCacheBlock(0, is_null=True),
+                        KVCacheBlock(0, is_null=True),
+                        KVCacheBlock(0, is_null=True),
+                        KVCacheBlock(41),
+                        KVCacheBlock(42),
+                    ],
+                )
+            ),
+            num_external_tokens=20,
+        )
+
+        [load_job] = scheduler._current_batch_load_jobs.values()
+        dst_spec = load_job.dst_spec
+        assert isinstance(dst_spec, GPULoadStoreSpec)
+        assert dst_spec.block_ids.tolist() == [31, 32, 41, 42]
+        assert dst_spec.group_sizes == [2, 2]
+        assert dst_spec.block_indices == [0, 3]
+
+    def test_finished_replay_tail_retains_pruned_recurrent_boundary(self):
+        """A pruned recurrent group retains the completed-request boundary.
+
+        Four-token recurrent chunks are ordinarily retained only at the end
+        of each 16-token target-cache segment. A 27-token prompt has a stable
+        replay boundary at token 20, so chunk index 4 must remain reachable
+        even though it is not a normal segment-tail chunk.
+        """
+        scheduler = self._make_mixed_block_scheduler()
+        recurrent_group = scheduler.config.kv_group_configs[1]._replace(
+            is_eagle_group=False,
+            sliding_window_size_in_chunks=1,
+            alignment_chunk_count=4,
+        )
+        scheduler.config = scheduler.config._replace(
+            kv_group_configs=(
+                scheduler.config.kv_group_configs[0],
+                recurrent_group,
+            )
+        )
+        request = MagicMock()
+        request.num_prompt_tokens = 27
+        request.shared_prefix_boundary = None
+
+        reachable_ends = scheduler._reachable_tail_end_chunks(
+            recurrent_group, request, shift=0
+        )
+
+        assert reachable_ends == (5,)
+        assert is_store_reachable_swa_chunk(
+            absolute_chunk_index=4,
+            alignment_chunk_count=4,
+            sliding_window_chunks=1,
+            is_eagle_group=False,
+            reachable_tail_end_chunks=reachable_ends,
+        )
 
     # -------------------------------------------------------------------
     # Lookup unit tests: call _lookup() directly via request_runner
