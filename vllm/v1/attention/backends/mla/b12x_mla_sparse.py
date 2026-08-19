@@ -3213,7 +3213,17 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             ckv_workspace = prefetch_state.get_ckv_workspace(self._ckv_workspace_nbytes)
             if layer_idx is not None and self._ckv_prefetch_depth > 0:
                 prefetch_state.enter_layer(layer_idx)
-                prefetch_state.register_cache(layer_idx, kv_cache)
+                # The prefetch registry must hold a per-layer cache. For
+                # KVarN MLA ``kv_cache`` is the cross-layer SHARED FP8
+                # staging view materialized from this layer's paged slice;
+                # registering it poisons every prefetched layer, whose
+                # side-stream gathers would then read this one tensor
+                # (identical wrong KV for every layer). The packed paged
+                # cache itself is not gatherable in this format, so KVarN
+                # MLA keeps no registry entry and every gather stays on the
+                # synchronous per-layer path below.
+                if not self._is_kvarn_mla:
+                    prefetch_state.register_cache(layer_idx, kv_cache)
             pending = (
                 prefetch_state.pending_layers.pop(layer_idx, None)
                 if layer_idx is not None and self._ckv_prefetch_depth > 0
