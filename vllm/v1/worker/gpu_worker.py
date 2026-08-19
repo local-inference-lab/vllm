@@ -529,6 +529,26 @@ class Worker(WorkerBase):
         # allocations and the model's transient activation workspace.
         self.model_runner.profile_run()
 
+    def _release_unoccupied_accelerator_memory(self) -> None:
+        """Return unoccupied caching-allocator blocks to the device.
+
+        Synchronization makes every completed allocation eligible for Python
+        reference collection. Live model weights and retained workspaces remain
+        allocated because ``empty_cache`` releases only unoccupied blocks.
+        """
+        torch.accelerator.synchronize(self.device)
+        gc.collect()
+        torch.accelerator.empty_cache()
+
+    def _capture_model_with_reclaimed_manual_kv_cache(self) -> int:
+        if self.cache_config.kv_cache_memory_bytes is not None:
+            # Manual KV sizing can leave large unoccupied allocator blocks
+            # after the cache tensors and persistent kernel workspaces are
+            # initialized. Return those blocks before CUDA creates its
+            # graph-private pool; live KV tensors remain allocated.
+            self._release_unoccupied_accelerator_memory()
+        return self.model_runner.capture_model()
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -547,11 +567,14 @@ class Worker(WorkerBase):
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
+            self._release_unoccupied_accelerator_memory()
             self.model_runner.profile_run()
+            self._release_unoccupied_accelerator_memory()
             deepseek_v4_compressor_triton_warmup(
                 self.get_model(), self.get_kv_cache_spec(), self.vllm_config
             )
             self._warmup_kernels_once()
+            self._release_unoccupied_accelerator_memory()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -795,7 +818,9 @@ class Worker(WorkerBase):
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
-            cuda_graph_memory_bytes = self.model_runner.capture_model()
+            cuda_graph_memory_bytes = (
+                self._capture_model_with_reclaimed_manual_kv_cache()
+            )
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (

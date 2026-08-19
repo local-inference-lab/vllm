@@ -141,6 +141,88 @@ def test_memory_profile_replays_model_after_kernel_warmup(
     ]
 
 
+def test_manual_kv_profile_releases_unoccupied_memory(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    worker = object.__new__(Worker)
+    calls: list[object] = []
+    worker.device = "cuda:0"
+    worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=1024)
+    worker.model_runner = SimpleNamespace(
+        profile_run=lambda: calls.append("profile"),
+    )
+    worker.vllm_config = SimpleNamespace()
+    worker.init_snapshot = SimpleNamespace(free_memory=2048)
+    worker.model_config = SimpleNamespace(multimodal_config=None)
+    worker.parallel_config = SimpleNamespace(_api_process_count=1)
+    worker.get_model = lambda: object()
+    worker.get_kv_cache_spec = lambda: object()
+    monkeypatch.setattr(gpu_worker_module, "maybe_apply_startup_plan", lambda _: None)
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "deepseek_v4_compressor_triton_warmup",
+        lambda *args: calls.append("compressor"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_warmup_kernels_once",
+        lambda: calls.append("kernel_warmup"),
+    )
+    monkeypatch.setattr(
+        gpu_worker_module.torch.accelerator,
+        "synchronize",
+        lambda device: calls.append(("synchronize", device)),
+    )
+    monkeypatch.setattr(
+        gpu_worker_module.gc,
+        "collect",
+        lambda: calls.append("collect"),
+    )
+    monkeypatch.setattr(
+        gpu_worker_module.torch.accelerator,
+        "empty_cache",
+        lambda: calls.append("empty_cache"),
+    )
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "reserve_mm_ipc_gpu_memory",
+        lambda *args: 1024,
+    )
+
+    assert worker.determine_available_memory() == 1024
+    assert calls == [
+        ("synchronize", "cuda:0"),
+        "collect",
+        "empty_cache",
+        "profile",
+        ("synchronize", "cuda:0"),
+        "collect",
+        "empty_cache",
+        "compressor",
+        "kernel_warmup",
+        ("synchronize", "cuda:0"),
+        "collect",
+        "empty_cache",
+    ]
+
+
+@pytest.mark.parametrize("kv_cache_memory_bytes", [None, 1024])
+def test_manual_kv_graph_capture_releases_unoccupied_memory(
+    kv_cache_memory_bytes: int | None,
+):
+    worker = object.__new__(Worker)
+    calls: list[str] = []
+    worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=kv_cache_memory_bytes)
+    worker.model_runner = SimpleNamespace(
+        capture_model=lambda: calls.append("capture") or 17,
+    )
+    worker._release_unoccupied_accelerator_memory = lambda: calls.append("release")
+
+    assert worker._capture_model_with_reclaimed_manual_kv_cache() == 17
+    expected = ["capture"] if kv_cache_memory_bytes is None else ["release", "capture"]
+    assert calls == expected
+
+
 # Startup-plan persistence (vllm/v1/worker/startup_plan.py), applied and
 # saved by Worker.determine_available_memory / compile_or_warm_up_model.
 
