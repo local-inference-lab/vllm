@@ -72,6 +72,9 @@ def _moe_workspace_token_limit() -> int:
     A zero value leaves the logical batch unbounded. KQuant calibration keeps
     one launch per logical batch because its sampling coordinates are defined
     over the complete row range.
+
+    Returns:
+        Maximum rows per launch, or zero when launch rows are unbounded.
     """
     if os.getenv("VLLM_KQUANT_CAPTURE_DIR"):
         return 0
@@ -79,7 +82,14 @@ def _moe_workspace_token_limit() -> int:
 
 
 def _moe_workspace_tokens(num_tokens: int) -> int:
-    """Bound one launch's scratch geometry without changing output shape."""
+    """Bound one launch's scratch geometry without changing output shape.
+
+    Args:
+        num_tokens: Logical token rows requested by the caller.
+
+    Returns:
+        Token rows represented by one B12X scratch plan or launch.
+    """
     num_tokens = max(int(num_tokens), 1)
     limit = _moe_workspace_token_limit()
     return min(num_tokens, limit) if limit else num_tokens
