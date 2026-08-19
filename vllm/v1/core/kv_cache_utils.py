@@ -2003,6 +2003,14 @@ def _annotate_eagle_groups(
     topology-independent layer set. DeepSeek-V4 does not expose equivalent
     per-layer metadata, so its established final-layer rule remains the
     compatibility fallback.
+
+    Args:
+        vllm_config: Global model, scheduler, and speculative-decoding config.
+        kv_cache_spec: Cache specification keyed by attention-layer name.
+        kv_cache_groups: Cache groups to annotate in place.
+
+    Returns:
+        None.
     """
     spec_config = getattr(vllm_config, "speculative_config", None)
     if spec_config is None or not spec_config.use_eagle():
