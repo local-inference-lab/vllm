@@ -322,6 +322,7 @@ class _GroupState:
     free_slots: list[int] = field(default_factory=list)
     block_fill: dict[int, int] = field(default_factory=dict)
     mirrors: dict[torch.device, torch.Tensor] = field(default_factory=dict)
+    flushed: set[int] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.free_slots = list(range(self.pool_size - 1, -1, -1))
@@ -442,10 +443,18 @@ class KVarNMLAStateManager:
             )
             for impl in impls:
                 impl._flush_kvarn_mla_blocks(block_ids, pool_slots)
+            # The paged packed copy of these blocks is now valid, so a later
+            # prefix-cache hit can restore exact rows from it.
+            state.flushed.update(flush_ids)
 
         for block_id in retired:
             state.free_slots.append(state.mapping.pop(block_id))
-            state.block_fill.pop(block_id, None)
+            fill = state.block_fill.pop(block_id, 0)
+            if fill < config.group:
+                # A block retired below full fill has no packed copy of its
+                # current content, so it can never be served from the paged
+                # record.
+                state.flushed.discard(block_id)
 
         missing = sorted(needed.difference(state.mapping))
         if len(missing) > len(state.free_slots):
@@ -459,6 +468,40 @@ class KVarNMLAStateManager:
             slot = state.free_slots.pop()
             state.mapping[block_id] = slot
             mirror_updates[block_id] = slot
+
+        # A missing block whose rows were persisted by a retire-flush is a
+        # prefix-cache hit (or an equivalent re-entry): no step will ever
+        # scatter its pre-computed rows again, but the freshly popped slot
+        # still holds another block's exact rows. Restore this block's rows
+        # from its packed paged record so exact-pool readers see its own KV.
+        # Blocks without a packed copy are genuinely fresh: every row they
+        # will ever expose is written by scatter in the acquiring step, which
+        # overwrites whatever the recycled slot held.
+        rehydrate_ids = [block_id for block_id in missing if block_id in state.flushed]
+        if rehydrate_ids:
+            from vllm.v1.attention.ops.kvarn_mla import rehydrate_kvarn_mla_blocks
+
+            device = impls[0].device
+            block_ids = torch.tensor(rehydrate_ids, dtype=torch.long, device=device)
+            pool_slots = torch.tensor(
+                [state.mapping[block_id] for block_id in rehydrate_ids],
+                dtype=torch.long,
+                device=device,
+            )
+            for impl in impls:
+                cache_ref = getattr(impl, "_kvarn_cache_ref", None)
+                latent_pool = getattr(impl, "_kvarn_latent_pool", None)
+                rope_pool = getattr(impl, "_kvarn_rope_pool", None)
+                if cache_ref is None or latent_pool is None or rope_pool is None:
+                    continue
+                rehydrate_kvarn_mla_blocks(
+                    cache_ref,
+                    latent_pool,
+                    rope_pool,
+                    block_ids,
+                    pool_slots,
+                    config,
+                )
 
         for mirror in state.mirrors.values():
             cls._update_mirror(mirror, mirror_updates)

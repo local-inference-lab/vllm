@@ -573,6 +573,123 @@ def materialize_selected_kvarn_mla(
 
 
 @triton.jit
+def _rehydrate_kvarn_mla_blocks_kernel(
+    cache_ptr,
+    block_ids_ptr,
+    pool_slots_ptr,
+    latent_pool_ptr,
+    rope_pool_ptr,
+    cache_stride_b,
+    latent_pool_stride_s,
+    latent_pool_stride_t,
+    rope_pool_stride_s,
+    rope_pool_stride_t,
+    BLOCK_L: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    GROUP: tl.constexpr,
+    LATENT_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    BITS: tl.constexpr,
+    S_COL_OFFSET: tl.constexpr,
+    ZP_OFFSET: tl.constexpr,
+    S_ROW_OFFSET: tl.constexpr,
+    ROPE_OFFSET: tl.constexpr,
+):
+    """Rebuild exact pool rows for one packed block from its paged record.
+
+    Inverse of ``pack_kvarn_mla_blocks``: dequantizes the packed latent tile
+    and copies the serialized RoPE rows back into the exact side pool so a
+    cache-hit block that re-enters ownership reads its own KV instead of a
+    recycled slot's previous occupant.
+    """
+    entry = tl.program_id(0)
+    token = tl.program_id(1)
+    block = tl.load(block_ids_ptr + entry)
+    slot = tl.load(pool_slots_ptr + entry)
+    record = cache_ptr + block * cache_stride_b
+
+    cols = tl.arange(0, BLOCK_L)
+    latent_mask = cols < LATENT_DIM
+    q = _unpack_dense_bits(record, cols * GROUP + token, latent_mask, BITS).to(
+        tl.float32
+    )
+    fp16_record = record.to(tl.pointer_type(tl.float16))
+    s_col = tl.load(fp16_record + S_COL_OFFSET // 2 + cols, mask=latent_mask, other=0.0)
+    zp = tl.load(fp16_record + ZP_OFFSET // 2 + cols, mask=latent_mask, other=0.0)
+    s_row = tl.load(fp16_record + S_ROW_OFFSET // 2 + token)
+    latent = (q * s_col + zp) * s_row
+    tl.store(
+        latent_pool_ptr
+        + slot * latent_pool_stride_s
+        + token * latent_pool_stride_t
+        + cols,
+        latent.to(latent_pool_ptr.dtype.element_ty),
+        mask=latent_mask,
+    )
+
+    rope_cols = tl.arange(0, BLOCK_R)
+    rope_mask = rope_cols < ROPE_DIM
+    body_rope = tl.load(
+        (record + ROPE_OFFSET).to(tl.pointer_type(tl.bfloat16))
+        + token * ROPE_DIM
+        + rope_cols,
+        mask=rope_mask,
+        other=0.0,
+    )
+    tl.store(
+        rope_pool_ptr
+        + slot * rope_pool_stride_s
+        + token * rope_pool_stride_t
+        + rope_cols,
+        body_rope,
+        mask=rope_mask,
+    )
+
+
+def rehydrate_kvarn_mla_blocks(
+    kv_cache: torch.Tensor,
+    latent_pool: torch.Tensor,
+    rope_pool: torch.Tensor,
+    block_ids: torch.Tensor,
+    pool_slots: torch.Tensor,
+    config: KVarNMLAConfig,
+) -> None:
+    """Restore exact-pool rows for packed blocks (paged record -> pool slot)."""
+    if block_ids.numel() == 0:
+        return
+    if latent_pool.shape[0] != rope_pool.shape[0]:
+        raise ValueError("KVarN MLA exact latent/RoPE pools must have equal slots")
+    if block_ids.dtype != torch.long or pool_slots.dtype != torch.long:
+        raise ValueError("KVarN MLA rehydrate index buffers must be int64")
+    if not block_ids.is_contiguous() or not pool_slots.is_contiguous():
+        raise ValueError("KVarN MLA rehydrate index buffers must be contiguous")
+    cache_bytes = kv_cache.view(torch.uint8)
+    _rehydrate_kvarn_mla_blocks_kernel[(block_ids.numel(), config.group)](
+        cache_bytes,
+        block_ids,
+        pool_slots,
+        latent_pool,
+        rope_pool,
+        cache_bytes.stride(0),
+        latent_pool.stride(0),
+        latent_pool.stride(1),
+        rope_pool.stride(0),
+        rope_pool.stride(1),
+        BLOCK_L=triton.next_power_of_2(config.latent_dim),
+        BLOCK_R=triton.next_power_of_2(config.rope_dim),
+        GROUP=config.group,
+        LATENT_DIM=config.latent_dim,
+        ROPE_DIM=config.rope_dim,
+        BITS=config.bits,
+        S_COL_OFFSET=config.latent_s_col_offset,
+        ZP_OFFSET=config.latent_zp_offset,
+        S_ROW_OFFSET=config.latent_s_row_offset,
+        ROPE_OFFSET=config.rope_offset,
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _copy_bounded_physical_indices_kernel(
     selected_ptr,
     remapped_ptr,

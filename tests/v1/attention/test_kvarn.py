@@ -312,6 +312,9 @@ class _FakeMLAImpl:
     _kvarn_group_key = None
     device = torch.device("cpu")
     _kvarn_pool_size = 32
+    _kvarn_cache_ref: object | None = None
+    _kvarn_latent_pool: object | None = None
+    _kvarn_rope_pool: object | None = None
 
     def __init__(self) -> None:
         self.flushed: list[int] = []
@@ -620,6 +623,176 @@ def test_mla_fused_serializer_matches_reference(monkeypatch) -> None:
     )
 
     assert torch.equal(cache.view(torch.uint8).reshape(1, -1), expected)
+
+
+def test_mla_reentry_rehydrates_only_flushed_blocks(monkeypatch) -> None:
+    import vllm.v1.attention.ops.kvarn_mla as kvarn_mla_ops
+
+    rehydrated: list[tuple[list[int], list[int]]] = []
+
+    def fake_rehydrate(
+        cache_ref, latent_pool, rope_pool, block_ids, pool_slots, config
+    ) -> None:
+        rehydrated.append((block_ids.tolist(), pool_slots.tolist()))
+
+    monkeypatch.setattr(kvarn_mla_ops, "rehydrate_kvarn_mla_blocks", fake_rehydrate)
+
+    KVarNMLAStateManager._impls.clear()
+    KVarNMLAStateManager.reset_cache_bindings()
+    config = KVarNMLAConfig()
+    impl = _FakeMLAImpl()
+    impl._kvarn_cache_ref = object()
+    impl._kvarn_latent_pool = object()
+    impl._kvarn_rope_pool = object()
+    KVarNMLAStateManager.register(impl)
+    group_key = ("layer.0",)
+
+    def prepare(block_fills: dict[int, int | None]) -> None:
+        metadata = SimpleNamespace(kvarn_mla_block_fills=block_fills)
+        KVarNMLAStateManager.prepare_step(
+            group_key,
+            ["layer.0"],
+            metadata,
+            config,
+            dcp_world_size=1,
+        )
+
+    # Own block 0 at full fill, then retire it: the retire-flush packs its
+    # rows into the paged record, so a later re-entry is restorable.
+    prepare({0: 64})
+    assert rehydrated == []
+    prepare({})
+    assert impl.flushed == [0]
+    assert KVarNMLAStateManager._groups[group_key].flushed == {0}
+
+    # A partial re-fill does not invalidate the packed copy yet, but retiring
+    # below full fill does: the record no longer matches the block content.
+    prepare({0: 32})
+    assert rehydrated == [([0], [KVarNMLAStateManager._groups[group_key].mapping[0]])]
+    prepare({})
+    assert KVarNMLAStateManager._groups[group_key].flushed == set()
+
+    # Re-entering a block without a valid packed copy must not rehydrate:
+    # every row it exposes is scattered by the acquiring step instead.
+    prepare({0: 64})
+    assert len(rehydrated) == 1
+
+    KVarNMLAStateManager._impls.clear()
+    KVarNMLAStateManager.reset_cache_bindings()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mla_rehydrate_restores_recycled_slot_from_packed_record(
+    monkeypatch,
+) -> None:
+    from vllm.v1.attention.ops.kvarn_mla import (
+        pack_kvarn_mla_blocks,
+        rehydrate_kvarn_mla_blocks,
+    )
+
+    monkeypatch.delenv("KVARN_RTN_QUANTILE", raising=False)
+    monkeypatch.setenv("KVARN_AFFINE_REFIT", "1")
+    config = KVarNMLAConfig()
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(41)
+    latent_pool = (
+        torch.randn(
+            2,
+            config.group,
+            config.latent_dim,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        .to(torch.float8_e4m3fn)
+        .to(torch.bfloat16)
+    )
+    rope_pool = torch.randn(
+        2,
+        config.group,
+        config.rope_dim,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    rope_source = rope_pool[0].clone()
+    cache = torch.zeros(
+        4,
+        config.group,
+        config.bytes_per_token,
+        dtype=torch.uint8,
+        device=device,
+    )
+    block_ids = torch.tensor([2], dtype=torch.long, device=device)
+    pool_slots = torch.tensor([0], dtype=torch.long, device=device)
+    pack_kvarn_mla_blocks(
+        cache,
+        latent_pool,
+        rope_pool,
+        block_ids,
+        pool_slots,
+        config,
+    )
+
+    # Recycle the slot: the pool row now belongs to another block, as when a
+    # LIFO free-list hands a retired slot to a prefix-cache-hit block.
+    other = torch.Generator(device=device).manual_seed(97)
+    latent_pool[0] = torch.randn(
+        config.group,
+        config.latent_dim,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=other,
+    )
+    rope_pool[0] = torch.randn(
+        config.group,
+        config.rope_dim,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=other,
+    )
+
+    rehydrate_kvarn_mla_blocks(
+        cache,
+        latent_pool,
+        rope_pool,
+        block_ids,
+        pool_slots,
+        config,
+    )
+
+    # RoPE is serialized losslessly (BF16 copy) and must match exactly.
+    assert torch.equal(rope_pool[0], rope_source)
+
+    # Latent round-trips the 5-bit packed record: compare against the same
+    # dequantization computed directly from the packed bytes.
+    flat = cache.reshape(cache.shape[0], -1)[2]
+    value_indices = torch.arange(config.latent_dim * config.group, device=device)
+    bit_offsets = value_indices * config.bits
+    lo = flat[bit_offsets // 8].to(torch.int64)
+    hi = flat[bit_offsets // 8 + 1].to(torch.int64)
+    q = ((lo | (hi << 8)) >> (bit_offsets % 8)) & ((1 << config.bits) - 1)
+    q = q.reshape(config.latent_dim, config.group).float()
+    s_col = (
+        flat[config.latent_s_col_offset : config.latent_zp_offset]
+        .view(torch.float16)
+        .float()
+    )
+    zp = (
+        flat[config.latent_zp_offset : config.latent_s_row_offset]
+        .view(torch.float16)
+        .float()
+    )
+    s_row = (
+        flat[config.latent_s_row_offset : config.rope_offset]
+        .view(torch.float16)
+        .float()
+    )
+    expected = ((q * s_col.unsqueeze(1) + zp.unsqueeze(1)) * s_row.unsqueeze(0)).t()
+    assert torch.equal(
+        latent_pool[0],
+        expected.to(torch.bfloat16),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
