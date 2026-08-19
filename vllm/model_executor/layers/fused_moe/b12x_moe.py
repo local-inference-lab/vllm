@@ -66,6 +66,25 @@ def _env_first(*names: str) -> str | None:
     return None
 
 
+def _moe_workspace_token_limit() -> int:
+    """Return the maximum token rows processed by one B12X MoE launch.
+
+    A zero value leaves the logical batch unbounded. KQuant calibration keeps
+    one launch per logical batch because its sampling coordinates are defined
+    over the complete row range.
+    """
+    if os.getenv("VLLM_KQUANT_CAPTURE_DIR"):
+        return 0
+    return max(_env_int("B12X_MOE_WORKSPACE_TOKEN_LIMIT", 0), 0)
+
+
+def _moe_workspace_tokens(num_tokens: int) -> int:
+    """Bound one launch's scratch geometry without changing output shape."""
+    num_tokens = max(int(num_tokens), 1)
+    limit = _moe_workspace_token_limit()
+    return min(num_tokens, limit) if limit else num_tokens
+
+
 def _moe_repeat_check_enabled() -> bool:
     return _env_flag("B12X_MOE_REPEAT_CHECK") or _env_flag("VLLM_B12X_MOE_REPEAT_CHECK")
 
@@ -1365,6 +1384,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 quant_mode=meta.quant_mode,
                 requested_tokens=requested_tokens,
             )
+            tokens = _moe_workspace_tokens(tokens)
             launch_plan = _plan_b12x_moe_execution(
                 tokens=tokens,
                 topk=meta.topk,
@@ -1513,7 +1533,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         ):
             swiglu_limit = None
         plan = _plan_b12x_moe_fp4_scratch(
-            tokens=max(int(M), 1),
+            tokens=_moe_workspace_tokens(M),
             topk=int(topk),
             device=device,
             quant_mode=quant_mode,
@@ -1590,42 +1610,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             swiglu_limit = None
         topk_ids = _normalize_b12x_moe_topk_ids(topk_ids)
         topk_weights = _normalize_b12x_moe_topk_weights(topk_weights)
-        plan = _plan_b12x_moe_fp4_scratch(
-            tokens=int(hidden_states.shape[0]),
-            topk=int(topk_ids.shape[1]),
-            device=hidden_states.device,
-            quant_mode=quant_mode,
-            experts=prepared,
-            apply_router_weight_on_input=(
-                apply_router_weight_on_input
-                if apply_router_weight_on_input is not None
-                else False
-            ),
-            swiglu_limit=swiglu_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            collect_activation_amax=activation_amax is not None,
-            route_num_experts=(
-                int(global_num_experts) if expert_map is not None else 0
-            ),
-        )
-        scratch = _workspace2_as_b12x_scratch(workspace2, plan)
-
-        binding = _run_b12x_moe_fp4(
-            a=hidden_states,
-            experts=prepared,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            output=output,
-            input_scales_static=input_scales_static,
-            unit_scale_contract=unit_scale_contract,
-            plan=plan,
-            scratch=scratch,
-            activation_amax=activation_amax,
-            layer_idx=activation_layer_idx,
-            route_expert_map=expert_map,
-        )
-        if os.getenv("VLLM_KQUANT_CAPTURE_DIR"):
+        capture_kquant = bool(os.getenv("VLLM_KQUANT_CAPTURE_DIR"))
+        if capture_kquant:
             from vllm.model_executor.layers.fused_moe.kquant_capture import (
                 collect_kquant_mid,
             )
@@ -1635,25 +1621,69 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 raise RuntimeError(
                     "KQuant capture was enabled after B12X weight preparation"
                 )
-            collect_kquant_mid(
-                prefix=prefix,
-                binding=binding,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-            )
-        if activation_amax is None:
-            _maybe_repeat_check_b12x_moe(
-                original_output=output,
-                a=hidden_states,
+
+        num_tokens = int(hidden_states.shape[0])
+        tokens_per_launch = _moe_workspace_tokens(num_tokens)
+        for start in range(0, num_tokens, tokens_per_launch):
+            end = min(start + tokens_per_launch, num_tokens)
+            chunk_hidden_states = hidden_states[start:end]
+            chunk_topk_weights = topk_weights[start:end]
+            chunk_topk_ids = topk_ids[start:end]
+            chunk_output = output[start:end]
+            plan = _plan_b12x_moe_fp4_scratch(
+                tokens=end - start,
+                topk=int(topk_ids.shape[1]),
+                device=hidden_states.device,
+                quant_mode=quant_mode,
                 experts=prepared,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
+                apply_router_weight_on_input=(
+                    apply_router_weight_on_input
+                    if apply_router_weight_on_input is not None
+                    else False
+                ),
+                swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                collect_activation_amax=activation_amax is not None,
+                route_num_experts=(
+                    int(global_num_experts) if expert_map is not None else 0
+                ),
+            )
+            scratch = _workspace2_as_b12x_scratch(workspace2, plan)
+            binding = _run_b12x_moe_fp4(
+                a=chunk_hidden_states,
+                experts=prepared,
+                topk_weights=chunk_topk_weights,
+                topk_ids=chunk_topk_ids,
+                output=chunk_output,
                 input_scales_static=input_scales_static,
                 unit_scale_contract=unit_scale_contract,
                 plan=plan,
                 scratch=scratch,
+                activation_amax=activation_amax,
+                layer_idx=activation_layer_idx,
                 route_expert_map=expert_map,
             )
+            if capture_kquant:
+                collect_kquant_mid(
+                    prefix=prefix,
+                    binding=binding,
+                    topk_weights=chunk_topk_weights,
+                    topk_ids=chunk_topk_ids,
+                )
+            if activation_amax is None:
+                _maybe_repeat_check_b12x_moe(
+                    original_output=chunk_output,
+                    a=chunk_hidden_states,
+                    experts=prepared,
+                    topk_weights=chunk_topk_weights,
+                    topk_ids=chunk_topk_ids,
+                    input_scales_static=input_scales_static,
+                    unit_scale_contract=unit_scale_contract,
+                    plan=plan,
+                    scratch=scratch,
+                    route_expert_map=expert_map,
+                )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         raise NotImplementedError("LoRA is not supported for B12xExperts")
