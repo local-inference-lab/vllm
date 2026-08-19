@@ -1656,6 +1656,7 @@ def _promote_local_kv_cache_specs(
                     compress_ratio=spec.compress_ratio,
                     model_version=spec.model_version,
                     dcp_replicated=spec.dcp_replicated,
+                    non_causal_multi_token_decode=spec.non_causal_multi_token_decode,
                 )
             elif isinstance(spec, SlidingWindowSpec):
                 block_size = full_attention_block_size or spec.block_size
@@ -1990,14 +1991,33 @@ def _get_kv_cache_groups_uniform_groups(
     return [full_mla_group, *swa_mla_groups]
 
 
-def _annotate_eagle_groups_deepseek_v4(
+def _annotate_eagle_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> None:
-    spec_config = vllm_config.speculative_config
+    """Identify cache groups that contain speculative-draft attention.
+
+    Kimi parallel drafters expose their execution contract directly on each
+    MLA cache specification. This gives the cache planner an exact,
+    topology-independent layer set. DeepSeek-V4 does not expose equivalent
+    per-layer metadata, so its established final-layer rule remains the
+    compatibility fallback.
+    """
+    spec_config = getattr(vllm_config, "speculative_config", None)
     if spec_config is None or not spec_config.use_eagle():
         return
+
+    draft_layer_names = {
+        layer_name
+        for layer_name, spec in kv_cache_spec.items()
+        if getattr(spec, "non_causal_multi_token_decode", False)
+    }
+    if draft_layer_names:
+        for group in kv_cache_groups:
+            if draft_layer_names.intersection(group.layer_names):
+                group.is_eagle_group = True
+
     # Detection uses the merged MLA spec's model_version.
     if not any(
         getattr(spec, "model_version", None) == "deepseek_v4"
@@ -2046,12 +2066,16 @@ def get_kv_cache_groups(
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
         # each layer.
-        return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+        kv_cache_groups = _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+        _annotate_eagle_groups(vllm_config, kv_cache_spec, kv_cache_groups)
+        return kv_cache_groups
     elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
         # All layers need the same number of token slots (e.g., all layers are
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
-        return _get_kv_cache_groups_uniform_type(uniform_spec)
+        kv_cache_groups = _get_kv_cache_groups_uniform_type(uniform_spec)
+        _annotate_eagle_groups(vllm_config, kv_cache_spec, kv_cache_groups)
+        return kv_cache_groups
     elif grouped_specs := group_and_unify_kv_cache_specs(
         kv_cache_spec,
         vllm_config.parallel_config.decode_context_parallel_size,
@@ -2062,7 +2086,7 @@ def get_kv_cache_groups(
         # attention in different sizes. Need to group layers into multiple
         # UniformTypeKVCacheSpecs.
         kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
-        _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
+        _annotate_eagle_groups(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
 
     # Pull HiddenStateCacheSpec layers out before the general multi-group
@@ -2084,6 +2108,7 @@ def get_kv_cache_groups(
         fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
         if fallback_groups is None:
             raise
+        _annotate_eagle_groups(vllm_config, kv_cache_spec, fallback_groups)
         return fallback_groups
     model_config = getattr(vllm_config, "model_config", None)
     hf_config = getattr(model_config, "hf_config", None)
@@ -2132,6 +2157,7 @@ def get_kv_cache_groups(
             aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
             groups.append(KVCacheGroupSpec([name], aligned))
 
+    _annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
     return groups
 
 
