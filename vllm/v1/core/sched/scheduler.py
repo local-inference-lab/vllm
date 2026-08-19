@@ -1258,6 +1258,17 @@ class Scheduler(SchedulerInterface):
                 len(num_scheduled_tokens)
             ]
 
+        # Skip spec decode when all scheduled requests need ≤1 output token.
+        # Speculative decoding is useless for 1-token outputs and adds ~40ms
+        # of draft generation + verification overhead.
+        if (
+            num_spec_tokens_to_schedule > 0
+            and scheduled_new_reqs
+            and not scheduled_running_reqs
+            and all(req.max_tokens <= 1 for req in scheduled_new_reqs)
+        ):
+            num_spec_tokens_to_schedule = 0
+
         scheduled_encoder_input_stats = None
         if (
             self.log_stats
