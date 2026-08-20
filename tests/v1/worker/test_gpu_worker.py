@@ -213,9 +213,12 @@ def test_manual_kv_graph_capture_releases_unoccupied_memory(
     worker = object.__new__(Worker)
     calls: list[str] = []
     worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=kv_cache_memory_bytes)
-    worker.model_runner = SimpleNamespace(
-        capture_model=lambda: calls.append("capture") or 17,
-    )
+
+    def capture_model() -> int:
+        calls.append("capture")
+        return 17
+
+    worker.model_runner = SimpleNamespace(capture_model=capture_model)
     worker._release_unoccupied_accelerator_memory = lambda: calls.append("release")
 
     assert worker._capture_model_with_reclaimed_manual_kv_cache() == 17
