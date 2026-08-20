@@ -18,6 +18,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce_in_place,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -42,6 +43,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
@@ -198,6 +200,8 @@ class KimiMLP(nn.Module):
     block still ends with one collective per direction.
     """
 
+    _CALLER_OUTPUT_MIN_TOKENS = 1024
+
     def __init__(
         self,
         hidden_size: int,
@@ -251,8 +255,65 @@ class KimiMLP(nn.Module):
                 "Only silu and situ are supported."
             )
 
-    def forward(self, x):
+    @property
+    def supports_caller_output(self) -> bool:
+        """Whether the down projection can write into caller-owned storage."""
+        return (
+            isinstance(self.down_proj.quant_method, UnquantizedLinearMethod)
+            and self.down_proj.input_is_parallel
+            and self.down_proj.bias is None
+            and not envs.VLLM_BATCH_INVARIANT
+        )
+
+    def should_use_caller_output(self, x: torch.Tensor) -> bool:
+        """Use donated storage only for allocation-sensitive prefill GEMMs."""
+        return (
+            self.supports_caller_output
+            and x.ndim == 2
+            and x.shape[0] >= self._CALLER_OUTPUT_MIN_TOKENS
+        )
+
+    def _down_proj_into(self, x: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+        if not self.supports_caller_output:
+            raise ValueError(
+                "KimiMLP caller-owned output requires an unquantized, "
+                "bias-free row-parallel down projection"
+            )
+        if x.ndim != 2 or output.ndim != 2:
+            raise ValueError("KimiMLP caller-owned output requires 2D tensors")
+        expected_shape = (x.shape[0], self.down_proj.output_size)
+        if tuple(output.shape) != expected_shape:
+            raise ValueError(
+                "KimiMLP caller-owned output has shape "
+                f"{tuple(output.shape)}; expected {expected_shape}"
+            )
+        if not output.is_contiguous() or output.dtype != x.dtype:
+            raise ValueError(
+                "KimiMLP caller-owned output must be contiguous and match "
+                "the activation dtype"
+            )
+        if output.untyped_storage().data_ptr() == x.untyped_storage().data_ptr():
+            raise ValueError(
+                "KimiMLP caller-owned output must not alias the down-projection input"
+            )
+
+        torch.mm(x, self.down_proj.weight.t(), out=output)
+        if self.down_proj.reduce_results and self.down_proj.tp_size > 1:
+            output = tensor_model_parallel_all_reduce_in_place(output)
+        return output
+
+    def forward(
+        self, x: torch.Tensor, output: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        # Decoder layers may donate their normalized hidden-state storage. The
+        # gate/up projection has consumed that tensor before the down
+        # projection writes the donated buffer.
         if self.shard_sequence_parallel:
+            if output is not None:
+                raise ValueError(
+                    "KimiMLP caller-owned output is incompatible with "
+                    "sequence-parallel input gathering"
+                )
             # Each rank holds a weight shard but only its own tokens, so it
             # cannot finish those tokens alone: gather the full token set,
             # compute this rank's partial for all of them, then reduce-scatter,
@@ -260,7 +321,15 @@ class KimiMLP(nn.Module):
             x = sp_all_gather(x)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        # The gated activation no longer reads the packed gate/up projection.
+        # Release that large prefill tensor before down_proj allocates its
+        # output; retaining both tensors can exceed the available device
+        # memory at large scheduler chunk sizes.
+        del gate_up
+        if output is None:
+            x, _ = self.down_proj(x)
+        else:
+            x = self._down_proj_into(x, output)
         if self.shard_sequence_parallel:
             x = sp_reduce_scatter(x)
         return x
@@ -1363,7 +1432,12 @@ class KimiDecoderLayer(nn.Module):
         )
 
         # MoE/MLP.
-        hidden_states = self.mlp(hidden_states)
+        if isinstance(self.mlp, KimiMLP) and self.mlp.should_use_caller_output(
+            hidden_states
+        ):
+            hidden_states = self.mlp(hidden_states, output=hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
         return hidden_states, prefix_sum, residual
 
 
