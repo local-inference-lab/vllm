@@ -40,8 +40,16 @@ def test_warm_vision_position_interpolation_ignores_other_modules() -> None:
 def test_kimi_warmup_runs_vision_before_kda_state_exists(monkeypatch) -> None:
     model = torch.nn.Linear(2, 2)
     calls = []
-    warm_vision = Mock(side_effect=lambda model: calls.append("vision") or 1)
-    get_kda_layer = Mock(side_effect=lambda worker: calls.append("kda"))
+
+    def record_vision(_model):
+        calls.append("vision")
+        return 1
+
+    def record_kda(_worker):
+        calls.append("kda")
+
+    warm_vision = Mock(side_effect=record_vision)
+    get_kda_layer = Mock(side_effect=record_kda)
     monkeypatch.setattr(kimi_k3_triton_warmup.current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(
         kimi_k3_triton_warmup,
