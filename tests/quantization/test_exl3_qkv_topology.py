@@ -293,6 +293,33 @@ def test_split_rejects_runtime_output_split_mismatch():
         )
 
 
+def test_split_tp_runtime_reconstructs_local_output_splits():
+    topology, storage = _mixed_checkpoint()
+    method = Exl3LinearMethod(_configure(topology, storage))
+    layer = torch.nn.Module()
+    layer.prefix = "model.layers.1.self_attn.qkv_proj"
+    layer.tp_rank = 0
+    layer.tp_size = 2
+    layer.num_heads = 24
+    layer.num_kv_heads = 2
+    layer.num_kv_head_replicas = 1
+    layer.head_size = 256
+    layer.v_head_size = 256
+    runtime_splits = [6143, 512, 512]
+
+    with pytest.raises(ValueError, match="expected_local=\\[6144, 512, 512\\]"):
+        method.create_weights(
+            layer,
+            input_size_per_partition=4096,
+            output_partition_sizes=runtime_splits,
+            input_size=4096,
+            output_size=sum(runtime_splits),
+            params_dtype=torch.float16,
+        )
+
+
+
+
 
 
 def test_fused_uniform_rejects_packed_fallback():
