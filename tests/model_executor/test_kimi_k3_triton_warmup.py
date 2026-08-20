@@ -19,12 +19,14 @@ def test_kda_layer_lookup_before_kv_cache_binding(monkeypatch) -> None:
         pass
 
     layer = FakeKimiK3DeltaAttention()
+    target_model = SimpleNamespace(modules=lambda: (layer,))
     worker = SimpleNamespace(
+        get_model=lambda: target_model,
         model_runner=SimpleNamespace(
             compilation_config=SimpleNamespace(
                 static_forward_context={"layer": layer},
             )
-        )
+        ),
     )
     monkeypatch.setattr(
         "vllm.models.kimi_k3.nvidia.kda.KimiK3DeltaAttention",
@@ -33,6 +35,32 @@ def test_kda_layer_lookup_before_kv_cache_binding(monkeypatch) -> None:
 
     assert not hasattr(layer, "kv_cache")
     assert _get_kda_layer(worker) is layer
+
+
+def test_kda_layer_lookup_ignores_speculative_draft(monkeypatch) -> None:
+    class FakeKimiK3DeltaAttention:
+        pass
+
+    target_layer = FakeKimiK3DeltaAttention()
+    draft_layer = FakeKimiK3DeltaAttention()
+    worker = SimpleNamespace(
+        get_model=lambda: SimpleNamespace(modules=lambda: (target_layer,)),
+        model_runner=SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                static_forward_context={
+                    "draft.layers.0": draft_layer,
+                    "target.layers.0": target_layer,
+                },
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm.models.kimi_k3.nvidia.kda.KimiK3DeltaAttention",
+        FakeKimiK3DeltaAttention,
+    )
+
+    assert not hasattr(target_layer, "kv_cache")
+    assert _get_kda_layer(worker) is target_layer
 
 
 def test_speculative_kda_warmup_before_kv_cache_binding(monkeypatch) -> None:

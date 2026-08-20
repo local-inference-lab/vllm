@@ -21,6 +21,26 @@ logger = init_logger(__name__)
 def _get_kda_layer(worker: Worker) -> KimiK3DeltaAttention | None:
     from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 
+    # The target model and speculative draft are separate model-runner
+    # objects, but both register attention layers in the shared compilation
+    # context. Traverse the target model first so a cacheless draft layer can
+    # never become the warmup template before KV pages are bound.
+    get_model = getattr(worker, "get_model", None)
+    if callable(get_model):
+        target_model = get_model()
+        modules = getattr(target_model, "modules", None)
+        if callable(modules):
+            target_layer = next(
+                (
+                    layer
+                    for layer in modules()
+                    if isinstance(layer, KimiK3DeltaAttention)
+                ),
+                None,
+            )
+            if target_layer is not None:
+                return target_layer
+
     compilation_config = getattr(
         worker.model_runner,
         "compilation_config",
@@ -29,13 +49,14 @@ def _get_kda_layer(worker: Worker) -> KimiK3DeltaAttention | None:
     static_context = getattr(compilation_config, "static_forward_context", None)
     if not isinstance(static_context, dict):
         return None
+    candidates = [
+        layer
+        for layer in static_context.values()
+        if isinstance(layer, KimiK3DeltaAttention)
+    ]
     return next(
-        (
-            layer
-            for layer in static_context.values()
-            if isinstance(layer, KimiK3DeltaAttention)
-        ),
-        None,
+        (layer for layer in candidates if hasattr(layer, "kv_cache")),
+        candidates[0] if candidates else None,
     )
 
 
