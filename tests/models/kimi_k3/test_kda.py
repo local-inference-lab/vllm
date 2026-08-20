@@ -129,6 +129,7 @@ def test_sharded_kda_f_a_is_gathered_before_f_b(monkeypatch):
     layer.in_proj_padding = 0
     layer.shard_f_a = True
     layer.head_dim = 2
+    layer.tp_size = 2
 
     projected = torch.arange(20, dtype=torch.float32).view(2, 10)
     layer.in_proj_qkvgfab = _StaticLinear(projected)
@@ -144,6 +145,11 @@ def test_sharded_kda_f_a_is_gathered_before_f_b(monkeypatch):
         return torch.cat((local_f_a, local_f_a + 100), dim=-1)
 
     monkeypatch.setattr(kimi_kda, "gather_kimi_sharded_projection", gather_f_a)
+    monkeypatch.setattr(
+        kimi_kda,
+        "reduce_kimi_full_width_projection",
+        lambda output, tp_size: output,
+    )
 
     output = layer(torch.empty(2, 1), positions=torch.arange(2))
 

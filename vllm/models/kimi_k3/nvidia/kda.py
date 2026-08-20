@@ -45,6 +45,7 @@ from vllm.models.kimi_k3.nvidia.kda_metadata import (
 )
 from vllm.models.kimi_k3.nvidia.tp_projection import (
     gather_kimi_sharded_projection,
+    reduce_kimi_full_width_projection,
 )
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
@@ -583,6 +584,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             self.projection_size,
             self.hidden_size,
             bias=False,
+            reduce_results=False,
             quant_config=self.quant_config,
             prefix=f"{prefix}.o_proj",
         )
@@ -643,7 +645,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
-        return self.o_proj(core_attn_out)[0]
+        output_parallel = self.o_proj(core_attn_out)[0]
+        return reduce_kimi_full_width_projection(output_parallel, self.tp_size)
 
     @eager_break_during_capture
     def _forward(
