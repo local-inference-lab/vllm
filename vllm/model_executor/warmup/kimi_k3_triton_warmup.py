@@ -33,7 +33,7 @@ def _get_kda_layer(worker: Worker) -> KimiK3DeltaAttention | None:
         (
             layer
             for layer in static_context.values()
-            if isinstance(layer, KimiK3DeltaAttention) and hasattr(layer, "kv_cache")
+            if isinstance(layer, KimiK3DeltaAttention)
         ),
         None,
     )

@@ -6,11 +6,33 @@ from types import SimpleNamespace
 import torch
 
 from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
+    _get_kda_layer,
     _warm_chunk_kda_prefill,
     _warm_recurrent_kda,
 )
 from vllm.models.kimi_k3.nvidia.ops.third_party import kda
 from vllm.models.kimi_k3.nvidia.ops.third_party.kda import fused_recurrent
+
+
+def test_kda_layer_lookup_before_kv_cache_binding(monkeypatch) -> None:
+    class FakeKimiK3DeltaAttention:
+        pass
+
+    layer = FakeKimiK3DeltaAttention()
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                static_forward_context={"layer": layer},
+            )
+        )
+    )
+    monkeypatch.setattr(
+        "vllm.models.kimi_k3.nvidia.kda.KimiK3DeltaAttention",
+        FakeKimiK3DeltaAttention,
+    )
+
+    assert not hasattr(layer, "kv_cache")
+    assert _get_kda_layer(worker) is layer
 
 
 def test_speculative_kda_warmup_before_kv_cache_binding(monkeypatch) -> None:
