@@ -3040,6 +3040,31 @@ class TestEagle:
         assert src_spec.group_sizes == [1, 0, 1]
         assert src_spec.block_indices == [1, 0, 0]
 
+    def test_finished_replay_tail_store_respects_request_token_limit(self):
+        """A request-level offload cap also bounds completion-only stores."""
+        scheduler = self._make_mixed_block_scheduler()
+        request = MagicMock()
+        request.request_id = "limited-tail-store"
+        request.kv_transfer_params = {"max_offload_tokens": 16}
+        request.num_prompt_tokens = 35
+        request.num_tokens = 36
+        request.status = RequestStatus.FINISHED_STOPPED
+        request.block_hashes = [BlockHash(str(i).encode()) for i in range(9)]
+        request.all_token_ids = list(range(36))
+        request.lora_request = None
+        request.is_finished.return_value = True
+        scheduler.on_new_request(request)
+        req_status = scheduler._req_status[request.request_id]
+        req_status.group_states[0].block_ids[:] = [11, 12, 13]
+        req_status.group_states[1].block_ids[:] = list(range(21, 30))
+
+        jobs = scheduler._build_finished_replay_tail_store_jobs(
+            SimpleNamespace(finished_req_ids=[request.request_id])
+        )
+
+        assert jobs == {}
+        scheduler.manager.prepare_store.assert_not_called()
+
     @pytest.mark.parametrize("missing_source", [False, True])
     def test_finished_replay_tail_store_skips_unsafe_request(
         self, missing_source: bool

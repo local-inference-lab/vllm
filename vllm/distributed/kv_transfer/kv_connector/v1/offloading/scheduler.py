@@ -206,6 +206,16 @@ class SchedulerOffloadConfig(NamedTuple):
         vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig,
     ) -> "SchedulerOffloadConfig":
+        """Build scheduler-side offload geometry from the cache plan.
+
+        Args:
+            spec: Connector chunking and hashing configuration.
+            vllm_config: Model, scheduler, and parallel runtime configuration.
+            kv_cache_config: Allocated cache groups and their attention specs.
+
+        Returns:
+            Immutable group geometry and replay-boundary capabilities.
+        """
         # Determine the alignment token count from the full-attention group(s).
         # This is the tokens_per_chunk of the full-attention group; load
         # hits are always aligned to this boundary, so SWA blocks earlier in
@@ -1003,7 +1013,14 @@ class OffloadingConnectorScheduler:
         return make_offload_key(request.block_hashes[hash_idx], group_idx)
 
     def _finished_replay_tail_boundary(self, request: Request) -> int | None:
-        """Return the largest stable replay boundary for a finished request."""
+        """Return the largest stable replay boundary for a finished request.
+
+        Args:
+            request: Completed request whose prompt prefix may be exported.
+
+        Returns:
+            Positive aligned token boundary, or ``None`` when none is stable.
+        """
         alignment = self.config.finished_replay_tail_alignment_tokens
         if alignment is None:
             return None
@@ -1025,6 +1042,14 @@ class OffloadingConnectorScheduler:
         needs a later full-chunk key as a stability witness; the witness is
         checked and retained but is not copied into the request's restored
         prefix.
+
+        Args:
+            req_status: Connector state and keys for the request being matched.
+            complete_hit: Tokens matched by ordinary complete-chunk lookup.
+
+        Returns:
+            Additional external-hit tokens after any local prefix, or ``None``
+            while a required asynchronous lookup is pending.
         """
         max_boundary = self._finished_replay_tail_boundary(req_status.req)
         alignment = self.config.finished_replay_tail_alignment_tokens
@@ -1186,7 +1211,14 @@ class OffloadingConnectorScheduler:
         self,
         scheduler_output: SchedulerOutput,
     ) -> dict[int, TransferJob]:
-        """Store immutable prefix data from completed requests' final pages."""
+        """Build stores for immutable data in completed requests' final pages.
+
+        Args:
+            scheduler_output: Finished request IDs and batch scheduling result.
+
+        Returns:
+            Transfer jobs keyed by scheduler-generated job ID.
+        """
         if self.config.finished_replay_tail_alignment_tokens is None:
             return {}
 
@@ -1201,6 +1233,15 @@ class OffloadingConnectorScheduler:
             boundary = self._finished_replay_tail_boundary(req)
             if boundary is None:
                 continue
+            if req_status.max_offload_tokens is not None:
+                alignment = self.config.finished_replay_tail_alignment_tokens
+                assert alignment is not None
+                boundary = min(
+                    boundary,
+                    round_down(req_status.max_offload_tokens, alignment),
+                )
+                if boundary == 0:
+                    continue
 
             partial_groups = [
                 config
