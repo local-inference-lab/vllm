@@ -6,10 +6,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
+import vllm.v1.worker.gpu.model_runner as gpu_model_runner_v2_module
 import vllm.v1.worker.gpu_worker as gpu_worker_module
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import startup_plan
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
@@ -32,6 +35,45 @@ def test_gpu_worker_keeps_cuda_warmup_import_lazy(monkeypatch: pytest.MonkeyPatc
     gpu_worker_module.kernel_warmup(worker)
 
     run_kernel_warmup.assert_called_once_with(worker)
+
+
+@pytest.mark.parametrize("kv_cache_memory_bytes", [None, 1024])
+def test_release_allocator_slack_before_manual_kv_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_memory_bytes: int | None,
+):
+    runner = object.__new__(GPUModelRunnerV2)
+    runner.cache_config = SimpleNamespace(
+        kv_cache_memory_bytes=kv_cache_memory_bytes,
+    )
+    runner.device = torch.device("cuda:3")
+    calls: list[object] = []
+    monkeypatch.setattr(
+        gpu_model_runner_v2_module.torch.accelerator,
+        "synchronize",
+        lambda device: calls.append(("synchronize", device)),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2_module.gc,
+        "collect",
+        lambda: calls.append("collect"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2_module.torch.accelerator,
+        "empty_cache",
+        lambda: calls.append("empty_cache"),
+    )
+
+    runner._release_allocator_slack_before_manual_kv_cache()
+
+    if kv_cache_memory_bytes is None:
+        assert calls == []
+    else:
+        assert calls == [
+            ("synchronize", torch.device("cuda:3")),
+            "collect",
+            "empty_cache",
+        ]
 
 
 def test_kernel_warmup_runs_once(monkeypatch: pytest.MonkeyPatch):

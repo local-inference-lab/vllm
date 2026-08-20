@@ -570,6 +570,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return {}
         return get_kv_cache_spec(self.vllm_config)
 
+    def _release_allocator_slack_before_manual_kv_cache(self) -> None:
+        """Return free allocator blocks immediately before fixed KV storage."""
+        if self.cache_config.kv_cache_memory_bytes is None:
+            return
+        torch.accelerator.synchronize(self.device)
+        gc.collect()
+        torch.accelerator.empty_cache()
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
@@ -693,6 +701,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # to its own attention support.
             with use_workspace_lane(1):
                 self.speculator.init_cudagraph_manager(cudagraph_mode)
+
+        # Attention metadata and speculative-decoder setup can release large
+        # temporary blocks after the earlier profiling cleanup. Fixed-size KV
+        # storage must see those blocks as device memory, especially when the
+        # allocator cannot use expandable segments because a connector records
+        # stable KV addresses.
+        self._release_allocator_slack_before_manual_kv_cache()
 
         self.kv_caches: list[torch.Tensor] = []
         kv_caches_dict = init_kv_cache(
