@@ -1070,6 +1070,29 @@ class QKVParallelLinear(ColumnParallelLinear):
             disable_tp=disable_tp,
         )
 
+    def forward_qkv_views(
+        self, x: torch.Tensor
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        Parameter | None,
+    ]:
+        """Project QKV and return ordered views.
+
+        Quant methods may supply a topology-aware one-apply implementation.
+        Every other method retains the established packed forward, including
+        EXL3 split's three applies and cat, before the result is viewed.
+        """
+        bias = self.bias if not self.skip_bias_add else None
+        apply_views = getattr(self.quant_method, "apply_qkv_views", None)
+        if apply_views is None:
+            output = self.quant_method.apply(self, x, bias)
+            views = output.split(self.output_partition_sizes, dim=-1)
+        else:
+            views = apply_views(self, x, bias)
+        output_bias = self.bias if self.skip_bias_add else None
+        return views, output_bias
+
+
     def validate_shard_id(self, shard_id: Any) -> TypeIs[str | None]:
         if shard_id in {"q", "k", "v"} or shard_id is None:
             return True
