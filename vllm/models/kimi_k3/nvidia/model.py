@@ -1255,7 +1255,14 @@ class KimiDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if output is not None:
+            return self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+                output=output,
+            )
         if self._self_attn_writes_output:
             output = torch.empty_like(hidden_states)
             self.self_attn(
@@ -1268,6 +1275,27 @@ class KimiDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             positions=positions,
         )
+
+    def _select_self_attn_output(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Return consumed attention-input storage when reuse is supported."""
+        should_use_caller_output = getattr(
+            getattr(self, "self_attn", None),
+            "should_use_caller_output",
+            None,
+        )
+        if (
+            not self.use_sequence_parallel
+            and callable(should_use_caller_output)
+            and should_use_caller_output(hidden_states)
+        ):
+            # Both normalization paths produce an attention input whose last
+            # reader is the attention front-end. The residual and attention-
+            # residual prefix remain in separate live tensors.
+            return hidden_states
+        return None
 
     def _pre_attn_norm(
         self,
@@ -1352,7 +1380,15 @@ class KimiDecoderLayer(nn.Module):
             hidden_states = hidden_states[: positions.shape[0]]
 
         # Attention.
-        hidden_states = self._run_self_attn(positions, hidden_states)
+        caller_output = self._select_self_attn_output(hidden_states)
+        if caller_output is None:
+            hidden_states = self._run_self_attn(positions, hidden_states)
+        else:
+            hidden_states = self._run_self_attn(
+                positions,
+                hidden_states,
+                output=caller_output,
+            )
 
         if self.use_sequence_parallel:
             # Add SP padding if needed, and then perform reduce scatter.
