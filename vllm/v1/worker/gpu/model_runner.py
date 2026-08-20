@@ -582,7 +582,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _allocate_manual_kv_cache_before_metadata(
         self, kv_cache_config: KVCacheConfig
     ) -> dict[str, torch.Tensor] | None:
-        """Reserve fixed KV storage before persistent metadata fragments memory."""
+        """Reserve fixed KV storage before persistent metadata fragments memory.
+
+        Args:
+            kv_cache_config: Physical tensor layout selected for the worker.
+
+        Returns:
+            The preallocated backing tensors when manual cache sizing is active,
+            otherwise ``None``.
+        """
         if self.cache_config.kv_cache_memory_bytes is None:
             return None
         self._release_allocator_slack_before_manual_kv_cache()

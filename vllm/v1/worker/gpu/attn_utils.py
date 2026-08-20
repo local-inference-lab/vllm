@@ -228,7 +228,16 @@ def allocate_kv_cache(
     vllm_config: VllmConfig,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    """Allocate fixed KV storage before attention metadata is materialized."""
+    """Allocate fixed KV storage before attention metadata is materialized.
+
+    Args:
+        kv_cache_config: Physical tensor layout selected for the worker.
+        vllm_config: Engine configuration that defines cache groups and dtypes.
+        device: Accelerator on which to allocate the backing tensors.
+
+    Returns:
+        A mapping from KV-cache layer names to their backing tensors.
+    """
     return _allocate_kv_cache(
         kv_cache_config,
         get_shared_kv_cache_layers(vllm_config),

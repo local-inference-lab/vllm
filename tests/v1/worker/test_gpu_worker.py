@@ -37,7 +37,7 @@ def test_gpu_worker_keeps_cuda_warmup_import_lazy(monkeypatch: pytest.MonkeyPatc
     run_kernel_warmup.assert_called_once_with(worker)
 
 
-@pytest.mark.parametrize("kv_cache_memory_bytes", [None, 1024])
+@pytest.mark.parametrize("kv_cache_memory_bytes", [None, 0, 1024])
 def test_release_allocator_slack_before_manual_kv_cache(
     monkeypatch: pytest.MonkeyPatch,
     kv_cache_memory_bytes: int | None,
@@ -76,7 +76,7 @@ def test_release_allocator_slack_before_manual_kv_cache(
         ]
 
 
-@pytest.mark.parametrize("kv_cache_memory_bytes", [None, 1024])
+@pytest.mark.parametrize("kv_cache_memory_bytes", [None, 0, 1024])
 def test_manual_kv_storage_precedes_attention_metadata(
     monkeypatch: pytest.MonkeyPatch,
     kv_cache_memory_bytes: int | None,
@@ -228,13 +228,17 @@ def test_memory_profile_replays_model_after_kernel_warmup(
     ]
 
 
+@pytest.mark.parametrize("kv_cache_memory_bytes", [0, 1024])
 def test_manual_kv_profile_releases_unoccupied_memory(
     monkeypatch: pytest.MonkeyPatch,
+    kv_cache_memory_bytes: int,
 ):
     worker = object.__new__(Worker)
     calls: list[object] = []
     worker.device = "cuda:0"
-    worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=1024)
+    worker.cache_config = SimpleNamespace(
+        kv_cache_memory_bytes=kv_cache_memory_bytes,
+    )
     worker.model_runner = SimpleNamespace(
         profile_run=lambda: calls.append("profile"),
     )
@@ -273,10 +277,10 @@ def test_manual_kv_profile_releases_unoccupied_memory(
     monkeypatch.setattr(
         gpu_worker_module,
         "reserve_mm_ipc_gpu_memory",
-        lambda *args: 1024,
+        lambda size, *args: size,
     )
 
-    assert worker.determine_available_memory() == 1024
+    assert worker.determine_available_memory() == kv_cache_memory_bytes
     assert calls == [
         ("synchronize", "cuda:0"),
         "collect",
@@ -293,7 +297,7 @@ def test_manual_kv_profile_releases_unoccupied_memory(
     ]
 
 
-@pytest.mark.parametrize("kv_cache_memory_bytes", [None, 1024])
+@pytest.mark.parametrize("kv_cache_memory_bytes", [None, 0, 1024])
 def test_manual_kv_graph_capture_releases_unoccupied_memory(
     kv_cache_memory_bytes: int | None,
 ):

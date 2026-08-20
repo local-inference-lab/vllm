@@ -541,6 +541,11 @@ class Worker(WorkerBase):
         torch.accelerator.empty_cache()
 
     def _capture_model_with_reclaimed_manual_kv_cache(self) -> int:
+        """Capture CUDA graphs after releasing unoccupied allocator blocks.
+
+        Returns:
+            The number of bytes occupied by the captured CUDA graphs.
+        """
         if self.cache_config.kv_cache_memory_bytes is not None:
             # Manual KV sizing can leave large unoccupied allocator blocks
             # after the cache tensors and persistent kernel workspaces are
@@ -564,7 +569,8 @@ class Worker(WorkerBase):
         """
         maybe_apply_startup_plan(self)
 
-        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+        kv_cache_memory_bytes = self.cache_config.kv_cache_memory_bytes
+        if kv_cache_memory_bytes is not None:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self._release_unoccupied_accelerator_memory()
