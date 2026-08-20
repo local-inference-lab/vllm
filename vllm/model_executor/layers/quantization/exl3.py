@@ -163,8 +163,8 @@ class Exl3Int8EmbeddingMethod(QuantizeMethodBase):
         layer.register_buffer("q_weight", q_weight, persistent=False)
         layer.register_buffer("embed_scale", scales, persistent=False)
         layer.embed_output_dtype = dtype
-        # Native target/MTP sharing inspects ``weight.shape[-1]`` before it
-        # shares the whole module. Keep that surface without retaining storage.
+        # Preserve the generic embedding-width surface without retaining dense
+        # storage. Equality checks must use q_weight and embed_scale instead.
         layer.register_parameter(
             "weight",
             Parameter(torch.empty((0, hidden), dtype=dtype, device=device), False),

@@ -70,20 +70,98 @@ def _create_draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
     return draft_vllm_config
 
 
-def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
-    """Share when the draft has no own copy, or its copy matches the target."""
+def _tensor_equal(left: torch.Tensor, right: torch.Tensor) -> bool:
+    if left.shape != right.shape or left.dtype != right.dtype:
+        return False
+    if left.device != right.device:
+        return torch.equal(left.cpu(), right.cpu())
+    if left.is_cuda and torch.accelerator.get_memory_info(left.device)[0] < (
+        left.numel() * left.element_size()
+    ):
+        return torch.equal(left.cpu(), right.cpu())
+    return torch.equal(left, right)
 
-    if not getattr(eagle, flag, False) or draft is None:
-        return True
+
+def embedding_quantization_compatible(draft: nn.Module, target: nn.Module) -> bool:
+    """Return whether two embeddings have the same width and representation."""
+    draft_q = getattr(draft, "q_weight", None)
+    target_q = getattr(target, "q_weight", None)
+    draft_scale = getattr(draft, "embed_scale", None)
+    target_scale = getattr(target, "embed_scale", None)
+    quantized = (draft_q, target_q, draft_scale, target_scale)
+    if any(isinstance(tensor, torch.Tensor) for tensor in quantized):
+        if not (
+            isinstance(draft_q, torch.Tensor)
+            and isinstance(target_q, torch.Tensor)
+            and isinstance(draft_scale, torch.Tensor)
+            and isinstance(target_scale, torch.Tensor)
+        ):
+            return False
+        return (
+            draft_q.ndim == 2
+            and target_q.ndim == 2
+            and draft_scale.ndim == 1
+            and target_scale.ndim == 1
+            and draft_q.dtype == target_q.dtype
+            and draft_scale.dtype == target_scale.dtype
+            and draft_q.shape[-1] == target_q.shape[-1]
+            and draft_q.shape[0] == draft_scale.shape[0]
+            and target_q.shape[0] == target_scale.shape[0]
+        )
+
+    draft_weight = getattr(draft, "weight", None)
+    target_weight = getattr(target, "weight", None)
+    return (
+        isinstance(draft_weight, torch.Tensor)
+        and isinstance(target_weight, torch.Tensor)
+        and draft_weight.ndim == 2
+        and target_weight.ndim == 2
+        and draft_weight.shape[-1] == target_weight.shape[-1]
+    )
+
+
+def embeddings_equal(draft: nn.Module, target: nn.Module) -> bool:
+    """Compare the real dense or row-wise-int8 embedding representation."""
+    if not embedding_quantization_compatible(draft, target):
+        return False
+
+    draft_q = getattr(draft, "q_weight", None)
+    target_q = getattr(target, "q_weight", None)
+    if isinstance(draft_q, torch.Tensor) and isinstance(target_q, torch.Tensor):
+        return _tensor_equal(draft_q, target_q) and _tensor_equal(
+            draft.embed_scale, target.embed_scale
+        )
+
+    draft_weight = draft.weight
+    target_weight = target.weight
+    if draft_weight.numel() == 0 or target_weight.numel() == 0:
+        return False
+    return _tensor_equal(draft_weight, target_weight)
+
+
+def _should_share(
+    eagle: nn.Module,
+    flag: str,
+    draft,
+    target,
+    *,
+    validate_embedding_compatibility: bool = False,
+) -> bool:
+    """Share absent weights, or an owned copy that matches the target."""
+    has_own_copy = getattr(eagle, flag, False)
     if target is None:
         return False
-    # torch.equal on GPU allocates a bool mask the size of the input.
-    # Use the faster GPU path when there is plenty of headroom;
-    # otherwise compare on CPU.
-    w = draft.weight
-    if w.is_cuda and torch.accelerator.get_memory_info(w.device)[0] < w.numel() * 2:
-        return torch.equal(w.cpu(), target.weight.cpu())
-    return torch.equal(w, target.weight)
+    if not has_own_copy:
+        if flag == "has_own_embed_tokens" and validate_embedding_compatibility:
+            return draft is not None and embedding_quantization_compatible(
+                draft, target
+            )
+        return True
+    if draft is None:
+        return False
+    if flag == "has_own_embed_tokens":
+        return embeddings_equal(draft, target)
+    return _tensor_equal(draft.weight, target.weight)
 
 
 def get_target_lm_head(target_model: nn.Module, target_language_model: nn.Module):
@@ -130,7 +208,11 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
             target_embed = target_embed.base_layer
         draft_embed = getattr(draft_inner, "embed_tokens", None)
         if target_embed is not None and _should_share(
-            eagle_model, "has_own_embed_tokens", draft_embed, target_embed
+            eagle_model,
+            "has_own_embed_tokens",
+            draft_embed,
+            target_embed,
+            validate_embedding_compatibility=speculative_config.method == "mtp",
         ):
             if draft_embed is not None:
                 del draft_inner.embed_tokens
