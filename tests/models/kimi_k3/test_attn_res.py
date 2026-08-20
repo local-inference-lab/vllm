@@ -194,6 +194,135 @@ def test_attn_res_without_output_norm():
     torch.testing.assert_close(actual, expected, atol=8e-2, rtol=3e-2)
 
 
+def test_attn_res_reuses_delta_for_output():
+    prefix = torch.randn(17, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    delta = torch.randn_like(prefix)
+    blocks = torch.randn(
+        17, MAX_BLOCKS, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+    )
+    norm_weight = torch.ones(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    qk_weight = (
+        torch.randn(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16) / HIDDEN_SIZE**0.5
+    )
+    output_norm_weight = torch.ones_like(norm_weight)
+    expected, expected_prefix = _reference(
+        prefix.clone(),
+        delta.clone(),
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        MAX_BLOCKS,
+    )
+    output_pointer = delta.data_ptr()
+
+    actual = attn_res(
+        prefix,
+        delta,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        MAX_BLOCKS,
+        -1,
+        EPS,
+        EPS,
+        output=delta,
+    )
+
+    assert actual.data_ptr() == output_pointer
+    torch.testing.assert_close(actual, expected, atol=8e-2, rtol=3e-2)
+    torch.testing.assert_close(prefix, expected_prefix, atol=0, rtol=0)
+
+
+def test_attn_res_uses_an_inactive_workspace_block_for_output():
+    num_tokens = 17
+    prefix = torch.randn(num_tokens, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    block_storage = torch.randn(
+        MAX_BLOCKS,
+        num_tokens,
+        HIDDEN_SIZE,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    blocks = block_storage.permute(1, 0, 2)
+    output = blocks[:, -1]
+    norm_weight = torch.ones(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    qk_weight = (
+        torch.randn(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16) / HIDDEN_SIZE**0.5
+    )
+    output_norm_weight = torch.ones_like(norm_weight)
+    expected, expected_prefix = _reference(
+        prefix.clone(),
+        None,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        0,
+    )
+    output_pointer = output.data_ptr()
+
+    actual = attn_res(
+        prefix,
+        None,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        0,
+        0,
+        EPS,
+        EPS,
+        output=output,
+    )
+
+    assert actual.data_ptr() == output_pointer
+    torch.testing.assert_close(actual, expected, atol=8e-2, rtol=3e-2)
+    torch.testing.assert_close(prefix, expected_prefix, atol=0, rtol=0)
+    torch.testing.assert_close(blocks[:, 0], expected_prefix, atol=0, rtol=0)
+
+
+def test_attn_res_reused_output_supports_cuda_graph_replay():
+    prefix = torch.randn(17, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    delta = torch.randn_like(prefix)
+    blocks = torch.randn(
+        17, MAX_BLOCKS, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+    )
+    norm_weight = torch.ones(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    qk_weight = (
+        torch.randn(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16) / HIDDEN_SIZE**0.5
+    )
+    output_norm_weight = torch.ones_like(norm_weight)
+    original_prefix = prefix.clone()
+    original_delta = delta.clone()
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        actual = attn_res(
+            prefix,
+            delta,
+            blocks,
+            norm_weight,
+            qk_weight,
+            output_norm_weight,
+            MAX_BLOCKS,
+            -1,
+            EPS,
+            EPS,
+            output=delta,
+        )
+
+    prefix.copy_(original_prefix)
+    delta.copy_(original_delta)
+    graph.replay()
+    first = actual.clone()
+    prefix.copy_(original_prefix)
+    delta.copy_(original_delta)
+    graph.replay()
+    torch.testing.assert_close(actual, first, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("num_tokens", [0, 1, 17])
 def test_fused_mtp_input(num_tokens: int):
     positions = torch.arange(num_tokens, device="cuda")

@@ -178,7 +178,15 @@ def attn_res(
     block_write_idx: int,
     eps: float,
     output_norm_eps: float,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Mix AttnRes sources into caller-owned or newly allocated storage.
+
+    ``output`` may alias ``delta`` because each token row is read completely
+    before that row is written. If it shares storage with ``blocks``, the
+    caller must select a block outside both the active source range and
+    ``block_write_idx``.
+    """
     num_tokens, hidden_size = prefix.shape
     assert prefix.stride(-1) == 1
     assert delta is None or delta.stride(-1) == 1
@@ -186,6 +194,11 @@ def attn_res(
     assert norm_weight.stride(-1) == 1
     assert qk_weight.stride(-1) == 1
     assert output_norm_weight is None or output_norm_weight.stride(-1) == 1
+    if output is not None:
+        assert output.shape == prefix.shape
+        assert output.device == prefix.device
+        assert output.dtype == prefix.dtype
+        assert output.stride(-1) == 1
     # The in-tree NVIDIA kernel covers the common fused-add + output-norm path;
     # Triton handles block boundaries and final pre-norm output. The native op
     # is only compiled for SM100 under CUDA >= 13, so a device check alone is
@@ -198,6 +211,9 @@ def attn_res(
         and block_write_idx < 0
         and current_platform.is_device_capability_family(100)
         and hasattr(torch.ops._C, "kimi_k3_attn_res")
+        # The SM100 operation does not declare caller-output aliasing. An
+        # explicit output therefore selects the Triton implementation.
+        and output is None
     ):
         return ops.kimi_k3_attn_res(
             prefix,
@@ -210,7 +226,8 @@ def attn_res(
             eps,
             output_norm_eps,
         )
-    output = prefix.new_empty(prefix.shape)
+    if output is None:
+        output = prefix.new_empty(prefix.shape)
     # Tuned on GB300: source tiling helps decode, while one-source tiles scale
     # better for prefill.
     # Keep get_attn_res_triton_warmup_profiles in sync with these fallbacks.
