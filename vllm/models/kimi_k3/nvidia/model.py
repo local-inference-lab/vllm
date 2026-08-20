@@ -12,6 +12,7 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -408,7 +409,8 @@ class KimiRoutedOutputTransform(nn.Module):
         """Project the routed latent back to the hidden dim.
 
         Args:
-            hidden_states: Routed expert output in latent space.
+            hidden_states: Consumed routed expert output in latent space.
+                Eligible prefill tensors may be normalized in place.
             residual: Optional tensor of the up-projection's output shape to
                 accumulate into. A replicated projection consumes it in the
                 GEMM's beta-add epilogue; a TP-sharded projection adds the two
@@ -422,7 +424,7 @@ class KimiRoutedOutputTransform(nn.Module):
             )
         self.capture_routed_latent(hidden_states)
         if self.norm is not None:
-            hidden_states = self.norm(hidden_states)
+            hidden_states = self.normalize_routed_latent(hidden_states)
         if residual is not None and isinstance(self.up_proj, ReplicatedLinear):
             return residual.addmm_(hidden_states, self.up_proj.weight.t())
         if residual is not None and isinstance(
@@ -445,6 +447,40 @@ class KimiRoutedOutputTransform(nn.Module):
         if residual is not None:
             hidden_states.add_(residual)
         return hidden_states
+
+    def can_normalize_routed_latent_in_place(self, hidden_states: torch.Tensor) -> bool:
+        """Check whether the consumed prefill latent can hold its RMSNorm."""
+        norm = self.norm
+        return (
+            norm is not None
+            and not envs.VLLM_BATCH_INVARIANT
+            and not torch.is_grad_enabled()
+            and norm.pass_weight
+            and norm.variance_size_override is None
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] >= self._CALLER_OUTPUT_MIN_TOKENS
+            and hidden_states.shape[1] == norm.hidden_size
+            and hidden_states.is_contiguous()
+            and norm.weight.device == hidden_states.device
+            and norm.weight.dtype == hidden_states.dtype
+        )
+
+    def normalize_routed_latent(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize a consumed routed latent with bounded prefill storage."""
+        norm = self.norm
+        if norm is None:
+            return hidden_states
+        if self.can_normalize_routed_latent_in_place(hidden_states):
+            ops.rms_norm(
+                hidden_states,
+                hidden_states,
+                norm.weight.data,
+                norm.variance_epsilon,
+            )
+            return hidden_states
+        return cast(torch.Tensor, norm(hidden_states))
 
     def can_accumulate_residual(
         self, hidden_states: torch.Tensor, residual: torch.Tensor

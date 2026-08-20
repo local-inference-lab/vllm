@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.models.kimi_k3.nvidia.model import (
     KimiMLP,
@@ -51,6 +52,19 @@ class _DownInto(nn.Module):
         self.output_size = hidden_size
         self.reduce_results = tp_size > 1
         self.tp_size = tp_size
+
+
+def _make_rms_norm(hidden_size: int) -> RMSNorm:
+    norm = object.__new__(RMSNorm)
+    nn.Module.__init__(norm)
+    norm.hidden_size = hidden_size
+    norm.variance_epsilon = 1e-5
+    norm.variance_size_override = None
+    norm.has_weight = True
+    norm.pass_weight = True
+    norm.pass_weight_add = True
+    norm.weight = nn.Parameter(torch.ones(hidden_size), requires_grad=False)
+    return norm
 
 
 def test_mlp_releases_gate_up_before_down_projection() -> None:
@@ -180,6 +194,52 @@ def test_routed_output_transform_keeps_decode_on_allocating_path() -> None:
     output = torch.empty(8, 4)
 
     assert not transform.can_write_output(hidden_states, output)
+
+
+def test_routed_output_transform_normalizes_consumed_prefill_latent_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    norm = _make_rms_norm(4)
+    transform = KimiRoutedOutputTransform(norm, nn.Identity(), layer_idx=0)
+    hidden_states = torch.arange(16).view(4, 4).float()
+    expected = hidden_states.clone()
+    input_pointer = hidden_states.data_ptr()
+    calls: list[tuple[int, int, float]] = []
+
+    def _rms_norm(
+        output: torch.Tensor,
+        input_tensor: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> None:
+        calls.append((output.data_ptr(), input_tensor.data_ptr(), epsilon))
+        output.copy_(input_tensor.clone() * weight)
+
+    monkeypatch.setattr(
+        KimiRoutedOutputTransform,
+        "can_normalize_routed_latent_in_place",
+        lambda _self, _hidden_states: True,
+    )
+    monkeypatch.setattr(
+        "vllm.models.kimi_k3.nvidia.model.ops.rms_norm",
+        _rms_norm,
+    )
+
+    with torch.inference_mode():
+        actual = transform.normalize_routed_latent(hidden_states)
+
+    assert actual.data_ptr() == input_pointer
+    assert calls == [(input_pointer, input_pointer, 1e-5)]
+    torch.testing.assert_close(actual, expected)
+
+
+def test_routed_output_transform_keeps_cpu_latent_on_allocating_norm_path() -> None:
+    norm = _make_rms_norm(4)
+    transform = KimiRoutedOutputTransform(norm, nn.Identity(), layer_idx=0)
+    hidden_states = torch.arange(4096).view(1024, 4).float()
+
+    with torch.inference_mode():
+        assert not transform.can_normalize_routed_latent_in_place(hidden_states)
 
 
 def test_routed_output_transform_accumulates_prefill_in_bounded_tiles() -> None:
