@@ -915,7 +915,13 @@ class Platform:
             )
 
         if cache_config.mamba_cache_mode == "align":
-            cache_config.mamba_block_size = cache_config.block_size
+            # An explicitly configured Mamba block is the recurrent-state
+            # checkpoint cadence. It does not determine the physical page
+            # size: Mamba pages are padded to the attention page below. This
+            # permits a hybrid model to align recurrent checkpoints with a
+            # coarser attention or DCP boundary while retaining smaller
+            # physical attention pages.
+            cache_config.mamba_block_size = mamba_block_size or cache_config.block_size
 
         # Pad mamba page size to exactly match attention page size
         attn_page_size = cache_config.block_size * attn_page_size_1_token

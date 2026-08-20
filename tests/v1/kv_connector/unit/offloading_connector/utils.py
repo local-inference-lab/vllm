@@ -41,6 +41,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
 )
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
@@ -241,6 +242,15 @@ class RequestRunner:
                 )
             ]
 
+        mamba_modes = {
+            group.kv_cache_spec.mamba_cache_mode
+            for group in kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        }
+        if mamba_modes:
+            assert len(mamba_modes) == 1
+            vllm_config.cache_config.mamba_cache_mode = mamba_modes.pop()
+
         kv_cache_tensors = [
             KVCacheTensor(
                 size=group.kv_cache_spec.page_size_bytes * num_gpu_blocks,
@@ -282,16 +292,23 @@ class RequestRunner:
         for group in kv_cache_groups:
             spec = group.kv_cache_spec
             for layer_name in group.layer_names:
-                # Shape follows FlashAttention layout:
-                # Shape: (num_blocks, 2, block_size, num_kv_heads, head_size)
-                kv_caches[layer_name] = torch.empty(
-                    num_gpu_blocks,
-                    2,
-                    spec.block_size,
-                    spec.num_kv_heads,
-                    spec.head_size,
-                    dtype=spec.dtype,
-                )
+                if isinstance(spec, MambaSpec):
+                    kv_caches[layer_name] = torch.empty(
+                        num_gpu_blocks,
+                        spec.page_size_bytes,
+                        dtype=torch.int8,
+                    )
+                else:
+                    # Shape follows FlashAttention layout:
+                    # (blocks, K/V, tokens, heads, head size).
+                    kv_caches[layer_name] = torch.empty(
+                        num_gpu_blocks,
+                        2,
+                        spec.block_size,
+                        spec.num_kv_heads,
+                        spec.head_size,
+                        dtype=spec.dtype,
+                    )
 
         with set_current_vllm_config(vllm_config):
             self.worker_connector.register_kv_caches(kv_caches)

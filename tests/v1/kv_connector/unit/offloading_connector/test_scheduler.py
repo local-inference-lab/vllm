@@ -42,6 +42,7 @@ from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     KVCacheGroupSpec,
+    MambaSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.kv_offload.base import (
@@ -112,8 +113,8 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
     req_status = scheduler._req_status["req"]
     req_status.group_states[0].block_ids[:] = [11, 12]
     req_status.group_states[1].block_ids[:] = [0, 21]
-    scheduler.manager.prepare_store.side_effect = (
-        lambda keys, req_context: generate_store_output(keys)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
     )
 
     output = SimpleNamespace(partial_tail_offloads={"req": [(1, 99, 28)]})
@@ -3423,6 +3424,122 @@ class TestEagle:
         # 249, the tail of the first 1000-token chunk.)
         assert offsets == list(range(len(offsets))), (
             f"interior hole in stored blocks: {offsets}"
+        )
+
+    def test_mixed_mamba_store_is_invariant_to_prefill_chunk_budget(
+        self, request_runner
+    ):
+        """A larger prefill chunk must not remove reusable recurrent states.
+
+        This geometry is a 1:256 scale model of Kimi-K3 with DCP16: twelve
+        recurrent groups checkpoint on the 12,288-token target-attention
+        boundary, four target-attention groups use 12,288-token blocks, and
+        one EAGLE draft group uses a 32,768-token sliding window over
+        768-token blocks. Scheduler budgets of 3 and 16 model 768-token and
+        4,096-token prefill budgets.
+
+        Every target-attention boundary needs the corresponding recurrent
+        state. The externally reusable prefix therefore cannot depend on the
+        scheduler chunk budget.
+        """
+
+        target_block = 48
+        recurrent_block = target_block
+        physical_block = 3
+        draft_window = 128
+        prompt_tokens = 524
+
+        def make_groups() -> list[KVCacheGroupSpec]:
+            recurrent = [
+                KVCacheGroupSpec(
+                    [f"recurrent-{idx}"],
+                    MambaSpec(
+                        block_size=recurrent_block,
+                        shapes=((1,),),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                    ),
+                )
+                for idx in range(12)
+            ]
+            target = [
+                KVCacheGroupSpec(
+                    [f"target-{idx}"],
+                    FullAttentionSpec(
+                        block_size=target_block,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                )
+                for idx in range(4)
+            ]
+            draft = KVCacheGroupSpec(
+                ["draft"],
+                SlidingWindowSpec(
+                    block_size=physical_block,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=draft_window,
+                ),
+                is_eagle_group=True,
+            )
+            return [*recurrent, *target, draft]
+
+        def run(prefill_budget: int) -> tuple[int, list[int]]:
+            runner = request_runner(
+                block_size=physical_block,
+                num_gpu_blocks=1024,
+                async_scheduling=False,
+                kv_cache_groups=make_groups(),
+            )
+            runner.scheduler.max_num_scheduled_tokens = prefill_budget
+
+            stored_keys = set()
+
+            def prepare_store(keys, req_context):
+                keys = list(keys)
+                stored_keys.update(keys)
+                return generate_store_output(keys)
+
+            runner.manager.prepare_store.side_effect = prepare_store
+            token_ids = [0] * prompt_tokens
+            runner.new_request(token_ids=token_ids)
+            full_blocks, tail = divmod(prompt_tokens, recurrent_block)
+            prefill_steps = full_blocks * (recurrent_block // prefill_budget)
+            prefill_steps += (tail + prefill_budget - 1) // prefill_budget
+            runner._run(
+                [1] * prefill_steps + [EOS_TOKEN_ID],
+                complete_transfers=True,
+            )
+
+            group_counts = [0] * len(make_groups())
+            for key in stored_keys:
+                group_counts[get_offload_group_idx(key)] += 1
+
+            runner.scheduler.reset_prefix_cache()
+            runner.new_request(token_ids=token_ids)
+            req_status = runner.connector_scheduler._req_status[str(runner.req_id)]
+            req_status.update_offload_keys()
+            runner.manager.lookup.side_effect = lambda key, req_context: (
+                LookupResult.HIT if key in stored_keys else LookupResult.MISS
+            )
+            hit = runner.connector_scheduler._lookup(req_status)
+            assert hit is not None
+            return hit, group_counts
+
+        narrow_hit, narrow_counts = run(3)
+        wide_hit, wide_counts = run(16)
+
+        # Recurrent and target groups define the reusable full-context prefix.
+        # Sliding-window draft storage can legitimately vary with step shape.
+        assert wide_counts[:-1] == narrow_counts[:-1], (
+            "recurrent/target stored group counts differ: "
+            f"narrow={narrow_counts[:-1]}, wide={wide_counts[:-1]}"
+        )
+        assert wide_hit == narrow_hit == 480, (
+            f"external hit differs: narrow={narrow_hit}, wide={wide_hit}"
         )
 
     @pytest.mark.parametrize("async_scheduling", [True, False])
