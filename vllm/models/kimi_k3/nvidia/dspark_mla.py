@@ -8,11 +8,16 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import vllm._custom_ops as ops
 from vllm import envs
 from vllm.config import VllmConfig
-from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
+from vllm.distributed import (
+    get_tp_group,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce_in_place,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -40,6 +45,7 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 
 _COMPACT_ROPE_PROTECTED_IDS: set[int] = set()
+_STREAMED_AUX_MIN_TOKENS = 1024
 
 
 def _load_b12x_vocab_parallel_argmax() -> Any | None:
@@ -220,14 +226,16 @@ class K3DSparkModel(nn.Module):
         if self.context_proj_sharded:
             # Target auxiliary states are identical across TP ranks. Each rank
             # retains and evaluates only its output rows; the gathered result
-            # preserves the draft hidden-state layout exactly.
+            # preserves the draft hidden-state layout exactly. Keep this one
+            # projection in BF16: large-prefill streaming reads contiguous
+            # input-column slices before the complete target state exists.
             self.context_proj = ColumnParallelLinear(
                 context_input_size,
                 self.config.hidden_size,
                 bias=False,
                 gather_output=True,
                 return_bias=False,
-                quant_config=self.quant_config,
+                quant_config=None,
                 prefix=context_prefix,
             )
         else:
@@ -278,6 +286,42 @@ class K3DSparkModel(nn.Module):
         self._max_num_context_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
         )
+        self._streamed_aux_layer_ids = tuple(
+            int(layer_id) + 1
+            for layer_id in getattr(self.config, "target_layer_ids", ())
+        )
+        self._streamed_aux_scratch: torch.Tensor | None = None
+        self._streamed_aux_tokens = 0
+        self._streamed_aux_index = 0
+        self._context_local_width = (
+            int(self.config.hidden_size) // tp_size
+            if self.context_proj_sharded
+            else int(self.config.hidden_size)
+        )
+        self._context_local_start = (
+            int(getattr(self.context_proj, "tp_rank", 0)) * self._context_local_width
+        )
+        model_dtype = getattr(
+            getattr(vllm_config, "model_config", None),
+            "dtype",
+            torch.get_default_dtype(),
+        )
+        if self.context_proj_sharded:
+            self.register_buffer(
+                "_streamed_context_states",
+                torch.empty(
+                    self._max_num_context_tokens,
+                    self._context_local_width,
+                    dtype=model_dtype,
+                ),
+                persistent=False,
+            )
+        else:
+            self.register_buffer(
+                "_streamed_context_states",
+                torch.empty(0, dtype=model_dtype),
+                persistent=False,
+            )
         self._compact_rope_enabled = bool(envs.VLLM_DSPARK_COMPACT_ROPE)
         if self._compact_rope_enabled:
             self._init_compact_rope()
@@ -391,6 +435,145 @@ class K3DSparkModel(nn.Module):
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.context_norm(self.context_proj(hidden_states))
 
+    def bind_auxiliary_stream_scratch(self, scratch: torch.Tensor) -> None:
+        """Bind caller-owned storage used to form one target auxiliary state."""
+        expected_width = int(self.config.target_hidden_size)
+        if scratch.ndim != 2 or scratch.shape[1] != expected_width:
+            raise ValueError(
+                "Kimi-K3 DSpark auxiliary scratch must have shape "
+                f"[tokens, {expected_width}], got {tuple(scratch.shape)}."
+            )
+        if scratch.shape[0] < self._max_num_context_tokens:
+            raise ValueError(
+                "Kimi-K3 DSpark auxiliary scratch has insufficient token capacity: "
+                f"capacity={scratch.shape[0]}, required={self._max_num_context_tokens}."
+            )
+        self._streamed_aux_scratch = scratch
+
+    def can_stream_auxiliary_states(
+        self,
+        layer_ids: tuple[int, ...],
+        hidden_states: torch.Tensor,
+    ) -> bool:
+        """Return whether a large target forward can use streamed projection."""
+        if not self.context_proj_sharded or self._streamed_aux_scratch is None:
+            return False
+        if hidden_states.ndim != 2 or hidden_states.shape[0] < _STREAMED_AUX_MIN_TOKENS:
+            return False
+        if tuple(layer_ids) != self._streamed_aux_layer_ids:
+            return False
+        if hidden_states.shape[1] != self.config.target_hidden_size:
+            return False
+        if hidden_states.dtype != self.context_proj.weight.dtype:
+            return False
+        if hidden_states.device != self.context_proj.weight.device:
+            return False
+        if self._streamed_aux_scratch.dtype != hidden_states.dtype:
+            return False
+        if self._streamed_aux_scratch.device != hidden_states.device:
+            return False
+        if hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():
+            return False
+        context_kv_weight = getattr(self.context_kv_proj, "weight", None)
+        return context_kv_weight is not None and context_kv_weight.ndim == 2
+
+    def begin_auxiliary_stream(self, hidden_states: torch.Tensor) -> None:
+        """Start one ordered sequence of target auxiliary-state projections."""
+        if not self.can_stream_auxiliary_states(
+            self._streamed_aux_layer_ids, hidden_states
+        ):
+            raise RuntimeError(
+                "Kimi-K3 DSpark auxiliary streaming was started for an "
+                "unsupported tensor geometry."
+            )
+        self._streamed_aux_tokens = int(hidden_states.shape[0])
+        self._streamed_aux_index = 0
+
+    def accumulate_auxiliary_state(
+        self,
+        primary: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> None:
+        """Project one target state into its TP-local draft-hidden rows."""
+        index = self._streamed_aux_index
+        if index >= len(self._streamed_aux_layer_ids):
+            raise RuntimeError("Kimi-K3 DSpark received too many auxiliary states.")
+        num_tokens = self._streamed_aux_tokens
+        if tuple(primary.shape) != (num_tokens, self.config.target_hidden_size):
+            raise ValueError(
+                "Kimi-K3 DSpark auxiliary state shape changed during projection: "
+                f"got={tuple(primary.shape)}, tokens={num_tokens}, "
+                f"width={self.config.target_hidden_size}."
+            )
+        assert self._streamed_aux_scratch is not None
+        scratch = self._streamed_aux_scratch[:num_tokens]
+        if residual is None:
+            scratch.copy_(primary)
+        else:
+            torch.add(primary, residual, out=scratch)
+
+        input_width = int(self.config.target_hidden_size)
+        weight = self.context_proj.weight[
+            :, index * input_width : (index + 1) * input_width
+        ]
+        output = self._streamed_context_states[:num_tokens]
+        if index == 0:
+            torch.mm(scratch, weight.t(), out=output)
+        else:
+            torch.addmm(
+                output,
+                scratch,
+                weight.t(),
+                beta=1.0,
+                alpha=1.0,
+                out=output,
+            )
+        self._streamed_aux_index = index + 1
+
+    def finish_auxiliary_stream(self) -> torch.Tensor:
+        """Normalize and return the TP-local projected target context."""
+        expected = len(self._streamed_aux_layer_ids)
+        if self._streamed_aux_index != expected:
+            raise RuntimeError(
+                "Kimi-K3 DSpark auxiliary stream ended with an incomplete "
+                f"projection: received={self._streamed_aux_index}, expected={expected}."
+            )
+        output = self._streamed_context_states[: self._streamed_aux_tokens]
+        squared_norm = torch.linalg.vector_norm(
+            output,
+            ord=2,
+            dim=-1,
+            keepdim=True,
+            dtype=torch.float32,
+        ).square_()
+        tensor_model_parallel_all_reduce_in_place(squared_norm)
+        squared_norm.div_(self.config.hidden_size).add_(
+            self.context_norm.variance_epsilon
+        )
+        squared_norm.rsqrt_()
+        output.mul_(squared_norm.to(dtype=output.dtype))
+
+        output.mul_(
+            self.context_norm.weight[
+                self._context_local_start : self._context_local_start
+                + self._context_local_width
+            ]
+        )
+        return output
+
+    def is_streamed_context_states(self, states: list[torch.Tensor]) -> bool:
+        """Return whether ``states`` is the completed TP-local stream output."""
+        if not self.context_proj_sharded or len(states) != 1:
+            return False
+        candidate = states[0]
+        expected = self._streamed_context_states[: self._streamed_aux_tokens]
+        return (
+            candidate.shape == expected.shape
+            and candidate.dtype == expected.dtype
+            and candidate.device == expected.device
+            and candidate.data_ptr() == expected.data_ptr()
+        )
+
     @torch.inference_mode()
     def precompute_and_store_context_kv(
         self,
@@ -436,6 +619,15 @@ class K3DSparkModel(nn.Module):
         context_positions: torch.Tensor,
         context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None,
     ) -> None:
+        if (
+            self.context_proj_sharded
+            and context_states.shape[-1] == self._context_local_width
+        ):
+            self._precompute_streamed_context_kv(
+                context_states, context_positions, context_slot_mapping
+            )
+            return
+
         num_ctx = context_states.shape[0]
         num_layers = self._num_context_layers
 
@@ -538,6 +730,72 @@ class K3DSparkModel(nn.Module):
                 attn.kv_cache_dtype,
                 attn._k_scale,
             )
+
+    def _precompute_streamed_context_kv(
+        self,
+        context_states: torch.Tensor,
+        context_positions: torch.Tensor,
+        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None,
+    ) -> None:
+        """Project TP-local context one draft layer at a time."""
+        num_ctx = int(context_states.shape[0])
+        full_weight = self.context_kv_proj.weight
+        if full_weight.ndim != 2:
+            raise RuntimeError(
+                "Streamed Kimi-K3 DSpark context KV requires an unquantized "
+                "two-dimensional fused projection weight."
+            )
+
+        rope_positions, rope_cos_sin_cache = self._get_rope_inputs(context_positions)
+        rotary_emb = self.layers[0].self_attn.rotary_emb
+        assert rotary_emb is not None
+
+        for layer_idx, layer in enumerate(self.layers):
+            row_start = layer_idx * self._context_kv_width
+            weight = full_weight[
+                row_start : row_start + self._context_kv_width,
+                self._context_local_start : self._context_local_start
+                + self._context_local_width,
+            ]
+            layer_kv = F.linear(context_states, weight)
+            tensor_model_parallel_all_reduce_in_place(layer_kv)
+
+            kv_c = layer_kv[:, : self._context_kv_lora_rank].contiguous()
+            ops.rms_norm(
+                kv_c,
+                kv_c,
+                self._context_kv_norm_weights[layer_idx],
+                self._context_rms_norm_eps,
+            )
+            k_pe = layer_kv[:, self._context_kv_lora_rank :].contiguous()
+            k_pe = k_pe.view(num_ctx, 1, self._context_rope_dim)
+            ops.rotary_embedding(
+                rope_positions,
+                k_pe,
+                None,
+                rotary_emb.head_size,
+                rope_cos_sin_cache,
+                rotary_emb.is_neox_style,
+            )
+
+            slot_mapping = (
+                context_slot_mapping[layer_idx]
+                if isinstance(context_slot_mapping, (list, tuple))
+                else context_slot_mapping
+            )
+            if slot_mapping is None:
+                del layer_kv, kv_c, k_pe
+                continue
+            attn = layer.self_attn
+            attn.impl.do_kv_cache_update(
+                kv_c,
+                k_pe,
+                attn.kv_cache,
+                slot_mapping,
+                attn.kv_cache_dtype,
+                attn._k_scale,
+            )
+            del layer_kv, kv_c, k_pe
 
     def _has_uniform_block_layout(
         self,
@@ -652,6 +910,30 @@ class K3DSparkForCausalLM(nn.Module):
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.combine_hidden_states(hidden_states)
+
+    def bind_target_auxiliary_stream(
+        self,
+        target_model: nn.Module,
+        scratch: torch.Tensor,
+    ) -> None:
+        """Connect the target's large-prefill states to the draft projector."""
+        get_language_model = getattr(target_model, "get_language_model", None)
+        target_language_model = (
+            get_language_model() if callable(get_language_model) else target_model
+        )
+        target_inner = getattr(target_language_model, "model", None)
+        setter = getattr(target_inner, "set_aux_hidden_state_projector", None)
+        if not callable(setter):
+            raise TypeError(
+                "Kimi-K3 DSpark auxiliary streaming requires a target model "
+                "that accepts a memory-bounded auxiliary-state projector."
+            )
+        self.model.bind_auxiliary_stream_scratch(scratch)
+        setter(self.model)
+
+    def is_streamed_context_states(self, states: list[torch.Tensor]) -> bool:
+        """Return whether target auxiliary states are already TP-local."""
+        return self.model.is_streamed_context_states(states)
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.layer_name for layer in self.model.layers]

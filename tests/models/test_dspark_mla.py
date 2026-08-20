@@ -288,6 +288,140 @@ def test_k3_dspark_context_projection_uses_divisible_tp_geometry(
         args, kwargs = context_projection_calls[0]
         assert args == (7168 * 5, 7168)
         assert kwargs["gather_output"] is True
+        assert kwargs["quant_config"] is None
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_streams_auxiliary_projection_into_tp_local_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = object.__new__(K3DSparkModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        target_hidden_size=4,
+        hidden_size=2,
+        target_layer_ids=(0, 1),
+    )
+    model.context_proj_sharded = True
+    model.context_proj = nn.Linear(8, 2, bias=False, dtype=torch.bfloat16)
+    model.context_norm = SimpleNamespace(
+        weight=torch.tensor([0.75, 1.25], dtype=torch.bfloat16),
+        variance_epsilon=1e-5,
+    )
+    model.context_kv_proj = nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+    model._max_num_context_tokens = 1024
+    model._streamed_aux_layer_ids = (1, 2)
+    model._streamed_aux_scratch = None
+    model._streamed_aux_tokens = 0
+    model._streamed_aux_index = 0
+    model._context_local_width = 2
+    model._context_local_start = 0
+    model.register_buffer(
+        "_streamed_context_states",
+        torch.empty(1024, 2, dtype=torch.bfloat16),
+        persistent=False,
+    )
+    scratch = torch.empty(1024, 4, dtype=torch.bfloat16)
+    model.bind_auxiliary_stream_scratch(scratch)
+    monkeypatch.setattr(
+        dspark_mla,
+        "tensor_model_parallel_all_reduce_in_place",
+        lambda tensor: tensor,
+    )
+
+    first = torch.randn(1024, 4, dtype=torch.bfloat16)
+    second = torch.randn(1024, 4, dtype=torch.bfloat16)
+    residual = torch.randn(1024, 4, dtype=torch.bfloat16)
+    combined = torch.cat((first, second + residual), dim=-1)
+    projected = torch.nn.functional.linear(combined, model.context_proj.weight)
+    expected = projected * torch.rsqrt(
+        projected.float().square().mean(dim=-1, keepdim=True) + 1e-5
+    ).to(projected.dtype)
+    expected *= model.context_norm.weight
+
+    assert model.can_stream_auxiliary_states((1, 2), first)
+    with torch.inference_mode():
+        model.begin_auxiliary_stream(first)
+        model.accumulate_auxiliary_state(first, None)
+        model.accumulate_auxiliary_state(second, residual)
+        output = model.finish_auxiliary_stream()
+
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+    assert model.is_streamed_context_states([output])
+    assert output.data_ptr() == model._streamed_context_states.data_ptr()
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_projects_streamed_context_one_layer_at_a_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = object.__new__(K3DSparkModel)
+    nn.Module.__init__(model)
+    model._context_local_start = 2
+    model._context_local_width = 2
+    model._context_kv_width = 3
+    model._context_kv_lora_rank = 2
+    model._context_rope_dim = 1
+    model._context_rms_norm_eps = 1e-5
+    model._context_kv_norm_weights = torch.ones(2, 2)
+    model.context_kv_proj = nn.Linear(4, 6, bias=False)
+    model.context_kv_proj.weight.data.copy_(torch.arange(24).view(6, 4))
+    cache_updates = []
+
+    class Attention:
+        def __init__(self):
+            self.rotary_emb = SimpleNamespace(head_size=1, is_neox_style=True)
+            self.impl = SimpleNamespace(
+                do_kv_cache_update=lambda *args: cache_updates.append(args)
+            )
+            self.kv_cache = object()
+            self.kv_cache_dtype = "bf16"
+            self._k_scale = 1.0
+
+    model.layers = [
+        SimpleNamespace(self_attn=Attention()),
+        SimpleNamespace(self_attn=Attention()),
+    ]
+    model._get_rope_inputs = lambda positions: (positions, torch.empty(0))
+    reduced = []
+
+    def record_all_reduce(tensor):
+        reduced.append(tensor.clone())
+        return tensor
+
+    monkeypatch.setattr(
+        dspark_mla,
+        "tensor_model_parallel_all_reduce_in_place",
+        record_all_reduce,
+    )
+    monkeypatch.setattr(
+        dspark_mla.ops,
+        "rms_norm",
+        lambda output, input_, weight, eps: output.copy_(input_),
+    )
+    monkeypatch.setattr(dspark_mla.ops, "rotary_embedding", lambda *args: None)
+    context = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    positions = torch.tensor([5, 6])
+    first_slots = torch.tensor([0, 1])
+
+    model._precompute_streamed_context_kv(
+        context,
+        positions,
+        [first_slots, None],
+    )
+
+    expected = []
+    for layer_index in range(2):
+        weight = model.context_kv_proj.weight[
+            layer_index * 3 : (layer_index + 1) * 3, 2:4
+        ]
+        expected.append(torch.nn.functional.linear(context, weight))
+    torch.testing.assert_close(reduced[0], expected[0])
+    torch.testing.assert_close(reduced[1], expected[1])
+    assert len(cache_updates) == 1
+    torch.testing.assert_close(cache_updates[0][0], expected[0][:, :2])
+    torch.testing.assert_close(cache_updates[0][1], expected[0][:, 2:].view(2, 1, 1))
+    assert cache_updates[0][3] is first_slots
 
 
 def test_context_kv_weights_are_loaded_as_merged_linear_shards():

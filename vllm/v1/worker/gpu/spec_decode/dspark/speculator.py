@@ -180,6 +180,9 @@ class DSparkSpeculator(DFlashSpeculator):
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
         model = load_dspark_model(target_model, self.vllm_config)
+        bind_auxiliary_stream = getattr(model, "bind_target_auxiliary_stream", None)
+        if callable(bind_auxiliary_stream):
+            bind_auxiliary_stream(target_model, self.hidden_states)
         confidence_head = getattr(
             getattr(model, "model", None), "confidence_head", None
         )

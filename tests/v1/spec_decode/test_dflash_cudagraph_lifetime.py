@@ -254,6 +254,54 @@ def test_dflash_context_precompute_keeps_eager_fallback():
     assert args[2] is context_slots
 
 
+def test_dflash_uses_streamed_context_without_copying_full_hidden_state():
+    speculator = object.__new__(DFlashSpeculator)
+    streamed = torch.randn(1024, 4)
+    retained = torch.full((1024, 8), float("nan"))
+    model = Mock()
+    model.is_streamed_context_states.return_value = True
+    speculator.model = model
+    speculator.hidden_states = retained
+    speculator.dynamic_physical_depth = False
+    speculator.num_speculative_steps = 7
+    speculator.num_query_per_req = 8
+    speculator.sample_from_anchor = False
+    speculator.max_model_len = 4096
+    speculator.draft_kv_window = None
+    speculator.context_positions = torch.arange(1024)
+    speculator._prepare_eplb_forward = Mock()
+    speculator._generate_draft = Mock()
+    speculator.draft_tokens = torch.zeros(1, 7, dtype=torch.int64)
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_tokens=1024,
+        seq_lens_cpu_upper_bound=torch.tensor([1024]),
+    )
+
+    result = DFlashSpeculator.propose(
+        speculator,
+        input_batch,
+        attn_metadata={},
+        slot_mappings={},
+        last_hidden_states=torch.empty(1024, 8),
+        aux_hidden_states=[streamed],
+        num_sampled=torch.zeros(1, dtype=torch.int32),
+        num_rejected=torch.zeros(1, dtype=torch.int32),
+        last_sampled=torch.zeros(1, dtype=torch.int32),
+        next_prefill_tokens=torch.zeros(1, dtype=torch.int32),
+        temperature=torch.zeros(1),
+        seeds=torch.zeros(1, dtype=torch.int64),
+        dummy_run=True,
+        skip_attn_for_dummy_run=True,
+    )
+
+    args = model.precompute_and_store_context_kv.call_args.args
+    assert args[0] is streamed
+    assert torch.isnan(retained).all()
+    speculator._generate_draft.assert_called_once()
+    assert result.shape == (1, 7)
+
+
 def test_dflash_input_warmup_copies_sampling_state(monkeypatch):
     temperature = torch.ones(2)
     seeds = torch.zeros(2, dtype=torch.int64)

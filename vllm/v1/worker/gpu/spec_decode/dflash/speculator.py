@@ -719,20 +719,38 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        if aux_hidden_states:
+        is_streamed_context_states = getattr(
+            self.model, "is_streamed_context_states", None
+        )
+        context_states_are_streamed = bool(
+            aux_hidden_states
+            and callable(is_streamed_context_states)
+            and is_streamed_context_states(aux_hidden_states)
+        )
+        if context_states_are_streamed:
+            assert aux_hidden_states is not None
+            context_states = aux_hidden_states[0]
+        elif aux_hidden_states:
             hidden_states = self.model.combine_hidden_states(
                 torch.cat(aux_hidden_states, dim=-1)
             )
+            self.hidden_states[:num_target_tokens].copy_(
+                hidden_states[:num_target_tokens]
+            )
+            context_states = self.hidden_states[:num_target_tokens]
         else:
             hidden_states = last_hidden_states
-        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
+            self.hidden_states[:num_target_tokens].copy_(
+                hidden_states[:num_target_tokens]
+            )
+            context_states = self.hidden_states[:num_target_tokens]
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
             self.model.precompute_and_store_context_kv(
-                self.hidden_states[:num_target_tokens],
+                context_states,
                 self.context_positions[:num_target_tokens],
             )
             # DFlash processes all speculative tokens in one forward pass,
@@ -832,11 +850,23 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        self._precompute_context_kv(
-            num_target_tokens,
-            context_batch_desc,
-            context_slots,
-        )
+        if context_states_are_streamed:
+            if context_batch_desc.cg_mode != CUDAGraphMode.NONE:
+                raise RuntimeError(
+                    "Streamed target context cannot use a captured DFlash "
+                    "context-KV graph."
+                )
+            self.model.precompute_and_store_context_kv(
+                context_states,
+                self.context_positions[:num_target_tokens],
+                context_slots,
+            )
+        else:
+            self._precompute_context_kv(
+                num_target_tokens,
+                context_batch_desc,
+                context_slots,
+            )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(

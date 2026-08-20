@@ -11,6 +11,43 @@ from vllm.v1.worker.gpu.spec_decode.dspark import speculator as speculator_modul
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 
+def test_kimi_dspark_binds_target_auxiliary_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scratch = torch.empty(16, 8)
+    binder = Mock()
+    model = SimpleNamespace(
+        bind_target_auxiliary_stream=binder,
+        draft_id_to_target_id=None,
+    )
+    speculator = SimpleNamespace(
+        vllm_config=object(),
+        hidden_states=scratch,
+        use_draft_token_capacity=False,
+        draft_logits=None,
+        _draft_topk=None,
+        _use_local_draft_argmax=False,
+        _capture_sharded_markov=False,
+        _markov_outside_cudagraph=False,
+    )
+    target_model = object()
+    monkeypatch.delenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", raising=False)
+    monkeypatch.setattr(
+        speculator_module,
+        "load_dspark_model",
+        lambda _target_model, _vllm_config: model,
+    )
+
+    loaded = DSparkSpeculator.load_draft_model(
+        speculator,
+        target_model=target_model,
+        target_attn_layer_names=set(),
+    )
+
+    assert loaded is model
+    binder.assert_called_once_with(target_model, scratch)
+
+
 def test_sharded_markov_model_selects_local_sampling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
