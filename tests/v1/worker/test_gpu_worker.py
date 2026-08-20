@@ -76,6 +76,51 @@ def test_release_allocator_slack_before_manual_kv_cache(
         ]
 
 
+@pytest.mark.parametrize("kv_cache_memory_bytes", [None, 1024])
+def test_manual_kv_storage_precedes_attention_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_memory_bytes: int | None,
+):
+    runner = object.__new__(GPUModelRunnerV2)
+    runner.cache_config = SimpleNamespace(
+        kv_cache_memory_bytes=kv_cache_memory_bytes,
+    )
+    runner.device = torch.device("cuda:3")
+    runner.vllm_config = object()
+    kv_cache_config = object()
+    storage = object()
+    calls: list[object] = []
+    monkeypatch.setattr(
+        runner,
+        "_release_allocator_slack_before_manual_kv_cache",
+        lambda: calls.append("release"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2_module,
+        "allocate_kv_cache",
+        lambda config, vllm_config, device: (
+            calls.append(("allocate", config, vllm_config, device)) or storage
+        ),
+    )
+
+    result = runner._allocate_manual_kv_cache_before_metadata(kv_cache_config)
+
+    if kv_cache_memory_bytes is None:
+        assert result is None
+        assert calls == []
+    else:
+        assert result is storage
+        assert calls == [
+            "release",
+            (
+                "allocate",
+                kv_cache_config,
+                runner.vllm_config,
+                torch.device("cuda:3"),
+            ),
+        ]
+
+
 def test_kernel_warmup_runs_once(monkeypatch: pytest.MonkeyPatch):
     worker = object.__new__(Worker)
     calls = []

@@ -223,6 +223,19 @@ def _allocate_kv_cache(
     return kv_cache_raw_tensors
 
 
+def allocate_kv_cache(
+    kv_cache_config: KVCacheConfig,
+    vllm_config: VllmConfig,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Allocate fixed KV storage before attention metadata is materialized."""
+    return _allocate_kv_cache(
+        kv_cache_config,
+        get_shared_kv_cache_layers(vllm_config),
+        device,
+    )
+
+
 def _reshape_attention_kv_cache(
     kv_raw_tensor: torch.Tensor,
     kv_cache_spec: AttentionSpec,
@@ -495,11 +508,13 @@ def init_kv_cache(
     cache_dtype: str,
     kernel_block_sizes: list[int],
     vllm_config: VllmConfig,
+    kv_cache_raw_tensors: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, Any]:
     shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
-    kv_cache_raw_tensors = _allocate_kv_cache(
-        kv_cache_config, shared_kv_cache_layers, device
-    )
+    if kv_cache_raw_tensors is None:
+        kv_cache_raw_tensors = _allocate_kv_cache(
+            kv_cache_config, shared_kv_cache_layers, device
+        )
     flattened_attn_groups = list(group for groups in attn_groups for group in groups)
     kv_caches = _reshape_kv_cache(
         attn_groups=flattened_attn_groups,
