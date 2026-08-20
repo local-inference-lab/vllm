@@ -63,6 +63,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -79,6 +80,7 @@ from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
 )
 from vllm.models.kimi_k3.nvidia.tp_projection import (
     gather_kimi_sharded_projection,
+    reduce_kimi_full_width_projection,
 )
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -112,6 +114,7 @@ logger = init_logger(__name__)
 # attention front-end (the GEMM is small and launch-bound, so the overlap
 # hides it); at or above it, run the gate on the main stream.
 _GATE_MULTI_STREAM_TOKEN_THRESHOLD = 512
+_MLA_CALLER_OUTPUT_MIN_TOKENS = 1024
 
 
 @torch.compile(backend=current_platform.simple_compile_backend)
@@ -473,6 +476,66 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
         self.kv_cache = torch.tensor([])
 
+    @property
+    def supports_caller_output(self) -> bool:
+        """Report whether MLA can write its reduced output into caller storage."""
+        return (
+            isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
+            and getattr(self.o_proj, "weight", None) is not None
+            and self.o_proj.input_is_parallel
+            and self.o_proj.bias is None
+            and self.o_proj.reduce_results
+            and not envs.VLLM_BATCH_INVARIANT
+        )
+
+    def should_use_caller_output(self, hidden_states: torch.Tensor) -> bool:
+        """Select consumed hidden-state storage for allocation-sensitive prefill."""
+        weight = getattr(self.o_proj, "weight", None)
+        return (
+            self.supports_caller_output
+            and hidden_states.ndim == 2
+            and hidden_states.shape == (hidden_states.shape[0], self.o_proj.output_size)
+            and hidden_states.shape[0] >= _MLA_CALLER_OUTPUT_MIN_TOKENS
+            and hidden_states.is_contiguous()
+            and weight is not None
+            and hidden_states.dtype == weight.dtype
+            and hidden_states.device == weight.device
+        )
+
+    def _project_output_into(
+        self,
+        attn_out: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project MLA output into consumed storage and reduce it in place."""
+        if not self.should_use_caller_output(output):
+            raise ValueError(
+                "Kimi-K3 MLA caller-owned output requires at least 1,024 rows "
+                "of contiguous projection-compatible storage"
+            )
+        if attn_out.ndim != 2:
+            raise ValueError("Kimi-K3 MLA output projection requires a 2D input")
+        expected_input_shape = (
+            output.shape[0],
+            self.o_proj.input_size_per_partition,
+        )
+        if tuple(attn_out.shape) != expected_input_shape:
+            raise ValueError(
+                "Kimi-K3 MLA projection input has shape "
+                f"{tuple(attn_out.shape)}; expected {expected_input_shape}"
+            )
+        if attn_out.dtype != output.dtype or attn_out.device != output.device:
+            raise ValueError(
+                "Kimi-K3 MLA projection input and caller output must share "
+                "dtype and device"
+            )
+        if attn_out.untyped_storage().data_ptr() == output.untyped_storage().data_ptr():
+            raise ValueError(
+                "Kimi-K3 MLA caller output must not alias the projection input"
+            )
+        torch.mm(attn_out, self.o_proj.weight.t(), out=output)
+        return reduce_kimi_full_width_projection(output, self.o_proj.tp_size)
+
     # ------------------------------------------------------------------
     # AttentionLayerBase interface
     # ------------------------------------------------------------------
@@ -683,6 +746,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         rope_cos_sin_cache: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Both branches produce (attn_out, gate); they differ only in whether
         # the g_proj GEMM is overlapped on the aux stream.
@@ -710,10 +774,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         if gate is not None:
             attn_out = _gate_sigmoid_mul(attn_out, gate)
 
-        # ``o_proj`` (RowParallelLinear + out-of-place all-reduce) returns a
-        # fresh private tensor, so return it directly rather than copying into a
-        # caller buffer -- the previous ``output[:] = ...`` convention forced an
-        # extra [num_tokens, hidden] copy per layer.
+        if output is not None:
+            return self._project_output_into(attn_out, output)
         return self.o_proj(attn_out)[0]
 
     @eager_break_during_capture
