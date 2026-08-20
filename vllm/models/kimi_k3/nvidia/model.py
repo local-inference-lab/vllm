@@ -1431,6 +1431,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self._model_dtype = vllm_config.model_config.dtype
+        self._attn_res_workspace: torch.Tensor | None
         self.register_buffer("_attn_res_workspace", None, persistent=False)
 
         if get_pp_group().is_last_rank:
