@@ -598,12 +598,15 @@ class MoERunner(MoERunnerInterface):
         self,
         fused_output: torch.Tensor,
         fused_output_is_reduced: bool,
+        *,
+        in_place: bool = False,
     ) -> tuple[torch.Tensor, bool]:
         """All-reduce latent routed output before its output transform.
 
         Latent MoE output transforms may contain non-linear ops, e.g. RMSNorm.
         TP partial routed outputs must be summed in latent space before such
-        transforms are applied.
+        transforms are applied. ``in_place`` is valid only when the local
+        partial tensor has no consumer after the collective.
         """
         if (
             self.routed_output_transform is not None
@@ -611,7 +614,10 @@ class MoERunner(MoERunnerInterface):
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not fused_output_is_reduced
         ):
-            fused_output = tensor_model_parallel_all_reduce(fused_output)
+            if in_place:
+                fused_output = tensor_model_parallel_all_reduce_in_place(fused_output)
+            else:
+                fused_output = tensor_model_parallel_all_reduce(fused_output)
             fused_output_is_reduced = True
         return fused_output, fused_output_is_reduced
 
@@ -949,6 +955,7 @@ class MoERunner(MoERunnerInterface):
             self._maybe_reduce_routed_output_before_transform(
                 fused_output,
                 fused_output_is_reduced,
+                in_place=reuse_shared_experts_input,
             )
         )
 

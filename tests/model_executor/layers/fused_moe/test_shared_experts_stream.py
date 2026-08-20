@@ -301,3 +301,74 @@ def test_tp_partial_output_transform_accumulates_into_reused_shared_input(
     assert actual.data_ptr() == input_ptr
     assert reduced_ptrs == [input_ptr]
     torch.testing.assert_close(actual, torch.full_like(actual, 10.0))
+
+
+def test_reused_shared_input_reduces_latent_output_in_place(monkeypatch) -> None:
+    runner = object.__new__(MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.routed_output_transform = _ResidualPartialOutputTransform()
+    runner.routed_input_transform = None
+    runner.routed_scaling_factor = 1.0
+    runner.router = None
+    runner.layer_name = "test"
+    runner.moe_config = SimpleNamespace(
+        hidden_dim_unpadded=4,
+        is_sequence_parallel=False,
+        skip_final_all_reduce=False,
+        tp_size=2,
+        ep_size=1,
+    )
+    runner.routed_experts = SimpleNamespace(
+        quant_method=SimpleNamespace(
+            has_unpadded_output=False,
+            moe_kernel=SimpleNamespace(output_is_reduced=lambda: False),
+        )
+    )
+    runner._maybe_pad_hidden_states = MethodType(
+        lambda self, shared, routed: (routed, None, None),
+        runner,
+    )
+    runner._shared_experts = SimpleNamespace(can_reuse_input=lambda value: True)
+
+    fused_output = torch.full((2, 4), 3.0)
+
+    def reuse_entry(*args):
+        shared_input = args[2]
+        shared_input.fill_(2)
+        return fused_output
+
+    runner._shared_input_reuse_entry = Mock(side_effect=reuse_entry)
+    runner._forward_entry = Mock()
+    functional_reduce = Mock()
+    reduced_ptrs: list[int] = []
+
+    def all_reduce_in_place(hidden_states: torch.Tensor) -> torch.Tensor:
+        reduced_ptrs.append(hidden_states.data_ptr())
+        hidden_states.mul_(2)
+        return hidden_states
+
+    monkeypatch.setattr(
+        moe_runner_module,
+        "tensor_model_parallel_all_reduce",
+        functional_reduce,
+    )
+    monkeypatch.setattr(
+        moe_runner_module,
+        "tensor_model_parallel_all_reduce_in_place",
+        all_reduce_in_place,
+    )
+
+    shared_input = torch.zeros_like(fused_output)
+    shared_input_ptr = shared_input.data_ptr()
+    fused_output_ptr = fused_output.data_ptr()
+    actual = runner.forward(
+        torch.zeros_like(fused_output),
+        router_logits=torch.empty(2, 1),
+        shared_experts_input=shared_input,
+    )
+
+    runner._forward_entry.assert_not_called()
+    functional_reduce.assert_not_called()
+    assert actual.data_ptr() == shared_input_ptr
+    assert reduced_ptrs == [fused_output_ptr, shared_input_ptr]
+    torch.testing.assert_close(actual, torch.full_like(actual, 16.0))
