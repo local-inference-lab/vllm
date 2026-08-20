@@ -302,6 +302,27 @@ def test_dflash_uses_streamed_context_without_copying_full_hidden_state():
     assert result.shape == (1, 7)
 
 
+def test_dflash_streamed_context_bypasses_captured_context_graph():
+    manager = Mock()
+    manager.dispatch_context.return_value = SimpleNamespace(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=2048,
+    )
+    speculator = SimpleNamespace(context_cudagraph_manager=manager)
+
+    result = DFlashSpeculator._dispatch_context_batch(
+        speculator,
+        1024,
+        context_states_are_streamed=True,
+        dummy_run=False,
+        is_profile=False,
+    )
+
+    manager.dispatch_context.assert_not_called()
+    assert result.cg_mode == CUDAGraphMode.NONE
+    assert result.num_tokens == 1024
+
+
 def test_dflash_input_warmup_copies_sampling_state(monkeypatch):
     temperature = torch.ones(2)
     seeds = torch.zeros(2, dtype=torch.int64)

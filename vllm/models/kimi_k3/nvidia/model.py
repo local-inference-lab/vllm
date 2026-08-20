@@ -5,7 +5,7 @@
 import math
 import os
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import regex as re
 import torch
@@ -133,6 +133,27 @@ from ..common.mm_preprocess import (
 )
 
 logger = init_logger(__name__)
+
+
+class AuxiliaryStateProjector(Protocol):
+    """Consumer that projects target auxiliary states as they are produced."""
+
+    def can_stream_auxiliary_states(
+        self,
+        layer_ids: tuple[int, ...],
+        hidden_states: torch.Tensor,
+    ) -> bool: ...
+
+    def begin_auxiliary_stream(self, hidden_states: torch.Tensor) -> None: ...
+
+    def accumulate_auxiliary_state(
+        self,
+        primary: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> None: ...
+
+    def finish_auxiliary_stream(self) -> torch.Tensor: ...
+
 
 # Token-count cutoff for overlapping the MoE router gate with the routed-expert
 # down projection on a separate CUDA stream (latent MoE). At or below this many
@@ -1455,7 +1476,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         # Bypass nn.Module registration because the draft is not a target child.
         object.__setattr__(self, "_aux_hidden_state_projector", None)
 
-    def set_aux_hidden_state_projector(self, projector: Any | None) -> None:
+    def set_aux_hidden_state_projector(
+        self,
+        projector: AuxiliaryStateProjector | None,
+    ) -> None:
         """Bind a non-owning consumer for memory-bounded auxiliary states."""
         object.__setattr__(self, "_aux_hidden_state_projector", projector)
 

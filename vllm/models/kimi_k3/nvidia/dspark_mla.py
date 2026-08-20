@@ -293,6 +293,10 @@ class K3DSparkModel(nn.Module):
         self._streamed_aux_scratch: torch.Tensor | None = None
         self._streamed_aux_tokens = 0
         self._streamed_aux_index = 0
+        self._streamed_aux_generation = 0
+        self._completed_stream_generation = 0
+        self._consumed_stream_generation = 0
+        self._completed_stream_result: torch.Tensor | None = None
         self._context_local_width = (
             int(self.config.hidden_size) // tp_size
             if self.context_proj_sharded
@@ -301,25 +305,26 @@ class K3DSparkModel(nn.Module):
         self._context_local_start = (
             int(getattr(self.context_proj, "tp_rank", 0)) * self._context_local_width
         )
-        model_dtype = getattr(
-            getattr(vllm_config, "model_config", None),
-            "dtype",
-            torch.get_default_dtype(),
-        )
+        context_proj_weight = self.context_proj.weight
         if self.context_proj_sharded:
             self.register_buffer(
                 "_streamed_context_states",
                 torch.empty(
                     self._max_num_context_tokens,
                     self._context_local_width,
-                    dtype=model_dtype,
+                    dtype=context_proj_weight.dtype,
+                    device=context_proj_weight.device,
                 ),
                 persistent=False,
             )
         else:
             self.register_buffer(
                 "_streamed_context_states",
-                torch.empty(0, dtype=model_dtype),
+                torch.empty(
+                    0,
+                    dtype=context_proj_weight.dtype,
+                    device=context_proj_weight.device,
+                ),
                 persistent=False,
             )
         self._compact_rope_enabled = bool(envs.VLLM_DSPARK_COMPACT_ROPE)
@@ -435,20 +440,25 @@ class K3DSparkModel(nn.Module):
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.context_norm(self.context_proj(hidden_states))
 
-    def bind_auxiliary_stream_scratch(self, scratch: torch.Tensor) -> None:
+    def bind_auxiliary_stream_scratch(self, scratch: torch.Tensor) -> bool:
         """Bind caller-owned storage used to form one target auxiliary state."""
         expected_width = int(self.config.target_hidden_size)
         if scratch.ndim != 2 or scratch.shape[1] != expected_width:
-            raise ValueError(
-                "Kimi-K3 DSpark auxiliary scratch must have shape "
-                f"[tokens, {expected_width}], got {tuple(scratch.shape)}."
+            logger.warning_once(
+                "Kimi-K3 DSpark auxiliary streaming is disabled because its "
+                "caller-owned scratch has shape %s instead of [tokens, %d].",
+                tuple(scratch.shape),
+                expected_width,
             )
+            self._streamed_aux_scratch = None
+            return False
         if scratch.shape[0] < self._max_num_context_tokens:
             raise ValueError(
                 "Kimi-K3 DSpark auxiliary scratch has insufficient token capacity: "
                 f"capacity={scratch.shape[0]}, required={self._max_num_context_tokens}."
             )
         self._streamed_aux_scratch = scratch
+        return True
 
     def can_stream_auxiliary_states(
         self,
@@ -488,6 +498,8 @@ class K3DSparkModel(nn.Module):
             )
         self._streamed_aux_tokens = int(hidden_states.shape[0])
         self._streamed_aux_index = 0
+        self._streamed_aux_generation += 1
+        self._completed_stream_result = None
 
     def accumulate_auxiliary_state(
         self,
@@ -559,20 +571,28 @@ class K3DSparkModel(nn.Module):
                 + self._context_local_width
             ]
         )
+        self._completed_stream_generation = self._streamed_aux_generation
+        self._completed_stream_result = output
         return output
 
     def is_streamed_context_states(self, states: list[torch.Tensor]) -> bool:
-        """Return whether ``states`` is the completed TP-local stream output."""
+        """Claim the completed TP-local stream output exactly once."""
         if not self.context_proj_sharded or len(states) != 1:
             return False
         candidate = states[0]
         expected = self._streamed_context_states[: self._streamed_aux_tokens]
-        return (
-            candidate.shape == expected.shape
+        matches = (
+            candidate is self._completed_stream_result
+            and self._completed_stream_generation > self._consumed_stream_generation
+            and candidate.shape == expected.shape
             and candidate.dtype == expected.dtype
             and candidate.device == expected.device
             and candidate.data_ptr() == expected.data_ptr()
         )
+        if matches:
+            self._consumed_stream_generation = self._completed_stream_generation
+            self._completed_stream_result = None
+        return matches
 
     @torch.inference_mode()
     def precompute_and_store_context_kv(
@@ -760,9 +780,14 @@ class K3DSparkModel(nn.Module):
             layer_kv = F.linear(context_states, weight)
             tensor_model_parallel_all_reduce_in_place(layer_kv)
 
-            kv_c = layer_kv[:, : self._context_kv_lora_rank].contiguous()
+            kv_c = layer_kv[:, : self._context_kv_lora_rank]
+            normalized_kv_c = torch.empty(
+                (num_ctx, self._context_kv_lora_rank),
+                dtype=kv_c.dtype,
+                device=kv_c.device,
+            )
             ops.rms_norm(
-                kv_c,
+                normalized_kv_c,
                 kv_c,
                 self._context_kv_norm_weights[layer_idx],
                 self._context_rms_norm_eps,
@@ -784,18 +809,18 @@ class K3DSparkModel(nn.Module):
                 else context_slot_mapping
             )
             if slot_mapping is None:
-                del layer_kv, kv_c, k_pe
+                del layer_kv, kv_c, normalized_kv_c, k_pe
                 continue
             attn = layer.self_attn
             attn.impl.do_kv_cache_update(
-                kv_c,
+                normalized_kv_c,
                 k_pe,
                 attn.kv_cache,
                 slot_mapping,
                 attn.kv_cache_dtype,
                 attn._k_scale,
             )
-            del layer_kv, kv_c, k_pe
+            del layer_kv, kv_c, normalized_kv_c, k_pe
 
     def _has_uniform_block_layout(
         self,
@@ -924,11 +949,13 @@ class K3DSparkForCausalLM(nn.Module):
         target_inner = getattr(target_language_model, "model", None)
         setter = getattr(target_inner, "set_aux_hidden_state_projector", None)
         if not callable(setter):
-            raise TypeError(
-                "Kimi-K3 DSpark auxiliary streaming requires a target model "
-                "that accepts a memory-bounded auxiliary-state projector."
+            logger.warning_once(
+                "Kimi-K3 DSpark auxiliary streaming is disabled because the "
+                "target model does not expose an auxiliary-state projector hook."
             )
-        self.model.bind_auxiliary_stream_scratch(scratch)
+            return
+        if not self.model.bind_auxiliary_stream_scratch(scratch):
+            return
         setter(self.model)
 
     def is_streamed_context_states(self, states: list[torch.Tensor]) -> bool:

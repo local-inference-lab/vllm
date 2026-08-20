@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -176,6 +177,7 @@ def test_k3_dspark_uses_replicated_markov_head(monkeypatch: pytest.MonkeyPatch):
     class DummyModule(nn.Module):
         def __init__(self, *args, **kwargs):
             super().__init__()
+            self.weight = nn.Parameter(torch.empty(0))
 
     def make_markov_head(*args, **kwargs):
         markov_head_calls.append((args, kwargs))
@@ -243,6 +245,7 @@ def test_k3_dspark_context_projection_uses_divisible_tp_geometry(
     class DummyModule(nn.Module):
         def __init__(self, *args, **kwargs):
             super().__init__()
+            self.weight = nn.Parameter(torch.empty(0))
 
     def make_sharded_projection(*args, **kwargs):
         context_projection_calls.append((args, kwargs))
@@ -283,6 +286,8 @@ def test_k3_dspark_context_projection_uses_divisible_tp_geometry(
     )
 
     assert model.context_proj_sharded is expect_sharded
+    assert model._streamed_context_states.dtype == model.context_proj.weight.dtype
+    assert model._streamed_context_states.device == model.context_proj.weight.device
     assert bool(context_projection_calls) is expect_sharded
     if expect_sharded:
         args, kwargs = context_projection_calls[0]
@@ -314,6 +319,10 @@ def test_k3_dspark_streams_auxiliary_projection_into_tp_local_rows(
     model._streamed_aux_scratch = None
     model._streamed_aux_tokens = 0
     model._streamed_aux_index = 0
+    model._streamed_aux_generation = 0
+    model._completed_stream_generation = 0
+    model._consumed_stream_generation = 0
+    model._completed_stream_result = None
     model._context_local_width = 2
     model._context_local_start = 0
     model.register_buffer(
@@ -329,6 +338,7 @@ def test_k3_dspark_streams_auxiliary_projection_into_tp_local_rows(
         lambda tensor: tensor,
     )
 
+    torch.manual_seed(0)
     first = torch.randn(1024, 4, dtype=torch.bfloat16)
     second = torch.randn(1024, 4, dtype=torch.bfloat16)
     residual = torch.randn(1024, 4, dtype=torch.bfloat16)
@@ -348,7 +358,116 @@ def test_k3_dspark_streams_auxiliary_projection_into_tp_local_rows(
 
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
     assert model.is_streamed_context_states([output])
+    assert not model.is_streamed_context_states([output])
     assert output.data_ptr() == model._streamed_context_states.data_ptr()
+
+    with torch.inference_mode():
+        model.begin_auxiliary_stream(first)
+        model.accumulate_auxiliary_state(first, None)
+        model.accumulate_auxiliary_state(second, residual)
+        next_output = model.finish_auxiliary_stream()
+
+    assert not model.is_streamed_context_states([output])
+    assert model.is_streamed_context_states([next_output])
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_streamed_auxiliary_normalization_uses_global_hidden_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = object.__new__(K3DSparkModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        target_hidden_size=4,
+        hidden_size=4,
+        target_layer_ids=(0, 1),
+    )
+    model.context_proj_sharded = True
+    model.context_proj = nn.Linear(8, 2, bias=False, dtype=torch.bfloat16)
+    model.context_norm = SimpleNamespace(
+        weight=torch.tensor([0.5, 1.0, 1.5, 2.0], dtype=torch.bfloat16),
+        variance_epsilon=1e-5,
+    )
+    model.context_kv_proj = nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+    model._max_num_context_tokens = 1024
+    model._streamed_aux_layer_ids = (1, 2)
+    model._streamed_aux_scratch = None
+    model._streamed_aux_tokens = 0
+    model._streamed_aux_index = 0
+    model._streamed_aux_generation = 0
+    model._completed_stream_generation = 0
+    model._consumed_stream_generation = 0
+    model._completed_stream_result = None
+    model._context_local_width = 2
+    model._context_local_start = 2
+    model.register_buffer(
+        "_streamed_context_states",
+        torch.empty(1024, 2, dtype=torch.bfloat16),
+        persistent=False,
+    )
+    model.bind_auxiliary_stream_scratch(torch.empty(1024, 4, dtype=torch.bfloat16))
+
+    first = torch.randn(1024, 4, dtype=torch.bfloat16)
+    second = torch.randn(1024, 4, dtype=torch.bfloat16)
+    combined = torch.cat((first, second), dim=-1)
+    local_projection = torch.nn.functional.linear(combined, model.context_proj.weight)
+    other_rank_projection = torch.randn_like(local_projection)
+
+    def add_other_rank_squared_norm(tensor: torch.Tensor) -> torch.Tensor:
+        tensor.add_(other_rank_projection.float().square().sum(dim=-1, keepdim=True))
+        return tensor
+
+    monkeypatch.setattr(
+        dspark_mla,
+        "tensor_model_parallel_all_reduce_in_place",
+        add_other_rank_squared_norm,
+    )
+    expected_scale = torch.rsqrt(
+        (
+            local_projection.float().square().sum(dim=-1, keepdim=True)
+            + other_rank_projection.float().square().sum(dim=-1, keepdim=True)
+        )
+        / model.config.hidden_size
+        + model.context_norm.variance_epsilon
+    ).to(local_projection.dtype)
+    expected = local_projection * expected_scale * model.context_norm.weight[2:4]
+
+    with torch.inference_mode():
+        model.begin_auxiliary_stream(first)
+        model.accumulate_auxiliary_state(first, None)
+        model.accumulate_auxiliary_state(second, None)
+        output = model.finish_auxiliary_stream()
+
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_disables_streaming_for_incompatible_scratch_width() -> None:
+    model = object.__new__(K3DSparkModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(target_hidden_size=8)
+    model._max_num_context_tokens = 16
+    model._streamed_aux_scratch = torch.empty(16, 8)
+
+    assert not model.bind_auxiliary_stream_scratch(torch.empty(16, 4))
+    assert model._streamed_aux_scratch is None
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_preserves_fallback_when_target_has_no_stream_hook() -> None:
+    wrapper = object.__new__(K3DSparkForCausalLM)
+    nn.Module.__init__(wrapper)
+    wrapper.model = SimpleNamespace(bind_auxiliary_stream_scratch=Mock())
+    target_model = SimpleNamespace(
+        get_language_model=lambda: SimpleNamespace(model=object())
+    )
+
+    wrapper.bind_target_auxiliary_stream(
+        target_model,
+        torch.empty(16, 8),
+    )
+
+    wrapper.model.bind_auxiliary_stream_scratch.assert_not_called()
 
 
 @pytest.mark.cpu_test
@@ -394,11 +513,13 @@ def test_k3_dspark_projects_streamed_context_one_layer_at_a_time(
         "tensor_model_parallel_all_reduce_in_place",
         record_all_reduce,
     )
-    monkeypatch.setattr(
-        dspark_mla.ops,
-        "rms_norm",
-        lambda output, input_, weight, eps: output.copy_(input_),
-    )
+    rms_norm_io = []
+
+    def record_rms_norm(output, input_, weight, eps):
+        rms_norm_io.append((output, input_))
+        output.copy_(input_)
+
+    monkeypatch.setattr(dspark_mla.ops, "rms_norm", record_rms_norm)
     monkeypatch.setattr(dspark_mla.ops, "rotary_embedding", lambda *args: None)
     context = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
     positions = torch.tensor([5, 6])
@@ -418,6 +539,7 @@ def test_k3_dspark_projects_streamed_context_one_layer_at_a_time(
         expected.append(torch.nn.functional.linear(context, weight))
     torch.testing.assert_close(reduced[0], expected[0])
     torch.testing.assert_close(reduced[1], expected[1])
+    assert all(output.data_ptr() != input_.data_ptr() for output, input_ in rms_norm_io)
     assert len(cache_updates) == 1
     torch.testing.assert_close(cache_updates[0][0], expected[0][:, :2])
     torch.testing.assert_close(cache_updates[0][1], expected[0][:, 2:].view(2, 1, 1))

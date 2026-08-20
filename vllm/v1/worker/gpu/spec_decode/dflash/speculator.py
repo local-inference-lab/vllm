@@ -571,6 +571,27 @@ class DFlashSpeculator(DraftModelSpeculator):
             context_slots,
         )
 
+    def _dispatch_context_batch(
+        self,
+        num_target_tokens: int,
+        *,
+        context_states_are_streamed: bool,
+        dummy_run: bool,
+        is_profile: bool,
+    ) -> BatchExecutionDescriptor:
+        """Select eager execution for streamed caller-owned context states."""
+        if (
+            self.context_cudagraph_manager is not None
+            and not context_states_are_streamed
+            and not (dummy_run or is_profile)
+        ):
+            return self.context_cudagraph_manager.dispatch_context(num_target_tokens)
+        return BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.NONE,
+            num_tokens=num_target_tokens,
+            num_reqs=None,
+        )
+
     def _generate_draft(
         self,
         num_reqs: int,
@@ -771,16 +792,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
-        if self.context_cudagraph_manager is not None and not (dummy_run or is_profile):
-            context_batch_desc = self.context_cudagraph_manager.dispatch_context(
-                num_target_tokens
-            )
-        else:
-            context_batch_desc = BatchExecutionDescriptor(
-                cg_mode=CUDAGraphMode.NONE,
-                num_tokens=num_target_tokens,
-                num_reqs=None,
-            )
+        context_batch_desc = self._dispatch_context_batch(
+            num_target_tokens,
+            context_states_are_streamed=context_states_are_streamed,
+            dummy_run=dummy_run,
+            is_profile=is_profile,
+        )
         context_num_tokens_padded = context_batch_desc.num_tokens
         # Support multiple draft KV cache groups by preparing inputs once for each
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
@@ -851,11 +868,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
         if context_states_are_streamed:
-            if context_batch_desc.cg_mode != CUDAGraphMode.NONE:
-                raise RuntimeError(
-                    "Streamed target context cannot use a captured DFlash "
-                    "context-KV graph."
-                )
+            assert context_batch_desc.cg_mode == CUDAGraphMode.NONE
             self.model.precompute_and_store_context_kv(
                 context_states,
                 self.context_positions[:num_target_tokens],
