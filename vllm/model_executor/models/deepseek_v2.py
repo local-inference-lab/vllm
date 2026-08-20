@@ -1821,8 +1821,11 @@ class DeepseekV2Model(nn.Module):
             # built, so get_spec_layer_idx_from_weight_name does not divert
             # their checkpoint tensors and they reach AutoWeightsLoader with
             # no destination, raising KeyError (e.g.
-            # 'layers.78.eh_proj.weight'). Inert when MTP is enabled.
-            if _skip_disabled_mtp_weight(self.config, name):
+            # 'layers.78.eh_proj.weight'). When MTP *is* enabled, checkpoint
+            # tensors targeting layers at or above
+            # num_hidden_layers + num_nextn_predict_layers are equally
+            # out-of-range and must be dropped for the same reason.
+            if _skip_unloadable_mtp_weight(self.config, name):
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
@@ -2209,8 +2212,8 @@ def _nonnegative_layer_count(config, name: str, *, default: int = 0) -> int | No
     return value if value >= 0 else None
 
 
-def _skip_disabled_mtp_weight(config, name: str) -> bool:
-    """Report whether a checkpoint weight targets a disabled MTP layer.
+def _skip_unloadable_mtp_weight(config, name: str) -> bool:
+    """Report whether a checkpoint weight targets an unloadable MTP layer.
 
     Args:
         config: Model config carrying `num_nextn_predict_layers` and
@@ -2219,19 +2222,24 @@ def _skip_disabled_mtp_weight(config, name: str) -> bool:
         name: Checkpoint weight name as it appears in the safetensors index.
 
     Returns:
-        True when MTP is disabled (`num_nextn_predict_layers == 0`) and
-        `name` addresses a layer at or beyond `num_hidden_layers`, i.e. an
-        MTP-layer tensor with no destination module; False otherwise.
+        True when `name` addresses a layer at or beyond the upper bound of
+        loadable layers. When MTP is disabled
+        (`num_nextn_predict_layers == 0`) the bound is `num_hidden_layers`,
+        so out-of-range MTP-layer tensors with no destination module are
+        skipped. When MTP is enabled (`num_nextn_predict_layers > 0`) the
+        bound is `num_hidden_layers + num_nextn_predict_layers`, so tensors
+        targeting layers beyond the built MTP blocks (which have no
+        destination and would raise KeyError) are also skipped. Returns
+        False when the config is malformed.
     """
 
     nextn = _nonnegative_layer_count(config, "num_nextn_predict_layers")
     hidden = _nonnegative_layer_count(config, "num_hidden_layers")
-    if nextn is None or hidden is None:
+    if nextn is None or hidden is None or hidden <= 0:
         return False
-    if nextn != 0 or hidden <= 0:
-        return False
+    upper_bound = hidden + nextn
     match = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
-    return match is not None and int(match.group(1)) >= hidden
+    return match is not None and int(match.group(1)) >= upper_bound
 
 
 def get_spec_layer_idx_from_weight_name(

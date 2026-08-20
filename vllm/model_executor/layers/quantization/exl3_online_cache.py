@@ -84,7 +84,23 @@ def resolve_model_identity(
     revision: str | None = None,
     hf_config: Any | None = None,
 ) -> str:
-    """Fingerprint a Hub revision or a local checkpoint without reading weights."""
+    """Fingerprint a Hub revision or a local checkpoint without reading weights.
+
+    .. note::
+
+        For local checkpoints this fingerprint is **not** a content hash of the
+        weights. A single-file checkpoint larger than 16 MiB is identified only
+        by its resolved path, size, and ``mtime_ns``; a directory checkpoint is
+        identified by hashed config/marker files plus per-shard ``(name, path,
+        size, mtime_ns)`` tuples — the shard bytes themselves are never hashed.
+        Consequently an in-place weight replacement that preserves file size and
+        ``mtime_ns`` (e.g. ``cp`` followed by ``touch -r``) produces the same
+        identity and may cause stale encoded EXL3 tensors to be reused from
+        ``VLLM_EXL3_ONLINE_CACHE_DIR``. After replacing local weights in place,
+        operators should either delete the affected cache entry (or the whole
+        ``VLLM_EXL3_ONLINE_CACHE_DIR``) or set
+        ``VLLM_EXL3_ONLINE_CACHE_MODE=off`` to force re-encoding.
+    """
 
     resolved_revision = getattr(hf_config, "_commit_hash", None) or revision
     model_path = Path(model_name).expanduser()
