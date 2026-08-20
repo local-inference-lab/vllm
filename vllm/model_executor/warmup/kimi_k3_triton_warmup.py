@@ -181,6 +181,69 @@ def _warm_recurrent_kda(
         )
 
 
+def _warm_chunk_kda_prefill(
+    layer: KimiK3DeltaAttention,
+    input_dtype: torch.dtype,
+) -> None:
+    """Compile the Triton KDA prefill path before KV-cache allocation."""
+    if layer.kda_prefill_backend != "triton":
+        return
+
+    from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
+        chunk_kda_with_fused_gate,
+    )
+    from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
+
+    device = layer.A_log.device
+    num_heads = int(layer.local_num_heads)
+    head_dim = int(layer.head_dim)
+    num_tokens = FLA_CHUNK_SIZE
+    state_shape = layer.get_state_shape()[1]
+    state_dtype = layer.get_state_dtype()[1]
+
+    packed_qkv = torch.empty(
+        (3, 1, num_tokens, num_heads, head_dim),
+        dtype=input_dtype,
+        device=device,
+    )
+    raw_g = torch.zeros(
+        (1, num_tokens, num_heads, head_dim),
+        dtype=input_dtype,
+        device=device,
+    )
+    raw_beta = torch.zeros(
+        (1, num_tokens, num_heads),
+        dtype=input_dtype,
+        device=device,
+    )
+    initial_state = torch.zeros(
+        (1, *state_shape),
+        dtype=state_dtype,
+        device=device,
+    )
+    cu_seqlens = torch.tensor(
+        [0, num_tokens],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    logger.info("Warming up Kimi-K3 Triton KDA prefill kernels.")
+    chunk_kda_with_fused_gate(
+        q=packed_qkv[0],
+        k=packed_qkv[1],
+        v=packed_qkv[2],
+        raw_g=raw_g,
+        raw_beta=raw_beta,
+        A_log=layer.A_log,
+        g_bias=layer.dt_bias,
+        lower_bound=layer.gate_lower_bound,
+        initial_state=initial_state,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+
 @torch.inference_mode()
 def kimi_k3_triton_warmup(worker: Worker) -> None:
     """Warm Kimi-K3 Triton kernels reachable by this server."""
@@ -192,4 +255,5 @@ def kimi_k3_triton_warmup(worker: Worker) -> None:
         return
 
     _warm_attn_res(worker)
+    _warm_chunk_kda_prefill(layer, worker.model_config.dtype)
     _warm_recurrent_kda(layer, worker.model_config.dtype)
