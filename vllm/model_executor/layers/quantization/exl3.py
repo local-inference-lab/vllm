@@ -81,8 +81,27 @@ _QKV_SCALE_POLICIES = {"always", "never", "auto"}
 
 
 def _qkv_layer_index(prefix: str) -> int | None:
-    match = re.search(r"(?:^|\.)layers\.(\d+)\.self_attn(?:\.qkv_proj)?$", prefix)
-    return int(match.group(1)) if match is not None else None
+    """Return the text-decoder layer index for a supported QKV prefix.
+
+    Args:
+        prefix: Canonical producer identity or a known vLLM text-model alias,
+            optionally ending in ``.qkv_proj``.
+
+    Returns:
+        The decoder layer index, or ``None`` for non-text identities such as
+        vision and MTP modules.
+    """
+    suffix = r"\.self_attn(?:\.qkv_proj)?"
+    patterns = (
+        rf"model\.language_model\.layers\.(\d+){suffix}",
+        rf"language_model\.model\.layers\.(\d+){suffix}",
+        rf"model\.layers\.(\d+){suffix}",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, prefix)
+        if match is not None:
+            return int(match.group(1))
+    return None
 
 
 
@@ -652,10 +671,7 @@ class Exl3Config(QuantizationConfig):
                 name: [
                     key
                     for key in self.tensor_storage
-                    if re.search(
-                        rf"(?:^|\.)layers\.{layer_index}\.self_attn\.{name}$",
-                        key,
-                    )
+                    if key == f"{layer}.{name}"
                 ]
                 for name in (*_QKV_COMPONENTS, "qkv_proj")
             }

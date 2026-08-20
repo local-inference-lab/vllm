@@ -127,6 +127,25 @@ def test_checkpoint_mixes_explicit_split_and_fused_uniform_routes():
     ]
 
 
+def test_text_routes_ignore_visual_layer_index_collisions():
+    topology, storage = _mixed_checkpoint()
+    visual = "model.visual.layers.1.self_attn"
+    for component, width in zip(COMPONENTS, (6, 5, 4), strict=True):
+        key = f"{visual}.{component}"
+        storage[key] = _entry(key, width)
+
+    config = _configure(topology, storage)
+
+    assert config.qkv_topology_for_prefix(
+        "model.visual.layers.1.self_attn.qkv_proj"
+    ) is None
+    assert config.qkv_topology_for_prefix(
+        "language_model.model.layers.1.self_attn.qkv_proj"
+    )["variant"] == "split"
+
+
+
+
 @pytest.mark.parametrize(("width", "codebook"), [(3, "mcg"), (8, "mul1")])
 def test_projection_accepts_supported_k_boundaries_and_codebooks(width, codebook):
     topology, storage = _mixed_checkpoint()
