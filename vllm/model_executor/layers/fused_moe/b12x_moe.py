@@ -1675,6 +1675,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 route_expert_map=expert_map,
             )
             if capture_kquant:
+                assert prefix is not None
                 collect_kquant_mid(
                     prefix=prefix,
                     binding=binding,

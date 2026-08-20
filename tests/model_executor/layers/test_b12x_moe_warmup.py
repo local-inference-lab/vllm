@@ -432,12 +432,15 @@ def test_b12x_moe_warmup_uses_workspace_token_limit(monkeypatch) -> None:
         "_dynamic_moe_warmup_tokens",
         lambda *, topk, quant_mode, requested_tokens: requested_tokens,
     )
+
+    def record_plan(**kwargs):
+        planned_tokens.append(kwargs["tokens"])
+        return _FakePlan().launch_plan
+
     monkeypatch.setattr(
         b12x_moe,
         "_plan_b12x_moe_execution",
-        lambda **kwargs: (
-            planned_tokens.append(kwargs["tokens"]) or _FakePlan().launch_plan
-        ),
+        record_plan,
     )
     monkeypatch.setattr(
         b12x_moe,
