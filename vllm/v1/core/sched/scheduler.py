@@ -1304,6 +1304,17 @@ class Scheduler(SchedulerInterface):
             and all(req.max_tokens <= 1 for req in scheduled_new_reqs)
         ):
             num_spec_tokens_to_schedule = 0
+            # NOTE: allocate_slots (called above for each request) already
+            # reserved KV blocks for self.num_lookahead_tokens speculative
+            # slots. We cannot retroactively shrink that reservation here
+            # because it was made per-request during the scheduling loop,
+            # before this aggregate skip condition is evaluated. The
+            # reservation is harmless: these are single-token requests
+            # (max_tokens <= 1) that finish immediately after one decode
+            # step, so the extra blocks are released at the next scheduling
+            # iteration. Zeroing num_spec_tokens_to_schedule prevents the
+            # draft model from running, which is the source of the wasted
+            # latency we are avoiding.
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
