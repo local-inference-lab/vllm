@@ -145,6 +145,19 @@ logger = init_logger(__name__)
 _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD = 256
 
 
+def _release_cuda_cache_before_retained_allocation(device: torch.device) -> None:
+    """Give retained post-load storage a dedicated allocator segment.
+
+    A persistent allocation must not pin the unused part of a large cached
+    segment left by quantization repacking.  KV cache allocation follows this
+    hook and needs every otherwise-inactive segment to be releasable.
+    """
+    if device.type != "cuda":
+        return
+    torch.accelerator.synchronize(device)
+    torch.accelerator.empty_cache()
+
+
 def _uses_native_b12x_mxfp4_intermediate_size(
     vllm_config: VllmConfig,
 ) -> bool:
@@ -1814,6 +1827,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             or workspace.dtype != self._model_dtype
             or tuple(workspace.shape) != shape
         ):
+            _release_cuda_cache_before_retained_allocation(parameter.device)
             self._attn_res_workspace = torch.empty(
                 shape[1],
                 shape[0],
