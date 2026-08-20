@@ -2901,6 +2901,19 @@ class TestEagle:
         assert scheduler._lookup(req_status) == 16
         assert req_status.partial_tail_boundary is None
 
+    def test_finished_replay_tail_bounds_long_prompt_lookup_to_next_page(self):
+        """A cold long-prompt lookup probes only the next target page."""
+        scheduler = self._make_mixed_block_scheduler()
+        req_status = self._make_req_status(
+            scheduler,
+            num_tokens=100_003,
+            offload_keys_per_group=[list(range(6_250)), list(range(25_000))],
+        )
+        scheduler.manager.lookup.return_value = LookupResult.MISS
+
+        assert scheduler._lookup_finished_replay_tail(req_status, 16) == 16
+        assert scheduler.manager.lookup.call_count == 3
+
     def test_finished_replay_tail_rejects_full_attention_hole(self):
         """A missing interior draft key prevents partial-target replay."""
         scheduler = self._make_mixed_block_scheduler()
@@ -2985,6 +2998,80 @@ class TestEagle:
         assert src_spec.block_indices == [1, 0]
         assert scheduler._block_id_to_pending_jobs == {12: {job_id}}
 
+    def test_finished_replay_tail_store_orders_partial_groups(self):
+        """Source block order follows cache-group order, not manager order."""
+        scheduler = self._make_mixed_block_scheduler()
+        third_group = scheduler.config.kv_group_configs[0]._replace(
+            group_idx=2,
+            tokens_per_block=32,
+            tokens_per_chunk=32,
+            hashes_per_chunk=8,
+        )
+        scheduler.config = scheduler.config._replace(
+            kv_group_configs=(*scheduler.config.kv_group_configs, third_group)
+        )
+        request = MagicMock()
+        request.request_id = "ordered-tail-store"
+        request.kv_transfer_params = None
+        request.num_prompt_tokens = 27
+        request.num_tokens = 28
+        request.status = RequestStatus.FINISHED_STOPPED
+        request.block_hashes = [BlockHash(str(i).encode()) for i in range(8)]
+        request.all_token_ids = list(range(28))
+        request.lora_request = None
+        request.is_finished.return_value = True
+        scheduler.on_new_request(request)
+        req_status = scheduler._req_status[request.request_id]
+        req_status.group_states[0].block_ids[:] = [11, 12]
+        req_status.group_states[1].block_ids[:] = [21, 22, 23, 24, 25, 26, 27]
+        req_status.group_states[2].block_ids[:] = [31]
+        scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+            generate_store_output(reversed(keys))
+        )
+
+        jobs = scheduler._build_finished_replay_tail_store_jobs(
+            SimpleNamespace(finished_req_ids=[request.request_id])
+        )
+
+        [job] = jobs.values()
+        src_spec = job.src_spec
+        assert isinstance(src_spec, GPULoadStoreSpec)
+        assert src_spec.block_ids.tolist() == [12, 31]
+        assert src_spec.group_sizes == [1, 0, 1]
+        assert src_spec.block_indices == [1, 0, 0]
+
+    @pytest.mark.parametrize("missing_source", [False, True])
+    def test_finished_replay_tail_store_skips_unsafe_request(
+        self, missing_source: bool
+    ):
+        """Aborted requests and missing source pages publish no tail keys."""
+        scheduler = self._make_mixed_block_scheduler()
+        request = MagicMock()
+        request.request_id = "unsafe-tail-store"
+        request.kv_transfer_params = None
+        request.num_prompt_tokens = 27
+        request.num_tokens = 28
+        request.status = (
+            RequestStatus.FINISHED_STOPPED
+            if missing_source
+            else RequestStatus.FINISHED_ABORTED
+        )
+        request.block_hashes = [BlockHash(str(i).encode()) for i in range(7)]
+        request.all_token_ids = list(range(28))
+        request.lora_request = None
+        request.is_finished.return_value = True
+        scheduler.on_new_request(request)
+        req_status = scheduler._req_status[request.request_id]
+        req_status.group_states[0].block_ids[:] = [11, 0 if missing_source else 12]
+        req_status.group_states[1].block_ids[:] = [21, 22, 23, 24, 25, 26, 27]
+
+        jobs = scheduler._build_finished_replay_tail_store_jobs(
+            SimpleNamespace(finished_req_ids=[request.request_id])
+        )
+
+        assert jobs == {}
+        scheduler.manager.prepare_store.assert_not_called()
+
     def test_finished_replay_tail_load_maps_partial_and_aligned_groups(
         self,
     ):
@@ -3063,6 +3150,22 @@ class TestEagle:
             sliding_window_chunks=1,
             is_eagle_group=False,
             reachable_tail_end_chunks=reachable_ends,
+        )
+
+        scheduler.config = scheduler.config._replace(
+            finished_replay_tail_alignment_tokens=None,
+            replay_alignment_tokens=16,
+        )
+        fallback_ends = scheduler._reachable_tail_end_chunks(
+            recurrent_group, request, shift=0
+        )
+        assert fallback_ends == (4,)
+        assert is_store_reachable_swa_chunk(
+            absolute_chunk_index=3,
+            alignment_chunk_count=4,
+            sliding_window_chunks=1,
+            is_eagle_group=False,
+            reachable_tail_end_chunks=fallback_ends,
         )
 
     # -------------------------------------------------------------------

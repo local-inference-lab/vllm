@@ -361,7 +361,9 @@ class SchedulerOffloadConfig(NamedTuple):
                     and config.tokens_per_chunk == replay_alignment
                 )
                 for group, config in zip(
-                    kv_cache_config.kv_cache_groups, kv_group_configs
+                    kv_cache_config.kv_cache_groups,
+                    kv_group_configs,
+                    strict=True,
                 )
             )
             if (
@@ -1035,6 +1037,18 @@ class OffloadingConnectorScheduler:
         ):
             return complete_hit
 
+        # A completion-only key supplies data from the physical page directly
+        # after the ordinary complete hit. A boundary beyond every group's
+        # next page would require an intervening complete page that the
+        # ordinary lookup did not find, so it cannot produce a contiguous
+        # load. Bounding the scan also keeps a cold long-prompt lookup linear
+        # in the number of cache groups instead of the prompt length.
+        next_page_boundary = max(
+            cdiv(complete_boundary + 1, group.tokens_per_chunk) * group.tokens_per_chunk
+            for group in self.config.kv_group_configs
+        )
+        max_boundary = min(max_boundary, next_page_boundary)
+
         pending = False
         for boundary in range(max_boundary, complete_boundary, -alignment):
             boundary_pending = False
@@ -1226,7 +1240,10 @@ class OffloadingConnectorScheduler:
             block_indices = [0] * len(self.config.kv_group_configs)
             accepted_block_ids: list[int] = []
             accepted_keys: set[OffloadKey] = set(store_output.keys_to_store)
-            for key in store_output.keys_to_store:
+            for key in sorted(
+                store_output.keys_to_store,
+                key=lambda accepted_key: source_by_key[accepted_key][0],
+            ):
                 group_idx, block_id, block_idx = source_by_key[key]
                 group_sizes[group_idx] = 1
                 block_indices[group_idx] = block_idx
@@ -1604,7 +1621,10 @@ class OffloadingConnectorScheduler:
         alignment_tokens = (
             self.config.replay_alignment_tokens
             if group_config.uses_sparse_retention
-            else self.config.finished_replay_tail_alignment_tokens
+            else (
+                self.config.finished_replay_tail_alignment_tokens
+                or self.config.replay_alignment_tokens
+            )
         )
         if alignment_tokens is None:
             return ()
