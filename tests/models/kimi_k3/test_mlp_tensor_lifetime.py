@@ -112,13 +112,23 @@ def test_mlp_rejects_activation_output_as_caller_output() -> None:
         mlp._down_proj_into(activation, activation)
 
 
-def test_mlp_preserves_functional_decode_collective() -> None:
+def test_mlp_caller_output_selection_uses_prefill_threshold() -> None:
     mlp = KimiMLP.__new__(KimiMLP)
     nn.Module.__init__(mlp)
     mlp.down_proj = _DownInto(hidden_size=4, tp_size=2)
+    mlp.shard_sequence_parallel = False
 
     assert not mlp.should_use_caller_output(torch.empty(8, 4))
     assert mlp.should_use_caller_output(torch.empty(1024, 4))
+
+
+def test_mlp_caller_output_selection_rejects_sequence_parallel() -> None:
+    mlp = KimiMLP.__new__(KimiMLP)
+    nn.Module.__init__(mlp)
+    mlp.down_proj = _DownInto(hidden_size=4, tp_size=2)
+    mlp.shard_sequence_parallel = True
+
+    assert not mlp.should_use_caller_output(torch.empty(1024, 4))
 
 
 def test_routed_output_transform_reuses_full_width_prefill_input() -> None:

@@ -258,23 +258,51 @@ class KimiMLP(nn.Module):
 
     @property
     def supports_caller_output(self) -> bool:
-        """Whether the down projection can write into caller-owned storage."""
+        """Report whether the down projection accepts caller-owned storage.
+
+        Returns:
+            ``True`` for a materialized, unquantized, bias-free row-parallel
+            projection outside batch-invariant execution.
+        """
         return (
             isinstance(self.down_proj.quant_method, UnquantizedLinearMethod)
+            and getattr(self.down_proj, "weight", None) is not None
             and self.down_proj.input_is_parallel
             and self.down_proj.bias is None
             and not envs.VLLM_BATCH_INVARIANT
         )
 
     def should_use_caller_output(self, x: torch.Tensor) -> bool:
-        """Use donated storage only for allocation-sensitive prefill GEMMs."""
+        """Select caller-owned storage for allocation-sensitive prefill GEMMs.
+
+        Args:
+            x: Down-projection input used to classify the token batch.
+
+        Returns:
+            ``True`` when the projection supports caller storage, sequence
+            parallelism is disabled, and the input has at least 1,024 rows.
+        """
         return (
             self.supports_caller_output
+            and not self.shard_sequence_parallel
             and x.ndim == 2
             and x.shape[0] >= self._CALLER_OUTPUT_MIN_TOKENS
         )
 
     def _down_proj_into(self, x: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+        """Write the row-parallel down projection into consumed caller storage.
+
+        Args:
+            x: Gated activation consumed by the down projection.
+            output: Contiguous output storage owned by the caller.
+
+        Returns:
+            The supplied output tensor after projection and TP reduction.
+
+        Raises:
+            ValueError: If the projection or output buffer violates the
+                caller-owned output contract.
+        """
         if not self.supports_caller_output:
             raise ValueError(
                 "KimiMLP caller-owned output requires an unquantized, "
@@ -306,6 +334,19 @@ class KimiMLP(nn.Module):
     def forward(
         self, x: torch.Tensor, output: torch.Tensor | None = None
     ) -> torch.Tensor:
+        """Apply the gated MLP and optionally reuse caller-owned output storage.
+
+        Args:
+            x: Hidden states consumed by the gate/up projection.
+            output: Optional storage for the down-projection result.
+
+        Returns:
+            Projected hidden states.
+
+        Raises:
+            ValueError: If caller storage is supplied with sequence-parallel
+                execution or violates the down-projection contract.
+        """
         # Decoder layers may donate their normalized hidden-state storage. The
         # gate/up projection has consumed that tensor before the down
         # projection writes the donated buffer.
@@ -403,6 +444,7 @@ class KimiRoutedOutputTransform(nn.Module):
         return (
             isinstance(self.up_proj, KimiPaddedRowParallelLinear)
             and isinstance(self.up_proj.quant_method, UnquantizedLinearMethod)
+            and getattr(self.up_proj, "weight", None) is not None
             and self.up_proj.bias is None
             and not envs.VLLM_BATCH_INVARIANT
             and hidden_states.ndim == 2
