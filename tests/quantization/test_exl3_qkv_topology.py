@@ -273,6 +273,28 @@ def test_fused_uniform_rejects_runtime_output_split_mismatch():
         )
 
 
+def test_split_rejects_runtime_output_split_mismatch():
+    topology, storage = _mixed_checkpoint()
+    method = Exl3LinearMethod(_configure(topology, storage))
+    layer = torch.nn.Module()
+    layer.prefix = "model.layers.1.self_attn.qkv_proj"
+    layer.tp_rank = 0
+    layer.tp_size = 1
+    runtime_splits = [OUTPUT_SPLITS[0] - 1, *OUTPUT_SPLITS[1:]]
+
+    with pytest.raises(ValueError, match="output_splits disagree"):
+        method.create_weights(
+            layer,
+            input_size_per_partition=4096,
+            output_partition_sizes=runtime_splits,
+            input_size=4096,
+            output_size=sum(runtime_splits),
+            params_dtype=torch.float16,
+        )
+
+
+
+
 def test_fused_uniform_rejects_packed_fallback():
     topology, storage = _mixed_checkpoint()
     method = Exl3LinearMethod(_configure(topology, storage))

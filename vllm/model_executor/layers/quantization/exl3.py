@@ -1146,16 +1146,60 @@ class Exl3LinearMethod(LinearMethodBase):
         layer.exl3_qkv_variant = (
             qkv_route["variant"] if qkv_route is not None else None
         )
-        if layer.exl3_qkv_variant == "fused_uniform":
-            if layer.exl3_tp_size != 1:
+        if qkv_route is not None:
+            if (
+                qkv_route["variant"] == "fused_uniform"
+                and layer.exl3_tp_size != 1
+            ):
                 raise NotImplementedError(
                     "fused_uniform EXL3 QKV currently requires TP=1; the payload "
                     "declares global output_splits and is not rank-sliced"
                 )
-            if output_partition_sizes != qkv_route["output_splits"]:
+            expected_splits = qkv_route["output_splits"]
+            if layer.exl3_tp_size != 1:
+                geometry = {
+                    name: getattr(layer, name, None)
+                    for name in (
+                        "num_heads",
+                        "num_kv_heads",
+                        "num_kv_head_replicas",
+                        "head_size",
+                        "v_head_size",
+                    )
+                }
+                if any(
+                    not isinstance(value, int) or value <= 0
+                    for value in geometry.values()
+                ):
+                    raise ValueError(
+                        "split EXL3 QKV TP validation requires positive runtime "
+                        f"head geometry, got {geometry}"
+                    )
+                expected_splits = [
+                    geometry["num_heads"] * geometry["head_size"],
+                    geometry["num_kv_heads"] * geometry["head_size"],
+                    geometry["num_kv_heads"] * geometry["v_head_size"],
+                ]
+                reconstructed_global = [
+                    expected_splits[0] * layer.exl3_tp_size,
+                    expected_splits[1]
+                    * layer.exl3_tp_size
+                    // geometry["num_kv_head_replicas"],
+                    expected_splits[2]
+                    * layer.exl3_tp_size
+                    // geometry["num_kv_head_replicas"],
+                ]
+                if reconstructed_global != qkv_route["output_splits"]:
+                    raise ValueError(
+                        "split EXL3 QKV metadata disagrees with runtime TP "
+                        f"geometry: metadata={qkv_route['output_splits']} "
+                        f"runtime_global={reconstructed_global}"
+                    )
+            if output_partition_sizes != expected_splits:
                 raise ValueError(
-                    "fused_uniform EXL3 QKV output_splits disagree with the "
-                    f"runtime layer: metadata={qkv_route['output_splits']} "
+                    f"{qkv_route['variant']} EXL3 QKV output_splits disagree "
+                    f"with the runtime layer: metadata={qkv_route['output_splits']} "
+                    f"expected_local={expected_splits} "
                     f"runtime={output_partition_sizes}"
                 )
         layer.exl3_shard_ids = self._shard_ids_for_layer(
