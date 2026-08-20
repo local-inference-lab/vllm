@@ -180,3 +180,33 @@ def test_routed_output_transform_keeps_decode_on_allocating_path() -> None:
     output = torch.empty(8, 4)
 
     assert not transform.can_write_output(hidden_states, output)
+
+
+def test_routed_output_transform_accumulates_prefill_in_bounded_tiles() -> None:
+    projection = object.__new__(KimiPaddedRowParallelLinear)
+    nn.Module.__init__(projection)
+    projection.input_pad = 0
+    projection.input_is_parallel = False
+    projection.tp_size = 2
+    projection.tp_rank = 0
+    projection.output_size = 2048
+    projection.reduce_results = False
+    projection.quant_method = UnquantizedLinearMethod()
+    projection.register_parameter("bias", None)
+    projection.weight = nn.Parameter(
+        torch.arange(2048 * 3).view(2048, 3).float() / 1024,
+        requires_grad=False,
+    )
+
+    transform = KimiRoutedOutputTransform(None, projection, layer_idx=0)
+    hidden_states = torch.arange(1024 * 6).view(1024, 6).float() / 1024
+    residual = torch.arange(1024 * 2048).view(1024, 2048).float() / 2048
+    expected = residual + torch.mm(hidden_states[:, :3], projection.weight.t())
+    residual_ptr = residual.data_ptr()
+
+    assert transform.can_accumulate_residual(hidden_states, residual)
+    with torch.inference_mode():
+        actual = transform(hidden_states, residual=residual)
+
+    assert actual.data_ptr() == residual_ptr
+    torch.testing.assert_close(actual, expected)

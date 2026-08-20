@@ -425,6 +425,15 @@ class KimiRoutedOutputTransform(nn.Module):
             hidden_states = self.norm(hidden_states)
         if residual is not None and isinstance(self.up_proj, ReplicatedLinear):
             return residual.addmm_(hidden_states, self.up_proj.weight.t())
+        if residual is not None and isinstance(
+            self.up_proj, KimiPaddedRowParallelLinear
+        ):
+            if not self.can_accumulate_residual(hidden_states, residual):
+                raise ValueError(
+                    "Kimi routed output transform cannot accumulate into the "
+                    "supplied residual"
+                )
+            return self.up_proj.accumulate_into(hidden_states, residual)
         if output is not None:
             if not self.can_write_output(hidden_states, output):
                 raise ValueError(
@@ -436,6 +445,29 @@ class KimiRoutedOutputTransform(nn.Module):
         if residual is not None:
             hidden_states.add_(residual)
         return hidden_states
+
+    def can_accumulate_residual(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> bool:
+        """Check the prefill-only tiled residual-accumulation contract."""
+        return (
+            isinstance(self.up_proj, KimiPaddedRowParallelLinear)
+            and isinstance(self.up_proj.quant_method, UnquantizedLinearMethod)
+            and getattr(self.up_proj, "weight", None) is not None
+            and self.up_proj.bias is None
+            and not self.up_proj.reduce_results
+            and not envs.VLLM_BATCH_INVARIANT
+            and hidden_states.ndim == 2
+            and residual.ndim == 2
+            and hidden_states.shape[0] >= self._CALLER_OUTPUT_MIN_TOKENS
+            and residual.shape == (hidden_states.shape[0], self.up_proj.output_size)
+            and residual.dtype == hidden_states.dtype
+            and residual.device == hidden_states.device
+            and residual.is_contiguous()
+            and self.up_proj.output_size % self.up_proj._ACCUMULATION_TILE_ROWS == 0
+            and residual.untyped_storage().data_ptr()
+            != hidden_states.untyped_storage().data_ptr()
+        )
 
     def can_write_output(
         self, hidden_states: torch.Tensor, output: torch.Tensor
@@ -568,6 +600,8 @@ class KimiColumnParallelGate(KimiPaddedColumnParallelLinear):
 class KimiPaddedRowParallelLinear(RowParallelLinear):
     """Row-parallel linear with a zero-padded input axis."""
 
+    _ACCUMULATION_TILE_ROWS = 1024
+
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         input_dim = getattr(param, "input_dim", None)
         if input_dim is None or getattr(param, "is_sharded_weight", False):
@@ -622,6 +656,70 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
             )
         torch.mm(input_parallel, self.weight.t(), out=output)
         return output, None
+
+    def accumulate_into(self, x: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+        """Add an unquantized rank-local projection using bounded scratch.
+
+        The output dimension is processed in fixed row tiles. Each tile is
+        rounded to BF16 by ``torch.mm`` before it is added to the BF16
+        residual, matching the allocating projection-then-add operation while
+        avoiding a full-width projection allocation.
+        """
+        if not isinstance(self.quant_method, UnquantizedLinearMethod):
+            raise ValueError("Residual accumulation requires an unquantized projection")
+        if self.bias is not None or self.reduce_results:
+            raise ValueError(
+                "Residual accumulation requires a bias-free unreduced projection"
+            )
+        if x.ndim != 2 or output.ndim != 2:
+            raise ValueError("Residual accumulation requires 2D tensors")
+        if self.input_pad:
+            x = torch.nn.functional.pad(x, (0, self.input_pad))
+        if self.input_is_parallel:
+            input_parallel = x
+        else:
+            input_parallel = split_tensor_along_last_dim(
+                x, num_partitions=self.tp_size
+            )[self.tp_rank].contiguous()
+        expected_shape = (input_parallel.shape[0], self.output_size)
+        if output.shape != expected_shape:
+            raise ValueError(
+                f"Residual output has shape {tuple(output.shape)}; "
+                f"expected {expected_shape}"
+            )
+        if (
+            not output.is_contiguous()
+            or output.dtype != input_parallel.dtype
+            or output.device != input_parallel.device
+        ):
+            raise ValueError(
+                "Residual output must be contiguous and match the projection input"
+            )
+        if (
+            output.untyped_storage().data_ptr()
+            == input_parallel.untyped_storage().data_ptr()
+        ):
+            raise ValueError("Residual output must not alias the projection input")
+        tile_rows = self._ACCUMULATION_TILE_ROWS
+        if self.output_size % tile_rows:
+            raise ValueError(
+                "Residual accumulation requires an output size divisible by "
+                f"{tile_rows}"
+            )
+        scratch = torch.empty(
+            (input_parallel.shape[0], tile_rows),
+            dtype=output.dtype,
+            device=output.device,
+        )
+        for row_start in range(0, self.output_size, tile_rows):
+            row_end = row_start + tile_rows
+            torch.mm(
+                input_parallel,
+                self.weight[row_start:row_end].t(),
+                out=scratch,
+            )
+            output[:, row_start:row_end].add_(scratch)
+        return output
 
 
 class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):

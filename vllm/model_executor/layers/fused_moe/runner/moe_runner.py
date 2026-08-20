@@ -189,8 +189,47 @@ def _moe_forward_shared_fake(
     return shared_out, fused_out
 
 
-# NOTE: `moe_forward` and `moe_forward_shared` being opaque custom ops is a
-# load-bearing assumption for the MoE-LoRA dual-stream path.
+def _moe_forward_shared_input_reuse(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
+) -> torch.Tensor:
+    """Run MoE while overwriting the consumed shared-expert input.
+
+    The dedicated operator schema declares the input mutation without exposing
+    an aliased output, which keeps functionalization and CUDA Graph ownership
+    explicit.
+    """
+    if shared_experts_input is None:
+        raise ValueError("Shared-expert input reuse requires a shared input tensor")
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    result = layer._forward_impl(
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+        reuse_shared_experts_input=True,
+    )
+    if not isinstance(result, tuple):
+        raise RuntimeError("Shared-expert input reuse requires separate MoE outputs")
+    shared_output, fused_output = result
+    if (
+        shared_output.shape != shared_experts_input.shape
+        or shared_output.untyped_storage().data_ptr()
+        != shared_experts_input.untyped_storage().data_ptr()
+    ):
+        raise RuntimeError(
+            "Shared expert did not write its result into the declared input buffer"
+        )
+    return fused_output
+
+
+# The MoE entry points are opaque custom ops. This is a load-bearing assumption
+# for the MoE-LoRA dual-stream path. Input-reuse variants have a separate schema
+# because functionalization must know that the shared-expert input is mutated.
 direct_register_custom_op(
     op_name="moe_forward",
     op_func=_moe_forward,
@@ -223,6 +262,24 @@ direct_register_custom_op(
     op_func=_moe_forward_shared,
     mutates_args=["hidden_states"],
     fake_impl=_moe_forward_shared_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+direct_register_custom_op(
+    op_name="moe_forward_shared_input_reuse",
+    op_func=_moe_forward_shared_input_reuse,
+    mutates_args=["hidden_states", "shared_experts_input"],
+    fake_impl=_moe_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+direct_register_custom_op(
+    op_name="b12x_moe_forward_shared_input_reuse",
+    op_func=_moe_forward_shared_input_reuse,
+    mutates_args=["hidden_states", "shared_experts_input"],
+    fake_impl=_moe_forward_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
@@ -306,6 +363,11 @@ class MoERunner(MoERunnerInterface):
         self.layer_name = layer_name
 
         self._forward_entry = self._select_forward()
+        self._shared_input_reuse_entry = (
+            self._select_shared_input_reuse_forward()
+            if self._shared_experts is not None
+            else None
+        )
 
         # For smuggling this layer into the fused moe custom op
         register_layer_for_moe_forward_op(get_current_vllm_config(), self)
@@ -334,6 +396,14 @@ class MoERunner(MoERunnerInterface):
             if self._shared_experts is None
             else torch.ops.vllm.moe_forward_shared
         )
+
+    def _select_shared_input_reuse_forward(self) -> Callable:
+        """Select the MoE operator whose schema declares shared-input mutation."""
+        if current_platform.is_tpu() or current_platform.is_cpu():
+            return _moe_forward_shared_input_reuse
+        if self._uses_b12x_moe_kernel:
+            return torch.ops.vllm.b12x_moe_forward_shared_input_reuse
+        return torch.ops.vllm.moe_forward_shared_input_reuse
 
     @property
     def shared_experts(self) -> SharedExperts | None:
@@ -412,6 +482,7 @@ class MoERunner(MoERunnerInterface):
     def apply_routed_output_transform(
         self,
         fused_output: torch.Tensor,
+        residual: torch.Tensor | None = None,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply transform to routed expert output (e.g., latent to full dim).
@@ -421,10 +492,15 @@ class MoERunner(MoERunnerInterface):
         the full hidden dimension before combining with shared expert output.
         """
         if self.routed_output_transform is not None:
-            if output is None:
-                r = self.routed_output_transform(fused_output)
-            else:
+            if residual is not None:
+                r = self.routed_output_transform(
+                    fused_output,
+                    residual=residual,
+                )
+            elif output is not None:
                 r = self.routed_output_transform(fused_output, output=output)
+            else:
+                r = self.routed_output_transform(fused_output)
             fused_output = r[0] if isinstance(r, tuple) else r
         return fused_output
 
@@ -432,6 +508,7 @@ class MoERunner(MoERunnerInterface):
         self,
         fused_output: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
+        shared_output: torch.Tensor | None,
     ) -> torch.Tensor | None:
         """Return dead caller storage accepted by the output transform."""
         if shared_experts_input is None or self.routed_output_transform is None:
@@ -443,7 +520,29 @@ class MoERunner(MoERunnerInterface):
             fused_output, shared_experts_input
         ):
             return None
+        if (
+            shared_output is not None
+            and shared_output.untyped_storage().data_ptr()
+            == shared_experts_input.untyped_storage().data_ptr()
+        ):
+            return None
         return shared_experts_input
+
+    def _can_accumulate_routed_output_residual(
+        self,
+        fused_output: torch.Tensor,
+        shared_output: torch.Tensor | None,
+    ) -> bool:
+        """Return whether the output transform can consume a shared residual."""
+        if shared_output is None or self.routed_output_transform is None:
+            return False
+        can_accumulate_residual = getattr(
+            self.routed_output_transform, "can_accumulate_residual", None
+        )
+        return bool(
+            can_accumulate_residual is not None
+            and can_accumulate_residual(fused_output, shared_output)
+        )
 
     def _maybe_apply_routed_scale_to_output(
         self,
@@ -631,10 +730,15 @@ class MoERunner(MoERunnerInterface):
         self,
         shared_experts_input: torch.Tensor | None,
         order: SharedExpertsOrder,
+        reuse_input: bool = False,
     ):
         if self._shared_experts is not None:
             assert shared_experts_input is not None
-            self._shared_experts(shared_experts_input, order)
+            self._shared_experts(
+                shared_experts_input,
+                order,
+                reuse_input=reuse_input,
+            )
 
     def _apply_quant_method(
         self,
@@ -642,6 +746,7 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
+        reuse_shared_experts_input: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -650,7 +755,9 @@ class MoERunner(MoERunnerInterface):
         (shared_expert_output, fused_expert_output).
         """
         self._maybe_apply_shared_experts(
-            shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+            shared_experts_input,
+            SharedExpertsOrder.NO_OVERLAP,
+            reuse_input=reuse_shared_experts_input,
         )
 
         if self.routed_experts.quant_method.is_monolithic:
@@ -792,7 +899,19 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
-        result = self._forward_entry(
+        shared_experts = getattr(self, "_shared_experts", None)
+        reuse_shared_experts_input = bool(
+            shared_experts_input is not None
+            and shared_experts is not None
+            and shared_experts.can_reuse_input(shared_experts_input)
+        )
+        forward_entry = (
+            self._shared_input_reuse_entry
+            if reuse_shared_experts_input
+            else self._forward_entry
+        )
+        assert forward_entry is not None
+        result = forward_entry(
             hidden_states,
             router_logits,
             shared_experts_input,
@@ -814,6 +933,10 @@ class MoERunner(MoERunnerInterface):
 
         # Extract outputs from result
         shared_output, fused_output = _unpack(result)
+        if reuse_shared_experts_input:
+            assert shared_experts_input is not None
+            assert shared_output is None
+            shared_output = shared_experts_input
 
         if og_hidden_dim_pre_xform is not None:
             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
@@ -849,15 +972,28 @@ class MoERunner(MoERunnerInterface):
             shared_output, fused_output
         )
 
-        # The shared-expert input is dead after _forward_entry returns. Output
-        # transforms that explicitly accept caller-owned storage may reuse it
-        # for allocation-sensitive prefill projections.
+        # The shared-expert input has been consumed when the MoE entry returns.
+        # An output transform may use that storage when the shared result has a
+        # separate allocation. If the shared result already occupies the input
+        # storage, the routed projection accumulates into it with bounded scratch.
         routed_output_buffer = self._get_routed_output_buffer(
-            fused_output, shared_experts_input
+            fused_output,
+            shared_experts_input,
+            shared_output,
+        )
+        routed_output_residual = (
+            shared_output
+            if routed_output_buffer is None
+            and self._can_accumulate_routed_output_residual(fused_output, shared_output)
+            else None
         )
         fused_output = self.apply_routed_output_transform(
-            fused_output, output=routed_output_buffer
+            fused_output,
+            residual=routed_output_residual,
+            output=routed_output_buffer,
         )
+        if routed_output_residual is not None:
+            shared_output = None
         if output_transform_is_tp_partial:
             fused_output_is_reduced = False
 
@@ -874,7 +1010,9 @@ class MoERunner(MoERunnerInterface):
             result,
             og_hidden_dim_post_xform,
             fused_output_is_reduced,
-            in_place=routed_output_buffer is not None,
+            in_place=(
+                routed_output_buffer is not None or routed_output_residual is not None
+            ),
         )
 
         return self._maybe_add_zero_expert_output(result)
@@ -940,6 +1078,7 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
+        reuse_shared_experts_input: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Entry point called by the custom op to run the MoE computation.
 
@@ -983,6 +1122,7 @@ class MoERunner(MoERunnerInterface):
                 router_logits=router_logits,
                 shared_experts_input=shared_experts_input,
                 input_ids=input_ids,
+                reuse_shared_experts_input=reuse_shared_experts_input,
             )
 
             return self._maybe_combine(

@@ -118,6 +118,22 @@ def test_b12x_moe_runner_uses_functional_custom_op(monkeypatch) -> None:
     assert forward_entry._qualified_op_name == "vllm::b12x_moe_forward"
 
 
+def test_b12x_moe_runner_uses_shared_input_reuse_custom_op(monkeypatch) -> None:
+    monkeypatch.setattr(
+        moe_runner,
+        "current_platform",
+        SimpleNamespace(is_tpu=lambda: False, is_cpu=lambda: False),
+    )
+
+    runner = _make_fake_moe_runner(object.__new__(b12x_moe.B12xExperts))
+
+    forward_entry = runner._select_shared_input_reuse_forward()
+
+    assert forward_entry._qualified_op_name == (
+        "vllm::b12x_moe_forward_shared_input_reuse"
+    )
+
+
 def test_non_b12x_moe_runner_keeps_generic_custom_op(monkeypatch) -> None:
     monkeypatch.setattr(
         moe_runner,
@@ -132,16 +148,42 @@ def test_non_b12x_moe_runner_keeps_generic_custom_op(monkeypatch) -> None:
     assert forward_entry._qualified_op_name == "vllm::moe_forward"
 
 
+def test_non_b12x_moe_runner_keeps_generic_shared_input_reuse_op(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        moe_runner,
+        "current_platform",
+        SimpleNamespace(is_tpu=lambda: False, is_cpu=lambda: False),
+    )
+
+    runner = _make_fake_moe_runner(object())
+
+    forward_entry = runner._select_shared_input_reuse_forward()
+
+    assert forward_entry._qualified_op_name == "vllm::moe_forward_shared_input_reuse"
+
+
 def test_b12x_moe_custom_op_matches_generic_mutation_contract() -> None:
     b12x_schema = str(torch.ops.vllm.b12x_moe_forward.default._schema)
     b12x_shared_schema = str(torch.ops.vllm.b12x_moe_forward_shared.default._schema)
     generic_schema = str(torch.ops.vllm.moe_forward.default._schema)
     generic_shared_schema = str(torch.ops.vllm.moe_forward_shared.default._schema)
+    b12x_reuse_schema = str(
+        torch.ops.vllm.b12x_moe_forward_shared_input_reuse.default._schema
+    )
+    generic_reuse_schema = str(
+        torch.ops.vllm.moe_forward_shared_input_reuse.default._schema
+    )
 
     assert "Tensor(a0!) hidden_states" in generic_schema
     assert "Tensor(a0!) hidden_states" in generic_shared_schema
     assert "Tensor(a0!) hidden_states" in b12x_schema
     assert "Tensor(a0!) hidden_states" in b12x_shared_schema
+    assert "Tensor(a0!) hidden_states" in generic_reuse_schema
+    assert "!)? shared_experts_input" in generic_reuse_schema
+    assert "Tensor(a0!) hidden_states" in b12x_reuse_schema
+    assert "!)? shared_experts_input" in b12x_reuse_schema
 
 
 def test_b12x_moe_run_binds_only_the_prepared_expert_owner(monkeypatch) -> None:
