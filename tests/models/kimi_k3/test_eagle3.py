@@ -148,7 +148,26 @@ def test_kimi_attn_res_workspace_is_reused_and_sliced():
     assert grown.untyped_storage().data_ptr() != largest.untyped_storage().data_ptr()
 
 
-def test_kimi_attn_res_workspace_can_be_reserved_before_prefill():
+def test_kimi_retained_workspace_releases_cuda_cache(monkeypatch):
+    events = []
+    device = torch.device("cuda", 3)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "synchronize",
+        lambda actual_device: events.append(("synchronize", actual_device)),
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "empty_cache",
+        lambda: events.append(("empty_cache", None)),
+    )
+
+    kimi_model._release_cuda_cache_before_retained_allocation(device)
+
+    assert events == [("synchronize", device), ("empty_cache", None)]
+
+
+def test_kimi_attn_res_workspace_can_be_reserved_before_prefill(monkeypatch):
     model = _make_kimi_linear_model()
     object.__setattr__(model, "use_attn_res", True)
     object.__setattr__(model, "num_attn_res_blocks", 3)
@@ -160,8 +179,27 @@ def test_kimi_attn_res_workspace_can_be_reserved_before_prefill():
         torch.nn.Parameter(torch.empty(1, dtype=torch.bfloat16)),
     )
 
+    events = []
+    original_empty = torch.empty
+
+    def record_allocator_release(device):
+        events.append(("release", device.type))
+
+    def record_workspace_allocation(*args, **kwargs):
+        device = kwargs.get("device")
+        if device is not None:
+            events.append(("allocate", device.type))
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(
+        kimi_model,
+        "_release_cuda_cache_before_retained_allocation",
+        record_allocator_release,
+    )
+    monkeypatch.setattr(torch, "empty", record_workspace_allocation)
     model.reserve_attn_res_workspace()
 
+    assert events == [("release", "cpu"), ("allocate", "cpu")]
     workspace = model._attn_res_workspace
     assert workspace is not None
     assert workspace.shape == (16, 3, 4)
