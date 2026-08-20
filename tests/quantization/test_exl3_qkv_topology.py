@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import inspect
 from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.layers.quantization.exl3 import Exl3Config, Exl3LinearMethod
 
 
@@ -15,23 +15,33 @@ COMPONENTS = ["q_proj", "k_proj", "v_proj"]
 OUTPUT_SPLITS = [12288, 1024, 1024]
 
 
-def _entry(key: str, width: int, scale: str = "always") -> dict:
+def _entry(
+    key: str,
+    width: int,
+    scale: str = "always",
+    codebook: str = "mcg",
+) -> dict:
     return {
         "quant_format": "exl3",
         "bits_per_weight": width,
-        "codebook": "mcg",
+        "codebook": codebook,
         "scale": scale,
         "stored_tensors": {
             f"{key}.trellis": {},
             f"{key}.suh": {},
             f"{key}.svh": {},
-            f"{key}.mcg": {},
+            f"{key}.{codebook}": {},
         },
     }
 
 
-def _projection(name: str, width: int, scale: str = "always") -> dict:
-    return {"name": name, "K": width, "codebook": "mcg", "scale": scale}
+def _projection(
+    name: str,
+    width: int,
+    scale: str = "always",
+    codebook: str = "mcg",
+) -> dict:
+    return {"name": name, "K": width, "codebook": codebook, "scale": scale}
 
 
 def _mixed_checkpoint() -> tuple[dict, dict]:
@@ -89,6 +99,18 @@ def _configure(topology: dict, storage: dict) -> Exl3Config:
     return config
 
 
+def _set_split_q(
+    topology: dict,
+    storage: dict,
+    width: int,
+    codebook: str,
+) -> None:
+    layer = topology["layers"][0]["layer"]
+    topology["layers"][0]["projections"][0].update(K=width, codebook=codebook)
+    key = f"{layer}.q_proj"
+    storage[key] = _entry(key, width, codebook=codebook)
+
+
 def test_checkpoint_mixes_explicit_split_and_fused_uniform_routes():
     topology, storage = _mixed_checkpoint()
     config = _configure(topology, storage)
@@ -103,6 +125,32 @@ def test_checkpoint_mixes_explicit_split_and_fused_uniform_routes():
         ("split", 3),
         ("fused_uniform", 1),
     ]
+
+
+@pytest.mark.parametrize(("width", "codebook"), [(3, "mcg"), (8, "mul1")])
+def test_projection_accepts_supported_k_boundaries_and_codebooks(width, codebook):
+    topology, storage = _mixed_checkpoint()
+    _set_split_q(topology, storage, width, codebook)
+
+    config = _configure(topology, storage)
+
+    projection = config.qkv_topology_by_layer[1]["projections"][0]
+    assert (projection["K"], projection["codebook"]) == (width, codebook)
+
+
+@pytest.mark.parametrize(
+    "layer",
+    [
+        "model.language_model.mtp.layers.1.self_attn",
+        "model.visual.layers.1.self_attn",
+    ],
+)
+def test_topology_rejects_non_decoder_layer_identities(layer):
+    topology, storage = _mixed_checkpoint()
+    topology["layers"][0]["layer"] = layer
+
+    with pytest.raises(ValueError, match="full text-decoder self_attn block"):
+        _configure(topology, storage)
 
 
 @pytest.mark.parametrize(
@@ -120,6 +168,24 @@ def test_checkpoint_mixes_explicit_split_and_fused_uniform_routes():
                 K=[5, 6, 6]
             ),
             "one integer",
+        ),
+        (
+            lambda topology, storage: topology["layers"][0]["projections"][0].update(
+                K=2
+            ),
+            "one integer in 3\\.\\.8",
+        ),
+        (
+            lambda topology, storage: topology["layers"][0]["projections"][0].update(
+                K=9
+            ),
+            "one integer in 3\\.\\.8",
+        ),
+        (
+            lambda topology, storage: topology["layers"][0]["projections"][0].update(
+                codebook="other"
+            ),
+            "mcg.*mul1",
         ),
         (
             lambda topology, storage: storage.update(
@@ -147,6 +213,73 @@ def test_declared_topology_rejects_route_fallback():
 
     with pytest.raises(ValueError, match="no explicit EXL3 QKV route"):
         config.qkv_topology_for_prefix("model.layers.3.self_attn.qkv_proj")
+
+
+def test_fused_uniform_rejects_tensor_parallel_runtime():
+    topology, storage = _mixed_checkpoint()
+    method = Exl3LinearMethod(_configure(topology, storage))
+    layer = torch.nn.Module()
+    layer.prefix = "model.layers.4.self_attn.qkv_proj"
+    layer.tp_rank = 0
+    layer.tp_size = 2
+
+    with pytest.raises(NotImplementedError, match="requires TP=1"):
+        method.create_weights(
+            layer,
+            input_size_per_partition=4096,
+            output_partition_sizes=OUTPUT_SPLITS,
+            input_size=4096,
+            output_size=sum(OUTPUT_SPLITS),
+            params_dtype=torch.float16,
+        )
+
+
+def test_fused_uniform_rejects_runtime_output_split_mismatch():
+    topology, storage = _mixed_checkpoint()
+    method = Exl3LinearMethod(_configure(topology, storage))
+    layer = torch.nn.Module()
+    layer.prefix = "model.layers.4.self_attn.qkv_proj"
+    layer.tp_rank = 0
+    layer.tp_size = 1
+    runtime_splits = [OUTPUT_SPLITS[0], OUTPUT_SPLITS[1], OUTPUT_SPLITS[2] - 1]
+
+    with pytest.raises(ValueError, match="output_splits disagree"):
+        method.create_weights(
+            layer,
+            input_size_per_partition=4096,
+            output_partition_sizes=runtime_splits,
+            input_size=4096,
+            output_size=sum(runtime_splits),
+            params_dtype=torch.float16,
+        )
+
+
+def test_fused_uniform_rejects_packed_fallback():
+    topology, storage = _mixed_checkpoint()
+    method = Exl3LinearMethod(_configure(topology, storage))
+    layer = SimpleNamespace(exl3_qkv_variant="fused_uniform")
+
+    with pytest.raises(RuntimeError, match="cannot use the packed-tensor fallback"):
+        method.apply(layer, torch.ones(2, 4, dtype=torch.float16))
+
+
+def test_split_view_fallback_rejects_packed_width_mismatch(monkeypatch):
+    topology, storage = _mixed_checkpoint()
+    method = Exl3LinearMethod(_configure(topology, storage))
+    layer = SimpleNamespace(
+        exl3_qkv_variant="split",
+        exl3_output_partition_sizes=[6, 2, 2],
+    )
+    monkeypatch.setattr(
+        method,
+        "apply",
+        lambda actual_layer, x, bias: torch.zeros(
+            *x.shape[:-1], 9, dtype=x.dtype
+        ),
+    )
+
+    with pytest.raises(RuntimeError):
+        method.apply_qkv_views(layer, torch.ones(2, 4, dtype=torch.float16))
 
 
 def test_fused_uniform_issues_one_apply_and_returns_views(monkeypatch):
@@ -201,6 +334,50 @@ def test_split_route_retains_three_applies_and_cat(monkeypatch):
     assert config.qkv_warmup_counters == {"split": 1, "fused_uniform": 0}
 
 
+def test_qkv_views_honor_return_bias_false():
+    calls = []
+
+    def apply_views(layer, x, bias):
+        calls.append((layer, bias))
+        return x[..., :2], x[..., 2:4], x[..., 4:6]
+
+    layer = SimpleNamespace(
+        bias=None,
+        skip_bias_add=False,
+        return_bias=False,
+        quant_method=SimpleNamespace(apply_qkv_views=apply_views),
+    )
+
+    views = QKVParallelLinear.forward_qkv_views(
+        layer, torch.ones(2, 6, dtype=torch.float16)
+    )
+
+    assert len(views) == 3
+    assert calls == [(layer, None)]
+
+
+def test_qkv_views_return_deferred_bias_when_requested():
+    bias = torch.nn.Parameter(torch.ones(6))
+
+    def apply_views(layer, x, actual_bias):
+        assert actual_bias is None
+        return x[..., :2], x[..., 2:4], x[..., 4:6]
+
+    layer = SimpleNamespace(
+        bias=bias,
+        skip_bias_add=True,
+        return_bias=True,
+        quant_method=SimpleNamespace(apply_qkv_views=apply_views),
+    )
+
+    views, deferred_bias = QKVParallelLinear.forward_qkv_views(
+        layer, torch.ones(2, 6, dtype=torch.float16)
+    )
+
+    assert len(views) == 3
+    assert deferred_bias is bias
+
+
 def test_metadata_objects_are_not_aliased_to_caller():
     topology, storage = _mixed_checkpoint()
     original = deepcopy(topology)
@@ -209,14 +386,3 @@ def test_metadata_objects_are_not_aliased_to_caller():
 
     assert config.qkv_topology_by_layer[1]["projections"][0]["K"] == 6
     assert original["layers"][0]["projections"][0]["K"] == 6
-
-
-def test_fused_consumer_source_has_one_apply_and_view_split():
-    source = inspect.getsource(Exl3LinearMethod.apply_qkv_views)
-    fused_source = source.split(
-        'record_qkv_route(layer, "fused_uniform")', maxsplit=1
-    )[1]
-
-    assert fused_source.count("self._apply_one(") == 1
-    assert ".split(layer.exl3_output_partition_sizes" in fused_source
-    assert "torch.cat" not in fused_source

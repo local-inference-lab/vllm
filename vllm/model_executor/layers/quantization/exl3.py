@@ -622,11 +622,16 @@ class Exl3Config(QuantizationConfig):
             variant_key = "projections" if variant == "split" else "projection"
             self._qkv_exact_keys(raw, common | {variant_key}, label)
             layer = raw["layer"]
-            if not isinstance(layer, str) or not layer.endswith(".self_attn"):
-                raise ValueError(f"{label}.layer must name a self_attn block")
-            layer_index = _qkv_layer_index(layer)
-            if layer_index is None:
-                raise ValueError(f"{label}.layer has no decoder-layer index")
+            if not isinstance(layer, str):
+                raise ValueError(f"{label}.layer must be a string")
+            match = re.fullmatch(
+                r"model\.language_model\.layers\.(\d+)\.self_attn", layer
+            )
+            if match is None:
+                raise ValueError(
+                    f"{label}.layer must name a full text-decoder self_attn block"
+                )
+            layer_index = int(match.group(1))
             if layer_index in by_index:
                 raise ValueError(
                     f"duplicate/mixed QKV metadata for decoder layer {layer_index}"
@@ -1105,11 +1110,15 @@ class Exl3LinearMethod(LinearMethodBase):
             layer.exl3_tp_rank = 0
             layer.exl3_tp_size = 1
         else:
-            layer.exl3_tp_rank = getattr(
-                layer, "tp_rank", get_tensor_model_parallel_rank()
+            layer.exl3_tp_rank = (
+                layer.tp_rank
+                if hasattr(layer, "tp_rank")
+                else get_tensor_model_parallel_rank()
             )
-            layer.exl3_tp_size = getattr(
-                layer, "tp_size", get_tensor_model_parallel_world_size()
+            layer.exl3_tp_size = (
+                layer.tp_size
+                if hasattr(layer, "tp_size")
+                else get_tensor_model_parallel_world_size()
             )
         layer.exl3_input_size = input_size
         layer.exl3_input_size_per_partition = input_size_per_partition
@@ -1239,6 +1248,27 @@ class Exl3LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply the QKV projection and return ordered Q/K/V views.
+
+        This is the duck-typed split-view API consumed by
+        ``QKVParallelLinear.forward_qkv_views``. It adds ``bias`` before
+        splitting; the caller owns the deferred-bias/``return_bias`` contract.
+        Fused-uniform payloads use one apply and return storage-sharing views.
+        Other routes retain the packed apply path before splitting.
+
+        Args:
+            layer: QKV layer carrying the validated EXL3 topology.
+            x: Input tensor whose last dimension is the projection input width.
+            bias: Optional full-width bias to add before returning the views.
+
+        Returns:
+            Q, K, and V tensors in checkpoint output order. Every leading
+            dimension matches ``x``.
+
+        Raises:
+            RuntimeError: If the packed output width does not match the declared
+                Q/K/V partition sizes.
+        """
         if getattr(layer, "exl3_qkv_variant", None) != "fused_uniform":
             packed = self.apply(layer, x, bias)
             return packed.split(layer.exl3_output_partition_sizes, dim=-1)
