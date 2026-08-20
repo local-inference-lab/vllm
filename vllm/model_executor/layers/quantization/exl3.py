@@ -7,10 +7,10 @@ Rank-sliced routed-expert checkpoints use B12X's unified planned
 ``fused_moe`` API for the Trellis decode/prefill windows and the ExLlamaV3
 extension for the small eager parity window. Generic dense and non-rank-sliced
 MoE checkpoints use the
-bit-faithful ``exllamav3_ext.exl3_gemm`` parity path. Every logical checkpoint
-matrix is dispatched independently: vLLM's packed QKV and gate/up modules are
-not treated as one EXL3 matrix because each source matrix owns its Hadamard
-vectors and codebook marker.
+bit-faithful ``exllamav3_ext.exl3_gemm`` parity path. Dense packed projections
+normally dispatch every logical checkpoint matrix independently. Explicit
+``exl3_qkv_topology/1`` metadata may instead select a jointly quantized,
+uniform-width QKV payload for one apply while preserving split Q/K/V elsewhere.
 
 Both dependencies are imported lazily. Importing this module, parsing
 checkpoint metadata, or compiling it with ``py_compile`` does not load either
@@ -74,6 +74,35 @@ _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
 _MIXED_TRELLIS_ROUTE_BLOCK_SIZE = 8
+_QKV_TOPOLOGY_SCHEMA = "exl3_qkv_topology/1"
+_QKV_COMPONENTS = ["q_proj", "k_proj", "v_proj"]
+_QWEN38_QKV_OUTPUT_SPLITS = [12288, 1024, 1024]
+_QKV_SCALE_POLICIES = {"always", "never", "auto"}
+
+
+def _qkv_layer_index(prefix: str) -> int | None:
+    """Return the text-decoder layer index for a supported QKV prefix.
+
+    Args:
+        prefix: Canonical producer identity or a known vLLM text-model alias,
+            optionally ending in ``.qkv_proj``.
+
+    Returns:
+        The decoder layer index, or ``None`` for non-text identities such as
+        vision and MTP modules.
+    """
+    suffix = r"\.self_attn(?:\.qkv_proj)?"
+    patterns = (
+        rf"model\.language_model\.layers\.(\d+){suffix}",
+        rf"language_model\.model\.layers\.(\d+){suffix}",
+        rf"model\.layers\.(\d+){suffix}",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, prefix)
+        if match is not None:
+            return int(match.group(1))
+    return None
+
 
 
 # Smallest m the Trellis kernel path can service, and therefore the smallest
@@ -348,6 +377,7 @@ class Exl3Config(QuantizationConfig):
         codebook: str | None = None,
         version: str | None = None,
         tensor_storage: dict[str, Any] | None = None,
+        exl3_qkv_topology: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.bits = bits
@@ -355,6 +385,12 @@ class Exl3Config(QuantizationConfig):
         self.codebook = codebook
         self.version = version
         self.tensor_storage = tensor_storage or {}
+        self._raw_qkv_topology = exl3_qkv_topology
+        self.qkv_topology_by_layer: dict[int, dict[str, Any]] = {}
+        self.qkv_registry_rows: list[dict[str, Any]] = []
+        self.qkv_route_counters = {"split": 0, "fused_uniform": 0}
+        self.qkv_warmup_counters = {"split": 0, "fused_uniform": 0}
+        self._qkv_warmed_layers: set[str] = set()
         self._eager_checked = False
         self.rank_sliced_metadata: dict[str, Any] | None = None
         self.rank_sliced_k_values: tuple[int, ...] | None = None
@@ -384,6 +420,7 @@ class Exl3Config(QuantizationConfig):
             codebook=config.get("codebook"),
             version=config.get("version"),
             tensor_storage=config.get("tensor_storage"),
+            exl3_qkv_topology=config.get("exl3_qkv_topology"),
         )
 
     @classmethod
@@ -423,9 +460,10 @@ class Exl3Config(QuantizationConfig):
                 )
             return
 
-        # vLLM returns the summary embedded in config.json without consulting
-        # get_config_filenames().  Hydrate the per-module records explicitly.
-        if not self.tensor_storage:
+        # vLLM returns the summary embedded in config.json without necessarily
+        # consulting get_config_filenames(). Hydrate the authoritative external
+        # metadata whenever either payload inventory or QKV topology is absent.
+        if not self.tensor_storage or self._raw_qkv_topology is None:
             resolved_revision = revision
             if resolved_revision is None and hf_config is not None:
                 resolved_revision = getattr(hf_config, "_commit_hash", None)
@@ -445,8 +483,12 @@ class Exl3Config(QuantizationConfig):
             self.codebook = config.get("codebook", self.codebook)
             self.version = config.get("version", self.version)
             self.tensor_storage = config["tensor_storage"]
+            if self._raw_qkv_topology is None:
+                self._raw_qkv_topology = config.get("exl3_qkv_topology")
 
         self._validate_storage_metadata()
+        if self._raw_qkv_topology is not None:
+            self._configure_qkv_topology(self._raw_qkv_topology, hf_config)
         self._force_independent_lm_head(hf_config)
 
     def _configure_rank_sliced(self, metadata: dict[str, Any]) -> None:
@@ -506,6 +548,252 @@ class Exl3Config(QuantizationConfig):
             self.rank_sliced_k_values = None
         self.codebook = str(metadata["codebook"])
         self.version = str(metadata.get("exllamav3_version", "rank-sliced"))
+
+    @staticmethod
+    def _qkv_exact_keys(
+        value: dict[str, Any], expected: set[str], label: str
+    ) -> None:
+        missing = sorted(expected.difference(value))
+        unknown = sorted(set(value).difference(expected))
+        if missing or unknown:
+            raise ValueError(f"{label} has missing={missing} unknown={unknown}")
+
+    @classmethod
+    def _normalize_qkv_projection(
+        cls, value: Any, expected_name: str, label: str
+    ) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValueError(f"{label} must be an object")
+        cls._qkv_exact_keys(value, {"name", "K", "codebook", "scale"}, label)
+        if value["name"] != expected_name:
+            raise ValueError(f"{label}.name must be {expected_name!r}")
+        k = value["K"]
+        if isinstance(k, bool) or not isinstance(k, int) or k not in range(3, 9):
+            raise ValueError(f"{label}.K must be one integer in 3..8")
+        if value["codebook"] not in {"mcg", "mul1"}:
+            raise ValueError(f"{label}.codebook must be 'mcg' or 'mul1'")
+        if value["scale"] not in _QKV_SCALE_POLICIES:
+            raise ValueError(
+                f"{label}.scale must be one of {sorted(_QKV_SCALE_POLICIES)}"
+            )
+        return dict(value)
+
+    @staticmethod
+    def _qkv_storage_codebook(entry: dict[str, Any], label: str) -> str:
+        stored = entry.get("stored_tensors")
+        if not isinstance(stored, dict):
+            raise ValueError(f"{label}.stored_tensors must be an object")
+        suffixes = {name.rsplit(".", 1)[-1] for name in stored}
+        markers = [marker for marker in ("mcg", "mul1") if marker in suffixes]
+        if len(markers) != 1:
+            raise ValueError(
+                f"{label} must contain exactly one mcg/mul1 codebook marker"
+            )
+        if entry.get("codebook") != markers[0]:
+            raise ValueError(f"{label}.codebook disagrees with its marker tensor")
+        return markers[0]
+
+    def _validate_qkv_payload(
+        self, layer: str, projection: dict[str, Any], label: str
+    ) -> None:
+        key = f"{layer}.{projection['name']}"
+        entry = self.tensor_storage.get(key)
+        if not isinstance(entry, dict) or entry.get("quant_format") != "exl3":
+            raise ValueError(f"{label} requires EXL3 payload {key!r}")
+        if entry.get("bits_per_weight") != projection["K"]:
+            raise ValueError(f"{label} K disagrees with tensor_storage[{key!r}]")
+        if self._qkv_storage_codebook(entry, key) != projection["codebook"]:
+            raise ValueError(
+                f"{label} codebook disagrees with tensor_storage[{key!r}]"
+            )
+        if entry.get("scale") != projection["scale"]:
+            raise ValueError(f"{label} scale disagrees with tensor_storage[{key!r}]")
+
+    def _configure_qkv_topology(
+        self, metadata: dict[str, Any], hf_config: PretrainedConfig | None
+    ) -> None:
+        if not isinstance(metadata, dict):
+            raise ValueError("exl3_qkv_topology must be an object")
+        self._qkv_exact_keys(metadata, {"schema", "layers"}, "exl3_qkv_topology")
+        if metadata["schema"] != _QKV_TOPOLOGY_SCHEMA:
+            raise ValueError(
+                "unsupported EXL3 QKV topology schema "
+                f"{metadata['schema']!r}; expected {_QKV_TOPOLOGY_SCHEMA!r}"
+            )
+        raw_layers = metadata["layers"]
+        if not isinstance(raw_layers, list) or not raw_layers:
+            raise ValueError("exl3_qkv_topology.layers must be a non-empty list")
+
+        self.qkv_registry_rows = []
+        normalized: list[dict[str, Any]] = []
+        by_index: dict[int, dict[str, Any]] = {}
+        for position, raw in enumerate(raw_layers):
+            label = f"exl3_qkv_topology.layers[{position}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{label} must be an object")
+            variant = raw.get("variant")
+            if variant not in {"split", "fused_uniform"}:
+                raise ValueError(
+                    f"{label}.variant {variant!r} is unsupported; mixed-width "
+                    "one-launch QKV remains future research"
+                )
+            common = {"layer", "variant", "components", "output_splits"}
+            variant_key = "projections" if variant == "split" else "projection"
+            self._qkv_exact_keys(raw, common | {variant_key}, label)
+            layer = raw["layer"]
+            if not isinstance(layer, str):
+                raise ValueError(f"{label}.layer must be a string")
+            match = re.fullmatch(
+                r"model\.language_model\.layers\.(\d+)\.self_attn", layer
+            )
+            if match is None:
+                raise ValueError(
+                    f"{label}.layer must name a full text-decoder self_attn block"
+                )
+            layer_index = int(match.group(1))
+            if layer_index in by_index:
+                raise ValueError(
+                    f"duplicate/mixed QKV metadata for decoder layer {layer_index}"
+                )
+            if raw["components"] != _QKV_COMPONENTS:
+                raise ValueError(
+                    f"{label}.components must be {_QKV_COMPONENTS!r} in output order"
+                )
+            if raw["output_splits"] != _QWEN38_QKV_OUTPUT_SPLITS:
+                raise ValueError(
+                    f"{label}.output_splits must be "
+                    f"{_QWEN38_QKV_OUTPUT_SPLITS!r} for Qwen3.8"
+                )
+
+            split_keys = [f"{layer}.{name}" for name in _QKV_COMPONENTS]
+            fused_key = f"{layer}.qkv_proj"
+            payload_keys = {
+                name: [
+                    key
+                    for key in self.tensor_storage
+                    if key == f"{layer}.{name}"
+                ]
+                for name in (*_QKV_COMPONENTS, "qkv_proj")
+            }
+            if variant == "split":
+                raw_projections = raw["projections"]
+                if not isinstance(raw_projections, list) or len(raw_projections) != 3:
+                    raise ValueError(
+                        f"{label}.projections must contain q_proj, k_proj, v_proj"
+                    )
+                projections = [
+                    self._normalize_qkv_projection(item, name, f"{label}.{name}")
+                    for item, name in zip(
+                        raw_projections, _QKV_COMPONENTS, strict=True
+                    )
+                ]
+                if payload_keys["qkv_proj"]:
+                    raise ValueError(
+                        f"{label} has duplicate split+fused payloads "
+                        f"{payload_keys['qkv_proj']}"
+                    )
+                mismatched = {
+                    name: payload_keys[name]
+                    for name, expected in zip(
+                        _QKV_COMPONENTS, split_keys, strict=True
+                    )
+                    if payload_keys[name] != [expected]
+                }
+                if mismatched:
+                    raise ValueError(
+                        f"{label} split payload is missing or duplicated: {mismatched}"
+                    )
+                for projection in projections:
+                    self._validate_qkv_payload(layer, projection, label)
+                variant_data: dict[str, Any] = {"projections": projections}
+                registry_projections = projections
+                launches = 3
+                topology = "split_qkv"
+            else:
+                projection = self._normalize_qkv_projection(
+                    raw["projection"], "qkv_proj", f"{label}.projection"
+                )
+                duplicates = [
+                    key
+                    for name in _QKV_COMPONENTS
+                    for key in payload_keys[name]
+                ]
+                if duplicates:
+                    raise ValueError(
+                        f"{label} has duplicate split+fused payloads {duplicates}"
+                    )
+                if payload_keys["qkv_proj"] != [fused_key]:
+                    raise ValueError(
+                        f"{label} fused payload is missing or duplicated: "
+                        f"{payload_keys['qkv_proj']}"
+                    )
+                self._validate_qkv_payload(layer, projection, label)
+                variant_data = {"projection": projection}
+                registry_projections = [projection]
+                launches = 1
+                topology = "fused_uniform_qkv"
+
+            row = {
+                "layer": layer,
+                "variant": variant,
+                "components": list(_QKV_COMPONENTS),
+                "output_splits": list(_QWEN38_QKV_OUTPUT_SPLITS),
+                **variant_data,
+            }
+            normalized.append(row)
+            by_index[layer_index] = row
+            self.qkv_registry_rows.append(
+                {
+                    "layer": layer,
+                    "variant": variant,
+                    "topology": topology,
+                    "launches": launches,
+                    "components": list(_QKV_COMPONENTS),
+                    "output_splits": list(_QWEN38_QKV_OUTPUT_SPLITS),
+                    "projections": registry_projections,
+                }
+            )
+
+        names = [row["layer"] for row in normalized]
+        if names != sorted(names):
+            raise ValueError("exl3_qkv_topology.layers must be sorted by layer")
+        text_config = hf_config
+        if hf_config is not None:
+            try:
+                text_config = hf_config.get_text_config()
+            except (AttributeError, TypeError):
+                pass
+        layer_types = getattr(text_config, "layer_types", None)
+        if isinstance(layer_types, (list, tuple)):
+            expected = {
+                index
+                for index, layer_type in enumerate(layer_types)
+                if layer_type == "full_attention"
+            }
+            actual = set(by_index)
+            if actual != expected:
+                raise ValueError(
+                    "EXL3 QKV topology does not cover every full-attention block: "
+                    f"missing={sorted(expected - actual)} "
+                    f"unsupported={sorted(actual - expected)}"
+                )
+        self.qkv_topology_by_layer = by_index
+
+    def qkv_topology_for_prefix(self, prefix: str) -> dict[str, Any] | None:
+        layer_index = _qkv_layer_index(prefix)
+        if layer_index is None:
+            return None
+        row = self.qkv_topology_by_layer.get(layer_index)
+        if self._raw_qkv_topology is not None and row is None:
+            raise ValueError(f"no explicit EXL3 QKV route for {prefix!r}")
+        return row
+
+    def record_qkv_route(self, layer: Any, variant: str) -> None:
+        self.qkv_route_counters[variant] += 1
+        prefix = str(getattr(layer, "prefix", ""))
+        if prefix not in self._qkv_warmed_layers:
+            self._qkv_warmed_layers.add(prefix)
+            self.qkv_warmup_counters[variant] += 1
 
     def _load_rank_sliced_bitrates(
         self,
@@ -699,6 +987,11 @@ class Exl3Config(QuantizationConfig):
         return entry is not None and entry.get("quant_format") == "exl3"
 
     def _linear_prefix_is_exl3(self, prefix: str) -> bool:
+        route = self.qkv_topology_for_prefix(prefix)
+        if route is not None:
+            # Payload presence and exclusivity were validated from the producer
+            # names. Runtime aliases must not silently select a different route.
+            return True
         if self._is_exl3_prefix(prefix):
             return True
         leaf = prefix.rsplit(".", 1)[-1]
@@ -833,27 +1126,105 @@ class Exl3LinearMethod(LinearMethodBase):
             layer.exl3_tp_rank = 0
             layer.exl3_tp_size = 1
         else:
-            layer.exl3_tp_rank = getattr(
-                layer, "tp_rank", get_tensor_model_parallel_rank()
+            layer.exl3_tp_rank = (
+                layer.tp_rank
+                if hasattr(layer, "tp_rank")
+                else get_tensor_model_parallel_rank()
             )
-            layer.exl3_tp_size = getattr(
-                layer, "tp_size", get_tensor_model_parallel_world_size()
+            layer.exl3_tp_size = (
+                layer.tp_size
+                if hasattr(layer, "tp_size")
+                else get_tensor_model_parallel_world_size()
             )
         layer.exl3_input_size = input_size
         layer.exl3_input_size_per_partition = input_size_per_partition
         layer.exl3_output_size = output_size
         layer.exl3_output_partition_sizes = output_partition_sizes
-        layer.exl3_shard_ids = self._shard_ids_for_layer(layer, output_partition_sizes)
+        qkv_route = self.quant_config.qkv_topology_for_prefix(
+            str(getattr(layer, "prefix", ""))
+        )
+        layer.exl3_qkv_variant = (
+            qkv_route["variant"] if qkv_route is not None else None
+        )
+        if qkv_route is not None:
+            if (
+                qkv_route["variant"] == "fused_uniform"
+                and layer.exl3_tp_size != 1
+            ):
+                raise NotImplementedError(
+                    "fused_uniform EXL3 QKV currently requires TP=1; the payload "
+                    "declares global output_splits and is not rank-sliced"
+                )
+            expected_splits = qkv_route["output_splits"]
+            if layer.exl3_tp_size != 1:
+                geometry = {
+                    name: getattr(layer, name, None)
+                    for name in (
+                        "num_heads",
+                        "num_kv_heads",
+                        "num_kv_head_replicas",
+                        "head_size",
+                        "v_head_size",
+                    )
+                }
+                if any(
+                    not isinstance(value, int) or value <= 0
+                    for value in geometry.values()
+                ):
+                    raise ValueError(
+                        "split EXL3 QKV TP validation requires positive runtime "
+                        f"head geometry, got {geometry}"
+                    )
+                expected_splits = [
+                    geometry["num_heads"] * geometry["head_size"],
+                    geometry["num_kv_heads"] * geometry["head_size"],
+                    geometry["num_kv_heads"] * geometry["v_head_size"],
+                ]
+                reconstructed_global = [
+                    expected_splits[0] * layer.exl3_tp_size,
+                    expected_splits[1]
+                    * layer.exl3_tp_size
+                    // geometry["num_kv_head_replicas"],
+                    expected_splits[2]
+                    * layer.exl3_tp_size
+                    // geometry["num_kv_head_replicas"],
+                ]
+                if reconstructed_global != qkv_route["output_splits"]:
+                    raise ValueError(
+                        "split EXL3 QKV metadata disagrees with runtime TP "
+                        f"geometry: metadata={qkv_route['output_splits']} "
+                        f"runtime_global={reconstructed_global}"
+                    )
+            if output_partition_sizes != expected_splits:
+                raise ValueError(
+                    f"{qkv_route['variant']} EXL3 QKV output_splits disagree "
+                    f"with the runtime layer: metadata={qkv_route['output_splits']} "
+                    f"expected_local={expected_splits} "
+                    f"runtime={output_partition_sizes}"
+                )
+        layer.exl3_shard_ids = self._shard_ids_for_layer(
+            layer, output_partition_sizes
+        )
         layer.exl3_parallel_mode = (
             "row" if input_size_per_partition != input_size else "column"
         )
-        source_prefixes = self._source_prefixes_for_layer(layer, layer.exl3_shard_ids)
-        layer.exl3_expected_codebooks = {
-            shard_id: self.quant_config.codebook_for_prefix(source_prefix)
-            for shard_id, source_prefix in zip(
-                layer.exl3_shard_ids, source_prefixes, strict=True
-            )
-        }
+        source_prefixes = self._source_prefixes_for_layer(
+            layer, layer.exl3_shard_ids
+        )
+        if qkv_route is None:
+            expected_codebooks = [
+                self.quant_config.codebook_for_prefix(source_prefix)
+                for source_prefix in source_prefixes
+            ]
+        elif qkv_route["variant"] == "split":
+            expected_codebooks = [
+                projection["codebook"] for projection in qkv_route["projections"]
+            ]
+        else:
+            expected_codebooks = [qkv_route["projection"]["codebook"]]
+        layer.exl3_expected_codebooks = dict(
+            zip(layer.exl3_shard_ids, expected_codebooks, strict=True)
+        )
 
         # su/sv are legacy packed sign bitfields.  Modern checkpoints load
         # suh/svh directly.
@@ -911,6 +1282,14 @@ class Exl3LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        variant = getattr(layer, "exl3_qkv_variant", None)
+        if variant == "fused_uniform":
+            raise RuntimeError(
+                "fused_uniform EXL3 QKV cannot use the packed-tensor fallback; "
+                "the attention consumer must request q/k/v views"
+            )
+        if variant == "split":
+            self.quant_config.record_qkv_route(layer, variant)
         original_shape = x.shape[:-1]
         original_dtype = x.dtype
         x_2d = x.reshape(-1, x.shape[-1]).to(torch.float16).contiguous()
@@ -922,6 +1301,50 @@ class Exl3LinearMethod(LinearMethodBase):
             output = output + bias.to(dtype=output.dtype)
         output = output.reshape(*original_shape, output.shape[-1])
         return output if output.dtype == original_dtype else output.to(original_dtype)
+
+    def apply_qkv_views(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply the QKV projection and return ordered Q/K/V views.
+
+        This is the duck-typed split-view API consumed by
+        ``QKVParallelLinear.forward_qkv_views``. It adds ``bias`` before
+        splitting; the caller owns the deferred-bias/``return_bias`` contract.
+        Fused-uniform payloads use one apply and return storage-sharing views.
+        Other routes retain the packed apply path before splitting.
+
+        Args:
+            layer: QKV layer carrying the validated EXL3 topology.
+            x: Input tensor whose last dimension is the projection input width.
+            bias: Optional full-width bias to add before returning the views.
+
+        Returns:
+            Q, K, and V tensors in checkpoint output order. Every leading
+            dimension matches ``x``.
+
+        Raises:
+            RuntimeError: If the packed output width does not match the declared
+                Q/K/V partition sizes.
+        """
+        if getattr(layer, "exl3_qkv_variant", None) != "fused_uniform":
+            packed = self.apply(layer, x, bias)
+            return packed.split(layer.exl3_output_partition_sizes, dim=-1)
+        self.quant_config.record_qkv_route(layer, "fused_uniform")
+        original_shape = x.shape[:-1]
+        original_dtype = x.dtype
+        x_2d = x.reshape(-1, x.shape[-1]).to(torch.float16).contiguous()
+        # Exactly one EXL3 apply. torch.split below returns storage-sharing views.
+        output = self._apply_one(layer, x_2d, None)
+        if bias is not None:
+            output = output + bias.to(dtype=output.dtype)
+        output = output.reshape(*original_shape, output.shape[-1])
+        if output.dtype != original_dtype:
+            output = output.to(original_dtype)
+        q, k, v = output.split(layer.exl3_output_partition_sizes, dim=-1)
+        return q, k, v
 
     @staticmethod
     def _unpack_signs(bitfield: torch.Tensor) -> torch.Tensor:
@@ -1014,9 +1437,13 @@ class Exl3LinearMethod(LinearMethodBase):
     @staticmethod
     def _output_shard_size(layer: torch.nn.Module, shard_id: ShardId) -> int:
         if shard_id is None:
+            if getattr(layer, "exl3_qkv_variant", None) == "fused_uniform":
+                return sum(layer.exl3_output_partition_sizes)
             return layer.exl3_output_partition_sizes[0]
         if isinstance(shard_id, str) and shard_id in ("q", "k", "v"):
-            return layer.exl3_output_partition_sizes[{"q": 0, "k": 1, "v": 2}[shard_id]]
+            return layer.exl3_output_partition_sizes[
+                {"q": 0, "k": 1, "v": 2}[shard_id]
+            ]
         if isinstance(shard_id, tuple):
             return sum(layer.exl3_output_partition_sizes[idx] for idx in shard_id)
         if isinstance(shard_id, int):
@@ -1116,8 +1543,8 @@ class Exl3LinearMethod(LinearMethodBase):
         layer.exl3_shard_ids = expanded_ids
         return component_ids
 
-    @staticmethod
     def _shard_ids_for_layer(
+        self,
         layer: torch.nn.Module,
         output_partition_sizes: list[int],
     ) -> list[ShardId]:
@@ -1125,6 +1552,9 @@ class Exl3LinearMethod(LinearMethodBase):
             return [None]
         prefix = getattr(layer, "prefix", "")
         if isinstance(layer, QKVParallelLinear) and len(output_partition_sizes) == 3:
+            route = self.quant_config.qkv_topology_for_prefix(prefix)
+            if route is not None and route["variant"] == "fused_uniform":
+                return [None]
             return ["q", "k", "v"]
         if prefix.endswith("in_proj_qkvz"):
             return [(0, 1, 2), 3]

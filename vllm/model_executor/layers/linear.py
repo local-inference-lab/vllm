@@ -1070,6 +1070,48 @@ class QKVParallelLinear(ColumnParallelLinear):
             disable_tp=disable_tp,
         )
 
+    def forward_qkv_views(
+        self, x: torch.Tensor
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+            Parameter | None,
+        ]
+    ):
+        """Project QKV and return ordered views.
+
+        Quant methods may provide the duck-typed
+        ``apply_qkv_views(layer, x, bias) -> (q, k, v)`` API. The provider must
+        preserve every input dimension except the last, return Q/K/V in output
+        order, and add the supplied bias; deferred bias remains this wrapper's
+        responsibility. A fused provider may return storage-sharing views.
+        Methods without the API retain the packed forward followed by a split.
+
+        Args:
+            x: Input tensor whose last dimension is the projection input width.
+
+        Returns:
+            Ordered Q/K/V views when ``return_bias`` is false. Otherwise, a pair
+            containing those views and the deferred bias, matching ``forward``.
+
+        Raises:
+            RuntimeError: If the packed output cannot be split into the declared
+                Q/K/V partition sizes.
+        """
+        bias = self.bias if not self.skip_bias_add else None
+        apply_views = getattr(self.quant_method, "apply_qkv_views", None)
+        if apply_views is None:
+            output = self.quant_method.apply(self, x, bias)
+            views = output.split(self.output_partition_sizes, dim=-1)
+        else:
+            views = apply_views(self, x, bias)
+        if not self.return_bias:
+            return views
+        output_bias = self.bias if self.skip_bias_add else None
+        return views, output_bias
+
+
     def validate_shard_id(self, shard_id: Any) -> TypeIs[str | None]:
         if shard_id in {"q", "k", "v"} or shard_id is None:
             return True

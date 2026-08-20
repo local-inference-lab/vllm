@@ -349,19 +349,24 @@ class Qwen3NextAttention(nn.Module):
 
     def _project_qkv_gate(
         self,
-        qkv: torch.Tensor,
+        qkv: torch.Tensor
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Return post-norm, post-RoPE (q, k, v) and the pre-sigmoid gate.
 
-        Dispatches between the fused Triton kernel and the eager
-        split + QK-RMSNorm + RoPE path. ``gate`` is ``None`` when output
-        gating is disabled.
+        A tuple carries storage-sharing views from a topology-aware quantized
+        projection. Other methods retain the existing packed-tensor route.
         """
-        if self.use_fused_qk_norm_rope_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+        if isinstance(qkv, tuple):
+            q_component, k, v = qkv
+        else:
+            q_width = self.q_size * (2 if self.attn_output_gate else 1)
+            q_component, k, v = qkv.split(
+                [q_width, self.kv_size, self.kv_size], dim=-1
             )
+        if self.use_fused_qk_norm_rope_gate:
+            q_gate = q_component
             # mRoPE passes positions as (3, n_tokens) for T/H/W. Fusion is only
             # enabled text-only, where the three rows are identical, so taking
             # the T row is exact. (1D positions pass through.)
@@ -382,16 +387,14 @@ class Qwen3NextAttention(nn.Module):
             return q, k, v, gate
 
         if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
-            )
+            q_gate = q_component
             orig_shape = q_gate.shape[:-1]
             q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
             q, gate = torch.chunk(q_gate, 2, dim=-1)
             q = q.reshape(*orig_shape, -1)
             gate = gate.reshape(*orig_shape, -1)
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q = q_component
             gate = None
 
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
@@ -408,8 +411,8 @@ class Qwen3NextAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        qkv_views, _ = self.qkv_proj.forward_qkv_views(hidden_states)
+        q, k, v, gate = self._project_qkv_gate(qkv_views, positions)
         attn_output = self.attn(q, k, v)
         if gate is not None:
             attn_output = attn_output * torch.sigmoid(gate)
