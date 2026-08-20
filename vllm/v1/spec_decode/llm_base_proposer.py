@@ -65,6 +65,10 @@ from vllm.v1.spec_decode.utils import (
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import maybe_load_mask_embedding
+from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+    embedding_quantization_compatible,
+    embeddings_equal,
+)
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -1527,24 +1531,18 @@ class SpecDecodeBaseProposer:
                 )
 
             share_embeddings = False
+            draft_embed = getattr(self.model.model, "embed_tokens", None)
             if hasattr(self.model, "has_own_embed_tokens"):
                 # EAGLE model
                 if not self.model.has_own_embed_tokens:
                     share_embeddings = True
                     logger.info(
                         "Detected EAGLE model without its own embed_tokens in the"
-                        " checkpoint. Sharing target model embedding weights with the"
-                        " draft model."
+                        " checkpoint. Sharing target model embedding weights with"
+                        " the draft model."
                     )
-                elif (
-                    isinstance(target_embed_tokens.weight, torch.Tensor)
-                    and isinstance(self.model.model.embed_tokens.weight, torch.Tensor)
-                    # TODO: Offload to CPU for comparison to avoid extra GPU memory
-                    # usage in CI testing environments with limited GPU memory
-                    and torch.equal(
-                        target_embed_tokens.weight.cpu(),
-                        self.model.model.embed_tokens.weight.cpu(),
-                    )
+                elif draft_embed is not None and embeddings_equal(
+                    draft_embed, target_embed_tokens
                 ):
                     share_embeddings = True
                     logger.info(
@@ -1552,38 +1550,32 @@ class SpecDecodeBaseProposer:
                         " model. Sharing target model embedding weights with the draft"
                         " model."
                     )
-                else:
+
+                if not share_embeddings:
                     logger.info(
-                        "Detected EAGLE model with distinct embed_tokens weights. "
-                        "Keeping separate embedding weights from the target model."
+                        "Detected EAGLE model with distinct or incompatible "
+                        "embed_tokens weights. Keeping separate embedding weights "
+                        "from the target model."
                     )
             else:
-                # MTP model
-                share_embeddings = True
-                logger.info(
-                    "Detected MTP model. "
-                    "Sharing target model embedding weights with the draft model."
+                # Native MTP embeddings are aliases, but the modules must have
+                # matching widths and quantization representations.
+                share_embeddings = (
+                    draft_embed is not None
+                    and embedding_quantization_compatible(
+                        draft_embed, target_embed_tokens
+                    )
                 )
-
-            if share_embeddings:
-                draft_embed = self.model.model.embed_tokens
-                # Only share when both models use the same embedding width.
-                # Guard with isinstance so non-Tensor weights (e.g. in tests)
-                # are not affected — mirrors the weight-equality check above.
-                if isinstance(target_embed_tokens.weight, torch.Tensor) and isinstance(
-                    draft_embed.weight, torch.Tensor
-                ):
-                    target_dim = target_embed_tokens.weight.shape[-1]
-                    draft_dim = draft_embed.weight.shape[-1]
-                    if target_dim != draft_dim:
-                        share_embeddings = False
-                        logger.info(
-                            "Target embedding dim (%d) differs from draft "
-                            "embedding dim (%d). Keeping separate embedding "
-                            "weights.",
-                            target_dim,
-                            draft_dim,
-                        )
+                if share_embeddings:
+                    logger.info(
+                        "Detected MTP model. "
+                        "Sharing target model embedding weights with the draft model."
+                    )
+                else:
+                    logger.info(
+                        "Detected MTP model with incompatible embedding width or "
+                        "quantization. Keeping separate embedding weights."
+                    )
 
             if share_embeddings:
                 if hasattr(self.model.model, "embed_tokens"):
