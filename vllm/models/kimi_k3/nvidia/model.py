@@ -20,6 +20,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce_in_place,
 )
+from vllm.distributed.utils import split_tensor_along_last_dim
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
@@ -336,6 +337,8 @@ class KimiMLP(nn.Module):
 
 
 class KimiRoutedOutputTransform(nn.Module):
+    _CALLER_OUTPUT_MIN_TOKENS = 1024
+
     def __init__(
         self,
         norm: RMSNorm | None,
@@ -359,6 +362,7 @@ class KimiRoutedOutputTransform(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Project the routed latent back to the hidden dim.
 
@@ -368,16 +372,49 @@ class KimiRoutedOutputTransform(nn.Module):
                 accumulate into. A replicated projection consumes it in the
                 GEMM's beta-add epilogue; a TP-sharded projection adds the two
                 rank-local partials before their shared all-reduce.
+            output: Dead caller-owned storage for the routed projection. This
+                preserves the separate projection and shared-output addition.
         """
+        if residual is not None and output is not None:
+            raise ValueError(
+                "Kimi routed output transform accepts either residual or output"
+            )
         self.capture_routed_latent(hidden_states)
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
         if residual is not None and isinstance(self.up_proj, ReplicatedLinear):
             return residual.addmm_(hidden_states, self.up_proj.weight.t())
-        hidden_states, _ = self.up_proj(hidden_states)
+        if output is not None:
+            if not self.can_write_output(hidden_states, output):
+                raise ValueError(
+                    "Kimi routed output transform cannot write the supplied buffer"
+                )
+            hidden_states, _ = self.up_proj.forward_into(hidden_states, output)
+        else:
+            hidden_states, _ = self.up_proj(hidden_states)
         if residual is not None:
             hidden_states.add_(residual)
         return hidden_states
+
+    def can_write_output(
+        self, hidden_states: torch.Tensor, output: torch.Tensor
+    ) -> bool:
+        """Check the prefill-only caller-owned output contract."""
+        return (
+            isinstance(self.up_proj, KimiPaddedRowParallelLinear)
+            and isinstance(self.up_proj.quant_method, UnquantizedLinearMethod)
+            and self.up_proj.bias is None
+            and not envs.VLLM_BATCH_INVARIANT
+            and hidden_states.ndim == 2
+            and output.ndim == 2
+            and hidden_states.shape[0] >= self._CALLER_OUTPUT_MIN_TOKENS
+            and output.shape == (hidden_states.shape[0], self.up_proj.output_size)
+            and output.dtype == hidden_states.dtype
+            and output.device == hidden_states.device
+            and output.is_contiguous()
+            and output.untyped_storage().data_ptr()
+            != hidden_states.untyped_storage().data_ptr()
+        )
 
     @property
     def output_is_tp_partial(self) -> bool:
@@ -514,6 +551,35 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
         if self.input_pad:
             x = torch.nn.functional.pad(x, (0, self.input_pad))
         return super().forward(x)
+
+    def forward_into(
+        self, x: torch.Tensor, output: torch.Tensor
+    ) -> tuple[torch.Tensor, None]:
+        """Write an unquantized rank-local projection into caller storage."""
+        if not isinstance(self.quant_method, UnquantizedLinearMethod):
+            raise ValueError("Caller-owned output requires an unquantized projection")
+        if self.bias is not None or self.reduce_results:
+            raise ValueError(
+                "Caller-owned output requires a bias-free unreduced projection"
+            )
+        if x.ndim != 2 or output.ndim != 2:
+            raise ValueError("Caller-owned output requires 2D tensors")
+        if self.input_pad:
+            x = torch.nn.functional.pad(x, (0, self.input_pad))
+        if self.input_is_parallel:
+            input_parallel = x
+        else:
+            input_parallel = split_tensor_along_last_dim(
+                x, num_partitions=self.tp_size
+            )[self.tp_rank].contiguous()
+        expected_shape = (input_parallel.shape[0], self.output_size)
+        if output.shape != expected_shape:
+            raise ValueError(
+                f"Caller-owned output has shape {tuple(output.shape)}; "
+                f"expected {expected_shape}"
+            )
+        torch.mm(input_parallel, self.weight.t(), out=output)
+        return output, None
 
 
 class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):

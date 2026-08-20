@@ -20,6 +20,22 @@ class _PartialOutputTransform(torch.nn.Module):
         return hidden_states
 
 
+class _BufferedPartialOutputTransform(torch.nn.Module):
+    output_is_tp_partial = True
+
+    def can_write_output(
+        self, hidden_states: torch.Tensor, output: torch.Tensor
+    ) -> bool:
+        return hidden_states.shape == output.shape
+
+    def forward(
+        self, hidden_states: torch.Tensor, output: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        assert output is not None
+        output.copy_(hidden_states)
+        return output
+
+
 def test_aux_stream_output_lifetime_extends_to_consumer(monkeypatch) -> None:
     shared_experts = object.__new__(SharedExperts)
     aux_stream = Mock()
@@ -95,4 +111,66 @@ def test_tp_partial_output_transform_defers_shared_reduce(monkeypatch) -> None:
 
     assert len(reduced_inputs) == 1
     torch.testing.assert_close(reduced_inputs[0], shared_output + fused_output)
+    torch.testing.assert_close(actual, (shared_output + fused_output) * 2)
+
+
+def test_tp_partial_output_transform_reuses_dead_input(monkeypatch) -> None:
+    runner = object.__new__(MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.routed_output_transform = _BufferedPartialOutputTransform()
+    runner.routed_input_transform = None
+    runner.routed_scaling_factor = 1.0
+    runner.router = None
+    runner.layer_name = "test"
+    runner.moe_config = SimpleNamespace(
+        hidden_dim_unpadded=4,
+        is_sequence_parallel=False,
+        skip_final_all_reduce=False,
+        tp_size=2,
+        ep_size=1,
+    )
+    runner.routed_experts = SimpleNamespace(
+        quant_method=SimpleNamespace(
+            has_unpadded_output=False,
+            moe_kernel=SimpleNamespace(output_is_reduced=lambda: True),
+        )
+    )
+    runner._maybe_pad_hidden_states = MethodType(
+        lambda self, shared, routed: (routed, None, None),
+        runner,
+    )
+
+    shared_output = torch.full((2, 4), 2.0)
+    fused_output = torch.full((2, 4), 3.0)
+    runner._forward_entry = Mock(return_value=(shared_output, fused_output))
+    functional_reduce = Mock()
+    reduced_ptrs: list[int] = []
+
+    def all_reduce_in_place(hidden_states: torch.Tensor) -> torch.Tensor:
+        reduced_ptrs.append(hidden_states.data_ptr())
+        hidden_states.mul_(2)
+        return hidden_states
+
+    monkeypatch.setattr(
+        moe_runner_module,
+        "tensor_model_parallel_all_reduce",
+        functional_reduce,
+    )
+    monkeypatch.setattr(
+        moe_runner_module,
+        "tensor_model_parallel_all_reduce_in_place",
+        all_reduce_in_place,
+    )
+
+    dead_input = torch.zeros_like(shared_output)
+    dead_input_ptr = dead_input.data_ptr()
+    actual = runner.forward(
+        torch.zeros_like(shared_output),
+        router_logits=torch.empty(2, 1),
+        shared_experts_input=dead_input,
+    )
+
+    assert actual.data_ptr() == dead_input_ptr
+    assert reduced_ptrs == [dead_input_ptr]
+    functional_reduce.assert_not_called()
     torch.testing.assert_close(actual, (shared_output + fused_output) * 2)

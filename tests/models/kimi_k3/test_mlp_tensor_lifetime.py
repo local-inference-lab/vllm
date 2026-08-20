@@ -7,7 +7,11 @@ import torch
 from torch import nn
 
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-from vllm.models.kimi_k3.nvidia.model import KimiMLP
+from vllm.models.kimi_k3.nvidia.model import (
+    KimiMLP,
+    KimiPaddedRowParallelLinear,
+    KimiRoutedOutputTransform,
+)
 
 
 class _GateUp(nn.Module):
@@ -115,3 +119,54 @@ def test_mlp_preserves_functional_decode_collective() -> None:
 
     assert not mlp.should_use_caller_output(torch.empty(8, 4))
     assert mlp.should_use_caller_output(torch.empty(1024, 4))
+
+
+def test_routed_output_transform_reuses_full_width_prefill_input() -> None:
+    projection = object.__new__(KimiPaddedRowParallelLinear)
+    nn.Module.__init__(projection)
+    projection.input_pad = 0
+    projection.input_is_parallel = False
+    projection.tp_size = 2
+    projection.tp_rank = 0
+    projection.output_size = 4
+    projection.reduce_results = False
+    projection.quant_method = UnquantizedLinearMethod()
+    projection.register_parameter("bias", None)
+    projection.weight = nn.Parameter(
+        torch.arange(12).view(4, 3).float(), requires_grad=False
+    )
+
+    transform = KimiRoutedOutputTransform(None, projection, layer_idx=0)
+    hidden_states = torch.arange(1024 * 6).view(1024, 6).float()
+    output = torch.empty(1024, 4)
+    output_ptr = output.data_ptr()
+    expected = torch.mm(hidden_states[:, :3], projection.weight.t())
+
+    assert transform.can_write_output(hidden_states, output)
+    with torch.inference_mode():
+        actual = transform(hidden_states, output=output)
+
+    assert actual.data_ptr() == output_ptr
+    torch.testing.assert_close(actual, expected)
+
+
+def test_routed_output_transform_keeps_decode_on_allocating_path() -> None:
+    projection = object.__new__(KimiPaddedRowParallelLinear)
+    nn.Module.__init__(projection)
+    projection.input_pad = 0
+    projection.input_is_parallel = False
+    projection.tp_size = 2
+    projection.tp_rank = 0
+    projection.output_size = 4
+    projection.reduce_results = False
+    projection.quant_method = UnquantizedLinearMethod()
+    projection.register_parameter("bias", None)
+    projection.weight = nn.Parameter(
+        torch.arange(12).view(4, 3).float(), requires_grad=False
+    )
+
+    transform = KimiRoutedOutputTransform(None, projection, layer_idx=0)
+    hidden_states = torch.arange(8 * 6).view(8, 6).float()
+    output = torch.empty(8, 4)
+
+    assert not transform.can_write_output(hidden_states, output)

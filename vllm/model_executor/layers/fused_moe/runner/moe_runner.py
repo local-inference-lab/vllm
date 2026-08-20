@@ -14,6 +14,7 @@ from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce_in_place,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import (
@@ -411,6 +412,7 @@ class MoERunner(MoERunnerInterface):
     def apply_routed_output_transform(
         self,
         fused_output: torch.Tensor,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply transform to routed expert output (e.g., latent to full dim).
 
@@ -419,9 +421,29 @@ class MoERunner(MoERunnerInterface):
         the full hidden dimension before combining with shared expert output.
         """
         if self.routed_output_transform is not None:
-            r = self.routed_output_transform(fused_output)
+            if output is None:
+                r = self.routed_output_transform(fused_output)
+            else:
+                r = self.routed_output_transform(fused_output, output=output)
             fused_output = r[0] if isinstance(r, tuple) else r
         return fused_output
+
+    def _get_routed_output_buffer(
+        self,
+        fused_output: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Return dead caller storage accepted by the output transform."""
+        if shared_experts_input is None or self.routed_output_transform is None:
+            return None
+        can_write_output = getattr(
+            self.routed_output_transform, "can_write_output", None
+        )
+        if can_write_output is None or not can_write_output(
+            fused_output, shared_experts_input
+        ):
+            return None
+        return shared_experts_input
 
     def _maybe_apply_routed_scale_to_output(
         self,
@@ -499,6 +521,8 @@ class MoERunner(MoERunnerInterface):
         states: torch.Tensor,
         trunc_size: int | None,
         output_is_reduced: bool | None = None,
+        *,
+        in_place: bool = False,
     ) -> torch.Tensor:
         """All-reduce the combined output if needed.
 
@@ -526,7 +550,10 @@ class MoERunner(MoERunnerInterface):
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not output_is_reduced
         ):
-            states = tensor_model_parallel_all_reduce(states)
+            if in_place:
+                states = tensor_model_parallel_all_reduce_in_place(states)
+            else:
+                states = tensor_model_parallel_all_reduce(states)
 
         return states[..., :trunc_size] if trunc_size is not None else states
 
@@ -822,18 +849,32 @@ class MoERunner(MoERunnerInterface):
             shared_output, fused_output
         )
 
-        # Apply output transform (e.g. latent -> full dim)
-        fused_output = self.apply_routed_output_transform(fused_output)
+        # The shared-expert input is dead after _forward_entry returns. Output
+        # transforms that explicitly accept caller-owned storage may reuse it
+        # for allocation-sensitive prefill projections.
+        routed_output_buffer = self._get_routed_output_buffer(
+            fused_output, shared_experts_input
+        )
+        fused_output = self.apply_routed_output_transform(
+            fused_output, output=routed_output_buffer
+        )
         if output_transform_is_tp_partial:
             fused_output_is_reduced = False
 
         if shared_output is not None:
-            result = shared_output + fused_output
+            if routed_output_buffer is not None:
+                fused_output.add_(shared_output)
+                result = fused_output
+            else:
+                result = shared_output + fused_output
         else:
             result = fused_output
 
         result = self._maybe_reduce_final_output(
-            result, og_hidden_dim_post_xform, fused_output_is_reduced
+            result,
+            og_hidden_dim_post_xform,
+            fused_output_is_reduced,
+            in_place=routed_output_buffer is not None,
         )
 
         return self._maybe_add_zero_expert_output(result)
