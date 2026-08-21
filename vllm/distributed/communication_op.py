@@ -29,7 +29,16 @@ def tensor_model_parallel_all_gather(
 def tensor_model_parallel_all_gatherv(
     input_: torch.Tensor, sizes: list[int], dim: int = 0
 ) -> torch.Tensor:
-    """All-gather variable-length tensor slices across the model-parallel group."""
+    """All-gather variable-length slices across the model-parallel group.
+
+    Args:
+        input_: Local tensor slice.
+        sizes: Slice length for each tensor-parallel rank.
+        dim: Dimension along which the slices are concatenated.
+
+    Returns:
+        Rank-ordered tensor slices concatenated along ``dim``.
+    """
     tp_group = get_tp_group()
     if tp_group.world_size == 1:
         return input_
