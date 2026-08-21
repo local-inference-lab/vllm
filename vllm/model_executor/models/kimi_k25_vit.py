@@ -840,21 +840,24 @@ class MoonViT3dPretrainedModel(nn.Module):
 
 @torch.inference_mode()
 def mm_projector_forward(mm_projector: torch.nn.Module, vt_output: list[torch.Tensor]):
-    """Apply MM projector to vision tower outputs."""
-    num_embedding_list = [x.shape[0] for x in vt_output]
-    batched = torch.cat(vt_output, dim=0)
+    """Apply the projector without concatenating independent image features."""
+    if not vt_output:
+        raise ValueError("Kimi vision projection requires at least one image feature")
+
     projector_norm = getattr(mm_projector, "pre_norm", None)
     if projector_norm is None:
         projector_norm = getattr(mm_projector, "post_norm", None)
     projector_dtype = (
-        projector_norm.weight.dtype if projector_norm is not None else batched.dtype
+        projector_norm.weight.dtype if projector_norm is not None else None
     )
-    if batched.dtype != projector_dtype:
-        batched = batched.to(projector_dtype)
-    proj_out = mm_projector(batched)
-    proj_out = proj_out.reshape(-1, proj_out.shape[-1])
-    proj_out = torch.split(proj_out, num_embedding_list)
-    return proj_out
+
+    projected = []
+    for image_features in vt_output:
+        if projector_dtype is not None and image_features.dtype != projector_dtype:
+            image_features = image_features.to(projector_dtype)
+        output = mm_projector(image_features)
+        projected.append(output.reshape(-1, output.shape[-1]))
+    return tuple(projected)
 
 
 @torch.inference_mode()
