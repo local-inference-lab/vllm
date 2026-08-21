@@ -562,13 +562,8 @@ class DelegatingParser(Parser):
 
         reasoning_enabled = self._reasoning_enabled()
 
-        # When the model emits a reasoning prefix (e.g. ``...</think>``) before
-        # its tool call, the structural-tag grammar MUST include the reasoning
-        # section. Otherwise the grammar only models the tool-call format and
-        # the structured-output FSM rejects the reasoning tokens at the
-        # reasoning->tool boundary (HTTP 500 non-streaming / mid-stream error
-        # streaming). The engine's structural-tag same-step advance also assumes
-        # the tag models this phased (reasoning -> tool) output.
+        # A reasoning-aware structural grammar owns both the unconstrained
+        # reasoning prefix and the constrained tool-call suffix.
         structure_tag = self._tool_parser.get_structural_tag(
             request,
             reasoning=reasoning_enabled,
@@ -585,22 +580,10 @@ class DelegatingParser(Parser):
         else:
             request.response_format = None
 
-        # The structural tag now models the reasoning phase itself (an
-        # unconstrained prefix terminated by the reasoning-end marker), so the
-        # structured-output engine must enforce the grammar from the FIRST
-        # token rather than deferring past a reasoning section it would no
-        # longer detect separately. Without this, tokens sampled immediately
-        # after the reasoning-end marker escape the grammar bitmask, so a
-        # forced/required tool suffix can be violated (e.g. the model samples
-        # prose instead of the tool call); the FSM advance then rejects those
-        # tokens and the request fails with an internal error. This reuses the
-        # same signal the Mistral grammar path uses to mark "the grammar
-        # handles reasoning" (-> reasoning_ended=True at generation start). The
-        # reasoning prefix is unconstrained, so thinking is not restricted; only
-        # the post-reasoning tool call is enforced. PrivateAttr exists only on
-        # ChatCompletionRequest, hence the guard.
-        if reasoning_enabled and hasattr(request, "_grammar_from_tool_parser"):
-            request._grammar_from_tool_parser = True
+        # Chat serving normally defers grammar activation until reasoning ends.
+        # This grammar already models reasoning, so activate it at token zero.
+        if reasoning_enabled and hasattr(request, "_grammar_from_parser"):
+            request._grammar_from_parser = True
         return request
 
     def extract_reasoning_streaming(
