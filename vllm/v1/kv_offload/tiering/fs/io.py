@@ -87,6 +87,25 @@ def _validate_offsets(view: memoryview, offsets: list[int], block_size: int) -> 
             )
 
 
+def _publish_file_if_absent(tmp_path: str, dest_path: str) -> None:
+    """Publish a complete content-addressed file without replacing its inode.
+
+    Args:
+        tmp_path: Path to the completed private temporary file.
+        dest_path: Path to the content-addressed destination file.
+
+    Returns:
+        None.
+
+    Raises:
+        OSError: If publication or temporary-file cleanup fails.
+    """
+    # A competing writer may have published the same immutable key.
+    with contextlib.suppress(FileExistsError):
+        os.link(tmp_path, dest_path)
+    os.remove(tmp_path)
+
+
 def _store_block(
     dest_path: str,
     buffer: memoryview,
@@ -95,7 +114,7 @@ def _store_block(
     use_o_direct: bool = True,
 ) -> None:
     """
-    Store callback: Writes to a temp file then atomically replaces the destination.
+    Store callback: Writes to a temp file then publishes it if absent.
     """
     # Check if block already exists to avoid redundant writes
     if os.path.exists(dest_path):
@@ -123,7 +142,7 @@ def _store_block(
                 )
         finally:
             os.close(fd)
-        os.replace(tmp_path, dest_path)
+        _publish_file_if_absent(tmp_path, dest_path)
     except Exception:
         try:
             os.remove(tmp_path)
@@ -175,8 +194,9 @@ def batch_store_block(
     """
     Store a batch of KV blocks from a shared buffer to disk in one call.
 
-    Each block buffer[offsets[i] : offsets[i]+block_size] is written atomically
-    to dest_paths[i] via a temp-file rename.  Raises on first error.
+    Each block buffer[offsets[i] : offsets[i]+block_size] is written to a
+    private temp file and atomically published only if dest_paths[i] is absent.
+    Raises on first error.
     """
     _validate_offsets(view, offsets, block_size)
 

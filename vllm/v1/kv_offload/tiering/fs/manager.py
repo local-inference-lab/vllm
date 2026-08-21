@@ -4,8 +4,8 @@
 FileSystemTierManager: Pure-Python file system secondary tier for KV cache offloading.
 
 Store path:
-    Data is written to a temp file (<dest_path.tmp>) via os.write,
-    then os.replace'd to the final path (without .tmp).
+    Data is written to a private temp file via os.write, then atomically linked
+    to the final content-addressed path only if that path is absent.
 
 Load path:
     Data is read from the block file directly via os.readv into the
