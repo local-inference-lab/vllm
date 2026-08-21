@@ -601,6 +601,42 @@ def copy_kv_cache_blocks_inplace(
         blocks[dst_indices] = blocks[src_indices]
 
 
+def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:
+    """Whether every request in the batch has the same query length.
+
+    Shape test only; use ``get_uniform_decode_token_count`` to classify a
+    scheduled batch, since a prompt chunk can have a decode batch's shape.
+
+    Args:
+        num_reqs: Number of scheduled requests.
+        num_tokens: Total number of scheduled query tokens.
+        max_query_len: Largest scheduled query length in the batch.
+
+    Returns:
+        True when the batch is non-empty and every query has the same length.
+    """
+    return num_reqs > 0 and num_tokens == max_query_len * num_reqs
+
+
+def get_uniform_decode_token_count(
+    num_reqs: int, num_tokens: int, max_query_len: int, has_prefill: bool
+) -> int | None:
+    """Return the per-request token count for a uniform decode batch.
+
+    Args:
+        num_reqs: Number of scheduled requests.
+        num_tokens: Total number of scheduled query tokens.
+        max_query_len: Largest scheduled query length in the batch.
+        has_prefill: Whether any scheduled request is consuming prompt tokens.
+
+    Returns:
+        The common query length for a uniform all-decode batch, otherwise None.
+    """
+    if not has_prefill and is_uniform_query_len(num_reqs, num_tokens, max_query_len):
+        return max_query_len
+    return None
+
+
 def is_residual_scattered_for_sp(
     vllm_config: VllmConfig, num_input_tokens: int
 ) -> bool:

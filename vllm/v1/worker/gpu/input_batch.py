@@ -112,6 +112,15 @@ class InputBatch:
     # Seeded per num_tokens so all TP ranks generate identical ids.
     dummy_input_ids_random_high: ClassVar[int] = 0
 
+    @property
+    def has_prefill(self) -> bool:
+        """Whether any scheduled request is still consuming prompt tokens.
+
+        Returns:
+            True when at least one request is prefilling.
+        """
+        return bool(self.is_prefilling_np.any())
+
     @classmethod
     def make_dummy(
         cls,

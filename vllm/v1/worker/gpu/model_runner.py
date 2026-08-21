@@ -156,7 +156,11 @@ from vllm.v1.worker.gpu.spec_decode.utils import (
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
+from vllm.v1.worker.utils import (
+    KVBlockZeroer,
+    copy_kv_cache_blocks_inplace,
+    get_uniform_decode_token_count,
+)
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
@@ -1369,25 +1373,77 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.kv_cache_block_copies,
             )
 
+    def gather_batch_req_state(
+        self, scheduler_output: SchedulerOutput, dummy_run: bool
+    ) -> tuple["BatchReqState | None", int | None]:
+        """Classify scheduled requests before selecting a CUDA graph.
+
+        A prompt chunk can have the same token-count shape as a speculative
+        decode batch. Request state, rather than shape alone, determines
+        whether a FULL decode graph is eligible.
+
+        Args:
+            scheduler_output: Scheduler decisions for the model invocation.
+            dummy_run: Whether the invocation constructs graph-capture inputs.
+
+        Returns:
+            A tuple containing ordered CPU request state (None for a dummy run)
+            and the common decode query length when FULL replay is eligible.
+        """
+        num_tokens_per_req = scheduler_output.num_scheduled_tokens
+        num_reqs = len(num_tokens_per_req)
+        num_tokens = scheduler_output.total_num_scheduled_tokens
+        max_query_len = max(num_tokens_per_req.values())
+
+        if dummy_run:
+            return None, get_uniform_token_count(num_reqs, num_tokens, max_query_len)
+
+        req_ids = sort_batch_req_ids(num_tokens_per_req, self.decode_query_len)
+        num_scheduled_tokens = np.fromiter(
+            map(num_tokens_per_req.__getitem__, req_ids),
+            dtype=np.int32,
+            count=num_reqs,
+        )
+        idx_mapping_np = np.fromiter(
+            map(self.req_states.req_id_to_index.__getitem__, req_ids),
+            dtype=np.intp,
+            count=num_reqs,
+        )
+        prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
+        num_computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens[
+            idx_mapping_np
+        ]
+        is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
+        batch_req_state = BatchReqState(
+            req_ids=req_ids,
+            num_scheduled_tokens=num_scheduled_tokens,
+            idx_mapping_np=idx_mapping_np,
+            prefill_len_np=prefill_len_np,
+            num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
+            is_prefilling_np=is_prefilling_np,
+            has_prefill=bool(is_prefilling_np.any()),
+        )
+        return batch_req_state, get_uniform_decode_token_count(
+            num_reqs,
+            num_tokens,
+            max_query_len,
+            batch_req_state.has_prefill,
+        )
+
     def prepare_inputs(
         self,
         scheduler_output: SchedulerOutput,
+        batch_req_state: "BatchReqState",
         batch_desc: BatchExecutionDescriptor,
         max_query_len: int,
     ) -> InputBatch:
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_tokens_after_padding = batch_desc.num_tokens
-        num_tokens_per_req = scheduler_output.num_scheduled_tokens
-        num_reqs = len(num_tokens_per_req)
-
-        # batch_idx -> req_id
-        req_ids = sort_batch_req_ids(num_tokens_per_req, self.decode_query_len)
-        numtoks_iter = map(num_tokens_per_req.__getitem__, req_ids)
-        num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
-
-        idx_mapping_iter = map(self.req_states.req_id_to_index.__getitem__, req_ids)
-        idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.intp, count=num_reqs)
+        req_ids = batch_req_state.req_ids
+        num_scheduled_tokens = batch_req_state.num_scheduled_tokens
+        idx_mapping_np = batch_req_state.idx_mapping_np
         idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+        num_reqs = len(req_ids)
 
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -1451,13 +1507,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
-        prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
-        computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens
-        num_computed_prefill_tokens_np = computed_prefill_tokens_np[idx_mapping_np]
-        is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
-
         # Get prefill tokens if any.
-        if np.any(is_prefilling_np):
+        if batch_req_state.has_prefill:
             prepare_prefill_inputs(
                 self.input_buffers.input_ids,
                 self.req_states.next_prefill_tokens,
@@ -1548,9 +1599,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_seq_len_upper_bound=max_seq_len_upper_bound,
             dcp_local_seq_lens=dcp_local_seq_lens,
             num_computed_tokens_np=num_computed_tokens_np,
-            prefill_len_np=prefill_len_np,
-            num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
-            is_prefilling_np=is_prefilling_np,
+            prefill_len_np=batch_req_state.prefill_len_np,
+            num_computed_prefill_tokens_np=(
+                batch_req_state.num_computed_prefill_tokens_np
+            ),
+            is_prefilling_np=batch_req_state.is_prefilling_np,
             max_seq_len_np=max_seq_len_np,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
@@ -1743,7 +1796,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
-        uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        batch_req_state, uniform_tok_count = self.gather_batch_req_state(
+            scheduler_output, dummy_run
+        )
         # Per-request token bound for graph dispatch: varlen spec-decode graphs
         # are captured for at most `max_req_tokens` tokens per request, so a
         # batch may only replay one if its longest request fits.
@@ -1830,9 +1885,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
+            assert batch_req_state is not None
             with record_function_or_nullcontext("vllm:v2/target/prepare_inputs"):
                 input_batch = self.prepare_inputs(
-                    scheduler_output, batch_desc, max_query_len
+                    scheduler_output,
+                    batch_req_state,
+                    batch_desc,
+                    max_query_len,
                 )
             _prepare_kquant_capture_batch(input_batch)
             phase = _profile_batch_phase(input_batch)
@@ -2420,6 +2479,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @property
     def pcp_manager_cls(self) -> type[pcp.PCPManager]:
         return pcp.PCPManager
+
+
+class BatchReqState(NamedTuple):
+    """CPU request state for a scheduled batch, in execution order."""
+
+    req_ids: list[str]
+    num_scheduled_tokens: np.ndarray
+    idx_mapping_np: np.ndarray
+    prefill_len_np: np.ndarray
+    num_computed_prefill_tokens_np: np.ndarray
+    is_prefilling_np: np.ndarray
+    has_prefill: bool
 
 
 class ExecuteModelState(NamedTuple):
