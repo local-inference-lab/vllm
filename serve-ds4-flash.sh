@@ -7,6 +7,11 @@ set -euo pipefail
 
 unset NCCL_GRAPH_FILE NCCL_GRAPH_DUMP_FILE VLLM_B12X_MLA_EXTEND_MAX_CHUNKS
 
+# All distributed workers launched by this entrypoint share one host. Keep
+# process-group bootstrap local unless a multi-node wrapper selects an interface.
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-lo}"
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-lo}"
+
 bool_value() {
   local name=$1 value=${2,,}
   case "${value}" in
@@ -85,6 +90,11 @@ revision_args=()
 if [[ -n "${model_revision}" ]]; then
   revision_args=(--revision "${model_revision}")
 fi
+tokenizer_revision=${TOKENIZER_REVISION:-${model_revision}}
+tokenizer_revision_args=()
+if [[ -n "${tokenizer_revision}" ]]; then
+  tokenizer_revision_args=(--tokenizer-revision "${tokenizer_revision}")
+fi
 
 host=${HOST:-0.0.0.0}
 port=${PORT:-8000}
@@ -120,7 +130,13 @@ if [[ -n "${kv_offloading_size}" \
   exit 2
 fi
 native_l2_enabled=0
-if [[ -n "${native_l2_path}" || -n "${native_l2_size}" ]]; then
+# A zero capacity disables filesystem L2 even when a deployment supplies a
+# reusable default path. Positive capacities require the complete L1/L2
+# contract below.
+if [[ -n "${native_l2_size}" \
+  && "${native_l2_size}" =~ ^0*([.]0*)?$ ]]; then
+  :
+elif [[ -n "${native_l2_path}" || -n "${native_l2_size}" ]]; then
   if [[ -z "${native_l2_path}" || -z "${native_l2_size}" ]]; then
     echo "NATIVE_L2_PATH and NATIVE_L2_GB must be set together" >&2
     exit 2
@@ -299,6 +315,7 @@ spec_args=()
 spec_tokens=0
 graph_multiplier=4
 dspark_depth_mode=disabled
+capacity_activation_summary=disabled
 if [[ "${mode}" == "mtp2" || "${mode}" == "mtp3" ]]; then
   if [[ "${mode}" == "mtp2" ]]; then spec_tokens=2; else spec_tokens=3; fi
   mtp_moe_json=
@@ -343,7 +360,7 @@ elif [[ "${mode}" == "dspark" ]]; then
     dynamic)
       default_dspark_capacity=1
       default_dynamic_depth=1
-      default_activation_batch_size=1
+      default_activation_batch_size=0
       ;;
     *)
       echo "DSPARK_DEPTH_MODE must be fixed or dynamic" >&2
@@ -400,13 +417,20 @@ elif [[ "${mode}" == "dspark" ]]; then
   export VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE=${activation_batch_size}
   require_nonnegative_int DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE \
     "${VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE}"
+  if [[ "${dspark_capacity}" == "1" ]]; then
+    if [[ "${activation_batch_size}" == "0" ]]; then
+      capacity_activation_summary=auto
+    else
+      capacity_activation_summary=${activation_batch_size}
+    fi
+  fi
   export VLLM_DSPARK_CAPACITY_LOG_INTERVAL=${DSPARK_CAPACITY_LOG_INTERVAL:-0}
   export VLLM_DSPARK_STS_LOG_INTERVAL=${DSPARK_STS_LOG_INTERVAL:-0}
   export VLLM_DSPARK_TP_CHECK=${DSPARK_TP_CHECK:-0}
 fi
 
-# v9 used graph 256 for MTP-off and 512 for MTP modes at cc64. Keep that MTP
-# contract; DSpark uses its exact (K + 1) physical verifier width.
+# Target-only profiles reserve four graph rows per request and MTP profiles
+# reserve eight. DSpark uses its exact one-target-plus-K-drafts verifier width.
 graph_cap=${MAX_CUDAGRAPH_CAPTURE_SIZE:-${GRAPH:-}}
 if [[ -z "${graph_cap}" || "${graph_cap}" == "auto" ]]; then
   graph_cap=$((max_num_seqs * graph_multiplier))
@@ -559,6 +583,7 @@ mkdir -p \
 command=(
   vllm serve "${model}"
   "${revision_args[@]}"
+  "${tokenizer_revision_args[@]}"
   --served-model-name "${served_model_name}"
   --host "${host}"
   --port "${port}"
@@ -603,13 +628,15 @@ if [[ -n "${EXTRA_VLLM_ARGS:-}" ]]; then
 fi
 command+=("$@")
 
-printf 'DS4 launch: mode=%s depth=%s backend=%s allreduce=%s b12x_dma=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s instanttensor_backend=%s native_l2=%s allocator=%s model=%s\n' \
-  "${mode}" "${dspark_depth_mode}" \
+printf 'DS4 launch: mode=%s depth=%s capacity_activation=%s backend=%s allreduce=%s b12x_dma=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s instanttensor_backend=%s native_l2=%s allocator=%s model=%s\n' \
+  "${mode}" "${dspark_depth_mode}" "${capacity_activation_summary}" \
   "${backend}" "${allreduce_mode}" "${b12x_pcie_dma}" \
   "${indexer_backend}" "${tp_size}" "${dcp_size}" "${max_num_seqs}" \
   "${graph_cap}" "${load_format}" "${INSTANTTENSOR_BACKEND}" \
   "${native_l2_enabled}" \
   "${PYTORCH_CUDA_ALLOC_CONF:-<unset>}" "${model}" >&2
+printf 'Process-group interfaces: GLOO_SOCKET_IFNAME=%s NCCL_SOCKET_IFNAME=%s\n' \
+  "${GLOO_SOCKET_IFNAME}" "${NCCL_SOCKET_IFNAME}" >&2
 printf 'Command:' >&2
 printf ' %q' "${command[@]}" >&2
 printf '\n' >&2
