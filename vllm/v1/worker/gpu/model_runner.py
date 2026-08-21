@@ -1558,6 +1558,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_lens=prompt_lens,
             max_req_tokens=max_req_tokens,
             valid_num_draft_tokens_per_req=valid_num_draft_tokens_per_req,
+            all_token_ids_cpu=self.req_states.all_token_ids.cpu,
         )
         # InputBuffers are reused across real, dummy, and captured batches.
         # Clear stale padding before a capacity manager optionally marks a
