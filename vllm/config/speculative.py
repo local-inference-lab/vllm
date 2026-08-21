@@ -799,15 +799,21 @@ class SpeculativeConfig:
         parts = model.split(".")
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
-    def _inherit_target_revision_for_mtp(self) -> None:
-        """Pin an in-checkpoint MTP draft to the target model revision."""
+    def _inherit_target_identity_for_in_checkpoint_draft(self) -> None:
+        """Use target artifact settings for a draft stored in that artifact."""
         target = self.target_model_config
-        if self.method != "mtp" or target is None or self.model != target.model:
+        if (
+            self.method not in ("mtp", "dspark")
+            or target is None
+            or self.model != target.model
+        ):
             return
         if self.revision is None:
             self.revision = target.revision
         if self.code_revision is None:
             self.code_revision = target.code_revision
+        if self.quantization is None:
+            self.quantization = target.quantization
 
     def _cap_same_model_draft_position_embeddings(self) -> bool:
         """Cap an in-checkpoint draft to the target's effective RoPE table."""
@@ -1003,7 +1009,7 @@ class SpeculativeConfig:
             self.prompt_lookup_min = 0
 
             if self.model is not None:
-                self._inherit_target_revision_for_mtp()
+                self._inherit_target_identity_for_in_checkpoint_draft()
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # lack a model_type key in config.json, so AutoConfig cannot
                 # detect them. When the method is explicitly "medusa", inject
