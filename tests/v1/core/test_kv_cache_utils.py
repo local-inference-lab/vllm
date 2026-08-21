@@ -2935,6 +2935,73 @@ def test_k3_hybrid_group_size_is_model_and_cache_specific(
     assert len(groups) == expected_groups
 
 
+@pytest.mark.parametrize("dcp_world_size", [8, 16])
+def test_k3_parallel_draft_groups_are_annotated_by_layer_contract(
+    dcp_world_size: int,
+):
+    target = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+    )
+    partial_dcp = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=288,
+        dtype=torch.uint8,
+        dcp_kv_shard_count=8,
+    )
+    parallel_draft = SlidingWindowMLASpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        sliding_window=32768,
+        dcp_replicated=True,
+        non_causal_multi_token_decode=True,
+    )
+    specs: dict[str, KVCacheSpec] = {
+        # Names intentionally disagree with execution metadata so this test
+        # rejects name-based draft-group classification.
+        "draft_name_but_target.0": target,
+        "draft_name_but_target.1": target,
+        "partial_dcp_target.0": partial_dcp,
+        "ordinary_name.0": parallel_draft,
+        "ordinary_name.1": parallel_draft,
+    }
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp_world_size,
+            prefill_context_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="kimi_k3"),
+        ),
+        speculative_config=SimpleNamespace(use_eagle=lambda: True),
+    )
+
+    groups = get_kv_cache_groups(config, specs)
+
+    # DCP8 uses generic uniform-page grouping. DCP16 recognizes the target and
+    # partial-DCP MLA lockstep and packs each semantic type into one group.
+    assert len(groups) == {8: 5, 16: 3}[dcp_world_size]
+    for group in groups:
+        contains_parallel_draft = any(
+            getattr(specs[layer_name], "non_causal_multi_token_decode", False)
+            for layer_name in group.layer_names
+        )
+        assert group.is_eagle_group is contains_parallel_draft
+
+    assert not next(
+        group for group in groups if "draft_name_but_target.0" in group.layer_names
+    ).is_eagle_group
+    assert next(
+        group for group in groups if "ordinary_name.0" in group.layer_names
+    ).is_eagle_group
+
+
 def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():
     # DeepseekV4-style: differing page sizes across MLA and sliding-window MLA
     # layers do require tuple packing, so grouping must still be produced.

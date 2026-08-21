@@ -9,6 +9,76 @@ import torch
 from vllm.models.kimi_k3.nvidia import tp_projection
 
 
+def test_full_width_projection_reduces_large_prefill_in_place(monkeypatch):
+    output_parallel = torch.empty(4096, 4)
+    calls: list[tuple[str, torch.Tensor]] = []
+
+    def reduce_in_place(value: torch.Tensor) -> torch.Tensor:
+        calls.append(("in_place", value))
+        return value
+
+    monkeypatch.setattr(
+        tp_projection,
+        "tensor_model_parallel_all_reduce_in_place",
+        reduce_in_place,
+    )
+    monkeypatch.setattr(
+        tp_projection,
+        "tensor_model_parallel_all_reduce",
+        lambda value: pytest.fail("large prefill must not allocate collective output"),
+    )
+
+    result = tp_projection.reduce_kimi_full_width_projection(output_parallel, 16)
+
+    assert result is output_parallel
+    assert calls == [("in_place", output_parallel)]
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 1023])
+def test_full_width_projection_preserves_decode_collective(monkeypatch, num_tokens):
+    output_parallel = torch.empty(num_tokens, 4)
+    reduced = torch.empty_like(output_parallel)
+    calls: list[torch.Tensor] = []
+
+    def reduce(value: torch.Tensor) -> torch.Tensor:
+        calls.append(value)
+        return reduced
+
+    monkeypatch.setattr(
+        tp_projection,
+        "tensor_model_parallel_all_reduce",
+        reduce,
+    )
+    monkeypatch.setattr(
+        tp_projection,
+        "tensor_model_parallel_all_reduce_in_place",
+        lambda value: pytest.fail("decode must retain its functional collective"),
+    )
+
+    result = tp_projection.reduce_kimi_full_width_projection(output_parallel, 16)
+
+    assert result is reduced
+    assert calls == [output_parallel]
+
+
+def test_full_width_projection_is_identity_at_tp1(monkeypatch):
+    output_parallel = torch.empty(4096, 4)
+    monkeypatch.setattr(
+        tp_projection,
+        "tensor_model_parallel_all_reduce",
+        lambda value: pytest.fail("TP1 must not enter a collective"),
+    )
+    monkeypatch.setattr(
+        tp_projection,
+        "tensor_model_parallel_all_reduce_in_place",
+        lambda value: pytest.fail("TP1 must not enter a collective"),
+    )
+
+    result = tp_projection.reduce_kimi_full_width_projection(output_parallel, 1)
+
+    assert result is output_parallel
+
+
 def test_projection_group_uses_matching_dcp_coordinator(monkeypatch):
     tp_group = SimpleNamespace(world_size=8, ranks=list(range(8)))
     dcp_group = SimpleNamespace(world_size=8, ranks=list(range(8)))

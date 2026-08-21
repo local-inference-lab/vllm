@@ -12,13 +12,16 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce_in_place,
 )
+from vllm.distributed.utils import split_tensor_along_last_dim
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
@@ -42,6 +45,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
@@ -163,6 +167,19 @@ class AuxiliaryStateProjector(Protocol):
 _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD = 256
 
 
+def _release_cuda_cache_before_retained_allocation(device: torch.device) -> None:
+    """Give retained post-load storage a dedicated allocator segment.
+
+    A persistent allocation must not pin the unused part of a large cached
+    segment left by quantization repacking.  KV cache allocation follows this
+    hook and needs every otherwise-inactive segment to be releasable.
+    """
+    if device.type != "cuda":
+        return
+    torch.accelerator.synchronize(device)
+    torch.accelerator.empty_cache()
+
+
 def _uses_native_b12x_mxfp4_intermediate_size(
     vllm_config: VllmConfig,
 ) -> bool:
@@ -219,6 +236,8 @@ class KimiMLP(nn.Module):
     block still ends with one collective per direction.
     """
 
+    _CALLER_OUTPUT_MIN_TOKENS = 1024
+
     def __init__(
         self,
         hidden_size: int,
@@ -272,8 +291,106 @@ class KimiMLP(nn.Module):
                 "Only silu and situ are supported."
             )
 
-    def forward(self, x):
+    @property
+    def supports_caller_output(self) -> bool:
+        """Report whether the down projection accepts caller-owned storage.
+
+        Returns:
+            ``True`` for a materialized, unquantized, bias-free row-parallel
+            projection outside batch-invariant execution.
+        """
+        return (
+            isinstance(self.down_proj.quant_method, UnquantizedLinearMethod)
+            and getattr(self.down_proj, "weight", None) is not None
+            and self.down_proj.input_is_parallel
+            and self.down_proj.bias is None
+            and not envs.VLLM_BATCH_INVARIANT
+        )
+
+    def should_use_caller_output(self, x: torch.Tensor) -> bool:
+        """Select caller-owned storage for allocation-sensitive prefill GEMMs.
+
+        Args:
+            x: Down-projection input used to classify the token batch.
+
+        Returns:
+            ``True`` when the projection supports caller storage, sequence
+            parallelism is disabled, and the input has at least 1,024 rows.
+        """
+        return (
+            self.supports_caller_output
+            and not self.shard_sequence_parallel
+            and x.ndim == 2
+            and x.shape[0] >= self._CALLER_OUTPUT_MIN_TOKENS
+        )
+
+    def _down_proj_into(self, x: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+        """Write the row-parallel down projection into consumed caller storage.
+
+        Args:
+            x: Gated activation consumed by the down projection.
+            output: Contiguous output storage owned by the caller.
+
+        Returns:
+            The supplied output tensor after projection and TP reduction.
+
+        Raises:
+            ValueError: If the projection or output buffer violates the
+                caller-owned output contract.
+        """
+        if not self.supports_caller_output:
+            raise ValueError(
+                "KimiMLP caller-owned output requires an unquantized, "
+                "bias-free row-parallel down projection"
+            )
+        if x.ndim != 2 or output.ndim != 2:
+            raise ValueError("KimiMLP caller-owned output requires 2D tensors")
+        expected_shape = (x.shape[0], self.down_proj.output_size)
+        if tuple(output.shape) != expected_shape:
+            raise ValueError(
+                "KimiMLP caller-owned output has shape "
+                f"{tuple(output.shape)}; expected {expected_shape}"
+            )
+        if not output.is_contiguous() or output.dtype != x.dtype:
+            raise ValueError(
+                "KimiMLP caller-owned output must be contiguous and match "
+                "the activation dtype"
+            )
+        if output.untyped_storage().data_ptr() == x.untyped_storage().data_ptr():
+            raise ValueError(
+                "KimiMLP caller-owned output must not alias the down-projection input"
+            )
+
+        torch.mm(x, self.down_proj.weight.t(), out=output)
+        if self.down_proj.reduce_results and self.down_proj.tp_size > 1:
+            output = tensor_model_parallel_all_reduce_in_place(output)
+        return output
+
+    def forward(
+        self, x: torch.Tensor, output: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Apply the gated MLP and optionally reuse caller-owned output storage.
+
+        Args:
+            x: Hidden states consumed by the gate/up projection.
+            output: Optional storage for the down-projection result.
+
+        Returns:
+            Projected hidden states.
+
+        Raises:
+            ValueError: If caller storage is supplied with sequence-parallel
+                execution or violates the down-projection contract.
+        """
+        # Decoder layers may donate their normalized hidden-state storage. The
+        # gate/up projection has consumed that tensor before the down
+        # projection writes the donated buffer.
         if self.shard_sequence_parallel:
+            if output is not None:
+                raise ValueError(
+                    "KimiMLP caller-owned output is incompatible with "
+                    "sequence-parallel input gathering"
+                )
             # Each rank holds a weight shard but only its own tokens, so it
             # cannot finish those tokens alone: gather the full token set,
             # compute this rank's partial for all of them, then reduce-scatter,
@@ -281,13 +398,23 @@ class KimiMLP(nn.Module):
             x = sp_all_gather(x)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        # The gated activation no longer reads the packed gate/up projection.
+        # Release that large prefill tensor before down_proj allocates its
+        # output; retaining both tensors can exceed the available device
+        # memory at large scheduler chunk sizes.
+        del gate_up
+        if output is None:
+            x, _ = self.down_proj(x)
+        else:
+            x = self._down_proj_into(x, output)
         if self.shard_sequence_parallel:
             x = sp_reduce_scatter(x)
         return x
 
 
 class KimiRoutedOutputTransform(nn.Module):
+    _CALLER_OUTPUT_MIN_TOKENS = 1024
+
     def __init__(
         self,
         norm: RMSNorm | None,
@@ -311,25 +438,127 @@ class KimiRoutedOutputTransform(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Project the routed latent back to the hidden dim.
 
         Args:
-            hidden_states: Routed expert output in latent space.
+            hidden_states: Consumed routed expert output in latent space.
+                Eligible prefill tensors may be normalized in place.
             residual: Optional tensor of the up-projection's output shape to
                 accumulate into. A replicated projection consumes it in the
                 GEMM's beta-add epilogue; a TP-sharded projection adds the two
                 rank-local partials before their shared all-reduce.
+            output: Dead caller-owned storage for the routed projection. This
+                preserves the separate projection and shared-output addition.
         """
+        if residual is not None and output is not None:
+            raise ValueError(
+                "Kimi routed output transform accepts either residual or output"
+            )
         self.capture_routed_latent(hidden_states)
         if self.norm is not None:
-            hidden_states = self.norm(hidden_states)
+            hidden_states = self.normalize_routed_latent(hidden_states)
         if residual is not None and isinstance(self.up_proj, ReplicatedLinear):
             return residual.addmm_(hidden_states, self.up_proj.weight.t())
-        hidden_states, _ = self.up_proj(hidden_states)
+        if residual is not None and isinstance(
+            self.up_proj, KimiPaddedRowParallelLinear
+        ):
+            if not self.can_accumulate_residual(hidden_states, residual):
+                raise ValueError(
+                    "Kimi routed output transform cannot accumulate into the "
+                    "supplied residual"
+                )
+            return self.up_proj.accumulate_into(hidden_states, residual)
+        if output is not None:
+            if not self.can_write_output(hidden_states, output):
+                raise ValueError(
+                    "Kimi routed output transform cannot write the supplied buffer"
+                )
+            hidden_states, _ = self.up_proj.forward_into(hidden_states, output)
+        else:
+            hidden_states, _ = self.up_proj(hidden_states)
         if residual is not None:
             hidden_states.add_(residual)
         return hidden_states
+
+    def can_normalize_routed_latent_in_place(self, hidden_states: torch.Tensor) -> bool:
+        """Check whether the consumed prefill latent can hold its RMSNorm."""
+        norm = self.norm
+        return (
+            norm is not None
+            and not envs.VLLM_BATCH_INVARIANT
+            and not torch.is_grad_enabled()
+            and norm.pass_weight
+            and norm.variance_size_override is None
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] >= self._CALLER_OUTPUT_MIN_TOKENS
+            and hidden_states.shape[1] == norm.hidden_size
+            and hidden_states.is_contiguous()
+            and norm.weight.device == hidden_states.device
+            and norm.weight.dtype == hidden_states.dtype
+        )
+
+    def normalize_routed_latent(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize a consumed routed latent with bounded prefill storage."""
+        norm = self.norm
+        if norm is None:
+            return hidden_states
+        if self.can_normalize_routed_latent_in_place(hidden_states):
+            ops.rms_norm(
+                hidden_states,
+                hidden_states,
+                norm.weight.data,
+                norm.variance_epsilon,
+            )
+            return hidden_states
+        return cast(torch.Tensor, norm(hidden_states))
+
+    def can_accumulate_residual(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> bool:
+        """Check the prefill-only tiled residual-accumulation contract."""
+        return (
+            isinstance(self.up_proj, KimiPaddedRowParallelLinear)
+            and isinstance(self.up_proj.quant_method, UnquantizedLinearMethod)
+            and getattr(self.up_proj, "weight", None) is not None
+            and self.up_proj.bias is None
+            and not self.up_proj.reduce_results
+            and not envs.VLLM_BATCH_INVARIANT
+            and hidden_states.ndim == 2
+            and residual.ndim == 2
+            and hidden_states.shape[0] >= self._CALLER_OUTPUT_MIN_TOKENS
+            and residual.shape == (hidden_states.shape[0], self.up_proj.output_size)
+            and residual.dtype == hidden_states.dtype
+            and residual.device == hidden_states.device
+            and residual.is_contiguous()
+            and self.up_proj.output_size % self.up_proj._ACCUMULATION_TILE_ROWS == 0
+            and residual.untyped_storage().data_ptr()
+            != hidden_states.untyped_storage().data_ptr()
+        )
+
+    def can_write_output(
+        self, hidden_states: torch.Tensor, output: torch.Tensor
+    ) -> bool:
+        """Check the prefill-only caller-owned output contract."""
+        return (
+            isinstance(self.up_proj, KimiPaddedRowParallelLinear)
+            and isinstance(self.up_proj.quant_method, UnquantizedLinearMethod)
+            and getattr(self.up_proj, "weight", None) is not None
+            and self.up_proj.bias is None
+            and not envs.VLLM_BATCH_INVARIANT
+            and hidden_states.ndim == 2
+            and output.ndim == 2
+            and hidden_states.shape[0] >= self._CALLER_OUTPUT_MIN_TOKENS
+            and output.shape == (hidden_states.shape[0], self.up_proj.output_size)
+            and output.dtype == hidden_states.dtype
+            and output.device == hidden_states.device
+            and output.is_contiguous()
+            and output.untyped_storage().data_ptr()
+            != hidden_states.untyped_storage().data_ptr()
+        )
 
     @property
     def output_is_tp_partial(self) -> bool:
@@ -441,6 +670,8 @@ class KimiColumnParallelGate(KimiPaddedColumnParallelLinear):
 class KimiPaddedRowParallelLinear(RowParallelLinear):
     """Row-parallel linear with a zero-padded input axis."""
 
+    _ACCUMULATION_TILE_ROWS = 1024
+
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         input_dim = getattr(param, "input_dim", None)
         if input_dim is None or getattr(param, "is_sharded_weight", False):
@@ -466,6 +697,99 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
         if self.input_pad:
             x = torch.nn.functional.pad(x, (0, self.input_pad))
         return super().forward(x)
+
+    def forward_into(
+        self, x: torch.Tensor, output: torch.Tensor
+    ) -> tuple[torch.Tensor, None]:
+        """Write an unquantized rank-local projection into caller storage."""
+        if not isinstance(self.quant_method, UnquantizedLinearMethod):
+            raise ValueError("Caller-owned output requires an unquantized projection")
+        if self.bias is not None or self.reduce_results:
+            raise ValueError(
+                "Caller-owned output requires a bias-free unreduced projection"
+            )
+        if x.ndim != 2 or output.ndim != 2:
+            raise ValueError("Caller-owned output requires 2D tensors")
+        if self.input_pad:
+            x = torch.nn.functional.pad(x, (0, self.input_pad))
+        if self.input_is_parallel:
+            input_parallel = x
+        else:
+            input_parallel = split_tensor_along_last_dim(
+                x, num_partitions=self.tp_size
+            )[self.tp_rank].contiguous()
+        expected_shape = (input_parallel.shape[0], self.output_size)
+        if output.shape != expected_shape:
+            raise ValueError(
+                f"Caller-owned output has shape {tuple(output.shape)}; "
+                f"expected {expected_shape}"
+            )
+        torch.mm(input_parallel, self.weight.t(), out=output)
+        return output, None
+
+    def accumulate_into(self, x: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+        """Add an unquantized rank-local projection using bounded scratch.
+
+        The output dimension is processed in fixed row tiles. Each tile is
+        rounded to BF16 by ``torch.mm`` before it is added to the BF16
+        residual, matching the allocating projection-then-add operation while
+        avoiding a full-width projection allocation.
+        """
+        if not isinstance(self.quant_method, UnquantizedLinearMethod):
+            raise ValueError("Residual accumulation requires an unquantized projection")
+        if self.bias is not None or self.reduce_results:
+            raise ValueError(
+                "Residual accumulation requires a bias-free unreduced projection"
+            )
+        if x.ndim != 2 or output.ndim != 2:
+            raise ValueError("Residual accumulation requires 2D tensors")
+        if self.input_pad:
+            x = torch.nn.functional.pad(x, (0, self.input_pad))
+        if self.input_is_parallel:
+            input_parallel = x
+        else:
+            input_parallel = split_tensor_along_last_dim(
+                x, num_partitions=self.tp_size
+            )[self.tp_rank].contiguous()
+        expected_shape = (input_parallel.shape[0], self.output_size)
+        if output.shape != expected_shape:
+            raise ValueError(
+                f"Residual output has shape {tuple(output.shape)}; "
+                f"expected {expected_shape}"
+            )
+        if (
+            not output.is_contiguous()
+            or output.dtype != input_parallel.dtype
+            or output.device != input_parallel.device
+        ):
+            raise ValueError(
+                "Residual output must be contiguous and match the projection input"
+            )
+        if (
+            output.untyped_storage().data_ptr()
+            == input_parallel.untyped_storage().data_ptr()
+        ):
+            raise ValueError("Residual output must not alias the projection input")
+        tile_rows = self._ACCUMULATION_TILE_ROWS
+        if self.output_size % tile_rows:
+            raise ValueError(
+                "Residual accumulation requires an output size divisible by "
+                f"{tile_rows}"
+            )
+        scratch = torch.empty(
+            (input_parallel.shape[0], tile_rows),
+            dtype=output.dtype,
+            device=output.device,
+        )
+        for row_start in range(0, self.output_size, tile_rows):
+            row_end = row_start + tile_rows
+            torch.mm(
+                input_parallel,
+                self.weight[row_start:row_end].t(),
+                out=scratch,
+            )
+            output[:, row_start:row_end].add_(scratch)
+        return output
 
 
 class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
@@ -1247,6 +1571,9 @@ class KimiDecoderLayer(nn.Module):
 
         attn_res_block_size = config.attn_res_block_size
         self.use_attn_res = attn_res_block_size is not None
+        self.reuse_attn_res_output = (
+            self.use_attn_res and current_platform.is_device_capability_family(120)
+        )
         if self.use_attn_res:
             assert attn_res_block_size is not None
             self.attn_res_block_size = attn_res_block_size
@@ -1276,7 +1603,14 @@ class KimiDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if output is not None:
+            return self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+                output=output,
+            )
         if self._self_attn_writes_output:
             output = torch.empty_like(hidden_states)
             self.self_attn(
@@ -1290,11 +1624,33 @@ class KimiDecoderLayer(nn.Module):
             positions=positions,
         )
 
+    def _select_self_attn_output(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Return consumed attention-input storage when reuse is supported."""
+        should_use_caller_output = getattr(
+            getattr(self, "self_attn", None),
+            "should_use_caller_output",
+            None,
+        )
+        if (
+            not self.use_sequence_parallel
+            and callable(should_use_caller_output)
+            and should_use_caller_output(hidden_states)
+        ):
+            # Both normalization paths produce an attention input whose last
+            # reader is the attention front-end. The residual and attention-
+            # residual prefix remain in separate live tensors.
+            return hidden_states
+        return None
+
     def _pre_attn_norm(
         self,
         hidden_states: torch.Tensor | None,
         residual: torch.Tensor | None,
         prefix_sum: torch.Tensor | None,
+        attn_res_scratch: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         if not self.use_attn_res:
             assert hidden_states is not None
@@ -1318,6 +1674,9 @@ class KimiDecoderLayer(nn.Module):
             block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
             eps=self.self_attention_res_norm.variance_epsilon,
             output_norm_eps=self.input_layernorm.variance_epsilon,
+            output=(hidden_states if hidden_states is not None else attn_res_scratch)
+            if self.reuse_attn_res_output
+            else None,
         )
         return hidden_states, prefix_sum, residual
 
@@ -1335,10 +1694,12 @@ class KimiDecoderLayer(nn.Module):
 
         assert prefix_sum is not None
         if self.is_block_write_layer:
+            output = prefix_sum if self.reuse_attn_res_output else None
             prefix_sum = hidden_states
             prefix_delta = None
         else:
             prefix_delta = hidden_states
+            output = prefix_delta if self.reuse_attn_res_output else None
         mlp_valid_blocks = self.prev_valid_blocks + self.is_block_write_layer
         hidden_states = attn_res(
             prefix_sum,
@@ -1351,6 +1712,7 @@ class KimiDecoderLayer(nn.Module):
             block_write_idx=-1,
             eps=self.mlp_res_norm.variance_epsilon,
             output_norm_eps=self.post_attention_layernorm.variance_epsilon,
+            output=output,
         )
         return hidden_states, prefix_sum, residual
 
@@ -1360,10 +1722,11 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor | None,
         residual: torch.Tensor | None,
         prefix_sum: torch.Tensor | None = None,
+        attn_res_scratch: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         hidden_states, prefix_sum, residual = self._pre_attn_norm(
-            hidden_states, residual, prefix_sum
+            hidden_states, residual, prefix_sum, attn_res_scratch
         )
         assert hidden_states is not None
 
@@ -1373,7 +1736,15 @@ class KimiDecoderLayer(nn.Module):
             hidden_states = hidden_states[: positions.shape[0]]
 
         # Attention.
-        hidden_states = self._run_self_attn(positions, hidden_states)
+        caller_output = self._select_self_attn_output(hidden_states)
+        if caller_output is None:
+            hidden_states = self._run_self_attn(positions, hidden_states)
+        else:
+            hidden_states = self._run_self_attn(
+                positions,
+                hidden_states,
+                output=caller_output,
+            )
 
         if self.use_sequence_parallel:
             # Add SP padding if needed, and then perform reduce scatter.
@@ -1384,7 +1755,12 @@ class KimiDecoderLayer(nn.Module):
         )
 
         # MoE/MLP.
-        hidden_states = self.mlp(hidden_states)
+        if isinstance(self.mlp, KimiMLP) and self.mlp.should_use_caller_output(
+            hidden_states
+        ):
+            hidden_states = self.mlp(hidden_states, output=hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
         return hidden_states, prefix_sum, residual
 
 
@@ -1405,6 +1781,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.config = config
         self.attn_res_block_size: int | None = config.attn_res_block_size
         self.use_attn_res = self.attn_res_block_size is not None
+        self.reuse_attn_res_output = (
+            self.use_attn_res and current_platform.is_device_capability_family(120)
+        )
         parallel_config = vllm_config.parallel_config
         use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         self.use_sequence_parallel = (
@@ -1448,6 +1827,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             if self.attn_res_block_size is not None
             else 0
         )
+        self._max_num_batched_tokens = int(
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        self._model_dtype = vllm_config.model_config.dtype
+        self._attn_res_workspace: torch.Tensor | None
+        self.register_buffer("_attn_res_workspace", None, persistent=False)
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1509,6 +1894,71 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _get_attn_res_workspace(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return retained AttnRes storage for the active token rows."""
+        shape = (
+            hidden_states.size(0),
+            self.num_attn_res_blocks,
+            hidden_states.size(1),
+        )
+        workspace = self._attn_res_workspace
+        if (
+            workspace is None
+            or workspace.device != hidden_states.device
+            or workspace.dtype != hidden_states.dtype
+            or workspace.size(0) < shape[0]
+            or workspace.size(1) != shape[1]
+            or workspace.size(2) != shape[2]
+        ):
+            # Physical block-major storage keeps every token-major block view
+            # contiguous for AttnRes kernels and later buffer reuse.
+            workspace = hidden_states.new_empty(
+                shape[1],
+                shape[0],
+                shape[2],
+            ).permute(1, 0, 2)
+            self._attn_res_workspace = workspace
+        return workspace[: shape[0]]
+
+    def reserve_attn_res_workspace(self) -> None:
+        """Reserve maximum-size AttnRes storage before KV cache allocation.
+
+        Chunked prefill reuses one allocation for every scheduler chunk. Early
+        reservation prevents model-load and CUDA-graph allocations from
+        fragmenting the contiguous block required by a maximum-size chunk.
+        """
+        if not self.use_attn_res or self.num_attn_res_blocks == 0:
+            return
+        shape = (
+            self._max_num_batched_tokens,
+            self.num_attn_res_blocks,
+            self.config.hidden_size,
+        )
+        workspace = self._attn_res_workspace
+        parameter = next(self.parameters())
+        if (
+            workspace is None
+            or workspace.device != parameter.device
+            or workspace.dtype != self._model_dtype
+            or tuple(workspace.shape) != shape
+        ):
+            _release_cuda_cache_before_retained_allocation(parameter.device)
+            self._attn_res_workspace = torch.empty(
+                shape[1],
+                shape[0],
+                shape[2],
+                dtype=self._model_dtype,
+                device=parameter.device,
+            ).permute(1, 0, 2)
+            logger.info_once(
+                "Kimi-K3 retained %.2f MiB/rank for the %d-token AttnRes "
+                "prefill workspace.",
+                self._attn_res_workspace.numel()
+                * self._attn_res_workspace.element_size()
+                / (1024**2),
+                self._max_num_batched_tokens,
+            )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1568,16 +2018,21 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         prefix_sum = None
         if self.use_attn_res:
-            block_residual = hidden_states.new_empty(
-                hidden_states.size(0),
-                self.num_attn_res_blocks,
-                hidden_states.size(1),
-            )
+            block_residual = self._get_attn_res_workspace(hidden_states)
             if residual is not None:
                 block_residual[:, : residual.size(1), :].copy_(residual)
             prefix_sum = hidden_states
             hidden_states = None
             residual = block_residual
+            # The final block is not an AttnRes input until the final block
+            # boundary, so its storage can hold the first normalized output.
+            attn_res_scratch = (
+                block_residual[:, -1]
+                if self.reuse_attn_res_output and self.num_attn_res_blocks > 1
+                else None
+            )
+        else:
+            attn_res_scratch = None
 
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
@@ -1588,6 +2043,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 hidden_states=hidden_states,
                 prefix_sum=prefix_sum,
                 residual=residual,
+                attn_res_scratch=attn_res_scratch,
             )
             if (layer_idx + 1) in self.aux_hidden_state_layers:
                 if stream_aux_hidden_states and self.use_attn_res:
@@ -1630,6 +2086,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 block_write_idx=-1,
                 eps=self.output_attn_res_norm.variance_epsilon,
                 output_norm_eps=0.0,
+                output=(hidden_states if self.reuse_attn_res_output else None),
             )
         else:
             hidden_states = hidden_states + residual
@@ -1968,6 +2425,9 @@ class KimiLinearForCausalLM(
         # (W_UK_T / W_UV absorption) is driven by the loader's generic post-load
         # hook for any AttentionLayerBase, so no manual trigger is needed here.
         return loaded
+
+    def process_weights_after_loading(self) -> None:
+        self.model.reserve_attn_res_workspace()
 
 
 def get_spec_layer_idx_from_weight_name(
@@ -2433,3 +2893,6 @@ class KimiK3ForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def process_weights_after_loading(self) -> None:
+        self.language_model.process_weights_after_loading()

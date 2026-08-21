@@ -103,13 +103,18 @@ def _build_config(
     kv_connector: str | None,
     enable_sleep_mode: bool = False,
     enable_cumem_allocator: bool = False,
+    kv_connector_extra_config: dict | None = None,
 ) -> VllmConfig:
     """Build a VllmConfig that exercises _verify_kv_transfer_compat without
     requiring a real model (avoids HF downloads in CI)."""
     from types import SimpleNamespace
 
     kv_transfer_config = (
-        KVTransferConfig(kv_connector=kv_connector, kv_role="kv_both")
+        KVTransferConfig(
+            kv_connector=kv_connector,
+            kv_role="kv_both",
+            kv_connector_extra_config=kv_connector_extra_config or {},
+        )
         if kv_connector is not None
         else None
     )
@@ -150,6 +155,35 @@ def test_kv_connector_allows_expandable_segments_with_cumem_allocator(
     """Manual CuMem allocation must also bypass expandable_segments."""
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     _build_config(kv_connector="NixlConnector", enable_cumem_allocator=True)
+
+
+@pytest.mark.parametrize(
+    "kv_connector", ["OffloadingConnector", "SimpleCPUOffloadConnector"]
+)
+def test_local_offload_allows_expandable_segments(monkeypatch, kv_connector):
+    """Local CPU copies do not retain GPU physical-page registrations."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    _build_config(kv_connector=kv_connector)
+
+
+@pytest.mark.parametrize("spec_name", ["TieringOffloadingSpec", "ExternalSpec"])
+def test_nonlocal_offloading_spec_with_expandable_segments_is_rejected(
+    monkeypatch, spec_name
+):
+    """Tiered and out-of-tree specs may retain GPU page registrations."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    with pytest.raises(ValueError, match="expandable_segments"):
+        _build_config(
+            kv_connector="OffloadingConnector",
+            kv_connector_extra_config={"spec_name": spec_name},
+        )
+
+
+def test_unknown_connector_with_expandable_segments_stays_rejected(monkeypatch):
+    """An unresolved connector has no verified VMM-safety contract."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    with pytest.raises(ValueError, match="expandable_segments"):
+        _build_config(kv_connector="SomeOOTConnector")
 
 
 def test_kv_connector_allows_other_alloc_conf(monkeypatch):

@@ -14,6 +14,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.models.kimi_k25_vit import (
     KimiK25MultiModalProjector,
+    apply_rope,
     mm_projector_forward,
 )
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3VisionConfig
@@ -97,3 +98,29 @@ def test_kimi_projector_uses_norm_activation_dtype_for_fp8_weights():
     assert projector.input_dtype == torch.bfloat16
     assert [output.shape for output in outputs] == [(2, 4), (1, 4)]
     assert all(output.dtype == torch.bfloat16 for output in outputs)
+
+
+def test_kimi_vision_rope_reuses_packed_qk_buffers():
+    packed_qkv = torch.randn(17, 3, 4, 8, dtype=torch.bfloat16)
+    query, key, _ = torch.unbind(packed_qkv, dim=1)
+    phases = torch.randn(17, 4)
+    frequencies = torch.polar(torch.ones_like(phases), phases)
+
+    def reference(inputs: torch.Tensor) -> torch.Tensor:
+        complex_inputs = torch.view_as_complex(
+            inputs.float().view(*inputs.shape[:-1], -1, 2)
+        )
+        rotated = complex_inputs * frequencies.unsqueeze(-2)
+        return torch.view_as_real(rotated).flatten(-2).to(inputs.dtype)
+
+    expected_query = reference(query)
+    expected_key = reference(key)
+    query_pointer = query.data_ptr()
+    key_pointer = key.data_ptr()
+
+    output_query, output_key = apply_rope(query, key, frequencies)
+
+    assert output_query.data_ptr() == query_pointer
+    assert output_key.data_ptr() == key_pointer
+    torch.testing.assert_close(output_query, expected_query, rtol=0, atol=0)
+    torch.testing.assert_close(output_key, expected_key, rtol=0, atol=0)

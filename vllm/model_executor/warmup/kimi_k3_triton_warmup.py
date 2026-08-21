@@ -18,8 +18,56 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _warm_vision_position_interpolation(model: torch.nn.Module) -> int:
+    """Compile Kimi vision interpolation before KV-cache allocation.
+
+    Args:
+        model: Loaded model whose module tree may contain Kimi vision position
+            embeddings.
+
+    Returns:
+        Number of Kimi vision interpolation modules invoked.
+    """
+    from vllm.model_executor.models.kimi_k25_vit import (
+        Learnable2DInterpPosEmbDivided_fixed,
+        get_rope_shape,
+    )
+
+    warmed = 0
+    for module in model.modules():
+        if not isinstance(module, Learnable2DInterpPosEmbDivided_fixed):
+            continue
+        get_rope_shape(
+            module.weight,
+            interpolation_mode=module.interpolation_mode,
+            shape=(64, 64),
+        )
+        warmed += 1
+    return warmed
+
+
 def _get_kda_layer(worker: Worker) -> KimiK3DeltaAttention | None:
     from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
+
+    # The target model and speculative draft are separate model-runner
+    # objects, but both register attention layers in the shared compilation
+    # context. Traverse the target model first so a cacheless draft layer can
+    # never become the warmup template before KV pages are bound.
+    get_model = getattr(worker, "get_model", None)
+    if callable(get_model):
+        target_model = get_model()
+        modules = getattr(target_model, "modules", None)
+        if callable(modules):
+            target_layer = next(
+                (
+                    layer
+                    for layer in modules()
+                    if isinstance(layer, KimiK3DeltaAttention)
+                ),
+                None,
+            )
+            if target_layer is not None:
+                return target_layer
 
     compilation_config = getattr(
         worker.model_runner,
@@ -29,13 +77,14 @@ def _get_kda_layer(worker: Worker) -> KimiK3DeltaAttention | None:
     static_context = getattr(compilation_config, "static_forward_context", None)
     if not isinstance(static_context, dict):
         return None
+    candidates = [
+        layer
+        for layer in static_context.values()
+        if isinstance(layer, KimiK3DeltaAttention)
+    ]
     return next(
-        (
-            layer
-            for layer in static_context.values()
-            if isinstance(layer, KimiK3DeltaAttention) and hasattr(layer, "kv_cache")
-        ),
-        None,
+        (layer for layer in candidates if hasattr(layer, "kv_cache")),
+        candidates[0] if candidates else None,
     )
 
 
@@ -181,15 +230,88 @@ def _warm_recurrent_kda(
         )
 
 
+def _warm_chunk_kda_prefill(
+    layer: KimiK3DeltaAttention,
+    input_dtype: torch.dtype,
+) -> None:
+    """Compile the Triton KDA prefill path before KV-cache allocation."""
+    if layer.kda_prefill_backend != "triton":
+        return
+
+    from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
+        chunk_kda_with_fused_gate,
+    )
+    from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
+
+    device = layer.A_log.device
+    num_heads = int(layer.local_num_heads)
+    head_dim = int(layer.head_dim)
+    num_tokens = FLA_CHUNK_SIZE
+    state_shape = layer.get_state_shape()[1]
+    state_dtype = layer.get_state_dtype()[1]
+
+    packed_qkv = torch.empty(
+        (3, 1, num_tokens, num_heads, head_dim),
+        dtype=input_dtype,
+        device=device,
+    )
+    raw_g = torch.zeros(
+        (1, num_tokens, num_heads, head_dim),
+        dtype=input_dtype,
+        device=device,
+    )
+    raw_beta = torch.zeros(
+        (1, num_tokens, num_heads),
+        dtype=input_dtype,
+        device=device,
+    )
+    initial_state = torch.zeros(
+        (1, *state_shape),
+        dtype=state_dtype,
+        device=device,
+    )
+    cu_seqlens = torch.tensor(
+        [0, num_tokens],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    logger.info("Warming up Kimi-K3 Triton KDA prefill kernels.")
+    chunk_kda_with_fused_gate(
+        q=packed_qkv[0],
+        k=packed_qkv[1],
+        v=packed_qkv[2],
+        raw_g=raw_g,
+        raw_beta=raw_beta,
+        A_log=layer.A_log,
+        g_bias=layer.dt_bias,
+        lower_bound=layer.gate_lower_bound,
+        initial_state=initial_state,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+
 @torch.inference_mode()
 def kimi_k3_triton_warmup(worker: Worker) -> None:
     """Warm Kimi-K3 Triton kernels reachable by this server."""
     if not current_platform.is_cuda():
         return
 
+    warmed_vision_interpolators = _warm_vision_position_interpolation(
+        worker.get_model()
+    )
+    if warmed_vision_interpolators:
+        logger.info(
+            "Warmed up %d Kimi vision position interpolator(s).",
+            warmed_vision_interpolators,
+        )
+
     layer = _get_kda_layer(worker)
     if layer is None:
         return
 
     _warm_attn_res(worker)
+    _warm_chunk_kda_prefill(layer, worker.model_config.dtype)
     _warm_recurrent_kda(layer, worker.model_config.dtype)

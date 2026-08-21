@@ -10,6 +10,8 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce_in_place,
 )
 from vllm.v1.attention.ops import dcp_alltoall
 from vllm.v1.attention.ops.dcp_alltoall import (
@@ -18,6 +20,30 @@ from vllm.v1.attention.ops.dcp_alltoall import (
 )
 
 _KIMI_B12X_PAIRED_PROJECTION_MAX_TOKENS = 8
+_KIMI_INPLACE_REDUCTION_MIN_TOKENS = 1024
+
+
+def reduce_kimi_full_width_projection(
+    output_parallel: torch.Tensor,
+    tp_size: int,
+) -> torch.Tensor:
+    """Reduce a Kimi full-width row-parallel projection.
+
+    A projection with at least 1,024 rows is a prefill intermediate whose
+    rank-local value is dead after reduction. NCCL may therefore overwrite
+    that storage and avoid an equally sized output allocation. Smaller
+    projections retain the ordinary functional collective used by decode and
+    CUDA Graph capture.
+    """
+    if tp_size <= 1:
+        return output_parallel
+    if (
+        output_parallel.ndim == 2
+        and output_parallel.shape[0] >= _KIMI_INPLACE_REDUCTION_MIN_TOKENS
+        and output_parallel.is_contiguous()
+    ):
+        return tensor_model_parallel_all_reduce_in_place(output_parallel)
+    return tensor_model_parallel_all_reduce(output_parallel)
 
 
 def _get_kimi_projection_group():

@@ -5,12 +5,13 @@ from typing import Any
 
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
     KVConnectorRole,
     SupportsHMA,
+    SupportsVmmSafeTransfers,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -46,7 +47,22 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 
-class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransfers):
+    """KV offload with a configuration-selected storage implementation.
+
+    The built-in CPU implementation pins host storage for asynchronous copies
+    but never registers GPU cache pages. Tiered and out-of-tree implementations
+    may use RDMA and do not share that property.
+    """
+
+    @classmethod
+    def supports_vmm_safe_transfer_config(
+        cls, kv_transfer_config: KVTransferConfig
+    ) -> bool:
+        extra_config = kv_transfer_config.kv_connector_extra_config or {}
+        spec_name = extra_config.get("spec_name", "CPUOffloadingSpec")
+        return spec_name == "CPUOffloadingSpec"
+
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         return True

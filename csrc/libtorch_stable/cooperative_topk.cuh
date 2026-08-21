@@ -496,7 +496,7 @@ __device__ void large_topk(const float* __restrict__ row_input,
 template <uint32_t TopK, uint32_t CS>
 __device__ void cooperative_topk_body(CooperativeTopKParams<TopK> params) {
   const auto rank = blockIdx.y, row = blockIdx.x, tx = threadIdx.x;
-  const auto sl = params.lengths[row];
+  const int32_t sl = params.lengths[row] > 0 ? params.lengths[row] : 0;
   int32_t* out = params.output + row * TopK;
   const float* in = params.input + row * params.stride;
 

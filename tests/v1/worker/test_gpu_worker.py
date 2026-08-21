@@ -6,10 +6,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
+import vllm.v1.worker.gpu.model_runner as gpu_model_runner_v2_module
 import vllm.v1.worker.gpu_worker as gpu_worker_module
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import startup_plan
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
@@ -32,6 +35,90 @@ def test_gpu_worker_keeps_cuda_warmup_import_lazy(monkeypatch: pytest.MonkeyPatc
     gpu_worker_module.kernel_warmup(worker)
 
     run_kernel_warmup.assert_called_once_with(worker)
+
+
+@pytest.mark.parametrize("kv_cache_memory_bytes", [None, 0, 1024])
+def test_release_allocator_slack_before_manual_kv_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_memory_bytes: int | None,
+):
+    runner = object.__new__(GPUModelRunnerV2)
+    runner.cache_config = SimpleNamespace(
+        kv_cache_memory_bytes=kv_cache_memory_bytes,
+    )
+    runner.device = torch.device("cuda:3")
+    calls: list[object] = []
+    monkeypatch.setattr(
+        gpu_model_runner_v2_module.torch.accelerator,
+        "synchronize",
+        lambda device: calls.append(("synchronize", device)),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2_module.gc,
+        "collect",
+        lambda: calls.append("collect"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2_module.torch.accelerator,
+        "empty_cache",
+        lambda: calls.append("empty_cache"),
+    )
+
+    runner._release_allocator_slack_before_manual_kv_cache()
+
+    if kv_cache_memory_bytes is None:
+        assert calls == []
+    else:
+        assert calls == [
+            ("synchronize", torch.device("cuda:3")),
+            "collect",
+            "empty_cache",
+        ]
+
+
+@pytest.mark.parametrize("kv_cache_memory_bytes", [None, 0, 1024])
+def test_manual_kv_storage_precedes_attention_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_memory_bytes: int | None,
+):
+    runner = object.__new__(GPUModelRunnerV2)
+    runner.cache_config = SimpleNamespace(
+        kv_cache_memory_bytes=kv_cache_memory_bytes,
+    )
+    runner.device = torch.device("cuda:3")
+    runner.vllm_config = object()
+    kv_cache_config = object()
+    storage = object()
+    calls: list[object] = []
+    monkeypatch.setattr(
+        runner,
+        "_release_allocator_slack_before_manual_kv_cache",
+        lambda: calls.append("release"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2_module,
+        "allocate_kv_cache",
+        lambda config, vllm_config, device: (
+            calls.append(("allocate", config, vllm_config, device)) or storage
+        ),
+    )
+
+    result = runner._allocate_manual_kv_cache_before_metadata(kv_cache_config)
+
+    if kv_cache_memory_bytes is None:
+        assert result is None
+        assert calls == []
+    else:
+        assert result is storage
+        assert calls == [
+            "release",
+            (
+                "allocate",
+                kv_cache_config,
+                runner.vllm_config,
+                torch.device("cuda:3"),
+            ),
+        ]
 
 
 def test_kernel_warmup_runs_once(monkeypatch: pytest.MonkeyPatch):
@@ -139,6 +226,95 @@ def test_memory_profile_replays_model_after_kernel_warmup(
         ("reset_peak", "cuda:0"),
         "profile",
     ]
+
+
+@pytest.mark.parametrize("kv_cache_memory_bytes", [0, 1024])
+def test_manual_kv_profile_releases_unoccupied_memory(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_memory_bytes: int,
+):
+    worker = object.__new__(Worker)
+    calls: list[object] = []
+    worker.device = "cuda:0"
+    worker.cache_config = SimpleNamespace(
+        kv_cache_memory_bytes=kv_cache_memory_bytes,
+    )
+    worker.model_runner = SimpleNamespace(
+        profile_run=lambda: calls.append("profile"),
+    )
+    worker.vllm_config = SimpleNamespace()
+    worker.init_snapshot = SimpleNamespace(free_memory=2048)
+    worker.model_config = SimpleNamespace(multimodal_config=None)
+    worker.parallel_config = SimpleNamespace(_api_process_count=1)
+    worker.get_model = lambda: object()
+    worker.get_kv_cache_spec = lambda: object()
+    monkeypatch.setattr(gpu_worker_module, "maybe_apply_startup_plan", lambda _: None)
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "deepseek_v4_compressor_triton_warmup",
+        lambda *args: calls.append("compressor"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_warmup_kernels_once",
+        lambda: calls.append("kernel_warmup"),
+    )
+    monkeypatch.setattr(
+        gpu_worker_module.torch.accelerator,
+        "synchronize",
+        lambda device: calls.append(("synchronize", device)),
+    )
+    monkeypatch.setattr(
+        gpu_worker_module.gc,
+        "collect",
+        lambda: calls.append("collect"),
+    )
+    monkeypatch.setattr(
+        gpu_worker_module.torch.accelerator,
+        "empty_cache",
+        lambda: calls.append("empty_cache"),
+    )
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "reserve_mm_ipc_gpu_memory",
+        lambda size, *args: size,
+    )
+
+    assert worker.determine_available_memory() == kv_cache_memory_bytes
+    assert calls == [
+        ("synchronize", "cuda:0"),
+        "collect",
+        "empty_cache",
+        "profile",
+        ("synchronize", "cuda:0"),
+        "collect",
+        "empty_cache",
+        "compressor",
+        "kernel_warmup",
+        ("synchronize", "cuda:0"),
+        "collect",
+        "empty_cache",
+    ]
+
+
+@pytest.mark.parametrize("kv_cache_memory_bytes", [None, 0, 1024])
+def test_manual_kv_graph_capture_releases_unoccupied_memory(
+    kv_cache_memory_bytes: int | None,
+):
+    worker = object.__new__(Worker)
+    calls: list[str] = []
+    worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=kv_cache_memory_bytes)
+
+    def capture_model() -> int:
+        calls.append("capture")
+        return 17
+
+    worker.model_runner = SimpleNamespace(capture_model=capture_model)
+    worker._release_unoccupied_accelerator_memory = lambda: calls.append("release")
+
+    assert worker._capture_model_with_reclaimed_manual_kv_cache() == 17
+    expected = ["capture"] if kv_cache_memory_bytes is None else ["release", "capture"]
+    assert calls == expected
 
 
 # Startup-plan persistence (vllm/v1/worker/startup_plan.py), applied and

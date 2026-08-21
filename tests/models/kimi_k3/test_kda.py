@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
@@ -22,6 +23,7 @@ from vllm.models.kimi_k3.amd.ops.third_party.kda import (
     fused_recurrent_kda_packed_decode as fused_recurrent_kda_packed_decode_amd,
 )
 from vllm.models.kimi_k3.nvidia import kda as kimi_kda
+from vllm.models.kimi_k3.nvidia import model as kimi_model
 from vllm.models.kimi_k3.nvidia.kda import (
     get_kda_f_a_partition,
     initialize_kda_input_projection_padding,
@@ -119,6 +121,45 @@ class _IdentityLinear(nn.Module):
         return input_, None
 
 
+class _UnquantizedOutputLinear(nn.Module):
+    def __init__(self, input_size: int, output_size: int, tp_size: int = 2):
+        super().__init__()
+        self.quant_method = UnquantizedLinearMethod()
+        self.input_is_parallel = True
+        self.input_size_per_partition = input_size
+        self.output_size = output_size
+        self.reduce_results = False
+        self.tp_size = tp_size
+        self.register_parameter("bias", None)
+        self.weight = nn.Parameter(
+            torch.randn(output_size, input_size),
+            requires_grad=False,
+        )
+
+
+class _CallerOutputAttention(nn.Module):
+    def __init__(self, enabled: bool = True):
+        super().__init__()
+        self.enabled = enabled
+        self.output: torch.Tensor | None = None
+
+    def should_use_caller_output(self, _hidden_states: torch.Tensor) -> bool:
+        return self.enabled
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del positions
+        if output is None:
+            return hidden_states + 1
+        self.output = output
+        output.copy_(hidden_states + 1)
+        return output
+
+
 def test_sharded_kda_f_a_is_gathered_before_f_b(monkeypatch):
     layer = object.__new__(kimi_kda.KimiK3DeltaAttention)
     nn.Module.__init__(layer)
@@ -129,6 +170,7 @@ def test_sharded_kda_f_a_is_gathered_before_f_b(monkeypatch):
     layer.in_proj_padding = 0
     layer.shard_f_a = True
     layer.head_dim = 2
+    layer.tp_size = 2
 
     projected = torch.arange(20, dtype=torch.float32).view(2, 10)
     layer.in_proj_qkvgfab = _StaticLinear(projected)
@@ -144,6 +186,11 @@ def test_sharded_kda_f_a_is_gathered_before_f_b(monkeypatch):
         return torch.cat((local_f_a, local_f_a + 100), dim=-1)
 
     monkeypatch.setattr(kimi_kda, "gather_kimi_sharded_projection", gather_f_a)
+    monkeypatch.setattr(
+        kimi_kda,
+        "reduce_kimi_full_width_projection",
+        lambda output, tp_size: output,
+    )
 
     output = layer(torch.empty(2, 1), positions=torch.arange(2))
 
@@ -155,6 +202,135 @@ def test_sharded_kda_f_a_is_gathered_before_f_b(monkeypatch):
         torch.cat((expected_local, expected_local + 100), dim=-1),
     )
     torch.testing.assert_close(output, torch.zeros(2, 2))
+
+
+def test_kda_projects_prefill_into_caller_storage(monkeypatch):
+    layer = object.__new__(kimi_kda.KimiK3DeltaAttention)
+    nn.Module.__init__(layer)
+    layer.o_proj = _UnquantizedOutputLinear(input_size=3, output_size=4)
+
+    reduced_ptrs: list[int] = []
+
+    def reduce_output(value: torch.Tensor, tp_size: int) -> torch.Tensor:
+        assert tp_size == 2
+        reduced_ptrs.append(value.data_ptr())
+        value.mul_(2)
+        return value
+
+    monkeypatch.setattr(
+        kimi_kda,
+        "reduce_kimi_full_width_projection",
+        reduce_output,
+    )
+
+    core_attn_out = torch.randn(1024, 3)
+    output = torch.empty(1024, 4)
+    output_ptr = output.data_ptr()
+    expected = torch.mm(core_attn_out, layer.o_proj.weight.t()) * 2
+
+    projected = layer._project_output_into(core_attn_out, output)
+    actual = kimi_kda.reduce_kimi_full_width_projection(projected, layer.o_proj.tp_size)
+
+    assert actual.data_ptr() == output_ptr
+    assert reduced_ptrs == [output_ptr]
+    torch.testing.assert_close(actual, expected)
+
+
+def test_kda_caller_output_selection_preserves_decode_path():
+    layer = object.__new__(kimi_kda.KimiK3DeltaAttention)
+    nn.Module.__init__(layer)
+    layer.o_proj = _UnquantizedOutputLinear(input_size=3, output_size=4)
+
+    assert not layer.should_use_caller_output(torch.empty(8, 4))
+    assert layer.should_use_caller_output(torch.empty(1024, 4))
+
+
+def test_kda_caller_output_rejects_projection_input_alias():
+    layer = object.__new__(kimi_kda.KimiK3DeltaAttention)
+    nn.Module.__init__(layer)
+    layer.o_proj = _UnquantizedOutputLinear(input_size=4, output_size=4)
+    aliased = torch.empty(1024, 4)
+
+    with pytest.raises(ValueError, match="must not alias"):
+        layer._project_output_into(aliased, aliased)
+
+
+def test_kda_forward_reuses_consumed_hidden_state(monkeypatch):
+    layer = object.__new__(kimi_kda.KimiK3DeltaAttention)
+    nn.Module.__init__(layer)
+    layer.split_mixed_precision_input = False
+    layer.local_projection_size = 2
+    layer.local_fa_size = 1
+    layer.local_num_heads = 1
+    layer.in_proj_padding = 0
+    layer.shard_f_a = False
+    layer.head_dim = 2
+    layer.tp_size = 2
+    projected = torch.randn(1024, 10)
+    layer.in_proj_qkvgfab = _StaticLinear(projected)
+    layer.f_b_proj = _CaptureLinear(output_width=2)
+    layer.o_proj = _UnquantizedOutputLinear(input_size=2, output_size=4)
+    layer._forward = lambda **kwargs: kwargs["core_attn_out"].zero_()
+    monkeypatch.setattr(
+        kimi_kda,
+        "reduce_kimi_full_width_projection",
+        lambda output, _tp_size: output,
+    )
+
+    hidden_states = torch.randn(1024, 4)
+    output_pointer = hidden_states.data_ptr()
+    actual = layer(
+        hidden_states,
+        positions=torch.arange(1024),
+        output=hidden_states,
+    )
+
+    assert actual.data_ptr() == output_pointer
+    torch.testing.assert_close(actual, torch.zeros_like(actual))
+
+
+@pytest.mark.parametrize(
+    ("use_sequence_parallel", "attention_enabled", "expects_reuse"),
+    [
+        (False, True, True),
+        (False, False, False),
+        (True, True, False),
+    ],
+)
+def test_decoder_selects_kda_caller_output(
+    use_sequence_parallel: bool,
+    attention_enabled: bool,
+    expects_reuse: bool,
+):
+    layer = object.__new__(kimi_model.KimiDecoderLayer)
+    nn.Module.__init__(layer)
+    layer.use_sequence_parallel = use_sequence_parallel
+    layer.self_attn = _CallerOutputAttention(enabled=attention_enabled)
+    hidden_states = torch.empty(1024, 4)
+
+    output = layer._select_self_attn_output(hidden_states)
+
+    assert (output is hidden_states) is expects_reuse
+
+
+def test_decoder_passes_caller_output_to_kda():
+    layer = object.__new__(kimi_model.KimiDecoderLayer)
+    nn.Module.__init__(layer)
+    attention = _CallerOutputAttention()
+    layer.self_attn = attention
+    layer._self_attn_writes_output = False
+    hidden_states = torch.zeros(1024, 4)
+    output_ptr = hidden_states.data_ptr()
+
+    actual = layer._run_self_attn(
+        torch.arange(1024),
+        hidden_states,
+        output=hidden_states,
+    )
+
+    assert actual.data_ptr() == output_ptr
+    assert attention.output is hidden_states
+    torch.testing.assert_close(actual, torch.ones_like(actual))
 
 
 def test_kda_input_projection_padding_is_declared_and_zeroed():

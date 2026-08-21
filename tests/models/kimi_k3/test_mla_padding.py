@@ -6,6 +6,29 @@ from types import SimpleNamespace
 import torch
 
 
+def _unquantized_output_projection(
+    input_size: int,
+    output_size: int,
+    *,
+    tp_size: int = 2,
+):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    projection = torch.nn.Module()
+    projection.quant_method = UnquantizedLinearMethod()
+    projection.input_is_parallel = True
+    projection.input_size_per_partition = input_size
+    projection.output_size = output_size
+    projection.reduce_results = True
+    projection.tp_size = tp_size
+    projection.register_parameter("bias", None)
+    projection.weight = torch.nn.Parameter(
+        torch.randn(output_size, input_size),
+        requires_grad=False,
+    )
+    return projection
+
+
 def test_kimi_mla_absorbed_weight_preallocation_uses_local_heads():
     from vllm.model_executor.layers.attention.mla_attention import (
         _preallocate_absorbed_mla_weights,
@@ -97,3 +120,55 @@ def test_kimi_mla_defines_graph_padding_before_output_projection(monkeypatch):
 
     torch.testing.assert_close(output[:2], torch.full_like(output[:2], 3))
     torch.testing.assert_close(output[2:], torch.zeros_like(output[2:]))
+
+
+def test_kimi_mla_caller_output_selection_preserves_decode_and_sp_paths():
+    from vllm.models.kimi_k3.nvidia import mla
+
+    attention = object.__new__(mla.MultiHeadLatentAttention)
+    torch.nn.Module.__init__(attention)
+    attention.o_proj = _unquantized_output_projection(3, 4)
+
+    assert not attention.should_use_caller_output(torch.empty(8, 4))
+    assert attention.should_use_caller_output(torch.empty(1024, 4))
+
+    attention.o_proj.reduce_results = False
+    assert not attention.should_use_caller_output(torch.empty(1024, 4))
+
+
+def test_kimi_mla_forward_reuses_consumed_hidden_state(monkeypatch):
+    from vllm.models.kimi_k3.nvidia import mla
+
+    attention = object.__new__(mla.MultiHeadLatentAttention)
+    torch.nn.Module.__init__(attention)
+    attention.o_proj = _unquantized_output_projection(3, 4)
+    attention.g_proj = None
+    attention._gate_events = None
+    attention.aux_stream = None
+
+    attn_out = torch.randn(1024, 3)
+    attention._forward_attn = lambda *_args, **_kwargs: attn_out
+
+    reduced_pointers: list[int] = []
+
+    def reduce_output(value: torch.Tensor, tp_size: int) -> torch.Tensor:
+        assert tp_size == 2
+        reduced_pointers.append(value.data_ptr())
+        value.mul_(2)
+        return value
+
+    monkeypatch.setattr(mla, "reduce_kimi_full_width_projection", reduce_output)
+
+    hidden_states = torch.empty(1024, 4)
+    output_pointer = hidden_states.data_ptr()
+    expected = torch.mm(attn_out, attention.o_proj.weight.t()) * 2
+
+    actual = attention(
+        torch.arange(1024),
+        hidden_states,
+        output=hidden_states,
+    )
+
+    assert actual.data_ptr() == output_pointer
+    assert reduced_pointers == [output_pointer]
+    torch.testing.assert_close(actual, expected)

@@ -4,17 +4,20 @@ import pytest
 import torch
 
 
-def test_deepseek_v4_c128a_dynamic_topk_packed_buffers():
+def test_deepseek_v4_c128a_metadata_preserves_capacity_stride():
     from vllm.models.deepseek_v4.sparse_mla import build_c128a_topk_metadata
 
     device = torch.device("cuda")
     capacity_width = 256
     active_width = 128
-    global_decode_buffer = torch.empty(
-        (2, capacity_width), dtype=torch.int32, device=device
+    untouched = -77
+    global_decode_buffer = torch.full(
+        (2, capacity_width), untouched, dtype=torch.int32, device=device
     )
     decode_lens_buffer = torch.empty(2, dtype=torch.int32, device=device)
-    prefill_buffer = torch.empty((2, capacity_width), dtype=torch.int32, device=device)
+    prefill_buffer = torch.full(
+        (2, capacity_width), untouched, dtype=torch.int32, device=device
+    )
 
     global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
         positions=torch.tensor([255, 511], dtype=torch.int64, device=device),
@@ -31,15 +34,17 @@ def test_deepseek_v4_c128a_dynamic_topk_packed_buffers():
         max_compressed_tokens=active_width,
     )
 
-    assert global_decode.shape == (1, active_width)
-    assert prefill_local.shape == (1, active_width)
-    assert global_decode.stride() == (active_width, 1)
-    assert prefill_local.stride() == (active_width, 1)
+    assert global_decode.shape == (1, capacity_width)
+    assert prefill_local.shape == (1, capacity_width)
+    assert global_decode.stride() == (capacity_width, 1)
+    assert prefill_local.stride() == (capacity_width, 1)
     assert global_decode[0, :2].cpu().tolist() == [768, 769]
     assert decode_lens.cpu().tolist() == [2]
     assert prefill_local[0, :4].cpu().tolist() == list(range(4))
-    assert torch.all(global_decode[0, 2:] == -1)
-    assert torch.all(prefill_local[0, 4:] == -1)
+    assert torch.all(global_decode[0, 2:active_width] == -1)
+    assert torch.all(prefill_local[0, 4:active_width] == -1)
+    assert torch.all(global_decode[0, active_width:] == untouched)
+    assert torch.all(prefill_local[0, active_width:] == untouched)
 
 
 def test_sparse_flashmla_metadata_smoke():

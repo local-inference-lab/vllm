@@ -7,13 +7,14 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
     SupportsHMA,
+    SupportsVmmSafeTransfers,
 )
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -51,8 +52,20 @@ _DISK_ONLY_KEYS = (
 )
 
 
-class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
-    """CPU KV cache offloading with custom kernel transfers and BlockPool LRU."""
+class SimpleCPUOffloadConnector(
+    KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransfers
+):
+    """CPU KV offload using copy operations on GPU virtual addresses.
+
+    The connector does not retain GPU physical-page registrations, so its GPU
+    transfers tolerate PyTorch expandable CUDA VMM segments.
+    """
+
+    @classmethod
+    def supports_vmm_safe_transfer_config(
+        cls, kv_transfer_config: KVTransferConfig
+    ) -> bool:
+        return True
 
     @property
     def requires_kv_delivery(self) -> bool:

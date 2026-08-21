@@ -90,12 +90,18 @@ def apply_rope(
     _apply_rope_input_validation(xk, freqs_cis)
 
     freqs_cis = freqs_cis.unsqueeze(-2)  # ..., 1, head_dim/2
-    # ..., num_heads, head_dim/2
-    xq_ = torch.view_as_complex(xq.float().view(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().view(*xq.shape[:-1], -1, 2))
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+    # Q and K are non-overlapping views of the packed QKV projection. Their
+    # unrotated values are dead after this call, so reuse those BF16 buffers
+    # instead of retaining two additional full-size outputs. Processing Q and
+    # K sequentially also permits the allocator to reuse the FP32 temporary.
+    xq_complex = torch.view_as_complex(xq.float().view(*xq.shape[:-1], -1, 2))
+    xq.copy_(torch.view_as_real(xq_complex * freqs_cis).flatten(-2))
+    del xq_complex
+
+    xk_complex = torch.view_as_complex(xk.float().view(*xk.shape[:-1], -1, 2))
+    xk.copy_(torch.view_as_real(xk_complex * freqs_cis).flatten(-2))
+    return xq, xk
 
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):

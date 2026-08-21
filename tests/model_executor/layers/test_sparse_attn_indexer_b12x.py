@@ -1650,3 +1650,67 @@ def test_mtp_variable_decode_preserves_block_table_alignment_padding():
             next_n=4,
             max_decode_len=3,
         )
+
+
+def test_native_mtp_padding_lengths_are_non_negative():
+    from vllm.v1.attention.backends.mla import indexer as mla_indexer_mod
+
+    builder = object.__new__(mla_indexer_mod.DeepseekV32IndexerMetadataBuilder)
+    builder.decode_seq_lens_buffer = torch.empty(8, dtype=torch.int32)
+    builder.offsets_buffer = torch.arange(4, dtype=torch.int32)
+
+    seq_lens = torch.tensor([0, 5], dtype=torch.int32)
+    block_table = torch.zeros((2, 2), dtype=torch.int32)
+    decode_lens = torch.tensor([2, 2], dtype=torch.int32)
+
+    prepared, _, _, batch_size, requires_padding = builder._prepare_decode_tensors(
+        seq_lens=seq_lens,
+        block_table=block_table,
+        decode_lens=decode_lens,
+        decode_lens_cpu=decode_lens,
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        num_decodes=2,
+        num_decode_tokens=4,
+        use_native=True,
+        next_n=2,
+        max_decode_len=2,
+    )
+
+    assert prepared.tolist() == [[0, 0], [4, 5]]
+    assert batch_size == 2
+    assert not requires_padding
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="This test requires CUDA")
+def test_uniform_decode_kernel_clamps_graph_padding_lengths():
+    from vllm.v1.attention.backends.mla.indexer import (
+        _prepare_uniform_decode_kernel,
+    )
+
+    device = torch.device("cuda")
+    seq_lens = torch.tensor([0, 5], dtype=torch.int32, device=device)
+    block_table = torch.tensor([[11, 12], [21, 22]], dtype=torch.int32, device=device)
+    prepared = torch.empty(4, dtype=torch.int32, device=device)
+    expanded_block_table = torch.empty((4, 2), dtype=torch.int32, device=device)
+    decode_lens = torch.empty(4, dtype=torch.int32, device=device)
+
+    _prepare_uniform_decode_kernel[(4,)](
+        seq_lens,
+        prepared,
+        block_table,
+        block_table.stride(0),
+        expanded_block_table,
+        expanded_block_table.stride(0),
+        decode_lens,
+        2,
+        BLOCK_SIZE=1024,
+    )
+
+    assert prepared.cpu().tolist() == [0, 0, 4, 5]
+    assert expanded_block_table.cpu().tolist() == [
+        [11, 12],
+        [11, 12],
+        [21, 22],
+        [21, 22],
+    ]
+    assert decode_lens.cpu().tolist() == [1, 1, 1, 1]

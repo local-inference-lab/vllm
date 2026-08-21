@@ -4,6 +4,7 @@ import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import chain, islice
+from math import lcm
 from typing import Any, NamedTuple
 
 import vllm.envs as envs
@@ -188,6 +189,10 @@ class SchedulerOffloadConfig(NamedTuple):
     num_workers: int
     offload_prompt_only: bool
     supports_partial_tail: bool
+    # Token alignment for a completed request's immutable replay tail. This
+    # permits a smaller cache group to identify a stable prefix inside the
+    # final physical block of a larger cache group.
+    finished_replay_tail_alignment_tokens: int | None = None
     # Token alignment of the per-request "replay boundary" tail (see
     # OffloadingConnectorScheduler._reachable_tail_end_chunks). Set to the
     # full-attention alignment size when sparse retention
@@ -201,6 +206,16 @@ class SchedulerOffloadConfig(NamedTuple):
         vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig,
     ) -> "SchedulerOffloadConfig":
+        """Build scheduler-side offload geometry from the cache plan.
+
+        Args:
+            spec: Connector chunking and hashing configuration.
+            vllm_config: Model, scheduler, and parallel runtime configuration.
+            kv_cache_config: Allocated cache groups and their attention specs.
+
+        Returns:
+            Immutable group geometry and replay-boundary capabilities.
+        """
         # Determine the alignment token count from the full-attention group(s).
         # This is the tokens_per_chunk of the full-attention group; load
         # hits are always aligned to this boundary, so SWA blocks earlier in
@@ -330,6 +345,50 @@ class SchedulerOffloadConfig(NamedTuple):
             and vllm_config.parallel_config.decode_context_parallel_size == 1
         )
 
+        # A completed request may safely export the immutable prefix of an
+        # append-only attention page. A Mamba group can participate only when
+        # the replay boundary is one of its complete, densely retained blocks;
+        # recurrent state inside a partial page must never be relabeled as an
+        # earlier boundary. One GPU block per offload chunk lets the worker
+        # copy a containing attention page without sub-page transfer metadata.
+        # The least common multiple of the draft-group chunk sizes is a
+        # complete draft boundary and can identify a stable prefix inside a
+        # larger target-cache page.
+        finished_replay_tail_alignment_tokens: int | None = None
+        eagle_chunk_sizes = [
+            config.tokens_per_chunk
+            for config in kv_group_configs
+            if config.is_eagle_group
+        ]
+        if eagle_chunk_sizes and spec.blocks_per_chunk == 1:
+            group_chunk_sizes = [config.tokens_per_chunk for config in kv_group_configs]
+            replay_alignment = lcm(*eagle_chunk_sizes)
+            groups_support_replay_tail = all(
+                isinstance(group.kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec))
+                or (
+                    isinstance(group.kv_cache_spec, MambaSpec)
+                    and retention_interval is None
+                    and config.tokens_per_chunk == replay_alignment
+                )
+                for group, config in zip(
+                    kv_cache_config.kv_cache_groups,
+                    kv_group_configs,
+                    strict=True,
+                )
+            )
+            if (
+                groups_support_replay_tail
+                and replay_alignment % spec.tokens_per_hash == 0
+                and any(size != replay_alignment for size in group_chunk_sizes)
+            ):
+                finished_replay_tail_alignment_tokens = replay_alignment
+                logger.info(
+                    "KV offloading: completed-request replay tails use a "
+                    "%d-token boundary across cache-group chunks %s.",
+                    replay_alignment,
+                    group_chunk_sizes,
+                )
+
         return cls(
             num_workers=vllm_config.parallel_config.world_size,
             kv_group_configs=kv_group_configs,
@@ -337,6 +396,9 @@ class SchedulerOffloadConfig(NamedTuple):
             tokens_per_hash=spec.tokens_per_hash,
             offload_prompt_only=spec.offload_prompt_only,
             supports_partial_tail=supports_partial_tail,
+            finished_replay_tail_alignment_tokens=(
+                finished_replay_tail_alignment_tokens
+            ),
             replay_alignment_tokens=(
                 alignment_tokens
                 if any(group.uses_sparse_retention for group in kv_group_configs)
@@ -950,10 +1012,157 @@ class OffloadingConnectorScheduler:
         hash_idx = boundary_tokens // self.config.tokens_per_hash - 1
         return make_offload_key(request.block_hashes[hash_idx], group_idx)
 
+    def _finished_replay_tail_boundary(self, request: Request) -> int | None:
+        """Return the largest stable replay boundary for a finished request.
+
+        Args:
+            request: Completed request whose prompt prefix may be exported.
+
+        Returns:
+            Positive aligned token boundary, or ``None`` when none is stable.
+        """
+        alignment = self.config.finished_replay_tail_alignment_tokens
+        if alignment is None:
+            return None
+        # Preserve the final prompt token for target logprob production. Draft
+        # groups additionally require one complete chunk beyond the restored
+        # boundary to prove that their trailing state is no longer volatile.
+        max_boundary = request.num_prompt_tokens - self._replay_reserve_tokens
+        boundary = round_down(max_boundary, alignment)
+        return boundary if boundary > 0 else None
+
+    def _lookup_finished_replay_tail(
+        self,
+        req_status: RequestOffloadState,
+        complete_hit: int,
+    ) -> int | None:
+        """Find an immutable completed-request tail beyond complete chunks.
+
+        The boundary key is loaded for every group. An EAGLE/MTP group also
+        needs a later full-chunk key as a stability witness; the witness is
+        checked and retained but is not copied into the request's restored
+        prefix.
+
+        Args:
+            req_status: Connector state and keys for the request being matched.
+            complete_hit: Tokens matched by ordinary complete-chunk lookup.
+
+        Returns:
+            Additional external-hit tokens after any local prefix, or ``None``
+            while a required asynchronous lookup is pending.
+        """
+        max_boundary = self._finished_replay_tail_boundary(req_status.req)
+        alignment = self.config.finished_replay_tail_alignment_tokens
+        local_tokens = req_status.num_locally_computed_tokens
+        complete_boundary = local_tokens + complete_hit
+        if (
+            max_boundary is None
+            or alignment is None
+            or max_boundary <= complete_boundary
+        ):
+            return complete_hit
+
+        # A completion-only key supplies data from the physical page directly
+        # after the ordinary complete hit. A boundary beyond every group's
+        # next page would require an intervening complete page that the
+        # ordinary lookup did not find, so it cannot produce a contiguous
+        # load. Bounding the scan also keeps a cold long-prompt lookup linear
+        # in the number of cache groups instead of the prompt length.
+        next_page_boundary = max(
+            cdiv(complete_boundary + 1, group.tokens_per_chunk) * group.tokens_per_chunk
+            for group in self.config.kv_group_configs
+        )
+        max_boundary = min(max_boundary, next_page_boundary)
+
+        pending = False
+        for boundary in range(max_boundary, complete_boundary, -alignment):
+            boundary_pending = False
+            boundary_missed = False
+            # At least one group must carry a completion-only boundary key.
+            # Besides supplying the larger group's partial physical page, this
+            # key proves that the source request reached an immutable terminal
+            # state. An all-aligned boundary has no such marker and remains on
+            # the ordinary complete-chunk lookup path.
+            if not any(
+                boundary % group.tokens_per_chunk
+                for group in self.config.kv_group_configs
+            ):
+                continue
+
+            for group_config, group_state in zip(
+                self.config.kv_group_configs, req_status.group_states
+            ):
+                tokens_per_chunk = group_config.tokens_per_chunk
+                end_chunk_idx = boundary // tokens_per_chunk
+                if boundary % tokens_per_chunk:
+                    keys = [
+                        self._make_boundary_key(
+                            req_status.req, group_config.group_idx, boundary
+                        )
+                    ]
+                elif group_config.sliding_window_size_in_chunks is None:
+                    # A full-attention group must be contiguous from the
+                    # already-qualified complete hit through the finer replay
+                    # boundary. Checking only the final key would admit a
+                    # host-cache hole that prepare_load cannot materialize.
+                    start_chunk_idx = complete_boundary // tokens_per_chunk
+                    keys = group_state.offload_keys[start_chunk_idx:end_chunk_idx]
+                    if len(keys) != end_chunk_idx - start_chunk_idx:
+                        boundary_missed = True
+                        break
+                else:
+                    # Windowed attention and recurrent state need only their
+                    # terminal window at the selected replay boundary.
+                    window = group_config.sliding_window_size_in_chunks
+                    start_chunk_idx = max(0, end_chunk_idx - window)
+                    keys = group_state.offload_keys[start_chunk_idx:end_chunk_idx]
+                    if len(keys) != end_chunk_idx - start_chunk_idx:
+                        boundary_missed = True
+                        break
+                if group_config.is_eagle_group:
+                    keys.append(
+                        self._make_boundary_key(
+                            req_status.req,
+                            group_config.group_idx,
+                            boundary + group_config.tokens_per_chunk,
+                        )
+                    )
+                for key in keys:
+                    result = self.manager.lookup(key, req_status.req_context)
+                    if result is LookupResult.MISS:
+                        boundary_missed = True
+                        break
+                    if result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
+                        boundary_pending = True
+                if boundary_missed:
+                    break
+
+            pending |= boundary_pending
+            if not boundary_missed and not boundary_pending:
+                for group_config in self.config.kv_group_configs:
+                    key = self._make_boundary_key(
+                        req_status.req, group_config.group_idx, boundary
+                    )
+                    self._events_tracker.record_partial_lookup(
+                        req_status.req, group_config, boundary, key
+                    )
+                req_status.partial_tail_boundary = boundary
+                return boundary - local_tokens
+
+        if pending and complete_hit == 0:
+            return None
+        return complete_hit
+
     def _lookup(self, req_status: RequestOffloadState) -> int | None:
         complete_hit = self._lookup_complete_chunks(req_status)
         req_status.partial_tail_boundary = None
-        if complete_hit is None or not self.config.supports_partial_tail:
+        if complete_hit is None:
+            return complete_hit
+
+        replay_tail_hit = self._lookup_finished_replay_tail(req_status, complete_hit)
+        if replay_tail_hit is None or replay_tail_hit > complete_hit:
+            return replay_tail_hit
+        if not self.config.supports_partial_tail:
             return complete_hit
 
         local_tokens = req_status.num_locally_computed_tokens
@@ -997,6 +1206,115 @@ class OffloadingConnectorScheduler:
         if pending and complete_hit == 0:
             return None
         return complete_hit
+
+    def _build_finished_replay_tail_store_jobs(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> dict[int, TransferJob]:
+        """Build stores for immutable data in completed requests' final pages.
+
+        Args:
+            scheduler_output: Finished request IDs and batch scheduling result.
+
+        Returns:
+            Transfer jobs keyed by scheduler-generated job ID.
+        """
+        if self.config.finished_replay_tail_alignment_tokens is None:
+            return {}
+
+        store_jobs: dict[int, TransferJob] = {}
+        for req_id in scheduler_output.finished_req_ids or ():
+            req_status = self._req_status.get(req_id)
+            if req_status is None:
+                continue
+            req = req_status.req
+            if req.status is RequestStatus.FINISHED_ABORTED:
+                continue
+            boundary = self._finished_replay_tail_boundary(req)
+            if boundary is None:
+                continue
+            if req_status.max_offload_tokens is not None:
+                alignment = self.config.finished_replay_tail_alignment_tokens
+                assert alignment is not None
+                boundary = min(
+                    boundary,
+                    round_down(req_status.max_offload_tokens, alignment),
+                )
+                if boundary == 0:
+                    continue
+
+            partial_groups = [
+                config
+                for config in self.config.kv_group_configs
+                if boundary % config.tokens_per_chunk != 0
+            ]
+            if not partial_groups:
+                continue
+
+            keys: list[OffloadKey] = []
+            source_by_key: dict[OffloadKey, tuple[int, int, int]] = {}
+            source_missing = False
+            for group_config in partial_groups:
+                group_idx = group_config.group_idx
+                block_idx = (boundary - 1) // group_config.tokens_per_block
+                group_blocks = req_status.group_states[group_idx].block_ids
+                if block_idx >= len(group_blocks) or group_blocks[block_idx] == 0:
+                    source_missing = True
+                    break
+                key = self._make_boundary_key(req, group_idx, boundary)
+                block_id = group_blocks[block_idx]
+                keys.append(key)
+                source_by_key[key] = (group_idx, block_id, block_idx)
+            if source_missing or not keys:
+                continue
+
+            store_output = self.manager.prepare_store(keys, req_status.req_context)
+            if store_output is None:
+                self._connector_stats.increase_counter(
+                    _ConnectorMetricName.ALLOCATION_FAILURE
+                )
+                continue
+            if not store_output.keys_to_store:
+                continue
+
+            group_sizes = [0] * len(self.config.kv_group_configs)
+            block_indices = [0] * len(self.config.kv_group_configs)
+            accepted_block_ids: list[int] = []
+            accepted_keys: set[OffloadKey] = set(store_output.keys_to_store)
+            for key in sorted(
+                store_output.keys_to_store,
+                key=lambda accepted_key: source_by_key[accepted_key][0],
+            ):
+                group_idx, block_id, block_idx = source_by_key[key]
+                group_sizes[group_idx] = 1
+                block_indices[group_idx] = block_idx
+                accepted_block_ids.append(block_id)
+                self._events_tracker.record_partial_store(
+                    req, self.config.kv_group_configs[group_idx], boundary, key
+                )
+
+            job_id = self._generate_job_id()
+            req_status.transfer_jobs.add(job_id)
+            for block_id in accepted_block_ids:
+                self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
+            self._jobs[job_id] = TransferJobStatus(
+                req_id=req_id,
+                pending_count=self.config.num_workers,
+                keys=accepted_keys,
+                is_store=True,
+                fenced_block_ids=accepted_block_ids,
+            )
+            store_jobs[job_id] = TransferJob(
+                req_id=req_id,
+                src_spec=GPULoadStoreSpec(
+                    accepted_block_ids,
+                    group_sizes=group_sizes,
+                    block_indices=block_indices,
+                ),
+                dst_spec=store_output.store_spec,
+            )
+
+        return store_jobs
 
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
@@ -1334,8 +1652,22 @@ class OffloadingConnectorScheduler:
         Clamp each boundary to the latest point that every group can service,
         including a complete EAGLE/MTP peek chunk.
         """
-        alignment_tokens = self.config.replay_alignment_tokens
-        if alignment_tokens is None or not group_config.uses_sparse_retention:
+        # Sparse-retention groups use the full-attention replay alignment.
+        # Dense recurrent/windowed groups can still be pruned to target-cache
+        # segment boundaries by ``alignment_chunk_count``. When completed-
+        # request replay is enabled, retain their state at the finer draft
+        # boundary while prefill owns the corresponding historical state;
+        # recurrent state cannot be reconstructed from the request's final
+        # block table after generation has advanced past that boundary.
+        alignment_tokens = (
+            self.config.replay_alignment_tokens
+            if group_config.uses_sparse_retention
+            else (
+                self.config.finished_replay_tail_alignment_tokens
+                or self.config.replay_alignment_tokens
+            )
+        )
+        if alignment_tokens is None:
             return ()
 
         latest_serviceable = req.num_prompt_tokens - self._replay_reserve_tokens
@@ -1598,11 +1930,16 @@ class OffloadingConnectorScheduler:
                 for jid in self._block_id_to_pending_jobs[bid]
             )
 
-        partial_store_jobs = self._build_partial_tail_store_jobs(scheduler_output)
         normal_store_jobs = self._build_store_jobs(scheduler_output)
+        partial_store_jobs = self._build_partial_tail_store_jobs(scheduler_output)
+        replay_tail_store_jobs = self._build_finished_replay_tail_store_jobs(
+            scheduler_output
+        )
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
-            store_jobs=partial_store_jobs | normal_store_jobs,
+            store_jobs=(
+                normal_store_jobs | partial_store_jobs | replay_tail_store_jobs
+            ),
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
 

@@ -87,6 +87,7 @@ from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
+    allocate_kv_cache,
     build_slot_mappings_by_layer,
     get_kv_cache_spec,
     init_attn_backend,
@@ -570,9 +571,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return {}
         return get_kv_cache_spec(self.vllm_config)
 
+    def _release_allocator_slack_before_manual_kv_cache(self) -> None:
+        """Return free allocator blocks immediately before fixed KV storage."""
+        if self.cache_config.kv_cache_memory_bytes is None:
+            return
+        torch.accelerator.synchronize(self.device)
+        gc.collect()
+        torch.accelerator.empty_cache()
+
+    def _allocate_manual_kv_cache_before_metadata(
+        self, kv_cache_config: KVCacheConfig
+    ) -> dict[str, torch.Tensor] | None:
+        """Reserve fixed KV storage before persistent metadata fragments memory.
+
+        Args:
+            kv_cache_config: Physical tensor layout selected for the worker.
+
+        Returns:
+            The preallocated backing tensors when manual cache sizing is active,
+            otherwise ``None``.
+        """
+        if self.cache_config.kv_cache_memory_bytes is None:
+            return None
+        self._release_allocator_slack_before_manual_kv_cache()
+        return allocate_kv_cache(kv_cache_config, self.vllm_config, self.device)
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        kv_cache_raw_tensors = self._allocate_manual_kv_cache_before_metadata(
+            kv_cache_config
+        )
 
         block_table_max_model_len = self.max_model_len
         if self.is_encoder_decoder:
@@ -704,6 +733,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.cache_config.cache_dtype,
             self.kernel_block_sizes,
             self.vllm_config,
+            kv_cache_raw_tensors=kv_cache_raw_tensors,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
