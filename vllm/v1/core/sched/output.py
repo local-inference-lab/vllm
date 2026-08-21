@@ -295,3 +295,7 @@ class GrammarOutput:
     structured_output_request_ids: list[str]
     # Bitmask ordered as structured_output_request_ids.
     grammar_bitmask: "npt.NDArray[np.int32]"
+    # Number of speculative rows represented in grammar_bitmask for each
+    # structured output request. Worker-side draft trimming may reduce the
+    # number of logits without changing this compact source layout.
+    num_spec_tokens: list[int]
