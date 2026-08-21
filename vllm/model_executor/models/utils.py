@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import operator
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -493,6 +494,27 @@ def maybe_fuse_shared_experts(
             )
 
 
+def _nonnegative_layer_count(config: "ModelConfig", name: str) -> int | None:
+    """Return an integral nonnegative layer count from a model config.
+
+    Args:
+        config: Model configuration containing the requested count.
+        name: Configuration attribute to read.
+
+    Returns:
+        The nonnegative integer count, or ``None`` for invalid input.
+    """
+
+    value = getattr(config, name, 0)
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        value = operator.index(value)
+    except TypeError:
+        return None
+    return value if value >= 0 else None
+
+
 def get_spec_layer_idx_from_weight_name(
     config: "ModelConfig", weight_name: str
 ) -> int | None:
@@ -506,12 +528,16 @@ def get_spec_layer_idx_from_weight_name(
     Returns:
         The absolute layer index for an MTP-layer weight, else None.
     """
-    if not (n := getattr(config, "num_nextn_predict_layers", 0)):
+    n = _nonnegative_layer_count(config, "num_nextn_predict_layers")
+    base = _nonnegative_layer_count(config, "num_hidden_layers")
+    if n is None or base is None or n == 0:
         return None
-    base = config.num_hidden_layers
-    for i in range(n):
-        if weight_name.startswith((f"model.layers.{base + i}.", f"layers.{base + i}.")):
-            return base + i
+    match = re.match(r"^(?:model\.)?layers\.(\d+)\.", weight_name)
+    if match is None:
+        return None
+    weight_layer_idx = int(match.group(1))
+    if base <= weight_layer_idx < base + n:
+        return weight_layer_idx
     return None
 
 

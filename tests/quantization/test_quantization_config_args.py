@@ -189,6 +189,35 @@ def test_resolve_rejects_modelopt_moe_override():
         )
 
 
+def test_resolve_allows_exl3_bf16_mxfp8_overlay():
+    args = resolve_quantization_config(
+        "exl3",
+        {
+            "linear": {"weight": "mxfp8"},
+            "shared_experts": "mxfp8",
+            "ignore": ["re:.*q_a_proj$", "lm_head"],
+        },
+    )
+
+    assert args.linear == QuantSpec(weight=kMxfp8Dynamic)
+    assert args.shared_experts == QuantSpec(weight=kMxfp8Dynamic)
+    assert args.ignore == ["re:.*q_a_proj$", "lm_head"]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"linear": {"weight": "fp8_per_block_static"}},
+        {"linear": {"weight": "mxfp8", "activation": "mxfp8"}},
+        {"linear": {"weight": "mxfp8"}, "moe": "mxfp8"},
+        {"shared_experts": "mxfp8", "ignore": ["lm_head"]},
+    ],
+)
+def test_resolve_rejects_unsupported_exl3_overlay(config):
+    with pytest.raises(ValueError, match="checkpoint online overlay"):
+        resolve_quantization_config("exl3", config)
+
+
 def test_resolve_rejects_quantization_config_with_non_shorthand_quant():
     # If --quantization names something other than an online shorthand,
     # quantization_config is not allowed via this path (checkpoint quant
