@@ -1931,6 +1931,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         ``delta`` is deliberate: the kernel writes an applied delta back into
         the prefix in place, which would double-add it into the live residual
         stream.
+
+        Args:
+            layer_idx: Index of the layer that produced the pending MLP output.
+            prefix_sum: Running prefix for the active AttnRes block.
+            pending_mlp_out: MLP output to fold into the running prefix, if any.
+            block_residual: Committed AttnRes block bank for the active rows.
+
+        Returns:
+            Auxiliary hidden states for the configured DFlash capture mode.
         """
         prefix = prefix_sum if pending_mlp_out is None else prefix_sum + pending_mlp_out
         # `use_attn_res` is what constructs the norm and projection weights this

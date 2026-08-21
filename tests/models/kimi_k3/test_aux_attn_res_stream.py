@@ -34,6 +34,14 @@ def _stub_model(*, enabled: bool, use_attn_res: bool = True) -> SimpleNamespace:
     Constructing the real model needs a distributed init and weights, and none
     of it participates in the selection under test.
     """
+    model = SimpleNamespace(
+        _aux_attn_res_stream=enabled,
+        use_attn_res=use_attn_res,
+        end_layer=END_LAYER,
+    )
+    if not use_attn_res:
+        return model
+
     consumers = []
     for i in range(END_LAYER):
         consumers.append(
@@ -45,15 +53,11 @@ def _stub_model(*, enabled: bool, use_attn_res: bool = True) -> SimpleNamespace:
                 prev_valid_blocks=i,
             )
         )
-    return SimpleNamespace(
-        _aux_attn_res_stream=enabled,
-        use_attn_res=use_attn_res,
-        end_layer=END_LAYER,
-        layers=consumers,
-        output_attn_res_norm=_weights(99.0),
-        output_attn_res_proj=SimpleNamespace(weight=torch.full((1, 2), 99.0)),
-        num_attn_res_blocks=99,
-    )
+    model.layers = consumers
+    model.output_attn_res_norm = _weights(99.0)
+    model.output_attn_res_proj = SimpleNamespace(weight=torch.full((1, 2), 99.0))
+    model.num_attn_res_blocks = 99
+    return model
 
 
 @pytest.fixture
@@ -139,6 +143,7 @@ def test_taps_the_consumer_layer_when_one_follows(recorder, monkeypatch):
     call = recorder[0]
     # Layer 2's weights, not layer 1's.
     torch.testing.assert_close(call.norm_weight, torch.full((2,), 2.0))
+    torch.testing.assert_close(call.proj_weight, torch.full((2,), 2.0))
     assert call.kwargs["num_blocks"] == 2
 
 
@@ -154,6 +159,7 @@ def test_last_layer_on_the_final_rank_uses_the_output_aggregation(
 
     assert len(recorder) == 1
     torch.testing.assert_close(recorder[0].norm_weight, torch.full((2,), 99.0))
+    torch.testing.assert_close(recorder[0].proj_weight, torch.full((2,), 99.0))
     assert recorder[0].kwargs["num_blocks"] == 99
 
 
