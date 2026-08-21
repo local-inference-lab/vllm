@@ -152,6 +152,13 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                 ParserState.CONTENT,
                 (),
             ),
+            # A DSML tool block owns its closing marker. Treat a repeated
+            # closer as idempotent instead of exposing protocol markup as
+            # assistant content after the first closer leaves tool state.
+            (ParserState.CONTENT, "TOOL_END"): Transition(
+                ParserState.CONTENT,
+                (),
+            ),
             # Absorb a duplicate <think> while already reasoning
             (ParserState.REASONING, "THINK_START"): Transition(
                 ParserState.REASONING,
