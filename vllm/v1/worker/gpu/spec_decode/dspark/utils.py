@@ -59,7 +59,9 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     with rope_ownership, set_model_tag("dspark_head"):
         draft_model = get_model(
-            vllm_config=draft_vllm_config, model_config=draft_model_config
+            vllm_config=draft_vllm_config,
+            model_config=draft_model_config,
+            load_config=speculative_config.draft_load_config,
         )
 
     if get_pp_group().world_size != 1:

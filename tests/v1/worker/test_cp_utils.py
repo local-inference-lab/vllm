@@ -94,3 +94,34 @@ def test_check_attention_cp_compatibility_rejects_no_lse_return(monkeypatch):
 
     with pytest.raises(AssertionError, match="requires attention implementations"):
         cp_utils.check_attention_cp_compatibility(_make_config(dcp_size=2))
+
+
+def test_replicated_kv_group_executes_attention_as_dcp1(monkeypatch):
+    """A complete per-rank KV copy must not enter DCP attention collectives."""
+    impl = SimpleNamespace(
+        can_return_lse_for_decode=True,
+        dcp_world_size=16,
+        dcp_rank=7,
+        total_cp_world_size=16,
+        total_cp_rank=7,
+        need_to_return_lse_for_decode=True,
+        supports_pcp=False,
+    )
+    layer = SimpleNamespace(
+        impl=impl,
+        get_kv_cache_spec=lambda _config: SimpleNamespace(dcp_replicated=True),
+    )
+
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda vllm_config, layer_type: {"draft.layer": layer},
+    )
+
+    cp_utils.check_attention_cp_compatibility(_make_config(dcp_size=16))
+
+    assert impl.dcp_world_size == 1
+    assert impl.dcp_rank == 0
+    assert impl.total_cp_world_size == 1
+    assert impl.total_cp_rank == 0
+    assert impl.need_to_return_lse_for_decode is False
