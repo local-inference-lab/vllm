@@ -142,6 +142,18 @@ class ApplyRotaryEmb(CustomOp):
                     "flash_attn.ops.triton.rotary"
                 ).apply_rotary
 
+        self.apply_rotary_emb_vllm_flash_attn = None
+        if current_platform.is_cuda():
+            try:
+                self.apply_rotary_emb_vllm_flash_attn = import_module(
+                    "vllm.vllm_flash_attn.layers.rotary"
+                ).apply_rotary_emb
+            except ModuleNotFoundError as error:
+                missing = error.name or ""
+                expected = "vllm.vllm_flash_attn.layers.rotary"
+                if not missing or not expected.startswith(missing):
+                    raise
+
     @staticmethod
     def forward_static(
         x: torch.Tensor,
@@ -232,7 +244,9 @@ class ApplyRotaryEmb(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+        apply_rotary_emb = self.apply_rotary_emb_vllm_flash_attn
+        if apply_rotary_emb is None:
+            return self.forward_native(x, cos, sin)
 
         x, cos, sin, origin_shape, origin_dtype = self._pre_process(x, cos, sin)
 
