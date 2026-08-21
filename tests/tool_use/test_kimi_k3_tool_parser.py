@@ -171,6 +171,48 @@ def test_delegating_parser_preserves_tool_calls_after_reasoning():
     assert json.loads(tool_calls[0].arguments) == {"x": 1}
 
 
+def test_fresh_tool_stream_does_not_inherit_closed_reasoning():
+    parser = KimiK3DelegatingParser(
+        DummyTokenizer(),
+        chat_template_kwargs={
+            "thinking": True,
+            "add_generation_prompt": True,
+        },
+    )
+    request = _request()
+    messages: list[DeltaMessage] = []
+    chunks = [
+        (".", [9]),
+        (f"{CLOSE}think", [4, 2]),
+        (
+            f"{SEP}{_response('')}{_tools(_call('calc', 1))}",
+            [3, 10],
+        ),
+    ]
+
+    for index, (text, token_ids) in enumerate(chunks):
+        delta = parser.parse_delta(
+            delta_text=text,
+            delta_token_ids=token_ids,
+            request=request,
+            prompt_token_ids=[4, 2, 3],
+            finished=index == len(chunks) - 1,
+        )
+        if delta is not None:
+            messages.append(delta)
+
+    reasoning = "".join(message.reasoning or "" for message in messages)
+    content = "".join(message.content or "" for message in messages)
+    tool_calls = [call for message in messages for call in (message.tool_calls or [])]
+    assert reasoning == "."
+    assert content == ""
+    assert len(tool_calls) == 1
+    assert tool_calls[0].function.name == "calc"
+    assert OPEN not in reasoning + content
+    assert CLOSE not in reasoning + content
+    assert SEP not in reasoning + content
+
+
 def test_delegating_parser_required_tool_choice_uses_xtml_parser():
     parser = KimiK3DelegatingParser(DummyTokenizer())
     request = _request().model_copy(update={"tool_choice": "required"})
