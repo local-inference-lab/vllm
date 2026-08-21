@@ -224,6 +224,11 @@ class _CKVPrefetchWorkspacePool:
         )
         self._free_slots = list(reversed(range(self.max_slots)))
         self._leased_slots: set[int] = set()
+        # Metadata builders used for graph capture and ordinary execution can
+        # differ while borrowing the same physical WorkspaceManager lane. The
+        # pool owns the state map so those builders share one ring and one
+        # pending-work lifecycle for each backing workspace.
+        self._state_map: dict[_CKVWorkspaceIdentity, _CKVPrefetchState] = {}
 
     def acquire(self) -> tuple[int, torch.Tensor]:
         if not self._free_slots:
@@ -414,16 +419,23 @@ _CKV_PREFETCH_STATE_REGISTRIES: weakref.WeakSet = weakref.WeakSet()
 
 
 class _CKVPrefetchStateRegistry:
-    """Builder-owned states partitioned by lane-scoped CKV workspace."""
+    """Access pool-owned states partitioned by lane-scoped CKV workspace."""
 
     def __init__(self, workspace_pool: _CKVPrefetchWorkspacePool | None = None) -> None:
         self.states: dict[_CKVWorkspaceIdentity, _CKVPrefetchState] = {}
-        self.workspace_pool = workspace_pool
+        self.workspace_pool: _CKVPrefetchWorkspacePool | None = None
+        if workspace_pool is not None:
+            self._bind_workspace_pool(workspace_pool)
         _CKV_PREFETCH_STATE_REGISTRIES.add(self)
 
     def _bind_workspace_pool(self, pool: _CKVPrefetchWorkspacePool) -> None:
         if self.workspace_pool is None:
+            if self.states:
+                raise RuntimeError(
+                    "CKV prefetch registry cannot bind a pool after creating states"
+                )
             self.workspace_pool = pool
+            self.states = pool._state_map
         elif self.workspace_pool is not pool:
             raise RuntimeError("CKV prefetch registry cannot switch workspace pools")
 

@@ -635,6 +635,30 @@ def _get_kv_b_proj_input_dtype(
     return weight_dtype
 
 
+def _get_dcp_batch_metadata(
+    attn_metadata: AttentionMetadata,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return aligned request lengths and query offsets for MLA DCP merge."""
+    decode_metadata = getattr(attn_metadata, "decode", None)
+    if decode_metadata is not None:
+        num_reqs = attn_metadata.num_decodes  # type: ignore[attr-defined]
+        seq_lens = cast(torch.Tensor, decode_metadata.seq_lens)
+    else:
+        # Sparse MLA routes prefill and decode through one MQA path. Its
+        # metadata therefore describes every request at the top level rather
+        # than exposing a nested decode-only object.
+        num_reqs = attn_metadata.num_reqs  # type: ignore[attr-defined]
+        seq_lens = cast(
+            torch.Tensor, attn_metadata.seq_lens
+        )[  # type: ignore[attr-defined]
+            :num_reqs
+        ]
+    query_start_loc = attn_metadata.query_start_loc[  # type: ignore[attr-defined]
+        : num_reqs + 1
+    ]
+    return seq_lens, query_start_loc
+
+
 class MLAAttention(nn.Module, AttentionLayerBase):
     """Multi-Head Latent Attention layer.
 
@@ -1611,16 +1635,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         "softmax LSE required by DCP."
                     )
                 assert self.dcp_manager is not None
-                seq_lens = (
-                    attn_metadata.decode.seq_lens
-                    if attn_metadata.decode is not None
-                    else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
-                        : attn_metadata.num_decodes
-                    ]
-                )
-                query_start_loc = attn_metadata.query_start_loc[
-                    : attn_metadata.num_decodes + 1
-                ]
+                seq_lens, query_start_loc = _get_dcp_batch_metadata(attn_metadata)
                 valid_counts = None
                 if project_before_merge:
                     valid_counts_tensor = getattr(
