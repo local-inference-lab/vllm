@@ -105,9 +105,9 @@ def test_b12x_dense_can_share_page128_group() -> None:
     )
 
 
-def test_b12x_hybrid_align_reserves_expanded_page_table() -> None:
-    assert _max_page_table_width(4096, 128, 4096, "none") == 32
-    assert _max_page_table_width(4096, 128, 4096, "align") == 64
+def test_b12x_hybrid_reserves_expanded_page_table() -> None:
+    assert _max_page_table_width(4096, 128, 4096, False) == 32
+    assert _max_page_table_width(4096, 128, 4096, True) == 64
 
     storage_block_size = 3200
     expanded_width = (
@@ -116,7 +116,19 @@ def test_b12x_hybrid_align_reserves_expanded_page_table() -> None:
         * (storage_block_size // 128)
     )
     assert expanded_width == 50
-    assert expanded_width <= _max_page_table_width(4096, 128, 4096, "align")
+    assert expanded_width <= _max_page_table_width(4096, 128, 4096, True)
+
+    # Qwen3.5 hybrid cache expands 128-token attention pages into a
+    # 896-token storage block even when prefix caching is disabled. Rounding
+    # 65,536 tokens to storage blocks therefore produces 518 kernel pages.
+    storage_block_size = 896
+    expanded_width = (
+        (65536 + storage_block_size - 1)
+        // storage_block_size
+        * (storage_block_size // 128)
+    )
+    assert expanded_width == 518
+    assert expanded_width <= _max_page_table_width(65536, 128, 8192, True)
 
 
 def test_b12x_runtime_page_size_comes_from_static_cache_shape() -> None:

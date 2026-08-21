@@ -86,13 +86,15 @@ def _max_page_table_width(
     max_model_len: int,
     block_size: int,
     max_num_batched_tokens: int,
-    mamba_cache_mode: str,
+    is_hybrid: bool,
 ) -> int:
     width = max(cdiv(max(max_model_len, 1), block_size), 1)
-    if mamba_cache_mode == "align":
+    if is_hybrid:
         # Hybrid cache setup can enlarge the storage block after attention
-        # layers are initialized. Its expansion into kernel-sized blocks adds
-        # at most one storage block of trailing page-table capacity.
+        # layers are initialized, including when prefix caching forces
+        # mamba_cache_mode to "none". Expanding a partially used final storage
+        # block into kernel-sized blocks adds at most one storage block of
+        # trailing page-table capacity.
         width += cdiv(max_num_batched_tokens, block_size)
     return width
 
@@ -709,7 +711,7 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
                 max_model_len,
                 page_size,
                 max_batched,
-                cache_config.mamba_cache_mode,
+                model_config.is_hybrid,
             )
             for page_size in _B12X_SUPPORTED_PAGE_SIZES
         }
