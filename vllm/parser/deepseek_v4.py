@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from vllm.tool_parsers.abstract_tool_parser import Tool
 
 _DSML = "｜DSML｜"
+_LEGACY_DSML = "|DSML|"
 
 DSML_THINK_START = "<think>"
 DSML_THINK_END = "</think>"
@@ -49,14 +50,24 @@ DSML_INVOKE_NAME_END = '">'
 DSML_INVOKE_END = f"</{_DSML}invoke>"
 DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
 
+# Some older tool prompts contain ASCII-pipe DSML examples without the optional
+# ``tool_calls`` wrapper. The model can reproduce that input faithfully; parse
+# it as a compatibility variant instead of exposing protocol text as content.
+LEGACY_DSML_TOOL_START = f"<{_LEGACY_DSML}tool_calls>"
+LEGACY_DSML_TOOL_END = f"</{_LEGACY_DSML}tool_calls>"
+LEGACY_DSML_INVOKE_PREFIX = f'<{_LEGACY_DSML}invoke name="'
+LEGACY_DSML_INVOKE_END = f"</{_LEGACY_DSML}invoke>"
+LEGACY_DSML_PARAM_CLOSE = f"</{_LEGACY_DSML}parameter>"
+
 _ESCAPED_DSML = re.escape(_DSML)
+_DSML_TOKEN_RE = rf"(?:{_ESCAPED_DSML}|{re.escape(_LEGACY_DSML)})"
 _PARAM_RE = re.compile(
-    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
-    rf"(.*?)</{_ESCAPED_DSML}parameter>",
+    rf'<{_DSML_TOKEN_RE}parameter\s+name="([^"]+)"\s+string="(true|false)">'
+    rf"(.*?)</{_DSML_TOKEN_RE}parameter>",
     re.DOTALL,
 )
 _PARTIAL_PARAM_RE = re.compile(
-    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
+    rf'<{_DSML_TOKEN_RE}parameter\s+name="([^"]+)"\s+string="(true|false)">'
     rf"(.*)$",
     re.DOTALL,
 )
@@ -135,6 +146,11 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             "INVOKE_NAME_END": DSML_INVOKE_NAME_END,
             "INVOKE_END": DSML_INVOKE_END,
             "PARAM_CLOSE": DSML_PARAM_CLOSE,
+            "TOOL_START_LEGACY": LEGACY_DSML_TOOL_START,
+            "TOOL_END_LEGACY": LEGACY_DSML_TOOL_END,
+            "INVOKE_PREFIX_LEGACY": LEGACY_DSML_INVOKE_PREFIX,
+            "INVOKE_END_LEGACY": LEGACY_DSML_INVOKE_END,
+            "PARAM_CLOSE_LEGACY": LEGACY_DSML_PARAM_CLOSE,
         },
         token_id_terminals={
             "THINK_START": DSML_THINK_START,
@@ -170,7 +186,36 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                 ParserState.TOOL_PREAMBLE,
                 (),
             ),
+            (ParserState.CONTENT, "TOOL_START_LEGACY"): Transition(
+                ParserState.TOOL_PREAMBLE,
+                (),
+            ),
+            # The outer ``tool_calls`` wrapper is optional in legacy DSML.
+            (ParserState.CONTENT, "INVOKE_PREFIX"): Transition(
+                ParserState.TOOL_DIRECT_NAME,
+                (EventType.TOOL_CALL_START,),
+            ),
+            (ParserState.CONTENT, "INVOKE_PREFIX_LEGACY"): Transition(
+                ParserState.TOOL_DIRECT_NAME,
+                (EventType.TOOL_CALL_START,),
+            ),
+            (ParserState.REASONING, "TOOL_START_LEGACY"): Transition(
+                ParserState.TOOL_PREAMBLE,
+                (EventType.REASONING_END,),
+            ),
+            (ParserState.REASONING, "INVOKE_PREFIX"): Transition(
+                ParserState.TOOL_DIRECT_NAME,
+                (EventType.REASONING_END, EventType.TOOL_CALL_START),
+            ),
+            (ParserState.REASONING, "INVOKE_PREFIX_LEGACY"): Transition(
+                ParserState.TOOL_DIRECT_NAME,
+                (EventType.REASONING_END, EventType.TOOL_CALL_START),
+            ),
             (ParserState.TOOL_PREAMBLE, "INVOKE_PREFIX"): Transition(
+                ParserState.TOOL_NAME,
+                (EventType.TOOL_CALL_START,),
+            ),
+            (ParserState.TOOL_PREAMBLE, "INVOKE_PREFIX_LEGACY"): Transition(
                 ParserState.TOOL_NAME,
                 (EventType.TOOL_CALL_START,),
             ),
@@ -178,11 +223,34 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                 ParserState.TOOL_ARGS,
                 (),
             ),
+            (ParserState.TOOL_DIRECT_NAME, "INVOKE_NAME_END"): Transition(
+                ParserState.TOOL_DIRECT_ARGS,
+                (),
+            ),
             (ParserState.TOOL_ARGS, "INVOKE_END"): Transition(
                 ParserState.TOOL_BETWEEN,
                 (EventType.TOOL_CALL_END,),
             ),
+            (ParserState.TOOL_ARGS, "INVOKE_END_LEGACY"): Transition(
+                ParserState.TOOL_BETWEEN,
+                (EventType.TOOL_CALL_END,),
+            ),
+            # A direct invoke has no enclosing wrapper. Return to content so
+            # subsequent prose is not suppressed; a later direct invoke can
+            # start another call from CONTENT.
+            (ParserState.TOOL_DIRECT_ARGS, "INVOKE_END"): Transition(
+                ParserState.CONTENT,
+                (EventType.TOOL_CALL_END,),
+            ),
+            (ParserState.TOOL_DIRECT_ARGS, "INVOKE_END_LEGACY"): Transition(
+                ParserState.CONTENT,
+                (EventType.TOOL_CALL_END,),
+            ),
             (ParserState.TOOL_ARGS, "TOOL_END"): Transition(
+                ParserState.CONTENT,
+                (EventType.TOOL_CALL_END,),
+            ),
+            (ParserState.TOOL_ARGS, "TOOL_END_LEGACY"): Transition(
                 ParserState.CONTENT,
                 (EventType.TOOL_CALL_END,),
             ),
@@ -191,7 +259,15 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                 ParserState.TOOL_NAME,
                 (EventType.TOOL_CALL_START,),
             ),
+            (ParserState.TOOL_BETWEEN, "INVOKE_PREFIX_LEGACY"): Transition(
+                ParserState.TOOL_NAME,
+                (EventType.TOOL_CALL_START,),
+            ),
             (ParserState.TOOL_BETWEEN, "TOOL_END"): Transition(
+                ParserState.CONTENT,
+                (),
+            ),
+            (ParserState.TOOL_BETWEEN, "TOOL_END_LEGACY"): Transition(
                 ParserState.CONTENT,
                 (),
             ),
@@ -201,6 +277,8 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             ParserState.REASONING: EventType.REASONING_CHUNK,
             ParserState.TOOL_NAME: EventType.TOOL_NAME,
             ParserState.TOOL_ARGS: EventType.ARG_VALUE_CHUNK,
+            ParserState.TOOL_DIRECT_NAME: EventType.TOOL_NAME,
+            ParserState.TOOL_DIRECT_ARGS: EventType.ARG_VALUE_CHUNK,
         },
         arg_converter=_dsml_arg_converter,
         arg_structural_chars=frozenset(">"),

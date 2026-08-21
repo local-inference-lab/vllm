@@ -33,6 +33,8 @@ class ParserState(Enum):
     TOOL_NAME = auto()
     TOOL_ARGS = auto()
     TOOL_BETWEEN = auto()
+    TOOL_DIRECT_NAME = auto()
+    TOOL_DIRECT_ARGS = auto()
 
 
 @dataclass(frozen=True, slots=True)
