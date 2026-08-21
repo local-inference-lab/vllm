@@ -2068,6 +2068,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             set_default_quant_scales(self, register_buffer=False)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
+        dcp_manager = getattr(self, "dcp_manager", None)
+        if dcp_manager is not None:
+            dcp_device = _find_linear_weight_device(self.kv_b_proj)
+            if dcp_device is None:
+                raise RuntimeError(
+                    "Cannot determine the device for MLA DCP collective workspaces."
+                )
+            dcp_manager.materialize(dcp_device)
+
         self._use_b12x_absorb_bmm = self._prepare_b12x_absorb_bmm(act_dtype)
         self._fused_mla_query_output_dtype = (
             current_platform.fp8_dtype()

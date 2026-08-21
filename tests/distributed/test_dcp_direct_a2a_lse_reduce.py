@@ -390,6 +390,50 @@ def test_mla_dcp_manager_selects_direct_backends(monkeypatch):
     )
 
 
+def test_mla_dcp_manager_materializes_direct_backends_after_meta_init(monkeypatch):
+    import vllm.v1.attention.ops.dcp_utils as dcp_manager
+
+    group = MagicMock(world_size=2)
+    monkeypatch.setattr(dcp_manager, "get_dcp_group", lambda: group)
+    direct_a2a = MagicMock()
+    direct_query = MagicMock()
+    init_a2a = MagicMock(return_value=direct_a2a)
+    init_query = MagicMock(return_value=direct_query)
+    monkeypatch.setattr(dcp_manager, "get_direct_dcp_a2a_workspace", init_a2a)
+    monkeypatch.setattr(
+        dcp_manager,
+        "get_direct_dcp_q_gather_workspace",
+        init_query,
+    )
+
+    manager = dcp_manager.MLADCPManager(
+        vllm_config=_manager_config(),
+        device=torch.device("meta"),
+        num_heads=2,
+        query_head_dim=8,
+        output_head_dim=4,
+        query_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        padded_num_heads=None,
+        is_lse_base_on_e=False,
+        use_pcp=False,
+    )
+
+    init_a2a.assert_not_called()
+    init_query.assert_not_called()
+    assert isinstance(manager.combine, functools.partial)
+    assert manager.combine.func is dcp_manager.dcp_a2a_lse_reduce
+    assert manager.query_gather == manager._gather_query
+
+    manager.materialize(torch.device("cuda", 0))
+
+    init_a2a.assert_called_once()
+    init_query.assert_called_once()
+    assert manager.device == torch.device("cuda", 0)
+    assert manager.combine.func == direct_a2a.lse_reduce
+    assert manager.query_gather == direct_query.gather
+
+
 def test_mla_dcp_manager_selects_fallback_backends(monkeypatch):
     import vllm.v1.attention.ops.dcp_utils as dcp_manager
 
