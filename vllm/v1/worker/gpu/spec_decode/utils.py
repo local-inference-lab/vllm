@@ -34,6 +34,8 @@ def limit_draft_tokens(
             "Speculator returned unsupported draft shape "
             f"{tuple(draft_tokens.shape)}; expected a 2D tensor."
         )
+    if num_speculative_tokens == 0:
+        return draft_tokens[:, :0]
     if not 1 <= num_speculative_tokens <= max_num_speculative_tokens:
         raise RuntimeError(
             "Scheduler selected an invalid speculative-token count "

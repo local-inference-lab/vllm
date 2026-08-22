@@ -55,6 +55,32 @@ def test_remote_tokens_copy_supports_adaptive_depth():
     ]
 
 
+def test_remote_speculator_accepts_scheduler_selected_zero_depth():
+    proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy.num_speculative_steps = 3
+    proxy.draft_tokens = torch.full((4, 3), -1, dtype=torch.int64)
+    batch = SimpleNamespace(num_reqs=2)
+    empty = torch.empty(0)
+
+    output = proxy.propose(
+        batch,
+        {},
+        {},
+        empty,
+        None,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        num_speculative_tokens=0,
+    )
+
+    assert output.shape == (2, 0)
+    assert output.is_contiguous()
+
+
 def test_adaptive_depth_output_is_contiguous_for_tp_broadcast():
     draft_tokens = torch.arange(24, dtype=torch.int64).view(3, 8)
 
