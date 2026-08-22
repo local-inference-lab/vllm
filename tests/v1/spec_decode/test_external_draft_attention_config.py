@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
+import torch.nn as nn
 
+from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 from vllm.v1.worker.gpu.spec_decode.dspark import utils as dspark_utils
@@ -23,6 +26,7 @@ def test_dspark_loader_uses_external_draft_parallel_geometry(monkeypatch) -> Non
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         attention_config=SimpleNamespace(backend=None, use_non_causal=False),
         quant_config=object(),
+        lora_config=object(),
     )
     draft_quant_config = object()
     captured = {}
@@ -59,6 +63,72 @@ def test_dspark_loader_uses_external_draft_parallel_geometry(monkeypatch) -> Non
     assert loaded_config.attention_config.backend == AttentionBackendEnum.B12X_MLA
     assert loaded_config.attention_config.use_non_causal
     assert loaded_config.quant_config is draft_quant_config
+    assert loaded_config.lora_config is None
+
+
+def test_dspark_loader_shares_unwrapped_lora_embed_and_lm_head(monkeypatch) -> None:
+    """The external draft shares base layers, never target LoRA wrappers."""
+
+    target_embed_base = nn.Identity()
+    target_lm_head_base = nn.Identity()
+    target_embed = BaseLayerWithLoRA()
+    target_embed.base_layer = target_embed_base
+    target_lm_head = BaseLayerWithLoRA()
+    target_lm_head.base_layer = target_lm_head_base
+    target_model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=target_embed),
+        lm_head=target_lm_head,
+    )
+    draft_model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=nn.Identity()),
+        lm_head=nn.Identity(),
+    )
+    draft_model_config = SimpleNamespace(hf_config=SimpleNamespace())
+    target_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=draft_model_config,
+            attention_backend=AttentionBackendEnum.B12X_MLA,
+        )
+    )
+    draft_config = SimpleNamespace(
+        attention_config=SimpleNamespace(backend=None, use_non_causal=False),
+        quant_config=object(),
+        lora_config=object(),
+    )
+
+    monkeypatch.setattr(
+        dspark_utils,
+        "_create_draft_vllm_config",
+        lambda config: draft_config if config is target_config else None,
+    )
+    monkeypatch.setattr(dspark_utils, "get_model", lambda **_kwargs: draft_model)
+    monkeypatch.setattr(
+        dspark_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+    monkeypatch.setattr(dspark_utils, "_should_share", lambda *_args: True)
+    monkeypatch.setattr(
+        "vllm.compilation.backends.set_model_tag",
+        lambda _tag: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_dflash.dflash_has_any_non_causal",
+        lambda _config: False,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.utils.get_draft_quant_config",
+        lambda _config: None,
+    )
+
+    loaded = dspark_utils.load_dspark_model(target_model, target_config)
+
+    assert loaded is draft_model
+    assert loaded.model.embed_tokens is target_embed_base
+    assert loaded.lm_head is target_lm_head_base
+    assert loaded.model.embed_tokens is not target_embed
+    assert loaded.lm_head is not target_lm_head
+    assert draft_config.lora_config is None
 
 
 def test_dflash_attention_metadata_uses_external_draft_geometry(monkeypatch) -> None:

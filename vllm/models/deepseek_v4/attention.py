@@ -49,7 +49,11 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    deepgemm_post_process_fp8_weight_block,
+)
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.utils import replace_parameter
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.triton_utils import tl, triton
@@ -220,7 +224,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
-        self._use_b12x_wo = bool(envs.VLLM_USE_B12X_WO_PROJECTION)
+        self._use_b12x_wo = bool(
+            envs.VLLM_USE_B12X_WO_PROJECTION and vllm_config.lora_config is None
+        )
+        if envs.VLLM_USE_B12X_WO_PROJECTION and not self._use_b12x_wo:
+            logger.warning_once(
+                "Disabling the fused B12X DeepSeek-V4 WO projection because "
+                "LoRA is enabled; the generic projection preserves wo_b LoRA."
+            )
         self._b12x_wo_projection_weights: Any | None = None
         tp_size = get_tensor_model_parallel_world_size()
         layer_id = extract_layer_index(prefix)
@@ -485,6 +496,53 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
         )
 
+    def setup_generic_wo_projection(self) -> None:
+        """Prepare the LoRA-safe DeepGEMM WO-A grouped-einsum layout.
+
+        SM120 normally consumes the checkpoint's canonical 2-D WO tensors in
+        the fused B12X projection. LoRA must keep WO-B callable so its delta is
+        applied, which selects the generic DeepGEMM chain. Repack WO-A once
+        after ordinary quant-method finalization.
+        """
+        if self._use_b12x_wo:
+            return
+
+        wo_a_base = getattr(self.wo_a, "base_layer", self.wo_a)
+        if wo_a_base.weight.ndim == 3:
+            return
+        if wo_a_base.weight.ndim != 2:
+            raise RuntimeError(
+                "DeepSeek V4 generic WO-A expected a 2-D checkpoint tensor or "
+                f"3-D prepared tensor, got shape {tuple(wo_a_base.weight.shape)}"
+            )
+
+        scale_name = (
+            "weight_scale" if hasattr(wo_a_base, "weight_scale") else "weight_scale_inv"
+        )
+        weight_scale = getattr(wo_a_base, scale_name)
+        block_shape = tuple(getattr(wo_a_base, "weight_block_size", (128, 128)))
+        if block_shape != (128, 128):
+            raise NotImplementedError(
+                "DeepSeek V4 generic WO-A currently requires 128x128 FP8 "
+                f"blocks, got {block_shape}"
+            )
+
+        weight, weight_scale = deepgemm_post_process_fp8_weight_block(
+            wq=wo_a_base.weight,
+            ws=weight_scale,
+            quant_block_shape=block_shape,
+            use_e8m0=True,
+            is_bmm=True,
+            bmm_batch_size=self.n_local_groups,
+        )
+        replace_parameter(wo_a_base, "weight", weight)
+        replace_parameter(wo_a_base, scale_name, weight_scale)
+        logger.info_once(
+            "Prepared DeepSeek V4 generic WO-A for LoRA: weight=%s scale=%s",
+            tuple(weight.shape),
+            tuple(weight_scale.shape),
+        )
+
     def _apply_b12x_wo_projection(
         self,
         o: torch.Tensor,
@@ -688,11 +746,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
-                return torch.mm(
-                    hidden_states,
-                    compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
-                )
+                # This packed projection can carry the adapter's compressor
+                # kv/gate LoRA. Calling the module preserves that delta.
+                projected = compressor.fused_wkv_wgate(hidden_states)
+                if isinstance(projected, tuple):
+                    projected = projected[0]
+                return projected.float()
 
             aux_fns[0] = compressor_kv_score
 
@@ -705,9 +764,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
+                # The adapter excludes the indexer compressor, but LoRA model
+                # management still wraps its supported linear module.
+                wrapped = indexer.compressor.fused_wkv_wgate
+                base = getattr(wrapped, "base_layer", wrapped)
                 return torch.mm(
                     hidden_states,
-                    indexer.compressor.fused_wkv_wgate.weight.T,
+                    base.weight.T,
                     out_dtype=torch.float32,
                 )
 

@@ -4,6 +4,7 @@
 
 import os
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -19,6 +20,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
     RoutingMethodType,
+)
+from vllm.model_executor.layers.fused_moe.experts.lora_context import MoELoRAContext
+from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
+    LoRAExpertsMixin,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -589,6 +594,7 @@ def _run_b12x_moe_fp4(
     activation_amax: torch.Tensor | None = None,
     layer_idx: int | None = None,
     route_expert_map: torch.Tensor | None = None,
+    static_lora: Any | None = None,
 ) -> Any:
     """Call b12x MoE with caller-owned live scratch."""
     from b12x.moe.fused_moe import run as b12x_moe_fp4
@@ -610,6 +616,7 @@ def _run_b12x_moe_fp4(
         activation_amax=activation_amax,
         layer_idx=layer_idx,
         route_expert_map=route_expert_map,
+        static_lora=static_lora,
     )
     b12x_moe_fp4(binding=binding)
     return binding
@@ -681,6 +688,23 @@ def _is_current_stream_capturing() -> bool:
     return bool(is_capturing is not None and is_capturing())
 
 
+def _static_lora_for_token_range(
+    static_lora: Any | None, start: int, end: int
+) -> Any | None:
+    """Bind one chunk to the corresponding graph-dynamic LoRA token map."""
+    if static_lora is None or static_lora.token_lora_mapping is None:
+        return static_lora
+    token_mapping = static_lora.token_lora_mapping
+    if start < 0 or end < start or end > int(token_mapping.shape[0]):
+        raise ValueError(
+            "B12X LoRA token-map range is outside the live mapping: "
+            f"[{start}, {end}) vs {int(token_mapping.shape[0])} rows"
+        )
+    if start == 0 and end == int(token_mapping.shape[0]):
+        return static_lora
+    return replace(static_lora, token_lora_mapping=token_mapping[start:end])
+
+
 def _maybe_repeat_check_b12x_moe(
     *,
     original_output: torch.Tensor,
@@ -693,6 +717,7 @@ def _maybe_repeat_check_b12x_moe(
     plan: Any,
     scratch: torch.Tensor,
     route_expert_map: torch.Tensor | None = None,
+    static_lora: Any | None = None,
 ) -> None:
     global _moe_repeat_check_reports
 
@@ -718,6 +743,7 @@ def _maybe_repeat_check_b12x_moe(
         plan=plan,
         scratch=scratch,
         route_expert_map=route_expert_map,
+        static_lora=static_lora,
     )
 
     original_f = original_output.float()
@@ -811,7 +837,7 @@ def _has_b12x() -> bool:
         return False
 
 
-class B12xExperts(mk.FusedMoEExpertsModular):
+class B12xExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
     """Native FP4 MoE backend powered by b12x kernels."""
 
     def __init__(
@@ -834,6 +860,168 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._activation_amax_state_key: tuple[str, str, int] | None = None
         self._activation_amax_layer_idx: int | None = None
         self._kquant_capture_prefix: str | None = None
+        self._b12x_static_lora: Any | None = None
+        self._b12x_lora_weight_signature: tuple[tuple[int, int], ...] | None = None
+        self._b12x_lora_mapping_ptr: int | None = None
+        self._b12x_lora_packed_factors: dict[str, torch.Tensor] = {}
+
+    @staticmethod
+    def _lora_weight_signature(ctx: MoELoRAContext) -> tuple[tuple[int, int], ...]:
+        tensors = (
+            *ctx.w13_lora_a_stacked,
+            *ctx.w13_lora_b_stacked,
+            *ctx.w2_lora_a_stacked,
+            *ctx.w2_lora_b_stacked,
+        )
+        return tuple((tensor.data_ptr(), tensor._version) for tensor in tensors)
+
+    def _rank4_lora_factor(
+        self, tensor: torch.Tensor, *, rank_dim: int, name: str
+    ) -> torch.Tensor:
+        """Return stable contiguous rank-4 storage for one vLLM cache factor.
+
+        vLLM's smallest cache capacity is rank 8. Real rank-4 adapters occupy
+        its first four lanes and leave the rest zero. A narrow view retains
+        rank-8 row strides, so pack it once into persistent storage and update
+        that same allocation when vLLM mutates the source cache.
+        """
+        rank_capacity = tensor.shape[rank_dim]
+        if rank_capacity < 4:
+            raise NotImplementedError(
+                f"B12X W4A16 requires rank-4 expert LoRA; {name} has "
+                f"rank capacity {rank_capacity}"
+            )
+        if rank_capacity > 4:
+            padding = tensor.narrow(rank_dim, 4, rank_capacity - 4)
+            if torch.count_nonzero(padding).item() != 0:
+                raise NotImplementedError(
+                    "B12X W4A16 supports a rank-4 expert LoRA stored in a "
+                    f"zero-padded cache; {name} has non-zero rank padding"
+                )
+        view = tensor.narrow(rank_dim, 0, 4)
+        if view.is_contiguous():
+            return view
+
+        packed = self._b12x_lora_packed_factors.get(name)
+        if packed is None:
+            packed = torch.empty_like(view, memory_format=torch.contiguous_format)
+            self._b12x_lora_packed_factors[name] = packed
+        elif (
+            packed.shape != view.shape
+            or packed.dtype != view.dtype
+            or packed.device != view.device
+        ):
+            raise RuntimeError(
+                "B12X W4A16 static LoRA cache geometry changed after setup: "
+                f"{name} cached={tuple(packed.shape)}/{packed.dtype}/{packed.device}, "
+                f"live={tuple(view.shape)}/{view.dtype}/{view.device}"
+            )
+        packed.copy_(view)
+        return packed
+
+    def set_lora_context(self, ctx: MoELoRAContext) -> None:
+        super().set_lora_context(ctx)
+        if ctx.max_loras != 1:
+            raise NotImplementedError("B12X W4A16 supports exactly one LoRA slot")
+        if ctx.fully_sharded:
+            raise NotImplementedError("B12X W4A16 does not support sharded LoRA rank")
+        if ctx.enable_moe_shared_loras:
+            raise NotImplementedError("B12X W4A16 does not support shared-expert LoRA")
+        if ctx.w13_num_slices not in (1, 2):
+            raise NotImplementedError(
+                "B12X W4A16 requires fused or split gated W13 LoRA"
+            )
+        if ctx.aux_stream is not None:
+            raise NotImplementedError("B12X W4A16 LoRA runs inline on the main stream")
+        if (
+            len(ctx.w13_lora_a_stacked) != ctx.w13_num_slices
+            or len(ctx.w13_lora_b_stacked) != ctx.w13_num_slices
+            or len(ctx.w2_lora_a_stacked) != 1
+            or len(ctx.w2_lora_b_stacked) != 1
+        ):
+            raise ValueError("B12X W4A16 received invalid gated LoRA storage")
+
+        # The compact kernel scratch can retain a preceding adapter mapping
+        # when a request contains no LoRA. Punica's primary allocation is
+        # refreshed for every request, including all-base (-1) batches.
+        token_lora_mapping = ctx.punica_wrapper.token_lora_indices_buffer
+        if token_lora_mapping.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "B12X W4A16 requires an int32/int64 token LoRA mapping, got "
+                f"{token_lora_mapping.dtype}"
+            )
+        if not token_lora_mapping.is_contiguous():
+            raise ValueError("B12X W4A16 requires contiguous token LoRA mapping")
+        signature = self._lora_weight_signature(ctx)
+        mapping_ptr = token_lora_mapping.data_ptr()
+        if (
+            signature == self._b12x_lora_weight_signature
+            and self._b12x_static_lora is not None
+        ):
+            self._b12x_static_lora = replace(
+                self._b12x_static_lora,
+                token_lora_mapping=token_lora_mapping,
+            )
+            self._b12x_lora_mapping_ptr = mapping_ptr
+            return
+        if _is_current_stream_capturing():
+            raise RuntimeError("B12X W4A16 LoRA storage changed during graph capture")
+
+        w13_a_gate = self._rank4_lora_factor(
+            ctx.w13_lora_a_stacked[0][0], rank_dim=1, name="w13_a_gate"
+        )
+        if w13_a_gate.shape[0] != ctx.local_num_experts:
+            raise NotImplementedError("B12X W4A16 requires per-expert W13 LoRA A")
+        if ctx.w13_num_slices == 2:
+            w13_a_up = self._rank4_lora_factor(
+                ctx.w13_lora_a_stacked[1][0], rank_dim=1, name="w13_a_up"
+            )
+            if not torch.equal(w13_a_gate, w13_a_up):
+                raise NotImplementedError(
+                    "B12X W4A16 currently requires gate/up to share W13 LoRA A"
+                )
+            w13_b = self._rank4_lora_factor(
+                ctx.w13_lora_b_stacked[0][0], rank_dim=2, name="w13_b_gate"
+            )
+            w13_b_up = self._rank4_lora_factor(
+                ctx.w13_lora_b_stacked[1][0], rank_dim=2, name="w13_b_up"
+            )
+        else:
+            w13_b = self._rank4_lora_factor(
+                ctx.w13_lora_b_stacked[0][0], rank_dim=2, name="w13_b"
+            )
+            w13_b_up = None
+        w2_a = self._rank4_lora_factor(
+            ctx.w2_lora_a_stacked[0][0], rank_dim=1, name="w2_a"
+        )
+        w2_b = self._rank4_lora_factor(
+            ctx.w2_lora_b_stacked[0][0], rank_dim=2, name="w2_b"
+        )
+
+        try:
+            from b12x.moe.fused_moe import StaticExpertLoRA
+        except ImportError as error:
+            raise RuntimeError(
+                "B12X W4A16 LoRA requires a B12X revision that exports "
+                "StaticExpertLoRA (local-inference-lab/b12x#240 or later)"
+            ) from error
+
+        self._b12x_static_lora = StaticExpertLoRA(
+            w13_a=w13_a_gate,
+            w13_b=w13_b,
+            w13_b_up=w13_b_up,
+            w2_a=w2_a,
+            w2_b=w2_b,
+            token_lora_mapping=token_lora_mapping,
+            adapter_slot=0,
+        )
+        self._b12x_lora_weight_signature = signature
+        self._b12x_lora_mapping_ptr = mapping_ptr
+
+    def refresh_lora_context(self) -> None:
+        """Refresh packed rank-4 factors after vLLM mutates its LoRA cache."""
+        if self._lora_context is not None:
+            self.set_lora_context(self._lora_context)
 
     def _quant_mode(self) -> str:
         source_format = self._source_format()
@@ -1126,6 +1314,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         params_dtype: torch.dtype,
     ):
         quant_mode = self._quant_mode()
+
+        if self._b12x_static_lora is not None and quant_mode != "w4a16":
+            raise RuntimeError(
+                "B12X expert LoRA requires quant_mode='w4a16'; set "
+                "B12X_MOE_FORCE_A16=1 for NVFP4 checkpoints"
+            )
         prepared = self._prepared_experts
         if prepared is not None:
             requested_dtype = str(params_dtype).removeprefix("torch.")
@@ -1592,6 +1786,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
         quant_mode = self._quant_mode()
 
+        if self._b12x_static_lora is not None and expert_map is not None:
+            raise NotImplementedError(
+                "B12X W4A16 expert LoRA does not yet support expert parallel"
+            )
+
         if expert_map is not None:
             if quant_mode != "w4a16":
                 raise RuntimeError(
@@ -1640,6 +1839,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             chunk_topk_weights = topk_weights[start:end]
             chunk_topk_ids = topk_ids[start:end]
             chunk_output = output[start:end]
+            chunk_static_lora = _static_lora_for_token_range(
+                self._b12x_static_lora, start, end
+            )
             plan = _plan_b12x_moe_fp4_scratch(
                 tokens=end - start,
                 topk=int(topk_ids.shape[1]),
@@ -1673,6 +1875,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 activation_amax=activation_amax,
                 layer_idx=activation_layer_idx,
                 route_expert_map=expert_map,
+                static_lora=chunk_static_lora,
             )
             if capture_kquant:
                 assert prefix is not None
@@ -1694,10 +1897,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                     plan=plan,
                     scratch=scratch,
                     route_expert_map=expert_map,
+                    static_lora=chunk_static_lora,
                 )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
-        raise NotImplementedError("LoRA is not supported for B12xExperts")
+        raise NotImplementedError("B12xExperts writes reduced output inline")
 
 
 def warmup_b12x_moe_dynamic(

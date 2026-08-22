@@ -59,6 +59,7 @@ from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     MixtureOfExperts,
     SupportsEagle3,
+    SupportsLoRA,
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
@@ -1913,6 +1914,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.attn.setup_b12x_wo_projection()
 
+    def setup_generic_wo_projection(self) -> None:
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            layer.attn.setup_generic_wo_projection()
+
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     if expert_dtype == "fp4":
@@ -1946,6 +1951,8 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
             ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
         },
         orig_to_new_substr={
+            ".self_attn.": ".attn.",
+            ".mlp.": ".ffn.",
             ".shared_experts.w2": ".shared_experts.down_proj",
         },
     )
@@ -1989,8 +1996,21 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
 
 
 class DeepseekV4ForCausalLM(
-    nn.Module, SupportsPP, SupportsEagle3, DeepseekV4MixtureOfExperts
+    nn.Module,
+    SupportsPP,
+    SupportsEagle3,
+    SupportsLoRA,
+    DeepseekV4MixtureOfExperts,
 ):
+    is_3d_moe_weight = True
+    lora_skip_prefixes = ["mtp."]
+    packed_modules_mapping = {
+        "fused_wqa_wkv": ["q_a_proj", "kv_proj"],
+        "wq_b": ["q_b_proj"],
+        "wo_b": ["o_b_proj"],
+        "fused_wkv_wgate": ["kv_proj", "gate_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
@@ -2080,6 +2100,11 @@ class DeepseekV4ForCausalLM(
         self.model.finalize_mhc_broadcast_weights()
         self.model.setup_b12x_wo_projection()
         return loaded_params
+
+    def process_weights_after_loading(self) -> None:
+        # After per-linear quant finalization, prepare generic WO-A when LoRA
+        # keeps WO-B callable instead of using the fused B12X projection.
+        self.model.setup_generic_wo_projection()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

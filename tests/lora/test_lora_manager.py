@@ -163,7 +163,12 @@ def test_wrap_replicated_linear_subclasses(default_vllm_config, dist_init, dummy
 
 def test_wrap_gate_linear(default_vllm_config, dist_init, dummy_model):
     model = dummy_model
-    model.add_module("router_gate", GateLinear(10, 4, bias=False))
+    router_gate = GateLinear(10, 4, bias=False)
+    router_gate.e_score_correction_bias = nn.Parameter(torch.randn(4))
+    router_gate.tid2eid = nn.Parameter(
+        torch.randint(0, 4, (10, 2)), requires_grad=False
+    )
+    model.add_module("router_gate", router_gate)
 
     manager = LoRAModelManager(
         model,
@@ -177,9 +182,10 @@ def test_wrap_gate_linear(default_vllm_config, dist_init, dummy_model):
         default_vllm_config,
     )
 
-    assert isinstance(
-        manager.model.get_submodule("router_gate"), ReplicatedLinearWithLoRA
-    )
+    wrapped_gate = manager.model.get_submodule("router_gate")
+    assert isinstance(wrapped_gate, ReplicatedLinearWithLoRA)
+    assert wrapped_gate.e_score_correction_bias is router_gate.e_score_correction_bias
+    assert wrapped_gate.tid2eid is router_gate.tid2eid
 
 
 def test_dedup_shared_module_across_paths(default_vllm_config, dist_init, dummy_model):
