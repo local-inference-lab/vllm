@@ -998,7 +998,13 @@ class B12xExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             ctx.w2_lora_b_stacked[0][0], rank_dim=2, name="w2_b"
         )
 
-        from b12x.moe.fused_moe import StaticExpertLoRA
+        try:
+            from b12x.moe.fused_moe import StaticExpertLoRA
+        except ImportError as error:
+            raise RuntimeError(
+                "B12X W4A16 LoRA requires a B12X revision that exports "
+                "StaticExpertLoRA (local-inference-lab/b12x#240 or later)"
+            ) from error
 
         self._b12x_static_lora = StaticExpertLoRA(
             w13_a=w13_a_gate,
