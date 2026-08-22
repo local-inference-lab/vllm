@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +24,11 @@ class _FakePlan:
     @staticmethod
     def scratch_specs():
         return [SimpleNamespace(dtype=torch.uint8, shape=(64,))]
+
+
+@dataclass(frozen=True)
+class _FakeStaticLoRA:
+    token_lora_mapping: torch.Tensor
 
 
 def _make_fake_prepared_experts(
@@ -789,6 +795,63 @@ def test_b12x_moe_workspace_limit_chunks_token_independent_launches(
     assert torch.equal(
         torch.cat([call["topk_weights"] for call in run_calls]), topk_weights
     )
+    assert torch.equal(output, hidden_states)
+
+
+def test_b12x_moe_workspace_chunks_slice_static_lora_token_mapping(
+    monkeypatch,
+) -> None:
+    run_calls = []
+
+    def fake_run(**kwargs):
+        run_calls.append(kwargs)
+        kwargs["output"].copy_(kwargs["a"])
+
+    monkeypatch.setenv("B12X_MOE_WORKSPACE_TOKEN_LIMIT", "2")
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    monkeypatch.setattr(
+        b12x_moe,
+        "_plan_b12x_moe_fp4_scratch",
+        lambda **kwargs: _FakePlan(),
+    )
+    monkeypatch.setattr(b12x_moe, "_run_b12x_moe_fp4", fake_run)
+
+    experts = _make_fake_b12x_experts()
+    experts._prepared_experts = _make_fake_prepared_experts(quant_mode="w4a16")
+    token_mapping = torch.tensor([0, 0, -1, -1, 0], dtype=torch.int32)
+    experts._b12x_static_lora = _FakeStaticLoRA(token_mapping)
+    hidden_states = torch.arange(5 * 64, dtype=torch.bfloat16).view(5, 64)
+    output = torch.empty_like(hidden_states)
+    topk_ids = torch.arange(5 * 4, dtype=torch.int32).view(5, 4) % 8
+    topk_weights = torch.full((5, 4), 0.25, dtype=torch.float32)
+
+    experts.apply(
+        output=output,
+        hidden_states=hidden_states,
+        w1=torch.empty(0, dtype=torch.uint8),
+        w2=torch.empty(0, dtype=torch.uint8),
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        global_num_experts=8,
+        expert_map=None,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=None,
+        workspace2=torch.empty(64, dtype=torch.uint8),
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
+    )
+
+    chunk_mappings = [
+        call["static_lora"].token_lora_mapping for call in run_calls
+    ]
+    assert [mapping.tolist() for mapping in chunk_mappings] == [
+        [0, 0],
+        [-1, -1],
+        [0],
+    ]
+    assert all(mapping.is_contiguous() for mapping in chunk_mappings)
     assert torch.equal(output, hidden_states)
 
 

@@ -4,6 +4,7 @@
 
 import os
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -685,6 +686,23 @@ def _is_current_stream_capturing() -> bool:
         return False
     is_capturing = getattr(cuda, "is_current_stream_capturing", None)
     return bool(is_capturing is not None and is_capturing())
+
+
+def _static_lora_for_token_range(
+    static_lora: Any | None, start: int, end: int
+) -> Any | None:
+    """Bind one chunk to the corresponding graph-dynamic LoRA token map."""
+    if static_lora is None or static_lora.token_lora_mapping is None:
+        return static_lora
+    token_mapping = static_lora.token_lora_mapping
+    if start < 0 or end < start or end > int(token_mapping.shape[0]):
+        raise ValueError(
+            "B12X LoRA token-map range is outside the live mapping: "
+            f"[{start}, {end}) vs {int(token_mapping.shape[0])} rows"
+        )
+    if start == 0 and end == int(token_mapping.shape[0]):
+        return static_lora
+    return replace(static_lora, token_lora_mapping=token_mapping[start:end])
 
 
 def _maybe_repeat_check_b12x_moe(
@@ -1797,6 +1815,9 @@ class B12xExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             chunk_topk_weights = topk_weights[start:end]
             chunk_topk_ids = topk_ids[start:end]
             chunk_output = output[start:end]
+            chunk_static_lora = _static_lora_for_token_range(
+                self._b12x_static_lora, start, end
+            )
             plan = _plan_b12x_moe_fp4_scratch(
                 tokens=end - start,
                 topk=int(topk_ids.shape[1]),
@@ -1830,7 +1851,7 @@ class B12xExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 activation_amax=activation_amax,
                 layer_idx=activation_layer_idx,
                 route_expert_map=expert_map,
-                static_lora=self._b12x_static_lora,
+                static_lora=chunk_static_lora,
             )
             if capture_kquant:
                 assert prefix is not None
@@ -1852,7 +1873,7 @@ class B12xExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                     plan=plan,
                     scratch=scratch,
                     route_expert_map=expert_map,
-                    static_lora=self._b12x_static_lora,
+                    static_lora=chunk_static_lora,
                 )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
