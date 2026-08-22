@@ -47,6 +47,15 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
                 except Exception:
                     spec = None
                 if getattr(spec, "dcp_replicated", False):
+                    # A replicated KV group contains the complete sequence on
+                    # every rank. Its attention kernel must therefore execute
+                    # as a local DCP1 operation; applying DCP collectives would
+                    # partition and reduce the same cache a second time.
+                    layer_impl.dcp_world_size = 1
+                    layer_impl.dcp_rank = 0
+                    layer_impl.total_cp_world_size = 1
+                    layer_impl.total_cp_rank = 0
+                    layer_impl.need_to_return_lse_for_decode = False
                     continue
             if vllm_config.speculative_config is not None and interleave_size > 1:
                 assert layer_impl.supports_mtp_with_cp_non_trivial_interleave_size, (
