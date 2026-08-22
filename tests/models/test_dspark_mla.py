@@ -56,6 +56,13 @@ def test_dspark_mla_checkpoint_weight_mapping(checkpoint_name, runtime_name, sha
     ) == (runtime_name, shard_id)
 
 
+def test_dspark_mla_exposes_packed_quantization_mapping() -> None:
+    assert K3DSparkForCausalLM.packed_modules_mapping == {
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+
 def test_dspark_mla_shares_frozen_target_weights_and_skips_training_head():
     assert not K3DSparkForCausalLM.has_own_embed_tokens
     assert not K3DSparkForCausalLM.has_own_lm_head
@@ -64,6 +71,50 @@ def test_dspark_mla_shares_frozen_target_weights_and_skips_training_head():
         "embed_tokens",
         "lm_head",
     }
+
+
+@pytest.mark.cpu_test
+def test_dspark_quant_config_aliases_runtime_layer_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entries = {
+        "layers.0.mlp.down_proj": {"stored_tensors": {"down": {}}},
+        "model.layers.1.self_attn.q_b_proj": {"stored_tensors": {"q_b": {}}},
+        "context_proj": {"stored_tensors": {"context": {}}},
+    }
+    quant_config = SimpleNamespace(tensor_storage=entries)
+    vllm_config = SimpleNamespace(
+        quant_config=quant_config,
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(num_hidden_layers=2)
+            )
+        ),
+    )
+
+    def fail_reparse(*args, **kwargs):
+        raise AssertionError("configured draft quantization must be reused")
+
+    monkeypatch.setattr(dspark_mla, "get_draft_quant_config", fail_reparse)
+
+    result = dspark_mla._prepare_dspark_quant_config(vllm_config, start_layer_id=5)
+
+    assert result is quant_config
+    assert entries["layers.5.mlp.down_proj"] is entries["layers.0.mlp.down_proj"]
+    assert (
+        entries["model.layers.6.self_attn.q_b_proj"]
+        is entries["model.layers.1.self_attn.q_b_proj"]
+    )
+    assert set(entries) == {
+        "layers.0.mlp.down_proj",
+        "model.layers.1.self_attn.q_b_proj",
+        "context_proj",
+        "layers.5.mlp.down_proj",
+        "model.layers.6.self_attn.q_b_proj",
+    }
+
+    dspark_mla._prepare_dspark_quant_config(vllm_config, start_layer_id=5)
+    assert len(entries) == 5
 
 
 @pytest.mark.cpu_test
@@ -167,6 +218,130 @@ def test_replicated_markov_w1_requires_sharded_head(
 
     with pytest.raises(ValueError, match="requires VLLM_DSPARK_SHARD_MARKOV_HEAD"):
         DSparkMarkovHead(128, 128, 8, prefix="markov_head")
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_model_reuses_prepared_quant_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quant_config = object()
+    projection_configs = []
+    decoder_configs = []
+
+    class DummyModule(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(0))
+
+    def make_projection(*args, **kwargs):
+        projection_configs.append(kwargs.get("quant_config"))
+        return DummyModule()
+
+    def make_decoder(*args, **kwargs):
+        decoder_configs.append(kwargs.get("quant_config"))
+        return DummyModule()
+
+    monkeypatch.setattr(
+        dspark_mla,
+        "_prepare_dspark_quant_config",
+        lambda vllm_config, start_layer_id: quant_config,
+    )
+    monkeypatch.setattr(
+        dspark_mla,
+        "get_draft_quant_config",
+        lambda _: (_ for _ in ()).throw(
+            AssertionError("decoder must reuse prepared quantization")
+        ),
+    )
+    monkeypatch.setattr(dspark_mla, "ColumnParallelLinear", make_projection)
+    monkeypatch.setattr(dspark_mla, "ReplicatedLinear", make_projection)
+    monkeypatch.setattr(dspark_mla, "MergedColumnParallelLinear", make_projection)
+    monkeypatch.setattr(dspark_mla, "RMSNorm", DummyModule)
+    monkeypatch.setattr(dspark_mla, "K3DSparkDecoderLayer", make_decoder)
+    monkeypatch.setattr(dspark_mla, "DSparkMarkovHead", DummyModule)
+
+    config = SimpleNamespace(
+        target_hidden_size=16,
+        num_target_layers=2,
+        hidden_size=8,
+        kv_lora_rank=3,
+        qk_rope_head_dim=1,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        vocab_size=128,
+        draft_vocab_size=128,
+        markov_rank=4,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(hf_config=config)
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+    )
+
+    K3DSparkModel(vllm_config=vllm_config, start_layer_id=5, prefix="model")
+
+    assert decoder_configs == [quant_config]
+    assert projection_configs and all(
+        candidate is quant_config for candidate in projection_configs
+    )
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_quantized_context_projection_needs_no_dense_weight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class QuantizedProjection(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.register_parameter(
+                "trellis",
+                nn.Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False),
+            )
+
+    class DummyModule(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(0))
+
+    monkeypatch.setattr(
+        dspark_mla,
+        "_prepare_dspark_quant_config",
+        lambda vllm_config, start_layer_id: object(),
+    )
+    monkeypatch.setattr(dspark_mla, "ReplicatedLinear", QuantizedProjection)
+    monkeypatch.setattr(dspark_mla, "MergedColumnParallelLinear", QuantizedProjection)
+    monkeypatch.setattr(dspark_mla, "RMSNorm", DummyModule)
+    monkeypatch.setattr(dspark_mla, "K3DSparkDecoderLayer", DummyModule)
+    monkeypatch.setattr(dspark_mla, "DSparkMarkovHead", DummyModule)
+
+    config = SimpleNamespace(
+        target_hidden_size=16,
+        num_target_layers=2,
+        hidden_size=8,
+        kv_lora_rank=3,
+        qk_rope_head_dim=1,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        vocab_size=128,
+        draft_vocab_size=128,
+        markov_rank=4,
+        target_layer_ids=(),
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(hf_config=config)
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+    )
+
+    model = K3DSparkModel(vllm_config=vllm_config, start_layer_id=5, prefix="model")
+
+    assert not hasattr(model.context_proj, "weight")
+    assert model._streamed_context_states.dtype == torch.get_default_dtype()
+    assert model._streamed_context_states.device == model.context_proj.trellis.device
 
 
 @pytest.mark.cpu_test

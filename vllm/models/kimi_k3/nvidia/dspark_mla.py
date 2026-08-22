@@ -26,6 +26,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -123,6 +124,39 @@ def _fill_compact_rope_cache(
     return cache
 
 
+def _prepare_dspark_quant_config(
+    vllm_config: VllmConfig,
+    start_layer_id: int,
+) -> QuantizationConfig | None:
+    quant_config = getattr(vllm_config, "quant_config", None)
+    if quant_config is None:
+        quant_config = get_draft_quant_config(vllm_config)
+    if quant_config is None:
+        return None
+
+    tensor_storage = getattr(quant_config, "tensor_storage", None)
+    if not isinstance(tensor_storage, dict) or start_layer_id == 0:
+        return quant_config
+
+    assert vllm_config.speculative_config is not None
+    num_layers = int(
+        vllm_config.speculative_config.draft_model_config.hf_config.num_hidden_layers
+    )
+    for prefix, entry in list(tensor_storage.items()):
+        parts = prefix.split(".")
+        try:
+            layers_index = parts.index("layers")
+            layer_index = int(parts[layers_index + 1])
+        except (ValueError, IndexError):
+            continue
+        if not 0 <= layer_index < num_layers:
+            continue
+        aliased = parts.copy()
+        aliased[layers_index + 1] = str(start_layer_id + layer_index)
+        tensor_storage.setdefault(".".join(aliased), entry)
+    return quant_config
+
+
 class K3DSparkDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -132,9 +166,9 @@ class K3DSparkDecoderLayer(nn.Module):
         layer_idx: int,
         start_layer_id: int,
         prefix: str,
+        quant_config: QuantizationConfig | None,
     ) -> None:
         super().__init__()
-        quant_config = get_draft_quant_config(vllm_config)
         self.self_attn = MultiHeadLatentAttention(
             config=config,
             hidden_size=config.hidden_size,
@@ -209,7 +243,7 @@ class K3DSparkModel(nn.Module):
         super().__init__()
         assert vllm_config.speculative_config is not None
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
-        self.quant_config = get_draft_quant_config(vllm_config)
+        self.quant_config = _prepare_dspark_quant_config(vllm_config, start_layer_id)
 
         # The frozen target embedding is aliased after the draft checkpoint loads.
         self.embed_tokens: nn.Module | None = None
@@ -259,6 +293,7 @@ class K3DSparkModel(nn.Module):
                     layer_idx=layer_idx,
                     start_layer_id=start_layer_id,
                     prefix=prefix,
+                    quant_config=self.quant_config,
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
@@ -305,15 +340,17 @@ class K3DSparkModel(nn.Module):
         self._context_local_start = (
             int(getattr(self.context_proj, "tp_rank", 0)) * self._context_local_width
         )
-        context_proj_weight = self.context_proj.weight
+        context_proj_parameter = next(self.context_proj.parameters())
+        context_dtype = torch.get_default_dtype()
+        context_device = context_proj_parameter.device
         if self.context_proj_sharded:
             self.register_buffer(
                 "_streamed_context_states",
                 torch.empty(
                     self._max_num_context_tokens,
                     self._context_local_width,
-                    dtype=context_proj_weight.dtype,
-                    device=context_proj_weight.device,
+                    dtype=context_dtype,
+                    device=context_device,
                 ),
                 persistent=False,
             )
@@ -322,8 +359,8 @@ class K3DSparkModel(nn.Module):
                 "_streamed_context_states",
                 torch.empty(
                     0,
-                    dtype=context_proj_weight.dtype,
-                    device=context_proj_weight.device,
+                    dtype=context_dtype,
+                    device=context_device,
                 ),
                 persistent=False,
             )
@@ -878,6 +915,10 @@ class K3DSparkModel(nn.Module):
 
 
 class K3DSparkForCausalLM(nn.Module):
+    packed_modules_mapping = {
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
     has_own_embed_tokens = False
     has_own_lm_head = False
     draft_id_to_target_id = None
