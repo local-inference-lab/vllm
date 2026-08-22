@@ -728,6 +728,11 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             if num_speculative_tokens is not None
             else self.num_speculative_steps
         )
+        # A scheduler can intentionally disable speculation for one step (for
+        # example, a request with max_tokens=1). ModelRunner treats an empty
+        # second dimension as a normal non-speculative step.
+        if active_k == 0:
+            return self.draft_tokens[: input_batch.num_reqs, :0].contiguous()
         if not 1 <= active_k <= self.num_speculative_steps:
             raise ValueError(
                 f"Remote DSpark depth must be in [1, "
