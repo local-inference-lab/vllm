@@ -39,14 +39,35 @@ __global__ void merge_attn_states_kernel(
   const uint global_idx = blockIdx.x * NUM_THREADS + threadIdx.x;
   const uint token_head_threads = num_tokens * num_heads * threads_per_head;
 
-  if (global_idx >= token_head_threads) return;
-
-  // global_idx -> token_idx + head_idx + pack_idx
+  // Derive indices before the block barrier so every thread reaches it.
   const uint token_head_idx = global_idx / threads_per_head;
   const uint pack_idx = global_idx % threads_per_head;
-
   const uint token_idx = token_head_idx / num_heads;
   const uint head_idx = token_head_idx % num_heads;
+
+  // A running chunked-attention LSE may be both prefix_lse and output_lse.
+  // Load it once per head before any thread can overwrite the destination.
+  // Groups that cross block boundaries retain independent global loads.
+  __shared__ float shared_prefix_lse[NUM_THREADS];
+  __shared__ float shared_suffix_lse[NUM_THREADS];
+  const bool group_fits_in_block = NUM_THREADS % threads_per_head == 0;
+  const bool is_valid = global_idx < token_head_threads;
+  const uint group_idx = threadIdx.x / threads_per_head;
+
+  if (group_fits_in_block) {
+    if (is_valid && pack_idx == 0 && token_idx < prefix_num_tokens) {
+      shared_prefix_lse[group_idx] =
+          prefix_lse[head_idx * prefix_lse_head_stride +
+                     token_idx * prefix_lse_token_stride];
+      shared_suffix_lse[group_idx] =
+          suffix_lse[head_idx * suffix_lse_head_stride +
+                     token_idx * suffix_lse_token_stride];
+    }
+    __syncthreads();
+    if (!is_valid) return;
+  } else if (!is_valid) {
+    return;
+  }
 
   const uint pack_offset = pack_idx * pack_size;  // (0~15)*8, etc.
   const uint src_head_offset = token_idx * num_heads * prefix_head_stride +
@@ -95,11 +116,18 @@ __global__ void merge_attn_states_kernel(
     return;
   }
 
-  // For tokens within prefix range, merge prefix and suffix
-  float p_lse = prefix_lse[head_idx * prefix_lse_head_stride +
-                           token_idx * prefix_lse_token_stride];
-  float s_lse = suffix_lse[head_idx * suffix_lse_head_stride +
-                           token_idx * suffix_lse_token_stride];
+  // For tokens within prefix range, merge prefix and suffix.
+  float p_lse;
+  float s_lse;
+  if (group_fits_in_block) {
+    p_lse = shared_prefix_lse[group_idx];
+    s_lse = shared_suffix_lse[group_idx];
+  } else {
+    p_lse = prefix_lse[head_idx * prefix_lse_head_stride +
+                       token_idx * prefix_lse_token_stride];
+    s_lse = suffix_lse[head_idx * suffix_lse_head_stride +
+                       token_idx * suffix_lse_token_stride];
+  }
   p_lse = std::isinf(p_lse) ? -std::numeric_limits<float>::infinity() : p_lse;
   s_lse = std::isinf(s_lse) ? -std::numeric_limits<float>::infinity() : s_lse;
 

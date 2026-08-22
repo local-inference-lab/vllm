@@ -99,6 +99,60 @@ def test_merge_attn_states_both_empty(merge_fn, output_dtype) -> None:
     assert not output.isnan().any()
 
 
+@pytest.mark.parametrize("num_tokens", [256, 4096])
+@torch.inference_mode()
+def test_merge_attn_states_cuda_inplace_accumulator(num_tokens: int) -> None:
+    """The CUDA kernel supports a running partial as input and destination.
+
+    Chunked attention folds each suffix partial into one prefix allocation.
+    Both the attention output and its log-sum-exp tensor therefore alias their
+    corresponding destinations.  The result must match a merge into disjoint
+    output allocations exactly, including at Kimi-K3's MLA head geometry.
+    """
+    if not current_platform.is_cuda():
+        pytest.skip("The custom merge-attention kernel requires CUDA")
+
+    torch.manual_seed(0)
+    num_heads = 6
+    head_size = 128
+    shape = (num_tokens, num_heads, head_size)
+
+    prefix_output = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    suffix_output = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    prefix_lse = torch.randn(
+        (num_heads, num_tokens), dtype=torch.float32, device="cuda"
+    )
+    suffix_lse = torch.randn(
+        (num_heads, num_tokens), dtype=torch.float32, device="cuda"
+    )
+
+    reference_output = torch.empty_like(prefix_output)
+    reference_lse = torch.empty_like(prefix_lse)
+    merge_attn_states_cuda(
+        reference_output,
+        prefix_output,
+        prefix_lse,
+        suffix_output,
+        suffix_lse,
+        reference_lse,
+    )
+
+    inplace_output = prefix_output.clone()
+    inplace_lse = prefix_lse.clone()
+    merge_attn_states_cuda(
+        inplace_output,
+        inplace_output,
+        inplace_lse,
+        suffix_output,
+        suffix_lse,
+        inplace_lse,
+    )
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(inplace_output, reference_output, rtol=0, atol=0)
+    torch.testing.assert_close(inplace_lse, reference_lse, rtol=0, atol=0)
+
+
 def generate_markdown_table():
     global all_case_info
     table_header = (
