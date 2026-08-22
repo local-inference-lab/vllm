@@ -12,6 +12,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.parser.abstract_parser import DelegatingParser
 from vllm.reasoning.kimi_k3_reasoning_parser import KimiK3ReasoningParser
+from vllm.tool_parsers.utils import partial_tag_overlap
 
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -22,6 +23,45 @@ if TYPE_CHECKING:
 
 class KimiK3Parser(DelegatingParser):
     """Compose the Kimi K3 reasoning and tool parsers for XTML output."""
+
+    _CONTENT_PROTOCOL_MARKERS = (
+        "<|open|>think<|sep|>",
+        "<|close|>think<|sep|>",
+        "<|open|>response<|sep|>",
+        "<|close|>response<|sep|>",
+        "<|close|>message<|sep|>",
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pending_content_protocol = ""
+
+    def _strip_content_protocol(
+        self, content: str | None, *, finished: bool
+    ) -> str | None:
+        """Remove Kimi XTML control markers from streamed API content.
+
+        Reasoning and tool parsers normally consume these markers before this
+        method runs. The final filter preserves the API invariant when a
+        malformed model transition or an inconsistent initial parser phase
+        routes a marker through the content field. Marker prefixes are held
+        across stream chunks so partial control tokens are never exposed.
+        """
+        pending = self._pending_content_protocol + (content or "")
+        for marker in self._CONTENT_PROTOCOL_MARKERS:
+            pending = pending.replace(marker, "")
+
+        overlap = max(
+            partial_tag_overlap(pending, marker)
+            for marker in self._CONTENT_PROTOCOL_MARKERS
+        )
+        if overlap:
+            emitted = pending[:-overlap]
+            self._pending_content_protocol = "" if finished else pending[-overlap:]
+        else:
+            emitted = pending
+            self._pending_content_protocol = ""
+        return emitted or None
 
     # TODO: Switch Kimi K3 to the parser engine once its XTML reasoning/tool
     # path is covered there.
@@ -113,18 +153,25 @@ class KimiK3Parser(DelegatingParser):
         )
 
         if (
-            self._tool_parser is not None
-            or not isinstance(self._reasoning_parser, KimiK3ReasoningParser)
-            or not state.reasoning_ended
-            or delta_message is None
+            delta_message is not None
+            and self._tool_parser is None
+            and isinstance(self._reasoning_parser, KimiK3ReasoningParser)
+            and state.reasoning_ended
         ):
-            return delta_message
+            stripped = self._reasoning_parser.strip_content_streaming(
+                previous_text=previous_content,
+                current_text=state.previous_text,
+            )
+            delta_message.content = stripped.content if stripped is not None else None
 
-        stripped = self._reasoning_parser.strip_content_streaming(
-            previous_text=previous_content,
-            current_text=state.previous_text,
+        if delta_message is None:
+            if finished:
+                self._pending_content_protocol = ""
+            return None
+
+        delta_message.content = self._strip_content_protocol(
+            delta_message.content, finished=finished
         )
-        delta_message.content = stripped.content if stripped is not None else None
         if (
             delta_message.role is None
             and delta_message.content is None
