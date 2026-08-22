@@ -367,6 +367,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         target_attn_layer_names: set[str],
     ) -> nn.Module:
         model = load_dflash_model(target_model, self.vllm_config)
+        bind_auxiliary_stream = getattr(model, "bind_target_auxiliary_stream", None)
+        if callable(bind_auxiliary_stream):
+            bind_auxiliary_stream(target_model, self.hidden_states)
         maybe_load_mask_embedding(
             model,
             self.draft_model_config.model,
