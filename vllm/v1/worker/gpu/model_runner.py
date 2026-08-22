@@ -65,7 +65,6 @@ from vllm.multimodal.encoder_budget import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
-from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -620,19 +619,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
-            # One local block covers `block_size * dcp_shard_count` tokens in
-            # the global sequence. Replicated groups keep the full cache on
-            # every rank instead.
             group_cp_size = get_kv_cache_dcp_shard_count(spec, self.dcp_size)
             group_cp_sizes.append(group_cp_size)
-            max_num_blocks = cdiv(
-                block_table_max_model_len, spec.block_size * group_cp_size
+            # Cache specifications own their block-table geometry. Attention
+            # caches account for their token-position DCP shards, while
+            # recurrent state and replicated attention caches remain unscaled.
+            max_num_blocks = spec.max_num_blocks_per_req(
+                self.vllm_config, block_table_max_model_len
             )
-            # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
             if isinstance(spec, MambaSpec):
-                max_num_blocks = (
-                    max_num_blocks if self.cache_config.enable_prefix_caching else 1
-                ) + spec.num_speculative_blocks
                 max_num_blocks = get_block_table_width(
                     max_num_blocks, spec.block_size, token_alignment=None
                 )
