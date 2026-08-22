@@ -101,13 +101,19 @@ def deep_gemm_fp8_o_proj(
         device=o.device,
         dtype=torch.bfloat16,
     )
+    # LoRA management wraps supported linear modules even when an adapter does
+    # not target a particular projection. The fused einsum needs the raw wo_a
+    # tensor, while wo_b remains a normal callable so its LoRA delta applies.
+    wo_a_base = getattr(wo_a, "base_layer", wo_a)
     weight_scale = (
-        wo_a.weight_scale if hasattr(wo_a, "weight_scale") else wo_a.weight_scale_inv
+        wo_a_base.weight_scale
+        if hasattr(wo_a_base, "weight_scale")
+        else wo_a_base.weight_scale_inv
     )
     torch.ops.vllm.deepseek_v4_fp8_o_proj_einsum(
         o_fp8,
         o_scale,
-        wo_a.weight,
+        wo_a_base.weight,
         weight_scale,
         z,
         einsum_recipe[0],

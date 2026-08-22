@@ -59,6 +59,7 @@ from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     MixtureOfExperts,
     SupportsEagle3,
+    SupportsLoRA,
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
@@ -1946,6 +1947,8 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
             ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
         },
         orig_to_new_substr={
+            ".self_attn.": ".attn.",
+            ".mlp.": ".ffn.",
             ".shared_experts.w2": ".shared_experts.down_proj",
         },
     )
@@ -1989,8 +1992,21 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
 
 
 class DeepseekV4ForCausalLM(
-    nn.Module, SupportsPP, SupportsEagle3, DeepseekV4MixtureOfExperts
+    nn.Module,
+    SupportsPP,
+    SupportsEagle3,
+    SupportsLoRA,
+    DeepseekV4MixtureOfExperts,
 ):
+    is_3d_moe_weight = True
+    lora_skip_prefixes = ["mtp."]
+    packed_modules_mapping = {
+        "fused_wqa_wkv": ["q_a_proj", "kv_proj"],
+        "wq_b": ["q_b_proj"],
+        "wo_b": ["o_b_proj"],
+        "fused_wkv_wgate": ["kv_proj", "gate_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.

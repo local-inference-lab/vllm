@@ -220,7 +220,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
-        self._use_b12x_wo = bool(envs.VLLM_USE_B12X_WO_PROJECTION)
+        self._use_b12x_wo = bool(
+            envs.VLLM_USE_B12X_WO_PROJECTION and vllm_config.lora_config is None
+        )
+        if envs.VLLM_USE_B12X_WO_PROJECTION and not self._use_b12x_wo:
+            logger.warning_once(
+                "Disabling the fused B12X DeepSeek-V4 WO projection because "
+                "LoRA is enabled; the generic projection preserves wo_b LoRA."
+            )
         self._b12x_wo_projection_weights: Any | None = None
         tp_size = get_tensor_model_parallel_world_size()
         layer_id = extract_layer_index(prefix)
@@ -688,11 +695,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
-                return torch.mm(
-                    hidden_states,
-                    compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
-                )
+                # This packed projection can carry the adapter's compressor
+                # kv/gate LoRA. Calling the module preserves that delta.
+                projected = compressor.fused_wkv_wgate(hidden_states)
+                if isinstance(projected, tuple):
+                    projected = projected[0]
+                return projected.float()
 
             aux_fns[0] = compressor_kv_score
 
@@ -705,9 +713,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
+                # The adapter excludes the indexer compressor, but LoRA model
+                # management still wraps its supported linear module.
+                wrapped = indexer.compressor.fused_wkv_wgate
+                base = getattr(wrapped, "base_layer", wrapped)
                 return torch.mm(
                     hidden_states,
-                    indexer.compressor.fused_wkv_wgate.weight.T,
+                    base.weight.T,
                     out_dtype=torch.float32,
                 )
 
