@@ -80,6 +80,13 @@ def use_eagle_for_target_cache(
     draft KV outside the target cache groups. In that layout, falling back from
     an empty ``is_eagle_group`` set to all target groups drops one valid target
     prefix hash. Classic EAGLE keeps the historical unannotated fallback.
+
+    Args:
+        speculative_config: Active speculative-decoding configuration, if any.
+        kv_cache_groups: Target-cache groups inspected for explicit EAGLE state.
+
+    Returns:
+        Whether target-cache prefix matching must drop EAGLE's trailing hash.
     """
     if speculative_config is None or not speculative_config.use_eagle():
         return False
