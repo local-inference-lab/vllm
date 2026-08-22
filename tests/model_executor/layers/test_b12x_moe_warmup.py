@@ -93,6 +93,7 @@ def _make_fake_b12x_experts() -> b12x_moe.B12xExperts:
     experts._b12x_static_lora = None
     experts._b12x_lora_weight_signature = None
     experts._b12x_lora_mapping_ptr = None
+    experts._b12x_lora_packed_factors = {}
     return experts
 
 
@@ -101,34 +102,59 @@ def _make_fake_lora_context(
     num_experts: int = 8,
     hidden_size: int = 64,
     intermediate_size: int = 16,
+    rank_capacity: int = 4,
+    fused_w13: bool = False,
 ):
-    w13_a = torch.randn(
-        1, num_experts, 4, hidden_size, dtype=torch.bfloat16
+    w13_a = torch.zeros(
+        1, num_experts, rank_capacity, hidden_size, dtype=torch.bfloat16
     )
+    w13_a[:, :, :4].normal_()
+
+    def padded_b(output_size: int) -> torch.Tensor:
+        tensor = torch.zeros(
+            1,
+            num_experts,
+            output_size,
+            rank_capacity,
+            dtype=torch.bfloat16,
+        )
+        tensor[:, :, :, :4].normal_()
+        return tensor
+
+    def padded_a(input_size: int) -> torch.Tensor:
+        tensor = torch.zeros(
+            1,
+            num_experts,
+            rank_capacity,
+            input_size,
+            dtype=torch.bfloat16,
+        )
+        tensor[:, :, :4].normal_()
+        return tensor
+
+    if fused_w13:
+        w13_lora_a_stacked = (w13_a,)
+        w13_lora_b_stacked = (padded_b(2 * intermediate_size),)
+        w13_num_slices = 1
+    else:
+        w13_lora_a_stacked = (w13_a, w13_a.clone())
+        w13_lora_b_stacked = (
+            padded_b(intermediate_size),
+            padded_b(intermediate_size),
+        )
+        w13_num_slices = 2
+
     return SimpleNamespace(
         max_loras=1,
         fully_sharded=False,
         enable_moe_shared_loras=False,
-        w13_num_slices=2,
+        w13_num_slices=w13_num_slices,
         aux_stream=None,
         local_num_experts=num_experts,
-        w13_lora_a_stacked=(w13_a, w13_a.clone()),
-        w13_lora_b_stacked=(
-            torch.randn(
-                1, num_experts, intermediate_size, 4, dtype=torch.bfloat16
-            ),
-            torch.randn(
-                1, num_experts, intermediate_size, 4, dtype=torch.bfloat16
-            ),
-        ),
-        w2_lora_a_stacked=(
-            torch.randn(
-                1, num_experts, 4, intermediate_size, dtype=torch.bfloat16
-            ),
-        ),
-        w2_lora_b_stacked=(
-            torch.randn(1, num_experts, hidden_size, 4, dtype=torch.bfloat16),
-        ),
+        w13_lora_a_stacked=w13_lora_a_stacked,
+        w13_lora_b_stacked=w13_lora_b_stacked,
+        w2_lora_a_stacked=(padded_a(intermediate_size),),
+        w2_lora_b_stacked=(padded_b(hidden_size),),
         punica_wrapper=SimpleNamespace(
             token_mapping_meta=SimpleNamespace(
                 token_lora_mapping=torch.tensor([0, -1], dtype=torch.int32)
@@ -339,6 +365,49 @@ def test_b12x_experts_rejects_distinct_gate_up_lora_a() -> None:
 
     with pytest.raises(NotImplementedError, match="share W13 LoRA A"):
         experts.set_lora_context(ctx)
+
+
+def test_b12x_experts_accepts_zero_padded_rank4_lora_cache() -> None:
+    experts = _make_fake_b12x_experts()
+    ctx = _make_fake_lora_context(rank_capacity=8)
+
+    experts.set_lora_context(ctx)
+
+    adapter = experts._b12x_static_lora
+    assert adapter.w13_a.shape[1] == 4
+    assert adapter.w13_b.shape[2] == 4
+    assert adapter.w13_b_up.shape[2] == 4
+    assert adapter.w2_a.shape[1] == 4
+    assert adapter.w2_b.shape[2] == 4
+    assert adapter.w13_a.is_contiguous()
+    assert adapter.w13_b.is_contiguous()
+    assert adapter.w13_a.data_ptr() != ctx.w13_lora_a_stacked[0][0].data_ptr()
+
+    packed_ptr = adapter.w13_b.data_ptr()
+    ctx.w13_lora_b_stacked[0][:, :, :, :4].add_(1)
+    experts.set_lora_context(ctx)
+    assert experts._b12x_static_lora.w13_b.data_ptr() == packed_ptr
+
+
+def test_b12x_experts_rejects_nonzero_rank_padding() -> None:
+    experts = _make_fake_b12x_experts()
+    ctx = _make_fake_lora_context(rank_capacity=8)
+    ctx.w2_lora_b_stacked[0][0, 0, 0, 4] = 1
+
+    with pytest.raises(NotImplementedError, match="non-zero rank padding"):
+        experts.set_lora_context(ctx)
+
+
+def test_b12x_experts_accepts_fused_3d_moe_lora_storage() -> None:
+    experts = _make_fake_b12x_experts()
+    ctx = _make_fake_lora_context(rank_capacity=8, fused_w13=True)
+
+    experts.set_lora_context(ctx)
+
+    adapter = experts._b12x_static_lora
+    assert adapter.w13_b_up is None
+    assert adapter.w13_b.shape == (8, 32, 4)
+    assert adapter.w13_b.is_contiguous()
 
 
 def test_b12x_source_release_leaves_prepared_owner_as_storage_owner() -> None:
