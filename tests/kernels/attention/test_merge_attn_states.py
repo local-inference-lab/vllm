@@ -100,21 +100,25 @@ def test_merge_attn_states_both_empty(merge_fn, output_dtype) -> None:
 
 
 @pytest.mark.parametrize("num_tokens", [256, 4096])
+@pytest.mark.parametrize("head_size", [128, 192, 512])
 @torch.inference_mode()
-def test_merge_attn_states_cuda_inplace_accumulator(num_tokens: int) -> None:
+def test_merge_attn_states_cuda_inplace_accumulator(
+    num_tokens: int, head_size: int
+) -> None:
     """The CUDA kernel supports a running partial as input and destination.
 
     Chunked attention folds each suffix partial into one prefix allocation.
     Both the attention output and its log-sum-exp tensor therefore alias their
     corresponding destinations.  The result must match a merge into disjoint
-    output allocations exactly, including at Kimi-K3's MLA head geometry.
+    output allocations exactly. The 192-element case is Kimi-K3's chunked
+    context-merge geometry and does not divide the kernel's 128-thread limit;
+    the 512-element case spans multiple warps per head.
     """
     if not current_platform.is_cuda():
         pytest.skip("The custom merge-attention kernel requires CUDA")
 
     torch.manual_seed(0)
     num_heads = 6
-    head_size = 128
     shape = (num_tokens, num_heads, head_size)
 
     prefix_output = torch.randn(shape, dtype=torch.bfloat16, device="cuda")

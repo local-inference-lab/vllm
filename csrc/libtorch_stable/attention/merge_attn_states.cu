@@ -36,7 +36,7 @@ __global__ void merge_attn_states_kernel(
   const uint pack_size = 16 / sizeof(scalar_t);
   const uint threads_per_head = head_size / pack_size;
 
-  const uint global_idx = blockIdx.x * NUM_THREADS + threadIdx.x;
+  const uint global_idx = blockIdx.x * blockDim.x + threadIdx.x;
   const uint token_head_threads = num_tokens * num_heads * threads_per_head;
 
   // Derive indices before the block barrier so every thread reaches it.
@@ -46,28 +46,23 @@ __global__ void merge_attn_states_kernel(
   const uint head_idx = token_head_idx % num_heads;
 
   // A running chunked-attention LSE may be both prefix_lse and output_lse.
-  // Load it once per head before any thread can overwrite the destination.
-  // Groups that cross block boundaries retain independent global loads.
+  // The launcher aligns block boundaries to complete head groups, allowing
+  // every group to load its LSE values before any thread overwrites them.
   __shared__ float shared_prefix_lse[NUM_THREADS];
   __shared__ float shared_suffix_lse[NUM_THREADS];
-  const bool group_fits_in_block = NUM_THREADS % threads_per_head == 0;
   const bool is_valid = global_idx < token_head_threads;
   const uint group_idx = threadIdx.x / threads_per_head;
 
-  if (group_fits_in_block) {
-    if (is_valid && pack_idx == 0 && token_idx < prefix_num_tokens) {
-      shared_prefix_lse[group_idx] =
-          prefix_lse[head_idx * prefix_lse_head_stride +
-                     token_idx * prefix_lse_token_stride];
-      shared_suffix_lse[group_idx] =
-          suffix_lse[head_idx * suffix_lse_head_stride +
-                     token_idx * suffix_lse_token_stride];
-    }
-    __syncthreads();
-    if (!is_valid) return;
-  } else if (!is_valid) {
-    return;
+  if (is_valid && pack_idx == 0 && token_idx < prefix_num_tokens) {
+    shared_prefix_lse[group_idx] =
+        prefix_lse[head_idx * prefix_lse_head_stride +
+                   token_idx * prefix_lse_token_stride];
+    shared_suffix_lse[group_idx] =
+        suffix_lse[head_idx * suffix_lse_head_stride +
+                   token_idx * suffix_lse_token_stride];
   }
+  __syncthreads();
+  if (!is_valid) return;
 
   const uint pack_offset = pack_idx * pack_size;  // (0~15)*8, etc.
   const uint src_head_offset = token_idx * num_heads * prefix_head_stride +
@@ -117,17 +112,8 @@ __global__ void merge_attn_states_kernel(
   }
 
   // For tokens within prefix range, merge prefix and suffix.
-  float p_lse;
-  float s_lse;
-  if (group_fits_in_block) {
-    p_lse = shared_prefix_lse[group_idx];
-    s_lse = shared_suffix_lse[group_idx];
-  } else {
-    p_lse = prefix_lse[head_idx * prefix_lse_head_stride +
-                       token_idx * prefix_lse_token_stride];
-    s_lse = suffix_lse[head_idx * suffix_lse_head_stride +
-                       token_idx * suffix_lse_token_stride];
-  }
+  float p_lse = shared_prefix_lse[group_idx];
+  float s_lse = shared_suffix_lse[group_idx];
   p_lse = std::isinf(p_lse) ? -std::numeric_limits<float>::infinity() : p_lse;
   s_lse = std::isinf(s_lse) ? -std::numeric_limits<float>::infinity() : s_lse;
 
@@ -335,10 +321,19 @@ void merge_attn_states_launcher(
   // Process one pack elements per thread. for float, the
   // pack_size is 4 for half/bf16, the pack_size is 8.
   const uint threads_per_head = head_size / pack_size;
+  STD_TORCH_CHECK(
+      threads_per_head <= NUM_THREADS,
+      "headsize requires more threads than the merge kernel block supports: ",
+      head_size);
   const uint total_threads = num_tokens * num_heads * threads_per_head;
+  // Keep each token-head group inside one block. This is required when
+  // output_lse aliases prefix_lse because the whole group must read the input
+  // LSE before its first thread writes the merged value.
+  const uint block_threads =
+      (NUM_THREADS / threads_per_head) * threads_per_head;
 
-  dim3 block(NUM_THREADS);
-  dim3 grid((total_threads + NUM_THREADS - 1) / NUM_THREADS);
+  dim3 block(block_threads);
+  dim3 grid((total_threads + block_threads - 1) / block_threads);
 
   const torch::stable::accelerator::DeviceGuard device_guard(
       prefix_output.get_device_index());
