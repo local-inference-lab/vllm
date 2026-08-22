@@ -90,7 +90,51 @@ def _make_fake_b12x_experts() -> b12x_moe.B12xExperts:
     experts._activation_amax_base_num_layers = None
     experts._activation_amax_state_key = None
     experts._activation_amax_layer_idx = None
+    experts._b12x_static_lora = None
+    experts._b12x_lora_weight_signature = None
+    experts._b12x_lora_mapping_ptr = None
     return experts
+
+
+def _make_fake_lora_context(
+    *,
+    num_experts: int = 8,
+    hidden_size: int = 64,
+    intermediate_size: int = 16,
+):
+    w13_a = torch.randn(
+        1, num_experts, 4, hidden_size, dtype=torch.bfloat16
+    )
+    return SimpleNamespace(
+        max_loras=1,
+        fully_sharded=False,
+        enable_moe_shared_loras=False,
+        w13_num_slices=2,
+        aux_stream=None,
+        local_num_experts=num_experts,
+        w13_lora_a_stacked=(w13_a, w13_a.clone()),
+        w13_lora_b_stacked=(
+            torch.randn(
+                1, num_experts, intermediate_size, 4, dtype=torch.bfloat16
+            ),
+            torch.randn(
+                1, num_experts, intermediate_size, 4, dtype=torch.bfloat16
+            ),
+        ),
+        w2_lora_a_stacked=(
+            torch.randn(
+                1, num_experts, 4, intermediate_size, dtype=torch.bfloat16
+            ),
+        ),
+        w2_lora_b_stacked=(
+            torch.randn(1, num_experts, hidden_size, 4, dtype=torch.bfloat16),
+        ),
+        punica_wrapper=SimpleNamespace(
+            token_mapping_meta=SimpleNamespace(
+                token_lora_mapping=torch.tensor([0, -1], dtype=torch.int32)
+            )
+        ),
+    )
 
 
 def _make_fake_moe_runner(fused_experts: object) -> MoERunner:
@@ -237,7 +281,64 @@ def test_b12x_moe_run_binds_only_the_prepared_expert_owner(monkeypatch) -> None:
         "activation_amax": None,
         "layer_idx": None,
         "route_expert_map": None,
+        "static_lora": None,
     }
+
+
+def test_b12x_experts_adapts_vllm_split_lora_storage_without_copy() -> None:
+    experts = _make_fake_b12x_experts()
+    ctx = _make_fake_lora_context()
+
+    experts.set_lora_context(ctx)
+
+    adapter = experts._b12x_static_lora
+    assert experts.supports_lora()
+    assert adapter.w13_a.data_ptr() == ctx.w13_lora_a_stacked[0][0].data_ptr()
+    assert adapter.w13_b.data_ptr() == ctx.w13_lora_b_stacked[0][0].data_ptr()
+    assert adapter.w13_b_up.data_ptr() == ctx.w13_lora_b_stacked[1][0].data_ptr()
+    assert adapter.w2_a.data_ptr() == ctx.w2_lora_a_stacked[0][0].data_ptr()
+    assert adapter.w2_b.data_ptr() == ctx.w2_lora_b_stacked[0][0].data_ptr()
+    assert (
+        adapter.token_lora_mapping.data_ptr()
+        == ctx.punica_wrapper.token_mapping_meta.token_lora_mapping.data_ptr()
+    )
+
+    experts.set_lora_context(ctx)
+    assert experts._b12x_static_lora is adapter
+
+    replacement_mapping = torch.tensor([-1, 0], dtype=torch.int32)
+    ctx.punica_wrapper.token_mapping_meta.token_lora_mapping = replacement_mapping
+    experts.set_lora_context(ctx)
+    assert experts._b12x_static_lora is not adapter
+    assert (
+        experts._b12x_static_lora.token_lora_mapping.data_ptr()
+        == replacement_mapping.data_ptr()
+    )
+
+
+def test_b12x_experts_revalidates_mutated_lora_storage() -> None:
+    experts = _make_fake_b12x_experts()
+    ctx = _make_fake_lora_context()
+    experts.set_lora_context(ctx)
+    first_adapter = experts._b12x_static_lora
+
+    ctx.w13_lora_b_stacked[0].add_(1)
+    experts.set_lora_context(ctx)
+
+    assert experts._b12x_static_lora is not first_adapter
+    assert (
+        experts._b12x_static_lora.w13_b.data_ptr()
+        == ctx.w13_lora_b_stacked[0][0].data_ptr()
+    )
+
+
+def test_b12x_experts_rejects_distinct_gate_up_lora_a() -> None:
+    experts = _make_fake_b12x_experts()
+    ctx = _make_fake_lora_context()
+    ctx.w13_lora_a_stacked[1].add_(1)
+
+    with pytest.raises(NotImplementedError, match="share W13 LoRA A"):
+        experts.set_lora_context(ctx)
 
 
 def test_b12x_source_release_leaves_prepared_owner_as_storage_owner() -> None:
