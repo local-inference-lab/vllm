@@ -363,8 +363,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         assert tgt == 1, f"expert-dim mismatch: source {src.shape[0]} vs buffer {tgt}"
         return src[:1]
 
-    def reset_lora(self, index: int):
-        """Resets the lora weights at index back to 0."""
+    def _zero_lora_weights(self, index: int) -> None:
         for pos in range(self._w13_slices):
             self.w13_lora_a_stacked[pos][index] = 0
             self.w13_lora_b_stacked[pos][index] = 0
@@ -372,6 +371,20 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.w2_lora_a_stacked[0][index] = 0
         self.w2_lora_b_stacked[0][index] = 0
         self.adapter_enabled[index] = 0
+
+    def _refresh_expert_lora_context(self) -> None:
+        refresh = getattr(
+            self._moe_kernel.fused_experts,
+            "refresh_lora_context",
+            None,
+        )
+        if callable(refresh):
+            refresh()
+
+    def reset_lora(self, index: int):
+        """Resets the lora weights at index back to 0."""
+        self._zero_lora_weights(index)
+        self._refresh_expert_lora_context()
 
     #
 
@@ -386,7 +399,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         assert isinstance(lora_a, list)
         assert isinstance(lora_b, list)
 
-        self.reset_lora(index)
+        self._zero_lora_weights(index)
         self.adapter_enabled[index] = 1
 
         w1_lora_a, w2_lora_a, w3_lora_a = lora_a
@@ -442,6 +455,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.w2_lora_b_stacked[0][
             index, :, : sliced_w2_lora_b.shape[1], : sliced_w2_lora_b.shape[2]
         ].copy_(sliced_w2_lora_b, non_blocking=True)
+        self._refresh_expert_lora_context()
 
     def set_mapping(self, punica_wrapper):
         super().set_mapping(punica_wrapper)
@@ -585,7 +599,7 @@ class FusedMoE3DWithLoRA(FusedMoEWithLoRA):
         assert isinstance(lora_b, list)
         assert len(lora_a) == len(lora_b) == 2
 
-        self.reset_lora(index)
+        self._zero_lora_weights(index)
         self.adapter_enabled[index] = 1
 
         w13_lora_a, w2_lora_a = lora_a
@@ -610,6 +624,7 @@ class FusedMoE3DWithLoRA(FusedMoEWithLoRA):
         self.w2_lora_b_stacked[0][
             index, :, : sliced_w2_lora_b.shape[1], : sliced_w2_lora_b.shape[2]
         ].copy_(sliced_w2_lora_b, non_blocking=True)
+        self._refresh_expert_lora_context()
 
     @property
     def w13_input_size(self):

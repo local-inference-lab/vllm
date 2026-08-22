@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
@@ -35,6 +36,9 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     # Reusing target DCP geometry would partition a cache that every target rank
     # must populate and consume independently.
     draft_vllm_config = _create_draft_vllm_config(vllm_config)
+    # DSpark proposes for the target verifier; it is not part of the target
+    # adapter. Inheriting LoRA here can select incompatible draft projections.
+    draft_vllm_config.lora_config = None
     draft_vllm_config.attention_config.backend = backend
     draft_vllm_config.attention_config.use_non_causal = dflash_has_any_non_causal(
         draft_model_config.hf_config
@@ -69,6 +73,8 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     draft_inner = draft_model.model
 
     target_embed = getattr(target_inner, "embed_tokens", None)
+    if isinstance(target_embed, BaseLayerWithLoRA):
+        target_embed = target_embed.base_layer
     draft_embed = getattr(draft_inner, "embed_tokens", None)
     if target_embed is not None and _should_share(
         draft_model, "has_own_embed_tokens", draft_embed, target_embed
@@ -78,6 +84,8 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         draft_inner.embed_tokens = target_embed
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
+    if isinstance(target_lm_head, BaseLayerWithLoRA):
+        target_lm_head = target_lm_head.base_layer
     draft_lm_head = getattr(draft_model, "lm_head", None)
     if target_lm_head is not None and _should_share(
         draft_model, "has_own_lm_head", draft_lm_head, target_lm_head

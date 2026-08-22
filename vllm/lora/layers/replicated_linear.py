@@ -22,6 +22,16 @@ class ReplicatedLinearWithLoRA(BaseLinearLayerWithLoRA):
         self.output_size = self.base_layer.output_size
         self.n_slices = 1
 
+    @property
+    def e_score_correction_bias(self) -> torch.Tensor | None:
+        """Forward specialized router metadata exposed by ``GateLinear``."""
+        return getattr(self.base_layer, "e_score_correction_bias", None)
+
+    @property
+    def tid2eid(self) -> torch.Tensor | None:
+        """Forward DeepSeek V4's optional hash-router lookup table."""
+        return getattr(self.base_layer, "tid2eid", None)
+
     def forward(
         self, input_: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:

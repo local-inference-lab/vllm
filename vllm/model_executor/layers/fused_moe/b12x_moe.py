@@ -941,14 +941,28 @@ class B12xExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         ):
             raise ValueError("B12X W4A16 received invalid gated LoRA storage")
 
-        token_mapping_meta = ctx.punica_wrapper.token_mapping_meta
-        token_lora_mapping = token_mapping_meta.token_lora_mapping
+        # The compact kernel scratch can retain a preceding adapter mapping
+        # when a request contains no LoRA. Punica's primary allocation is
+        # refreshed for every request, including all-base (-1) batches.
+        token_lora_mapping = ctx.punica_wrapper.token_lora_indices_buffer
+        if token_lora_mapping.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "B12X W4A16 requires an int32/int64 token LoRA mapping, got "
+                f"{token_lora_mapping.dtype}"
+            )
+        if not token_lora_mapping.is_contiguous():
+            raise ValueError("B12X W4A16 requires contiguous token LoRA mapping")
         signature = self._lora_weight_signature(ctx)
         mapping_ptr = token_lora_mapping.data_ptr()
         if (
             signature == self._b12x_lora_weight_signature
-            and mapping_ptr == self._b12x_lora_mapping_ptr
+            and self._b12x_static_lora is not None
         ):
+            self._b12x_static_lora = replace(
+                self._b12x_static_lora,
+                token_lora_mapping=token_lora_mapping,
+            )
+            self._b12x_lora_mapping_ptr = mapping_ptr
             return
         if _is_current_stream_capturing():
             raise RuntimeError("B12X W4A16 LoRA storage changed during graph capture")
@@ -997,6 +1011,11 @@ class B12xExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         )
         self._b12x_lora_weight_signature = signature
         self._b12x_lora_mapping_ptr = mapping_ptr
+
+    def refresh_lora_context(self) -> None:
+        """Refresh packed rank-4 factors after vLLM mutates its LoRA cache."""
+        if self._lora_context is not None:
+            self.set_lora_context(self._lora_context)
 
     def _quant_mode(self) -> str:
         source_format = self._source_format()
@@ -1290,12 +1309,11 @@ class B12xExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
     ):
         quant_mode = self._quant_mode()
 
-        if self._b12x_static_lora is not None:
-            if quant_mode != "w4a16":
-                raise RuntimeError(
-                    "B12X expert LoRA requires quant_mode='w4a16'; set "
-                    "B12X_MOE_FORCE_A16=1 for NVFP4 checkpoints"
-                )
+        if self._b12x_static_lora is not None and quant_mode != "w4a16":
+            raise RuntimeError(
+                "B12X expert LoRA requires quant_mode='w4a16'; set "
+                "B12X_MOE_FORCE_A16=1 for NVFP4 checkpoints"
+            )
         prepared = self._prepared_experts
         if prepared is not None:
             requested_dtype = str(params_dtype).removeprefix("torch.")

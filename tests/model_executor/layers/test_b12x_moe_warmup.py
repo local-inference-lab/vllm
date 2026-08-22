@@ -162,9 +162,13 @@ def _make_fake_lora_context(
         w2_lora_a_stacked=(padded_a(intermediate_size),),
         w2_lora_b_stacked=(padded_b(hidden_size),),
         punica_wrapper=SimpleNamespace(
+            token_lora_indices=torch.tensor([0, -1], dtype=torch.int64),
+            token_lora_indices_buffer=torch.tensor([0, -1, -1, -1], dtype=torch.int64),
             token_mapping_meta=SimpleNamespace(
-                token_lora_mapping=torch.tensor([0, -1], dtype=torch.int32)
-            )
+                # Deliberately stale compact scratch: B12X must retain the
+                # canonical mapping allocation above instead.
+                token_lora_mapping=torch.tensor([0, 0], dtype=torch.int32)
+            ),
         ),
     )
 
@@ -332,15 +336,17 @@ def test_b12x_experts_adapts_vllm_split_lora_storage_without_copy() -> None:
     assert adapter.w2_b.data_ptr() == ctx.w2_lora_b_stacked[0][0].data_ptr()
     assert (
         adapter.token_lora_mapping.data_ptr()
-        == ctx.punica_wrapper.token_mapping_meta.token_lora_mapping.data_ptr()
+        == ctx.punica_wrapper.token_lora_indices_buffer.data_ptr()
     )
+    assert adapter.token_lora_mapping.dtype == torch.int64
 
     experts.set_lora_context(ctx)
-    assert experts._b12x_static_lora is adapter
+    assert experts._b12x_static_lora is not adapter
+    assert experts._b12x_static_lora.w13_a.data_ptr() == adapter.w13_a.data_ptr()
 
-    replacement_mapping = torch.tensor([-1, 0], dtype=torch.int32)
-    ctx.punica_wrapper.token_mapping_meta.token_lora_mapping = replacement_mapping
-    experts.set_lora_context(ctx)
+    replacement_mapping = torch.tensor([-1, 0, -1, -1], dtype=torch.int64)
+    ctx.punica_wrapper.token_lora_indices_buffer = replacement_mapping
+    experts.refresh_lora_context()
     assert experts._b12x_static_lora is not adapter
     assert (
         experts._b12x_static_lora.token_lora_mapping.data_ptr()
@@ -843,9 +849,7 @@ def test_b12x_moe_workspace_chunks_slice_static_lora_token_mapping(
         apply_router_weight_on_input=False,
     )
 
-    chunk_mappings = [
-        call["static_lora"].token_lora_mapping for call in run_calls
-    ]
+    chunk_mappings = [call["static_lora"].token_lora_mapping for call in run_calls]
     assert [mapping.tolist() for mapping in chunk_mappings] == [
         [0, 0],
         [-1, -1],

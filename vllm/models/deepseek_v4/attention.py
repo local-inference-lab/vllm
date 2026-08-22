@@ -49,7 +49,11 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    deepgemm_post_process_fp8_weight_block,
+)
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.utils import replace_parameter
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.triton_utils import tl, triton
@@ -490,6 +494,53 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 rank=rank,
                 hidden=hidden,
             )
+        )
+
+    def setup_generic_wo_projection(self) -> None:
+        """Prepare the LoRA-safe DeepGEMM WO-A grouped-einsum layout.
+
+        SM120 normally consumes the checkpoint's canonical 2-D WO tensors in
+        the fused B12X projection. LoRA must keep WO-B callable so its delta is
+        applied, which selects the generic DeepGEMM chain. Repack WO-A once
+        after ordinary quant-method finalization.
+        """
+        if self._use_b12x_wo:
+            return
+
+        wo_a_base = getattr(self.wo_a, "base_layer", self.wo_a)
+        if wo_a_base.weight.ndim == 3:
+            return
+        if wo_a_base.weight.ndim != 2:
+            raise RuntimeError(
+                "DeepSeek V4 generic WO-A expected a 2-D checkpoint tensor or "
+                f"3-D prepared tensor, got shape {tuple(wo_a_base.weight.shape)}"
+            )
+
+        scale_name = (
+            "weight_scale" if hasattr(wo_a_base, "weight_scale") else "weight_scale_inv"
+        )
+        weight_scale = getattr(wo_a_base, scale_name)
+        block_shape = tuple(getattr(wo_a_base, "weight_block_size", (128, 128)))
+        if block_shape != (128, 128):
+            raise NotImplementedError(
+                "DeepSeek V4 generic WO-A currently requires 128x128 FP8 "
+                f"blocks, got {block_shape}"
+            )
+
+        weight, weight_scale = deepgemm_post_process_fp8_weight_block(
+            wq=wo_a_base.weight,
+            ws=weight_scale,
+            quant_block_shape=block_shape,
+            use_e8m0=True,
+            is_bmm=True,
+            bmm_batch_size=self.n_local_groups,
+        )
+        replace_parameter(wo_a_base, "weight", weight)
+        replace_parameter(wo_a_base, scale_name, weight_scale)
+        logger.info_once(
+            "Prepared DeepSeek V4 generic WO-A for LoRA: weight=%s scale=%s",
+            tuple(weight.shape),
+            tuple(weight_scale.shape),
         )
 
     def _apply_b12x_wo_projection(

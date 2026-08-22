@@ -23,6 +23,7 @@ def test_dspark_loader_uses_external_draft_parallel_geometry(monkeypatch) -> Non
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         attention_config=SimpleNamespace(backend=None, use_non_causal=False),
         quant_config=object(),
+        lora_config=object(),
     )
     draft_quant_config = object()
     captured = {}
@@ -59,6 +60,7 @@ def test_dspark_loader_uses_external_draft_parallel_geometry(monkeypatch) -> Non
     assert loaded_config.attention_config.backend == AttentionBackendEnum.B12X_MLA
     assert loaded_config.attention_config.use_non_causal
     assert loaded_config.quant_config is draft_quant_config
+    assert loaded_config.lora_config is None
 
 
 def test_dflash_attention_metadata_uses_external_draft_geometry(monkeypatch) -> None:

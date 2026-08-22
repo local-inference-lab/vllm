@@ -256,6 +256,17 @@ class PunicaWrapperBase(PunicaWrapperABC):
         return self._token_lora_indices[:token_lora_len]
 
     @property
+    def token_lora_indices_buffer(self) -> torch.Tensor:
+        """Return the stable backing allocation for token-to-LoRA indices.
+
+        ``token_lora_indices`` is a request-sized view whose length changes
+        whenever LoRA metadata is updated. Long-lived kernel contracts that
+        retain a tensor pointer must instead hold this allocation and consume
+        only the rows participating in the current forward pass.
+        """
+        return self._token_lora_indices
+
+    @property
     def sampler_indices(self) -> torch.Tensor:
         """
         This property is used to access the lora indices specifically for

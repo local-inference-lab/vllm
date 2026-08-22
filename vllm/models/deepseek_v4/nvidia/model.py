@@ -1914,6 +1914,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.attn.setup_b12x_wo_projection()
 
+    def setup_generic_wo_projection(self) -> None:
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            layer.attn.setup_generic_wo_projection()
+
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     if expert_dtype == "fp4":
@@ -2096,6 +2100,11 @@ class DeepseekV4ForCausalLM(
         self.model.finalize_mhc_broadcast_weights()
         self.model.setup_b12x_wo_projection()
         return loaded_params
+
+    def process_weights_after_loading(self) -> None:
+        # After per-linear quant finalization, prepare generic WO-A when LoRA
+        # keeps WO-B callable instead of using the fused B12X projection.
+        self.model.setup_generic_wo_projection()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
