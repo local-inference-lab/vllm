@@ -39,6 +39,111 @@ _B12X_MXFP8: Any | None = None
 _B12X_MXFP8_MISSING = False
 
 
+class B12xMxfp8InputAccumulator:
+    """Incrementally assemble one retained MXFP8 linear input.
+
+    Each appended BF16/FP16 tensor occupies a disjoint feature slice. The
+    completed input is consumed by the layer's original packed weight and dense
+    GEMM, so feature-slice lifetime changes without changing GEMM accumulation.
+    """
+
+    def __init__(
+        self,
+        layer: torch.nn.Module,
+        output: torch.Tensor,
+    ) -> None:
+        packed_weight = getattr(layer, "b12x_mxfp8_packed_weight", None)
+        if packed_weight is None:
+            raise ValueError("layer does not have a B12X MXFP8 packed weight")
+        mxfp8 = _import_b12x_mxfp8()
+        if mxfp8 is None:
+            raise ImportError("b12x.gemm.mxfp8_linear is not importable")
+        for name in ("empty_input", "mm_quantized", "quantize_input_slice"):
+            if not callable(getattr(mxfp8, name, None)):
+                raise ImportError(f"b12x.gemm.mxfp8_linear missing callable {name}")
+        if output.ndim != 2:
+            raise ValueError(
+                f"output must have shape [max_tokens,N], got {tuple(output.shape)}"
+            )
+        if int(output.shape[1]) != int(packed_weight.out_features):
+            raise ValueError(
+                "output width does not match packed weight: "
+                f"output={output.shape[1]}, weight={packed_weight.out_features}"
+            )
+        if int(packed_weight.in_features) != int(packed_weight.padded_in_features):
+            raise ValueError(
+                "incremental MXFP8 input requires a weight whose input width "
+                "does not need K padding"
+            )
+
+        self._mxfp8 = mxfp8
+        self._packed_weight = packed_weight
+        self._output = output
+        self._input = mxfp8.empty_input(
+            int(output.shape[0]),
+            int(packed_weight.in_features),
+            device=output.device,
+        )
+        self._tokens = 0
+        self._next_column = 0
+
+    @property
+    def input_width(self) -> int:
+        return int(self._packed_weight.in_features)
+
+    @property
+    def max_tokens(self) -> int:
+        return int(self._output.shape[0])
+
+    def begin(self, tokens: int) -> None:
+        tokens = int(tokens)
+        if tokens <= 0 or tokens > self.max_tokens:
+            raise ValueError(f"tokens must be in [1,{self.max_tokens}], got {tokens}")
+        self._tokens = tokens
+        self._next_column = 0
+
+    def append(self, source: torch.Tensor) -> None:
+        if self._tokens <= 0:
+            raise RuntimeError("incremental MXFP8 input has not been started")
+        source_2d = source.reshape(-1, source.shape[-1]).contiguous()
+        if int(source_2d.shape[0]) != self._tokens:
+            raise ValueError(
+                "source row count changed during incremental quantization: "
+                f"source={source_2d.shape[0]}, expected={self._tokens}"
+            )
+        width = int(source_2d.shape[1])
+        if self._next_column + width > self.input_width:
+            raise ValueError(
+                "source slices exceed the packed linear input width: "
+                f"next_column={self._next_column}, width={width}, "
+                f"input_width={self.input_width}"
+            )
+        self._mxfp8.quantize_input_slice(
+            source_2d,
+            self._input,
+            destination_column=self._next_column,
+        )
+        self._next_column += width
+
+    def finish(self) -> torch.Tensor:
+        if self._next_column != self.input_width:
+            raise RuntimeError(
+                "incremental MXFP8 input is incomplete: "
+                f"filled={self._next_column}, required={self.input_width}"
+            )
+        output = self._mxfp8.mm_quantized(
+            self._input,
+            self._packed_weight,
+            tokens=self._tokens,
+            out=self._output,
+            expected_m=self._tokens,
+            stream=current_stream().cuda_stream,
+        )
+        self._tokens = 0
+        self._next_column = 0
+        return output
+
+
 def _import_b12x_mxfp8() -> Any | None:
     global _B12X_MXFP8, _B12X_MXFP8_MISSING
     if _B12X_MXFP8 is not None:

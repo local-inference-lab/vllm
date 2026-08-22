@@ -4,6 +4,7 @@
 import dataclasses
 import io
 from collections.abc import Iterable, Mapping
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -60,6 +61,7 @@ logger = init_logger(__name__)
 
 
 _SLIDING_ATTENTION = "sliding_attention"
+_STREAMED_AUX_MIN_TOKENS = 1024
 
 
 def _retain_dflash_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -483,6 +485,20 @@ class DFlashQwen3Model(nn.Module):
                 prefix=maybe_prefix(prefix, "fc"),
                 return_bias=False,
             )
+        self._streamed_aux_layer_ids = tuple(
+            get_eagle3_aux_layers_from_config(vllm_config.speculative_config) or ()
+        )
+        self._target_hidden_size = int(
+            getattr(self.config, "target_hidden_size", None) or self.config.hidden_size
+        )
+        self._streamed_aux_accumulator: Any | None = None
+        self._streamed_aux_scratch: torch.Tensor | None = None
+        self._streamed_aux_tokens = 0
+        self._streamed_aux_index = 0
+        self._streamed_aux_generation = 0
+        self._completed_stream_generation = 0
+        self._consumed_stream_generation = 0
+        self._completed_stream_result: torch.Tensor | None = None
         self.hidden_norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -499,6 +515,118 @@ class DFlashQwen3Model(nn.Module):
             is_mask = (input_ids == self.mask_token_id).unsqueeze(-1)
             embeds = torch.where(is_mask, self.mask_embedding.to(embeds.dtype), embeds)
         return embeds
+
+    def bind_auxiliary_stream(
+        self,
+        accumulator: Any,
+        scratch: torch.Tensor,
+    ) -> None:
+        """Bind retained storage for large target auxiliary-state projections."""
+        if scratch.ndim != 2 or int(scratch.shape[1]) != int(self.config.hidden_size):
+            raise ValueError(
+                "DFlash auxiliary output scratch must have shape "
+                f"[max_tokens,{self.config.hidden_size}], got {tuple(scratch.shape)}"
+            )
+        self._streamed_aux_accumulator = accumulator
+        self._streamed_aux_scratch = scratch
+
+    def can_stream_auxiliary_states(
+        self,
+        layer_ids: tuple[int, ...],
+        hidden_states: torch.Tensor,
+    ) -> bool:
+        """Return whether a target forward can release auxiliary states early."""
+        accumulator = self._streamed_aux_accumulator
+        scratch = self._streamed_aux_scratch
+        if accumulator is None or scratch is None or not self.use_aux_hidden_state:
+            return False
+        if hidden_states.ndim != 2 or hidden_states.shape[0] < _STREAMED_AUX_MIN_TOKENS:
+            return False
+        if tuple(layer_ids) != self._streamed_aux_layer_ids:
+            return False
+        if hidden_states.shape[1] * len(layer_ids) != accumulator.input_width:
+            return False
+        if hidden_states.shape[0] > accumulator.max_tokens:
+            return False
+        if (
+            hidden_states.dtype != scratch.dtype
+            or hidden_states.device != scratch.device
+        ):
+            return False
+        return not (hidden_states.is_cuda and torch.cuda.is_current_stream_capturing())
+
+    def begin_auxiliary_stream(self, hidden_states: torch.Tensor) -> None:
+        """Start one ordered sequence of target auxiliary-state slices."""
+        if not self.can_stream_auxiliary_states(
+            self._streamed_aux_layer_ids, hidden_states
+        ):
+            raise RuntimeError(
+                "DFlash auxiliary streaming was started for an unsupported geometry"
+            )
+        self._streamed_aux_tokens = int(hidden_states.shape[0])
+        self._streamed_aux_index = 0
+        self._streamed_aux_generation += 1
+        self._completed_stream_result = None
+        self._streamed_aux_accumulator.begin(self._streamed_aux_tokens)
+
+    def accumulate_auxiliary_state(
+        self,
+        primary: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> None:
+        """Quantize one complete target state into the retained linear input."""
+        if self._streamed_aux_index >= len(self._streamed_aux_layer_ids):
+            raise RuntimeError("DFlash received too many auxiliary states")
+        expected_shape = (self._streamed_aux_tokens, self._target_hidden_size)
+        if tuple(primary.shape) != expected_shape:
+            raise ValueError(
+                "DFlash auxiliary state shape changed during streaming: "
+                f"got={tuple(primary.shape)}, expected={expected_shape}"
+            )
+        source = primary
+        if residual is not None:
+            if tuple(residual.shape) != expected_shape:
+                raise ValueError(
+                    "DFlash auxiliary residual shape changed during streaming: "
+                    f"got={tuple(residual.shape)}, expected={expected_shape}"
+                )
+            assert self._streamed_aux_scratch is not None
+            source = self._streamed_aux_scratch[: self._streamed_aux_tokens]
+            torch.add(primary, residual, out=source)
+        self._streamed_aux_accumulator.append(source)
+        self._streamed_aux_index += 1
+
+    def finish_auxiliary_stream(self) -> torch.Tensor:
+        """Project the assembled MXFP8 input with the draft's original FC."""
+        expected = len(self._streamed_aux_layer_ids)
+        if self._streamed_aux_index != expected:
+            raise RuntimeError(
+                "DFlash auxiliary stream ended before every configured state "
+                f"was received: received={self._streamed_aux_index}, "
+                f"expected={expected}"
+            )
+        output = self._streamed_aux_accumulator.finish()
+        self._completed_stream_generation = self._streamed_aux_generation
+        self._completed_stream_result = output
+        return output
+
+    def is_streamed_context_states(self, states: list[torch.Tensor]) -> bool:
+        """Claim one completed streamed projection exactly once."""
+        if len(states) != 1 or self._completed_stream_result is None:
+            return False
+        candidate = states[0]
+        expected = self._completed_stream_result
+        matches = (
+            self._completed_stream_generation > self._consumed_stream_generation
+            and candidate is expected
+            and candidate.shape == expected.shape
+            and candidate.dtype == expected.dtype
+            and candidate.device == expected.device
+            and candidate.data_ptr() == expected.data_ptr()
+        )
+        if matches:
+            self._consumed_stream_generation = self._completed_stream_generation
+        return matches
 
     def _build_context_kv_buffers(
         self,
@@ -853,6 +981,52 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         if needs_squeeze:
             result = result.squeeze(0)
         return result
+
+    def bind_target_auxiliary_stream(
+        self,
+        target_model: nn.Module,
+        scratch: torch.Tensor,
+    ) -> None:
+        """Connect a Kimi target to the memory-bounded MXFP8 FC input."""
+        get_language_model = getattr(target_model, "get_language_model", None)
+        target_language_model = (
+            get_language_model() if callable(get_language_model) else target_model
+        )
+        target_inner = getattr(target_language_model, "model", None)
+        setter = getattr(target_inner, "set_aux_hidden_state_projector", None)
+        if not callable(setter):
+            logger.warning_once(
+                "DFlash auxiliary streaming is disabled because the target "
+                "model does not expose an auxiliary-state projector hook."
+            )
+            return
+        if not self.model.use_aux_hidden_state:
+            return
+        try:
+            from vllm.model_executor.kernels.linear.mxfp8.b12x import (
+                B12xMxfp8InputAccumulator,
+            )
+
+            accumulator = B12xMxfp8InputAccumulator(self.model.fc, scratch)
+        except (ImportError, ValueError) as error:
+            logger.warning_once(
+                "DFlash auxiliary streaming is disabled: %s",
+                error,
+            )
+            return
+        self.model.bind_auxiliary_stream(accumulator, scratch)
+        setter(self.model)
+        logger.info_once(
+            "DFlash auxiliary projection uses staged B12X MXFP8 input: "
+            "max_tokens=%d input_width=%d output_width=%d.",
+            accumulator.max_tokens,
+            accumulator.input_width,
+            int(scratch.shape[1]),
+        )
+
+    def is_streamed_context_states(self, states: list[torch.Tensor]) -> bool:
+        """Return whether target auxiliary states are already FC-projected."""
+        return self.model.is_streamed_context_states(states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         model_weights = {}

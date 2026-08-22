@@ -193,6 +193,82 @@ def test_kimi_linear_forward_streams_auxiliary_states(monkeypatch):
     assert aux_hidden_states[0] is projected
 
 
+def test_kimi_linear_forward_streams_attn_res_mixtures(monkeypatch):
+    """A streaming consumer receives the same pre-norm mixture as fallback."""
+    model = _make_kimi_linear_model()
+    initial_hidden_states = torch.tensor([[1.0, 2.0]])
+    layer_hidden_states = torch.tensor([[3.0, 4.0]])
+    prefix_sum = torch.tensor([[5.0, 6.0]])
+    block_residual = torch.tensor([[[7.0, 8.0]]])
+    captured = torch.tensor([[11.0, 12.0]])
+    projected = torch.tensor([[13.0, 14.0]])
+
+    class Projector:
+        def __init__(self):
+            self.calls = []
+
+        def can_stream_auxiliary_states(self, layer_ids, hidden_states):
+            return layer_ids == (1,) and hidden_states is initial_hidden_states
+
+        def begin_auxiliary_stream(self, hidden_states):
+            assert hidden_states is initial_hidden_states
+
+        def accumulate_auxiliary_state(self, primary, residual):
+            self.calls.append((primary, residual))
+
+        def finish_auxiliary_stream(self):
+            return projected
+
+    projector = Projector()
+    model.set_aux_hidden_state_projector(projector)
+    object.__setattr__(model, "start_layer", 0)
+    object.__setattr__(model, "end_layer", 1)
+    object.__setattr__(
+        model,
+        "layers",
+        [Mock(return_value=(layer_hidden_states, prefix_sum, block_residual))],
+    )
+    object.__setattr__(model, "aux_hidden_state_layers", (1,))
+    object.__setattr__(model, "use_attn_res", True)
+    object.__setattr__(model, "num_attn_res_blocks", 1)
+    object.__setattr__(
+        model,
+        "output_attn_res_norm",
+        SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-5),
+    )
+    object.__setattr__(
+        model,
+        "output_attn_res_proj",
+        SimpleNamespace(weight=torch.ones(1, 2)),
+    )
+    monkeypatch.setattr(
+        kimi_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(kimi_model, "attn_res", Mock(return_value=torch.zeros(1, 2)))
+    monkeypatch.setenv("VLLM_KIMI_K3_AUX_ATTN_RES_STREAM", "1")
+    capture = Mock(return_value=captured)
+    monkeypatch.setattr(KimiLinearModel, "_capture_aux_hidden_stream", capture)
+
+    _, aux_hidden_states = model.forward(
+        input_ids=None,
+        positions=torch.tensor([0]),
+        intermediate_tensors=None,
+        inputs_embeds=initial_hidden_states,
+    )
+
+    capture.assert_called_once_with(
+        0,
+        prefix_sum,
+        layer_hidden_states,
+        block_residual,
+    )
+    assert projector.calls == [(captured, None)]
+    assert len(aux_hidden_states) == 1
+    assert aux_hidden_states[0] is projected
+
+
 def test_attn_res_stream_capture_receives_layer_outputs_in_order(monkeypatch):
     """Verify the positional contract between ``forward`` and the capture tap."""
     model = _make_kimi_linear_model()
