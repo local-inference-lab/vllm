@@ -1579,6 +1579,11 @@ class KimiDecoderLayer(nn.Module):
             self.attn_res_block_size = attn_res_block_size
             self.is_block_write_layer = layer_idx % self.attn_res_block_size == 0
             self.block_write_idx = layer_idx // self.attn_res_block_size
+            self.is_final_block_write_layer = (
+                self.is_block_write_layer
+                and self.block_write_idx
+                == cdiv(config.num_hidden_layers, self.attn_res_block_size) - 1
+            )
             self.prev_valid_blocks = cdiv(layer_idx, self.attn_res_block_size)
             self.self_attention_res_norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -1694,7 +1699,14 @@ class KimiDecoderLayer(nn.Module):
 
         assert prefix_sum is not None
         if self.is_block_write_layer:
-            output = prefix_sum if self.reuse_attn_res_output else None
+            # The old prefix becomes the last committed residual block at the
+            # final block boundary. It must remain immutable for every later
+            # AttnRes mixture and therefore cannot also hold the new delta.
+            output = (
+                prefix_sum
+                if self.reuse_attn_res_output and not self.is_final_block_write_layer
+                else None
+            )
             prefix_sum = hidden_states
             prefix_delta = None
         else:
