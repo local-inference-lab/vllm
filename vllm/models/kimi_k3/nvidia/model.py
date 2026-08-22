@@ -2081,9 +2081,6 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         pp_group = get_pp_group()
         stream_aux_hidden_states = bool(
             projector is not None
-            # The streaming projector consumes plain residual sums. DFlash
-            # AttnRes capture requires the pre-norm mixture computed below.
-            and not self._aux_attn_res_stream
             and not self.use_sequence_parallel
             and pp_group.is_first_rank
             and pp_group.is_last_rank

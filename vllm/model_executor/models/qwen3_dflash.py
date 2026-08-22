@@ -527,6 +527,12 @@ class DFlashQwen3Model(nn.Module):
                 "DFlash auxiliary output scratch must have shape "
                 f"[max_tokens,{self.config.hidden_size}], got {tuple(scratch.shape)}"
             )
+        if int(scratch.shape[1]) < self._target_hidden_size:
+            raise ValueError(
+                "DFlash auxiliary output scratch also stages target residual "
+                f"sums and must be at least {self._target_hidden_size} wide, "
+                f"got {scratch.shape[1]}"
+            )
         self._streamed_aux_accumulator = accumulator
         self._streamed_aux_scratch = scratch
 
@@ -591,7 +597,9 @@ class DFlashQwen3Model(nn.Module):
                     f"got={tuple(residual.shape)}, expected={expected_shape}"
                 )
             assert self._streamed_aux_scratch is not None
-            source = self._streamed_aux_scratch[: self._streamed_aux_tokens]
+            source = self._streamed_aux_scratch[
+                : self._streamed_aux_tokens, : self._target_hidden_size
+            ]
             torch.add(primary, residual, out=source)
         self._streamed_aux_accumulator.append(source)
         self._streamed_aux_index += 1

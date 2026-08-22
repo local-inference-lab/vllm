@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm.model_executor.kernels.linear.mxfp8 import b12x
+from vllm.platforms import current_platform
 
 
 def test_input_accumulator_fills_ordered_slices_and_reuses_output(monkeypatch):
@@ -71,9 +72,12 @@ def test_input_accumulator_fills_ordered_slices_and_reuses_output(monkeypatch):
     assert calls[3] == ("mm", storage, weight, 3, output, 3, "stream")
 
 
-@pytest.mark.skipif(not torch.accelerator.is_available(), reason="requires accelerator")
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not torch.accelerator.is_available(),
+    reason="requires CUDA",
+)
 def test_input_accumulator_runs_under_fullgraph_compile() -> None:
-    from b12x.gemm import mxfp8_linear
+    mxfp8_linear = pytest.importorskip("b12x.gemm.mxfp8_linear")
 
     tokens = 8
     width = 128

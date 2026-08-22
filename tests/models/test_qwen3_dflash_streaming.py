@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -61,3 +62,45 @@ def test_dflash_streams_auxiliary_states_and_claims_result_once() -> None:
     torch.testing.assert_close(accumulator.inputs[1], second + residual)
     assert model.is_streamed_context_states([result])
     assert not model.is_streamed_context_states([result])
+
+
+def test_dflash_narrows_output_scratch_for_target_residual_staging() -> None:
+    """A narrower target state may reuse the draft output buffer safely."""
+    model = object.__new__(DFlashQwen3Model)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(hidden_size=6)
+    model.use_aux_hidden_state = True
+    model._target_hidden_size = 4
+    model._streamed_aux_layer_ids = (2, 4)
+    model._streamed_aux_tokens = 0
+    model._streamed_aux_index = 0
+    model._streamed_aux_generation = 0
+    model._completed_stream_generation = 0
+    model._consumed_stream_generation = 0
+    model._completed_stream_result = None
+    scratch = torch.empty(2048, 6)
+    accumulator = _Accumulator(scratch)
+    model.bind_auxiliary_stream(accumulator, scratch)
+
+    primary = torch.full((1024, 4), 2.0)
+    residual = torch.full((1024, 4), 3.0)
+    model.begin_auxiliary_stream(primary)
+    model.accumulate_auxiliary_state(primary, residual)
+
+    assert len(accumulator.inputs) == 1
+    torch.testing.assert_close(
+        accumulator.inputs[0],
+        torch.full((1024, 4), 5.0),
+    )
+
+
+def test_dflash_rejects_output_scratch_narrower_than_target_state() -> None:
+    """Streaming must fall back when target residuals cannot fit the scratch."""
+    model = object.__new__(DFlashQwen3Model)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(hidden_size=4)
+    model._target_hidden_size = 6
+    scratch = torch.empty(2048, 4)
+
+    with pytest.raises(ValueError, match="at least 6 wide"):
+        model.bind_auxiliary_stream(_Accumulator(scratch), scratch)
