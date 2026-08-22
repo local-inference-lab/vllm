@@ -70,6 +70,24 @@ from vllm.v1.utils import compute_iteration_details, record_function_or_nullcont
 logger = init_logger(__name__)
 
 
+def use_eagle_for_target_cache(
+    speculative_config: Any | None,
+    kv_cache_groups: Iterable[Any],
+) -> bool:
+    """Whether target KV groups require EAGLE's last-hash drop.
+
+    DSpark and DFlash use EAGLE-style scheduling/lookahead but can keep their
+    draft KV outside the target cache groups. In that layout, falling back from
+    an empty ``is_eagle_group`` set to all target groups drops one valid target
+    prefix hash. Classic EAGLE keeps the historical unannotated fallback.
+    """
+    if speculative_config is None or not speculative_config.use_eagle():
+        return False
+    if any(group.is_eagle_group for group in kv_cache_groups):
+        return True
+    return speculative_config.method not in ("dspark", "dflash")
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -270,6 +288,11 @@ class Scheduler(SchedulerInterface):
                 )
             self.use_eagle = speculative_config.use_eagle()
 
+        self.use_eagle_for_target_cache = use_eagle_for_target_cache(
+            speculative_config,
+            kv_cache_config.kv_cache_groups,
+        )
+
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
@@ -279,7 +302,7 @@ class Scheduler(SchedulerInterface):
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            use_eagle=self.use_eagle_for_target_cache,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
@@ -406,7 +429,7 @@ class Scheduler(SchedulerInterface):
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle:
+        if getattr(self, "use_eagle_for_target_cache", self.use_eagle):
             # EAGLE drops the last complete draft-attention block. Convert the
             # resulting maximum reusable prefix to the recurrent-state grid.
             # Older configurations without an annotated EAGLE group retain
