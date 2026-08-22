@@ -58,7 +58,7 @@ class B12xMxfp8InputAccumulator:
         mxfp8 = _import_b12x_mxfp8()
         if mxfp8 is None:
             raise ImportError("b12x.gemm.mxfp8_linear is not importable")
-        for name in ("empty_input", "mm_quantized", "quantize_input_slice"):
+        for name in ("empty_input", "mm_quantized_into", "quantize_input_slice"):
             if not callable(getattr(mxfp8, name, None)):
                 raise ImportError(f"b12x.gemm.mxfp8_linear missing callable {name}")
         if output.ndim != 2:
@@ -131,7 +131,7 @@ class B12xMxfp8InputAccumulator:
                 "incremental MXFP8 input is incomplete: "
                 f"filled={self._next_column}, required={self.input_width}"
             )
-        output = self._mxfp8.mm_quantized(
+        output = self._mxfp8.mm_quantized_into(
             self._input,
             self._packed_weight,
             tokens=self._tokens,

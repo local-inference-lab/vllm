@@ -34,7 +34,7 @@ def test_input_accumulator_fills_ordered_slices_and_reuses_output(monkeypatch):
             )
 
         @staticmethod
-        def mm_quantized(
+        def mm_quantized_into(
             source,
             weight,
             *,
