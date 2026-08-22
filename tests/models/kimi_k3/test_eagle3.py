@@ -273,6 +273,7 @@ def _make_attn_res_decoder_layer(*, block_write: bool):
     object.__setattr__(layer, "use_attn_res", True)
     object.__setattr__(layer, "reuse_attn_res_output", True)
     object.__setattr__(layer, "is_block_write_layer", block_write)
+    object.__setattr__(layer, "is_final_block_write_layer", False)
     object.__setattr__(layer, "block_write_idx", 0)
     object.__setattr__(layer, "prev_valid_blocks", 0)
     object.__setattr__(
@@ -361,3 +362,28 @@ def test_kimi_post_attn_norm_reuses_dead_input(monkeypatch):
     assert regular_hidden is attention_output
     assert regular_prefix is prefix
     assert outputs == [prefix, attention_output]
+
+
+def test_kimi_post_attn_norm_preserves_final_committed_block(monkeypatch):
+    prefix = torch.randn(2, 4)
+    attention_output = torch.randn(2, 4)
+    blocks = torch.randn(2, 3, 4)
+    allocated_output = torch.randn(2, 4)
+    outputs = []
+
+    def record_attn_res(*args, **kwargs):
+        outputs.append(kwargs["output"])
+        return allocated_output
+
+    monkeypatch.setattr(kimi_model, "attn_res", record_attn_res)
+    layer = _make_attn_res_decoder_layer(block_write=True)
+    object.__setattr__(layer, "is_final_block_write_layer", True)
+
+    hidden, next_prefix, next_blocks = layer._post_attn_norm(
+        attention_output, blocks, prefix
+    )
+
+    assert hidden is allocated_output
+    assert next_prefix is attention_output
+    assert next_blocks is blocks
+    assert outputs == [None]
