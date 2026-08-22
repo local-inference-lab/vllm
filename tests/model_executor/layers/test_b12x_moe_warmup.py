@@ -31,6 +31,13 @@ class _FakeStaticLoRA:
     token_lora_mapping: torch.Tensor
 
 
+def _require_b12x_static_expert_lora() -> None:
+    """Skip tests unless the installed B12X exposes the companion LoRA API."""
+    fused_moe = pytest.importorskip("b12x.moe.fused_moe")
+    if not hasattr(fused_moe, "StaticExpertLoRA"):
+        pytest.skip("installed B12X does not expose StaticExpertLoRA")
+
+
 def _make_fake_prepared_experts(
     *,
     quant_mode: str = "nvfp4",
@@ -324,7 +331,7 @@ def test_b12x_moe_run_binds_only_the_prepared_expert_owner(monkeypatch) -> None:
 def test_b12x_experts_adapts_vllm_split_lora_storage_without_copy(
     monkeypatch,
 ) -> None:
-    pytest.importorskip("b12x.moe.fused_moe")
+    _require_b12x_static_expert_lora()
     monkeypatch.setattr(b12x_moe, "_is_current_stream_capturing", lambda: False)
     experts = _make_fake_b12x_experts()
     ctx = _make_fake_lora_context()
@@ -359,7 +366,7 @@ def test_b12x_experts_adapts_vllm_split_lora_storage_without_copy(
 
 
 def test_b12x_experts_revalidates_mutated_lora_storage(monkeypatch) -> None:
-    pytest.importorskip("b12x.moe.fused_moe")
+    _require_b12x_static_expert_lora()
     monkeypatch.setattr(b12x_moe, "_is_current_stream_capturing", lambda: False)
     experts = _make_fake_b12x_experts()
     ctx = _make_fake_lora_context()
@@ -386,7 +393,7 @@ def test_b12x_experts_rejects_distinct_gate_up_lora_a() -> None:
 
 
 def test_b12x_experts_accepts_zero_padded_rank4_lora_cache(monkeypatch) -> None:
-    pytest.importorskip("b12x.moe.fused_moe")
+    _require_b12x_static_expert_lora()
     monkeypatch.setattr(b12x_moe, "_is_current_stream_capturing", lambda: False)
     experts = _make_fake_b12x_experts()
     ctx = _make_fake_lora_context(rank_capacity=8)
@@ -419,7 +426,7 @@ def test_b12x_experts_rejects_nonzero_rank_padding() -> None:
 
 
 def test_b12x_experts_accepts_fused_3d_moe_lora_storage(monkeypatch) -> None:
-    pytest.importorskip("b12x.moe.fused_moe")
+    _require_b12x_static_expert_lora()
     monkeypatch.setattr(b12x_moe, "_is_current_stream_capturing", lambda: False)
     experts = _make_fake_b12x_experts()
     ctx = _make_fake_lora_context(rank_capacity=8, fused_w13=True)
