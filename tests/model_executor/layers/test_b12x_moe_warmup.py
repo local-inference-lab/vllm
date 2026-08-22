@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
 from dataclasses import dataclass
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -36,6 +37,15 @@ def _require_b12x_static_expert_lora() -> None:
     fused_moe = pytest.importorskip("b12x.moe.fused_moe")
     if not hasattr(fused_moe, "StaticExpertLoRA"):
         pytest.skip("installed B12X does not expose StaticExpertLoRA")
+
+
+def test_static_expert_lora_guard_skips_an_older_b12x(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    older_b12x = ModuleType("b12x.moe.fused_moe")
+    monkeypatch.setitem(sys.modules, "b12x.moe.fused_moe", older_b12x)
+    with pytest.raises(pytest.skip.Exception, match="does not expose"):
+        _require_b12x_static_expert_lora()
 
 
 def _make_fake_prepared_experts(
