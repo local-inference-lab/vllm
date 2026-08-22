@@ -574,6 +574,13 @@ class DFlashQwen3Model(nn.Module):
         self._streamed_aux_generation += 1
         self._completed_stream_result = None
         self._streamed_aux_accumulator.begin(self._streamed_aux_tokens)
+        logger.info_once(
+            "DFlash staged auxiliary projection is active: "
+            "tokens=%d target_width=%d slices=%d.",
+            self._streamed_aux_tokens,
+            self._target_hidden_size,
+            len(self._streamed_aux_layer_ids),
+        )
 
     def accumulate_auxiliary_state(
         self,
