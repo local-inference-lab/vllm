@@ -13,12 +13,17 @@ def _build_grammar_row_mapping(
     req_ids: list[str],
     grammar_req_ids: list[str],
     grammar_num_spec_tokens: list[int],
+    grammar_has_bonus_token: list[bool],
     cu_num_logits_np: np.ndarray,
     num_draft_tokens_per_req: np.ndarray | None,
     num_bonus_tokens: int,
 ) -> tuple[list[int], list[int]]:
     """Map serialized grammar rows to the active compact logits layout."""
-    assert len(grammar_req_ids) == len(grammar_num_spec_tokens)
+    assert (
+        len(grammar_req_ids)
+        == len(grammar_num_spec_tokens)
+        == len(grammar_has_bonus_token)
+    )
     assert num_bonus_tokens in (0, 1)
 
     req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}
@@ -26,9 +31,10 @@ def _build_grammar_row_mapping(
     logits_indices: list[int] = []
     source_offset = 0
 
-    for grammar_req_id, num_source_drafts in zip(
+    for grammar_req_id, num_source_drafts, has_source_bonus_token in zip(
         grammar_req_ids,
         grammar_num_spec_tokens,
+        grammar_has_bonus_token,
         strict=True,
     ):
         req_idx = req_id_to_idx[grammar_req_id]
@@ -48,10 +54,11 @@ def _build_grammar_row_mapping(
         source_indices.extend(range(source_offset, source_offset + num_active_drafts))
         logits_indices.extend(range(logits_start, logits_start + num_active_drafts))
         if num_bonus_tokens:
+            assert has_source_bonus_token
             source_indices.append(source_offset + num_source_drafts)
             logits_indices.append(logits_start + num_active_drafts)
 
-        source_offset += num_source_drafts + num_bonus_tokens
+        source_offset += num_source_drafts + int(has_source_bonus_token)
 
     return source_indices, logits_indices
 
@@ -81,6 +88,7 @@ class StructuredOutputsWorker:
         grammar_req_ids: list[str],
         grammar_bitmask: np.ndarray,
         grammar_num_spec_tokens: list[int],
+        grammar_has_bonus_token: list[bool],
     ) -> None:
         if not grammar_req_ids:
             return
@@ -89,12 +97,16 @@ class StructuredOutputsWorker:
             input_batch.req_ids,
             grammar_req_ids,
             grammar_num_spec_tokens,
+            grammar_has_bonus_token,
             input_batch.cu_num_logits_np,
             input_batch.num_draft_tokens_per_req,
             self.num_bonus_tokens,
         )
         expected_source_rows = sum(
-            num_drafts + self.num_bonus_tokens for num_drafts in grammar_num_spec_tokens
+            num_drafts + int(has_bonus_token)
+            for num_drafts, has_bonus_token in zip(
+                grammar_num_spec_tokens, grammar_has_bonus_token, strict=True
+            )
         )
         assert grammar_bitmask.shape[0] == expected_source_rows
         grammar_bitmask = grammar_bitmask[source_indices]

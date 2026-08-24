@@ -370,6 +370,7 @@ def warmup_kernels(
                 structured_output_request_ids=req_ids,
                 grammar_bitmask=grammar_bitmask,
                 num_spec_tokens=[0] * len(req_ids),
+                has_bonus_token=[True] * len(req_ids),
                 num_invalid_spec_tokens=[0] * len(req_ids),
             )
 

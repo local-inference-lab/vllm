@@ -131,9 +131,10 @@ def apply_grammar_bitmask(
     )
     sorted_bitmask = sorted_bitmask_tensor.numpy()
     cumulative_index = 0
-    for req_id, num_grammar_spec_tokens in zip(
+    for req_id, num_grammar_spec_tokens, has_bonus_token in zip(
         grammar_output.structured_output_request_ids,
         grammar_output.num_spec_tokens,
+        grammar_output.has_bonus_token,
         strict=True,
     ):
         num_worker_spec_tokens = len(spec_tokens.get(req_id, ()))
@@ -143,12 +144,13 @@ def apply_grammar_bitmask(
                 bitmask_index = logit_idx + i
                 sorted_bitmask[bitmask_index] = grammar_bitmask[cumulative_index + i]
                 out_indices.append(bitmask_index)
-            bonus_index = logit_idx + num_worker_spec_tokens
-            sorted_bitmask[bonus_index] = grammar_bitmask[
-                cumulative_index + num_grammar_spec_tokens
-            ]
-            out_indices.append(bonus_index)
-        cumulative_index += 1 + num_grammar_spec_tokens
+            if has_bonus_token:
+                bonus_index = logit_idx + num_worker_spec_tokens
+                sorted_bitmask[bonus_index] = grammar_bitmask[
+                    cumulative_index + num_grammar_spec_tokens
+                ]
+                out_indices.append(bonus_index)
+        cumulative_index += int(has_bonus_token) + num_grammar_spec_tokens
 
     # Copy async to device.
     grammar_bitmask = sorted_bitmask_tensor.to(logits.device, non_blocking=True)

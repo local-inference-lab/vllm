@@ -1651,6 +1651,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     grammar_output.structured_output_request_ids,
                     grammar_output.grammar_bitmask,
                     grammar_output.num_spec_tokens,
+                    grammar_output.has_bonus_token,
                 )
 
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
