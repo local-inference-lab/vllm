@@ -38,7 +38,12 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len, get_kv_cache_configs
-from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
+from vllm.v1.core.sched.output import (
+    CachedRequestData,
+    GrammarOutput,
+    NewRequestData,
+    SchedulerOutput,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -144,6 +149,72 @@ def model_runner():
 
 
 model_runner_2 = model_runner
+
+
+def test_invalid_grammar_suffix_counts_follow_compact_worker_order():
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["plain", "structured-a", "structured-b"])
+    )
+    grammar_output = GrammarOutput(
+        structured_output_request_ids=["structured-b", "structured-a"],
+        grammar_bitmask=np.empty((0, 0), dtype=np.int32),
+        num_spec_tokens=[4, 3],
+        num_invalid_spec_tokens=[3, 1],
+    )
+    spec_decode_metadata = SimpleNamespace(num_draft_tokens=[1, 2, 3])
+
+    assert GPUModelRunner._get_invalid_draft_counts(
+        runner, grammar_output, spec_decode_metadata
+    ) == [0, 0, 2]
+
+
+@pytest.mark.parametrize(
+    "request_ids,widths,invalid,error",
+    [
+        (["a", "a"], [1, 1], [0, 0], "duplicate"),
+        (["a"], [1, 2], [0], "align"),
+        (["a"], [1], None, "missing"),
+        (["a"], [1], [2], "outside"),
+    ],
+)
+def test_invalid_grammar_suffix_counts_validate_serialized_metadata(
+    request_ids, widths, invalid, error
+):
+    runner = SimpleNamespace(input_batch=SimpleNamespace(req_ids=["a"]))
+    grammar_output = GrammarOutput(
+        structured_output_request_ids=request_ids,
+        grammar_bitmask=np.empty((0, 0), dtype=np.int32),
+        num_spec_tokens=widths,
+        num_invalid_spec_tokens=invalid,
+    )
+    spec_decode_metadata = SimpleNamespace(num_draft_tokens=[1])
+
+    with pytest.raises(ValueError, match=error):
+        GPUModelRunner._get_invalid_draft_counts(
+            runner, grammar_output, spec_decode_metadata
+        )
+
+
+def test_sample_forwards_invalid_draft_counts_to_rejection_sampler():
+    runner = object.__new__(GPUModelRunner)
+    runner.input_batch = SimpleNamespace(
+        sampling_metadata=Mock(),
+        update_async_output_token_ids=Mock(),
+    )
+    runner.use_async_scheduling = False
+    runner._get_spec_decode_draft_probs = Mock(return_value=None)
+    runner.rejection_sampler = Mock(return_value="sampler-output")
+    spec_decode_metadata = SimpleNamespace()
+
+    output = GPUModelRunner._sample(
+        runner,
+        torch.zeros(1, 2),
+        spec_decode_metadata,
+        [1],
+    )
+
+    assert output == "sampler-output"
+    assert runner.rejection_sampler.call_args.args[4] == [1]
 
 
 def _schedule_new_request(*req_ids: str) -> SchedulerOutput:
