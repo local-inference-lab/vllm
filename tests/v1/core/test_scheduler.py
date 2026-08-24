@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 from concurrent.futures import Future
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -3258,6 +3259,42 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     assert [req.req_id for req in next_output.scheduled_new_reqs] == [
         healthy_request.request_id
     ]
+
+
+@pytest.mark.parametrize(
+    "invalid_spec_tokens,expected_invalid_counts",
+    [({"structured": 2}, [2]), (None, [0])],
+)
+def test_get_grammar_bitmask_forwards_invalid_draft_counts(
+    invalid_spec_tokens, expected_invalid_counts
+):
+    scheduler = object.__new__(Scheduler)
+    scheduler.requests = {
+        "plain": SimpleNamespace(use_structured_output=False, is_prefill_chunk=False),
+        "structured": SimpleNamespace(
+            use_structured_output=True, is_prefill_chunk=False
+        ),
+    }
+    scheduler.structured_output_manager = Mock()
+    scheduler.structured_output_manager.grammar_bitmask.return_value = Mock()
+    scheduler_output = SimpleNamespace(
+        has_structured_output_requests=True,
+        num_scheduled_tokens={"plain": 1, "structured": 4},
+        scheduled_spec_decode_tokens={"structured": [1, 2, 3]},
+        num_invalid_spec_tokens=invalid_spec_tokens,
+    )
+
+    grammar_output = scheduler.get_grammar_bitmask(scheduler_output)
+
+    assert grammar_output is not None
+    assert grammar_output.structured_output_request_ids == ["structured"]
+    assert grammar_output.num_spec_tokens == [3]
+    assert grammar_output.num_invalid_spec_tokens == expected_invalid_counts
+    scheduler.structured_output_manager.grammar_bitmask.assert_called_once_with(
+        scheduler.requests,
+        ["structured"],
+        scheduler_output.scheduled_spec_decode_tokens,
+    )
 
 
 def test_abort_request_when_structured_output_fsm_cannot_advance():

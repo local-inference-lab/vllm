@@ -1695,10 +1695,16 @@ class Scheduler(SchedulerInterface):
             len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
             for req_id in structured_output_request_ids
         ]
+        invalid_spec_tokens = scheduler_output.num_invalid_spec_tokens or {}
+        num_invalid_spec_tokens = [
+            invalid_spec_tokens.get(req_id, 0)
+            for req_id in structured_output_request_ids
+        ]
         return GrammarOutput(
             structured_output_request_ids,
             bitmask,
             num_spec_tokens,
+            num_invalid_spec_tokens,
         )
 
     def update_from_output(

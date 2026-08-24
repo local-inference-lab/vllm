@@ -134,6 +134,7 @@ def test_apply_grammar_bitmask_preserves_source_offsets_after_draft_trimming(
             dtype=np.int32,
         ),
         num_spec_tokens=[3, 3],
+        num_invalid_spec_tokens=[0, 0],
     )
     input_batch = SimpleNamespace(req_ids=["trimmed-request", "full-request"])
     logits = torch.zeros((6, 32))
