@@ -216,6 +216,14 @@ class StructuredOutputManager:
     ) -> Future:
         return self.executor_for_fillmask.submit(self._fill_bitmasks, batch)
 
+    def has_grammar_bonus_token(
+        self, scheduled_spec_decode_tokens: Sequence[int]
+    ) -> bool:
+        """Whether a request contributes a bonus row to the compact mask."""
+        return not (
+            self.vllm_config.model_config.is_diffusion and scheduled_spec_decode_tokens
+        )
+
     def grammar_bitmask(
         self,
         requests: dict[str, "Request"],
@@ -339,7 +347,7 @@ class StructuredOutputManager:
                     cumulative_index += 1
                 # Diffusion LLMs don't sample a bonus token after the
                 # scheduled positions, so skip its bitmask in that case.
-                if not (self.vllm_config.model_config.is_diffusion and req_tokens):
+                if self.has_grammar_bonus_token(req_tokens):
                     # bonus_apply must be True when the bonus-row position
                     # should be grammar-constrained. Two triggers:
                     # - should_fill_bitmask(request): reasoning was already
@@ -380,9 +388,7 @@ class StructuredOutputManager:
                 # After unifying the `openai_gptoss` and non-`openai_gptoss` styles,
                 # it can be removed.
                 request.structured_output_request.reasoning_ended = (
-                    reasoner.is_reasoning_end_for_prompt(
-                        request.prompt_token_ids or []
-                    )
+                    reasoner.is_reasoning_end_for_prompt(request.prompt_token_ids or [])
                 )
             return request.structured_output_request.reasoning_ended
         return True

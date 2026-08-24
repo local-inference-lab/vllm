@@ -295,3 +295,13 @@ class GrammarOutput:
     structured_output_request_ids: list[str]
     # Bitmask ordered as structured_output_request_ids.
     grammar_bitmask: "npt.NDArray[np.int32]"
+    # Number of speculative rows represented in grammar_bitmask for each
+    # structured output request. Worker-side draft trimming may reduce the
+    # number of logits without changing this compact source layout.
+    num_spec_tokens: list[int]
+    # Whether grammar_bitmask contains the per-request bonus row. Diffusion
+    # requests that already have scheduled positions omit this source row.
+    has_bonus_token: list[bool]
+    # Number of grammar-invalid draft tokens per structured request. This is
+    # forwarded to the worker so a stale draft snapshot cannot be accepted.
+    num_invalid_spec_tokens: list[int]

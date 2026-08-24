@@ -32,6 +32,42 @@ MAX_CHUNK_BYTES = 2**30  # 1GB
 _FP32_BYTES = 4
 
 
+def force_reject_invalid_draft_suffixes(
+    draft_sampled: torch.Tensor,
+    cu_num_logits_np: np.ndarray,
+    num_invalid_draft_tokens: list[int] | None,
+) -> torch.Tensor:
+    """Replace grammar-rejected draft suffixes with rejection placeholders.
+
+    Async scheduling can leave this worker with an unfiltered draft snapshot
+    while the scheduler has already rejected a trailing grammar-invalid
+    suffix. The rejection kernels treat ``-1`` as a forced rejection and
+    recover from the grammar-masked target distribution.
+    """
+    if num_invalid_draft_tokens is None:
+        return draft_sampled
+    if cu_num_logits_np.ndim != 1 or cu_num_logits_np.size == 0:
+        raise ValueError("invalid cumulative logits metadata")
+    num_reqs = cu_num_logits_np.size - 1
+    if len(num_invalid_draft_tokens) != num_reqs:
+        raise ValueError("invalid draft counts must align with batch requests")
+    if draft_sampled.numel() != int(cu_num_logits_np[-1]):
+        raise ValueError("draft samples must align with cumulative logits")
+    if not any(num_invalid_draft_tokens):
+        return draft_sampled
+
+    sanitized = draft_sampled.clone()
+    for req_idx, num_invalid in enumerate(num_invalid_draft_tokens):
+        start = int(cu_num_logits_np[req_idx])
+        end = int(cu_num_logits_np[req_idx + 1])
+        num_drafts = end - start - 1
+        if not 0 <= num_invalid <= num_drafts:
+            raise ValueError("invalid draft count is outside its request width")
+        if num_invalid:
+            sanitized[end - num_invalid : end] = -1
+    return sanitized
+
+
 def _iter_request_chunks(
     cu_num_logits: np.ndarray, max_chunk_logits: int
 ) -> Iterator[tuple[int, int]]:
@@ -250,6 +286,7 @@ class RejectionSampler:
         logits: torch.Tensor,
         input_batch: InputBatch,
         draft_logits: torch.Tensor | None = None,
+        num_invalid_draft_tokens: list[int] | None = None,
     ) -> SamplerOutput:
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
@@ -258,6 +295,11 @@ class RejectionSampler:
         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
         draft_sampled.masked_fill_(
             input_batch.is_padding[input_batch.logits_indices], -1
+        )
+        draft_sampled = force_reject_invalid_draft_suffixes(
+            draft_sampled,
+            input_batch.cu_num_logits_np,
+            num_invalid_draft_tokens,
         )
         pos = input_batch.positions[input_batch.logits_indices]
 

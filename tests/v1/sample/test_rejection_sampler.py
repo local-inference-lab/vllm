@@ -14,6 +14,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RejectionSampler,
+    force_reject_invalid_draft_suffixes,
     sample_recovered_tokens,
 )
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
@@ -1183,3 +1184,77 @@ def test_placeholder_draft_token_rejected_random(rejection_sampler):
     assert sampled[0, 1].item() == vocab_size - 1
     recovered = sampled[0, 2].item()
     assert 0 <= recovered < vocab_size
+
+
+def test_forced_grammar_rejection_recovers_from_target_distribution(
+    rejection_sampler,
+):
+    logits = torch.tensor(
+        [[float("-inf"), 0.0, 0.0]], dtype=torch.float32, device=DEVICE_TYPE
+    )
+    draft_probs = torch.tensor(
+        [[0.0, 0.5, 0.5]], dtype=torch.float32, device=DEVICE_TYPE
+    )
+    metadata = create_sampling_metadata(
+        all_greedy=False,
+        temperature=torch.ones(1, dtype=torch.float32, device=DEVICE_TYPE),
+        generators={0: torch.Generator(device=DEVICE_TYPE).manual_seed(0)},
+    )
+    spec_decode_metadata = create_spec_decode_metadata([[0]], logits)
+    mock_sampler_output(
+        rejection_sampler, torch.tensor([1], dtype=torch.int32, device=DEVICE_TYPE)
+    )
+
+    output = rejection_sampler(
+        spec_decode_metadata,
+        draft_probs=draft_probs,
+        logits=logits,
+        sampling_metadata=metadata,
+        num_invalid_draft_tokens=[1],
+    )
+
+    assert output.sampled_token_ids[0, 0].item() in {1, 2}
+    assert output.sampled_token_ids[0, 1].item() == PLACEHOLDER_TOKEN_ID
+
+
+def test_force_rejects_only_the_invalid_suffix_for_each_request():
+    drafts = torch.tensor([10, 11, 12, 20, 21, 30], dtype=torch.int32)
+    draft_probs = torch.ones((6, 4), dtype=torch.float32)
+
+    sanitized, sanitized_probs = force_reject_invalid_draft_suffixes(
+        drafts,
+        draft_probs,
+        num_draft_tokens=[3, 2, 1],
+        num_invalid_draft_tokens=[1, 2, 0],
+    )
+
+    assert sanitized.tolist() == [10, 11, -1, -1, -1, 30]
+    assert drafts.tolist() == [10, 11, 12, 20, 21, 30]
+    assert sanitized_probs is not None
+    assert torch.equal(sanitized_probs[[0, 1, 5]], torch.ones((3, 4)))
+    assert not sanitized_probs[[2, 3, 4]].any()
+
+
+@pytest.mark.parametrize(
+    "drafts,widths,invalid",
+    [
+        ([1, 2], [2], [3]),
+        ([1, 2], [2], [1, 0]),
+        ([1], [2], [1]),
+    ],
+)
+def test_force_rejection_rejects_misaligned_metadata(drafts, widths, invalid):
+    with pytest.raises(ValueError):
+        force_reject_invalid_draft_suffixes(
+            torch.tensor(drafts, dtype=torch.int32), None, widths, invalid
+        )
+
+
+def test_force_rejection_rejects_misaligned_draft_probabilities():
+    with pytest.raises(ValueError):
+        force_reject_invalid_draft_suffixes(
+            torch.tensor([1, 2], dtype=torch.int32),
+            torch.ones((1, 4)),
+            [2],
+            [1],
+        )

@@ -1723,7 +1723,28 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
         )
-        return GrammarOutput(structured_output_request_ids, bitmask)
+        num_spec_tokens = [
+            len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
+            for req_id in structured_output_request_ids
+        ]
+        has_bonus_token = [
+            self.structured_output_manager.has_grammar_bonus_token(
+                scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
+            )
+            for req_id in structured_output_request_ids
+        ]
+        invalid_spec_tokens = scheduler_output.num_invalid_spec_tokens or {}
+        num_invalid_spec_tokens = [
+            invalid_spec_tokens.get(req_id, 0)
+            for req_id in structured_output_request_ids
+        ]
+        return GrammarOutput(
+            structured_output_request_ids,
+            bitmask,
+            num_spec_tokens,
+            has_bonus_token,
+            num_invalid_spec_tokens,
+        )
 
     def update_from_output(
         self,
