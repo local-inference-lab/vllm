@@ -299,3 +299,6 @@ class GrammarOutput:
     # structured output request. Worker-side draft trimming may reduce the
     # number of logits without changing this compact source layout.
     num_spec_tokens: list[int]
+    # Number of grammar-invalid draft tokens per structured request. This is
+    # forwarded to the worker so a stale draft snapshot cannot be accepted.
+    num_invalid_spec_tokens: list[int]
