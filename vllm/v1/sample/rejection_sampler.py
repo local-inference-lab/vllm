@@ -35,6 +35,48 @@ GREEDY_TEMPERATURE: tl.constexpr = 0
 MAX_SPEC_LEN = 128
 
 
+def force_reject_invalid_draft_suffixes(
+    draft_token_ids: torch.Tensor,
+    draft_probs: torch.Tensor | None,
+    num_draft_tokens: list[int],
+    num_invalid_draft_tokens: list[int] | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Replace grammar-invalid draft suffixes with rejection placeholders."""
+    if num_invalid_draft_tokens is None:
+        return draft_token_ids, draft_probs
+    if len(num_invalid_draft_tokens) != len(num_draft_tokens):
+        raise ValueError("invalid draft counts must align with batch requests")
+
+    total_drafts = sum(num_draft_tokens)
+    if draft_token_ids.numel() != total_drafts:
+        raise ValueError("draft ids must align with per-request draft counts")
+    if not any(num_invalid_draft_tokens):
+        return draft_token_ids, draft_probs
+
+    sanitized = draft_token_ids.clone()
+    forced_reject_mask = torch.zeros(
+        total_drafts, dtype=torch.bool, device=draft_token_ids.device
+    )
+    offset = 0
+    for num_drafts, num_invalid in zip(
+        num_draft_tokens, num_invalid_draft_tokens, strict=True
+    ):
+        if not 0 <= num_invalid <= num_drafts:
+            raise ValueError("invalid draft count is outside its request width")
+        if num_invalid:
+            start = offset + num_drafts - num_invalid
+            sanitized[start : offset + num_drafts] = PLACEHOLDER_TOKEN_ID
+            forced_reject_mask[start : offset + num_drafts] = True
+        offset += num_drafts
+
+    if draft_probs is not None:
+        if draft_probs.shape[0] != total_drafts:
+            raise ValueError("draft probabilities must align with draft ids")
+        draft_probs = draft_probs.clone()
+        draft_probs.masked_fill_(forced_reject_mask.unsqueeze(1), 0)
+    return sanitized, draft_probs
+
+
 class RejectionSampler(nn.Module):
     """
     The implementation strictly follows the algorithm described in
@@ -97,6 +139,7 @@ class RejectionSampler(nn.Module):
         # [num_tokens + batch_size, vocab_size]
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        num_invalid_draft_tokens: list[int] | None = None,
     ) -> SamplerOutput:
         """
         Args:
@@ -170,8 +213,14 @@ class RejectionSampler(nn.Module):
             sampling_metadata,
         )
 
-        output_token_ids = rejection_sample(
+        draft_token_ids, draft_probs = force_reject_invalid_draft_suffixes(
             metadata.draft_token_ids,
+            draft_probs,
+            metadata.num_draft_tokens,
+            num_invalid_draft_tokens,
+        )
+        output_token_ids = rejection_sample(
+            draft_token_ids,
             metadata.num_draft_tokens,
             metadata.max_spec_len,
             metadata.cu_num_draft_tokens,
