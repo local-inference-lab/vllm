@@ -134,6 +134,7 @@ def test_apply_grammar_bitmask_preserves_source_offsets_after_draft_trimming(
             dtype=np.int32,
         ),
         num_spec_tokens=[3, 3],
+        has_bonus_token=[True, True],
         num_invalid_spec_tokens=[0, 0],
     )
     input_batch = SimpleNamespace(req_ids=["trimmed-request", "full-request"])
@@ -161,3 +162,47 @@ def test_apply_grammar_bitmask_preserves_source_offsets_after_draft_trimming(
 
     assert applied_bitmask is not None
     assert applied_bitmask[:, 0].tolist() == [10, 13, 20, 21, 22, 23]
+
+
+def test_apply_grammar_bitmask_skips_omitted_diffusion_bonus_rows(monkeypatch):
+    """An omitted source bonus row must not consume the next request's mask."""
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={
+            "diffusion-request": [1],
+            "later-request": [2, 3, 4],
+        }
+    )
+    grammar_output = GrammarOutput(
+        structured_output_request_ids=["diffusion-request", "later-request"],
+        grammar_bitmask=np.array([[10], [20], [21], [22], [23]], dtype=np.int32),
+        num_spec_tokens=[1, 3],
+        has_bonus_token=[False, True],
+        num_invalid_spec_tokens=[0, 0],
+    )
+    input_batch = SimpleNamespace(req_ids=["diffusion-request", "later-request"])
+    logits = torch.zeros((6, 32))
+    applied_bitmask = None
+    applied_indices = None
+
+    def capture_bitmask(logits, bitmask, indices):
+        nonlocal applied_bitmask, applied_indices
+        applied_bitmask = bitmask.clone()
+        applied_indices = indices
+
+    monkeypatch.setattr(
+        utils,
+        "xgr",
+        SimpleNamespace(apply_token_bitmask_inplace=capture_bitmask),
+    )
+    monkeypatch.setattr(utils, "PIN_MEMORY", False)
+
+    utils.apply_grammar_bitmask(
+        scheduler_output,
+        grammar_output,
+        input_batch,
+        logits,
+    )
+
+    assert applied_bitmask is not None
+    assert applied_bitmask[:, 0].tolist() == [10, -1, 20, 21, 22, 23]
+    assert applied_indices == [0, 2, 3, 4, 5]

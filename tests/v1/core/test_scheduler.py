@@ -3443,6 +3443,7 @@ def test_get_grammar_bitmask_forwards_invalid_draft_counts(
     }
     scheduler.structured_output_manager = Mock()
     scheduler.structured_output_manager.grammar_bitmask.return_value = Mock()
+    scheduler.structured_output_manager.has_grammar_bonus_token.return_value = True
     scheduler_output = SimpleNamespace(
         has_structured_output_requests=True,
         num_scheduled_tokens={"plain": 1, "structured": 4},
@@ -3455,11 +3456,15 @@ def test_get_grammar_bitmask_forwards_invalid_draft_counts(
     assert grammar_output is not None
     assert grammar_output.structured_output_request_ids == ["structured"]
     assert grammar_output.num_spec_tokens == [3]
+    assert grammar_output.has_bonus_token == [True]
     assert grammar_output.num_invalid_spec_tokens == expected_invalid_counts
     scheduler.structured_output_manager.grammar_bitmask.assert_called_once_with(
         scheduler.requests,
         ["structured"],
         scheduler_output.scheduled_spec_decode_tokens,
+    )
+    scheduler.structured_output_manager.has_grammar_bonus_token.assert_called_once_with(
+        [1, 2, 3]
     )
 
 

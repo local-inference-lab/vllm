@@ -159,6 +159,7 @@ def test_invalid_grammar_suffix_counts_follow_compact_worker_order():
         structured_output_request_ids=["structured-b", "structured-a"],
         grammar_bitmask=np.empty((0, 0), dtype=np.int32),
         num_spec_tokens=[4, 3],
+        has_bonus_token=[True, True],
         num_invalid_spec_tokens=[3, 1],
     )
     spec_decode_metadata = SimpleNamespace(num_draft_tokens=[1, 2, 3])
@@ -185,6 +186,7 @@ def test_invalid_grammar_suffix_counts_validate_serialized_metadata(
         structured_output_request_ids=request_ids,
         grammar_bitmask=np.empty((0, 0), dtype=np.int32),
         num_spec_tokens=widths,
+        has_bonus_token=[True] * len(request_ids),
         num_invalid_spec_tokens=invalid,
     )
     spec_decode_metadata = SimpleNamespace(num_draft_tokens=[1])

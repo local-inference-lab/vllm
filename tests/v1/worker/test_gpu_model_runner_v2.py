@@ -19,6 +19,7 @@ def _grammar_output() -> GrammarOutput:
         structured_output_request_ids=["structured-b", "structured-a"],
         grammar_bitmask=np.empty((0, 0), dtype=np.int32),
         num_spec_tokens=[4, 3],
+        has_bonus_token=[True, True],
         num_invalid_spec_tokens=[3, 1],
     )
 
@@ -60,6 +61,7 @@ def test_invalid_grammar_suffix_counts_project_active_width(
         structured_output_request_ids=["structured"],
         grammar_bitmask=np.empty((0, 0), dtype=np.int32),
         num_spec_tokens=[source_width],
+        has_bonus_token=[True],
         num_invalid_spec_tokens=[source_invalid],
     )
     input_batch = SimpleNamespace(
@@ -87,6 +89,7 @@ def test_invalid_grammar_suffix_counts_validate_metadata(
         structured_output_request_ids=request_ids,
         grammar_bitmask=np.empty((0, 0), dtype=np.int32),
         num_spec_tokens=widths,
+        has_bonus_token=[True] * len(request_ids),
         num_invalid_spec_tokens=invalid,
     )
     input_batch = SimpleNamespace(
