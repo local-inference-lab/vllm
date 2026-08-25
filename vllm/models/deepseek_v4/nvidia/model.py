@@ -76,6 +76,10 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.nvidia.b12x import (
+    DeepseekV4B12xAttention,
+    b12x_dsv4_is_supported,
+)
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -1041,6 +1045,15 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         if device_capability is not None and device_capability.major == 12:
             return DeepseekV4FlashInferSM120Attention
         return DeepseekV4FlashInferMLAAttention
+    if backend == AttentionBackendEnum.B12X:
+        if device_capability is None or (
+            device_capability.major,
+            device_capability.minor,
+        ) not in ((12, 0), (12, 1)):
+            raise ValueError("B12X attention requires an SM120 or SM121 GPU.")
+        if not b12x_dsv4_is_supported():
+            raise ValueError("B12X attention requires a supported b12x installation.")
+        return DeepseekV4B12xAttention
     if backend in (
         AttentionBackendEnum.FLASHMLA_SPARSE,
         AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,

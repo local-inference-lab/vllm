@@ -1,0 +1,607 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""B12x compressed sparse MLA for DeepSeek V4."""
+
+from collections.abc import Callable
+from functools import cache
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
+
+import torch
+
+from vllm.config import VllmConfig
+from vllm.forward_context import get_forward_context
+from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.common.ops import (
+    compute_global_topk_indices_and_lens,
+)
+from vllm.models.deepseek_v4.nvidia.b12x_indexer import (
+    DeepseekV4B12xIndexerBackend,
+    DeepseekV4B12xSparseIndexer,
+    b12x_indexer_is_supported,
+)
+from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
+    compute_fp8_einsum_recipe,
+    deep_gemm_fp8_o_proj,
+)
+from vllm.models.deepseek_v4.sparse_mla import (
+    DeepseekV4FlashMLAMetadata,
+    DeepseekV4SparseMLABackend,
+    DeepseekV4SparseMLAMetadataBuilder,
+)
+from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
+from vllm.utils.b12x import get_b12x_compressed_sparse_mla
+from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_dspark_swa_index_width,
+)
+from vllm.v1.worker.workspace import current_workspace_manager
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.backends.mla.sparse_swa import (
+        DeepseekSparseSWAMetadata,
+    )
+
+_DSV4_HEAD_DIM = 512
+_DSV4_CACHE_BYTES_PER_TOKEN = 584
+_C128A_TOPK_ALIGNMENT = 128
+
+
+def _require_b12x_compressed_sparse_mla() -> Any:
+    module = get_b12x_compressed_sparse_mla()
+    if module is None:
+        raise RuntimeError(
+            "DeepSeek V4 B12x attention requires `pip install vllm[b12x]`."
+        )
+    if not module.is_supported():
+        raise RuntimeError(
+            "B12x compressed sparse MLA is not supported on this device."
+        )
+    for name in ("Caps", "plan", "run", "split_chunks_for_contract"):
+        getattr(module, name)
+    return module
+
+
+def b12x_dsv4_is_supported() -> bool:
+    attention_module = get_b12x_compressed_sparse_mla()
+    return bool(
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and attention_module is not None
+        and attention_module.is_supported()
+        and b12x_indexer_is_supported()
+    )
+
+
+def _get_dspark_decode_row_capacity(vllm_config: VllmConfig) -> int | None:
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or not speculative_config.use_dspark():
+        return None
+    num_speculative_tokens = int(speculative_config.num_speculative_tokens or 0)
+    if num_speculative_tokens <= 0:
+        return None
+    scheduler_config = vllm_config.scheduler_config
+    # Kernel warmup adds one row to the decode query length per request.
+    warmup_rows_per_request = 2 + num_speculative_tokens
+    return min(
+        int(scheduler_config.max_num_batched_tokens),
+        int(scheduler_config.max_num_seqs) * warmup_rows_per_request,
+    )
+
+
+def _c128a_topk_width(max_model_len: int, compress_ratio: int) -> int:
+    compressed_width = cdiv(max_model_len, compress_ratio)
+    return cdiv(compressed_width, _C128A_TOPK_ALIGNMENT) * _C128A_TOPK_ALIGNMENT
+
+
+@cache
+def _max_q_chunks(
+    max_rows: int,
+    width: int,
+    split_chunks_for_contract: Callable[..., int],
+    decode_row_capacity: int | None,
+) -> int:
+    return max(
+        rows
+        * split_chunks_for_contract(
+            rows=rows,
+            width=width,
+            decode_row_capacity=decode_row_capacity,
+        )
+        for rows in range(1, max(int(max_rows), 1) + 1)
+    )
+
+
+def _cache_page_view(
+    cache: torch.Tensor,
+    page_size: int,
+    name: str,
+) -> torch.Tensor:
+    page_nbytes = int(page_size) * _DSV4_CACHE_BYTES_PER_TOKEN
+    if page_nbytes <= 0:
+        raise ValueError(f"{name} page_size must be positive, got {page_size}")
+
+    byte_cache = cache if cache.dtype == torch.uint8 else cache.view(torch.uint8)
+    if byte_cache.ndim < 2:
+        raise RuntimeError(
+            f"{name} expected a paged cache tensor, got shape {tuple(cache.shape)}"
+        )
+
+    page_stride = int(byte_cache.stride(0))
+    if page_stride < page_nbytes:
+        raise RuntimeError(
+            f"{name} page stride {page_stride} is smaller than its "
+            f"{page_nbytes}-byte payload"
+        )
+
+    expected_stride = 1
+    for dim in range(byte_cache.ndim - 1, 0, -1):
+        if int(byte_cache.stride(dim)) != expected_stride:
+            raise RuntimeError(
+                f"{name} page payload must be contiguous, got stride "
+                f"{tuple(byte_cache.stride())}"
+            )
+        expected_stride *= int(byte_cache.shape[dim])
+    if expected_stride < page_nbytes:
+        raise RuntimeError(
+            f"{name} page width {expected_stride} is smaller than its "
+            f"{page_nbytes}-byte payload"
+        )
+
+    return torch.as_strided(
+        byte_cache,
+        size=(int(byte_cache.shape[0]), page_nbytes),
+        stride=(page_stride, 1),
+    )
+
+
+def _cache_page_view_key(
+    cache: torch.Tensor,
+    page_size: int,
+) -> tuple[int, int, torch.dtype, int, tuple[int, ...], tuple[int, ...]]:
+    return (
+        int(cache.untyped_storage().data_ptr()),
+        int(cache.storage_offset()),
+        cache.dtype,
+        int(page_size),
+        tuple(int(dim) for dim in cache.shape),
+        tuple(int(stride) for stride in cache.stride()),
+    )
+
+
+def _run_compressed_sparse_mla(
+    *,
+    q: torch.Tensor,
+    output: torch.Tensor,
+    attn_sink: torch.Tensor,
+    scale: float,
+    swa_k_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor,
+    swa_page_size: int,
+    indexed_k_cache: torch.Tensor | None,
+    indexed_indices: torch.Tensor | None,
+    indexed_lens: torch.Tensor | None,
+    indexed_page_size: int | None,
+    mode: Literal["decode", "extend"],
+    decode_row_capacity: int | None = None,
+) -> None:
+    module = _require_b12x_compressed_sparse_mla()
+    rows, heads = int(q.shape[0]), int(q.shape[1])
+    if (
+        mode == "decode"
+        and decode_row_capacity is not None
+        and rows > int(decode_row_capacity)
+    ):
+        raise ValueError(
+            f"B12x decode rows {rows} exceed the declared capacity "
+            f"{decode_row_capacity}"
+        )
+
+    q = q.contiguous()
+    swa_indices = swa_indices.contiguous()
+    swa_lens = swa_lens.contiguous()
+    if indexed_indices is not None:
+        indexed_indices = indexed_indices.contiguous()
+    if indexed_lens is not None:
+        indexed_lens = indexed_lens.contiguous()
+
+    width = int(swa_indices.shape[-1])
+    if indexed_indices is not None:
+        width += int(indexed_indices.shape[-1])
+    max_chunks_per_row = module.split_chunks_for_contract(
+        rows=max(rows, 1),
+        width=max(width, 1),
+        decode_row_capacity=decode_row_capacity,
+    )
+    plan = module.plan(
+        module.Caps(
+            device=q.device,
+            num_q_heads=heads,
+            max_q_rows=max(rows, 1),
+            max_width=max(width, 1),
+            head_dim=_DSV4_HEAD_DIM,
+            v_head_dim=_DSV4_HEAD_DIM,
+            page_size=int(swa_page_size),
+            max_chunks_per_row=max_chunks_per_row,
+            decode_row_capacity=decode_row_capacity,
+        )
+    )
+    scratch = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
+    binding = plan.bind(
+        scratch=scratch,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lens,
+        indexed_indices=indexed_indices,
+        indexed_lengths=indexed_lens,
+    )
+    binding.scratch.mode = mode
+    module.run(
+        binding=binding,
+        swa_k_cache=swa_k_cache,
+        swa_page_size=int(swa_page_size),
+        indexed_k_cache=indexed_k_cache,
+        indexed_page_size=indexed_page_size,
+        attn_sink=attn_sink[:heads].contiguous(),
+        sm_scale=scale,
+        expected_num_q_heads=heads,
+        out=output,
+    )
+
+
+class DeepseekV4B12xSparseMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+
+
+class DeepseekV4B12xSparseMLABackend(DeepseekV4SparseMLABackend):
+    @staticmethod
+    def get_name() -> str:
+        return "B12X"
+
+    @staticmethod
+    def get_builder_cls() -> type[DeepseekV4B12xSparseMLAMetadataBuilder]:
+        return DeepseekV4B12xSparseMLAMetadataBuilder
+
+    @classmethod
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+        return (capability.major, capability.minor) in ((12, 0), (12, 1))
+
+
+class DeepseekV4B12xAttention(DeepseekV4Attention):
+    backend_cls = DeepseekV4B12xSparseMLABackend
+    indexer_backend_cls = DeepseekV4B12xIndexerBackend
+    indexer_op_cls = DeepseekV4B12xSparseIndexer
+
+    def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.decode_context_parallel_size != 1:
+            raise NotImplementedError(
+                "B12X compressed sparse MLA does not support decode context "
+                "parallelism."
+            )
+        if parallel_config.prefill_context_parallel_size != 1:
+            raise NotImplementedError(
+                "B12X compressed sparse MLA does not support prefill context "
+                "parallelism."
+            )
+        _require_b12x_compressed_sparse_mla()
+        self.vllm_config = vllm_config
+        self._b12x_cache_page_views: dict[object, torch.Tensor] = {}
+        super().__init__(vllm_config, *args, **kwargs)
+        self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
+
+    @classmethod
+    def get_padded_num_q_heads(cls, num_heads: int) -> int:
+        for supported in (16, 32, 64, 128):
+            if num_heads <= supported:
+                return supported
+        raise ValueError(
+            f"DeepSeek V4 B12x sparse MLA does not support {num_heads} heads."
+        )
+
+    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        return deep_gemm_fp8_o_proj(
+            o,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.wo_a,
+            self.wo_b,
+            n_groups=self.n_local_groups,
+            heads_per_group=self.n_local_heads // self.n_local_groups,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+            o_lora_rank=self.o_lora_rank,
+            einsum_recipe=self._einsum_recipe,
+            tma_aligned_scales=self._tma_aligned_scales,
+        )
+
+    def _get_cache_page_view(
+        self,
+        cache: torch.Tensor,
+        page_size: int,
+        name: str,
+    ) -> torch.Tensor:
+        key = _cache_page_view_key(cache, page_size)
+        view = self._b12x_cache_page_views.get(key)
+        if view is None:
+            view = _cache_page_view(cache, page_size, name)
+            self._b12x_cache_page_views[key] = view
+        return view
+
+    def _reserve_profile_workspace(self, q: torch.Tensor) -> None:
+        module = _require_b12x_compressed_sparse_mla()
+        indexed_width = 0
+        if self.compress_ratio == 4:
+            if self.topk_indices_buffer is not None:
+                indexed_width = int(self.topk_indices_buffer.shape[-1])
+            elif self.indexer is not None:
+                indexed_width = int(self.indexer.topk_tokens)
+        elif self.compress_ratio > 1:
+            indexed_width = _c128a_topk_width(
+                self.max_model_len,
+                self.compress_ratio,
+            )
+
+        swa_width = int(self.window_size)
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is not None and speculative_config.use_dspark():
+            swa_width = max(
+                swa_width,
+                get_dspark_swa_index_width(
+                    swa_width,
+                    speculative_config.num_speculative_tokens or 0,
+                ),
+            )
+        width = max(swa_width + indexed_width, 1)
+        rows = max(int(self.max_num_batched_tokens), 1)
+        decode_row_capacity = _get_dspark_decode_row_capacity(self.vllm_config)
+        max_chunks_per_row = module.split_chunks_for_contract(
+            rows=rows,
+            width=width,
+            decode_row_capacity=decode_row_capacity,
+        )
+        max_q_chunks = _max_q_chunks(
+            rows,
+            width,
+            module.split_chunks_for_contract,
+            decode_row_capacity,
+        )
+        plan = module.plan(
+            module.Caps(
+                device=q.device,
+                num_q_heads=int(q.shape[1]),
+                max_q_rows=rows,
+                max_width=width,
+                head_dim=_DSV4_HEAD_DIM,
+                v_head_dim=_DSV4_HEAD_DIM,
+                page_size=int(self.swa_cache_layer.block_size),
+                max_chunks_per_row=max_chunks_per_row,
+                max_q_chunks=max_q_chunks,
+                decode_row_capacity=decode_row_capacity,
+            )
+        )
+        current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
+
+    def forward_mqa(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        del kv, positions
+        if output.shape != q.shape or output.dtype != q.dtype:
+            raise RuntimeError(
+                f"B12x output {output.shape}/{output.dtype} must match "
+                f"q {q.shape}/{q.dtype}."
+            )
+
+        attn_metadata = get_forward_context().attn_metadata
+        if attn_metadata is None:
+            output.zero_()
+            self._reserve_profile_workspace(q)
+            return
+
+        assert isinstance(attn_metadata, dict)
+        sparse_metadata = cast(
+            DeepseekV4FlashMLAMetadata | None,
+            attn_metadata.get(self.prefix),
+        )
+        swa_metadata = cast(
+            "DeepseekSparseSWAMetadata | None",
+            attn_metadata.get(self.swa_cache_layer.prefix),
+        )
+        assert swa_metadata is not None
+
+        num_decode_tokens = swa_metadata.num_decode_tokens
+        num_prefill_tokens = swa_metadata.num_prefill_tokens
+        compressed_cache = self.kv_cache if self.compress_ratio > 1 else None
+        if swa_metadata.num_prefills > 0:
+            prefill_end = num_decode_tokens + num_prefill_tokens
+            self._forward_prefill(
+                q=q[num_decode_tokens:prefill_end],
+                output=output[num_decode_tokens:prefill_end],
+                compressed_cache=compressed_cache,
+                sparse_metadata=sparse_metadata,
+                swa_metadata=swa_metadata,
+            )
+        if swa_metadata.num_decodes > 0:
+            self._forward_decode(
+                q=q[:num_decode_tokens],
+                output=output[:num_decode_tokens],
+                compressed_cache=compressed_cache,
+                sparse_metadata=sparse_metadata,
+                swa_metadata=swa_metadata,
+            )
+
+    def _indexed_region(
+        self,
+        *,
+        compressed_cache: torch.Tensor | None,
+        sparse_metadata: DeepseekV4FlashMLAMetadata | None,
+        swa_metadata: "DeepseekSparseSWAMetadata",
+        token_slice: slice,
+        decode: bool,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        int | None,
+    ]:
+        if self.compress_ratio <= 1:
+            return None, None, None, None
+        assert compressed_cache is not None
+        assert sparse_metadata is not None
+        assert swa_metadata.is_valid_token is not None
+        assert swa_metadata.token_to_req_indices is not None
+
+        if self.compress_ratio == 4:
+            assert self.topk_indices_buffer is not None
+            local_indices = self.topk_indices_buffer[token_slice]
+        elif decode:
+            local_indices = sparse_metadata.c128a_global_decode_topk_indices
+            assert local_indices is not None
+            topk_lens = sparse_metadata.c128a_decode_topk_lens
+            assert topk_lens is not None
+            page_size = sparse_metadata.block_size // self.compress_ratio
+            cache_view = self._get_cache_page_view(
+                compressed_cache, page_size, "indexed_k_cache"
+            )
+            return cache_view, local_indices, topk_lens, page_size
+        else:
+            local_indices = sparse_metadata.c128a_prefill_topk_indices
+            assert local_indices is not None
+
+        page_size = sparse_metadata.block_size // self.compress_ratio
+        global_indices, topk_lens = compute_global_topk_indices_and_lens(
+            local_indices,
+            swa_metadata.token_to_req_indices[token_slice],
+            sparse_metadata.block_table,
+            page_size,
+            swa_metadata.is_valid_token[token_slice],
+        )
+        cache_view = self._get_cache_page_view(
+            compressed_cache, page_size, "indexed_k_cache"
+        )
+        return cache_view, global_indices, topk_lens, page_size
+
+    def _forward_decode(
+        self,
+        *,
+        q: torch.Tensor,
+        output: torch.Tensor,
+        compressed_cache: torch.Tensor | None,
+        sparse_metadata: DeepseekV4FlashMLAMetadata | None,
+        swa_metadata: "DeepseekSparseSWAMetadata",
+    ) -> None:
+        num_tokens = swa_metadata.num_decode_tokens
+        indexed_cache, indexed_indices, indexed_lens, indexed_page_size = (
+            self._indexed_region(
+                compressed_cache=compressed_cache,
+                sparse_metadata=sparse_metadata,
+                swa_metadata=swa_metadata,
+                token_slice=slice(0, num_tokens),
+                decode=True,
+            )
+        )
+        assert swa_metadata.decode_swa_indices is not None
+        assert swa_metadata.decode_swa_lens is not None
+        swa_cache = self._get_cache_page_view(
+            self.swa_cache_layer.kv_cache,
+            swa_metadata.block_size,
+            "swa_k_cache",
+        )
+        _run_compressed_sparse_mla(
+            q=q,
+            output=output,
+            attn_sink=self.attn_sink,
+            scale=self.scale,
+            swa_k_cache=swa_cache,
+            swa_indices=swa_metadata.decode_swa_indices,
+            swa_lens=swa_metadata.decode_swa_lens,
+            swa_page_size=swa_metadata.block_size,
+            indexed_k_cache=indexed_cache,
+            indexed_indices=indexed_indices,
+            indexed_lens=indexed_lens,
+            indexed_page_size=indexed_page_size,
+            mode="decode",
+            decode_row_capacity=_get_dspark_decode_row_capacity(self.vllm_config),
+        )
+
+    def _forward_prefill(
+        self,
+        *,
+        q: torch.Tensor,
+        output: torch.Tensor,
+        compressed_cache: torch.Tensor | None,
+        sparse_metadata: DeepseekV4FlashMLAMetadata | None,
+        swa_metadata: "DeepseekSparseSWAMetadata",
+    ) -> None:
+        num_decode_tokens = swa_metadata.num_decode_tokens
+        num_prefill_tokens = swa_metadata.num_prefill_tokens
+        token_slice = slice(
+            num_decode_tokens,
+            num_decode_tokens + num_prefill_tokens,
+        )
+        indexed_cache, indexed_indices, indexed_lens, indexed_page_size = (
+            self._indexed_region(
+                compressed_cache=compressed_cache,
+                sparse_metadata=sparse_metadata,
+                swa_metadata=swa_metadata,
+                token_slice=token_slice,
+                decode=False,
+            )
+        )
+        assert swa_metadata.prefill_swa_indices is not None
+        assert swa_metadata.prefill_swa_lens is not None
+        assert swa_metadata.query_start_loc_cpu is not None
+        swa_cache = self._get_cache_page_view(
+            self.swa_cache_layer.kv_cache,
+            swa_metadata.block_size,
+            "swa_k_cache",
+        )
+
+        num_decodes = swa_metadata.num_decodes
+        prefill_base = swa_metadata.query_start_loc_cpu[num_decodes]
+        for request_start in range(
+            0,
+            swa_metadata.num_prefills,
+            self.PREFILL_CHUNK_SIZE,
+        ):
+            request_end = min(
+                request_start + self.PREFILL_CHUNK_SIZE,
+                swa_metadata.num_prefills,
+            )
+            query_start = (
+                swa_metadata.query_start_loc_cpu[num_decodes + request_start]
+                - prefill_base
+            )
+            query_end = (
+                swa_metadata.query_start_loc_cpu[num_decodes + request_end]
+                - prefill_base
+            )
+            _run_compressed_sparse_mla(
+                q=q[query_start:query_end],
+                output=output[query_start:query_end],
+                attn_sink=self.attn_sink,
+                scale=self.scale,
+                swa_k_cache=swa_cache,
+                swa_indices=swa_metadata.prefill_swa_indices[query_start:query_end],
+                swa_lens=swa_metadata.prefill_swa_lens[query_start:query_end],
+                swa_page_size=swa_metadata.block_size,
+                indexed_k_cache=indexed_cache,
+                indexed_indices=(
+                    indexed_indices[query_start:query_end]
+                    if indexed_indices is not None
+                    else None
+                ),
+                indexed_lens=(
+                    indexed_lens[query_start:query_end]
+                    if indexed_lens is not None
+                    else None
+                ),
+                indexed_page_size=indexed_page_size,
+                mode="extend",
+            )

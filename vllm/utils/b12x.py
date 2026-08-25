@@ -36,6 +36,7 @@ _B12X_SUBMODULES = {
     for module_name in (
         "b12x.attention.paged",
         "b12x.attention.sparse_mla",
+        "b12x.attention.compressed_sparse_mla",
         "b12x.attention.dsa_indexer",
         "b12x.gemm.blockscaled",
         # TODO: Remove once B12X exposes the scale-swizzle API publicly.
@@ -62,6 +63,10 @@ def get_b12x_blockscaled() -> ModuleType | None:
 
 def get_b12x_sparse_mla() -> ModuleType | None:
     return _get_submodule("b12x.attention.sparse_mla")
+
+
+def get_b12x_compressed_sparse_mla() -> ModuleType | None:
+    return _get_submodule("b12x.attention.compressed_sparse_mla")
 
 
 def get_b12x_dsa_indexer() -> ModuleType | None:
