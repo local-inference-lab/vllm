@@ -90,6 +90,73 @@ def test_b12x_compressed_sparse_mla_uses_plan_bind_run(monkeypatch) -> None:
     assert torch.count_nonzero(output != 3) == 0
 
 
+def test_b12x_wo_projection_packs_and_runs(monkeypatch) -> None:
+    calls: dict[str, Any] = {}
+
+    def pack_weights(*args, **kwargs):
+        calls["pack"] = (args, kwargs)
+        return object()
+
+    def run_inv_rope(*args, **kwargs):
+        calls["run"] = (args, kwargs)
+        return torch.full((args[0].shape[0], 256), 7, dtype=torch.bfloat16)
+
+    module = SimpleNamespace(
+        is_supported=lambda: True,
+        pack_weights=pack_weights,
+        run_inv_rope=run_inv_rope,
+    )
+    monkeypatch.setattr(b12x_mla, "get_b12x_wo_projection", lambda: module)
+    monkeypatch.setattr(
+        b12x_mla,
+        "current_stream",
+        lambda: SimpleNamespace(cuda_stream=123),
+    )
+
+    layer = object.__new__(b12x_mla.DeepseekV4B12xAttention)
+    torch.nn.Module.__init__(layer)
+    layer.n_local_groups = 2
+    layer.n_local_heads = 4
+    layer.head_dim = 128
+    layer.nope_head_dim = 96
+    layer.rope_head_dim = 32
+    layer.o_lora_rank = 128
+    layer.hidden_size = 256
+    layer.rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty((1, 64)))
+    layer.wo_a = SimpleNamespace(
+        weight=torch.empty((256, 256), dtype=torch.float8_e4m3fn),
+        weight_scale_inv=torch.empty((2, 2), dtype=torch.float32),
+        b12x_warmup_provider=object(),
+    )
+    layer.wo_b = SimpleNamespace(
+        weight=torch.empty((256, 256), dtype=torch.float8_e4m3fn),
+        weight_scale_inv=torch.empty((2, 2), dtype=torch.float32),
+        b12x_warmup_provider=object(),
+        reduce_results=False,
+        tp_size=2,
+    )
+    layer._b12x_wo_projection_weights = None
+
+    layer.setup_b12x_wo_projection()
+    output = layer._o_proj(
+        torch.empty((3, 4, 128), dtype=torch.bfloat16),
+        torch.arange(3),
+    )
+
+    assert calls["pack"][1] == {
+        "groups": 2,
+        "group_width": 256,
+        "rank": 128,
+        "hidden": 256,
+    }
+    assert calls["run"][1]["heads_per_group"] == 2
+    assert calls["run"][1]["stream"] == 123
+    assert layer.wo_a.b12x_warmup_provider is None
+    assert layer.wo_b.b12x_warmup_provider is None
+    assert output.shape == (3, 256)
+    assert torch.count_nonzero(output != 7) == 0
+
+
 def test_b12x_dsv4_indexer_uses_logical_slots(monkeypatch) -> None:
     calls: dict[str, Any] = {}
 

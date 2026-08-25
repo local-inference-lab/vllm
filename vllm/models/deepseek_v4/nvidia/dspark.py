@@ -516,6 +516,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         self._finalize_moe()
+        for layer in self.model.layers:
+            layer.process_b12x_weights_after_loading()
 
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.

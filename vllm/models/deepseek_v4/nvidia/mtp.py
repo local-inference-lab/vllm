@@ -512,6 +512,8 @@ class DeepSeekV4MTP(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         self.finalize_mega_moe_weights()
+        for layer in self.model.layers.values():
+            layer.mtp_block.process_b12x_weights_after_loading()
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         """

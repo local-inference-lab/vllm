@@ -1157,6 +1157,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             requires_grad=False,
         )
 
+    def process_b12x_weights_after_loading(self) -> None:
+        if isinstance(self.attn, DeepseekV4B12xAttention):
+            self.attn.setup_b12x_wo_projection()
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1637,6 +1641,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             else:
                 layer.hc_attn_fn_broadcast.copy_(broadcast)
 
+    def process_b12x_weights_after_loading(self) -> None:
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            layer.process_b12x_weights_after_loading()
+
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     if expert_dtype == "fp4":
@@ -1832,6 +1840,7 @@ class DeepseekV4ForCausalLM(
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
+        self.model.process_b12x_weights_after_loading()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

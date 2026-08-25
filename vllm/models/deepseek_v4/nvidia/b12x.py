@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
@@ -19,10 +20,6 @@ from vllm.models.deepseek_v4.nvidia.b12x_indexer import (
     DeepseekV4B12xSparseIndexer,
     b12x_indexer_is_supported,
 )
-from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
-    compute_fp8_einsum_recipe,
-    deep_gemm_fp8_o_proj,
-)
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
@@ -30,8 +27,12 @@ from vllm.models.deepseek_v4.sparse_mla import (
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
-from vllm.utils.b12x import get_b12x_compressed_sparse_mla
+from vllm.utils.b12x import (
+    get_b12x_compressed_sparse_mla,
+    get_b12x_wo_projection,
+)
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import current_stream
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
@@ -63,13 +64,29 @@ def _require_b12x_compressed_sparse_mla() -> Any:
     return module
 
 
+def _require_b12x_wo_projection() -> Any:
+    module = get_b12x_wo_projection()
+    if module is None:
+        raise RuntimeError(
+            "DeepSeek V4 B12x output projection requires `pip install vllm[b12x]`."
+        )
+    if not module.is_supported():
+        raise RuntimeError("B12x output projection is not supported on this device.")
+    for name in ("pack_weights", "run_inv_rope"):
+        getattr(module, name)
+    return module
+
+
 def b12x_dsv4_is_supported() -> bool:
     attention_module = get_b12x_compressed_sparse_mla()
+    wo_module = get_b12x_wo_projection()
     return bool(
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(120)
         and attention_module is not None
         and attention_module.is_supported()
+        and wo_module is not None
+        and wo_module.is_supported()
         and b12x_indexer_is_supported()
     )
 
@@ -287,10 +304,11 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                 "parallelism."
             )
         _require_b12x_compressed_sparse_mla()
+        _require_b12x_wo_projection()
         self.vllm_config = vllm_config
         self._b12x_cache_page_views: dict[object, torch.Tensor] = {}
+        self._b12x_wo_projection_weights: Any | None = None
         super().__init__(vllm_config, *args, **kwargs)
-        self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -301,21 +319,85 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             f"DeepSeek V4 B12x sparse MLA does not support {num_heads} heads."
         )
 
+    def _validate_wo_projection_tensors(self) -> tuple[int, int, int, int]:
+        if not hasattr(self.wo_a, "weight_scale_inv"):
+            raise RuntimeError("B12x WO-A requires wo_a.weight_scale_inv.")
+        if not hasattr(self.wo_b, "weight_scale_inv"):
+            raise RuntimeError("B12x WO-B requires wo_b.weight_scale_inv.")
+
+        groups = self.n_local_groups
+        heads_per_group = self.n_local_heads // groups
+        group_width = heads_per_group * self.head_dim
+        rank = self.o_lora_rank
+        hidden = self.hidden_size
+        wo_a_shape = (groups * rank, group_width)
+        wo_b_shape = (hidden, groups * rank)
+        wo_a_scale_shape = (
+            groups * cdiv(rank, 128),
+            cdiv(group_width, 128),
+        )
+        wo_b_scale_shape = (cdiv(hidden, 128), cdiv(groups * rank, 128))
+
+        tensors = (
+            ("WO-A weight", self.wo_a.weight, wo_a_shape),
+            ("WO-B weight", self.wo_b.weight, wo_b_shape),
+            ("WO-A scale", self.wo_a.weight_scale_inv, wo_a_scale_shape),
+            ("WO-B scale", self.wo_b.weight_scale_inv, wo_b_scale_shape),
+        )
+        for name, tensor, expected_shape in tensors:
+            if tuple(tensor.shape) != expected_shape:
+                raise RuntimeError(
+                    f"B12x {name} shape mismatch: expected {expected_shape}, "
+                    f"got {tuple(tensor.shape)}."
+                )
+        if self.wo_a.weight.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                "B12x WO-A weight must be torch.float8_e4m3fn, "
+                f"got {self.wo_a.weight.dtype}."
+            )
+        if self.wo_b.weight.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                "B12x WO-B weight must be torch.float8_e4m3fn, "
+                f"got {self.wo_b.weight.dtype}."
+            )
+        return groups, group_width, rank, hidden
+
+    def setup_b12x_wo_projection(self) -> None:
+        self.wo_a.b12x_warmup_provider = None
+        self.wo_b.b12x_warmup_provider = None
+        if self._b12x_wo_projection_weights is not None:
+            return
+
+        groups, group_width, rank, hidden = self._validate_wo_projection_tensors()
+        module = _require_b12x_wo_projection()
+        self._b12x_wo_projection_weights = module.pack_weights(
+            self.wo_a.weight.detach(),
+            self.wo_a.weight_scale_inv.detach(),
+            self.wo_b.weight.detach(),
+            self.wo_b.weight_scale_inv.detach(),
+            groups=groups,
+            group_width=group_width,
+            rank=rank,
+            hidden=hidden,
+        )
+
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        return deep_gemm_fp8_o_proj(
+        if self._b12x_wo_projection_weights is None:
+            raise RuntimeError("B12x WO-A/WO-B weights were not packed after loading.")
+        module = _require_b12x_wo_projection()
+        out = module.run_inv_rope(
             o,
             positions,
             self.rotary_emb.cos_sin_cache,
-            self.wo_a,
-            self.wo_b,
-            n_groups=self.n_local_groups,
+            self._b12x_wo_projection_weights,
             heads_per_group=self.n_local_heads // self.n_local_groups,
             nope_dim=self.nope_head_dim,
             rope_dim=self.rope_head_dim,
-            o_lora_rank=self.o_lora_rank,
-            einsum_recipe=self._einsum_recipe,
-            tma_aligned_scales=self._tma_aligned_scales,
+            stream=current_stream().cuda_stream,
         )
+        if self.wo_b.reduce_results and self.wo_b.tp_size > 1:
+            out = tensor_model_parallel_all_reduce(out)
+        return out
 
     def _get_cache_page_view(
         self,
