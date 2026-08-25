@@ -359,6 +359,12 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
         "fp8_e4m3",
     ):
         return "fp8_ds_mla"
+    if backend_name == "B12X" and kv_cache_dtype in (
+        "auto",
+        "fp8",
+        "fp8_e4m3",
+    ):
+        return "fp8_ds_mla"
     return kv_cache_dtype
 
 

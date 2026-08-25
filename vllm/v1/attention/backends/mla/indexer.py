@@ -518,6 +518,24 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     reorder_batch_threshold: int | None = None
     requires_block_table_width = True
 
+    def _supports_native_decode(self, next_n: int) -> bool:
+        return _supports_native_decode(next_n)
+
+    def _split_prefill_chunks(
+        self,
+        compressed_seq_lens_cpu: torch.Tensor,
+        prefill_query_lens_cpu: torch.Tensor,
+        num_decodes: int,
+        max_logits_bytes: int,
+    ) -> list[tuple[slice, slice]]:
+        return split_indexer_prefill_chunks(
+            compressed_seq_lens_cpu[num_decodes:],
+            prefill_query_lens_cpu,
+            self.max_prefill_buffer_size,
+            max_logits_bytes,
+            request_offset=num_decodes,
+        )
+
     @classmethod
     def get_cudagraph_support(
         cls,
@@ -899,17 +917,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 query_start_loc_cpu[num_decodes : num_decodes + num_prefills + 1]
             )
             max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+            chunk_specs = self._split_prefill_chunks(
+                compressed_seq_lens_cpu,
+                prefill_query_lens_cpu,
+                num_decodes,
+                max_logits_bytes,
+            )
             # Upper bound is exact for prefill rows (the `[num_decodes:]`
             # slice below).
             assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
-            chunk_specs = split_indexer_prefill_chunks(
-                compressed_seq_lens_cpu[num_decodes:],
-                prefill_query_lens_cpu,
-                self.max_prefill_buffer_size,
-                max_logits_bytes,
-                request_offset=num_decodes,
-            )
 
             chunks = []
             for req_slice, query_slice in chunk_specs:
@@ -964,7 +981,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # The kernel sees max_decode_len Q rows, not the configured next_n,
             # so legality is per-step: on SM90 a uniformly 3-deep batch has no
             # native kernel. max_decode_len <= 1 always has one.
-            step_next_n_ok = max_decode_len <= 1 or _supports_native_decode(
+            step_next_n_ok = max_decode_len <= 1 or self._supports_native_decode(
                 max_decode_len
             )
             use_native = (
