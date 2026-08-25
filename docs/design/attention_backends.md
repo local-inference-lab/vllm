@@ -131,7 +131,9 @@ Priority is **1 = highest** (tried first).
 ### b12x
 
 The optional [b12x](https://pypi.org/project/b12x/) backend supports causal
-decoder attention on NVIDIA SM120 and SM121 GPUs. Install and select it with:
+decoder attention on NVIDIA SM120 and SM121 GPUs. For models using the
+non-compressed DeepSeek V3.2/GLM DSA contract, the same selector uses the b12x
+sparse MLA and DSA indexer kernels. Install and select it with:
 
 ```bash
 uv pip install "vllm[b12x]"
