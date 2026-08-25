@@ -184,7 +184,7 @@ DeepSeek V4 sparse MLA uses its own decode backends, selected via
 pipeline (compressor + SWA + indexer, 256-token blocks, head 512);
 default on NVIDIA is `FLASHINFER_MLA_SPARSE_DSV4` on SM12x and
 `FLASHMLA_SPARSE_DSV4` on other supported CUDA architectures.
-On SM120 and SM121, `B12X` selects the optional `b12x` DSA indexer and
-compressed sparse MLA kernels.
+On SM120 and SM121, `B12X` selects the optional `b12x` DSA indexer, compressed
+sparse MLA, and fused output-projection kernels.
 
 --8<-- "gen:table-mla-v4-decode"
