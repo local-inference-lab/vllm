@@ -28,7 +28,6 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
-    mhc_post_tilelang,
 )
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -180,7 +179,9 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         hidden_states, residual, post_mix, res_mix = self.mtp_block(
             positions=positions, x=hidden_states, input_ids=None
         )
-        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        hidden_states = self.mtp_block.mhc_post(
+            hidden_states, residual, post_mix, res_mix
+        )
         if self.mtp_block.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
         # Return the flat pre-hc_head residual so it can be re-fed as the

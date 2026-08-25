@@ -157,6 +157,92 @@ def test_b12x_wo_projection_packs_and_runs(monkeypatch) -> None:
     assert torch.count_nonzero(output != 7) == 0
 
 
+def test_b12x_mhc_uses_plan_bind_run(monkeypatch) -> None:
+    calls: dict[str, Any] = {}
+
+    def make_caps(**kwargs):
+        calls["caps"] = kwargs
+        return SimpleNamespace(**kwargs)
+
+    def bind(plan, **kwargs):
+        calls["bind"] = (plan, kwargs)
+        return SimpleNamespace(**kwargs)
+
+    plan = SimpleNamespace(
+        shapes_and_dtypes=lambda: (((64,), torch.uint8),),
+    )
+
+    def run_pre(*args, **kwargs):
+        calls["pre"] = (args, kwargs)
+        binding = kwargs["binding"]
+        return binding.out, binding.post, binding.comb, binding.y
+
+    def run_post_pre(*args, **kwargs):
+        calls["post_pre"] = (args, kwargs)
+        binding = kwargs["binding"]
+        return binding.out, binding.post, binding.comb, binding.y
+
+    def run_post(*args):
+        calls["post"] = args
+        return args[1]
+
+    module = SimpleNamespace(
+        Caps=make_caps,
+        DEFAULT_BLOCK_K=128,
+        MULT=4,
+        bind=bind,
+        plan=lambda caps: plan,
+        run_post=run_post,
+        run_post_pre=run_post_pre,
+        run_pre=run_pre,
+    )
+    monkeypatch.setattr(b12x_mla, "_require_b12x_mhc", lambda: module)
+    monkeypatch.setattr(b12x_mla, "current_workspace_manager", lambda: _Workspace())
+
+    mhc = b12x_mla.B12xMHCResidual(
+        hidden_size=256,
+        hc_mult=4,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+    )
+    residual = torch.empty((3, 256), dtype=torch.bfloat16)
+    hc_fn = torch.empty((24, 256), dtype=torch.float32)
+    hc_scale = torch.empty((3,), dtype=torch.float32)
+    hc_base = torch.empty((24,), dtype=torch.float32)
+    norm_weight = torch.empty((256,), dtype=torch.bfloat16)
+
+    residual_out, post, comb, layer_input = mhc.run_pre(
+        residual,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        norm_weight=norm_weight,
+        norm_eps=1e-6,
+    )
+    next_outputs = mhc.run_post_pre(
+        layer_input,
+        residual_out,
+        post,
+        comb,
+        torch.empty((24, 1024), dtype=torch.float32),
+        hc_scale,
+        hc_base,
+        norm_weight=norm_weight,
+        norm_eps=1e-6,
+    )
+    final = mhc.run_post(layer_input, *next_outputs[:3])
+
+    assert calls["caps"]["hidden_size"] == 256
+    assert calls["caps"]["split_k"] == 8
+    assert calls["bind"][1]["scratch"].dtype == torch.uint8
+    assert calls["pre"][1]["binding"].expected_m == 3
+    assert calls["post_pre"][1]["expected_m"] == 3
+    assert residual_out.shape == (3, 4, 256)
+    assert layer_input.shape == (3, 256)
+    assert final is next_outputs[0]
+
+
 def test_b12x_dsv4_indexer_uses_logical_slots(monkeypatch) -> None:
     calls: dict[str, Any] = {}
 

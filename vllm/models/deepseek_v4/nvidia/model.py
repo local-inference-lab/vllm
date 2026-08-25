@@ -77,6 +77,7 @@ from vllm.models.common.ops.sequence_parallel import (
 )
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.nvidia.b12x import (
+    B12xMHCResidual,
     DeepseekV4B12xAttention,
     b12x_dsv4_is_supported,
 )
@@ -1157,9 +1158,93 @@ class DeepseekV4DecoderLayer(nn.Module):
             requires_grad=False,
         )
 
+        self._b12x_mhc = (
+            B12xMHCResidual(
+                hidden_size=self.hidden_size,
+                hc_mult=self.hc_mult,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                sinkhorn_iters=self.hc_sinkhorn_iters,
+            )
+            if isinstance(self.attn, DeepseekV4B12xAttention)
+            else None
+        )
+        if self._b12x_mhc is not None:
+            self.register_buffer(
+                "hc_ffn_fn_bf16",
+                torch.empty_like(self.hc_ffn_fn, dtype=torch.bfloat16),
+                persistent=False,
+            )
+        else:
+            self.hc_ffn_fn_bf16 = None
+
     def process_b12x_weights_after_loading(self) -> None:
         if isinstance(self.attn, DeepseekV4B12xAttention):
             self.attn.setup_b12x_wo_projection()
+        if self._b12x_mhc is not None:
+            assert self.hc_ffn_fn_bf16 is not None
+            self.hc_ffn_fn_bf16.copy_(self.hc_ffn_fn.detach().to(torch.bfloat16))
+
+    @property
+    def uses_b12x_mhc(self) -> bool:
+        return self._b12x_mhc is not None
+
+    def _mhc_post_pre(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        *,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+        hc_fn_bf16: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._b12x_mhc is not None:
+            return self._b12x_mhc.run_post_pre(
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+                hc_fn_bf16=hc_fn_bf16,
+            )
+        return mhc_fused_post_pre_tilelang(
+            x,
+            residual,
+            post_mix,
+            res_mix,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+            n_splits=1,
+            tile_n=1,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+
+    def mhc_post(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._b12x_mhc is not None:
+            return self._b12x_mhc.run_post(x, residual, post_mix, res_mix)
+        return mhc_post_tilelang(x, residual, post_mix, res_mix)
 
     def forward(
         self,
@@ -1173,23 +1258,32 @@ class DeepseekV4DecoderLayer(nn.Module):
         attn_norm_weight = self.attn_norm.weight.data
         attn_norm_eps = self.attn_norm.variance_epsilon
         if residual is None:
-            # Run standalone mhc_pre on first layer
             if x.dim() == 2:
                 assert self.hc_attn_fn_broadcast is not None
-                residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(
-                    x,
-                    self.hc_attn_fn,
-                    self.hc_attn_scale,
-                    self.hc_attn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    self.hc_post_alpha,
-                    self.hc_sinkhorn_iters,
-                    norm_weight=attn_norm_weight,
-                    norm_eps=attn_norm_eps,
-                    fn_broadcast=self.hc_attn_fn_broadcast,
-                )
+                if self._b12x_mhc is not None:
+                    residual, post_mix, res_mix, x = self._b12x_mhc.run_pre(
+                        x,
+                        self.hc_attn_fn_broadcast,
+                        self.hc_attn_scale,
+                        self.hc_attn_base,
+                        norm_weight=attn_norm_weight,
+                        norm_eps=attn_norm_eps,
+                    )
+                else:
+                    residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(
+                        x,
+                        self.hc_attn_fn,
+                        self.hc_attn_scale,
+                        self.hc_attn_base,
+                        self.rms_norm_eps,
+                        self.hc_eps,
+                        self.hc_eps,
+                        self.hc_post_alpha,
+                        self.hc_sinkhorn_iters,
+                        norm_weight=attn_norm_weight,
+                        norm_eps=attn_norm_eps,
+                        fn_broadcast=self.hc_attn_fn_broadcast,
+                    )
             else:
                 residual = x
                 post_mix, res_mix, x = mhc_pre_tilelang(
@@ -1206,7 +1300,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                     norm_eps=attn_norm_eps,
                 )
         else:
-            residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+            assert post_mix is not None
+            assert res_mix is not None
+            residual, post_mix, res_mix, x = self._mhc_post_pre(
                 x,
                 residual,
                 post_mix,
@@ -1214,13 +1310,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_fn,
                 self.hc_attn_scale,
                 self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                self.hc_post_alpha,
-                self.hc_sinkhorn_iters,
-                n_splits=1,
-                tile_n=1,
                 norm_weight=attn_norm_weight,
                 norm_eps=attn_norm_eps,
             )
@@ -1234,7 +1323,10 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
-        residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+        assert residual is not None
+        assert post_mix is not None
+        assert res_mix is not None
+        residual, post_mix, res_mix, x = self._mhc_post_pre(
             x,
             residual,
             post_mix,
@@ -1242,15 +1334,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-            self.hc_eps,
-            self.hc_post_alpha,
-            self.hc_sinkhorn_iters,
-            n_splits=1,
-            tile_n=1,
             norm_weight=ffn_norm_weight,
             norm_eps=ffn_norm_eps,
+            hc_fn_bf16=self.hc_ffn_fn_bf16,
         )
 
         x = self.ffn(x, input_ids)
@@ -1420,9 +1506,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
-                aux_recon = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
-                )
+                aux_recon = layer.mhc_post(hidden_states, residual, post_mix, res_mix)
                 aux_hidden_state = aux_recon.mean(dim=1)
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
@@ -1433,7 +1517,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
             else:
-                hidden_states = mhc_post_tilelang(
+                hidden_states = layer.mhc_post(
                     hidden_states, residual, post_mix, res_mix
                 )
 

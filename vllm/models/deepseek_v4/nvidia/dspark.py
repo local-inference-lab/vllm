@@ -25,7 +25,6 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
-    mhc_post_tilelang,
 )
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -154,6 +153,20 @@ class DSparkDeepseekV4Model(nn.Module):
         """
         return self.main_norm(self.main_proj(aux_hidden_states))
 
+    def finalize_mhc_broadcast_weights(self) -> None:
+        first_layer = self.layers[0]
+        if not first_layer.uses_b12x_mhc:
+            return
+        broadcast = (
+            first_layer.hc_attn_fn.detach()
+            .view(-1, first_layer.hc_mult, first_layer.hidden_size)
+            .sum(dim=1)
+        )
+        if first_layer.hc_attn_fn_broadcast is None:
+            first_layer.hc_attn_fn_broadcast = broadcast
+        else:
+            first_layer.hc_attn_fn_broadcast.copy_(broadcast)
+
     @torch.inference_mode()
     def precompute_and_store_context_kv(
         self,
@@ -204,8 +217,10 @@ class DSparkDeepseekV4Model(nn.Module):
                 )
             inputs_embeds = sp_shard(inputs_embeds)
             input_ids = sp_shard(input_ids)
-        # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
-        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        if self.layers[0].uses_b12x_mhc:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
         residual = post_mix = res_mix = None
         for layer in self.layers:
@@ -217,7 +232,9 @@ class DSparkDeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
-        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        hidden_states = self.layers[-1].mhc_post(
+            hidden_states, residual, post_mix, res_mix
+        )
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         # hc_head reduces the hc copies; return the PRE-norm head hidden
@@ -516,6 +533,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         self._finalize_moe()
+        self.model.finalize_mhc_broadcast_weights()
         for layer in self.model.layers:
             layer.process_b12x_weights_after_loading()
 
