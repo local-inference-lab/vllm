@@ -185,6 +185,6 @@ pipeline (compressor + SWA + indexer, 256-token blocks, head 512);
 default on NVIDIA is `FLASHINFER_MLA_SPARSE_DSV4` on SM12x and
 `FLASHMLA_SPARSE_DSV4` on other supported CUDA architectures.
 On SM120 and SM121, `B12X` selects the optional `b12x` DSA indexer, compressed
-sparse MLA, and fused output-projection kernels.
+sparse MLA, fused output-projection, and mHC residual kernels.
 
 --8<-- "gen:table-mla-v4-decode"
