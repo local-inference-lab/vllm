@@ -141,7 +141,11 @@ def _b12x_pcie_allreduce_max_size(world_size: int) -> int:
 
 
 def _b12x_pcie_plain_route_generic_max_size() -> int:
-    """Return the operator-controlled generic B12X/NCCL crossover."""
+    """Resolve the operator-controlled generic B12X/NCCL crossover.
+
+    Returns:
+        Maximum tensor size in bytes routed through the generic B12X path.
+    """
 
     configured = os.getenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE")
     if configured is not None:

@@ -190,7 +190,8 @@ def test_b12x_hierarchical_allreduce_dispatches_above_world_size_eight() -> None
     inp = torch.randn(2, 4)
 
     assert custom_allreduce.should_custom_ar(inp)
-    runtime.for_stream.return_value.should_route_plain_allreduce.assert_called_once_with(
+    route_policy = runtime.for_stream.return_value.should_route_plain_allreduce
+    route_policy.assert_called_once_with(
         inp,
         generic_max_bytes=64,
         graph_capture=False,
@@ -207,7 +208,8 @@ def test_b12x_plain_route_receives_graph_capture_state() -> None:
     inp = torch.empty((64, 4096), dtype=torch.bfloat16)
 
     assert custom_allreduce.should_custom_ar(inp)
-    runtime.for_stream.return_value.should_route_plain_allreduce.assert_called_once_with(
+    route_policy = runtime.for_stream.return_value.should_route_plain_allreduce
+    route_policy.assert_called_once_with(
         inp,
         generic_max_bytes=84 * 1024,
         graph_capture=True,
