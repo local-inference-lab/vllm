@@ -529,6 +529,12 @@ class Worker(WorkerBase):
         # allocations and the model's transient activation workspace.
         self.model_runner.profile_run()
 
+        # Distributed sparse-attention backends can defer metadata kernels and
+        # persistent workspaces until they see a single long request with a KV
+        # cache. Profile that serving shape before the remaining memory is
+        # assigned to the production KV cache.
+        self.model_runner.profile_single_request_prefill()
+
     def _release_unoccupied_accelerator_memory(self) -> None:
         """Return unoccupied caching-allocator blocks to the device.
 

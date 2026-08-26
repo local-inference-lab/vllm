@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -8,7 +9,9 @@ import numpy as np
 import pytest
 import torch
 
+import vllm.v1.worker.gpu.model_runner as gpu_model_runner_module
 from vllm.config.model import LogprobsMode
+from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample import prompt_logprob
 from vllm.v1.worker.gpu.sample.prompt_logprob import (
@@ -234,3 +237,106 @@ def test_non_last_pp_rank_does_not_profile_prompt_logprobs(
     GPUModelRunner.profile_run(runner)
 
     runner.prompt_logprobs_worker.profile_run.assert_not_called()
+
+
+@pytest.mark.parametrize("dummy_run_fails", [False, True])
+def test_v2_single_request_prefill_profile_uses_attention_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    dummy_run_fails: bool,
+):
+    hidden_states = torch.zeros((8, 4))
+    sample_hidden_states = hidden_states[-1:]
+    runner = object.__new__(GPUModelRunner)
+    runner.vllm_config = object()
+    runner.max_num_tokens = 8192
+    runner.is_last_pp_rank = True
+    runner.pooling_runner = None
+    runner._init_minimal_kv_cache_for_profiling = Mock()
+    runner._dummy_sampler_run = Mock()
+    runner.reset_encoder_cache = Mock()
+    runner._cleanup_cudagraph_memory_profile = Mock()
+
+    if dummy_run_fails:
+        runner._dummy_run = Mock(side_effect=RuntimeError("expected prefill failure"))
+    else:
+        runner._dummy_run = Mock(return_value=(hidden_states, sample_hidden_states))
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_current_vllm_config",
+        lambda _: nullcontext(),
+    )
+    synchronize = Mock()
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
+
+    if dummy_run_fails:
+        with pytest.raises(RuntimeError, match="expected prefill failure"):
+            runner.profile_single_request_prefill()
+    else:
+        runner.profile_single_request_prefill()
+
+    runner._init_minimal_kv_cache_for_profiling.assert_called_once_with()
+    runner._dummy_run.assert_called_once_with(
+        8192,
+        skip_eplb=True,
+        is_profile=True,
+        single_request_prefill=True,
+    )
+    runner.reset_encoder_cache.assert_called_once_with()
+    runner._cleanup_cudagraph_memory_profile.assert_called_once_with()
+    if dummy_run_fails:
+        synchronize.assert_not_called()
+        runner._dummy_sampler_run.assert_not_called()
+    else:
+        synchronize.assert_called_once_with()
+        runner._dummy_sampler_run.assert_called_once_with(sample_hidden_states)
+
+
+def test_v2_dummy_sampler_profiles_configured_speculative_width():
+    runner = object.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.input_buffers = InputBuffers(8, 48, runner.device)
+    runner.num_speculative_steps = 5
+    runner.decode_query_len = 6
+    runner.model = SimpleNamespace(
+        compute_logits=lambda hidden_states: torch.zeros(
+            hidden_states.shape[0], 16, dtype=hidden_states.dtype
+        )
+    )
+    runner.sampler = Mock()
+    runner.rejection_sampler = Mock()
+    draft_logits = torch.zeros(8, 5, 16)
+    runner.speculator = SimpleNamespace(draft_logits=draft_logits)
+
+    runner._dummy_sampler_run(torch.zeros(3, 8))
+
+    runner.sampler.assert_called_once()
+    verify_logits, input_batch, passed_draft_logits = (
+        runner.rejection_sampler.call_args.args
+    )
+    assert verify_logits.shape == (18, 16)
+    assert input_batch.num_draft_tokens == 15
+    assert input_batch.num_draft_tokens_per_req.tolist() == [5, 5, 5]
+    assert input_batch.cu_num_logits_np.tolist() == [0, 6, 12, 18]
+    assert input_batch.expanded_idx_mapping.tolist() == [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+    ]
+    assert input_batch.expanded_local_pos.tolist() == [0, 1, 2, 3, 4, 5] * 3
+    assert passed_draft_logits is draft_logits
