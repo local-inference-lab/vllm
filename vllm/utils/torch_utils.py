@@ -50,6 +50,10 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "turboquant_4bit_nc": torch.uint8,
     "turboquant_k3v4_nc": torch.uint8,
     "turboquant_3bit_nc": torch.uint8,
+    "kvarn_k4v2_g128": torch.uint8,
+    "kvarn_k4v4_g128": torch.uint8,
+    "kvarn_k5v5_g64": torch.uint8,
+    "kvarn_mla_k5_g64": torch.uint8,
     "nvfp4": torch.uint8,
     "nvfp4_4over6": torch.uint8,
 }
@@ -77,7 +81,7 @@ PIN_MEMORY = is_pin_memory_available()
 
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return (
-        kv_cache_dtype.startswith("fp8")
+        kv_cache_dtype.startswith(("fp8", "kvarn_"))
         or kv_cache_dtype.endswith("per_token_head")
         or kv_cache_dtype.startswith("nvfp4")
     )
