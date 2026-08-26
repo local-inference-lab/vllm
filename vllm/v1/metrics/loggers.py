@@ -536,6 +536,59 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 gauge_waiting_by_reason, per_engine_labelvalues_with_reason
             )
 
+        # DSpark prefix repair/suppression counters.
+        counter_dspark_prefix_repairs = self._counter_cls(
+            name="vllm:dspark_prefix_repairs_total",
+            documentation=(
+                "Requests whose block-unaligned restored prefix was repaired "
+                "for DFlash/DSpark drafting (tail prefilled through the "
+                "target)."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_dspark_prefix_repairs = create_metric_per_engine(
+            counter_dspark_prefix_repairs, per_engine_labelvalues
+        )
+        counter_dspark_prefix_repair_tokens = self._counter_cls(
+            name="vllm:dspark_prefix_repair_tokens_total",
+            documentation=(
+                "Tail tokens moved from the restored prefix to normal prefill "
+                "by the DFlash/DSpark prefix repair."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_dspark_prefix_repair_tokens = create_metric_per_engine(
+            counter_dspark_prefix_repair_tokens, per_engine_labelvalues
+        )
+        gauge_dspark_prefix_suppressed_batches = self._gauge_cls(
+            name="vllm:dspark_prefix_suppressed_batches",
+            documentation=(
+                "Cumulative batches whose DFlash/DSpark drafting was "
+                "suppressed by a block-unaligned restored prefix "
+                "(fail-closed)."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_dspark_prefix_suppressed_batches = create_metric_per_engine(
+            gauge_dspark_prefix_suppressed_batches, per_engine_labelvalues
+        )
+        gauge_dspark_prefix_suppressed_rows = self._gauge_cls(
+            name="vllm:dspark_prefix_suppressed_rows",
+            documentation=(
+                "Cumulative request rows whose DFlash/DSpark drafting was "
+                "suppressed by a block-unaligned restored prefix "
+                "(fail-closed)."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_dspark_prefix_suppressed_rows = create_metric_per_engine(
+            gauge_dspark_prefix_suppressed_rows, per_engine_labelvalues
+        )
+        self._last_dspark_prefix_repairs: dict[int, int] = {}
+        self._last_dspark_prefix_repair_tokens: dict[int, int] = {}
+
         gauge_engine_sleep_state = self._gauge_cls(
             name="vllm:engine_sleep_state",
             documentation=(
@@ -1101,6 +1154,34 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             metrics_info["engine"] = str(engine_index)
             info_gauge.labels(**metrics_info).set(1)
 
+    def _record_dspark_prefix_metrics(
+        self, scheduler_stats: SchedulerStats, engine_idx: int
+    ) -> None:
+        """Record cumulative DSpark prefix-repair metrics as deltas."""
+        prev_repairs = self._last_dspark_prefix_repairs.get(engine_idx, 0)
+        if scheduler_stats.dspark_prefix_repairs > prev_repairs:
+            self.counter_dspark_prefix_repairs[engine_idx].inc(
+                scheduler_stats.dspark_prefix_repairs - prev_repairs
+            )
+        self._last_dspark_prefix_repairs[engine_idx] = (
+            scheduler_stats.dspark_prefix_repairs
+        )
+
+        prev_repair_tokens = self._last_dspark_prefix_repair_tokens.get(engine_idx, 0)
+        if scheduler_stats.dspark_prefix_repair_tokens > prev_repair_tokens:
+            self.counter_dspark_prefix_repair_tokens[engine_idx].inc(
+                scheduler_stats.dspark_prefix_repair_tokens - prev_repair_tokens
+            )
+        self._last_dspark_prefix_repair_tokens[engine_idx] = (
+            scheduler_stats.dspark_prefix_repair_tokens
+        )
+        self.gauge_dspark_prefix_suppressed_batches[engine_idx].set(
+            scheduler_stats.dspark_prefix_suppressed_batches
+        )
+        self.gauge_dspark_prefix_suppressed_rows[engine_idx].set(
+            scheduler_stats.dspark_prefix_suppressed_rows
+        )
+
     def record(
         self,
         scheduler_stats: SchedulerStats | None,
@@ -1125,6 +1206,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+
+            self._record_dspark_prefix_metrics(scheduler_stats, engine_idx)
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

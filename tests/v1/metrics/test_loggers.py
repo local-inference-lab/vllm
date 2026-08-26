@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 from vllm.config import VllmConfig
-from vllm.v1.metrics.loggers import LoggingStatLogger
+from vllm.v1.metrics.loggers import LoggingStatLogger, PrometheusStatLogger
 from vllm.v1.metrics.stats import IterationStats, PrefillStats, SchedulerStats
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingStats
 
@@ -70,3 +70,60 @@ def test_spec_decoding_log_reports_current_speculative_depth():
     message = log_args[0] % log_args[1:]
     assert "Mean acceptance length: 2.00" in message
     assert "Current speculative depth: 2" in message
+
+
+def test_prometheus_dspark_prefix_metrics_use_cumulative_deltas():
+    logger = object.__new__(PrometheusStatLogger)
+    logger._last_dspark_prefix_repairs = {}
+    logger._last_dspark_prefix_repair_tokens = {}
+    logger.counter_dspark_prefix_repairs = {0: Mock()}
+    logger.counter_dspark_prefix_repair_tokens = {0: Mock()}
+    logger.gauge_dspark_prefix_suppressed_batches = {0: Mock()}
+    logger.gauge_dspark_prefix_suppressed_rows = {0: Mock()}
+
+    logger._record_dspark_prefix_metrics(
+        SchedulerStats(
+            dspark_prefix_repairs=1,
+            dspark_prefix_repair_tokens=2,
+            dspark_prefix_suppressed_batches=3,
+            dspark_prefix_suppressed_rows=4,
+        ),
+        engine_idx=0,
+    )
+    logger._record_dspark_prefix_metrics(
+        SchedulerStats(
+            dspark_prefix_repairs=1,
+            dspark_prefix_repair_tokens=2,
+            dspark_prefix_suppressed_batches=3,
+            dspark_prefix_suppressed_rows=4,
+        ),
+        engine_idx=0,
+    )
+    logger._record_dspark_prefix_metrics(
+        SchedulerStats(
+            dspark_prefix_repairs=2,
+            dspark_prefix_repair_tokens=5,
+            dspark_prefix_suppressed_batches=6,
+            dspark_prefix_suppressed_rows=8,
+        ),
+        engine_idx=0,
+    )
+
+    assert logger.counter_dspark_prefix_repairs[0].inc.call_args_list == [
+        call(1),
+        call(1),
+    ]
+    assert logger.counter_dspark_prefix_repair_tokens[0].inc.call_args_list == [
+        call(2),
+        call(3),
+    ]
+    assert logger.gauge_dspark_prefix_suppressed_batches[0].set.call_args_list == [
+        call(3),
+        call(3),
+        call(6),
+    ]
+    assert logger.gauge_dspark_prefix_suppressed_rows[0].set.call_args_list == [
+        call(4),
+        call(4),
+        call(8),
+    ]
