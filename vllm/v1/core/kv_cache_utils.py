@@ -24,6 +24,8 @@ from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
+    KVarNFullAttentionSpec,
+    KVarNSlidingWindowSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -1011,6 +1013,102 @@ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
     return num_blocks
 
 
+def _get_kvarn_mla_workspace_config(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> Any | None:
+    """Return the one shared MLA workspace geometry used by this worker."""
+    kvarn_specs: list[MLAAttentionSpec] = []
+    for group in kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        specs: Iterable[KVCacheSpec]
+        if isinstance(group_spec, UniformTypeKVCacheSpecs):
+            specs = group_spec.kv_cache_specs.values()
+        else:
+            specs = (group_spec,)
+        kvarn_specs.extend(
+            spec
+            for spec in specs
+            if isinstance(spec, MLAAttentionSpec)
+            and spec.cache_dtype_str == "kvarn_mla_k5_g64"
+        )
+
+    if not kvarn_specs:
+        return None
+    from vllm.model_executor.layers.quantization.kvarn.config import KVarNMLAConfig
+
+    geometries: dict[tuple[Any, ...], KVarNMLAConfig] = {}
+    for spec in kvarn_specs:
+        assert spec.cache_dtype_str is not None
+        config = KVarNMLAConfig.from_cache_dtype(spec.cache_dtype_str)
+        geometry = (
+            spec.block_size,
+            spec.num_kv_heads,
+            spec.head_size,
+            spec.dtype,
+            config.group,
+            config.latent_dim,
+            config.rope_dim,
+            config.bits,
+        )
+        geometries.setdefault(geometry, config)
+
+    if len(geometries) != 1:
+        raise ValueError(
+            "A local worker cannot share one KVarN MLA workspace across "
+            f"multiple incompatible cache geometries: {tuple(geometries)}"
+        )
+    return next(iter(geometries.values()))
+
+
+def _get_kvarn_mla_num_blocks(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+    packed_bytes_per_block: int,
+) -> int | None:
+    """Solve packed-cache plus shared-workspace capacity, if MLA KVarN is used."""
+    config = _get_kvarn_mla_workspace_config(kv_cache_groups)
+    if config is None:
+        return None
+
+    def required_memory(num_pages: int) -> int:
+        workspace_bytes = config.workspace_envelope(vllm_config, num_pages).total_bytes
+        return packed_bytes_per_block * num_pages + workspace_bytes
+
+    override = vllm_config.cache_config.num_gpu_blocks_override
+    if override is not None:
+        if override <= 0:
+            return override
+        required_bytes = required_memory(override)
+        if required_bytes > available_memory:
+            raise ValueError(
+                f"num_gpu_blocks_override={override} requires {required_bytes} "
+                "bytes for packed KVarN MLA cache pages and the shared workspace, "
+                f"but only {available_memory} bytes are available"
+            )
+        return override
+
+    max_pages_without_workspace = max(
+        int(available_memory // packed_bytes_per_block), 0
+    )
+    if max_pages_without_workspace == 0:
+        return 0
+
+    def fits(num_pages: int) -> bool:
+        return required_memory(num_pages) <= available_memory
+
+    if not fits(1):
+        return 0
+    low, high = 1, max_pages_without_workspace
+    while low < high:
+        mid = (low + high + 1) // 2
+        if fits(mid):
+            low = mid
+        else:
+            high = mid - 1
+    return low
+
+
 def _pool_bytes_per_block(
     vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
 ) -> int:
@@ -1148,6 +1246,19 @@ def unify_kv_cache_spec_page_size(
             new_spec: KVCacheSpec = replace(
                 layer_spec, page_size_padded=target_page_size
             )
+            assert new_spec.page_size_bytes == target_page_size
+            new_kv_cache_spec[layer_name] = new_spec
+        elif isinstance(layer_spec, (KVarNFullAttentionSpec, KVarNSlidingWindowSpec)):
+            real_page_size = layer_spec.real_page_size_bytes
+            if target_page_size % real_page_size == 0:
+                ratio = target_page_size // real_page_size
+                new_spec = replace(
+                    layer_spec,
+                    block_size=layer_spec.block_size * ratio,
+                    page_size_padded=None,
+                )
+            else:
+                new_spec = replace(layer_spec, page_size_padded=target_page_size)
             assert new_spec.page_size_bytes == target_page_size
             new_kv_cache_spec[layer_name] = new_spec
         else:
@@ -1484,7 +1595,14 @@ def _get_kv_cache_config_packed(
     ):
         tensor_slots = _get_lockstep_mla_tensor_slots(kv_cache_groups)
         total_num_bytes_per_block = sum(page_size for page_size, _ in tensor_slots)
-        num_blocks = available_memory // total_num_bytes_per_block
+        num_blocks = _get_kvarn_mla_num_blocks(
+            vllm_config,
+            kv_cache_groups,
+            available_memory,
+            total_num_bytes_per_block,
+        )
+        if num_blocks is None:
+            num_blocks = available_memory // total_num_bytes_per_block
         num_blocks = may_override_num_blocks(vllm_config, num_blocks)
         return num_blocks, [
             KVCacheTensor(size=page_size * num_blocks, shared_by=slot)
@@ -1493,7 +1611,14 @@ def _get_kv_cache_config_packed(
 
     block_stride, layers_by_offset = _get_packed_kv_cache_layout(kv_cache_groups)
 
-    num_blocks = available_memory // block_stride
+    num_blocks = _get_kvarn_mla_num_blocks(
+        vllm_config,
+        kv_cache_groups,
+        available_memory,
+        block_stride,
+    )
+    if num_blocks is None:
+        num_blocks = available_memory // block_stride
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
     total_size = block_stride * num_blocks
@@ -1544,9 +1669,12 @@ def get_kv_cache_config_from_groups(
         # Special case: all layers have the same type of KV cache but with
         # different hidden sizes. Allocate different amount of memory for each
         # layer based on its hidden size.
-        num_blocks = (
-            available_memory // kv_cache_groups[0].kv_cache_spec.page_size_bytes
+        bytes_per_block = kv_cache_groups[0].kv_cache_spec.page_size_bytes
+        num_blocks = _get_kvarn_mla_num_blocks(
+            vllm_config, kv_cache_groups, available_memory, bytes_per_block
         )
+        if num_blocks is None:
+            num_blocks = available_memory // bytes_per_block
         num_blocks = may_override_num_blocks(vllm_config, num_blocks)
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
         kv_cache_tensors = [
@@ -1577,9 +1705,18 @@ def get_kv_cache_config_from_groups(
             [group.kv_cache_spec for group in kv_cache_groups]
         )
         assert group_size > 0, "group_size must be greater than 0"
-        num_blocks = get_num_blocks(
-            vllm_config, group_size, available_memory, page_size
+        num_blocks = _get_kvarn_mla_num_blocks(
+            vllm_config,
+            kv_cache_groups,
+            available_memory,
+            page_size * group_size,
         )
+        if num_blocks is None:
+            num_blocks = get_num_blocks(
+                vllm_config, group_size, available_memory, page_size
+            )
+        else:
+            num_blocks = may_override_num_blocks(vllm_config, num_blocks)
         kv_cache_tensors = []
         for i in range(group_size):
             shared_by = []
@@ -2299,6 +2436,23 @@ def _max_memory_usage_bytes_from_groups(
     return group_size * page_size * blocks_needed
 
 
+def _max_memory_usage_with_kvarn_mla_workspace(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    packed_bytes = _max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
+    workspace_config = _get_kvarn_mla_workspace_config(kv_cache_groups)
+    if workspace_config is None or packed_bytes == 0:
+        return packed_bytes
+    required_pages = cdiv(
+        packed_bytes, _pool_bytes_per_block(vllm_config, kv_cache_groups)
+    )
+    return (
+        packed_bytes
+        + workspace_config.workspace_envelope(vllm_config, required_pages).total_bytes
+    )
+
+
 def _estimate_max_model_len_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -2313,7 +2467,7 @@ def _estimate_max_model_len_from_groups(
     def fits(model_len: int) -> bool:
         vllm_config.model_config.max_model_len = model_len
         return (
-            _max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
+            _max_memory_usage_with_kvarn_mla_workspace(vllm_config, kv_cache_groups)
             <= available_memory
         )
 
@@ -2505,12 +2659,10 @@ def get_kv_cache_configs(
         for worker_spec in kv_cache_specs
     ]
 
-    # If `num_gpu_blocks_override` is set, the cache size that will actually
-    # be allocated is decoupled from the profiled `available_memory`:
-    # `may_override_num_blocks` in `get_kv_cache_config_from_groups` clamps
-    # `num_blocks` to the override. Reflect that in `available_memory` here so
-    # auto-fit, the admission check, and the per-worker config builder all
-    # plan against the same effective capacity.
+    # An override defines the effective cache capacity used by auto-fit,
+    # admission, and tensor planning. KVarN MLA still validates that its packed
+    # pages plus the separately allocated shared workspace fit the profiled
+    # per-worker allocation before replacing it with this effective capacity.
     override = vllm_config.cache_config.num_gpu_blocks_override
     if override is not None:
         adjusted_memory: list[int] = []
@@ -2533,7 +2685,20 @@ def get_kv_cache_configs(
                 profiled_num_blocks,
                 override,
             )
-            adjusted_memory.append(override * bytes_per_block)
+            effective_memory = override * bytes_per_block
+            workspace_config = _get_kvarn_mla_workspace_config(groups)
+            if workspace_config is not None and override > 0:
+                effective_memory += workspace_config.workspace_envelope(
+                    vllm_config, override
+                ).total_bytes
+                if effective_memory > avail_mem:
+                    raise ValueError(
+                        f"num_gpu_blocks_override={override} requires "
+                        f"{effective_memory} bytes for packed KVarN MLA cache "
+                        "pages and the shared workspace, but only "
+                        f"{avail_mem} bytes are available"
+                    )
+            adjusted_memory.append(effective_memory)
         available_memory = adjusted_memory
 
     if vllm_config.model_config.original_max_model_len == -1:
@@ -2547,7 +2712,11 @@ def get_kv_cache_configs(
             continue
         _check_enough_kv_cache_memory(
             avail_mem,
-            partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
+            partial(
+                _max_memory_usage_with_kvarn_mla_workspace,
+                vllm_config,
+                groups,
+            ),
             vllm_config.model_config.max_model_len,
             partial(_estimate_max_model_len_from_groups, vllm_config, groups),
         )

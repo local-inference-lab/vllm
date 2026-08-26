@@ -2454,6 +2454,14 @@ class VllmConfig:
         if model_config is not None and model_config.enable_prompt_embeds:
             unsupported.append("prompt embeds")
 
+        cache_dtype = self.cache_config.cache_dtype
+        if (
+            isinstance(cache_dtype, str)
+            and cache_dtype.startswith("kvarn_")
+            and cache_dtype != "kvarn_mla_k5_g64"
+        ):
+            unsupported.append("KVarN KV cache")
+
         if self.cache_config.kv_sharing_fast_prefill:
             # Will be added by https://github.com/vllm-project/vllm/pull/35045
             unsupported.append("KV sharing fast prefill")

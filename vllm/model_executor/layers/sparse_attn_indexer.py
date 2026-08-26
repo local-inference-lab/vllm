@@ -2004,19 +2004,16 @@ def sparse_attn_indexer(
                 continue
 
             if use_b12x_indexer:
-                if chunk.num_reqs != 1:
-                    raise RuntimeError(
-                        "B12X sparse prefill requires single-request chunks so "
-                        "the page table can be row-shared without packing."
-                    )
                 if qs_active:
                     rel_start = qs_row_start - chunk.token_start
                     rel_end = qs_row_end - chunk.token_start
                     cu_seqlen_ks = chunk.cu_seqlen_ks[rel_start:rel_end]
                     cu_seqlen_ke = chunk.cu_seqlen_ke[rel_start:rel_end]
+                    token_to_seq = chunk.token_to_seq[rel_start:rel_end]
                 else:
                     cu_seqlen_ks = chunk.cu_seqlen_ks
                     cu_seqlen_ke = chunk.cu_seqlen_ke
+                    token_to_seq = chunk.token_to_seq
                 row_has_no_kv = cu_seqlen_ke <= cu_seqlen_ks
                 seq_lens = torch.where(
                     row_has_no_kv,
@@ -2036,10 +2033,15 @@ def sparse_attn_indexer(
                 active_page_width = min(
                     active_page_width, int(chunk.block_table.shape[1])
                 )
-                block_table = chunk.block_table[:1, :active_page_width].expand(
-                    int(q_slice.shape[0]),
-                    active_page_width,
-                )
+                if chunk.num_reqs == 1:
+                    block_table = chunk.block_table[:1, :active_page_width].expand(
+                        int(q_slice.shape[0]),
+                        active_page_width,
+                    )
+                else:
+                    block_table = chunk.block_table.index_select(
+                        0, token_to_seq.to(torch.long)
+                    )[:, :active_page_width]
                 topk_scores = None
                 if dcp_world_size > 1:
                     if topk_scores_buffer is None:
@@ -2059,7 +2061,7 @@ def sparse_attn_indexer(
                     topk_indices=topk_indices,
                     topk_tokens=topk_tokens,
                     topk_scores=topk_scores,
-                    shared_page_table=True,
+                    shared_page_table=chunk.num_reqs == 1,
                     output_physical_slots=output_physical_slots,
                 )
                 if dcp_global_topk:

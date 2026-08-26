@@ -3,6 +3,7 @@
 import contextlib
 import enum
 import functools
+import math
 import os
 import platform
 import sys
@@ -702,7 +703,21 @@ class Platform:
             if cache_config.cache_dtype != "auto"
             else model_config.dtype
         )
-        primary_page = per_token_page_bytes(primary_dtype, cache_config.cache_dtype)
+        if cache_config.cache_dtype.startswith("kvarn_") and not model_config.use_mla:
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNConfig,
+            )
+
+            kvarn_config = KVarNConfig.from_cache_dtype(
+                cache_config.cache_dtype, model_config.get_head_size()
+            )
+            primary_page = (
+                kvarn_config.tile_bytes_aligned
+                * model_config.get_num_kv_heads(parallel_config)
+                // kvarn_config.group
+            )
+        else:
+            primary_page = per_token_page_bytes(primary_dtype, cache_config.cache_dtype)
 
         # Per-token page of every higher-precision padded spec sharing the pool.
         padded_pages: list[int] = []
@@ -796,8 +811,26 @@ class Platform:
 
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
 
-        # Compute attention page size for 1 token
-        if model_config.use_mla:
+        # Compute attention page size for one token. KVarN's dense 5-bit
+        # payload is group-locked and cannot use FullAttentionSpec's raw uint8
+        # formula.
+        is_standard_kvarn = (
+            cache_config.cache_dtype.startswith("kvarn_") and not model_config.use_mla
+        )
+        if is_standard_kvarn:
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNConfig,
+            )
+
+            kvarn_config = KVarNConfig.from_cache_dtype(
+                cache_config.cache_dtype, model_config.get_head_size()
+            )
+            attn_page_size_1_token = (
+                kvarn_config.tile_bytes_aligned
+                * model_config.get_num_kv_heads(parallel_config)
+                // kvarn_config.group
+            )
+        elif model_config.use_mla:
             attn_page_size_1_token = MLAAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
@@ -862,6 +895,22 @@ class Platform:
         ).page_size_bytes
 
         if mamba_page_size == 0:
+            return
+        if is_standard_kvarn:
+            # Keep group-64 quantization tiles while allowing multiple tiles to
+            # share one hybrid cache page. This preserves KVarN's
+            # bytes/token instead of padding every 64-token tile to a Mamba
+            # state page.
+            tile_page_size = (
+                kvarn_config.tile_bytes_aligned
+                * model_config.get_num_kv_heads(parallel_config)
+            )
+            tiles_per_page = max(
+                math.ceil(mamba_page_size / tile_page_size),
+                1,
+            )
+            cache_config.block_size = kvarn_config.group * tiles_per_page
+            cache_config.mamba_page_size_padded = tile_page_size * tiles_per_page
             return
 
         # mamba_block_size here should either be user specified value or None

@@ -152,6 +152,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLEX_ATTENTION,
                 AttentionBackendEnum.TURBOQUANT,
+                AttentionBackendEnum.KVARN,
             ]
         else:
             return [
@@ -160,6 +161,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLEX_ATTENTION,
                 AttentionBackendEnum.TURBOQUANT,
+                AttentionBackendEnum.KVARN,
             ]
 
 
@@ -350,6 +352,123 @@ class CudaPlatformBase(Platform):
                 "setting in %%USERPROFILE%%\\.wslconfig and run "
                 "`wsl --shutdown`."
             )
+
+        cache_config = vllm_config.cache_config
+        cache_dtype = cache_config.cache_dtype
+        is_kvarn = isinstance(cache_dtype, str) and cache_dtype.startswith("kvarn_")
+        if is_kvarn:
+            if cache_config.enable_prefix_caching:
+                raise ValueError(
+                    "KVarN precision tails do not yet support prefix caching. "
+                    "Disable prefix caching explicitly."
+                )
+            if cache_config.kv_offloading_size is not None:
+                raise ValueError("KVarN does not yet support KV cache offloading.")
+            if vllm_config.kv_transfer_config is not None:
+                raise ValueError(
+                    "KVarN does not yet support KV transfer or disaggregated serving."
+                )
+            if model_config is None:
+                return
+            if cache_dtype == "kvarn_mla_k5_g64" and not model_config.use_mla:
+                raise ValueError("kvarn_mla_k5_g64 requires an MLA model.")
+
+            if model_config.use_mla:
+                if cache_dtype != "kvarn_mla_k5_g64":
+                    raise ValueError(
+                        "MLA KVarN requires kv_cache_dtype='kvarn_mla_k5_g64'."
+                    )
+                backend = vllm_config.attention_config.backend
+                if backend not in (
+                    "B12X_MLA_SPARSE",
+                    AttentionBackendEnum.B12X_MLA_SPARSE,
+                ):
+                    raise ValueError(
+                        "kvarn_mla_k5_g64 requires --attention-backend B12X_MLA_SPARSE."
+                    )
+                if cache_config.block_size != 64:
+                    raise ValueError(
+                        "kvarn_mla_k5_g64 requires --block-size 64; "
+                        f"got {cache_config.block_size}."
+                    )
+                if cache_config.kv_cache_dtype_skip_layers:
+                    raise ValueError(
+                        "MLA KVarN does not support mixed KV-cache dtypes."
+                    )
+                if parallel_config.enable_dbo:
+                    raise ValueError(
+                        "MLA KVarN does not yet support dual-batch overlap because "
+                        "its dequantization workspace is shared across layers."
+                    )
+                spec_config = vllm_config.speculative_config
+                if spec_config is not None and getattr(
+                    spec_config, "method", None
+                ) not in {
+                    "ngram",
+                    "ngram_gpu",
+                }:
+                    if getattr(spec_config, "attention_backend", None) not in (
+                        "B12X_MLA_SPARSE",
+                        AttentionBackendEnum.B12X_MLA_SPARSE,
+                    ):
+                        raise ValueError(
+                            "MLA KVarN speculative decoding requires explicit "
+                            "attention_backend='B12X_MLA_SPARSE'."
+                        )
+                    if (
+                        getattr(spec_config, "kv_cache_dtype", None)
+                        != "kvarn_mla_k5_g64"
+                    ):
+                        raise ValueError(
+                            "MLA KVarN speculative decoding requires explicit "
+                            "kv_cache_dtype='kvarn_mla_k5_g64'."
+                        )
+
+            else:
+                from vllm.model_executor.layers.quantization.kvarn.config import (
+                    KVarNConfig,
+                )
+
+                head_size = model_config.get_head_size()
+                if (
+                    parallel_config.decode_context_parallel_size > 1
+                    or parallel_config.prefill_context_parallel_size > 1
+                ):
+                    raise ValueError(
+                        "Standard KVarN does not support decode or prefill "
+                        "context parallelism."
+                    )
+                if cache_config.kv_cache_dtype_skip_layers:
+                    raise ValueError(
+                        "Standard KVarN does not support mixed KV-cache dtypes."
+                    )
+
+                if head_size not in (128, 256, 512):
+                    raise ValueError(
+                        "KVarN requires head_dim 128, 256, or 512; "
+                        f"the model uses {head_size}."
+                    )
+                kvarn_config = KVarNConfig.from_cache_dtype(cache_dtype, head_size)
+                supported = kvarn_config.max_supported_seqs(
+                    total_gpu_bytes=cls.get_device_total_memory(),
+                    num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                    num_layers=KVarNConfig.num_kvarn_layers(
+                        model_config, parallel_config
+                    ),
+                    max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
+                    gpu_memory_utilization=cache_config.gpu_memory_utilization,
+                    weight_bytes=kvarn_config.estimate_weight_bytes(
+                        model_config.model,
+                        tensor_parallel_size=parallel_config.tensor_parallel_size,
+                    ),
+                )
+                if scheduler_config.max_num_seqs > supported:
+                    logger.warning(
+                        "KVarN precision-tail pool caps max_num_seqs from %d to %d.",
+                        scheduler_config.max_num_seqs,
+                        supported,
+                    )
+                    scheduler_config.max_num_seqs = supported
 
     @classmethod
     def get_current_memory_usage(

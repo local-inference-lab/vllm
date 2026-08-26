@@ -26,6 +26,7 @@ ONE ``get_simultaneous`` call so they never alias.
 """
 
 import inspect
+import math
 import os
 import weakref
 from dataclasses import dataclass
@@ -43,6 +44,10 @@ from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
 from vllm.model_executor.layers.mla_cache_format import (
     NVFP4_MLA_CACHE_FORMAT,
 )
+from vllm.model_executor.layers.quantization.kvarn.config import (
+    kvarn_mla_workspace_envelope as _kvarn_mla_workspace_envelope,
+)
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
@@ -63,6 +68,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops.kvarn_decode import kvarn_hadamard
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -723,6 +729,7 @@ class B12xMLASparseBackend(AttentionBackend):
         "nvfp4_ds_mla",
         "fp8",  # aliases for fp8_ds_mla on this backend
         "fp8_e4m3",
+        "kvarn_mla_k5_g64",
     ]
 
     @staticmethod
@@ -795,6 +802,17 @@ class B12xMLASparseBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        if cache_dtype_str == "kvarn_mla_k5_g64":
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNMLAConfig,
+            )
+
+            config = KVarNMLAConfig.from_cache_dtype(cache_dtype_str)
+            if block_size != config.group:
+                raise ValueError(
+                    f"MLA KVarN requires block_size={config.group}, got {block_size}"
+                )
+            return (num_blocks, 1, config.tile_bytes)
         if cache_dtype_str == "fp8_ds_mla":
             # V32 fp8_ds_mla packed: 656 B/token (512 NoPE + 16 inline FP32
             # scales + 128 BF16 RoPE). Mirrors the FlashMLA / SPARSE_MLA_SM120
@@ -884,6 +902,15 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         self.kv_cache_spec = kv_cache_spec
         self.model_config = vllm_config.model_config
         self.device = device
+        self.kvarn_config = None
+        cache_dtype_str = getattr(kv_cache_spec, "cache_dtype_str", None)
+        if cache_dtype_str == "kvarn_mla_k5_g64":
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNMLAConfig,
+            )
+
+            self.kvarn_config = KVarNMLAConfig.from_cache_dtype(cache_dtype_str)
+            self.supports_exact_metadata_reuse = False
 
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens = vllm_config.model_config.hf_config.index_topk
@@ -902,6 +929,14 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         max_seqs = vllm_config.scheduler_config.max_num_seqs
+        if self.kvarn_config is not None:
+            num_kv_pages = vllm_config.cache_config.num_gpu_blocks
+            if num_kv_pages is None or num_kv_pages <= 0:
+                raise RuntimeError(
+                    "KVarN MLA workspace initialization requires the allocated "
+                    "local KV page count before metadata builders are created"
+                )
+            B12xMLASparseImpl.initialize_kvarn_workspaces(int(num_kv_pages), device)
         from vllm import envs as envs_mod
 
         ckv_gather_requested = envs_mod.VLLM_B12X_MLA_CKV_GATHER
@@ -969,6 +1004,18 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         fast_build: bool = False,
     ) -> B12xMLASparseMetadata:
         cm = common_attn_metadata
+        if self.kvarn_config is not None:
+            from vllm.v1.attention.backends.mla.kvarn_mla_state import (
+                KVarNMLAStateManager,
+            )
+
+            KVarNMLAStateManager.prepare_step(
+                tuple(self.layer_names),
+                self.layer_names,
+                cm,
+                self.kvarn_config,
+                self.dcp_world_size,
+            )
         num_tokens = cm.num_actual_tokens
         if cm.max_query_len <= 1 and num_tokens == cm.num_reqs:
             num_decodes = cm.num_reqs
@@ -1239,7 +1286,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
     """b12x unified sparse-MLA implementation (decode + extend/prefill)."""
 
-    is_sparse = True
+    is_sparse: ClassVar[bool] = True
     can_return_lse_for_decode: bool = True
     # B12X handles decode and extend inside its own top-k MQA kernels; the
     # generic dense-MHA prefill path assumes cache layouts it never validated.
@@ -1253,6 +1300,12 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
     _all_layer_kv_caches: list[torch.Tensor | None] = []
     _shared_gather_event: torch.cuda.Event | None = None
     _shared_gather_buf_idx: int = 0
+    _kvarn_shared_dense: ClassVar[dict[tuple, torch.Tensor]] = {}
+    _kvarn_shared_remapped: ClassVar[dict[tuple, torch.Tensor]] = {}
+    _kvarn_shared_rotated: ClassVar[dict[tuple, torch.Tensor]] = {}
+    _kvarn_shared_physical_slots: ClassVar[dict[tuple, torch.Tensor]] = {}
+    _kvarn_instances: ClassVar[weakref.WeakSet] = weakref.WeakSet()
+    _kvarn_hadamard: ClassVar[dict[torch.device, torch.Tensor]] = {}
 
     def __init__(
         self,
@@ -1280,11 +1333,20 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 "B12X_MLA_SPARSE only supports decoder self-attention"
             )
 
+        self.layer_name = ""
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self._is_kvarn_mla = self.kv_cache_dtype == "kvarn_mla_k5_g64"
+        self._kvarn_config = None
+        if self._is_kvarn_mla:
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNMLAConfig,
+            )
+
+            self._kvarn_config = KVarNMLAConfig.from_cache_dtype(self.kv_cache_dtype)
         self._kv_fp8_rope = bool(
             self.kv_cache_dtype == "nvfp4_ds_mla" and _kv_fp8_rope_enabled()
         )
@@ -1360,6 +1422,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
+        self._vllm_config = vllm_config
         parallel_config = vllm_config.parallel_config
         self.dcp_workspace_non_dbo = not bool(parallel_config.enable_dbo)
         self.dcp_world_size = parallel_config.decode_context_parallel_size
@@ -1454,8 +1517,84 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self._decode_max_rows = min(max_num_seqs * q_per_req, max_batched)
         if self._decode_max_rows < max_num_seqs:
             self._decode_max_rows = max_num_seqs
+        if self._is_kvarn_mla:
+            assert self._kvarn_config is not None
+            assert self._decode_max_rows == self._kvarn_config.max_active_rows(
+                vllm_config
+            )
 
         self._max_batched = int(max_batched)
+        self._kvarn_group_key: tuple[str, ...] | None = None
+        self._kvarn_cache_ref: torch.Tensor | None = None
+        self._kvarn_block_to_slot: torch.Tensor | None = None
+        if self._is_kvarn_mla:
+            assert self._kvarn_config is not None
+            kvarn_config = self._kvarn_config
+            max_rollback_tokens = (
+                int(spec.num_speculative_tokens)
+                if vllm_config.scheduler_config.async_scheduling
+                and spec is not None
+                and getattr(spec, "num_speculative_tokens", None)
+                else 0
+            )
+            self._kvarn_pool_size = kvarn_config.pool_slots(
+                max_num_seqs,
+                max_batched,
+                max_rollback_tokens,
+            )
+            self._kvarn_latent_pool = torch.zeros(
+                self._kvarn_pool_size,
+                kvarn_config.group,
+                kvarn_config.latent_dim,
+                dtype=torch.float8_e4m3fn,
+                device=self.device,
+            )
+            self._kvarn_rope_pool = torch.zeros(
+                self._kvarn_pool_size,
+                kvarn_config.group,
+                kvarn_config.rope_dim,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            self._kvarn_boundary_blocks = max_num_seqs
+            self._kvarn_rollback_blocks = (
+                _cdiv(
+                    max_num_seqs * max_rollback_tokens,
+                    kvarn_config.group,
+                )
+                + max_num_seqs
+                if max_rollback_tokens
+                else 0
+            )
+            self._kvarn_dense_cache: torch.Tensor | None = None
+            self._kvarn_remapped_indices: torch.Tensor | None = None
+            self._kvarn_rotated_scratch: torch.Tensor | None = None
+            self._kvarn_physical_slots: torch.Tensor | None = None
+            cls = type(self)
+            cls._kvarn_instances.add(self)
+            if self.device not in cls._kvarn_hadamard:
+                hadamard = torch.ones(1, 1, dtype=torch.float32)
+                while hadamard.shape[0] < kvarn_config.latent_dim:
+                    hadamard = torch.cat(
+                        [
+                            torch.cat([hadamard, hadamard], dim=1),
+                            torch.cat([hadamard, -hadamard], dim=1),
+                        ],
+                        dim=0,
+                    )
+                cls._kvarn_hadamard[self.device] = (
+                    hadamard.div(math.sqrt(kvarn_config.latent_dim))
+                    .to(self.device, dtype=torch.bfloat16)
+                    .contiguous()
+                )
+            self._kvarn_h = cls._kvarn_hadamard[self.device]
+            from vllm.v1.attention.backends.mla.kvarn_mla_state import (
+                KVarNMLAStateManager,
+            )
+
+            KVarNMLAStateManager.register(self)
+        else:
+            self._kvarn_pool_size = 0
 
         # Lazily import B12X only on this opt-in path.
         from b12x.attention.sparse_mla import (
@@ -1538,7 +1677,8 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
 
         ckv_gather_requested = envs_mod.VLLM_B12X_MLA_CKV_GATHER
         self._ckv_gather_enabled = ckv_gather_requested and (
-            self.dcp_world_size > 1
+            not self._is_kvarn_mla
+            and self.dcp_world_size > 1
             and self.pcp_world_size == 1
             and self.num_heads % _HEAD_ALIGNMENT == 0
             and self.dcp_workspace_non_dbo
@@ -1697,6 +1837,92 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self.supports_quant_query_input = False
 
     @classmethod
+    def initialize_kvarn_workspaces(
+        cls, num_kv_pages: int, device: torch.device
+    ) -> None:
+        """Allocate graph-static KVarN staging after local pages are known."""
+        matching = [
+            impl
+            for impl in cls._kvarn_instances
+            if impl._is_kvarn_mla and impl.device == device
+        ]
+        for impl in matching:
+            config = impl._kvarn_config
+            assert config is not None
+            envelope = config.workspace_envelope(impl._vllm_config, num_kv_pages)
+            runtime_envelope = _kvarn_mla_workspace_envelope(
+                num_kv_pages=num_kv_pages,
+                group_size=config.group,
+                latent_dim=config.latent_dim,
+                rope_dim=config.rope_dim,
+                max_batched_tokens=impl._max_batched,
+                max_active_rows=impl._decode_max_rows,
+                topk_tokens=impl.topk_tokens,
+                boundary_blocks=impl._kvarn_boundary_blocks,
+                rollback_blocks=impl._kvarn_rollback_blocks,
+            )
+            if runtime_envelope != envelope:
+                raise ValueError(
+                    "KVarN MLA runtime geometry does not match the workspace "
+                    "geometry budgeted from VllmConfig"
+                )
+            key = (
+                device,
+                num_kv_pages,
+                envelope,
+                impl.topk_tokens,
+                config.group,
+                config.latent_dim,
+                config.rope_dim,
+            )
+            if key not in cls._kvarn_shared_dense:
+                if device.type == "cuda":
+                    free_bytes, _ = current_platform.mem_get_info()
+                    reusable_bytes = max(
+                        torch.accelerator.memory_reserved(device)
+                        - torch.accelerator.memory_allocated(device),
+                        0,
+                    )
+                    if envelope.total_bytes > free_bytes + reusable_bytes:
+                        raise MemoryError(
+                            "KVarN MLA graph workspace requires "
+                            f"{envelope.total_bytes} bytes but only "
+                            f"{free_bytes + reusable_bytes} bytes are available"
+                        )
+                dense = torch.empty(
+                    envelope.dense_rows // config.group,
+                    config.group,
+                    config.latent_dim + config.rope_dim,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                remapped = torch.empty(
+                    impl._max_batched,
+                    impl.topk_tokens,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                rotated = torch.empty(
+                    envelope.rotation_rows,
+                    config.latent_dim,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                physical_slots = torch.arange(
+                    envelope.physical_slot_rows,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                cls._kvarn_shared_dense[key] = dense
+                cls._kvarn_shared_remapped[key] = remapped
+                cls._kvarn_shared_rotated[key] = rotated
+                cls._kvarn_shared_physical_slots[key] = physical_slots
+            impl._kvarn_dense_cache = cls._kvarn_shared_dense[key]
+            impl._kvarn_remapped_indices = cls._kvarn_shared_remapped[key]
+            impl._kvarn_rotated_scratch = cls._kvarn_shared_rotated[key]
+            impl._kvarn_physical_slots = cls._kvarn_shared_physical_slots[key]
+
+    @classmethod
     def reset_kv_cache_binding_state(cls) -> None:
         """Drop prefetch state whose pointers belong to an old KV cache.
 
@@ -1716,6 +1942,209 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         cls._shared_gather_buf_idx = 0
         for registry in tuple(_CKV_PREFETCH_STATE_REGISTRIES):
             registry.clear()
+        for impl in tuple(cls._kvarn_instances):
+            impl._kvarn_dense_cache = None
+            impl._kvarn_remapped_indices = None
+            impl._kvarn_rotated_scratch = None
+            impl._kvarn_physical_slots = None
+        cls._kvarn_shared_dense.clear()
+        cls._kvarn_shared_remapped.clear()
+        cls._kvarn_shared_rotated.clear()
+        cls._kvarn_shared_physical_slots.clear()
+        from vllm.v1.attention.backends.mla.kvarn_mla_state import (
+            KVarNMLAStateManager,
+        )
+
+        KVarNMLAStateManager.reset_cache_bindings()
+
+    def _ensure_kvarn_mla_cache(self, kv_cache: torch.Tensor) -> None:
+        if not self._is_kvarn_mla:
+            return
+        if self._kvarn_group_key is None:
+            raise RuntimeError(
+                "MLA KVarN metadata must establish exact-block ownership before use"
+            )
+        from vllm.v1.attention.backends.mla.kvarn_mla_state import (
+            KVarNMLAStateManager,
+        )
+
+        self._kvarn_block_to_slot = KVarNMLAStateManager.ensure_mirror(
+            self._kvarn_group_key,
+            kv_cache.device,
+            kv_cache.shape[0],
+        )
+        if self._kvarn_physical_slots is None:
+            raise RuntimeError(
+                "KVarN MLA graph workspace was not initialized before cache use"
+            )
+        assert self._kvarn_config is not None
+        planned_pages = self._kvarn_physical_slots.numel() // self._kvarn_config.group
+        if kv_cache.shape[0] != planned_pages:
+            raise RuntimeError(
+                "KVarN MLA cache page count changed after workspace allocation: "
+                f"planned {planned_pages}, got {kv_cache.shape[0]}"
+            )
+        if self._kvarn_block_to_slot.shape[0] < planned_pages:
+            raise RuntimeError(
+                "KVarN MLA exact-slot map is smaller than the allocated cache"
+            )
+        self._kvarn_cache_ref = kv_cache
+
+    def _flush_kvarn_mla_blocks(
+        self, block_ids: torch.Tensor, pool_slots: torch.Tensor
+    ) -> None:
+        if self._kvarn_cache_ref is None or block_ids.numel() == 0:
+            return
+        assert self._kvarn_config is not None
+        from vllm.v1.attention.ops.kvarn_mla import pack_kvarn_mla_blocks
+
+        pack_kvarn_mla_blocks(
+            self._kvarn_cache_ref,
+            self._kvarn_latent_pool,
+            self._kvarn_rope_pool,
+            block_ids,
+            pool_slots,
+            self._kvarn_config,
+        )
+
+    def _materialize_kvarn_mla_cache(
+        self,
+        selected_indices: torch.Tensor,
+        _attn_metadata: B12xMLASparseMetadata,
+        kv_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self._kvarn_config is not None
+        assert self._kvarn_block_to_slot is not None
+        if (
+            self._kvarn_dense_cache is None
+            or self._kvarn_remapped_indices is None
+            or self._kvarn_physical_slots is None
+        ):
+            raise RuntimeError("KVarN MLA graph workspace is not initialized")
+        from vllm.v1.attention.ops.kvarn_mla import (
+            materialize_physical_kvarn_mla,
+            materialize_selected_kvarn_mla,
+        )
+
+        num_rows, width = selected_indices.shape
+        remap_elements = num_rows * width
+        if remap_elements > self._kvarn_remapped_indices.numel():
+            raise ValueError(
+                "KVarN MLA remap workspace has "
+                f"{self._kvarn_remapped_indices.numel()} entries, "
+                f"requires {remap_elements}"
+            )
+        remapped = self._kvarn_remapped_indices.view(-1)[:remap_elements].view(
+            num_rows, width
+        )
+        if num_rows <= self._decode_max_rows:
+            materialize_selected_kvarn_mla(
+                selected_indices,
+                kv_cache,
+                self._kvarn_block_to_slot,
+                self._kvarn_latent_pool,
+                self._kvarn_rope_pool,
+                self._kvarn_dense_cache,
+                remapped,
+                self._kvarn_config,
+            )
+        else:
+            materialize_physical_kvarn_mla(
+                self._kvarn_physical_slots,
+                selected_indices,
+                kv_cache,
+                self._kvarn_block_to_slot,
+                self._kvarn_latent_pool,
+                self._kvarn_rope_pool,
+                self._kvarn_dense_cache,
+                remapped,
+                self._kvarn_config,
+            )
+        return self._kvarn_dense_cache, remapped
+
+    def _stage_kvarn_mla_fp8_cache(
+        self,
+        selected_indices: torch.Tensor,
+        _attn_metadata: B12xMLASparseMetadata,
+        kv_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self._kvarn_config is not None
+        assert self._kvarn_block_to_slot is not None
+        if (
+            self._kvarn_dense_cache is None
+            or self._kvarn_remapped_indices is None
+            or self._kvarn_physical_slots is None
+        ):
+            raise RuntimeError("KVarN MLA graph workspace is not initialized")
+        from vllm.v1.attention.ops.kvarn_mla import (
+            stage_physical_kvarn_mla_fp8,
+        )
+
+        num_rows, width = selected_indices.shape
+        remap_elements = num_rows * width
+        if remap_elements > self._kvarn_remapped_indices.numel():
+            raise ValueError(
+                "KVarN MLA remap workspace has "
+                f"{self._kvarn_remapped_indices.numel()} entries, "
+                f"requires {remap_elements}"
+            )
+        remapped = self._kvarn_remapped_indices.view(-1)[:remap_elements].view(
+            num_rows, width
+        )
+        page_rows = kv_cache.shape[0] * self._kvarn_config.group
+        required_bytes = page_rows * 656
+        byte_workspace = self._kvarn_dense_cache.view(torch.uint8).view(-1)
+        if byte_workspace.numel() < required_bytes:
+            raise ValueError(
+                f"KVarN MLA FP8 workspace has fewer than {required_bytes} bytes"
+            )
+        records = byte_workspace[:required_bytes].view(page_rows, 656)
+        stage_physical_kvarn_mla_fp8(
+            self._kvarn_physical_slots,
+            selected_indices,
+            kv_cache,
+            self._kvarn_block_to_slot,
+            self._kvarn_latent_pool,
+            self._kvarn_rope_pool,
+            records,
+            remapped,
+            self._kvarn_config,
+        )
+        return records.view(-1, self.block_size, 656), remapped
+
+    def _forward_kvarn_mla(
+        self,
+        q: torch.Tensor,
+        dense_cache: torch.Tensor,
+        selected_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        assert self._kvarn_config is not None
+        from vllm.v1.attention.ops.xpu_mla_sparse import (
+            triton_bf16_mla_sparse_interface,
+        )
+
+        latent_dim = self._kvarn_config.latent_dim
+        dense = dense_cache.view(-1, latent_dim + self._kvarn_config.rope_dim)
+        out, _, lse = triton_bf16_mla_sparse_interface(
+            q,
+            dense.unsqueeze(1),
+            selected_indices.unsqueeze(1),
+            sm_scale=self.scale,
+            d_v=latent_dim,
+            block_dpe=self._kvarn_config.rope_dim,
+            out=q[..., :latent_dim],
+            return_lse=self.need_to_return_lse_for_decode,
+            return_max_logits=False,
+        )
+        return (
+            self._restore_kvarn_mla_output(out),
+            lse if self.need_to_return_lse_for_decode else None,
+        )
+
+    def _restore_kvarn_mla_output(self, output: torch.Tensor) -> torch.Tensor:
+        if not self._is_kvarn_mla:
+            return output
+        return kvarn_hadamard(output, self._kvarn_h)
 
     def do_kv_cache_update(
         self,
@@ -1733,6 +2162,43 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         b12x package writer API, which does not replace or perturb the stock
         writer used by KV_FP8_ROPE=0.
         """
+        if self._is_kvarn_mla:
+            if kv_cache.numel() == 0 or slot_mapping is None:
+                return
+            if self._kvarn_group_key is None:
+                return
+            assert self._kvarn_config is not None
+            self._ensure_kvarn_mla_cache(kv_cache)
+            assert self._kvarn_block_to_slot is not None
+            num_tokens = slot_mapping.numel()
+            if self._kvarn_rotated_scratch is None:
+                raise RuntimeError("KVarN MLA graph workspace is not initialized")
+            if num_tokens > self._kvarn_rotated_scratch.shape[0]:
+                raise ValueError(
+                    "KVarN MLA rotation workspace has "
+                    f"{self._kvarn_rotated_scratch.shape[0]} rows, "
+                    f"requires {num_tokens}"
+                )
+            if kv_c_normed.numel() < num_tokens * self._kvarn_config.latent_dim:
+                raise ValueError("KVarN MLA latent input has too few elements")
+            if k_pe.numel() < num_tokens * self._kvarn_config.rope_dim:
+                raise ValueError("KVarN MLA RoPE input has too few elements")
+            latent = kv_c_normed[:num_tokens].reshape(
+                num_tokens, self._kvarn_config.latent_dim
+            )
+            rotated = self._kvarn_rotated_scratch[:num_tokens]
+            kvarn_hadamard(latent, self._kvarn_h, out=rotated)
+            from vllm.v1.attention.ops.kvarn_mla import scatter_kvarn_mla_exact
+
+            scatter_kvarn_mla_exact(
+                rotated,
+                k_pe[:num_tokens].reshape(num_tokens, self._kvarn_config.rope_dim),
+                slot_mapping.reshape(-1),
+                self._kvarn_block_to_slot,
+                self._kvarn_latent_pool,
+                self._kvarn_rope_pool,
+            )
+            return
         if not self._kv_fp8_rope:
             return super().do_kv_cache_update(
                 kv_c_normed,
@@ -2296,7 +2762,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         tokens — not just the local rank's share — into the correct slots
         of the rank-ordered gathered buffer.
         """
-        if self._ckv_current_chunk_kv_c is None or num_actual_toks == 0:
+        if (
+            self._ckv_current_chunk_kv_c is None
+            or self._ckv_current_chunk_kpe is None
+            or num_actual_toks == 0
+        ):
             return
         kv_c = self._ckv_current_chunk_kv_c[:num_actual_toks]
         assert self._ckv_current_chunk_kpe is not None
@@ -2310,7 +2780,8 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         if global_seq_lens is None:
             return
         global_seq_lens = global_seq_lens[:num_reqs]
-        assert attn_metadata.req_id_per_token is not None
+        if attn_metadata.req_id_per_token is None:
+            return
         req_ids = attn_metadata.req_id_per_token[:num_actual_toks].to(torch.int64)
         global_seq_per_token = global_seq_lens[req_ids].to(torch.int32)
 
@@ -2333,7 +2804,8 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         ).to(torch.int64)
 
         rank_req_starts = attn_metadata.dcp_rank_req_starts
-        assert rank_req_starts is not None
+        if rank_req_starts is None:
+            return
         flat_idx = owner * num_reqs + req_ids
         # ``dcp_rank_req_starts`` is a ``[dcp, :num_reqs]`` slice of a
         # ``[dcp, max_seqs]`` buffer, so it is non-contiguous whenever
@@ -2506,14 +2978,21 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         attn_metadata: B12xMLASparseMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self._is_kvarn_mla and self._kvarn_group_key is None:
+            q_tensor = q[0] if isinstance(q, tuple) else q
+            output_shape = (*q_tensor.shape[:-1], self.kv_lora_rank)
+            return torch.zeros(
+                output_shape, dtype=q_tensor.dtype, device=q_tensor.device
+            ), None
         # Stored by MultiHeadLatentAttentionWrapper as a host float. Avoid
         # reading device state or allocating per-call CUDA state; the CuTe
         # launch receives this as a runtime scalar.
         latent_scale = float(getattr(layer, "_nvfp4_mla_outer_scale", 1.0))
         kernel_format_kwargs = self._b12x_kernel_format_kwargs(latent_scale)
         query_rows = q[0].shape[0] if isinstance(q, tuple) else q.shape[0]
-        use_ckv_gather = self.dcp_prefill_ckv_gather_eligible(
-            attn_metadata, int(query_rows)
+        use_ckv_gather = (
+            not self._is_kvarn_mla
+            and self.dcp_prefill_ckv_gather_eligible(attn_metadata, int(query_rows))
         )
         workspace_tensors = self._borrow_workspaces()
         q_workspace = workspace_tensors[0]
@@ -2544,7 +3023,13 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 )
             q_buffer = q_buffer[:num_actual_toks]
             q_all = q_buffer[:, :num_input_heads]
-            ops.concat_mla_q(ql_nope, q_pe, q_all)
+            if self._is_kvarn_mla:
+                q_all[..., : self.kv_lora_rank].copy_(
+                    kvarn_hadamard(ql_nope, self._kvarn_h)
+                )
+                q_all[..., self.kv_lora_rank :].copy_(q_pe)
+            else:
+                ops.concat_mla_q(ql_nope, q_pe, q_all)
         else:
             num_actual_toks = q.shape[0]
             num_input_heads = q.shape[1]
@@ -2565,6 +3050,13 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             )
             if not exact_workspace_alias:
                 q_all.copy_(q.contiguous())
+            if self._is_kvarn_mla:
+                q_all[..., : self.kv_lora_rank].copy_(
+                    kvarn_hadamard(
+                        q[..., : self.kv_lora_rank],
+                        self._kvarn_h,
+                    )
+                )
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
@@ -2648,29 +3140,58 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             selected_indices = topk_indices
             nsa_cache_seqlens = per_token_cache
 
-        # KV cache -> paged rank-3 uint8. B12X unified SM120 kernels consume
-        # flat slot ids in selected_indices, but compute raw byte offsets as:
-        #   block = slot // page_size, local = slot % page_size
-        # so the cache tensor itself must expose a per-block stride of
-        # block_size * record_bytes. The older split path used a token-flat
-        # (num_slots, 1, bytes) view; that makes stride(0) one record and breaks
-        # the unified block-stride contract.
-        kv_u8 = kv_c_and_k_pe_cache.view(torch.uint8)
-        if kv_u8.ndim == 3 and kv_u8.shape[1] == self.block_size:
-            kv_cache = kv_u8
-        elif kv_u8.ndim == 3 and kv_u8.shape[1] == 1:
-            if kv_u8.shape[0] % self.block_size != 0:
-                raise ValueError(
-                    "B12X_MLA_SPARSE flat KV cache rows must be divisible by "
-                    f"block_size={self.block_size}; got {kv_u8.shape[0]}"
-                )
-            kv_cache = kv_u8.reshape(-1, self.block_size, kv_u8.shape[-1])
-        else:
-            raise ValueError(
-                f"B12X_MLA_SPARSE expected {self.kv_cache_dtype} KV cache as "
-                f"(blocks,{self.block_size},bytes) or (slots,1,bytes), got "
-                f"{tuple(kv_u8.shape)}"
+        if self._is_kvarn_mla:
+            self._ensure_kvarn_mla_cache(kv_c_and_k_pe_cache)
+            use_spec_decode_kernel = self.spec_extend_as_decode and (
+                self.spec_extend_as_decode_force or attn_metadata.is_spec_decode
             )
+            use_decode_kernel = attn_metadata.max_query_len <= 1 or (
+                use_spec_decode_kernel
+                and attn_metadata.max_query_len <= self.spec_decode_max_q
+                and num_actual_toks <= attn_metadata.num_reqs * self.spec_decode_max_q
+                and num_actual_toks <= self._decode_max_rows
+            )
+            if use_decode_kernel:
+                dense_cache, selected_indices = self._materialize_kvarn_mla_cache(
+                    selected_indices,
+                    attn_metadata,
+                    kv_c_and_k_pe_cache,
+                )
+                return self._forward_kvarn_mla(
+                    q_all[:num_actual_toks, : self._input_num_heads],
+                    dense_cache,
+                    selected_indices,
+                )
+            kv_cache, selected_indices = self._stage_kvarn_mla_fp8_cache(
+                selected_indices,
+                attn_metadata,
+                kv_c_and_k_pe_cache,
+            )
+            kernel_format_kwargs = {"latent_scale": 1.0, "scale_format": 1}
+        else:
+            # KV cache -> paged rank-3 uint8. B12X unified SM120 kernels consume
+            # flat slot ids in selected_indices, but compute raw byte offsets as:
+            #   block = slot // page_size, local = slot % page_size
+            # so the cache tensor itself must expose a per-block stride of
+            # block_size * record_bytes. The older split path used a token-flat
+            # (num_slots, 1, bytes) view; that makes stride(0) one record and breaks
+            # the unified block-stride contract.
+            kv_u8 = kv_c_and_k_pe_cache.view(torch.uint8)
+            if kv_u8.ndim == 3 and kv_u8.shape[1] == self.block_size:
+                kv_cache = kv_u8
+            elif kv_u8.ndim == 3 and kv_u8.shape[1] == 1:
+                if kv_u8.shape[0] % self.block_size != 0:
+                    raise ValueError(
+                        "B12X_MLA_SPARSE flat KV cache rows must be divisible by "
+                        f"block_size={self.block_size}; got {kv_u8.shape[0]}"
+                    )
+                kv_cache = kv_u8.reshape(-1, self.block_size, kv_u8.shape[-1])
+            else:
+                raise ValueError(
+                    f"B12X_MLA_SPARSE expected {self.kv_cache_dtype} KV cache as "
+                    f"(blocks,{self.block_size},bytes) or (slots,1,bytes), got "
+                    f"{tuple(kv_u8.shape)}"
+                )
         if not kv_cache.is_contiguous():
             raise ValueError(
                 "B12X_MLA_SPARSE requires a contiguous native paged KV cache; "
@@ -2692,7 +3213,17 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             ckv_workspace = prefetch_state.get_ckv_workspace(self._ckv_workspace_nbytes)
             if layer_idx is not None and self._ckv_prefetch_depth > 0:
                 prefetch_state.enter_layer(layer_idx)
-                prefetch_state.register_cache(layer_idx, kv_cache)
+                # The prefetch registry must hold a per-layer cache. For
+                # KVarN MLA ``kv_cache`` is the cross-layer SHARED FP8
+                # staging view materialized from this layer's paged slice;
+                # registering it poisons every prefetched layer, whose
+                # side-stream gathers would then read this one tensor
+                # (identical wrong KV for every layer). The packed paged
+                # cache itself is not gatherable in this format, so KVarN
+                # MLA keeps no registry entry and every gather stays on the
+                # synchronous per-layer path below.
+                if not self._is_kvarn_mla:
+                    prefetch_state.register_cache(layer_idx, kv_cache)
             pending = (
                 prefetch_state.pending_layers.pop(layer_idx, None)
                 if layer_idx is not None and self._ckv_prefetch_depth > 0
@@ -2817,7 +3348,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     dense_out.copy_(out[:, : self._input_num_heads, :])
                     out = dense_out
                     lse = lse[:, : self._input_num_heads]
-                return out, lse
+                return self._restore_kvarn_mla_output(out), lse
             out = cast(
                 torch.Tensor,
                 self._sparse_mla_decode_forward(
@@ -2834,7 +3365,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 dense_out = dense_out_workspace[:num_actual_toks]
                 dense_out.copy_(out[:, : self._input_num_heads, :])
                 out = dense_out
-            return out, None
+            return self._restore_kvarn_mla_output(out), None
         else:
             # Extend / prefill -> single-pass unified prefill (no split-K
             # scratch needed; only output_buffer is read). b12x supports 8-head
@@ -2892,4 +3423,4 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 out = dense_out
                 if lse is not None:
                     lse = lse[:, : self._input_num_heads]
-        return out, lse
+        return self._restore_kvarn_mla_output(out), lse

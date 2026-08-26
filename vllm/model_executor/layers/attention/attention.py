@@ -420,6 +420,7 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_sharing_target_layer_name,
             **extra_impl_args,
         )
+        self.impl.layer_name = prefix  # type: ignore[attr-defined]
         self.backend = AttentionBackendEnum[self.attn_backend.get_name()]
         self.dtype = dtype
 
@@ -607,7 +608,27 @@ class Attention(nn.Module, AttentionLayerBase):
         # Should not be called for enc-dec attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
-        if self.sliding_window is not None:
+        if self.sliding_window is not None and self.kv_cache_dtype.startswith("kvarn_"):
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNConfig,
+            )
+            from vllm.v1.kv_cache_interface import KVarNSlidingWindowSpec
+
+            kvarn_config = KVarNConfig.from_cache_dtype(
+                self.kv_cache_dtype, self.head_size
+            )
+            return KVarNSlidingWindowSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+                sliding_window=self.sliding_window,
+                tile_size=kvarn_config.tile_bytes_aligned,
+                quant_group_size=kvarn_config.group,
+            )
+
+        elif self.sliding_window is not None:
             assert not self.attn_backend.is_mla(), (
                 "MLA is not supported for sliding window"
             )
@@ -658,6 +679,24 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
                 tq_slot_size=tq_config.slot_size_aligned,
+            )
+        elif self.kv_cache_dtype.startswith("kvarn_"):
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNConfig,
+            )
+            from vllm.v1.kv_cache_interface import KVarNFullAttentionSpec
+
+            kvarn_config = KVarNConfig.from_cache_dtype(
+                self.kv_cache_dtype, self.head_size
+            )
+            return KVarNFullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+                tile_size=kvarn_config.tile_bytes_aligned,
+                quant_group_size=kvarn_config.group,
             )
         else:
             return FullAttentionSpec(

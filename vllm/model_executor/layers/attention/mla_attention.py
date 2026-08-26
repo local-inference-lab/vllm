@@ -601,6 +601,8 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     kv_cache_dtype: CacheDType,
 ) -> CacheDType:
     backend_name = attn_backend.get_name()
+    if backend_name == "B12X_MLA_SPARSE" and kv_cache_dtype == "kvarn_mla_k5_g64":
+        return kv_cache_dtype
     if backend_name == "B12X_MLA_SPARSE" and kv_cache_dtype == "nvfp4_ds_mla":
         # B12X reads the packed 432B NVFP4 MLA record natively; do NOT coerce
         # it to fp8_ds_mla. [nvfp4_reader_port]
@@ -798,6 +800,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             indexer=indexer,
             **extra_impl_args,
         )
+        self.impl.layer_name = prefix  # type: ignore[attr-defined]
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
         self.use_safe_mla_query_bmm = getattr(
             self.impl, "use_safe_mla_query_bmm", False
@@ -1274,7 +1277,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
 
-        if fp8_attention and self.kv_cache_dtype not in ("fp8_ds_mla", "nvfp4_ds_mla"):
+        if (
+            fp8_attention
+            and not self.kv_cache_dtype.startswith("kvarn_")
+            and self.kv_cache_dtype not in ("fp8_ds_mla", "nvfp4_ds_mla")
+        ):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
         assert (
@@ -1305,6 +1312,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
             use_mha = (use_dense_mha or use_masked_mha) and not (
                 self._vllm_config.attention_config.sparse_mla_force_mqa
+                or self.kv_cache_dtype.startswith("kvarn_")
             )
             if not use_mha:
                 num_mqa_tokens = q.size(0)

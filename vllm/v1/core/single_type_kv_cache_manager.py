@@ -20,6 +20,8 @@ from vllm.v1.kv_cache_interface import (
     CrossAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
+    KVarNFullAttentionSpec,
+    KVarNSlidingWindowSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -95,6 +97,7 @@ class SingleTypeKVCacheManager(ABC):
         self._record_new_block_ids = needs_kv_cache_zeroing and type(kv_cache_spec) in (
             FullAttentionSpec,
             TQFullAttentionSpec,
+            KVarNFullAttentionSpec,
             MLAAttentionSpec,
             HiddenStateCacheSpec,
         )
@@ -1945,6 +1948,11 @@ def register_all_kvcache_specs(vllm_config):
         SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowMLASpec,
     )
+    KVCacheSpecRegistry.register(
+        KVarNSlidingWindowSpec,
+        SlidingWindowManager,
+        uniform_type_base_spec=KVarNSlidingWindowSpec,
+    )
 
     KVCacheSpecRegistry.register(
         MambaSpec, MambaManager, uniform_type_base_spec=MambaSpec
@@ -1963,6 +1971,11 @@ def register_all_kvcache_specs(vllm_config):
     # FullAttentionSpec subclasses — grouped with FullAttentionSpec
     KVCacheSpecRegistry.register(
         TQFullAttentionSpec,
+        FullAttentionManager,
+        uniform_type_base_spec=FullAttentionSpec,
+    )
+    KVCacheSpecRegistry.register(
+        KVarNFullAttentionSpec,
         FullAttentionManager,
         uniform_type_base_spec=FullAttentionSpec,
     )
