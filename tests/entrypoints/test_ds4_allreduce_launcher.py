@@ -37,11 +37,11 @@ def _dry_run(tmp_path: Path, **overrides: str) -> str:
     return result.stderr
 
 
-def test_ds4_launcher_auto_selects_flashinfer_ipc_for_tp2(tmp_path: Path) -> None:
-    """Verify that automatic selection uses FlashInfer IPC at TP2."""
+def test_ds4_launcher_auto_selects_b12x_for_tp2(tmp_path: Path) -> None:
+    """Verify that automatic selection uses B12X policy at TP2."""
     output = _dry_run(tmp_path, TP="2")
 
-    assert "allreduce=flashinfer-ipc" in output
+    assert "allreduce=b12x" in output
 
 
 def test_ds4_launcher_auto_keeps_b12x_for_tp4(tmp_path: Path) -> None:
