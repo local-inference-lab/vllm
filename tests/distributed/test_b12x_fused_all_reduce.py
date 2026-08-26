@@ -33,6 +33,7 @@ from vllm.distributed.device_communicators.custom_all_reduce import (
     _b12x_pcie_allreduce_max_size,
     _b12x_pcie_dma_min_bytes,
     _b12x_pcie_oneshot_limits,
+    _b12x_pcie_plain_route_generic_max_size,
     _load_b12x_pcie_recommended_max_bytes,
     get_b12x_pcie_allreduce,
 )
@@ -73,15 +74,18 @@ def make_b12x_custom_allreduce(
 ) -> tuple[CustomAllreduce, MagicMock]:
     runtime = MagicMock()
     runtime.for_stream.return_value.should_allreduce.return_value = True
+    runtime.for_stream.return_value.should_route_plain_allreduce.return_value = True
 
     custom_allreduce = object.__new__(CustomAllreduce)
     custom_allreduce.disabled = False
     custom_allreduce.world_size = world_size
     custom_allreduce._pcie_runtime = runtime
+    custom_allreduce._pcie_backend_name = "b12x"
     custom_allreduce._pcie_dma = None
     custom_allreduce._pcie_capture_stream = None
     custom_allreduce._pcie_capture_channel_id = None
     custom_allreduce._pcie_allreduce_max_size = allreduce_max_size
+    custom_allreduce._pcie_plain_route_generic_max_size = allreduce_max_size
     custom_allreduce._pcie_fused_add_rms_norm_max_size = fused_max_size
     custom_allreduce._pcie_logged_first_allreduce = False
     custom_allreduce._IS_CAPTURING = False
@@ -163,6 +167,7 @@ def test_b12x_eager_owner_fails_closed_on_second_stream_bind() -> None:
             raise RuntimeError("stream-affine logical owner rebound")
         channel = MagicMock()
         channel.should_allreduce.return_value = True
+        channel.should_route_plain_allreduce.return_value = True
         return channel
 
     runtime.for_stream.side_effect = for_stream
@@ -185,7 +190,43 @@ def test_b12x_hierarchical_allreduce_dispatches_above_world_size_eight() -> None
     inp = torch.randn(2, 4)
 
     assert custom_allreduce.should_custom_ar(inp)
-    runtime.for_stream.return_value.should_allreduce.assert_called_once_with(inp)
+    route_policy = runtime.for_stream.return_value.should_route_plain_allreduce
+    route_policy.assert_called_once_with(
+        inp,
+        generic_max_bytes=64,
+        graph_capture=False,
+    )
+
+
+def test_b12x_plain_route_receives_graph_capture_state() -> None:
+    custom_allreduce, runtime = make_b12x_custom_allreduce(
+        allreduce_max_size=512 * 1024,
+        fused_max_size=64,
+    )
+    custom_allreduce._pcie_plain_route_generic_max_size = 84 * 1024
+    custom_allreduce._IS_CAPTURING = True
+    inp = torch.empty((64, 4096), dtype=torch.bfloat16)
+
+    assert custom_allreduce.should_custom_ar(inp)
+    route_policy = runtime.for_stream.return_value.should_route_plain_allreduce
+    route_policy.assert_called_once_with(
+        inp,
+        generic_max_bytes=84 * 1024,
+        graph_capture=True,
+    )
+
+
+def test_b12x_plain_route_supports_runtime_without_policy_api() -> None:
+    custom_allreduce, runtime = make_b12x_custom_allreduce(
+        allreduce_max_size=64,
+        fused_max_size=64,
+    )
+    legacy_channel = SimpleNamespace(should_allreduce=MagicMock(return_value=True))
+    runtime.for_stream.return_value = legacy_channel
+    inp = torch.randn(2, 4)
+
+    assert custom_allreduce.should_custom_ar(inp)
+    legacy_channel.should_allreduce.assert_called_once_with(inp)
 
 
 def test_b12x_fused_allreduce_falls_back_above_its_cutoff() -> None:
@@ -468,6 +509,22 @@ def test_b12x_allreduce_limit_preserves_explicit_operator_value(
 
     assert _b12x_pcie_allreduce_max_size(16) == 64 * 1024
     recommender.assert_not_called()
+
+
+def test_b12x_plain_route_generic_limit_is_not_enlarged_by_runtime_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", raising=False)
+
+    assert _b12x_pcie_plain_route_generic_max_size() == 84 * 1024
+
+
+def test_b12x_plain_route_generic_limit_preserves_operator_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "64KB")
+
+    assert _b12x_pcie_plain_route_generic_max_size() == 64 * 1024
 
 
 def test_b12x_allreduce_limit_uses_vllm_default_without_b12x_policy(

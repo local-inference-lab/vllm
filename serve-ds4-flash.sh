@@ -182,11 +182,7 @@ export VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD=${VLLM_MULTI_STREAM_GEMM_TOKEN_THR
 
 allreduce_mode=${ALLREDUCE_MODE:-auto}
 if [[ "${allreduce_mode}" == "auto" ]]; then
-  if [[ "${tp_size}" == "2" ]]; then
-    allreduce_mode=flashinfer-ipc
-  else
-    allreduce_mode=b12x
-  fi
+  allreduce_mode=b12x
 fi
 b12x_pcie_dma=$(bool_value B12X_PCIE_DMA "${B12X_PCIE_DMA:-0}")
 export VLLM_USE_B12X_PCIE_DMA=${b12x_pcie_dma}
@@ -195,7 +191,6 @@ case "${allreduce_mode}" in
   b12x)
     export VLLM_ENABLE_PCIE_ALLREDUCE=1
     export VLLM_PCIE_ALLREDUCE_BACKEND=b12x
-    export VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE=${VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE:-64KB}
     export VLLM_ALLOW_CUSTOM_ALLREDUCE_PCIE=0
     export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
     ;;

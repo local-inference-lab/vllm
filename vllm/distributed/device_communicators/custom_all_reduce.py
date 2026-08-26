@@ -140,6 +140,19 @@ def _b12x_pcie_allreduce_max_size(world_size: int) -> int:
     return resolved
 
 
+def _b12x_pcie_plain_route_generic_max_size() -> int:
+    """Resolve the operator-controlled generic B12X/NCCL crossover.
+
+    Returns:
+        Maximum tensor size in bytes routed through the generic B12X path.
+    """
+
+    configured = os.getenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE")
+    if configured is not None:
+        return _parse_byte_size(configured)
+    return _parse_byte_size(envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE)
+
+
 def _b12x_pcie_oneshot_limits(world_size: int) -> tuple[int, int, int]:
     allreduce_max_size = _b12x_pcie_allreduce_max_size(world_size)
     fused_max_size = _parse_byte_size(
@@ -364,6 +377,7 @@ class CustomAllreduce:
         self._pcie_capture_stream: torch.cuda.Stream | None = None
         self._pcie_capture_channel_id: str | None = None
         self._pcie_allreduce_max_size: int | None = None
+        self._pcie_plain_route_generic_max_size: int | None = None
         self._pcie_fused_add_rms_norm_max_size: int | None = None
         self._cpp_ar_cutoff_size: int | None = None
         self._cpp_ar_ignore_cutoff_max_rows = 0
@@ -599,6 +613,9 @@ class CustomAllreduce:
                 self._pcie_fused_add_rms_norm_max_size,
                 pcie_oneshot_buffer_size,
             ) = _b12x_pcie_oneshot_limits(world_size)
+            self._pcie_plain_route_generic_max_size = (
+                _b12x_pcie_plain_route_generic_max_size()
+            )
             if self.nccl_group is None:
                 logger.warning(
                     "Custom allreduce is disabled because %s PCIe oneshot "
@@ -1037,13 +1054,27 @@ class CustomAllreduce:
             return False
         if self._pcie_runtime is not None:
             inp_size = inp.numel() * inp.element_size()
+            channel = self._pcie_runtime.for_stream(
+                self._pcie_runtime_stream(),
+                channel_id=self._pcie_runtime_channel_id(),
+            )
+            should_route = getattr(channel, "should_route_plain_allreduce", None)
+            if self._pcie_backend_name == "b12x" and should_route is not None:
+                assert self._pcie_plain_route_generic_max_size is not None
+                runtime_accepts = should_route(
+                    inp,
+                    generic_max_bytes=self._pcie_plain_route_generic_max_size,
+                    graph_capture=(
+                        self._IS_CAPTURING
+                        or (inp.is_cuda and torch.cuda.is_current_stream_capturing())
+                    ),
+                )
+            else:
+                runtime_accepts = channel.should_allreduce(inp)
             use_custom = (
                 self._pcie_allreduce_max_size is not None
                 and inp_size <= self._pcie_allreduce_max_size
-                and self._pcie_runtime.for_stream(
-                    self._pcie_runtime_stream(),
-                    channel_id=self._pcie_runtime_channel_id(),
-                ).should_allreduce(inp)
+                and runtime_accepts
             )
             if (
                 not use_custom
