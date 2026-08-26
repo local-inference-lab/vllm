@@ -206,6 +206,13 @@ class SchedulerStats:
     spec_decoding_stats: SpecDecodingStats | None = None
     kv_connector_stats: dict[str, Any] | None = None
 
+    # Cumulative DSpark prefix-repair and suppression counters
+    # (scheduler-side repairs + worker-reported fail-closed suppressions).
+    dspark_prefix_repairs: int = 0
+    dspark_prefix_repair_tokens: int = 0
+    dspark_prefix_suppressed_batches: int = 0
+    dspark_prefix_suppressed_rows: int = 0
+
     waiting_lora_adapters: dict[str, int] = field(default_factory=dict)
     running_lora_adapters: dict[str, int] = field(default_factory=dict)
 

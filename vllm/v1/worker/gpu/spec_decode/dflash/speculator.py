@@ -133,6 +133,13 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
         self.num_cached_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
 
+        # Suppression accounting for batches that still hit the
+        # block-unaligned fail-closed path (e.g. external/connector-restored
+        # tokens). Observable counters so the fleet-level suppress ratio can be
+        # measured after the scheduler-side repair is deployed.
+        self.num_unaligned_prefix_suppressed_batches = 0
+        self.num_unaligned_prefix_suppressed_rows = 0
+
         # Per-mask-token sampling buffers. Flattened from (num_reqs, num_spec_tokens).
         max_num_sampled_tokens = self.max_num_reqs * self.num_speculative_steps
         self.sample_indices = torch.zeros(
@@ -708,11 +715,17 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         if not dummy_run and self._has_unaligned_cached_prefix(input_batch):
-            logger.warning_once(
-                "DFlash/DSpark drafting is disabled for a batch containing a "
-                "block-unaligned cache-restored prefix because draft KV is "
-                "not available for the restored partial block."
-            )
+            self.num_unaligned_prefix_suppressed_batches += 1
+            self.num_unaligned_prefix_suppressed_rows += num_reqs
+            if self.num_unaligned_prefix_suppressed_batches % 100 == 1:
+                logger.warning(
+                    "DFlash/DSpark drafting is disabled for a batch containing "
+                    "a block-unaligned cache-restored prefix because draft KV "
+                    "is not available for the restored partial block. "
+                    "Suppressed so far: %d batches, %d rows.",
+                    self.num_unaligned_prefix_suppressed_batches,
+                    self.num_unaligned_prefix_suppressed_rows,
+                )
             self.draft_tokens[:num_reqs].fill_(-1)
             return self.draft_tokens[:num_reqs]
         active_num_speculative_steps = self.num_speculative_steps

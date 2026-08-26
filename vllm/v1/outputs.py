@@ -298,6 +298,12 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    # Cumulative DSpark prefix-suppression counters reported
+    # by the worker's draft speculator (block-unaligned fail-closed batches
+    # and rows). The engine core exports them as metrics.
+    dspark_suppressed_batches: int = 0
+    dspark_suppressed_rows: int = 0
+
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 

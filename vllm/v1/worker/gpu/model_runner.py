@@ -2249,6 +2249,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     num_spec_tokens_to_schedule,
                     self.num_speculative_steps,
                 )
+                # propose() records unaligned cached-prefix suppressions. Update
+                # the shared output only after that call so async output observes
+                # the current cumulative counters rather than the prior step.
+                model_runner_output.dspark_suppressed_batches = getattr(
+                    self.speculator, "num_unaligned_prefix_suppressed_batches", 0
+                )
+                model_runner_output.dspark_suppressed_rows = getattr(
+                    self.speculator, "num_unaligned_prefix_suppressed_rows", 0
+                )
             with record_function_or_nullcontext(
                 f"vllm:v2/speculator/{phase}/store_draft_tokens"
             ):

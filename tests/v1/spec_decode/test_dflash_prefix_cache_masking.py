@@ -48,6 +48,51 @@ def test_unaligned_cached_prefix_detection():
     assert DFlashSpeculator._has_unaligned_cached_prefix(speculator, unaligned)
 
 
+@pytest.mark.parametrize("num_cached", [31, 33, 47, 49])
+def test_unaligned_detection_single_request(num_cached: int):
+    speculator = SimpleNamespace(
+        num_cached_tokens_np=np.array([num_cached], dtype=np.int32),
+        block_tables=SimpleNamespace(kernel_block_sizes=[16]),
+    )
+    batch = SimpleNamespace(
+        idx_mapping_np=np.array([0], dtype=np.int32),
+        num_reqs=1,
+    )
+    assert DFlashSpeculator._has_unaligned_cached_prefix(speculator, batch)
+
+
+@pytest.mark.parametrize("num_cached", [32, 48])
+def test_aligned_detection_single_request(num_cached: int):
+    speculator = SimpleNamespace(
+        num_cached_tokens_np=np.array([num_cached], dtype=np.int32),
+        block_tables=SimpleNamespace(kernel_block_sizes=[16]),
+    )
+    batch = SimpleNamespace(
+        idx_mapping_np=np.array([0], dtype=np.int32),
+        num_reqs=1,
+    )
+    assert not DFlashSpeculator._has_unaligned_cached_prefix(speculator, batch)
+
+
+@pytest.mark.parametrize(
+    "cached_counts,expected",
+    [
+        (np.array([32, 35], dtype=np.int32), True),
+        (np.array([32, 48], dtype=np.int32), False),
+    ],
+)
+def test_unaligned_detection_mixed_batch(cached_counts, expected: bool):
+    speculator = SimpleNamespace(
+        num_cached_tokens_np=cached_counts,
+        block_tables=SimpleNamespace(kernel_block_sizes=[16]),
+    )
+    batch = SimpleNamespace(
+        idx_mapping_np=np.arange(2, dtype=np.int32),
+        num_reqs=2,
+    )
+    assert DFlashSpeculator._has_unaligned_cached_prefix(speculator, batch) is expected
+
+
 def _make_block_table(num_reqs: int) -> torch.Tensor:
     # Distinct block ids per (request, slot) so shifts are detectable.
     table = torch.arange(
@@ -63,6 +108,12 @@ def _make_block_table(num_reqs: int) -> torch.Tensor:
         (BLOCK_SIZE * 3, 3),  # block-aligned hit (the common APC case)
         (BLOCK_SIZE * 3 + 5, 3),  # unaligned: floor to whole blocks
         (BLOCK_SIZE - 1, 0),  # less than one block: no-op
+        (BLOCK_SIZE * 2 - 1, 1),  # 31: floor 1 block
+        (BLOCK_SIZE * 2, 2),  # 32: aligned
+        (BLOCK_SIZE * 2 + 1, 2),  # 33: floor 2 blocks
+        (BLOCK_SIZE * 3 - 1, 2),  # 47: floor 2 blocks
+        (BLOCK_SIZE * 3, 3),  # 48: aligned
+        (BLOCK_SIZE * 3 + 1, 3),  # 49: floor 3 blocks
     ],
 )
 def test_shift_single_request(num_cached: int, expected_shift: int):
@@ -117,6 +168,36 @@ def test_shift_per_request_and_idx_mapping():
             block_table[batch_idx, :kept],
             original[batch_idx, shift:],
             msg=f"batch row {batch_idx} (slot {shift})",
+        )
+
+
+def test_shift_mixed_aligned_unaligned_batch():
+    # A mixed 32+35-token batch: both rows floor to a 2-block shift (the
+    # residual 3 tokens of the unaligned request are hidden by the repaired
+    # scheduler admission, never by the block-table shift).
+    num_reqs = 2
+    block_table = _make_block_table(num_reqs)
+    original = block_table.clone()
+    idx_mapping = torch.tensor([1, 0], dtype=torch.int32, device=DEVICE)
+    num_cached_tokens = torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device=DEVICE)
+    num_cached_tokens[:2] = torch.tensor([35, 32], dtype=torch.int32, device=DEVICE)
+
+    seq_lens = torch.full(
+        (num_reqs,),
+        MAX_BLOCKS * BLOCK_SIZE,
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    shift_draft_block_tables(
+        block_table, idx_mapping, num_cached_tokens, seq_lens, BLOCK_SIZE
+    )
+
+    for batch_idx in range(num_reqs):
+        kept = MAX_BLOCKS - 2
+        torch.testing.assert_close(
+            block_table[batch_idx, :kept],
+            original[batch_idx, 2:],
+            msg=f"batch row {batch_idx}",
         )
 
 

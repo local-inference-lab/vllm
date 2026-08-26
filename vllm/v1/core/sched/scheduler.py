@@ -54,7 +54,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -178,6 +178,18 @@ class Scheduler(SchedulerInterface):
         self.block_size = block_size
         self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
         self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+
+        # DSpark prefix-repair accounting. When a cache lookup
+        # restores a block-unaligned prefix, only the block-aligned region is
+        # adopted and the tail prefills through the target so the draft KV
+        # becomes valid (otherwise DFlash/DSpark drafting fail-closes for the
+        # whole batch).
+        self.num_dspark_prefix_repairs = 0
+        self.num_dspark_prefix_repair_tokens = 0
+        # Worker-reported cumulative suppression counters,
+        # refreshed from the model runner output and exported via SchedulerStats.
+        self._dspark_suppressed_batches = 0
+        self._dspark_suppressed_rows = 0
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
@@ -479,6 +491,83 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.get_computed_blocks(request)
         )
         return blocks, num_local, shared_prefix_boundary, False
+
+    def _repair_unaligned_dspark_prefix_enabled(self) -> bool:
+        """Whether local prefix-cache hits must be repaired for DSpark.
+
+        DFlash/DSpark derive their draft KV from target hidden states, so
+        tokens restored from the prefix cache never have draft KV. A
+        block-unaligned restored prefix cannot be hidden by the draft
+        block-table shift and currently fail-closes drafting for the whole
+        batch. Only the speculators with this property need the repair.
+        """
+        speculative_config = self.vllm_config.speculative_config
+        if (
+            speculative_config is None
+            or speculative_config.method not in ("dspark", "dflash")
+            or self.connector is not None
+            or self.dcp_world_size != 1
+            or self.need_mamba_block_aligned_split
+            or getattr(
+                self.kv_cache_manager.coordinator, "enable_partial_hash_hits", False
+            )
+        ):
+            return False
+
+        groups = self.kv_cache_config.kv_cache_groups
+        if (
+            sum(isinstance(group.kv_cache_spec, FullAttentionSpec) for group in groups)
+            != 1
+        ):
+            return False
+
+        return all(
+            self.block_size % manager.block_size == 0
+            for manager in self.kv_cache_manager.coordinator.single_type_managers
+        )
+
+    def _repair_unaligned_dspark_prefix(
+        self, blocks: KVCacheBlocks, num_local_computed_tokens: int
+    ) -> tuple[KVCacheBlocks, int, int]:
+        """Clamp a block-unaligned local cache hit to its aligned prefix.
+
+        The residual tail is not adopted from the cache: it prefills through
+        the target forward so its hidden states produce valid DFlash/DSpark
+        draft KV. Without this repair a single unaligned request would
+        fail-close drafting for every aligned request in the same batch.
+
+        Args:
+            blocks: Computed-block lookup result for the request.
+            num_local_computed_tokens: Tokens restored from the local cache.
+
+        Returns:
+            (blocks, aligned_tokens, partial_tail): the truncated lookup
+            result, the aligned restored-token count, and the tail length
+            (0 when no repair was needed or applied).
+        """
+        if not self._repair_unaligned_dspark_prefix_enabled():
+            return blocks, num_local_computed_tokens, 0
+        partial_tail = num_local_computed_tokens % self.block_size
+        if partial_tail == 0:
+            return blocks, num_local_computed_tokens, 0
+        blocks = self.kv_cache_manager.truncate_computed_blocks(
+            blocks, num_local_computed_tokens - partial_tail
+        )
+        num_local_computed_tokens -= partial_tail
+        self.num_dspark_prefix_repairs += 1
+        self.num_dspark_prefix_repair_tokens += partial_tail
+        if self.num_dspark_prefix_repairs % 100 == 1:
+            logger.info(
+                "DSpark prefix repair: restored %d of %d cached tokens "
+                "(block-aligned) and the %d-token tail prefills normally "
+                "(repairs=%d, repair_tokens=%d).",
+                num_local_computed_tokens,
+                num_local_computed_tokens + partial_tail,
+                partial_tail,
+                self.num_dspark_prefix_repairs,
+                self.num_dspark_prefix_repair_tokens,
+            )
+        return blocks, num_local_computed_tokens, partial_tail
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -806,6 +895,22 @@ class Scheduler(SchedulerInterface):
                         request.shared_prefix_boundary,
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
+
+                    # Repair a block-unaligned restored prefix
+                    # for DSpark. Adopt only the block-aligned region and let
+                    # the residual tail prefill through the target forward so
+                    # its target hidden states produce valid draft KV. Without
+                    # this, one unaligned request fail-closes DSpark drafting
+                    # for every aligned request in the same batch. The
+                    # connector path keeps its own tail arbitration and is not
+                    # touched here.
+                    (
+                        new_computed_blocks,
+                        num_new_local_computed_tokens,
+                        _,
+                    ) = self._repair_unaligned_dspark_prefix(
+                        new_computed_blocks, num_new_local_computed_tokens
+                    )
 
                     # Get externally-cached tokens if using a KVConnector.
                     # Even when reads are disabled, call the connector so it
@@ -1738,6 +1843,14 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = model_runner_output.ec_connector_output
+
+        # Refresh the worker-reported suppression counters.
+        self._dspark_suppressed_batches = getattr(
+            model_runner_output, "dspark_suppressed_batches", 0
+        )
+        self._dspark_suppressed_rows = getattr(
+            model_runner_output, "dspark_suppressed_rows", 0
+        )
         cudagraph_stats = model_runner_output.cudagraph_stats
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
@@ -2653,6 +2766,10 @@ class Scheduler(SchedulerInterface):
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
             num_scheduled_prompt_tokens=num_scheduled_prompt_tokens,
+            dspark_prefix_repairs=self.num_dspark_prefix_repairs,
+            dspark_prefix_repair_tokens=self.num_dspark_prefix_repair_tokens,
+            dspark_prefix_suppressed_batches=self._dspark_suppressed_batches,
+            dspark_prefix_suppressed_rows=self._dspark_suppressed_rows,
         )
 
     def make_spec_decoding_stats(
