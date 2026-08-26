@@ -43,7 +43,7 @@ def _install_recording_b12x(monkeypatch, caps_calls: list[SimpleNamespace]):
     b12x.__path__ = []
     attention = types.ModuleType("b12x.attention")
     attention.__path__ = []
-    compressed_mla = types.ModuleType("b12x.attention.compressed_mla")
+    compressed_mla = types.ModuleType("b12x.attention.compressed_sparse_mla")
 
     def caps(**kwargs) -> SimpleNamespace:
         return SimpleNamespace(**kwargs)
@@ -74,7 +74,7 @@ def _install_recording_b12x(monkeypatch, caps_calls: list[SimpleNamespace]):
     monkeypatch.setitem(sys.modules, "b12x.attention", attention)
     monkeypatch.setitem(
         sys.modules,
-        "b12x.attention.compressed_mla",
+        "b12x.attention.compressed_sparse_mla",
         compressed_mla,
     )
     return split_chunks_for_contract
@@ -431,7 +431,7 @@ def test_real_b12x_reserve_dominates_runtime_envelope(
     runtime_widths: tuple[int, ...],
     expected_reserve_mib: float,
 ) -> None:
-    compressed_mla = pytest.importorskip("b12x.attention.compressed_mla")
+    compressed_mla = pytest.importorskip("b12x.attention.compressed_sparse_mla")
     workspace = _RecordingWorkspaceManager()
     monkeypatch.setattr(b12x_mod, "current_workspace_manager", lambda: workspace)
     layer = _make_layer(
@@ -464,7 +464,7 @@ def test_real_b12x_reserve_dominates_runtime_envelope(
 def test_mns64_contract_does_not_grow_production_mnb8192_scratch(
     monkeypatch,
 ) -> None:
-    compressed_mla = pytest.importorskip("b12x.attention.compressed_mla")
+    compressed_mla = pytest.importorskip("b12x.attention.compressed_sparse_mla")
     workspace = _RecordingWorkspaceManager()
     monkeypatch.setattr(b12x_mod, "current_workspace_manager", lambda: workspace)
     max_rows = 8192
