@@ -217,6 +217,37 @@ def test_glm5next_model_applies_exl3_name_normalization():
     assert loaded == set()
 
 
+def test_glm5next_model_retains_quant_config_for_weight_loading(monkeypatch):
+    pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=False)
+    monkeypatch.setattr(glm5next_model, "get_pp_group", lambda: pp_group)
+    monkeypatch.setattr(
+        glm5next_model,
+        "make_layers",
+        lambda *args, **kwargs: (0, 0, torch.nn.ModuleList()),
+    )
+    monkeypatch.setattr(
+        glm5next_model, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    quant_config = object()
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                vocab_size=1,
+                hidden_size=8,
+                num_hidden_layers=0,
+                num_attention_heads=1,
+                index_topk=None,
+            )
+        ),
+        quant_config=quant_config,
+        parallel_config=SimpleNamespace(use_sequence_parallel_moe=False),
+    )
+
+    model = glm5next_model.Glm5NextModel(vllm_config=vllm_config)
+
+    assert model.quant_config is quant_config
+
+
 def test_glm_model_retains_quant_config_for_weight_loading(monkeypatch):
     pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=False)
     monkeypatch.setattr(glm4_moe, "get_pp_group", lambda: pp_group)

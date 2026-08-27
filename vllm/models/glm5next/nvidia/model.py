@@ -908,6 +908,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
 
         config = vllm_config.model_config.hf_config
         self.config = config
+        self.quant_config = vllm_config.quant_config
         speculative_config = vllm_config.speculative_config
         self.dflash_capture = speculative_config is not None and (
             speculative_config.use_dflash()
