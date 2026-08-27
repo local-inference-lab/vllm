@@ -625,6 +625,7 @@ class GroupCoordinator:
 
         # only cuda uses this function,
         # so we don't abstract it into the base class
+        maybe_b12x_context = nullcontext()
         maybe_ca_context = nullcontext()
         maybe_aiter_context = nullcontext()
         from vllm.distributed.device_communicators.cuda_communicator import (
@@ -639,6 +640,9 @@ class GroupCoordinator:
                 self.device_communicator,
                 (CudaCommunicator, XpuCommunicator),
             )
+            b12x_ar_comm = getattr(self.device_communicator, "b12x_ar_comm", None)
+            if b12x_ar_comm is not None:
+                maybe_b12x_context = b12x_ar_comm.capture(stream=stream)
             ca_comm = self.device_communicator.ca_comm
             if ca_comm is not None:
                 maybe_ca_context = ca_comm.capture()  # type: ignore
@@ -656,7 +660,12 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with torch.cuda.stream(stream), maybe_ca_context, maybe_aiter_context:
+        with (
+            torch.cuda.stream(stream),
+            maybe_b12x_context,
+            maybe_ca_context,
+            maybe_aiter_context,
+        ):
             yield graph_capture_context
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
@@ -1223,14 +1232,14 @@ class GroupCoordinator:
         return self.device_communicator.recv(size, dtype, src)
 
     def destroy(self):
+        if self.device_communicator is not None:
+            self.device_communicator.destroy()
         if hasattr(self, "device_group"):
             torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
         if hasattr(self, "cpu_group"):
             torch.distributed.destroy_process_group(self.cpu_group)
             del self.cpu_group
-        if self.device_communicator is not None:
-            self.device_communicator.destroy()
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 

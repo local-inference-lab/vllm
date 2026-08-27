@@ -155,7 +155,7 @@ def enable_act_fusion(cfg: "VllmConfig") -> bool:
 
 
 def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
-    """Enable if TP > 1 and Hopper/Blackwell and flashinfer installed."""
+    """Enable when a supported fused all-reduce RMSNorm backend is active."""
     from vllm.platforms import current_platform
     from vllm.utils.flashinfer import has_flashinfer
 
@@ -170,14 +170,13 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
             rocm_aiter_ops.is_enabled() and cfg.parallel_config.tensor_parallel_size > 1
         )
 
-    return (
-        cfg.parallel_config.tensor_parallel_size > 1
-        and current_platform.is_cuda()
-        and has_flashinfer()
-        and (
-            current_platform.is_device_capability_family(100)
-            or current_platform.is_device_capability(90)
-        )
+    if cfg.parallel_config.tensor_parallel_size <= 1 or not current_platform.is_cuda():
+        return False
+    if envs.VLLM_ENABLE_PCIE_ALLREDUCE:
+        return envs.VLLM_PCIE_ALLREDUCE_BACKEND == "b12x"
+    return has_flashinfer() and (
+        current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability(90)
     )
 
 

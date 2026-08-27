@@ -218,6 +218,12 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
+    VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
+    VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x"] = "b12x"
+    VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
+    VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
+    VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
+    VLLM_PCIE_DMA_FP8: str | None = None
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1868,6 +1874,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ALLREDUCE_USE_FLASHINFER": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER", "1"))
     ),
+    # Enable the B12X all-reduce implementation for PCIe-connected GPUs.
+    "VLLM_ENABLE_PCIE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_PCIE_ALLREDUCE", "0"))
+    ),
+    "VLLM_PCIE_ALLREDUCE_BACKEND": env_with_choices(
+        "VLLM_PCIE_ALLREDUCE_BACKEND", "b12x", ["b12x"]
+    ),
+    # Maximum input sizes dispatched to the low-latency one-shot kernels.
+    "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "84KB"
+    ),
+    "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "84KB"
+    ),
+    # Minimum input size for the DMA ring. Set to "off" to keep large
+    # all-reduces on the normal fallback backend.
+    "VLLM_PCIE_DMA_MIN_BYTES": lambda: os.getenv("VLLM_PCIE_DMA_MIN_BYTES", "6MB"),
+    # Optional B12X DMA wire codec. Unset uses lossless transport.
+    "VLLM_PCIE_DMA_FP8": lambda: os.getenv("VLLM_PCIE_DMA_FP8"),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
