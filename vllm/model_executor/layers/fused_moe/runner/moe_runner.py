@@ -758,10 +758,20 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
-        # If routed output is already reduced, reduce shared to match.
+        # A TP-sharded output transform turns a reduced latent into a partial
+        # hidden state. Keep the shared output partial so the two branches can
+        # share the final all-reduce.
+        output_transform_is_tp_partial = bool(
+            self.routed_output_transform is not None
+            and getattr(self.routed_output_transform, "output_is_tp_partial", False)
+        )
+
+        # If routed output is already reduced, reduce shared to match unless
+        # the output transform makes the routed branch TP-partial again.
         # See note above re: the two all-reduce points.
         shared_output = self._maybe_reduce_shared_expert_output(
-            shared_output, fused_output_is_reduced
+            shared_output,
+            fused_output_is_reduced and not output_transform_is_tp_partial,
         )
 
         shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
@@ -770,6 +780,8 @@ class MoERunner(MoERunnerInterface):
 
         # Apply output transform (e.g. latent -> full dim)
         fused_output = self.apply_routed_output_transform(fused_output)
+        if output_transform_is_tp_partial:
+            fused_output_is_reduced = False
 
         if shared_output is not None:
             result = shared_output + fused_output

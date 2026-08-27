@@ -52,14 +52,15 @@ class LatentTailTier(IntEnum):
 
 
 class LatentMoERunner(MoERunner):
-    """MoE runner for latent MoE with a replicated routed up-projection.
+    """MoE runner for latent MoE output projections.
 
     The fused path (tp>1, un-reduced combine output, shared expert, no SP)
     dispatches over ``LatentTailTier`` by token count; see that enum for what
     each tier does and when it applies.
 
-    Native path: the replicated up-proj produces the full hidden dim on every
-    rank, so the base runner combines routed + shared correctly at any TP size.
+    The base path supports replicated and row-parallel up-projections. A
+    row-parallel projection combines routed and shared rank-local partials
+    before one final all-reduce.
     """
 
     def __init__(
@@ -179,12 +180,21 @@ class LatentMoERunner(MoERunner):
     def _use_fused_path(self) -> bool:
         # The fused path merges the latent and shared reductions into one
         # all-reduce, so it needs actual TP parallelism, a shared expert (to
-        # concat), an un-reduced combine output, and no sequence parallelism.
+        # concat), an un-reduced combine output, no sequence parallelism, and a
+        # replicated up-projection shared by its specialized tail tiers.
         return (
             self.moe_config.tp_size > 1
             and self._shared_experts is not None
             and not self._fused_output_is_reduced
             and not self.moe_config.is_sequence_parallel
+            and not bool(
+                self.routed_output_transform is not None
+                and getattr(
+                    self.routed_output_transform,
+                    "output_is_tp_partial",
+                    False,
+                )
+            )
         )
 
     def _select_tail_tier(

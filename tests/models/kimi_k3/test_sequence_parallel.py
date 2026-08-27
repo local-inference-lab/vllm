@@ -9,8 +9,11 @@ import pytest
 import torch
 from torch import nn
 
+import vllm.model_executor.layers.fused_moe.runner.moe_runner as moe_runner_module
 from vllm.config import ParallelConfig
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.layers.linear import RowParallelLinear
 from vllm.models.common.ops import sequence_parallel as sp_ops
 from vllm.models.kimi_k3.nvidia import model as kimi_model
 from vllm.models.kimi_k3.nvidia import mtp as kimi_mtp
@@ -50,6 +53,23 @@ class _Projection(nn.Module):
             torch.ones(1, hidden_size),
             requires_grad=False,
         )
+
+
+class _PartialRowProjection(RowParallelLinear):
+    def __init__(self, weight: torch.Tensor) -> None:
+        nn.Module.__init__(self)
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.reduce_results = False
+
+    def forward(self, hidden_states: torch.Tensor):
+        return torch.nn.functional.linear(hidden_states, self.weight), None
+
+
+class _PartialOutputTransform(nn.Module):
+    output_is_tp_partial = True
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
 
 
 class _SequenceParallelMTPBlock:
@@ -302,6 +322,140 @@ def test_shard_sequence_parallel_mlp_gating(
 
 
 @pytest.mark.parametrize(
+    (
+        "use_sequence_parallel",
+        "tp_size",
+        "num_experts",
+        "routed_hidden_size",
+        "expected",
+    ),
+    [
+        (False, 16, 896, 3584, True),
+        (False, 8, 896, 3584, True),
+        (False, 12, 896, 3584, False),
+        (True, 16, 896, 3584, False),
+        (False, 1, 896, 3584, False),
+    ],
+)
+def test_auxiliary_projection_sharding_requires_shared_rows_and_even_widths(
+    monkeypatch,
+    use_sequence_parallel: bool,
+    tp_size: int,
+    num_experts: int,
+    routed_hidden_size: int,
+    expected: bool,
+):
+    monkeypatch.setattr(
+        kimi_model, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+
+    assert (
+        kimi_model.shard_auxiliary_projections(
+            use_sequence_parallel=use_sequence_parallel,
+            num_experts=num_experts,
+            routed_hidden_size=routed_hidden_size,
+        )
+        is expected
+    )
+
+
+def test_column_parallel_gate_preserves_rank_major_fp32_logits(monkeypatch):
+    gate = object.__new__(kimi_model.KimiColumnParallelGate)
+    nn.Module.__init__(gate)
+    gate.weight = nn.Parameter(
+        torch.tensor(
+            [
+                [1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0],
+            ],
+            dtype=torch.float32,
+        ),
+        requires_grad=False,
+    )
+    gate.tp_size = 2
+    hidden_states = torch.tensor([[2.0, 3.0, 4.0]], dtype=torch.float32)
+    local_logits = torch.nn.functional.linear(hidden_states, gate.weight)
+    gathered_logits = torch.cat((local_logits, local_logits + 100.0), dim=-1)
+    gather = Mock(return_value=gathered_logits)
+    monkeypatch.setattr(kimi_model, "tensor_model_parallel_all_gather", gather)
+
+    actual, bias = gate(hidden_states)
+
+    assert bias is None
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, gathered_logits)
+    gather.assert_called_once()
+    torch.testing.assert_close(gather.call_args.args[0], local_logits)
+
+
+def test_partial_routed_output_transform_adds_partial_residual():
+    weight = torch.arange(12, dtype=torch.float32).view(4, 3)
+    projection = _PartialRowProjection(weight)
+    transform = kimi_model.KimiRoutedOutputTransform(None, projection)
+    hidden_states = torch.arange(6, dtype=torch.float32).view(2, 3)
+    residual = torch.full((2, 4), 2.0)
+
+    actual = transform(hidden_states, residual=residual)
+    expected = torch.nn.functional.linear(hidden_states, weight) + residual
+
+    assert transform.output_is_tp_partial
+    torch.testing.assert_close(actual, expected)
+
+
+def test_tp_partial_output_transform_defers_shared_reduce(monkeypatch):
+    runner = object.__new__(MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.routed_output_transform = _PartialOutputTransform()
+    runner.routed_input_transform = None
+    runner.routed_scaling_factor = 1.0
+    runner.router = None
+    runner.layer_name = "test"
+    runner.moe_config = SimpleNamespace(
+        hidden_dim_unpadded=4,
+        is_sequence_parallel=False,
+        skip_final_all_reduce=False,
+        tp_size=2,
+        ep_size=1,
+    )
+    runner.routed_experts = SimpleNamespace(
+        quant_method=SimpleNamespace(
+            has_unpadded_output=False,
+            moe_kernel=SimpleNamespace(output_is_reduced=lambda: True),
+        )
+    )
+    runner._maybe_pad_hidden_states = MethodType(
+        lambda self, shared, routed: (routed, None, None),
+        runner,
+    )
+
+    shared_output = torch.full((2, 4), 2.0)
+    fused_output = torch.full((2, 4), 3.0)
+    runner._forward_entry = Mock(return_value=(shared_output, fused_output))
+    reduced_inputs = []
+
+    def all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
+        reduced_inputs.append(hidden_states.clone())
+        return hidden_states * 2
+
+    monkeypatch.setattr(
+        moe_runner_module,
+        "tensor_model_parallel_all_reduce",
+        all_reduce,
+    )
+
+    hidden_states = torch.zeros_like(shared_output)
+    actual = runner.forward(
+        hidden_states,
+        router_logits=torch.empty(2, 1),
+        shared_experts_input=hidden_states,
+    )
+
+    assert len(reduced_inputs) == 1
+    torch.testing.assert_close(reduced_inputs[0], shared_output + fused_output)
+    torch.testing.assert_close(actual, (shared_output + fused_output) * 2)
+
+
+@pytest.mark.parametrize(
     ("quantization", "moe_backend", "expected"),
     [
         ("mxfp4", "b12x", True),
@@ -320,10 +474,7 @@ def test_native_mxfp4_moe_shard_requires_b12x_backend(
         kernel_config=SimpleNamespace(moe_backend=moe_backend),
     )
 
-    assert (
-        kimi_model._uses_native_b12x_mxfp4_intermediate_size(vllm_config)
-        is expected
-    )
+    assert kimi_model._uses_native_b12x_mxfp4_intermediate_size(vllm_config) is expected
 
 
 def test_sharded_sequence_parallel_mlp_matches_replicated(default_vllm_config):
