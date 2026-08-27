@@ -306,36 +306,93 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         vllm_config = get_current_vllm_config()
         scheduler_config = vllm_config.scheduler_config
         max_tokens = int(scheduler_config.max_num_batched_tokens)
-        max_seqs = int(scheduler_config.max_num_seqs)
+        max_cudagraph_rows = int(
+            vllm_config.compilation_config.max_cudagraph_capture_size or 0
+        )
+        # Sparse MLA metadata is token-granular: chunked prefill contributes
+        # one cache-length row per query token, while CUDA graph capture can
+        # pad decode rows. The caller-owned plan scratch must cover both.
+        max_batch = max(max_tokens, max_cudagraph_rows)
         self._input_num_heads = self.num_heads * self.dcp_world_size
         self._q_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
-        self._topk_tokens = int(self.topk_indices_buffer.shape[-1])
+        self._physical_topk_tokens = int(self.topk_indices_buffer.shape[-1])
+        self._topk_tokens = self._get_kernel_topk_tokens(self._physical_topk_tokens)
         self._max_tokens = max_tokens
+        self._max_batch = max_batch
         self._kv_dtype = torch.uint8
+        self._b12x_module = module
 
-        def make_plan(mode: str):
-            return module.plan(
-                module.Caps(
-                    device=torch.device(
-                        "cuda", torch.accelerator.current_device_index()
-                    ),
-                    num_q_heads=self._input_num_heads,
-                    max_q_rows=max_tokens,
-                    max_width=self._topk_tokens,
-                    dtype=torch.bfloat16,
-                    kv_dtype=self._kv_dtype,
-                    head_dim=self._q_head_dim,
-                    v_head_dim=self.kv_lora_rank,
-                    mode=mode,
-                    max_batch=max_seqs,
-                    max_chunks_per_row=max(1, (self._topk_tokens + 63) // 64),
-                    page_size=64,
-                )
-            )
-
-        self._decode_plan = make_plan("decode")
-        self._extend_plan = make_plan("extend")
+        self._decode_plan = self._make_plan("decode", self._topk_tokens)
+        self._extend_plan = self._make_plan("extend", self._topk_tokens)
         self.supports_quant_query_input = False
+
+    def _get_kernel_topk_tokens(self, physical_topk_tokens: int) -> int:
+        """Return the index width consumed by one B12X attention launch."""
+        return physical_topk_tokens
+
+    def _make_plan(self, mode: str, topk_tokens: int):
+        return self._b12x_module.plan(
+            self._b12x_module.Caps(
+                device=torch.device("cuda", torch.accelerator.current_device_index()),
+                num_q_heads=self._input_num_heads,
+                max_q_rows=self._max_tokens,
+                max_width=topk_tokens,
+                dtype=torch.bfloat16,
+                kv_dtype=self._kv_dtype,
+                head_dim=self._q_head_dim,
+                v_head_dim=self.kv_lora_rank,
+                mode=mode,
+                max_batch=self._max_batch,
+                max_chunks_per_row=max(1, (topk_tokens + 63) // 64),
+                page_size=64,
+            )
+        )
+
+    def _convert_topk_indices(
+        self,
+        attn_metadata: B12xMLASparseMetadata,
+        topk_indices: torch.Tensor,
+        block_stride_rows: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.dcp_world_size > 1:
+            return triton_filter_and_convert_dcp_index(
+                attn_metadata.req_id_per_token[: topk_indices.shape[0]],
+                attn_metadata.block_table,
+                topk_indices,
+                dcp_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=(attn_metadata.cp_kv_cache_interleave_size),
+                BLOCK_SIZE=attn_metadata.block_size,
+                BLOCK_STRIDE_ROWS=block_stride_rows,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+                return_valid_counts=True,
+            )
+        return triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token[: topk_indices.shape[0]],
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            BLOCK_STRIDE_ROWS=block_stride_rows,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            return_valid_counts=True,
+        )
+
+    def _copy_query_to_buffer(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        q_buffer: torch.Tensor,
+    ) -> tuple[int, torch.Tensor]:
+        """Pack one logical MLA query into the B12X kernel query buffer."""
+        if isinstance(q, tuple):
+            q_nope, q_pe = q
+            num_tokens = int(q_nope.shape[0])
+            q_all = q_buffer[:num_tokens]
+            ops.concat_mla_q(q_nope, q_pe, q_all)
+        else:
+            num_tokens = int(q.shape[0])
+            q_all = q_buffer[:num_tokens]
+            q_all.copy_(q)
+        return num_tokens, q_all
 
     def forward_mqa(
         self,
@@ -358,15 +415,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         q_buffer = workspaces[0]
         scratch = workspaces[1:]
 
-        if isinstance(q, tuple):
-            q_nope, q_pe = q
-            num_tokens = int(q_nope.shape[0])
-            q_all = q_buffer[:num_tokens]
-            ops.concat_mla_q(q_nope, q_pe, q_all)
-        else:
-            num_tokens = int(q.shape[0])
-            q_all = q_buffer[:num_tokens]
-            q_all.copy_(q)
+        num_tokens, q_all = self._copy_query_to_buffer(q, q_buffer)
 
         if int(q_all.shape[1]) != self._input_num_heads:
             raise ValueError(
@@ -375,32 +424,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             )
 
         assert self.topk_indices_buffer is not None
-        topk_indices = self.topk_indices_buffer[:num_tokens]
+        topk_indices = self.topk_indices_buffer[:num_tokens, : self._topk_tokens]
         record_width = int(kv_c_and_k_pe_cache.shape[-1])
         block_stride_rows = int(kv_c_and_k_pe_cache.stride(0)) // record_width
-        if self.dcp_world_size > 1:
-            selected_indices, active_counts = triton_filter_and_convert_dcp_index(
-                attn_metadata.req_id_per_token[:num_tokens],
-                attn_metadata.block_table,
-                topk_indices,
-                dcp_size=self.dcp_world_size,
-                dcp_rank=self.dcp_rank,
-                cp_kv_cache_interleave_size=(attn_metadata.cp_kv_cache_interleave_size),
-                BLOCK_SIZE=attn_metadata.block_size,
-                BLOCK_STRIDE_ROWS=block_stride_rows,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-                return_valid_counts=True,
-            )
-        else:
-            selected_indices, active_counts = triton_convert_req_index_to_global_index(
-                attn_metadata.req_id_per_token[:num_tokens],
-                attn_metadata.block_table,
-                topk_indices,
-                BLOCK_SIZE=attn_metadata.block_size,
-                BLOCK_STRIDE_ROWS=block_stride_rows,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-                return_valid_counts=True,
-            )
+        selected_indices, active_counts = self._convert_topk_indices(
+            attn_metadata, topk_indices, block_stride_rows
+        )
 
         cache_seq_lens = attn_metadata.cache_seq_lens_per_token
         assert cache_seq_lens is not None

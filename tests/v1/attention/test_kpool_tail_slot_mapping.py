@@ -218,6 +218,7 @@ def make_common_metadata(per_req_positions, own_blocks, with_positions=True):
 def make_tail_builder(block_size=KPOOL):
     builder = object.__new__(KpoolTailMetadataBuilder)
     builder.kv_cache_spec = SimpleNamespace(block_size=block_size)
+    builder.slot_mapping_buffer = torch.empty(4096, dtype=torch.int64)
     return builder
 
 
@@ -241,12 +242,26 @@ def test_builder_build_uses_circular_mapping():
     )
 
 
-def test_builder_build_falls_back_without_positions():
-    """Capture / dummy builds without positions keep the generic mapping."""
+def test_builder_build_reuses_slot_mapping_storage():
+    """Full CUDA graphs require metadata tensor addresses to remain stable."""
+    builder = make_tail_builder()
+    first = make_common_metadata([list(range(10))], [5])
+    first_meta = KpoolTailMetadataBuilder.build(builder, 0, first)
+    first_ptr = first_meta.slot_mapping.data_ptr()
+
+    second = make_common_metadata([list(range(12))], [9])
+    second_meta = KpoolTailMetadataBuilder.build(builder, 0, second)
+
+    assert second_meta.slot_mapping.data_ptr() == first_ptr
+    assert second_meta.slot_mapping.shape == second.slot_mapping.shape
+
+
+def test_builder_build_rejects_missing_positions():
+    """The circular tail layout cannot consume generic slot mappings."""
     per_req = [list(range(10))]
     cam = make_common_metadata(per_req, [5], with_positions=False)
-    meta = KpoolTailMetadataBuilder.build(make_tail_builder(), 0, cam)
-    assert meta.slot_mapping is cam.slot_mapping
+    with pytest.raises(AssertionError, match="requires token positions"):
+        KpoolTailMetadataBuilder.build(make_tail_builder(), 0, cam)
 
 
 # ---------------------------------------------------------------------------

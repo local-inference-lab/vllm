@@ -503,9 +503,18 @@ def compute_kpool_tail_slot_mapping(
     num_actual_tokens: int,
     num_reqs: int,
     kpool: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Map every token to its request's one circular tail block."""
-    out = slot_mapping.clone()
+    if out is None:
+        out = slot_mapping.clone()
+    else:
+        assert out.numel() >= slot_mapping.numel(), (
+            "K-pool tail slot-mapping workspace is smaller than the scheduled "
+            f"token count ({out.numel()} < {slot_mapping.numel()})."
+        )
+        out = out[: slot_mapping.numel()]
+        out.copy_(slot_mapping)
     if num_actual_tokens == 0:
         return out
     tokens = torch.arange(num_actual_tokens, device=slot_mapping.device)
@@ -532,6 +541,11 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.slot_mapping_buffer = torch.empty(
+            (vllm_config.scheduler_config.max_num_batched_tokens,),
+            dtype=torch.int64,
+            device=device,
+        )
 
     def build(
         self,
@@ -544,16 +558,20 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         )
         slot_mapping = common_attn_metadata.slot_mapping
         positions = common_attn_metadata.positions
-        if positions is not None:
-            slot_mapping = compute_kpool_tail_slot_mapping(
-                slot_mapping,
-                common_attn_metadata.block_table_tensor,
-                common_attn_metadata.query_start_loc,
-                positions,
-                common_attn_metadata.num_actual_tokens,
-                common_attn_metadata.num_reqs,
-                self.kv_cache_spec.block_size,
-            )
+        assert positions is not None, (
+            "KpoolTailMetadataBuilder requires token positions because the "
+            "one-block circular tail layout cannot use generic slot mappings."
+        )
+        slot_mapping = compute_kpool_tail_slot_mapping(
+            slot_mapping,
+            common_attn_metadata.block_table_tensor,
+            common_attn_metadata.query_start_loc,
+            positions,
+            common_attn_metadata.num_actual_tokens,
+            common_attn_metadata.num_reqs,
+            self.kv_cache_spec.block_size,
+            out=self.slot_mapping_buffer,
+        )
         return DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,

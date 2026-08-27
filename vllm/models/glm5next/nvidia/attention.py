@@ -509,6 +509,21 @@ class Glm5NextMLAAttention(nn.Module):
 
         self.is_v32 = config.index_topk is not None
 
+        attn_backend = None
+        if self.is_v32:
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+            if vllm_config.attention_config.backend == AttentionBackendEnum.B12X:
+                from vllm.models.glm5next.nvidia.b12x import (
+                    Glm5NextB12xMLASparseBackend,
+                )
+
+                attn_backend = Glm5NextB12xMLASparseBackend
+                logger.info_once(
+                    "Using B12X sparse MLA with exact zero padding for GLM-5 "
+                    "Next NoPE attention."
+                )
+
         if self.is_v32:
             self.indexer_rope_emb: RotaryEmbedding | None = get_rope(
                 qk_rope_head_dim,
@@ -569,6 +584,7 @@ class Glm5NextMLAAttention(nn.Module):
             prefix,
             skip_topk=False,
             fuse_qkv_rmsnorm=True,
+            attn_backend=attn_backend,
         )
 
     def forward(

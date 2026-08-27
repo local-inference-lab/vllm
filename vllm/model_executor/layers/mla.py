@@ -10,6 +10,7 @@ from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.platforms import current_platform
+from vllm.v1.attention.backend import AttentionBackend
 
 
 @dataclass
@@ -71,6 +72,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         non_causal_multi_token_decode: bool = False,
         allow_short_prefill_indexer_scoring_skip: bool = False,
         fuse_qkv_rmsnorm: bool = False,
+        attn_backend: type[AttentionBackend] | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -129,6 +131,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             indexer=self.indexer,
             topk_indices_buffer=mla_modules.topk_indices_buffer,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
+            attn_backend=attn_backend,
         )
         indexer_op = getattr(self.indexer, "indexer_op", None)
         if indexer_op is not None and hasattr(

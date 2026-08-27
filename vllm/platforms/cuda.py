@@ -439,10 +439,16 @@ class CudaPlatformBase(Platform):
             return None
         from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 
-        # kpool paged-MQA indexer: the storage block (block_size /
-        # index_kpool) is virtually split into pool pages, so block_size
-        # must be a multiple of index_kpool * min(PAGED_MQA_PAGE_SIZES).
-        return index_kpool * min(PAGED_MQA_PAGE_SIZES)
+        # The kpool paged-MQA indexer virtually splits each storage block into
+        # pool pages. SM120 DeepGEMM accepts only 64-state pages; older CUDA
+        # kernels also accept 32-state pages. Align the logical token block so
+        # virtual splitting always selects a supported physical page.
+        page_size = (
+            max(PAGED_MQA_PAGE_SIZES)
+            if cls.is_device_capability_family(120)
+            else min(PAGED_MQA_PAGE_SIZES)
+        )
+        return index_kpool * page_size
 
     @classmethod
     def get_attn_backend_cls(
