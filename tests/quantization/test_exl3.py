@@ -248,6 +248,35 @@ def test_glm5next_model_retains_quant_config_for_weight_loading(monkeypatch):
     assert model.quant_config is quant_config
 
 
+def test_uniform_trellis_does_not_require_mixed_route_pack_warmup(monkeypatch):
+    mixed = SimpleNamespace(
+        build_tiered_maps=object(),
+        combine_trellis_rotations=object(),
+        compile_mixed_trellis=object(),
+        make_mixed_trellis_buffers=object(),
+        run_mixed_trellis=object(),
+    )
+    prepare = SimpleNamespace(prepare_trellis256_moe_weights=object())
+    host = SimpleNamespace(max_packed_route_slots=object())
+
+    def import_module(name):
+        if name.endswith("mixed_trellis"):
+            return mixed
+        if name.endswith("prepare"):
+            return prepare
+        if name.endswith("host"):
+            return host
+        raise AssertionError(name)
+
+    monkeypatch.setattr(exl3_module, "_B12X_MIXED_TRELLIS_API", None)
+    monkeypatch.setattr(exl3_module.importlib, "import_module", import_module)
+
+    api = exl3_module._load_b12x_mixed_trellis()
+
+    assert api.prepare_weights is prepare.prepare_trellis256_moe_weights
+    assert api.warmup_mixed_trellis_route_pack is None
+
+
 def test_glm_model_retains_quant_config_for_weight_loading(monkeypatch):
     pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=False)
     monkeypatch.setattr(glm4_moe, "get_pp_group", lambda: pp_group)

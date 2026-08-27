@@ -241,6 +241,9 @@ def _load_b12x_mixed_trellis() -> Any:
         max_packed_route_slots=host.max_packed_route_slots,
         prepare_weights=prepare.prepare_trellis256_moe_weights,
         run_mixed_trellis=module.run_mixed_trellis,
+        warmup_mixed_trellis_route_pack=getattr(
+            module, "warmup_mixed_trellis_route_pack", None
+        ),
     )
     _B12X_MIXED_TRELLIS_API = api
     return api
