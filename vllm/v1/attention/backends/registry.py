@@ -66,6 +66,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     FLASHINFER_MLA = (
         "vllm.v1.attention.backends.mla.flashinfer_mla.FlashInferMLABackend"
     )
+    B12X = "vllm.v1.attention.backends.mla.b12x_mla.B12xMLABackend"
     TOKENSPEED_MLA = (
         "vllm.v1.attention.backends.mla.tokenspeed_mla.TokenspeedMLABackend"
     )
