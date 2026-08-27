@@ -52,6 +52,59 @@ LAYERWISE_INFO: WeakKeyDictionary[torch.nn.Module, LayerReloadingInfo] = (
 # Global set used to track loading for logging purposes only
 LOADING_LAYERS: WeakSet[torch.nn.Module] = WeakSet()
 
+_ONLINE_PROCESSING_UNLOADED_ATTR = "_vllm_online_processing_unloaded"
+
+
+def _online_processing_load_numel_total(layer: torch.nn.Module) -> int:
+    """Count checkpoint elements required before processing a layer.
+
+    A layer can allocate padded tensor tails that have no corresponding
+    checkpoint payload. The layer declares those omitted element counts in a
+    ``dict[str, int]`` named ``_vllm_online_processing_unloaded``.
+
+    Args:
+        layer: Layer whose registered tensors and unloaded-tail annotations
+            define the expected checkpoint payload.
+
+    Returns:
+        Number of tensor elements that checkpoint weight loaders must provide.
+
+    Raises:
+        TypeError: If the unloaded-tail annotation is not a dictionary.
+        ValueError: If an annotated tensor is absent or its unloaded element
+            count is outside the tensor's bounds.
+    """
+    total = get_layer_size(layer)
+    unloaded = getattr(layer, _ONLINE_PROCESSING_UNLOADED_ATTR, {})
+    if not isinstance(unloaded, dict):
+        raise TypeError(
+            f"{_ONLINE_PROCESSING_UNLOADED_ATTR} must be a dict, "
+            f"got {type(unloaded).__name__}"
+        )
+    for name, numel in unloaded.items():
+        tensor = get_layer_tensors(layer).get(name)
+        if tensor is None:
+            raise ValueError(f"Annotated unloaded tensor {name!r} is missing")
+        if not isinstance(numel, int) or not 0 <= numel <= tensor.numel():
+            raise ValueError(
+                f"Invalid unloaded element count for {name}: {numel} "
+                f"(tensor numel={tensor.numel()})"
+            )
+        total -= numel
+    return total
+
+
+def _zero_online_processing_unloaded(layer: torch.nn.Module) -> None:
+    """Zero checkpoint-omitted parameter tails before online processing.
+
+    Args:
+        layer: Materialized layer with unloaded-tail annotations.
+    """
+    unloaded = getattr(layer, _ONLINE_PROCESSING_UNLOADED_ATTR, {})
+    for name, numel in unloaded.items():
+        if numel:
+            getattr(layer, name).data.view(-1)[-numel:].zero_()
+
 
 def get_layerwise_info(layer: torch.nn.Module) -> LayerReloadingInfo:
     """
@@ -132,7 +185,7 @@ def initialize_online_processing(layer: torch.nn.Module):
 
     # Track loading progress to determine when to process/copy
     info.load_numel = 0
-    info.load_numel_total = get_layer_size(layer)
+    info.load_numel_total = _online_processing_load_numel_total(layer)
     _wrap_parameters_weight_loader(layer)
 
 
@@ -144,6 +197,28 @@ def _wrap_parameters_weight_loader(layer: torch.nn.Module) -> None:
             continue
         if _get_weight_loader(tensor).__name__ != "online_process_loader":
             tensor.weight_loader = make_online_process_loader(layer, name)
+
+
+def _own_deferred_accelerator_tensors(bound_args: inspect.BoundArguments) -> None:
+    """Give deferred weight-loader arguments independent device storage.
+
+    Streaming model loaders may yield views into reusable staging storage.
+    Layerwise processing replays bound arguments only after every checkpoint
+    shard for a layer arrives, so accelerator tensors must be cloned before
+    they enter the deferred queue. This also covers views created by name or
+    shard mapping because custom attributes on the source tensor are not
+    guaranteed to propagate to those views.
+
+    Args:
+        bound_args: Normalized weight-loader arguments to update in place.
+    """
+    for name, value in tuple(bound_args.arguments.items()):
+        if (
+            name != "param"
+            and isinstance(value, torch.Tensor)
+            and value.device.type not in ("meta", "cpu")
+        ):
+            bound_args.arguments[name] = value.clone()
 
 
 def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Callable:
@@ -176,16 +251,29 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         # Re-run on each load: layers may register parameters later (e.g., `bias`).
         # Wrap late parameters and refresh `load_numel_total` so processing waits
         # until all parameters are loaded.
-        info.load_numel_total = get_layer_size(layer)
+        info.load_numel_total = _online_processing_load_numel_total(layer)
         _wrap_parameters_weight_loader(layer)
 
         # Bind and normalize arguments
         bound_args = loader_signature.bind(*args, **kwargs)
         bound_args.apply_defaults()
 
-        # Buffer loaded weights, track loading progress
-        info.loaded_weights.append((param_name, bound_args))
-        num_loaded, ret = get_numel_loaded(original_loader, bound_args)
+        direct_load = info.kernel_tensors is None and not is_deferred_attention_layer(
+            layer
+        )
+        if direct_load:
+            # Initial online quantization can write each checkpoint shard into
+            # its materialized TP-local destination before the iterator
+            # advances. Reloading and deferred attention retain their queued
+            # arguments because their processing has different lifetime rules.
+            materialize_layer(layer, info)
+            bound_args.arguments["param"] = getattr(layer, param_name)
+            num_loaded, ret = get_numel_loaded(original_loader, bound_args)
+        else:
+            _own_deferred_accelerator_tensors(bound_args)
+            info.loaded_weights.append((param_name, bound_args))
+            num_loaded, ret = get_numel_loaded(original_loader, bound_args)
+
         info.load_numel += num_loaded
 
         logger.debug(
@@ -200,7 +288,11 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
             return ret
 
         # Log warnings allocating excessive buffers on device
-        if has_device_tensors(bound_args) and layer not in LOADING_LAYERS:
+        if (
+            not direct_load
+            and has_device_tensors(bound_args)
+            and layer not in LOADING_LAYERS
+        ):
             LOADING_LAYERS.add(layer)
             if len(LOADING_LAYERS) == 2:
                 names = sorted([layer.__class__.__name__ for layer in LOADING_LAYERS])
@@ -352,10 +444,21 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
         param.weight_loader = _get_original_loader(param)
 
     # Load all buffered weights into materialized layer (using original loaders)
-    for name, args in info.loaded_weights:
+    loaded_args = None
+    for name, loaded_args in info.loaded_weights:
         param = getattr(layer, name)
-        args.arguments["param"] = param
-        param.weight_loader(*args.args, **args.kwargs)
+        loaded_args.arguments["param"] = param
+        param.weight_loader(*loaded_args.args, **loaded_args.kwargs)
+
+    if info.kernel_tensors is None:
+        # Initial online quantization no longer needs checkpoint tensors after
+        # their values have reached the materialized parameters. Release the
+        # buffered sources before quantization and kernel repacking allocate
+        # their transient workspaces.
+        info.loaded_weights.clear()
+        loaded_args = None
+
+    _zero_online_processing_unloaded(layer)
 
     # Process weights (quantization, repacking, etc.)
     quant_method = getattr(layer, "quant_method", None)

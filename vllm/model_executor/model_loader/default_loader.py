@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import glob
+import json
 import os
 import time
 from collections.abc import Generator, Iterable
@@ -85,6 +86,8 @@ class DefaultModelLoader(BaseModelLoader):
             "enable_multithread_load",
             "num_threads",
             "enable_weights_track",
+            "instanttensor_priority_weight_name_prefixes",
+            "instanttensor_small_checkpoint_max_bytes",
         }
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
@@ -107,6 +110,30 @@ class DefaultModelLoader(BaseModelLoader):
         ):
             raise ValueError(
                 f"num_threads must be a positive integer, got {num_threads!r}"
+            )
+        priority_prefixes = extra_config.get(
+            "instanttensor_priority_weight_name_prefixes"
+        )
+        if priority_prefixes is not None and not (
+            isinstance(priority_prefixes, list)
+            and priority_prefixes
+            and all(isinstance(prefix, str) and prefix for prefix in priority_prefixes)
+        ):
+            raise ValueError(
+                "instanttensor_priority_weight_name_prefixes must be a "
+                "non-empty list of non-empty strings"
+            )
+        small_checkpoint_max_bytes = extra_config.get(
+            "instanttensor_small_checkpoint_max_bytes"
+        )
+        if small_checkpoint_max_bytes is not None and not (
+            isinstance(small_checkpoint_max_bytes, int)
+            and not isinstance(small_checkpoint_max_bytes, bool)
+            and small_checkpoint_max_bytes > 0
+        ):
+            raise ValueError(
+                "instanttensor_small_checkpoint_max_bytes must be a positive "
+                f"integer, got {small_checkpoint_max_bytes!r}"
             )
 
         self.enable_weights_track: bool | None = extra_config.get(
@@ -253,6 +280,16 @@ class DefaultModelLoader(BaseModelLoader):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
+        indexed_tensor_files: dict[str, str] | None = None
+        if use_safetensors:
+            index_path = os.path.join(hf_folder, SAFE_WEIGHTS_INDEX_NAME)
+            if os.path.isfile(index_path):
+                with open(index_path, encoding="utf-8") as index_handle:
+                    weight_map = json.load(index_handle)["weight_map"]
+                indexed_tensor_files = {
+                    name: os.path.abspath(os.path.join(hf_folder, filename))
+                    for name, filename in weight_map.items()
+                }
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -273,6 +310,13 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
+                    indexed_tensor_files=indexed_tensor_files,
+                    priority_weight_name_prefixes=extra_config.get(
+                        "instanttensor_priority_weight_name_prefixes"
+                    ),
+                    small_checkpoint_max_bytes=extra_config.get(
+                        "instanttensor_small_checkpoint_max_bytes"
+                    ),
                 )
             else:
                 if extra_config.get("enable_multithread_load"):
