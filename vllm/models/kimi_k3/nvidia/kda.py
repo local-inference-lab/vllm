@@ -82,6 +82,25 @@ def a_log_weight_loader(
     return loader
 
 
+def initialize_kda_input_projection_padding(
+    layer: nn.Module,
+    padding_rows: int,
+    hidden_size: int,
+) -> None:
+    """Declare and zero local KDA rows absent from checkpoint tensors."""
+    if padding_rows == 0:
+        return
+    if padding_rows < 0 or padding_rows > layer.weight.shape[0]:
+        raise ValueError(
+            "KDA input projection padding must fit the local weight rows, got "
+            f"padding_rows={padding_rows}, rows={layer.weight.shape[0]}."
+        )
+    layer._vllm_online_processing_unloaded = {
+        "weight": padding_rows * hidden_size,
+    }
+    layer.weight.data[-padding_rows:].zero_()
+
+
 class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
     """Merged projection with one output replicated across TP ranks."""
 
@@ -444,8 +463,11 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             quant_config=self.quant_config,
             prefix=f"{prefix}.in_proj_qkvgfab",
         )
-        if self.in_proj_padding:
-            self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
+        initialize_kda_input_projection_padding(
+            self.in_proj_qkvgfab,
+            self.in_proj_padding,
+            self.hidden_size,
+        )
 
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,

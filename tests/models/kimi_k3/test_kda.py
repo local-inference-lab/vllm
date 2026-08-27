@@ -73,6 +73,41 @@ def test_kda_warmup_skips_missing_metadata(monkeypatch):
     assert layer._forward(empty, empty, empty, empty, empty) is None
 
 
+def test_kda_input_projection_padding_is_declared_and_zeroed():
+    layer = torch.nn.Linear(3, 4, bias=False)
+    layer.weight.data.fill_(1)
+
+    nvidia_kda.initialize_kda_input_projection_padding(
+        layer, padding_rows=2, hidden_size=3
+    )
+
+    assert layer._vllm_online_processing_unloaded == {"weight": 6}
+    torch.testing.assert_close(layer.weight[:2], torch.ones(2, 3))
+    torch.testing.assert_close(layer.weight[2:], torch.zeros(2, 3))
+
+
+def test_kda_input_projection_without_padding_has_no_declaration():
+    layer = torch.nn.Linear(3, 4, bias=False)
+    original = layer.weight.detach().clone()
+
+    nvidia_kda.initialize_kda_input_projection_padding(
+        layer, padding_rows=0, hidden_size=3
+    )
+
+    assert not hasattr(layer, "_vllm_online_processing_unloaded")
+    torch.testing.assert_close(layer.weight, original)
+
+
+@pytest.mark.parametrize("padding_rows", [-1, 5])
+def test_kda_input_projection_rejects_invalid_padding(padding_rows: int):
+    layer = torch.nn.Linear(3, 4, bias=False)
+
+    with pytest.raises(ValueError, match="must fit"):
+        nvidia_kda.initialize_kda_input_projection_padding(
+            layer, padding_rows, hidden_size=3
+        )
+
+
 def test_kda_recoverssm_config_state_layout():
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
