@@ -155,6 +155,8 @@ def _runtime_scope_id(quant_config: Any) -> int:
 
 
 _RANK_SLICED_FORMAT = "exl3-trellis"
+_GLM53_ROUTED_EXPERTS_SCOPE = "glm53_routed_experts_only"
+_PER_EXPERT_ROTATION_LAYOUT = "per_expert_v1"
 _RANK_SLICED_WEIGHT_RE = re.compile(
     r"^(?P<prefix>.+)\.rank(?P<rank>\d+)\."
     r"(?P<field>trellis|suh|svh|mcg|mul1)$"
@@ -354,8 +356,10 @@ class Exl3Config(QuantizationConfig):
         self.tensor_storage = tensor_storage or {}
         self._eager_checked = False
         self.rank_sliced_metadata: dict[str, Any] | None = None
+        self.rank_sliced_rotation_layout = _PER_EXPERT_ROTATION_LAYOUT
         self.rank_sliced_k_values: tuple[int, ...] | None = None
         self.rank_sliced_bits_by_layer: dict[int, tuple[int, ...]] = {}
+        self.glm53_unsliced_routed_experts = False
 
     def get_name(self) -> QuantizationMethods:
         return "exl3"
@@ -375,13 +379,31 @@ class Exl3Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> Exl3Config:
-        return cls(
+        instance = cls(
             bits=config.get("bits"),
             head_bits=config.get("head_bits"),
             codebook=config.get("codebook"),
             version=config.get("version"),
             tensor_storage=config.get("tensor_storage"),
         )
+        if config.get("scope") == _GLM53_ROUTED_EXPERTS_SCOPE:
+            expected = {
+                "bits": 4,
+                "codebook": "mcg",
+                "non_routed_dtype_policy": "official_source_native",
+            }
+            mismatches = {
+                key: (config.get(key), value)
+                for key, value in expected.items()
+                if config.get(key) != value
+            }
+            if mismatches:
+                raise ValueError(
+                    "GLM-5.3 routed-only EXL3 metadata is unsupported: "
+                    f"{mismatches}"
+                )
+            instance.glm53_unsliced_routed_experts = True
+        return instance
 
     @classmethod
     def override_quantization_method(
@@ -390,9 +412,10 @@ class Exl3Config(QuantizationConfig):
         user_quant: str | None,
         hf_config: PretrainedConfig | None = None,
     ) -> QuantizationMethods | None:
-        del hf_quant_cfg
         if user_quant is not None and user_quant != "exl3":
             return None
+        if hf_quant_cfg.get("scope") == _GLM53_ROUTED_EXPERTS_SCOPE:
+            return "exl3"
         metadata = getattr(hf_config, "hybrid_tr3_tail", None)
         if isinstance(metadata, dict) and metadata.get("format") == _RANK_SLICED_FORMAT:
             return "exl3"
@@ -404,6 +427,9 @@ class Exl3Config(QuantizationConfig):
         hf_config: PretrainedConfig | None = None,
         revision: str | None = None,
     ) -> None:
+        if self.glm53_unsliced_routed_experts:
+            self._configure_glm53_unsliced_routed_experts(hf_config)
+            return
         rank_sliced = getattr(hf_config, "hybrid_tr3_tail", None)
         if (
             isinstance(rank_sliced, dict)
@@ -445,6 +471,71 @@ class Exl3Config(QuantizationConfig):
 
         self._validate_storage_metadata()
         self._force_independent_lm_head(hf_config)
+
+    def _configure_glm53_unsliced_routed_experts(
+        self, hf_config: PretrainedConfig | None
+    ) -> None:
+        text_config = getattr(hf_config, "text_config", hf_config)
+        expected = {
+            "model_type": "glm5_next_text",
+            "num_hidden_layers": 45,
+            "first_k_dense_replace": 3,
+            "n_routed_experts": 288,
+            "hidden_size": 4096,
+            "moe_intermediate_size": 2048,
+            "mla_use_nope": True,
+            "qk_nope_head_dim": 256,
+            "qk_rope_head_dim": 0,
+            "v_head_dim": 256,
+            "index_n_heads": 32,
+            "index_head_dim": 128,
+            "index_topk": 2048,
+            "index_kpool": 4,
+            "index_kpool_compress": True,
+            "index_kpool_always_select_tail": True,
+        }
+        mismatches = {
+            key: (getattr(text_config, key, None), value)
+            for key, value in expected.items()
+            if getattr(text_config, key, None) != value
+        }
+        if mismatches:
+            raise ValueError(
+                "GLM-5.3 routed-only EXL3 architecture mismatch: "
+                f"{mismatches}"
+            )
+        linear = getattr(text_config, "linear_attn_config", None)
+        expected_linear = {
+            "num_heads": 64,
+            "head_dim": 128,
+            "short_conv_kernel_size": 4,
+            "full_attn_layers": [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43],
+        }
+        if not isinstance(linear, dict) or any(
+            linear.get(key) != value for key, value in expected_linear.items()
+        ):
+            raise ValueError(
+                "GLM-5.3 routed-only EXL3 linear/sparse attention mismatch: "
+                f"expected {expected_linear}, got {linear!r}"
+            )
+        self.rank_sliced_metadata = {
+            "bits": 4,
+            "codebook": "mcg",
+            "experts_per_layer": 288,
+            "moe_layers": (3, 44),
+            "tensor_schema": (
+                "model.language_model.layers.{L}.mlp.experts.{E}."
+                "{proj}.{trellis|suh|svh|mcg}"
+            ),
+            "tp": 2,
+            "source_layout": "unsliced_tp_stream",
+        }
+        self.rank_sliced_rotation_layout = _PER_EXPERT_ROTATION_LAYOUT
+        self.rank_sliced_k_values = None
+        logger.info_once(
+            "GLM-5.3 routed-only EXL3: streaming unsliced K4 experts into "
+            "TP2 B12X slabs for layers 3..44"
+        )
 
     def _configure_rank_sliced(self, metadata: dict[str, Any]) -> None:
         required = {
@@ -1182,8 +1273,9 @@ class Exl3MoEParameter(BasevLLMParameter):
         num_experts: int = 0,
         shard_ids: tuple[str, ...] = (),
         preallocate: bool = False,
+        tp_slice: tuple[int, int, int, int] | None = None,
     ):
-        del num_experts, shard_ids, preallocate
+        del num_experts, shard_ids, preallocate, tp_slice
         data = torch.empty(0, dtype=torch.uint8)
         return super().__new__(cls, data=data, weight_loader=weight_loader)
 
@@ -1194,13 +1286,36 @@ class Exl3MoEParameter(BasevLLMParameter):
         num_experts: int = 0,
         shard_ids: tuple[str, ...] = (),
         preallocate: bool = False,
+        tp_slice: tuple[int, int, int, int] | None = None,
     ):
         self.exl3_tensors: dict[tuple[int, str], torch.Tensor] = {}
         self.exl3_backing: torch.Tensor | None = None
         self.exl3_num_experts = int(num_experts)
         self.exl3_shard_ids = tuple(shard_ids)
         self.exl3_preallocate = bool(preallocate)
+        self.exl3_tp_slice = tp_slice
         super().__init__(data=self.data, weight_loader=weight_loader)
+
+    def _slice_loaded_weight(self, loaded_weight: torch.Tensor) -> torch.Tensor:
+        """Materialize only the local TP range from an unsliced EXL3 tensor."""
+        if self.exl3_tp_slice is None:
+            return loaded_weight
+        dim, start, size, quantum = self.exl3_tp_slice
+        if start % quantum or size % quantum:
+            raise ValueError(
+                "EXL3 streaming TP slice is not quantum-aligned: "
+                f"start={start}, size={size}, quantum={quantum}"
+            )
+        offset = start // quantum
+        length = size // quantum
+        if offset + length > loaded_weight.shape[dim]:
+            raise ValueError(
+                "EXL3 streaming TP slice exceeds the loaded tensor: "
+                f"shape={tuple(loaded_weight.shape)}, dim={dim}, "
+                f"offset={offset}, length={length}"
+            )
+        sliced = loaded_weight.narrow(dim, offset, length)
+        return sliced.clone() if sliced.is_contiguous() else sliced.contiguous()
 
     def load_exl3_weight(
         self,
@@ -1210,6 +1325,7 @@ class Exl3MoEParameter(BasevLLMParameter):
         shard_id: str,
     ) -> None:
         key = (int(expert_id), str(shard_id))
+        loaded_weight = self._slice_loaded_weight(loaded_weight)
         if not self.exl3_preallocate:
             self.exl3_tensors[key] = loaded_weight.contiguous()
             return
@@ -1306,6 +1422,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_intermediate_size_per_partition = intermediate_size_per_partition
         layer.exl3_params_dtype = params_dtype
         rank_sliced_metadata = self.quant_config.rank_sliced_metadata
+        unsliced_stream_tp = (
+            self.quant_config.glm53_unsliced_routed_experts
+            and layer.exl3_tp_size > 1
+        )
+        stream_slice_start = (
+            layer.exl3_tp_rank * layer.exl3_intermediate_size_per_partition
+        )
+        stream_slice_size = layer.exl3_intermediate_size_per_partition
         rank_sliced = rank_sliced_metadata is not None
         if rank_sliced_metadata is not None:
             checkpoint_tp = int(rank_sliced_metadata["tp"])
@@ -1358,6 +1482,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.exl3_mixed_bitrate = len(set(layer.exl3_layer_bitrates)) > 1
         for prefix, shard_ids in (("w13", ("w1", "w3")), ("w2", ("w2",))):
             for suffix in ("suh", "svh", "trellis", "mcg", "mul1"):
+                tp_slice = None
+                if unsliced_stream_tp:
+                    if (prefix, suffix) == ("w13", "svh"):
+                        tp_slice = (0, stream_slice_start, stream_slice_size, 1)
+                    elif (prefix, suffix) == ("w13", "trellis"):
+                        tp_slice = (1, stream_slice_start, stream_slice_size, 16)
+                    elif (prefix, suffix) == ("w2", "suh"):
+                        tp_slice = (0, stream_slice_start, stream_slice_size, 1)
+                    elif (prefix, suffix) == ("w2", "trellis"):
+                        tp_slice = (0, stream_slice_start, stream_slice_size, 16)
                 layer.register_parameter(
                     f"{prefix}_{suffix}",
                     Exl3MoEParameter(
@@ -1371,6 +1505,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                             if getattr(layer, "exl3_mixed_bitrate", False)
                             else {"suh", "svh", "trellis"}
                         ),
+                        tp_slice=tp_slice,
                     ),
                 )
 

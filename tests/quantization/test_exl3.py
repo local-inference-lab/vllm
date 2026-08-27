@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization.exl3 import (
     Exl3MoEParameter,
 )
 from vllm.model_executor.models import glm4_moe
+from vllm.models.glm5next.nvidia import model as glm5next_model
 
 
 def _rank_sliced_metadata(**overrides):
@@ -35,6 +36,35 @@ def _rank_sliced_metadata(**overrides):
     return metadata
 
 
+def _glm53_config(**overrides):
+    values = {
+        "model_type": "glm5_next_text",
+        "num_hidden_layers": 45,
+        "first_k_dense_replace": 3,
+        "n_routed_experts": 288,
+        "hidden_size": 4096,
+        "moe_intermediate_size": 2048,
+        "mla_use_nope": True,
+        "qk_nope_head_dim": 256,
+        "qk_rope_head_dim": 0,
+        "v_head_dim": 256,
+        "index_n_heads": 32,
+        "index_head_dim": 128,
+        "index_topk": 2048,
+        "index_kpool": 4,
+        "index_kpool_compress": True,
+        "index_kpool_always_select_tail": True,
+        "linear_attn_config": {
+            "num_heads": 64,
+            "head_dim": 128,
+            "short_conv_kernel_size": 4,
+            "full_attn_layers": [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43],
+        },
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_rank_sliced_checkpoint_selects_exl3_override():
     hf_config = SimpleNamespace(hybrid_tr3_tail=_rank_sliced_metadata())
 
@@ -51,6 +81,140 @@ def test_rank_sliced_checkpoint_selects_exl3_override():
         )
         is None
     )
+
+
+def test_glm53_unsliced_k4_checkpoint_selects_tp2_native_path():
+    quantization = {
+        "quant_method": "exl3",
+        "scope": "glm53_routed_experts_only",
+        "bits": 4,
+        "codebook": "mcg",
+        "non_routed_dtype_policy": "official_source_native",
+    }
+
+    assert (
+        Exl3Config.override_quantization_method(
+            quantization,
+            None,
+            SimpleNamespace(text_config=_glm53_config()),
+        )
+        == "exl3"
+    )
+    config = Exl3Config.from_config(quantization)
+    config.maybe_update_config(
+        "unused",
+        SimpleNamespace(text_config=_glm53_config()),
+    )
+
+    assert config.glm53_unsliced_routed_experts
+    assert config.rank_sliced_metadata == {
+        "bits": 4,
+        "codebook": "mcg",
+        "experts_per_layer": 288,
+        "moe_layers": (3, 44),
+        "tensor_schema": (
+            "model.language_model.layers.{L}.mlp.experts.{E}."
+            "{proj}.{trellis|suh|svh|mcg}"
+        ),
+        "tp": 2,
+        "source_layout": "unsliced_tp_stream",
+    }
+    assert config.rank_sliced_layer_bitrates(
+        "model.layers.3.mlp.experts"
+    ) == (4,) * 288
+    assert config.normalize_rank_sliced_weight_name(
+        "model.layers.3.mlp.experts.0.gate_proj.trellis"
+    ) == "model.layers.3.mlp.experts.0.gate_proj.trellis"
+
+
+def test_glm53_unsliced_k4_checkpoint_fails_closed_on_architecture_drift():
+    config = Exl3Config.from_config(
+        {
+            "quant_method": "exl3",
+            "scope": "glm53_routed_experts_only",
+            "bits": 4,
+            "codebook": "mcg",
+            "non_routed_dtype_policy": "official_source_native",
+        }
+    )
+
+    with pytest.raises(ValueError, match="architecture mismatch"):
+        config.maybe_update_config(
+            "unused",
+            SimpleNamespace(text_config=_glm53_config(index_kpool=16)),
+        )
+
+
+def test_glm53_unsliced_k4_creates_stream_sliced_tp2_slabs(monkeypatch):
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    config = Exl3Config.from_config(
+        {
+            "quant_method": "exl3",
+            "scope": "glm53_routed_experts_only",
+            "bits": 4,
+            "codebook": "mcg",
+            "non_routed_dtype_policy": "official_source_native",
+        }
+    )
+    config.maybe_update_config(
+        "unused",
+        SimpleNamespace(text_config=_glm53_config()),
+    )
+    current = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=2048),
+        model_config=SimpleNamespace(runner_type="target"),
+    )
+    monkeypatch.setattr(exl3_module, "get_current_vllm_config_or_none", lambda: current)
+    moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=False, tp_rank=1, tp_size=2),
+        has_bias=False,
+    )
+    method = Exl3MoEMethod(config, moe)
+    layer = torch.nn.Module()
+    layer.layer_name = "model.layers.3.mlp.experts"
+
+    method.create_weights(
+        layer,
+        num_experts=288,
+        hidden_size=4096,
+        intermediate_size_per_partition=1024,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert layer.exl3_rank_sliced
+    assert layer.w13_trellis.exl3_tp_slice == (1, 1024, 1024, 16)
+    assert layer.w13_svh.exl3_tp_slice == (0, 1024, 1024, 1)
+    assert layer.w2_trellis.exl3_tp_slice == (0, 1024, 1024, 16)
+    assert layer.w2_suh.exl3_tp_slice == (0, 1024, 1024, 1)
+    assert layer.w13_suh.exl3_tp_slice is None
+    assert layer.w2_svh.exl3_tp_slice is None
+
+
+def test_glm5next_model_applies_exl3_name_normalization():
+    seen = []
+
+    def normalize(name):
+        seen.append(name)
+        return None
+
+    model = object.__new__(glm5next_model.Glm5NextModel)
+    torch.nn.Module.__init__(model)
+    model.quant_config = SimpleNamespace(
+        normalize_rank_sliced_weight_name=normalize
+    )
+    model.config = SimpleNamespace(
+        is_moe=False,
+        mla_nope=False,
+        qk_rope_head_dim=0,
+    )
+
+    loaded = model.load_weights([("sentinel.weight", torch.ones(1))])
+
+    assert seen == ["sentinel.weight"]
+    assert loaded == set()
 
 
 def test_glm_model_retains_quant_config_for_weight_loading(monkeypatch):

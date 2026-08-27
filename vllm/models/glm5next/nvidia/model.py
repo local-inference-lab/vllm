@@ -1139,6 +1139,11 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             expert_params_mapping = []
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        rank_sliced_name = getattr(
+            self.quant_config,
+            "normalize_rank_sliced_weight_name",
+            None,
+        )
 
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; pad them with zeros for the model shape.
@@ -1151,6 +1156,10 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         for args in weights:
             name, loaded_weight = args[:2]
             kwargs: dict = args[2] if len(args) > 2 else {}
+            if rank_sliced_name is not None:
+                name = rank_sliced_name(name)
+                if name is None:
+                    continue
             if "rotary_emb.inv_freq" in name:
                 continue
 
