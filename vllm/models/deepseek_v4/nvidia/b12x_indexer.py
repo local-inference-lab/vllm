@@ -8,10 +8,12 @@ from typing import Any, cast
 import torch
 from torch import nn
 
+from vllm import _custom_ops as ops
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.utils.b12x import get_b12x_dsa_indexer
+from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
@@ -239,6 +241,95 @@ def _run_paged_topk(
     )
 
 
+def _run_deepgemm_prefill_topk(
+    *,
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    kv_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    gather_cu_seq_lens: torch.Tensor,
+    row_starts: torch.Tensor,
+    output: torch.Tensor,
+    topk: int,
+    total_k_rows: int,
+    workspace_k_rows: int,
+) -> None:
+    """Gather a shared paged cache and score prefill rows with DeepGEMM."""
+    q_rows = int(q.shape[0])
+    expected_cache_tail = (_INDEX_PAGE_SIZE, _INDEX_HEAD_DIM + _INDEX_SCALE_BYTES)
+    if q.ndim != 3 or int(q.shape[2]) != _INDEX_HEAD_DIM:
+        raise ValueError(
+            "DeepGEMM C4 prefill queries must have shape [rows, heads, 128]"
+        )
+    if weights.shape != (q_rows, int(q.shape[1])) or weights.dtype != torch.float32:
+        raise ValueError("DeepGEMM C4 prefill weights must be FP32 [rows, heads]")
+    if (
+        kv_cache.ndim != 3
+        or kv_cache.dtype != torch.uint8
+        or tuple(kv_cache.shape[1:]) != expected_cache_tail
+    ):
+        raise ValueError("DeepGEMM C4 prefill cache must be uint8 [pages, 64, 132]")
+    if seq_lens.shape != (q_rows,) or seq_lens.dtype != torch.int32:
+        raise ValueError("DeepGEMM C4 prefill lengths must be int32 [rows]")
+    if block_table.ndim != 2 or int(block_table.shape[0]) != 1:
+        raise ValueError("DeepGEMM C4 prefill requires one shared page-table row")
+    if gather_cu_seq_lens.shape != (2,) or gather_cu_seq_lens.dtype != torch.int32:
+        raise ValueError("DeepGEMM C4 gather boundaries must be int32 [2]")
+    if row_starts.shape != (q_rows,) or row_starts.dtype != torch.int32:
+        raise ValueError("DeepGEMM C4 row starts must be int32 [rows]")
+    if output.shape != (q_rows, int(topk)) or output.dtype != torch.int32:
+        raise ValueError("DeepGEMM C4 prefill output must be int32 [rows, topk]")
+    if not 0 <= int(total_k_rows) <= int(workspace_k_rows):
+        raise ValueError(
+            "DeepGEMM C4 gathered length exceeds workspace capacity: "
+            f"length={total_k_rows}, capacity={workspace_k_rows}"
+        )
+
+    output.fill_(-1)
+    if q_rows == 0 or total_k_rows == 0:
+        return
+
+    active_pages = (int(total_k_rows) + _INDEX_PAGE_SIZE - 1) // _INDEX_PAGE_SIZE
+    if active_pages > int(block_table.shape[1]):
+        raise ValueError(
+            "DeepGEMM C4 page table does not cover the gathered prefix: "
+            f"required={active_pages}, available={block_table.shape[1]}"
+        )
+
+    k_quant_full, k_scale_full = current_workspace_manager().get_simultaneous(
+        ((max(int(workspace_k_rows), 1), _INDEX_HEAD_DIM), q.dtype),
+        ((max(int(workspace_k_rows), 1), _INDEX_SCALE_BYTES), torch.uint8),
+    )
+    k_quant = k_quant_full[:total_k_rows]
+    k_scale_bytes = k_scale_full[:total_k_rows]
+    ops.cp_gather_indexer_k_quant_cache(
+        kv_cache,
+        k_quant,
+        k_scale_bytes,
+        block_table[:, :active_pages],
+        gather_cu_seq_lens,
+    )
+    logits = fp8_fp4_mqa_logits(
+        (q, None),
+        (k_quant, k_scale_bytes.view(torch.float32).squeeze(-1)),
+        weights,
+        row_starts,
+        seq_lens,
+        clean_logits=False,
+    )
+    ops.top_k_per_row_prefill(
+        logits,
+        row_starts,
+        seq_lens,
+        output,
+        q_rows,
+        int(logits.stride(0)),
+        int(logits.stride(1)),
+        int(topk),
+    )
+
+
 class B12xC4SparseIndexer(nn.Module):
     """Shared C4 FP8 paged indexer used by DeepSeek V4 and GLM-5.3-Flash."""
 
@@ -301,6 +392,18 @@ class B12xC4SparseIndexer(nn.Module):
             if shared_page_table:
                 _assert_prefill_route(plan)
             current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
+        current_workspace_manager().get_simultaneous(
+            ((max(self.max_model_len, 1), _INDEX_HEAD_DIM), q.dtype),
+            (
+                (max(self.max_model_len, 1), _INDEX_SCALE_BYTES),
+                torch.uint8,
+            ),
+        )
+        torch.empty(
+            (max(q_rows, 1), max(self.max_model_len, 1)),
+            dtype=torch.float32,
+            device=q.device,
+        )
 
     def reserve_profile_workspace(self, q: torch.Tensor) -> None:
         self._reserve_profile_workspace(q)
@@ -344,6 +447,35 @@ class B12xC4SparseIndexer(nn.Module):
             scores=scores,
             topk=self.topk_tokens,
             shared_page_table=shared_page_table,
+        )
+        return output
+
+    def run_deepgemm_prefill_topk(
+        self,
+        *,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        gather_cu_seq_lens: torch.Tensor,
+        row_starts: torch.Tensor,
+        output: torch.Tensor,
+        total_k_rows: int,
+    ) -> torch.Tensor:
+        """Use DeepGEMM for shared-page-table C4 prefill selection."""
+        _run_deepgemm_prefill_topk(
+            q=q,
+            weights=weights,
+            kv_cache=kv_cache,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            gather_cu_seq_lens=gather_cu_seq_lens,
+            row_starts=row_starts,
+            output=output,
+            topk=self.topk_tokens,
+            total_k_rows=int(total_k_rows),
+            workspace_k_rows=self.max_model_len,
         )
         return output
 

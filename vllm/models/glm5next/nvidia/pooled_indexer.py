@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GLM-5.3 C4 pooling around the shared b12x FP8 paged indexer."""
+"""GLM-5.3 C4 pooling with B12X decode and DeepGEMM prefill selection."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ _MLA_RECORD_BYTES = 528
 
 
 class Glm5NextPooledIndexer(nn.Module):
-    """Produce GLM C4 pools, select them with b12x, and expand token IDs."""
+    """Produce C4 pools, select them by execution phase, and expand token IDs."""
 
     def __init__(
         self,
@@ -223,6 +223,16 @@ class Glm5NextPooledIndexer(nn.Module):
                 dtype=torch.float32,
                 device=device,
             ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_pool_seq_starts",
+            torch.zeros(self.max_tokens, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_gather_cu_seq_lens",
+            torch.zeros((self.max_seqs, 2), dtype=torch.int32, device=device),
             persistent=False,
         )
         self.register_buffer(
@@ -479,29 +489,49 @@ class Glm5NextPooledIndexer(nn.Module):
 
         if decode_rows < live_rows:
             query_lens_cpu = main_metadata.prefill_query_lens_cpu
-            if query_lens_cpu is None:
+            request_seq_lens_cpu = main_metadata.prefill_seq_lens_cpu
+            if query_lens_cpu is None or request_seq_lens_cpu is None:
                 raise RuntimeError("GLM selector prefill metadata is incomplete")
+            if len(query_lens_cpu) != len(request_seq_lens_cpu):
+                raise RuntimeError(
+                    "GLM selector prefill request metadata has inconsistent lengths"
+                )
             row_start = decode_rows
             for local_request, query_len in enumerate(query_lens_cpu.tolist()):
                 row_end = row_start + int(query_len)
                 request = num_decodes + local_request
-                shared_table = self._pool_block_table[request : request + 1].expand(
-                    int(query_len), -1
-                )
-                self.indexer_op.run_paged_topk(
-                    q=q_fp8[row_start:row_end],
-                    weights=weights[row_start:row_end],
-                    kv_cache=index_cache,
-                    seq_lens=seq_lens[row_start:row_end],
-                    block_table=shared_table,
-                    output=pool_ids[row_start:row_end],
-                    scores=(
-                        pool_scores[row_start:row_end]
-                        if pool_scores is not None
-                        else None
-                    ),
-                    shared_page_table=True,
-                )
+                if self.dcp_world_size > 1:
+                    assert pool_scores is not None
+                    shared_table = self._pool_block_table[request : request + 1].expand(
+                        int(query_len), -1
+                    )
+                    self.indexer_op.run_paged_topk(
+                        q=q_fp8[row_start:row_end],
+                        weights=weights[row_start:row_end],
+                        kv_cache=index_cache,
+                        seq_lens=seq_lens[row_start:row_end],
+                        block_table=shared_table,
+                        output=pool_ids[row_start:row_end],
+                        scores=pool_scores[row_start:row_end],
+                        shared_page_table=True,
+                    )
+                else:
+                    total_pool_len = (
+                        int(request_seq_lens_cpu[local_request]) // _POOL_SIZE
+                    )
+                    gather_cu_seq_lens = self._gather_cu_seq_lens[local_request]
+                    gather_cu_seq_lens[1].fill_(total_pool_len)
+                    self.indexer_op.run_deepgemm_prefill_topk(
+                        q=q_fp8[row_start:row_end],
+                        weights=weights[row_start:row_end],
+                        kv_cache=index_cache,
+                        seq_lens=seq_lens[row_start:row_end],
+                        block_table=self._pool_block_table[request : request + 1],
+                        gather_cu_seq_lens=gather_cu_seq_lens,
+                        row_starts=self._pool_seq_starts[row_start:row_end],
+                        output=pool_ids[row_start:row_end],
+                        total_k_rows=total_pool_len,
+                    )
                 if pool_scores is not None:
                     _merge_dcp_topk(
                         pool_ids[row_start:row_end],

@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.models.deepseek_v4.nvidia import b12x_indexer
 from vllm.models.deepseek_v4.nvidia.b12x_indexer import _flatten_index_cache
 from vllm.models.glm5next.nvidia.ops.glm_kpool import (
     expand_c4_block_table,
@@ -123,10 +124,12 @@ def test_glm53_selector_prefill_lengths_do_not_require_attention_backend() -> No
         num_decode_tokens=1,
         prefill=None,
         prefill_query_lens_cpu=torch.tensor([3], dtype=torch.int32),
+        prefill_seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
     )
 
     assert metadata.prefill is None
     assert metadata.prefill_query_lens_cpu.tolist() == [3]
+    assert metadata.prefill_seq_lens_cpu.tolist() == [8]
 
 
 def test_glm53_packed_c4_metadata_uses_parent_stride() -> None:
@@ -374,6 +377,117 @@ def test_glm53_packed_tail_scores_through_existing_c4_indexer() -> None:
     torch.accelerator.synchronize()
     assert torch.accelerator.memory_allocated() == allocated
     assert set(output[0, :2].tolist()) == {0, 1}
+
+
+def test_glm53_deepgemm_prefill_matches_b12x_on_packed_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _require_glm_gpu()
+    _, main = _packed_main_cache(
+        device=device, blocks=2, layers=3, block_size=512, layer=1
+    )
+    index_cache, _, parent_stride_pages = Glm5NextPooledIndexer._index_cache_view(main)
+    virtual_page = parent_stride_pages
+    page = index_cache[virtual_page]
+    quant = page.as_strided(
+        (64, 128), (128, 1), storage_offset=page.storage_offset()
+    ).view(torch.float8_e4m3fn)
+    scales = page.as_strided(
+        (64 * 4,),
+        (1,),
+        storage_offset=page.storage_offset() + 64 * 128,
+    ).view(torch.float32)
+    generator = torch.Generator(device=device).manual_seed(5303)
+    quant.copy_(
+        torch.randn((64, 128), generator=generator, device=device).to(
+            torch.float8_e4m3fn
+        )
+    )
+    scales.copy_(
+        torch.exp2(
+            torch.randint(-3, 3, (64,), generator=generator, device=device).float()
+        )
+    )
+    q = torch.randn(
+        (3, 32, 128), generator=generator, device=device, dtype=torch.float32
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn(
+        (3, 32), generator=generator, device=device, dtype=torch.float32
+    )
+    seq_lens = torch.tensor([16, 37, 64], dtype=torch.int32, device=device)
+    block_table = torch.tensor([[virtual_page]], dtype=torch.int32, device=device)
+    topk = 512
+
+    from vllm.utils.b12x import get_b12x_dsa_indexer
+
+    module = get_b12x_dsa_indexer()
+    assert module is not None
+    plan = module.plan(
+        module.Caps(
+            device=device,
+            source_layout=module.SOURCE_LAYOUT_PAGED,
+            num_q_heads=32,
+            max_q_rows=3,
+            max_page_table_width=1,
+            topk=topk,
+            mode="prefill",
+            shared_page_table=True,
+        )
+    )
+    scratch = tuple(
+        torch.empty(shape, dtype=dtype, device=device)
+        for shape, dtype in plan.shapes_and_dtypes()
+    )
+    binding = plan.bind(
+        scratch=scratch,
+        real_page_table=block_table.expand(3, 1),
+        cache_seqlens_int32=seq_lens,
+        expected_num_q_heads=32,
+        shared_page_table=True,
+        output_physical_slots=False,
+    )
+    expected = torch.empty((3, topk), dtype=torch.int32, device=device)
+    module.index_topk_fp8(
+        q_fp8=q,
+        weights=weights,
+        index_k_cache=_flatten_index_cache(index_cache),
+        binding=binding,
+        page_size=64,
+        expected_num_q_heads=32,
+        out_indices=expected,
+    )
+
+    class Workspace:
+        def get_simultaneous(self, *specs):
+            return tuple(
+                torch.empty(shape, dtype=dtype, device=device) for shape, dtype in specs
+            )
+
+    monkeypatch.setattr(
+        b12x_indexer,
+        "current_workspace_manager",
+        lambda: Workspace(),
+    )
+    actual = torch.empty_like(expected)
+    b12x_indexer._run_deepgemm_prefill_topk(
+        q=q,
+        weights=weights,
+        kv_cache=index_cache,
+        seq_lens=seq_lens,
+        block_table=block_table,
+        gather_cu_seq_lens=torch.tensor([0, 64], dtype=torch.int32, device=device),
+        row_starts=torch.zeros(3, dtype=torch.int32, device=device),
+        output=actual,
+        topk=topk,
+        total_k_rows=64,
+        workspace_k_rows=64,
+    )
+    torch.accelerator.synchronize()
+
+    assert torch.equal(
+        torch.sort(actual, dim=-1).values,
+        torch.sort(expected, dim=-1).values,
+    )
 
 
 def test_glm53_pool_write_matches_fp8_reference() -> None:
