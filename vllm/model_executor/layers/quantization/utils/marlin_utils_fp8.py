@@ -475,6 +475,34 @@ def prepare_mxfp8_layer_for_marlin(layer: torch.nn.Module) -> None:
     qweight = qweight.T.contiguous()
     qweight = marlin_pad_qweight(qweight, part_size_n, part_size_k, padded_n, padded_k)
 
+    # qweight owns an independent contiguous copy at this point. The source
+    # FP8 parameter is no longer needed, and retaining it while the Marlin
+    # output is allocated makes peak memory proportional to three full weight
+    # buffers. Keep an empty registered parameter so reload metadata remains
+    # available until the final packed parameter replaces it below.
+    replace_parameter(
+        layer,
+        "weight",
+        torch.empty(0, dtype=layer.weight.dtype, device=device),
+    )
+
+    # Online quantization can leave reusable allocator blocks split across
+    # sizes that are unsuitable for the final contiguous Marlin output. This
+    # matters when expandable segments are disabled for pointer-stable KV
+    # cache integrations. Release inactive blocks only under low physical
+    # memory; active model tensors and qweight remain allocated.
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    minimum_free_bytes = max(1 << 30, 2 * qweight.numel() * qweight.element_size())
+    if free_bytes < minimum_free_bytes:
+        logger.info(
+            "Releasing inactive CUDA allocator blocks before MXFP8 Marlin "
+            "repack for %s (%d MiB free, %d MiB required).",
+            getattr(layer, "prefix", type(layer).__name__),
+            free_bytes >> 20,
+            minimum_free_bytes >> 20,
+        )
+        torch.cuda.empty_cache()
+
     marlin_qweight = ops.gptq_marlin_repack(
         b_q_weight=qweight,
         perm=perm,

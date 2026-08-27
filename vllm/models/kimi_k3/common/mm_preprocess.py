@@ -4,6 +4,7 @@
 
 import math
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from typing import Any, cast
 
 import torch
@@ -32,6 +33,63 @@ from vllm.transformers_utils.processor import cached_get_image_processor
 from vllm.transformers_utils.processors.kimi_k3 import KimiK3Processor
 
 logger = init_logger(__name__)
+
+
+_PATCH_LIMIT_KEYS = ("in_patch_limit", "patch_limit_on_one_side")
+
+
+def _apply_image_patch_limits(
+    image_processor: Any,
+    processor_kwargs: Mapping[str, object],
+) -> Any:
+    """Return a processor with deployment-wide Kimi image limits applied.
+
+    Kimi's image processor resizes inputs to ``in_patch_limit`` and
+    ``patch_limit_on_one_side``. Restricting those checkpoint defaults bounds
+    both the startup memory profile and request-time vision activations. The
+    cached checkpoint processor is copied so another model configuration in
+    the same process cannot inherit these deployment-specific limits.
+    """
+    overrides = {
+        key: processor_kwargs[key]
+        for key in _PATCH_LIMIT_KEYS
+        if key in processor_kwargs
+    }
+    if not overrides:
+        return image_processor
+
+    media_proc_cfg = getattr(image_processor, "media_proc_cfg", None)
+    if not isinstance(media_proc_cfg, Mapping):
+        raise ValueError(
+            "Kimi-K3 image patch limits require an image processor with "
+            "a media_proc_cfg mapping"
+        )
+
+    bounded_cfg = dict(media_proc_cfg)
+    for key, value in overrides.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"Kimi-K3 {key} must be a positive integer")
+        checkpoint_limit = bounded_cfg.get(key)
+        if not isinstance(checkpoint_limit, int) or checkpoint_limit <= 0:
+            raise ValueError(
+                f"Kimi-K3 checkpoint does not define a positive {key} limit"
+            )
+        if value > checkpoint_limit:
+            raise ValueError(
+                f"Kimi-K3 {key}={value} exceeds the checkpoint limit "
+                f"of {checkpoint_limit}"
+            )
+        bounded_cfg[key] = value
+
+    bounded_processor = deepcopy(image_processor)
+    bounded_processor.media_proc_cfg = bounded_cfg
+    logger.info(
+        "Kimi-K3 image processing limits: in_patch_limit=%d, "
+        "patch_limit_on_one_side=%d",
+        bounded_cfg["in_patch_limit"],
+        bounded_cfg["patch_limit_on_one_side"],
+    )
+    return bounded_processor
 
 
 def navit_resize_image(
@@ -107,6 +165,14 @@ class KimiK3ProcessingInfo(BaseProcessingInfo):
             revision=self.ctx.model_config.revision,
             trust_remote_code=self.ctx.model_config.trust_remote_code,
         )
+        get_mm_config = getattr(self.ctx.model_config, "get_multimodal_config", None)
+        if get_mm_config is not None:
+            mm_config = get_mm_config()
+            processor_kwargs = mm_config.mm_processor_kwargs or {}
+            image_processor = _apply_image_patch_limits(
+                image_processor,
+                processor_kwargs,
+            )
 
         # Resolve token ID from the tokenizer because transformers v5
         # may remap token IDs vs config.json.

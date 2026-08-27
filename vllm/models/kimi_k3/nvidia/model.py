@@ -1922,9 +1922,15 @@ class KimiK3ForConditionalGeneration(
                 quant_config=self._maybe_ignore_quant_config(quant_config),
                 prefix=maybe_prefix(prefix, "vision_tower"),
             )
-            if self._maybe_ignore_quant_config(quant_config) is not None:
+            vision_has_deferred_weights = any(
+                parameter.is_meta for parameter in self.vision_tower.parameters()
+            )
+            if (
+                self._maybe_ignore_quant_config(quant_config) is not None
+                and not vision_has_deferred_weights
+            ):
                 self.vision_tower = self.vision_tower.to(device=self.device)
-            else:
+            elif self._maybe_ignore_quant_config(quant_config) is None:
                 self.vision_tower = self.vision_tower.to(
                     device=self.device, dtype=model_config.dtype
                 )
@@ -1962,9 +1968,18 @@ class KimiK3ForConditionalGeneration(
                 quant_config=self._maybe_ignore_quant_config(quant_config),
                 prefix=maybe_prefix(prefix, "mm_projector"),
             )
-            self.mm_projector = self.mm_projector.to(
-                device=self.device, dtype=model_config.dtype
+            projector_has_deferred_weights = any(
+                parameter.is_meta for parameter in self.mm_projector.parameters()
             )
+            if (
+                self._maybe_ignore_quant_config(quant_config) is not None
+                and not projector_has_deferred_weights
+            ):
+                self.mm_projector = self.mm_projector.to(device=self.device)
+            elif self._maybe_ignore_quant_config(quant_config) is None:
+                self.mm_projector = self.mm_projector.to(
+                    device=self.device, dtype=model_config.dtype
+                )
 
         self.quant_config = quant_config
         with self._mark_language_model(vllm_config):

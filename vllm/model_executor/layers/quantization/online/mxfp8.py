@@ -81,7 +81,15 @@ class Mxfp8OnlineLinearMethod(_Fp8OnlineLinearBase):
         replace_parameter(layer, "weight", weight_fp8.data)
         replace_parameter(layer, "weight_scale", weight_scale.data)
 
-        self.kernel.process_weights_after_loading(layer)
+        weight_shape = tuple(layer.weight.shape)
+        try:
+            self.kernel.process_weights_after_loading(layer)
+        except RuntimeError as error:
+            prefix = getattr(layer, "prefix", type(layer).__name__)
+            raise RuntimeError(
+                "MXFP8 weight preparation failed for "
+                f"{prefix} with weight shape {weight_shape}"
+            ) from error
 
         layer._already_called_process_weights_after_loading = True
 
