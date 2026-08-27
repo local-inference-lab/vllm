@@ -134,6 +134,21 @@ logger = init_logger(__name__)
 _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD = 256
 
 
+def _uses_native_b12x_mxfp4_intermediate_size(
+    vllm_config: VllmConfig,
+) -> bool:
+    """Return whether B12X consumes the checkpoint MoE shard width.
+
+    The B12X W4A16 kernel accepts intermediate tails such as Kimi-K3's
+    3,072 / TP16 = 192 shard. Generic model-level padding to 256 channels per
+    rank would increase every routed-expert layer without changing its logical
+    shape.
+    """
+    if vllm_config.model_config.quantization != "mxfp4":
+        return False
+    return vllm_config.kernel_config.moe_backend == "b12x"
+
+
 def shard_sequence_parallel_mlp(
     hidden_size: int,
     intermediate_size: int,
@@ -599,12 +614,28 @@ class KimiMoE(nn.Module):
         min_moe_intermediate_per_partition = getattr(
             config, "min_moe_intermediate_per_partition", 256
         )
-        if self.tp_size > 1 and not vllm_config.parallel_config.enable_expert_parallel:
+        use_native_b12x_intermediate = (
+            not self.use_mega_moe
+            and _uses_native_b12x_mxfp4_intermediate_size(vllm_config)
+        )
+        if (
+            self.tp_size > 1
+            and not vllm_config.parallel_config.enable_expert_parallel
+            and not use_native_b12x_intermediate
+        ):
             moe_intermediate_per_partition = moe_intermediate_size // self.tp_size
             if moe_intermediate_per_partition < min_moe_intermediate_per_partition:
                 self.padded_moe_intermediate_size = (
                     min_moe_intermediate_per_partition * self.tp_size
                 )
+        elif use_native_b12x_intermediate:
+            logger.info_once(
+                "Kimi-K3 B12X MXFP4 keeps the checkpoint MoE intermediate "
+                "shard (%d / TP%d = %d).",
+                moe_intermediate_size,
+                self.tp_size,
+                moe_intermediate_size // self.tp_size,
+            )
         activation_situ_beta = (
             config.activation_situ_beta if config.hidden_act == "situ" else None
         )

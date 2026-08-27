@@ -301,6 +301,31 @@ def test_shard_sequence_parallel_mlp_gating(
     )
 
 
+@pytest.mark.parametrize(
+    ("quantization", "moe_backend", "expected"),
+    [
+        ("mxfp4", "b12x", True),
+        ("mxfp4", "auto", False),
+        ("mxfp4", "flashinfer_cutlass", False),
+        (None, "b12x", False),
+    ],
+)
+def test_native_mxfp4_moe_shard_requires_b12x_backend(
+    quantization: str | None,
+    moe_backend: str,
+    expected: bool,
+):
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(quantization=quantization),
+        kernel_config=SimpleNamespace(moe_backend=moe_backend),
+    )
+
+    assert (
+        kimi_model._uses_native_b12x_mxfp4_intermediate_size(vllm_config)
+        is expected
+    )
+
+
 def test_sharded_sequence_parallel_mlp_matches_replicated(default_vllm_config):
     """Sharded SP MLP must reproduce the replicated result for every token.
 
