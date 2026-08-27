@@ -150,6 +150,11 @@ class KVCacheSpec:
     block_size: int
 
     @property
+    def participates_in_prefix_caching(self) -> bool:
+        """Whether this spec's group participates in prefix caching."""
+        return True
+
+    @property
     def num_heads(self) -> int:
         raise NotImplementedError
 
@@ -807,6 +812,28 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         )
 
 
+@dataclass(frozen=True, kw_only=True)
+class KpoolTailSpec(SlidingWindowSpec):
+    """One-block circular scratch cache for a kpool indexer's raw tail."""
+
+    def max_admission_blocks_per_request(
+        self, max_in_flight_tokens: int, max_model_len: int
+    ) -> int:
+        return 1
+
+    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
+        return 1
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(isinstance(spec, KpoolTailSpec) for spec in kv_cache_specs.values())
+
+    @property
+    def participates_in_prefix_caching(self) -> bool:
+        return False
+
+
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
@@ -825,6 +852,10 @@ class MambaSpec(KVCacheSpec):
             prod(shape) * get_dtype_size(dtype)
             for (shape, dtype) in zip(self.shapes, self.dtypes)
         )
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return self.state_content_size_bytes
 
     @property
     def page_size_bytes(self) -> int:
@@ -958,6 +989,12 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     """
 
     kv_cache_specs: dict[str, KVCacheSpec]
+
+    @property
+    def participates_in_prefix_caching(self) -> bool:
+        return all(
+            spec.participates_in_prefix_caching for spec in self.kv_cache_specs.values()
+        )
 
     @property
     def page_size_bytes(self) -> int:
