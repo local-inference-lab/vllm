@@ -45,7 +45,10 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
@@ -119,6 +122,137 @@ def _gate_sigmoid_mul(attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tenso
     return attn_out * gate.sigmoid()
 
 
+def _restore_merged_output_order(
+    rank_major_output: torch.Tensor,
+    output_sizes: list[int],
+    tp_size: int,
+) -> torch.Tensor:
+    """Restore logical projection order after gathering TP-local shards."""
+    if tp_size == 1:
+        return rank_major_output
+    if any(size % tp_size for size in output_sizes):
+        raise ValueError(
+            f"Merged output sizes {output_sizes} must be divisible by TP={tp_size}"
+        )
+    local_sizes = [size // tp_size for size in output_sizes]
+    local_total = sum(local_sizes)
+    expected_width = local_total * tp_size
+    if rank_major_output.shape[-1] != expected_width:
+        raise ValueError(
+            "Unexpected gathered merged projection width: "
+            f"got {rank_major_output.shape[-1]}, expected {expected_width}"
+        )
+    rank_major = rank_major_output.unflatten(-1, (tp_size, local_total))
+    logical_local_shards = rank_major.split(local_sizes, dim=-1)
+    return torch.cat(
+        [shards.flatten(-2) for shards in logical_local_shards],
+        dim=-1,
+    )
+
+
+def _shard_qkv_a_projection(
+    vllm_config: VllmConfig,
+    output_sizes: list[int],
+    tp_size: int,
+) -> bool:
+    """Validate the requested TP layout for Kimi MLA latent projections."""
+    additional_config = vllm_config.additional_config
+    enabled = bool(
+        additional_config.get("kimi_shard_qkv_a", False)
+        if isinstance(additional_config, dict)
+        else False
+    )
+    if not enabled or tp_size == 1:
+        return False
+    if any(size % tp_size for size in output_sizes):
+        raise ValueError(
+            "Kimi MLA latent projection sharding requires every merged output "
+            f"width to be divisible by TP={tp_size}; got {output_sizes}."
+        )
+    return True
+
+
+class KimiShardedMergedColumnParallelLinear(MergedColumnParallelLinear):
+    """Shard a merged projection and restore its logical output ordering."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        *,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        super().__init__(
+            input_size,
+            output_sizes,
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def forward(self, x: torch.Tensor):
+        output_parallel, output_bias = super().forward(x)
+        if self.tp_size == 1:
+            return output_parallel, output_bias
+        rank_major_output = tensor_model_parallel_all_gather(output_parallel, dim=-1)
+        output = _restore_merged_output_order(
+            rank_major_output,
+            self.output_sizes,
+            self.tp_size,
+        )
+        return output, output_bias
+
+
+class KimiShardedMergedQKVGateLinear(MergedColumnParallelLinear):
+    """Shard Kimi QKV-A and gate weights while assembling QKV-A outputs."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        q_lora_rank: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        total_num_heads: int,
+        v_head_dim: int,
+        *,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        self.qkv_output_sizes = [
+            q_lora_rank,
+            kv_lora_rank + qk_rope_head_dim,
+        ]
+        gate_output_size = total_num_heads * v_head_dim
+        super().__init__(
+            hidden_size,
+            [*self.qkv_output_sizes, gate_output_size],
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        self.qkv_local_width = sum(self.qkv_output_sizes) // self.tp_size
+        self.gate_local_width = gate_output_size // self.tp_size
+
+    def forward(self, x: torch.Tensor):
+        output_parallel, output_bias = super().forward(x)
+        if self.tp_size == 1:
+            return output_parallel, output_bias
+        qkv_local, gate_local = output_parallel.split(
+            [self.qkv_local_width, self.gate_local_width],
+            dim=-1,
+        )
+        qkv_rank_major = tensor_model_parallel_all_gather(qkv_local, dim=-1)
+        qkv = _restore_merged_output_order(
+            qkv_rank_major,
+            self.qkv_output_sizes,
+            self.tp_size,
+        )
+        return torch.cat((qkv, gate_local), dim=-1), output_bias
+
+
 class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
     """Kimi-K3 Multi-head Latent Attention with optional RoPE and output gate."""
 
@@ -142,6 +276,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         run_gemm_rs_ar: bool = False,
     ) -> None:
         super().__init__()
+        vllm_config = get_current_vllm_config()
         self.hidden_size = hidden_size
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -201,7 +336,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         # Exactly one query layout is constructed below. Kimi-K3 uses q-LoRA;
         # Kimi-Linear uses independent full-rank Q and KV projections.
         self.fused_qkv_a_proj: MergedColumnParallelLinear | None = None
-        self.fused_qkv_a_g_proj: KimiK3MergedQKVGateLinear | None = None
+        self.fused_qkv_a_g_proj: (
+            KimiK3MergedQKVGateLinear | KimiShardedMergedQKVGateLinear | None
+        ) = None
         self.q_proj: ColumnParallelLinear | None = None
         self.kv_a_proj_with_mqa: ReplicatedLinear | None = None
         self.g_proj: ColumnParallelLinear | None = None
@@ -210,40 +347,63 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
 
         # Kimi-K3: low-rank Q and KV projections share one input projection.
         if self.q_lora_rank is not None:
-            # The latent Q and KV shards are replicated across TP ranks. Their
-            # TP splitting happens in q_b_proj and kv_b_proj instead.
+            qkv_a_output_sizes = [
+                self.q_lora_rank,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ]
+            shard_qkv_a = _shard_qkv_a_projection(
+                vllm_config,
+                qkv_a_output_sizes,
+                tp_size,
+            )
             if use_output_gate:
-                # The output gate is shard 2 of the same input projection.
-                self.fused_qkv_a_g_proj = KimiK3MergedQKVGateLinear(
-                    hidden_size=self.hidden_size,
-                    q_lora_rank=self.q_lora_rank,
-                    kv_lora_rank=self.kv_lora_rank,
-                    qk_rope_head_dim=self.qk_rope_head_dim,
-                    total_num_heads=num_heads,
-                    v_head_dim=self.v_head_dim,
-                    bias=False,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.fused_qkv_a_g_proj",
-                )
-                # Only supports unquantized weights for sliced side-stream path
-                # for now.
-                if aux_stream is not None and isinstance(
-                    self.fused_qkv_a_g_proj.quant_method, UnquantizedLinearMethod
-                ):
-                    self.aux_stream = aux_stream
-                    self._gate_events = (torch.cuda.Event(), torch.cuda.Event())
+                if shard_qkv_a:
+                    self.fused_qkv_a_g_proj = KimiShardedMergedQKVGateLinear(
+                        hidden_size=self.hidden_size,
+                        q_lora_rank=self.q_lora_rank,
+                        kv_lora_rank=self.kv_lora_rank,
+                        qk_rope_head_dim=self.qk_rope_head_dim,
+                        total_num_heads=num_heads,
+                        v_head_dim=self.v_head_dim,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.fused_qkv_a_g_proj",
+                    )
+                else:
+                    self.fused_qkv_a_g_proj = KimiK3MergedQKVGateLinear(
+                        hidden_size=self.hidden_size,
+                        q_lora_rank=self.q_lora_rank,
+                        kv_lora_rank=self.kv_lora_rank,
+                        qk_rope_head_dim=self.qk_rope_head_dim,
+                        total_num_heads=num_heads,
+                        v_head_dim=self.v_head_dim,
+                        bias=False,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.fused_qkv_a_g_proj",
+                    )
+                    # The sliced side-stream path requires replicated latent rows.
+                    if aux_stream is not None and isinstance(
+                        self.fused_qkv_a_g_proj.quant_method,
+                        UnquantizedLinearMethod,
+                    ):
+                        self.aux_stream = aux_stream
+                        self._gate_events = (torch.cuda.Event(), torch.cuda.Event())
             else:
-                self.fused_qkv_a_proj = MergedColumnParallelLinear(
-                    self.hidden_size,
-                    [
-                        self.q_lora_rank,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                    ],
-                    bias=False,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.fused_qkv_a_proj",
-                    disable_tp=True,
-                )
+                if shard_qkv_a:
+                    self.fused_qkv_a_proj = KimiShardedMergedColumnParallelLinear(
+                        self.hidden_size,
+                        qkv_a_output_sizes,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.fused_qkv_a_proj",
+                    )
+                else:
+                    self.fused_qkv_a_proj = MergedColumnParallelLinear(
+                        self.hidden_size,
+                        qkv_a_output_sizes,
+                        bias=False,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.fused_qkv_a_proj",
+                        disable_tp=True,
+                    )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 self.q_lora_rank,
@@ -363,7 +523,6 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             self.impl.dcp_rank = 0
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
 
-        vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
         assert parallel_config.prefill_context_parallel_size == 1, (
             "Kimi-K3 MultiHeadLatentAttention does not support prefill context "
