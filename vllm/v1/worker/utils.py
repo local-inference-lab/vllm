@@ -375,11 +375,32 @@ def select_common_block_size(
     raise ValueError(f"No common block size for {kv_manager_block_size}. ")
 
 
+def allocate_kv_cache_storage(
+    kv_cache_config: KVCacheConfig,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Allocate the shared byte storage described by a KV cache config."""
+    if not kv_cache_config.kv_cache_tensors:
+        return None
+
+    sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
+    assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
+    raw_size = sizes.pop()
+    page_size = 4096
+    return torch.zeros(
+        ((raw_size + page_size - 1) // page_size) * page_size,
+        dtype=torch.int8,
+        device=device,
+    )
+
+
 def allocate_kv_cache(
     kv_cache_config: KVCacheConfig,
     device: torch.device,
     layout: KVCacheLayout,
     kernel_block_sizes: list[int] | None = None,
+    *,
+    kv_cache_storage: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Allocate the KV cache and view it as ``[B, H, N, C]`` per layer.
 
@@ -390,15 +411,17 @@ def allocate_kv_cache(
     if not kv_cache_config.kv_cache_tensors:
         return {}
 
+    buf = kv_cache_storage
+    if buf is None:
+        buf = allocate_kv_cache_storage(kv_cache_config, device)
+    assert buf is not None
+    assert buf.dtype == torch.int8
+    assert buf.device == device
     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
     assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
-    raw_size = sizes.pop()
-    page_size = 4096
-    buf = torch.zeros(
-        ((raw_size + page_size - 1) // page_size) * page_size,
-        dtype=torch.int8,
-        device=device,
-    )
+    expected_size = sizes.pop()
+    expected_size = ((expected_size + 4095) // 4096) * 4096
+    assert buf.numel() == expected_size
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:

@@ -29,6 +29,7 @@ from vllm.v1.worker.gpu.attn_utils import (
 from vllm.v1.worker.utils import (
     AttentionGroup,
     allocate_kv_cache,
+    allocate_kv_cache_storage,
     copy_kv_cache_blocks_inplace,
 )
 
@@ -181,6 +182,43 @@ def test_allocate_compressed_mla_cache(
     )
 
     assert caches["layer.0"].shape == (expected_num_blocks, 1, expected_num_states, 128)
+
+
+def test_allocate_kv_cache_reuses_preallocated_storage():
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.float32,
+    )
+    num_blocks = 2
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=num_blocks * spec.page_size_bytes,
+                layers=["layer.0"],
+                layer_stride=num_blocks * spec.page_size_bytes,
+                block_stride=spec.page_size_bytes,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(["layer.0"], spec)],
+    )
+    storage = allocate_kv_cache_storage(config, torch.device("cpu"))
+    assert storage is not None
+
+    caches = allocate_kv_cache(
+        config,
+        torch.device("cpu"),
+        KVCacheLayout.LBHNC,
+        kv_cache_storage=storage,
+    )
+
+    cache = caches["layer.0"]
+    assert cache.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
+    cache.fill_(1)
+    assert torch.equal(cache, torch.ones_like(cache))
+    assert torch.count_nonzero(storage) > 0
 
 
 @pytest.mark.parametrize("layout", list(KVCacheLayout))

@@ -20,7 +20,7 @@ instead of embedding feature-specific logic directly.
 import functools
 import gc
 import time
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -159,6 +159,7 @@ from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
     KVBlockZeroer,
+    allocate_kv_cache_storage,
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
 )
@@ -527,6 +528,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def get_kv_cache_spec(self):
         return get_kv_cache_spec(self.vllm_config)
 
+    def _allocate_manual_kv_cache_storage(
+        self,
+        kv_cache_config: KVCacheConfig,
+        allocation_context: AbstractContextManager | None,
+    ) -> torch.Tensor | None:
+        """Reserve fixed KV storage before persistent metadata allocations."""
+        if self.cache_config.kv_cache_memory_bytes is None:
+            return None
+        torch.accelerator.synchronize(self.device)
+        gc.collect()
+        torch.accelerator.empty_cache()
+        with allocation_context or nullcontext():
+            return allocate_kv_cache_storage(kv_cache_config, self.device)
+
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
@@ -535,6 +550,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> None:
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        kv_cache_storage = self._allocate_manual_kv_cache_storage(
+            kv_cache_config,
+            kv_cache_allocation_context,
+        )
+        if self.cache_config.kv_cache_memory_bytes is not None:
+            # The allocation context was consumed by the retained backing
+            # tensor. Metadata and views must remain outside that scope.
+            kv_cache_allocation_context = None
 
         block_table_max_model_len = self.max_model_len
         if self.is_encoder_decoder:
@@ -664,6 +687,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kernel_block_sizes,
             self.vllm_config,
             kv_cache_allocation_context=kv_cache_allocation_context,
+            kv_cache_storage=kv_cache_storage,
         )
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR

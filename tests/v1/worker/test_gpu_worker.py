@@ -7,13 +7,86 @@ from unittest.mock import patch
 import pytest
 import torch
 
+import vllm.v1.worker.gpu.model_runner as gpu_model_runner_module
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import startup_plan
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
+
+
+class _AllocationScope:
+    def __init__(self) -> None:
+        self.active = False
+
+    def __enter__(self):
+        assert not self.active
+        self.active = True
+        return self
+
+    def __exit__(self, *_args) -> None:
+        assert self.active
+        self.active = False
+
+
+@pytest.mark.parametrize("kv_cache_memory_bytes", [None, 1024])
+def test_manual_kv_storage_is_allocated_after_reclaim(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_memory_bytes: int | None,
+):
+    runner = object.__new__(GPUModelRunner)
+    runner.cache_config = SimpleNamespace(
+        kv_cache_memory_bytes=kv_cache_memory_bytes,
+    )
+    runner.device = torch.device("cuda:3")
+    config = object()
+    storage = object()
+    scope = _AllocationScope()
+    calls: list[object] = []
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.accelerator,
+        "synchronize",
+        lambda device: calls.append(("synchronize", device)),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.gc,
+        "collect",
+        lambda: calls.append("collect"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.accelerator,
+        "empty_cache",
+        lambda: calls.append("empty_cache"),
+    )
+
+    def allocate(actual_config, device):
+        assert scope.active
+        calls.append(("allocate", actual_config, device))
+        return storage
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "allocate_kv_cache_storage",
+        allocate,
+    )
+
+    result = runner._allocate_manual_kv_cache_storage(config, scope)
+
+    if kv_cache_memory_bytes is None:
+        assert result is None
+        assert calls == []
+    else:
+        assert result is storage
+        assert calls == [
+            ("synchronize", torch.device("cuda:3")),
+            "collect",
+            "empty_cache",
+            ("allocate", config, torch.device("cuda:3")),
+        ]
+    assert not scope.active
 
 
 def test_kimi_k3_prefill_warmup_releases_autotune_scratch(

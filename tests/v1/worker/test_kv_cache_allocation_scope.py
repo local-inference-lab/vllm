@@ -59,6 +59,42 @@ def test_mrv2_kv_pool_only_wraps_backing_allocation(monkeypatch) -> None:
     assert not scope.active
 
 
+def test_mrv2_preallocated_storage_does_not_reenter_kv_pool(monkeypatch) -> None:
+    scope = _AllocationScope()
+    storage = torch.empty(0, dtype=torch.int8)
+    kv_caches = {"layer": torch.empty(0)}
+
+    def allocate(*args, **kwargs):
+        assert not scope.active
+        assert kwargs["kv_cache_storage"] is storage
+        return kv_caches
+
+    def bind(*args, **kwargs):
+        assert not scope.active
+
+    monkeypatch.setattr(attn_utils, "allocate_kv_cache", allocate)
+    monkeypatch.setattr(attn_utils, "bind_kv_cache", bind)
+    monkeypatch.setattr(attn_utils, "get_shared_kv_cache_layers", lambda config: {})
+
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(get_resolved_kv_cache_layout=lambda: None),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="test")),
+    )
+    result = attn_utils.init_kv_cache(
+        [],
+        {},
+        object(),
+        torch.device("cpu"),
+        [],
+        config,
+        kv_cache_allocation_context=scope,
+        kv_cache_storage=storage,
+    )
+
+    assert result is kv_caches
+    assert not scope.active
+
+
 def test_mrv1_kv_pool_only_wraps_backing_allocation(monkeypatch) -> None:
     scope = _AllocationScope()
     kv_caches = {"layer": torch.empty(0)}
