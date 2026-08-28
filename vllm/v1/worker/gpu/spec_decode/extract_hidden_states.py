@@ -12,7 +12,10 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.speculator import (
+    CUDAGraphCapturePhase,
+    DraftModelSpeculator,
+)
 
 
 class ExtractHiddenStatesSpeculator(DraftModelSpeculator):
@@ -81,7 +84,8 @@ class ExtractHiddenStatesSpeculator(DraftModelSpeculator):
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         del cudagraph_mode
 
-    def capture(self) -> None:
+    def capture(self, *, capture_phase: CUDAGraphCapturePhase) -> None:
+        del capture_phase
         return None
 
     @torch.inference_mode()

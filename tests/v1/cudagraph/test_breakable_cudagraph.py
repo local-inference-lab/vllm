@@ -62,13 +62,18 @@ def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
         patch(
             "vllm.v1.worker.gpu.cudagraph_utils.graph_capture",
             return_value=nullcontext(),
-        ),
+        ) as graph_capture,
         patch(
             "vllm.v1.worker.gpu.cudagraph_utils.is_global_first_rank",
             return_value=False,
         ),
     ):
-        manager.capture(create_forward_fn)
+        manager.capture(create_forward_fn, channel_id="test:breakable")
+
+    graph_capture.assert_called_once_with(
+        device=manager.device,
+        channel_id="test:breakable",
+    )
 
     assert [warmup for warmup, _ in create_calls] == [True, False]
     assert [mode for _, mode, _ in forward_calls] == [

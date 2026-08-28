@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -29,6 +29,8 @@ from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
+CUDAGraphCapturePhase = Literal["profile", "production"]
+
 
 class BaseSpeculator(ABC):
     @abstractmethod
@@ -36,7 +38,7 @@ class BaseSpeculator(ABC):
         pass
 
     @abstractmethod
-    def capture(self) -> None:
+    def capture(self, *, capture_phase: CUDAGraphCapturePhase) -> None:
         pass
 
     @abstractmethod

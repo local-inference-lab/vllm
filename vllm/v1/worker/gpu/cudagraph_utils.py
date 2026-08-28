@@ -313,6 +313,8 @@ class CudaGraphManager:
     def capture(
         self,
         create_forward_fn: CreateForwardFn,
+        *,
+        channel_id: str,
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture CUDA graphs.
@@ -323,8 +325,9 @@ class CudaGraphManager:
                 it is invoked once with warmup=True and again with warmup=False
                 because attention backends may mutate or lazily initialize
                 metadata during warmup.
+            channel_id: Stable distributed identity for this graph owner.
         """
-        with graph_capture(device=self.device):
+        with graph_capture(device=self.device, channel_id=channel_id):
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -499,6 +502,8 @@ class ModelCudaGraphManager(CudaGraphManager):
         has_lora: bool = False,
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
+        *,
+        channel_id: str,
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
@@ -610,7 +615,11 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        super().capture(
+            create_forward_fn,
+            channel_id=channel_id,
+            progress_bar_desc=progress_bar_desc,
+        )
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor
@@ -710,6 +719,35 @@ _FULL_GRAPH_PROFILING_SAMPLES = 2
 _MIN_PER_GRAPH_BYTES = 1 << 20
 
 
+def _checkpoint_b12x_graph_channels() -> list[Any]:
+    """Snapshot graph-owned B12X channels before disposable profiling."""
+    from vllm.distributed.parallel_state import get_dcp_group, get_tp_group
+    from vllm.v1.attention.ops.b12x_dcp import checkpoint_b12x_dcp_channels
+
+    checkpoints: list[Any] = []
+    seen_groups: set[int] = set()
+    for get_group in (get_tp_group, get_dcp_group):
+        try:
+            group = get_group()
+        except AssertionError:
+            # Runners without initialized distributed groups need no cleanup.
+            continue
+        group_id = id(group.device_group)
+        if group.world_size <= 1 or group_id in seen_groups:
+            continue
+        seen_groups.add(group_id)
+        checkpoints.append(checkpoint_b12x_dcp_channels(group))
+    return checkpoints
+
+
+def _rollback_b12x_graph_channels(checkpoints: list[Any]) -> None:
+    """Release disposable B12X channels after profiling graphs are gone."""
+    from vllm.v1.attention.ops.b12x_dcp import rollback_b12x_dcp_channels
+
+    for checkpoint in reversed(checkpoints):
+        rollback_b12x_dcp_channels(checkpoint)
+
+
 @torch.inference_mode()
 def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     """Estimate the GPU memory needed for CUDA graph capture.
@@ -761,9 +799,11 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         original_pools: dict[int, Any] = {}
         speculator = getattr(runner, "speculator", None)
         spec_manager_names: list[str] = []
+        graph_channel_checkpoints: list[Any] = []
         try:
             if not manager.needs_capture():
                 return 0
+            graph_channel_checkpoints = _checkpoint_b12x_graph_channels()
             manager.pool = throwaway_pool
             if manager.use_breakable_cg:
                 # Create the breakable runner before the wrapper pool swap so
@@ -785,7 +825,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             mem_samples: list[int] = []
             manager._capture_mem_samples = mem_samples
 
-            measured = int(runner.capture_model())
+            measured = int(runner.capture_model(capture_phase="profile"))
 
             # The measured delta covers PIECEWISE, encoder and speculator graphs
             # plus the sampled FULL graphs; swap the sampled FULL cost for the
@@ -811,7 +851,10 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             # Drop local references before teardown detaches the runner's
             # manager and flushes the allocator.
             del manager
-            _teardown_profiling_state(runner)
+            try:
+                _teardown_profiling_state(runner)
+            finally:
+                _rollback_b12x_graph_channels(graph_channel_checkpoints)
     finally:
         platform_cls._global_graph_pool = saved_global_pool
 

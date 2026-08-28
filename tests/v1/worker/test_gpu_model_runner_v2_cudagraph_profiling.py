@@ -66,8 +66,10 @@ def _make_profiling_runner(
 
     events: list[str] = []
     runner.events = events
+    runner.capture_phases = []
 
-    def _capture_model() -> int:
+    def _capture_model(*, capture_phase: str) -> int:
+        runner.capture_phases.append(capture_phase)
         events.append("capture")
         # Simulate the manager's per-FULL-graph memory sampling.
         samples = runner.cudagraph_manager._capture_mem_samples
@@ -155,6 +157,7 @@ def test_profile_cudagraph_memory_samples_and_extrapolates(monkeypatch):
     assert result == (1000 - (100 + 20) + (100 + 2 * 20)) * gib
     # Bootstrap, capture, and teardown run in order.
     assert runner.events == ["init", "capture", "teardown"]
+    assert runner.capture_phases == ["profile"]
     # Capture must use a throwaway pool, not the persistent global pool.
     assert runner.cudagraph_manager.pool == THROWAWAY_POOL
     # FULL capture must be limited to the largest few graphs.
@@ -182,8 +185,21 @@ def test_profile_cudagraph_memory_piecewise_only_returns_measured(monkeypatch):
 def test_profile_cudagraph_memory_tears_down_on_capture_error(monkeypatch):
     _patch_module(monkeypatch)
     runner = _make_profiling_runner(CUDAGraphMode.FULL)
+    checkpoint = object()
 
-    def _boom() -> int:
+    def _checkpoint_channels():
+        runner.events.append("checkpoint-channels")
+        return [checkpoint]
+
+    def _rollback_channels(checkpoints):
+        assert checkpoints == [checkpoint]
+        runner.events.append("rollback-channels")
+
+    monkeypatch.setattr(cgu, "_checkpoint_b12x_graph_channels", _checkpoint_channels)
+    monkeypatch.setattr(cgu, "_rollback_b12x_graph_channels", _rollback_channels)
+
+    def _boom(*, capture_phase: str) -> int:
+        assert capture_phase == "profile"
         runner.events.append("capture")
         raise RuntimeError("capture failed")
 
@@ -197,14 +213,21 @@ def test_profile_cudagraph_memory_tears_down_on_capture_error(monkeypatch):
         raise AssertionError("expected capture error to propagate")
 
     # Teardown still runs even if capture raises.
-    assert runner.events == ["init", "capture", "teardown"]
+    assert runner.events == [
+        "init",
+        "checkpoint-channels",
+        "capture",
+        "teardown",
+        "rollback-channels",
+    ]
 
 
 def test_profile_cudagraph_memory_restores_compilation_counters(monkeypatch):
     _patch_module(monkeypatch)
     runner = _make_profiling_runner(CUDAGraphMode.FULL)
 
-    def _capture_model() -> int:
+    def _capture_model(*, capture_phase: str) -> int:
+        assert capture_phase == "profile"
         compilation_counter.num_cudagraph_captured += 5
         compilation_counter.num_gpu_runner_capture_triggers += 1
         return 1 << 30
@@ -288,9 +311,9 @@ def test_profile_cudagraph_memory_redirects_wrapper_pools(monkeypatch):
     try:
         capture_model = runner.capture_model
 
-        def _capture_model() -> int:
+        def _capture_model(*, capture_phase: str) -> int:
             wrapper.pool_during_capture = wrapper.graph_pool
-            return capture_model()
+            return capture_model(capture_phase=capture_phase)
 
         runner.capture_model = _capture_model
 
@@ -328,9 +351,9 @@ def test_profile_cudagraph_memory_swaps_and_drops_speculator_managers(monkeypatc
     pools_seen: list[Any] = []
     capture_model = runner.capture_model
 
-    def _capture_model() -> int:
+    def _capture_model(*, capture_phase: str) -> int:
         pools_seen.append(runner.speculator.cudagraph_manager.pool)
-        return capture_model()
+        return capture_model(capture_phase=capture_phase)
 
     runner.capture_model = _capture_model
 
@@ -379,7 +402,8 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch):
         manager.pool = cgu.current_platform.get_global_graph_pool()
         r.speculator = SimpleNamespace(cudagraph_manager=manager)
 
-    def _capture_model() -> int:
+    def _capture_model(*, capture_phase: str) -> int:
+        assert capture_phase == "profile"
         for owner in (
             runner.cudagraph_manager,
             runner.speculator.cudagraph_manager,

@@ -87,8 +87,11 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
     def create_forward_fn(desc, warmup):
         return lambda _mode: None
 
+    graph_capture_calls = []
+
     @contextmanager
     def fake_graph_capture(*args, **kwargs):
+        graph_capture_calls.append((args, kwargs))
         yield SimpleNamespace(stream=MagicMock())
 
     fake_offloader = MagicMock()
@@ -110,9 +113,12 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
             return_value=mock_cuda_graph_ctx,
         ) as mock_cuda_graph,
     ):
-        manager.capture(create_forward_fn)
+        manager.capture(create_forward_fn, channel_id="test:model")
 
     mock_cuda_graph.assert_called_once()
+    assert graph_capture_calls == [
+        ((), {"device": manager.device, "channel_id": "test:model"})
+    ]
 
 
 def test_piecewise_capture_uses_pcp_dummy_slot_mappings():

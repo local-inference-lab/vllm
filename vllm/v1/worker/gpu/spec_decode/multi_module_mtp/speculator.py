@@ -18,7 +18,10 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
-from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.speculator import (
+    CUDAGraphCapturePhase,
+    DraftModelSpeculator,
+)
 from vllm.v1.worker.utils import get_uniform_decode_token_count
 
 logger = init_logger(__name__)
@@ -110,7 +113,7 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
             self.num_speculative_steps + 1,
         )
 
-    def capture(self) -> None:
+    def capture(self, *, capture_phase: CUDAGraphCapturePhase) -> None:
         logger.info("Capturing model for multi-module MTP speculator...")
         # Reset indices to zeros to prevent stale values from prior
         # dummy runs to cause out-of-bounds indexing during capture.
@@ -125,6 +128,7 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
             self.block_tables,
             self.attn_groups,
             self.kv_cache_config,
+            channel_id=f"vllm:draft:multi-module-mtp:{capture_phase}",
             progress_bar_desc="Capturing multi-module MTP CUDA graphs",
         )
 
