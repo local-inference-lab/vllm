@@ -787,6 +787,40 @@ def test_glm5next_processor_resolves_repository_video_config(
     )
 
 
+def test_glm5next_processing_info_pins_processor_revision(monkeypatch) -> None:
+    from vllm.models.glm5next.nvidia.multimodal import Glm5NextProcessingInfo
+
+    calls = []
+    processor = object()
+
+    def fake_from_pretrained(model, **kwargs):
+        calls.append((model, kwargs))
+        return processor
+
+    monkeypatch.setattr(
+        glm5next_processor.Glm5NextProcessor,
+        "from_pretrained",
+        staticmethod(fake_from_pretrained),
+    )
+    info = SimpleNamespace(
+        ctx=SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="local-inference-lab/GLM-5.3-Flash-NVFP4",
+                revision="checkpoint-commit",
+            )
+        )
+    )
+
+    assert Glm5NextProcessingInfo.get_hf_processor(info) is processor
+    assert Glm5NextProcessingInfo.get_hf_processor(info) is processor
+    assert calls == [
+        (
+            "local-inference-lab/GLM-5.3-Flash-NVFP4",
+            {"revision": "checkpoint-commit"},
+        )
+    ]
+
+
 def test_glm5next_processor_counts_video_only_tokens() -> None:
     class FakeVideoProcessor:
         merge_size = 2
