@@ -1234,6 +1234,7 @@ class MLADCPManager:
         padded_num_heads: int | None,
         is_lse_base_on_e: bool,
         use_pcp: bool,
+        use_b12x: bool = False,
     ) -> None:
         parallel_config = vllm_config.parallel_config
         self.group = get_dcp_group()
@@ -1242,6 +1243,9 @@ class MLADCPManager:
         self.max_num_tokens = get_dcp_workspace_max_num_tokens(vllm_config)
         self.use_a2a = parallel_config.dcp_comm_backend == "a2a"
         self.padded_num_heads = padded_num_heads
+        self.use_b12x = use_b12x and self.use_a2a and not use_pcp
+        self.query_head_dim = query_head_dim
+        self.output_head_dim = output_head_dim
 
         self.combine = self._init_combine(
             num_heads,
@@ -1269,7 +1273,7 @@ class MLADCPManager:
         use_pcp: bool,
     ) -> DCPCombine:
         direct_workspace = None
-        if self.use_a2a:
+        if self.use_a2a and not self.use_b12x:
             direct_workspace = get_direct_dcp_a2a_workspace(
                 self.group,
                 self.device,
@@ -1294,10 +1298,54 @@ class MLADCPManager:
             if use_pcp
             else cp_lse_ag_out_rs
         )
-        return functools.partial(
+        fallback_combine = functools.partial(
             combine_fn,
             cp_group=self.group,
             is_lse_base_on_e=is_lse_base_on_e,
+        )
+        if not self.use_b12x:
+            return fallback_combine
+        return functools.partial(
+            self._b12x_combine,
+            fallback=functools.partial(
+                cp_lse_ag_out_rs,
+                cp_group=self.group,
+                is_lse_base_on_e=is_lse_base_on_e,
+            ),
+            is_lse_base_on_e=is_lse_base_on_e,
+        )
+
+    def _b12x_combine(
+        self,
+        partial_output: torch.Tensor,
+        partial_lse: torch.Tensor,
+        *,
+        fallback: DCPCombine,
+        is_lse_base_on_e: bool,
+        seq_lens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        from vllm.v1.attention.ops.b12x_dcp import (
+            B12X_DECODE_TOKEN_CAP,
+            try_b12x_lse_reduce_scatter,
+        )
+
+        mask_dcp_empty_shards_(partial_lse, seq_lens, query_start_loc)
+        result = try_b12x_lse_reduce_scatter(
+            partial_output,
+            partial_lse,
+            self.group,
+            is_lse_base_on_e=is_lse_base_on_e,
+            max_batch_size=B12X_DECODE_TOKEN_CAP,
+            query_head_dim=self.query_head_dim,
+        )
+        if result is not None:
+            return result
+        return fallback(
+            partial_output,
+            partial_lse,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
         )
 
     def _direct_workspace_combine(
@@ -1335,6 +1383,8 @@ class MLADCPManager:
         head_dim: int,
         dtype: torch.dtype,
     ) -> Callable[[torch.Tensor], torch.Tensor]:
+        if self.use_b12x:
+            return self._b12x_query_gather
         direct_workspace = get_direct_dcp_q_gather_workspace(
             self.group,
             self.device,
@@ -1352,6 +1402,24 @@ class MLADCPManager:
                 direct_workspace,
             )
         return self._gather_query
+
+    def _b12x_query_gather(self, query: torch.Tensor) -> torch.Tensor:
+        from vllm.v1.attention.ops.b12x_dcp import (
+            B12X_DECODE_TOKEN_CAP,
+            try_b12x_query_gather,
+        )
+
+        result = try_b12x_query_gather(
+            query,
+            self.group,
+            max_batch_size=B12X_DECODE_TOKEN_CAP,
+            output_head_dim=self.output_head_dim,
+        )
+        if result is None:
+            return self._gather_query(query)
+        if self.padded_num_heads is not None:
+            result = reserve_query_head_storage(result, self.padded_num_heads)
+        return result
 
     def _gather_query(self, query: torch.Tensor) -> torch.Tensor:
         query = self.group.all_gather(query, dim=1)

@@ -6779,13 +6779,31 @@ class GPUModelRunner(
             else None
         )
 
+        from vllm.v1.attention.ops.b12x_dcp import (
+            checkpoint_b12x_dcp_channels,
+            rollback_b12x_dcp_channels,
+        )
+
+        graph_channel_checkpoints = []
+        seen_groups: set[int] = set()
+        for group in (get_tp_group(), get_dcp_group()):
+            group_id = id(group.device_group)
+            if group.world_size <= 1 or group_id in seen_groups:
+                continue
+            seen_groups.add(group_id)
+            graph_channel_checkpoints.append(checkpoint_b12x_dcp_channels(group))
+
         # Cleanup-only guard: CUDA graph capture errors should still propagate
         # because encoder graph capture is opt-in.
         try:
             set_cudagraph_capturing_enabled(True)
             with (
                 self._freeze_gc(),
-                graph_capture(device=self.device, graph_capture_context=cap_ctx),
+                graph_capture(
+                    device=self.device,
+                    graph_capture_context=cap_ctx,
+                    channel_id="vllm:target:profile",
+                ),
             ):
                 torch.accelerator.synchronize()
                 torch.accelerator.empty_cache()
@@ -6843,23 +6861,29 @@ class GPUModelRunner(
                         encoder_graphs,
                     )
         finally:
-            set_cudagraph_capturing_enabled(False)
-            CUDAGraphWrapper.clear_all_graphs()
-            BreakableCUDAGraphWrapper.clear_all_graphs()
-            if encoder_cudagraph_manager is not None:
-                encoder_cudagraph_manager.clear()
-            all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
-                BreakableCUDAGraphWrapper._all_instances
-            )
-            for instance in all_wrappers:
-                if id(instance) in original_pools:
-                    instance.graph_pool = original_pools[id(instance)]
-            for key_set in self.cudagraph_dispatcher.cudagraph_keys.values():
-                key_set.clear()
-            self.cudagraph_dispatcher.keys_initialized = False
-            self.maybe_remove_all_loras(self.lora_config)
-            self._cleanup_profiling_kv_cache()
-            compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
+            try:
+                set_cudagraph_capturing_enabled(False)
+                CUDAGraphWrapper.clear_all_graphs()
+                BreakableCUDAGraphWrapper.clear_all_graphs()
+                if encoder_cudagraph_manager is not None:
+                    encoder_cudagraph_manager.clear()
+                all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
+                    BreakableCUDAGraphWrapper._all_instances
+                )
+                for instance in all_wrappers:
+                    if id(instance) in original_pools:
+                        instance.graph_pool = original_pools[id(instance)]
+                for key_set in self.cudagraph_dispatcher.cudagraph_keys.values():
+                    key_set.clear()
+                self.cudagraph_dispatcher.keys_initialized = False
+                self.maybe_remove_all_loras(self.lora_config)
+                self._cleanup_profiling_kv_cache()
+                compilation_counter.num_cudagraph_captured = (
+                    saved_num_cudagraph_captured
+                )
+            finally:
+                for checkpoint in reversed(graph_channel_checkpoints):
+                    rollback_b12x_dcp_channels(checkpoint)
 
         # FULL and PIECEWISE graphs share the global pool at runtime and are
         # never replayed concurrently, so the pool overlays their memory.
@@ -6935,7 +6959,13 @@ class GPUModelRunner(
                 "Rank %d: Torch profiler disabled for CUDA graph capture", local_rank
             )
 
-        with self._freeze_gc(), graph_capture(device=self.device):
+        with (
+            self._freeze_gc(),
+            graph_capture(
+                device=self.device,
+                channel_id="vllm:target:production",
+            ),
+        ):
             torch.accelerator.synchronize()
             torch.accelerator.empty_cache()
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]

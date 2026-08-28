@@ -15,7 +15,6 @@ from vllm.distributed import (
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -110,6 +109,11 @@ from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
 )
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.ops import attn_res
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    B12X_DECODE_TOKEN_CAP,
+    gather_kimi_sharded_projection,
+    gather_kimi_sharded_projection_pair,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
@@ -360,7 +364,15 @@ class KimiMLP(nn.Module):
 class KimiColumnParallelGate(ColumnParallelLinear):
     """Feature-sharded router that returns globally ordered FP32 logits."""
 
-    def __init__(self, input_size: int, output_size: int, prefix: str) -> None:
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        prefix: str,
+        *,
+        use_b12x: bool,
+    ) -> None:
+        self.use_b12x = use_b12x
         super().__init__(
             input_size,
             output_size,
@@ -370,15 +382,22 @@ class KimiColumnParallelGate(ColumnParallelLinear):
             prefix=prefix,
         )
 
-    def forward(self, x: torch.Tensor):
+    def forward_local(self, x: torch.Tensor):
         if x.is_cuda and x.dtype == self.weight.dtype == torch.bfloat16:
             output_parallel = torch.mm(x, self.weight.t(), out_dtype=torch.float32)
         else:
             output_parallel = torch.nn.functional.linear(
                 x.to(self.weight.dtype), self.weight
             ).float()
+        return output_parallel, None
+
+    def forward(self, x: torch.Tensor):
+        output_parallel, _ = self.forward_local(x)
         if self.tp_size > 1:
-            output = tensor_model_parallel_all_gather(output_parallel)
+            output = gather_kimi_sharded_projection(
+                output_parallel,
+                use_b12x=self.use_b12x,
+            )
         else:
             output = output_parallel
         return output, None
@@ -658,6 +677,10 @@ class KimiMoE(nn.Module):
             num_experts=num_experts,
             routed_hidden_size=self.moe_hidden_size,
         )
+        attention_backend = vllm_config.attention_config.backend
+        self.use_b12x_projection_transport = (
+            attention_backend is not None and attention_backend.name == "B12X"
+        )
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
@@ -715,6 +738,7 @@ class KimiMoE(nn.Module):
                 input_size=hidden_size,
                 output_size=num_experts,
                 prefix=f"{prefix}.gate",
+                use_b12x=self.use_b12x_projection_transport,
             )
         else:
             self.gate = GateLinear(
@@ -760,7 +784,7 @@ class KimiMoE(nn.Module):
                     hidden_size,
                     self.moe_hidden_size,
                     bias=False,
-                    gather_output=True,
+                    gather_output=False,
                     quant_config=None,
                     prefix=f"{prefix}.routed_expert_down_proj",
                 )
@@ -897,12 +921,14 @@ class KimiMoE(nn.Module):
             logits and ``topk_ids`` is ``None``.
         """
 
-        def _router(
-            hidden_states: torch.Tensor,
+        def _finish_router(
+            router_logits: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor | None]:
-            router_logits, _ = self.gate(hidden_states)
             if not self.use_mega_moe:
                 return router_logits, None
+            return _select_mega_moe_experts(router_logits)
+
+        def _select_mega_moe_experts(router_logits: torch.Tensor):
             return fused_grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -915,11 +941,36 @@ class KimiMoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
             )
 
+        def _router(
+            hidden_states: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            router_logits, _ = self.gate(hidden_states)
+            return _finish_router(router_logits)
+
         down_proj = self.routed_expert_down_proj
         if down_proj is None:
             router_output, topk_ids = _router(hidden_states)
             return hidden_states, router_output, topk_ids
         num_tokens = hidden_states.shape[0]
+        if (
+            self.auxiliary_projections_tp_sharded
+            and 0 < num_tokens <= B12X_DECODE_TOKEN_CAP
+            and isinstance(self.gate, KimiColumnParallelGate)
+        ):
+            (router_local, _), (down_local, _) = maybe_execute_in_parallel(
+                lambda: self.gate.forward_local(hidden_states),
+                lambda: down_proj(hidden_states),
+                self._down_proj_events[0],
+                self._down_proj_events[1],
+                self._down_proj_stream,
+            )
+            routed_hidden_states, router_logits = gather_kimi_sharded_projection_pair(
+                down_local,
+                router_local,
+                use_b12x=self.use_b12x_projection_transport,
+            )
+            router_output, topk_ids = _finish_router(router_logits)
+            return routed_hidden_states, router_output, topk_ids
         (router_output, topk_ids), (routed_hidden_states, _) = (
             maybe_execute_in_parallel(
                 lambda: _router(hidden_states),
@@ -932,6 +983,11 @@ class KimiMoE(nn.Module):
                 else None,
             )
         )
+        if self.auxiliary_projections_tp_sharded:
+            routed_hidden_states = gather_kimi_sharded_projection(
+                routed_hidden_states,
+                use_b12x=self.use_b12x_projection_transport,
+            )
         return routed_hidden_states, router_output, topk_ids
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

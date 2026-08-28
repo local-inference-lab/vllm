@@ -45,10 +45,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import (
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
-)
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
@@ -87,6 +84,9 @@ from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_kv_concat,
     fused_mla_kv_concat_quant_fp8,
     fused_mla_qkv_quant_kv_cache_fp8_insert,
+)
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    gather_kimi_sharded_projection,
 )
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -182,7 +182,9 @@ class KimiShardedMergedColumnParallelLinear(MergedColumnParallelLinear):
         *,
         quant_config: QuantizationConfig | None,
         prefix: str,
+        use_b12x: bool,
     ) -> None:
+        self.use_b12x = use_b12x
         super().__init__(
             input_size,
             output_sizes,
@@ -196,7 +198,10 @@ class KimiShardedMergedColumnParallelLinear(MergedColumnParallelLinear):
         output_parallel, output_bias = super().forward(x)
         if self.tp_size == 1:
             return output_parallel, output_bias
-        rank_major_output = tensor_model_parallel_all_gather(output_parallel, dim=-1)
+        rank_major_output = gather_kimi_sharded_projection(
+            output_parallel,
+            use_b12x=self.use_b12x,
+        )
         output = _restore_merged_output_order(
             rank_major_output,
             self.output_sizes,
@@ -219,7 +224,9 @@ class KimiShardedMergedQKVGateLinear(MergedColumnParallelLinear):
         *,
         quant_config: QuantizationConfig | None,
         prefix: str,
+        use_b12x: bool,
     ) -> None:
+        self.use_b12x = use_b12x
         self.qkv_output_sizes = [
             q_lora_rank,
             kv_lora_rank + qk_rope_head_dim,
@@ -244,7 +251,10 @@ class KimiShardedMergedQKVGateLinear(MergedColumnParallelLinear):
             [self.qkv_local_width, self.gate_local_width],
             dim=-1,
         )
-        qkv_rank_major = tensor_model_parallel_all_gather(qkv_local, dim=-1)
+        qkv_rank_major = gather_kimi_sharded_projection(
+            qkv_local,
+            use_b12x=self.use_b12x,
+        )
         qkv = _restore_merged_output_order(
             qkv_rank_major,
             self.qkv_output_sizes,
@@ -351,6 +361,10 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 self.q_lora_rank,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             ]
+            attention_backend = vllm_config.attention_config.backend
+            use_b12x_projection_transport = (
+                attention_backend is not None and attention_backend.name == "B12X"
+            )
             shard_qkv_a = _shard_qkv_a_projection(
                 vllm_config,
                 qkv_a_output_sizes,
@@ -367,6 +381,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                         v_head_dim=self.v_head_dim,
                         quant_config=quant_config,
                         prefix=f"{prefix}.fused_qkv_a_g_proj",
+                        use_b12x=use_b12x_projection_transport,
                     )
                 else:
                     self.fused_qkv_a_g_proj = KimiK3MergedQKVGateLinear(
@@ -394,6 +409,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                         qkv_a_output_sizes,
                         quant_config=quant_config,
                         prefix=f"{prefix}.fused_qkv_a_proj",
+                        use_b12x=use_b12x_projection_transport,
                     )
                 else:
                     self.fused_qkv_a_proj = MergedColumnParallelLinear(
@@ -548,6 +564,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 padded_num_heads=self.q_pad_num_heads,
                 is_lse_base_on_e=self.impl.lse_base_on_e,
                 use_pcp=False,
+                use_b12x=self.attn_backend.get_name() == "B12X",
             )
         self.prefill_backend = get_mla_prefill_backend(vllm_config)(
             num_heads=self.num_local_heads,

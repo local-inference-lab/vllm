@@ -373,11 +373,12 @@ def test_column_parallel_gate_preserves_rank_major_fp32_logits(monkeypatch):
         requires_grad=False,
     )
     gate.tp_size = 2
+    gate.use_b12x = False
     hidden_states = torch.tensor([[2.0, 3.0, 4.0]], dtype=torch.float32)
     local_logits = torch.nn.functional.linear(hidden_states, gate.weight)
     gathered_logits = torch.cat((local_logits, local_logits + 100.0), dim=-1)
     gather = Mock(return_value=gathered_logits)
-    monkeypatch.setattr(kimi_model, "tensor_model_parallel_all_gather", gather)
+    monkeypatch.setattr(kimi_model, "gather_kimi_sharded_projection", gather)
 
     actual, bias = gate(hidden_states)
 
@@ -386,6 +387,7 @@ def test_column_parallel_gate_preserves_rank_major_fp32_logits(monkeypatch):
     torch.testing.assert_close(actual, gathered_logits)
     gather.assert_called_once()
     torch.testing.assert_close(gather.call_args.args[0], local_logits)
+    assert gather.call_args.kwargs == {"use_b12x": False}
 
 
 def test_partial_routed_output_transform_adds_partial_residual():

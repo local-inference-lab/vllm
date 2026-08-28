@@ -65,6 +65,7 @@ if TYPE_CHECKING:
 @dataclass
 class GraphCaptureContext:
     stream: torch.cuda.Stream
+    channel_id: str | None = None
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -1460,6 +1461,7 @@ def get_pcp_group() -> GroupCoordinator:
 def graph_capture(
     device: torch.device,
     graph_capture_context: GraphCaptureContext | None = None,
+    channel_id: str | None = None,
 ):
     """
     `graph_capture` is a context manager which should surround the code that
@@ -1477,10 +1479,46 @@ def graph_capture(
     A caller may pass an explicit ``graph_capture_context`` to control the
     stream used (e.g. to capture on the default stream).
     """
-    context = graph_capture_context or GraphCaptureContext(
-        torch.cuda.Stream(device=device)
-    )
-    with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
+    if graph_capture_context is None:
+        context = GraphCaptureContext(
+            torch.cuda.Stream(device=device), channel_id=channel_id
+        )
+    else:
+        context = graph_capture_context
+        if channel_id is not None:
+            if context.channel_id is not None and context.channel_id != channel_id:
+                raise ValueError(
+                    "graph capture context and argument specify different "
+                    "semantic channel IDs"
+                )
+            if context.channel_id is None:
+                context = GraphCaptureContext(context.stream, channel_id=channel_id)
+
+    from vllm.v1.attention.ops.b12x_dcp import capture_b12x_dcp_pools
+
+    b12x_contexts: list[contextlib.AbstractContextManager[Any]] = []
+    if context.channel_id is not None:
+        seen_groups: set[int] = set()
+        for group in (_TP, _DCP):
+            if group is None or group.world_size <= 1:
+                continue
+            group_id = id(group.device_group)
+            if group_id in seen_groups:
+                continue
+            seen_groups.add(group_id)
+            b12x_contexts.append(
+                capture_b12x_dcp_pools(
+                    group,
+                    context.stream,
+                    channel_id=context.channel_id,
+                )
+            )
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(get_tp_group().graph_capture(context))
+        stack.enter_context(get_pp_group().graph_capture(context))
+        for b12x_context in b12x_contexts:
+            stack.enter_context(b12x_context)
         yield context
 
 
