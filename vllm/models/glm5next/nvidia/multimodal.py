@@ -630,7 +630,10 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         if proc is None:
             from vllm.transformers_utils.processors.glm5next import Glm5NextProcessor
 
-            proc = Glm5NextProcessor.from_pretrained(self.ctx.model_config.model)
+            proc = Glm5NextProcessor.from_pretrained(
+                self.ctx.model_config.model,
+                revision=self.ctx.model_config.revision,
+            )
             self._glm5_hf_processor = proc
         return proc
 
