@@ -38,6 +38,7 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup, unbind_kv_cache
+from vllm.v1.worker.workspace import collect_cuda_graph_capture_resources
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -133,6 +134,7 @@ class CudaGraphManager:
         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
 
         self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
+        self.graph_capture_resources: dict[BatchExecutionDescriptor, list[Any]] = {}
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
 
         self._graphs_captured = False
@@ -377,18 +379,20 @@ class CudaGraphManager:
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
                             free_before = torch.accelerator.get_memory_info()[0]
-                        with torch.cuda.graph(graph, self.pool):
+                        with (
+                            collect_cuda_graph_capture_resources() as resources,
+                            torch.cuda.graph(graph, self.pool),
+                        ):
                             forward_fn(CUDAGraphMode.NONE)
-                            # Join offloader's copy stream after forward to avoid
-                            # unjoined stream error. The last layer's start_prefetch
-                            # forks copy_stream, but wait_prefetch only happens in
-                            # the next forward pass.
+                            # Join the offloader copy stream because the last layer
+                            # can leave a prefetch pending at capture end.
                             get_offloader().join_after_forward()
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
                             free_after = torch.accelerator.get_memory_info()[0]
                             self._capture_mem_samples.append(free_before - free_after)
                         self.graphs[desc] = graph
+                        self.graph_capture_resources[desc] = resources
                         compilation_counter.num_cudagraph_captured += 1
         self._graphs_captured = True
 
@@ -817,6 +821,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         BreakableCUDAGraphWrapper.clear_all_graphs()
         for graph_manager in graph_managers:
             graph_manager.graphs.clear()
+            graph_manager.graph_capture_resources.clear()
             graph_manager._graphs_captured = False
             graph_manager.pool = original_manager_pools[id(graph_manager)]
         live_wrappers = list(CUDAGraphWrapper._all_instances) + list(

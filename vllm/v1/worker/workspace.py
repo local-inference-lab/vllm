@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from itertools import accumulate
 from math import prod
+from typing import Any
 
 import torch
 
@@ -30,6 +31,9 @@ _GiB = 1024**3
 # Global workspace manager instance
 _manager: "WorkspaceManager | None" = None
 _workspace_lane: ContextVar[int] = ContextVar("vllm_workspace_lane", default=0)
+_cuda_graph_capture_resources: ContextVar[list[Any] | None] = ContextVar(
+    "vllm_cuda_graph_capture_resources", default=None
+)
 
 
 @contextmanager
@@ -42,6 +46,33 @@ def use_workspace_lane(lane: int) -> Iterator[None]:
         yield
     finally:
         _workspace_lane.reset(token)
+
+
+@contextmanager
+def collect_cuda_graph_capture_resources() -> Iterator[list[Any]]:
+    """Collect objects whose storage is referenced by one CUDA graph.
+
+    A CUDA graph records device pointers, but it does not retain the Python
+    objects that own those allocations. Callers that allocate custom-op output
+    or scratch tensors during capture can register their owner with
+    :func:`retain_cuda_graph_capture_resource`. The graph manager keeps the
+    returned list alive for exactly as long as the captured graph.
+    """
+    resources: list[Any] = []
+    token = _cuda_graph_capture_resources.set(resources)
+    try:
+        yield resources
+    finally:
+        _cuda_graph_capture_resources.reset(token)
+
+
+def retain_cuda_graph_capture_resource(resource: Any) -> bool:
+    """Retain ``resource`` when called inside full CUDA graph capture."""
+    resources = _cuda_graph_capture_resources.get()
+    if resources is None:
+        return False
+    resources.append(resource)
+    return True
 
 
 class WorkspaceManager:

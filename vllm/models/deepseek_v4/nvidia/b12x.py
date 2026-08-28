@@ -38,7 +38,10 @@ from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
-from vllm.v1.worker.workspace import current_workspace_manager
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    retain_cuda_graph_capture_resource,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -170,7 +173,7 @@ class B12xMHCResidual:
             raise ValueError("B12x mHC scratch plan did not provide any buffers.")
         scratch: torch.Tensor | tuple[torch.Tensor, ...]
         scratch = buffers[0] if len(buffers) == 1 else tuple(buffers)
-        return self._bind(
+        binding = self._bind(
             plan,
             scratch=scratch,
             tokens=tokens,
@@ -180,6 +183,8 @@ class B12xMHCResidual:
             out=out,
             expected_m=expected_m,
         )
+        retain_cuda_graph_capture_resource(binding)
+        return binding
 
     def run_pre(
         self,

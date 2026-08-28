@@ -100,3 +100,21 @@ def test_workspace_lane_validation(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="at least one"):
         workspace.WorkspaceManager(torch.device("cpu"), num_lanes=0)
+
+
+def test_cuda_graph_capture_resources_are_scoped_to_collector() -> None:
+    outside = object()
+    first = object()
+    nested = object()
+    second = object()
+
+    assert not workspace.retain_cuda_graph_capture_resource(outside)
+    with workspace.collect_cuda_graph_capture_resources() as resources:
+        assert workspace.retain_cuda_graph_capture_resource(first)
+        with workspace.collect_cuda_graph_capture_resources() as nested_resources:
+            assert workspace.retain_cuda_graph_capture_resource(nested)
+        assert workspace.retain_cuda_graph_capture_resource(second)
+
+    assert resources == [first, second]
+    assert nested_resources == [nested]
+    assert not workspace.retain_cuda_graph_capture_resource(outside)

@@ -839,6 +839,7 @@ def test_b12x_wo_projection_packs_and_runs_public_api(monkeypatch) -> None:
 
 def test_b12x_mhc_uses_public_plan_bind_run(monkeypatch) -> None:
     calls: dict[str, Any] = {}
+    retained_bindings: list[Any] = []
 
     def make_caps(**kwargs):
         calls["caps"] = kwargs
@@ -878,6 +879,11 @@ def test_b12x_mhc_uses_public_plan_bind_run(monkeypatch) -> None:
     )
     monkeypatch.setattr(b12x_mla, "_require_b12x_mhc", lambda: module)
     monkeypatch.setattr(b12x_mla, "current_workspace_manager", lambda: _Workspace())
+    monkeypatch.setattr(
+        b12x_mla,
+        "retain_cuda_graph_capture_resource",
+        retained_bindings.append,
+    )
 
     mhc = b12x_mla.B12xMHCResidual(
         hidden_size=256,
@@ -918,6 +924,10 @@ def test_b12x_mhc_uses_public_plan_bind_run(monkeypatch) -> None:
     assert calls["bind"][1]["scratch"].dtype == torch.uint8
     assert calls["pre"][1]["binding"].expected_m == 3
     assert calls["post_pre"][1]["expected_m"] == 3
+    assert retained_bindings == [
+        calls["pre"][1]["binding"],
+        calls["post_pre"][1]["binding"],
+    ]
     assert residual_out.shape == (3, 4, 256)
     assert layer_input.shape == (3, 256)
     assert final is next_outputs[0]
