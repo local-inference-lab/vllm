@@ -1630,6 +1630,11 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             if self.attn_res_block_size is not None
             else 0
         )
+        self._max_num_batched_tokens = int(
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        self._model_dtype = vllm_config.model_config.dtype
+        self.register_buffer("_attn_res_workspace", None, persistent=False)
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1760,6 +1765,70 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _get_attn_res_workspace(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return retained AttnRes storage for the active token rows."""
+        shape = (
+            hidden_states.size(0),
+            self.num_attn_res_blocks,
+            hidden_states.size(1),
+        )
+        workspace = self._attn_res_workspace
+        if (
+            workspace is None
+            or workspace.device != hidden_states.device
+            or workspace.dtype != hidden_states.dtype
+            or workspace.size(0) < shape[0]
+            or workspace.size(1) != shape[1]
+            or workspace.size(2) != shape[2]
+        ):
+            # Physical block-major storage keeps every token-major block view
+            # contiguous for AttnRes kernels and later buffer reuse.
+            workspace = hidden_states.new_empty(
+                shape[1],
+                shape[0],
+                shape[2],
+            ).permute(1, 0, 2)
+            self._attn_res_workspace = workspace
+        return workspace[: shape[0]]
+
+    def reserve_attn_res_workspace(self) -> None:
+        """Reserve maximum-size AttnRes storage before KV cache allocation.
+
+        Chunked prefill reuses one allocation for every scheduler chunk. Early
+        reservation prevents model-load and CUDA-graph allocations from
+        fragmenting the contiguous block required by a maximum-size chunk.
+        """
+        if not self.use_attn_res or self.num_attn_res_blocks == 0:
+            return
+        shape = (
+            self._max_num_batched_tokens,
+            self.num_attn_res_blocks,
+            self.config.hidden_size,
+        )
+        workspace = self._attn_res_workspace
+        parameter = next(self.parameters())
+        if (
+            workspace is None
+            or workspace.device != parameter.device
+            or workspace.dtype != self._model_dtype
+            or tuple(workspace.shape) != shape
+        ):
+            self._attn_res_workspace = torch.empty(
+                shape[1],
+                shape[0],
+                shape[2],
+                dtype=self._model_dtype,
+                device=parameter.device,
+            ).permute(1, 0, 2)
+            logger.info_once(
+                "Kimi-K3 retained %.2f MiB/rank for the %d-token AttnRes "
+                "prefill workspace.",
+                self._attn_res_workspace.numel()
+                * self._attn_res_workspace.element_size()
+                / (1024**2),
+                self._max_num_batched_tokens,
+            )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1800,11 +1869,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         prefix_sum = None
         if self.use_attn_res:
-            block_residual = hidden_states.new_empty(
-                hidden_states.size(0),
-                self.num_attn_res_blocks,
-                hidden_states.size(1),
-            )
+            block_residual = self._get_attn_res_workspace(hidden_states)
             if residual is not None:
                 block_residual[:, : residual.size(1), :].copy_(residual)
             prefix_sum = hidden_states
@@ -2168,6 +2233,9 @@ class KimiLinearForCausalLM(
         # (W_UK_T / W_UV absorption) is driven by the loader's generic post-load
         # hook for any AttentionLayerBase, so no manual trigger is needed here.
         return loaded
+
+    def process_weights_after_loading(self) -> None:
+        self.model.reserve_attn_res_workspace()
 
 
 def get_spec_layer_idx_from_weight_name(
@@ -2627,3 +2695,6 @@ class KimiK3ForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def process_weights_after_loading(self) -> None:
+        self.language_model.process_weights_after_loading()
