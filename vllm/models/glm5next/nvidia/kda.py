@@ -10,7 +10,6 @@ from vllm.config import VllmConfig
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     KimiGatedDeltaNetAttention,
 )
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 
 class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
@@ -38,16 +37,13 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
                 f"got {backend!r}."
             )
         self._glm53_kda_decode_backend = backend
-        self.enable_b12x_kda_decode = backend != "triton"
+        # A recurrent cache uses one KDA implementation for its full lifetime.
+        # Keeping its BF16 rounding consistent prevents speculative acceptance
+        # from depending on whether a step entered through plain or spec decode.
+        self.enable_b12x_kda_decode = backend == "b12x" or (
+            backend == "auto" and vllm_config.speculative_config is not None
+        )
         super().__init__(config, vllm_config, prefix)
-
-    def _can_use_b12x_kda_decode(self, m: GDNAttentionMetadata) -> bool:
-        backend = self._glm53_kda_decode_backend
-        if backend == "triton":
-            return False
-        if backend == "auto" and m.spec_sequence_masks is None:
-            return False
-        return super()._can_use_b12x_kda_decode(m)
 
     def forward(  # type: ignore[override]
         self,
