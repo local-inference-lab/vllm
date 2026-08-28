@@ -251,6 +251,195 @@ def _decode_update_kernel(
         tl.store(tail + base + tail_stride_1 + dim, current_gate, mask=dim_mask)
 
 
+@triton.jit
+def _prefill_pool_kernel(
+    cache_fp8,
+    cache_fp32,
+    tail,
+    state_slots,
+    query_start_loc,
+    key,
+    gate,
+    ape,
+    slot_mapping,
+    positions,
+    request_offset,
+    page_stride_bytes,
+    model_block_size,
+    parent_stride_pages,
+    tail_stride_0,
+    tail_stride_1,
+    tail_stride_2,
+    key_stride_0,
+    gate_stride_0,
+    ape_stride_0,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    POOL_SIZE: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    request = request_offset + tl.program_id(0)
+    pool_ordinal = tl.program_id(1)
+    state_slot = tl.load(state_slots + request).to(tl.int64)
+    start = tl.load(query_start_loc + request).to(tl.int64)
+    end = tl.load(query_start_loc + request + 1).to(tl.int64)
+    has_rows = end > start
+    first_position = tl.load(positions + start, mask=has_rows, other=0).to(tl.int64)
+    first_physical_slot = first_position % POOL_SIZE
+    first_completion = start + (POOL_SIZE - 1 - first_physical_slot)
+    completion_row = first_completion + pool_ordinal * POOL_SIZE
+    write_pool = has_rows & (completion_row < end) & (state_slot >= 0)
+    completion_position = tl.load(
+        positions + completion_row, mask=write_pool, other=-1
+    ).to(tl.int64)
+    write_pool &= completion_position % POOL_SIZE == POOL_SIZE - 1
+    main_cache_location = tl.load(
+        slot_mapping + completion_row, mask=write_pool, other=-1
+    ).to(tl.int64)
+    write_pool &= main_cache_location >= 0
+    parent_page = main_cache_location // model_block_size
+    model_page_offset = main_cache_location - parent_page * model_block_size
+    pool_offset = model_page_offset // POOL_SIZE
+    child_page = pool_offset // PAGE_SIZE
+    child_offset = pool_offset - child_page * PAGE_SIZE
+    cache_location = (
+        parent_page * parent_stride_pages + child_page
+    ) * PAGE_SIZE + child_offset
+
+    dim = tl.arange(0, BLOCK_D)
+    dim_mask = dim < HEAD_DIM
+    maximum = tl.full((BLOCK_D,), -float("inf"), tl.float32)
+    for slot in tl.static_range(0, POOL_SIZE):
+        source_row = completion_row - (POOL_SIZE - 1 - slot)
+        from_current_chunk = source_row >= start
+        tail_offset = (
+            state_slot * tail_stride_0 + tail_stride_1 + slot * tail_stride_2 + dim
+        )
+        current_score = tl.load(
+            gate + source_row * gate_stride_0 + dim,
+            mask=dim_mask & write_pool & from_current_chunk,
+            other=0.0,
+        ).to(tl.float32)
+        previous_score = tl.load(
+            tail + tail_offset,
+            mask=dim_mask & write_pool & ~from_current_chunk,
+            other=0.0,
+        ).to(tl.float32)
+        score = tl.where(from_current_chunk, current_score, previous_score)
+        score += tl.load(
+            ape + slot * ape_stride_0 + dim,
+            mask=dim_mask & write_pool,
+            other=0.0,
+        ).to(tl.float32)
+        maximum = tl.maximum(maximum, score)
+
+    numerator = tl.zeros((BLOCK_D,), tl.float32)
+    denominator = tl.zeros((BLOCK_D,), tl.float32)
+    for slot in tl.static_range(0, POOL_SIZE):
+        source_row = completion_row - (POOL_SIZE - 1 - slot)
+        from_current_chunk = source_row >= start
+        tail_offset = state_slot * tail_stride_0 + slot * tail_stride_2 + dim
+        current_value = tl.load(
+            key + source_row * key_stride_0 + dim,
+            mask=dim_mask & write_pool & from_current_chunk,
+            other=0.0,
+        ).to(tl.float32)
+        previous_value = tl.load(
+            tail + tail_offset,
+            mask=dim_mask & write_pool & ~from_current_chunk,
+            other=0.0,
+        ).to(tl.float32)
+        value = tl.where(from_current_chunk, current_value, previous_value)
+        current_score = tl.load(
+            gate + source_row * gate_stride_0 + dim,
+            mask=dim_mask & write_pool & from_current_chunk,
+            other=0.0,
+        ).to(tl.float32)
+        previous_score = tl.load(
+            tail + tail_offset + tail_stride_1,
+            mask=dim_mask & write_pool & ~from_current_chunk,
+            other=0.0,
+        ).to(tl.float32)
+        score = tl.where(from_current_chunk, current_score, previous_score)
+        score += tl.load(
+            ape + slot * ape_stride_0 + dim,
+            mask=dim_mask & write_pool,
+            other=0.0,
+        ).to(tl.float32)
+        weight = tl.exp(score - maximum)
+        numerator += value * weight
+        denominator += weight
+
+    pooled = numerator / tl.maximum(denominator, 1e-20)
+    _write_pool(
+        cache_fp8,
+        cache_fp32,
+        cache_location,
+        pooled,
+        dim,
+        dim_mask,
+        write_pool,
+        page_stride_bytes,
+        PAGE_SIZE,
+        HEAD_DIM,
+        FP8_MAX,
+    )
+
+
+@triton.jit
+def _prefill_tail_kernel(
+    tail,
+    state_slots,
+    query_start_loc,
+    key,
+    gate,
+    positions,
+    request_offset,
+    tail_stride_0,
+    tail_stride_1,
+    tail_stride_2,
+    key_stride_0,
+    gate_stride_0,
+    HEAD_DIM: tl.constexpr,
+    POOL_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    request = request_offset + tl.program_id(0)
+    state_slot = tl.load(state_slots + request).to(tl.int64)
+    start = tl.load(query_start_loc + request).to(tl.int64)
+    end = tl.load(query_start_loc + request + 1).to(tl.int64)
+    last_row = end - 1
+    has_rows = end > start
+    last_position = tl.load(positions + last_row, mask=has_rows, other=0).to(tl.int64)
+    last_physical_slot = last_position % POOL_SIZE
+    dim = tl.arange(0, BLOCK_D)
+    dim_mask = (dim < HEAD_DIM) & has_rows & (state_slot >= 0)
+    for slot in tl.static_range(0, POOL_SIZE):
+        distance = (last_physical_slot - slot + POOL_SIZE) % POOL_SIZE
+        source_row = last_row - distance
+        source_in_chunk = source_row >= start
+        source_position = tl.load(
+            positions + source_row,
+            mask=has_rows & source_in_chunk,
+            other=-1,
+        ).to(tl.int64)
+        write_slot = dim_mask & source_in_chunk & (source_position % POOL_SIZE == slot)
+        value = tl.load(
+            key + source_row * key_stride_0 + dim,
+            mask=write_slot,
+            other=0.0,
+        )
+        score = tl.load(
+            gate + source_row * gate_stride_0 + dim,
+            mask=write_slot,
+            other=0.0,
+        )
+        tail_offset = state_slot * tail_stride_0 + slot * tail_stride_2 + dim
+        tl.store(tail + tail_offset, value, mask=write_slot)
+        tl.store(tail + tail_offset + tail_stride_1, score, mask=write_slot)
+
+
 def update_decode_pools(
     kv_cache: torch.Tensor,
     tail: torch.Tensor,
@@ -263,10 +452,18 @@ def update_decode_pools(
     positions: torch.Tensor,
     num_requests: int,
     *,
+    num_decode_requests: int | None = None,
+    max_query_len: int | None = None,
     model_block_size: int | None = None,
     parent_stride_pages: int | None = None,
 ) -> None:
-    """Update raw tails and write every newly completed FP8 pool."""
+    """Update request tails and write every newly completed FP8 C4 pool.
+
+    Decode and speculative-decode requests retain ordered row processing. Prefill
+    requests use one program per completed pool and a separate final-tail update;
+    their positions must be consecutive within each request, as required by the
+    packed GLM MLA cache contract.
+    """
     if num_requests <= 0:
         return
     page_size = int(kv_cache.shape[1])
@@ -287,7 +484,17 @@ def update_decode_pools(
     assert parent_stride_pages is not None
     if parent_stride_pages <= 0:
         raise ValueError("GLM parent_stride_pages must be positive")
-    _decode_update_kernel[(num_requests,)](
+    if num_decode_requests is None:
+        num_decode_requests = num_requests
+    if not 0 <= num_decode_requests <= num_requests:
+        raise ValueError("GLM decode request count exceeds the request batch")
+    num_prefill_requests = num_requests - num_decode_requests
+    if num_prefill_requests and not packed_main_slots:
+        raise ValueError("parallel GLM prefill requires packed main-cache slots")
+    if num_prefill_requests and (max_query_len is None or max_query_len <= 0):
+        raise ValueError("parallel GLM prefill requires a positive max_query_len")
+
+    common_args = (
         kv_cache.view(torch.float8_e4m3fn),
         kv_cache.view(torch.float32),
         tail,
@@ -307,14 +514,49 @@ def update_decode_pools(
         int(key.stride(0)),
         int(gate.stride(0)),
         int(ape.stride(0)),
+    )
+    common_meta = dict(
         PAGE_SIZE=page_size,
         HEAD_DIM=_HEAD_DIM,
         POOL_SIZE=_POOL_SIZE,
         FP8_MAX=_FP8_MAX,
         BLOCK_D=128,
-        PACKED_MAIN_SLOTS=packed_main_slots,
         num_warps=4,
     )
+    if num_decode_requests:
+        _decode_update_kernel[(num_decode_requests,)](
+            *common_args,
+            PACKED_MAIN_SLOTS=packed_main_slots,
+            **common_meta,
+        )
+    if num_prefill_requests:
+        assert max_query_len is not None
+        _prefill_pool_kernel[
+            (num_prefill_requests, triton.cdiv(max_query_len, _POOL_SIZE))
+        ](
+            *common_args[:10],
+            num_decode_requests,
+            *common_args[10:],
+            **common_meta,
+        )
+        _prefill_tail_kernel[(num_prefill_requests,)](
+            tail,
+            state_slots,
+            query_start_loc,
+            key,
+            gate,
+            positions,
+            num_decode_requests,
+            int(tail.stride(0)),
+            int(tail.stride(1)),
+            int(tail.stride(2)),
+            int(key.stride(0)),
+            int(gate.stride(0)),
+            HEAD_DIM=_HEAD_DIM,
+            POOL_SIZE=_POOL_SIZE,
+            BLOCK_D=128,
+            num_warps=4,
+        )
 
 
 @triton.jit
