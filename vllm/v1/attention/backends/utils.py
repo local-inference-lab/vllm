@@ -390,7 +390,16 @@ def get_num_attention_heads_from_layers(
 def get_kv_cache_dtype_from_layers(
     vllm_config: VllmConfig, layer_names: list[str]
 ) -> str | None:
-    """Return the KV-cache format shared by one attention group."""
+    """Return the KV-cache format shared by one attention group.
+
+    Args:
+        vllm_config: Engine configuration containing the attention layers.
+        layer_names: Names of the layers in the attention group.
+
+    Returns:
+        The shared cache format, or ``None`` when the group has no attention
+        layers.
+    """
     attn_layers = get_layers_from_vllm_config(
         vllm_config,
         AttentionLayerBase,  # type: ignore[type-abstract]

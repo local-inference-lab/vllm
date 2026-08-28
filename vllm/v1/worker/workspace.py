@@ -67,7 +67,14 @@ def collect_cuda_graph_capture_resources() -> Iterator[list[Any]]:
 
 
 def retain_cuda_graph_capture_resource(resource: Any) -> bool:
-    """Retain ``resource`` when called inside full CUDA graph capture."""
+    """Retain an object whose storage is referenced by a CUDA graph.
+
+    Args:
+        resource: Python owner that must remain alive while the graph exists.
+
+    Returns:
+        ``True`` when a capture resource collector retained the object.
+    """
     resources = _cuda_graph_capture_resources.get()
     if resources is None:
         return False

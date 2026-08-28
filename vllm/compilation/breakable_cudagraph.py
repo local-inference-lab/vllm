@@ -45,6 +45,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import weak_ref_tensor, weak_ref_tensors
+from vllm.v1.worker.workspace import collect_cuda_graph_capture_resources
 
 logger = init_logger(__name__)
 
@@ -241,6 +242,7 @@ class _BreakableEntry:
     capture: BreakableCUDAGraphCapture | None = None
     output: Any = None
     input_addresses: list[int] | None = None
+    resources: list[Any] | None = None
 
 
 class BreakableCUDAGraphWrapper:
@@ -379,7 +381,7 @@ class BreakableCUDAGraphWrapper:
         get_offloader().sync_prev_onload()
 
         capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
-        with capture:
+        with collect_cuda_graph_capture_resources() as resources, capture:
             output = self.runnable(*args, **kwargs)
             # Join the offloader's copy stream while we still hold the last
             # segment open, so the join is captured into the graph (otherwise
@@ -392,6 +394,7 @@ class BreakableCUDAGraphWrapper:
             output = weak_ref_tensors(output)
 
         entry.capture = capture
+        entry.resources = resources
         entry.output = weak_ref_tensors(output)
 
         logger.debug(

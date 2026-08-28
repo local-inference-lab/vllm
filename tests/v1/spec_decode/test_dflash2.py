@@ -101,6 +101,39 @@ def test_dflash2_auxiliary_linears_use_draft_quantization(
     assert selector.hidden_projection.quant_config is quant_config
 
 
+@pytest.mark.parametrize("mxfp8_layer", [0, 1])
+def test_dflash_context_projection_rejects_mixed_quantization(mxfp8_layer: int):
+    from torch import nn
+
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMxFp8LinearMethod,
+    )
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+
+    class UnreadableWeight:
+        def __getitem__(self, _key):
+            raise AssertionError("weights must not be read before validation")
+
+    mxfp8_method = object.__new__(ModelOptMxFp8LinearMethod)
+    methods = [None, None]
+    methods[mxfp8_layer] = mxfp8_method
+    layers_attn = [
+        SimpleNamespace(
+            qkv_proj=SimpleNamespace(
+                quant_method=method,
+                q_size=1,
+                weight=UnreadableWeight(),
+            )
+        )
+        for method in methods
+    ]
+    model = object.__new__(DFlashQwen3Model)
+    nn.Module.__init__(model)
+
+    with pytest.raises(ValueError, match="Every DFlash attention layer"):
+        model._build_context_kv_buffers(layers_attn, has_bias=False)
+
+
 def test_selector_edges_match_sequential_reference():
     torch.manual_seed(1)
     batch, steps, top_k, rank = 2, 4, 3, 5

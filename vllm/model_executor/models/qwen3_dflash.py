@@ -494,26 +494,27 @@ class DFlashQwen3Model(nn.Module):
         layers_attn: list[nn.Module],
         has_bias: bool,
     ) -> None:
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptMxFp8LinearMethod,
+        )
+
+        quant_methods = [a.qkv_proj.quant_method for a in layers_attn]
+        uses_mxfp8 = [
+            isinstance(method, ModelOptMxFp8LinearMethod) for method in quant_methods
+        ]
+        if any(uses_mxfp8) and not all(uses_mxfp8):
+            raise ValueError(
+                "Every DFlash attention layer must use the same MXFP8 "
+                "linear format for the fused context K/V projection."
+            )
+
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
         kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
 
-        from vllm.model_executor.layers.quantization.modelopt import (
-            ModelOptMxFp8LinearMethod,
-        )
-
-        quant_method = layers_attn[0].qkv_proj.quant_method
-        if isinstance(quant_method, ModelOptMxFp8LinearMethod):
-            if not all(
-                isinstance(a.qkv_proj.quant_method, ModelOptMxFp8LinearMethod)
-                for a in layers_attn
-            ):
-                raise ValueError(
-                    "Every DFlash attention layer must use the same MXFP8 "
-                    "linear format for the fused context K/V projection."
-                )
+        if all(uses_mxfp8):
             kv_scales = [a.qkv_proj.weight_scale[a.q_size :] for a in layers_attn]
             self._fused_kv_weight_scale = torch.cat(kv_scales, dim=0)
         else:
