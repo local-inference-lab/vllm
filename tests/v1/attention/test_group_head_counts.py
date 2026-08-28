@@ -14,6 +14,7 @@ from vllm.v1.attention.backends.cpu_attn import (
     CPUAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadataBuilder
+from vllm.v1.attention.backends.utils import get_kv_cache_dtype_from_layers
 
 requires_cpu = pytest.mark.skipif(
     not current_platform.is_cpu(), reason="CPU attention backend"
@@ -127,3 +128,18 @@ def test_flash_attention_geometry_comes_from_the_group():
     assert builder.num_heads_q == 16
     assert builder.num_heads_kv == 2
     assert builder.headdim == 64
+
+
+def test_kv_cache_dtype_comes_from_the_attention_group():
+    """A draft attention group can use a different cache format than its target."""
+    layers = {
+        "draft.layer.0": SimpleNamespace(kv_cache_dtype="fp8"),
+        "draft.layer.1": SimpleNamespace(kv_cache_dtype="fp8"),
+    }
+    with patch(
+        "vllm.v1.attention.backends.utils.get_layers_from_vllm_config",
+        return_value=layers,
+    ):
+        cache_dtype = get_kv_cache_dtype_from_layers(MagicMock(), list(layers))
+
+    assert cache_dtype == "fp8"

@@ -28,6 +28,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
     get_attn_cg_support,
     get_query_lens_mismatch_unsupported_backend,
+    synchronize_attention_impl_kv_cache_layout,
 )
 from vllm.v1.worker.utils import (
     AttentionGroup,
@@ -77,6 +78,26 @@ class _CachingMetadataBuilder:
             slot_mapping=slot_mapping,
             reused=metadata,
         )
+
+
+def test_attention_impl_cache_layout_preserves_model_specific_dtype():
+    target_cache_config = SimpleNamespace(
+        cache_dtype="fp8_ds_mla", kv_cache_layout=None
+    )
+    draft_cache_config = SimpleNamespace(cache_dtype="fp8", kv_cache_layout=None)
+    layers = {
+        "target": SimpleNamespace(
+            impl=SimpleNamespace(cache_config=target_cache_config)
+        ),
+        "draft": SimpleNamespace(impl=SimpleNamespace(cache_config=draft_cache_config)),
+    }
+
+    synchronize_attention_impl_kv_cache_layout(layers, "BLHNC")
+
+    assert target_cache_config.kv_cache_layout == "BLHNC"
+    assert draft_cache_config.kv_cache_layout == "BLHNC"
+    assert target_cache_config.cache_dtype == "fp8_ds_mla"
+    assert draft_cache_config.cache_dtype == "fp8"
 
 
 def test_attention_checks_preserve_global_and_target_scoped_support():
