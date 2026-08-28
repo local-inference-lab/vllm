@@ -5,13 +5,57 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import startup_plan
+from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
+
+
+def test_kimi_k3_prefill_warmup_releases_autotune_scratch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.warmup import kimi_k3_triton_warmup
+
+    worker = object.__new__(Worker)
+    worker.device = torch.device("cuda:3")
+    worker.vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(enable_jit_warmup=True)
+    )
+    calls: list[object] = []
+    monkeypatch.setattr(
+        kimi_k3_triton_warmup,
+        "kimi_k3_triton_prefill_warmup",
+        lambda warmed_worker: calls.append(("warmup", warmed_worker)) or True,
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "synchronize",
+        lambda device: calls.append(("synchronize", device)),
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_worker.gc.collect",
+        lambda: calls.append("collect"),
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "empty_cache",
+        lambda: calls.append("empty_cache"),
+    )
+
+    worker._warmup_kimi_k3_prefill_before_kv_cache()
+
+    assert calls == [
+        ("warmup", worker),
+        ("synchronize", torch.device("cuda:3")),
+        "collect",
+        "empty_cache",
+    ]
+
 
 # Startup-plan persistence (vllm/v1/worker/startup_plan.py), applied and
 # saved by Worker.determine_available_memory / compile_or_warm_up_model.

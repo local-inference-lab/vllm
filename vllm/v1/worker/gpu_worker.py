@@ -476,6 +476,22 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
 
+    def _warmup_kimi_k3_prefill_before_kv_cache(self) -> None:
+        """Autotune cache-independent KDA kernels and release their scratch."""
+        if not self.vllm_config.kernel_config.enable_jit_warmup:
+            return
+
+        from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
+            kimi_k3_triton_prefill_warmup,
+        )
+
+        if not kimi_k3_triton_prefill_warmup(self):
+            return
+
+        torch.accelerator.synchronize(self.device)
+        gc.collect()
+        torch.accelerator.empty_cache()
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -495,6 +511,7 @@ class Worker(WorkerBase):
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+            self._warmup_kimi_k3_prefill_before_kv_cache()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -514,6 +531,8 @@ class Worker(WorkerBase):
                 self.model_config.multimodal_config,
                 getattr(self.parallel_config, "_api_process_count", 1),
             )
+
+        self._warmup_kimi_k3_prefill_before_kv_cache()
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
