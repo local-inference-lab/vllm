@@ -247,6 +247,71 @@ def test_glm5next_alone_opts_into_b12x_kda_decode() -> None:
     assert Glm5NextLinearAttention.b12x_kda_null_state_index == 0
 
 
+@pytest.mark.parametrize(
+    ("backend", "initializes_b12x", "uses_b12x_plain", "uses_b12x_spec"),
+    [
+        ("auto", True, False, True),
+        ("b12x", True, True, True),
+        ("triton", False, False, False),
+    ],
+)
+def test_glm5next_selects_configured_kda_decode_backend(
+    monkeypatch,
+    backend: str,
+    initializes_b12x: bool,
+    uses_b12x_plain: bool,
+    uses_b12x_spec: bool,
+) -> None:
+    monkeypatch.setattr(
+        KimiGatedDeltaNetAttention,
+        "__init__",
+        lambda self, config, vllm_config, prefix: None,
+    )
+    monkeypatch.setattr(
+        KimiGatedDeltaNetAttention,
+        "_can_use_b12x_kda_decode",
+        lambda self, metadata: True,
+    )
+    vllm_config = SimpleNamespace(
+        additional_config={"glm53_kda_decode_backend": backend}
+    )
+
+    layer = Glm5NextLinearAttention(object(), vllm_config)
+
+    assert layer.enable_b12x_kda_decode is initializes_b12x
+    assert (
+        layer._can_use_b12x_kda_decode(SimpleNamespace(spec_sequence_masks=None))
+        is uses_b12x_plain
+    )
+    assert (
+        layer._can_use_b12x_kda_decode(SimpleNamespace(spec_sequence_masks=object()))
+        is uses_b12x_spec
+    )
+
+
+def test_glm5next_defaults_to_hybrid_kda_decode(monkeypatch) -> None:
+    monkeypatch.setattr(
+        KimiGatedDeltaNetAttention,
+        "__init__",
+        lambda self, config, vllm_config, prefix: None,
+    )
+    vllm_config = SimpleNamespace(additional_config={})
+
+    layer = Glm5NextLinearAttention(object(), vllm_config)
+
+    assert layer._glm53_kda_decode_backend == "auto"
+    assert layer.enable_b12x_kda_decode
+
+
+def test_glm5next_rejects_unknown_kda_decode_backend() -> None:
+    vllm_config = SimpleNamespace(
+        additional_config={"glm53_kda_decode_backend": "unknown"}
+    )
+
+    with pytest.raises(ValueError, match="KDA decode backend"):
+        Glm5NextLinearAttention(object(), vllm_config)
+
+
 def test_glm5next_b12x_mhc_builds_first_layer_broadcast_fn() -> None:
     hidden_size = 4
     hc_mult = 4
