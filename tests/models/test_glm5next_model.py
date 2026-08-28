@@ -442,6 +442,34 @@ def test_glm5next_dflash_maps_target_layers_to_completed_outputs() -> None:
     assert supports_eagle3(Glm5NextForConditionalGeneration)
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [
+        (1, True),
+        (8, True),
+        (9, False),
+    ],
+)
+def test_glm5next_b12x_mhc_dispatches_decode_sized_batches(
+    num_tokens: int, expected: bool
+) -> None:
+    layer = Glm5NextDecoderLayer.__new__(Glm5NextDecoderLayer)
+    torch.nn.Module.__init__(layer)
+    layer._b12x_mhc = object()
+    layer._b12x_mhc_max_tokens = 8
+
+    assert layer._use_b12x_mhc(torch.empty(num_tokens, 4)) is expected
+
+
+def test_glm5next_b12x_mhc_dispatch_requires_available_backend() -> None:
+    layer = Glm5NextDecoderLayer.__new__(Glm5NextDecoderLayer)
+    torch.nn.Module.__init__(layer)
+    layer._b12x_mhc = None
+    layer._b12x_mhc_max_tokens = 8
+
+    assert not layer._use_b12x_mhc(torch.empty(1, 4))
+
+
 def test_glm5next_conditional_post_load_finalizes_language_model() -> None:
     class FakeLanguageModel(torch.nn.Module):
         def __init__(self) -> None:
