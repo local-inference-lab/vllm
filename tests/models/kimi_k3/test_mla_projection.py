@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.models.kimi_k3.nvidia import mla as mla_module
 from vllm.models.kimi_k3.nvidia.mla import (
     KimiShardedMergedQKVGateLinear,
@@ -16,10 +17,68 @@ from vllm.models.kimi_k3.nvidia.mla import (
 )
 
 
+class _UnquantizedOutputLinear(nn.Module):
+    def __init__(self, input_size: int, output_size: int, tp_size: int = 2):
+        super().__init__()
+        self.quant_method = UnquantizedLinearMethod()
+        self.input_is_parallel = True
+        self.input_size_per_partition = input_size
+        self.output_size = output_size
+        self.reduce_results = True
+        self.tp_size = tp_size
+        self.register_parameter("bias", None)
+        self.weight = nn.Parameter(
+            torch.randn(output_size, input_size),
+            requires_grad=False,
+        )
+
+
 def test_output_gate_uses_bounded_compile_config() -> None:
     compiler_config = mla_module._gate_sigmoid_mul.get_compiler_config()
 
     assert compiler_config["triton.autotune_pointwise"] is False
+
+
+def test_mla_projects_prefill_into_caller_storage(monkeypatch) -> None:
+    layer = object.__new__(mla_module.MultiHeadLatentAttention)
+    nn.Module.__init__(layer)
+    layer.o_proj = _UnquantizedOutputLinear(input_size=3, output_size=4)
+    attn_out = torch.randn(1024, 3)
+    output = torch.empty(1024, 4)
+    expected = torch.mm(attn_out, layer.o_proj.weight.t())
+    reduce_in_place = Mock(side_effect=lambda value, tp_size: value)
+    monkeypatch.setattr(
+        mla_module,
+        "reduce_kimi_full_width_projection",
+        reduce_in_place,
+    )
+
+    with torch.inference_mode():
+        actual = layer._project_output_into(attn_out, output)
+
+    assert actual is output
+    torch.testing.assert_close(actual, expected)
+    reduce_in_place.assert_called_once_with(output, 2)
+
+
+def test_mla_caller_output_selection_preserves_decode_path() -> None:
+    layer = object.__new__(mla_module.MultiHeadLatentAttention)
+    nn.Module.__init__(layer)
+    layer.o_proj = _UnquantizedOutputLinear(input_size=3, output_size=4)
+
+    assert not layer.should_use_caller_output(torch.empty(8, 4))
+    assert layer.should_use_caller_output(torch.empty(1024, 4))
+    assert not layer.should_use_caller_output(torch.empty(1024, 3))
+
+
+def test_mla_caller_output_rejects_projection_input_alias() -> None:
+    layer = object.__new__(mla_module.MultiHeadLatentAttention)
+    nn.Module.__init__(layer)
+    layer.o_proj = _UnquantizedOutputLinear(input_size=4, output_size=4)
+    aliased = torch.empty(1024, 4)
+
+    with pytest.raises(ValueError, match="must not alias"):
+        layer._project_output_into(aliased, aliased)
 
 
 def test_restore_merged_output_order() -> None:

@@ -38,6 +38,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
@@ -87,6 +88,7 @@ from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
 )
 from vllm.models.kimi_k3.nvidia.tp_projection import (
     gather_kimi_sharded_projection,
+    reduce_kimi_full_width_projection,
 )
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -114,6 +116,7 @@ logger = init_logger(__name__)
 # Below this conservative threshold, overlap the gate projection with attention
 # on the auxiliary stream.
 _GATE_MULTI_STREAM_TOKEN_THRESHOLD = 512
+_MLA_CALLER_OUTPUT_MIN_TOKENS = 1024
 
 
 @torch.compile(
@@ -588,6 +591,66 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
         self.kv_cache = torch.tensor([])
 
+    @property
+    def supports_caller_output(self) -> bool:
+        """Report whether MLA can write its reduced output into caller storage."""
+        return (
+            isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
+            and getattr(self.o_proj, "weight", None) is not None
+            and self.o_proj.input_is_parallel
+            and self.o_proj.bias is None
+            and self.o_proj.reduce_results
+            and not envs.VLLM_BATCH_INVARIANT
+        )
+
+    def should_use_caller_output(self, hidden_states: torch.Tensor) -> bool:
+        """Select consumed hidden-state storage for allocation-sensitive prefill."""
+        weight = getattr(self.o_proj, "weight", None)
+        return (
+            self.supports_caller_output
+            and hidden_states.ndim == 2
+            and hidden_states.shape == (hidden_states.shape[0], self.o_proj.output_size)
+            and hidden_states.shape[0] >= _MLA_CALLER_OUTPUT_MIN_TOKENS
+            and hidden_states.is_contiguous()
+            and weight is not None
+            and hidden_states.dtype == weight.dtype
+            and hidden_states.device == weight.device
+        )
+
+    def _project_output_into(
+        self,
+        attn_out: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project MLA output into consumed storage and reduce it in place."""
+        if not self.should_use_caller_output(output):
+            raise ValueError(
+                "Kimi-K3 MLA caller-owned output requires at least 1,024 rows "
+                "of contiguous projection-compatible storage"
+            )
+        if attn_out.ndim != 2:
+            raise ValueError("Kimi-K3 MLA output projection requires a 2D input")
+        expected_input_shape = (
+            output.shape[0],
+            self.o_proj.input_size_per_partition,
+        )
+        if tuple(attn_out.shape) != expected_input_shape:
+            raise ValueError(
+                "Kimi-K3 MLA projection input has shape "
+                f"{tuple(attn_out.shape)}; expected {expected_input_shape}"
+            )
+        if attn_out.dtype != output.dtype or attn_out.device != output.device:
+            raise ValueError(
+                "Kimi-K3 MLA projection input and caller output must share "
+                "dtype and device"
+            )
+        if attn_out.untyped_storage().data_ptr() == output.untyped_storage().data_ptr():
+            raise ValueError(
+                "Kimi-K3 MLA caller output must not alias the projection input"
+            )
+        torch.mm(attn_out, self.o_proj.weight.t(), out=output)
+        return reduce_kimi_full_width_projection(output, self.o_proj.tp_size)
+
     # ------------------------------------------------------------------
     # AttentionLayerBase interface
     # ------------------------------------------------------------------
@@ -803,6 +866,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.q_lora_rank is None:
             attn_out, gate = self._forward_full_rank_q(positions, hidden_states)
@@ -812,6 +876,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         if gate is not None:
             attn_out = _gate_sigmoid_mul(attn_out, gate)
 
+        if output is not None:
+            return self._project_output_into(attn_out, output)
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(attn_out):
             return self.gemm_rs_ar(attn_out, self.o_proj.weight)
 
