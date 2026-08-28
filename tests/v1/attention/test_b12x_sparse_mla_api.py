@@ -170,10 +170,14 @@ def test_b12x_glm5_next_cache_spec_and_layout(monkeypatch) -> None:
     assert invalid_reasons == []
     assert unidentified == probe
     assert packed_by_glm_backend.state_content_bytes == 528
-    assert packed_by_glm_backend.page_size_padded == 64 * 528 + 16 * 128 * 2
+    assert packed_by_glm_backend.page_size_padded is None
+    assert packed_by_glm_backend.page_tail_bytes_per_token == 33
+    assert packed_by_glm_backend.page_size_bytes == 64 * (528 + 33)
     assert packed_by_glm_backend.model_version == "glm5_next"
     assert packed.state_content_bytes == 528
-    assert packed.page_size_padded == 64 * 528 + 16 * 128 * 2
+    assert packed.page_size_padded is None
+    assert packed.page_tail_bytes_per_token == 33
+    assert packed.page_size_bytes == 64 * (528 + 33)
     assert packed.model_version == "glm5_next"
     assert packed_without_config_context == packed
     assert layouts == (KVCacheLayout.BLHNC,)
@@ -515,7 +519,7 @@ def test_glm_selector_metadata_builder_stages_padded_rows_and_capture(
     monkeypatch.setattr(
         SparseMLACommonMetadataBuilder,
         "build",
-        lambda *args, **kwargs: SimpleNamespace(),
+        lambda *args, **kwargs: SimpleNamespace(num_prefills=0),
     )
     builder = _bare_glm_selector_metadata_builder()
     common = SimpleNamespace(
@@ -591,7 +595,7 @@ def test_glm_selector_metadata_builder_requires_complete_runtime_state(
     monkeypatch.setattr(
         SparseMLACommonMetadataBuilder,
         "build",
-        lambda *args, **kwargs: SimpleNamespace(),
+        lambda *args, **kwargs: SimpleNamespace(num_prefills=0),
     )
     builder = _bare_glm_selector_metadata_builder()
     common = SimpleNamespace(
