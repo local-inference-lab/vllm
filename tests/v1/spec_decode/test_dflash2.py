@@ -60,6 +60,47 @@ def test_grouped_conv_matches_reference(block_size: int):
     torch.testing.assert_close(actual, expected.flatten(0, 1).flatten(-2))
 
 
+def test_dflash2_auxiliary_linears_use_draft_quantization(
+    monkeypatch, default_vllm_config
+):
+    """Every checkpoint-serialized DFlash2 linear receives its quant config."""
+    from torch import nn
+
+    import vllm.model_executor.models.qwen3_dflash2 as dflash2
+
+    class StubLinear(nn.Module):
+        def __init__(self, *args, quant_config=None, **kwargs):
+            super().__init__()
+            self.quant_config = quant_config
+
+    monkeypatch.setattr(dflash2, "ReplicatedLinear", StubLinear)
+    quant_config = object()
+    from vllm.config import set_current_vllm_config
+
+    with set_current_vllm_config(default_vllm_config):
+        grouped_conv = dflash2.DFlashGroupedConv(
+            hidden_size=16,
+            taps=2,
+            group_size=4,
+            block_size=8,
+            params_dtype=torch.float32,
+            quant_config=quant_config,
+            prefix="attention_conv",
+        )
+        selector = dflash2.CandidateSelector(
+            hidden_size=16,
+            vocab_size=32,
+            rank=4,
+            top_k=3,
+            params_dtype=torch.float32,
+            quant_config=quant_config,
+            prefix="candidate_selector",
+        )
+
+    assert grouped_conv.kernel_projection.quant_config is quant_config
+    assert selector.hidden_projection.quant_config is quant_config
+
+
 def test_selector_edges_match_sequential_reference():
     torch.manual_seed(1)
     batch, steps, top_k, rank = 2, 4, 3, 5
