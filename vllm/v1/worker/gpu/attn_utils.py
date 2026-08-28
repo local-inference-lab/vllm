@@ -73,6 +73,24 @@ def get_shared_kv_cache_layers(vllm_config: VllmConfig):
     }
 
 
+def synchronize_attention_impl_kv_cache_layout(
+    attn_layers: Mapping[str, AttentionLayerBase],
+    resolved_layout: str | None,
+) -> None:
+    """Give every attention implementation the allocated cache layout.
+
+    A speculative model can own a CacheConfig copy so its cache dtype differs
+    from the target model. The engine resolves one physical layout for all
+    cache groups, while dtype remains specific to each model-owned copy.
+    """
+    if resolved_layout is None:
+        return
+    for layer in attn_layers.values():
+        impl_cache_config = getattr(getattr(layer, "impl", None), "cache_config", None)
+        if impl_cache_config is not None:
+            impl_cache_config.kv_cache_layout = resolved_layout
+
+
 def init_attn_backend(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -98,6 +116,10 @@ def init_attn_backend(
 
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(vllm_config, layer_type, layer_names)
+
+        synchronize_attention_impl_kv_cache_layout(
+            attn_layers, vllm_config.cache_config.kv_cache_layout
+        )
 
         group_map: dict[tuple[tuple[str, str], KVCacheSpec, int], AttentionGroup] = {}
         group_order: list[tuple[tuple[str, str], KVCacheSpec, int]] = []

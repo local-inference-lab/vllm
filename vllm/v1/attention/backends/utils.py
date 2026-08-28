@@ -387,6 +387,34 @@ def get_num_attention_heads_from_layers(
     return heads.pop()
 
 
+def get_kv_cache_dtype_from_layers(
+    vllm_config: VllmConfig, layer_names: list[str]
+) -> str | None:
+    """Return the KV-cache format shared by one attention group.
+
+    Args:
+        vllm_config: Engine configuration containing the attention layers.
+        layer_names: Names of the layers in the attention group.
+
+    Returns:
+        The shared cache format, or ``None`` when the group has no attention
+        layers.
+    """
+    attn_layers = get_layers_from_vllm_config(
+        vllm_config,
+        AttentionLayerBase,  # type: ignore[type-abstract]
+        layer_names,
+    )
+    if not attn_layers:
+        return None
+    cache_dtypes = {cast(Any, layer).kv_cache_dtype for layer in attn_layers.values()}
+    assert len(cache_dtypes) == 1, (
+        "All layers in one attention group must share kv_cache_dtype; "
+        f"got {cache_dtypes} for {layer_names}."
+    )
+    return cache_dtypes.pop()
+
+
 def infer_global_hyperparameters(
     per_layer_params: dict[str, PerLayerParameters],
 ) -> PerLayerParameters:

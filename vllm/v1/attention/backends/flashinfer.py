@@ -69,6 +69,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     get_flashinfer_layout_string,
+    get_kv_cache_dtype_from_layers,
     get_num_attention_heads_from_layers,
     get_per_layer_parameters,
     infer_global_hyperparameters,
@@ -759,7 +760,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.page_size = self.kv_cache_spec.block_size
 
         if self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
-            self.cache_dtype = self.cache_config.cache_dtype
+            self.cache_dtype = (
+                get_kv_cache_dtype_from_layers(vllm_config, layer_names)
+                or self.cache_config.cache_dtype
+            )
             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
             self.is_kvcache_nvfp4 = self.cache_dtype.startswith("nvfp4")
