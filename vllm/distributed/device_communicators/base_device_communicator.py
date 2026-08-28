@@ -220,6 +220,11 @@ class DeviceCommunicatorBase:
         dist.all_reduce(input_, group=self.device_group)
         return input_
 
+    def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
+        """All-reduce while allowing the input storage to hold the result."""
+        dist.all_reduce(input_, group=self.device_group)
+        return input_
+
     def checkpoint_prepare(self) -> None:
         """Prepare reclaimable communicator state for checkpoint (default: no-op)."""
 

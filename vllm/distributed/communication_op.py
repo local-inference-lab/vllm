@@ -14,6 +14,11 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().all_reduce(input_)
 
 
+def tensor_model_parallel_all_reduce_in_place(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce a dead input tensor without allocating an output tensor."""
+    return get_tp_group().all_reduce_in_place(input_)
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:

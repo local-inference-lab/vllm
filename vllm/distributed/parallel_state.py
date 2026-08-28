@@ -693,6 +693,14 @@ class GroupCoordinator:
         else:
             return self._all_reduce_out_place(input_)
 
+    def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
+        """All-reduce a tensor whose input storage may hold the result."""
+        if self.world_size == 1:
+            return input_
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.all_reduce_in_place(input_)
+
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
