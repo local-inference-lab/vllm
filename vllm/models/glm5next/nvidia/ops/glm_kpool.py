@@ -263,7 +263,6 @@ def _prefill_pool_kernel(
     ape,
     slot_mapping,
     positions,
-    request_offset,
     page_stride_bytes,
     model_block_size,
     parent_stride_pages,
@@ -273,6 +272,7 @@ def _prefill_pool_kernel(
     key_stride_0,
     gate_stride_0,
     ape_stride_0,
+    request_offset,
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     POOL_SIZE: tl.constexpr,
@@ -534,9 +534,8 @@ def update_decode_pools(
         _prefill_pool_kernel[
             (num_prefill_requests, triton.cdiv(max_query_len, _POOL_SIZE))
         ](
-            *common_args[:10],
+            *common_args,
             num_decode_requests,
-            *common_args[10:],
             **common_meta,
         )
         _prefill_tail_kernel[(num_prefill_requests,)](

@@ -384,38 +384,39 @@ def test_glm53_deepgemm_prefill_matches_b12x_on_packed_tail(
 ) -> None:
     device = _require_glm_gpu()
     _, main = _packed_main_cache(
-        device=device, blocks=2, layers=3, block_size=512, layer=1
+        device=device, blocks=2, layers=3, block_size=2304, layer=1
     )
     index_cache, _, parent_stride_pages = Glm5NextPooledIndexer._index_cache_view(main)
-    virtual_page = parent_stride_pages
-    page = index_cache[virtual_page]
-    quant = page.as_strided(
-        (64, 128), (128, 1), storage_offset=page.storage_offset()
-    ).view(torch.float8_e4m3fn)
-    scales = page.as_strided(
-        (64 * 4,),
-        (1,),
-        storage_offset=page.storage_offset() + 64 * 128,
-    ).view(torch.float32)
+    virtual_pages = list(range(parent_stride_pages, parent_stride_pages + 9))
     generator = torch.Generator(device=device).manual_seed(5303)
-    quant.copy_(
-        torch.randn((64, 128), generator=generator, device=device).to(
-            torch.float8_e4m3fn
+    for virtual_page in virtual_pages:
+        page = index_cache[virtual_page]
+        quant = page.as_strided(
+            (64, 128), (128, 1), storage_offset=page.storage_offset()
+        ).view(torch.float8_e4m3fn)
+        scales = page.as_strided(
+            (64 * 4,),
+            (1,),
+            storage_offset=page.storage_offset() + 64 * 128,
+        ).view(torch.float32)
+        quant.copy_(
+            torch.randn((64, 128), generator=generator, device=device).to(
+                torch.float8_e4m3fn
+            )
         )
-    )
-    scales.copy_(
-        torch.exp2(
-            torch.randint(-3, 3, (64,), generator=generator, device=device).float()
+        scales.copy_(
+            torch.exp2(
+                torch.randint(-3, 3, (64,), generator=generator, device=device).float()
+            )
         )
-    )
     q = torch.randn(
         (3, 32, 128), generator=generator, device=device, dtype=torch.float32
     ).to(torch.float8_e4m3fn)
     weights = torch.randn(
         (3, 32), generator=generator, device=device, dtype=torch.float32
     )
-    seq_lens = torch.tensor([16, 37, 64], dtype=torch.int32, device=device)
-    block_table = torch.tensor([[virtual_page]], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([513, 545, 576], dtype=torch.int32, device=device)
+    block_table = torch.tensor([virtual_pages], dtype=torch.int32, device=device)
     topk = 512
 
     from vllm.utils.b12x import get_b12x_dsa_indexer
@@ -428,7 +429,7 @@ def test_glm53_deepgemm_prefill_matches_b12x_on_packed_tail(
             source_layout=module.SOURCE_LAYOUT_PAGED,
             num_q_heads=32,
             max_q_rows=3,
-            max_page_table_width=1,
+            max_page_table_width=len(virtual_pages),
             topk=topk,
             mode="prefill",
             shared_page_table=True,
@@ -440,7 +441,7 @@ def test_glm53_deepgemm_prefill_matches_b12x_on_packed_tail(
     )
     binding = plan.bind(
         scratch=scratch,
-        real_page_table=block_table.expand(3, 1),
+        real_page_table=block_table.expand(3, -1),
         cache_seqlens_int32=seq_lens,
         expected_num_q_heads=32,
         shared_page_table=True,
@@ -475,12 +476,12 @@ def test_glm53_deepgemm_prefill_matches_b12x_on_packed_tail(
         kv_cache=index_cache,
         seq_lens=seq_lens,
         block_table=block_table,
-        gather_cu_seq_lens=torch.tensor([0, 64], dtype=torch.int32, device=device),
+        gather_cu_seq_lens=torch.tensor([0, 576], dtype=torch.int32, device=device),
         row_starts=torch.zeros(3, dtype=torch.int32, device=device),
         output=actual,
         topk=topk,
-        total_k_rows=64,
-        workspace_k_rows=64,
+        total_k_rows=576,
+        workspace_k_rows=576,
     )
     torch.accelerator.synchronize()
 
