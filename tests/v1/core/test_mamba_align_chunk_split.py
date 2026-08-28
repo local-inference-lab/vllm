@@ -80,7 +80,7 @@ def _make_hybrid_kv_cache_manager(
 def _split(
     request: Request,
     num_new_tokens: int,
-    use_eagle: bool = True,
+    drop_last_prefix_cache_block: bool = True,
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
     allow_speculative_checkpoints: bool = False,
@@ -88,7 +88,7 @@ def _split(
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     stub = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
-        use_eagle=use_eagle,
+        drop_last_prefix_cache_block=drop_last_prefix_cache_block,
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         # `prefix_match_unit` finer than the block size (#46384).
@@ -96,14 +96,16 @@ def _split(
         hash_block_size=ATTN_BLOCK_SIZE,
         mamba_has_prefill_checkpoint_blocks=(
             num_prefill_checkpoint_blocks > 0
-            and (not use_eagle or allow_speculative_checkpoints)
+            and (
+                not drop_last_prefix_cache_block or allow_speculative_checkpoints
+            )
         ),
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
 
 
 @pytest.mark.parametrize(
-    ("prompt_len", "num_new_tokens", "use_eagle", "expected"),
+    ("prompt_len", "num_new_tokens", "drop_last_prefix_cache_block", "expected"),
     [
         (2002, 2002, False, 2002),
         (3602, 2000, False, 2000),
@@ -111,19 +113,22 @@ def _split(
     ],
 )
 def test_internal_checkpoint_split(
-    prompt_len: int, num_new_tokens: int, use_eagle: bool, expected: int
+    prompt_len: int,
+    num_new_tokens: int,
+    drop_last_prefix_cache_block: bool,
+    expected: int,
 ) -> None:
     (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
     assert (
         _split(
             request,
             num_new_tokens,
-            use_eagle=use_eagle,
+            drop_last_prefix_cache_block=drop_last_prefix_cache_block,
             num_prefill_checkpoint_blocks=1,
         )
         == expected
     )
-    if not use_eagle:
+    if not drop_last_prefix_cache_block:
         manager = _make_hybrid_kv_cache_manager(num_prefill_checkpoint_blocks=1)
         assert manager.allocate_slots(request, expected) is not None
         mamba_manager = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
@@ -153,7 +158,7 @@ def test_dflash_checkpoint_keeps_intermediate_chunks_aligned_and_joins_prompt_ta
         _split(
             request,
             4089,
-            use_eagle=True,
+            drop_last_prefix_cache_block=False,
             num_prefill_checkpoint_blocks=1,
             allow_speculative_checkpoints=True,
         )
@@ -165,7 +170,7 @@ def test_dflash_checkpoint_keeps_intermediate_chunks_aligned_and_joins_prompt_ta
         _split(
             request,
             17,
-            use_eagle=True,
+            drop_last_prefix_cache_block=False,
             num_prefill_checkpoint_blocks=1,
             allow_speculative_checkpoints=True,
         )
@@ -192,11 +197,30 @@ def test_glm_mtp_checkpoint_joins_unaligned_prompt_tail(
         _split(
             request,
             prompt_len - request.num_computed_tokens,
-            use_eagle=True,
+            drop_last_prefix_cache_block=True,
             num_prefill_checkpoint_blocks=1,
             allow_speculative_checkpoints=True,
         )
         == 3648
+
+
+def test_dflash_does_not_back_off_last_cache_position() -> None:
+    """DFlash/DSpark never write target blocks, so the split must not back
+    off the last prefix-cache position by a mamba block.
+
+    Regression for #53477: the old `use_eagle` back-off made prompts shorter
+    than two mamba blocks skip the final block-aligned chunk, so the mamba
+    recurrent state was never materialized at a block boundary and the next
+    turn's prefix-cache lookup recomputed the whole context.
+    """
+    (request,) = create_requests(1, num_tokens=PROMPT_LEN, block_size=ATTN_BLOCK_SIZE)
+    assert (
+        _split(request, PROMPT_LEN, drop_last_prefix_cache_block=False)
+        == MAMBA_BLOCK_SIZE
+    )
+    assert (
+        _split(request, PROMPT_LEN, drop_last_prefix_cache_block=True)
+        == PROMPT_LEN
     )
 
 
@@ -320,14 +344,14 @@ def test_poisoning_is_block_size_independent(
 @pytest.mark.parametrize("partial_hit", [False, True])
 @pytest.mark.parametrize("resume_at", [331, 1599, 1601, 2531, 3011])
 @pytest.mark.parametrize(
-    ("num_prefill_checkpoint_blocks", "use_eagle"),
+    ("num_prefill_checkpoint_blocks", "drop_last_prefix_cache_block"),
     [(0, True), (1, False)],
 )
 def test_unaligned_resume_never_runs_past_its_block(
     partial_hit: bool,
     resume_at: int,
     num_prefill_checkpoint_blocks: int,
-    use_eagle: bool,
+    drop_last_prefix_cache_block: bool,
 ) -> None:
     """A prefill resuming mid-block must re-align before crossing a boundary.
 
@@ -345,7 +369,7 @@ def test_unaligned_resume_never_runs_past_its_block(
         num_new = _split(
             request,
             prompt_len - pos,
-            use_eagle=use_eagle,
+            drop_last_prefix_cache_block=drop_last_prefix_cache_block,
             partial_hit=partial_hit,
             num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
         )
