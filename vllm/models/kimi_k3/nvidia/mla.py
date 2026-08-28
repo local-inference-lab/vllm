@@ -116,7 +116,13 @@ logger = init_logger(__name__)
 _GATE_MULTI_STREAM_TOKEN_THRESHOLD = 512
 
 
-@torch.compile(backend=current_platform.simple_compile_backend)
+@torch.compile(
+    backend=current_platform.simple_compile_backend,
+    # Pointwise autotuning allocates a 128 MiB CUDA cache-flush buffer on the
+    # first invocation. The output gate runs while the model weights and
+    # prefill workspace are resident, so it must use a fixed pointwise config.
+    options={"triton.autotune_pointwise": False},
+)
 def _gate_sigmoid_mul(attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """Apply the sigmoid output gate to a precomputed gate projection."""
     return attn_out * gate.sigmoid()

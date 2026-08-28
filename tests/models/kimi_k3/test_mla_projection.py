@@ -16,6 +16,12 @@ from vllm.models.kimi_k3.nvidia.mla import (
 )
 
 
+def test_output_gate_uses_bounded_compile_config() -> None:
+    compiler_config = mla_module._gate_sigmoid_mul.get_compiler_config()
+
+    assert compiler_config["triton.autotune_pointwise"] is False
+
+
 def test_restore_merged_output_order() -> None:
     rank_major = torch.tensor(
         [
