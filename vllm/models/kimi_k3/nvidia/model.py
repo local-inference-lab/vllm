@@ -10,13 +10,16 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce_in_place,
 )
+from vllm.distributed.utils import split_tensor_along_last_dim
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
@@ -37,6 +40,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
@@ -268,6 +272,8 @@ class KimiMLP(nn.Module):
     block still ends with one collective per direction.
     """
 
+    _CALLER_OUTPUT_MIN_TOKENS = 1024
+
     def __init__(
         self,
         hidden_size: int,
@@ -342,8 +348,67 @@ class KimiMLP(nn.Module):
                 "Only silu and situ are supported."
             )
 
-    def forward(self, x):
+    @property
+    def supports_caller_output(self) -> bool:
+        """Report whether the down projection accepts caller-owned storage."""
+        return (
+            isinstance(self.down_proj.quant_method, UnquantizedLinearMethod)
+            and getattr(self.down_proj, "weight", None) is not None
+            and self.down_proj.input_is_parallel
+            and self.down_proj.bias is None
+            and not envs.VLLM_BATCH_INVARIANT
+        )
+
+    def should_use_caller_output(self, x: torch.Tensor) -> bool:
+        """Use donated storage only for allocation-sensitive prefill GEMMs."""
+        return (
+            self.supports_caller_output
+            and not self.shard_sequence_parallel
+            and x.ndim == 2
+            and x.shape[0] >= self._CALLER_OUTPUT_MIN_TOKENS
+        )
+
+    def _down_proj_into(self, x: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+        if not self.supports_caller_output:
+            raise ValueError(
+                "KimiMLP caller-owned output requires an unquantized, "
+                "bias-free row-parallel down projection"
+            )
+        if x.ndim != 2 or output.ndim != 2:
+            raise ValueError("KimiMLP caller-owned output requires 2D tensors")
+        expected_shape = (x.shape[0], self.down_proj.output_size)
+        if tuple(output.shape) != expected_shape:
+            raise ValueError(
+                "KimiMLP caller-owned output has shape "
+                f"{tuple(output.shape)}; expected {expected_shape}"
+            )
+        if not output.is_contiguous() or output.dtype != x.dtype:
+            raise ValueError(
+                "KimiMLP caller-owned output must be contiguous and match "
+                "the activation dtype"
+            )
+        if output.untyped_storage().data_ptr() == x.untyped_storage().data_ptr():
+            raise ValueError(
+                "KimiMLP caller-owned output must not alias the down-projection input"
+            )
+
+        torch.mm(x, self.down_proj.weight.t(), out=output)
+        if self.down_proj.reduce_results and self.down_proj.tp_size > 1:
+            output = tensor_model_parallel_all_reduce_in_place(output)
+        return output
+
+    def forward(
+        self, x: torch.Tensor, output: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        # Decoder layers may donate their normalized hidden-state storage. The
+        # gate/up projection has consumed that tensor before the down
+        # projection writes the donated buffer.
         if self.shard_sequence_parallel:
+            if output is not None:
+                raise ValueError(
+                    "KimiMLP caller-owned output is incompatible with "
+                    "sequence-parallel input gathering"
+                )
             # Each rank holds a weight shard but only its own tokens, so it
             # cannot finish those tokens alone: gather the full token set,
             # compute this rank's partial for all of them, then reduce-scatter,
@@ -351,11 +416,21 @@ class KimiMLP(nn.Module):
             x = sp_all_gather(x)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-
-        if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(x):
+        # The gated activation no longer reads the packed gate/up projection.
+        # Release that large prefill tensor before down_proj allocates its
+        # output; retaining both tensors can exceed the available device
+        # memory at large scheduler chunk sizes.
+        del gate_up
+        if (
+            output is None
+            and self.gemm_rs_ar is not None
+            and self.gemm_rs_ar.should_run(x)
+        ):
             return self.gemm_rs_ar(x, self.down_proj.weight)
-
-        x, _ = self.down_proj(x)
+        elif output is None:
+            x, _ = self.down_proj(x)
+        else:
+            x = self._down_proj_into(x, output)
         if self.shard_sequence_parallel:
             x = sp_reduce_scatter(x)
         return x
@@ -404,6 +479,11 @@ class KimiColumnParallelGate(ColumnParallelLinear):
 
 
 class KimiRoutedOutputTransform(nn.Module):
+    """Project latent expert output with bounded prefill storage."""
+
+    _CALLER_OUTPUT_MIN_TOKENS = 1024
+    _ACCUMULATION_TILE_ROWS = 1024
+
     def __init__(
         self,
         norm: RMSNorm | None,
@@ -417,24 +497,175 @@ class KimiRoutedOutputTransform(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Project the routed latent back to the hidden dim.
 
         Args:
-            hidden_states: Routed expert output in latent space.
+            hidden_states: Consumed routed expert output in latent space.
             residual: Optional tensor of the up-projection's output shape to
                 accumulate into. A replicated projection consumes it in the
                 GEMM beta-add epilogue. A row-parallel projection combines
                 rank-local routed and shared partials before their all-reduce.
+            output: Consumed caller-owned storage for a row-parallel projection.
         """
+        if residual is not None and output is not None:
+            raise ValueError(
+                "Kimi routed output transform accepts either residual or output"
+            )
         if self.norm is not None:
-            hidden_states = self.norm(hidden_states)
+            hidden_states = self.normalize_routed_latent(hidden_states)
         if residual is not None and isinstance(self.up_proj, ReplicatedLinear):
             return residual.addmm_(hidden_states, self.up_proj.weight.t())
-        hidden_states, _ = self.up_proj(hidden_states)
+        if residual is not None and self.can_accumulate_residual(
+            hidden_states, residual
+        ):
+            return self._accumulate_into(hidden_states, residual)
+        if output is not None:
+            if not self.can_write_output(hidden_states, output):
+                raise ValueError(
+                    "Kimi routed output transform cannot write the supplied buffer"
+                )
+            hidden_states = self._project_into(hidden_states, output)
+        else:
+            hidden_states, _ = self.up_proj(hidden_states)
         if residual is not None:
             hidden_states.add_(residual)
         return hidden_states
+
+    @property
+    def _supports_bounded_projection(self) -> bool:
+        up_proj = self.up_proj
+        return (
+            isinstance(up_proj, RowParallelLinear)
+            and isinstance(
+                getattr(up_proj, "quant_method", None),
+                UnquantizedLinearMethod,
+            )
+            and getattr(up_proj, "weight", None) is not None
+            and getattr(up_proj, "bias", None) is None
+            and not getattr(up_proj, "reduce_results", True)
+            and not envs.VLLM_BATCH_INVARIANT
+        )
+
+    def _local_projection_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not isinstance(self.up_proj, RowParallelLinear):
+            raise ValueError("Bounded projection requires RowParallelLinear")
+        if self.up_proj.input_is_parallel:
+            return hidden_states
+        return split_tensor_along_last_dim(
+            hidden_states, num_partitions=self.up_proj.tp_size
+        )[self.up_proj.tp_rank].contiguous()
+
+    def _valid_output_buffer(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+    ) -> bool:
+        return (
+            self._supports_bounded_projection
+            and hidden_states.ndim == 2
+            and output.ndim == 2
+            and hidden_states.shape[0] >= self._CALLER_OUTPUT_MIN_TOKENS
+            and hidden_states.shape[1] == self.up_proj.input_size
+            and output.shape == (hidden_states.shape[0], self.up_proj.output_size)
+            and output.dtype == hidden_states.dtype
+            and output.device == hidden_states.device
+            and output.is_contiguous()
+            and output.untyped_storage().data_ptr()
+            != hidden_states.untyped_storage().data_ptr()
+        )
+
+    def can_write_output(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+    ) -> bool:
+        """Check the prefill-only caller-owned output contract."""
+        return self._valid_output_buffer(hidden_states, output)
+
+    def can_accumulate_residual(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> bool:
+        """Check the prefill-only tiled residual-accumulation contract."""
+        return (
+            self._valid_output_buffer(hidden_states, residual)
+            and self.up_proj.output_size % self._ACCUMULATION_TILE_ROWS == 0
+        )
+
+    def _project_into(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        local_input = self._local_projection_input(hidden_states)
+        torch.mm(local_input, self.up_proj.weight.t(), out=output)
+        return output
+
+    def _accumulate_into(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add a rank-local projection using one fixed-width scratch tile."""
+        local_input = self._local_projection_input(hidden_states)
+        tile_rows = self._ACCUMULATION_TILE_ROWS
+        scratch = torch.empty(
+            (local_input.shape[0], tile_rows),
+            dtype=residual.dtype,
+            device=residual.device,
+        )
+        for row_start in range(0, self.up_proj.output_size, tile_rows):
+            row_end = row_start + tile_rows
+            torch.mm(
+                local_input,
+                self.up_proj.weight[row_start:row_end].t(),
+                out=scratch,
+            )
+            residual[:, row_start:row_end].add_(scratch)
+        return residual
+
+    def can_normalize_routed_latent_in_place(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> bool:
+        """Check whether a consumed prefill latent can hold its RMSNorm."""
+        norm = self.norm
+        return (
+            norm is not None
+            and not envs.VLLM_BATCH_INVARIANT
+            and not torch.is_grad_enabled()
+            and norm.pass_weight
+            and norm.variance_size_override is None
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] >= self._CALLER_OUTPUT_MIN_TOKENS
+            and hidden_states.shape[1] == norm.hidden_size
+            and hidden_states.is_contiguous()
+            and norm.weight.device == hidden_states.device
+            and norm.weight.dtype == hidden_states.dtype
+        )
+
+    def normalize_routed_latent(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Normalize a consumed routed latent without a full output allocation."""
+        norm = self.norm
+        if norm is None:
+            return hidden_states
+        if self.can_normalize_routed_latent_in_place(hidden_states):
+            ops.rms_norm(
+                hidden_states,
+                hidden_states,
+                norm.weight.data,
+                norm.variance_epsilon,
+            )
+            return hidden_states
+        return cast(torch.Tensor, norm(hidden_states))
 
     @property
     def output_is_tp_partial(self) -> bool:
@@ -1291,7 +1522,12 @@ class KimiDecoderLayer(nn.Module):
         )
 
         # MoE/MLP.
-        hidden_states = self.mlp(hidden_states)
+        if isinstance(self.mlp, KimiMLP) and self.mlp.should_use_caller_output(
+            hidden_states
+        ):
+            hidden_states = self.mlp(hidden_states, output=hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
         return hidden_states, prefix_sum, residual
 
 

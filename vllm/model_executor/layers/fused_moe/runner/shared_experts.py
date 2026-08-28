@@ -162,10 +162,25 @@ class SharedExperts(torch.nn.Module):
         self._output[self._output_idx] = None
         return output
 
+    def can_reuse_input(self, shared_experts_input: torch.Tensor) -> bool:
+        """Return whether synchronous execution may overwrite its input."""
+        should_use_caller_output = getattr(
+            self._layer,
+            "should_use_caller_output",
+            None,
+        )
+        return bool(
+            should_use_caller_output is not None
+            and self._determine_shared_experts_order(shared_experts_input)
+            == SharedExpertsOrder.NO_OVERLAP
+            and should_use_caller_output(shared_experts_input)
+        )
+
     def forward(
         self,
         shared_experts_input: torch.Tensor,
         order: SharedExpertsOrder,
+        reuse_input: bool = False,
     ):
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
@@ -174,7 +189,19 @@ class SharedExperts(torch.nn.Module):
 
         assert self._output[self._output_idx] is None
 
-        if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
+        if reuse_input:
+            if order != SharedExpertsOrder.NO_OVERLAP or not self.can_reuse_input(
+                shared_experts_input
+            ):
+                raise ValueError(
+                    "Shared-expert input reuse requires synchronous execution "
+                    "and an input-reuse-capable layer"
+                )
+            self._output[self._output_idx] = self._layer(
+                shared_experts_input,
+                output=shared_experts_input,
+            )
+        elif order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
             self._output[self._output_idx] = self._run_in_aux_stream(
                 shared_experts_input
             )
