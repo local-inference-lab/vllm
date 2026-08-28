@@ -1237,7 +1237,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
 
         Supported configs (K3 fp8 policy):
           - bf16 cache        -> bf16 prefill query
-          - plain fp8 cache   -> fp8 prefill query (unscaled q/k/v; cache _k_scale)
+          - plain fp8 cache   -> bf16 or fp8 prefill query
           - fp8_ds_mla cache  -> bf16 prefill query (656B per-tile self-scaled)
         """
         prefill = attn_metadata.prefill
@@ -1269,30 +1269,50 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache,
             )
         elif is_quantized_kv_cache(self.kv_cache_dtype):
-            assert fp8_prefill, (
-                "Kimi-K3 fp8 KV cache requires an fp8 prefill query; enable "
-                "--attention-config '{\"use_prefill_query_quantization\": true}'."
-            )
-            # Plain per-tensor fp8: quant q/k/v (unscaled, matching forward_mha's
-            # unscaled `.to(fp8)`) and insert the fp8 latent (scaled by _k_scale).
-            kv_cache = self.kv_cache
-            if kv_cache.dtype != torch.float8_e4m3fn:
-                kv_cache = kv_cache.view(torch.float8_e4m3fn)
-            q, k, v = fused_mla_qkv_quant_kv_cache_fp8_insert(
-                q,
-                k_nope,
-                k_pe,
-                kv_c_normed,
-                v,
-                kv_cache,
-                slot_mapping,
-                self._one_scale,
-                self._one_scale,
-                self._one_scale,
-                self._k_scale_inv,
-                positions,
-                cos_sin_cache,
-            )
+            if fp8_prefill:
+                # Plain per-tensor fp8: quantize q/k/v without an activation
+                # scale and insert the latent using the cache scale.
+                kv_cache = self.kv_cache
+                if kv_cache.dtype != torch.float8_e4m3fn:
+                    kv_cache = kv_cache.view(torch.float8_e4m3fn)
+                q, k, v = fused_mla_qkv_quant_kv_cache_fp8_insert(
+                    q,
+                    k_nope,
+                    k_pe,
+                    kv_c_normed,
+                    v,
+                    kv_cache,
+                    slot_mapping,
+                    self._one_scale,
+                    self._one_scale,
+                    self._one_scale,
+                    self._k_scale_inv,
+                    positions,
+                    cos_sin_cache,
+                )
+            else:
+                # FlashAttention on SM120 consumes BF16 prefill queries. Keep
+                # Q/K/V in BF16 and quantize only the latent cache write.
+                assert positions is None and cos_sin_cache is None, (
+                    "BF16 prefill with an FP8 cache is supported only for "
+                    "Kimi-K3 NoPE attention."
+                )
+                k_pe_flat = k_pe.reshape(k_pe.shape[0], -1)
+                k = torch.cat(
+                    (
+                        k_nope,
+                        k_pe_flat[:, None, :].expand(-1, k_nope.shape[1], -1),
+                    ),
+                    dim=-1,
+                )
+                ops.concat_and_cache_mla(
+                    kv_c_normed,
+                    k_pe_flat,
+                    self.kv_cache,
+                    slot_mapping.flatten(),
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=self._k_scale,
+                )
         else:
             # Concat full K = [k_nope | k_pe] and insert [kv_c_normed | k_pe]
             # into the paged cache for these prefill tokens, in one launch.

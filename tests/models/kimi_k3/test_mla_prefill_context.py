@@ -156,6 +156,40 @@ class _ReferenceImpl:
         self.v_head_dim = _V_HEAD_DIM
 
 
+class _NewTokenBackend:
+    """Records the tensors submitted for suffix-only prefill attention."""
+
+    def __init__(self) -> None:
+        self.call: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+
+    @staticmethod
+    def supports_out() -> bool:
+        return False
+
+    def run_prefill_new_tokens(
+        self, *, q, k, v, return_softmax_lse: bool, out=None
+    ) -> torch.Tensor:
+        assert not return_softmax_lse
+        assert out is None
+        self.call = (q.clone(), k.clone(), v.clone())
+        return v.clone()
+
+
+class _NewTokenLayer:
+    """Attributes used by Kimi-K3's fused new-token prefill epilogue."""
+
+    _forward_prefill_fused = MultiHeadLatentAttention._forward_prefill_fused
+
+    def __init__(self, kv_b_proj, kv_cache, k_scale) -> None:
+        self.kv_b_proj = kv_b_proj
+        self.kv_cache = kv_cache
+        self.kv_cache_dtype = "fp8"
+        self._k_scale = k_scale
+        self.num_local_heads = _NUM_HEADS
+        self.qk_nope_head_dim = _QK_NOPE
+        self.v_head_dim = _V_HEAD_DIM
+
+
 def _build_prefill_metadata(
     device: torch.device,
     workspace_dtype: torch.dtype,
@@ -317,3 +351,74 @@ def test_fused_context_rejects_an_unquantized_query() -> None:
     )
     with pytest.raises(AssertionError, match="new-token epilogue"):
         layer._compute_prefill_context(q, SimpleNamespace(prefill=prefill))
+
+
+@torch.inference_mode()
+def test_bf16_prefill_quantizes_only_the_plain_fp8_cache_write() -> None:
+    """SM120 FlashAttention keeps prefill Q/K/V in BF16 with an FP8 cache."""
+    torch.manual_seed(1)
+    device = torch.device("cuda")
+    num_tokens = 3
+    block_size = 8
+    fp8 = current_platform.fp8_dtype()
+    q = torch.randn(
+        num_tokens,
+        _NUM_HEADS,
+        _QK_NOPE + _QK_ROPE,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv_c = torch.randn(num_tokens, _KV_LORA_RANK, device=device, dtype=torch.bfloat16)
+    k_pe = torch.randn(num_tokens, _QK_ROPE, device=device, dtype=torch.bfloat16)
+    slots = torch.tensor([0, 3, 7], device=device, dtype=torch.int64)
+    cache = torch.zeros((1, block_size, _ENTRY), device=device, dtype=fp8)
+    backend = _NewTokenBackend()
+    prefill = SimpleNamespace(
+        chunked_context=None,
+        q_data_type=torch.bfloat16,
+        prefill_backend=backend,
+    )
+    layer = _NewTokenLayer(
+        _KVBProj(device, weight_dtype=torch.bfloat16),
+        cache,
+        torch.ones(1, device=device, dtype=torch.float32),
+    )
+    out = torch.empty(
+        num_tokens,
+        _NUM_HEADS * _V_HEAD_DIM,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    layer._forward_prefill_fused(
+        q,
+        kv_c,
+        k_pe,
+        positions=None,
+        cos_sin_cache=None,
+        slot_mapping=slots,
+        attn_metadata=SimpleNamespace(prefill=prefill),
+        out=out,
+    )
+
+    assert backend.call is not None
+    actual_q, actual_k, actual_v = backend.call
+    expected_k_nope_v = layer.kv_b_proj(kv_c)[0].view(
+        num_tokens, _NUM_HEADS, _QK_NOPE + _V_HEAD_DIM
+    )
+    expected_k_nope, expected_v = expected_k_nope_v.split(
+        (_QK_NOPE, _V_HEAD_DIM), dim=-1
+    )
+    expected_k = torch.cat(
+        (expected_k_nope, k_pe[:, None, :].expand(-1, _NUM_HEADS, -1)), dim=-1
+    )
+    torch.testing.assert_close(actual_q, q, atol=0, rtol=0)
+    torch.testing.assert_close(actual_k, expected_k, atol=0, rtol=0)
+    torch.testing.assert_close(actual_v, expected_v, atol=0, rtol=0)
+    torch.testing.assert_close(out, expected_v.flatten(start_dim=-2), atol=0, rtol=0)
+
+    expected_cache = torch.cat((kv_c, k_pe), dim=-1).to(fp8)
+    actual_cache = cache.view(-1, _ENTRY).index_select(0, slots)
+    torch.testing.assert_close(
+        actual_cache.float(), expected_cache.float(), atol=0, rtol=0
+    )
