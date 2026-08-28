@@ -472,6 +472,14 @@ class DFlashQwen3Model(nn.Module):
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
         )
+        # The context projection concatenates K/V weights from every draft
+        # layer. It is not a LinearBase module because its output layout is a
+        # DFlash-specific fusion. Serialized MXFP8 checkpoints retain an
+        # independently packed copy in this parameter container.
+        self._fused_kv_linear = nn.Module()
+        self._fused_kv_quant_method = None
+        self._fused_kv_weight: torch.Tensor | None = None
+        self._fused_kv_weight_scale: torch.Tensor | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         embeds = self.embed_tokens(input_ids)
@@ -486,11 +494,31 @@ class DFlashQwen3Model(nn.Module):
         layers_attn: list[nn.Module],
         has_bias: bool,
     ) -> None:
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptMxFp8LinearMethod,
+        )
+
+        quant_methods = [a.qkv_proj.quant_method for a in layers_attn]
+        uses_mxfp8 = [
+            isinstance(method, ModelOptMxFp8LinearMethod) for method in quant_methods
+        ]
+        if any(uses_mxfp8) and not all(uses_mxfp8):
+            raise ValueError(
+                "Every DFlash attention layer must use the same MXFP8 "
+                "linear format for the fused context K/V projection."
+            )
+
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
         kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+
+        if all(uses_mxfp8):
+            kv_scales = [a.qkv_proj.weight_scale[a.q_size :] for a in layers_attn]
+            self._fused_kv_weight_scale = torch.cat(kv_scales, dim=0)
+        else:
+            self._fused_kv_weight_scale = None
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
             self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
@@ -546,6 +574,41 @@ class DFlashQwen3Model(nn.Module):
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
 
+    def process_weights_after_loading(self) -> None:
+        """Pack the serialized MXFP8 context projection for its GEMM backend."""
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptMxFp8LinearMethod,
+        )
+
+        quant_method = self.layers[0].self_attn.qkv_proj.quant_method
+        if not isinstance(quant_method, ModelOptMxFp8LinearMethod):
+            return
+        if self._fused_kv_weight is None or self._fused_kv_weight_scale is None:
+            raise RuntimeError(
+                "The DFlash MXFP8 context projection requires serialized K/V "
+                "weights and block scales to be fused during checkpoint loading."
+            )
+
+        output_size, input_size = self._fused_kv_weight.shape
+        self._fused_kv_linear.input_size_per_partition = input_size
+        self._fused_kv_linear.output_size_per_partition = output_size
+        self._fused_kv_linear.logical_widths = [output_size]
+        self._fused_kv_linear.register_parameter(
+            "weight", nn.Parameter(self._fused_kv_weight, requires_grad=False)
+        )
+        self._fused_kv_linear.register_parameter(
+            "weight_scale",
+            nn.Parameter(self._fused_kv_weight_scale, requires_grad=False),
+        )
+        quant_method.process_weights_after_loading(self._fused_kv_linear)
+        self._fused_kv_quant_method = quant_method
+        self._fused_kv_weight = None
+        self._fused_kv_weight_scale = None
+        logger.info_once(
+            "Using %s for the fused DFlash context K/V projection.",
+            type(quant_method.kernel).__name__,
+        )
+
     def _project_context_kv(
         self,
         context_states: torch.Tensor,
@@ -562,9 +625,18 @@ class DFlashQwen3Model(nn.Module):
             self._hidden_norm_weight,
             self._rms_norm_eps,
         )
-        all_kv_flat = F.linear(
-            normed_context_states, self._fused_kv_weight, self._fused_kv_bias
-        )
+        if self._fused_kv_quant_method is None:
+            if self._fused_kv_weight is None:
+                raise RuntimeError("DFlash context K/V projection is not initialized.")
+            all_kv_flat = F.linear(
+                normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+            )
+        else:
+            all_kv_flat = self._fused_kv_quant_method.apply(
+                self._fused_kv_linear,
+                normed_context_states,
+                self._fused_kv_bias,
+            )
         # Single contiguous copy that separates K/V and transposes to
         # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
         # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
@@ -792,6 +864,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.model.precompute_and_store_context_kv(
             context_states, context_positions, context_slot_mapping
         )
+
+    def process_weights_after_loading(self) -> None:
+        """Finalize the DFlash fused context projection after linear packing."""
+        self.model.process_weights_after_loading()
 
     def combine_hidden_states(
         self,
