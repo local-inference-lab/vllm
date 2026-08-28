@@ -52,7 +52,10 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
+from vllm.model_executor.warmup.kernel_warmup import (
+    kernel_warmup,
+    runtime_kernel_warmup,
+)
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import (
@@ -476,21 +479,48 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
 
-    def _warmup_kimi_k3_prefill_before_kv_cache(self) -> None:
-        """Autotune cache-independent KDA kernels and release their scratch."""
-        if not self.vllm_config.kernel_config.enable_jit_warmup:
-            return
+    def _warmup_kernels_once(self) -> None:
+        """Materialize persistent kernel resources before KV cache sizing."""
+        if not getattr(self, "_kernel_warmup_complete", False):
+            runtime_complete = kernel_warmup(self)
+            self._kernel_warmup_complete = True
+            if runtime_complete:
+                self._runtime_kernel_warmup_complete = True
 
-        from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
-            kimi_k3_triton_prefill_warmup,
-        )
+        model_runner = getattr(self, "model_runner", None)
+        if (
+            model_runner is not None
+            and hasattr(model_runner, "block_tables")
+            and not getattr(self, "_runtime_kernel_warmup_complete", False)
+        ):
+            runtime_kernel_warmup(self)
+            self._runtime_kernel_warmup_complete = True
 
-        if not kimi_k3_triton_prefill_warmup(self):
-            return
+    def _profile_model_with_kernel_warmup(self) -> None:
+        """Profile activations on top of persistent kernel allocations."""
+        # The first pass initializes runner state required by some warmups.
+        self.model_runner.profile_run()
+        self._warmup_kernels_once()
 
+        # Exclude one-time compiler and loader temporaries while retaining every
+        # persistent allocation initialized by kernel warmup.
+        torch.accelerator.reset_peak_memory_stats(self.device)
+
+        # The second pass measures the repeatable serving activation peak on top
+        # of the persistent kernel allocations.
+        self.model_runner.profile_run()
+
+    def _release_unoccupied_accelerator_memory(self) -> None:
+        """Return unoccupied caching-allocator blocks to the device."""
         torch.accelerator.synchronize(self.device)
         gc.collect()
         torch.accelerator.empty_cache()
+
+    def _capture_model_with_reclaimed_manual_kv_cache(self) -> int:
+        """Capture CUDA graphs after releasing manual-KV allocator slack."""
+        if self.cache_config.kv_cache_memory_bytes is not None:
+            self._release_unoccupied_accelerator_memory()
+        return self.model_runner.capture_model()
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -507,11 +537,15 @@ class Worker(WorkerBase):
         """
         maybe_apply_startup_plan(self)
 
-        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+        kv_cache_memory_bytes = self.cache_config.kv_cache_memory_bytes
+        if kv_cache_memory_bytes is not None:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
+            self._release_unoccupied_accelerator_memory()
             self.model_runner.profile_run()
-            self._warmup_kimi_k3_prefill_before_kv_cache()
+            self._release_unoccupied_accelerator_memory()
+            self._warmup_kernels_once()
+            self._release_unoccupied_accelerator_memory()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -532,15 +566,13 @@ class Worker(WorkerBase):
                 getattr(self.parallel_config, "_api_process_count", 1),
             )
 
-        self._warmup_kimi_k3_prefill_before_kv_cache()
-
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
-            self.model_runner.profile_run()
+            self._profile_model_with_kernel_warmup()
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -758,11 +790,13 @@ class Worker(WorkerBase):
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
-        kernel_warmup(self)
+        self._warmup_kernels_once()
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
-            cuda_graph_memory_bytes = self.model_runner.capture_model()
+            cuda_graph_memory_bytes = (
+                self._capture_model_with_reclaimed_manual_kv_cache()
+            )
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (

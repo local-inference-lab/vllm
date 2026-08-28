@@ -108,7 +108,7 @@ def _warmup_kimi_k3_gemm_rs_ar() -> None:
         logger.info_once("Warmed up %d Kimi-K3 GEMM-RS/AR variants.", compiled)
 
 
-def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
+def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> bool:
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
     )
@@ -168,7 +168,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         cutedsl_warmup()
 
     if process_local_only:
-        return
+        return False
 
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
@@ -185,6 +185,19 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     b12x_warmup(worker, cudagraph_capture_sizes)
 
     minimax_m3_msa_warmup(worker)
+
+    if not hasattr(worker.model_runner, "block_tables"):
+        logger.info_once(
+            "Deferring runtime-dependent kernel warmup until KV cache initialization."
+        )
+        return False
+
+    runtime_kernel_warmup(worker)
+    return True
+
+
+def runtime_kernel_warmup(worker: "Worker") -> None:
+    """Warm kernels whose dummy runs require initialized KV-cache state."""
 
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune
@@ -204,15 +217,16 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         except NotImplementedError:
             return False
 
+    attn_groups = getattr(worker.model_runner, "attn_groups", None)
     if (
         not worker.model_runner.is_pooling_model
-        and worker.model_runner.attn_groups
+        and attn_groups
         # NOTE: This should be `any` instead of `all` but other hybrid attention
         # backends don't support this dummy run. Once we remove
         # `build_for_cudagraph_capture`, we can change it to `any`.
         and all(
             _is_flashinfer_backend(group.backend)
-            for groups in worker.model_runner.attn_groups
+            for groups in attn_groups
             for group in groups
         )
     ):

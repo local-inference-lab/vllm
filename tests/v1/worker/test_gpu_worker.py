@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as gpu_model_runner_module
+import vllm.v1.worker.gpu_worker as gpu_worker_module
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import startup_plan
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -89,22 +90,94 @@ def test_manual_kv_storage_is_allocated_after_reclaim(
     assert not scope.active
 
 
-def test_kimi_k3_prefill_warmup_releases_autotune_scratch(
+def test_persistent_and_runtime_kernel_warmups_run_once(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from vllm.model_executor.warmup import kimi_k3_triton_warmup
+    worker = object.__new__(Worker)
+    worker.model_runner = SimpleNamespace()
+    calls: list[tuple[str, object]] = []
 
+    def persistent_warmup(warmed_worker: object) -> bool:
+        calls.append(("persistent", warmed_worker))
+        return False
+
+    monkeypatch.setattr(gpu_worker_module, "kernel_warmup", persistent_warmup)
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "runtime_kernel_warmup",
+        lambda warmed_worker: calls.append(("runtime", warmed_worker)),
+    )
+
+    worker._warmup_kernels_once()
+    worker.model_runner.block_tables = object()
+    worker._warmup_kernels_once()
+    worker._warmup_kernels_once()
+
+    assert calls == [("persistent", worker), ("runtime", worker)]
+    assert worker._kernel_warmup_complete is True
+    assert worker._runtime_kernel_warmup_complete is True
+
+
+def test_failed_persistent_kernel_warmup_is_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    worker = object.__new__(Worker)
+    worker.model_runner = SimpleNamespace()
+    calls = 0
+
+    def fail_once(_worker: object) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("warmup failed")
+        return False
+
+    monkeypatch.setattr(gpu_worker_module, "kernel_warmup", fail_once)
+
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        worker._warmup_kernels_once()
+    worker._warmup_kernels_once()
+
+    assert calls == 2
+    assert worker._kernel_warmup_complete is True
+
+
+def test_memory_profile_replays_model_after_persistent_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+):
     worker = object.__new__(Worker)
     worker.device = torch.device("cuda:3")
-    worker.vllm_config = SimpleNamespace(
-        kernel_config=SimpleNamespace(enable_jit_warmup=True)
-    )
     calls: list[object] = []
-    monkeypatch.setattr(
-        kimi_k3_triton_warmup,
-        "kimi_k3_triton_prefill_warmup",
-        lambda warmed_worker: calls.append(("warmup", warmed_worker)) or True,
+    worker.model_runner = SimpleNamespace(
+        profile_run=lambda: calls.append("profile"),
     )
+    monkeypatch.setattr(
+        worker,
+        "_warmup_kernels_once",
+        lambda: calls.append("kernel_warmup"),
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "reset_peak_memory_stats",
+        lambda device: calls.append(("reset_peak", device)),
+    )
+
+    worker._profile_model_with_kernel_warmup()
+
+    assert calls == [
+        "profile",
+        "kernel_warmup",
+        ("reset_peak", torch.device("cuda:3")),
+        "profile",
+    ]
+
+
+def test_release_unoccupied_accelerator_memory(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    worker = object.__new__(Worker)
+    worker.device = torch.device("cuda:3")
+    calls: list[object] = []
     monkeypatch.setattr(
         torch.accelerator,
         "synchronize",
@@ -120,14 +193,69 @@ def test_kimi_k3_prefill_warmup_releases_autotune_scratch(
         lambda: calls.append("empty_cache"),
     )
 
-    worker._warmup_kimi_k3_prefill_before_kv_cache()
+    worker._release_unoccupied_accelerator_memory()
 
     assert calls == [
-        ("warmup", worker),
         ("synchronize", torch.device("cuda:3")),
         "collect",
         "empty_cache",
     ]
+
+
+def test_manual_kv_profile_warms_kernels_before_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    worker = object.__new__(Worker)
+    worker.device = torch.device("cuda:3")
+    worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=1024)
+    worker.model_runner = SimpleNamespace()
+    worker.model_config = SimpleNamespace(multimodal_config=None)
+    worker.parallel_config = SimpleNamespace(_api_process_count=1)
+    worker.init_snapshot = SimpleNamespace(free_memory=2048)
+    calls: list[object] = []
+    worker.model_runner.profile_run = lambda: calls.append("profile")
+    monkeypatch.setattr(gpu_worker_module, "maybe_apply_startup_plan", lambda _: None)
+    monkeypatch.setattr(
+        worker,
+        "_release_unoccupied_accelerator_memory",
+        lambda: calls.append("release"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_warmup_kernels_once",
+        lambda: calls.append("kernel_warmup"),
+    )
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "reserve_mm_ipc_gpu_memory",
+        lambda size, *_args: size,
+    )
+
+    assert worker.determine_available_memory() == 1024
+    assert calls == [
+        "release",
+        "profile",
+        "release",
+        "kernel_warmup",
+        "release",
+    ]
+
+
+@pytest.mark.parametrize("kv_cache_memory_bytes", [None, 0, 1024])
+def test_manual_kv_graph_capture_reclaims_allocator_slack(
+    kv_cache_memory_bytes: int | None,
+):
+    worker = object.__new__(Worker)
+    calls: list[str] = []
+    worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=kv_cache_memory_bytes)
+    worker.model_runner = SimpleNamespace(
+        capture_model=lambda: calls.append("capture") or 17,
+    )
+    worker._release_unoccupied_accelerator_memory = lambda: calls.append("release")
+
+    assert worker._capture_model_with_reclaimed_manual_kv_cache() == 17
+    expected = ["capture"] if kv_cache_memory_bytes is None else ["release", "capture"]
+    assert calls == expected
 
 
 # Startup-plan persistence (vllm/v1/worker/startup_plan.py), applied and
