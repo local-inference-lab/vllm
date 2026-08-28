@@ -9,6 +9,7 @@ from einops import rearrange
 from torch import nn
 from torch.nn.parameter import Parameter
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
@@ -19,6 +20,7 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -43,6 +45,9 @@ from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
 )
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    reduce_kimi_full_width_projection,
+)
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -55,6 +60,7 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 
 _KDA_GATE_LOGBOUND_MIN = -5.0
+_KDA_CALLER_OUTPUT_MIN_TOKENS = 1024
 
 
 def a_log_weight_loader(
@@ -591,6 +597,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             self.projection_size,
             self.hidden_size,
             bias=False,
+            reduce_results=False,
             quant_config=self.quant_config,
             prefix=f"{prefix}.o_proj",
         )
@@ -613,6 +620,67 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    @property
+    def supports_caller_output(self) -> bool:
+        """Report whether the output projection accepts caller-owned storage."""
+        return (
+            isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
+            and getattr(self.o_proj, "weight", None) is not None
+            and self.o_proj.input_is_parallel
+            and self.o_proj.bias is None
+            and not self.o_proj.reduce_results
+            and not envs.VLLM_BATCH_INVARIANT
+        )
+
+    def should_use_caller_output(self, hidden_states: torch.Tensor) -> bool:
+        """Select consumed hidden-state storage for KDA prefill output."""
+        weight = getattr(self.o_proj, "weight", None)
+        return (
+            self.supports_caller_output
+            and hidden_states.ndim == 2
+            and hidden_states.shape == (hidden_states.shape[0], self.o_proj.output_size)
+            and hidden_states.shape[0] >= _KDA_CALLER_OUTPUT_MIN_TOKENS
+            and hidden_states.is_contiguous()
+            and weight is not None
+            and hidden_states.dtype == weight.dtype
+            and hidden_states.device == weight.device
+        )
+
+    def _project_output_into(
+        self,
+        core_attn_out: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Write the rank-local KDA output projection into consumed storage."""
+        if not self.should_use_caller_output(output):
+            raise ValueError(
+                "Kimi-K3 KDA caller-owned output requires at least 1,024 rows "
+                "of contiguous projection-compatible storage"
+            )
+        expected_input_shape = (
+            output.shape[0],
+            self.o_proj.input_size_per_partition,
+        )
+        if tuple(core_attn_out.shape) != expected_input_shape:
+            raise ValueError(
+                "Kimi-K3 KDA projection input has shape "
+                f"{tuple(core_attn_out.shape)}; expected {expected_input_shape}"
+            )
+        if core_attn_out.dtype != output.dtype or core_attn_out.device != output.device:
+            raise ValueError(
+                "Kimi-K3 KDA projection input and caller output must share "
+                "dtype and device"
+            )
+        if (
+            core_attn_out.untyped_storage().data_ptr()
+            == output.untyped_storage().data_ptr()
+        ):
+            raise ValueError(
+                "Kimi-K3 KDA caller output must not alias the projection input"
+            )
+        torch.mm(core_attn_out, self.o_proj.weight.t(), out=output)
+        return output
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
         spec = super().get_kv_cache_spec(vllm_config)
         assert isinstance(spec, MambaSpec)
@@ -625,6 +693,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
         projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
@@ -656,9 +725,17 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
-        if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(core_attn_out):
+        if (
+            output is None
+            and self.gemm_rs_ar is not None
+            and self.gemm_rs_ar.should_run(core_attn_out)
+        ):
             return self.gemm_rs_ar(core_attn_out, self.o_proj.weight)
-        return self.o_proj(core_attn_out)[0]
+        if output is None:
+            output_parallel = self.o_proj(core_attn_out)[0]
+        else:
+            output_parallel = self._project_output_into(core_attn_out, output)
+        return reduce_kimi_full_width_projection(output_parallel, self.tp_size)
 
     @eager_break_during_capture
     def _forward(
