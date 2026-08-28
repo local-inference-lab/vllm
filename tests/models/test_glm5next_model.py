@@ -26,6 +26,7 @@ from vllm.models.glm5next.nvidia.model import (
     Glm5NextForCausalLM,
     Glm5NextForConditionalGeneration,
     Glm5NextModel,
+    Glm5NextMoE,
     _load_glm5next_fused_conv1d,
     _remap_glm5next_weight_name,
 )
@@ -124,6 +125,97 @@ def test_glm5next_kda_adapts_shared_out_buffer_forward(monkeypatch) -> None:
     actual = layer(hidden_states, positions)
 
     torch.testing.assert_close(actual, hidden_states + positions[:, None])
+
+
+def test_glm5next_moe_applies_external_gate_once() -> None:
+    layer = Glm5NextMoE.__new__(Glm5NextMoE)
+    torch.nn.Module.__init__(layer)
+    layer.is_sequence_parallel = False
+
+    class CountingGate(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, hidden_states):
+            self.calls += 1
+            return hidden_states + 1, None
+
+    class RecordingExperts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.router_input = None
+
+        def forward(self, *, hidden_states, router_logits):
+            self.router_input = router_logits
+            return hidden_states
+
+    layer.gate = CountingGate()
+    layer.experts = RecordingExperts()
+    hidden_states = torch.randn(2, 4)
+
+    actual = layer(hidden_states)
+
+    assert layer.gate.calls == 1
+    torch.testing.assert_close(layer.experts.router_input, hidden_states + 1)
+    torch.testing.assert_close(actual, hidden_states)
+
+
+def test_glm5next_moe_does_not_give_gate_to_runner(monkeypatch) -> None:
+    from vllm.models.glm5next.nvidia import model as glm5next_model
+
+    class FakeGate(torch.nn.Module):
+        out_dtype = torch.float32
+        e_score_correction_bias = None
+
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    class FakeExperts(torch.nn.Module):
+        pass
+
+    factory_kwargs = {}
+
+    def fake_factory(**kwargs):
+        factory_kwargs.update(kwargs)
+        return FakeExperts()
+
+    ep_group = SimpleNamespace(
+        device_group=SimpleNamespace(size=lambda: 1),
+        rank_in_group=0,
+    )
+    monkeypatch.setattr(
+        glm5next_model, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(glm5next_model, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(glm5next_model, "get_ep_group", lambda: ep_group)
+    monkeypatch.setattr(
+        glm5next_model, "_get_moe_router_dtype", lambda config: torch.float32
+    )
+    monkeypatch.setattr(glm5next_model, "GateLinear", FakeGate)
+    monkeypatch.setattr(glm5next_model, "FusedMoEFactory", fake_factory)
+
+    config = SimpleNamespace(
+        routed_scaling_factor=1.0,
+        n_routed_experts=8,
+        n_shared_experts=None,
+        hidden_act="silu",
+        hidden_size=16,
+        topk_method=None,
+        moe_intermediate_size=8,
+        num_experts_per_token=2,
+        moe_renormalize=False,
+    )
+    parallel_config = SimpleNamespace(
+        use_sequence_parallel_moe=False,
+        eplb_config=SimpleNamespace(num_redundant_experts=0),
+        enable_eplb=False,
+    )
+
+    layer = Glm5NextMoE(config, parallel_config)
+
+    assert isinstance(layer.gate, FakeGate)
+    assert "gate" not in factory_kwargs
 
 
 def test_glm5next_kda_splits_mixed_decode_prefill_batch(monkeypatch) -> None:
