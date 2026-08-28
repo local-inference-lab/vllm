@@ -439,6 +439,17 @@ class Glm5NextDecoderLayer(nn.Module):
             self.mhc_post_op = MHCPostOp()
             self.mhc_fused_post_pre_op = MHCFusedPostPreOp()
             self._b12x_mhc = None
+            max_decode_tokens = int(vllm_config.scheduler_config.max_num_seqs) * (
+                1 + int(vllm_config.num_speculative_tokens)
+            )
+            max_cudagraph_tokens = int(
+                vllm_config.compilation_config.max_cudagraph_capture_size or 0
+            )
+            max_b12x_mhc_tokens = max(max_decode_tokens, max_cudagraph_tokens)
+            if self.is_sequence_parallel:
+                tp_size = int(parallel_config.tensor_parallel_size)
+                max_b12x_mhc_tokens = (max_b12x_mhc_tokens + tp_size - 1) // tp_size
+            self._b12x_mhc_max_tokens = max_b12x_mhc_tokens
             if (
                 current_platform.is_cuda()
                 and current_platform.is_device_capability_family(120)
@@ -495,9 +506,11 @@ class Glm5NextDecoderLayer(nn.Module):
         # hc_post with this layer's attn hc_pre into one kernel (inter-layer
         # fusion). Layer 0 has no incoming state -> standalone hc_pre.
         x = hidden_states
+        use_b12x_mhc = self._use_b12x_mhc(x)
         if post is None:
-            if self._b12x_mhc is not None:
+            if use_b12x_mhc:
                 assert self.hc_attn_fn_broadcast is not None
+                assert self._b12x_mhc is not None
                 residual, post, comb, x = self._b12x_mhc.run_pre(
                     x,
                     self.hc_attn_fn_broadcast,
@@ -529,6 +542,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 self.hc_attn_base,
                 norm_weight=self.input_layernorm.weight,
                 norm_eps=self.input_layernorm.variance_epsilon,
+                use_b12x_mhc=use_b12x_mhc,
             )
 
         # Attention needs the full token sequence; mHC above ran on the SP
@@ -555,6 +569,7 @@ class Glm5NextDecoderLayer(nn.Module):
             self.hc_ffn_base,
             norm_weight=self.post_attention_layernorm.weight,
             norm_eps=self.post_attention_layernorm.variance_epsilon,
+            use_b12x_mhc=use_b12x_mhc,
         )
 
         # Fully Connected
@@ -567,7 +582,7 @@ class Glm5NextDecoderLayer(nn.Module):
         # to fuse with) then contracts; every other layer defers its hc_post to
         # the next layer's fused pre, returning the state.
         if self.layer_idx == self.num_hidden_layers - 1:
-            x = self.hc_post(x, residual, post, comb)
+            x = self.hc_post(x, residual, post, comb, use_b12x_mhc=use_b12x_mhc)
             x = hc_contract(x, self.n)
             return x, None, None, None
 
@@ -597,14 +612,31 @@ class Glm5NextDecoderLayer(nn.Module):
         )
         return post_mix, res_mix, layer_input
 
+    def _use_b12x_mhc(self, x: torch.Tensor) -> bool:
+        """Select B12X for decode-sized batches, including graph padding.
+
+        TileLang handles larger prefill batches. The threshold is expressed in
+        rank-local tokens so sequence-parallel layers make the same selection
+        before and after attention.
+        """
+        return self._b12x_mhc is not None and x.shape[0] <= self._b12x_mhc_max_tokens
+
     def hc_post(
         self,
         x: torch.Tensor,
         residual: torch.Tensor,
         post: torch.Tensor,
         comb: torch.Tensor,
+        *,
+        use_b12x_mhc: bool | None = None,
     ):
-        if self._b12x_mhc is not None:
+        # Auxiliary-state capture completes deferred mHC state outside the
+        # decoder-layer forward, so it must derive the backend from the same
+        # rank-local token count used by the layer dispatch.
+        if use_b12x_mhc is None:
+            use_b12x_mhc = self._use_b12x_mhc(x)
+        if use_b12x_mhc:
+            assert self._b12x_mhc is not None
             return self._b12x_mhc.run_post(x, residual, post, comb)
         return self.mhc_post_op(x, residual, post, comb)
 
@@ -619,8 +651,11 @@ class Glm5NextDecoderLayer(nn.Module):
         hc_base: torch.Tensor,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        *,
+        use_b12x_mhc: bool,
     ):
-        if self._b12x_mhc is not None:
+        if use_b12x_mhc:
+            assert self._b12x_mhc is not None
             return self._b12x_mhc.run_post_pre(
                 x,
                 residual,
