@@ -31,6 +31,7 @@ from vllm.utils.b12x import (
     get_b12x_fused_moe,
     reuse_packed_weight_storage,
 )
+from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
@@ -701,10 +702,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 activation=activation,
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
-            scratch = torch.empty(
-                (_b12x_scratch_nbytes(plan),),
-                dtype=torch.uint8,
-                device=device,
+            # Model profiling reserves the largest fused-MoE workspace before
+            # KV-cache allocation. Reuse that reservation so post-allocation
+            # JIT warmup does not require a second full-size scratch buffer.
+            (scratch,) = current_workspace_manager().get_simultaneous(
+                ((_b12x_scratch_nbytes(plan),), torch.uint8)
             )
             _run_b12x_moe_plan(
                 plan=plan,

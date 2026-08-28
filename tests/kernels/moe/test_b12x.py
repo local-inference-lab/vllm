@@ -769,6 +769,9 @@ def test_b12x_moe_warmup_runs_each_planner_regime_once(
     )
     planned_tokens = []
     launched_tokens = []
+    launched_scratch = []
+    workspace_requests = []
+    warmup_workspace = torch.empty((64,), dtype=torch.uint8)
 
     with pytest.raises(RuntimeError, match="process_weights_after_loading"):
         experts.warmup_launches(layer, token_counts=(1,))
@@ -795,9 +798,18 @@ def test_b12x_moe_warmup_runs_each_planner_regime_once(
 
     def fake_run(**kwargs):
         launched_tokens.append(kwargs["hidden_states"].shape[0])
+        launched_scratch.append(kwargs["scratch"])
+
+    class FakeWorkspaceManager:
+        def get_simultaneous(self, *shapes_and_dtypes):
+            workspace_requests.append(shapes_and_dtypes)
+            return [warmup_workspace]
 
     monkeypatch.setattr(b12x, "_b12x_moe_execution_plan", fake_execution_plan)
     monkeypatch.setattr(b12x, "_run_b12x_moe_plan", fake_run)
+    monkeypatch.setattr(
+        b12x, "current_workspace_manager", lambda: FakeWorkspaceManager()
+    )
     monkeypatch.setattr(experts, "_plan", fake_plan)
 
     warmed = experts.warmup_launches(layer, token_counts=(1, 2, 3, 4, 8))
@@ -805,6 +817,8 @@ def test_b12x_moe_warmup_runs_each_planner_regime_once(
     assert warmed == 3
     assert planned_tokens == [1, 3, 8]
     assert launched_tokens == planned_tokens
+    assert workspace_requests == [(((64,), torch.uint8),)] * 3
+    assert all(scratch is warmup_workspace for scratch in launched_scratch)
 
 
 def test_b12x_moe_reload_reprepares_current_parameters(
