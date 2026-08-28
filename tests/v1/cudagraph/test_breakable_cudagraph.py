@@ -78,6 +78,51 @@ def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
     assert create_calls[0][1] is not create_calls[1][1]
 
 
+def test_breakable_wrapper_retains_capture_resources(monkeypatch):
+    import vllm.compilation.breakable_cudagraph as breakable
+    from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
+
+    class FakeCapture:
+        def __init__(self, pool):
+            self.pool = pool
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    class FakeOffloader:
+        def sync_prev_onload(self):
+            pass
+
+        def join_after_forward(self):
+            pass
+
+    resource = object()
+
+    def runnable():
+        assert retain_cuda_graph_capture_resource(resource)
+        return object()
+
+    monkeypatch.setattr(breakable, "validate_cudagraph_capturing_enabled", lambda: None)
+    monkeypatch.setattr(breakable, "set_graph_pool_id", lambda _pool: None)
+    monkeypatch.setattr(breakable.gc, "collect", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(breakable, "get_offloader", lambda: FakeOffloader())
+    monkeypatch.setattr(breakable, "BreakableCUDAGraphCapture", FakeCapture)
+    monkeypatch.setattr(breakable, "weak_ref_tensors", lambda value: value)
+
+    wrapper = object.__new__(breakable.BreakableCUDAGraphWrapper)
+    wrapper.runnable = runnable
+    wrapper.graph_pool = object()
+    entry = breakable._BreakableEntry(batch_descriptor=object())
+
+    wrapper._capture(entry, (), {})
+
+    assert entry.resources == [resource]
+
+
 @pytest.fixture(autouse=True)
 def _reset_breakable_tls():
     """Defensively clear thread-local capture state between tests so a
