@@ -189,12 +189,36 @@ def _normalize_expert_scale(scale: torch.Tensor) -> torch.Tensor:
     return scale.to(dtype=torch.float32).contiguous()
 
 
+_FP4_ZERO_SIGN_CHUNK_BYTES = 32 * 1024 * 1024
+
+
 def _canonicalize_fp4_zero_signs_(packed: torch.Tensor) -> None:
-    """Clear sign bits from packed FP4 zero values in place."""
+    """Clear FP4 zero sign bits while bounding temporary CUDA storage."""
     packed = packed.view(torch.uint8)
-    magnitude = packed & 0x77
-    nonzero = (magnitude | (magnitude >> 1) | (magnitude >> 2)) & 0x11
-    packed.bitwise_and_(0x77 | (nonzero << 3))
+    pending = [packed]
+    while pending:
+        chunk = pending.pop()
+        if chunk.numel() > _FP4_ZERO_SIGN_CHUNK_BYTES:
+            # Narrowed views preserve arbitrary tensor strides. Repeatedly
+            # split the largest dimension so elementwise temporaries cannot
+            # grow with the complete expert tensor.
+            split_dim = max(range(chunk.ndim), key=lambda dim: chunk.shape[dim])
+            split_index = chunk.shape[split_dim] // 2
+            pending.append(
+                chunk.narrow(
+                    split_dim, split_index, chunk.shape[split_dim] - split_index
+                )
+            )
+            pending.append(chunk.narrow(split_dim, 0, split_index))
+            continue
+
+        keep_mask = chunk.bitwise_and(0x77)
+        keep_mask.bitwise_or_(keep_mask >> 1)
+        keep_mask.bitwise_or_(keep_mask >> 2)
+        keep_mask.bitwise_and_(0x11)
+        keep_mask.bitwise_left_shift_(3)
+        keep_mask.bitwise_or_(0x77)
+        chunk.bitwise_and_(keep_mask)
 
 
 class B12xExperts(mk.FusedMoEExpertsModular):

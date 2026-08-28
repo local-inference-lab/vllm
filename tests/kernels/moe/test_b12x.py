@@ -56,6 +56,31 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
 
+@pytest.mark.parametrize("strided", [False, True])
+def test_fp4_zero_sign_canonicalization_is_bounded_and_exact(
+    monkeypatch: pytest.MonkeyPatch,
+    strided: bool,
+) -> None:
+    packed = torch.arange(256, dtype=torch.uint8).reshape(16, 16)
+    if strided:
+        packed = packed.t()
+    expected = packed.clone()
+    magnitude = expected & 0x77
+    nonzero = (magnitude | (magnitude >> 1) | (magnitude >> 2)) & 0x11
+    expected.bitwise_and_(0x77 | (nonzero << 3))
+
+    # A limit below the tensor size exercises recursive narrowing. Seventeen
+    # bytes also prevents the chunk boundaries from matching either dimension.
+    monkeypatch.setattr(b12x, "_FP4_ZERO_SIGN_CHUNK_BYTES", 17)
+    b12x._canonicalize_fp4_zero_signs_(packed)
+
+    torch.testing.assert_close(packed, expected, rtol=0, atol=0)
+    low_zero = (packed & 0x07) == 0
+    high_zero = (packed & 0x70) == 0
+    assert torch.all((packed[low_zero] & 0x08) == 0)
+    assert torch.all((packed[high_zero] & 0x80) == 0)
+
+
 def _quantize_nvfp4_linear(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
