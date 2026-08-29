@@ -670,12 +670,16 @@ def resolve_kv_cache_block_sizes(
     groups = kv_cache_config.kv_cache_groups
 
     if len(groups) <= 1:
-        bs = cache_config.block_size * dcp
+        dcp_replicated = len(groups) == 1 and getattr(
+            groups[0].kv_cache_spec, "dcp_replicated", False
+        )
+        bs = cache_config.block_size * (1 if dcp_replicated else dcp)
         return bs, bs
 
     group_block_sizes = [
         g.kv_cache_spec.block_size * dcp
         if isinstance(g.kv_cache_spec, AttentionSpec)
+        and not getattr(g.kv_cache_spec, "dcp_replicated", False)
         else g.kv_cache_spec.block_size
         for g in groups
     ]
@@ -1595,6 +1599,44 @@ def group_and_unify_kv_cache_specs(
     return [mla_uniform_spec, *swa_uniform_specs]
 
 
+def group_dcp_replicated_draft_kv_cache_specs(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Keep a replicated speculative draft separate from a sharded target.
+
+    DFlash's small sliding-window cache has different allocation and DCP
+    semantics from the target cache. When both sides are independently
+    uniform, retain their concrete specs and native block sizes instead of
+    promoting or page-size-unifying the draft with the target.
+    """
+    replicated = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if getattr(spec, "dcp_replicated", False)
+    }
+    if not replicated:
+        return None
+    sharded = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if not getattr(spec, "dcp_replicated", False)
+    }
+    if not sharded:
+        return None
+    if not is_kv_cache_spec_uniform(replicated):
+        return None
+    # The target need not itself be uniform. GLM-5.3, for example, mixes MLA
+    # cache layouts that the normal hybrid grouping path already understands.
+    # Re-enter grouping without the replicated draft so that path can preserve
+    # the target's native groups instead of page-unifying it with the draft.
+    sharded_groups = get_kv_cache_groups(vllm_config, dict(sharded))
+    return [
+        *sharded_groups,
+        *_get_kv_cache_groups_uniform_spec(replicated),
+    ]
+
+
 def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
     """Pick a chunk size that minimizes total upward padding.
 
@@ -1779,6 +1821,10 @@ def get_kv_cache_groups(
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
+    elif replicated_groups := group_dcp_replicated_draft_kv_cache_specs(
+        vllm_config, kv_cache_spec
+    ):
+        return replicated_groups
     elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
         # DeepseekV4 case: All layers need the same number of token slots,
         # yet some layers are full attention while others are sliding window
@@ -2111,9 +2157,11 @@ def get_kv_cache_configs(
     # This is to prevent that some layers are initialized with unregistered specs.
     KVCacheSpecRegistry.check_kv_cache_spec_registry(merged_kv_cache_specs)
 
-    # When speculating with more than 1 speculative module (e.g. multi-layered MTP)
+    # When speculating with more than 1 speculative module (e.g. multi-layered MTP),
     # tag every SlidingWindowSpec with how many extra tokens to retain in the window.
-    extra_retained_tokens = (
+    # A model-specific cache spec may require a larger retention window (DFlash's
+    # EAGLE prefix proof is one example), so never erase that value here.
+    mtp_extra_retained_tokens = (
         vllm_config.speculative_config.num_speculative_tokens - 1
         if vllm_config.speculative_config is not None
         and vllm_config.speculative_config.use_multi_module_mtp()
@@ -2122,7 +2170,10 @@ def get_kv_cache_configs(
     for layer_name, layer_spec in merged_kv_cache_specs.items():
         if isinstance(layer_spec, SlidingWindowSpec):
             merged_kv_cache_specs[layer_name] = replace(
-                layer_spec, extra_retained_tokens=extra_retained_tokens
+                layer_spec,
+                extra_retained_tokens=max(
+                    layer_spec.extra_retained_tokens, mtp_extra_retained_tokens
+                ),
             )
 
     # Get global KV cache groups. This also handles spec unification for

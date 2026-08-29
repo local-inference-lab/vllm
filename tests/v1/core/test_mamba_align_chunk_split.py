@@ -82,6 +82,7 @@ def _split(
     use_eagle: bool = True,
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
+    has_sliding_eagle_group: bool = False,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     stub = SimpleNamespace(
@@ -95,8 +96,23 @@ def _split(
         mamba_has_prefill_checkpoint_blocks=(
             num_prefill_checkpoint_blocks > 0 and not use_eagle
         ),
+        mamba_has_sliding_eagle_group=has_sliding_eagle_group,
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
+
+
+def test_dflash_keeps_final_mamba_cache_boundary() -> None:
+    """DFlash drops its group-local draft block, not the target Mamba state."""
+    (request,) = create_requests(1, num_tokens=10355, block_size=ATTN_BLOCK_SIZE)
+    request.num_computed_tokens = 5 * MAMBA_BLOCK_SIZE
+    assert (
+        _split(
+            request,
+            request.num_tokens - request.num_computed_tokens,
+            has_sliding_eagle_group=True,
+        )
+        == MAMBA_BLOCK_SIZE
+    )
 
 
 @pytest.mark.parametrize(

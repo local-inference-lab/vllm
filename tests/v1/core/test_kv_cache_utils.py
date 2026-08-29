@@ -2079,6 +2079,30 @@ def test_get_kv_cache_configs_attention_free():
     ]
 
 
+def test_get_kv_cache_configs_preserves_model_sliding_window_retention():
+    """Generic spec-decode planning must not erase model-specific retention."""
+    model_config = ModelConfig(max_model_len=4096)
+    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
+    vllm_config.cache_config.prefix_cache_retention_interval = None
+    spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        sliding_window=2048,
+        extra_retained_tokens=2048,
+    )
+
+    configs = get_kv_cache_configs(
+        vllm_config,
+        [{"draft": spec}],
+        [spec.page_size_bytes * 1024],
+    )
+
+    assert configs[0].kv_cache_groups[0].kv_cache_spec.extra_retained_tokens == 2048
+
+
 def test_generate_uniform_type_kv_cache_specs():
     # All layers are full attention, can be merged
     kv_cache_specs = {
@@ -2230,6 +2254,62 @@ def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():
     assert len(grouped) == 2
     layer_names = {name for g in grouped for name in g.kv_cache_specs}
     assert layer_names == {"mla.0", "mla.1", "swa.0"}
+
+
+def test_group_dcp_replicated_dflash_draft():
+    target = new_mla_spec()
+    draft = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        sliding_window=2048,
+        dcp_replicated=True,
+    )
+    assert target.page_size_bytes != draft.page_size_bytes
+
+    specs = {"model.layers.0": target, "draft.layers.0": draft}
+    # DeepSeek-V4's UniformType tuple planner is not needed for DFlash.
+    assert group_and_unify_kv_cache_specs(specs) is None
+
+    groups = get_kv_cache_groups(_grouping_config(), specs)
+    draft_group = next(
+        group for group in groups if isinstance(group.kv_cache_spec, SlidingWindowSpec)
+    )
+    assert all(group.kv_cache_spec.block_size == 16 for group in groups)
+    assert draft_group.kv_cache_spec.dcp_replicated is True
+
+
+def test_group_dcp_replicated_dflash_with_hybrid_mla_target():
+    target_full = new_mla_spec(block_size=16)
+    target_swa = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+    )
+    draft = SlidingWindowSpec(
+        block_size=256,
+        num_kv_heads=4,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+        dcp_replicated=True,
+    )
+    config = _grouping_config()
+    groups = get_kv_cache_groups(
+        config,
+        {"target.full": target_full, "target.swa": target_swa, "draft": draft},
+    )
+
+    assert len(groups) == 3
+    assert [group.layer_names for group in groups] == [
+        ["target.full"],
+        ["target.swa"],
+        ["draft"],
+    ]
+    assert groups[-1].kv_cache_spec.dcp_replicated is True
 
 
 def new_indexer_mla_spec(block_size=16):

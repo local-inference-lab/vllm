@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import dataclasses
 import io
 from collections.abc import Iterable
 
@@ -35,6 +36,12 @@ from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheSpec,
+    SlidingWindowSpec,
+    get_kv_quant_mode,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -169,6 +176,33 @@ def _resolve_layer_attention(
     return sliding_window, _dflash_layer_causal(config, layer_idx)
 
 
+class DFlashAttention(Attention):
+    """Attention whose small draft KV is replicated across DCP ranks."""
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        dcp_replicated = vllm_config.parallel_config.decode_context_parallel_size > 1
+        if self.sliding_window is not None:
+            assert self.attn_type == AttentionType.DECODER
+            return SlidingWindowSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+                sliding_window=self.sliding_window,
+                # Prefix lookup verifies one lookahead block and then drops it.
+                # Keep one additional local window alive during chunked prefill
+                # so the proof block is not recycled before it can be hashed.
+                extra_retained_tokens=self.sliding_window,
+                kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+                dcp_replicated=dcp_replicated,
+            )
+        spec = super().get_kv_cache_spec(vllm_config)
+        if dcp_replicated and isinstance(spec, FullAttentionSpec):
+            spec = dataclasses.replace(spec, dcp_replicated=True)
+        return spec
+
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -244,7 +278,7 @@ class DFlashQwen3Attention(nn.Module):
         )
 
         self.sliding_window = sliding_window
-        self.attn = Attention(
+        self.attn = DFlashAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,

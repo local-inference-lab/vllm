@@ -37,7 +37,27 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
             layer_impl = getattr(layer, "impl", None)
             if layer_impl is None:
                 continue
-            if vllm_config.speculative_config is not None and interleave_size > 1:
+            get_spec = getattr(layer, "get_kv_cache_spec", None)
+            if get_spec is not None:
+                try:
+                    spec = get_spec(vllm_config)
+                except Exception:
+                    spec = None
+                if getattr(spec, "dcp_replicated", False):
+                    # Replicated draft KV contains the complete sequence on
+                    # every rank, so its attention executes as a local DCP1 op.
+                    layer_impl.dcp_world_size = 1
+                    layer_impl.dcp_rank = 0
+                    layer_impl.total_cp_world_size = 1
+                    layer_impl.total_cp_rank = 0
+                    layer_impl.need_to_return_lse_for_decode = False
+                    continue
+            speculative_config = vllm_config.speculative_config
+            if (
+                speculative_config is not None
+                and speculative_config.method == "mtp"
+                and interleave_size > 1
+            ):
                 assert layer_impl.supports_mtp_with_cp_non_trivial_interleave_size, (
                     "MTP with cp_kv_cache_interleave_size > 1 is not "
                     f"supported in {layer_impl.__class__.__name__}."

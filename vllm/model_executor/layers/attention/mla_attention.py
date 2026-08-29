@@ -346,6 +346,29 @@ def _detect_output_quant_key(
     return kFp8StaticTensorSym
 
 
+def _select_mqa_query(
+    q: torch.Tensor,
+    q_dcp_replicated: torch.Tensor | None,
+    *,
+    num_mqa_tokens: int,
+    full_ckv_dcp: bool,
+) -> tuple[torch.Tensor, bool]:
+    """Select local or replicated query geometry for MLA decode/prefill.
+
+    Args:
+        q: Query tensor in local DCP geometry.
+        q_dcp_replicated: Query tensor replicated across the DCP group, if built.
+        num_mqa_tokens: Number of MQA query rows required by the backend.
+        full_ckv_dcp: Whether the backend attends a globally gathered CKV cache.
+
+    Returns:
+        The selected query tensor and whether replicated geometry was selected.
+    """
+    if q_dcp_replicated is not None and not full_ckv_dcp:
+        return q_dcp_replicated[:num_mqa_tokens], True
+    return q[:num_mqa_tokens], False
+
+
 def _canonicalize_sparse_mla_kv_cache_dtype(
     attn_backend: type[AttentionBackend],
     kv_cache_dtype: CacheDType,
@@ -903,12 +926,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
         if num_mqa_tokens > 0:
-            if q_dcp_replicated is not None:
-                mqa_q = q_dcp_replicated[:num_mqa_tokens]
-                qrep_decode = True
-            else:
-                mqa_q = q[:num_mqa_tokens]
-                qrep_decode = False
+            full_ckv_dcp = self.impl.uses_full_ckv_dcp(attn_metadata, num_mqa_tokens)
+            # Full-CKV prefill already makes every rank's cache visible to
+            # its local query heads. Prefer the local projection even when
+            # dcp_q_replicate retained a global query for ordinary DCP decode;
+            # the replicated query does not fit the local-head CKV plan.
+            mqa_q, qrep_decode = _select_mqa_query(
+                q,
+                q_dcp_replicated,
+                num_mqa_tokens=num_mqa_tokens,
+                full_ckv_dcp=full_ckv_dcp,
+            )
             mqa_output_slice = output[:num_mqa_tokens]
 
             mqa_q_nope, mqa_q_pe = mqa_q.split(
@@ -998,17 +1026,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     if isinstance(mqa_q, tuple):
                         # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
                         mqa_q = torch.cat(mqa_q, dim=-1)
-                    if not qrep_decode:
+                    if not qrep_decode and not full_ckv_dcp:
                         assert self.dcp_manager.query_gather is not None
                         mqa_q = self.dcp_manager.query_gather(mqa_q)
 
             # call decode attn
             if not self.impl.is_sparse:
                 assert attn_metadata.decode is not None
+            if full_ckv_dcp:
+                ckv_setter = getattr(self.impl, "set_ckv_current_chunk_kv", None)
+                if callable(ckv_setter):
+                    ckv_setter(k_c_normed, k_pe)
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
 
             # correct dcp attn_out with lse.
-            if self.impl.dcp_world_size > 1:
+            if self.impl.dcp_world_size > 1 and not full_ckv_dcp:
                 assert lse is not None
                 assert self.dcp_manager is not None
                 decode_metadata = getattr(attn_metadata, "decode", None)

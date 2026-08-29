@@ -608,6 +608,7 @@ def bind_kv_cache(
 
 def unbind_kv_cache(forward_context: dict[str, Any]) -> None:
     """Release cache references retained by attention-like layers."""
+    reset_impl_types: set[type] = set()
     for layer in forward_context.values():
         unbind = getattr(layer, "unbind_kv_cache", None)
         if callable(unbind):
@@ -620,6 +621,11 @@ def unbind_kv_cache(forward_context: dict[str, Any]) -> None:
 
         impl = getattr(layer, "impl", None)
         if impl is not None:
+            impl_type = type(impl)
+            reset_binding_state = getattr(impl, "reset_kv_cache_binding_state", None)
+            if callable(reset_binding_state) and impl_type not in reset_impl_types:
+                reset_binding_state()
+                reset_impl_types.add(impl_type)
             if hasattr(impl, "_k_scale_cache"):
                 impl._k_scale_cache = None
             if hasattr(impl, "_v_scale_cache"):

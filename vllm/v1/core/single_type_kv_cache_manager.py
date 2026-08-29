@@ -71,11 +71,14 @@ class SingleTypeKVCacheManager(ABC):
                 block until the request finishes.
         """
         self.scheduler_block_size = scheduler_block_size
+        # The coordinator may lower this to the shared hash granularity when
+        # every group supports fine-grained prefix lookup.
+        self.prefix_cache_alignment_tokens = scheduler_block_size
         # The block size for this manager; used for actual block allocation.
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size > 1:
+        if dcp_world_size > 1 and not getattr(kv_cache_spec, "dcp_replicated", False):
             self.block_size *= dcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
@@ -455,7 +458,7 @@ class SingleTypeKVCacheManager(ABC):
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
             end_block=num_full_blocks,
-            alignment_tokens=self.scheduler_block_size,
+            alignment_tokens=self.prefix_cache_alignment_tokens,
             kv_cache_spec=self.kv_cache_spec,
             use_eagle=self.use_eagle,
             retention_interval=retention_interval,
@@ -700,7 +703,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             "and chunked local attention groups"
         )
         block_size = kv_cache_spec.block_size
-        if dcp_world_size > 1:
+        if dcp_world_size > 1 and not getattr(kv_cache_spec, "dcp_replicated", False):
             # DCP shards each block's KV across ranks; hashes must be viewed at
             # the sharded block size.
             block_size *= dcp_world_size
@@ -915,8 +918,12 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         assert isinstance(kv_cache_spec, SlidingWindowSpec), (
             "SlidingWindowManager can only be used for sliding window groups"
         )
-        assert dcp_world_size == 1, "DCP not support sliding window attn now."
-        assert pcp_world_size == 1, "PCP not support sliding window attn now."
+        assert dcp_world_size == 1 or kv_cache_spec.dcp_replicated, (
+            "DCP only supports sliding-window KV when it is replicated."
+        )
+        assert pcp_world_size == 1 or kv_cache_spec.dcp_replicated, (
+            "PCP only supports sliding-window KV when it is replicated."
+        )
         # Fine-grained partial hits are not supported for sliding window now
         assert alignment_tokens % kv_cache_spec.block_size == 0, (
             "SlidingWindowManager does not support fine-grained (partial) cache hits"

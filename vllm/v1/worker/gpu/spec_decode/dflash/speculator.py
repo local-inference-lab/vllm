@@ -419,9 +419,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 seeds,
                 self.block_tables.input_block_tables[gid],
                 self.block_tables.kernel_block_sizes[gid],
-                self.block_tables.cp_rank,
-                self.block_tables.cp_size,
-                self.block_tables.cp_interleave,
+                # Every DFlash draft cache group is replicated under DCP, so
+                # draft context/query slots are ordinary local DCP1 slots.
+                0,
+                1,
+                1,
                 self.parallel_drafting_token_id,
                 self.num_query_per_req,
                 self.num_speculative_steps,

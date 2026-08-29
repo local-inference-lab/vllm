@@ -985,6 +985,18 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
 
     supports_pcp: bool = True
 
+    def uses_full_ckv_dcp(self, attn_metadata: T, num_tokens: int) -> bool:
+        """Report whether this call attends a globally gathered DCP cache.
+
+        Args:
+            attn_metadata: Backend-specific attention metadata for this call.
+            num_tokens: Number of scheduled input tokens.
+
+        Returns:
+            True when the implementation will use globally gathered CKV.
+        """
+        return False
+
     @abstractmethod
     def __init__(
         self,

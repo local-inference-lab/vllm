@@ -1408,6 +1408,22 @@ def get_dcp_group() -> GroupCoordinator:
     return _DCP
 
 
+_DCP_CKV_PREFETCH: GroupCoordinator | None = None
+
+
+def get_dcp_ckv_prefetch_group() -> GroupCoordinator:
+    """Return the process group used to prefetch CKV across DCP ranks.
+
+    Returns:
+        The initialized DCP CKV prefetch group coordinator.
+
+    Raises:
+        AssertionError: If the DCP CKV prefetch group is not initialized.
+    """
+    assert _DCP_CKV_PREFETCH is not None, "DCP CKV prefetch group is not initialized"
+    return _DCP_CKV_PREFETCH
+
+
 _PP: GroupCoordinator | None = None
 
 
@@ -1875,6 +1891,19 @@ def initialize_model_parallel(
         group_name="dcp",
     )
 
+    # CKV lookahead gathers run on a side stream. Give them a distinct NCCL
+    # communicator so they cannot overlap the indexer's default-stream DCP
+    # collectives on the same communicator.
+    global _DCP_CKV_PREFETCH
+    assert _DCP_CKV_PREFETCH is None, "DCP CKV prefetch group is already initialized"
+    if dcp_size > 1 and envs.VLLM_B12X_MLA_CKV_GATHER:
+        _DCP_CKV_PREFETCH = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="dcp_ckv_prefetch",
+        )
+
     global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
     group_ranks = (
@@ -2102,6 +2131,11 @@ def destroy_model_parallel():
     if _DCP:
         _DCP.destroy()
     _DCP = None
+
+    global _DCP_CKV_PREFETCH
+    if _DCP_CKV_PREFETCH:
+        _DCP_CKV_PREFETCH.destroy()
+    _DCP_CKV_PREFETCH = None
 
     global _PCP
     if _PCP:

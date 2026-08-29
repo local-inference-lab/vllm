@@ -35,7 +35,18 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseImpl,
     B12xMLASparseMetadata,
     B12xMLASparseMetadataBuilder,
+    _ckv_prefetch_depth_within_budget,
+    _ckv_prefetch_execution_lanes,
+    _ckv_prefetch_ring_slots,
+    _ckv_prefetch_target_indices,
+    _ckv_prefetch_workspace_nbytes,
+    _CKVPrefetchStateRegistry,
+    _CKVPrefetchWorkspacePool,
+    _global_causal_lens_for_ckv_gather,
+    _is_glm_next_ckv_source_layout,
     _selected_index_block_stride_rows,
+    _use_b12x_full_ckv_gather,
+    _use_b12x_sparse_decode_plan,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import _remap_tiling
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -170,10 +181,12 @@ def test_b12x_glm5_next_cache_spec_and_layout(monkeypatch) -> None:
     assert invalid_reasons == []
     assert unidentified == probe
     assert packed_by_glm_backend.state_content_bytes == 528
-    assert packed_by_glm_backend.page_size_padded == 64 * 528 + 16 * 128 * 2
+    assert packed_by_glm_backend.page_size_padded is None
+    assert packed_by_glm_backend.page_size_bytes == 64 * (528 + 33)
     assert packed_by_glm_backend.model_version == "glm5_next"
     assert packed.state_content_bytes == 528
-    assert packed.page_size_padded == 64 * 528 + 16 * 128 * 2
+    assert packed.page_size_padded is None
+    assert packed.page_size_bytes == 64 * (528 + 33)
     assert packed.model_version == "glm5_next"
     assert packed_without_config_context == packed
     assert layouts == (KVCacheLayout.BLHNC,)
@@ -254,6 +267,170 @@ def test_b12x_glm5_next_accepts_dcp_with_speculation(monkeypatch) -> None:
         )
 
     assert invalid_reasons == []
+
+
+@pytest.mark.parametrize(
+    ("max_query_len", "is_spec_decode", "force", "expected"),
+    [
+        (1, False, False, True),
+        (6, True, False, True),
+        (6, False, False, False),
+        (6, False, True, True),
+        (9, True, False, False),
+    ],
+)
+def test_b12x_sparse_routes_only_verifier_extends_to_decode(
+    max_query_len: int,
+    is_spec_decode: bool,
+    force: bool,
+    expected: bool,
+) -> None:
+    assert (
+        _use_b12x_sparse_decode_plan(
+            max_query_len=max_query_len,
+            num_tokens=max_query_len * 4,
+            num_reqs=4,
+            is_spec_decode=is_spec_decode,
+            spec_extend_as_decode=True,
+            spec_extend_as_decode_force=force,
+            spec_decode_max_q=8,
+            max_tokens=4096,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_query_len", "is_spec_decode", "num_tokens", "expected"),
+    [
+        (1, False, 32, False),
+        (6, True, 192, False),
+        (6, False, 192, True),
+        (128, False, 8192, True),
+        (128, False, 600000, False),
+    ],
+)
+def test_b12x_full_ckv_gather_excludes_decode_and_mtp_batches(
+    max_query_len: int,
+    is_spec_decode: bool,
+    num_tokens: int,
+    expected: bool,
+) -> None:
+    assert (
+        _use_b12x_full_ckv_gather(
+            enabled=True,
+            is_glm_next=True,
+            dcp_world_size=4,
+            max_query_len=max_query_len,
+            num_tokens=num_tokens,
+            is_spec_decode=is_spec_decode,
+            min_tokens=16,
+            max_tokens=524288,
+        )
+        is expected
+    )
+
+
+def test_b12x_full_ckv_gather_uses_global_causal_lengths() -> None:
+    global_seq_lens = torch.tensor([5, 12], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32)
+    req_id_per_token = torch.tensor([0, 0, 1, 1, 1], dtype=torch.int32)
+
+    actual = _global_causal_lens_for_ckv_gather(
+        global_seq_lens,
+        query_start_loc,
+        req_id_per_token,
+        num_actual_tokens=5,
+    )
+
+    assert actual.tolist() == [4, 5, 10, 11, 12]
+
+
+@pytest.mark.parametrize(
+    ("depth", "expected_slots", "expected_targets"),
+    [
+        (0, 1, []),
+        (1, 2, [2]),
+        (3, 4, [2, 3, 4]),
+    ],
+)
+def test_b12x_ckv_prefetch_depth_controls_ring_and_targets(
+    depth: int,
+    expected_slots: int,
+    expected_targets: list[int],
+) -> None:
+    caches = [torch.empty(0) for _ in range(5)]
+    assert _ckv_prefetch_ring_slots(depth) == expected_slots
+    assert _ckv_prefetch_target_indices(1, depth, caches, {}) == expected_targets
+
+
+def test_b12x_ckv_prefetch_budget_caps_depth_but_keeps_sync_slot() -> None:
+    args = dict(dcp_world_size=4, local_capacity=1024, record_bytes=256)
+    assert _ckv_prefetch_workspace_nbytes(0, **args) == 5 * 1024 * 256
+    assert _ckv_prefetch_workspace_nbytes(2, **args) == 13 * 1024 * 256
+    assert _ckv_prefetch_depth_within_budget(3, 13 * 1024 * 256, **args) == 2
+    assert _ckv_prefetch_depth_within_budget(3, 4 * 1024 * 256, **args) == 0
+    assert _ckv_prefetch_depth_within_budget(3, 0, **args) == 3
+
+
+@pytest.mark.parametrize(
+    ("num_ubatches", "speculative", "expected"),
+    [(1, False, 1), (2, False, 2), (1, True, 2), (2, True, 4)],
+)
+def test_b12x_ckv_prefetch_reserves_execution_lanes(
+    num_ubatches: int,
+    speculative: bool,
+    expected: int,
+) -> None:
+    assert _ckv_prefetch_execution_lanes(num_ubatches, speculative) == expected
+
+
+def test_b12x_ckv_workspace_supports_unresolved_layer_index() -> None:
+    pool = _CKVPrefetchWorkspacePool(torch.device("cpu"), 64, 1)
+    registry = _CKVPrefetchStateRegistry()
+    query_workspace = torch.empty(8, dtype=torch.uint8)
+
+    state = registry.for_workspace(
+        query_workspace,
+        layer_idx=None,
+        kv_cache=None,
+        workspace_pool=pool,
+    )
+
+    assert state.get_ckv_workspace(64).numel() == 64
+    registry.clear()
+
+
+def test_b12x_ckv_prefetch_targets_stop_at_unknown_layer() -> None:
+    caches = [torch.empty(0), torch.empty(0), None, torch.empty(0)]
+    assert _ckv_prefetch_target_indices(0, 3, caches, {}) == [1]
+
+
+def test_b12x_ckv_prefetch_appends_current_chunk_to_rank_ordered_slots() -> None:
+    calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    impl = object.__new__(B12xMLASparseImpl)
+    impl.dcp_world_size = 4
+    impl._ckv_current_chunk_kv_c = torch.arange(5 * 512).view(5, 512)
+    impl._concat_and_cache_glm_next_mla = lambda *args: calls.append(args)
+    cache = torch.empty((1, 64, 528), dtype=torch.uint8)
+    metadata = SimpleNamespace(
+        num_reqs=2,
+        req_id_per_token=torch.tensor([0, 0, 1, 1, 1], dtype=torch.int32),
+        global_cache_seq_lens_per_req=torch.tensor([5, 12], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
+        cp_kv_cache_interleave_size=4,
+        dcp_rank_req_starts=torch.tensor(
+            [[0, 4], [0, 1], [0, 0], [0, 0]], dtype=torch.int32
+        ),
+        dcp_padded_total_tokens=8,
+    )
+
+    impl._append_current_chunk_to_gathered(cache, metadata, 5)
+
+    assert len(calls) == 1
+    assert torch.equal(calls[0][0], impl._ckv_current_chunk_kv_c)
+    assert calls[0][1] is cache
+    assert calls[0][2].tolist() == [3, 8, 17, 18, 19]
 
 
 def test_b12x_glm5_next_accepts_dcp_with_prefix_caching(monkeypatch) -> None:
@@ -339,6 +516,8 @@ def test_b12x_glm5_next_selected_indices_use_physical_slots() -> None:
         )
         == 64
     )
+    assert _is_glm_next_ckv_source_layout(cache, page_size=64)
+    assert not _is_glm_next_ckv_source_layout(cache[:, :, ::2], page_size=64)
 
 
 def test_sparse_index_remap_tiling_covers_glm5_next_width() -> None:
@@ -397,6 +576,8 @@ def test_b12x_glm5_next_cache_bind_replans_aligned_manager_page(monkeypatch) -> 
     impl._model_type = 1
     impl._decode_plan = SimpleNamespace()
     impl._extend_plan = SimpleNamespace()
+    impl._ckv_gather_enabled = False
+    impl._ckv_capacity_tokens = 0
     owner = SimpleNamespace(impl=impl, indexer=None)
     cache = torch.empty((2, 1, 2304, 528), dtype=torch.uint8)
 
@@ -414,10 +595,49 @@ def test_b12x_glm5_next_cache_bind_replans_aligned_manager_page(monkeypatch) -> 
     ]
 
 
+def test_b12x_glm5_next_pretouches_largest_attention_workspace(monkeypatch) -> None:
+    calls: list[tuple[tuple[tuple[int, ...], torch.dtype], ...]] = []
+
+    class RecordingWorkspace:
+        def get_simultaneous(self, *specs):
+            calls.append(specs)
+            return [torch.empty(shape, dtype=dtype) for shape, dtype in specs]
+
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "current_workspace_manager",
+        lambda: RecordingWorkspace(),
+    )
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._max_tokens = 4
+    impl._input_num_heads = 8
+    impl.num_heads = 2
+    impl._q_head_dim = 16
+    impl._decode_plan = SimpleNamespace(
+        shapes_and_dtypes=lambda: (((64,), torch.uint8),)
+    )
+    impl._extend_plan = SimpleNamespace(
+        shapes_and_dtypes=lambda: (((128,), torch.uint8),)
+    )
+    impl._ckv_extend_plan = SimpleNamespace(
+        shapes_and_dtypes=lambda: (((4096,), torch.uint8),)
+    )
+
+    impl._pretouch_attention_workspace()
+
+    assert calls == [
+        (
+            ((4, 2, 16), torch.bfloat16),
+            ((4096,), torch.uint8),
+        )
+    ]
+
+
 def _bare_glm_selector_metadata_builder() -> B12xMLASparseMetadataBuilder:
     builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
     builder.requires_glm_next_selector_metadata = True
     builder.supports_draft_decode_metadata_update = True
+    builder.ckv_prefetch_registry = None
     builder.dcp_world_size = 1
     builder._capture_default_state_slot_ids = torch.arange(4, dtype=torch.int32)
     builder._capture_state_slot_ids = torch.empty(4, dtype=torch.int32)

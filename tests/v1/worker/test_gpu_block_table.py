@@ -176,6 +176,45 @@ def test_dcp_slot_mapping_with_smaller_kernel_blocks(cp_rank: int):
     assert torch.equal(actual, expected)
 
 
+def test_dcp_slot_mapping_with_replicated_draft_group():
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[16, 16],
+        max_num_reqs=1,
+        max_num_batched_tokens=32,
+        max_num_blocks_per_group=[2, 2],
+        device=device,
+        kernel_block_sizes=[16, 16],
+        cp_size=4,
+        cp_rank=1,
+        cp_interleave=4,
+        group_cp_sizes=[4, 1],
+    )
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([5], [7, 8]),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 32], dtype=torch.int32, device=device)
+    positions = torch.arange(32, dtype=torch.int64, device=device)
+    actual = block_tables.compute_slot_mappings(
+        idx_mapping,
+        query_start_loc,
+        positions,
+        num_tokens_padded=32,
+    )
+
+    expected_target = torch.full((32,), -1, dtype=torch.int64, device=device)
+    expected_target[4:8] = torch.arange(80, 84, dtype=torch.int64, device=device)
+    expected_target[20:24] = torch.arange(84, 88, dtype=torch.int64, device=device)
+    expected_draft = torch.arange(112, 144, dtype=torch.int64, device=device)
+    assert torch.equal(actual[0], expected_target)
+    assert torch.equal(actual[1], expected_draft)
+
+
 def test_v1_block_table_move_row_clears_vacated_row():
     """condense() moves the last row into a freed slot; the vacated row must
     not keep stale block ids. Padded dummy-run batches dereference stale rows

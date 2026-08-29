@@ -3492,6 +3492,93 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
     assert [len(blocks) for blocks in computed_blocks.blocks] == [3, 12]
 
 
+def test_dcp_hybrid_dflash_reuses_chunked_prompt_boundary():
+    """DCP-sharded target + Mamba + replicated DFlash keeps one common hit."""
+    hash_block_size = 2304
+    scheduler_block_size = hash_block_size * 4
+    kv_cache_config = KVCacheConfig(
+        num_blocks=2000,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target"],
+                MLAAttentionSpec(
+                    # DCP4 expands this to the 9,216-token effective target
+                    # page used by GLM-5.3 Flash at runtime.
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                    tokens_per_state=4,
+                ),
+                is_eagle_group=True,
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=hash_block_size,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+                is_eagle_group=True,
+            ),
+            KVCacheGroupSpec(
+                ["draft"],
+                SlidingWindowSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                    sliding_window=2048,
+                    dcp_replicated=True,
+                    extra_retained_tokens=2048,
+                ),
+                is_eagle_group=True,
+            ),
+        ],
+        prefix_cache_retention_interval=0,
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=524288,
+        max_in_flight_tokens=4096,
+        enable_caching=True,
+        # Replicated DFlash storage requires dense checkpoints independently
+        # of the aggregate coordinator flag.
+        use_eagle=False,
+        hash_block_size=hash_block_size,
+        scheduler_block_size=scheduler_block_size,
+        dcp_world_size=4,
+    )
+
+    token_ids = list(range(10355))
+    fill = make_request("fill", token_ids, hash_block_size, sha256)
+    for chunk in (
+        hash_block_size,
+        hash_block_size,
+        hash_block_size,
+        hash_block_size,
+        len(token_ids) - 4 * hash_block_size,
+    ):
+        blocks = manager.allocate_slots(fill, chunk)
+        assert blocks is not None
+        fill.num_computed_tokens += chunk
+    manager.free(fill)
+
+    replay = make_request("replay", token_ids, hash_block_size, sha256)
+    _, per_group_hits = manager.coordinator.find_longest_cache_hit_per_group(
+        replay.block_hashes, replay.num_tokens - 1
+    )
+    assert per_group_hits == (
+        hash_block_size * 3,
+        hash_block_size * 4,
+        hash_block_size * 3,
+    )
+    _, num_computed_tokens, _ = manager.get_computed_blocks(replay)
+    assert num_computed_tokens == hash_block_size * 3
+
+
 def test_block_lookup_cache_single_block_per_key():
     cache = BlockHashToBlockMap()
     key0 = BlockHashWithGroupId(b"hash0")
