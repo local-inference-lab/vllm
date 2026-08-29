@@ -523,7 +523,7 @@ def mhc_post_tilelang(
             T.copy(d_shared, d_local)
             for i_hco, i1_h in T.Parallel(hc, h_blk):
                 x_local[i_hco, i1_h] = c_local[i_hco] * d_local[i1_h]
-                for i_hci in T.vectorized(hc):
+                for i_hci in T.serial(hc):
                     x_local[i_hco, i1_h] += a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
 
             T.copy(x_local, x[i_n, 0, i0_h * h_blk])
