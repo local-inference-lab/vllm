@@ -916,6 +916,81 @@ def test_prefill_hybrid_model_combinations(spec_types: list[str]):
     manager.free(req1)
 
 
+def test_prefill_hybrid_dcp_sliding_window():
+    """DCP scales SWA cache pages, cache-hit lookup, and retention together."""
+    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+
+    block_size = 16
+    dcp_world_size = 4
+    effective_block_size = block_size * dcp_world_size
+    kv_cache_config = _make_hybrid_kv_cache_config(
+        block_size,
+        num_blocks=64,
+        spec_types=["full", "sliding_window_large"],
+    )
+    swa_group = kv_cache_config.kv_cache_groups[1]
+    kv_cache_config = replace(
+        kv_cache_config,
+        kv_cache_groups=[
+            kv_cache_config.kv_cache_groups[0],
+            replace(
+                swa_group,
+                kv_cache_spec=replace(
+                    swa_group.kv_cache_spec,
+                    sliding_window=2 * effective_block_size,
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        scheduler_block_size=effective_block_size,
+        dcp_world_size=dcp_world_size,
+    )
+
+    assert [m.block_size for m in manager.coordinator.single_type_managers] == [
+        effective_block_size,
+        effective_block_size,
+    ]
+    swa_spec = kv_cache_config.kv_cache_groups[1].kv_cache_spec
+    assert isinstance(swa_spec, SlidingWindowSpec)
+    assert SlidingWindowManager.reachable_block_mask(
+        start_block=0,
+        end_block=4,
+        alignment_tokens=effective_block_size,
+        kv_cache_spec=swa_spec,
+        use_eagle=False,
+        retention_interval=0,
+        reachable_boundaries=(3 * effective_block_size - 1,),
+        effective_block_size=effective_block_size,
+    ) == [True, True, False, False]
+
+    common_token_ids = [i for i in range(12) for _ in range(block_size)]
+    req0 = make_request("dcp-producer", common_token_ids + [12] * 7, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
+    assert num_computed_tokens == 0
+    assert (
+        manager.allocate_slots(
+            req0,
+            len(req0.prompt_token_ids),
+            num_computed_tokens,
+            computed_blocks,
+        )
+        is not None
+    )
+    manager.new_step_starts()
+
+    req1 = make_request("dcp-consumer", common_token_ids + [13] * 5, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+
+    assert num_computed_tokens == len(common_token_ids)
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [3, 3]
+    manager.free(req0)
+
+
 # Test cases with eagle enabled: Only test a single simple case for now.
 # - 2 groups: 1 full + 1 other
 _EAGLE_HYBRID_MODEL_TEST_CASES = [

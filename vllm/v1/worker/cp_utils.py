@@ -38,8 +38,17 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
             if layer_impl is None:
                 continue
             if vllm_config.speculative_config is not None and interleave_size > 1:
-                assert layer_impl.supports_mtp_with_cp_non_trivial_interleave_size, (
-                    "MTP with cp_kv_cache_interleave_size > 1 is not "
+                supports_spec_decode = getattr(
+                    layer_impl,
+                    "supports_spec_decoding_with_cp_non_trivial_interleave_size",
+                    False,
+                ) or getattr(
+                    layer_impl,
+                    "supports_mtp_with_cp_non_trivial_interleave_size",
+                    False,
+                )
+                assert supports_spec_decode, (
+                    "Speculative decoding with cp_kv_cache_interleave_size > 1 is not "
                     f"supported in {layer_impl.__class__.__name__}."
                 )
             if dcp_size > 1:

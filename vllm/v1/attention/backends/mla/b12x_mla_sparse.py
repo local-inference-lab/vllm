@@ -606,7 +606,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         vllm_config = get_current_vllm_config()
         hf_config = vllm_config.model_config.hf_text_config
         self._is_glm_next = _is_glm_next_config(hf_config)
-        self.supports_mtp_with_cp_non_trivial_interleave_size = self._is_glm_next
+        self.supports_spec_decoding_with_cp_non_trivial_interleave_size = (
+            self._is_glm_next
+        )
         if self._is_glm_next:
             if recipe_error := _glm_next_recipe_error(hf_config):
                 raise ValueError(recipe_error)

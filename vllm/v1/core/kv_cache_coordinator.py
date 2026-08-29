@@ -610,13 +610,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         )
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
         if dcp_world_size > 1:
-            # DCP shards full-attention KV across ranks and replicates Mamba
-            # state; other spec types (e.g. sliding window) have no DCP-aware
-            # handling yet, so reject them explicitly.
+            # DCP shards full- and sliding-window attention KV across ranks and
+            # replicates Mamba state. Other spec types still lack DCP-aware
+            # cache-hit and retention geometry, so reject them explicitly.
             for g in kv_cache_config.kv_cache_groups:
-                assert isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec)), (
+                assert isinstance(
+                    g.kv_cache_spec,
+                    (FullAttentionSpec, SlidingWindowSpec, MambaSpec),
+                ), (
                     "DCP with hybrid KV cache layouts only supports "
-                    "full-attention and Mamba groups, got: "
+                    "full-attention, sliding-window, and Mamba groups, got: "
                     f"{type(g.kv_cache_spec).__name__}."
                 )
         # Fine-grained hash hits require Mamba "align" and compatible cache
@@ -845,7 +848,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     alignment_tokens=self._cache_hit_alignment_tokens,
                     dcp_world_size=(
                         self.dcp_world_size
-                        if isinstance(spec, FullAttentionSpec)
+                        if isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
                         else 1
                     ),
                 )
@@ -912,6 +915,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle,
                 alignment_tokens=self._cache_hit_alignment_tokens,
+                dcp_world_size=(
+                    self.dcp_world_size
+                    if isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
+                    else 1
+                ),
             )
             for gid, blks in zip(group_ids, blocks):
                 hit_blocks[gid] = blks

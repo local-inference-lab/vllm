@@ -460,6 +460,7 @@ class SingleTypeKVCacheManager(ABC):
             use_eagle=self.use_eagle,
             retention_interval=retention_interval,
             reachable_boundaries=reachable_boundaries,
+            effective_block_size=self.block_size,
         )
         self.block_pool.cache_full_blocks(
             request=request,
@@ -483,6 +484,7 @@ class SingleTypeKVCacheManager(ABC):
         use_eagle: bool,
         retention_interval: int | None = None,
         reachable_boundaries: Sequence[int] = (),
+        effective_block_size: int | None = None,
     ) -> list[bool] | None:
         """Per-block mask for ``cache_full_blocks``. ``None`` means cache
         every (non-null) block — the default for full attention.
@@ -915,23 +917,24 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         assert isinstance(kv_cache_spec, SlidingWindowSpec), (
             "SlidingWindowManager can only be used for sliding window groups"
         )
-        assert dcp_world_size == 1, "DCP not support sliding window attn now."
+        assert dcp_world_size >= 1
         assert pcp_world_size == 1, "PCP not support sliding window attn now."
+        block_size = kv_cache_spec.block_size * dcp_world_size
         # Fine-grained partial hits are not supported for sliding window now
-        assert alignment_tokens % kv_cache_spec.block_size == 0, (
+        assert alignment_tokens % block_size == 0, (
             "SlidingWindowManager does not support fine-grained (partial) cache hits"
         )
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
-            kv_cache_spec.block_size,
+            block_size,
             supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
             alignment_tokens=alignment_tokens,
         )
 
         # The number of contiguous blocks needed for a prefix cache hit.
         sliding_window_contiguous_blocks = cls._contiguous_blocks_for_hit(
-            kv_cache_spec.sliding_window, kv_cache_spec.block_size, drop_eagle_block
+            kv_cache_spec.sliding_window, block_size, drop_eagle_block
         )
 
         # TODO: reduce i by sliding_window_contiguous_blocks when cache miss, to
@@ -939,12 +942,11 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # O(max_num_blocks / sliding_window_contiguous_blocks +
         # sliding_window_contiguous_blocks),
         # which is good for low cache hit rate scenarios.
-        max_num_blocks = max_length // kv_cache_spec.block_size
+        max_num_blocks = max_length // block_size
         computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [block_pool.null_block] * max_num_blocks
             for _ in range(len(kv_cache_group_ids))
         )
-        block_size = kv_cache_spec.block_size
         num_contiguous_blocks = 0
         match_found = False
         # Search from right to left and early stop when a match is found.
@@ -1008,14 +1010,14 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         use_eagle: bool,
         retention_interval: int | None = None,
         reachable_boundaries: Sequence[int] = (),
+        effective_block_size: int | None = None,
     ) -> list[bool] | None:
         assert isinstance(kv_cache_spec, SlidingWindowSpec)
         if alignment_tokens is None:
             # Fast path: when the coordinator imposes no alignment constraint.
             return None
-        assert alignment_tokens % kv_cache_spec.block_size == 0
-
-        block_size = kv_cache_spec.block_size
+        block_size = effective_block_size or kv_cache_spec.block_size
+        assert alignment_tokens % block_size == 0
         # Contiguous blocks a hit needs at a boundary (incl. the EAGLE peek).
         need = cls._contiguous_blocks_for_hit(
             window_size=kv_cache_spec.sliding_window,
@@ -1383,6 +1385,7 @@ class MambaManager(SingleTypeKVCacheManager):
         use_eagle: bool,
         retention_interval: int | None = None,
         reachable_boundaries: Sequence[int] = (),
+        effective_block_size: int | None = None,
     ) -> list[bool] | None:
         """Sparse Mamba state-snapshot retention.
 
@@ -1400,7 +1403,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # Dense caching (default) or no alignment constraint imposed.
             return None
         assert isinstance(kv_cache_spec, MambaSpec)
-        block_size = kv_cache_spec.block_size
+        block_size = effective_block_size or kv_cache_spec.block_size
         mask = [False] * (end_block - start_block)
 
         # (1) Segment-boundary states. A Mamba hit needs exactly the single
@@ -1903,10 +1906,12 @@ def get_manager_for_kv_cache_spec(
         kv_cache_spec,
         (SlidingWindowSpec, ChunkedLocalAttentionSpec),
     ):
+        kv_shard_count = int(kwargs.get("dcp_world_size", 1))
         kwargs["max_admission_blocks_per_request"] = (
             kv_cache_spec.max_admission_blocks_per_request(
                 max_in_flight_tokens=max_in_flight_tokens,
                 max_model_len=max_model_len,
+                kv_shard_count=kv_shard_count,
             )
         )
     manager = manager_class(kv_cache_spec, **kwargs)

@@ -807,8 +807,11 @@ class AttentionImplBase(ABC, Generic[T]):
     supports_pcp: bool = False
     # Whether the attention impl supports Decode Context Parallelism.
     supports_dcp: bool = True
-    # Whether the attention impl(or ops) supports MTP
-    # when cp_kv_cache_interleave_size > 1
+    # Whether the attention implementation supports speculative decoding when
+    # cp_kv_cache_interleave_size > 1.
+    supports_spec_decoding_with_cp_non_trivial_interleave_size: bool = False
+    # Backward-compatible spelling for out-of-tree backends. This originally
+    # guarded every speculative method despite referring specifically to MTP.
     supports_mtp_with_cp_non_trivial_interleave_size: bool = False
 
     # some attention backends might not always want to return lse

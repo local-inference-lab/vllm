@@ -488,8 +488,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.attn_backend, kv_cache_dtype
         )
         if normalized_kv_cache_dtype != kv_cache_dtype:
-            if cache_config is not None:
-                cache_config.cache_dtype = normalized_kv_cache_dtype
+            # The canonical format is a property of this MLA layer/backend,
+            # not of the process-wide cache configuration. Mutating the
+            # shared config contaminates non-MLA draft layers loaded later
+            # (for example, a DFlash draft would incorrectly request the
+            # target's fp8_ds_mla layout from generic FlashInfer attention).
             kv_cache_dtype = normalized_kv_cache_dtype
             logger.info_once(
                 "Using %s KV cache format for %s backend.",
@@ -2211,7 +2214,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             self.determine_chunked_prefill_workspace_size(vllm_config)
         )
 
-        use_packed_fp8_cache = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        use_packed_fp8_cache = self.kv_cache_spec.cache_dtype_str == "fp8_ds_mla"
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:
             # Note(hc): The local kvcache is incomplete when DCP is triggered,

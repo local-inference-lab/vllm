@@ -168,6 +168,24 @@ def test_swa_admission_cap_accounts_for_overlapping_batches():
     assert overlapped == 193
 
 
+def test_swa_admission_cap_accounts_for_dcp_shards():
+    spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=1024,
+    )
+    cap = spec.max_admission_blocks_per_request(
+        max_in_flight_tokens=1024,
+        max_model_len=16384,
+        kv_shard_count=4,
+    )
+    # Each local page covers 16 * DCP4 global tokens. The one extra block
+    # accounts for a window whose trailing edge is not page-aligned.
+    assert cap == 33
+
+
 def test_chunked_local_free_waits_for_in_flight_step():
     """Chunked-local attention frees whole chunks left of the current one, and
     is exposed to the same load-WAR: with async scheduling those chunks must
@@ -219,6 +237,22 @@ def test_chunked_local_admission_cap_accounts_for_overlapping_batches():
     )
     # One extra in-flight chunk is held back: (1024 + 2 * 1024) tokens.
     assert overlapped == 192
+
+
+def test_chunked_local_admission_cap_accounts_for_dcp_shards():
+    spec = ChunkedLocalAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        attention_chunk_size=1024,
+    )
+    cap = spec.max_admission_blocks_per_request(
+        max_in_flight_tokens=1024,
+        max_model_len=16384,
+        kv_shard_count=4,
+    )
+    assert cap == 32
 
 
 def test_connector_finish_frees_on_settled_basis():

@@ -665,7 +665,10 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
     attention_chunk_size: int
 
     def max_admission_blocks_per_request(
-        self, max_in_flight_tokens: int, max_model_len: int
+        self,
+        max_in_flight_tokens: int,
+        max_model_len: int,
+        kv_shard_count: int = 1,
     ) -> int:
         """Per-request admission cap, in blocks.
 
@@ -681,12 +684,15 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
         num_tokens = min(
             self.attention_chunk_size + max_in_flight_tokens, max_model_len
         )
-        return cdiv(num_tokens, self.block_size)
+        return cdiv(num_tokens, self.block_size * kv_shard_count)
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_blocks = self.max_admission_blocks_per_request(
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             max_model_len=vllm_config.model_config.max_model_len,
+            kv_shard_count=(
+                vllm_config.parallel_config.decode_context_parallel_size
+            ),
         )
         return max_blocks * self.page_size_bytes
 
@@ -711,7 +717,10 @@ class SlidingWindowSpec(AttentionSpec):
     extra_retained_tokens: int = 0
 
     def max_admission_blocks_per_request(
-        self, max_in_flight_tokens: int, max_model_len: int
+        self,
+        max_in_flight_tokens: int,
+        max_model_len: int,
+        kv_shard_count: int = 1,
     ) -> int:
         """Per-request admission cap, in blocks.
 
@@ -736,15 +745,15 @@ class SlidingWindowSpec(AttentionSpec):
         # +1 because the sliding window may not start from the beginning of
         # the block. E.g. block size 4 and num_token 4 needs two blocks
         # [XXCD][EF] to store the 6-token window [CDEF].
-        return cdiv(num_tokens, self.block_size) + 1
+        return cdiv(num_tokens, self.block_size * kv_shard_count) + 1
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
-            "DCP not support sliding window."
-        )
         max_blocks = self.max_admission_blocks_per_request(
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             max_model_len=vllm_config.model_config.max_model_len,
+            kv_shard_count=(
+                vllm_config.parallel_config.decode_context_parallel_size
+            ),
         )
         return max_blocks * self.page_size_bytes
 
