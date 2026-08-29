@@ -298,6 +298,8 @@ def _prefill_pool_kernel(
         slot_mapping + completion_row, mask=write_pool, other=-1
     ).to(tl.int64)
     write_pool &= main_cache_location >= 0
+    if write_pool == 0:
+        return
     parent_page = main_cache_location // model_block_size
     model_page_offset = main_cache_location - parent_page * model_block_size
     pool_offset = model_page_offset // POOL_SIZE
