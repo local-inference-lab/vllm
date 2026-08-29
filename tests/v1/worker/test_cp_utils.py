@@ -65,6 +65,41 @@ def test_spec_decode_interleave_rejection_is_not_mtp_specific(monkeypatch) -> No
         check_attention_cp_compatibility(config)
 
 
+def test_replicated_kv_group_executes_attention_as_dcp1(monkeypatch) -> None:
+    impl = SimpleNamespace(
+        dcp_world_size=4,
+        dcp_rank=3,
+        total_cp_world_size=4,
+        total_cp_rank=3,
+        need_to_return_lse_for_decode=True,
+    )
+    layer = SimpleNamespace(
+        impl=impl,
+        get_kv_cache_spec=lambda _config: SimpleNamespace(dcp_replicated=True),
+    )
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda *_: {"draft.layer": layer},
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=4,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=SimpleNamespace(method="dflash"),
+    )
+
+    check_attention_cp_compatibility(config)
+
+    assert impl.dcp_world_size == 1
+    assert impl.dcp_rank == 0
+    assert impl.total_cp_world_size == 1
+    assert impl.total_cp_rank == 0
+    assert impl.need_to_return_lse_for_decode is False
+
+
 def test_skip_gate_only_for_zero_context():
     assert should_skip_dcp_context_attention(torch.zeros(3, dtype=torch.int32))
     assert not should_skip_dcp_context_attention(

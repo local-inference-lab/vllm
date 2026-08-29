@@ -400,6 +400,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         assert self.draft_kv_cache_group_id >= 0
         # Support multiple draft KV cache groups by preparing inputs once for each
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
+            group_cp_size = self.block_tables.group_cp_sizes_list[gid]
+            group_cp_rank = self.block_tables.cp_rank % group_cp_size
             prepare_dflash_inputs(
                 self.input_buffers,
                 self.block_tables.slot_mappings[gid],
@@ -419,8 +421,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 seeds,
                 self.block_tables.input_block_tables[gid],
                 self.block_tables.kernel_block_sizes[gid],
-                self.block_tables.cp_rank,
-                self.block_tables.cp_size,
+                group_cp_rank,
+                group_cp_size,
                 self.block_tables.cp_interleave,
                 self.parallel_drafting_token_id,
                 self.num_query_per_req,

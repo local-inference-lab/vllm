@@ -75,7 +75,7 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size > 1:
+        if dcp_world_size > 1 and not getattr(kv_cache_spec, "dcp_replicated", False):
             self.block_size *= dcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
@@ -702,7 +702,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             "and chunked local attention groups"
         )
         block_size = kv_cache_spec.block_size
-        if dcp_world_size > 1:
+        if dcp_world_size > 1 and not getattr(kv_cache_spec, "dcp_replicated", False):
             # DCP shards each block's KV across ranks; hashes must be viewed at
             # the sharded block size.
             block_size *= dcp_world_size
@@ -919,7 +919,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         )
         assert dcp_world_size >= 1
         assert pcp_world_size == 1, "PCP not support sliding window attn now."
-        block_size = kv_cache_spec.block_size * dcp_world_size
+        block_size = kv_cache_spec.block_size * (
+            1 if kv_cache_spec.dcp_replicated else dcp_world_size
+        )
         # Fine-grained partial hits are not supported for sliding window now
         assert alignment_tokens % block_size == 0, (
             "SlidingWindowManager does not support fine-grained (partial) cache hits"
@@ -1906,7 +1908,11 @@ def get_manager_for_kv_cache_spec(
         kv_cache_spec,
         (SlidingWindowSpec, ChunkedLocalAttentionSpec),
     ):
-        kv_shard_count = int(kwargs.get("dcp_world_size", 1))
+        kv_shard_count = (
+            1
+            if getattr(kv_cache_spec, "dcp_replicated", False)
+            else int(kwargs.get("dcp_world_size", 1))
+        )
         kwargs["max_admission_blocks_per_request"] = (
             kv_cache_spec.max_admission_blocks_per_request(
                 max_in_flight_tokens=max_in_flight_tokens,

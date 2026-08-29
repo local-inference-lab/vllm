@@ -176,6 +176,62 @@ def test_dcp_slot_mapping_with_smaller_kernel_blocks(cp_rank: int):
     assert torch.equal(actual, expected)
 
 
+def test_dcp_slot_mapping_supports_replicated_and_sharded_groups():
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[16, 16],
+        max_num_reqs=1,
+        max_num_batched_tokens=128,
+        max_num_blocks_per_group=[2, 2],
+        device=device,
+        kernel_block_sizes=[16, 16],
+        cp_size=4,
+        cp_rank=2,
+        cp_interleave=16,
+        group_cp_sizes=[4, 1],
+    )
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([5, 9], [20, 21]),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 128], dtype=torch.int32, device=device)
+    positions = torch.arange(128, dtype=torch.int64, device=device)
+    sharded, replicated = block_tables.compute_slot_mappings(
+        idx_mapping,
+        query_start_loc,
+        positions,
+        num_tokens_padded=128,
+    )
+
+    expected_sharded = torch.full((128,), -1, dtype=torch.int64, device=device)
+    expected_sharded[32:48] = torch.arange(
+        5 * 16, 6 * 16, dtype=torch.int64, device=device
+    )
+    expected_sharded[96:112] = torch.arange(
+        9 * 16, 10 * 16, dtype=torch.int64, device=device
+    )
+    expected_replicated = torch.full((128,), -1, dtype=torch.int64, device=device)
+    expected_replicated[:32] = torch.arange(
+        20 * 16, 22 * 16, dtype=torch.int64, device=device
+    )
+
+    assert torch.equal(sharded, expected_sharded)
+    assert torch.equal(replicated, expected_replicated)
+
+    # CuMem sleep/wake invalidates tensors allocated under the KV-cache pool.
+    # Layout reinitialization must restore the per-group topology values.
+    block_tables.group_cp_sizes.zero_()
+    block_tables.init_block_table_layout_tensors()
+    assert torch.equal(
+        block_tables.group_cp_sizes,
+        torch.tensor([4, 1], dtype=torch.int32, device=device),
+    )
+
+
 def test_v1_block_table_move_row_clears_vacated_row():
     """condense() moves the last row into a freed slot; the vacated row must
     not keep stale block ids. Padded dummy-run batches dereference stale rows

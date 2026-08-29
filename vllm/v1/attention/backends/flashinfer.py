@@ -763,17 +763,25 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     self._decode_cudagraph_max_bs,
                     self.compilation_config.max_cudagraph_capture_size,
                 )
-        try:
-            self.dcp_world_size = get_dcp_group().world_size
-            self.dcp_rank = get_dcp_group().rank_in_group
-            self.dcp_kv_cache_interleave_size = (
-                vllm_config.parallel_config.dcp_kv_cache_interleave_size
-            )
-        except AssertionError:
-            # DCP might not be initialized in testing
+        if getattr(kv_cache_spec, "dcp_replicated", False):
+            # Every rank owns the complete KV sequence for this group. Build
+            # ordinary local attention metadata instead of partitioning it a
+            # second time through the global DCP topology.
             self.dcp_world_size = 1
             self.dcp_rank = 0
             self.dcp_kv_cache_interleave_size = 1
+        else:
+            try:
+                self.dcp_world_size = get_dcp_group().world_size
+                self.dcp_rank = get_dcp_group().rank_in_group
+                self.dcp_kv_cache_interleave_size = (
+                    vllm_config.parallel_config.dcp_kv_cache_interleave_size
+                )
+            except AssertionError:
+                # DCP might not be initialized in testing
+                self.dcp_world_size = 1
+                self.dcp_rank = 0
+                self.dcp_kv_cache_interleave_size = 1
         self.use_dcp = self.dcp_world_size > 1
         self.dcp_a2a = (
             self.use_dcp and vllm_config.parallel_config.dcp_comm_backend == "a2a"

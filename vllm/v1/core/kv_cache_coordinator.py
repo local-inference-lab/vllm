@@ -847,7 +847,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self._cache_hit_alignment_tokens,
                     dcp_world_size=(
-                        self.dcp_world_size
+                        1
+                        if getattr(spec, "dcp_replicated", False)
+                        else self.dcp_world_size
                         if isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
                         else 1
                     ),
@@ -916,7 +918,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 drop_eagle_block=use_eagle,
                 alignment_tokens=self._cache_hit_alignment_tokens,
                 dcp_world_size=(
-                    self.dcp_world_size
+                    1
+                    if getattr(spec, "dcp_replicated", False)
+                    else self.dcp_world_size
                     if isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
                     else 1
                 ),

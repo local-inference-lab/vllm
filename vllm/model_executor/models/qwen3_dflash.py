@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import dataclasses
 import io
 from collections.abc import Iterable
 
@@ -35,6 +36,11 @@ from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheSpec,
+    SlidingWindowSpec,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -169,6 +175,27 @@ def _resolve_layer_attention(
     return sliding_window, _dflash_layer_causal(config, layer_idx)
 
 
+class DFlashAttention(Attention):
+    """Attention with DFlash-specific KV allocation semantics.
+
+    DFlash draft attention has no cross-rank reduction for sequence-sharded
+    KV. Under DCP, each rank therefore stores the complete draft KV sequence
+    and executes the draft attention as a local DCP1 operation. Sliding-window
+    drafts stay window bounded so replication does not allocate full-context
+    draft KV.
+    """
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        dcp_replicated = vllm_config.parallel_config.decode_context_parallel_size > 1
+        spec = super().get_kv_cache_spec(vllm_config)
+        # Preserve the parent layer's backend-specific cache geometry. In
+        # particular, sliding-window attention chooses its own kernel-sized
+        # block independently of the target model's --block-size.
+        if dcp_replicated and isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)):
+            spec = dataclasses.replace(spec, dcp_replicated=True)
+        return spec
+
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -244,7 +271,7 @@ class DFlashQwen3Attention(nn.Module):
         )
 
         self.sliding_window = sliding_window
-        self.attn = Attention(
+        self.attn = DFlashAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,

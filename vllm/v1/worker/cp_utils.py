@@ -37,6 +37,18 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
             layer_impl = getattr(layer, "impl", None)
             if layer_impl is None:
                 continue
+            get_spec = getattr(layer, "get_kv_cache_spec", None)
+            spec = get_spec(vllm_config) if get_spec is not None else None
+            if getattr(spec, "dcp_replicated", False):
+                # This group already contains the full sequence on every rank.
+                # Execute it as local DCP1 attention; another DCP partition and
+                # LSE reduction would duplicate/perturb the replicated cache.
+                layer_impl.dcp_world_size = 1
+                layer_impl.dcp_rank = 0
+                layer_impl.total_cp_world_size = 1
+                layer_impl.total_cp_rank = 0
+                layer_impl.need_to_return_lse_for_decode = False
+                continue
             if vllm_config.speculative_config is not None and interleave_size > 1:
                 supports_spec_decode = getattr(
                     layer_impl,
