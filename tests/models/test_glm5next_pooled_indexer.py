@@ -184,14 +184,21 @@ def test_glm53_packed_c4_metadata_uses_parent_stride() -> None:
 
 
 def _packed_main_cache(
-    *, device: torch.device, blocks: int, layers: int, block_size: int, layer: int
+    *,
+    device: torch.device,
+    blocks: int,
+    layers: int,
+    block_size: int,
+    layer: int,
+    record_bytes: int = 528,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    page_bytes = block_size * (528 + 33)
+    tail_bytes_per_token = 33 if record_bytes == 528 else 37
+    page_bytes = block_size * (record_bytes + tail_bytes_per_token)
     raw = torch.zeros(blocks * layers * page_bytes, dtype=torch.uint8, device=device)
     main = torch.as_strided(
         raw,
-        size=(blocks, block_size, 528),
-        stride=(layers * page_bytes, 528, 1),
+        size=(blocks, block_size, record_bytes),
+        stride=(layers * page_bytes, record_bytes, 1),
         storage_offset=layer * page_bytes,
     )
     return raw, main
@@ -244,16 +251,26 @@ def test_glm53_parent_table_width_tracks_dcp_sharding() -> None:
     )
 
 
-def test_glm53_packed_tail_reuses_c4_page_contract() -> None:
+@pytest.mark.parametrize(
+    ("record_bytes", "expected_parent_stride_pages"), [(528, 102), (656, 126)]
+)
+def test_glm53_packed_tail_reuses_c4_page_contract(
+    record_bytes: int, expected_parent_stride_pages: int
+) -> None:
     device = _require_glm_gpu()
     _, main = _packed_main_cache(
-        device=device, blocks=2, layers=3, block_size=512, layer=1
+        device=device,
+        blocks=2,
+        layers=3,
+        block_size=512,
+        layer=1,
+        record_bytes=record_bytes,
     )
     index_cache, subpages, parent_stride_pages = (
         Glm5NextPooledIndexer._index_cache_view(main)
     )
     assert subpages == 2
-    assert parent_stride_pages == 102
+    assert parent_stride_pages == expected_parent_stride_pages
     assert index_cache.stride() == (8448, 132, 1)
 
     generator = torch.Generator(device=device).manual_seed(55)

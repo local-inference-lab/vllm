@@ -106,6 +106,9 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
     require_uniform_decodes: ClassVar[bool] = False
     treat_short_extends_as_decodes: ClassVar[bool] = True
 
+    def _should_treat_short_extends_as_decodes(self) -> bool:
+        return self.treat_short_extends_as_decodes
+
     def __init__(
         self,
         kv_cache_spec: "AttentionSpec",
@@ -264,7 +267,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             common_attn_metadata,
             decode_threshold=self.reorder_batch_threshold or 1,
             treat_short_extends_as_decodes=(
-                self.treat_short_extends_as_decodes and not self.use_pcp
+                self._should_treat_short_extends_as_decodes() and not self.use_pcp
             ),
             require_uniform=self.require_uniform_decodes,
         )

@@ -46,7 +46,7 @@ _SELECTION_WIDTH = 2051
 _INDEX_CACHE_WIDTH = 132
 _INDEX_PAGE_SIZE = 64
 _INDEX_PAGE_BYTES = _INDEX_PAGE_SIZE * _INDEX_CACHE_WIDTH
-_MLA_RECORD_BYTES = 528
+_SUPPORTED_MLA_RECORD_BYTES = frozenset((528, 656))
 
 
 class Glm5NextPooledIndexer(nn.Module):
@@ -264,23 +264,28 @@ class Glm5NextPooledIndexer(nn.Module):
     def _index_cache_view(
         main_cache: torch.Tensor,
     ) -> tuple[torch.Tensor, int, int]:
+        record_bytes = int(main_cache.shape[-1]) if main_cache.ndim == 3 else -1
         if (
             main_cache.ndim != 3
             or main_cache.dtype != torch.uint8
-            or int(main_cache.shape[-1]) != _MLA_RECORD_BYTES
+            or record_bytes not in _SUPPORTED_MLA_RECORD_BYTES
         ):
-            raise ValueError("GLM MLA cache must be uint8 [pages, block, 528]")
+            supported = ", ".join(map(str, sorted(_SUPPORTED_MLA_RECORD_BYTES)))
+            raise ValueError(
+                "GLM MLA cache must be uint8 [pages, block, record], "
+                f"with record in {{{supported}}} bytes"
+            )
         pages, block_size, _ = map(int, main_cache.shape)
         if pages <= 0 or block_size % (_POOL_SIZE * _INDEX_PAGE_SIZE):
             raise ValueError(
                 "GLM MLA pages must contain a whole number of 64-pool C4 pages"
             )
-        if tuple(map(int, main_cache.stride()[1:])) != (_MLA_RECORD_BYTES, 1):
+        if tuple(map(int, main_cache.stride()[1:])) != (record_bytes, 1):
             raise ValueError("GLM MLA cache records must be contiguous within a page")
 
         subpages_per_parent = block_size // (_POOL_SIZE * _INDEX_PAGE_SIZE)
         parent_stride_bytes = int(main_cache.stride(0))
-        semantic_page_bytes = block_size * _MLA_RECORD_BYTES
+        semantic_page_bytes = block_size * record_bytes
         index_tail_bytes = subpages_per_parent * _INDEX_PAGE_BYTES
         if parent_stride_bytes < semantic_page_bytes + index_tail_bytes:
             raise ValueError("GLM MLA cache page does not contain its FP8 index tail")

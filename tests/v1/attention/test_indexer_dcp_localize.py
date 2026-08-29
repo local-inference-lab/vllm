@@ -672,6 +672,33 @@ def test_dcp_filter_compacts_valid_slots_for_sparse_kernel():
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+def test_dcp1_filter_still_compacts_interior_gaps():
+    num_topk = 128
+    req_id = torch.zeros(1, dtype=torch.int32, device="cuda")
+    token_indices = torch.full((1, num_topk), -1, dtype=torch.int32, device="cuda")
+    token_indices[0, :5] = torch.tensor(
+        [0, -1, 2, -1, 3], dtype=torch.int32, device="cuda"
+    )
+    block_table = torch.tensor([[10]], dtype=torch.int32, device="cuda")
+
+    out, valid_counts = triton_filter_and_convert_dcp_index(
+        req_id,
+        block_table,
+        token_indices,
+        dcp_size=1,
+        dcp_rank=0,
+        BLOCK_SIZE=4,
+        NUM_TOPK_TOKENS=num_topk,
+        return_valid_counts=True,
+    )
+
+    assert int(valid_counts.item()) == 3
+    assert (out[0, :3] >= 0).all()
+    assert (out[0, 3:] == -1).all()
+    assert set(out[0, :3].cpu().tolist()) == {40, 42, 43}
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
 @pytest.mark.parametrize("interleave", [1, 2])
 @pytest.mark.parametrize("dcp_rank", [0, 1])
 # 384 is not a power of two, so it exercises the multi-tile atomic allocator

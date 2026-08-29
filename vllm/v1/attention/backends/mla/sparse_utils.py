@@ -339,7 +339,7 @@ def triton_filter_and_convert_dcp_index(
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
 
-    if dcp_size == 1:
+    if dcp_size == 1 and not compact_valid_to_front:
         return triton_convert_req_index_to_global_index(
             req_id,
             block_table,
