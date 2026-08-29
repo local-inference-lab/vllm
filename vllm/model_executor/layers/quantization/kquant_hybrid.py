@@ -5,8 +5,9 @@
 
 The high-quality expert tier is stored as NVFP4 or MXFP4.  The secondary tier
 is either generic ``exl3_3`` trellis tensors or TP-independent
-``qsrt_sqg_e4m3`` atoms.  Both secondary formats execute through the B12X
-W4A16 trellis path; QSRT's exact endpoint is X4T.
+``qsrt_sqg_e4m3`` atoms.  Generic EXL3 executes through B12X W4A16; the
+uniform coupled-K2 atoms-v2 profile can optionally use B12X W4A8-MX for
+prefill while retaining W4A16 for the small decode band.
 """
 
 import dataclasses
@@ -62,6 +63,18 @@ _QSRT_X4T_W13_EXCEPTION_ROW_ROTATION = 0
 _QSRT_ATOMS_V2_PROFILE_H308 = "k3x22_k4x2"
 _QSRT_ATOMS_V2_PROFILE_COUPLED_K2 = "k2_coupled_h512_h128"
 _QSRT_ATOMS_V2_PROFILE_COUPLED_H308 = "k3x22_k4x2_coupled_h512_h128"
+
+
+def _qsrt_atoms_v2_w4a8_prefill_enabled(*, pure_k2: bool) -> bool:
+    """Enable W4A8 prefill only for the one profile it supports safely."""
+    requested = os.getenv("VLLM_KQUANT_QSRT_W4A8_PREFILL", "0").strip().lower()
+    enabled = requested in {"1", "true", "yes", "on"}
+    if enabled and not pure_k2:
+        raise ValueError(
+            "VLLM_KQUANT_QSRT_W4A8_PREFILL requires the uniform coupled pure-K2 "
+            f"profile {_QSRT_ATOMS_V2_PROFILE_COUPLED_K2!r}"
+        )
+    return enabled
 
 
 def _stack_exl3_intermediate_rotations(
@@ -178,7 +191,7 @@ def _b12x_tiles_for_geometry(
 
 
 class _HybridSharedRuntime:
-    """Process-wide b12x W4A16 runtime shared by every hybrid MoE layer.
+    """Process-wide B12X runtime shared by every hybrid MoE layer.
 
     One preplanned-launch cache and one scratch/route buffer set serve all
     layers: launches on a single stream never overlap and every
@@ -197,7 +210,12 @@ class _HybridSharedRuntime:
         # H128(h * down_suh); this stable buffer receives its inverse transform.
         self.kquant_logical_mid: torch.Tensor | None = None
         self.trellis_scratch: torch.Tensor | None = None
+        self.trellis_prefill_scratch: torch.Tensor | None = None
         self.trellis_output: torch.Tensor | None = None
+        self.trellis_prefill_input: torch.Tensor | None = None
+        self.trellis_prefill_output: torch.Tensor | None = None
+        self.trellis_prefill_topk_ids: torch.Tensor | None = None
+        self.trellis_prefill_topk_weights: torch.Tensor | None = None
         # X4T expands only routed scale rows immediately before W4A16. The
         # output grids are shared across layers on the same CUDA stream.
         self.x4t_w13_scale_scratch: torch.Tensor | None = None
@@ -248,6 +266,9 @@ class _HybridLayerState:
         self.uses_qsrt_atoms = False
         self.trellis_weights: Any = None
         self.trellis_plan: Any = None
+        self.trellis_prefill_weights: Any = None
+        self.trellis_prefill_plan: Any = None
+        self.trellis_use_w4a8_prefill = False
         self.runtime_ready = False
 
 
@@ -1017,10 +1038,12 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                     "QSRT atoms-v2 profile disagrees with the model descriptor"
                 )
             pure_k2 = metadata_v2.profile == _QSRT_ATOMS_V2_PROFILE_COUPLED_K2
+            state.trellis_use_w4a8_prefill = (
+                _qsrt_atoms_v2_w4a8_prefill_enabled(pure_k2=pure_k2)
+            )
             tp_size = get_tensor_model_parallel_world_size()
             tp_rank = get_tensor_model_parallel_rank()
-            plan = fused_moe.plan_weights(
-                quant_modes="w4a16",
+            weight_plan_kwargs: dict[str, Any] = dict(
                 source_format="qsrt_sqg_e4m3",
                 activation=self.moe.activation.value,
                 params_dtype=self.moe.in_dtype,
@@ -1032,6 +1055,10 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 trellis_tile_config=state.tiles,
                 qsrt_storage_format="qsrt_atoms_v2",
                 qsrt_profile=metadata_v2.profile,
+            )
+            plan = fused_moe.plan_weights(
+                quant_modes="w4a16",
+                **weight_plan_kwargs,
             )
             with open_qsrt_atom_v2_extent(
                 metadata_v2,
@@ -1054,15 +1081,39 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                     down_svh=metadata_v2.down_svh.unsqueeze(0).to(device),
                     qsrt_rotation_draws=metadata_v2.rotation_draws,
                 )
+            if state.trellis_use_w4a8_prefill:
+                # QSRT preparation currently accepts one quant mode per plan,
+                # but both execution modes consume the exact same immutable
+                # trellis-native tensors. Build a second validated package
+                # that aliases those allocations instead of preparing a
+                # second ~model-sized representation.
+                w4a8_plan = fused_moe.plan_weights(
+                    quant_modes="w4a8_mx",
+                    **weight_plan_kwargs,
+                )
+                representation = state.trellis_weights.representation
+                if representation is None:
+                    raise RuntimeError("QSRT W4A16 representation was not prepared")
+                state.trellis_prefill_weights = dataclasses.replace(
+                    state.trellis_weights,
+                    plan=w4a8_plan,
+                    representation=dataclasses.replace(
+                        representation,
+                        quant_mode="w4a8_mx",
+                    ),
+                )
             layer.qsrt_atom_placeholder.data = (
                 layer.qsrt_atom_placeholder.data.new_empty((0,))
             )
             logger.info(
-                "Loaded QSRT layer %d atoms-v2 shard %d/%d: %d QSRT experts",
+                "Loaded QSRT layer %d atoms-v2 shard %d/%d: %d QSRT experts%s",
                 layer_index,
                 tp_rank,
                 tp_size,
                 state.num_secondary,
+                " using W4A16 decode + W4A8 prefill"
+                if state.trellis_use_w4a8_prefill
+                else "",
             )
             return
 
@@ -1487,6 +1538,11 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         if getattr(state, "trellis_weights", None) is not None:
             from b12x.moe import fused_moe
 
+            w4a16_max_m = (
+                _B12X_DECODE_M
+                if state.trellis_prefill_weights is not None
+                else runtime.max_m
+            )
             key = (
                 "trellis",
                 state.num_secondary,
@@ -1496,12 +1552,12 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 self.moe.activation.value,
                 state.tiles,
                 runtime.topk,
-                runtime.max_m,
+                w4a16_max_m,
             )
             plan = runtime.launches.get(key)
             if plan is None:
                 caps = fused_moe.Caps(
-                    max_tokens=runtime.max_m,
+                    max_tokens=w4a16_max_m,
                     num_topk=runtime.topk,
                     device=torch.accelerator.current_device_index(),
                     weight_plan=state.trellis_weights.plan,
@@ -1525,7 +1581,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                     dtype=spec.dtype,
                     device=spec.device,
                 )
-            output_shape = (runtime.max_m, state.hidden_size)
+            output_shape = (w4a16_max_m, state.hidden_size)
             if (
                 runtime.trellis_output is None
                 or tuple(runtime.trellis_output.shape) != output_shape
@@ -1536,6 +1592,97 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                     dtype=torch.float32,
                     device=spec.device,
                 )
+            if state.trellis_prefill_weights is not None:
+                prefill_output_shape = (runtime.max_m, state.hidden_size)
+                prefill_key = (
+                    "trellis-w4a8-prefill",
+                    state.num_secondary,
+                    state.hidden_size,
+                    state.intermediate_size,
+                    self.moe.activation.value,
+                    state.tiles,
+                    runtime.topk,
+                    runtime.max_m,
+                )
+                prefill_plan = runtime.launches.get(prefill_key)
+                if prefill_plan is None:
+                    prefill_plan = fused_moe.plan(
+                        fused_moe.Caps(
+                            max_tokens=runtime.max_m,
+                            num_topk=runtime.topk,
+                            device=torch.accelerator.current_device_index(),
+                            weight_plan=state.trellis_prefill_weights.plan,
+                            quant_mode="w4a8_mx",
+                            route_num_experts=0,
+                        )
+                    )
+                    if prefill_plan.launch_plan.implementation != "dynamic":
+                        raise RuntimeError(
+                            "kquant_hybrid: W4A8 prefill plan is not dynamic"
+                        )
+                    runtime.launches[prefill_key] = prefill_plan
+                state.trellis_prefill_plan = prefill_plan
+                prefill_spec = prefill_plan.scratch_specs()[0]
+                prefill_need = int(torch.Size(prefill_spec.shape).numel())
+                prefill_scratch = runtime.trellis_prefill_scratch
+                if prefill_scratch is None or (
+                    prefill_scratch.numel() < prefill_need
+                    or prefill_scratch.dtype != prefill_spec.dtype
+                ):
+                    runtime.trellis_prefill_scratch = torch.empty(
+                        prefill_spec.shape,
+                        dtype=prefill_spec.dtype,
+                        device=prefill_spec.device,
+                    )
+                if (
+                    runtime.trellis_prefill_input is None
+                    or tuple(runtime.trellis_prefill_input.shape)
+                    != prefill_output_shape
+                    or runtime.trellis_prefill_input.device != prefill_spec.device
+                    or runtime.trellis_prefill_input.dtype != self.moe.in_dtype
+                ):
+                    runtime.trellis_prefill_input = torch.empty(
+                        prefill_output_shape,
+                        dtype=self.moe.in_dtype,
+                        device=prefill_spec.device,
+                    )
+                if (
+                    runtime.trellis_prefill_output is None
+                    or tuple(runtime.trellis_prefill_output.shape)
+                    != prefill_output_shape
+                    or runtime.trellis_prefill_output.device != prefill_spec.device
+                    or runtime.trellis_prefill_output.dtype != self.moe.in_dtype
+                ):
+                    runtime.trellis_prefill_output = torch.empty(
+                        prefill_output_shape,
+                        dtype=self.moe.in_dtype,
+                        device=prefill_spec.device,
+                    )
+                routing_shape = (runtime.max_m, runtime.topk)
+                if (
+                    runtime.trellis_prefill_topk_ids is None
+                    or tuple(runtime.trellis_prefill_topk_ids.shape)
+                    != routing_shape
+                    or runtime.trellis_prefill_topk_ids.device
+                    != prefill_spec.device
+                ):
+                    runtime.trellis_prefill_topk_ids = torch.empty(
+                        routing_shape,
+                        dtype=torch.int32,
+                        device=prefill_spec.device,
+                    )
+                if (
+                    runtime.trellis_prefill_topk_weights is None
+                    or tuple(runtime.trellis_prefill_topk_weights.shape)
+                    != routing_shape
+                    or runtime.trellis_prefill_topk_weights.device
+                    != prefill_spec.device
+                ):
+                    runtime.trellis_prefill_topk_weights = torch.empty(
+                        routing_shape,
+                        dtype=torch.float32,
+                        device=prefill_spec.device,
+                    )
             if (
                 os.getenv("VLLM_KQUANT_CAPTURE_DIR")
                 and os.getenv("VLLM_KQUANT_CAPTURE_PROFILE", "sampled_hessian")
@@ -1770,19 +1917,87 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 tids = tids.contiguous()
             if runtime.trellis_output is None:
                 raise RuntimeError("QSRT trellis output was not allocated eagerly")
-            binding = fused_moe.bind(
-                state.trellis_plan,
-                scratch=runtime.trellis_scratch,
-                a=x if x.is_contiguous() else x.contiguous(),
-                experts=state.trellis_weights,
+            use_w4a8_prefill = (
+                state.trellis_prefill_weights is not None and not decode
+            )
+            trellis_plan = (
+                state.trellis_prefill_plan
+                if use_w4a8_prefill
+                else state.trellis_plan
+            )
+            trellis_weights = (
+                state.trellis_prefill_weights
+                if use_w4a8_prefill
+                else state.trellis_weights
+            )
+            trellis_scratch = (
+                runtime.trellis_prefill_scratch
+                if use_w4a8_prefill
+                else runtime.trellis_scratch
+            )
+            trellis_output = (
+                runtime.trellis_prefill_output
+                if use_w4a8_prefill
+                else runtime.trellis_output
+            )
+            if trellis_scratch is None:
+                raise RuntimeError("QSRT trellis scratch was not allocated eagerly")
+            if (
+                trellis_plan is None
+                or trellis_weights is None
+                or trellis_output is None
+            ):
+                raise RuntimeError("QSRT trellis execution resources are incomplete")
+            launch_input = x if x.is_contiguous() else x.contiguous()
+            if use_w4a8_prefill:
+                from b12x.moe.fused_moe._impl import (
+                    run_w4a8_coupled_outer_transform,
+                    sanitize_w4a8_routing,
+                )
+
+                prefill_input = runtime.trellis_prefill_input
+                safe_ids = runtime.trellis_prefill_topk_ids
+                safe_weights = runtime.trellis_prefill_topk_weights
+                prepared_value = trellis_weights.representation.value
+                if prefill_input is None or safe_ids is None or safe_weights is None:
+                    raise RuntimeError(
+                        "QSRT W4A8 prefill buffers were not allocated eagerly"
+                    )
+                launch_input = run_w4a8_coupled_outer_transform(
+                    launch_input,
+                    prefill_input[:m],
+                    prepared_value.gate_suh,
+                    output_transform=False,
+                )
+                tids, weights = sanitize_w4a8_routing(
+                    tids,
+                    weights,
+                    safe_ids[:m],
+                    safe_weights[:m],
+                    num_experts=state.num_secondary,
+                )
+            bind_kwargs: dict[str, Any] = dict(
+                scratch=trellis_scratch,
+                a=launch_input,
+                experts=trellis_weights,
                 topk_weights=weights,
                 topk_ids=tids,
-                route_expert_map=state.emap_secondary,
-                output=runtime.trellis_output[:m],
+                output=trellis_output[:m],
             )
-            # The unified full-rotation top-k sum emits fp32; downstream
-            # layers expect the model dtype.
-            out_trellis = fused_moe.run(binding=binding)[:m].to(x.dtype)
+            if not use_w4a8_prefill:
+                bind_kwargs["route_expert_map"] = state.emap_secondary
+            binding = fused_moe.bind(trellis_plan, **bind_kwargs)
+            # W4A16 decode emits fp32 while W4A8 prefill emits model dtype;
+            # normalize both contracts for downstream layers.
+            out_trellis = fused_moe.run(binding=binding)[:m]
+            if use_w4a8_prefill:
+                out_trellis = run_w4a8_coupled_outer_transform(
+                    out_trellis,
+                    out_trellis,
+                    prepared_value.down_svh,
+                    output_transform=True,
+                )
+            out_trellis = out_trellis.to(x.dtype)
             if (
                 os.getenv("VLLM_KQUANT_CAPTURE_DIR")
                 and os.getenv("VLLM_KQUANT_CAPTURE_PROFILE", "sampled_hessian")
