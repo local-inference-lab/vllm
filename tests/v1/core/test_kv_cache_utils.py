@@ -2232,6 +2232,61 @@ def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():
     assert layer_names == {"mla.0", "mla.1", "swa.0"}
 
 
+def test_group_dcp_replicated_dflash_draft():
+    target = new_mla_spec()
+    draft = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        sliding_window=2048,
+        dcp_replicated=True,
+    )
+    assert target.page_size_bytes != draft.page_size_bytes
+
+    specs = {"model.layers.0": target, "draft.layers.0": draft}
+    # DeepSeek-V4's UniformType tuple planner is not needed for DFlash.
+    assert group_and_unify_kv_cache_specs(specs) is None
+
+    groups = get_kv_cache_groups(_grouping_config(), specs)
+    draft_group = next(
+        group for group in groups if isinstance(group.kv_cache_spec, SlidingWindowSpec)
+    )
+    assert all(group.kv_cache_spec.block_size == 16 for group in groups)
+    assert draft_group.kv_cache_spec.dcp_replicated is True
+
+
+def test_group_dcp_replicated_dflash_draft_with_hybrid_target():
+    target_mla = new_mla_spec()
+    target_mamba = new_mamba_spec(page_size_padded=target_mla.page_size_bytes)
+    draft = SlidingWindowSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        sliding_window=2048,
+        dcp_replicated=True,
+    )
+    assert target_mla.page_size_bytes == target_mamba.page_size_bytes
+    assert draft.page_size_bytes % target_mla.page_size_bytes != 0
+
+    specs = {
+        "model.mla": target_mla,
+        "model.mamba": target_mamba,
+        "draft.attn": draft,
+    }
+    groups = get_kv_cache_groups(_grouping_config(), specs)
+
+    assert {name for group in groups for name in group.layer_names} == set(specs)
+    draft_group = next(group for group in groups if "draft.attn" in group.layer_names)
+    assert draft_group.kv_cache_spec == draft
+    target_groups = [group for group in groups if "draft.attn" not in group.layer_names]
+    assert all(
+        not getattr(group.kv_cache_spec, "dcp_replicated", False)
+        for group in target_groups
+    )
+
+
 def new_indexer_mla_spec(block_size=16):
     # Sparse-attention indexer k_cache: an MLAAttentionSpec with a much smaller
     # page size than the main MLA attention (uint8, small head), so their pages
