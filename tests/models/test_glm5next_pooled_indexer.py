@@ -10,6 +10,8 @@ from torch import nn
 
 from vllm.models.deepseek_v4.nvidia.b12x_indexer import _flatten_index_cache
 from vllm.models.glm5next.nvidia.ops.glm_kpool import (
+    _prefill_pool_kernel,
+    _prefill_tail_kernel,
     expand_c4_block_table,
     expand_pool_ids,
     gather_c4_block_table_rows,
@@ -34,6 +36,12 @@ def _require_glm_gpu() -> torch.device:
     ):
         pytest.skip("GLM-5.3 GPU tests require SM120 or SM121")
     return device
+
+
+@pytest.mark.parametrize("kernel", [_prefill_pool_kernel, _prefill_tail_kernel])
+def test_glm53_parallel_prefill_request_offset_stays_runtime(kernel) -> None:
+    assert kernel.do_not_specialize == ["request_offset"]
+    assert kernel.do_not_specialize_on_alignment == ["request_offset"]
 
 
 def _hadamard128(x: torch.Tensor) -> torch.Tensor:

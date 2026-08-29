@@ -251,7 +251,10 @@ def _decode_update_kernel(
         tl.store(tail + base + tail_stride_1 + dim, current_gate, mask=dim_mask)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["request_offset"],
+    do_not_specialize_on_alignment=["request_offset"],
+)
 def _prefill_pool_kernel(
     cache_fp8,
     cache_fp32,
@@ -389,7 +392,10 @@ def _prefill_pool_kernel(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["request_offset"],
+    do_not_specialize_on_alignment=["request_offset"],
+)
 def _prefill_tail_kernel(
     tail,
     state_slots,
