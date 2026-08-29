@@ -1625,10 +1625,44 @@ def group_dcp_replicated_draft_kv_cache_specs(
     }
     if not sharded:
         return None
-    return [
-        *get_kv_cache_groups(vllm_config, sharded),
-        *get_kv_cache_groups(vllm_config, replicated),
-    ]
+
+    sharded_groups = get_kv_cache_groups(vllm_config, sharded)
+    replicated_groups = get_kv_cache_groups(vllm_config, replicated)
+
+    # A replicated sliding-window draft can use the target's common physical
+    # block without changing the scheduler LCM. This reduces the number of
+    # shared BlockPool IDs needed to retain the draft window. Keep the
+    # backend-selected block when it does not divide the target alignment or
+    # when the enlarged natural draft pages would increase the pool stride.
+    target_block_alignment = math.gcd(
+        *(group.kv_cache_spec.block_size for group in sharded_groups)
+    )
+    aligned_replicated = {
+        name: replace(
+            spec,
+            block_size=target_block_alignment,
+            page_size_padded=None,
+        )
+        if isinstance(spec, SlidingWindowSpec)
+        and target_block_alignment > spec.block_size
+        and target_block_alignment % spec.block_size == 0
+        else spec
+        for name, spec in replicated.items()
+    }
+    if aligned_replicated != replicated:
+        candidate_groups = get_kv_cache_groups(vllm_config, aligned_replicated)
+        if _get_kv_cache_bytes_per_block(
+            candidate_groups
+        ) <= _get_kv_cache_bytes_per_block(sharded_groups):
+            logger.info(
+                "Aligned DCP-replicated sliding-window cache blocks to the "
+                "sharded target's %d-token physical block without increasing "
+                "the KV cache pool stride.",
+                target_block_alignment,
+            )
+            replicated_groups = candidate_groups
+
+    return [*sharded_groups, *replicated_groups]
 
 
 def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:

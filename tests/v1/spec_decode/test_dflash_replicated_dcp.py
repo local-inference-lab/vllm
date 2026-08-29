@@ -184,3 +184,99 @@ def test_grouping_never_merges_replicated_draft_with_sharded_target():
         {"target.layer"},
         {"draft.layer"},
     ]
+
+
+def test_grouping_uses_memory_free_target_alignment_for_replicated_window():
+    target = FullAttentionSpec(
+        block_size=256,
+        num_kv_heads=8,
+        head_size=64,
+        dtype=torch.bfloat16,
+    )
+    draft = SlidingWindowSpec(
+        block_size=64,
+        num_kv_heads=2,
+        head_size=64,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+        page_size_padded=64 * 2 * 128 * 2,
+        dcp_replicated=True,
+    )
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        cache_config=SimpleNamespace(
+            block_size=256,
+            enable_prefix_caching=True,
+            prefix_match_unit=None,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        kv_transfer_config=None,
+    )
+
+    grouped = get_kv_cache_groups(
+        vllm_config, {"target.layer": target, "draft.layer": draft}
+    )
+
+    aligned_draft = grouped[1].kv_cache_spec
+    assert isinstance(aligned_draft, SlidingWindowSpec)
+    assert aligned_draft.block_size == 256
+    assert aligned_draft.page_size_padded is None
+    assert resolve_kv_cache_block_sizes(
+        KVCacheConfig(128, [], grouped), vllm_config
+    ) == (1024, 256)
+
+
+def test_grouping_preserves_draft_block_when_alignment_would_grow_pool():
+    target = FullAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.bfloat16,
+    )
+    draft = SlidingWindowSpec(
+        block_size=64,
+        num_kv_heads=8,
+        head_size=64,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+        dcp_replicated=True,
+    )
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False)
+    )
+
+    grouped = get_kv_cache_groups(
+        vllm_config, {"target.layer": target, "draft.layer": draft}
+    )
+
+    preserved_draft = grouped[1].kv_cache_spec
+    assert isinstance(preserved_draft, SlidingWindowSpec)
+    assert preserved_draft.block_size == 64
+
+
+def test_grouping_preserves_backend_block_that_does_not_divide_target():
+    target = FullAttentionSpec(
+        block_size=192,
+        num_kv_heads=8,
+        head_size=64,
+        dtype=torch.bfloat16,
+    )
+    draft = SlidingWindowSpec(
+        block_size=128,
+        num_kv_heads=2,
+        head_size=64,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+        dcp_replicated=True,
+    )
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False)
+    )
+
+    grouped = get_kv_cache_groups(
+        vllm_config, {"target.layer": target, "draft.layer": draft}
+    )
+
+    preserved_draft = grouped[1].kv_cache_spec
+    assert isinstance(preserved_draft, SlidingWindowSpec)
+    assert preserved_draft.block_size == 128
