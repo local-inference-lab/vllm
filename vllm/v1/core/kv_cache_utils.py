@@ -1600,6 +1600,37 @@ def group_and_unify_kv_cache_specs(
     return [mla_uniform_spec, *swa_uniform_specs]
 
 
+def group_dcp_replicated_draft_kv_cache_specs(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Keep replicated speculative KV separate from a sharded target.
+
+    Replicated draft cache groups have different allocation and DCP semantics
+    from target cache groups. Group each partition independently so a hybrid
+    target retains its native grouping and page sizes instead of being
+    page-size-unified with the draft.
+    """
+    replicated = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if getattr(spec, "dcp_replicated", False)
+    }
+    if not replicated:
+        return None
+    sharded = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if not getattr(spec, "dcp_replicated", False)
+    }
+    if not sharded:
+        return None
+    return [
+        *get_kv_cache_groups(vllm_config, sharded),
+        *get_kv_cache_groups(vllm_config, replicated),
+    ]
+
+
 def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
     """Pick a chunk size that minimizes total upward padding.
 
@@ -1784,6 +1815,10 @@ def get_kv_cache_groups(
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
+    elif replicated_groups := group_dcp_replicated_draft_kv_cache_specs(
+        vllm_config, kv_cache_spec
+    ):
+        return replicated_groups
     elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
         # DeepseekV4 case: All layers need the same number of token slots,
         # yet some layers are full attention while others are sliding window
