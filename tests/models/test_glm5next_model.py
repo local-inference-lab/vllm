@@ -555,7 +555,7 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
     assert captured_caps["null_state_index"] == 0
 
 
-def test_glm5next_b12x_kda_binds_caller_scratch_per_run(monkeypatch) -> None:
+def test_glm5next_b12x_kda_binds_spec_tensors_without_staging(monkeypatch) -> None:
     scratch = torch.empty(32, dtype=torch.uint8)
     bindings: list[dict[str, object]] = []
     runs: list[object] = []
@@ -620,12 +620,52 @@ def test_glm5next_b12x_kda_binds_caller_scratch_per_run(monkeypatch) -> None:
         num_requests=1,
     )
     layer._run_b12x_kda_decode_post_conv(**kwargs)
-    layer._run_b12x_kda_decode_post_conv(**kwargs)
+    spec_kwargs = dict(
+        mixed_qkv=torch.ones(4, 6),
+        raw_g=torch.ones(4, 1, 2),
+        raw_beta=torch.ones(4, 1),
+        z=torch.ones(4, 1, 2),
+        output=torch.empty(4, 1, 2),
+        state_indices=torch.tensor([[1, 2], [2, 1]], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+        num_accepted_tokens=torch.tensor([1, 2], dtype=torch.int32),
+        num_requests=2,
+    )
+    layer._run_b12x_kda_decode_post_conv(**spec_kwargs)
 
     assert len(bindings) == 2
     assert bindings[0] is not bindings[1]
     assert bindings[0]["scratch"] is scratch
     assert bindings[1]["scratch"] is scratch
+    assert bindings[0]["mixed_qkv"] is layer._b12x_kda_mixed_qkv
+    assert bindings[0]["raw_g"] is layer._b12x_kda_raw_g
+    assert bindings[0]["raw_beta"] is layer._b12x_kda_raw_beta
+    assert bindings[0]["z"] is layer._b12x_kda_z
+    assert bindings[0]["output"] is layer._b12x_kda_output
+    assert bindings[0]["query_start_loc"] is layer._b12x_kda_query_start_loc
+    assert bindings[0]["state_indices"] is layer._b12x_kda_state_indices
+    assert bindings[0]["num_tokens"] is layer._b12x_kda_num_tokens
+    torch.testing.assert_close(bindings[0]["mixed_qkv"][0], kwargs["mixed_qkv"][0])
+    assert bindings[1]["mixed_qkv"] is spec_kwargs["mixed_qkv"]
+    assert (
+        bindings[1]["num_accepted_tokens"].data_ptr()
+        == spec_kwargs["num_accepted_tokens"].data_ptr()
+    )
+    assert (
+        bindings[1]["query_start_loc"].data_ptr()
+        == spec_kwargs["query_start_loc"].data_ptr()
+    )
+    assert (
+        bindings[1]["state_indices"].data_ptr()
+        == spec_kwargs["state_indices"].data_ptr()
+    )
+    assert bindings[1]["num_tokens"] is layer._b12x_kda_num_tokens
+    assert bindings[1]["num_tokens"].item() == spec_kwargs["mixed_qkv"].shape[0]
+    assert (
+        bindings[1]["num_tokens"].data_ptr()
+        != spec_kwargs["query_start_loc"][2:].data_ptr()
+    )
+    assert bindings[1]["output"].data_ptr() == spec_kwargs["output"].data_ptr()
     assert len(runs) == 2
     assert runs[0] is bindings[0]
     assert runs[1] is bindings[1]

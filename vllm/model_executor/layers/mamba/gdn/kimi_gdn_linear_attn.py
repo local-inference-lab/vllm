@@ -503,6 +503,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_tokens > self._b12x_kda_max_tokens
             or num_requests > self._b12x_kda_max_seqs
             or state_columns > self._b12x_kda_state_index_columns
+            or num_tokens > num_requests * state_columns
         ):
             raise ValueError(
                 "b12x KDA capacity exceeded: "
@@ -511,6 +512,49 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 f"state_columns={state_columns}/"
                 f"{self._b12x_kda_state_index_columns}"
             )
+
+        scratch_buffers = current_workspace_manager().get_simultaneous(
+            *plan.shapes_and_dtypes()
+        )
+        if not scratch_buffers:
+            raise RuntimeError("b12x KDA plan did not expose caller scratch")
+        scratch: torch.Tensor | tuple[torch.Tensor, ...]
+        scratch = (
+            scratch_buffers[0] if len(scratch_buffers) == 1 else tuple(scratch_buffers)
+        )
+
+        if (
+            num_accepted_tokens is not None
+            and state_columns == self._b12x_kda_state_index_columns
+        ):
+            self._b12x_kda_num_seqs.fill_(num_requests)
+            self._b12x_kda_num_tokens.fill_(num_tokens)
+            query_start_loc = query_start_loc[: num_requests + 1]
+            binding = api.bind_kda(
+                plan,
+                scratch=scratch,
+                mixed_qkv=mixed_qkv,
+                raw_g=raw_g,
+                raw_beta=raw_beta,
+                z=z,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias.view(self.local_num_heads, self.head_dim),
+                norm_weight=self.o_norm.weight,
+                recurrent_state=self.kv_cache[1],
+                query_start_loc=query_start_loc,
+                num_accepted_tokens=num_accepted_tokens[:num_requests],
+                state_indices=state_indices[:num_requests, :state_columns],
+                num_seqs=self._b12x_kda_num_seqs,
+                num_tokens=self._b12x_kda_num_tokens,
+                output=output[:num_tokens],
+            )
+            api.run_kda(
+                binding,
+                lower_bound=self.gate_lower_bound,
+                eps=self.o_norm.eps,
+                scale=self.head_dim**-0.5,
+            )
+            return
 
         self._b12x_kda_mixed_qkv[:num_tokens].copy_(mixed_qkv)
         self._b12x_kda_raw_g[:num_tokens].copy_(raw_g)
@@ -530,19 +574,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             state_indices[:num_requests]
         )
         self._b12x_kda_num_seqs.fill_(num_requests)
-        self._b12x_kda_num_tokens.copy_(
-            query_start_loc[num_requests : num_requests + 1]
-        )
+        self._b12x_kda_num_tokens.fill_(num_tokens)
 
-        scratch_buffers = current_workspace_manager().get_simultaneous(
-            *plan.shapes_and_dtypes()
-        )
-        if not scratch_buffers:
-            raise RuntimeError("b12x KDA plan did not expose caller scratch")
-        scratch: torch.Tensor | tuple[torch.Tensor, ...]
-        scratch = (
-            scratch_buffers[0] if len(scratch_buffers) == 1 else tuple(scratch_buffers)
-        )
         binding = api.bind_kda(
             plan,
             scratch=scratch,
