@@ -1543,6 +1543,18 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
         kv_cache_spec: The kv cache spec of each attention layer in the model
     """
 
+    dcp_replication_modes = {
+        spec.dcp_replicated
+        for spec in kv_cache_spec.values()
+        if isinstance(spec, AttentionSpec)
+    }
+    if len(dcp_replication_modes) > 1:
+        raise ValueError(
+            "Hybrid KV cache manager cannot be disabled when attention layers "
+            "mix DCP-replicated and DCP-sharded KV cache specs. Remove "
+            "`--disable-hybrid-kv-cache-manager` or disable DCP."
+        )
+
     if is_kv_cache_spec_uniform(
         kv_cache_spec
     ) or UniformTypeKVCacheSpecs.is_uniform_type(kv_cache_spec):

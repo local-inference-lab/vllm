@@ -41,7 +41,11 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
             if get_spec is not None:
                 spec = get_spec(vllm_config)
                 if getattr(spec, "dcp_replicated", False):
-                    assert backend is None or backend.supports_dcp_replicated, (
+                    assert backend is not None, (
+                        "Attention with replicated DCP requires an attention "
+                        "backend that advertises local-DCP support."
+                    )
+                    assert backend.supports_dcp_replicated, (
                         "Attention with replicated DCP requires backend support, "
                         f"but {backend.get_name()} does not provide it."
                     )

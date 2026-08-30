@@ -154,3 +154,43 @@ def test_dflash_uses_draft_group_dcp_slot_parameters(monkeypatch):
     )
 
     assert cp_args == [(2, 4, 8)]
+
+
+def test_replicated_draft_metadata_uses_full_sequence_lengths(monkeypatch):
+    seq_lens = torch.tensor([128, 64], dtype=torch.int32)
+    captured = []
+
+    def capture_metadata(_self, *_args, **kwargs):
+        captured.append(kwargs["dcp_local_seq_lens"])
+        return {}
+
+    monkeypatch.setattr(
+        dflash_speculator.DraftModelSpeculator,
+        "_build_draft_attn_metadata",
+        capture_metadata,
+    )
+    speculator = object.__new__(dflash_speculator.DFlashSpeculator)
+    object.__setattr__(speculator, "draft_attn_layer_names", ["draft"])
+    object.__setattr__(speculator, "draft_cp_size", 1)
+    object.__setattr__(speculator, "block_tables", SimpleNamespace(cp_size=4))
+    object.__setattr__(
+        speculator,
+        "input_buffers",
+        SimpleNamespace(
+            seq_lens=seq_lens,
+            dcp_local_seq_lens=torch.empty_like(seq_lens),
+        ),
+    )
+    object.__setattr__(speculator, "num_query_per_req", 4)
+
+    result = speculator._build_draft_attn_metadata(
+        num_reqs=2,
+        num_reqs_padded=2,
+        num_tokens_padded=8,
+        seq_lens_cpu_upper_bound=seq_lens,
+        step=0,
+    )
+
+    assert result == {}
+    assert len(captured) == 1
+    assert captured[0] is seq_lens

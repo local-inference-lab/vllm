@@ -2429,6 +2429,38 @@ def test_disable_hybrid_manager_skips_dflash_partition():
     assert set(groups[0].layer_names) == set(specs)
 
 
+def test_disable_hybrid_manager_rejects_mixed_dcp_replication():
+    target = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+    )
+    draft = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        sliding_window=64,
+        dcp_replicated=True,
+    )
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=True),
+        speculative_config=SimpleNamespace(method="dflash"),
+        model_config=SimpleNamespace(get_num_layers=lambda _parallel_config: 1),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+    )
+
+    with pytest.raises(ValueError, match="DCP-replicated and DCP-sharded"):
+        get_kv_cache_groups(
+            config,
+            {
+                "model.layers.0.self_attn": target,
+                "model.layers.1.self_attn": draft,
+            },
+        )
+
+
 def test_dflash_draft_cache_partition_is_pp1_only():
     mamba = MambaSpec(
         block_size=16,

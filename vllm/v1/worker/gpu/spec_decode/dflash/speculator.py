@@ -318,16 +318,19 @@ class DFlashSpeculator(DraftModelSpeculator):
         if not self.draft_attn_layer_names:
             return None
         assert num_query_per_req is None  # Omitted for DFlash, read from self instead
-        if dcp_local_seq_lens is None and self.draft_cp_size > 1:
-            prepare_dcp_local_seq_lens(
-                self.input_buffers.dcp_local_seq_lens,
-                self.input_buffers.seq_lens,
-                num_reqs,
-                self.draft_cp_size,
-                self.draft_cp_rank,
-                self.draft_cp_interleave,
-            )
-            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
+        if dcp_local_seq_lens is None:
+            if self.draft_cp_size > 1:
+                prepare_dcp_local_seq_lens(
+                    self.input_buffers.dcp_local_seq_lens,
+                    self.input_buffers.seq_lens,
+                    num_reqs,
+                    self.draft_cp_size,
+                    self.draft_cp_rank,
+                    self.draft_cp_interleave,
+                )
+                dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
+            elif getattr(self.block_tables, "cp_size", 1) > 1:
+                dcp_local_seq_lens = self.input_buffers.seq_lens
         return super()._build_draft_attn_metadata(
             num_reqs,
             num_reqs_padded,
