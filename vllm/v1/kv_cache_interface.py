@@ -393,6 +393,8 @@ class AttentionSpec(KVCacheSpec):
     """Tokens covered by one stored state. Ints > 1 compress multiple tokens
     into one state (DSv4 sparse MLA); fractions < 1 store multiple states per
     token (Whisper block pooling: ``Fraction(1, block_pool_size)``)."""
+    dcp_replicated: bool = False
+    """Whether every DCP rank stores the complete KV cache for this layer."""
 
     def __post_init__(self):
         if self.head_size_v is None:
@@ -464,8 +466,6 @@ class FullAttentionSpec(AttentionSpec):
     caching) regardless of tensor-parallel layout. It does not affect the KV
     cache layout itself.
     """
-
-    dcp_replicated: bool = False
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
@@ -591,14 +591,17 @@ class MLAAttentionSpec(FullAttentionSpec):
         page_tail_bytes_per_token_set = set(
             spec.page_tail_bytes_per_token for spec in specs
         )
+        dcp_replicated_set = {spec.dcp_replicated for spec in specs}
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
             and len(model_version_set) == 1
             and len(page_tail_bytes_per_token_set) == 1
+            and len(dcp_replicated_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, tokens per state, model version, and page tail."
+            "quantization method, tokens per state, model version, page tail, "
+            "and DCP replication mode."
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
@@ -616,6 +619,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             non_causal_multi_token_decode=any(
                 spec.non_causal_multi_token_decode for spec in specs
             ),
+            dcp_replicated=dcp_replicated_set.pop(),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -671,6 +675,7 @@ class RSWASpec(FullAttentionSpec):
             sliding_window=base.sliding_window,
             attention_chunk_size=base.attention_chunk_size,
             non_causal=base.non_causal,
+            dcp_replicated=base.dcp_replicated,
             rswa_window=rswa_windows.pop(),
         )
 
@@ -718,7 +723,6 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
 @dataclass(frozen=True, kw_only=True)
 class SlidingWindowSpec(AttentionSpec):
     sliding_window: int
-    dcp_replicated: bool = False
     # The trailing edge of the window is extended by ``extra_retained_tokens``
     # so that those extra trailing tokens' blocks are retained (but not
     # attended). This is needed for multi-module spec decoding which can
@@ -806,16 +810,18 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         extra_retained_set = set(spec.extra_retained_tokens for spec in specs)
+        dcp_replicated_set = {spec.dcp_replicated for spec in specs}
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
             and len(extra_retained_set) == 1
+            and len(dcp_replicated_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, tokens per state, model version, sliding "
-            "window size, and retained token count."
+            "window size, retained token count, and DCP replication mode."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -830,6 +836,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
+            dcp_replicated=dcp_replicated_set.pop(),
         )
 
     def is_uniform_with_collection(
@@ -838,6 +845,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         return all(
             isinstance(spec, SlidingWindowMLASpec)
             and spec.sliding_window == self.sliding_window
+            and spec.dcp_replicated == self.dcp_replicated
             for spec in kv_cache_specs.values()
         )
 
@@ -953,6 +961,11 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         assert not any(isinstance(spec, MLAAttentionSpec) for spec in specs), (
             "MLAAttentionSpec should be merged in MLAAttentionSpec.merge"
         )
+        dcp_replicated = {spec.dcp_replicated for spec in specs}
+        assert len(dcp_replicated) == 1, (
+            "All attention layers in one KV cache group must use the same "
+            "DCP replication mode."
+        )
         merged_spec = cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
@@ -967,6 +980,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             non_causal=any(spec.non_causal for spec in specs),
+            dcp_replicated=dcp_replicated.pop(),
         )
         for spec in specs:
             for f in fields(AttentionSpec):

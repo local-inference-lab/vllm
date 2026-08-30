@@ -55,6 +55,7 @@ from vllm.v1.kv_cache_interface import (
     KVQuantMode,
     MambaSpec,
     MLAAttentionSpec,
+    RSWASpec,
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
@@ -2329,6 +2330,103 @@ def _grouping_config():
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         speculative_config=None,
     )
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.float16,
+            dcp_replicated=True,
+        ),
+        RSWASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.float16,
+            dcp_replicated=True,
+            rswa_window=64,
+        ),
+        SinkFullAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.float16,
+            dcp_replicated=True,
+            sink_len=4,
+        ),
+        SlidingWindowMLASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.float16,
+            dcp_replicated=True,
+            sliding_window=64,
+        ),
+    ],
+    ids=("mla", "rswa", "sink", "sliding-window-mla"),
+)
+def test_attention_spec_merge_preserves_dcp_replicated(spec):
+    merged = type(spec).merge([spec, spec])
+
+    assert merged.dcp_replicated is True
+
+
+def test_sliding_window_mla_uniformity_includes_dcp_replication():
+    replicated = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        dcp_replicated=True,
+        sliding_window=64,
+    )
+    sharded = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        dcp_replicated=False,
+        sliding_window=64,
+    )
+
+    assert not replicated.is_uniform_with_collection(
+        {"replicated": replicated, "sharded": sharded}
+    )
+
+
+def test_disable_hybrid_manager_skips_dflash_partition():
+    target = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+    )
+    draft = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        sliding_window=64,
+    )
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=True),
+        speculative_config=SimpleNamespace(method="dflash"),
+        model_config=SimpleNamespace(get_num_layers=lambda _parallel_config: 1),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+    )
+    specs = {
+        "model.layers.0.self_attn": target,
+        "model.layers.1.self_attn": draft,
+    }
+
+    groups = get_kv_cache_groups(config, specs)
+
+    assert len(groups) == 1
+    assert set(groups[0].layer_names) == set(specs)
 
 
 def test_dflash_draft_cache_partition_is_pp1_only():

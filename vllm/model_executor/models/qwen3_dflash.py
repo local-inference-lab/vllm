@@ -190,6 +190,9 @@ class DFlashAttention(Attention):
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 sliding_window=self.sliding_window,
+                page_size_padded=getattr(
+                    vllm_config.cache_config, "skip_page_size_padded", None
+                ),
                 # Prefix lookup verifies one lookahead block and then drops it.
                 # Keep one additional local window alive during chunked prefill
                 # so the proof block is not recycled before it can be hashed.

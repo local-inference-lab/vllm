@@ -28,8 +28,8 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
         layers = get_layers_from_vllm_config(vllm_config, layer_type)
         for layer in layers.values():
             get_attn_backend = getattr(layer, "get_attn_backend", None)
-            if pcp_size > 1 and get_attn_backend is not None:
-                backend = get_attn_backend()
+            backend = get_attn_backend() if get_attn_backend is not None else None
+            if pcp_size > 1 and backend is not None:
                 assert backend.supports_pcp(), (
                     "PCP requires attention backend support, "
                     f"but {backend.get_name()} does not support PCP."
@@ -39,11 +39,12 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
                 continue
             get_spec = getattr(layer, "get_kv_cache_spec", None)
             if get_spec is not None:
-                try:
-                    spec = get_spec(vllm_config)
-                except Exception:
-                    spec = None
+                spec = get_spec(vllm_config)
                 if getattr(spec, "dcp_replicated", False):
+                    assert backend is None or backend.supports_dcp_replicated, (
+                        "Attention with replicated DCP requires backend support, "
+                        f"but {backend.get_name()} does not provide it."
+                    )
                     # Replicated draft KV contains the complete sequence on
                     # every rank, so its attention executes as a local DCP1 op.
                     layer_impl.dcp_world_size = 1

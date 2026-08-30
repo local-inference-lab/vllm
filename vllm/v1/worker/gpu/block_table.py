@@ -40,9 +40,8 @@ class BlockTables:
         if group_cp_sizes is None:
             group_cp_sizes = [cp_size] * len(block_sizes)
         assert len(group_cp_sizes) == len(block_sizes)
-        self.group_cp_sizes = torch.tensor(
-            group_cp_sizes, dtype=torch.int32, device=device
-        )
+        assert all(group_cp_size in (1, cp_size) for group_cp_size in group_cp_sizes)
+        self.group_cp_sizes_list = list(group_cp_sizes)
 
         self.num_kv_cache_groups = len(self.block_sizes)
         assert len(max_num_blocks_per_group) == self.num_kv_cache_groups
@@ -112,7 +111,16 @@ class BlockTables:
         self.kernel_block_sizes_tensor = torch.tensor(
             self.kernel_block_sizes, dtype=torch.int32, device=self.device
         )
+        self.group_cp_sizes = torch.tensor(
+            self.group_cp_sizes_list, dtype=torch.int32, device=self.device
+        )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
+
+    def get_group_cp_parameters(self, group_id: int) -> tuple[int, int, int]:
+        group_cp_size = self.group_cp_sizes_list[group_id]
+        if group_cp_size == 1:
+            return 0, 1, 1
+        return self.cp_rank, group_cp_size, self.cp_interleave
 
     def append_block_ids(
         self,

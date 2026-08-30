@@ -1801,6 +1801,7 @@ def _partition_dflash_draft_specs(
         speculative_config is None
         or speculative_config.method != "dflash"
         or vllm_config.parallel_config.pipeline_parallel_size > 1
+        or vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
     ):
         return kv_cache_spec, {}
 

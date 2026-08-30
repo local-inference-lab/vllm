@@ -26,9 +26,14 @@ def test_replicated_draft_attention_executes_as_local_dcp(monkeypatch):
         total_cp_world_size=4,
         total_cp_rank=2,
     )
+    backend = SimpleNamespace(
+        supports_dcp_replicated=True,
+        get_name=lambda: "TEST_SUPPORTED",
+    )
     layer = SimpleNamespace(
         impl=layer_impl,
         get_kv_cache_spec=lambda _config: SimpleNamespace(dcp_replicated=True),
+        get_attn_backend=lambda: backend,
     )
     monkeypatch.setattr(
         cp_utils,
@@ -50,6 +55,73 @@ def test_replicated_draft_attention_executes_as_local_dcp(monkeypatch):
     assert layer_impl.dcp_rank == 0
     assert layer_impl.total_cp_world_size == 1
     assert layer_impl.total_cp_rank == 0
+
+
+def test_replicated_draft_rejects_backend_without_local_dcp(monkeypatch):
+    layer_impl = SimpleNamespace(
+        supports_mtp_with_cp_non_trivial_interleave_size=False,
+        need_to_return_lse_for_decode=False,
+    )
+    backend = SimpleNamespace(
+        supports_dcp_replicated=False,
+        get_name=lambda: "TEST_UNSUPPORTED",
+    )
+    layer = SimpleNamespace(
+        impl=layer_impl,
+        get_kv_cache_spec=lambda _config: SimpleNamespace(dcp_replicated=True),
+        get_attn_backend=lambda: backend,
+    )
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {"draft": layer},
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=4,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=SimpleNamespace(method="dflash"),
+    )
+
+    with pytest.raises(AssertionError, match="replicated DCP"):
+        cp_utils.check_attention_cp_compatibility(config)
+
+
+def test_attention_cache_spec_errors_are_not_swallowed(monkeypatch):
+    layer_impl = SimpleNamespace(
+        supports_mtp_with_cp_non_trivial_interleave_size=False,
+        need_to_return_lse_for_decode=True,
+    )
+
+    def raise_spec_error(_config):
+        raise RuntimeError("invalid cache spec")
+
+    layer = SimpleNamespace(
+        impl=layer_impl,
+        get_kv_cache_spec=raise_spec_error,
+        get_attn_backend=lambda: SimpleNamespace(
+            supports_dcp_replicated=False,
+            get_name=lambda: "TEST",
+        ),
+    )
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {"layer": layer},
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=4,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=None,
+    )
+
+    with pytest.raises(RuntimeError, match="invalid cache spec"):
+        cp_utils.check_attention_cp_compatibility(config)
 
 
 @pytest.mark.parametrize(

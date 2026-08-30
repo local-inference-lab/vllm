@@ -91,6 +91,7 @@ class FlashAttentionBackend(AttentionBackend):
         return [MultipleOf(16)]
 
     forward_includes_kv_cache_update: bool = False
+    supports_dcp_replicated: ClassVar[bool] = True
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
