@@ -212,7 +212,11 @@ from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
-from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
+from vllm.v1.utils import (
+    CpuGpuBuffer,
+    compute_iteration_details,
+    record_function_or_nullcontext,
+)
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.worker.cp_utils import (
@@ -4012,6 +4016,17 @@ class GPUModelRunner(
             else force_uniform_decode
         )
 
+    @staticmethod
+    def _compute_force_uniform_decode(
+        scheduler_output: "SchedulerOutput",
+        is_hybrid: bool,
+    ) -> bool | None:
+        if not is_hybrid:
+            return None
+        if compute_iteration_details(scheduler_output).num_ctx_requests > 0:
+            return False
+        return None
+
     def _allow_microbatching(
         self, num_reqs: int, num_scheduled_tokens_np: np.ndarray
     ) -> bool:
@@ -4386,6 +4401,9 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
+            force_uniform_decode = self._compute_force_uniform_decode(
+                scheduler_output, self.model_config.is_hybrid
+            )
             (
                 cudagraph_mode,
                 batch_desc,
@@ -4402,7 +4420,14 @@ class GPUModelRunner(
                 allow_microbatching=self._allow_microbatching(
                     num_reqs, num_scheduled_tokens_np
                 ),
+                force_uniform_decode=force_uniform_decode,
             )
+
+            if force_uniform_decode is False and cudagraph_mode == CUDAGraphMode.FULL:
+                raise RuntimeError(
+                    "hybrid prefill or mixed batch was dispatched to a FULL "
+                    "decode graph"
+                )
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
