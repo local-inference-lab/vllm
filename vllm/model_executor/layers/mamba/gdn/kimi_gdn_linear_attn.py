@@ -344,16 +344,29 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         ):
             return
 
-        max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+        max_live_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         state_index_columns = max(1, self.num_spec + 1)
         if state_index_columns > 8:
             return
-        max_tokens = max_seqs * state_index_columns
+        max_decode_tokens = max_live_seqs * state_index_columns
+        max_cudagraph_tokens = int(
+            vllm_config.compilation_config.max_cudagraph_capture_size or 0
+        )
+        max_tokens = max(max_decode_tokens, max_cudagraph_tokens)
+        plan_max_seqs = max(
+            max_live_seqs,
+            (max_tokens + state_index_columns - 1) // state_index_columns,
+        )
 
         self._b12x_kda_api = api
         self._b12x_kda_max_tokens = max_tokens
-        self._b12x_kda_max_seqs = max_seqs
+        self._b12x_kda_max_live_seqs = max_live_seqs
+        self._b12x_kda_plan_max_seqs = plan_max_seqs
         self._b12x_kda_state_index_columns = state_index_columns
+        null_state_index = self.b12x_kda_null_state_index
+        self._b12x_kda_null_state_index = (
+            -1 if null_state_index is None else int(null_state_index)
+        )
 
         provisional = self._make_b12x_kda_plan(max_state_slots=1)
         factory = dict(device=device, dtype=torch.bfloat16)
@@ -384,19 +397,19 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         self.register_buffer(
             "_b12x_kda_query_start_loc",
-            torch.zeros(max_seqs + 1, dtype=torch.int32, device=device),
+            torch.zeros(plan_max_seqs + 1, dtype=torch.int32, device=device),
             persistent=False,
         )
         self.register_buffer(
             "_b12x_kda_num_accepted_tokens",
-            torch.ones(max_seqs, dtype=torch.int32, device=device),
+            torch.ones(plan_max_seqs, dtype=torch.int32, device=device),
             persistent=False,
         )
         self.register_buffer(
             "_b12x_kda_state_indices",
-            torch.zeros(
-                max_seqs,
-                state_index_columns,
+            torch.full(
+                (plan_max_seqs, state_index_columns),
+                self._b12x_kda_null_state_index,
                 dtype=torch.int32,
                 device=device,
             ),
@@ -422,7 +435,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             api.Caps(
                 device=current_platform.current_device(),
                 max_tokens=self._b12x_kda_max_tokens,
-                max_seqs=self._b12x_kda_max_seqs,
+                max_seqs=self._b12x_kda_plan_max_seqs,
                 max_state_slots=max_state_slots,
                 key_heads=self.local_num_heads,
                 value_heads=self.local_num_heads,
@@ -433,7 +446,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 state_dtype=self.get_state_dtype()[1],
                 gate_activation="sigmoid",
                 qk_l2norm=True,
-                null_state_index=self.b12x_kda_null_state_index,
+                null_state_index=self._b12x_kda_null_state_index,
             )
         )
 
@@ -524,13 +537,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         state_columns = int(state_indices.shape[1])
         if (
             num_tokens > self._b12x_kda_max_tokens
-            or num_requests > self._b12x_kda_max_seqs
+            or num_requests > self._b12x_kda_max_live_seqs
             or state_columns > self._b12x_kda_state_index_columns
         ):
             raise ValueError(
                 "b12x KDA capacity exceeded: "
                 f"tokens={num_tokens}/{self._b12x_kda_max_tokens}, "
-                f"requests={num_requests}/{self._b12x_kda_max_seqs}, "
+                f"requests={num_requests}/{self._b12x_kda_max_live_seqs}, "
                 f"state_columns={state_columns}/"
                 f"{self._b12x_kda_state_index_columns}"
             )
@@ -548,7 +561,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             self._b12x_kda_num_accepted_tokens[:num_requests].copy_(
                 num_accepted_tokens[:num_requests]
             )
-        self._b12x_kda_state_indices.zero_()
+        self._b12x_kda_state_indices.fill_(self._b12x_kda_null_state_index)
         self._b12x_kda_state_indices[:num_requests, :state_columns].copy_(
             state_indices[:num_requests]
         )

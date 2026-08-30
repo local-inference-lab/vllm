@@ -10,6 +10,7 @@ from vllm.distributed.parallel_state import get_dp_group
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CudaGraphManager,
+    TargetExecutionBranch,
 )
 
 
@@ -23,6 +24,9 @@ def sync_cudagraph_and_dp_padding(
     dp_rank: int,
     max_query_len: int | None = None,
     num_active_loras: int = 0,
+    target_execution_branch: TargetExecutionBranch = (
+        TargetExecutionBranch.UNSPECIFIED
+    ),
 ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
     """
     Coordinates the batch descriptor and DP padding across all ranks.
@@ -87,6 +91,7 @@ def sync_cudagraph_and_dp_padding(
         synced_uniform_token_count,
         num_active_loras=num_active_loras,
         max_query_len=synced_max_query_len,
+        target_execution_branch=target_execution_branch,
     )
 
     # Update num_tokens_across_dp to reflect padded size.
@@ -105,6 +110,9 @@ def dispatch_cg_and_sync_dp(
     max_query_len: int | None = None,
     need_eager: bool = False,
     num_active_loras: int = 0,
+    target_execution_branch: TargetExecutionBranch = (
+        TargetExecutionBranch.UNSPECIFIED
+    ),
 ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
     if need_eager:
         batch_desc = BatchExecutionDescriptor(
@@ -112,6 +120,7 @@ def dispatch_cg_and_sync_dp(
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             num_active_loras=num_active_loras,
+            target_execution_branch=target_execution_branch,
         )
     else:
         assert cudagraph_manager is not None, (
@@ -124,6 +133,7 @@ def dispatch_cg_and_sync_dp(
             uniform_token_count,
             num_active_loras=num_active_loras,
             max_query_len=max_query_len,
+            target_execution_branch=target_execution_branch,
         )
 
     if dp_size == 1:
@@ -139,4 +149,5 @@ def dispatch_cg_and_sync_dp(
         dp_rank,
         max_query_len=max_query_len,
         num_active_loras=num_active_loras,
+        target_execution_branch=target_execution_branch,
     )

@@ -1648,6 +1648,24 @@ def test_is_uniform_decode() -> None:
     )
 
 
+def test_hybrid_prefill_disables_uniform_decode(monkeypatch) -> None:
+    scheduler_output = object()
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "compute_iteration_details",
+        lambda output: SimpleNamespace(num_ctx_requests=1),
+    )
+
+    assert (
+        GPUModelRunner._compute_force_uniform_decode(scheduler_output, is_hybrid=True)
+        is False
+    )
+    assert (
+        GPUModelRunner._compute_force_uniform_decode(scheduler_output, is_hybrid=False)
+        is None
+    )
+
+
 @pytest.mark.skipif(
     not current_platform.is_cuda(),
     reason="Attention backend FLASHINFER is only supported on CUDA.",

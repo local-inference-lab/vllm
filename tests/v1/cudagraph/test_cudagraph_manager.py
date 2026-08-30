@@ -18,7 +18,10 @@ from vllm.config import (
 )
 from vllm.distributed.device_communicators import pynccl_allocator
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    BatchExecutionDescriptor,
+    TargetExecutionBranch,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -45,6 +48,90 @@ def _create_vllm_config() -> MagicMock:
     vllm_config.speculative_config = None
     vllm_config.num_speculative_tokens = 0
     return vllm_config
+
+
+def test_branch_specialized_full_graphs_require_exact_decode_request_count():
+    desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=16,
+        num_reqs=4,
+        uniform_token_count=4,
+        target_execution_branch=TargetExecutionBranch.SPEC_DECODE,
+    )
+
+    assert gpu_cudagraph_utils._is_compatible(
+        desc,
+        4,
+        16,
+        4,
+        0,
+        None,
+        TargetExecutionBranch.SPEC_DECODE,
+        branch_specialized=True,
+    )
+    assert not gpu_cudagraph_utils._is_compatible(
+        desc,
+        1,
+        4,
+        4,
+        0,
+        None,
+        TargetExecutionBranch.SPEC_DECODE,
+        branch_specialized=True,
+    )
+    assert not gpu_cudagraph_utils._is_compatible(
+        desc,
+        4,
+        16,
+        4,
+        0,
+        None,
+        TargetExecutionBranch.PREFILL,
+        branch_specialized=True,
+    )
+
+
+def test_branch_specialized_geometries_cover_prefill_spec_and_decode():
+    geometries = gpu_cudagraph_utils._branch_geometries(16, 8, 4)
+
+    assert (TargetExecutionBranch.PREFILL, 8, None, 2) in geometries
+    assert (TargetExecutionBranch.SPEC_DECODE, 4, 4, None) in geometries
+    assert not any(branch is TargetExecutionBranch.DECODE for branch, *_ in geometries)
+    assert (
+        TargetExecutionBranch.DECODE,
+        4,
+        1,
+        None,
+    ) in gpu_cudagraph_utils._branch_geometries(4, 8, 4)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.FULL_AND_PIECEWISE],
+)
+def test_separate_full_modes_preserve_decode_branch_identity(monkeypatch, mode):
+    monkeypatch.setattr(
+        "vllm.models.glm5next_cudagraph.is_glm53_full_graph_path",
+        lambda _config: True,
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=_create_vllm_config(),
+        device=torch.device("cpu"),
+        cudagraph_mode=mode,
+        decode_query_len=4,
+    )
+
+    assert manager._branch_specialized_full_graphs
+    full_descriptors = manager._capture_descs[CUDAGraphMode.FULL]
+    assert full_descriptors
+    assert {
+        descriptor.target_execution_branch for descriptor in full_descriptors
+    } == {TargetExecutionBranch.SPEC_DECODE}
 
 
 def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
