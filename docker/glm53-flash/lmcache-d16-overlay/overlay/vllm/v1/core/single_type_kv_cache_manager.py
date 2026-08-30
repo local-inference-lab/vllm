@@ -1864,6 +1864,7 @@ class SinkFullAttentionManager(FullAttentionManager):
         scheduler_block_size: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        needs_kv_cache_zeroing: bool = False,
     ):
         super().__init__(
             kv_cache_spec=kv_cache_spec,
@@ -1873,6 +1874,7 @@ class SinkFullAttentionManager(FullAttentionManager):
             scheduler_block_size=scheduler_block_size,
             dcp_world_size=dcp_world_size,
             pcp_world_size=pcp_world_size,
+            needs_kv_cache_zeroing=needs_kv_cache_zeroing,
         )
         sink_len = kv_cache_spec.sink_len
         assert sink_len is not None and sink_len > 0 and sink_len % self.block_size == 0

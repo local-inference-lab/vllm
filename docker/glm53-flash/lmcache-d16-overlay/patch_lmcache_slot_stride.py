@@ -126,6 +126,7 @@ def patch_torch_ops(text: str, path: Path) -> str:
 
 def patch(root: Path, *, discover: bool = False) -> dict[Path, str]:
     results: dict[Path, str] = {}
+    writes: dict[Path, bytes] = {}
     for relative, transform in (
         (CONNECTORS, patch_connectors),
         (TORCH_OPS, patch_torch_ops),
@@ -138,14 +139,17 @@ def patch(root: Path, *, discover: bool = False) -> dict[Path, str]:
             continue
         if before != EXPECTED_BEFORE[relative]:
             raise RuntimeError(f"unexpected source hash for {path}: {before}")
-        path.write_text(transform(before_bytes.decode(), path))
-        after = digest(path.read_bytes())
+        after_bytes = transform(before_bytes.decode(), path).encode()
+        after = digest(after_bytes)
         if not discover and after != EXPECTED_AFTER[relative]:
             raise RuntimeError(
                 f"patched source hash mismatch for {path}: {after}, "
                 f"expected {EXPECTED_AFTER[relative]}"
             )
+        writes[path] = after_bytes
         results[relative] = after
+    for path, after_bytes in writes.items():
+        path.write_bytes(after_bytes)
     return results
 
 

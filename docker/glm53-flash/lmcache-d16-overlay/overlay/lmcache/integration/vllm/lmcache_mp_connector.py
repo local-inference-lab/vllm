@@ -1089,7 +1089,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """Record exact core-selected Mamba state blocks for future stores."""
         handoffs = getattr(scheduler_output, "partial_tail_offloads", None) or {}
         for request_id, entries in handoffs.items():
-            tracker = self._get_request_tracker(request_id)
+            tracker = self.request_trackers.get(request_id)
+            if tracker is None:
+                continue
             for group_id, block_id, boundary_tokens in entries:
                 if group_id not in self._mamba_group_ids or block_id < 0:
                     continue

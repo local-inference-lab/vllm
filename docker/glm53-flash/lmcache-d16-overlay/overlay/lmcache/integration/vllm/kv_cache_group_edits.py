@@ -52,6 +52,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     KVCacheSpecKind,
+    UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
 
@@ -520,10 +521,9 @@ class _SubpagedMLAAttentionViewEdit(KVCacheGroupEdit):
     ) -> torch.Tensor:
         """Re-view ``kv_cache`` at logical-block granularity.
 
-        The tensor is kernel-paged as ``(num_kernel_pages, 2,
-        kernel_block_size, num_kv_heads, head_size)``; the result is
-        ``(num_logical_blocks, 2, spec.block_size, num_heads, head_size)``
-        over the same storage.
+        The tensor is kernel-paged as ``(num_kernel_pages,
+        kernel_block_size, entry_size)``; the result is
+        ``(num_logical_blocks, spec.block_size, -1)`` over the same storage.
 
         Raises:
             ValueError: If the layout is not the expected kernel-paged shape,
@@ -605,8 +605,13 @@ def apply_kv_cache_group_edits(
     edited = dict(kv_caches)
     counts: Counter[str] = Counter()
     for group in kv_cache_config.kv_cache_groups:
-        spec = group.kv_cache_spec
+        group_spec = group.kv_cache_spec
         for name in group.layer_names:
+            spec = (
+                group_spec.kv_cache_specs[name]
+                if isinstance(group_spec, UniformTypeKVCacheSpecs)
+                else group_spec
+            )
             for edit in _EDITS:
                 if edit.matches(spec, kv_caches[name]):
                     edited[name] = edit.apply(spec, kv_caches[name], layout_hints)

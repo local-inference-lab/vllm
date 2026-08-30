@@ -65,14 +65,15 @@ def patch(root: Path, *, discover: bool = False) -> str:
         if text.count(old) != 1:
             raise RuntimeError(f"expected exactly one stride contract site in {path}")
         text = text.replace(old, new)
-    path.write_text(text)
 
-    after = digest(path.read_bytes())
+    after_bytes = text.encode()
+    after = digest(after_bytes)
     if not discover and after != EXPECTED_AFTER:
         raise RuntimeError(
             f"patched source hash mismatch for {path}: {after}, "
             f"expected {EXPECTED_AFTER}"
         )
+    path.write_bytes(after_bytes)
     return after
 
 

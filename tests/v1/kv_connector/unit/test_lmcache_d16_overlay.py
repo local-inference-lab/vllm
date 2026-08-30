@@ -27,6 +27,10 @@ GROUPS = (
     ROOT / "docker/glm53-flash/lmcache-d16-overlay/overlay/"
     "lmcache/integration/vllm/kv_cache_groups.py"
 )
+GROUP_EDITS = (
+    ROOT / "docker/glm53-flash/lmcache-d16-overlay/overlay/"
+    "lmcache/integration/vllm/kv_cache_group_edits.py"
+)
 ADAPTER = (
     ROOT / "docker/glm53-flash/lmcache-d16-overlay/overlay/"
     "lmcache/integration/vllm/vllm_multi_process_adapter.py"
@@ -47,6 +51,18 @@ CORE_SINGLE_TYPE_MANAGER = (
     ROOT / "docker/glm53-flash/lmcache-d16-overlay/overlay/"
     "vllm/v1/core/single_type_kv_cache_manager.py"
 )
+CUDA_SLOT_STRIDE_PATCH = (
+    ROOT
+    / "docker/glm53-flash/lmcache-d16-overlay/lmcache_cuda_ops_slot_stride.patch"
+)
+SLOT_STRIDE_PATCHER = (
+    ROOT / "docker/glm53-flash/lmcache-d16-overlay/patch_lmcache_slot_stride.py"
+)
+PADDED_STRIDE_PATCHER = (
+    ROOT
+    / "docker/glm53-flash/lmcache-d16-overlay/"
+    "patch_lmcache_padded_packed_stride.py"
+)
 
 
 class AttentionSpec:
@@ -61,6 +77,14 @@ class MambaSpec:
 
 def _load_layout():
     spec = importlib.util.spec_from_file_location("lmcache_dcp_layout", DCP_LAYOUT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -250,6 +274,7 @@ def test_scheduler_starts_each_heartbeat_once() -> None:
         keywords=[],
         body=[ensure_started],
         decorator_list=[],
+        type_params=[],
     )
     namespace: dict[str, Any] = {}
     started: list[str] = []
@@ -297,7 +322,14 @@ def test_connector_prefix_is_bounded_by_lagging_mamba_state() -> None:
         if isinstance(node, ast.FunctionDef)
         and node.name == "get_computed_blocks_for_connector"
     )
-    probe = ast.ClassDef("ManagerProbe", [], [], [method], [])
+    probe = ast.ClassDef(
+        name="ManagerProbe",
+        bases=[],
+        keywords=[],
+        body=[method],
+        decorator_list=[],
+        type_params=[],
+    )
 
     class HybridKVCacheCoordinator:
         pass
@@ -437,3 +469,270 @@ def test_connector_ingests_core_mamba_handoffs_before_stores() -> None:
         build_source.index("_process_new_requests")
     )
     assert "self._mamba_group_ids" in process_source
+
+
+def test_cuda_slot_stride_rejects_unaligned_xwords_before_conversion() -> None:
+    patch = CUDA_SLOT_STRIDE_PATCH.read_text()
+
+    check = "TORCH_CHECK(block_stride_elems % elements_per_xword == 0"
+    conversion = "block_stride_elems / elements_per_xword"
+    assert patch.index(check) < patch.index(conversion)
+
+
+def test_group_edits_unwrap_uniform_specs_per_layer() -> None:
+    tree = ast.parse(GROUP_EDITS.read_text())
+    apply_edits = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "apply_kv_cache_group_edits"
+    )
+
+    class UniformTypeKVCacheSpecs:
+        def __init__(self, specs):
+            self.kv_cache_specs = specs
+
+    layer_spec = object()
+    seen_specs = []
+
+    class Edit:
+        name = "probe"
+
+        def matches(self, spec, _cache):
+            seen_specs.append(spec)
+            return True
+
+        def apply(self, spec, cache, _layout_hints):
+            assert spec is layer_spec
+            return f"edited-{cache}"
+
+    namespace = {
+        "Counter": __import__("collections").Counter,
+        "KVCacheConfig": object,
+        "KVCacheSpec": object,
+        "LayoutHints": dict,
+        "Mapping": dict,
+        "RegisteredKVCache": object,
+        "UniformTypeKVCacheSpecs": UniformTypeKVCacheSpecs,
+        "_EDITS": (Edit(),),
+        "logger": SimpleNamespace(info=lambda *_args: None),
+        "validate_kv_cache_groups": lambda _config: None,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[apply_edits], type_ignores=[])
+            ),
+            str(GROUP_EDITS),
+            "exec",
+        ),
+        namespace,
+    )
+    config = SimpleNamespace(
+        has_mamba_layers=True,
+        kv_cache_groups=[
+            SimpleNamespace(
+                kv_cache_spec=UniformTypeKVCacheSpecs({"layer": layer_spec}),
+                layer_names=["layer"],
+            )
+        ],
+    )
+
+    assert namespace["apply_kv_cache_group_edits"](
+        config, {"layer": "cache"}, {}
+    ) == {"layer": "edited-cache"}
+    assert seen_specs == [layer_spec]
+
+
+def test_subpaged_mla_docstring_describes_three_dimensional_view() -> None:
+    tree = ast.parse(GROUP_EDITS.read_text())
+    edit = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "_SubpagedMLAAttentionViewEdit"
+    )
+    apply = next(
+        node
+        for node in edit.body
+        if isinstance(node, ast.FunctionDef) and node.name == "apply"
+    )
+    docstring = ast.get_docstring(apply)
+
+    assert docstring is not None
+    normalized = " ".join(docstring.split())
+    assert "(num_kernel_pages, kernel_block_size, entry_size)" in normalized
+    assert "(num_logical_blocks, spec.block_size, -1)" in normalized
+
+
+def test_exact_mamba_handoffs_skip_unknown_requests() -> None:
+    tree = ast.parse(CONNECTOR.read_text())
+    connector = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "LMCacheMPConnector"
+    )
+    ingest = next(
+        node
+        for node in connector.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_ingest_exact_mamba_boundary_blocks"
+    )
+    namespace = {"SchedulerOutput": object}
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[ingest], type_ignores=[])),
+            str(CONNECTOR),
+            "exec",
+        ),
+        namespace,
+    )
+    tracker = SimpleNamespace(exact_mamba_boundary_blocks={})
+    probe = SimpleNamespace(
+        request_trackers={"known": tracker},
+        _mamba_group_ids={1},
+    )
+    scheduler_output = SimpleNamespace(
+        partial_tail_offloads={
+            "unknown": [(1, 10, 64)],
+            "known": [(1, 11, 128), (2, 12, 128), (1, -1, 192)],
+        }
+    )
+
+    namespace["_ingest_exact_mamba_boundary_blocks"](probe, scheduler_output)
+
+    assert tracker.exact_mamba_boundary_blocks == {1: {128: 11}}
+
+
+def test_finished_store_dedup_state_is_pruned_after_engine_converges() -> None:
+    tree = ast.parse(ADAPTER.read_text())
+    adapter = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "LMCacheMPWorkerAdapter"
+    )
+    methods = [
+        node
+        for node in adapter.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name
+        in {"_process_finished_stores", "_update_and_get_finished_store"}
+    ]
+    probe_class = ast.ClassDef(
+        name="AdapterProbe",
+        bases=[],
+        keywords=[],
+        body=methods,
+        decorator_list=[],
+        type_params=[],
+    )
+    namespace: dict[str, Any] = {}
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[probe_class], type_ignores=[])
+            ),
+            str(ADAPTER),
+            "exec",
+        ),
+        namespace,
+    )
+    probe = namespace["AdapterProbe"]()
+    probe.finished_stores = set()
+    probe.previously_finished = set()
+    probe.store_futures = {}
+    probe._returned_finished = set()
+
+    assert probe._process_finished_stores(set(), {"request"}) == {"request"}
+    assert probe._process_finished_stores(set(), {"request"}) == set()
+    assert probe._returned_finished == {"request"}
+    assert probe._process_finished_stores(set(), set()) == set()
+    assert probe._returned_finished == set()
+
+
+def test_sink_manager_forwards_zeroing_constructor_argument() -> None:
+    tree = ast.parse(CORE_SINGLE_TYPE_MANAGER.read_text())
+    manager = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "SinkFullAttentionManager"
+    )
+    constructor = next(
+        node
+        for node in manager.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    source = ast.unparse(constructor)
+
+    assert "needs_kv_cache_zeroing: bool=False" in source
+    assert "needs_kv_cache_zeroing=needs_kv_cache_zeroing" in source
+
+
+def test_flashinfer_pins_match_docker_metadata() -> None:
+    assert "ARG FLASHINFER_VERSION=0.6.18" in (
+        ROOT / "docker/Dockerfile"
+    ).read_text()
+    assert '"FLASHINFER_VERSION": {\n      "default": "0.6.18"' in (
+        ROOT / "docker/versions.json"
+    ).read_text()
+    cuda_requirements = (ROOT / "requirements/cuda.txt").read_text()
+    assert "flashinfer-python==0.6.18" in cuda_requirements
+    assert "flashinfer-cubin==0.6.18" in cuda_requirements
+
+
+def test_slot_stride_patcher_validates_output_before_write(
+    monkeypatch, tmp_path
+) -> None:
+    patcher = _load_module("slot_stride_patcher", SLOT_STRIDE_PATCHER)
+    connector = Path("connector.py")
+    torch_ops = Path("torch_ops.py")
+    originals = {connector: b"connector", torch_ops: b"torch"}
+    for relative, content in originals.items():
+        (tmp_path / relative).write_bytes(content)
+
+    monkeypatch.setattr(patcher, "CONNECTORS", connector)
+    monkeypatch.setattr(patcher, "TORCH_OPS", torch_ops)
+    monkeypatch.setattr(
+        patcher,
+        "EXPECTED_BEFORE",
+        {relative: patcher.digest(content) for relative, content in originals.items()},
+    )
+    monkeypatch.setattr(
+        patcher,
+        "EXPECTED_AFTER",
+        {connector: patcher.digest(b"changed connector"), torch_ops: "wrong"},
+    )
+    monkeypatch.setattr(
+        patcher, "patch_connectors", lambda _text, _path: "changed connector"
+    )
+    monkeypatch.setattr(
+        patcher, "patch_torch_ops", lambda _text, _path: "changed torch"
+    )
+
+    with pytest.raises(RuntimeError, match="patched source hash mismatch"):
+        patcher.patch(tmp_path)
+    assert (tmp_path / connector).read_bytes() == originals[connector]
+    assert (tmp_path / torch_ops).read_bytes() == originals[torch_ops]
+
+
+def test_padded_stride_patcher_validates_output_before_write(
+    monkeypatch, tmp_path
+) -> None:
+    patcher = _load_module("padded_stride_patcher", PADDED_STRIDE_PATCHER)
+    relative = Path("utils.py")
+    original = b"allowlist\nerror\n"
+    path = tmp_path / relative
+    path.write_bytes(original)
+    monkeypatch.setattr(patcher, "RELATIVE", relative)
+    monkeypatch.setattr(patcher, "EXPECTED_BEFORE", patcher.digest(original))
+    monkeypatch.setattr(patcher, "EXPECTED_AFTER", "wrong")
+    monkeypatch.setattr(patcher, "OLD_ALLOWLIST", "allowlist")
+    monkeypatch.setattr(patcher, "NEW_ALLOWLIST", "new allowlist")
+    monkeypatch.setattr(patcher, "OLD_ERROR", "error")
+    monkeypatch.setattr(patcher, "NEW_ERROR", "new error")
+
+    with pytest.raises(RuntimeError, match="patched source hash mismatch"):
+        patcher.patch(tmp_path)
+    assert path.read_bytes() == original
