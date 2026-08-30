@@ -359,6 +359,7 @@ def lmcache_argv(config: Config) -> list[str]:
         config.eviction_policy,
         "--supported-transfer-mode",
         config.transfer_mode,
+        "--separate-object-groups",
     ]
 
 

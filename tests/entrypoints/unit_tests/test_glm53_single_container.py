@@ -43,6 +43,39 @@ def test_single_container_defaults_match_qualified_geometry(tmp_path) -> None:
     assert config.chunk_size == 9216
     assert config.l1_size_gb == 48
     assert config.max_gpu_workers == 4
+    assert supervisor.lmcache_argv(config) == [
+        str(lmcache),
+        "server",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "5555",
+        "--http-host",
+        "127.0.0.1",
+        "--http-port",
+        "8080",
+        "--l1-size-gb",
+        "48",
+        "--l1-init-size-gb",
+        "20",
+        "--l1-align-bytes",
+        "16384",
+        "--max-gpu-workers",
+        "4",
+        "--max-cpu-workers",
+        "8",
+        "--chunk-size",
+        "9216",
+        "--eviction-trigger-watermark",
+        "0.85",
+        "--eviction-ratio",
+        "0.1",
+        "--eviction-policy",
+        "LRU",
+        "--supported-transfer-mode",
+        "lmcache_driven",
+        "--separate-object-groups",
+    ]
     supervisor.ensure_broker_directory(broker)
     assert stat.S_IMODE(broker.stat().st_mode) == 0o700
     assert supervisor.child_environment(config, {})["LMCACHE_CUMEM_BROKER_DIR"] == str(

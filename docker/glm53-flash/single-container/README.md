@@ -60,3 +60,8 @@ both children, starts LMCache first, gates vLLM on LMCache health, bounds vLLM
 readiness, forwards SIGTERM/SIGINT to both child process groups, and kills and
 reaps either sibling when the other exits. LMCache persistence and reload are
 not part of this recipe.
+
+LMCache is always launched with `--separate-object-groups`. Separation is
+mandatory for this hybrid recipe so full attention history and the one-chunk
+Mamba state use separate object semantics. The recipe depends on the
+exact-boundary and sparse-transfer updates in #525 and #526.
