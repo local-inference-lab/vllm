@@ -464,12 +464,23 @@ def _validate_executables(config: Config) -> None:
             raise ValueError(f"{name} executable is missing or not executable: {path}")
 
 
+def _with_prompt_tokens_details(vllm_args: Sequence[str]) -> list[str]:
+    flag = "--enable-prompt-tokens-details"
+    args = [arg for arg in vllm_args if arg != flag]
+    if flag in vllm_args:
+        args.insert(list(vllm_args).index(flag), flag)
+    else:
+        args.append(flag)
+    return args
+
+
 def supervise(vllm_args: Sequence[str], environ: Mapping[str, str]) -> int:
     config = load_config(environ)
     if not vllm_args or vllm_args[0] != "serve":
         raise ValueError(
             "vLLM arguments must use the supported form: serve MODEL [OPTIONS]"
         )
+    vllm_args = _with_prompt_tokens_details(vllm_args)
     _validate_executables(config)
     ensure_broker_directory(config.broker_dir)
     env = child_environment(config, environ)

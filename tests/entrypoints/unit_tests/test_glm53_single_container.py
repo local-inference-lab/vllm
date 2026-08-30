@@ -125,6 +125,31 @@ def test_single_container_rejects_unknown_runtime_variable() -> None:
         supervisor.load_config({"GLM53_LMCACHE_UNSAFE_OPTION": "1"})
 
 
+def test_single_container_appends_prompt_tokens_details_flag() -> None:
+    supervisor = _load_supervisor()
+
+    args = supervisor._with_prompt_tokens_details(["serve", "model", "--port", "8000"])
+
+    assert args == [
+        "serve",
+        "model",
+        "--port",
+        "8000",
+        "--enable-prompt-tokens-details",
+    ]
+
+
+def test_single_container_keeps_one_prompt_tokens_details_flag() -> None:
+    supervisor = _load_supervisor()
+    flag = "--enable-prompt-tokens-details"
+
+    args = supervisor._with_prompt_tokens_details(
+        ["serve", "model", flag, "--port", "8000", flag]
+    )
+
+    assert args == ["serve", "model", flag, "--port", "8000"]
+
+
 def test_single_container_recipe_preserves_qualified_d16_contract() -> None:
     recipe = RECIPE.read_text()
     requirements = CUDA_REQUIREMENTS.read_text()
@@ -233,3 +258,54 @@ def test_lmcache_failure_prevents_vllm_start(tmp_path) -> None:
 
     assert status == 7
     assert not marker.exists()
+
+
+def test_supervisor_launches_vllm_with_prompt_tokens_details(
+    tmp_path, monkeypatch
+) -> None:
+    supervisor = _load_supervisor()
+    lmcache = tmp_path / "lmcache"
+    vllm = tmp_path / "vllm"
+    lmcache.touch(mode=0o755)
+    vllm.touch(mode=0o755)
+    launched: list[list[str]] = []
+
+    class Process:
+        pid = 1
+
+        def __init__(self, argv: list[str], **_kwargs: object) -> None:
+            launched.append(argv)
+
+        def poll(self) -> int | None:
+            return 0 if self is vllm_process else None
+
+    def popen(argv: list[str], **kwargs: object) -> Process:
+        nonlocal vllm_process
+        process = Process(argv, **kwargs)
+        if argv[0] == str(vllm):
+            vllm_process = process
+        return process
+
+    vllm_process: Process | None = None
+    monkeypatch.setattr(supervisor.subprocess, "Popen", popen)
+    monkeypatch.setattr(supervisor, "_healthy", lambda *_args: True)
+    monkeypatch.setattr(supervisor, "_stop_processes", lambda *_args: None)
+
+    status = supervisor.supervise(
+        ["serve", "model", "--port", "8000"],
+        {
+            "GLM53_LMCACHE_EXECUTABLE": str(lmcache),
+            "GLM53_VLLM_EXECUTABLE": str(vllm),
+            "GLM53_LMCACHE_CUMEM_BROKER_DIR": str(tmp_path / "broker"),
+        },
+    )
+
+    assert status == 0
+    assert launched[1] == [
+        str(vllm),
+        "serve",
+        "model",
+        "--port",
+        "8000",
+        "--enable-prompt-tokens-details",
+    ]

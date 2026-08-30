@@ -35,6 +35,7 @@ docker run --rm --restart=no --gpus all \
   --cp-kv-cache-interleave-size 4 \
   --mamba-cache-mode align \
   --enable-prefix-caching \
+  --enable-prompt-tokens-details \
   --enable-chunked-prefill \
   --dtype bfloat16 \
   --kv-cache-dtype fp8 \
@@ -65,6 +66,11 @@ LMCache is always launched with `--separate-object-groups`. Separation is
 mandatory for this hybrid recipe so full attention history and the one-chunk
 Mamba state use separate object semantics. The recipe depends on the
 exact-boundary and sparse-transfer updates in #525 and #526.
+
+The supervisor makes `--enable-prompt-tokens-details` mandatory so gateways
+such as Bifrost can report `usage.prompt_tokens_details.cached_tokens`. This
+changes cache accounting in API responses only; it does not change caching
+behavior.
 
 The image also installs startup-only vLLM fences around scheduler-realistic
 warmup stages and before FULL graph capture. They keep TP4/DCP4/MTP3 ranks
