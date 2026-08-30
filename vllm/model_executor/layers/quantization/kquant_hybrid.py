@@ -77,6 +77,19 @@ def _qsrt_atoms_v2_w4a8_prefill_enabled(*, pure_k2: bool) -> bool:
     return enabled
 
 
+def _qsrt_atoms_v2_w4a8_prequantized_input_enabled(
+    *, prefill_enabled: bool
+) -> bool:
+    """Use an external MXFP8 expert input only with W4A8 prefill."""
+    requested = os.getenv(
+        "VLLM_KQUANT_QSRT_W4A8_PREQUANTIZED_INPUT", "0"
+    ).strip().lower()
+    enabled = requested in {"1", "true", "yes", "on"}
+    if enabled and not prefill_enabled:
+        raise ValueError(
+            "VLLM_KQUANT_QSRT_W4A8_PREQUANTIZED_INPUT requires W4A8 prefill"
+        )
+    return enabled
 def _stack_exl3_intermediate_rotations(
     w13_svh: torch.Tensor,
     w2_suh: torch.Tensor,
@@ -211,8 +224,11 @@ class _HybridSharedRuntime:
         self.kquant_logical_mid: torch.Tensor | None = None
         self.trellis_scratch: torch.Tensor | None = None
         self.trellis_prefill_scratch: torch.Tensor | None = None
+        self.trellis_prefill_fallback_scratch: torch.Tensor | None = None
         self.trellis_output: torch.Tensor | None = None
         self.trellis_prefill_input: torch.Tensor | None = None
+        self.trellis_prefill_input_values: torch.Tensor | None = None
+        self.trellis_prefill_input_scales: torch.Tensor | None = None
         self.trellis_prefill_output: torch.Tensor | None = None
         self.trellis_prefill_topk_ids: torch.Tensor | None = None
         self.trellis_prefill_topk_weights: torch.Tensor | None = None
@@ -268,7 +284,9 @@ class _HybridLayerState:
         self.trellis_plan: Any = None
         self.trellis_prefill_weights: Any = None
         self.trellis_prefill_plan: Any = None
+        self.trellis_prefill_fallback_plan: Any = None
         self.trellis_use_w4a8_prefill = False
+        self.trellis_use_w4a8_prequantized_input = False
         self.runtime_ready = False
 
 
@@ -1041,6 +1059,11 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             state.trellis_use_w4a8_prefill = (
                 _qsrt_atoms_v2_w4a8_prefill_enabled(pure_k2=pure_k2)
             )
+            state.trellis_use_w4a8_prequantized_input = (
+                _qsrt_atoms_v2_w4a8_prequantized_input_enabled(
+                    prefill_enabled=state.trellis_use_w4a8_prefill
+                )
+            )
             tp_size = get_tensor_model_parallel_world_size()
             tp_rank = get_tensor_model_parallel_rank()
             weight_plan_kwargs: dict[str, Any] = dict(
@@ -1603,6 +1626,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                     state.tiles,
                     runtime.topk,
                     runtime.max_m,
+                    state.trellis_use_w4a8_prequantized_input,
                 )
                 prefill_plan = runtime.launches.get(prefill_key)
                 if prefill_plan is None:
@@ -1614,6 +1638,9 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                             weight_plan=state.trellis_prefill_weights.plan,
                             quant_mode="w4a8_mx",
                             route_num_experts=0,
+                            prequantized_input=(
+                                state.trellis_use_w4a8_prequantized_input
+                            ),
                         )
                     )
                     if prefill_plan.launch_plan.implementation != "dynamic":
@@ -1634,17 +1661,135 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                         dtype=prefill_spec.dtype,
                         device=prefill_spec.device,
                     )
-                if (
-                    runtime.trellis_prefill_input is None
-                    or tuple(runtime.trellis_prefill_input.shape)
-                    != prefill_output_shape
-                    or runtime.trellis_prefill_input.device != prefill_spec.device
-                    or runtime.trellis_prefill_input.dtype != self.moe.in_dtype
-                ):
-                    runtime.trellis_prefill_input = torch.empty(
-                        prefill_output_shape,
-                        dtype=self.moe.in_dtype,
-                        device=prefill_spec.device,
+                fallback_max_m = 0
+                if state.trellis_use_w4a8_prequantized_input:
+                    fallback_max_m = max(
+                        (
+                            candidate_m
+                            for candidate_m in range(9, runtime.max_m + 1)
+                            if not prefill_plan.supports_prequantized_input(
+                                candidate_m
+                            )
+                        ),
+                        default=0,
+                    )
+                fallback_need = 0
+                if fallback_max_m:
+                    fallback_key = (
+                        "trellis-w4a8-prefill-fallback",
+                        state.num_secondary,
+                        state.hidden_size,
+                        state.intermediate_size,
+                        self.moe.activation.value,
+                        state.tiles,
+                        runtime.topk,
+                        fallback_max_m,
+                    )
+                    fallback_plan = runtime.launches.get(fallback_key)
+                    if fallback_plan is None:
+                        fallback_plan = fused_moe.plan(
+                            fused_moe.Caps(
+                                max_tokens=fallback_max_m,
+                                num_topk=runtime.topk,
+                                device=torch.accelerator.current_device_index(),
+                                weight_plan=state.trellis_prefill_weights.plan,
+                                quant_mode="w4a8_mx",
+                                route_num_experts=0,
+                            )
+                        )
+                        runtime.launches[fallback_key] = fallback_plan
+                    if fallback_plan.launch_plan.implementation != "dynamic":
+                        raise RuntimeError(
+                            "kquant_hybrid: W4A8 fallback plan is not dynamic"
+                        )
+                    state.trellis_prefill_fallback_plan = fallback_plan
+                    fallback_spec = fallback_plan.scratch_specs()[0]
+                    fallback_need = int(torch.Size(fallback_spec.shape).numel())
+                    fallback_scratch = runtime.trellis_prefill_fallback_scratch
+                    if fallback_scratch is None or (
+                        fallback_scratch.numel() < fallback_need
+                        or fallback_scratch.dtype != fallback_spec.dtype
+                    ):
+                        runtime.trellis_prefill_fallback_scratch = torch.empty(
+                            fallback_spec.shape,
+                            dtype=fallback_spec.dtype,
+                            device=fallback_spec.device,
+                        )
+                else:
+                    state.trellis_prefill_fallback_plan = None
+                    runtime.trellis_prefill_fallback_scratch = None
+                if state.trellis_use_w4a8_prequantized_input:
+                    scale_shape = (runtime.max_m, state.hidden_size // 32)
+                    if (
+                        runtime.trellis_prefill_input_values is None
+                        or tuple(runtime.trellis_prefill_input_values.shape)
+                        != prefill_output_shape
+                        or runtime.trellis_prefill_input_values.device
+                        != prefill_spec.device
+                    ):
+                        runtime.trellis_prefill_input_values = torch.empty(
+                            prefill_output_shape,
+                            dtype=torch.float8_e4m3fn,
+                            device=prefill_spec.device,
+                        )
+                    if (
+                        runtime.trellis_prefill_input_scales is None
+                        or tuple(runtime.trellis_prefill_input_scales.shape)
+                        != scale_shape
+                        or runtime.trellis_prefill_input_scales.device
+                        != prefill_spec.device
+                    ):
+                        runtime.trellis_prefill_input_scales = torch.empty(
+                            scale_shape,
+                            dtype=torch.float8_e8m0fnu,
+                            device=prefill_spec.device,
+                        )
+                    if fallback_max_m:
+                        fallback_input_shape = (
+                            fallback_max_m,
+                            state.hidden_size,
+                        )
+                        if (
+                            runtime.trellis_prefill_input is None
+                            or tuple(runtime.trellis_prefill_input.shape)
+                            != fallback_input_shape
+                            or runtime.trellis_prefill_input.device
+                            != prefill_spec.device
+                            or runtime.trellis_prefill_input.dtype
+                            != self.moe.in_dtype
+                        ):
+                            runtime.trellis_prefill_input = torch.empty(
+                                fallback_input_shape,
+                                dtype=self.moe.in_dtype,
+                                device=prefill_spec.device,
+                            )
+                    else:
+                        runtime.trellis_prefill_input = None
+                else:
+                    if (
+                        runtime.trellis_prefill_input is None
+                        or tuple(runtime.trellis_prefill_input.shape)
+                        != prefill_output_shape
+                        or runtime.trellis_prefill_input.device != prefill_spec.device
+                        or runtime.trellis_prefill_input.dtype != self.moe.in_dtype
+                    ):
+                        runtime.trellis_prefill_input = torch.empty(
+                            prefill_output_shape,
+                            dtype=self.moe.in_dtype,
+                            device=prefill_spec.device,
+                        )
+                    runtime.trellis_prefill_input_values = None
+                    runtime.trellis_prefill_input_scales = None
+                if state.trellis_use_w4a8_prequantized_input:
+                    logger.info_once(
+                        "kquant_hybrid: W4A8 prequantized MXFP8 input enabled "
+                        "for M=%d..%d; BF16 fallback M=9..%d; scratch "
+                        "primary=%.1f MiB fallback=%.1f MiB",
+                        fallback_max_m + 1,
+                        runtime.max_m,
+                        fallback_max_m,
+                        prefill_need / (1024 * 1024),
+                        fallback_need / (1024 * 1024),
                     )
                 if (
                     runtime.trellis_prefill_output is None
@@ -1920,21 +2065,38 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             use_w4a8_prefill = (
                 state.trellis_prefill_weights is not None and not decode
             )
-            trellis_plan = (
-                state.trellis_prefill_plan
-                if use_w4a8_prefill
-                else state.trellis_plan
-            )
+            use_prequantized_input = False
+            if (
+                use_w4a8_prefill
+                and state.trellis_use_w4a8_prequantized_input
+                and state.trellis_prefill_plan is not None
+            ):
+                use_prequantized_input = (
+                    state.trellis_prefill_plan.supports_prequantized_input(m)
+                )
+            if use_w4a8_prefill:
+                trellis_plan = (
+                    state.trellis_prefill_plan
+                    if use_prequantized_input
+                    or not state.trellis_use_w4a8_prequantized_input
+                    else state.trellis_prefill_fallback_plan
+                )
+            else:
+                trellis_plan = state.trellis_plan
             trellis_weights = (
                 state.trellis_prefill_weights
                 if use_w4a8_prefill
                 else state.trellis_weights
             )
-            trellis_scratch = (
-                runtime.trellis_prefill_scratch
-                if use_w4a8_prefill
-                else runtime.trellis_scratch
-            )
+            if use_w4a8_prefill:
+                trellis_scratch = (
+                    runtime.trellis_prefill_scratch
+                    if use_prequantized_input
+                    or not state.trellis_use_w4a8_prequantized_input
+                    else runtime.trellis_prefill_fallback_scratch
+                )
+            else:
+                trellis_scratch = runtime.trellis_scratch
             trellis_output = (
                 runtime.trellis_prefill_output
                 if use_w4a8_prefill
@@ -1949,26 +2111,48 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             ):
                 raise RuntimeError("QSRT trellis execution resources are incomplete")
             launch_input = x if x.is_contiguous() else x.contiguous()
-            if use_w4a8_prefill:
+            use_outer_transform = use_w4a8_prefill
+            prefill_input_values: torch.Tensor | None = None
+            prefill_input_scales: torch.Tensor | None = None
+            if use_outer_transform:
                 from b12x.moe.fused_moe._impl import (
                     run_w4a8_coupled_outer_transform,
+                    run_w4a8_coupled_outer_transform_mxfp8,
                     sanitize_w4a8_routing,
                 )
 
                 prefill_input = runtime.trellis_prefill_input
+                prefill_input_values = runtime.trellis_prefill_input_values
+                prefill_input_scales = runtime.trellis_prefill_input_scales
                 safe_ids = runtime.trellis_prefill_topk_ids
                 safe_weights = runtime.trellis_prefill_topk_weights
                 prepared_value = trellis_weights.representation.value
-                if prefill_input is None or safe_ids is None or safe_weights is None:
+                if safe_ids is None or safe_weights is None:
                     raise RuntimeError(
                         "QSRT W4A8 prefill buffers were not allocated eagerly"
                     )
-                launch_input = run_w4a8_coupled_outer_transform(
-                    launch_input,
-                    prefill_input[:m],
-                    prepared_value.gate_suh,
-                    output_transform=False,
-                )
+                if use_prequantized_input:
+                    if prefill_input_values is None or prefill_input_scales is None:
+                        raise RuntimeError(
+                            "QSRT prequantized input buffers were not allocated"
+                        )
+                    run_w4a8_coupled_outer_transform_mxfp8(
+                        launch_input,
+                        prefill_input_values[:m],
+                        prefill_input_scales[:m],
+                        prepared_value.gate_suh,
+                    )
+                else:
+                    if prefill_input is None:
+                        raise RuntimeError(
+                            "QSRT BF16 outer-transform buffer was not allocated"
+                        )
+                    launch_input = run_w4a8_coupled_outer_transform(
+                        launch_input,
+                        prefill_input[:m],
+                        prepared_value.gate_suh,
+                        output_transform=False,
+                    )
                 tids, weights = sanitize_w4a8_routing(
                     tids,
                     weights,
@@ -1984,7 +2168,12 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 topk_ids=tids,
                 output=trellis_output[:m],
             )
-            if not use_w4a8_prefill:
+            if use_prequantized_input:
+                assert prefill_input_values is not None
+                assert prefill_input_scales is not None
+                bind_kwargs["a_prequant"] = prefill_input_values[:m]
+                bind_kwargs["a_prequant_scale"] = prefill_input_scales[:m]
+            if not use_outer_transform:
                 bind_kwargs["route_expert_map"] = state.emap_secondary
             binding = fused_moe.bind(trellis_plan, **bind_kwargs)
             # W4A16 decode emits fp32 while W4A8 prefill emits model dtype;

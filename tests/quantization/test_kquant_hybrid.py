@@ -9,9 +9,10 @@ import torch
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.kquant_hybrid import (
     KQuantHybridConfig,
-    _qsrt_atoms_v2_w4a8_prefill_enabled,
     _b12x_tiles_for_geometry,
     _is_dense_layer_ignored,
+    _qsrt_atoms_v2_w4a8_prefill_enabled,
+    _qsrt_atoms_v2_w4a8_prequantized_input_enabled,
     _read_hybrid_keys,
     _require_rank_local_kept_kernel,
     _stack_exl3_intermediate_rotations,
@@ -167,6 +168,20 @@ def test_qsrt_w4a8_prefill_is_opt_in_and_pure_k2_only(monkeypatch) -> None:
     assert _qsrt_atoms_v2_w4a8_prefill_enabled(pure_k2=True)
     with pytest.raises(ValueError, match="uniform coupled pure-K2"):
         _qsrt_atoms_v2_w4a8_prefill_enabled(pure_k2=False)
+
+
+def test_qsrt_w4a8_prequantized_input_requires_prefill(monkeypatch) -> None:
+    monkeypatch.delenv(
+        "VLLM_KQUANT_QSRT_W4A8_PREQUANTIZED_INPUT", raising=False
+    )
+    assert not _qsrt_atoms_v2_w4a8_prequantized_input_enabled(
+        prefill_enabled=True
+    )
+
+    monkeypatch.setenv("VLLM_KQUANT_QSRT_W4A8_PREQUANTIZED_INPUT", "1")
+    assert _qsrt_atoms_v2_w4a8_prequantized_input_enabled(prefill_enabled=True)
+    with pytest.raises(ValueError, match="requires W4A8 prefill"):
+        _qsrt_atoms_v2_w4a8_prequantized_input_enabled(prefill_enabled=False)
 
 
 def test_atoms_v2_profiles_have_canonical_row_strides() -> None:
