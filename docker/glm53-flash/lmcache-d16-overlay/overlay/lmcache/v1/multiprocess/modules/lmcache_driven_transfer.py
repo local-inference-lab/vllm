@@ -240,9 +240,25 @@ def all_null_chunk_masks(
     return masks
 
 
+def effective_blocks_per_chunk(cache_context: BaseCacheContext) -> list[int]:
+    """Return block IDs consumed per chunk after sliding-window reduction."""
+    manager = cache_context.kv_layer_groups_manager
+    return [
+        cache_context.calculate_num_blocks(
+            min(
+                cache_context.lmcache_tokens_per_chunk,
+                manager.get_subchunk_sw_size_tokens(group_id),
+            ),
+            group_id,
+        )
+        for group_id in range(manager.num_kernel_groups)
+    ]
+
+
 def downsample_and_stage_block_ids(
     cache_context: BaseCacheContext,
     block_ids: list[list[int]],
+    num_chunks: int,
 ) -> list[torch.Tensor]:
     """Cut the block id lists to skip the unneeded blocks in a chunk and
     stage it into GPU tensors for later use.
@@ -300,9 +316,15 @@ def downsample_and_stage_block_ids(
 
         new_block_ids = []
         old_block_ids = block_ids[kernel_group_id]
-        assert len(old_block_ids) % total_blocks_per_chunk == 0, (
-            f"len(block_ids[{kernel_group_id}]) should be a multiple "
-            f"of total_blocks_per_chunk ({total_blocks_per_chunk}), but got "
+        reduced_count = num_chunks * keep_blocks_per_chunk
+        raw_count = num_chunks * total_blocks_per_chunk
+        if len(old_block_ids) == reduced_count:
+            # Exact Mamba boundary handoffs and other pre-windowed callers
+            # already provide the representation consumed by the transfer.
+            continue
+        assert len(old_block_ids) == raw_count, (
+            f"len(block_ids[{kernel_group_id}]) should be either the raw "
+            f"count {raw_count} or reduced count {reduced_count}, but got "
             f"{len(old_block_ids)}"
         )
 
@@ -1212,15 +1234,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         )
         num_chunks = len(obj_keys_per_obj_group[0])
 
-        # NOTE: different engine groups may have different block sizes, so
-        # ``blocks_per_chunk[i]`` is the number of blocks in one chunk for
-        # group ``i``.
-        blocks_per_chunk = [
-            cache_context.calculate_num_blocks(self._ctx.chunk_size, group_idx)
-            for group_idx in range(
-                cache_context.kv_layer_groups_manager.num_kernel_groups
-            )
-        ]
+        effective_bpc = effective_blocks_per_chunk(cache_context)
 
         with (
             torch_dev.device(cache_context.device),
@@ -1228,43 +1242,36 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         ):
             event = event_backend.create_event(cache_context.device)
 
-            # Fail closed: every LMCache group must have block IDs covering all
-            # chunks. A short list (e.g. a caller/protocol bug) would otherwise
-            # drive the transfer kernel to read out-of-bounds GPU memory, so skip
-            # the whole store and commit nothing rather than caching a partial or
-            # garbage entry. A later request can store it once the block IDs are
-            # complete. Checked on the raw block ids, before cutting drops the
-            # per-chunk blocks that sliding-window groups do not need.
+            # Accept either full per-chunk lists or pre-windowed exact-state
+            # lists, but require complete coverage of every chunk.
             if any(
                 len(group_block_ids) < num_chunks * bpc
                 for group_block_ids, bpc in zip(
-                    gpu_block_ids, blocks_per_chunk, strict=True
+                    gpu_block_ids, effective_bpc, strict=True
                 )
             ):
                 logger.warning(
                     "STORE block ID underflow for request_id=%s: each group needs "
-                    "num_chunks * blocks_per_chunk block IDs for %d chunks "
-                    "(per-group blocks_per_chunk=%s); skipping the store.",
+                    "num_chunks * effective_blocks_per_chunk block IDs for %d "
+                    "chunks (per-group effective_blocks_per_chunk=%s); skipping "
+                    "the store.",
                     key.request_id,
                     num_chunks,
-                    blocks_per_chunk,
+                    effective_bpc,
                 )
                 event_backend.record_event(event, cache_context.stream)
                 return event_backend.export_event(event, cache_context.device), False
 
-            # Chunks whose block ids are all the null block (e.g. align-mode
-            # Mamba chunks holding no real state) carry no valid KV and must not
-            # be committed. Computed on the raw block ids before downsampling
-            # mutates them.
+            # Normalize raw full-chunk IDs and already-windowed exact-state IDs
+            # to the same representation before null-mask evaluation.
+            block_ids_per_group_gpu = downsample_and_stage_block_ids(
+                cache_context, gpu_block_ids, num_chunks
+            )
             skipped_chunks = all_null_chunk_masks(
                 gpu_block_ids,
                 cache_context.kv_layer_groups_manager.object_groups,
-                blocks_per_chunk,
+                effective_bpc,
                 num_chunks,
-            )
-
-            block_ids_per_group_gpu = downsample_and_stage_block_ids(
-                cache_context, gpu_block_ids
             )
 
             producer_event = event_backend.import_event(
@@ -1466,12 +1473,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             ),
         )
 
-        blocks_per_chunk = [
-            cache_context.calculate_num_blocks(self._ctx.chunk_size, group_idx)
-            for group_idx in range(
-                cache_context.kv_layer_groups_manager.num_kernel_groups
-            )
-        ]
+        effective_bpc = effective_blocks_per_chunk(cache_context)
 
         with (
             torch_dev.device(cache_context.device),
@@ -1479,31 +1481,29 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         ):
             event = event_backend.create_event(cache_context.device)
 
-            # Fail closed: a short block-id list would drive the transfer
-            # kernel to write out-of-bounds GPU memory. Checked on the raw
-            # block ids, before cutting drops the per-chunk blocks that
-            # sliding-window groups do not need.
+            # Loads normally receive raw destination block tables. Also accept
+            # pre-windowed tables so validation matches transfer semantics.
             if any(
                 len(group_block_ids) < num_chunks * bpc
                 for group_block_ids, bpc in zip(
-                    gpu_block_ids, blocks_per_chunk, strict=True
+                    gpu_block_ids, effective_bpc, strict=True
                 )
             ):
                 logger.error(
                     "RETRIEVE block ID underflow for request_id=%s: each group "
-                    "needs num_chunks * blocks_per_chunk block IDs for %d "
-                    "chunks (per-group blocks_per_chunk=%s); skipping the "
-                    "retrieve.",
+                    "needs num_chunks * effective_blocks_per_chunk block IDs for "
+                    "%d chunks (per-group effective_blocks_per_chunk=%s); "
+                    "skipping the retrieve.",
                     key.request_id,
                     num_chunks,
-                    blocks_per_chunk,
+                    effective_bpc,
                 )
                 event_backend.record_event(event, cache_context.stream)
                 return event_backend.export_event(event, cache_context.device), False
 
             # Cut and stage all block_ids to GPU once before the transfer
             block_ids_per_group_gpu = downsample_and_stage_block_ids(
-                cache_context, gpu_block_ids
+                cache_context, gpu_block_ids, num_chunks
             )
             producer_event = event_backend.import_event(
                 event_ipc_handle, cache_context.device
