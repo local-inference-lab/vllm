@@ -702,7 +702,7 @@ def test_fused_q_triton_supports_large_token_count():
 def test_fused_eh_norm(num_tokens: int):
     torch.manual_seed(4)
     dev = "cuda"
-    # Mix in a position-0 token to exercise the embeds-zeroing branch.
+    # Position zero is a live MTP token and must retain its embedding.
     pos = torch.arange(num_tokens, device=dev, dtype=torch.int64)
     pos[0] = 0
     embeds = torch.randn(num_tokens, HIDDEN, device=dev, dtype=torch.bfloat16)
@@ -712,7 +712,6 @@ def test_fused_eh_norm(num_tokens: int):
 
     out = K.fused_eh_norm(pos, embeds, prev, ew, hw, EPS)
 
-    masked = torch.where(pos.unsqueeze(-1) == 0, torch.zeros_like(embeds), embeds)
-    ref = torch.cat([rms_norm(masked, ew), rms_norm(prev, hw)], dim=-1)
+    ref = torch.cat([rms_norm(embeds, ew), rms_norm(prev, hw)], dim=-1)
     assert out.shape == (num_tokens, 2 * HIDDEN)
     assert_bf16(out, ref, "eh_norm")

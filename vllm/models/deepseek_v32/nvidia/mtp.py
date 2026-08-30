@@ -97,13 +97,10 @@ class DeepseekV32MultiTokenPredictorLayer(nn.Module):
         embed_table: torch.Tensor | None = None,
         spec_step_index: int = 0,
     ) -> torch.Tensor:
-        # Fused zero pos-0 + enorm(embeds) + hnorm(prev) + cat -> [N, 2H]. With a
-        # replicated table the caller passes ``embed_table`` so the embedding
-        # lookup is folded in too (fused_embed_eh_norm); otherwise the embeds are
-        # precomputed and go through the model-local fused_eh_norm.
+        # Fold the embedding lookup into the norm when the full table is
+        # available on-rank; otherwise use the precomputed embeddings.
         if embed_table is not None:
             eh_input = fused_embed_eh_norm(
-                positions,
                 input_ids,
                 embed_table,
                 previous_hidden_states,

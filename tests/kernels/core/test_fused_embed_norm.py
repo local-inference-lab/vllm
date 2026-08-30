@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for the replicated-embedding fused gather/norm kernels
-(``vllm.model_executor.layers.fused_embed_norm``).
+"""Unit tests for replicated-embedding fused gather/norm kernels.
 
-The guarantee: enabling ``VLLM_REPLICATE_EMBED`` (replicated table + fused
-kernels) must not change model outputs. The gathered residual is bit-exact and
-the fused norms match the unfused reference.
+Enabling ``VLLM_REPLICATE_EMBED`` must preserve every gathered embedding and
+match the unfused RMSNorm reference.
 """
 
 import pytest
@@ -15,8 +13,6 @@ from vllm.model_executor.layers.fused_embed_norm import (
     fused_embed_eh_norm,
     fused_embed_norm,
 )
-
-# The model-local (untouched) eh-norm the replicate path must match.
 from vllm.models.deepseek_v32.common.kernels import fused_eh_norm
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -59,17 +55,27 @@ def test_fused_embed_norm_matches_reference():
 @requires_cuda
 @torch.inference_mode()
 def test_fused_embed_eh_norm_matches_reference():
-    """MTP fusion (folded gather) is bit-exact vs gathering the embeds and
-    feeding the untouched model-local ``fused_eh_norm``."""
+    """The fused MTP gather/norm must preserve every embedding row."""
     set_random_seed(13)
     table = torch.randn(VOCAB, HIDDEN, dtype=DTYPE, device="cuda")
     ids = torch.randint(0, VOCAB, (NUM_TOKENS,), dtype=torch.int32, device="cuda")
     prev = torch.randn(NUM_TOKENS, HIDDEN, dtype=DTYPE, device="cuda")
+    positions = torch.arange(NUM_TOKENS, dtype=torch.int64, device="cuda")
     enorm_w = torch.randn(HIDDEN, dtype=DTYPE, device="cuda")
     hnorm_w = torch.randn(HIDDEN, dtype=DTYPE, device="cuda")
-    positions = torch.arange(NUM_TOKENS, device="cuda")  # includes pos 0
 
-    fused = fused_embed_eh_norm(positions, ids, table, prev, enorm_w, hnorm_w, EPS)
-    ref = fused_eh_norm(positions, table[ids.long()], prev, enorm_w, hnorm_w, EPS)
+    fused = fused_embed_eh_norm(ids, table, prev, enorm_w, hnorm_w, EPS)
+    local = fused_eh_norm(positions, table[ids.long()], prev, enorm_w, hnorm_w, EPS)
+    ref = torch.cat(
+        (
+            _rmsnorm(table[ids.long()], enorm_w, EPS).to(DTYPE),
+            _rmsnorm(prev, hnorm_w, EPS).to(DTYPE),
+        ),
+        dim=-1,
+    )
 
-    torch.testing.assert_close(fused, ref, atol=0.0, rtol=0.0)
+    # Both Triton paths implement the same operation and must remain bit-exact.
+    torch.testing.assert_close(fused, local, atol=0.0, rtol=0.0)
+    # PyTorch may reduce RMSNorm inputs in a different order. Compare against
+    # the independent reference at the precision promised by the BF16 output.
+    torch.testing.assert_close(fused.float(), ref.float(), atol=1e-3, rtol=1e-2)

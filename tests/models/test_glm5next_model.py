@@ -36,6 +36,7 @@ from vllm.models.glm5next.nvidia.model import (
 from vllm.models.glm5next.nvidia.mtp import (
     Glm5NextMTP,
     Glm5NextMultiTokenPredictor,
+    Glm5NextMultiTokenPredictorLayer,
 )
 from vllm.transformers_utils.configs.glm5_next import (
     Glm5NextConfig,
@@ -185,6 +186,55 @@ def test_glm5next_mtp_selects_only_draft_checkpoint_weights() -> None:
         "model.layers.45.",
         "layers.45.",
     )
+
+
+def test_glm5next_mtp_preserves_position_zero_embedding() -> None:
+    class CaptureProjection(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inputs: torch.Tensor | None = None
+
+        def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+            self.inputs = inputs
+            return inputs
+
+    class IdentityBlock(torch.nn.Module):
+        def forward(
+            self,
+            *,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            residual: torch.Tensor | None,
+            output_indices: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor, None, None]:
+            return hidden_states, torch.zeros_like(hidden_states), None, None
+
+    class IdentityHead(torch.nn.Module):
+        def norm(
+            self, hidden_states: torch.Tensor, residual: torch.Tensor
+        ) -> tuple[torch.Tensor, None]:
+            return hidden_states, None
+
+    layer = Glm5NextMultiTokenPredictorLayer.__new__(Glm5NextMultiTokenPredictorLayer)
+    torch.nn.Module.__init__(layer)
+    projection = CaptureProjection()
+    layer.enorm = torch.nn.Identity()
+    layer.hnorm = torch.nn.Identity()
+    layer.eh_proj = projection
+    layer.mtp_block = IdentityBlock()
+    layer.shared_head = IdentityHead()
+
+    inputs_embeds = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    previous_hidden_states = torch.zeros_like(inputs_embeds)
+    layer(
+        input_ids=torch.tensor([1, 2]),
+        positions=torch.tensor([0, 1]),
+        previous_hidden_states=previous_hidden_states,
+        inputs_embeds=inputs_embeds,
+    )
+
+    assert projection.inputs is not None
+    torch.testing.assert_close(projection.inputs[:, :2], inputs_embeds)
 
 
 def test_glm5next_mixed_precision_reaches_mla_projections(monkeypatch) -> None:
