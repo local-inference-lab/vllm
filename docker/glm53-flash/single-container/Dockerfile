@@ -8,6 +8,7 @@ COPY lmcache-d16-overlay/cumem_shareable_interposer.c /tmp/
 COPY single-container/vllm-startup-overlay/ /opt/glm53-vllm-startup-overlay/
 COPY single-container/serve_glm53_with_lmcache.py /usr/local/bin/
 COPY single-container/healthcheck_glm53_vllm.py /usr/local/bin/
+COPY single-container/glm53-logging.json /etc/vllm/glm53-logging.json
 
 RUN set -eux; \
     python_dir="$(/opt/venv/bin/python -c \

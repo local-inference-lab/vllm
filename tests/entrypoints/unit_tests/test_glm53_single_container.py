@@ -3,7 +3,9 @@
 
 import ast
 import importlib.util
+import json
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -15,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[3]
 SUPERVISOR = ROOT / "docker/glm53-flash/single-container/serve_glm53_with_lmcache.py"
 RECIPE = ROOT / "docker/glm53-flash/single-container/README.md"
 DOCKERFILE = ROOT / "docker/glm53-flash/single-container/Dockerfile"
+LOGGING_CONFIG = ROOT / "docker/glm53-flash/single-container/glm53-logging.json"
 VLLM_OVERLAY = ROOT / "docker/glm53-flash/single-container/vllm-startup-overlay/vllm"
 GPU_WORKER = VLLM_OVERLAY / "v1/worker/gpu_worker.py"
 GPU_WARMUP = VLLM_OVERLAY / "v1/worker/gpu/warmup.py"
@@ -125,11 +128,13 @@ def test_single_container_defaults_match_qualified_geometry(tmp_path) -> None:
     assert stat.S_IMODE(broker.stat().st_mode) == 0o700
     child_env = supervisor.child_environment(config, {})
     assert child_env["LMCACHE_CUMEM_BROKER_DIR"] == str(broker)
-    assert child_env["VLLM_LOGGING_LEVEL"] == "WARNING"
+    assert child_env["VLLM_LOGGING_CONFIG_PATH"] == supervisor.VLLM_LOGGING_CONFIG
+    assert "VLLM_LOGGING_LEVEL" not in child_env
     assert child_env["LMCACHE_LOG_LEVEL"] == "WARNING"
 
 
-def test_single_container_preserves_child_log_level_overrides(tmp_path) -> None:
+@pytest.mark.parametrize("level", ["INFO", "DEBUG"])
+def test_vllm_log_level_override_prevents_default_config(tmp_path, level) -> None:
     supervisor = _load_supervisor()
     config = supervisor.load_config(
         {"GLM53_LMCACHE_CUMEM_BROKER_DIR": str(tmp_path / "broker")}
@@ -138,13 +143,78 @@ def test_single_container_preserves_child_log_level_overrides(tmp_path) -> None:
     child_env = supervisor.child_environment(
         config,
         {
-            "VLLM_LOGGING_LEVEL": "DEBUG",
+            "VLLM_LOGGING_LEVEL": level,
             "LMCACHE_LOG_LEVEL": "INFO",
         },
     )
 
-    assert child_env["VLLM_LOGGING_LEVEL"] == "DEBUG"
+    assert child_env["VLLM_LOGGING_LEVEL"] == level
+    assert "VLLM_LOGGING_CONFIG_PATH" not in child_env
     assert child_env["LMCACHE_LOG_LEVEL"] == "INFO"
+
+
+def test_vllm_logging_config_override_is_preserved(tmp_path) -> None:
+    supervisor = _load_supervisor()
+    config = supervisor.load_config(
+        {"GLM53_LMCACHE_CUMEM_BROKER_DIR": str(tmp_path / "broker")}
+    )
+    custom_config = "/operator/logging.json"
+
+    child_env = supervisor.child_environment(
+        config, {"VLLM_LOGGING_CONFIG_PATH": custom_config}
+    )
+
+    assert child_env["VLLM_LOGGING_CONFIG_PATH"] == custom_config
+    assert "VLLM_LOGGING_LEVEL" not in child_env
+    assert child_env["LMCACHE_LOG_LEVEL"] == "WARNING"
+
+
+def test_packaged_logging_config_selects_only_periodic_metrics() -> None:
+    config = json.loads(LOGGING_CONFIG.read_text())
+    loggers = config["loggers"]
+    info_loggers = {
+        name for name, settings in loggers.items() if settings["level"] == "INFO"
+    }
+
+    assert config["handlers"]["vllm"]["level"] == "INFO"
+    assert loggers["vllm"] == {
+        "handlers": ["vllm"],
+        "level": "WARNING",
+        "propagate": False,
+    }
+    assert info_loggers == {
+        "vllm.v1.metrics.loggers",
+        "vllm.v1.spec_decode.metrics",
+    }
+    for name in info_loggers:
+        assert "handlers" not in loggers[name]
+        assert loggers[name]["propagate"] is True
+
+
+def test_packaged_logging_config_emits_selected_info_once() -> None:
+    script = """
+import json
+import logging
+import logging.config
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as config_file:
+    logging.config.dictConfig(json.load(config_file))
+logging.getLogger("vllm.other").info("hidden-info")
+logging.getLogger("vllm.other").warning("general-warning")
+logging.getLogger("vllm.v1.metrics.loggers").info("request-metrics")
+logging.getLogger("vllm.v1.spec_decode.metrics").info("spec-metrics")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(LOGGING_CONFIG)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "hidden-info" not in result.stderr
+    for message in ("general-warning", "request-metrics", "spec-metrics"):
+        assert result.stderr.count(message) == 1
 
 
 def test_single_container_rejects_unknown_runtime_variable() -> None:
@@ -318,6 +388,10 @@ def test_single_container_recipe_preserves_qualified_d16_contract() -> None:
 def test_docker_installs_startup_fences_into_vllm_package() -> None:
     dockerfile = DOCKERFILE.read_text()
 
+    assert (
+        "COPY single-container/glm53-logging.json "
+        "/etc/vllm/glm53-logging.json" in dockerfile
+    )
     assert (
         "COPY single-container/vllm-startup-overlay/ "
         "/opt/glm53-vllm-startup-overlay/" in dockerfile

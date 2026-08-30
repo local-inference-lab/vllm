@@ -94,10 +94,7 @@ DEFAULTS = {
     "GLM53_VLLM_HEALTH_POLL_SECONDS": "2",
 }
 HEALTHCHECK_ONLY_ENV = frozenset({"GLM53_VLLM_HEALTH_TIMEOUT_SECONDS"})
-CHILD_LOG_LEVEL_DEFAULTS = {
-    "VLLM_LOGGING_LEVEL": "WARNING",
-    "LMCACHE_LOG_LEVEL": "WARNING",
-}
+VLLM_LOGGING_CONFIG = "/etc/vllm/glm53-logging.json"
 METRICS_PATH = "/metrics"
 METRICS_TIMEOUT_SECONDS = 5.0
 METRICS_BODY_LIMIT_BYTES = 1 << 20
@@ -378,8 +375,12 @@ def child_environment(config: Config, environ: Mapping[str, str]) -> dict[str, s
     child_env = dict(environ)
     child_env["LMCACHE_CUMEM_BROKER_DIR"] = str(config.broker_dir)
     child_env["LMCACHE_MP_TRANSFER_MODE"] = config.transfer_mode
-    for name, level in CHILD_LOG_LEVEL_DEFAULTS.items():
-        child_env.setdefault(name, level)
+    child_env.setdefault("LMCACHE_LOG_LEVEL", "WARNING")
+    if (
+        "VLLM_LOGGING_CONFIG_PATH" not in environ
+        and "VLLM_LOGGING_LEVEL" not in environ
+    ):
+        child_env["VLLM_LOGGING_CONFIG_PATH"] = VLLM_LOGGING_CONFIG
     return child_env
 
 

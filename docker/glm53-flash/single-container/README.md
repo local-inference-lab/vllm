@@ -72,9 +72,12 @@ such as Bifrost can report `usage.prompt_tokens_details.cached_tokens`. This
 changes cache accounting in API responses only; it does not change caching
 behavior.
 
-Both children default to `WARNING` through `VLLM_LOGGING_LEVEL` and
-`LMCACHE_LOG_LEVEL`. Explicit operator values such as `INFO` or `DEBUG` are
-preserved.
+LMCache defaults to `WARNING` through `LMCACHE_LOG_LEVEL`. vLLM defaults to a
+packaged logging config that keeps the general `vllm` namespace at `WARNING`
+while restoring the periodic request metrics and speculative-decoding metrics
+at `INFO`. An explicit `VLLM_LOGGING_CONFIG_PATH` or `VLLM_LOGGING_LEVEL`
+preserves the operator's vLLM logging choice without injecting the packaged
+config. Explicit `LMCACHE_LOG_LEVEL` values are also preserved.
 
 Immediately after vLLM readiness, the supervisor makes one bounded
 `GET /metrics` request to the readiness host and port. It reports the
