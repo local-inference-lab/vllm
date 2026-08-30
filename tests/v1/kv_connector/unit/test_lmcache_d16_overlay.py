@@ -6,10 +6,9 @@ import importlib.util
 import logging
 import sys
 import threading
-from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
@@ -32,6 +31,22 @@ ADAPTER = (
     ROOT / "docker/glm53-flash/lmcache-d16-overlay/overlay/"
     "lmcache/integration/vllm/vllm_multi_process_adapter.py"
 )
+CONNECTOR = (
+    ROOT / "docker/glm53-flash/lmcache-d16-overlay/overlay/"
+    "lmcache/integration/vllm/lmcache_mp_connector.py"
+)
+METADATA = (
+    ROOT / "docker/glm53-flash/lmcache-d16-overlay/overlay/"
+    "lmcache/integration/vllm/lmcache_mp_metadata.py"
+)
+CORE_KV_CACHE_MANAGER = (
+    ROOT / "docker/glm53-flash/lmcache-d16-overlay/overlay/"
+    "vllm/v1/core/kv_cache_manager.py"
+)
+CORE_SINGLE_TYPE_MANAGER = (
+    ROOT / "docker/glm53-flash/lmcache-d16-overlay/overlay/"
+    "vllm/v1/core/single_type_kv_cache_manager.py"
+)
 
 
 class AttentionSpec:
@@ -50,6 +65,26 @@ def _load_layout():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_exact_mamba_store_helper():
+    tree = ast.parse(METADATA.read_text())
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "apply_exact_mamba_store_blocks"
+    )
+    namespace = {"LMCacheMPRequestTracker": object}
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[helper], type_ignores=[])),
+            str(METADATA),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace["apply_exact_mamba_store_blocks"]
 
 
 def _module(name: str, **attributes: object) -> ModuleType:
@@ -247,3 +282,158 @@ def test_scheduler_starts_each_heartbeat_once() -> None:
     adapter._ensure_heartbeat_started()
 
     assert started == ["client-a", "client-b"]
+
+
+def test_connector_prefix_is_bounded_by_lagging_mamba_state() -> None:
+    tree = ast.parse(CORE_KV_CACHE_MANAGER.read_text())
+    manager = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "KVCacheManager"
+    )
+    method = next(
+        node
+        for node in manager.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "get_computed_blocks_for_connector"
+    )
+    probe = ast.ClassDef("ManagerProbe", [], [], [method], [])
+
+    class HybridKVCacheCoordinator:
+        pass
+
+    namespace = {
+        "Request": object,
+        "KVCacheBlocks": object,
+        "HybridKVCacheCoordinator": HybridKVCacheCoordinator,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[probe], type_ignores=[])),
+            str(CORE_KV_CACHE_MANAGER),
+            "exec",
+        ),
+        namespace,
+    )
+    manager_probe = namespace["ManagerProbe"]()
+    coordinator = HybridKVCacheCoordinator()
+    coordinator.full_attention_group_id = 0
+    coordinator.find_longest_cache_hit_per_group = lambda *_: (
+        ("fa", "mamba"),
+        [8, 4],
+    )
+    manager_probe.coordinator = coordinator
+    manager_probe.kv_cache_config = SimpleNamespace(has_mamba_layers=True)
+    manager_probe.prefix_cache_lookup_enabled = lambda _request: True
+    manager_probe.create_kv_cache_blocks = lambda computed: ("unsafe", computed)
+    manager_probe.get_computed_blocks = lambda _request: ("reconciled", 4, 0)
+    request = SimpleNamespace(block_hashes=["h"], num_tokens=9)
+
+    assert manager_probe.get_computed_blocks_for_connector(request) == (
+        "reconciled",
+        4,
+        0,
+        True,
+    )
+
+
+def test_mamba_cache_blocks_emits_every_exact_committed_boundary() -> None:
+    tree = ast.parse(CORE_SINGLE_TYPE_MANAGER.read_text())
+    manager = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MambaManager"
+    )
+    cache_blocks = next(
+        node
+        for node in manager.body
+        if isinstance(node, ast.FunctionDef) and node.name == "cache_blocks"
+    )
+    source = ast.unparse(cache_blocks)
+
+    assert "_pending_partial_tail_offloads.append" in source
+    assert "(idx + 1) * self.block_size" in source
+    assert "block.is_null or block.block_hash is None" in source
+
+
+def test_tracker_initializes_exact_mamba_boundary_map() -> None:
+    tree = ast.parse(METADATA.read_text())
+    tracker = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "LMCacheMPRequestTracker"
+    )
+    constructor = next(
+        node
+        for node in tracker.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+
+    assert "self.exact_mamba_boundary_blocks = {}" in ast.unparse(constructor)
+
+
+def test_exact_mamba_boundaries_replace_only_mamba_source_ids() -> None:
+    apply = _load_exact_mamba_store_helper()
+    tracker = SimpleNamespace(
+        exact_mamba_boundary_blocks={0: {9216: 104, 18432: 108}}
+    )
+    block_ids = [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10]]
+
+    apply(
+        tracker,
+        block_ids,
+        group_tokens_per_block=[2304, 9216],
+        mamba_group_ids={0},
+        lmcache_tokens_per_chunk=9216,
+        start_token_idx=0,
+        end_token_idx=18432,
+    )
+    assert block_ids == [[104, 108], [9, 10]]
+
+
+def test_unavailable_mamba_boundaries_use_sparse_null_placeholders() -> None:
+    apply = _load_exact_mamba_store_helper()
+    tracker = SimpleNamespace(
+        exact_mamba_boundary_blocks={0: {18432: 108}},
+    )
+    block_ids = [[1] * 8, [9, 10]]
+
+    apply(
+        tracker,
+        block_ids,
+        group_tokens_per_block=[2304, 9216],
+        mamba_group_ids={0},
+        lmcache_tokens_per_chunk=9216,
+        start_token_idx=0,
+        end_token_idx=18432,
+    )
+    assert block_ids == [[0, 108], [9, 10]]
+
+
+def test_connector_ingests_core_mamba_handoffs_before_stores() -> None:
+    tree = ast.parse(CONNECTOR.read_text())
+    connector = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "LMCacheMPConnector"
+    )
+    build_meta = next(
+        node
+        for node in connector.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "build_connector_meta"
+    )
+    process_new = next(
+        node
+        for node in connector.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_process_new_requests"
+    )
+    build_source = ast.unparse(build_meta)
+    process_source = ast.unparse(process_new)
+
+    assert build_source.index("_ingest_exact_mamba_boundary_blocks") < (
+        build_source.index("_process_new_requests")
+    )
+    assert "self._mamba_group_ids" in process_source
