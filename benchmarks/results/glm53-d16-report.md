@@ -8,6 +8,10 @@ The committed artifact removes the machine hostname from two startup fields
 and has SHA-256
 `946b22d4cb9f44051ab21af82e7c979f378d6506ad192a3bb7cce82921e94c07`.
 
+> **Corrected readiness status:** D16 remains performance evidence only.
+> Delayed lockhandle corruption invalidated its production-readiness claim.
+> The measured benchmark results below are unchanged.
+
 ## Sustained aggregate decode tok/s
 
 | Context | C1 | C2 | C4 | Requested C8 |
@@ -59,10 +63,45 @@ The integrated scout uses client `prompt_tokens / TTFT`. Prometheus
 - zero request errors
 - 1,544,414-token KV pool, 1.47× exact-1M concurrency
 
-D16 correctness validation retrieved a unique buried record at 199,974
-tokens while storing 4.919 GB, immediately replayed the same prefix correctly,
-passed a four-turn chat, and passed one-container stop/start. The run had no
-OOM, CUDA error, `EngineDead`, or process restart.
+D16's immediate correctness validation retrieved a unique buried record at
+199,974 tokens while storing 4.919 GB, immediately replayed the same prefix
+correctly, passed a four-turn chat, and passed one-container stop/start. The run
+had no OOM, CUDA error, `EngineDead`, or process restart. Those immediate checks
+did not expose delayed lockhandle corruption and therefore do not establish
+production readiness.
+
+## Corrected D22 correctness qualification
+
+The root mechanism invalidating D16 readiness was positional/stale Mamba
+recurrent state stored under valid prefix keys. External H2D reload then
+silently corrupted live state while HTTP health stayed green.
+
+D22 corrects this with:
+
+- vLLM exact committed Mamba boundary handoffs
+- connector boundary reconciliation
+- sparse null placeholders for unavailable historical Mamba checkpoints
+- separated LMCache object groups
+- effective window-count validation and transfer
+
+Runtime code ownership is split across
+[#525](https://github.com/local-inference-lab/vllm/pull/525) for exact
+geometry and boundaries,
+[#526](https://github.com/local-inference-lab/vllm/pull/526) for transfer
+normalization, and
+[#527](https://github.com/local-inference-lab/vllm/pull/527) for lifecycle and
+object separation.
+
+D22 production qualification on 4× RTX PRO 6000 used a unique 131,041-token C1
+store. L1 held 60 objects totaling 993,329,152 bytes. C2 external reload
+processed 258,048 tokens total (2×129,024); both responses were coherent, and
+an unrelated post-reload raw probe was also coherent. The production container
+remained healthy with restart count 0 and OOM false. There was no lockhandle,
+CUDA error, `EngineDead`, or new Xid.
+
+The direct Bifrost smoke route `vllm/glm-5.3-flash` returned exactly `OK` for
+the exact-OK prompt, with 578 ms displayed latency and 20 input / 53 output
+tokens.
 
 ## Interpretation
 

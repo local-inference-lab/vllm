@@ -7,8 +7,23 @@ source or recipe and focused regression test in this change. “Excluded”
 identifies fleet-only qualification, image-build, or diagnostic behavior that
 does not belong in the production vLLM/LMCache integration.
 
+## D22 readiness correction
+
+D16 remains performance evidence only. Its production-readiness claim was
+invalidated by delayed lockhandle corruption: positional/stale Mamba recurrent
+state was stored under valid prefix keys, then external H2D reload silently
+corrupted live state while HTTP health stayed green. The historical
+dispositions below remain unchanged.
+
+| D22 area | Corrected disposition and evidence |
+| --- | --- |
+| Mamba boundary state | Proven — vLLM exact committed Mamba boundary handoffs, connector boundary reconciliation, and sparse null placeholders for unavailable historical Mamba checkpoints. Runtime ownership: [#525](https://github.com/local-inference-lab/vllm/pull/525) exact geometry/boundaries. |
+| Transfer and storage | Proven — separated LMCache object groups plus effective window-count validation/transfer. Runtime ownership: [#526](https://github.com/local-inference-lab/vllm/pull/526) transfer normalization and [#527](https://github.com/local-inference-lab/vllm/pull/527) lifecycle/object separation. |
+| Production qualification | Proven on 4× RTX PRO 6000 — unique 131,041-token C1 store; L1 60 objects / 993,329,152 bytes; C2 external reload 258,048 tokens total (2×129,024); both responses coherent; unrelated post-reload raw probe coherent. Production container healthy, restart count 0, OOM false; no lockhandle, CUDA error, `EngineDead`, or new Xid. |
+| Direct Bifrost smoke | Proven — route `vllm/glm-5.3-flash` returned exactly `OK` for the exact-OK prompt, with 578 ms displayed latency and 20 input / 53 output tokens. |
+
 | # | Reference | Behavior | Disposition and evidence |
-|---:|---|---|---|
+| ---: | --- | --- | --- |
 | 1 | `30df0f8` | GLM qualification track | Excluded — fleet qualification orchestration; the portable recipe is `single-container/README.md`. |
 | 2 | `1e737d9` | SM120 sparse MLA | Already Jovian — B12X sparse MLA dispatch is in `vllm/v1/attention/backends/mla/b12x_mla_sparse.py`. |
 | 3 | `871c192` | BF16 sparse-MLA query | Already Jovian — GLM B12X attention preserves the model query path. |
@@ -97,7 +112,7 @@ All listed PRs target the same Jovian base, so this change avoids copying their
 independent optimizations:
 
 | PR | State at audit | Overlap disposition |
-|---:|---|---|
+| ---: | --- | --- |
 | #488 | Open | Broad B12X CKV/DCP/MTP work. This change touches the sparse metadata builder only to add the GLM FULL capability gate. |
 | #498 | Open | mHC token-batch dispatch; no shared files. |
 | #505 | Open | C4 prefill-pool kernel optimization. Shared selector files are changed here only for fixed-address, graph-safe metadata and all-row dispatch; no kernel changes are copied. |
