@@ -641,13 +641,16 @@ def test_finished_store_dedup_state_is_pruned_after_engine_converges() -> None:
     probe = namespace["AdapterProbe"]()
     probe.finished_stores = set()
     probe.previously_finished = set()
-    probe.store_futures = {}
+    probe.store_futures = {"request": object()}
     probe._returned_finished = set()
 
-    assert probe._process_finished_stores(set(), {"request"}) == {"request"}
     assert probe._process_finished_stores(set(), {"request"}) == set()
+    probe.store_futures = {}
+    assert probe._process_finished_stores({"request"}, set()) == {"request"}
     assert probe._returned_finished == {"request"}
     assert probe._process_finished_stores(set(), set()) == set()
+    assert probe._returned_finished == {"request"}
+    assert probe._process_finished_stores(set(), {"request"}) == set()
     assert probe._returned_finished == set()
 
 

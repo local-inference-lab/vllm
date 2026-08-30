@@ -1594,10 +1594,10 @@ class LMCacheMPWorkerAdapter:
     ) -> set[str]:
         """Merge LMCache-side and engine-side finished store info."""
         self.finished_stores.update(finished_req_ids_from_lmcache)
-        self._returned_finished.intersection_update(finished_req_ids_from_engine)
         ret_stores = set()
         for req_id in finished_req_ids_from_engine:
             if req_id in self._returned_finished:
+                self._returned_finished.discard(req_id)
                 continue
             if req_id in self.finished_stores or req_id in self.store_futures:
                 self.previously_finished.add(req_id)
