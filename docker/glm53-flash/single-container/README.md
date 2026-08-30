@@ -72,6 +72,18 @@ such as Bifrost can report `usage.prompt_tokens_details.cached_tokens`. This
 changes cache accounting in API responses only; it does not change caching
 behavior.
 
+Both children default to `WARNING` through `VLLM_LOGGING_LEVEL` and
+`LMCACHE_LOG_LEVEL`. Explicit operator values such as `INFO` or `DEBUG` are
+preserved.
+
+Immediately after vLLM readiness, the supervisor makes one bounded
+`GET /metrics` request to the readiness host and port. It reports the
+`vllm:cache_config_info` KV capacity as tokens, max-context concurrency, block
+size, and KV dtype. Concurrency falls back to capacity divided by an explicit
+`--max-model-len` when the metric omits it. Other labels are not logged.
+Unavailable, non-200, malformed, or oversized metrics produce one warning and
+do not interrupt serving.
+
 The image also installs startup-only vLLM fences around scheduler-realistic
 warmup stages and before FULL graph capture. They keep TP4/DCP4/MTP3 ranks
 aligned during capture without making steady-state serving synchronous.

@@ -15,12 +15,23 @@ ROOT = Path(__file__).resolve().parents[3]
 SUPERVISOR = ROOT / "docker/glm53-flash/single-container/serve_glm53_with_lmcache.py"
 RECIPE = ROOT / "docker/glm53-flash/single-container/README.md"
 DOCKERFILE = ROOT / "docker/glm53-flash/single-container/Dockerfile"
-VLLM_OVERLAY = (
-    ROOT / "docker/glm53-flash/single-container/vllm-startup-overlay/vllm"
-)
+VLLM_OVERLAY = ROOT / "docker/glm53-flash/single-container/vllm-startup-overlay/vllm"
 GPU_WORKER = VLLM_OVERLAY / "v1/worker/gpu_worker.py"
 GPU_WARMUP = VLLM_OVERLAY / "v1/worker/gpu/warmup.py"
 CUDA_REQUIREMENTS = ROOT / "requirements/cuda.txt"
+METRICS_SAMPLE = (
+    "# HELP vllm:cache_config_info Information of the LLMEngine CacheConfig\n"
+    "# TYPE vllm:cache_config_info gauge\n"
+    'vllm:cache_config_info{block_size="2304",cache_dtype="fp8_e4m3",'
+    'enable_prefix_caching="True",gpu_memory_utilization="0.9",'
+    'kv_cache_max_concurrency="1.4728683471679688",'
+    'kv_cache_size_tokens="1544414",num_gpu_blocks="670",'
+    'swap_space_bytes="4294967296"} 1.0\n'
+)
+KV_POOL_SUMMARY = (
+    "KV pool: 1,544,414 tokens | max-context concurrency: 1.47x "
+    "| block: 2304 | dtype: fp8_e4m3"
+)
 
 
 def _load_supervisor():
@@ -41,9 +52,7 @@ def _function(tree: ast.AST, name: str) -> ast.FunctionDef:
 
 
 def _call_name(statement: ast.stmt) -> str | None:
-    if not isinstance(statement, ast.Expr) or not isinstance(
-        statement.value, ast.Call
-    ):
+    if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
         return None
     return ast.unparse(statement.value.func)
 
@@ -114,9 +123,28 @@ def test_single_container_defaults_match_qualified_geometry(tmp_path) -> None:
     ]
     supervisor.ensure_broker_directory(broker)
     assert stat.S_IMODE(broker.stat().st_mode) == 0o700
-    assert supervisor.child_environment(config, {})["LMCACHE_CUMEM_BROKER_DIR"] == str(
-        broker
+    child_env = supervisor.child_environment(config, {})
+    assert child_env["LMCACHE_CUMEM_BROKER_DIR"] == str(broker)
+    assert child_env["VLLM_LOGGING_LEVEL"] == "WARNING"
+    assert child_env["LMCACHE_LOG_LEVEL"] == "WARNING"
+
+
+def test_single_container_preserves_child_log_level_overrides(tmp_path) -> None:
+    supervisor = _load_supervisor()
+    config = supervisor.load_config(
+        {"GLM53_LMCACHE_CUMEM_BROKER_DIR": str(tmp_path / "broker")}
     )
+
+    child_env = supervisor.child_environment(
+        config,
+        {
+            "VLLM_LOGGING_LEVEL": "DEBUG",
+            "LMCACHE_LOG_LEVEL": "INFO",
+        },
+    )
+
+    assert child_env["VLLM_LOGGING_LEVEL"] == "DEBUG"
+    assert child_env["LMCACHE_LOG_LEVEL"] == "INFO"
 
 
 def test_single_container_rejects_unknown_runtime_variable() -> None:
@@ -148,6 +176,121 @@ def test_single_container_keeps_one_prompt_tokens_details_flag() -> None:
     )
 
     assert args == ["serve", "model", flag, "--port", "8000"]
+
+
+def test_kv_pool_summary_reports_only_capacity_fields() -> None:
+    supervisor = _load_supervisor()
+
+    summary = supervisor.kv_pool_summary(METRICS_SAMPLE)
+
+    assert summary == KV_POOL_SUMMARY
+    for unrelated in (
+        "gpu_memory_utilization",
+        "num_gpu_blocks",
+        "swap_space_bytes",
+        "enable_prefix_caching",
+        "0.9",
+    ):
+        assert unrelated not in summary
+
+
+def test_kv_pool_summary_falls_back_to_max_model_len() -> None:
+    supervisor = _load_supervisor()
+    without_concurrency = METRICS_SAMPLE.replace(
+        'kv_cache_max_concurrency="1.4728683471679688",', ""
+    )
+
+    assert supervisor.kv_pool_summary(without_concurrency) is None
+    assert supervisor.kv_pool_summary(without_concurrency, 1048576) == KV_POOL_SUMMARY
+    assert (
+        supervisor._max_model_len(["serve", "model", "--max-model-len", "1048576"])
+        == 1048576
+    )
+    assert (
+        supervisor._max_model_len(["serve", "model", "--max-model-len=1048576"])
+        == 1048576
+    )
+    assert supervisor._max_model_len(["serve", "model"]) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "",
+        "# HELP vllm:cache_config_info Information of the LLMEngine CacheConfig\n",
+        'vllm:cache_config_info{block_size="2304"} 1.0\n',
+        'vllm:cache_config_info{kv_cache_size_tokens="many",block_size="2304",'
+        'cache_dtype="fp8_e4m3",kv_cache_max_concurrency="1.47"} 1.0\n',
+        'vllm:cache_config_info{kv_cache_size_tokens="1544414",block_size="0",'
+        'cache_dtype="fp8_e4m3",kv_cache_max_concurrency="1.47"} 1.0\n',
+        'vllm:cache_config_info{kv_cache_size_tokens="1544414",block_size="2304",'
+        'cache_dtype="",kv_cache_max_concurrency="1.47"} 1.0\n',
+        'vllm:cache_config_info{kv_cache_size_tokens="1544414",block_size="2304",'
+        'cache_dtype="fp8_e4m3",kv_cache_max_concurrency="nan"} 1.0\n',
+        'vllm:cache_config_info{kv_cache_size_tokens="1544414",block_size="2304",'
+        'cache_dtype="fp8_e4m3",kv_cache_max_concurrency="1.47"\n',
+        "<html><body>404 not found</body></html>\n",
+    ],
+)
+def test_kv_pool_summary_rejects_malformed_metrics(payload) -> None:
+    supervisor = _load_supervisor()
+
+    assert supervisor.kv_pool_summary(payload) is None
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (503, b"unavailable"),
+        (200, b"x" * ((1 << 20) + 1)),
+        (200, b"\xff"),
+    ],
+)
+def test_metrics_response_failures_return_none(
+    tmp_path, monkeypatch, status, body
+) -> None:
+    supervisor = _load_supervisor()
+    config = supervisor.load_config(
+        {"GLM53_LMCACHE_CUMEM_BROKER_DIR": str(tmp_path / "broker")}
+    )
+
+    class Response:
+        def read(self, amount: int) -> bytes:
+            assert amount == supervisor.METRICS_BODY_LIMIT_BYTES + 1
+            return body[:amount]
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def request(self, method: str, path: str) -> None:
+            assert (method, path) == ("GET", "/metrics")
+
+        def getresponse(self) -> Response:
+            response = Response()
+            response.status = status
+            return response
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(supervisor.http.client, "HTTPConnection", Connection)
+
+    assert supervisor._fetch_metrics(config, 5.0) is None
+
+
+def test_unavailable_metrics_warn_once(monkeypatch, capsys, tmp_path) -> None:
+    supervisor = _load_supervisor()
+    config = supervisor.load_config(
+        {"GLM53_LMCACHE_CUMEM_BROKER_DIR": str(tmp_path / "broker")}
+    )
+    monkeypatch.setattr(supervisor, "_fetch_metrics", lambda *_args: None)
+
+    supervisor.report_kv_pool(config, ["serve", "model"])
+
+    stderr = capsys.readouterr().err
+    assert stderr.count("WARNING KV pool capacity unavailable from /metrics") == 1
+    assert "KV pool:" not in stderr
 
 
 def test_single_container_recipe_preserves_qualified_d16_contract() -> None:
@@ -217,9 +360,7 @@ def test_scheduler_warmup_stages_are_rank_fenced() -> None:
 
 
 def test_kernel_warmup_is_fenced_before_full_graph_capture() -> None:
-    method = _function(
-        ast.parse(GPU_WORKER.read_text()), "compile_or_warm_up_model"
-    )
+    method = _function(ast.parse(GPU_WORKER.read_text()), "compile_or_warm_up_model")
     calls = sorted(
         (node.lineno, node.col_offset, ast.unparse(node))
         for node in ast.walk(method)
@@ -309,3 +450,49 @@ def test_supervisor_launches_vllm_with_prompt_tokens_details(
         "8000",
         "--enable-prompt-tokens-details",
     ]
+
+
+def test_supervisor_fetches_metrics_once_after_readiness(tmp_path, monkeypatch) -> None:
+    supervisor = _load_supervisor()
+    lmcache = tmp_path / "lmcache"
+    vllm = tmp_path / "vllm"
+    lmcache.touch(mode=0o755)
+    vllm.touch(mode=0o755)
+    events: list[str] = []
+
+    class Process:
+        pid = 1
+
+        def __init__(self, argv: list[str], **_kwargs: object) -> None:
+            self.is_vllm = argv[0] == str(vllm)
+
+        def poll(self) -> int | None:
+            if self.is_vllm and "metrics" in events:
+                return 0
+            return None
+
+    def readiness(*_args) -> bool:
+        events.append("readiness")
+        return True
+
+    def fetch_metrics(*_args) -> str:
+        events.append("metrics")
+        return METRICS_SAMPLE
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", Process)
+    monkeypatch.setattr(supervisor, "_healthy", lambda *_args: True)
+    monkeypatch.setattr(supervisor, "_vllm_healthy", readiness)
+    monkeypatch.setattr(supervisor, "_fetch_metrics", fetch_metrics)
+    monkeypatch.setattr(supervisor, "_stop_processes", lambda *_args: None)
+
+    status = supervisor.supervise(
+        ["serve", "model", "--max-model-len=1048576"],
+        {
+            "GLM53_LMCACHE_EXECUTABLE": str(lmcache),
+            "GLM53_VLLM_EXECUTABLE": str(vllm),
+            "GLM53_LMCACHE_CUMEM_BROKER_DIR": str(tmp_path / "broker"),
+        },
+    )
+
+    assert status == 0
+    assert events == ["readiness", "metrics"]

@@ -94,6 +94,16 @@ DEFAULTS = {
     "GLM53_VLLM_HEALTH_POLL_SECONDS": "2",
 }
 HEALTHCHECK_ONLY_ENV = frozenset({"GLM53_VLLM_HEALTH_TIMEOUT_SECONDS"})
+CHILD_LOG_LEVEL_DEFAULTS = {
+    "VLLM_LOGGING_LEVEL": "WARNING",
+    "LMCACHE_LOG_LEVEL": "WARNING",
+}
+METRICS_PATH = "/metrics"
+METRICS_TIMEOUT_SECONDS = 5.0
+METRICS_BODY_LIMIT_BYTES = 1 << 20
+CACHE_CONFIG_METRIC = "vllm:cache_config_info"
+METRIC_LABEL = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)="((?:[^"\\]|\\.)*)"')
+CACHE_DTYPE = re.compile(r"[A-Za-z0-9_.+-]{1,32}")
 
 
 def _value(environ: Mapping[str, str], name: str) -> str:
@@ -364,9 +374,12 @@ def lmcache_argv(config: Config) -> list[str]:
 
 
 def child_environment(config: Config, environ: Mapping[str, str]) -> dict[str, str]:
+    """Build the environment shared by both sibling children."""
     child_env = dict(environ)
     child_env["LMCACHE_CUMEM_BROKER_DIR"] = str(config.broker_dir)
     child_env["LMCACHE_MP_TRANSFER_MODE"] = config.transfer_mode
+    for name, level in CHILD_LOG_LEVEL_DEFAULTS.items():
+        child_env.setdefault(name, level)
     return child_env
 
 
@@ -453,6 +466,110 @@ def _vllm_healthy(config: Config, timeout: float) -> bool:
         return False
     finally:
         connection.close()
+
+
+def _fetch_metrics(config: Config, timeout: float) -> str | None:
+    connection = http.client.HTTPConnection(
+        config.vllm_health_host,
+        config.vllm_health_port,
+        timeout=timeout,
+    )
+    try:
+        connection.request("GET", METRICS_PATH)
+        response = connection.getresponse()
+        body = response.read(METRICS_BODY_LIMIT_BYTES + 1)
+        if response.status != 200 or len(body) > METRICS_BODY_LIMIT_BYTES:
+            return None
+        return body.decode()
+    except (OSError, UnicodeError, http.client.HTTPException):
+        return None
+    finally:
+        connection.close()
+
+
+def _cache_config_labels(payload: str) -> dict[str, str]:
+    for line in payload.splitlines():
+        sample = line.strip()
+        if not sample.startswith(f"{CACHE_CONFIG_METRIC}{{"):
+            continue
+        end = sample.rfind("}")
+        if end < 0:
+            continue
+        body = sample[len(CACHE_CONFIG_METRIC) + 1 : end]
+        labels = {match[1]: match[2] for match in METRIC_LABEL.finditer(body)}
+        if labels:
+            return labels
+    return {}
+
+
+def _metric_integer(raw: str | None) -> int | None:
+    if raw is None or INTEGER.fullmatch(raw) is None:
+        return None
+    value = int(raw)
+    return value if value > 0 else None
+
+
+def _metric_number(raw: str | None) -> float | None:
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return value
+
+
+def _max_model_len(vllm_args: Sequence[str]) -> int | None:
+    flag = "--max-model-len"
+    for index, argument in enumerate(vllm_args):
+        if argument == flag and index + 1 < len(vllm_args):
+            candidate = vllm_args[index + 1]
+        elif argument.startswith(f"{flag}="):
+            candidate = argument.split("=", 1)[1]
+        else:
+            continue
+        value = _metric_integer(candidate)
+        if value is not None:
+            return value
+    return None
+
+
+def kv_pool_summary(payload: str, max_model_len: int | None = None) -> str | None:
+    """Summarize KV pool capacity from a vLLM Prometheus metrics payload."""
+    labels = _cache_config_labels(payload)
+    tokens = _metric_integer(labels.get("kv_cache_size_tokens"))
+    block_size = _metric_integer(labels.get("block_size"))
+    dtype = labels.get("cache_dtype", "")
+    if tokens is None or block_size is None or CACHE_DTYPE.fullmatch(dtype) is None:
+        return None
+    concurrency = _metric_number(labels.get("kv_cache_max_concurrency"))
+    if concurrency is None and max_model_len is not None:
+        concurrency = tokens / max_model_len
+    if concurrency is None:
+        return None
+    return (
+        f"KV pool: {tokens:,} tokens | max-context concurrency: {concurrency:.2f}x "
+        f"| block: {block_size} | dtype: {dtype}"
+    )
+
+
+def report_kv_pool(config: Config, vllm_args: Sequence[str]) -> None:
+    """Emit one KV pool capacity line, or one warning line if unavailable."""
+    payload = _fetch_metrics(config, METRICS_TIMEOUT_SECONDS)
+    summary = (
+        None if payload is None else kv_pool_summary(payload, _max_model_len(vllm_args))
+    )
+    if summary is None:
+        print(
+            "[glm53-lifecycle] WARNING KV pool capacity unavailable from "
+            f"{METRICS_PATH}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    print(f"[glm53-lifecycle] {summary}", file=sys.stderr, flush=True)
 
 
 def _validate_executables(config: Config) -> None:
@@ -593,6 +710,7 @@ def supervise(vllm_args: Sequence[str], environ: Mapping[str, str]) -> int:
                     file=sys.stderr,
                     flush=True,
                 )
+                report_kv_pool(config, vllm_args)
                 break
             time.sleep(min(config.vllm_health_poll_seconds, max(0.0, remaining)))
 
