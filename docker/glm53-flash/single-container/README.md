@@ -65,3 +65,7 @@ LMCache is always launched with `--separate-object-groups`. Separation is
 mandatory for this hybrid recipe so full attention history and the one-chunk
 Mamba state use separate object semantics. The recipe depends on the
 exact-boundary and sparse-transfer updates in #525 and #526.
+
+The image also installs startup-only vLLM fences around scheduler-realistic
+warmup stages and before FULL graph capture. They keep TP4/DCP4/MTP3 ranks
+aligned during capture without making steady-state serving synchronous.
