@@ -7,14 +7,16 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.fused_embed_norm import (
+    fused_embed_eh_norm,
+    has_full_vocab_on_rank,
+    make_input_embedding,
+)
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
-)
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -87,13 +89,23 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         previous_hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_index: int = 0,
+        embed_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        assert inputs_embeds is not None
-        aligned_embeds = inputs_embeds.masked_fill(positions.eq(0).unsqueeze(-1), 0)
-        eh_input = torch.cat(
-            (self.enorm(aligned_embeds), self.hnorm(previous_hidden_states)),
-            dim=-1,
-        )
+        if embed_table is not None:
+            eh_input = fused_embed_eh_norm(
+                input_ids,
+                embed_table,
+                previous_hidden_states,
+                self.enorm.weight,
+                self.hnorm.weight,
+                self.enorm.variance_epsilon,
+            )
+        else:
+            assert inputs_embeds is not None
+            eh_input = torch.cat(
+                (self.enorm(inputs_embeds), self.hnorm(previous_hidden_states)),
+                dim=-1,
+            )
         hidden_states = self.eh_proj(eh_input)
         # Fuse the residual add and final RMSNorm. Glm5NextMoE already performs
         # its all-reduce, so no collective is needed here. The post-norm result
@@ -122,11 +134,13 @@ class Glm5NextMultiTokenPredictor(nn.Module):
                 )
             }
         )
-        self.embed_tokens = VocabParallelEmbedding(
+        self.embed_tokens = make_input_embedding(
             config.vocab_size,
             config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
         )
+        self.replicated_embed = has_full_vocab_on_rank(self.embed_tokens)
         # Plain list for the per-propose lookup: ModuleDict[str(...)] builds a
         # string and hashes it on every draft step.
         self._mtp_layers = list(self.layers.values())
@@ -182,15 +196,20 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        embed_table = None
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            if self.replicated_embed:
+                embed_table = self.embed_tokens.weight
+            else:
+                inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
         return self._mtp_layers[current_step_idx](
             input_ids,
             positions,
             previous_hidden_states,
             inputs_embeds,
-            current_step_idx,
+            spec_step_index=current_step_idx,
+            embed_table=embed_table,
         )
 
     def compute_logits(
