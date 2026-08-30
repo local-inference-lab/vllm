@@ -17,12 +17,31 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
+    _PersistentGDNMetadataArena,
 )
 from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
+
+
+def test_gdn_metadata_arena_has_fixed_bounded_storage() -> None:
+    arena = _PersistentGDNMetadataArena(
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        num_spec=3,
+        device=DEVICE,
+    )
+    pointer = arena.query_start_loc.data_ptr()
+    staged = arena.stage(
+        arena.query_start_loc,
+        torch.tensor([0, 4, 8], dtype=torch.int32),
+    )
+    assert staged.data_ptr() == pointer
+    assert arena.query_start_loc.data_ptr() == pointer
+    with pytest.raises(ValueError, match="token capacity"):
+        arena.require_fits(num_reqs=4, num_tokens=33)
 
 
 @dataclass

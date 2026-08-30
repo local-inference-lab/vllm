@@ -8,7 +8,10 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
-from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.models.glm5next_cudagraph import (
+    is_glm53_full_graph_path,
+    require_glm53_full_graph_capacity,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -17,11 +20,10 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
-    compute_causal_conv1d_metadata,
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -85,10 +87,175 @@ class GDNAttentionMetadata:
     seq_lens: torch.Tensor | None = None
 
 
+class _PersistentGDNMetadataArena:
+    """Fixed-address metadata storage bounded by scheduler maxima."""
+
+    def __init__(
+        self,
+        *,
+        max_num_seqs: int,
+        max_num_batched_tokens: int,
+        num_spec: int,
+        device: torch.device,
+    ) -> None:
+        if max_num_seqs <= 0 or max_num_batched_tokens <= 0:
+            raise ValueError("GDN metadata arena capacities must be positive")
+        self.request_rows = max_num_seqs
+        self.token_rows = max_num_batched_tokens
+        self.state_width = num_spec + 1
+        chunk_rows = (max_num_batched_tokens + 63) // 64 + max_num_seqs
+        conv_rows = 2 * max(1024, (max_num_batched_tokens + 7) // 8 + max_num_seqs)
+        self.query_start_loc = torch.empty(
+            max_num_seqs + 1, dtype=torch.int32, device=device
+        )
+        self.prefill_query_start_loc = torch.empty_like(self.query_start_loc)
+        self.seq_lens = torch.empty(max_num_seqs, dtype=torch.int32, device=device)
+        self.state_indices = torch.empty(
+            (max_num_seqs, self.state_width), dtype=torch.int32, device=device
+        )
+        self.has_initial_state = torch.empty(
+            max_num_seqs, dtype=torch.bool, device=device
+        )
+        self.chunk_indices = torch.empty(
+            (chunk_rows, 2), dtype=torch.int32, device=device
+        )
+        self.chunk_offsets = torch.empty(
+            max_num_seqs + 1, dtype=torch.int32, device=device
+        )
+        self.batch_ptr = torch.full(
+            (conv_rows,), NULL_BLOCK_ID, dtype=torch.int32, device=device
+        )
+        self.token_chunk_offset_ptr = torch.full_like(self.batch_ptr, NULL_BLOCK_ID)
+        self.spec_sequence_masks = torch.empty(
+            max_num_seqs, dtype=torch.bool, device=device
+        )
+        self.num_accepted_tokens = torch.empty(
+            max_num_seqs, dtype=torch.int32, device=device
+        )
+        self.spec_query_start_loc = torch.empty_like(self.query_start_loc)
+        self.non_spec_query_start_loc = torch.empty_like(self.query_start_loc)
+        self.spec_state_indices = torch.empty_like(self.state_indices)
+        self.non_spec_state_indices = torch.empty(
+            max_num_seqs, dtype=torch.int32, device=device
+        )
+        self.spec_token_indices = torch.empty(
+            max_num_batched_tokens, dtype=torch.int32, device=device
+        )
+        self.non_spec_token_indices = torch.empty_like(self.spec_token_indices)
+        pin_memory = device.type == "cuda"
+        self._conv_batch_cpu = torch.empty(
+            conv_rows, dtype=torch.int32, pin_memory=pin_memory
+        )
+        self._conv_offset_cpu = torch.empty_like(
+            self._conv_batch_cpu, pin_memory=pin_memory
+        )
+        self._conv_nums_cpu = torch.empty(
+            max_num_seqs, dtype=torch.int32, pin_memory=pin_memory
+        )
+        self.nums_dict = {
+            8: {
+                "nums": self._conv_nums_cpu,
+                "tot": 0,
+                "mlist": self._conv_batch_cpu,
+                "mlist_len": 0,
+                "offsetlist": self._conv_offset_cpu,
+                "batch_ptr": self.batch_ptr,
+                "token_chunk_offset_ptr": self.token_chunk_offset_ptr,
+            }
+        }
+
+    def require_fits(self, *, num_reqs: int, num_tokens: int) -> None:
+        if num_reqs > self.request_rows:
+            raise ValueError("GDN metadata request capacity exceeded")
+        if num_tokens > self.token_rows:
+            raise ValueError("GDN metadata token capacity exceeded")
+
+    @staticmethod
+    def stage(
+        storage: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        fill: int | bool | None = None,
+    ) -> torch.Tensor:
+        rows = value.shape[0]
+        if rows > storage.shape[0]:
+            raise ValueError("GDN metadata arena staging capacity exceeded")
+        storage[:rows].copy_(value, non_blocking=True)
+        if fill is not None and rows < storage.shape[0]:
+            storage[rows:].fill_(fill)
+        return storage[:rows]
+
+    def stage_causal_conv(
+        self, query_start_loc_cpu: torch.Tensor
+    ) -> tuple[dict, torch.Tensor, torch.Tensor]:
+        num_reqs = query_start_loc_cpu.numel() - 1
+        if num_reqs > self.request_rows:
+            raise ValueError("GDN causal-conv request capacity exceeded")
+        total_programs = 0
+        for request_idx in range(num_reqs):
+            seq_len = int(
+                query_start_loc_cpu[request_idx + 1] - query_start_loc_cpu[request_idx]
+            )
+            num_programs = (seq_len + 7) // 8
+            self._conv_nums_cpu[request_idx] = num_programs
+            end = total_programs + num_programs
+            if end > self.batch_ptr.shape[0]:
+                raise ValueError("GDN causal-conv program capacity exceeded")
+            self._conv_batch_cpu[total_programs:end].fill_(request_idx)
+            if num_programs:
+                torch.arange(
+                    num_programs,
+                    dtype=torch.int32,
+                    out=self._conv_offset_cpu[total_programs:end],
+                )
+            total_programs = end
+        self.batch_ptr.fill_(NULL_BLOCK_ID)
+        self.token_chunk_offset_ptr.fill_(NULL_BLOCK_ID)
+        self.batch_ptr[:total_programs].copy_(
+            self._conv_batch_cpu[:total_programs], non_blocking=True
+        )
+        self.token_chunk_offset_ptr[:total_programs].copy_(
+            self._conv_offset_cpu[:total_programs], non_blocking=True
+        )
+        entry = self.nums_dict[8]
+        entry["tot"] = total_programs
+        entry["mlist_len"] = total_programs
+        return self.nums_dict, self.batch_ptr, self.token_chunk_offset_ptr
+
+
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+    _glm53_graph_safe_gdn_marker = "fixed-address-gdn-metadata-v1"
     supports_update_block_table: bool = True
+
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: KVCacheSpec,
+    ) -> AttentionCGSupport:
+        if (
+            not isinstance(kv_cache_spec, MambaSpec)
+            or not is_glm53_full_graph_path(vllm_config)
+            or kv_cache_spec.block_size != 2304
+        ):
+            return AttentionCGSupport.UNIFORM_BATCH
+        require_glm53_full_graph_capacity(vllm_config)
+        from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+            B12xGLM5NextMLASparseMetadataBuilder,
+        )
+
+        marker = getattr(
+            B12xGLM5NextMLASparseMetadataBuilder,
+            "_glm53_graph_safe_selector_marker",
+            None,
+        )
+        if marker != "fixed-address-vectorized-pooled-selector-v1":
+            raise RuntimeError(
+                "GLM-5.3 mixed FULL requires graph-safe pooled selection"
+            )
+        return AttentionCGSupport.ALWAYS
 
     mamba_aligned_state_indices: torch.Tensor | None = None
 
@@ -172,6 +339,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        self.arena = _PersistentGDNMetadataArena(
+            max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+            max_num_batched_tokens=(
+                vllm_config.scheduler_config.max_num_batched_tokens
+            ),
+            num_spec=self.num_spec,
+            device=device,
+        )
 
     def _get_state_indices(
         self,
@@ -222,15 +397,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         assert prefill_query_start_loc_cpu is not None
+        chunk_indices = prepare_chunk_indices(
+            prefill_query_start_loc_cpu, FLA_CHUNK_SIZE
+        )
+        chunk_offsets = prepare_chunk_offsets(
+            prefill_query_start_loc_cpu, FLA_CHUNK_SIZE
+        )
         return (
-            async_tensor_h2d(
-                prepare_chunk_indices(prefill_query_start_loc_cpu, FLA_CHUNK_SIZE),
-                device=device,
-            ),
-            async_tensor_h2d(
-                prepare_chunk_offsets(prefill_query_start_loc_cpu, FLA_CHUNK_SIZE),
-                device=device,
-            ),
+            self.arena.stage(self.arena.chunk_indices, chunk_indices),
+            self.arena.stage(self.arena.chunk_offsets, chunk_offsets),
         )
 
     def build(  # type: ignore[override]
@@ -242,8 +417,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
+        self.arena.require_fits(num_reqs=m.num_reqs, num_tokens=m.num_actual_tokens)
 
-        query_start_loc = m.query_start_loc
+        query_start_loc = self.arena.stage(
+            self.arena.query_start_loc, m.query_start_loc
+        )
+        seq_lens = self.arena.stage(self.arena.seq_lens, m.seq_lens)
         query_start_loc_cpu = m.query_start_loc_cpu
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         block_table_tensor = self._get_state_indices(
@@ -268,8 +447,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_sequence_masks = None
                 spec_sequence_masks_cpu = None
             else:
-                spec_sequence_masks = async_tensor_h2d(
-                    spec_sequence_masks_cpu, device=query_start_loc.device
+                spec_sequence_masks = self.arena.stage(
+                    self.arena.spec_sequence_masks,
+                    spec_sequence_masks_cpu.to(
+                        device=query_start_loc.device, non_blocking=True
+                    ),
+                    fill=False,
                 )
 
         if spec_sequence_masks is None:
@@ -436,11 +619,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             if spec_sequence_masks_cpu is not None:
                 has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
                 assert non_spec_query_start_loc_cpu is not None
-            nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(
-                    non_spec_query_start_loc_cpu,
-                    device=query_start_loc.device,
-                )
+            nums_dict, batch_ptr, token_chunk_offset_ptr = self.arena.stage_causal_conv(
+                non_spec_query_start_loc_cpu
             )
             if spec_sequence_masks is None and num_decodes > 0:
                 prefill_has_initial_state = has_initial_state[num_decodes:]
@@ -448,6 +628,25 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 prefill_has_initial_state = has_initial_state
         else:
             has_initial_state = None
+
+        if prefill_query_start_loc is not None:
+            prefill_query_start_loc = self.arena.stage(
+                self.arena.prefill_query_start_loc,
+                prefill_query_start_loc,
+            )
+        if prefill_state_indices is not None:
+            storage = (
+                self.arena.state_indices
+                if prefill_state_indices.ndim == 2
+                else self.arena.non_spec_state_indices
+            )
+            prefill_state_indices = self.arena.stage(storage, prefill_state_indices)
+        if prefill_has_initial_state is not None:
+            prefill_has_initial_state = self.arena.stage(
+                self.arena.has_initial_state,
+                prefill_has_initial_state,
+                fill=False,
+            )
 
         # Function code counted on either presency non-spec decode or spec decode,
         # but not both.
@@ -554,7 +753,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
             num_reqs=m.num_reqs,
-            seq_lens=m.seq_lens,
+            seq_lens=seq_lens,
         )
         return attn_metadata
 
@@ -682,11 +881,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ):
-        """
-        This method builds the metadata for full cudagraph capture.
-        Currently, only decode is supported for full cudagraphs with Mamba.
-        """
+        """Build capture metadata under the selected path's capacity contract."""
         m = common_attn_metadata
+
+        if is_glm53_full_graph_path(self.vllm_config):
+            self.arena.require_fits(num_reqs=m.num_reqs, num_tokens=m.num_actual_tokens)
+            if m.is_prefilling is not None and bool(m.is_prefilling.any()):
+                return self.build(0, m, None, None)
+            accepted = self.arena.num_accepted_tokens[: m.num_reqs]
+            torch.diff(m.query_start_loc, out=accepted)
+            return self.build(0, m, accepted, (accepted - 1).cpu())
 
         assert (
             m.num_reqs <= self.decode_cudagraph_max_bs
