@@ -981,16 +981,15 @@ def _fused_eh_norm_kernel(
     H: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """MTP input fusion: zero embeds at position 0, RMSNorm(embeds) with enorm
-    and RMSNorm(prev_hidden) with hnorm, written side-by-side into ``out``
-    ([N, 2H]) ready for the eh_proj GEMM. Replaces where + 2x RMSNorm + cat."""
+    """MTP input fusion: RMSNorm(embeds) with enorm and RMSNorm(prev_hidden)
+    with hnorm, written side-by-side into ``out`` ([N, 2H]) ready for the
+    eh_proj GEMM. Replaces 2x RMSNorm + cat.
+    """
     tok = tl.program_id(0)
     off = tl.arange(0, BLOCK)
     mask = off < H
 
-    pos = tl.load(pos_ptr + tok)
     e = tl.load(embeds_ptr + tok * embeds_stride + off, mask=mask, other=0.0)
-    e = tl.where(pos == 0, 0.0, e.to(tl.float32))
     ew = tl.load(enorm_w_ptr + off, mask=mask)
     e_normed = _rms_norm(e, ew, eps, H)
     tl.store(out_ptr + tok * out_stride + off, e_normed, mask=mask)
@@ -1009,7 +1008,7 @@ def fused_eh_norm(
     hnorm_w: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Returns cat([enorm(masked embeds), hnorm(prev_hidden)]) -> [N, 2H]."""
+    """Returns cat([enorm(embeds), hnorm(prev_hidden)]) -> [N, 2H]."""
     n, h = inputs_embeds.shape
     out = torch.empty(n, 2 * h, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
     _fused_eh_norm_kernel[(n,)](

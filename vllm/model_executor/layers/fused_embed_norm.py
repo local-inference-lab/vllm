@@ -8,10 +8,8 @@ the full on-rank table unlocks --
 
   * ``fused_embed_norm``: gather + a chained RMSNorm (e.g. the first decoder
     layer's ``input_layernorm``), and
-  * ``fused_embed_eh_norm``: gather + pos-0 zeroing + enorm/hnorm + cat, the
-    embed/previous-hidden input norm for a speculative (MTP/eagle) depth layer
-    (the replicated-table analogue of the model-local ``fused_eh_norm``, which
-    takes precomputed embeds).
+  * ``fused_embed_eh_norm``: gather + enorm/hnorm + cat, the
+    embed/previous-hidden input norm for a speculative (MTP/eagle) depth layer.
 
 Self-contained (no model-local imports) so it can live under ``layers/``.
 """
@@ -152,7 +150,6 @@ def fused_embed_norm(
 
 @triton.jit
 def _fused_embed_eh_norm_kernel(
-    pos_ptr,
     ids_ptr,  # [T] token ids
     table_ptr,  # [V, H] embedding table (full vocab, replicated on-rank)
     table_stride,
@@ -166,19 +163,17 @@ def _fused_embed_eh_norm_kernel(
     H: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """MTP input fusion with a folded embedding gather: gather
-    ``table[ids]``, zero it at position 0, RMSNorm(embed) with enorm and
-    RMSNorm(prev_hidden) with hnorm, written side-by-side into ``out`` ([N, 2H])
-    ready for the eh_proj GEMM. Replaces embedding lookup + where + 2x RMSNorm +
-    cat. Requires the full table on-rank (replicated embedding)."""
+    """MTP input fusion with a folded embedding gather: gather ``table[ids]``,
+    RMSNorm(embed) with enorm, and RMSNorm(prev_hidden) with hnorm, written
+    side-by-side into ``out`` ([N, 2H]) ready for the eh_proj GEMM. Requires the
+    full table on-rank (replicated embedding).
+    """
     tok = tl.program_id(0)
     off = tl.arange(0, BLOCK)
     mask = off < H
 
-    pos = tl.load(pos_ptr + tok)
     row = tl.load(ids_ptr + tok).to(tl.int64)
     e = tl.load(table_ptr + row * table_stride + off, mask=mask, other=0.0)
-    e = tl.where(pos == 0, 0.0, e.to(tl.float32))
     ew = tl.load(enorm_w_ptr + off, mask=mask)
     e_normed = _rms_norm(e, ew, eps, H)
     tl.store(out_ptr + tok * out_stride + off, e_normed, mask=mask)
@@ -191,7 +186,6 @@ def _fused_embed_eh_norm_kernel(
 
 # MTP fusion
 def fused_embed_eh_norm(
-    positions: torch.Tensor,
     input_ids: torch.Tensor,
     embed_table: torch.Tensor,
     previous_hidden: torch.Tensor,
@@ -199,22 +193,20 @@ def fused_embed_eh_norm(
     hnorm_w: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Fused ``cat([enorm(masked embed_table[ids]), hnorm(prev_hidden)])`` -> [N, 2H].
+    """Fused ``cat([enorm(embed_table[ids]), hnorm(prev_hidden)])`` -> [N, 2H].
 
     Folds the embedding row gather into the MTP eh-norm launch; requires the full
-    table on-rank (replicated embedding). Bit-exact vs gathering ``embed_table[
-    input_ids]`` and passing it to the model-local ``fused_eh_norm``.
+    table on-rank (replicated embedding).
     """
     assert previous_hidden.ndim == 2 and embed_table.ndim == 2
     n, h = previous_hidden.shape
-    assert positions.shape == (n,) and input_ids.view(-1).shape == (n,)
+    assert input_ids.view(-1).shape == (n,)
     assert embed_table.shape[1] == h, (embed_table.shape, h)
     assert enorm_w.shape == (h,) and hnorm_w.shape == (h,)
     out = torch.empty(
         n, 2 * h, dtype=previous_hidden.dtype, device=previous_hidden.device
     )
     _fused_embed_eh_norm_kernel[(n,)](
-        positions,
         input_ids,
         embed_table,
         embed_table.stride(0),

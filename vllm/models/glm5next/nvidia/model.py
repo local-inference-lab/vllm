@@ -17,6 +17,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
+from vllm.model_executor.layers.fused_embed_norm import make_input_embedding
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
@@ -47,10 +48,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_VALUE_DTYPE,
     dequant_mxfp8_to_bf16,
 )
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -708,10 +706,11 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             pool_topk_indices_buffer = None
 
         if get_pp_group().is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
+            self.embed_tokens = make_input_embedding(
                 config.vocab_size,
                 config.hidden_size,
                 prefix=f"{prefix}.embed_tokens",
+                tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
             )
         else:
             self.embed_tokens = PPMissingLayer()
