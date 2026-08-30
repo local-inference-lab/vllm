@@ -1,15 +1,19 @@
 diff --git a/csrc/cuda/mem_kernels.cu b/csrc/cuda/mem_kernels.cu
-index e19f1ebb..79b8bcfc 100644
+index e19f1ebb..4fc93605 100644
 --- a/csrc/cuda/mem_kernels.cu
 +++ b/csrc/cuda/mem_kernels.cu
-@@ -214,4 +214,5 @@ template <EngineKVFormat format>
+@@ -214,7 +214,8 @@ template <EngineKVFormat format>
  __device__ __forceinline__ int64_t page_buffer_offset(
      const int k_or_v, const int token_idx, const int scalar_offset,
      const int scalars_per_token, const int page_buffer_size,
 -    const int block_size, const int head_size) {
 +    const int block_size, const int head_size,
 +    const int64_t block_stride_xwords) {
-@@ -292,13 +293,26 @@ __device__ __forceinline__ int64_t page_buffer_offset(
+   /*
+   logical semantics of arguments (agnostic to physical format):
+   k_or_v:            0 for key, 1 for value
+@@ -290,17 +291,30 @@ __device__ __forceinline__ int64_t page_buffer_offset(
+            head_offset;
    } else if constexpr (format == EngineKVFormat::NL_X_NB_NH_BS_TWO_HS ||
                         format == EngineKVFormat::NL_X_NB_NH_BS_CS) {
 -    const int hs2 = 2 * head_size;  // packed K+V width per head (xword units)
@@ -43,24 +47,41 @@ index e19f1ebb..79b8bcfc 100644
 +    return block_idx * block_step +
 +           static_cast<int64_t>(block_offset) * scalars_per_token +
 +           scalar_offset;
-@@ -436,3 +449,3 @@ __global__ void load_and_reshape_multi_layer_fused_kernel(
+   }
+   // DSA indexer: page [BSxvals][BSxscales]; 4B units, so scale == 1 unit
+   else if constexpr (format == EngineKVFormat::NL_X_NB_BSV_BSS) {
+@@ -436,7 +450,7 @@ __global__ void load_and_reshape_multi_layer_fused_kernel(
+                          num_tokens, num_layers);
      const int64_t vllm_offset =
          page_buffer_offset<format>(k_or_v, slot_idx, i, scalars_per_token,
 -                                   page_buffer_size, block_size, head_size);
 +                                   page_buffer_size, block_size, head_size, 0);
-@@ -464,4 +477,4 @@ __global__ void load_and_reshape_multi_layer_kernel(
+     if (DIRECTION)
+       chunk.key_value[lmcache_offset] = paged_buffer_ptr[vllm_offset];
+     else
+@@ -464,7 +478,7 @@ __global__ void load_and_reshape_multi_layer_kernel(
      const int64_t* __restrict__ slot_mapping,   // [num_tokens]
      const int scalars_per_token, const int num_tokens, const int num_layers,
      const int page_buffer_size, const int block_size, const int head_size,
 -    const int skip_prefix_n_tokens) {
 +    const int skip_prefix_n_tokens, const int64_t block_stride_xwords) {
-@@ -487,3 +500,4 @@ __global__ void load_and_reshape_multi_layer_kernel(
+   const int token_id = blockIdx.x;
+   const int layer_id = blockIdx.y;
+   const int k_or_v = blockIdx.z;
+@@ -486,8 +500,9 @@ __global__ void load_and_reshape_multi_layer_kernel(
+                          num_tokens, num_layers);
+-
++
      const int64_t vllm_offset =
          page_buffer_offset<format>(k_or_v, slot_idx, i, scalars_per_token,
 -                                   page_buffer_size, block_size, head_size);
 +                                   page_buffer_size, block_size, head_size,
 +                                   block_stride_xwords);
-@@ -599,5 +613,6 @@ T* get_kernel_ptr(TENSOR_TYPE& tensor) {
+-
++
+     if (DIRECTION)  // 1 is paged buffer to LMCache
+       key_value[lmcache_offset] = paged_buffer_ptr[vllm_offset];
+@@ -599,7 +614,8 @@ T* get_kernel_ptr(TENSOR_TYPE& tensor) {
        <<<grid, block, 0, stream>>>(key_value_ptr, page_buffer_ptrs,          \
                                     slot_mapping_ptr, num_xwords, num_tokens, \
                                     num_layers, page_buffer_size, block_size, \
@@ -68,50 +89,67 @@ index e19f1ebb..79b8bcfc 100644
 +                                   head_size_xword, skip_prefix_n_tokens,    \
 +                                   block_stride_xwords);                    \
    C10_CUDA_KERNEL_LAUNCH_CHECK();
-@@ -614,4 +629,5 @@ void multi_layer_kv_transfer_templated(
+-
++
+ template <typename T>
+@@ -614,7 +630,8 @@ void multi_layer_kv_transfer_templated(
      const torch::Tensor& slot_mapping,    // [num_tokens],
      const torch::Device& paged_memory_device, const int page_buffer_size,
      const TransferDirection direction, const EngineKVFormat engine_kv_format,
 -    const int block_size, const int head_size, const int skip_prefix_n_tokens) {
 +    const int block_size, const int head_size, const int skip_prefix_n_tokens,
 +    const int64_t block_stride_elems) {
-@@ -634,3 +650,6 @@ void multi_layer_kv_transfer_templated(
-
+   T* key_value_ptr = get_kernel_ptr<T, torch::Tensor>(key_value);
+   T** page_buffer_ptrs =
+       get_kernel_ptr<T*, const torch::Tensor>(key_value_ptrs);
+@@ -634,5 +651,8 @@ void multi_layer_kv_transfer_templated(
    lmc::check_block_size(engine_kv_format, block_size);
    lmc::check_head_size(engine_kv_format, head_size_xword);
 +  TORCH_CHECK(block_stride_elems % elements_per_xword == 0,
 +              "block_stride_elems must be divisible by elements_per_xword");
 +  const int64_t block_stride_xwords = block_stride_elems / elements_per_xword;
-@@ -906,4 +925,5 @@ void multi_layer_kv_transfer(
+   TORCH_CHECK(
+       engine_kv_format != EngineKVFormat::NL_X_NB_BSV_BSS || sizeof(T) == 4,
+       "NL_X_NB_BSV_BSS requires 4-byte transfer units (row bytes "
+@@ -906,7 +926,8 @@ void multi_layer_kv_transfer(
      const torch::Tensor& slot_mapping, const torch::Device& paged_memory_device,
      const int page_buffer_size, const TransferDirection direction,
      const EngineKVFormat engine_kv_format, const int block_size,
 -    const int head_size, const int skip_prefix_n_tokens) {
 +    const int head_size, const int skip_prefix_n_tokens,
 +    const int64_t block_stride_elems) {
-@@ -915,5 +935,5 @@ void multi_layer_kv_transfer(
+   int num_origin_elements = key_value.size(3);
+   int copy_size = num_origin_elements * key_value.element_size();
+ #ifndef LAUNCH_MULTI_LAYER_KV_TRANSFER
+@@ -915,7 +936,7 @@ void multi_layer_kv_transfer(
        multi_layer_kv_transfer_templated<type>(                          \
            key_value, key_value_ptrs, slot_mapping, paged_memory_device, \
            page_buffer_size, direction, engine_kv_format, block_size,    \
 -          head_size, skip_prefix_n_tokens);                             \
 +          head_size, skip_prefix_n_tokens, block_stride_elems);         \
      } while (0)
+ #endif
+   if (copy_size % 8 == 0) {
 diff --git a/csrc/cuda/mem_kernels.cuh b/csrc/cuda/mem_kernels.cuh
 index 6385338b..61a36c26 100644
 --- a/csrc/cuda/mem_kernels.cuh
 +++ b/csrc/cuda/mem_kernels.cuh
-@@ -13,4 +13,5 @@ void multi_layer_kv_transfer(
+@@ -13,7 +13,8 @@ void multi_layer_kv_transfer(
      const torch::Tensor& slot_mapping, const torch::Device& paged_memory_device,
      const int page_buffer_size, const TransferDirection direction,
      const EngineKVFormat engine_kv_format, const int block_size = 0,
 -    const int head_size = 0, const int skip_prefix_n_tokens = 0);
 +    const int head_size = 0, const int skip_prefix_n_tokens = 0,
 +    const int64_t block_stride_elems = 0);
+-
++
+ // Max chunks per fused launch; the by-value pack must fit the 4 KB
+ // kernel-arg buffer.
 diff --git a/csrc/cuda/pybind.cpp b/csrc/cuda/pybind.cpp
 index 416075df..abaf01fb 100644
 --- a/csrc/cuda/pybind.cpp
 +++ b/csrc/cuda/pybind.cpp
-@@ -33,16 +33,17 @@ PYBIND11_MODULE(cuda_ops, m) {
+@@ -33,18 +33,19 @@ PYBIND11_MODULE(cuda_ops, m) {
           const torch::Tensor& slot_mapping,
           const torch::Device& paged_memory_device, const int page_buffer_size,
           int direction, int engine_kv_format, const int block_size = 0,
@@ -132,3 +170,5 @@ index 416075df..abaf01fb 100644
 -      py::arg("skip_prefix_n_tokens") = 0,
 +      py::arg("skip_prefix_n_tokens") = 0, py::arg("block_stride_elems") = 0,
        py::call_guard<py::gil_scoped_release>());
+   m.def("multi_layer_kv_transfer_unilateral",
+         [](torch::Tensor& key_value, const torch::Tensor& key_value_ptrs,

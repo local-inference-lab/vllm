@@ -3,7 +3,11 @@
 
 import ast
 import importlib.util
+import itertools
 import logging
+import os
+import re
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -52,15 +56,18 @@ CORE_SINGLE_TYPE_MANAGER = (
     "vllm/v1/core/single_type_kv_cache_manager.py"
 )
 CUDA_SLOT_STRIDE_PATCH = (
-    ROOT
-    / "docker/glm53-flash/lmcache-d16-overlay/lmcache_cuda_ops_slot_stride.patch"
+    ROOT / "docker/glm53-flash/lmcache-d16-overlay/lmcache_cuda_ops_slot_stride.patch"
 )
+CUDA_ODD_WIDTH_PATCH = (
+    ROOT / "docker/glm53-flash/lmcache-d16-overlay/lmcache_cuda_ops_odd_width.patch"
+)
+LMCACHE_SOURCE_COMMIT = "3e11b8ed191631e6f098b8038235823f1a410b24"
+NATIVE_PATCHES = (CUDA_ODD_WIDTH_PATCH, CUDA_SLOT_STRIDE_PATCH)
 SLOT_STRIDE_PATCHER = (
     ROOT / "docker/glm53-flash/lmcache-d16-overlay/patch_lmcache_slot_stride.py"
 )
 PADDED_STRIDE_PATCHER = (
-    ROOT
-    / "docker/glm53-flash/lmcache-d16-overlay/"
+    ROOT / "docker/glm53-flash/lmcache-d16-overlay/"
     "patch_lmcache_padded_packed_stride.py"
 )
 
@@ -259,8 +266,7 @@ def test_scheduler_starts_each_heartbeat_once() -> None:
     adapter_class = next(
         node
         for node in tree.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "LMCacheMPSchedulerAdapter"
+        if isinstance(node, ast.ClassDef) and node.name == "LMCacheMPSchedulerAdapter"
     )
     ensure_started = next(
         node
@@ -393,8 +399,7 @@ def test_tracker_initializes_exact_mamba_boundary_map() -> None:
     tracker = next(
         node
         for node in tree.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "LMCacheMPRequestTracker"
+        if isinstance(node, ast.ClassDef) and node.name == "LMCacheMPRequestTracker"
     )
     constructor = next(
         node
@@ -407,9 +412,7 @@ def test_tracker_initializes_exact_mamba_boundary_map() -> None:
 
 def test_exact_mamba_boundaries_replace_only_mamba_source_ids() -> None:
     apply = _load_exact_mamba_store_helper()
-    tracker = SimpleNamespace(
-        exact_mamba_boundary_blocks={0: {9216: 104, 18432: 108}}
-    )
+    tracker = SimpleNamespace(exact_mamba_boundary_blocks={0: {9216: 104, 18432: 108}})
     block_ids = [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10]]
 
     apply(
@@ -453,14 +456,12 @@ def test_connector_ingests_core_mamba_handoffs_before_stores() -> None:
     build_meta = next(
         node
         for node in connector.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "build_connector_meta"
+        if isinstance(node, ast.FunctionDef) and node.name == "build_connector_meta"
     )
     process_new = next(
         node
         for node in connector.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_process_new_requests"
+        if isinstance(node, ast.FunctionDef) and node.name == "_process_new_requests"
     )
     build_source = ast.unparse(build_meta)
     process_source = ast.unparse(process_new)
@@ -477,6 +478,76 @@ def test_cuda_slot_stride_rejects_unaligned_xwords_before_conversion() -> None:
     check = "TORCH_CHECK(block_stride_elems % elements_per_xword == 0"
     conversion = "block_stride_elems / elements_per_xword"
     assert patch.index(check) < patch.index(conversion)
+
+
+@pytest.mark.parametrize("patch_path", NATIVE_PATCHES, ids=lambda path: path.stem)
+def test_native_patches_carry_context_git_apply_can_anchor(
+    patch_path: Path,
+) -> None:
+    hunks = _parse_hunks(patch_path.read_text())
+
+    assert hunks
+    for header, body in hunks:
+        old_count = sum(1 for line in body if line[:1] in (" ", "-"))
+        new_count = sum(1 for line in body if line[:1] in (" ", "+"))
+        assert (old_count, new_count) == (header[1], header[3]), header
+        leading = len(list(itertools.takewhile(_is_context, body)))
+        trailing = len(list(itertools.takewhile(_is_context, reversed(body))))
+        assert header[0] == 1 or leading >= 1, header
+        assert trailing >= 1, header
+
+
+def test_native_patches_apply_in_order_to_pinned_lmcache(tmp_path: Path) -> None:
+    source_value = os.environ.get("LMCACHE_SOURCE_DIR")
+    if source_value is None:
+        pytest.skip("set LMCACHE_SOURCE_DIR to exercise ordered git apply")
+
+    source = Path(source_value)
+    source_commit = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert source_commit == LMCACHE_SOURCE_COMMIT
+
+    checkout = tmp_path / "lmcache"
+    subprocess.run(
+        ["git", "clone", "--quiet", "--no-hardlinks", str(source), str(checkout)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "checkout", "--quiet", LMCACHE_SOURCE_COMMIT],
+        check=True,
+    )
+    for patch_path in NATIVE_PATCHES:
+        subprocess.run(
+            ["git", "-C", str(checkout), "apply", "--check", str(patch_path)],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(checkout), "apply", str(patch_path)],
+            check=True,
+        )
+
+
+def _is_context(line: str) -> bool:
+    return line[:1] == " "
+
+
+def _parse_hunks(patch: str) -> list[tuple[tuple[int, ...], list[str]]]:
+    hunks: list[tuple[tuple[int, ...], list[str]]] = []
+    body: list[str] | None = None
+    for line in patch.split("\n"):
+        match = re.match(r"^@@ -(\d+),(\d+) \+(\d+),(\d+) @@", line)
+        if match:
+            body = []
+            hunks.append((tuple(int(group) for group in match.groups()), body))
+        elif line.startswith("diff --git "):
+            body = None
+        elif body is not None and line[:1] in (" ", "-", "+"):
+            body.append(line)
+    return hunks
 
 
 def test_group_edits_unwrap_uniform_specs_per_layer() -> None:
@@ -520,9 +591,7 @@ def test_group_edits_unwrap_uniform_specs_per_layer() -> None:
     }
     exec(
         compile(
-            ast.fix_missing_locations(
-                ast.Module(body=[apply_edits], type_ignores=[])
-            ),
+            ast.fix_missing_locations(ast.Module(body=[apply_edits], type_ignores=[])),
             str(GROUP_EDITS),
             "exec",
         ),
@@ -538,9 +607,9 @@ def test_group_edits_unwrap_uniform_specs_per_layer() -> None:
         ],
     )
 
-    assert namespace["apply_kv_cache_group_edits"](
-        config, {"layer": "cache"}, {}
-    ) == {"layer": "edited-cache"}
+    assert namespace["apply_kv_cache_group_edits"](config, {"layer": "cache"}, {}) == {
+        "layer": "edited-cache"
+    }
     assert seen_specs == [layer_spec]
 
 
@@ -609,15 +678,13 @@ def test_finished_store_dedup_state_is_pruned_after_engine_converges() -> None:
     adapter = next(
         node
         for node in tree.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "LMCacheMPWorkerAdapter"
+        if isinstance(node, ast.ClassDef) and node.name == "LMCacheMPWorkerAdapter"
     )
     methods = [
         node
         for node in adapter.body
         if isinstance(node, ast.FunctionDef)
-        and node.name
-        in {"_process_finished_stores", "_update_and_get_finished_store"}
+        and node.name in {"_process_finished_stores", "_update_and_get_finished_store"}
     ]
     probe_class = ast.ClassDef(
         name="AdapterProbe",
@@ -630,9 +697,7 @@ def test_finished_store_dedup_state_is_pruned_after_engine_converges() -> None:
     namespace: dict[str, Any] = {}
     exec(
         compile(
-            ast.fix_missing_locations(
-                ast.Module(body=[probe_class], type_ignores=[])
-            ),
+            ast.fix_missing_locations(ast.Module(body=[probe_class], type_ignores=[])),
             str(ADAPTER),
             "exec",
         ),
@@ -659,8 +724,7 @@ def test_sink_manager_forwards_zeroing_constructor_argument() -> None:
     manager = next(
         node
         for node in tree.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "SinkFullAttentionManager"
+        if isinstance(node, ast.ClassDef) and node.name == "SinkFullAttentionManager"
     )
     constructor = next(
         node
@@ -674,12 +738,11 @@ def test_sink_manager_forwards_zeroing_constructor_argument() -> None:
 
 
 def test_flashinfer_pins_match_docker_metadata() -> None:
-    assert "ARG FLASHINFER_VERSION=0.6.18" in (
-        ROOT / "docker/Dockerfile"
-    ).read_text()
-    assert '"FLASHINFER_VERSION": {\n      "default": "0.6.18"' in (
-        ROOT / "docker/versions.json"
-    ).read_text()
+    assert "ARG FLASHINFER_VERSION=0.6.18" in (ROOT / "docker/Dockerfile").read_text()
+    assert (
+        '"FLASHINFER_VERSION": {\n      "default": "0.6.18"'
+        in (ROOT / "docker/versions.json").read_text()
+    )
     cuda_requirements = (ROOT / "requirements/cuda.txt").read_text()
     assert "flashinfer-python==0.6.18" in cuda_requirements
     assert "flashinfer-cubin==0.6.18" in cuda_requirements

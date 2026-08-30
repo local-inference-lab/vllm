@@ -12,7 +12,7 @@ index 5963b8ab..01cf52b5 100644
    if (engine_kv_format == EngineKVFormat::NL_X_NB_BSV_BSS) {
      // Blocked-scale indexer cache: the per-token fp32 scale must be a whole
      // number of transfer units, so pin 4-byte units regardless of row width.
-@@ -464,8 +461,10 @@ void multi_layer_block_kv_transfer(
+@@ -464,7 +461,9 @@ void multi_layer_block_kv_transfer(
      LAUNCH_TEMPLATED(uint4);  // 16 bytes per copy
    } else if (head_bytes % sizeof(uint32_t) == 0) {
      LAUNCH_TEMPLATED(uint32_t);  // 4 bytes per copy
