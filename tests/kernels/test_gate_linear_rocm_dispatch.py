@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Platform-agnostic eligibility tests for GateLinear's fused router GEMM.
+"""Platform-agnostic eligibility tests for GateLinear router GEMMs.
 
 These assert the ``allow_cublas_router_gemm`` dispatch flag directly, so they
 run device-free by mocking the platform predicates. The flag decides whether
 the bf16xbf16->fp32 router GEMM uses ``torch.mm``'s fused out_dtype epilogue
 (one kernel) or falls back to a bf16 matmul plus a standalone bf16->fp32 copy.
 
-The ROCm branch is guarded on ``not bias`` because ``torch.mm`` has no bias
-term; a biased gate must fall back so the bias is not silently dropped.
+ROCm's fused ``torch.mm`` branch and SM120's CuTe branch are both guarded on
+``not bias`` so a biased gate cannot silently drop its bias term.
 """
 
 import torch
@@ -22,6 +22,7 @@ def _make_gate(
     *,
     is_rocm: bool,
     is_cuda: bool = False,
+    device_capability: tuple[int, int] | None = None,
     bias: bool = False,
     params_dtype: torch.dtype = torch.bfloat16,
     out_dtype: torch.dtype | None = torch.float32,
@@ -43,10 +44,17 @@ def _make_gate(
     platform = gate_linear_mod.current_platform
     monkeypatch.setattr(platform, "is_cuda", lambda: is_cuda)
     monkeypatch.setattr(platform, "is_rocm", lambda: is_rocm)
-    # Force the CUDA specialized-kernel gate off so ROCm eligibility is the
-    # only thing under test (these are the SM90/SM100 capability checks).
-    monkeypatch.setattr(platform, "is_device_capability", lambda *a, **k: False)
+    monkeypatch.setattr(
+        platform,
+        "is_device_capability",
+        lambda capability: capability == device_capability,
+    )
     monkeypatch.setattr(platform, "is_device_capability_family", lambda *a, **k: False)
+    if is_cuda and device_capability == (12, 0):
+        monkeypatch.setattr(
+            "vllm.model_executor.kernels.linear.cute_dsl.ll_bf16.is_available",
+            lambda: True,
+        )
 
     return GateLinear(
         input_size=2048,
@@ -96,3 +104,43 @@ def test_rocm_set_out_dtype_respects_bias_guard(monkeypatch):
     gate = _make_gate(monkeypatch, is_rocm=True, bias=True, out_dtype=None)
     gate.set_out_dtype(torch.float32)
     assert not gate.allow_cublas_router_gemm
+
+
+def test_sm120_enables_only_ll_bf16_router(monkeypatch):
+    gate = _make_gate(
+        monkeypatch,
+        is_rocm=False,
+        is_cuda=True,
+        device_capability=(12, 0),
+    )
+
+    assert gate.allow_ll_bf16_gemm
+    assert not gate.allow_specialized_router_gemm
+    assert not gate.allow_dsv3_router_gemm
+    assert not gate.allow_cublas_router_gemm
+
+
+def test_sm120_ll_bf16_respects_bias(monkeypatch):
+    gate = _make_gate(
+        monkeypatch,
+        is_rocm=False,
+        is_cuda=True,
+        device_capability=(12, 0),
+        bias=True,
+    )
+
+    assert not gate.allow_ll_bf16_gemm
+
+
+def test_sm120_set_out_dtype_enables_ll_bf16(monkeypatch):
+    gate = _make_gate(
+        monkeypatch,
+        is_rocm=False,
+        is_cuda=True,
+        device_capability=(12, 0),
+        out_dtype=None,
+    )
+
+    assert not gate.allow_ll_bf16_gemm
+    gate.set_out_dtype(torch.float32)
+    assert gate.allow_ll_bf16_gemm

@@ -58,8 +58,14 @@ class GateLinear(ReplicatedLinear):
     ):
         is_hopper = current_platform.is_device_capability((9, 0))
         is_blackwell = current_platform.is_device_capability_family(100)
+        is_blackwell_rtx = current_platform.is_device_capability((12, 0))
         can_use_specialized_kernels = (
             current_platform.is_cuda() and (is_hopper or is_blackwell) and not bias
+        )
+        self._can_use_ll_bf16 = (
+            current_platform.is_cuda()
+            and (is_hopper or is_blackwell or is_blackwell_rtx)
+            and not bias
         )
 
         # If fp32 compute is required and no specialized kernel is available,
@@ -133,7 +139,7 @@ class GateLinear(ReplicatedLinear):
         # 1. PDL support. Both dot-product and split-K kernels.
         # 2. Thread Block Clusters. Split-K kernel for cross-CTA reduction.
         self.allow_ll_bf16_gemm = False
-        if can_use_specialized_kernels:
+        if self._can_use_ll_bf16:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
                 is_available,
             )
@@ -165,7 +171,7 @@ class GateLinear(ReplicatedLinear):
             self.allow_cublas_router_gemm = self.weight.dtype == torch.bfloat16
 
         # out_dtype may start as None -> recompute eligibility here
-        if self.allow_specialized_router_gemm:
+        if self._can_use_ll_bf16:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
                 is_available,
             )
