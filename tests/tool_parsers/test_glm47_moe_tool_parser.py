@@ -19,6 +19,7 @@ from vllm.entrypoints.openai.engine.protocol import FunctionCall
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.entrypoints.openai.responses.utils import build_response_output_items
 from vllm.tokenizers import get_tokenizer
+from vllm.tokenizers.detokenizer_utils import detokenize_incrementally
 from vllm.tool_parsers.glm47_moe_tool_parser import Glm47MoeModelToolParser
 
 MODEL = "zai-org/GLM-4.7"
@@ -145,15 +146,25 @@ def run_glm_output(glm_parser, output: str, *, mode: str):
         tokenizer = parser.model_tokenizer
         token_ids = tokenizer.encode(output, add_special_tokens=False)
         stream_steps = []
-        previous_decoded = ""
+        previous_tokens: list[str] | None = None
+        prefix_offset = 0
+        read_offset = 0
         for index, token_id in enumerate(token_ids):
-            decoded = tokenizer.decode(
-                token_ids[: index + 1],
-                skip_special_tokens=False,
+            (new_tokens, delta_text, prefix_offset, read_offset) = (
+                detokenize_incrementally(
+                    tokenizer=tokenizer,
+                    all_input_ids=token_ids[: index + 1],
+                    prev_tokens=previous_tokens,
+                    prefix_offset=prefix_offset,
+                    read_offset=read_offset,
+                    skip_special_tokens=False,
+                    spaces_between_special_tokens=True,
+                )
             )
-            assert decoded.startswith(previous_decoded)
-            stream_steps.append((decoded[len(previous_decoded) :], [token_id]))
-            previous_decoded = decoded
+            stream_steps.append((delta_text, [token_id]))
+            previous_tokens = (
+                previous_tokens + new_tokens if previous_tokens else new_tokens
+            )
     else:
         raise ValueError(f"unknown GLM output mode: {mode}")
 
@@ -385,6 +396,7 @@ class TestGlm47ExtractToolCalls:
                 id="later-terminals",
             ),
             pytest.param("雪 \\tmp\\file &amp; <b>bold</b>", id="data-bytes"),
+            pytest.param("ok 🎉 ∮ 𠀋 done", id="byte-fallback"),
             pytest.param("", id="empty"),
         ],
     )
