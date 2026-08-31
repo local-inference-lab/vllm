@@ -37,7 +37,12 @@ class PauseState(enum.IntEnum):
 
 class SchedulerInterface(ABC):
     current_step: int
-    """Number of scheduling decisions completed by this scheduler."""
+    """Number of scheduling decisions completed by this scheduler.
+
+    Implementations initialize this counter to zero and increment it exactly
+    once at the start of every ``schedule`` call. Engine-level prefill cadence
+    reads the counter before the next scheduling decision.
+    """
 
     @abstractmethod
     def __init__(

@@ -384,6 +384,36 @@ def test_schedule_prefills_gating(has_running: bool):
     assert any(r.req_id == "new0" for r in output.scheduled_new_reqs)
 
 
+def test_throttle_prefills_admits_work_when_decode_is_temporarily_ineligible():
+    """Prefill runs instead of an empty step while async decode waits for its
+    pipeline-parallel scheduling slot.
+    """
+    scheduler = create_scheduler(max_num_seqs=16, max_num_batched_tokens=8192)
+
+    (decode_req,) = create_requests(num_requests=1, num_tokens=8, req_ids=["decode"])
+    scheduler.add_request(decode_req)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["decode"],
+            req_id_to_index={"decode": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    decode_req.next_decode_eligible_step = scheduler.current_step + 2
+
+    (prefill_req,) = create_requests(num_requests=1, num_tokens=8, req_ids=["prefill"])
+    scheduler.add_request(prefill_req)
+    output = scheduler.schedule(throttle_prefills=True)
+
+    assert "decode" not in output.num_scheduled_tokens
+    assert "prefill" in output.num_scheduled_tokens
+
+
 def _setup_remote_kv_resume(num_prompt_tokens: int, matched_tokens: int):
     """Drive a remote-KV request `r2` to the resume point (async load complete)
     while another request `r1` is already decoding, so the step is throttle-

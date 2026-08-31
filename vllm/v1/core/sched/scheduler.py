@@ -557,11 +557,18 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
-        # On a throttled cadence step, defer all prefill compute unless the
-        # prefill queue is saturated.
+        # On a throttled cadence step, defer prefill compute only when this
+        # decision can schedule decode work. Pipeline-parallel async requests
+        # can be temporarily ineligible; admitting prefill in that case avoids
+        # an empty model-executor step.
+        has_eligible_decode = any(
+            not request.is_prefill_chunk
+            and self.current_step >= request.next_decode_eligible_step
+            for request in self.running
+        )
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
-        ) and any(not r.is_prefill_chunk for r in self.running)
+        ) and has_eligible_decode
 
         # First, schedule the RUNNING requests.
         req_index = 0

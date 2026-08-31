@@ -4,6 +4,8 @@
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
@@ -104,3 +106,19 @@ def test_non_dp_prefill_schedule_interval_uses_scheduler_step():
     engine.vllm_config.scheduler_config.prefill_schedule_interval = 1
     engine.scheduler.current_step = 3
     assert not EngineCore._should_throttle_prefills(engine)
+
+
+@pytest.mark.parametrize("current_step", [None, -1, True, 1.5])
+def test_non_dp_prefill_schedule_interval_validates_scheduler_step(current_step):
+    scheduler = SimpleNamespace()
+    if current_step is not None:
+        scheduler.current_step = current_step
+    engine = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            scheduler_config=SimpleNamespace(prefill_schedule_interval=4)
+        ),
+        scheduler=scheduler,
+    )
+
+    with pytest.raises(RuntimeError, match="scheduler.current_step"):
+        EngineCore._should_throttle_prefills(engine)

@@ -599,7 +599,20 @@ class EngineCore:
         synchronized across DP ranks.
         """
         interval = self.vllm_config.scheduler_config.prefill_schedule_interval
-        return interval > 1 and self.scheduler.current_step % interval != 0
+        if interval <= 1:
+            return False
+        current_step = getattr(self.scheduler, "current_step", None)
+        if (
+            not isinstance(current_step, int)
+            or isinstance(current_step, bool)
+            or current_step < 0
+        ):
+            raise RuntimeError(
+                "prefill_schedule_interval greater than one requires "
+                "scheduler.current_step to be a non-negative integer that "
+                "advances once per schedule() call"
+            )
+        return current_step % interval != 0
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
