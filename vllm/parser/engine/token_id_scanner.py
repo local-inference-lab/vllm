@@ -282,6 +282,8 @@ class TokenIDScanner:
         ``delta_text`` that has no corresponding token ID in
         ``delta_token_ids``.  This hold-back text always appears as a
         prefix of ``delta_text``.
+
+        Serving can strip a trailing DROP terminal's text while retaining its ID.
         """
         if not results:
             return [TextChunk(delta_text)]
@@ -296,6 +298,26 @@ class TokenIDScanner:
             return [TextChunk(delta_text[:pos])] + results
         if pos == 0:
             return results
+
+        trailing_drop_index = len(results)
+        while trailing_drop_index > 0:
+            trailing_drop = results[trailing_drop_index - 1]
+            if (
+                not isinstance(trailing_drop, PreLexedTerminal)
+                or trailing_drop.terminal != DROP_TERMINAL
+            ):
+                break
+            trailing_drop_index -= 1
+
+        retained = results[:trailing_drop_index]
+        retained_text = self._join_decoded_text(retained)
+        if retained_text and retained_text == delta_text:
+            trailing_drops = results[trailing_drop_index:]
+            for trailing_drop in trailing_drops:
+                assert isinstance(trailing_drop, PreLexedTerminal)
+                self._deferred_terminals.append(trailing_drop)
+                self._deferred_prefix_token_counts.append(0)
+            return retained
 
         # Fallback: SentencePiece context-dependent decoding mismatch.
         # Rebuild from delta_text using PreLexedTerminals as split anchors.

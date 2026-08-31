@@ -17,6 +17,7 @@ from tests.entrypoints.openai.utils import (
     verify_chat_response,
     verify_harmony_messages,
 )
+from tests.parser.engine.replay_harness import MockTokenizer
 from tests.utils import RemoteOpenAIServer
 from vllm._aiter_ops import is_aiter_found_and_supported
 from vllm.config import MultiModalConfig
@@ -47,6 +48,7 @@ from vllm.inputs import TokensPrompt
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import HarmonyParser
+from vllm.parser.glm47_moe import Glm47MoeParser
 from vllm.renderers.hf import HfRenderer
 from vllm.renderers.mistral import MistralRenderer
 from vllm.renderers.online_renderer import OnlineRenderer
@@ -847,6 +849,272 @@ class MockEngine:
     input_processor: MagicMock = field(default_factory=MagicMock)
     renderer: MagicMock = field(default_factory=MagicMock)
     errored: bool = False
+
+
+_GLM47_THINK_END = "</think>"
+_GLM47_TOOL_START = "<tool_call>"
+_GLM47_TOOL_END = "</tool_call>"
+_GLM47_ARG_KEY_START = "<arg_key>"
+_GLM47_ARG_KEY_END = "</arg_key>"
+_GLM47_ARG_VALUE_START = "<arg_value>"
+_GLM47_ARG_VALUE_END = "</arg_value>"
+_GLM47_OBSERVATION = "<|observation|>"
+_GLM47_THINK_END_ID = 154842
+_GLM47_TOOL_START_ID = 154843
+_GLM47_TOOL_END_ID = 154844
+_GLM47_ARG_KEY_START_ID = 154847
+_GLM47_ARG_KEY_END_ID = 154848
+_GLM47_ARG_VALUE_START_ID = 154849
+_GLM47_ARG_VALUE_END_ID = 154850
+_GLM47_OBSERVATION_ID = 154829
+_GLM47_REASONING_ID = 301
+_GLM47_NAME_ID = 302
+_GLM47_KEY_ID = 303
+_GLM47_VALUE_PREFIX_ID = 304
+_GLM47_VALUE_SUFFIX_ID = 305
+_GLM47_REASONING = "Reasoning describes the requested value."
+_GLM47_GENERATED_TOKENS = [
+    (_GLM47_REASONING_ID, _GLM47_REASONING),
+    (_GLM47_THINK_END_ID, _GLM47_THINK_END),
+    (_GLM47_TOOL_START_ID, _GLM47_TOOL_START),
+    (_GLM47_NAME_ID, "record_value"),
+    (_GLM47_ARG_KEY_START_ID, _GLM47_ARG_KEY_START),
+    (_GLM47_KEY_ID, "value"),
+    (_GLM47_ARG_KEY_END_ID, _GLM47_ARG_KEY_END),
+    (_GLM47_ARG_VALUE_START_ID, _GLM47_ARG_VALUE_START),
+    (_GLM47_VALUE_PREFIX_ID, "</tool_call> and "),
+    (_GLM47_VALUE_SUFFIX_ID, "<tool_call>"),
+    (_GLM47_ARG_VALUE_END_ID, _GLM47_ARG_VALUE_END),
+    (_GLM47_TOOL_END_ID, _GLM47_TOOL_END),
+]
+_GLM47_OUTPUT_TEXT = "".join(text for _, text in _GLM47_GENERATED_TOKENS)
+_GLM47_OUTPUT_IDS = [
+    *(token_id for token_id, _ in _GLM47_GENERATED_TOKENS),
+    _GLM47_OBSERVATION_ID,
+]
+_GLM47_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "record_value",
+            "description": "Record an exact value.",
+            "parameters": {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        },
+    }
+]
+
+
+def _glm47_stop_tokenizer() -> MockTokenizer:
+    vocab = {
+        "<think>": 154841,
+        _GLM47_THINK_END: _GLM47_THINK_END_ID,
+        _GLM47_TOOL_START: _GLM47_TOOL_START_ID,
+        _GLM47_TOOL_END: _GLM47_TOOL_END_ID,
+        _GLM47_ARG_KEY_START: _GLM47_ARG_KEY_START_ID,
+        _GLM47_ARG_KEY_END: _GLM47_ARG_KEY_END_ID,
+        _GLM47_ARG_VALUE_START: _GLM47_ARG_VALUE_START_ID,
+        _GLM47_ARG_VALUE_END: _GLM47_ARG_VALUE_END_ID,
+        _GLM47_OBSERVATION: _GLM47_OBSERVATION_ID,
+    }
+    tokens = [
+        *_GLM47_GENERATED_TOKENS,
+        (154841, "<think>"),
+        (_GLM47_OBSERVATION_ID, _GLM47_OBSERVATION),
+    ]
+    return MockTokenizer(vocab=vocab, tokens=tokens)
+
+
+def _glm47_request(*, stream: bool) -> ChatCompletionRequest:
+    return ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Record the exact value."}],
+        tools=_GLM47_TOOLS,
+        tool_choice="auto",
+        parallel_tool_calls=False,
+        include_reasoning=True,
+        return_token_ids=True,
+        stream=stream,
+    )
+
+
+def _glm47_request_output(
+    *,
+    text: str,
+    token_ids: list[int],
+    finished: bool,
+) -> RequestOutput:
+    return RequestOutput(
+        request_id="glm47-stop-test",
+        prompt="test",
+        prompt_token_ids=[1, 2, 3],
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text=text,
+                token_ids=token_ids,
+                cumulative_logprob=0.0,
+                logprobs=None,
+                finish_reason="stop" if finished else None,
+                stop_reason=_GLM47_OBSERVATION_ID if finished else None,
+            )
+        ],
+        finished=finished,
+    )
+
+
+def _glm47_serving_chat() -> OpenAIServingChat:
+    serving = _build_serving_chat(
+        MockEngine(),
+        reasoning_parser="glm45",
+        tool_parser="glm47",
+        enable_auto_tools=True,
+    )
+    assert serving.parser_cls is Glm47MoeParser
+    return serving
+
+
+@pytest.mark.asyncio
+async def test_glm47_full_response_with_stripped_trailing_drop():
+    tokenizer = _glm47_stop_tokenizer()
+    request = _glm47_request(stream=False)
+    normalized_messages = {}
+
+    for mode, text in {
+        "matching": _GLM47_OUTPUT_TEXT + _GLM47_OBSERVATION,
+        "stop_stripped": _GLM47_OUTPUT_TEXT,
+    }.items():
+        serving = _glm47_serving_chat()
+        assert serving.parser_cls is not None
+        parser = serving.parser_cls(tokenizer, request.tools)
+        response = await serving.chat_completion_full_generator(
+            request=request,
+            result_generator=_single_request_output(
+                _glm47_request_output(
+                    text=text,
+                    token_ids=list(_GLM47_OUTPUT_IDS),
+                    finished=True,
+                )
+            ),
+            request_id="chatcmpl-glm47-stop-test",
+            model_name=MODEL_NAME,
+            conversation=[],
+            tokenizer=tokenizer,
+            request_metadata=RequestResponseMetadata(
+                request_id="chatcmpl-glm47-stop-test",
+                model_name=MODEL_NAME,
+            ),
+            parser=parser,
+        )
+
+        assert isinstance(response, ChatCompletionResponse)
+        choice = response.choices[0]
+        message = choice.message
+        assert message.content in (None, "")
+        assert len(message.tool_calls or []) == 1
+        call = message.tool_calls[0].function
+        assert call.name == "record_value"
+        assert json.loads(call.arguments) == {"value": "</tool_call> and <tool_call>"}
+        assert choice.finish_reason == "tool_calls"
+        assert choice.stop_reason == _GLM47_OBSERVATION_ID
+        assert choice.token_ids is not None
+        assert choice.token_ids[-1] == _GLM47_OBSERVATION_ID
+        normalized_messages[mode] = {
+            "reasoning": message.reasoning,
+            "content": message.content,
+            "name": call.name,
+            "arguments": json.loads(call.arguments),
+            "finish_reason": choice.finish_reason,
+            "stop_reason": choice.stop_reason,
+            "token_ids": choice.token_ids,
+        }
+
+    assert normalized_messages["matching"] == normalized_messages["stop_stripped"]
+
+
+@pytest.mark.asyncio
+async def test_glm47_stream_response_with_empty_trailing_drop():
+    tokenizer = _glm47_stop_tokenizer()
+    request = _glm47_request(stream=True)
+    serving = _glm47_serving_chat()
+
+    async def result_generator():
+        for token_id, text in _GLM47_GENERATED_TOKENS:
+            yield _glm47_request_output(
+                text=text,
+                token_ids=[token_id],
+                finished=False,
+            )
+        yield _glm47_request_output(
+            text="",
+            token_ids=[_GLM47_OBSERVATION_ID],
+            finished=True,
+        )
+
+    call_ids = set()
+    indexes = set()
+    names = []
+    argument_fragments = []
+    content_fragments = []
+    finish_reasons = []
+    stop_reasons = []
+    token_id_deltas = []
+    done = False
+
+    async for line in serving.chat_completion_stream_generator(
+        request=request,
+        result_generator=result_generator(),
+        request_id="chatcmpl-glm47-stop-test",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=tokenizer,
+        request_metadata=RequestResponseMetadata(
+            request_id="chatcmpl-glm47-stop-test",
+            model_name=MODEL_NAME,
+        ),
+    ):
+        payload = line.removeprefix("data: ").strip()
+        if payload == "[DONE]":
+            done = True
+            continue
+        document = json.loads(payload)
+        for choice in document.get("choices", []):
+            if choice.get("finish_reason"):
+                finish_reasons.append(choice["finish_reason"])
+            if choice.get("stop_reason") is not None:
+                stop_reasons.append(choice["stop_reason"])
+            if choice.get("token_ids") is not None:
+                token_id_deltas.append(choice["token_ids"])
+            delta = choice.get("delta") or {}
+            if isinstance(delta.get("content"), str):
+                content_fragments.append(delta["content"])
+            for call in delta.get("tool_calls") or []:
+                indexes.add(call["index"])
+                if isinstance(call.get("id"), str):
+                    call_ids.add(call["id"])
+                function = call.get("function") or {}
+                if isinstance(function.get("name"), str):
+                    names.append(function["name"])
+                if isinstance(function.get("arguments"), str):
+                    argument_fragments.append(function["arguments"])
+
+    assert done
+    assert indexes == {0}
+    assert len(call_ids) == 1
+    assert "".join(names) == "record_value"
+    assert len(argument_fragments) > 1
+    assert json.loads("".join(argument_fragments)) == {
+        "value": "</tool_call> and <tool_call>"
+    }
+    assert "".join(content_fragments) == ""
+    assert finish_reasons == ["tool_calls"]
+    assert stop_reasons == [_GLM47_OBSERVATION_ID]
+    assert token_id_deltas[-1] == [_GLM47_OBSERVATION_ID]
 
 
 async def _async_serving_chat_init():

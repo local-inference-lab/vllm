@@ -9,6 +9,7 @@ import pytest
 from vllm.parser.engine.events import EventType
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
 from vllm.parser.engine.token_id_scanner import (
+    DROP_TERMINAL,
     PreLexedTerminal,
     TextChunk,
     TokenIDScanner,
@@ -1015,3 +1016,137 @@ class TestRebuildFromAnchorsCascadingDeferral:
         assert bare_scanner._deferred_post_text == "more"
         assert len(bare_scanner._deferred_terminals) == 1
         assert bare_scanner._deferred_terminals[0].terminal == "THINK_END"
+
+
+class TestTrailingDropAnchorRecovery:
+    DROP_TEXT = "<|observation|>"
+    DROP_TEXT_2 = "<|user|>"
+    DROP_ID = 112
+    DROP_ID_2 = 113
+    TEXT_ID = 201
+    BODY_ID = 202
+    AFTER_ID = 203
+    BODY = (
+        "record_value<arg_key>value</arg_key><arg_value>"
+        "</tool_call> and <tool_call></arg_value>"
+    )
+
+    def _scanner(self) -> TokenIDScanner:
+        tokenizer = MagicMock()
+        tokenizer.decode.side_effect = lambda ids: {
+            self.TEXT_ID: "prefix",
+            self.BODY_ID: self.BODY,
+            self.AFTER_ID: "after",
+            TOOL_START_ID: TOOL_START,
+            TOOL_END_ID: TOOL_END,
+            self.DROP_ID: self.DROP_TEXT,
+            self.DROP_ID_2: self.DROP_TEXT_2,
+        }[ids[0]]
+        return TokenIDScanner(
+            {
+                TOOL_START_ID: "TOOL_START",
+                TOOL_END_ID: "TOOL_END",
+                self.DROP_ID: DROP_TERMINAL,
+                self.DROP_ID_2: DROP_TERMINAL,
+            },
+            tokenizer,
+        )
+
+    @staticmethod
+    def _signature(items, *, without_drop: bool = False):
+        result: list[tuple[object, ...]] = []
+        for item in items:
+            if isinstance(item, TextChunk):
+                result.append(("text", item.text, item.token_count))
+            elif not without_drop or item.terminal != DROP_TERMINAL:
+                result.append(("terminal", item.terminal))
+        return result
+
+    def _texts_and_ids(self, *drop_ids: int):
+        ids = [
+            self.TEXT_ID,
+            TOOL_START_ID,
+            self.BODY_ID,
+            TOOL_END_ID,
+            *drop_ids,
+        ]
+        matching = f"prefix{TOOL_START}{self.BODY}{TOOL_END}"
+        for drop_id in drop_ids:
+            matching += {
+                self.DROP_ID: self.DROP_TEXT,
+                self.DROP_ID_2: self.DROP_TEXT_2,
+            }[drop_id]
+        stripped = f"prefix{TOOL_START}{self.BODY}{TOOL_END}"
+        return matching, stripped, ids
+
+    def test_stop_stripped_trailing_drop_preserves_structural_anchors(self):
+        matching, stripped, ids = self._texts_and_ids(self.DROP_ID)
+        matching_scanner = self._scanner()
+        stripped_scanner = self._scanner()
+
+        matching_items = matching_scanner.scan(matching, ids)
+        stripped_items = stripped_scanner.scan(stripped, ids)
+
+        expected = [
+            ("text", "prefix", 1),
+            ("terminal", "TOOL_START"),
+            ("text", self.BODY, 1),
+            ("terminal", "TOOL_END"),
+        ]
+        assert self._signature(matching_items, without_drop=True) == expected
+        assert self._signature(stripped_items) == expected
+        assert [item.terminal for item in stripped_scanner._deferred_terminals] == [
+            DROP_TERMINAL
+        ]
+        assert stripped_scanner._deferred_prefix_token_counts == [0]
+        assert stripped_scanner._deferred_post_text == ""
+
+    def test_stop_stripped_drop_preserves_text_token_count(self):
+        matching_scanner = self._scanner()
+        stripped_scanner = self._scanner()
+
+        matching = matching_scanner.scan(
+            "prefix" + self.DROP_TEXT,
+            [self.TEXT_ID, self.DROP_ID],
+        )
+        stripped = stripped_scanner.scan(
+            "prefix",
+            [self.TEXT_ID, self.DROP_ID],
+        )
+
+        matching_count = sum(
+            item.token_count for item in matching if isinstance(item, TextChunk)
+        )
+        stripped_count = sum(
+            item.token_count for item in stripped if isinstance(item, TextChunk)
+        )
+        assert matching_count == stripped_count == 1
+
+    def test_deferred_trailing_drop_resolves_on_next_delta(self):
+        _, stripped, ids = self._texts_and_ids(self.DROP_ID)
+        scanner = self._scanner()
+        scanner.scan(stripped, ids)
+
+        items = scanner.scan(self.DROP_TEXT + "after", [self.AFTER_ID])
+
+        assert self._signature(items) == [
+            ("terminal", DROP_TERMINAL),
+            ("text", "after", 1),
+        ]
+        assert scanner._deferred_terminals == []
+
+    def test_absent_trailing_drop_is_flushed_in_order(self):
+        _, stripped, ids = self._texts_and_ids(self.DROP_ID, self.DROP_ID_2)
+        scanner = self._scanner()
+
+        stripped_items = scanner.scan(stripped, ids)
+        pending = scanner.flush_pending()
+
+        assert self._signature(stripped_items) == [
+            ("text", "prefix", 1),
+            ("terminal", "TOOL_START"),
+            ("text", self.BODY, 1),
+            ("terminal", "TOOL_END"),
+        ]
+        assert [item.token_id for item in pending] == [self.DROP_ID, self.DROP_ID_2]
+        assert all(item.terminal == DROP_TERMINAL for item in pending)
