@@ -344,14 +344,24 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        glm5_next_mtp_has_independent_draft_state = (
+            speculative_config is not None
+            and speculative_config.method == "mtp"
+            and speculative_config.draft_model_config is not None
+            and "Glm5NextMTPModel"
+            in (speculative_config.draft_model_config.hf_config.architectures or ())
+        )
         self.mamba_has_prefill_checkpoint_blocks = (
             self.has_mamba_layers
-            # DFlash's external draft has no recurrent state. The target GDN
-            # backend can therefore publish its internal prefill checkpoint
-            # without changing the drafter's cache contract.
+            # DFlash and GLM-5.3 MTP keep draft attention state independently
+            # from the target GDN recurrent state. Publishing a target GDN
+            # checkpoint therefore does not mutate draft KV. Prefix-cache
+            # lookup still drops and re-prefills the lookahead-dependent MTP
+            # draft tail through the EAGLE group policy.
             and (
                 not self.use_eagle
                 or (speculative_config is not None and speculative_config.use_dflash())
+                or glm5_next_mtp_has_independent_draft_state
             )
             and all(
                 not isinstance(group.kv_cache_spec, MambaSpec)

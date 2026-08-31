@@ -173,6 +173,33 @@ def test_dflash_checkpoint_keeps_intermediate_chunks_aligned_and_joins_prompt_ta
     )
 
 
+def test_glm_mtp_checkpoint_joins_unaligned_prompt_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Target GDN checkpointing does not add an MTP target-only tail step.
+
+    GLM-5.3 MTP stores draft MLA KV independently from the target GDN state.
+    The EAGLE cache-group policy remains responsible for dropping and replaying
+    the lookahead-dependent draft tail during prefix-cache lookup.
+    """
+    block_size = 512
+    prompt_len = 32320
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    monkeypatch.setattr(sys.modules[__name__], "MAMBA_BLOCK_SIZE", block_size)
+
+    request.num_computed_tokens = 7 * 4096
+    assert (
+        _split(
+            request,
+            prompt_len - request.num_computed_tokens,
+            use_eagle=True,
+            num_prefill_checkpoint_blocks=1,
+            allow_speculative_checkpoints=True,
+        )
+        == 3648
+    )
+
+
 def _run_chunked_prefill(
     manager: KVCacheManager, request: Request, budgets: list[int]
 ) -> dict[int, int]:
