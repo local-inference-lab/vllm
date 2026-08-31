@@ -640,6 +640,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             signature = (execution_plan.implementation, execution_plan.execution)
             launch_tokens.setdefault(signature, tokens)
 
+        launch_resources: list[tuple[torch.Tensor, ...]] = []
         for tokens in launch_tokens.values():
             hidden_states = torch.zeros(
                 (tokens, int(prepared.hidden_size)),
@@ -671,6 +672,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 dtype=torch.uint8,
                 device=device,
             )
+            # B12X warmup launches may outlive the Python call that submits
+            # them. Retain every caller-owned input, output, and scratch tensor
+            # until device completion so the allocator cannot reuse an address
+            # while a warmup kernel still references it.
+            launch_resources.append(
+                (hidden_states, output, topk_ids, topk_weights, scratch)
+            )
             _run_b12x_moe_plan(
                 plan=plan,
                 scratch=scratch,
@@ -681,6 +689,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 output=output,
                 unit_scale_contract=self._quant_mode == "w4a16",
             )
+        if launch_resources:
+            torch.accelerator.synchronize()
         return len(launch_tokens)
 
     def workspace_shapes(

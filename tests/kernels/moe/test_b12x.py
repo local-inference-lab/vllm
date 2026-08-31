@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the b12x tensor-parallel MoE integration."""
 
+import weakref
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
@@ -738,6 +739,8 @@ def test_b12x_moe_warmup_runs_each_planner_regime_once(
     )
     planned_tokens = []
     launched_tokens = []
+    launched_resources = []
+    synchronized = []
 
     with pytest.raises(RuntimeError, match="process_weights_after_loading"):
         experts.warmup_launches(layer, token_counts=(1,))
@@ -764,16 +767,38 @@ def test_b12x_moe_warmup_runs_each_planner_regime_once(
 
     def fake_run(**kwargs):
         launched_tokens.append(kwargs["hidden_states"].shape[0])
+        launched_resources.append(
+            tuple(
+                weakref.ref(kwargs[name])
+                for name in (
+                    "hidden_states",
+                    "output",
+                    "topk_ids",
+                    "topk_weights",
+                    "scratch",
+                )
+            )
+        )
+
+    def fake_synchronize():
+        assert all(
+            resource() is not None
+            for launch in launched_resources
+            for resource in launch
+        )
+        synchronized.append(True)
 
     monkeypatch.setattr(b12x, "_b12x_moe_execution_plan", fake_execution_plan)
     monkeypatch.setattr(b12x, "_run_b12x_moe_plan", fake_run)
     monkeypatch.setattr(experts, "_plan", fake_plan)
+    monkeypatch.setattr(b12x.torch.accelerator, "synchronize", fake_synchronize)
 
     warmed = experts.warmup_launches(layer, token_counts=(1, 2, 3, 4, 8))
 
     assert warmed == 3
     assert planned_tokens == [1, 3, 8]
     assert launched_tokens == planned_tokens
+    assert synchronized == [True]
 
 
 def test_b12x_moe_reload_reprepares_current_parameters(

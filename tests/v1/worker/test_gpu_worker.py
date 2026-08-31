@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from vllm.utils.mem_constants import GiB_bytes
-from vllm.v1.worker import startup_plan
+from vllm.v1.worker import gpu_worker, startup_plan
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
@@ -77,3 +78,69 @@ def test_startup_plan_apply_gate(plan_env):
     explicit = _plan_worker(kv_bytes=7 * GiB_bytes)
     maybe_apply_startup_plan(explicit)
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
+
+
+def test_b12x_warmup_precedes_cudagraph_memory_profile(monkeypatch):
+    """B12X launch modules must be resolved before descriptor capture begins."""
+    events = []
+
+    model_runner = SimpleNamespace(
+        model_memory_usage=0,
+        profile_run=lambda: events.append("profile_run"),
+        profile_cudagraph_memory=lambda: events.append("profile_cudagraph_memory") or 0,
+    )
+    profile_result = SimpleNamespace(
+        total_consumed=10,
+        transient_peak_headroom=5,
+        after_profile=SimpleNamespace(free_memory=80),
+        non_kv_cache_memory=10,
+    )
+
+    @contextmanager
+    def fake_memory_profiling(*args, **kwargs):
+        yield profile_result
+
+    worker = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            kv_cache_memory_bytes=None,
+            gpu_memory_utilization=0.9,
+        ),
+        model_runner=model_runner,
+        init_snapshot=SimpleNamespace(free_memory=100, total_memory=100),
+        requested_memory=90,
+        model_config=SimpleNamespace(multimodal_config=None),
+        parallel_config=SimpleNamespace(),
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                cudagraph_mode=gpu_worker.CUDAGraphMode.PIECEWISE,
+                cudagraph_capture_sizes=[8, 4],
+            )
+        ),
+    )
+
+    monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", lambda worker: None)
+    monkeypatch.setattr(gpu_worker, "memory_profiling", fake_memory_profiling)
+    monkeypatch.setattr(
+        gpu_worker,
+        "current_platform",
+        SimpleNamespace(is_cuda_alike=lambda: True),
+    )
+    monkeypatch.setattr(
+        gpu_worker,
+        "b12x_warmup",
+        lambda worker, sizes: events.append(("b12x_warmup", tuple(sizes))),
+    )
+    monkeypatch.setattr(
+        gpu_worker,
+        "reserve_mm_ipc_gpu_memory",
+        lambda requested, *args: requested,
+    )
+
+    available = gpu_worker.Worker.determine_available_memory(worker)
+
+    assert events == [
+        "profile_run",
+        ("b12x_warmup", (8, 4)),
+        "profile_cudagraph_memory",
+    ]
+    assert available == 80

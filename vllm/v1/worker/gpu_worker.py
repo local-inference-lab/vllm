@@ -52,6 +52,7 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
@@ -535,6 +536,14 @@ class Worker(WorkerBase):
             current_platform.is_cuda_alike()
             and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
+            # Resolve B12X launch modules before the graph-memory profiler
+            # enters its descriptor capture loop. A disk-cache miss can run
+            # CUDA module initialization on first use, which is not a valid
+            # operation to introduce between breakable graph descriptors.
+            capture_sizes = list(
+                self.vllm_config.compilation_config.cudagraph_capture_sizes or []
+            )
+            b12x_warmup(self, capture_sizes)
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
         # Respect the opt-in flag as originally designed.
