@@ -151,6 +151,7 @@ class BreakableCUDAGraphCapture:
     def __init__(self, pool: Any | None = None) -> None:
         self.pool = pool
         self.segments: list[Callable[[], Any]] = []
+        self._graphs: list[torch.cuda.CUDAGraph] = []
         self._num_graphs: int = 0
         self._num_eager_breaks: int = 0
         self._current_graph: torch.cuda.CUDAGraph | None = None
@@ -188,6 +189,7 @@ class BreakableCUDAGraphCapture:
             return
         assert self._current_graph is not None
         self._current_graph.capture_end()
+        self._graphs.append(self._current_graph)
         self.segments.append(self._current_graph.replay)
         self._num_graphs += 1
         self._current_graph = None
@@ -213,6 +215,15 @@ class BreakableCUDAGraphCapture:
     def replay(self) -> None:
         for r in self.segments:
             r()
+
+    def reset(self) -> None:
+        """Destroy every graph segment after its pending work has completed."""
+        if self._capturing:
+            raise RuntimeError("Cannot reset an active breakable CUDA graph capture.")
+        for graph in self._graphs:
+            graph.reset()
+        self._graphs.clear()
+        self.segments.clear()
 
     # --- introspection ---------------------------------------------------
 
@@ -267,6 +278,12 @@ class BreakableCUDAGraphWrapper:
         for instance in list(cls._all_instances):
             instance.clear_graphs()
 
+    @classmethod
+    def reset_all_graphs(cls) -> None:
+        """Destroy graph segments without releasing entry-owned resources."""
+        for instance in list(cls._all_instances):
+            instance.reset_graphs()
+
     def __init__(
         self,
         runnable: Callable[..., Any],
@@ -306,6 +323,14 @@ class BreakableCUDAGraphWrapper:
 
     def clear_graphs(self) -> None:
         self.entries.clear()
+
+    def reset_graphs(self) -> None:
+        """Destroy graph segments while retaining their captured resources."""
+        for entry in self.entries.values():
+            capture = entry.capture
+            if capture is not None:
+                capture.reset()
+                entry.capture = None
 
     # --- dispatch --------------------------------------------------------
 
@@ -367,13 +392,16 @@ class BreakableCUDAGraphWrapper:
         else:
             set_graph_pool_id(current_platform.graph_pool_handle())
 
-        # Match torch.cuda.graph()'s pre-capture cleanup once per descriptor.
+        # Match torch.cuda.graph()'s pre-capture barrier and cleanup once per
+        # descriptor. The warmup immediately before this call may use shared
+        # communication scratch. Starting capture before that work completes
+        # lets the captured kernels race the warmup on the same storage.
         # We drive capture_begin/end directly and bypass torch.cuda.graph(),
-        # so its built-in gc + empty_cache never fire. Run them here once
-        # per _capture call -- NOT inside _begin_segment, since this capture
-        # session may issue many begin/end pairs (one per layer's break),
-        # and repeated gc would tank capture time the way it did for the
-        # pre-`gc_disable` piecewise path.
+        # so its synchronize + gc + empty_cache sequence never runs. Run it
+        # here once per _capture call -- NOT inside _begin_segment, since this
+        # capture session may issue many begin/end pairs (one per layer's
+        # break), and repeated cleanup would dominate capture time.
+        torch.accelerator.synchronize()
         gc.collect()
         torch.accelerator.empty_cache()
         # Sync the offloader's copy stream before capture so any in-flight

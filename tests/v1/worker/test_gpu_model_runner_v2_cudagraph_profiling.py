@@ -51,10 +51,31 @@ class _FakeCudaGraphManager(cgu.CudaGraphManager):
         self._capture_mem_samples: list[int] | None = None
         self.use_breakable_cg = False
         self.graphs: dict[Any, Any] = {}
+        self.graph_capture_resources: dict[Any, list[Any]] = {}
         self._graphs_captured = False
 
     def needs_capture(self) -> bool:
         return self._needs_capture
+
+
+class _RecordingGraph:
+    def __init__(self, lifecycle: list[str], name: str) -> None:
+        self.lifecycle = lifecycle
+        self.name = name
+
+    def reset(self) -> None:
+        self.lifecycle.append(f"reset-{self.name}")
+
+
+class _RecordingDict(dict[Any, Any]):
+    def __init__(self, lifecycle: list[str], name: str) -> None:
+        super().__init__()
+        self.lifecycle = lifecycle
+        self.name = name
+
+    def clear(self) -> None:
+        self.lifecycle.append(f"clear-{self.name}")
+        super().clear()
 
 
 def _make_profiling_runner(
@@ -108,6 +129,7 @@ def _patch_module(monkeypatch) -> None:
     # The profiler reads free GPU memory before/after to compute what it
     # retained; default to a constant (nothing retained).
     monkeypatch.setattr(cgu.torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(cgu.torch.accelerator, "synchronize", lambda: None)
     monkeypatch.setattr(
         cgu.torch.accelerator, "get_memory_info", lambda: (1 << 30, 1 << 30)
     )
@@ -282,23 +304,86 @@ def test_profile_cudagraph_memory_clears_captured_graphs(monkeypatch):
     _patch_module(monkeypatch)
     runner = _make_profiling_runner(CUDAGraphMode.FULL_AND_PIECEWISE)
 
-    cleared: list[str] = []
+    lifecycle: list[str] = []
+    monkeypatch.setattr(
+        cgu.torch.accelerator,
+        "synchronize",
+        lambda: lifecycle.append("synchronize"),
+    )
+    monkeypatch.setattr(
+        cgu.CUDAGraphWrapper,
+        "reset_all_graphs",
+        classmethod(lambda cls: lifecycle.append("reset-piecewise")),
+    )
+    monkeypatch.setattr(
+        cgu.BreakableCUDAGraphWrapper,
+        "reset_all_graphs",
+        classmethod(lambda cls: lifecycle.append("reset-breakable")),
+    )
     monkeypatch.setattr(
         cgu.CUDAGraphWrapper,
         "clear_all_graphs",
-        classmethod(lambda cls: cleared.append("piecewise")),
+        classmethod(lambda cls: lifecycle.append("clear-piecewise")),
     )
     monkeypatch.setattr(
         cgu.BreakableCUDAGraphWrapper,
         "clear_all_graphs",
-        classmethod(lambda cls: cleared.append("breakable")),
+        classmethod(lambda cls: lifecycle.append("clear-breakable")),
     )
+    runner.cudagraph_manager.graphs = _RecordingDict(lifecycle, "full")
+    runner.cudagraph_manager.graphs["profile"] = _RecordingGraph(lifecycle, "full")
+    runner.cudagraph_manager.graph_capture_resources = _RecordingDict(
+        lifecycle, "resources"
+    )
+    runner.cudagraph_manager.graph_capture_resources["profile"] = [object()]
 
     cgu.profile_cudagraph_memory(runner)
 
-    # Profiling captures are discarded so the real capture re-captures them
-    # against the KV cache.
-    assert cleared == ["piecewise", "breakable"]
+    # CUDA graph executables must be destroyed and synchronized before their
+    # B12X channel checkpoints and tensor workspaces are released.
+    assert lifecycle == [
+        "synchronize",
+        "reset-piecewise",
+        "reset-breakable",
+        "reset-full",
+        "synchronize",
+        "clear-piecewise",
+        "clear-breakable",
+        "clear-full",
+        "clear-resources",
+    ]
+
+
+def test_cuda_graph_wrappers_reset_executables_without_releasing_resources():
+    lifecycle: list[str] = []
+    piecewise = object.__new__(cgu.CUDAGraphWrapper)
+    piecewise_entry = SimpleNamespace(
+        cudagraph=_RecordingGraph(lifecycle, "piecewise"),
+        output=object(),
+    )
+    piecewise.concrete_cudagraph_entries = {"profile": piecewise_entry}
+
+    class _RecordingCapture:
+        def reset(self) -> None:
+            lifecycle.append("reset-breakable")
+
+    breakable = object.__new__(cgu.BreakableCUDAGraphWrapper)
+    breakable_entry = SimpleNamespace(
+        capture=_RecordingCapture(),
+        resources=[object()],
+    )
+    breakable.entries = {"profile": breakable_entry}
+
+    piecewise.reset_graphs()
+    breakable.reset_graphs()
+
+    assert lifecycle == ["reset-piecewise", "reset-breakable"]
+    assert piecewise_entry.cudagraph is None
+    assert piecewise_entry.output is not None
+    assert piecewise.concrete_cudagraph_entries == {"profile": piecewise_entry}
+    assert breakable_entry.capture is None
+    assert breakable_entry.resources
+    assert breakable.entries == {"profile": breakable_entry}
 
 
 def test_profile_cudagraph_memory_redirects_wrapper_pools(monkeypatch):
@@ -317,6 +402,9 @@ def test_profile_cudagraph_memory_redirects_wrapper_pools(monkeypatch):
             self.pool_during_capture: Any = None
 
         def clear_graphs(self) -> None:
+            pass
+
+        def reset_graphs(self) -> None:
             pass
 
     wrapper = _FakeWrapper()
@@ -349,6 +437,9 @@ def test_profile_cudagraph_memory_redirects_late_created_wrappers(monkeypatch):
             self.pool_during_capture: Any = None
 
         def clear_graphs(self) -> None:
+            pass
+
+        def reset_graphs(self) -> None:
             pass
 
     wrapper: _FakeWrapper | None = None
@@ -390,8 +481,9 @@ def test_profile_cudagraph_memory_redirects_speculator_managers(monkeypatch):
     def _capture_model() -> int:
         nonlocal pools_during_capture
         pools_during_capture = (prefill_manager.pool, decode_manager.pool)
-        prefill_manager.graphs["profile"] = object()
-        decode_manager.graphs["profile"] = object()
+        lifecycle: list[str] = []
+        prefill_manager.graphs["profile"] = _RecordingGraph(lifecycle, "prefill")
+        decode_manager.graphs["profile"] = _RecordingGraph(lifecycle, "decode")
         prefill_manager._graphs_captured = True
         decode_manager._graphs_captured = True
         return capture_model()
@@ -455,7 +547,7 @@ def test_v2_profiling_teardown_runs_cache_lifecycle_hooks(monkeypatch):
     assert runner.kv_caches == []
     assert runner.attn_groups == []
     assert runner.cudagraph_manager is None
-    assert runner.block_tables is None
+    assert not hasattr(runner, "block_tables")
     assert runner.pcp_manager is None
     assert runner.adaptive_verification is None
     assert not hasattr(runner, "kv_cache_config")

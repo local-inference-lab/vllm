@@ -27,6 +27,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import requires_raw_input_tokens
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -44,6 +45,23 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
+
+
+def normalize_model_token_inputs(
+    model: nn.Module,
+    model_inputs: dict[str, Any],
+) -> None:
+    """Keep token-input arguments identical between graph capture and replay.
+
+    Models that receive prepared embeddings normally omit ``input_ids``. Models
+    declaring ``requires_raw_input_tokens`` are the exception and receive both.
+    CUDA graph capture and ordinary execution must apply the same rule because
+    breakable graphs require an invariant set of tensor arguments and addresses.
+    """
+    if model_inputs.get("inputs_embeds") is not None and not (
+        requires_raw_input_tokens(model)
+    ):
+        model_inputs["input_ids"] = None
 
 
 class AttentionState(NamedTuple):
@@ -339,6 +357,11 @@ class CudaGraphManager:
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
 
+    def reset_graphs(self) -> None:
+        """Destroy FULL graph executables while retaining captured resources."""
+        for graph in self.graphs.values():
+            graph.reset()
+
     @torch.inference_mode()
     def capture(
         self,
@@ -557,6 +580,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 "positions": input_buffers.positions[:num_tokens],
                 **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
             }
+            normalize_model_token_inputs(model, model_inputs)
             if not self.is_first_pp_rank:
                 # Update for non-first PP ranks.
                 model_inputs["input_ids"] = None
@@ -847,6 +871,18 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     finally:
         compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
         compilation_counter.num_gpu_runner_capture_triggers = saved_capture_triggers
+
+        # Graph reset can defer CUDA-side destruction. Keep graph entries and
+        # their Python-owned output/scratch tensors alive until every reset has
+        # completed; otherwise the allocator can reuse those addresses while
+        # the discarded profiling executable still references them.
+        torch.accelerator.synchronize()
+        CUDAGraphWrapper.reset_all_graphs()
+        BreakableCUDAGraphWrapper.reset_all_graphs()
+        for graph_manager in graph_managers:
+            graph_manager.reset_graphs()
+        torch.accelerator.synchronize()
+
         CUDAGraphWrapper.clear_all_graphs()
         BreakableCUDAGraphWrapper.clear_all_graphs()
         for graph_manager in graph_managers:
@@ -932,4 +968,5 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
     runner.cache_config.num_gpu_blocks = None
     runner.maybe_remove_all_loras(runner.lora_config)
     gc.collect()
+    torch.accelerator.synchronize()
     torch.accelerator.empty_cache()

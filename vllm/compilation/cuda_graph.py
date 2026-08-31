@@ -175,6 +175,12 @@ class CUDAGraphWrapper:
         for instance in list(cls._all_instances):
             instance.clear_graphs()
 
+    @classmethod
+    def reset_all_graphs(cls) -> None:
+        """Destroy captured graph executables without releasing their entries."""
+        for instance in list(cls._all_instances):
+            instance.reset_graphs()
+
     def __init__(
         self,
         runnable: Callable[..., Any],
@@ -229,6 +235,14 @@ class CUDAGraphWrapper:
 
     def clear_graphs(self) -> None:
         self.concrete_cudagraph_entries.clear()
+
+    def reset_graphs(self) -> None:
+        """Destroy graph executables while retaining entry-owned tensors."""
+        for entry in self.concrete_cudagraph_entries.values():
+            graph = entry.cudagraph
+            if graph is not None:
+                graph.reset()
+                entry.cudagraph = None
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any | None:
         if not is_forward_context_available():

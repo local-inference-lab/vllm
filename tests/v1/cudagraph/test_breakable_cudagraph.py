@@ -82,6 +82,8 @@ def test_breakable_wrapper_retains_capture_resources(monkeypatch):
     import vllm.compilation.breakable_cudagraph as breakable
     from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
 
+    lifecycle: list[str] = []
+
     class FakeCapture:
         def __init__(self, pool):
             self.pool = pool
@@ -102,13 +104,21 @@ def test_breakable_wrapper_retains_capture_resources(monkeypatch):
     resource = object()
 
     def runnable():
+        lifecycle.append("capture")
         assert retain_cuda_graph_capture_resource(resource)
         return object()
 
     monkeypatch.setattr(breakable, "validate_cudagraph_capturing_enabled", lambda: None)
     monkeypatch.setattr(breakable, "set_graph_pool_id", lambda _pool: None)
-    monkeypatch.setattr(breakable.gc, "collect", lambda: None)
-    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "synchronize",
+        lambda: lifecycle.append("synchronize"),
+    )
+    monkeypatch.setattr(breakable.gc, "collect", lambda: lifecycle.append("collect"))
+    monkeypatch.setattr(
+        torch.accelerator, "empty_cache", lambda: lifecycle.append("empty-cache")
+    )
     monkeypatch.setattr(breakable, "get_offloader", lambda: FakeOffloader())
     monkeypatch.setattr(breakable, "BreakableCUDAGraphCapture", FakeCapture)
     monkeypatch.setattr(breakable, "weak_ref_tensors", lambda value: value)
@@ -121,6 +131,7 @@ def test_breakable_wrapper_retains_capture_resources(monkeypatch):
     wrapper._capture(entry, (), {})
 
     assert entry.resources == [resource]
+    assert lifecycle == ["synchronize", "collect", "empty-cache", "capture"]
 
 
 @pytest.fixture(autouse=True)

@@ -47,6 +47,44 @@ def _create_vllm_config() -> MagicMock:
     return vllm_config
 
 
+@pytest.mark.parametrize("requires_raw_tokens", [False, True])
+def test_capture_token_inputs_match_runtime_embedding_contract(requires_raw_tokens):
+    """Prepared embeddings replace token IDs unless the model needs both."""
+
+    class Model:
+        requires_raw_input_tokens = requires_raw_tokens
+
+    input_ids = torch.arange(4, dtype=torch.int32)
+    inputs_embeds = torch.zeros((4, 8), dtype=torch.bfloat16)
+    model_inputs = {
+        "input_ids": input_ids,
+        "positions": torch.arange(4),
+        "inputs_embeds": inputs_embeds,
+    }
+
+    gpu_cudagraph_utils.normalize_model_token_inputs(Model(), model_inputs)
+
+    if requires_raw_tokens:
+        assert model_inputs["input_ids"] is input_ids
+    else:
+        assert model_inputs["input_ids"] is None
+    assert model_inputs["inputs_embeds"] is inputs_embeds
+
+
+def test_capture_token_inputs_keep_ids_without_embeddings():
+    """Text-only token input remains present when no embeddings are supplied."""
+    input_ids = torch.arange(4, dtype=torch.int32)
+    model_inputs = {
+        "input_ids": input_ids,
+        "positions": torch.arange(4),
+        "inputs_embeds": None,
+    }
+
+    gpu_cudagraph_utils.normalize_model_token_inputs(object(), model_inputs)
+
+    assert model_inputs["input_ids"] is input_ids
+
+
 def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
     """FULL capture must set graph_pool_id before entering torch.cuda.graph().
 
