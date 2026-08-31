@@ -124,10 +124,23 @@ def test_glm53_selector_prefill_lengths_do_not_require_attention_backend() -> No
         num_decode_tokens=1,
         prefill=None,
         prefill_query_lens_cpu=torch.tensor([3], dtype=torch.int32),
+        prefill_seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
     )
 
     assert metadata.prefill is None
     assert metadata.prefill_query_lens_cpu.tolist() == [3]
+    assert metadata.prefill_seq_lens_cpu is not None
+    assert metadata.prefill_seq_lens_cpu.tolist() == [8]
+
+
+@pytest.mark.parametrize(
+    ("seq_len", "expected_pages"),
+    [(0, 1), (3, 1), (4, 1), (259, 1), (260, 2), (32768, 128)],
+)
+def test_glm53_active_index_pages_cover_completed_pools(
+    seq_len: int, expected_pages: int
+) -> None:
+    assert Glm5NextPooledIndexer._active_index_page_count(seq_len) == expected_pages
 
 
 def test_glm53_packed_c4_metadata_uses_parent_stride() -> None:
@@ -208,7 +221,8 @@ def test_glm53_decode_table_capacity_uses_batched_token_limit() -> None:
     indexer.max_tokens = 128
     indexer.max_seqs = 16
     indexer.max_model_len = 4096
-    indexer.indexer_op = SimpleNamespace(max_model_len=0)
+    indexer.dcp_world_size = 1
+    indexer.indexer_op = SimpleNamespace(max_model_len=4096 // 4)
 
     indexer.bind_main_kv_cache(main)
 
@@ -468,7 +482,7 @@ def test_glm53_decode_tail_completes_the_same_pool_as_prefill() -> None:
     torch.testing.assert_close(actual_scale, expected_scale.reshape(1), rtol=0, atol=0)
 
 
-def test_glm53_decode_writer_matches_batched_prefill_writer() -> None:
+def test_glm53_decode_writer_matches_parallel_prefill_writer() -> None:
     device = _require_glm_gpu()
     generator = torch.Generator(device=device).manual_seed(56)
     key = torch.randn(
@@ -496,9 +510,13 @@ def test_glm53_decode_writer_matches_batched_prefill_writer() -> None:
         key,
         gate,
         ape,
-        torch.tensor([-1, -1, -1, 0, -1, -1, -1, 1], device=device),
+        torch.tensor([-1, -1, -1, 3, -1, -1, -1, 7], device=device),
         torch.arange(8, dtype=torch.int64, device=device),
         1,
+        num_decode_requests=0,
+        max_query_len=8,
+        model_block_size=256,
+        parent_stride_pages=1,
     )
     for position in range(8):
         update_decode_pools(
@@ -510,16 +528,125 @@ def test_glm53_decode_writer_matches_batched_prefill_writer() -> None:
             gate[position : position + 1],
             ape,
             torch.tensor(
-                [position // 4 if position % 4 == 3 else -1],
+                [position if position % 4 == 3 else -1],
                 dtype=torch.int64,
                 device=device,
             ),
             torch.tensor([position], dtype=torch.int64, device=device),
             1,
+            model_block_size=256,
+            parent_stride_pages=1,
         )
 
     assert torch.equal(decode_cache, prefill_cache)
     assert torch.equal(decode_tail, prefill_tail)
+
+
+def test_glm53_parallel_prefill_preserves_boundary_tail_and_state_slots() -> None:
+    device = _require_glm_gpu()
+    generator = torch.Generator(device=device).manual_seed(5304)
+    key = torch.randn(
+        (10, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    gate = torch.randn(
+        (10, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    ape = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    initial_tail = torch.randn(
+        (2, 2, 4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    sequential_tail = initial_tail.clone()
+    parallel_tail = initial_tail.clone()
+    sequential_cache = torch.zeros((2, 64, 132), dtype=torch.uint8, device=device)
+    parallel_cache = torch.zeros_like(sequential_cache)
+    state_slots = torch.tensor([1, 0], dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 5, 10], dtype=torch.int32, device=device)
+    positions = torch.tensor(
+        [4099, 4100, 4101, 4102, 4103, 4099, 4100, 4101, 4102, 4103],
+        dtype=torch.int64,
+        device=device,
+    )
+    slot_mapping = torch.tensor(
+        [3, -1, -1, -1, 7, 259, -1, -1, -1, 263],
+        dtype=torch.int64,
+        device=device,
+    )
+    common = dict(model_block_size=256, parent_stride_pages=1)
+
+    update_decode_pools(
+        sequential_cache,
+        sequential_tail,
+        state_slots,
+        query_start_loc,
+        key,
+        gate,
+        ape,
+        slot_mapping,
+        positions,
+        2,
+        **common,
+    )
+    update_decode_pools(
+        parallel_cache,
+        parallel_tail,
+        state_slots,
+        query_start_loc,
+        key,
+        gate,
+        ape,
+        slot_mapping,
+        positions,
+        2,
+        num_decode_requests=0,
+        max_query_len=5,
+        **common,
+    )
+
+    assert torch.equal(parallel_cache, sequential_cache)
+    assert torch.equal(parallel_tail, sequential_tail)
+
+
+def test_glm53_parallel_prefill_ignores_invalid_dummy_slots() -> None:
+    device = _require_glm_gpu()
+    generator = torch.Generator(device=device).manual_seed(5305)
+    key = torch.randn(
+        (8, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    gate = torch.randn(
+        (8, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    ape = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    cache = torch.zeros((1, 64, 132), dtype=torch.uint8, device=device)
+    initial_tail = torch.randn(
+        (1, 2, 4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    tail = initial_tail.clone()
+
+    update_decode_pools(
+        cache,
+        tail,
+        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.tensor([0, 8], dtype=torch.int32, device=device),
+        key,
+        gate,
+        ape,
+        torch.full((8,), -1, dtype=torch.int64, device=device),
+        torch.zeros(8, dtype=torch.int64, device=device),
+        1,
+        num_decode_requests=0,
+        max_query_len=8,
+        model_block_size=256,
+        parent_stride_pages=1,
+    )
+
+    assert torch.count_nonzero(cache).item() == 0
+    torch.testing.assert_close(tail[0, 0, 0], key[-1])
+    torch.testing.assert_close(tail[0, 1, 0], gate[-1])
+    assert torch.equal(tail[:, :, 1:], initial_tail[:, :, 1:])
 
 
 def test_glm53_tail_state_isolated_between_requests() -> None:

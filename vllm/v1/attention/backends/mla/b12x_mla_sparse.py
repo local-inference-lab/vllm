@@ -291,6 +291,7 @@ class B12xMLASparseMetadata(AttentionMetadata):
     prefill_max_seq_len: int = 0
     prefill: MLACommonPrefillMetadata | None = None
     prefill_query_lens_cpu: torch.Tensor | None = None
+    prefill_seq_lens_cpu: torch.Tensor | None = None
     block_size: int = 64
     topk_tokens: int = 2048
     cp_kv_cache_interleave_size: int = 1
@@ -524,6 +525,14 @@ class B12xMLASparseMetadataBuilder(
             metadata.prefill_query_lens_cpu = torch.diff(
                 common.query_start_loc_cpu[prefill_start:prefill_end]
             )
+            seq_lens_cpu_source = (
+                common.seq_lens_cpu_upper_bound
+                if common.seq_lens_cpu_upper_bound is not None
+                else common.seq_lens_cpu
+            )
+            metadata.prefill_seq_lens_cpu = seq_lens_cpu_source[
+                prefill_start : prefill_start + metadata.num_prefills
+            ].clone()
         (
             metadata.selector_state_slot_ids,
             metadata.selector_state_is_fresh,

@@ -261,6 +261,12 @@ class Glm5NextPooledIndexer(nn.Module):
         return math.ceil(max_model_len / (block_size * dcp_world_size))
 
     @staticmethod
+    def _active_index_page_count(seq_len: int) -> int:
+        """Return FP8 C4 pages that can contain completed visible pools."""
+        completed_pools = seq_len // _POOL_SIZE
+        return max(1, math.ceil(completed_pools / _INDEX_PAGE_SIZE))
+
+    @staticmethod
     def _index_cache_view(
         main_cache: torch.Tensor,
     ) -> tuple[torch.Tensor, int, int]:
@@ -430,6 +436,8 @@ class Glm5NextPooledIndexer(nn.Module):
             main_metadata.slot_mapping[:rows],
             positions,
             num_reqs,
+            num_decode_requests=num_decodes,
+            max_query_len=int(main_metadata.max_query_len),
             model_block_size=self.block_size,
             parent_stride_pages=self._parent_stride_pages,
         )
@@ -480,15 +488,35 @@ class Glm5NextPooledIndexer(nn.Module):
 
         if decode_rows < live_rows:
             query_lens_cpu = main_metadata.prefill_query_lens_cpu
-            if query_lens_cpu is None:
+            request_seq_lens_cpu = main_metadata.prefill_seq_lens_cpu
+            if query_lens_cpu is None or request_seq_lens_cpu is None:
                 raise RuntimeError("GLM selector prefill metadata is incomplete")
+            if len(query_lens_cpu) != len(request_seq_lens_cpu):
+                raise RuntimeError(
+                    "GLM selector prefill request metadata has inconsistent lengths"
+                )
             row_start = decode_rows
             for local_request, query_len in enumerate(query_lens_cpu.tolist()):
                 row_end = row_start + int(query_len)
                 request = num_decodes + local_request
-                shared_table = self._pool_block_table[request : request + 1].expand(
-                    int(query_len), -1
-                )
+                if self.dcp_world_size == 1:
+                    active_pages = self._active_index_page_count(
+                        int(request_seq_lens_cpu[local_request])
+                    )
+                    if active_pages > int(self._pool_block_table.shape[1]):
+                        raise RuntimeError(
+                            "GLM selector visible C4 pages exceed table capacity: "
+                            f"active={active_pages}, "
+                            f"capacity={int(self._pool_block_table.shape[1])}"
+                        )
+                    request_table = self._pool_block_table[
+                        request : request + 1, :active_pages
+                    ]
+                else:
+                    # DCP pool ownership is interleaved across ranks, so a global
+                    # sequence length does not define a contiguous local prefix.
+                    request_table = self._pool_block_table[request : request + 1]
+                shared_table = request_table.expand(int(query_len), -1)
                 self.indexer_op.run_paged_topk(
                     q=q_fp8[row_start:row_end],
                     weights=weights[row_start:row_end],
