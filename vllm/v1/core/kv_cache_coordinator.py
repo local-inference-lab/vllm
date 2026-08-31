@@ -598,6 +598,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
         self.dcp_world_size = dcp_world_size
+        self.pcp_world_size = pcp_world_size
+        self.has_dcp_replicated_group = any(
+            getattr(group.kv_cache_spec, "dcp_replicated", False)
+            for group in kv_cache_config.kv_cache_groups
+        )
         group_block_sizes = [
             manager.block_size for manager in self.single_type_managers
         ]
@@ -610,14 +615,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         )
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
         if dcp_world_size > 1:
-            # DCP shards full-attention KV across ranks and replicates Mamba
-            # state; other spec types (e.g. sliding window) have no DCP-aware
-            # handling yet, so reject them explicitly.
+            # Target attention remains DCP-sharded. Small speculative draft
+            # groups may instead replicate their cache and execute locally.
             for g in kv_cache_config.kv_cache_groups:
-                assert isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec)), (
+                spec = g.kv_cache_spec
+                assert isinstance(spec, (FullAttentionSpec, MambaSpec)) or getattr(
+                    spec, "dcp_replicated", False
+                ), (
                     "DCP with hybrid KV cache layouts only supports "
-                    "full-attention and Mamba groups, got: "
-                    f"{type(g.kv_cache_spec).__name__}."
+                    "full-attention, Mamba, and replicated draft groups, got: "
+                    f"{type(spec).__name__}."
                 )
         # Fine-grained hash hits require Mamba "align" and compatible cache
         # managers in every group. TP needs hashing finer than the Mamba block;
@@ -711,6 +718,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if group.use_eagle:
                 for gid in group.group_ids:
                     self.single_type_managers[gid].use_eagle = True
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
+        if (
+            self.dcp_world_size > 1
+            and self.pcp_world_size == 1
+            and self.has_dcp_replicated_group
+        ):
+            # Avoid enabling cascade attention for only the sharded target side
+            # of a target+replicated-draft hybrid. Concrete prefix replay still
+            # happens through find_longest_cache_hit().
+            return [0] * len(self.kv_cache_config.kv_cache_groups)
+        return super().get_num_common_prefix_blocks(running_request_id)
 
     def _align_cacheable(self, num_tokens: int) -> int:
         """Largest prefix of ``num_tokens`` a future cache hit could match.

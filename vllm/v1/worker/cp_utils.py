@@ -28,8 +28,8 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
         layers = get_layers_from_vllm_config(vllm_config, layer_type)
         for layer in layers.values():
             get_attn_backend = getattr(layer, "get_attn_backend", None)
-            if pcp_size > 1 and get_attn_backend is not None:
-                backend = get_attn_backend()
+            backend = get_attn_backend() if get_attn_backend is not None else None
+            if pcp_size > 1 and backend is not None:
                 assert backend.supports_pcp(), (
                     "PCP requires attention backend support, "
                     f"but {backend.get_name()} does not support PCP."
@@ -37,6 +37,26 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
             layer_impl = getattr(layer, "impl", None)
             if layer_impl is None:
                 continue
+            get_spec = getattr(layer, "get_kv_cache_spec", None)
+            if get_spec is not None:
+                spec = get_spec(vllm_config)
+                if getattr(spec, "dcp_replicated", False):
+                    assert backend is not None, (
+                        "Attention with replicated DCP requires an attention "
+                        "backend that advertises local-DCP support."
+                    )
+                    assert backend.supports_dcp_replicated, (
+                        "Attention with replicated DCP requires backend support, "
+                        f"but {backend.get_name()} does not provide it."
+                    )
+                    # Replicated draft KV contains the complete sequence on
+                    # every rank, so its attention executes as a local DCP1 op.
+                    layer_impl.dcp_world_size = 1
+                    layer_impl.dcp_rank = 0
+                    layer_impl.total_cp_world_size = 1
+                    layer_impl.total_cp_rank = 0
+                    layer_impl.need_to_return_lse_for_decode = False
+                    continue
             if vllm_config.speculative_config is not None and interleave_size > 1:
                 assert layer_impl.supports_mtp_with_cp_non_trivial_interleave_size, (
                     "MTP with cp_kv_cache_interleave_size > 1 is not "

@@ -183,6 +183,17 @@ class DFlashSpeculator(DraftModelSpeculator):
         ]
         assert self.draft_kv_cache_group_ids, "No draft attention groups found."
         self.draft_kv_cache_group_id = self.draft_kv_cache_group_ids[0]
+        draft_cp_parameters = {
+            block_tables.get_group_cp_parameters(gid)
+            for gid in self.draft_kv_cache_group_ids
+        }
+        if len(draft_cp_parameters) != 1:
+            raise NotImplementedError(
+                "DFlash draft attention groups must use one DCP layout."
+            )
+        self.draft_cp_rank, self.draft_cp_size, self.draft_cp_interleave = (
+            draft_cp_parameters.pop()
+        )
 
         # Per-group context slot buffers for the precompute (one row per group).
         self._context_slot_mappings = torch.zeros(
@@ -222,6 +233,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         for name in (
             "draft_kv_cache_group_ids",
             "draft_kv_cache_group_id",
+            "draft_cp_rank",
+            "draft_cp_size",
+            "draft_cp_interleave",
             "_context_slot_mappings",
             "_layer_group_idx",
             "_group_causal",
@@ -304,16 +318,19 @@ class DFlashSpeculator(DraftModelSpeculator):
         if not self.draft_attn_layer_names:
             return None
         assert num_query_per_req is None  # Omitted for DFlash, read from self instead
-        if dcp_local_seq_lens is None and self.block_tables.cp_size > 1:
-            prepare_dcp_local_seq_lens(
-                self.input_buffers.dcp_local_seq_lens,
-                self.input_buffers.seq_lens,
-                num_reqs,
-                self.block_tables.cp_size,
-                self.block_tables.cp_rank,
-                self.block_tables.cp_interleave,
-            )
-            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
+        if dcp_local_seq_lens is None:
+            if self.draft_cp_size > 1:
+                prepare_dcp_local_seq_lens(
+                    self.input_buffers.dcp_local_seq_lens,
+                    self.input_buffers.seq_lens,
+                    num_reqs,
+                    self.draft_cp_size,
+                    self.draft_cp_rank,
+                    self.draft_cp_interleave,
+                )
+                dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
+            elif getattr(self.block_tables, "cp_size", 1) > 1:
+                dcp_local_seq_lens = self.input_buffers.seq_lens
         return super()._build_draft_attn_metadata(
             num_reqs,
             num_reqs_padded,
@@ -402,6 +419,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         assert self.draft_kv_cache_group_id >= 0
         # Support multiple draft KV cache groups by preparing inputs once for each
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
+            cp_rank, cp_size, cp_interleave = self.block_tables.get_group_cp_parameters(
+                gid
+            )
             prepare_dflash_inputs(
                 self.input_buffers,
                 self.block_tables.slot_mappings[gid],
@@ -421,9 +441,9 @@ class DFlashSpeculator(DraftModelSpeculator):
                 seeds,
                 self.block_tables.input_block_tables[gid],
                 self.block_tables.kernel_block_sizes[gid],
-                self.block_tables.cp_rank,
-                self.block_tables.cp_size,
-                self.block_tables.cp_interleave,
+                cp_rank,
+                cp_size,
+                cp_interleave,
                 self.parallel_drafting_token_id,
                 self.num_query_per_req,
                 self.num_speculative_steps,

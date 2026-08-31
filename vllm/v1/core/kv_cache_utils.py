@@ -15,6 +15,7 @@ from typing import Any, NamedTuple, NewType, TypeAlias, overload
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.hashing import xxhash, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
@@ -670,12 +671,16 @@ def resolve_kv_cache_block_sizes(
     groups = kv_cache_config.kv_cache_groups
 
     if len(groups) <= 1:
-        bs = cache_config.block_size * dcp
+        dcp_replicated = len(groups) == 1 and getattr(
+            groups[0].kv_cache_spec, "dcp_replicated", False
+        )
+        bs = cache_config.block_size * (1 if dcp_replicated else dcp)
         return bs, bs
 
     group_block_sizes = [
         g.kv_cache_spec.block_size * dcp
         if isinstance(g.kv_cache_spec, AttentionSpec)
+        and not getattr(g.kv_cache_spec, "dcp_replicated", False)
         else g.kv_cache_spec.block_size
         for g in groups
     ]
@@ -1538,6 +1543,18 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
         kv_cache_spec: The kv cache spec of each attention layer in the model
     """
 
+    dcp_replication_modes = {
+        spec.dcp_replicated
+        for spec in kv_cache_spec.values()
+        if isinstance(spec, AttentionSpec)
+    }
+    if len(dcp_replication_modes) > 1:
+        raise ValueError(
+            "Hybrid KV cache manager cannot be disabled when attention layers "
+            "mix DCP-replicated and DCP-sharded KV cache specs. Remove "
+            "`--disable-hybrid-kv-cache-manager` or disable DCP."
+        )
+
     if is_kv_cache_spec_uniform(
         kv_cache_spec
     ) or UniformTypeKVCacheSpecs.is_uniform_type(kv_cache_spec):
@@ -1593,6 +1610,44 @@ def group_and_unify_kv_cache_specs(
         swa_uniform_specs.append(uniform_spec)
 
     return [mla_uniform_spec, *swa_uniform_specs]
+
+
+def group_dcp_replicated_draft_kv_cache_specs(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Keep a replicated speculative draft separate from a sharded target.
+
+    DFlash's small sliding-window cache has different allocation and DCP
+    semantics from the target cache. When both sides are independently
+    uniform, retain their concrete specs and native block sizes instead of
+    promoting or page-size-unifying the draft with the target.
+    """
+    replicated = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if getattr(spec, "dcp_replicated", False)
+    }
+    if not replicated:
+        return None
+    sharded = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if not getattr(spec, "dcp_replicated", False)
+    }
+    if not sharded:
+        return None
+    if not is_kv_cache_spec_uniform(replicated):
+        return None
+    # The target need not itself be uniform. GLM-5.3, for example, mixes MLA
+    # cache layouts that the normal hybrid grouping path already understands.
+    # Re-enter grouping without the replicated draft so that path can preserve
+    # the target's native groups instead of page-unifying it with the draft.
+    sharded_groups = get_kv_cache_groups(vllm_config, dict(sharded))
+    return [
+        *sharded_groups,
+        *_get_kv_cache_groups_uniform_spec(replicated),
+    ]
 
 
 def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
@@ -1748,6 +1803,38 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
     return 1
 
 
+def _partition_dflash_draft_specs(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> tuple[dict[str, KVCacheSpec], dict[str, KVCacheSpec]]:
+    """Split appended DFlash layers from the target for PP1 grouping."""
+    speculative_config = vllm_config.speculative_config
+    if (
+        speculative_config is None
+        or speculative_config.method != "dflash"
+        or vllm_config.parallel_config.pipeline_parallel_size > 1
+        or vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+    ):
+        return kv_cache_spec, {}
+
+    target_num_layers = vllm_config.model_config.get_num_layers(
+        vllm_config.parallel_config
+    )
+    target_specs: dict[str, KVCacheSpec] = {}
+    draft_specs: dict[str, KVCacheSpec] = {}
+    for layer_name, spec in kv_cache_spec.items():
+        try:
+            layer_index = extract_layer_index(layer_name)
+        except (AssertionError, IndexError, ValueError):
+            target_specs[layer_name] = spec
+            continue
+        if layer_index >= target_num_layers:
+            draft_specs[layer_name] = spec
+        else:
+            target_specs[layer_name] = spec
+    return target_specs, draft_specs
+
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> list[KVCacheGroupSpec]:
@@ -1769,6 +1856,19 @@ def get_kv_cache_groups(
         # attention free models.
         return []
 
+    target_specs, draft_specs = _partition_dflash_draft_specs(
+        vllm_config, kv_cache_spec
+    )
+    if target_specs and draft_specs:
+        target_groups = get_kv_cache_groups(vllm_config, target_specs)
+        draft_groups = get_kv_cache_groups(vllm_config, draft_specs)
+        logger.info(
+            "Keeping %d DFlash draft KV layers in %d independent cache groups",
+            len(draft_specs),
+            len(draft_groups),
+        )
+        return [*target_groups, *draft_groups]
+
     if is_kv_cache_spec_uniform(kv_cache_spec):
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
@@ -1779,6 +1879,10 @@ def get_kv_cache_groups(
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
+    elif replicated_groups := group_dcp_replicated_draft_kv_cache_specs(
+        vllm_config, kv_cache_spec
+    ):
+        return replicated_groups
     elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
         # DeepseekV4 case: All layers need the same number of token slots,
         # yet some layers are full attention while others are sliding window
@@ -2111,9 +2215,11 @@ def get_kv_cache_configs(
     # This is to prevent that some layers are initialized with unregistered specs.
     KVCacheSpecRegistry.check_kv_cache_spec_registry(merged_kv_cache_specs)
 
-    # When speculating with more than 1 speculative module (e.g. multi-layered MTP)
+    # When speculating with more than 1 speculative module (e.g. multi-layered MTP),
     # tag every SlidingWindowSpec with how many extra tokens to retain in the window.
-    extra_retained_tokens = (
+    # A model-specific cache spec may require a larger retention window (DFlash's
+    # EAGLE prefix proof is one example), so never erase that value here.
+    mtp_extra_retained_tokens = (
         vllm_config.speculative_config.num_speculative_tokens - 1
         if vllm_config.speculative_config is not None
         and vllm_config.speculative_config.use_multi_module_mtp()
@@ -2122,7 +2228,10 @@ def get_kv_cache_configs(
     for layer_name, layer_spec in merged_kv_cache_specs.items():
         if isinstance(layer_spec, SlidingWindowSpec):
             merged_kv_cache_specs[layer_name] = replace(
-                layer_spec, extra_retained_tokens=extra_retained_tokens
+                layer_spec,
+                extra_retained_tokens=max(
+                    layer_spec.extra_retained_tokens, mtp_extra_retained_tokens
+                ),
             )
 
     # Get global KV cache groups. This also handles spec unification for
