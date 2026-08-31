@@ -176,6 +176,111 @@ def test_dcp_slot_mapping_with_smaller_kernel_blocks(cp_rank: int):
     assert torch.equal(actual, expected)
 
 
+def test_mixed_group_cp_slot_mapping():
+    """Replicated draft and sharded target groups use independent CP geometry."""
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[128, 128],
+        max_num_reqs=1,
+        max_num_batched_tokens=1024,
+        max_num_blocks_per_group=[2, 8],
+        device=device,
+        kernel_block_sizes=[128, 128],
+        cp_size=4,
+        cp_rank=1,
+        cp_interleave=128,
+        group_cp_sizes=[4, 1],
+    )
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([5, 9], list(range(20, 28))),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 1024], dtype=torch.int32, device=device)
+    positions = torch.arange(1024, dtype=torch.int64, device=device)
+    actual = block_tables.compute_slot_mappings(
+        idx_mapping,
+        query_start_loc,
+        positions,
+        num_tokens_padded=1024,
+    )
+
+    expected_sharded = torch.full((1024,), -1, dtype=torch.int64, device=device)
+    expected_sharded[128:256] = torch.arange(
+        5 * 128, 6 * 128, dtype=torch.int64, device=device
+    )
+    expected_sharded[640:768] = torch.arange(
+        9 * 128, 10 * 128, dtype=torch.int64, device=device
+    )
+    expected_replicated = torch.cat(
+        [
+            torch.arange(block_id * 128, (block_id + 1) * 128, device=device)
+            for block_id in range(20, 28)
+        ]
+    )
+
+    assert torch.equal(actual[0], expected_sharded)
+    assert torch.equal(actual[1], expected_replicated)
+
+
+def test_group_cp_sizes_rebuilt_with_layout_tensors():
+    """CuMem wake-up must restore group CP constants, not undefined storage."""
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[128, 128],
+        max_num_reqs=1,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[1, 1],
+        device=device,
+        kernel_block_sizes=[128, 128],
+        cp_size=4,
+        cp_rank=1,
+        cp_interleave=128,
+        group_cp_sizes=[4, 1],
+    )
+    block_tables.group_cp_sizes.fill_(99)
+
+    block_tables.init_block_table_layout_tensors()
+
+    assert block_tables.group_cp_sizes.tolist() == [4, 1]
+
+
+def test_gather_block_tables_clears_shortened_row_tail():
+    """A shortened request row must not retain block ids from its prior owner."""
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[16],
+        max_num_reqs=1,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[4],
+        device=device,
+        kernel_block_sizes=[16],
+    )
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([7, 8, 9],),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+    block_tables.gather_block_tables(idx_mapping, num_reqs_padded=1)
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([11],),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+
+    gathered = block_tables.gather_block_tables(idx_mapping, num_reqs_padded=1)[0]
+    torch.accelerator.synchronize()
+
+    assert gathered[0, 0].item() == 11
+    assert (gathered[0, 1:] == 0).all()
+
+
 def test_v1_block_table_move_row_clears_vacated_row():
     """condense() moves the last row into a freed slot; the vacated row must
     not keep stale block ids. Padded dummy-run batches dereference stale rows
