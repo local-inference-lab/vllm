@@ -1434,6 +1434,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         stream_slice_size = layer.exl3_intermediate_size_per_partition
         rank_sliced = rank_sliced_metadata is not None
+        layer.exl3_rank_sliced = rank_sliced
         if rank_sliced_metadata is not None:
             checkpoint_tp = int(rank_sliced_metadata["tp"])
             if checkpoint_tp != layer.exl3_tp_size:

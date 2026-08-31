@@ -240,6 +240,7 @@ def test_glm5next_model_retains_quant_config_for_weight_loading(monkeypatch):
             )
         ),
         quant_config=quant_config,
+        speculative_config=None,
         parallel_config=SimpleNamespace(use_sequence_parallel_moe=False),
     )
 
