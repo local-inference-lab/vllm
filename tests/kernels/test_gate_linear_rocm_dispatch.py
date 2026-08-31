@@ -26,6 +26,7 @@ def _make_gate(
     bias: bool = False,
     params_dtype: torch.dtype = torch.bfloat16,
     out_dtype: torch.dtype | None = torch.float32,
+    force_fp32_compute: bool = False,
 ) -> GateLinear:
     """Build a GateLinear with platform predicates mocked, no GPU needed."""
     for target in (
@@ -62,6 +63,7 @@ def _make_gate(
         bias=bias,
         out_dtype=out_dtype,
         params_dtype=params_dtype,
+        force_fp32_compute=force_fp32_compute,
     )
 
 
@@ -129,6 +131,19 @@ def test_sm120_ll_bf16_respects_bias(monkeypatch):
         bias=True,
     )
 
+    assert not gate.allow_ll_bf16_gemm
+
+
+def test_sm120_force_fp32_compute_preserves_fp32_weight_contract(monkeypatch):
+    gate = _make_gate(
+        monkeypatch,
+        is_rocm=False,
+        is_cuda=True,
+        device_capability=(12, 0),
+        force_fp32_compute=True,
+    )
+
+    assert gate.weight.dtype == torch.float32
     assert not gate.allow_ll_bf16_gemm
 
 
