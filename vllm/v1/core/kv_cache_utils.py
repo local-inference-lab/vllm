@@ -1125,6 +1125,7 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
 
 
 def _get_kv_cache_groups_uniform_page_size(
+    vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
     """
@@ -1241,6 +1242,46 @@ def _get_kv_cache_groups_uniform_page_size(
         # layers while accommodating speculative decoding drafters that add
         # extra layers to one attention type.
         group_size = max_num_layers
+    unbounded_attention_buckets = [
+        i
+        for i, specs in enumerate(spec_buckets)
+        if all(isinstance(spec, FullAttentionSpec) for spec in specs)
+    ]
+    bounded_cache_types = (MambaSpec, SlidingWindowSpec, ChunkedLocalAttentionSpec)
+    if len(unbounded_attention_buckets) == 1:
+        unbounded_idx = unbounded_attention_buckets[0]
+        other_buckets_are_bounded = all(
+            i == unbounded_idx
+            or all(isinstance(spec, bounded_cache_types) for spec in specs)
+            for i, specs in enumerate(spec_buckets)
+        )
+        if other_buckets_are_bounded:
+            unbounded_group_size = len(layer_buckets[unbounded_idx])
+
+            def max_request_allocation_cost(candidate_size: int) -> int:
+                # All pages have the same byte size here. The common factor can
+                # be omitted, leaving pool pages per block (candidate_size)
+                # times blocks needed by one maximum-length request.
+                blocks_per_request = 0
+                for layers, specs in zip(layer_buckets, spec_buckets):
+                    merged_spec = specs[0].merge(specs)
+                    blocks_per_group = cdiv(
+                        merged_spec.max_memory_usage_bytes(vllm_config),
+                        merged_spec.page_size_bytes,
+                    )
+                    blocks_per_request += (
+                        cdiv(len(layers), candidate_size) * blocks_per_group
+                    )
+                return candidate_size * blocks_per_request
+
+            # A bounded state/window bucket should not split the only cache
+            # that grows over the full sequence when removing that split also
+            # improves max-context admission. Keep the existing heuristic when
+            # padding the bounded buckets would cost more than it saves.
+            if max_request_allocation_cost(
+                unbounded_group_size
+            ) < max_request_allocation_cost(group_size):
+                group_size = unbounded_group_size
     grouped_layers = []
     for layers in layer_buckets:
         num_padding_layers = group_size - len(layers) % group_size
@@ -1808,7 +1849,7 @@ def get_kv_cache_groups(
         if fallback_groups is None:
             raise
         return fallback_groups
-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    groups = _get_kv_cache_groups_uniform_page_size(vllm_config, filtered_spec)
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:

@@ -2248,7 +2248,52 @@ def _grouping_config():
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         speculative_config=None,
+        model_config=SimpleNamespace(max_model_len=1_048_576),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+        max_in_flight_tokens=8192,
     )
+
+
+def test_bounded_draft_layers_do_not_split_unbounded_attention_group():
+    specs = {
+        **{f"full.{i}": new_kv_cache_spec() for i in range(11)},
+        **{f"mamba.{i}": new_mamba_spec() for i in range(34)},
+        **{f"draft.{i}": new_sliding_window_spec() for i in range(5)},
+    }
+
+    groups = get_kv_cache_groups(_grouping_config(), specs)
+
+    full_groups = [
+        group for group in groups if isinstance(group.kv_cache_spec, FullAttentionSpec)
+    ]
+    mamba_groups = [
+        group for group in groups if isinstance(group.kv_cache_spec, MambaSpec)
+    ]
+    draft_groups = [
+        group for group in groups if isinstance(group.kv_cache_spec, SlidingWindowSpec)
+    ]
+    assert [len(group.layer_names) for group in full_groups] == [11]
+    assert sorted(len(group.layer_names) for group in mamba_groups) == [8, 8, 9, 9]
+    assert [len(group.layer_names) for group in draft_groups] == [5]
+
+
+def test_unbounded_anchor_is_rejected_when_bounded_padding_costs_more():
+    specs = {
+        **{f"full.{i}": new_kv_cache_spec() for i in range(4)},
+        "mamba.0": new_mamba_spec(),
+    }
+
+    groups = get_kv_cache_groups(_grouping_config(), specs)
+
+    full_groups = [
+        group for group in groups if isinstance(group.kv_cache_spec, FullAttentionSpec)
+    ]
+    mamba_groups = [
+        group for group in groups if isinstance(group.kv_cache_spec, MambaSpec)
+    ]
+    assert [len(group.layer_names) for group in full_groups] == [1, 1, 1, 1]
+    assert [len(group.layer_names) for group in mamba_groups] == [1]
 
 
 def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
