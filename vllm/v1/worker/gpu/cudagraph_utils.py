@@ -730,6 +730,9 @@ def prepare_inputs_to_capture(
 # Number of FULL graphs captured during profiling; the total FULL capture
 # cost is extrapolated from this sample to avoid a second full capture.
 _FULL_GRAPH_PROFILING_SAMPLES = 2
+# Capture small FULL graph sets exactly. This avoids extrapolation error while
+# keeping profiling bounded for the large default capture grid.
+_MAX_EXACT_FULL_GRAPH_PROFILING_GRAPHS = 8
 # Floor for the extrapolated per-graph cost (driver overhead per graph).
 _MIN_PER_GRAPH_BYTES = 1 << 20
 
@@ -830,18 +833,28 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         for wrapper in all_wrappers:
             original_pools[id(wrapper)] = wrapper.graph_pool
             wrapper.graph_pool = manager.pool
-        manager._max_full_descs_to_capture = _FULL_GRAPH_PROFILING_SAMPLES
+        num_full_graphs = len(manager._capture_descs.get(CUDAGraphMode.FULL, []))
+        profile_full_graphs_exactly = (
+            num_full_graphs <= _MAX_EXACT_FULL_GRAPH_PROFILING_GRAPHS
+        )
+        manager._max_full_descs_to_capture = (
+            None if profile_full_graphs_exactly else _FULL_GRAPH_PROFILING_SAMPLES
+        )
         mem_samples: list[int] = []
-        manager._capture_mem_samples = mem_samples
+        manager._capture_mem_samples = (
+            None if profile_full_graphs_exactly else mem_samples
+        )
 
         measured = int(runner.capture_model())
+
+        if profile_full_graphs_exactly:
+            return measured
 
         # The measured delta covers PIECEWISE, encoder and speculator graphs
         # plus the sampled FULL graphs; swap the sampled FULL cost for the
         # extrapolated total. FULL and PIECEWISE share one pool here just as
         # they share the global pool at runtime, so the overlap is not
         # double-counted.
-        num_full_graphs = len(manager._capture_descs.get(CUDAGraphMode.FULL, []))
         full_estimate = _extrapolate_full_graph_memory(mem_samples, num_full_graphs)
         return max(measured - sum(mem_samples) + full_estimate, 0)
     finally:

@@ -51,6 +51,7 @@ class _FakeCudaGraphManager(cgu.CudaGraphManager):
         self._capture_mem_samples: list[int] | None = None
         self.use_breakable_cg = False
         self.graphs: dict[Any, Any] = {}
+        self.graph_capture_resources: dict[Any, Any] = {}
         self._graphs_captured = False
 
     def needs_capture(self) -> bool:
@@ -136,21 +137,39 @@ def test_profile_cudagraph_memory_no_graphs_tears_down(monkeypatch):
     assert runner.cudagraph_manager.pool == GLOBAL_POOL
 
 
-def test_profile_cudagraph_memory_samples_and_extrapolates(monkeypatch):
+def test_profile_cudagraph_memory_small_full_set_returns_exact_measurement(monkeypatch):
+    _patch_module(monkeypatch)
+    captured_bytes = 7 << 30
+    runner = _make_profiling_runner(
+        CUDAGraphMode.FULL,
+        num_full_descs=cgu._MAX_EXACT_FULL_GRAPH_PROFILING_GRAPHS,
+        captured_bytes=captured_bytes,
+    )
+
+    result = cgu.profile_cudagraph_memory(runner)
+
+    assert result == captured_bytes
+    assert runner.events == ["init", "capture", "teardown"]
+    assert runner.pool_during_capture == THROWAWAY_POOL
+    assert runner.cudagraph_manager.pool == GLOBAL_POOL
+    assert runner.cudagraph_manager._max_full_descs_to_capture is None
+
+
+def test_profile_cudagraph_memory_large_full_set_extrapolates(monkeypatch):
     _patch_module(monkeypatch)
     gib = 1 << 30
     # Measured delta 1000 MiB includes the sampled FULL graphs (100 + 20 MiB).
-    # Extrapolated FULL cost for 3 graphs: 100 + 2 * 20 = 140 MiB.
+    # Extrapolated FULL cost for 9 graphs: 100 + 8 * 20 = 260 MiB.
     runner = _make_profiling_runner(
         CUDAGraphMode.FULL,
-        num_full_descs=3,
+        num_full_descs=cgu._MAX_EXACT_FULL_GRAPH_PROFILING_GRAPHS + 1,
         captured_bytes=1000 * gib,
         mem_samples=[100 * gib, 20 * gib],
     )
 
     result = cgu.profile_cudagraph_memory(runner)
 
-    assert result == (1000 - (100 + 20) + (100 + 2 * 20)) * gib
+    assert result == (1000 - (100 + 20) + (100 + 8 * 20)) * gib
     # Bootstrap, capture, and teardown run in order.
     assert runner.events == ["init", "capture", "teardown"]
     # Capture must use a throwaway pool, not the persistent global pool.
