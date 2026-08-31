@@ -18,6 +18,10 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonImpl,
     SparseMLACommonMetadataBuilder,
 )
+from vllm.models.glm5next_cudagraph import (
+    is_glm53_full_graph_path,
+    require_glm53_full_graph_capacity,
+)
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.b12x import get_b12x_sparse_mla
 from vllm.v1.attention.backend import (
@@ -34,7 +38,11 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_filter_and_convert_dcp_index,
 )
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
-from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheSpec,
+    MLAAttentionSpec,
+)
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -586,6 +594,35 @@ class B12xGLM5NextMLASparseMetadataBuilder(B12xMLASparseMetadataBuilder):
     # The pooled selector must commit every fresh or extended prompt row
     # through run_prefill; decode commits only accepted prior rows.
     treat_short_extends_as_decodes: ClassVar[bool] = False
+    _glm53_graph_safe_selector_marker = "fixed-address-vectorized-pooled-selector-v1"
+
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: KVCacheSpec,
+    ) -> AttentionCGSupport:
+        if (
+            not isinstance(kv_cache_spec, AttentionSpec)
+            or not is_glm53_full_graph_path(vllm_config)
+            or kv_cache_spec.block_size != 2304
+            or kv_cache_spec.head_size != 512
+            or getattr(kv_cache_spec, "model_version", None) != "glm5_next"
+        ):
+            return AttentionCGSupport.UNIFORM_BATCH
+        require_glm53_full_graph_capacity(vllm_config)
+        from vllm.v1.attention.backends.gdn_attn import (
+            GDNAttentionMetadataBuilder,
+        )
+
+        marker = getattr(
+            GDNAttentionMetadataBuilder,
+            "_glm53_graph_safe_gdn_marker",
+            None,
+        )
+        if marker != "fixed-address-gdn-metadata-v1":
+            raise RuntimeError("GLM-5.3 mixed FULL requires graph-safe GDN metadata")
+        return AttentionCGSupport.ALWAYS
 
 
 class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):

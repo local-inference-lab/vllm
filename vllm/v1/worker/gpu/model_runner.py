@@ -93,6 +93,7 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
+    derive_target_execution_branch,
 )
 from vllm.v1.worker.gpu.cudagraph_utils import (
     profile_cudagraph_memory as _profile_cudagraph_memory,
@@ -1542,6 +1543,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        target_execution_branch = derive_target_execution_branch(
+            has_prefill=bool(batch_req_state and batch_req_state.has_prefill),
+            has_spec_decode=bool(scheduler_output.scheduled_spec_decode_tokens),
+        )
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
@@ -1552,6 +1557,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_query_len=max_query_len,
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
+            target_execution_branch=target_execution_branch,
         )
 
         if batch_desc.num_tokens == 0:

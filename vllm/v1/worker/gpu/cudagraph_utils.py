@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from enum import Enum, auto
 from itertools import groupby, product
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
@@ -51,10 +52,77 @@ class AttentionState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor]
 
 
+class TargetExecutionBranch(Enum):
+    """Python/kernel branch captured by a target FULL graph."""
+
+    UNSPECIFIED = auto()
+    PREFILL = auto()
+    SPEC_DECODE = auto()
+    DECODE = auto()
+
+
+def derive_target_execution_branch(
+    *, has_prefill: bool, has_spec_decode: bool
+) -> TargetExecutionBranch:
+    if has_prefill:
+        return TargetExecutionBranch.PREFILL
+    if has_spec_decode:
+        return TargetExecutionBranch.SPEC_DECODE
+    return TargetExecutionBranch.DECODE
+
+
+def _request_count_is_compatible(
+    captured: int | None,
+    runtime: int,
+    branch: TargetExecutionBranch,
+    *,
+    branch_specialized: bool,
+) -> bool:
+    if captured is None:
+        return True
+    if branch_specialized and branch in {
+        TargetExecutionBranch.DECODE,
+        TargetExecutionBranch.SPEC_DECODE,
+    }:
+        return captured == runtime
+    return captured >= runtime
+
+
+def _branch_geometries(
+    num_tokens: int,
+    max_num_reqs: int,
+    decode_query_len: int,
+) -> list[tuple[TargetExecutionBranch, int, int | None, int | None]]:
+    prefill_reqs = min(num_tokens, max_num_reqs)
+    geometries: list[tuple[TargetExecutionBranch, int, int | None, int | None]] = [
+        (
+            TargetExecutionBranch.PREFILL,
+            prefill_reqs,
+            None,
+            (num_tokens + prefill_reqs - 1) // prefill_reqs,
+        )
+    ]
+    if num_tokens <= max_num_reqs:
+        geometries.append((TargetExecutionBranch.DECODE, num_tokens, 1, None))
+    if (
+        decode_query_len > 1
+        and num_tokens % decode_query_len == 0
+        and num_tokens // decode_query_len <= max_num_reqs
+    ):
+        geometries.append(
+            (
+                TargetExecutionBranch.SPEC_DECODE,
+                num_tokens // decode_query_len,
+                decode_query_len,
+                None,
+            )
+        )
+    return geometries
+
+
 @dataclass(frozen=True)
 class BatchExecutionDescriptor:
-    """Describes the shape of the batch and CG mode to run; this is used to make shape
-    matches between the capture and runtime."""
+    """Describes the shape and execution branch captured by a CUDA graph."""
 
     cg_mode: CUDAGraphMode
     num_tokens: int
@@ -64,6 +132,7 @@ class BatchExecutionDescriptor:
     # uniform_token_count unset, so this is what keeps a prefill batch out of one.
     max_query_len: int | None = None
     num_active_loras: int = 0
+    target_execution_branch: TargetExecutionBranch = TargetExecutionBranch.UNSPECIFIED
 
 
 class CreateForwardFn(Protocol):
@@ -85,6 +154,9 @@ def _is_compatible(
     uniform_token_count: int | None,
     num_active_loras: int,
     max_query_len: int | None,
+    target_execution_branch: TargetExecutionBranch,
+    *,
+    branch_specialized: bool,
 ) -> bool:
     # desc.uniform_token_count=None (PIECEWISE) can handle any uniform_token_count
     # desc.num_reqs=None means no request padding needed (PIECEWISE)
@@ -92,6 +164,13 @@ def _is_compatible(
     # caller that does not track max_query_len must not match one that does
     return (
         (
+            not branch_specialized
+            or (
+                desc.target_execution_branch is not TargetExecutionBranch.UNSPECIFIED
+                and desc.target_execution_branch is target_execution_branch
+            )
+        )
+        and (
             desc.uniform_token_count is None
             or desc.uniform_token_count == uniform_token_count
         )
@@ -99,7 +178,12 @@ def _is_compatible(
             desc.max_query_len is None
             or (max_query_len is not None and desc.max_query_len >= max_query_len)
         )
-        and (desc.num_reqs is None or desc.num_reqs >= num_reqs)
+        and _request_count_is_compatible(
+            desc.num_reqs,
+            num_reqs,
+            target_execution_branch,
+            branch_specialized=branch_specialized,
+        )
         and desc.num_tokens >= num_tokens
         and desc.num_active_loras == num_active_loras
     )
@@ -125,6 +209,13 @@ class CudaGraphManager:
         self.decode_query_len = decode_query_len
         self.varlen_decode = varlen_decode
         self.full_capture_request_sizes = full_capture_request_sizes
+        self._branch_specialized_full_graphs = False
+        if cudagraph_mode.has_mode(CUDAGraphMode.FULL):
+            from vllm.models.glm5next_cudagraph import (
+                is_glm53_full_graph_path,
+            )
+
+            self._branch_specialized_full_graphs = is_glm53_full_graph_path(vllm_config)
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -260,14 +351,35 @@ class CudaGraphManager:
             # Varlen decode graphs take any mix of 1..decode_query_len tokens per
             # request, worst case 1 token per request (or max_num_reqs)
             if capture_varlen_decode and num_tokens <= max_decode_tokens:
-                desc = BatchExecutionDescriptor(
-                    cg_mode=decode_mode,
-                    num_tokens=num_tokens,
-                    num_reqs=min(num_tokens, self.max_num_reqs),
-                    max_query_len=self.decode_query_len,
-                    num_active_loras=num_active_loras,
-                )
-                descs_by_mode[decode_mode].append(desc)
+                if self._branch_specialized_full_graphs:
+                    max_reqs = min(num_tokens, self.max_num_reqs)
+                    for num_reqs in range(1, max_reqs + 1):
+                        if num_tokens == num_reqs:
+                            branches = (TargetExecutionBranch.DECODE,)
+                        elif num_tokens <= num_reqs * self.decode_query_len:
+                            branches = (TargetExecutionBranch.SPEC_DECODE,)
+                        else:
+                            continue
+                        for branch in branches:
+                            descs_by_mode[decode_mode].append(
+                                BatchExecutionDescriptor(
+                                    cg_mode=decode_mode,
+                                    num_tokens=num_tokens,
+                                    num_reqs=num_reqs,
+                                    max_query_len=self.decode_query_len,
+                                    num_active_loras=num_active_loras,
+                                    target_execution_branch=branch,
+                                )
+                            )
+                else:
+                    desc = BatchExecutionDescriptor(
+                        cg_mode=decode_mode,
+                        num_tokens=num_tokens,
+                        num_reqs=min(num_tokens, self.max_num_reqs),
+                        max_query_len=self.decode_query_len,
+                        num_active_loras=num_active_loras,
+                    )
+                    descs_by_mode[decode_mode].append(desc)
             # Capture uniform decode specfifc graphs if required
             #  (i.e. separate decode routine)
             elif separate_decode_routine and decode_mode and not self.varlen_decode:
@@ -287,12 +399,20 @@ class CudaGraphManager:
                     ):
                         continue
 
+                    target_branch = TargetExecutionBranch.UNSPECIFIED
+                    if self._branch_specialized_full_graphs:
+                        target_branch = (
+                            TargetExecutionBranch.SPEC_DECODE
+                            if decode_query_len > 1
+                            else TargetExecutionBranch.DECODE
+                        )
                     desc = BatchExecutionDescriptor(
                         cg_mode=decode_mode,
                         num_tokens=rounded_num_tokens,
                         num_reqs=rounded_num_reqs,
                         uniform_token_count=decode_query_len,
                         num_active_loras=num_active_loras,
+                        target_execution_branch=target_branch,
                     )
 
                     # avoid duplicate graphs
@@ -305,16 +425,51 @@ class CudaGraphManager:
                 # For breakable PW graphs, break-point kernels read the real batch
                 # from the forward context; in-graph kernels handle the token padding
                 # themselves from the padded slot_mapping (rows with slot == -1).
-                num_reqs = None
-                if mixed_mode == CUDAGraphMode.FULL:
-                    num_reqs = min(num_tokens, self.max_num_reqs)
-                desc = BatchExecutionDescriptor(
-                    cg_mode=mixed_mode,
-                    num_tokens=num_tokens,
-                    num_reqs=num_reqs,
-                    num_active_loras=num_active_loras,
-                )
-                descs_by_mode[mixed_mode].append(desc)
+                geometries: Sequence[
+                    tuple[
+                        TargetExecutionBranch,
+                        int | None,
+                        int | None,
+                        int | None,
+                    ]
+                ] = [
+                    (
+                        TargetExecutionBranch.UNSPECIFIED,
+                        None,
+                        None,
+                        None,
+                    )
+                ]
+                if (
+                    mixed_mode == CUDAGraphMode.FULL
+                    and self._branch_specialized_full_graphs
+                ):
+                    geometries = _branch_geometries(
+                        num_tokens,
+                        self.max_num_reqs,
+                        self.decode_query_len,
+                    )
+                elif mixed_mode == CUDAGraphMode.FULL:
+                    geometries = [
+                        (
+                            TargetExecutionBranch.UNSPECIFIED,
+                            min(num_tokens, self.max_num_reqs),
+                            None,
+                            None,
+                        )
+                    ]
+                for branch, num_reqs, uniform_count, max_query_len in geometries:
+                    descs_by_mode[mixed_mode].append(
+                        BatchExecutionDescriptor(
+                            cg_mode=mixed_mode,
+                            num_tokens=num_tokens,
+                            num_reqs=num_reqs,
+                            uniform_token_count=uniform_count,
+                            max_query_len=max_query_len,
+                            num_active_loras=num_active_loras,
+                            target_execution_branch=branch,
+                        )
+                    )
 
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
@@ -439,6 +594,9 @@ class CudaGraphManager:
         uniform_token_count: int | None,
         num_active_loras: int,
         max_query_len: int | None = None,
+        target_execution_branch: TargetExecutionBranch = (
+            TargetExecutionBranch.UNSPECIFIED
+        ),
     ) -> BatchExecutionDescriptor:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
 
@@ -453,6 +611,8 @@ class CudaGraphManager:
                     uniform_token_count,
                     effective_loras,
                     max_query_len,
+                    target_execution_branch,
+                    branch_specialized=self._branch_specialized_full_graphs,
                 ):
                     return desc
         return BatchExecutionDescriptor(
@@ -460,6 +620,7 @@ class CudaGraphManager:
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             num_active_loras=effective_loras,
+            target_execution_branch=target_execution_branch,
         )
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
@@ -574,6 +735,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 kv_cache_config,
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
                 max_query_len=desc.max_query_len,
+                target_execution_branch=desc.target_execution_branch,
             )
 
             # Capture with dummy rows marked as padding.
@@ -666,10 +828,20 @@ def prepare_inputs_to_capture(
     kv_cache_config: KVCacheConfig,
     full_cudagraph: bool,
     max_query_len: int | None = None,
+    target_execution_branch: TargetExecutionBranch = (
+        TargetExecutionBranch.UNSPECIFIED
+    ),
 ) -> AttentionState:
     input_batch = InputBatch.make_dummy(
         num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
     )
+    if target_execution_branch is TargetExecutionBranch.PREFILL:
+        input_batch.is_prefilling_np.fill(True)
+        input_batch.prefill_len_np[:] = input_batch.num_scheduled_tokens
+        input_batch.num_computed_prefill_tokens_np.fill(0)
+        input_batch.has_prefill = True
+    elif target_execution_branch is TargetExecutionBranch.DECODE:
+        assert num_tokens == num_reqs
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
     slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
     slot_mappings_by_layer = build_slot_mappings_by_layer(
