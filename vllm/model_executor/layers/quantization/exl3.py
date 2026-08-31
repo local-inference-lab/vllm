@@ -223,12 +223,8 @@ def _load_b12x_mixed_trellis() -> Any:
     if _B12X_MIXED_TRELLIS_API is not None:
         return _B12X_MIXED_TRELLIS_API
     try:
-        module = importlib.import_module(
-            "b12x.moe._shared.kernels.w4a16.mixed_trellis"
-        )
-        prepare = importlib.import_module(
-            "b12x.moe._shared.kernels.w4a16.prepare"
-        )
+        module = importlib.import_module("b12x.moe._shared.kernels.w4a16.mixed_trellis")
+        prepare = importlib.import_module("b12x.moe._shared.kernels.w4a16.prepare")
         host = importlib.import_module("b12x.moe._shared.kernels.w4a16.host")
     except Exception as exc:
         raise RuntimeError(
@@ -567,6 +563,7 @@ class Exl3Config(QuantizationConfig):
         if self.rank_sliced_k_values is None:
             if self.bits is None or float(self.bits) != int(self.bits):
                 raise ValueError(f"invalid uniform EXL3 bitrate {self.bits!r}")
+            assert self.rank_sliced_metadata is not None
             experts = int(self.rank_sliced_metadata["experts_per_layer"])
             return (int(self.bits),) * experts
         try:
