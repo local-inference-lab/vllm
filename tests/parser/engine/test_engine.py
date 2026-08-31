@@ -780,6 +780,113 @@ class TestToolPreambleFinish:
         assert engine.state == ParserState.CONTENT
 
 
+class TestPendingArgValueEnd:
+    @staticmethod
+    def _config() -> ParserEngineConfig:
+        arg_chunk = (EventType.ARG_VALUE_CHUNK,)
+        return ParserEngineConfig(
+            name="pending_arg_value_end",
+            terminals={
+                "TOOL_START": "<tool_call>",
+                "TOOL_END": "</tool_call>",
+                "ARG_KEY_START": "<arg_key>",
+                "ARG_KEY_END": "</arg_key>",
+                "ARG_VALUE_START": "<arg_value>",
+                "ARG_VALUE_END": "</arg_value>",
+            },
+            transitions={
+                (ParserState.CONTENT, "TOOL_START"): Transition(
+                    ParserState.TOOL_NAME,
+                    (EventType.TOOL_CALL_START,),
+                ),
+                (ParserState.TOOL_NAME, "ARG_KEY_START"): Transition(
+                    ParserState.TOOL_BETWEEN,
+                    arg_chunk,
+                ),
+                (ParserState.TOOL_BETWEEN, "ARG_KEY_END"): Transition(
+                    ParserState.TOOL_BETWEEN,
+                    arg_chunk,
+                ),
+                (ParserState.TOOL_BETWEEN, "ARG_VALUE_START"): Transition(
+                    ParserState.TOOL_ARGS,
+                    arg_chunk,
+                ),
+                (ParserState.TOOL_ARGS, "ARG_VALUE_END"): Transition(
+                    ParserState.TOOL_ARG_END_PENDING,
+                    arg_chunk,
+                ),
+                (ParserState.TOOL_ARG_END_PENDING, "ARG_VALUE_END"): Transition(
+                    ParserState.TOOL_ARG_END_PENDING,
+                    arg_chunk,
+                ),
+                (ParserState.TOOL_ARG_END_PENDING, "ARG_KEY_START"): Transition(
+                    ParserState.TOOL_BETWEEN,
+                    arg_chunk,
+                ),
+                (ParserState.TOOL_ARG_END_PENDING, "TOOL_END"): Transition(
+                    ParserState.CONTENT,
+                    (EventType.TOOL_CALL_END,),
+                ),
+            },
+            non_whitespace_transitions={
+                ParserState.TOOL_ARG_END_PENDING: Transition(
+                    ParserState.TOOL_ARGS,
+                    arg_chunk,
+                )
+            },
+            content_events={
+                ParserState.CONTENT: EventType.TEXT_CHUNK,
+                ParserState.TOOL_NAME: EventType.TOOL_NAME,
+                ParserState.TOOL_ARGS: EventType.ARG_VALUE_CHUNK,
+                ParserState.TOOL_BETWEEN: EventType.ARG_VALUE_CHUNK,
+                ParserState.TOOL_ARG_END_PENDING: EventType.ARG_VALUE_CHUNK,
+            },
+            tool_args_json=False,
+        )
+
+    def test_pending_arg_value_end_rejects_candidate_on_content(self):
+        engine = StreamingParserEngine(
+            self._config(),
+            tokenizer=None,
+        )
+        events = engine.feed(
+            "<tool_call>record_value<arg_key>value</arg_key><arg_value>left ",
+            [],
+        )
+        assert engine.state == ParserState.TOOL_ARGS
+
+        events.extend(engine.feed("</arg_value>", []))
+        events.extend(engine.feed(" \n", []))
+        assert engine.state == ParserState.TOOL_ARG_END_PENDING
+        events.extend(engine.feed("then ", []))
+        assert engine.state == ParserState.TOOL_ARGS
+
+        literal_end_events = engine.feed("</tool_call>", [])
+        assert all(
+            event.type != EventType.TOOL_CALL_END for event in literal_end_events
+        )
+        events.extend(literal_end_events)
+        events.extend(engine.feed(" as data more", []))
+        events.extend(engine.feed("</arg_value>", []))
+        events.extend(engine.feed("</tool_call>after", []))
+        events.extend(engine.finish())
+
+        assert sum(event.type == EventType.TOOL_CALL_START for event in events) == 1
+        assert sum(event.type == EventType.TOOL_CALL_END for event in events) == 1
+        raw_args = "".join(
+            event.value for event in events if event.type == EventType.ARG_VALUE_CHUNK
+        )
+        assert raw_args == (
+            "<arg_key>value</arg_key><arg_value>"
+            "left </arg_value> \nthen </tool_call> as data more"
+            "</arg_value>"
+        )
+        content = "".join(
+            event.value for event in events if event.type == EventType.TEXT_CHUNK
+        )
+        assert content == "after"
+
+
 class TestRegexTerminalInfraRemoved:
     """TerminalDef.priority, LexerShape.regex_terminals, and the regex
     matching loop were removed."""
