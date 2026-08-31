@@ -10,15 +10,18 @@ import torch
 from torch import nn
 
 from vllm.models.deepseek_v4.nvidia.b12x_indexer import _flatten_index_cache
+from vllm.models.glm5next.nvidia.ops import glm_kpool
 from vllm.models.glm5next.nvidia.ops.glm_kpool import (
     expand_c4_block_table,
     expand_pool_ids,
+    fwht128_quant_fp8,
     gather_c4_block_table_rows,
     pool_seq_lens,
     update_decode_pools,
 )
 from vllm.models.glm5next.nvidia.pooled_indexer import Glm5NextPooledIndexer
 from vllm.platforms import current_platform
+from vllm.triton_utils import triton
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseMetadata
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
@@ -43,6 +46,113 @@ def _hadamard128(x: torch.Tensor) -> torch.Tensor:
         a, b = x[:, 0], x[:, 1]
         x = torch.stack((a + b, a - b), dim=1).reshape(128)
     return x / (128**0.5)
+
+
+@pytest.mark.parametrize("rows", [1, 4, 5, 31, 32, 33, 128])
+def test_glm53_fused_fwht_weight_scaling_is_bitwise(rows: int) -> None:
+    device = _require_glm_gpu()
+    generator = torch.Generator(device=device).manual_seed(53 + rows)
+    query = torch.randn(
+        (rows, 128), generator=generator, dtype=torch.bfloat16, device=device
+    )
+    expected_query = torch.empty_like(query, dtype=torch.float8_e4m3fn)
+    expected_scales = torch.empty(rows, dtype=torch.float32, device=device)
+    actual_query = torch.empty_like(expected_query)
+    actual_scales = torch.empty_like(expected_scales)
+    legacy_query = torch.empty_like(expected_query)
+    legacy_scales = torch.empty_like(expected_scales)
+    initial_weights = torch.randn(
+        rows, generator=generator, dtype=torch.float32, device=device
+    )
+    expected_weights = initial_weights.clone()
+    actual_weights = initial_weights.clone()
+    legacy_weights = initial_weights.clone()
+
+    fwht128_quant_fp8(query, expected_query, expected_scales)
+    expected_weights.mul_(expected_scales)
+    expected_weights.mul_((128 * 32) ** -0.5)
+    fwht128_quant_fp8(
+        query,
+        actual_query,
+        actual_scales,
+        weights=actual_weights,
+    )
+    glm_kpool._fwht_quant_kernel[(triton.cdiv(rows, 32),)](
+        query,
+        legacy_query,
+        legacy_scales,
+        legacy_weights,
+        rows,
+        HEAD_DIM=128,
+        FP8_MAX=448.0,
+        BLOCK_R=32,
+        SCALE_WEIGHTS=True,
+        WEIGHT_NORM=(128 * 32) ** -0.5,
+        num_warps=2,
+    )
+
+    torch.testing.assert_close(actual_query, expected_query, rtol=0, atol=0)
+    torch.testing.assert_close(actual_scales, expected_scales, rtol=0, atol=0)
+    torch.testing.assert_close(actual_weights, expected_weights, rtol=0, atol=0)
+    torch.testing.assert_close(actual_query, legacy_query, rtol=0, atol=0)
+    torch.testing.assert_close(actual_scales, legacy_scales, rtol=0, atol=0)
+    torch.testing.assert_close(actual_weights, legacy_weights, rtol=0, atol=0)
+
+
+def test_glm53_fused_fwht_weight_scaling_graph_replays_live_inputs() -> None:
+    device = _require_glm_gpu()
+    rows = 33
+    generator = torch.Generator(device=device).manual_seed(5300)
+    query = torch.randn(
+        (rows, 128), generator=generator, dtype=torch.bfloat16, device=device
+    )
+    weights = torch.randn(rows, generator=generator, dtype=torch.float32, device=device)
+    query_out = torch.empty_like(query, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(rows, dtype=torch.float32, device=device)
+
+    def transform() -> None:
+        fwht128_quant_fp8(query, query_out, scales, weights=weights)
+
+    transform()
+    device_module = torch.get_device_module(device)
+    graph = device_module.CUDAGraph()
+    with device_module.graph(graph):
+        transform()
+
+    query.copy_(
+        torch.randn(
+            query.shape,
+            generator=generator,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+    )
+    input_weights = torch.randn(
+        rows, generator=generator, dtype=torch.float32, device=device
+    )
+    weights.copy_(input_weights)
+    query_out.zero_()
+    scales.zero_()
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    expected_query = torch.empty_like(query_out)
+    expected_scales = torch.empty_like(scales)
+    expected_weights = input_weights.clone()
+    fwht128_quant_fp8(query, expected_query, expected_scales)
+    expected_weights.mul_(expected_scales)
+    expected_weights.mul_((128 * 32) ** -0.5)
+    torch.testing.assert_close(query_out, expected_query, rtol=0, atol=0)
+    torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+
+    allocated = torch.accelerator.memory_allocated()
+    weights.copy_(input_weights)
+    graph.replay()
+    weights.copy_(input_weights)
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert torch.accelerator.memory_allocated() == allocated
 
 
 def _pool_reference(
