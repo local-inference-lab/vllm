@@ -34,6 +34,7 @@ from .ops.glm_kpool import (
     fwht128_quant_fp8,
     gather_c4_block_table_rows,
     pool_seq_lens,
+    prepare_c4_decode_metadata,
     update_decode_pools,
 )
 
@@ -441,31 +442,48 @@ class Glm5NextPooledIndexer(nn.Module):
             model_block_size=self.block_size,
             parent_stride_pages=self._parent_stride_pages,
         )
-        expand_c4_block_table(
-            main_metadata.block_table[:num_reqs, : self._parent_table_width],
-            self._pool_block_table,
-            rows=num_reqs,
-            subpages_per_parent=self._subpages_per_parent,
-            parent_stride_pages=self._parent_stride_pages,
-        )
+        parent_table = main_metadata.block_table[:num_reqs, : self._parent_table_width]
         seq_lens = self._pool_seq_lens[:live_rows]
-        pool_seq_lens(
-            positions[:live_rows],
-            seq_lens,
-            dcp_size=self.dcp_world_size,
-            dcp_rank=self.dcp_rank,
-            pool_interleave=self.pool_interleave,
-        )
+        decode_only = decode_rows == live_rows
+        decode_table = self._decode_block_table[:decode_rows]
+        if decode_only:
+            prepare_c4_decode_metadata(
+                parent_table,
+                main_metadata.req_id_per_token[:decode_rows],
+                positions[:decode_rows],
+                decode_table,
+                seq_lens,
+                subpages_per_parent=self._subpages_per_parent,
+                parent_stride_pages=self._parent_stride_pages,
+                dcp_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                pool_interleave=self.pool_interleave,
+            )
+        else:
+            expand_c4_block_table(
+                parent_table,
+                self._pool_block_table,
+                rows=num_reqs,
+                subpages_per_parent=self._subpages_per_parent,
+                parent_stride_pages=self._parent_stride_pages,
+            )
+            pool_seq_lens(
+                positions[:live_rows],
+                seq_lens,
+                dcp_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                pool_interleave=self.pool_interleave,
+            )
         pool_ids = self.pool_topk_indices_buffer[:rows]
         pool_scores = self._pool_scores[:rows] if self.dcp_world_size > 1 else None
 
         if decode_rows:
-            decode_table = self._decode_block_table[:decode_rows]
-            gather_c4_block_table_rows(
-                self._pool_block_table,
-                main_metadata.req_id_per_token[:decode_rows],
-                decode_table,
-            )
+            if not decode_only:
+                gather_c4_block_table_rows(
+                    self._pool_block_table,
+                    main_metadata.req_id_per_token[:decode_rows],
+                    decode_table,
+                )
             self.indexer_op.run_paged_topk(
                 q=q_fp8[:decode_rows],
                 weights=weights[:decode_rows],
