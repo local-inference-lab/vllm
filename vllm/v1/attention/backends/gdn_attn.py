@@ -39,6 +39,22 @@ class GDNAttentionBackend(AttentionBackend):
 
 
 @dataclass
+class GDNPrefillCheckpointMetadata:
+    """One recurrent-state checkpoint inside each packed prefill sequence.
+
+    ``checkpoint_offsets`` are relative to the corresponding packed query.
+    ``request_rows`` and ``block_table_columns`` identify the cache slots that
+    receive the checkpoint, allowing metadata reuse to refresh physical block
+    IDs from a replacement block table.
+    """
+
+    checkpoint_offsets: torch.Tensor
+    state_indices: torch.Tensor
+    request_rows: torch.Tensor
+    block_table_columns: torch.Tensor
+
+
+@dataclass
 class GDNAttentionMetadata:
     num_prefills: int
     num_prefill_tokens: int
@@ -83,6 +99,8 @@ class GDNAttentionMetadata:
     # groups whose state block tables differ.
     num_reqs: int = 0
     seq_lens: torch.Tensor | None = None
+
+    prefill_checkpoint: GDNPrefillCheckpointMetadata | None = None
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
@@ -449,6 +467,76 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             has_initial_state = None
 
+        prefill_checkpoint = None
+        if (
+            num_prefills > 0
+            and self.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+            and self.vllm_config.cache_config.mamba_cache_mode == "align"
+        ):
+            # FlashKDA can materialize one state at a cache-block boundary
+            # without splitting the target-model forward. Only prefill rows
+            # participate, in the same order as prefill_query_start_loc.
+            assert m.seq_lens_cpu_upper_bound is not None
+            all_query_lens = query_start_loc_cpu.diff().tolist()
+            if spec_sequence_masks_cpu is None:
+                request_rows = list(range(num_decodes, num_decodes + num_prefills))
+            else:
+                request_rows = [
+                    row
+                    for row in (~spec_sequence_masks_cpu).nonzero().flatten().tolist()
+                    if all_query_lens[row] > 0
+                ]
+            assert len(request_rows) == num_prefills
+
+            seq_lens = m.seq_lens_cpu_upper_bound.tolist()
+            block_size = self.kv_cache_spec.block_size
+            checkpoint_offsets: list[int] = []
+            checkpoint_columns: list[int] = []
+            for row in request_rows:
+                query_len = all_query_lens[row]
+                seq_len = seq_lens[row]
+                offset = seq_len // block_size * block_size - (seq_len - query_len)
+                valid = (
+                    seq_len % block_size != 0
+                    and 0 < offset < query_len
+                    # FlashKDA checkpoint outputs are produced on its
+                    # 16-token recurrence boundary.
+                    and offset % 16 == 0
+                )
+                checkpoint_offsets.append(offset if valid else 0)
+                checkpoint_columns.append(seq_len // block_size - 1 if valid else -1)
+
+            if any(checkpoint_offsets):
+                checkpoint_offsets_tensor = async_tensor_h2d(
+                    checkpoint_offsets,
+                    dtype=torch.int32,
+                    device=query_start_loc.device,
+                )
+                request_rows_tensor = async_tensor_h2d(
+                    request_rows,
+                    dtype=torch.int64,
+                    device=query_start_loc.device,
+                )
+                checkpoint_columns_tensor = async_tensor_h2d(
+                    checkpoint_columns,
+                    dtype=torch.int64,
+                    device=query_start_loc.device,
+                )
+                checkpoint_state_indices = m.block_table_tensor[
+                    request_rows_tensor, checkpoint_columns_tensor
+                ]
+                checkpoint_state_indices = torch.where(
+                    checkpoint_columns_tensor >= 0,
+                    checkpoint_state_indices,
+                    NULL_BLOCK_ID,
+                )
+                prefill_checkpoint = GDNPrefillCheckpointMetadata(
+                    checkpoint_offsets=checkpoint_offsets_tensor,
+                    state_indices=checkpoint_state_indices,
+                    request_rows=request_rows_tensor,
+                    block_table_columns=checkpoint_columns_tensor,
+                )
+
         # Function code counted on either presency non-spec decode or spec decode,
         # but not both.
         assert not (num_decodes > 0 and num_spec_decodes > 0), (
@@ -555,6 +643,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             token_chunk_offset_ptr=token_chunk_offset_ptr,
             num_reqs=m.num_reqs,
             seq_lens=m.seq_lens,
+            prefill_checkpoint=prefill_checkpoint,
         )
         return attn_metadata
 
@@ -589,6 +678,22 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 prefill_state_indices = non_spec_state_indices[metadata.num_decodes :]
             else:
                 prefill_state_indices = non_spec_state_indices
+
+        prefill_checkpoint = metadata.prefill_checkpoint
+        if prefill_checkpoint is not None:
+            checkpoint_state_indices = blk_table[
+                prefill_checkpoint.request_rows,
+                prefill_checkpoint.block_table_columns,
+            ]
+            checkpoint_state_indices = torch.where(
+                prefill_checkpoint.block_table_columns >= 0,
+                checkpoint_state_indices,
+                NULL_BLOCK_ID,
+            )
+            prefill_checkpoint = replace(
+                prefill_checkpoint,
+                state_indices=checkpoint_state_indices,
+            )
 
         spec_sequence_masks = metadata.spec_sequence_masks
         spec_token_indx = metadata.spec_token_indx
@@ -677,6 +782,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
             num_accepted_tokens=num_accepted_tokens,
+            prefill_checkpoint=prefill_checkpoint,
         )
 
     def build_for_cudagraph_capture(

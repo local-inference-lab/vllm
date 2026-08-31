@@ -123,11 +123,13 @@ GDN_BUILD_TEST_CASES = {
 def _create_gdn_builder(
     num_speculative_tokens: int = 0,
     full_cuda_graph: bool = False,
+    num_prefill_checkpoint_blocks: int = 0,
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B",
         block_size=BLOCK_SIZE,
+        max_num_batched_tokens=4096,
     )
     if full_cuda_graph:
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
@@ -140,6 +142,7 @@ def _create_gdn_builder(
         block_size=BLOCK_SIZE,
         shapes=((16, 64),),
         dtypes=(torch.float16,),
+        num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
     )
     return GDNAttentionMetadataBuilder(
         kv_cache_spec=mamba_spec,
@@ -258,6 +261,67 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
 def test_gdn_block_table_reuse_supports_regular_and_spec_decode() -> None:
     assert _create_gdn_builder().supports_update_block_table
     assert _create_gdn_builder(num_speculative_tokens=2).supports_update_block_table
+
+
+def test_gdn_prefill_checkpoint_targets_crossed_cache_boundary() -> None:
+    builder = _create_gdn_builder(num_prefill_checkpoint_blocks=1)
+    builder.vllm_config.cache_config.mamba_cache_mode = "align"
+    batch = BatchSpec(seq_lens=[33], query_lens=[33])
+    common = create_common_attn_metadata(
+        batch,
+        BLOCK_SIZE,
+        DEVICE,
+        arange_block_indices=True,
+    ).replace(is_prefilling=torch.tensor([True]))
+
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert metadata.prefill_checkpoint is not None
+    torch.testing.assert_close(
+        metadata.prefill_checkpoint.checkpoint_offsets,
+        torch.tensor([32], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        metadata.prefill_checkpoint.request_rows,
+        torch.tensor([0], dtype=torch.int64),
+    )
+    torch.testing.assert_close(
+        metadata.prefill_checkpoint.block_table_columns,
+        torch.tensor([1], dtype=torch.int64),
+    )
+    torch.testing.assert_close(
+        metadata.prefill_checkpoint.state_indices,
+        torch.tensor([1], dtype=torch.int32),
+    )
+
+
+def test_gdn_prefill_checkpoint_refreshes_reused_block_table() -> None:
+    builder = _create_gdn_builder(num_prefill_checkpoint_blocks=1)
+    builder.vllm_config.cache_config.mamba_cache_mode = "align"
+    batch = BatchSpec(seq_lens=[33], query_lens=[33])
+    common = create_common_attn_metadata(
+        batch,
+        BLOCK_SIZE,
+        DEVICE,
+        arange_block_indices=True,
+    ).replace(is_prefilling=torch.tensor([True]))
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    replacement_block_table = torch.tensor(
+        [[101, 102, 103]],
+        dtype=torch.int32,
+    )
+
+    updated = builder.update_block_table(
+        metadata,
+        replacement_block_table,
+        torch.zeros(33, dtype=torch.int64),
+    )
+
+    assert updated.prefill_checkpoint is not None
+    torch.testing.assert_close(
+        updated.prefill_checkpoint.state_indices,
+        torch.tensor([102], dtype=torch.int32),
+    )
 
 
 def test_gdn_update_block_table_uses_current_builders_graph_buffers() -> None:

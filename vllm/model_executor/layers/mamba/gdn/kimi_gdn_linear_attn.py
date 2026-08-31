@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -24,8 +25,12 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import get_b12x_gdn_decode, get_b12x_scratch_buffers
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.worker.workspace import current_workspace_manager
 
 from ...linear import (
     ColumnParallelLinear,
@@ -43,6 +48,151 @@ from ..ops.gather_initial_states import gather_initial_states
 
 # Empirical lower bound for the KDA gate to avoid numerical underflow.
 _KDA_GATE_LOGBOUND_MIN = -5.0
+
+
+def is_flashkda_supported(
+    head_dim: int,
+    dtype: torch.dtype,
+    lower_bound: float | None,
+) -> bool:
+    """Return whether FlashKDA supports the layer's prefill contract."""
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability()
+    return (
+        capability is not None
+        and capability.major in (9, 10, 12)
+        and head_dim == 128
+        and dtype == torch.bfloat16
+        and lower_bound is not None
+    )
+
+
+def _flashkda_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    final_state: torch.Tensor,
+    workspace: torch.Tensor,
+    checkpoint_state: torch.Tensor | None = None,
+    checkpoint_offsets: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run packed bounded-gate KDA prefill into caller-owned buffers."""
+    import vllm._flashkda_C  # noqa: F401
+
+    torch.ops._flashkda_C.fwd(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        g.contiguous(),
+        beta,
+        q.shape[-1] ** -0.5,
+        out,
+        workspace,
+        A_log.contiguous(),
+        dt_bias.view(-1, q.shape[-1]).contiguous(),
+        lower_bound,
+        initial_state.contiguous(),
+        final_state,
+        cu_seqlens.contiguous(),
+        checkpoint_state,
+        checkpoint_offsets.contiguous() if checkpoint_offsets is not None else None,
+    )
+    return out, final_state
+
+
+@triton.jit
+def _store_cache_checkpoints_kernel(
+    x_ptr,
+    conv_state_ptr,
+    recurrent_checkpoint_ptr,
+    recurrent_state_ptr,
+    query_start_loc_ptr,
+    checkpoint_offsets_ptr,
+    checkpoint_state_indices_ptr,
+    x_stride_0: tl.constexpr,
+    x_stride_1: tl.constexpr,
+    state_stride_0: tl.constexpr,
+    state_stride_1: tl.constexpr,
+    state_stride_2: tl.constexpr,
+    checkpoint_stride_0: tl.constexpr,
+    recurrent_state_stride_0: tl.constexpr,
+    checkpoint_offset_stride: tl.constexpr,
+    STATE_LEN: tl.constexpr,
+    WIDTH: tl.constexpr,
+    RECURRENT_ROW_SIZE: tl.constexpr,
+    NULL_STATE_IDX: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Store FlashKDA recurrent and convolution state at an internal boundary."""
+    seq_idx = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    seq_idx_i64 = seq_idx.to(tl.int64)
+    cols_i64 = cols.to(tl.int64)
+    state_idx = tl.load(checkpoint_state_indices_ptr + seq_idx_i64)
+    state_idx_i64 = state_idx.to(tl.int64)
+    checkpoint_offset = tl.load(
+        checkpoint_offsets_ptr + seq_idx_i64 * checkpoint_offset_stride
+    )
+    valid_checkpoint = (state_idx != NULL_STATE_IDX) & (checkpoint_offset > 0)
+    valid_conv = (
+        (cols < WIDTH * STATE_LEN) & valid_checkpoint & (checkpoint_offset >= STATE_LEN)
+    )
+    width_idx = cols // STATE_LEN
+    history_idx = cols % STATE_LEN
+    checkpoint_end = tl.load(query_start_loc_ptr + seq_idx_i64) + checkpoint_offset
+    token_idx = checkpoint_end.to(tl.int64) - STATE_LEN + history_idx.to(tl.int64)
+    values = tl.load(
+        x_ptr + token_idx * x_stride_0 + width_idx.to(tl.int64) * x_stride_1,
+        mask=valid_conv,
+    )
+    tl.store(
+        conv_state_ptr
+        + state_idx_i64 * state_stride_0
+        + width_idx.to(tl.int64) * state_stride_1
+        + history_idx.to(tl.int64) * state_stride_2,
+        values,
+        mask=valid_conv,
+    )
+
+    valid_recurrent = (cols < RECURRENT_ROW_SIZE) & valid_checkpoint
+    recurrent = tl.load(
+        recurrent_checkpoint_ptr + seq_idx_i64 * checkpoint_stride_0 + cols_i64,
+        mask=valid_recurrent,
+    )
+    tl.store(
+        recurrent_state_ptr + state_idx_i64 * recurrent_state_stride_0 + cols_i64,
+        recurrent,
+        mask=valid_recurrent,
+    )
+
+
+def resolve_kda_prefill_backend(
+    backend: str,
+    head_dim: int,
+    dtype: torch.dtype,
+    lower_bound: float | None,
+) -> str:
+    """Resolve the packed KDA prefill implementation for one server."""
+    if backend not in ("auto", "triton", "flashkda"):
+        raise ValueError(f"Unsupported KDA prefill backend: {backend}")
+    supported = is_flashkda_supported(head_dim, dtype, lower_bound)
+    if backend == "flashkda" and not supported:
+        raise RuntimeError(
+            "FlashKDA requires CUDA SM90/SM10x/SM12x, bfloat16, "
+            "head_dim=128, and a bounded KDA gate."
+        )
+    if supported and backend != "triton":
+        return "flashkda"
+    return "triton"
 
 
 def a_log_weight_loader(
@@ -178,6 +328,14 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_spec=self.num_spec,
         )
 
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
+        spec = super().get_kv_cache_spec(vllm_config)
+        assert isinstance(spec, MambaSpec)
+        return replace(
+            spec,
+            num_prefill_checkpoint_blocks=int(self.kda_prefill_backend == "flashkda"),
+        )
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -285,11 +443,38 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             if isinstance(additional_config, dict)
             else "auto"
         )
-        backend = "triton" if backend == "auto" else backend
-        assert backend == "triton", (
-            "The shared Kimi GDN layer only supports the Triton KDA "
-            f"prefill backend, got {backend!r}."
+        self.kda_prefill_backend = resolve_kda_prefill_backend(
+            backend,
+            self.head_dim,
+            vllm_config.model_config.dtype,
+            self.gate_lower_bound,
         )
+        self._flashkda_buffer_specs: (
+            tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
+        ) = None
+        if self.kda_prefill_backend == "flashkda":
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            max_sequences = vllm_config.scheduler_config.max_num_seqs
+            heads, head_dim = self.local_num_heads, self.head_dim
+            import vllm._flashkda_C  # noqa: F401
+
+            workspace_size = torch.ops._flashkda_C.get_workspace_size(
+                max_tokens,
+                heads,
+                max_sequences,
+            )
+            self._flashkda_buffer_specs = (
+                ((1, max_tokens, heads, head_dim), self.model_config.dtype),
+                (
+                    (max_sequences, heads, head_dim, head_dim),
+                    self.get_state_dtype()[1],
+                ),
+                (
+                    (max_sequences, heads, head_dim, head_dim),
+                    self.get_state_dtype()[1],
+                ),
+                ((workspace_size,), torch.uint8),
+            )
         if not self.use_full_rank_gate:
             self.g_a_proj = ReplicatedLinear(
                 self.hidden_size,
@@ -659,6 +844,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
         assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
         m = attn_metadata_narrowed
+        prefill_checkpoint = m.prefill_checkpoint
         has_initial_state = m.has_initial_state
         non_spec_query_start_loc = m.non_spec_query_start_loc
         non_spec_state_indices_tensor = m.non_spec_state_indices_tensor
@@ -793,6 +979,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 q_ns, k_ns, v_ns = mixed_qkv_ns.split(
                     self.local_projection_size, dim=-1
                 )
+                prefill_mixed_qkv = mixed_qkv_ns
 
                 # Packed prefill conv would require copying V solely to make
                 # it dense for KDA. Separate calls accept the strided inputs
@@ -835,6 +1022,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 if split_non_spec:
                     assert non_spec_query_start_loc is not None
                     nd_tok = m.num_decode_tokens
+                    prefill_mixed_qkv = prefill_mixed_qkv[nd_tok:]
                     core_attn_out_decode, _ = fused_recurrent_kda(
                         q=q_ns[:, :nd_tok],
                         k=k_ns[:, :nd_tok],
@@ -871,25 +1059,117 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     prefill_state_indices,
                     prefill_has_initial_state,
                 )
-                (
-                    core_attn_out_non_spec,
-                    last_recurrent_state,
-                ) = chunk_kda_with_fused_gate(
-                    q=q_ns,
-                    k=k_ns,
-                    v=v_ns,
-                    raw_g=g1_ns,
-                    raw_beta=beta_ns,
-                    A_log=self.A_log,
-                    g_bias=self.dt_bias,
-                    lower_bound=self.gate_lower_bound,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
-                    cu_seqlens=prefill_query_start_loc,
-                    chunk_indices=m.chunk_indices,
-                    chunk_offsets=m.chunk_offsets,
-                )
+                if self.kda_prefill_backend == "flashkda":
+                    assert self.gate_lower_bound is not None
+                    assert self._flashkda_buffer_specs is not None
+                    assert prefill_query_start_loc is not None
+                    workspace_out, final_state, checkpoint_state, workspace = (
+                        current_workspace_manager().get_simultaneous(
+                            *self._flashkda_buffer_specs
+                        )
+                    )
+                    flashkda_out = workspace_out[:, : q_ns.shape[1]]
+                    if prefill_checkpoint is not None:
+                        assert prefill_query_start_loc is not None
+                        num_sequences = initial_state.shape[0]
+                        assert prefill_checkpoint.checkpoint_offsets.shape == (
+                            num_sequences,
+                        )
+                        final_state = final_state[:num_sequences]
+                        checkpoint_state = checkpoint_state[:num_sequences]
+                        _flashkda_prefill(
+                            q=q_ns,
+                            k=k_ns,
+                            v=v_ns,
+                            g=g1_ns,
+                            beta=beta_ns,
+                            A_log=self.A_log,
+                            dt_bias=self.dt_bias,
+                            lower_bound=self.gate_lower_bound,
+                            initial_state=initial_state,
+                            cu_seqlens=prefill_query_start_loc,
+                            out=flashkda_out,
+                            final_state=final_state,
+                            workspace=workspace,
+                            checkpoint_state=checkpoint_state,
+                            checkpoint_offsets=(prefill_checkpoint.checkpoint_offsets),
+                        )
+                        core_attn_out_non_spec = flashkda_out
+                        last_recurrent_state = final_state
+
+                        state_len = conv_state.shape[-1]
+                        width = prefill_mixed_qkv.shape[-1]
+                        recurrent_row_size = checkpoint_state[0].numel()
+                        store_block_size = 256
+                        _store_cache_checkpoints_kernel[
+                            (
+                                prefill_checkpoint.checkpoint_offsets.numel(),
+                                triton.cdiv(
+                                    max(width * state_len, recurrent_row_size),
+                                    store_block_size,
+                                ),
+                            )
+                        ](
+                            prefill_mixed_qkv,
+                            conv_state,
+                            checkpoint_state,
+                            recurrent_state,
+                            prefill_query_start_loc,
+                            prefill_checkpoint.checkpoint_offsets,
+                            prefill_checkpoint.state_indices,
+                            prefill_mixed_qkv.stride(0),
+                            prefill_mixed_qkv.stride(1),
+                            conv_state.stride(0),
+                            conv_state.stride(1),
+                            conv_state.stride(2),
+                            checkpoint_state.stride(0),
+                            recurrent_state.stride(0),
+                            prefill_checkpoint.checkpoint_offsets.stride(0),
+                            state_len,
+                            width,
+                            recurrent_row_size,
+                            NULL_BLOCK_ID,
+                            store_block_size,
+                        )
+                    else:
+                        (
+                            core_attn_out_non_spec,
+                            last_recurrent_state,
+                        ) = _flashkda_prefill(
+                            q=q_ns,
+                            k=k_ns,
+                            v=v_ns,
+                            g=g1_ns,
+                            beta=beta_ns,
+                            A_log=self.A_log,
+                            dt_bias=self.dt_bias,
+                            lower_bound=self.gate_lower_bound,
+                            initial_state=initial_state,
+                            cu_seqlens=prefill_query_start_loc,
+                            out=flashkda_out,
+                            final_state=final_state[: initial_state.shape[0]],
+                            workspace=workspace,
+                        )
+                else:
+                    (
+                        core_attn_out_non_spec,
+                        last_recurrent_state,
+                    ) = chunk_kda_with_fused_gate(
+                        q=q_ns,
+                        k=k_ns,
+                        v=v_ns,
+                        raw_g=g1_ns,
+                        raw_beta=beta_ns,
+                        A_log=self.A_log,
+                        g_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=prefill_query_start_loc,
+                        chunk_indices=m.chunk_indices,
+                        chunk_offsets=m.chunk_offsets,
+                    )
                 # Init cache
                 recurrent_state[prefill_state_indices] = last_recurrent_state
 

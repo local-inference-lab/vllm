@@ -8,6 +8,7 @@ the wrong offset, and a later chunk crossing that boundary publishes it anyway.
 Requests resuming from it then restore a truncated state (#43559).
 """
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -82,6 +83,7 @@ def _split(
     use_eagle: bool = True,
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
+    allow_speculative_checkpoints: bool = False,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     stub = SimpleNamespace(
@@ -93,7 +95,8 @@ def _split(
         mamba_partial_cache_hit=partial_hit,
         hash_block_size=ATTN_BLOCK_SIZE,
         mamba_has_prefill_checkpoint_blocks=(
-            num_prefill_checkpoint_blocks > 0 and not use_eagle
+            num_prefill_checkpoint_blocks > 0
+            and (not use_eagle or allow_speculative_checkpoints)
         ),
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
@@ -126,6 +129,48 @@ def test_internal_checkpoint_split(
         mamba_manager = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
         blocks = mamba_manager.req_to_blocks[request.request_id]
         assert all(not block.is_null for block in blocks)  # checkpoint + running state
+
+
+def test_dflash_checkpoint_keeps_intermediate_chunks_aligned_and_joins_prompt_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DFlash reserves unaligned draft slots but can checkpoint the prompt tail.
+
+    Intermediate chunks still end on the recurrent cache grid. Once a chunk
+    reaches the prompt end, the internal checkpoint preserves the crossed
+    boundary and the scheduler need not emit a one-token target forward.
+    """
+    block_size = 16
+    prompt_len = 32321
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=block_size)
+    # Model a resumed request whose replay range extends one token past the
+    # prompt. This is the case in which prefill_end alone would floor 17 to 16.
+    request.append_output_token_ids([1, 2])
+    monkeypatch.setattr(sys.modules[__name__], "MAMBA_BLOCK_SIZE", block_size)
+
+    request.num_computed_tokens = 0
+    assert (
+        _split(
+            request,
+            4089,
+            use_eagle=True,
+            num_prefill_checkpoint_blocks=1,
+            allow_speculative_checkpoints=True,
+        )
+        == 4080
+    )
+
+    request.num_computed_tokens = 32304
+    assert (
+        _split(
+            request,
+            17,
+            use_eagle=True,
+            num_prefill_checkpoint_blocks=1,
+            allow_speculative_checkpoints=True,
+        )
+        == 17
+    )
 
 
 def _run_chunked_prefill(

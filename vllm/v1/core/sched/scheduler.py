@@ -346,8 +346,13 @@ class Scheduler(SchedulerInterface):
         )
         self.mamba_has_prefill_checkpoint_blocks = (
             self.has_mamba_layers
-            # TODO: support spec decoding
-            and not self.use_eagle
+            # DFlash's external draft has no recurrent state. The target GDN
+            # backend can therefore publish its internal prefill checkpoint
+            # without changing the drafter's cache contract.
+            and (
+                not self.use_eagle
+                or (speculative_config is not None and speculative_config.use_dflash())
+            )
             and all(
                 not isinstance(group.kv_cache_spec, MambaSpec)
                 or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
@@ -446,7 +451,20 @@ class Scheduler(SchedulerInterface):
         # aligned. Exempt: the prompt's last chunk, whose slot decode advances
         # to the boundary. A block too wide for one chunk advances sub-block
         # and re-aligns at the next boundary.
-        if end < prefill_end and not use_internal_checkpoint:
+        checkpoint_covers_prompt_tail = (
+            use_internal_checkpoint and end >= request.num_prompt_tokens
+        )
+        if (
+            end < prefill_end
+            and not checkpoint_covers_prompt_tail
+            and (
+                not use_internal_checkpoint
+                # DFlash reserves draft input slots, so its target-token budget
+                # is not necessarily block aligned. Keep intermediate target
+                # chunks aligned; only the prompt tail uses the checkpoint.
+                or self.use_eagle
+            )
+        ):
             max_prefill_tokens = self.max_num_scheduled_tokens
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:

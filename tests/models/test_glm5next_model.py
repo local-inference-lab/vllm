@@ -13,6 +13,7 @@ from vllm.model_executor.layers import mla as mla_layer
 from vllm.model_executor.layers.mamba.gdn import kimi_gdn_linear_attn
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     KimiGatedDeltaNetAttention,
+    resolve_kda_prefill_backend,
 )
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
@@ -461,7 +462,10 @@ def test_glm5next_moe_does_not_give_gate_to_runner(monkeypatch) -> None:
     assert "gate" not in factory_kwargs
 
 
-def test_glm5next_kda_splits_mixed_decode_prefill_batch(monkeypatch) -> None:
+@pytest.mark.parametrize("prefill_backend", ["triton", "flashkda"])
+def test_glm5next_kda_splits_mixed_decode_prefill_batch(
+    monkeypatch, prefill_backend: str
+) -> None:
     from vllm.models.kimi_k3.nvidia.ops.third_party import kda as kda_ops
     from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
@@ -493,6 +497,13 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(monkeypatch) -> None:
     layer.local_projection_size = 1
     layer.local_num_heads = 1
     layer.gate_lower_bound = -5.0
+    layer.kda_prefill_backend = prefill_backend
+    layer._flashkda_buffer_specs = (
+        ((1, 4, 1, 1), torch.float32),
+        ((1, 1, 1, 1), torch.float32),
+        ((1, 1, 1, 1), torch.float32),
+        ((1,), torch.uint8),
+    )
     layer.A_log = torch.ones(1)
     layer.dt_bias = torch.ones(1)
     layer._b12x_kda_plan = None
@@ -529,6 +540,21 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(monkeypatch) -> None:
         calls["chunk_offsets"] = chunk_offsets
         return torch.full_like(q, 22), torch.full_like(initial_state, 33)
 
+    def fake_flashkda(
+        *, q, beta, initial_state, cu_seqlens, out, final_state, **kwargs
+    ):
+        calls["prefill_q_len"] = q.shape[1]
+        calls["prefill_query_start_loc"] = cu_seqlens.clone()
+        calls["prefill_beta"] = beta.clone()
+        out.fill_(22)
+        final_state.fill_(33)
+        return out, final_state
+
+    class FakeWorkspaceManager:
+        @staticmethod
+        def get_simultaneous(*specs):
+            return [torch.empty(shape, dtype=dtype) for shape, dtype in specs]
+
     def fake_gather(state, indices, has_initial_state):
         calls["prefill_state_indices"] = indices.clone()
         calls["prefill_has_initial_state"] = has_initial_state.clone()
@@ -542,6 +568,12 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(monkeypatch) -> None:
     monkeypatch.setattr(kimi_gdn_linear_attn, "is_conv_state_dim_first", lambda: True)
     monkeypatch.setattr(kimi_gdn_linear_attn, "causal_conv1d_fn", fake_conv)
     monkeypatch.setattr(kimi_gdn_linear_attn, "gather_initial_states", fake_gather)
+    monkeypatch.setattr(kimi_gdn_linear_attn, "_flashkda_prefill", fake_flashkda)
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn,
+        "current_workspace_manager",
+        lambda: FakeWorkspaceManager(),
+    )
     monkeypatch.setattr(kda_ops, "fused_recurrent_kda", fake_recurrent)
     monkeypatch.setattr(kda_ops, "chunk_kda_with_fused_gate", fake_chunk)
 
@@ -565,8 +597,11 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(monkeypatch) -> None:
     assert torch.equal(
         calls["prefill_query_start_loc"], torch.tensor([0, 2], dtype=torch.int32)
     )
-    assert calls["chunk_indices"] is chunk_indices
-    assert calls["chunk_offsets"] is chunk_offsets
+    if prefill_backend == "triton":
+        assert calls["chunk_indices"] is chunk_indices
+        assert calls["chunk_offsets"] is chunk_offsets
+    else:
+        assert torch.equal(calls["prefill_beta"], torch.ones(1, 2, 1))
     assert torch.equal(
         calls["prefill_state_indices"], torch.tensor([3], dtype=torch.int32)
     )
@@ -574,6 +609,45 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(monkeypatch) -> None:
     assert torch.equal(core_attn_out[:, :2], torch.full((1, 2, 1, 1), 11.0))
     assert torch.equal(core_attn_out[:, 2:], torch.full((1, 2, 1, 1), 22.0))
     assert torch.equal(layer.kv_cache[1][3], torch.full((1, 1, 1), 33.0))
+
+
+@pytest.mark.parametrize(
+    ("configured", "supported", "expected"),
+    [
+        ("auto", True, "flashkda"),
+        ("auto", False, "triton"),
+        ("flashkda", True, "flashkda"),
+        ("triton", True, "triton"),
+    ],
+)
+def test_glm5next_kda_prefill_backend_resolution(
+    monkeypatch, configured: str, supported: bool, expected: str
+) -> None:
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn,
+        "is_flashkda_supported",
+        lambda *args: supported,
+    )
+
+    assert (
+        resolve_kda_prefill_backend(configured, 128, torch.bfloat16, -5.0) == expected
+    )
+
+
+def test_glm5next_explicit_flashkda_rejects_unsupported_layer(monkeypatch) -> None:
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn,
+        "is_flashkda_supported",
+        lambda *args: False,
+    )
+
+    with pytest.raises(RuntimeError, match="FlashKDA requires"):
+        resolve_kda_prefill_backend("flashkda", 64, torch.float16, None)
+
+
+def test_glm5next_kda_prefill_backend_rejects_unknown_name() -> None:
+    with pytest.raises(ValueError, match="Unsupported KDA prefill backend"):
+        resolve_kda_prefill_backend("unknown", 128, torch.bfloat16, -5.0)
 
 
 def test_glm5next_alone_opts_into_b12x_kda_decode() -> None:
