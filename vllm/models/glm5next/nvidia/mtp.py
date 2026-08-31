@@ -87,6 +87,7 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         previous_hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_index: int = 0,
+        output_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
         aligned_embeds = inputs_embeds.masked_fill(positions.eq(0).unsqueeze(-1), 0)
@@ -99,7 +100,10 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         # its all-reduce, so no collective is needed here. The post-norm result
         # feeds both draft logits and the next recycled hidden state.
         hidden_states, residual, _, _ = self.mtp_block(
-            positions=positions, hidden_states=hidden_states, residual=None
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=None,
+            output_indices=output_indices,
         )
         hidden_states, _ = self.shared_head.norm(hidden_states, residual=residual)
         return hidden_states, hidden_states
@@ -130,6 +134,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         # Plain list for the per-propose lookup: ModuleDict[str(...)] builds a
         # string and hashes it on every draft step.
         self._mtp_layers = list(self.layers.values())
+        self._prefill_output_indices: torch.Tensor | None = None
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -171,6 +176,10 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             if restore is not None:
                 restore()
 
+    def set_prefill_output_indices(self, output_indices: torch.Tensor | None) -> None:
+        """Select request-tail outputs after populating all MTP attention caches."""
+        self._prefill_output_indices = output_indices
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -191,6 +200,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             previous_hidden_states,
             inputs_embeds,
             current_step_idx,
+            self._prefill_output_indices,
         )
 
     def compute_logits(

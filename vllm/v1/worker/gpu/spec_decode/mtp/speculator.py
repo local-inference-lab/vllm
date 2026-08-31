@@ -36,6 +36,9 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         self.rollback_qsa_interval_starts = hasattr(
             draft_model.model, "snapshot_qsa_interval_starts"
         ) and hasattr(draft_model.model, "restore_qsa_interval_starts")
+        self.prefill_outputs_are_compact = hasattr(
+            draft_model.model, "set_prefill_output_indices"
+        )
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:
@@ -43,6 +46,10 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         # midway cannot leave reuse mode on.
         if self.share_mtp_topk_indices:
             self.model.model.set_skip_topk(False)
+        if self.prefill_outputs_are_compact:
+            self.model.model.set_prefill_output_indices(
+                self.last_token_indices[:num_reqs]
+            )
 
     def on_prefill_end(self, num_reqs: int) -> None:
         # Step 0 (prefill) wrote topk indices for every query token in the
@@ -50,6 +57,8 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         # steps 1+ can reuse them from the shared buffer.
         if self.share_mtp_topk_indices and self.num_speculative_steps > 1:
             self.model.model.compact_topk_indices(self.last_token_indices[:num_reqs])
+        if self.prefill_outputs_are_compact:
+            self.model.model.set_prefill_output_indices(None)
 
     def on_multi_step_decode_begin(self, num_reqs: int) -> None:
         if self.rollback_qsa_interval_starts:

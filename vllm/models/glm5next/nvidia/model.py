@@ -481,6 +481,7 @@ class Glm5NextDecoderLayer(nn.Module):
         residual: torch.Tensor | None = None,
         post: torch.Tensor | None = None,
         comb: torch.Tensor | None = None,
+        output_indices: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -496,6 +497,16 @@ class Glm5NextDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 positions=positions,
             )
+            if output_indices is not None:
+                if not self.is_mtp_layer:
+                    raise ValueError(
+                        "Selective decoder outputs are supported only for MTP layers."
+                    )
+                # Attention must process every prompt token because it owns the
+                # MTP MLA and sparse-index caches. Only request-tail outputs feed
+                # draft sampling, so compact the residual stream before the MoE.
+                attn_output = attn_output.index_select(0, output_indices)
+                residual = residual.index_select(0, output_indices)
             hidden_states, residual = self.post_attention_layernorm(
                 attn_output, residual=residual
             )

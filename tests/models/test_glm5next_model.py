@@ -695,6 +695,47 @@ def test_glm5next_b12x_mhc_builds_first_layer_broadcast_fn() -> None:
     assert layer.hc_attn_fn_broadcast.data_ptr() == broadcast_data_ptr
 
 
+def test_glm5next_mtp_compacts_outputs_after_attention_before_moe() -> None:
+    class Attention(torch.nn.Module):
+        def forward(self, hidden_states, positions):
+            return hidden_states + positions.unsqueeze(1)
+
+    class AddNorm(torch.nn.Module):
+        def forward(self, hidden_states, residual):
+            return hidden_states + residual, residual
+
+    class RecordingMLP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_input_tokens = 0
+
+        def forward(self, hidden_states):
+            self.num_input_tokens = hidden_states.shape[0]
+            return hidden_states * 2
+
+    layer = Glm5NextDecoderLayer.__new__(Glm5NextDecoderLayer)
+    torch.nn.Module.__init__(layer)
+    layer.mhc = False
+    layer.is_mtp_layer = True
+    layer.input_layernorm = torch.nn.Identity()
+    layer.self_attn = Attention()
+    layer.post_attention_layernorm = AddNorm()
+    layer.mlp = RecordingMLP()
+
+    hidden_states = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    positions = torch.arange(5, dtype=torch.float32)
+    output_indices = torch.tensor([1, 4])
+
+    full_output, full_residual, _, _ = layer(positions, hidden_states)
+    compact_output, compact_residual, _, _ = layer(
+        positions, hidden_states, output_indices=output_indices
+    )
+
+    torch.testing.assert_close(compact_output, full_output[output_indices])
+    torch.testing.assert_close(compact_residual, full_residual[output_indices])
+    assert layer.mlp.num_input_tokens == output_indices.numel()
+
+
 def test_glm5next_dflash_contracts_completed_mhc_hidden_state() -> None:
     completed = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
 
