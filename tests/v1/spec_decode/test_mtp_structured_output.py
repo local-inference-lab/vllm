@@ -497,3 +497,83 @@ def test_reasoning_boundary_scan_handles_marker_across_blocks():
     )
 
     assert boundary == 0
+
+
+@pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
+def test_speculative_grammar_filter_drops_invalid_single_token_bonus(backend):
+    """An invalid bonus is dropped without blocking the next valid commit.
+
+    Fails without the single-token gate: the token was committed unvalidated
+    and later surfaced as the accept_tokens invariant failure.
+    """
+    tokenizer, manager, request, prompt = _make_manager_and_request(
+        backend, prompt_str='{"a"'
+    )
+    grammar = request.structured_output_request.grammar
+    assert grammar.accept_tokens(request.request_id, prompt)
+
+    invalid_bonus = tokenizer.encode("z")[0]
+    filtered, rejected = manager.filter_speculative_grammar_tokens(
+        request, [invalid_bonus]
+    )
+
+    assert filtered == []
+    assert rejected == 1
+
+    # validate_tokens must leave the matcher unchanged so the next scheduler
+    # step can resample and commit from the same grammar state.
+    valid_bonus = tokenizer.encode(":")[0]
+    filtered, rejected = manager.filter_speculative_grammar_tokens(
+        request, [valid_bonus]
+    )
+
+    assert filtered == [valid_bonus]
+    assert rejected == 0
+    assert grammar.accept_tokens(request.request_id, filtered)
+
+
+@pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
+def test_speculative_grammar_filter_keeps_valid_single_token_bonus(backend):
+    tokenizer, manager, request, prompt = _make_manager_and_request(
+        backend, prompt_str='{"a"'
+    )
+    grammar = request.structured_output_request.grammar
+    assert grammar.accept_tokens(request.request_id, prompt)
+
+    valid_bonus = tokenizer.encode(":")[0]
+    filtered, rejected = manager.filter_speculative_grammar_tokens(
+        request, [valid_bonus]
+    )
+
+    assert filtered == [valid_bonus]
+    assert rejected == 0
+
+
+@pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
+def test_terminated_grammar_single_token_bonus_is_dropped(backend):
+    """A token after grammar completion is dropped like the multi-token path."""
+    tokenizer, manager, request, prompt = _make_manager_and_request(backend)
+    grammar = request.structured_output_request.grammar
+    assert grammar.accept_tokens(request.request_id, prompt)
+    assert grammar.accept_tokens(request.request_id, [tokenizer.eos_token_id])
+    assert grammar.is_terminated()
+
+    stray = tokenizer.encode("z")[0]
+    filtered, rejected = manager.filter_speculative_grammar_tokens(request, [stray])
+
+    assert filtered == []
+    assert rejected == 1
+
+
+@pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
+def test_single_token_bonus_inside_reasoning_passes_through(backend):
+    """A single token inside reasoning is not grammar content yet."""
+    tokenizer, manager, request, prompt, _ = _setup_boundary_request(backend)
+    reasoning_token = tokenizer.encode(" ")[0]
+
+    filtered, rejected = manager.filter_speculative_grammar_tokens(
+        request, [reasoning_token]
+    )
+
+    assert filtered == [reasoning_token]
+    assert rejected == 0

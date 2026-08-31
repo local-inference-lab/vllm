@@ -1896,7 +1896,7 @@ class Scheduler(SchedulerInterface):
             num_output_tokens_before = len(request._output_token_ids)
 
             if (
-                len(new_token_ids) > 1
+                len(new_token_ids) >= 1
                 and scheduled_spec_token_ids
                 and request.use_structured_output
                 and not output_is_stale

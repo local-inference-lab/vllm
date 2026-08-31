@@ -594,7 +594,29 @@ class StructuredOutputManager:
         """
         if self.vllm_config.speculative_config is None:
             return new_token_ids, 0
-        if len(new_token_ids) < 2 or not request.use_structured_output:
+        if not request.use_structured_output:
+            return new_token_ids, 0
+        if len(new_token_ids) < 2:
+            # A single-token speculative block can be the bonus-only result
+            # after all scheduled drafts were rejected or trimmed. Its
+            # active-depth mask should already constrain it; validate against
+            # the current grammar state as an independent fail-closed check
+            # before commit. An invalid bonus is dropped and resampled instead
+            # of corrupting the structured output.
+            if len(new_token_ids) == 1:
+                structured_request = request.structured_output_request
+                if structured_request is not None:
+                    grammar = structured_request.grammar
+                    if isinstance(grammar, StructuredOutputGrammar):
+                        reasoner = self._get_reasoner(request)
+                        if (
+                            reasoner is not None
+                            and not self.enable_in_reasoning
+                            and not structured_request.reasoning_ended
+                        ):
+                            return new_token_ids, 0
+                        if not grammar.validate_tokens(new_token_ids):
+                            return [], 1
             return new_token_ids, 0
 
         structured_request = request.structured_output_request

@@ -146,8 +146,11 @@ def apply_grammar_bitmask(
                 out_indices.append(bitmask_index)
             if has_bonus_token:
                 bonus_index = logit_idx + num_worker_spec_tokens
+                # The bonus row describes the grammar state after the worker's
+                # active drafts, so it must be read at the worker width
+                # instead of the full serialized window.
                 sorted_bitmask[bonus_index] = grammar_bitmask[
-                    cumulative_index + num_grammar_spec_tokens
+                    cumulative_index + num_worker_spec_tokens
                 ]
                 out_indices.append(bonus_index)
         cumulative_index += int(has_bonus_token) + num_grammar_spec_tokens

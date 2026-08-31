@@ -119,7 +119,9 @@ def test_apply_grammar_bitmask_preserves_source_offsets_after_draft_trimming(
 
     The scheduler serializes masks at its scheduled speculative width. A worker
     may trim grammar-invalid drafts before applying those masks, so source and
-    destination offsets must be advanced with their respective widths.
+    destination offsets must be advanced with their respective widths. The
+    trimmed request's bonus row describes the state after its worker width,
+    not the full serialized window.
     """
     scheduler_output = SimpleNamespace(
         scheduled_spec_decode_tokens={
@@ -161,7 +163,7 @@ def test_apply_grammar_bitmask_preserves_source_offsets_after_draft_trimming(
     )
 
     assert applied_bitmask is not None
-    assert applied_bitmask[:, 0].tolist() == [10, 13, 20, 21, 22, 23]
+    assert applied_bitmask[:, 0].tolist() == [10, 11, 20, 21, 22, 23]
 
 
 def test_apply_grammar_bitmask_skips_omitted_diffusion_bonus_rows(monkeypatch):
@@ -206,3 +208,45 @@ def test_apply_grammar_bitmask_skips_omitted_diffusion_bonus_rows(monkeypatch):
     assert applied_bitmask is not None
     assert applied_bitmask[:, 0].tolist() == [10, -1, 20, 21, 22, 23]
     assert applied_indices == [0, 2, 3, 4, 5]
+
+
+def test_apply_grammar_bitmask_uses_first_row_for_zero_draft_bonus(monkeypatch):
+    """A request without scheduled drafts masks its bonus with row zero.
+
+    k=0 is the dynamic-depth shape that previously read the final window row,
+    i.e. a grammar state the commit never reaches.
+    """
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={"zero-draft": [], "later-request": [2]}
+    )
+    grammar_output = GrammarOutput(
+        structured_output_request_ids=["zero-draft", "later-request"],
+        grammar_bitmask=np.array([[10], [11], [12], [20], [21]], dtype=np.int32),
+        num_spec_tokens=[2, 1],
+        has_bonus_token=[True, True],
+        num_invalid_spec_tokens=[0, 0],
+    )
+    input_batch = SimpleNamespace(req_ids=["zero-draft", "later-request"])
+    logits = torch.zeros((3, 32))
+    applied_bitmask = None
+
+    def capture_bitmask(logits, bitmask, indices):
+        nonlocal applied_bitmask
+        applied_bitmask = bitmask.clone()
+
+    monkeypatch.setattr(
+        utils,
+        "xgr",
+        SimpleNamespace(apply_token_bitmask_inplace=capture_bitmask),
+    )
+    monkeypatch.setattr(utils, "PIN_MEMORY", False)
+
+    utils.apply_grammar_bitmask(
+        scheduler_output,
+        grammar_output,
+        input_batch,
+        logits,
+    )
+
+    assert applied_bitmask is not None
+    assert applied_bitmask[:, 0].tolist() == [10, 20, 21]

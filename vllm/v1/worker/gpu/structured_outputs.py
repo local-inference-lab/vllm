@@ -55,7 +55,10 @@ def _build_grammar_row_mapping(
         logits_indices.extend(range(logits_start, logits_start + num_active_drafts))
         if num_bonus_tokens:
             assert has_source_bonus_token
-            source_indices.append(source_offset + num_source_drafts)
+            # The bonus row describes the grammar state after the active
+            # drafts, so it must be read at the active width instead of the
+            # full window width.
+            source_indices.append(source_offset + num_active_drafts)
             logits_indices.append(logits_start + num_active_drafts)
 
         source_offset += num_source_drafts + int(has_source_bonus_token)

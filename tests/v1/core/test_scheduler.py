@@ -917,6 +917,85 @@ def test_speculative_grammar_filter_rolls_back_scheduler_state_and_stats(
     ]
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize(
+    "filtered_tokens,num_grammar_rejected,expected_computed_tokens",
+    [
+        ([], 1, 0),
+        ([13], 0, 1),
+    ],
+)
+def test_speculative_grammar_filter_validates_single_token_bonus(
+    async_scheduling: bool,
+    filtered_tokens: list[int],
+    num_grammar_rejected: int,
+    expected_computed_tokens: int,
+):
+    """A single-token accepted block reaches the filter and rolls back cleanly.
+
+    Fails on the old call gate (len > 1): the invalid bonus token was
+    committed unvalidated and later surfaced as the accept_tokens 500.
+    """
+    scheduler = create_scheduler(
+        num_speculative_tokens=3,
+        speculative_method="ngram_gpu",
+        async_scheduling=async_scheduling,
+    )
+    request = create_requests(num_requests=1)[0]
+    request.structured_output_request = Mock()
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = request.num_tokens + 4
+    request.num_output_placeholders = 4 if async_scheduling else 0
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+
+    manager = Mock()
+    manager.filter_speculative_grammar_tokens.return_value = (
+        filtered_tokens,
+        num_grammar_rejected,
+    )
+    manager.should_advance.return_value = False
+    scheduler.structured_output_manager = manager
+
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 4},
+        total_num_scheduled_tokens=4,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={request.request_id: [10, 11, 12]},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[13]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    num_tokens = request.num_tokens
+    outputs = scheduler.update_from_output(scheduler_output, model_output)
+
+    assert request.num_computed_tokens == num_tokens + expected_computed_tokens
+    # Rejection rollback, the grammar drop, and the commit each consume the
+    # placeholders staged for the sampled block.
+    assert request.num_output_placeholders == 0
+    assert list(request.output_token_ids) == filtered_tokens
+    if filtered_tokens:
+        assert outputs[0].outputs[0].new_token_ids == filtered_tokens
+    manager.filter_speculative_grammar_tokens.assert_called_once_with(request, [13])
+    stats = outputs[0].scheduler_stats.spec_decoding_stats
+    assert stats is not None
+    assert stats.num_drafts == 1
+    assert stats.num_draft_tokens == 3
+    assert stats.num_accepted_tokens == 0
+    assert stats.num_accepted_tokens_per_pos == [0, 0, 0]
+
+
 def test_speculative_grammar_filter_is_not_called_for_unstructured_requests():
     """Unstructured speculative decoding does not enter grammar validation."""
     scheduler = create_scheduler(num_speculative_tokens=2)
