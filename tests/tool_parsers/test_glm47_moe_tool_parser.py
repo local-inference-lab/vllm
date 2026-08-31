@@ -187,6 +187,24 @@ class TestGlm47ExtractToolCalls:
         r = glm47_tool_parser.extract_tool_calls(out, request=mock_request)
         assert r.content is None
 
+    def test_tool_delimiters_in_arg_value(self, glm47_tool_parser, mock_request):
+        value = "close </tool_call> then open <tool_call>"
+        out = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key>"
+            f"<arg_value>{value}</arg_value>"
+            "</tool_call>"
+        )
+
+        result = glm47_tool_parser.extract_tool_calls(out, request=mock_request)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.content is None
+        function = result.tool_calls[0].function
+        assert function.name == "get_weather"
+        assert json.loads(function.arguments) == {"city": value}
+
 
 def _reset(parser):
     parser.current_tool_name_sent = False
@@ -266,3 +284,52 @@ class TestGlm47Streaming:
         ]
         args = json.loads("".join(arguments))
         assert args["city"] == "Beijing"
+
+    def test_tool_delimiters_in_arg_value(self, glm47_tool_parser, mock_request):
+        _reset(glm47_tool_parser)
+        value = "close </tool_call> then open <tool_call>"
+        chunks = [
+            "<tool_call>",
+            "get_weather",
+            "<arg_key>city</arg_key>",
+            "<arg_value>close ",
+            "</tool_call>",
+            " then open ",
+            "<tool_call>",
+            "</arg_value>",
+            "</tool_call>",
+        ]
+        current_text = ""
+        deltas = []
+        for chunk in chunks:
+            current_text += chunk
+            delta = glm47_tool_parser.extract_tool_calls_streaming(
+                previous_text="",
+                current_text=current_text,
+                delta_text=chunk,
+                previous_token_ids=[],
+                current_token_ids=[],
+                delta_token_ids=[],
+                request=mock_request,
+            )
+            if delta:
+                deltas.append(delta)
+        finish = glm47_tool_parser.finish_streaming()
+        if finish:
+            deltas.append(finish)
+
+        calls = [call for delta in deltas for call in (delta.tool_calls or [])]
+        names = [
+            call.function.name for call in calls if call.function and call.function.name
+        ]
+        arguments = [
+            call.function.arguments
+            for call in calls
+            if call.function and call.function.arguments
+        ]
+        content = "".join(delta.content or "" for delta in deltas)
+
+        assert {call.index for call in calls} == {0}
+        assert names == ["get_weather"]
+        assert content == ""
+        assert json.loads("".join(arguments)) == {"city": value}

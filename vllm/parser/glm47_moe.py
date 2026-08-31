@@ -73,16 +73,26 @@ def _glm47_arg_converter(raw_args: str, partial: bool) -> str:
 @functools.cache
 def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
     arg_tag_transitions = {
-        (ParserState.TOOL_ARGS, terminal): Transition(
+        (ParserState.TOOL_NAME, "ARG_KEY_START"): Transition(
+            ParserState.TOOL_BETWEEN,
+            (EventType.ARG_VALUE_CHUNK,),
+        ),
+        (ParserState.TOOL_BETWEEN, "ARG_KEY_START"): Transition(
+            ParserState.TOOL_BETWEEN,
+            (EventType.ARG_VALUE_CHUNK,),
+        ),
+        (ParserState.TOOL_BETWEEN, "ARG_KEY_END"): Transition(
+            ParserState.TOOL_BETWEEN,
+            (EventType.ARG_VALUE_CHUNK,),
+        ),
+        (ParserState.TOOL_BETWEEN, "ARG_VALUE_START"): Transition(
             ParserState.TOOL_ARGS,
             (EventType.ARG_VALUE_CHUNK,),
-        )
-        for terminal in (
-            "ARG_KEY_START",
-            "ARG_KEY_END",
-            "ARG_VALUE_START",
-            "ARG_VALUE_END",
-        )
+        ),
+        (ParserState.TOOL_ARGS, "ARG_VALUE_END"): Transition(
+            ParserState.TOOL_BETWEEN,
+            (EventType.ARG_VALUE_CHUNK,),
+        ),
     }
 
     reasoning_terminals = (
@@ -151,19 +161,22 @@ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
                 ParserState.TOOL_NAME,
                 (EventType.TOOL_CALL_START,),
             ),
-            (ParserState.TOOL_NAME, "ARG_KEY_START"): Transition(
-                ParserState.TOOL_ARGS,
-                (EventType.ARG_VALUE_CHUNK,),
-            ),
             (ParserState.TOOL_NAME, "TOOL_END"): Transition(
                 ParserState.CONTENT,
                 (EventType.TOOL_CALL_END,),
             ),
-            (ParserState.TOOL_ARGS, "TOOL_END"): Transition(
+            (ParserState.TOOL_BETWEEN, "TOOL_END"): Transition(
                 ParserState.CONTENT,
                 (EventType.TOOL_CALL_END,),
             ),
             **arg_tag_transitions,
+        },
+        content_events={
+            ParserState.CONTENT: EventType.TEXT_CHUNK,
+            ParserState.REASONING: EventType.REASONING_CHUNK,
+            ParserState.TOOL_NAME: EventType.TOOL_NAME,
+            ParserState.TOOL_ARGS: EventType.ARG_VALUE_CHUNK,
+            ParserState.TOOL_BETWEEN: EventType.ARG_VALUE_CHUNK,
         },
         arg_converter=_glm47_arg_converter,
         stream_arg_deltas=True,
