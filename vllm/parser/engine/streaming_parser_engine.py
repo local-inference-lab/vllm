@@ -39,6 +39,7 @@ class _DropInfo:
 def _build_drop_info(
     config: ParserEngineConfig,
     tokenizer,
+    vocab: dict[str, int],
 ) -> _DropInfo | None:
     try:
         special_tokens: list[str] = list(tokenizer.all_special_tokens)
@@ -54,12 +55,16 @@ def _build_drop_info(
         | set(config.terminals.values())
         | config.preserve_tokens
     )
+    protected_token_ids = {
+        tid for text in configured_texts if (tid := vocab.get(text)) is not None
+    }
 
     extra_token_ids: dict[int, str] = {}
     drop_texts: set[str] = set()
     for text, tid in zip(special_tokens, special_ids):
         if text not in configured_texts:
-            extra_token_ids[tid] = DROP_TERMINAL
+            if tid not in protected_token_ids:
+                extra_token_ids[tid] = DROP_TERMINAL
             drop_texts.add(text)
 
     if not drop_texts:
@@ -130,7 +135,8 @@ class StreamingParserEngine:
 
         drop_info: _DropInfo | None = None
         if tokenizer is not None:
-            drop_info = _build_drop_info(config, tokenizer)
+            assert vocab is not None
+            drop_info = _build_drop_info(config, tokenizer, vocab)
 
         lexer_shape = config.lexer_shape
         if drop_info is not None:

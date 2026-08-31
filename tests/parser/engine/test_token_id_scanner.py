@@ -7,6 +7,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from vllm.parser.engine.events import EventType
+from vllm.parser.engine.parser_engine_config import (
+    ParserEngineConfig,
+    ParserState,
+    Transition,
+)
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
 from vllm.parser.engine.token_id_scanner import (
     DROP_TERMINAL,
@@ -1150,3 +1155,150 @@ class TestTrailingDropAnchorRecovery:
         ]
         assert [item.token_id for item in pending] == [self.DROP_ID, self.DROP_ID_2]
         assert all(item.terminal == DROP_TERMINAL for item in pending)
+
+
+def _cleanup_tokenizer(decoded: dict[int, str]) -> MagicMock:
+    tokenizer = MagicMock()
+    tokenizer.decode.side_effect = lambda ids: decoded[ids[0]]
+    return tokenizer
+
+
+def test_reconstructed_current_text_binds_to_suffix():
+    body_id = 10
+    end_id = 11
+    scanner = TokenIDScanner(
+        {end_id: "END"},
+        _cleanup_tokenizer({body_id: "tail", end_id: "<end>"}),
+    )
+
+    items = scanner.scan("tail<end> held tail<end>", [body_id, end_id])
+
+    assert items == [
+        TextChunk("tail<end> held "),
+        TextChunk("tail", ("tail",), 1),
+        PreLexedTerminal("END", end_id, "<end>"),
+    ]
+
+
+def test_stripped_trailing_drop_preserves_holdback_and_token_count():
+    body_id = 10
+    drop_id = 11
+    scanner = TokenIDScanner(
+        {drop_id: DROP_TERMINAL},
+        _cleanup_tokenizer({body_id: "prefix", drop_id: "<drop>"}),
+    )
+
+    items = scanner.scan("holdback prefix", [body_id, drop_id])
+
+    assert items == [
+        TextChunk("holdback "),
+        TextChunk("prefix", ("prefix",), 1),
+    ]
+    assert scanner.flush_pending() == [
+        PreLexedTerminal(DROP_TERMINAL, drop_id, "<drop>")
+    ]
+
+
+def test_resolved_terminal_preserves_deferred_trailing_count():
+    body_id = 10
+    end_id = 11
+    scanner = TokenIDScanner(
+        {end_id: "END"},
+        _cleanup_tokenizer({body_id: "body", end_id: "<end>"}),
+    )
+
+    assert scanner.scan("", [end_id, body_id]) == []
+    assert scanner.scan("<end>", []) == [
+        PreLexedTerminal("END", end_id, "<end>"),
+        TextChunk("", token_count=1),
+    ]
+
+
+@pytest.mark.parametrize("finish", [False, True], ids=["resolve", "flush"])
+def test_inter_terminal_count_carrier_stays_ordered(finish: bool):
+    start_id = 10
+    body_id = 11
+    end_id = 12
+    scanner = TokenIDScanner(
+        {start_id: "START", end_id: "END"},
+        _cleanup_tokenizer(
+            {
+                start_id: "<start>",
+                body_id: "body",
+                end_id: "<end>",
+            }
+        ),
+    )
+
+    assert scanner.scan("", [start_id, body_id, end_id]) == []
+    items = scanner.flush_pending() if finish else scanner.scan("<start><end>", [])
+
+    assert items == [
+        PreLexedTerminal("START", start_id, "<start>"),
+        TextChunk("", token_count=1),
+        PreLexedTerminal("END", end_id, "<end>"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "protection",
+    ["terminals", "token_id_terminals", "preserve_tokens"],
+)
+def test_auto_drop_alias_does_not_override_protected_id(protection: str):
+    protected = "<protected>"
+    alias = "<alias>"
+    dropped = "<dropped>"
+    protected_id = 10
+    dropped_id = 11
+    tokenizer = _cleanup_tokenizer({protected_id: protected, dropped_id: dropped})
+    tokenizer.get_vocab.return_value = {
+        protected: protected_id,
+        alias: protected_id,
+        dropped: dropped_id,
+    }
+    tokenizer.all_special_tokens = [protected, alias, dropped]
+    tokenizer.all_special_ids = [protected_id, protected_id, dropped_id]
+
+    terminals = {"PROTECTED": protected} if protection == "terminals" else {}
+    token_id_terminals = (
+        {"PROTECTED": protected} if protection == "token_id_terminals" else {}
+    )
+    preserve_tokens = (
+        frozenset({protected}) if protection == "preserve_tokens" else frozenset()
+    )
+    transitions = (
+        {
+            (ParserState.CONTENT, "PROTECTED"): Transition(
+                ParserState.CONTENT,
+                (EventType.TEXT_CHUNK,),
+            )
+        }
+        if protection != "preserve_tokens"
+        else {}
+    )
+    config = ParserEngineConfig(
+        name=f"protected_{protection}",
+        terminals=terminals,
+        token_id_terminals=token_id_terminals,
+        transitions=transitions,
+        content_events={ParserState.CONTENT: EventType.TEXT_CHUNK},
+        initial_state=ParserState.CONTENT,
+        preserve_tokens=preserve_tokens,
+    )
+    engine = StreamingParserEngine(config, tokenizer)
+
+    events = engine.feed(protected, [protected_id])
+    events.extend(engine.finish())
+
+    assert (
+        "".join(event.value for event in events if event.type == EventType.TEXT_CHUNK)
+        == protected
+    )
+
+    alias_events = StreamingParserEngine(config, tokenizer).parse_complete(alias)
+    assert (
+        "".join(
+            event.value for event in alias_events if event.type == EventType.TEXT_CHUNK
+        )
+        == ""
+    )

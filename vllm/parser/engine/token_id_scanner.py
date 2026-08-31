@@ -123,6 +123,8 @@ class TokenIDScanner:
                         deferred_trailing_count + len(token_texts),
                     )
                 )
+            elif deferred_trailing_count:
+                prefix_items.append(TextChunk("", token_count=deferred_trailing_count))
             return prefix_items or self._EMPTY
 
         decoded_token_texts = [self._decode_token(tid) for tid in delta_token_ids]
@@ -189,17 +191,17 @@ class TokenIDScanner:
         if not self._deferred_terminals and not self._deferred_post_text:
             return []
         results: list[LexerInput] = []
-        if self._deferred_post_text:
-            prefix_count = (
-                self._deferred_prefix_token_counts[0]
-                if self._deferred_prefix_token_counts
-                else 0
-            )
-            results.append(
-                TextChunk(self._deferred_post_text, token_count=prefix_count)
-            )
-            self._deferred_post_text = ""
-        results.extend(self._deferred_terminals)
+        deferred_post_text = self._deferred_post_text
+        deferred = self._deferred_terminals
+        prefix_token_counts = self._deferred_prefix_token_counts
+        if not deferred and deferred_post_text:
+            results.append(TextChunk(deferred_post_text))
+        for idx, terminal in enumerate(deferred):
+            prefix_text = deferred_post_text if idx == 0 else ""
+            prefix_count = prefix_token_counts[idx]
+            if prefix_text or prefix_count:
+                results.append(TextChunk(prefix_text, token_count=prefix_count))
+            results.append(terminal)
         if self._deferred_trailing_token_count:
             results.append(
                 TextChunk("", token_count=self._deferred_trailing_token_count)
@@ -207,6 +209,7 @@ class TokenIDScanner:
         self._deferred_terminals.clear()
         self._deferred_prefix_token_counts.clear()
         self._deferred_trailing_token_count = 0
+        self._deferred_post_text = ""
         return results
 
     def _resolve_deferred(
@@ -253,6 +256,8 @@ class TokenIDScanner:
                 results.append(terminal)
                 remaining = remaining[pos + len(terminal.text) :]
             elif pos == 0:
+                if prefix_token_count:
+                    results.append(TextChunk("", token_count=prefix_token_count))
                 results.append(terminal)
                 remaining = remaining[len(terminal.text) :]
             else:
@@ -293,10 +298,10 @@ class TokenIDScanner:
         if not reconstructed:
             return [TextChunk(delta_text)] + results
 
-        pos = delta_text.find(reconstructed)
-        if pos > 0:
-            return [TextChunk(delta_text[:pos])] + results
-        if pos == 0:
+        if delta_text.endswith(reconstructed):
+            holdback_text = delta_text[: -len(reconstructed)]
+            if holdback_text:
+                return [TextChunk(holdback_text)] + results
             return results
 
         trailing_drop_index = len(results)
@@ -311,12 +316,15 @@ class TokenIDScanner:
 
         retained = results[:trailing_drop_index]
         retained_text = self._join_decoded_text(retained)
-        if retained_text and retained_text == delta_text:
+        if retained_text and delta_text.endswith(retained_text):
+            holdback_text = delta_text[: -len(retained_text)]
             trailing_drops = results[trailing_drop_index:]
             for trailing_drop in trailing_drops:
                 assert isinstance(trailing_drop, PreLexedTerminal)
                 self._deferred_terminals.append(trailing_drop)
                 self._deferred_prefix_token_counts.append(0)
+            if holdback_text:
+                return [TextChunk(holdback_text)] + retained
             return retained
 
         # Fallback: SentencePiece context-dependent decoding mismatch.
