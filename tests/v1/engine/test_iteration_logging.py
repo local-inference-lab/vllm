@@ -86,3 +86,21 @@ def test_attach_iteration_details_falls_back_to_client_zero_without_outputs():
     assert set(outputs) == {0}
     assert outputs[0].scheduler_stats is not None
     assert outputs[0].scheduler_stats.iteration_details == iteration_details
+
+
+def test_non_dp_prefill_schedule_interval_uses_scheduler_step():
+    engine = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            scheduler_config=SimpleNamespace(prefill_schedule_interval=4)
+        ),
+        scheduler=SimpleNamespace(current_step=0),
+    )
+
+    expected_by_completed_step = (False, True, True, True, False)
+    for completed_step, expected in enumerate(expected_by_completed_step):
+        engine.scheduler.current_step = completed_step
+        assert EngineCore._should_throttle_prefills(engine) is expected
+
+    engine.vllm_config.scheduler_config.prefill_schedule_interval = 1
+    engine.scheduler.current_step = 3
+    assert not EngineCore._should_throttle_prefills(engine)

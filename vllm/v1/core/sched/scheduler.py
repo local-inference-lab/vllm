@@ -557,8 +557,8 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
-        # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
-        # all prefill compute unless saturated.
+        # On a throttled cadence step, defer all prefill compute unless the
+        # prefill queue is saturated.
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
@@ -593,8 +593,8 @@ class Scheduler(SchedulerInterface):
                 continue
 
             if defer_prefills and request.is_prefill_chunk:
-                # DP prefill balancing: defer this in-progress prefill chunk to a
-                # cadence-aligned step; decodes still run to fill this step.
+                # Defer this in-progress chunk to a cadence-aligned step;
+                # decodes still run to fill this step.
                 req_index += 1
                 continue
 

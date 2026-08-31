@@ -339,11 +339,10 @@ def test_schedule_partial_requests():
 
 @pytest.mark.parametrize("has_running", [True, False])
 def test_schedule_prefills_gating(has_running: bool):
-    """DP prefill-balancing gate: when `throttle_prefills` is True, a new
-    WAITING (prefill) request is deferred ONLY if this rank has running work to
-    protect. With no running requests, the prefill is admitted regardless (so a
-    throttled step is never wasted as a dummy), and running/decode requests are
-    unaffected. Once the cadence allows prefills again, the request is admitted.
+    """When `throttle_prefills` is True, a new waiting prefill request is
+    deferred only if this engine has running decode work to protect. With no
+    running request, the prefill is admitted so a throttled step is not wasted.
+    Once the cadence allows prefills again, the request is admitted.
     """
     scheduler = create_scheduler(max_num_seqs=16, max_num_batched_tokens=8192)
 
@@ -463,10 +462,11 @@ def test_throttle_prefills_defers_remote_kv_resume_with_local_prefill():
 
 
 def test_throttle_defers_inflight_prefill_chunk():
-    """DP prefill balancing throttles ALL prefill compute on a throttled step,
-    not just new admissions: an in-progress (chunked) prefill already in the
-    running queue is also deferred, so the step runs decode-only, while a
-    separate decode keeps being scheduled."""
+    """A throttled step defers all prefill compute, not just new admissions.
+
+    An in-progress chunked prefill in the running queue is deferred so the step
+    runs decode-only while a separate decode request remains scheduled.
+    """
     scheduler = create_scheduler(
         max_num_seqs=16, max_num_batched_tokens=50, enable_chunked_prefill=True
     )

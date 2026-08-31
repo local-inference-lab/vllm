@@ -36,6 +36,9 @@ class PauseState(enum.IntEnum):
 
 
 class SchedulerInterface(ABC):
+    current_step: int
+    """Number of scheduling decisions completed by this scheduler."""
+
     @abstractmethod
     def __init__(
         self,
@@ -71,10 +74,10 @@ class SchedulerInterface(ABC):
         preparing inputs to the model.
 
         Args:
-            throttle_prefills: DP prefill balancing. When True (set by the DP
-                engine core on non-cadence-aligned steps), new prefill compute is
-                deferred to a later step so prefills stay aligned across DP ranks;
-                automatically overridden when the rank is saturated.
+            throttle_prefills: When True, defer prefill compute while decode
+                requests are running. Engine cores use this signal on
+                non-cadence steps. A saturated prefill queue overrides the signal
+                so queued requests continue to make progress.
 
         Returns:
             A SchedulerOutput object containing information about the scheduled
