@@ -22,6 +22,7 @@ from vllm.tokenizers import get_tokenizer
 from vllm.tool_parsers.glm47_moe_tool_parser import Glm47MoeModelToolParser
 
 MODEL = "zai-org/GLM-4.7"
+GLM_OUTPUT_MODES = ("whole", "character", "protocol", "token")
 VALUE = "left </arg_value> then </tool_call> as data more"
 OUTPUT = (
     "</think><tool_call>record_value"
@@ -135,19 +136,42 @@ def run_glm_output(glm_parser, output: str, *, mode: str):
         return SimpleNamespace(calls=calls, content=result.content or "")
 
     _reset(parser)
-    chunks = list(output) if mode == "character" else _protocol_chunks(output)
+    stream_steps: list[tuple[str, list[int]]]
+    if mode == "character":
+        stream_steps = [(chunk, []) for chunk in output]
+    elif mode == "protocol":
+        stream_steps = [(chunk, []) for chunk in _protocol_chunks(output)]
+    elif mode == "token":
+        tokenizer = parser.model_tokenizer
+        token_ids = tokenizer.encode(output, add_special_tokens=False)
+        stream_steps = []
+        previous_decoded = ""
+        for index, token_id in enumerate(token_ids):
+            decoded = tokenizer.decode(
+                token_ids[: index + 1],
+                skip_special_tokens=False,
+            )
+            assert decoded.startswith(previous_decoded)
+            stream_steps.append((decoded[len(previous_decoded) :], [token_id]))
+            previous_decoded = decoded
+    else:
+        raise ValueError(f"unknown GLM output mode: {mode}")
+
     current_text = ""
+    current_token_ids: list[int] = []
     deltas = []
-    for chunk in chunks:
+    for chunk, delta_token_ids in stream_steps:
         previous_text = current_text
+        previous_token_ids = current_token_ids
         current_text += chunk
+        current_token_ids = [*previous_token_ids, *delta_token_ids]
         delta = parser.extract_tool_calls_streaming(
             previous_text=previous_text,
             current_text=current_text,
             delta_text=chunk,
-            previous_token_ids=[],
-            current_token_ids=[],
-            delta_token_ids=[],
+            previous_token_ids=previous_token_ids,
+            current_token_ids=current_token_ids,
+            delta_token_ids=delta_token_ids,
             request=request,
         )
         if delta:
@@ -331,7 +355,7 @@ class TestGlm47ExtractToolCalls:
         assert function.name == "get_weather"
         assert json.loads(function.arguments) == {"city": value}
 
-    @pytest.mark.parametrize("mode", ["whole", "character", "token"])
+    @pytest.mark.parametrize("mode", GLM_OUTPUT_MODES)
     def test_literal_arg_value_end_keeps_later_tool_end_as_data(
         self,
         mode,
@@ -344,7 +368,7 @@ class TestGlm47ExtractToolCalls:
         assert json.loads(collect_arguments(calls)) == {"value": VALUE}
         assert collect_content(deltas) == "after"
 
-    @pytest.mark.parametrize("mode", ["whole", "character", "token"])
+    @pytest.mark.parametrize("mode", GLM_OUTPUT_MODES)
     @pytest.mark.parametrize(
         "value",
         [
@@ -385,7 +409,7 @@ class TestGlm47ExtractToolCalls:
         assert json.loads(collect_arguments(calls)) == {"value": value}
         assert collect_content(result) == "after"
 
-    @pytest.mark.parametrize("mode", ["whole", "character", "token"])
+    @pytest.mark.parametrize("mode", GLM_OUTPUT_MODES)
     def test_literal_arg_key_start_before_real_second_argument(
         self,
         mode,
@@ -438,7 +462,7 @@ class TestGlm47ExtractToolCalls:
         }
         assert collect_content(result) == "tail</arg_value></tool_call>"
 
-    @pytest.mark.parametrize("mode", ["whole", "character", "token"])
+    @pytest.mark.parametrize("mode", GLM_OUTPUT_MODES)
     def test_stray_text_after_real_closer_uses_malformed_finish_contract(
         self,
         mode,
@@ -455,9 +479,10 @@ class TestGlm47ExtractToolCalls:
         assert json.loads(collect_arguments(collect_calls(result))) == {
             "value": "Beijing"
         }
+        # Bytes after a malformed boundary remain inside the open call.
         assert collect_content(result) == ""
 
-    @pytest.mark.parametrize("mode", ["whole", "character", "token"])
+    @pytest.mark.parametrize("mode", GLM_OUTPUT_MODES)
     def test_missing_real_arg_value_end_remains_malformed(
         self,
         mode,
@@ -476,7 +501,7 @@ class TestGlm47ExtractToolCalls:
         }
         assert collect_content(result) == ""
 
-    @pytest.mark.parametrize("mode", ["whole", "character", "token"])
+    @pytest.mark.parametrize("mode", GLM_OUTPUT_MODES)
     def test_malformed_last_argument_keeps_prior_arguments_valid(
         self,
         mode,
