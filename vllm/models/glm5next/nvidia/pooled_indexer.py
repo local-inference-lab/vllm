@@ -430,6 +430,8 @@ class Glm5NextPooledIndexer(nn.Module):
             main_metadata.slot_mapping[:rows],
             positions,
             num_reqs,
+            num_decode_requests=num_decodes,
+            max_query_len=int(main_metadata.max_query_len),
             model_block_size=self.block_size,
             parent_stride_pages=self._parent_stride_pages,
         )
