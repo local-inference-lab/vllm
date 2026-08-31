@@ -35,9 +35,12 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseImpl,
     B12xMLASparseMetadata,
     B12xMLASparseMetadataBuilder,
+    _global_causal_lens_for_ckv_gather,
+    _is_glm_next_ckv_source_layout,
     _is_speculative_decode_batch,
     _max_speculative_decode_query_len,
     _selected_index_block_stride_rows,
+    _use_b12x_full_ckv_gather,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import _remap_tiling
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -172,10 +175,12 @@ def test_b12x_glm5_next_cache_spec_and_layout(monkeypatch) -> None:
     assert invalid_reasons == []
     assert unidentified == probe
     assert packed_by_glm_backend.state_content_bytes == 528
-    assert packed_by_glm_backend.page_size_padded == 64 * 528 + 16 * 128 * 2
+    assert packed_by_glm_backend.page_size_padded is None
+    assert packed_by_glm_backend.page_size_bytes == 64 * (528 + 33)
     assert packed_by_glm_backend.model_version == "glm5_next"
     assert packed.state_content_bytes == 528
-    assert packed.page_size_padded == 64 * 528 + 16 * 128 * 2
+    assert packed.page_size_padded is None
+    assert packed.page_size_bytes == 64 * (528 + 33)
     assert packed.model_version == "glm5_next"
     assert packed_without_config_context == packed
     assert layouts == (KVCacheLayout.BLHNC,)
@@ -256,6 +261,52 @@ def test_b12x_glm5_next_accepts_dcp_with_speculation(monkeypatch) -> None:
         )
 
     assert invalid_reasons == []
+
+
+@pytest.mark.parametrize(
+    ("max_query_len", "num_decode_tokens", "num_tokens", "expected"),
+    [
+        (1, 0, 32, False),
+        (6, 192, 192, False),
+        (6, 0, 192, True),
+        (128, 0, 8192, True),
+        (128, 0, 600000, False),
+    ],
+)
+def test_b12x_full_ckv_gather_excludes_decode_and_mtp_batches(
+    max_query_len: int,
+    num_decode_tokens: int,
+    num_tokens: int,
+    expected: bool,
+) -> None:
+    assert (
+        _use_b12x_full_ckv_gather(
+            enabled=True,
+            is_glm_next=True,
+            dcp_world_size=4,
+            max_query_len=max_query_len,
+            num_tokens=num_tokens,
+            num_decode_tokens=num_decode_tokens,
+            min_tokens=16,
+            max_tokens=524288,
+        )
+        is expected
+    )
+
+
+def test_b12x_full_ckv_gather_uses_global_causal_lengths() -> None:
+    global_seq_lens = torch.tensor([5, 12], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32)
+    req_id_per_token = torch.tensor([0, 0, 1, 1, 1], dtype=torch.int32)
+
+    actual = _global_causal_lens_for_ckv_gather(
+        global_seq_lens,
+        query_start_loc,
+        req_id_per_token,
+        num_actual_tokens=5,
+    )
+
+    assert actual.tolist() == [4, 5, 10, 11, 12]
 
 
 def test_b12x_glm5_next_accepts_dcp_with_prefix_caching(monkeypatch) -> None:
@@ -341,6 +392,8 @@ def test_b12x_glm5_next_selected_indices_use_physical_slots() -> None:
         )
         == 64
     )
+    assert _is_glm_next_ckv_source_layout(cache, page_size=64)
+    assert not _is_glm_next_ckv_source_layout(cache[:, :, ::2], page_size=64)
 
 
 def test_sparse_index_remap_tiling_covers_glm5_next_width() -> None:
@@ -369,18 +422,28 @@ def test_b12x_glm5_next_cache_writer_ignores_empty_rope() -> None:
     assert calls == [(kv_c, kv_cache, slots)]
 
 
-def test_b12x_glm5_next_cache_bind_replans_aligned_manager_page(monkeypatch) -> None:
+def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> None:
     planned: list[SimpleNamespace] = []
+    reservations: list[tuple[tuple[tuple[int, ...], torch.dtype], ...]] = []
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
     monkeypatch.setattr(
         b12x_mla_sparse,
         "is_workspace_manager_initialized",
         lambda: False,
     )
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "current_workspace_manager",
+        lambda: SimpleNamespace(reserve_all=lambda *specs: reservations.append(specs)),
+    )
 
     class FakeCaps(SimpleNamespace):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
+
+        @staticmethod
+        def shapes_and_dtypes():
+            return ()
 
     class FakeModule:
         Caps = FakeCaps
@@ -394,7 +457,10 @@ def test_b12x_glm5_next_cache_bind_replans_aligned_manager_page(monkeypatch) -> 
     impl._is_glm_next = True
     impl._module = FakeModule
     impl._kernel_page_size = 64
+    impl._kernel_page_size_finalized = False
     impl._input_num_heads = 64
+    impl.num_heads = 16
+    impl.dcp_world_size = 4
     impl._max_tokens = 4096
     impl._max_seqs = 4
     impl._max_speculative_decode_query_len = 6
@@ -404,23 +470,60 @@ def test_b12x_glm5_next_cache_bind_replans_aligned_manager_page(monkeypatch) -> 
     impl._q_head_dim = 512
     impl.kv_lora_rank = 512
     impl._model_type = 1
+    impl._ckv_gather_enabled = True
+    impl._ckv_capacity_tokens = 131200
+    impl._ckv_local_capacity = 131200
     impl._decode_plan = SimpleNamespace()
     impl._extend_plan = SimpleNamespace()
+    impl._ckv_extend_plan = SimpleNamespace()
     owner = SimpleNamespace(impl=impl, indexer=None)
     cache = torch.empty((2, 1, 2304, 528), dtype=torch.uint8)
 
+    MLAAttention.finalize_kv_cache_geometry(
+        owner,
+        SimpleNamespace(cache_config=SimpleNamespace(block_size=2304)),
+    )
     MLAAttention.bind_kv_cache(owner, cache)
 
     assert owner.kv_cache.shape == (2, 2304, 528)
     assert impl._kernel_page_size == 2304
+    assert impl._kernel_page_size_finalized
     assert [(caps.mode, caps.page_size) for caps in planned] == [
         ("decode", 2304),
         ("extend", 2304),
+        ("extend", 2304),
     ]
-    assert [(caps.max_q_rows, caps.max_batch) for caps in planned] == [
-        (24, 24),
-        (4096, 4096),
+    plan_geometry = [
+        (caps.num_q_heads, caps.max_q_rows, caps.max_batch) for caps in planned
     ]
+    assert plan_geometry == [
+        (64, 24, 24),
+        (64, 4096, 4096),
+        (16, 4096, 4096),
+    ]
+    assert len(reservations) == 3
+    assert reservations[0] == (((4096, 64, 512), torch.bfloat16),)
+    assert reservations[1] == (((4096, 64, 512), torch.bfloat16),)
+    assert reservations[2] == (
+        ((4096, 16, 512), torch.bfloat16),
+        ((131328, 528), torch.uint8),
+        ((525312, 528), torch.uint8),
+    )
+
+    with pytest.raises(RuntimeError, match="immutable after finalization"):
+        impl.finalize_kv_cache_geometry(64)
+    with pytest.raises(RuntimeError, match="does not match the finalized"):
+        impl.bind_kv_cache(torch.empty((2, 64, 528), dtype=torch.uint8))
+
+
+def test_b12x_glm5_next_full_ckv_bind_requires_geometry_finalization() -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._ckv_gather_enabled = True
+    impl._kernel_page_size_finalized = False
+
+    with pytest.raises(RuntimeError, match="before KV-cache memory profiling"):
+        impl.bind_kv_cache(torch.empty((2, 2304, 528), dtype=torch.uint8))
 
 
 @pytest.mark.parametrize(
@@ -533,6 +636,7 @@ def _bare_glm_selector_metadata_builder() -> B12xMLASparseMetadataBuilder:
     builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
     builder.requires_glm_next_selector_metadata = True
     builder.supports_draft_decode_metadata_update = True
+    builder._ckv_gather_requested = False
     builder.dcp_world_size = 1
     builder._max_speculative_decode_query_len = 6
     builder._capture_default_state_slot_ids = torch.arange(4, dtype=torch.int32)
@@ -631,7 +735,10 @@ def test_glm_selector_metadata_builder_stages_padded_rows_and_capture(
     monkeypatch.setattr(
         SparseMLACommonMetadataBuilder,
         "build",
-        lambda *args, **kwargs: SimpleNamespace(),
+        lambda *args, **kwargs: SimpleNamespace(
+            num_prefills=0,
+            num_decode_tokens=0,
+        ),
     )
     builder = _bare_glm_selector_metadata_builder()
     common = SimpleNamespace(
@@ -707,7 +814,10 @@ def test_glm_selector_metadata_builder_requires_complete_runtime_state(
     monkeypatch.setattr(
         SparseMLACommonMetadataBuilder,
         "build",
-        lambda *args, **kwargs: SimpleNamespace(),
+        lambda *args, **kwargs: SimpleNamespace(
+            num_prefills=0,
+            num_decode_tokens=0,
+        ),
     )
     builder = _bare_glm_selector_metadata_builder()
     common = SimpleNamespace(

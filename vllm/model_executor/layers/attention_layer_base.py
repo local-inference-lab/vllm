@@ -47,6 +47,23 @@ class AttentionLayerBase(ABC):
             if hasattr(impl, "_v_scale_cache"):
                 impl._v_scale_cache = None
 
+    def finalize_kv_cache_geometry(self, vllm_config: VllmConfig) -> None:
+        """Apply the resolved cache geometry to a loaded backend.
+
+        Hybrid cache alignment runs after model construction because it needs
+        the selected attention backend. Implementations that derive kernel
+        plans or persistent workspace sizes from the page geometry receive the
+        resolved value here, before device-memory profiling assigns the
+        remaining capacity to KV cache.
+
+        Args:
+            vllm_config: Configuration containing the resolved cache geometry.
+        """
+        impl = getattr(self, "impl", None)
+        finalize = getattr(impl, "finalize_kv_cache_geometry", None)
+        if callable(finalize):
+            finalize(vllm_config.cache_config.block_size)
+
     @abstractmethod
     def get_attn_backend(self) -> type[AttentionBackend]:
         """Get the attention backend class for this layer."""

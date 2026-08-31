@@ -178,6 +178,53 @@ class WorkspaceManager:
             for i in range(len(shapes_and_dtypes))
         ]
 
+    def reserve_all(
+        self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
+    ) -> None:
+        """Reserve one equal-size workspace for every execution slot.
+
+        Startup code uses this method when a runtime path can execute in any
+        microbatch or model lane. Reserving every slot before memory profiling
+        prevents the first request on an otherwise unused slot from growing
+        device memory after the KV-cache budget has been assigned.
+
+        Args:
+            *shapes_and_dtypes: Simultaneously live tensor shapes and dtypes.
+
+        Raises:
+            AssertionError: If the manager is locked and any slot is too small.
+        """
+        required_bytes = sum(
+            round_up(_compute_bytes(shape, dtype), 256)
+            for shape, dtype in shapes_and_dtypes
+        )
+        undersized = [
+            workspace_id
+            for workspace_id, workspace in enumerate(self._current_workspaces)
+            if self._workspace_size_bytes(workspace) < required_bytes
+        ]
+        if self._locked and undersized:
+            raise AssertionError(
+                "Workspace is locked but reserve_all requires "
+                f"{required_bytes / _MB:.2f} MB in slot(s) {undersized}."
+            )
+
+        for workspace_id in undersized:
+            current_workspace = self._current_workspaces[workspace_id]
+            self._current_workspaces[workspace_id] = None
+            del current_workspace
+            torch.accelerator.empty_cache()
+            self._current_workspaces[workspace_id] = torch.empty(
+                (required_bytes,), dtype=torch.uint8, device=self._device
+            )
+
+        if envs.VLLM_DEBUG_WORKSPACE and undersized:
+            logger.info(
+                "[WORKSPACE DEBUG] Reserved %.2f MB in execution slots %s",
+                required_bytes / _MB,
+                undersized,
+            )
+
     def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
         """Ensure workspace is allocated and large enough, return current workspace.
 

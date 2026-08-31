@@ -612,7 +612,10 @@ class Platform:
         For hybrid models, also aligns block_size with mamba page sizes.
         """
         from vllm.config.cache import CacheConfig
-        from vllm.config.vllm import set_current_vllm_config
+        from vllm.config.vllm import (
+            get_layers_from_vllm_config,
+            set_current_vllm_config,
+        )
 
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
@@ -649,6 +652,19 @@ class Platform:
         # May override the user's --block-size.
         if cache_config.kv_cache_dtype_skip_layers:
             cls._align_heterogeneous_kv_block_size(vllm_config, backend_cls)
+
+        # Model construction precedes hybrid block-size alignment. Notify
+        # loaded layers while memory profiling can still account for plans and
+        # persistent workspaces derived from the resolved cache geometry.
+        from vllm.model_executor.layers.attention_layer_base import (
+            AttentionLayerBase,
+        )
+
+        for layer in get_layers_from_vllm_config(
+            vllm_config,
+            AttentionLayerBase,  # type: ignore[type-abstract]
+        ).values():
+            layer.finalize_kv_cache_geometry(vllm_config)
 
     @classmethod
     def _align_heterogeneous_kv_block_size(

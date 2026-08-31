@@ -27,6 +27,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
     QueryLenSupport,
     _DecodeConcatQuantFP8,
+    _select_mqa_query,
     build_mla_chunked_context_metadata,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
@@ -66,6 +67,32 @@ if current_platform.is_rocm():
     BACKENDS_TO_TEST.append(AttentionBackendEnum.ROCM_AITER_MLA)
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.cpu_test
+def test_full_ckv_dcp_prefers_local_query_geometry() -> None:
+    q = torch.zeros((2, 2, 6))
+    q_dcp_replicated = torch.ones((2, 8, 6))
+
+    selected, replicated = _select_mqa_query(
+        q,
+        q_dcp_replicated,
+        num_mqa_tokens=1,
+        full_ckv_dcp=True,
+    )
+    assert selected.shape == (1, 2, 6)
+    assert not replicated
+    assert torch.equal(selected, q[:1])
+
+    selected, replicated = _select_mqa_query(
+        q,
+        q_dcp_replicated,
+        num_mqa_tokens=1,
+        full_ckv_dcp=False,
+    )
+    assert selected.shape == (1, 8, 6)
+    assert replicated
+    assert torch.equal(selected, q_dcp_replicated[:1])
 
 
 @pytest.mark.parametrize(

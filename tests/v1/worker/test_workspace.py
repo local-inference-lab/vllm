@@ -82,6 +82,34 @@ def test_workspace_lanes_compose_with_ubatches(monkeypatch) -> None:
     assert len(pointers) == 4
 
 
+def test_workspace_reservation_covers_every_execution_slot(monkeypatch) -> None:
+    active_ubatch = [0]
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: active_ubatch[0])
+    manager = workspace.WorkspaceManager(
+        torch.device("cpu"), num_ubatches=2, num_lanes=2
+    )
+
+    manager.reserve_all(((257,), torch.uint8), ((1,), torch.float32))
+
+    assert [
+        buffer.numel() if buffer is not None else 0
+        for buffer in manager._current_workspaces
+    ] == [768, 768, 768, 768]
+    for ubatch_id in range(2):
+        active_ubatch[0] = ubatch_id
+        for lane in range(2):
+            workspace_id = ubatch_id * 2 + lane
+            with workspace.use_workspace_lane(lane):
+                (view,) = manager.get_simultaneous(((8,), torch.uint8))
+            reserved = manager._current_workspaces[workspace_id]
+            assert reserved is not None
+            assert view.data_ptr() == reserved.data_ptr()
+
+    manager.lock()
+    with pytest.raises(AssertionError, match="reserve_all"):
+        manager.reserve_all(((1024,), torch.uint8))
+
+
 def test_workspace_lane_validation(monkeypatch) -> None:
     monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
     manager = workspace.WorkspaceManager(torch.device("cpu"), num_lanes=1)
