@@ -565,17 +565,11 @@ class ParserEngine(Parser):
         so it can parse content that has already had reasoning stripped.
         """
         self._check_skip_tool_parsing(request)
-        _, parsed_content, tool_call_info = self._single_pass_parse(
+        _, _, tool_call_info = self._single_pass_parse(
             content,
             [],
             initial_state=ParserState.CONTENT,
         )
-        if parsed_content is not None and tool_call_info.content is None:
-            tool_call_info = ExtractedToolCallInformation(
-                tools_called=tool_call_info.tools_called,
-                tool_calls=tool_call_info.tool_calls,
-                content=parsed_content,
-            )
         return tool_call_info
 
     def extract_tool_calls_streaming(

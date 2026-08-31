@@ -124,19 +124,15 @@ class StreamingParserEngine:
         self.config = config
 
         resolved_token_ids: dict[int, str] = {}
-        if tokenizer is not None:
-            if vocab is None:
-                vocab = tokenizer.get_vocab()
-            if config.token_id_terminals:
-                for terminal_name, token_text in config.token_id_terminals.items():
-                    tid = vocab.get(token_text)
-                    if tid is not None:
-                        resolved_token_ids[tid] = terminal_name
-
         drop_info: _DropInfo | None = None
         if tokenizer is not None:
-            assert vocab is not None
-            drop_info = _build_drop_info(config, tokenizer, vocab)
+            resolved_vocab = vocab if vocab is not None else tokenizer.get_vocab()
+            if config.token_id_terminals:
+                for terminal_name, token_text in config.token_id_terminals.items():
+                    tid = resolved_vocab.get(token_text)
+                    if tid is not None:
+                        resolved_token_ids[tid] = terminal_name
+            drop_info = _build_drop_info(config, tokenizer, resolved_vocab)
 
         lexer_shape = config.lexer_shape
         if drop_info is not None:
