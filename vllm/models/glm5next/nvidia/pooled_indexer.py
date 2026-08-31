@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 from .ops.glm_kpool import (
     expand_c4_block_table,
     expand_pool_ids,
+    expand_pool_ids_physical,
     fwht128_quant_fp8,
     gather_c4_block_table_rows,
     pool_seq_lens,
@@ -200,6 +201,11 @@ class Glm5NextPooledIndexer(nn.Module):
                 dtype=torch.float8_e4m3fn,
                 device=device,
             ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "physical_active_counts_buffer",
+            torch.empty(self.max_tokens, dtype=torch.int32, device=device),
             persistent=False,
         )
         self.register_buffer(
@@ -565,7 +571,21 @@ class Glm5NextPooledIndexer(nn.Module):
         output = self.topk_indices_buffer[:rows]
         if live_rows < rows:
             output[live_rows:].fill_(-1)
-        expand_pool_ids(pool_ids[:live_rows], positions[:live_rows], output[:live_rows])
+        if decode_only and self.dcp_world_size == 1:
+            expand_pool_ids_physical(
+                pool_ids[:live_rows],
+                positions[:live_rows],
+                main_metadata.req_id_per_token[:live_rows],
+                main_metadata.block_table,
+                output[:live_rows],
+                self.physical_active_counts_buffer[:live_rows],
+                block_size=self.block_size,
+                block_stride_rows=self.block_size,
+            )
+        else:
+            expand_pool_ids(
+                pool_ids[:live_rows], positions[:live_rows], output[:live_rows]
+            )
         return output
 
     def snapshot_speculative_interval_starts(self) -> None:

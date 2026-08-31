@@ -912,9 +912,132 @@ def expand_pool_ids(
         )
 
 
+@triton.jit
+def _expand_pool_ids_physical_kernel(
+    pool_ids,
+    positions,
+    request_ids,
+    block_table,
+    output,
+    active_counts,
+    pool_stride,
+    block_table_stride,
+    output_stride,
+    max_num_blocks,
+    HISTORY_TOKENS: tl.constexpr,
+    OUTPUT_WIDTH: tl.constexpr,
+    POOL_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_STRIDE_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    column = tile * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
+    mask = column < OUTPUT_WIDTH
+    sequence_length = tl.load(positions + row).to(tl.int64) + 1
+    complete_pools = sequence_length // POOL_SIZE
+    tail_start = complete_pools * POOL_SIZE
+    history = column < HISTORY_TOKENS
+    pool_column = column // POOL_SIZE
+    pool_offset = column % POOL_SIZE
+    pool_id = tl.load(
+        pool_ids + row * pool_stride + pool_column,
+        mask=mask & history,
+        other=-1,
+    ).to(tl.int64)
+    history_value = tl.where(pool_id >= 0, pool_id * POOL_SIZE + pool_offset, -1)
+    tail_offset = column - HISTORY_TOKENS
+    tail_count = sequence_length - tail_start
+    in_tail = (tail_offset >= 0) & (tail_offset < tail_count)
+    logical_token = tl.where(
+        history,
+        history_value,
+        tl.where(in_tail, tail_start + tail_offset, -1),
+    )
+
+    request = tl.load(request_ids + row).to(tl.int64)
+    block_id = logical_token // BLOCK_SIZE
+    in_block = logical_token - block_id * BLOCK_SIZE
+    valid = (logical_token >= 0) & (block_id < max_num_blocks)
+    page = tl.load(
+        block_table + request * block_table_stride + block_id,
+        mask=mask & valid,
+        other=-1,
+    ).to(tl.int64)
+    physical_token = tl.where(
+        valid & (page >= 0),
+        page * BLOCK_STRIDE_ROWS + in_block,
+        -1,
+    ).to(tl.int32)
+    tl.store(output + row * output_stride + column, physical_token, mask=mask)
+
+    # The selector returns one valid ID for every complete pool until top-k is
+    # saturated, followed by the 0--3 unpooled tail tokens. Every column tile
+    # computes the same scalar; only tile zero publishes it.
+    selected_pools = tl.minimum(complete_pools, HISTORY_TOKENS // POOL_SIZE)
+    active_count = selected_pools * POOL_SIZE + tail_count
+    tl.store(active_counts + row, active_count, mask=tile == 0)
+
+
+def expand_pool_ids_physical(
+    pool_ids: torch.Tensor,
+    positions: torch.Tensor,
+    request_ids: torch.Tensor,
+    block_table: torch.Tensor,
+    output: torch.Tensor,
+    active_counts: torch.Tensor,
+    *,
+    block_size: int,
+    block_stride_rows: int,
+) -> None:
+    """Expand pooled selections directly into physical main-cache token slots."""
+    if pool_ids.dtype != torch.int32 or request_ids.dtype != torch.int32:
+        raise TypeError("GLM pool selections and request IDs must use int32")
+    if positions.dtype != torch.int64:
+        raise TypeError("GLM expansion positions must use int64")
+    if block_table.dtype != torch.int32:
+        raise TypeError("GLM expansion block table must use int32")
+    if output.dtype != torch.int32 or active_counts.dtype != torch.int32:
+        raise TypeError("GLM physical-selection outputs must use int32")
+    if pool_ids.ndim != 2 or int(pool_ids.shape[1]) != 512:
+        raise ValueError("GLM pool selection must have shape [rows, 512]")
+    rows = int(pool_ids.shape[0])
+    if positions.shape != (rows,) or request_ids.shape != (rows,):
+        raise ValueError("GLM expansion metadata must have one entry per row")
+    if block_table.ndim != 2 or int(block_table.shape[1]) < 1:
+        raise ValueError("GLM expansion block table must be non-empty and rank two")
+    if output.shape != (rows, 2051) or active_counts.shape != (rows,):
+        raise ValueError("GLM physical-selection outputs have the wrong contract")
+    if block_size <= 0 or block_stride_rows < block_size:
+        raise ValueError("GLM physical token block geometry is invalid")
+    if rows:
+        block_cols = 128
+        _expand_pool_ids_physical_kernel[(rows, triton.cdiv(2051, block_cols))](
+            pool_ids,
+            positions,
+            request_ids,
+            block_table,
+            output,
+            active_counts,
+            int(pool_ids.stride(0)),
+            int(block_table.stride(0)),
+            int(output.stride(0)),
+            int(block_table.shape[1]),
+            HISTORY_TOKENS=2048,
+            OUTPUT_WIDTH=2051,
+            POOL_SIZE=_POOL_SIZE,
+            BLOCK_SIZE=block_size,
+            BLOCK_STRIDE_ROWS=block_stride_rows,
+            BLOCK_COLS=block_cols,
+            num_warps=4,
+        )
+
+
 __all__ = [
     "expand_c4_block_table",
     "expand_pool_ids",
+    "expand_pool_ids_physical",
     "fwht128_quant_fp8",
     "gather_c4_block_table_rows",
     "pool_seq_lens",

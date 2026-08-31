@@ -1012,6 +1012,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         vllm_config = get_current_vllm_config()
         hf_config = vllm_config.model_config.hf_text_config
         self._is_glm_next = _is_glm_next_config(hf_config)
+        self._glm_physical_active_counts = getattr(
+            indexer, "physical_active_counts_buffer", None
+        )
         self.supports_mtp_with_cp_non_trivial_interleave_size = self._is_glm_next
         if self._is_glm_next:
             if recipe_error := _glm_next_recipe_error(hf_config):
@@ -1493,6 +1496,15 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             ).contiguous()
             torch.minimum(active_counts, cache_seq_lens, out=active_counts)
             _mask_page_table_after_nsa_len(selected_indices, active_counts)
+        elif (
+            self._is_glm_next
+            and self.dcp_world_size == 1
+            and int(attn_metadata.num_prefills) == 0
+            and int(attn_metadata.num_decode_tokens) == num_tokens
+            and self._glm_physical_active_counts is not None
+        ):
+            selected_indices = topk_indices
+            active_counts = self._glm_physical_active_counts[:num_tokens]
         elif self.dcp_world_size > 1:
             block_stride_rows = _selected_index_block_stride_rows(
                 kv_c_and_k_pe_cache,
