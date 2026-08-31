@@ -711,7 +711,7 @@ def test_glm53_pool_expansion_appends_only_the_incomplete_tail() -> None:
     pool_ids[1, :2] = torch.tensor([1, 0], dtype=torch.int32, device=device)
     pool_ids[2] = torch.arange(512, dtype=torch.int32, device=device)
     positions = torch.tensor([2, 7, 2052], dtype=torch.int64, device=device)
-    output = torch.empty((3, 2051), dtype=torch.int32, device=device)
+    output = torch.full((3, 2051), 37, dtype=torch.int32, device=device)
 
     expand_pool_ids(pool_ids, positions, output)
 

@@ -52,9 +52,6 @@ class DeepseekV4B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
             max_page_table_width=block_table_width,
             page_size=_INDEX_PAGE_SIZE,
         )
-        self.active_width_buffer = torch.zeros(
-            (1,), dtype=torch.int32, device=self.device
-        )
 
     def _supports_native_decode(self, next_n: int) -> bool:
         return True
@@ -99,15 +96,13 @@ class DeepseekV4B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
                     self.num_sms,
                     out=self.scheduler_metadata_buffer,
                 )
-            active_width = (
-                int(metadata.max_seq_len) + int(self.compress_ratio) - 1
-            ) // int(self.compress_ratio)
-            self.active_width_buffer.fill_(active_width)
             decode_fields = vars(decode).copy()
             decode_fields["schedule_metadata"] = schedule_metadata
             metadata.decode = DeepseekV4B12xIndexerDecodeMetadata(
                 **decode_fields,
-                active_width=self.active_width_buffer,
+                # Fused decode does not consume active_width; other routes bind
+                # the immutable plan-capacity tensor when no override is given.
+                active_width=None,
             )
         return metadata
 
@@ -201,6 +196,13 @@ def _run_paged_topk(
     topk: int,
     shared_page_table: bool,
 ) -> None:
+    route = getattr(plan, "route", None)
+    if route is None:
+        route = getattr(getattr(plan, "layout", None), "route", None)
+    # The fused decode route owns every output slot, including -1 padding.
+    # Other routes retain caller initialization through this shared entry point.
+    if route != "paged_fused":
+        output.fill_(-1)
     if shared_page_table:
         _assert_prefill_route(plan)
     scratch = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
@@ -355,7 +357,6 @@ class B12xC4SparseIndexer(nn.Module):
             raise ValueError(
                 "B12x C4 scores must be float32 with the same shape as output"
             )
-        output.fill_(-1)
         _run_paged_topk(
             module=self._b12x_indexer,
             plan=self._plan_paged_topk(
@@ -427,7 +428,6 @@ class B12xC4SparseIndexer(nn.Module):
                 block_table = chunk.block_table[:1, :active_pages].expand(
                     int(q_chunk.shape[0]), active_pages
                 )
-                output.fill_(-1)
                 _run_paged_topk(
                     module=self._b12x_indexer,
                     plan=self._plan_paged_topk(
@@ -465,7 +465,6 @@ class B12xC4SparseIndexer(nn.Module):
                 )
             num_tokens = metadata.num_decode_tokens
             output = self.topk_indices_buffer[:num_tokens, : self.topk_tokens]
-            output.fill_(-1)
             active_width = getattr(decode, "active_width", None)
             _run_paged_topk(
                 module=self._b12x_indexer,

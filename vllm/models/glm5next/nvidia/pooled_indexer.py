@@ -457,7 +457,6 @@ class Glm5NextPooledIndexer(nn.Module):
             pool_interleave=self.pool_interleave,
         )
         pool_ids = self.pool_topk_indices_buffer[:rows]
-        pool_ids.fill_(-1)
         pool_scores = self._pool_scores[:rows] if self.dcp_world_size > 1 else None
 
         if decode_rows:
@@ -546,7 +545,8 @@ class Glm5NextPooledIndexer(nn.Module):
                 )
 
         output = self.topk_indices_buffer[:rows]
-        output.fill_(-1)
+        if live_rows < rows:
+            output[live_rows:].fill_(-1)
         expand_pool_ids(pool_ids[:live_rows], positions[:live_rows], output[:live_rows])
         return output
 

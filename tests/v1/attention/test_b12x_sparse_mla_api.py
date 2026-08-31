@@ -1246,6 +1246,92 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
     assert calls["caps"]["max_page_table_width"] == 1024
 
 
+@pytest.mark.parametrize(
+    ("route", "expected_initial_value"),
+    [("paged_fused", 17), ("paged_tiled", -1)],
+)
+def test_b12x_paged_topk_initializes_only_non_fused_routes(
+    monkeypatch, route: str, expected_initial_value: int
+) -> None:
+    observed: list[torch.Tensor] = []
+
+    plan = SimpleNamespace(
+        layout=SimpleNamespace(route=route),
+        shapes_and_dtypes=lambda: (),
+        bind=lambda **kwargs: SimpleNamespace(route=route),
+    )
+
+    def index_topk_fp8(**kwargs):
+        output = kwargs["out_indices"]
+        observed.append(output.clone())
+        output.fill_(5)
+
+    module = SimpleNamespace(
+        PAGED_INDEX_PAGE_SIZE=64,
+        index_topk_fp8=index_topk_fp8,
+    )
+    monkeypatch.setattr(b12x_indexer, "current_workspace_manager", lambda: _Workspace())
+    output = torch.full((2, 4), 17, dtype=torch.int32)
+
+    b12x_indexer._run_paged_topk(
+        module=module,
+        plan=plan,
+        q=torch.empty((2, 16, 128), dtype=torch.float8_e4m3fn),
+        weights=torch.empty((2, 16, 1), dtype=torch.float32),
+        kv_cache=torch.empty((4, 64, 132), dtype=torch.uint8),
+        seq_lens=torch.full((2,), 128, dtype=torch.int32),
+        block_table=torch.zeros((2, 2), dtype=torch.int32),
+        schedule_metadata=None,
+        active_width=None,
+        output=output,
+        scores=None,
+        topk=4,
+        shared_page_table=False,
+    )
+
+    assert torch.count_nonzero(observed[0] != expected_initial_value) == 0
+    assert torch.count_nonzero(output != 5) == 0
+
+
+def test_b12x_decode_metadata_uses_plan_capacity_for_active_width(monkeypatch) -> None:
+    decode = b12x_indexer.DeepSeekV32IndexerDecodeMetadata(
+        block_table=torch.zeros((2, 4), dtype=torch.int32),
+        seq_lens=torch.full((2,), 128, dtype=torch.int32),
+        decode_lens=torch.ones((2,), dtype=torch.int32),
+        requires_padding=False,
+        schedule_metadata=torch.empty(0, dtype=torch.int32),
+    )
+    metadata = b12x_indexer.DeepseekV32IndexerMetadata(
+        seq_lens=decode.seq_lens,
+        max_seq_len=128,
+        slot_mapping=torch.arange(2, dtype=torch.int64),
+        num_decodes=2,
+        num_decode_tokens=2,
+        num_prefills=0,
+        num_prefill_tokens=0,
+        decode=decode,
+    )
+    monkeypatch.setattr(
+        b12x_indexer.DeepseekV32IndexerMetadataBuilder,
+        "build",
+        lambda self, *args, **kwargs: metadata,
+    )
+    monkeypatch.setattr(
+        b12x_indexer,
+        "_require_b12x_indexer",
+        lambda: SimpleNamespace(uses_paged_schedule=lambda **kwargs: False),
+    )
+    builder = object.__new__(b12x_indexer.DeepseekV4B12xIndexerMetadataBuilder)
+    builder.scheduler_metadata_buffer = torch.empty(0, dtype=torch.int32)
+    builder.num_sms = 1
+
+    result = builder.build()
+
+    assert isinstance(result.decode, b12x_indexer.DeepseekV4B12xIndexerDecodeMetadata)
+    assert result.decode.active_width is None
+    assert not hasattr(builder, "active_width_buffer")
+
+
 def test_b12x_dsa_indexer_reuses_plans_and_rebinds_shared_workspace(
     monkeypatch,
 ) -> None:
