@@ -2313,6 +2313,55 @@ def test_group_dcp_replicated_dflash_with_hybrid_mla_target():
     assert groups[-1].kv_cache_spec.dcp_replicated is True
 
 
+def test_glm5next_split_cache_preserves_physical_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Split GLM-5.3 cache groups retain their independent page geometry."""
+    target = MLAAttentionSpec(
+        block_size=512,
+        num_kv_heads=1,
+        head_size=528,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8",
+        model_version="glm5_next",
+        page_tail_bytes_per_token=33,
+    )
+    recurrent = MambaSpec(
+        block_size=512,
+        shapes=((585728,),),
+        dtypes=(torch.bfloat16,),
+        mamba_cache_mode="align",
+    )
+    assert target.page_size_bytes == 287232
+    assert recurrent.page_size_bytes == 1171456
+
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "512")
+    groups = get_kv_cache_groups(
+        _grouping_config(),
+        {"model.target": target, "model.recurrent": recurrent},
+    )
+
+    pages = {
+        layer_name: group.kv_cache_spec.page_size_bytes
+        for group in groups
+        for layer_name in group.layer_names
+    }
+    assert pages == {
+        "model.target": target.page_size_bytes,
+        "model.recurrent": recurrent.page_size_bytes,
+    }
+
+    c4_index_page_bytes = 64 * 132
+    expected_pool_stride = (
+        (recurrent.page_size_bytes + c4_index_page_bytes - 1)
+        // c4_index_page_bytes
+        * c4_index_page_bytes
+    )
+    assert kv_cache_utils._get_kv_cache_bytes_per_block(groups) == (
+        expected_pool_stride
+    )
+
+
 def new_indexer_mla_spec(block_size=16):
     # Sparse-attention indexer k_cache: an MLAAttentionSpec with a much smaller
     # page size than the main MLA attention (uint8, small head), so their pages

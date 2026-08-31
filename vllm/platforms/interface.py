@@ -807,6 +807,53 @@ class Platform:
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
 
+        split_target_block_size = os.getenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE")
+        if split_target_block_size is not None:
+            if model_config.architecture != "Glm5NextForConditionalGeneration":
+                raise ValueError(
+                    "VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE is supported only for "
+                    "Glm5NextForConditionalGeneration."
+                )
+            target_block_size = int(split_target_block_size)
+            split_mamba_block_size = int(
+                os.getenv(
+                    "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE",
+                    split_target_block_size,
+                )
+            )
+            if target_block_size <= 0 or target_block_size % 64 != 0:
+                raise ValueError(
+                    "VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE must be a positive "
+                    "multiple of 64."
+                )
+            if (
+                split_mamba_block_size <= 0
+                or split_mamba_block_size % target_block_size != 0
+            ):
+                raise ValueError(
+                    "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE must be a positive "
+                    "multiple of VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE."
+                )
+            if cache_config.mamba_cache_mode != "align":
+                raise ValueError(
+                    "Split GLM-5.3 target and recurrent-state pages require "
+                    "mamba_cache_mode='align'."
+                )
+
+            # The target MLA cache and recurrent-state cache use independent
+            # physical pages. Their token block sizes remain scheduler-visible,
+            # so the recurrent block must be a multiple of the target block.
+            cache_config.block_size = target_block_size
+            cache_config.mamba_block_size = split_mamba_block_size
+            cache_config.mamba_page_size_padded = None
+            logger.warning(
+                "Using split GLM-5.3 cache pages: target block size %d tokens, "
+                "recurrent-state block size %d tokens.",
+                target_block_size,
+                split_mamba_block_size,
+            )
+            return
+
         if cache_config.cache_dtype == "auto":
             kv_cache_dtype = model_config.dtype
         else:

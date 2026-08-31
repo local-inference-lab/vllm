@@ -1282,6 +1282,14 @@ def _get_per_layer_spec(
     return spec
 
 
+def _contains_glm5_next_mla(kv_cache_specs: Iterable[KVCacheSpec]) -> bool:
+    """Return whether the cache specifications contain GLM-5.3 target MLA."""
+    return any(
+        isinstance(spec, MLAAttentionSpec) and spec.model_version == "glm5_next"
+        for spec in kv_cache_specs
+    )
+
+
 def _get_kv_cache_bytes_per_block(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
@@ -1294,6 +1302,21 @@ def _get_kv_cache_bytes_per_block(
         for group in kv_cache_groups
     )
     assert bytes_per_block > 0
+    contains_glm5_next_mla = _contains_glm5_next_mla(
+        _get_per_layer_spec(group, layer_name)
+        for group in kv_cache_groups
+        for layer_name in group.layer_names
+    )
+    if (
+        os.getenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE") is not None
+        and contains_glm5_next_mla
+    ):
+        # GLM-5.3 stores two 64-row by 132-byte FP8 C4 index pages in the
+        # target MLA page tail when the target block contains 512 tokens.
+        # The block-outermost pool stride must preserve the index-page unit
+        # even when a larger recurrent-state group determines pool capacity.
+        glm_c4_index_page_bytes = 64 * 132
+        bytes_per_block = round_up(bytes_per_block, glm_c4_index_page_bytes)
     return bytes_per_block
 
 
@@ -1902,6 +1925,36 @@ def get_kv_cache_groups(
         for k, v in kv_cache_spec.items()
         if not isinstance(v, HiddenStateCacheSpec)
     }
+
+    split_target_block_size = os.getenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE")
+    is_glm5_next_split_cache = (
+        split_target_block_size is not None
+        and _contains_glm5_next_mla(filtered_spec.values())
+    )
+    if is_glm5_next_split_cache:
+        if hidden_specs:
+            raise ValueError(
+                "Split GLM-5.3 cache pages do not support hidden-state cache layers."
+            )
+        if not any(isinstance(spec, MambaSpec) for spec in filtered_spec.values()):
+            raise ValueError(
+                "Split GLM-5.3 cache pages require recurrent-state cache layers."
+            )
+        # Preserve the target MLA and recurrent-state physical page sizes.
+        # The block-outermost layout packs each group's pages independently,
+        # while the hybrid coordinator handles their token block sizes.
+        groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+        logger.warning(
+            "Keeping split GLM-5.3 cache groups with physical page sizes %s.",
+            sorted(
+                {
+                    _get_per_layer_spec(group, layer_name).page_size_bytes
+                    for group in groups
+                    for layer_name in group.layer_names
+                }
+            ),
+        )
+        return groups
 
     # Prefer preserving each layer's cache semantics. If physical pages cannot
     # be unified, try a supported allocation-only fallback before failing.

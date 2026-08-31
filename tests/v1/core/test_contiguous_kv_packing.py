@@ -104,6 +104,15 @@ class TestDensePacking:
             list(g2),
         ]
 
+    def test_glm53_split_env_does_not_pad_other_mla_models(self, monkeypatch):
+        groups, _, _ = _mixed_page_groups()
+        expected = _expected_bytes_per_block(groups)
+        assert expected % (64 * 132) != 0
+
+        monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "512")
+
+        assert _get_kv_cache_bytes_per_block(groups) == expected
+
     def test_layers_within_a_group_are_dense(self):
         groups, _, _ = _mixed_page_groups()
         pages = _pages(groups)
