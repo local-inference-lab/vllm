@@ -1302,3 +1302,112 @@ def test_auto_drop_alias_does_not_override_protected_id(protection: str):
         )
         == ""
     )
+
+
+@pytest.mark.parametrize(
+    "protection",
+    ["terminals", "token_id_terminals", "preserve_tokens"],
+)
+def test_alias_spelling_survives_when_its_only_id_is_protected(
+    protection: str,
+):
+    protected = "<protected>"
+    alias = "<alias>"
+    protected_id = 10
+    tokenizer = _cleanup_tokenizer({protected_id: alias})
+    tokenizer.get_vocab.return_value = {
+        protected: protected_id,
+        alias: protected_id,
+    }
+    tokenizer.all_special_tokens = [protected, alias]
+    tokenizer.all_special_ids = [protected_id, protected_id]
+
+    terminals = {"PROTECTED": protected} if protection == "terminals" else {}
+    token_id_terminals = (
+        {"PROTECTED": protected} if protection == "token_id_terminals" else {}
+    )
+    preserve_tokens = (
+        frozenset({protected}) if protection == "preserve_tokens" else frozenset()
+    )
+    transitions = (
+        {
+            (ParserState.CONTENT, "PROTECTED"): Transition(
+                ParserState.CONTENT,
+                (EventType.TEXT_CHUNK,),
+            )
+        }
+        if protection != "preserve_tokens"
+        else {}
+    )
+    config = ParserEngineConfig(
+        name=f"alias_only_{protection}",
+        terminals=terminals,
+        token_id_terminals=token_id_terminals,
+        transitions=transitions,
+        content_events={ParserState.CONTENT: EventType.TEXT_CHUNK},
+        initial_state=ParserState.CONTENT,
+        preserve_tokens=preserve_tokens,
+    )
+
+    events = StreamingParserEngine(config, tokenizer).feed(alias, [protected_id])
+    assert (
+        "".join(event.value for event in events if event.type == EventType.TEXT_CHUNK)
+        == alias
+    )
+
+    text_only = StreamingParserEngine(config, tokenizer).parse_complete(alias)
+    assert not any(
+        event.value == alias
+        for event in text_only
+        if event.type == EventType.TEXT_CHUNK
+    )
+
+
+def test_deferred_terminal_binds_after_literal_lookalike():
+    body_id = 10
+    end_id = 11
+    scanner = TokenIDScanner(
+        {end_id: "END"},
+        _cleanup_tokenizer({body_id: "after", end_id: "<end>"}),
+    )
+
+    assert scanner.scan("", [end_id]) == []
+    items = scanner.scan("literal <end> real <end>after", [body_id])
+
+    assert items == [
+        TextChunk("literal <end> real "),
+        PreLexedTerminal("END", end_id, "<end>"),
+        TextChunk("after", ("after",), 1),
+    ]
+
+
+def test_deferred_terminal_sequence_uses_current_suffix_boundary():
+    start_id = 10
+    body_id = 11
+    end_id = 12
+    after_id = 13
+    scanner = TokenIDScanner(
+        {start_id: "START", end_id: "END"},
+        _cleanup_tokenizer(
+            {
+                start_id: "<start>",
+                body_id: "between",
+                end_id: "<end>",
+                after_id: "after",
+            }
+        ),
+    )
+
+    assert scanner.scan("", [start_id, body_id, end_id]) == []
+    items = scanner.scan(
+        "literal <start> real <start><end>after",
+        [after_id],
+    )
+
+    assert items == [
+        TextChunk("literal <start> real "),
+        PreLexedTerminal("START", start_id, "<start>"),
+        TextChunk("", token_count=1),
+        PreLexedTerminal("END", end_id, "<end>"),
+        TextChunk("after", ("after",), 1),
+    ]

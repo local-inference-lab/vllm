@@ -87,8 +87,13 @@ class TokenIDScanner:
         deferred_trailing_count = 0
 
         if self._deferred_terminals:
+            current_reconstruction = "".join(self._decode_tokens(delta_token_ids))
             prefix_items, effective_text, deferred_trailing_count = (
-                self._resolve_deferred(delta_text, len(delta_token_ids))
+                self._resolve_deferred(
+                    delta_text,
+                    len(delta_token_ids),
+                    current_reconstruction,
+                )
             )
 
         if not self.token_id_to_terminal:
@@ -216,6 +221,7 @@ class TokenIDScanner:
         self,
         delta_text: str,
         current_token_count: int = 0,
+        current_reconstruction: str = "",
     ) -> tuple[list[LexerInput], str, int]:
         """Resolve deferred terminals against new delta_text.
 
@@ -243,6 +249,16 @@ class TokenIDScanner:
         if self._deferred_post_text:
             remaining = self._deferred_post_text + remaining
             self._deferred_post_text = ""
+
+        suffix_resolution = self._resolve_deferred_before_suffix(
+            remaining,
+            current_reconstruction,
+            deferred,
+            prefix_token_counts,
+        )
+        if suffix_resolution is not None:
+            results, remaining = suffix_resolution
+            return results, remaining, trailing_token_count
 
         # Duplicate-text deferred terminals resolve left-to-right via
         # find(); correct when each terminal text appears once in sequence.
@@ -275,6 +291,40 @@ class TokenIDScanner:
             trailing_token_count = 0
 
         return results, remaining, trailing_token_count
+
+    @staticmethod
+    def _resolve_deferred_before_suffix(
+        text: str,
+        current_reconstruction: str,
+        deferred: list[PreLexedTerminal],
+        prefix_token_counts: list[int],
+    ) -> tuple[list[LexerInput], str] | None:
+        if not current_reconstruction or not text.endswith(current_reconstruction):
+            return None
+
+        search_end = len(text) - len(current_reconstruction)
+        positions = [-1] * len(deferred)
+        for idx in range(len(deferred) - 1, -1, -1):
+            position = text.rfind(deferred[idx].text, 0, search_end)
+            if position < 0:
+                return None
+            positions[idx] = position
+            search_end = position
+
+        results: list[LexerInput] = []
+        consumed = 0
+        for terminal, prefix_token_count, position in zip(
+            deferred,
+            prefix_token_counts,
+            positions,
+        ):
+            prefix_text = text[consumed:position]
+            if prefix_text or prefix_token_count:
+                results.append(TextChunk(prefix_text, token_count=prefix_token_count))
+            results.append(terminal)
+            consumed = position + len(terminal.text)
+
+        return results, text[consumed:]
 
     def _recover_holdback_text(
         self,

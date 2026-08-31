@@ -151,9 +151,10 @@ class StreamingParserEngine:
             tokenizer,
         )
 
-        self._token_id_terminal_names: frozenset[str] = frozenset(
-            resolved_token_ids.values()
-        )
+        token_id_terminal_names = set(resolved_token_ids.values())
+        if drop_info is not None:
+            token_id_terminal_names.add(DROP_TERMINAL)
+        self._token_id_terminal_names = frozenset(token_id_terminal_names)
 
         self._lexer = IncrementalLexer(lexer_shape, content_terminal=CONTENT_TERMINAL)
 
