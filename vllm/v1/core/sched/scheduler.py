@@ -1092,6 +1092,30 @@ class Scheduler(SchedulerInterface):
                 len(num_scheduled_tokens)
             ]
 
+        # Skip speculative decoding when every scheduled request needs at most
+        # one output token. Drafting cannot pay off for a 1-token output, so the
+        # draft pass plus verification is pure added latency. Only fires when no
+        # running request is scheduled, so an in-flight multi-token generation
+        # can never lose its draft tokens.
+        if (
+            num_spec_tokens_to_schedule > 0
+            and scheduled_new_reqs
+            and not scheduled_running_reqs
+            and all(req.max_tokens <= 1 for req in scheduled_new_reqs)
+        ):
+            num_spec_tokens_to_schedule = 0
+            # NOTE: allocate_slots (called above for each request) already
+            # reserved KV blocks for self.num_lookahead_tokens speculative
+            # slots. We cannot retroactively shrink that reservation here
+            # because it was made per-request during the scheduling loop,
+            # before this aggregate skip condition is evaluated. The
+            # reservation is harmless: these are single-token requests
+            # (max_tokens <= 1) that finish immediately after one decode
+            # step, so the extra blocks are released at the next scheduling
+            # iteration. Zeroing num_spec_tokens_to_schedule prevents the
+            # draft model from running, which is the source of the wasted
+            # latency we are avoiding.
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
