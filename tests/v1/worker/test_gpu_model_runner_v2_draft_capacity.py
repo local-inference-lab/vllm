@@ -149,6 +149,65 @@ def test_dynamic_draft_depth_applies_profiled_load_budget():
     assert controller.observe(capacities, attempted) == 5
 
 
+def test_dynamic_draft_depth_default_min_depth_keeps_floor_of_one():
+    controller = DSparkDynamicDraftDepthController(max_depth=5, observation_window=2)
+    attempted = np.full(2, 5, dtype=np.int32)
+    zero_capacity = np.zeros(2, dtype=np.int32)
+
+    assert controller.observe(zero_capacity, attempted) == 5
+    assert controller.observe(zero_capacity, attempted) == 1
+
+
+def test_dynamic_draft_depth_min_depth_floors_capacity_collapse():
+    controller = DSparkDynamicDraftDepthController(
+        max_depth=7,
+        observation_window=2,
+        min_depth=5,
+    )
+    attempted = np.full(2, 7, dtype=np.int32)
+    capacities = np.array([2, 3], dtype=np.int32)
+
+    assert controller.observe(capacities, attempted) == 7
+    assert controller.observe(capacities, attempted) == 5
+    assert controller.observe(capacities, attempted) == 5
+
+
+def test_dynamic_draft_depth_min_depth_is_clamped_to_valid_range():
+    assert DSparkDynamicDraftDepthController(5, 2, min_depth=0).min_depth == 1
+    assert DSparkDynamicDraftDepthController(5, 2, min_depth=-3).min_depth == 1
+    assert DSparkDynamicDraftDepthController(5, 2, min_depth=9).min_depth == 5
+
+
+def test_dynamic_draft_depth_load_budget_wins_over_min_depth():
+    controller = DSparkDynamicDraftDepthController(
+        max_depth=7,
+        observation_window=2,
+        min_depth=5,
+    )
+    controller.set_draft_token_budget(21)
+    attempted = np.full(8, 7, dtype=np.int32)
+    capacities = np.full(8, 7, dtype=np.int32)
+
+    assert controller.observe(capacities, attempted) == 7
+    assert controller.observe(capacities, attempted) == 3
+
+
+def test_dynamic_draft_depth_min_depth_still_probes_upward():
+    controller = DSparkDynamicDraftDepthController(
+        max_depth=7,
+        observation_window=2,
+        min_depth=5,
+    )
+    attempted = np.full(2, 7, dtype=np.int32)
+    capacities = np.full(2, 5, dtype=np.int32)
+
+    assert controller.observe(capacities, attempted) == 7
+    assert controller.observe(capacities, attempted) == 5
+    for _ in range(controller._PROBE_AFTER_WINDOWS * 2 - 1):
+        assert controller.observe(capacities, attempted) == 5
+    assert controller.observe(capacities, attempted) == 6
+
+
 def test_capacity_kernel_supports_shorter_logical_width_than_storage_stride():
     device = torch.device("cuda")
     confidence_probs = torch.full((2, 5), 0.01, device=device)
