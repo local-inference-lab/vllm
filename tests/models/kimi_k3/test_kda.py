@@ -33,6 +33,7 @@ from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
     KDARecoverSSMCommitContext,
     kda_recoverssm_verify,
 )
+from vllm.models.kimi_k3.nvidia.ops.third_party.kda import chunk as kda_chunk
 from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
     chunk_kda,
     chunk_kda_with_fused_gate,
@@ -51,6 +52,60 @@ pytestmark = pytest.mark.skipif(
     not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
     reason="The KDA kernels require a CUDA-alike or XPU device.",
 )
+
+
+def test_kda_threads_precomputed_chunk_offsets(monkeypatch) -> None:
+    sentinel = torch.tensor([0, 2], dtype=torch.int32)
+    captured: dict[str, torch.Tensor | None] = {}
+
+    monkeypatch.setattr(kda_chunk, "chunk_local_cumsum", lambda value, **_: value)
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        return kwargs["v"], None
+
+    monkeypatch.setattr(kda_chunk, "_chunk_kda_fwd_with_cumulative_g", capture)
+    tensor = torch.empty((1, 2, 1, 2))
+    kda_chunk.chunk_kda_fwd(
+        q=tensor,
+        k=tensor,
+        v=tensor,
+        g=tensor,
+        beta=tensor,
+        scale=1.0,
+        initial_state=tensor,
+        output_final_state=False,
+        chunk_indices=sentinel,
+        chunk_offsets=sentinel,
+    )
+
+    assert captured["chunk_indices"] is sentinel
+    assert captured["chunk_offsets"] is sentinel
+
+    captured.clear()
+    monkeypatch.setattr(
+        kda_chunk,
+        "fused_kda_gate_chunk_cumsum",
+        lambda raw_g, raw_beta, **_: (raw_g, raw_beta),
+    )
+    kda_chunk.chunk_kda_with_fused_gate_fwd(
+        q=tensor,
+        k=tensor,
+        v=tensor,
+        raw_g=tensor,
+        raw_beta=tensor,
+        A_log=tensor,
+        g_bias=None,
+        scale=1.0,
+        initial_state=tensor,
+        output_final_state=False,
+        chunk_indices=sentinel,
+        chunk_offsets=sentinel,
+    )
+
+    assert captured["chunk_indices"] is sentinel
+    assert captured["chunk_offsets"] is sentinel
+
 
 # The AMD and NVIDIA copies of the KDA kernels are vendored separately and are
 # free to diverge, so the shared-semantics tests below run against both.

@@ -17,7 +17,14 @@ from vllm.models.glm5next.nvidia.ops.glm_kpool import (
     pool_seq_lens,
     update_decode_pools,
 )
-from vllm.models.glm5next.nvidia.pooled_indexer import Glm5NextPooledIndexer
+from vllm.models.glm5next.nvidia.pooled_indexer import (
+    Glm5NextPooledIndexer,
+    _PersistentPooledSelectorArena,
+)
+from vllm.models.glm5next_cudagraph import (
+    is_glm53_full_graph_path,
+    require_glm53_full_graph_capacity,
+)
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseMetadata
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
@@ -35,6 +42,75 @@ def _require_glm_gpu() -> torch.device:
     ):
         pytest.skip("GLM-5.3 GPU tests require SM120 or SM121")
     return device
+
+
+def _glm53_full_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                model_type="glm5_next",
+                kv_lora_rank=512,
+                qk_nope_head_dim=256,
+                qk_rope_head_dim=0,
+                v_head_dim=256,
+                index_n_heads=32,
+                index_head_dim=128,
+                index_topk=2048,
+                index_kpool=4,
+            )
+        ),
+        attention_config=SimpleNamespace(backend="B12X"),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=4,
+            decode_context_parallel_size=4,
+            cp_kv_cache_interleave_size=4,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=4,
+            max_num_batched_tokens=32768,
+        ),
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+    )
+
+
+def test_glm53_full_graph_gate_is_exact_and_bounded() -> None:
+    config = _glm53_full_config()
+    assert is_glm53_full_graph_path(config)
+    require_glm53_full_graph_capacity(config)
+
+    config.parallel_config.decode_context_parallel_size = 1
+    assert not is_glm53_full_graph_path(config)
+    config.parallel_config.decode_context_parallel_size = 4
+    config.scheduler_config.max_num_seqs = 9
+    with pytest.raises(ValueError, match="max_num_seqs"):
+        require_glm53_full_graph_capacity(config)
+
+
+def test_glm53_selector_arena_preserves_replay_addresses() -> None:
+    arena = _PersistentPooledSelectorArena(
+        max_num_seqs=4,
+        max_num_batched_tokens=16,
+        pool_table_width=8,
+        device=torch.device("cpu"),
+    )
+    pointers = (
+        arena.query_start_loc.data_ptr(),
+        arena.row_request_ids.data_ptr(),
+        arena.token_block_table.data_ptr(),
+    )
+    arena.stage_replay_metadata(
+        query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+        req_id_per_token=torch.tensor([0] * 4 + [1] * 4, dtype=torch.int32),
+        num_reqs=2,
+        live_rows=8,
+    )
+    assert pointers == (
+        arena.query_start_loc.data_ptr(),
+        arena.row_request_ids.data_ptr(),
+        arena.token_block_table.data_ptr(),
+    )
+    with pytest.raises(ValueError, match="token capacity"):
+        arena.require_fits(num_reqs=2, num_tokens=17, pool_table_width=8)
 
 
 def _hadamard128(x: torch.Tensor) -> torch.Tensor:

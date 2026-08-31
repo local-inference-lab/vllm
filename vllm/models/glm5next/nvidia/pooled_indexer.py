@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dcp_group
 from vllm.forward_context import get_forward_context
@@ -47,6 +46,69 @@ _INDEX_CACHE_WIDTH = 132
 _INDEX_PAGE_SIZE = 64
 _INDEX_PAGE_BYTES = _INDEX_PAGE_SIZE * _INDEX_CACHE_WIDTH
 _MLA_RECORD_BYTES = 528
+
+
+class _PersistentPooledSelectorArena:
+    """Fixed-address selector metadata and workspaces."""
+
+    def __init__(
+        self,
+        *,
+        max_num_seqs: int,
+        max_num_batched_tokens: int,
+        pool_table_width: int,
+        device: torch.device,
+    ) -> None:
+        if min(max_num_seqs, max_num_batched_tokens, pool_table_width) <= 0:
+            raise ValueError("GLM selector arena capacities must be positive")
+        self.request_rows = max_num_seqs
+        self.token_rows = max_num_batched_tokens
+        self.pool_table_width = pool_table_width
+        self.request_block_table = torch.empty(
+            (max_num_seqs, pool_table_width),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.token_block_table = torch.empty(
+            (max_num_batched_tokens, pool_table_width),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.pool_seq_lens = torch.empty(
+            max_num_batched_tokens, dtype=torch.int32, device=device
+        )
+        self.pool_scores = torch.empty(
+            (max_num_batched_tokens, _POOL_TOPK),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.query_start_loc = torch.empty(
+            max_num_seqs + 1, dtype=torch.int32, device=device
+        )
+        self.row_request_ids = torch.empty(
+            max_num_batched_tokens, dtype=torch.int32, device=device
+        )
+
+    def require_fits(
+        self, *, num_reqs: int, num_tokens: int, pool_table_width: int
+    ) -> None:
+        if num_reqs > self.request_rows:
+            raise ValueError("GLM selector request capacity exceeded")
+        if num_tokens > self.token_rows:
+            raise ValueError("GLM selector token capacity exceeded")
+        if pool_table_width != self.pool_table_width:
+            raise ValueError("GLM selector pool-table geometry changed")
+
+    def stage_replay_metadata(
+        self,
+        *,
+        query_start_loc: torch.Tensor,
+        req_id_per_token: torch.Tensor,
+        num_reqs: int,
+        live_rows: int,
+    ) -> None:
+        self.query_start_loc[: num_reqs + 1].copy_(query_start_loc[: num_reqs + 1])
+        self.row_request_ids[:live_rows].copy_(req_id_per_token[:live_rows])
 
 
 class Glm5NextPooledIndexer(nn.Module):
@@ -210,34 +272,7 @@ class Glm5NextPooledIndexer(nn.Module):
             ),
             persistent=False,
         )
-        self.register_buffer(
-            "_pool_seq_lens",
-            torch.empty(self.max_tokens, dtype=torch.int32, device=device),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_pool_scores",
-            torch.empty(
-                (self.max_tokens, _POOL_TOPK),
-                dtype=torch.float32,
-                device=device,
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_pool_block_table",
-            torch.empty((self.max_seqs, 1), dtype=torch.int32, device=device),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_decode_block_table",
-            torch.empty(
-                (self.max_tokens, 1),
-                dtype=torch.int32,
-                device=device,
-            ),
-            persistent=False,
-        )
+        self._selector_arena: _PersistentPooledSelectorArena | None = None
         self._weights_proj_fp32: torch.Tensor | None = None
         self._index_cache: torch.Tensor | None = None
         self._parent_table_width = 0
@@ -321,14 +356,21 @@ class Glm5NextPooledIndexer(nn.Module):
         )
         pool_table_width = parent_table_width * subpages
         device = main_cache.device
-        self._pool_block_table = torch.empty(
-            (self.max_seqs, pool_table_width), dtype=torch.int32, device=device
-        )
-        self._decode_block_table = torch.empty(
-            (self.max_tokens, pool_table_width),
-            dtype=torch.int32,
-            device=device,
-        )
+        arena = self._selector_arena
+        if arena is None:
+            arena = _PersistentPooledSelectorArena(
+                max_num_seqs=self.max_seqs,
+                max_num_batched_tokens=self.max_tokens,
+                pool_table_width=pool_table_width,
+                device=device,
+            )
+            self._selector_arena = arena
+        else:
+            arena.require_fits(
+                num_reqs=self.max_seqs,
+                num_tokens=self.max_tokens,
+                pool_table_width=pool_table_width,
+            )
         self._index_cache = index_cache
         self._parent_table_width = parent_table_width
         self._subpages_per_parent = subpages
@@ -350,7 +392,6 @@ class Glm5NextPooledIndexer(nn.Module):
             raise RuntimeError("GLM selector state-slot metadata is missing")
         return cast(torch.Tensor, slots)
 
-    @eager_break_during_capture
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -406,7 +447,6 @@ class Glm5NextPooledIndexer(nn.Module):
         num_reqs = int(main_metadata.num_reqs)
         live_rows = int(main_metadata.num_actual_tokens)
         decode_rows = int(main_metadata.num_decode_tokens)
-        num_decodes = int(main_metadata.num_decodes)
         if not 0 <= decode_rows <= live_rows <= rows:
             raise RuntimeError(
                 "GLM selector token counts are inconsistent: "
@@ -419,11 +459,25 @@ class Glm5NextPooledIndexer(nn.Module):
                 f"actual={actual_table_width}, required={self._parent_table_width}"
             )
 
+        arena = self._selector_arena
+        if arena is None:
+            raise RuntimeError("GLM selector arena is not bound")
+        arena.require_fits(
+            num_reqs=num_reqs,
+            num_tokens=live_rows,
+            pool_table_width=(self._parent_table_width * self._subpages_per_parent),
+        )
+        arena.stage_replay_metadata(
+            query_start_loc=main_metadata.query_start_loc,
+            req_id_per_token=main_metadata.req_id_per_token,
+            num_reqs=num_reqs,
+            live_rows=live_rows,
+        )
         update_decode_pools(
             index_cache,
             self._tail,
             state_slots,
-            main_metadata.query_start_loc,
+            arena.query_start_loc,
             normalized_key,
             gate,
             self.index_kpool_compress_ape,
@@ -435,12 +489,12 @@ class Glm5NextPooledIndexer(nn.Module):
         )
         expand_c4_block_table(
             main_metadata.block_table[:num_reqs, : self._parent_table_width],
-            self._pool_block_table,
+            arena.request_block_table,
             rows=num_reqs,
             subpages_per_parent=self._subpages_per_parent,
             parent_stride_pages=self._parent_stride_pages,
         )
-        seq_lens = self._pool_seq_lens[:live_rows]
+        seq_lens = arena.pool_seq_lens[:live_rows]
         pool_seq_lens(
             positions[:live_rows],
             seq_lens,
@@ -450,72 +504,31 @@ class Glm5NextPooledIndexer(nn.Module):
         )
         pool_ids = self.pool_topk_indices_buffer[:rows]
         pool_ids.fill_(-1)
-        pool_scores = self._pool_scores[:rows] if self.dcp_world_size > 1 else None
-
-        if decode_rows:
-            decode_table = self._decode_block_table[:decode_rows]
-            gather_c4_block_table_rows(
-                self._pool_block_table,
-                main_metadata.req_id_per_token[:decode_rows],
-                decode_table,
+        pool_scores = arena.pool_scores[:live_rows] if self.dcp_world_size > 1 else None
+        token_block_table = arena.token_block_table[:live_rows]
+        gather_c4_block_table_rows(
+            arena.request_block_table,
+            arena.row_request_ids[:live_rows],
+            token_block_table,
+        )
+        self.indexer_op.run_paged_topk(
+            q=q_fp8[:live_rows],
+            weights=weights[:live_rows],
+            kv_cache=index_cache,
+            seq_lens=seq_lens,
+            block_table=token_block_table,
+            output=pool_ids[:live_rows],
+            scores=pool_scores,
+            shared_page_table=False,
+        )
+        if pool_scores is not None:
+            _merge_dcp_topk(
+                pool_ids[:live_rows],
+                pool_scores,
+                self.dcp_rank,
+                self.dcp_world_size,
+                self.pool_interleave,
             )
-            self.indexer_op.run_paged_topk(
-                q=q_fp8[:decode_rows],
-                weights=weights[:decode_rows],
-                kv_cache=index_cache,
-                seq_lens=seq_lens[:decode_rows],
-                block_table=decode_table,
-                output=pool_ids[:decode_rows],
-                scores=(pool_scores[:decode_rows] if pool_scores is not None else None),
-                shared_page_table=False,
-            )
-            if pool_scores is not None:
-                _merge_dcp_topk(
-                    pool_ids[:decode_rows],
-                    pool_scores[:decode_rows],
-                    self.dcp_rank,
-                    self.dcp_world_size,
-                    self.pool_interleave,
-                )
-
-        if decode_rows < live_rows:
-            query_lens_cpu = main_metadata.prefill_query_lens_cpu
-            if query_lens_cpu is None:
-                raise RuntimeError("GLM selector prefill metadata is incomplete")
-            row_start = decode_rows
-            for local_request, query_len in enumerate(query_lens_cpu.tolist()):
-                row_end = row_start + int(query_len)
-                request = num_decodes + local_request
-                shared_table = self._pool_block_table[request : request + 1].expand(
-                    int(query_len), -1
-                )
-                self.indexer_op.run_paged_topk(
-                    q=q_fp8[row_start:row_end],
-                    weights=weights[row_start:row_end],
-                    kv_cache=index_cache,
-                    seq_lens=seq_lens[row_start:row_end],
-                    block_table=shared_table,
-                    output=pool_ids[row_start:row_end],
-                    scores=(
-                        pool_scores[row_start:row_end]
-                        if pool_scores is not None
-                        else None
-                    ),
-                    shared_page_table=True,
-                )
-                if pool_scores is not None:
-                    _merge_dcp_topk(
-                        pool_ids[row_start:row_end],
-                        pool_scores[row_start:row_end],
-                        self.dcp_rank,
-                        self.dcp_world_size,
-                        self.pool_interleave,
-                    )
-                row_start = row_end
-            if row_start != live_rows:
-                raise RuntimeError(
-                    "GLM selector prefill row accounting is inconsistent"
-                )
 
         output = self.topk_indices_buffer[:rows]
         output.fill_(-1)
