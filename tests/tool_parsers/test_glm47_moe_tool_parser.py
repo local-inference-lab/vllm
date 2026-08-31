@@ -438,8 +438,10 @@ class TestGlm47ExtractToolCalls:
         }
         assert collect_content(result) == "tail</arg_value></tool_call>"
 
+    @pytest.mark.parametrize("mode", ["whole", "character", "token"])
     def test_stray_text_after_real_closer_uses_malformed_finish_contract(
         self,
+        mode,
         glm_parser,
     ):
         output = (
@@ -448,21 +450,51 @@ class TestGlm47ExtractToolCalls:
             " ok </tool_call>trailing text"
         )
 
-        result = run_glm_output(glm_parser, output, mode="whole")
+        result = run_glm_output(glm_parser, output, mode=mode)
 
-        assert json.loads(collect_arguments(collect_calls(result))) == {}
+        assert json.loads(collect_arguments(collect_calls(result))) == {
+            "value": "Beijing"
+        }
         assert collect_content(result) == ""
 
-    def test_missing_real_arg_value_end_remains_malformed(self, glm_parser):
+    @pytest.mark.parametrize("mode", ["whole", "character", "token"])
+    def test_missing_real_arg_value_end_remains_malformed(
+        self,
+        mode,
+        glm_parser,
+    ):
         output = (
             "</think><tool_call>record_value"
             "<arg_key>value</arg_key><arg_value>unterminated"
             "</tool_call>after"
         )
 
-        result = run_glm_output(glm_parser, output, mode="whole")
+        result = run_glm_output(glm_parser, output, mode=mode)
 
-        assert json.loads(collect_arguments(collect_calls(result))) == {}
+        assert json.loads(collect_arguments(collect_calls(result))) == {
+            "value": "unterminated</tool_call>after"
+        }
+        assert collect_content(result) == ""
+
+    @pytest.mark.parametrize("mode", ["whole", "character", "token"])
+    def test_malformed_last_argument_keeps_prior_arguments_valid(
+        self,
+        mode,
+        glm_parser,
+    ):
+        output = (
+            "</think><tool_call>record_value"
+            "<arg_key>value</arg_key><arg_value>first</arg_value>"
+            "<arg_key>path</arg_key><arg_value>/tmp/x</arg_value>"
+            " junk </tool_call>trailing text"
+        )
+
+        result = run_glm_output(glm_parser, output, mode=mode)
+
+        assert json.loads(collect_arguments(collect_calls(result))) == {
+            "value": "first",
+            "path": "/tmp/x",
+        }
         assert collect_content(result) == ""
 
     def test_literal_arg_value_end_round_trips_to_responses_output(

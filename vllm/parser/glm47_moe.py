@@ -68,7 +68,7 @@ def _glm47_arg_converter(raw_args: str, partial: bool) -> str:
                 key_end = candidate
                 value_start = after_key + len(ARG_VALUE_START)
                 break
-            key_end_search = candidate + 1
+            key_end_search = candidate + len(ARG_KEY_END)
 
         if key_end < 0:
             break
@@ -78,10 +78,12 @@ def _glm47_arg_converter(raw_args: str, partial: bool) -> str:
         value_end = -1
         next_cursor = -1
         pending_value_end = -1
+        last_value_end = -1
         while True:
             candidate = raw_args.find(ARG_VALUE_END, value_end_search)
             if candidate < 0:
                 break
+            last_value_end = candidate
             after_value = _skip_whitespace(
                 raw_args,
                 candidate + len(ARG_VALUE_END),
@@ -97,7 +99,13 @@ def _glm47_arg_converter(raw_args: str, partial: bool) -> str:
                     value_end = candidate
                     next_cursor = after_value
                 break
-            value_end_search = candidate + 1
+            if partial:
+                pending_value_end = candidate
+            value_end_search = candidate + len(ARG_VALUE_END)
+
+        if not partial and value_end < 0 and last_value_end >= 0:
+            value_end = last_value_end
+            next_cursor = last_value_end + len(ARG_VALUE_END)
 
         if value_end >= 0:
             params[key] = raw_args[value_start:value_end]
@@ -106,9 +114,11 @@ def _glm47_arg_converter(raw_args: str, partial: bool) -> str:
                 break
             continue
 
-        if partial and key:
-            partial_end = pending_value_end if pending_value_end >= 0 else len(raw_args)
-            params[key] = raw_args[value_start:partial_end]
+        if key:
+            value_end = pending_value_end if partial else len(raw_args)
+            if value_end < 0:
+                value_end = len(raw_args)
+            params[key] = raw_args[value_start:value_end]
         break
 
     return json.dumps(params, ensure_ascii=False)
