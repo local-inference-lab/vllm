@@ -523,6 +523,18 @@ class TestPostToolContentDeferral:
         assert delta.tool_calls
         assert delta.content is None
 
+    def test_single_pass_flushes_deferred_post_tool_content(self):
+        engine = _make_engine(config=_hermes_config())
+
+        _, content, result = engine._single_pass_parse(
+            '<tool_call>{"name":"f","arguments":{}}</tool_call>after',
+            [],
+        )
+
+        assert result.tools_called
+        assert content == "after"
+        assert result.content == "after"
+
     def test_text_before_tool_not_deferred(self):
         engine = _make_engine()
         engine._content_has_nonws = True

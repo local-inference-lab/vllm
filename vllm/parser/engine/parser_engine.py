@@ -646,17 +646,21 @@ class ParserEngine(Parser):
         events.extend(self._engine.finish())
 
         delta = self._events_to_delta(events, finished=True)
-        tool_call_info = self._build_extracted_result()
+        deferred_delta = self._events_to_delta([], finished=True)
+        tool_call_info = self._build_extracted_result(delta, deferred_delta)
 
-        reasoning = delta.reasoning if delta else None
+        reasoning = (
+            "".join(
+                item.reasoning or ""
+                for item in (delta, deferred_delta)
+                if item is not None
+            )
+            or None
+        )
         if reasoning and self._strip_trailing_reasoning_ws:
             reasoning = reasoning.rstrip() or None
 
-        content = delta.content if delta else None
-        if content:
-            content = self._strip_content_whitespace(
-                content, tool_call_info.tools_called
-            )
+        content = tool_call_info.content
 
         return reasoning, content, tool_call_info
 

@@ -16,8 +16,6 @@ import functools
 import json
 from typing import TYPE_CHECKING
 
-import regex as re
-
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.parser.engine.events import EventType
@@ -41,31 +39,77 @@ ARG_KEY_END = "</arg_key>"
 ARG_VALUE_START = "<arg_value>"
 ARG_VALUE_END = "</arg_value>"
 
-_ARG_RE = re.compile(
-    r"<arg_key>(?P<key>.*?)</arg_key>\s*"
-    r"<arg_value>(?P<value>.*?)</arg_value>",
-    re.DOTALL,
-)
-_PARTIAL_ARG_RE = re.compile(
-    r"<arg_key>(?P<key>.*?)</arg_key>\s*"
-    r"<arg_value>(?P<value>.*)$",
-    re.DOTALL,
-)
+
+def _skip_whitespace(text: str, offset: int) -> int:
+    while offset < len(text) and text[offset].isspace():
+        offset += 1
+    return offset
 
 
 def _glm47_arg_converter(raw_args: str, partial: bool) -> str:
     params: dict[str, object] = {}
+    cursor = 0
 
-    for match in _ARG_RE.finditer(raw_args):
-        params[match.group("key").strip()] = match.group("value")
+    while True:
+        key_start = raw_args.find(ARG_KEY_START, cursor)
+        if key_start < 0:
+            break
+        key_value_start = key_start + len(ARG_KEY_START)
 
-    if partial:
-        remaining = _ARG_RE.sub("", raw_args)
-        match = _PARTIAL_ARG_RE.search(remaining)
-        if match:
-            key = match.group("key").strip()
-            if key:
-                params[key] = match.group("value")
+        key_end_search = key_value_start
+        key_end = -1
+        value_start = -1
+        while True:
+            candidate = raw_args.find(ARG_KEY_END, key_end_search)
+            if candidate < 0:
+                break
+            after_key = _skip_whitespace(raw_args, candidate + len(ARG_KEY_END))
+            if raw_args.startswith(ARG_VALUE_START, after_key):
+                key_end = candidate
+                value_start = after_key + len(ARG_VALUE_START)
+                break
+            key_end_search = candidate + 1
+
+        if key_end < 0:
+            break
+
+        key = raw_args[key_value_start:key_end].strip()
+        value_end_search = value_start
+        value_end = -1
+        next_cursor = -1
+        pending_value_end = -1
+        while True:
+            candidate = raw_args.find(ARG_VALUE_END, value_end_search)
+            if candidate < 0:
+                break
+            after_value = _skip_whitespace(
+                raw_args,
+                candidate + len(ARG_VALUE_END),
+            )
+            if raw_args.startswith(ARG_KEY_START, after_value):
+                value_end = candidate
+                next_cursor = after_value
+                break
+            if after_value == len(raw_args):
+                if partial:
+                    pending_value_end = candidate
+                else:
+                    value_end = candidate
+                    next_cursor = after_value
+                break
+            value_end_search = candidate + 1
+
+        if value_end >= 0:
+            params[key] = raw_args[value_start:value_end]
+            cursor = next_cursor
+            if cursor >= len(raw_args):
+                break
+            continue
+
+        if partial and key:
+            partial_end = pending_value_end if pending_value_end >= 0 else len(raw_args)
+            params[key] = raw_args[value_start:partial_end]
+        break
 
     return json.dumps(params, ensure_ascii=False)
 
@@ -90,6 +134,14 @@ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
             (EventType.ARG_VALUE_CHUNK,),
         ),
         (ParserState.TOOL_ARGS, "ARG_VALUE_END"): Transition(
+            ParserState.TOOL_ARG_END_PENDING,
+            (EventType.ARG_VALUE_CHUNK,),
+        ),
+        (ParserState.TOOL_ARG_END_PENDING, "ARG_VALUE_END"): Transition(
+            ParserState.TOOL_ARG_END_PENDING,
+            (EventType.ARG_VALUE_CHUNK,),
+        ),
+        (ParserState.TOOL_ARG_END_PENDING, "ARG_KEY_START"): Transition(
             ParserState.TOOL_BETWEEN,
             (EventType.ARG_VALUE_CHUNK,),
         ),
@@ -169,7 +221,17 @@ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
                 ParserState.CONTENT,
                 (EventType.TOOL_CALL_END,),
             ),
+            (ParserState.TOOL_ARG_END_PENDING, "TOOL_END"): Transition(
+                ParserState.CONTENT,
+                (EventType.TOOL_CALL_END,),
+            ),
             **arg_tag_transitions,
+        },
+        non_whitespace_transitions={
+            ParserState.TOOL_ARG_END_PENDING: Transition(
+                ParserState.TOOL_ARGS,
+                (EventType.ARG_VALUE_CHUNK,),
+            )
         },
         content_events={
             ParserState.CONTENT: EventType.TEXT_CHUNK,
@@ -177,6 +239,7 @@ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
             ParserState.TOOL_NAME: EventType.TOOL_NAME,
             ParserState.TOOL_ARGS: EventType.ARG_VALUE_CHUNK,
             ParserState.TOOL_BETWEEN: EventType.ARG_VALUE_CHUNK,
+            ParserState.TOOL_ARG_END_PENDING: EventType.ARG_VALUE_CHUNK,
         },
         arg_converter=_glm47_arg_converter,
         stream_arg_deltas=True,
