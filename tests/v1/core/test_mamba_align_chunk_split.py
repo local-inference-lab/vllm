@@ -100,9 +100,7 @@ def _split(
         hash_block_size=ATTN_BLOCK_SIZE,
         mamba_has_prefill_checkpoint_blocks=(
             num_prefill_checkpoint_blocks > 0
-            and (
-                not drop_last_prefix_cache_block or allow_speculative_checkpoints
-            )
+            and (not drop_last_prefix_cache_block or allow_speculative_checkpoints)
         ),
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
@@ -206,6 +204,7 @@ def test_glm_mtp_checkpoint_joins_unaligned_prompt_tail(
             allow_speculative_checkpoints=True,
         )
         == 3648
+    )
 
 
 def test_dflash_does_not_back_off_last_cache_position() -> None:
@@ -222,10 +221,7 @@ def test_dflash_does_not_back_off_last_cache_position() -> None:
         _split(request, PROMPT_LEN, drop_last_prefix_cache_block=False)
         == MAMBA_BLOCK_SIZE
     )
-    assert (
-        _split(request, PROMPT_LEN, drop_last_prefix_cache_block=True)
-        == PROMPT_LEN
-    )
+    assert _split(request, PROMPT_LEN, drop_last_prefix_cache_block=True) == PROMPT_LEN
 
 
 def test_sliding_window_group_tolerates_finer_alignment() -> None:
