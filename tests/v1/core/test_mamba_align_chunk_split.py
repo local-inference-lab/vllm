@@ -92,6 +92,10 @@ def _split(
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     stub = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
+        # This helper models the speculative path used by its original tests.
+        # DFlash remains ``use_eagle`` for scheduling even though it no longer
+        # drops the target's last prefix-cache block.
+        use_eagle=True,
         drop_last_prefix_cache_block=drop_last_prefix_cache_block,
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
