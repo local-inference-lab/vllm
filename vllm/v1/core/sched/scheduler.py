@@ -340,6 +340,9 @@ class Scheduler(SchedulerInterface):
         self.max_num_prefill_tokens_per_step = (
             self.scheduler_config.max_num_prefill_tokens_per_step
         )
+        self.max_num_partial_prefills = (
+            self.scheduler_config.max_num_partial_prefills
+        )
         self._prefill_budget_rotation = 0
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
@@ -695,9 +698,14 @@ class Scheduler(SchedulerInterface):
             ]
             num_running = len(self.running) + self.num_waiting_for_streaming_input
             free_sequence_slots = max(self.max_num_running_reqs - num_running, 0)
+            partial_prefill_slot_available = (
+                self.max_num_partial_prefills == 0
+                or len(self._inflight_prefills) < self.max_num_partial_prefills
+            )
             reserve_waiting_quantum = int(
                 mixed_prefill_quanta > 0
                 and free_sequence_slots > 0
+                and partial_prefill_slot_available
                 and bool(self.waiting or self.skipped_waiting)
             )
             waiting_prefill_limits = (
@@ -1246,6 +1254,17 @@ class Scheduler(SchedulerInterface):
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
                         break
+
+                will_remain_partial = (
+                    has_local_prefill
+                    and num_computed_tokens + num_new_tokens < request.num_tokens
+                )
+                if (
+                    will_remain_partial
+                    and self.max_num_partial_prefills > 0
+                    and len(self._inflight_prefills) >= self.max_num_partial_prefills
+                ):
+                    break
 
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
