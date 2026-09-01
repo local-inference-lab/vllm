@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import time
 from concurrent.futures import Future
 from unittest.mock import Mock
 
@@ -6328,6 +6329,7 @@ def test_mixed_prefill_budget_does_not_limit_prefill_only_step(lp11_model_path):
         max_model_len=32768,
         max_num_prefill_tokens_per_step=2304,
     )
+    scheduler.decode_prefill_min_decode_steps = 4
     (request,) = create_requests(
         num_requests=1,
         num_tokens=8192,
@@ -6409,3 +6411,64 @@ def test_max_num_prefill_tokens_per_step_validation(value: int):
             max_num_batched_tokens=8192,
             max_num_prefill_tokens_per_step=value,
         )
+
+
+def test_decode_burst_requires_mixed_prefill_budget():
+    with pytest.raises(ValueError, match="max_num_prefill_tokens_per_step"):
+        SchedulerConfig(
+            max_model_len=32768,
+            is_encoder_decoder=False,
+            decode_prefill_min_decode_steps=4,
+        )
+
+
+def test_decode_burst_controller_balances_prefill_and_decode(lp11_model_path):
+    scheduler, prefills = _prepare_lp11_prefills(
+        lp11_model_path, num_prefills=2, mixed_prefill_budget=2304
+    )
+    scheduler.max_num_partial_prefills = 2
+    scheduler.decode_prefill_min_decode_steps = 4
+    scheduler.decode_prefill_max_wait_ms = 30_000
+    scheduler.drain_decode_prefill_stats()
+    (waiter,) = create_requests(
+        num_requests=1,
+        num_tokens=12000,
+        req_ids=["waiter"],
+    )
+    scheduler.add_request(waiter)
+    prefill_ids = {request.request_id for request in prefills}
+
+    outputs = []
+    for _ in range(5):
+        output = scheduler.schedule()
+        outputs.append(output)
+        scheduler.update_from_output(output, _empty_output_for_schedule(output))
+
+    prefill_tokens = [
+        sum(
+            count
+            for request_id, count in output.num_scheduled_tokens.items()
+            if request_id in prefill_ids
+        )
+        for output in outputs
+    ]
+    assert prefill_tokens[:4] == [0, 0, 0, 0]
+    assert prefill_tokens[4] == 2304
+    assert all(output.num_scheduled_tokens["decode"] > 0 for output in outputs)
+    assert waiter in scheduler.waiting
+
+    waiter.arrival_time = time.time() - 30.001
+    fairness_output = scheduler.schedule()
+    assert sum(
+        count
+        for request_id, count in fairness_output.num_scheduled_tokens.items()
+        if request_id in prefill_ids
+    ) == 2304
+
+    stats = scheduler.drain_decode_prefill_stats()
+    assert stats == {
+        "scheduled_prefill_tokens": 4608,
+        "active_partial_prefills": 2,
+        "decode_only_steps": 4,
+        "fairness_bypasses": 1,
+    }

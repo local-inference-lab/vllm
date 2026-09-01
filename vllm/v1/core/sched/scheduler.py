@@ -343,6 +343,16 @@ class Scheduler(SchedulerInterface):
         self.max_num_partial_prefills = (
             self.scheduler_config.max_num_partial_prefills
         )
+        self.decode_prefill_min_decode_steps = (
+            self.scheduler_config.decode_prefill_min_decode_steps
+        )
+        self.decode_prefill_max_wait_ms = (
+            self.scheduler_config.decode_prefill_max_wait_ms
+        )
+        self._decode_prefill_steps_since_prefill = 0
+        self._decode_prefill_scheduled_prefill_tokens = 0
+        self._decode_prefill_decode_only_steps = 0
+        self._decode_prefill_fairness_bypasses = 0
         self._prefill_budget_rotation = 0
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
@@ -617,6 +627,50 @@ class Scheduler(SchedulerInterface):
             self._prefill_budget_rotation = (start + 1) % len(request_ids)
         return limits
 
+    @staticmethod
+    def _request_has_pending_prefill(request: Request) -> bool:
+        return request.is_prefill_chunk or (
+            request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            and request.num_computed_tokens < request.num_tokens - 1
+        )
+
+    def _has_pending_prefill(self) -> bool:
+        return any(
+            self._request_has_pending_prefill(request)
+            for request in (*self.running, *self.waiting, *self.skipped_waiting)
+        )
+
+    def _oldest_prefill_waiter_age_ms(self, now: float) -> float:
+        arrival_times = (
+            request.arrival_time
+            for request in (*self.waiting, *self.skipped_waiting)
+            if self._request_has_pending_prefill(request)
+        )
+        oldest_arrival = min(arrival_times, default=now)
+        return max((now - oldest_arrival) * 1000, 0.0)
+
+    @property
+    def decode_prefill_active_partial_prefills(self) -> int:
+        return len(self._inflight_prefills)
+
+    def drain_decode_prefill_stats(self) -> dict[str, int]:
+        """Return and reset decode-prefill interval counters.
+
+        The active-partial-prefill value is a gauge and is not reset.
+        """
+        stats = {
+            "scheduled_prefill_tokens": (
+                self._decode_prefill_scheduled_prefill_tokens
+            ),
+            "active_partial_prefills": self.decode_prefill_active_partial_prefills,
+            "decode_only_steps": self._decode_prefill_decode_only_steps,
+            "fairness_bypasses": self._decode_prefill_fairness_bypasses,
+        }
+        self._decode_prefill_scheduled_prefill_tokens = 0
+        self._decode_prefill_decode_only_steps = 0
+        self._decode_prefill_fairness_bypasses = 0
+        return stats
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -652,6 +706,7 @@ class Scheduler(SchedulerInterface):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
+        all_scheduled_prefill_req_ids: set[str] = set()
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -667,9 +722,26 @@ class Scheduler(SchedulerInterface):
             and self.current_step >= request.next_decode_eligible_step
             for request in self.running
         )
-        defer_prefills = (
+        legacy_defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
         ) and has_eligible_decode
+        has_pending_prefill = self._has_pending_prefill()
+        decode_prefill_enabled = self.decode_prefill_min_decode_steps > 0
+        fairness_due = (
+            decode_prefill_enabled
+            and self.decode_prefill_max_wait_ms > 0
+            and self._oldest_prefill_waiter_age_ms(time.time())
+            >= self.decode_prefill_max_wait_ms
+        )
+        decode_burst_defer_prefills = (
+            decode_prefill_enabled
+            and has_eligible_decode
+            and has_pending_prefill
+            and self._decode_prefill_steps_since_prefill
+            < self.decode_prefill_min_decode_steps
+            and not fairness_due
+        )
+        defer_prefills = legacy_defer_prefills or decode_burst_defer_prefills
 
         prefill_budget_remaining: int | None = None
         running_prefill_limits: dict[str, int] = {}
@@ -882,6 +954,9 @@ class Scheduler(SchedulerInterface):
                                 scheduled_prefill_req_ids.remove(
                                     preempted_req_id
                                 )
+                            all_scheduled_prefill_req_ids.discard(
+                                preempted_req_id
+                            )
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -918,6 +993,8 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
+            if request.is_prefill_chunk:
+                all_scheduled_prefill_req_ids.add(request_id)
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
             if running_prefill_limit is not None:
@@ -1394,6 +1471,8 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if has_local_prefill and num_new_tokens > 0:
+                    all_scheduled_prefill_req_ids.add(request_id)
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 if waiting_prefill_limit is not None:
@@ -1587,6 +1666,29 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
+
+        scheduled_prefill_tokens = sum(
+            num_scheduled_tokens[request_id]
+            for request_id in all_scheduled_prefill_req_ids
+        )
+        self._decode_prefill_scheduled_prefill_tokens += scheduled_prefill_tokens
+        scheduled_decode_tokens = (
+            total_num_scheduled_tokens - scheduled_prefill_tokens
+        )
+        if decode_prefill_enabled:
+            if scheduled_prefill_tokens > 0:
+                self._decode_prefill_steps_since_prefill = 0
+                if fairness_due:
+                    self._decode_prefill_fairness_bypasses += 1
+            elif (
+                has_eligible_decode
+                and has_pending_prefill
+                and scheduled_decode_tokens > 0
+            ):
+                self._decode_prefill_steps_since_prefill += 1
+                self._decode_prefill_decode_only_steps += 1
+            elif not has_eligible_decode:
+                self._decode_prefill_steps_since_prefill = 0
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
