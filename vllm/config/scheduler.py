@@ -144,6 +144,14 @@ class SchedulerConfig:
     """Schedule prefill work once every N engine steps while decode requests
     are running. Data-parallel engines align the cadence across DP ranks."""
 
+    max_num_prefill_tokens_per_step: int = Field(default=0, ge=0)
+    """Maximum local prefill tokens scheduled in a step with eligible decode.
+
+    The budget is shared across running prefill chunks and waiting admissions.
+    Zero disables the separate mixed-step budget. Prefill-only steps continue
+    to use max_num_batched_tokens.
+    """
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.
@@ -279,6 +287,13 @@ class SchedulerConfig:
                 "long_prefill_token_threshold "
                 f"({self.long_prefill_token_threshold}) cannot be greater "
                 f"than the max_model_len ({max_model_len})."
+            )
+
+        if self.max_num_prefill_tokens_per_step > self.max_num_batched_tokens:
+            raise ValueError(
+                "max_num_prefill_tokens_per_step "
+                f"({self.max_num_prefill_tokens_per_step}) cannot be greater "
+                f"than max_num_batched_tokens ({self.max_num_batched_tokens})."
             )
 
         return self
