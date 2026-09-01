@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
-from vllm.v1.metrics.stats import KVCacheEvictionEvent
+from vllm.v1.metrics.stats import HybridPrefixCacheStats, KVCacheEvictionEvent
 
 
 class BlockMetricsState:
@@ -55,6 +55,7 @@ class KVCacheMetricsCollector:
         self.block_metrics: dict[int, BlockMetricsState] = {}
 
         self._eviction_events: list[KVCacheEvictionEvent] = []
+        self._prefix_lookup_stats = HybridPrefixCacheStats()
 
     def should_sample_block(self) -> bool:
         return random.random() < self.sample_rate
@@ -85,12 +86,46 @@ class KVCacheMetricsCollector:
             )
         )
 
+    def on_prefix_cache_lookup(
+        self,
+        cacheable_prefix_tokens: int,
+        reconciled_hit_tokens: int,
+        per_group_hit_tokens: dict[str, int],
+    ) -> None:
+        """Record one bounded, content-free hybrid prefix-cache lookup."""
+        stats = self._prefix_lookup_stats
+        stats.cacheable_prefix_tokens += cacheable_prefix_tokens
+        stats.reconciled_hit_tokens += reconciled_hit_tokens
+        for label, hit_tokens in per_group_hit_tokens.items():
+            stats.prefix_cache_group_hits[label] = (
+                stats.prefix_cache_group_hits.get(label, 0) + hit_tokens
+            )
+
+    def on_replay_boundary_registered(self, group_label: str) -> None:
+        stats = self._prefix_lookup_stats
+        stats.boundary_registrations[group_label] = (
+            stats.boundary_registrations.get(group_label, 0) + 1
+        )
+
+    def on_replay_boundary_evicted(self, group_label: str) -> None:
+        stats = self._prefix_lookup_stats
+        stats.boundary_evictions[group_label] = (
+            stats.boundary_evictions.get(group_label, 0) + 1
+        )
+
     def reset(self) -> None:
         """Clear all state on cache reset."""
         self.block_metrics.clear()
         self._eviction_events.clear()
+        self._prefix_lookup_stats = HybridPrefixCacheStats()
 
     def drain_events(self) -> list[KVCacheEvictionEvent]:
         events = self._eviction_events
         self._eviction_events = []
         return events
+
+    def drain_prefix_lookup_stats(self) -> HybridPrefixCacheStats:
+        """Drain aggregate hybrid prefix-cache diagnostics."""
+        stats = self._prefix_lookup_stats
+        self._prefix_lookup_stats = HybridPrefixCacheStats()
+        return stats

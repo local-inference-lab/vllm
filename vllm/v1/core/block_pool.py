@@ -194,6 +194,8 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self.prefix_cache_group_labels: tuple[str, ...] = ()
+        self.replay_boundary_labels_by_block: dict[int, set[str]] = {}
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -231,6 +233,7 @@ class BlockPool:
         block_size: int,
         kv_cache_group_id: int,
         block_mask: list[bool] | None = None,
+        replay_boundary_mask: list[bool] | None = None,
     ) -> None:
         """Cache a list of full blocks for prefix caching.
         This function takes a list of blocks that will have their block hash
@@ -255,11 +258,16 @@ class BlockPool:
                 consults a subset of blocks (e.g. SWA tail-window), so blocks
                 that can never serve a hit stay out of the prefix-cache hash
                 map.
+            replay_boundary_mask: Optional mask identifying the cached blocks
+                that are required to replay a sparse boundary.
         """
         if num_cached_blocks >= num_full_blocks:
             return
         new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
         assert block_mask is None or len(block_mask) == len(new_full_blocks)
+        assert replay_boundary_mask is None or len(replay_boundary_mask) == len(
+            new_full_blocks
+        )
         block_hashes = resolve_block_hashes(
             request.block_hashes, self.hash_block_size, block_size
         )
@@ -303,6 +311,15 @@ class BlockPool:
                 blk,
                 num_tokens=num_hash_tokens,
             )
+            if replay_boundary_mask is not None and replay_boundary_mask[i]:
+                label = self.prefix_cache_group_labels[kv_cache_group_id]
+                labels = self.replay_boundary_labels_by_block.setdefault(
+                    blk.block_id, set()
+                )
+                if label not in labels:
+                    labels.add(label)
+                    if self.metrics_collector:
+                        self.metrics_collector.on_replay_boundary_registered(label)
             newly_cached_indices.append(num_cached_blocks + i)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
@@ -647,6 +664,8 @@ class BlockPool:
         for block_hash in self._remove_cached_block_hashes(src_block):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
+        if labels := self.replay_boundary_labels_by_block.pop(src_block.block_id, None):
+            self.replay_boundary_labels_by_block[dst_block.block_id] = labels
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
@@ -691,6 +710,13 @@ class BlockPool:
         Returns:
             True if the block is evicted, False otherwise.
         """
+        boundary_labels = self.replay_boundary_labels_by_block.pop(
+            block.block_id, ()
+        )
+        if self.metrics_collector:
+            for label in boundary_labels:
+                self.metrics_collector.on_replay_boundary_evicted(label)
+
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
@@ -786,6 +812,7 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
+        self.replay_boundary_labels_by_block.clear()
 
         # Remove all hashes from all blocks.
         for block in self.blocks:

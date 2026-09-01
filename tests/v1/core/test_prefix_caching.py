@@ -29,6 +29,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager, Request
+from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
@@ -4438,3 +4439,155 @@ def test_swa_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction window -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
+
+
+def make_glm53_dflash_manager(num_blocks: int) -> KVCacheManager:
+    hash_block_size = 2304
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target"],
+                MLAAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                    tokens_per_state=4,
+                ),
+                is_eagle_group=True,
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=hash_block_size,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+                is_eagle_group=True,
+            ),
+            KVCacheGroupSpec(
+                ["draft"],
+                SlidingWindowSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                    sliding_window=2048,
+                    dcp_replicated=True,
+                    extra_retained_tokens=2048,
+                ),
+                is_eagle_group=True,
+            ),
+        ],
+        prefix_cache_retention_interval=0,
+    )
+    return make_kv_cache_manager(
+        config,
+        max_model_len=524288,
+        max_in_flight_tokens=8192,
+        enable_caching=True,
+        use_eagle=False,
+        hash_block_size=hash_block_size,
+        scheduler_block_size=4 * hash_block_size,
+        dcp_world_size=4,
+        metrics_collector=KVCacheMetricsCollector(sample_rate=1.0),
+    )
+
+
+def make_distinct_history_requests(agents: int, turns: int) -> list[list[Request]]:
+    block_size = 2304
+    prompt_tokens = 59 * block_size
+    histories = []
+    for agent in range(agents):
+        token_ids = list(range(agent * prompt_tokens, (agent + 1) * prompt_tokens))
+        histories.append(
+            [
+                make_request(
+                    f"agent_{agent}_turn_{turn}", token_ids, block_size, sha256
+                )
+                for turn in range(turns)
+            ]
+        )
+    return histories
+
+
+def _compute_and_release(manager: KVCacheManager, request: Request) -> None:
+    while request.num_computed_tokens < request.num_tokens:
+        chunk = min(2304, request.num_tokens - request.num_computed_tokens)
+        blocks = manager.allocate_slots(request, chunk)
+        assert blocks is not None
+        request.num_computed_tokens += chunk
+    manager.cache_blocks(request, request.num_computed_tokens)
+    manager.free(request)
+
+
+def exercise_history_replays(
+    manager: KVCacheManager, histories: list[list[Request]]
+) -> SimpleNamespace:
+    for agent, turns in enumerate(histories):
+        warm = make_request(
+            f"agent_{agent}_warm", list(turns[0].prompt_token_ids), 2304, sha256
+        )
+        _compute_and_release(manager, warm)
+
+    # Hold enough uncached working blocks to force LRU eviction of a small,
+    # deterministic part of the warmed history set while replays are measured.
+    pressure_blocks = manager.block_pool.get_new_blocks(2000)
+
+    per_group_hits = [0] * manager.num_kv_cache_groups
+    reconciled_hits = 0
+    for turns in histories:
+        for request in turns:
+            _, group_hits = manager.coordinator.find_longest_cache_hit_per_group(
+                request.block_hashes, request.num_tokens - 1
+            )
+            _, hit_tokens, _ = manager.get_computed_blocks(request)
+            reconciled_hits += hit_tokens
+            for group_id, group_hit in enumerate(group_hits):
+                per_group_hits[group_id] += group_hit
+
+    dense_intermediate_checkpoints = 0
+    for turns in histories:
+        request = turns[0]
+        for group_id in (1, 2):
+            cached = [
+                i
+                for i, block_hash in enumerate(request.block_hashes)
+                if manager.block_pool.get_cached_block(
+                    block_hash, kv_cache_group_ids=[group_id]
+                )
+                is not None
+            ]
+            dense_intermediate_checkpoints += sum(i < 54 for i in cached)
+
+    manager.block_pool.free_blocks(pressure_blocks)
+
+    lookup_stats = manager.metrics_collector.drain_prefix_lookup_stats()
+    labels = manager.coordinator.prefix_cache_group_labels
+    return SimpleNamespace(
+        cacheable_prefix_tokens=len(histories) * len(histories[0]) * 57 * 2304,
+        reconciled_hit_tokens=reconciled_hits,
+        per_group_hit_tokens=dict(zip(labels, per_group_hits)),
+        dense_intermediate_checkpoints=dense_intermediate_checkpoints,
+        lookup_stats=lookup_stats,
+    )
+
+
+def test_dflash_multi_history_retains_cacheable_replay_boundaries():
+    manager = make_glm53_dflash_manager(num_blocks=2400)
+    requests = make_distinct_history_requests(agents=20, turns=3)
+    result = exercise_history_replays(manager, requests)
+    assert result.cacheable_prefix_tokens == 7_879_680
+    assert result.reconciled_hit_tokens >= 0.90 * result.cacheable_prefix_tokens
+    assert result.reconciled_hit_tokens == min(result.per_group_hit_tokens.values())
+    assert result.dense_intermediate_checkpoints == 0
+    assert min(
+        result.per_group_hit_tokens, key=result.per_group_hit_tokens.get
+    ) == "group_0_mlaattentionspec"
+    assert result.lookup_stats.cacheable_prefix_tokens == result.cacheable_prefix_tokens
+    assert result.lookup_stats.reconciled_hit_tokens == result.reconciled_hit_tokens
+    assert result.lookup_stats.prefix_cache_group_hits == result.per_group_hit_tokens
+    assert sum(result.lookup_stats.boundary_evictions.values()) > 0

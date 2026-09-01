@@ -75,9 +75,10 @@ class SingleTypeKVCacheManager(ABC):
         # every group supports fine-grained prefix lookup.
         self.prefix_cache_alignment_tokens = scheduler_block_size
         # Additional offsets from prompt and shared-prefix boundaries that this
-        # group must retain. Hybrid coordinators use this for a target Mamba
-        # state that precedes a DFlash EAGLE lookahead block.
+        # group must retain. Hybrid coordinators can also align sparse replay
+        # boundaries to the target attention page before EAGLE backoff.
         self.extra_replay_boundary_offsets: tuple[int, ...] = ()
+        self.replay_boundary_alignment_tokens: int | None = None
         # The block size for this manager; used for actual block allocation.
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
@@ -457,10 +458,29 @@ class SingleTypeKVCacheManager(ABC):
         # Token boundaries whose reachable tail must be retained under sparse
         # retention: the replay boundary (``num_prompt - 1``, capped by
         # ``get_computed_blocks``) and any detected shared-prefix junction.
-        base_boundaries = [request.num_prompt_tokens - 1]
+        prompt_replay_boundary = request.num_prompt_tokens - 1
+        if (
+            self.use_eagle
+            and isinstance(self.kv_cache_spec, SlidingWindowSpec)
+            and request.num_prompt_tokens % self.prefix_cache_alignment_tokens == 0
+        ):
+            # At an exact prompt boundary there is no lookup-visible EAGLE
+            # block to the right. Retain the preceding replay window instead.
+            prompt_replay_boundary -= self.prefix_cache_alignment_tokens
+        base_boundaries = [prompt_replay_boundary]
         if request.shared_prefix_boundary:
             base_boundaries.append(request.shared_prefix_boundary)
         candidate_boundaries = list(base_boundaries)
+        if self.replay_boundary_alignment_tokens is not None:
+            for boundary in base_boundaries:
+                shifted = (
+                    boundary
+                    // self.replay_boundary_alignment_tokens
+                    * self.replay_boundary_alignment_tokens
+                    - self.prefix_cache_alignment_tokens
+                )
+                if shifted > 0:
+                    candidate_boundaries.append(shifted)
         for boundary in base_boundaries:
             candidate_boundaries.extend(
                 shifted
@@ -473,7 +493,13 @@ class SingleTypeKVCacheManager(ABC):
         if reached_tokens is None:
             reached_tokens = max(num_tokens, request.num_computed_tokens)
         reachable_boundaries = [
-            boundary for boundary in candidate_boundaries if boundary < reached_tokens
+            boundary
+            for boundary in candidate_boundaries
+            if boundary < reached_tokens
+            or (
+                boundary == reached_tokens
+                and isinstance(self.kv_cache_spec, MambaSpec)
+            )
         ]
 
         # A sparse boundary can become reachable after its blocks were first
@@ -499,6 +525,15 @@ class SingleTypeKVCacheManager(ABC):
             retention_interval=retention_interval,
             reachable_boundaries=reachable_boundaries,
         )
+        replay_boundary_mask = self.reachable_block_mask(
+            start_block=scan_start_block,
+            end_block=num_full_blocks,
+            alignment_tokens=self.prefix_cache_alignment_tokens,
+            kv_cache_spec=self.kv_cache_spec,
+            use_eagle=self.use_eagle,
+            retention_interval=0,
+            reachable_boundaries=reachable_boundaries,
+        )
         self.block_pool.cache_full_blocks(
             request=request,
             blocks=self.req_to_blocks[request.request_id],
@@ -507,6 +542,7 @@ class SingleTypeKVCacheManager(ABC):
             block_size=self.block_size,
             kv_cache_group_id=self.kv_cache_group_id,
             block_mask=block_mask,
+            replay_boundary_mask=replay_boundary_mask,
         )
 
         self.num_cached_block[request.request_id] = num_full_blocks

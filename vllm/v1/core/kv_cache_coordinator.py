@@ -94,6 +94,11 @@ class KVCacheCoordinator(ABC):
         )
         self.scheduler_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
+        self.metrics_collector = metrics_collector
+        self.prefix_cache_group_labels = tuple(
+            f"group_{group_id}_{type(group.kv_cache_spec).__name__.lower()}"
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+        )
 
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
@@ -102,6 +107,7 @@ class KVCacheCoordinator(ABC):
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
         )
+        self.block_pool.prefix_cache_group_labels = self.prefix_cache_group_labels
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
@@ -658,16 +664,28 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     ", ".join(sorted(unsupported_partial_hit_managers)),
                 )
         prefix_cache_alignment_tokens = self._cache_hit_alignment_tokens
+        full_attention_alignment_tokens = max(
+            (
+                manager.block_size
+                for manager in self.single_type_managers
+                if isinstance(manager.kv_cache_spec, FullAttentionSpec)
+            ),
+            default=prefix_cache_alignment_tokens,
+        )
         for manager in self.single_type_managers:
             manager.prefix_cache_alignment_tokens = prefix_cache_alignment_tokens
-            if self.has_replicated_sliding_group and isinstance(
-                manager.kv_cache_spec, MambaSpec
+            if self.has_replicated_sliding_group and (
+                isinstance(manager.kv_cache_spec, MambaSpec)
+                or (
+                    isinstance(manager.kv_cache_spec, SlidingWindowSpec)
+                    and manager.kv_cache_spec.dcp_replicated
+                )
             ):
-                # The DFlash group drops one EAGLE lookahead unit. Retain the
-                # target recurrent state at that common replay boundary without
-                # making every historical Mamba checkpoint dense.
-                manager.extra_replay_boundary_offsets = (
-                    -prefix_cache_alignment_tokens,
+                # The target page and EAGLE quantum define the common DFlash
+                # replay boundary. Retain only the recurrent state and draft
+                # window needed there.
+                manager.replay_boundary_alignment_tokens = (
+                    full_attention_alignment_tokens
                 )
         self.verify_and_split_kv_cache_groups()
 
@@ -919,6 +937,23 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         cache_hit_blocks = tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         )
+        if self.metrics_collector is not None:
+            _, independent_hits = self.find_longest_cache_hit_per_group(
+                block_hashes, max_cache_hit_length
+            )
+            cacheable_prefix_tokens = round_down(
+                max_cache_hit_length, self._cache_hit_alignment_tokens
+            )
+            if self.eagle_group_ids and cacheable_prefix_tokens > 0:
+                cacheable_prefix_tokens = max(
+                    0,
+                    cacheable_prefix_tokens - self._cache_hit_alignment_tokens,
+                )
+            self.metrics_collector.on_prefix_cache_lookup(
+                cacheable_prefix_tokens,
+                hit_length,
+                dict(zip(self.prefix_cache_group_labels, independent_hits)),
+            )
         return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
 
     def find_longest_cache_hit_per_group(
