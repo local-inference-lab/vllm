@@ -348,6 +348,25 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        mamba_block_sizes = [
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        self.mamba_block_size = math.lcm(*mamba_block_sizes)
+        self._prefill_budget_quantum = (
+            self.mamba_block_size if self.need_mamba_block_aligned_split else 1
+        )
+        if (
+            self.need_mamba_block_aligned_split
+            and self.max_num_prefill_tokens_per_step
+            and self.max_num_prefill_tokens_per_step % self._prefill_budget_quantum
+            != 0
+        ):
+            raise ValueError(
+                "max_num_prefill_tokens_per_step must be a multiple of "
+                f"the Mamba block size ({self._prefill_budget_quantum})"
+            )
         glm5_next_mtp_has_independent_draft_state = (
             speculative_config is not None
             and speculative_config.method == "mtp"
@@ -548,40 +567,24 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
-    def _distribute_prefill_token_budget(
+    def _select_running_prefill_limits(
         self,
-        budget: int,
-        num_candidates: int,
-    ) -> list[int]:
-        if budget <= 0 or num_candidates <= 0:
-            return []
+        request_ids: list[str],
+        num_quanta: int,
+    ) -> dict[str, int]:
+        if num_quanta <= 0 or not request_ids:
+            return {}
 
-        alignment = (
-            self.mamba_block_size if self.need_mamba_block_aligned_split else 1
-        )
-        budget_units = budget // alignment
-        base_units, extra_units = divmod(budget_units, num_candidates)
-        limits = [base_units * alignment for _ in range(num_candidates)]
-
-        if base_units == 0:
-            # Keep the earliest candidates eligible when the budget cannot
-            # cover every candidate. This retains FCFS admission order.
-            extra_indices = range(extra_units)
-        else:
-            # Rotate only the ownership of remainder units. Request and queue
-            # order stay unchanged, while equal-priority prefills take turns
-            # receiving the larger chunk.
-            start = self._prefill_budget_rotation % num_candidates
-            extra_indices = (
-                (start + offset) % num_candidates for offset in range(extra_units)
+        start = self._prefill_budget_rotation % len(request_ids)
+        limits: dict[str, int] = {}
+        for offset in range(num_quanta):
+            request_id = request_ids[(start + offset) % len(request_ids)]
+            limits[request_id] = (
+                limits.get(request_id, 0) + self._prefill_budget_quantum
             )
-            if extra_units:
-                self._prefill_budget_rotation = (
-                    start + extra_units
-                ) % num_candidates
-
-        for index in extra_indices:
-            limits[index] += alignment
+        self._prefill_budget_rotation = (
+            start + num_quanta
+        ) % len(request_ids)
         return limits
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
@@ -654,6 +657,9 @@ class Scheduler(SchedulerInterface):
                 token_budget,
                 input_budget,
             )
+            mixed_prefill_quanta = (
+                mixed_prefill_budget // self._prefill_budget_quantum
+            )
             running_prefill_ids = [
                 request.request_id
                 for request in self.running
@@ -662,23 +668,21 @@ class Scheduler(SchedulerInterface):
             ]
             num_running = len(self.running) + self.num_waiting_for_streaming_input
             free_sequence_slots = max(self.max_num_running_reqs - num_running, 0)
-            waiting_slots = min(
-                free_sequence_slots,
-                len(self.waiting) + len(self.skipped_waiting),
+            reserve_waiting_quantum = int(
+                mixed_prefill_quanta > 0
+                and free_sequence_slots > 0
+                and bool(self.waiting or self.skipped_waiting)
             )
-            limits = self._distribute_prefill_token_budget(
-                mixed_prefill_budget,
-                len(running_prefill_ids) + waiting_slots,
+            waiting_prefill_limits = (
+                [self._prefill_budget_quantum] if reserve_waiting_quantum else []
             )
-            running_prefill_limits = dict(
-                zip(
-                    running_prefill_ids,
-                    limits[: len(running_prefill_ids)],
-                    strict=True,
-                )
+            running_prefill_limits = self._select_running_prefill_limits(
+                running_prefill_ids,
+                mixed_prefill_quanta - reserve_waiting_quantum,
             )
-            waiting_prefill_limits = limits[len(running_prefill_ids) :]
-            prefill_budget_remaining = sum(limits)
+            prefill_budget_remaining = sum(running_prefill_limits.values()) + sum(
+                waiting_prefill_limits
+            )
 
         # First, schedule the RUNNING requests.
         req_index = 0
