@@ -485,6 +485,14 @@ class Scheduler(SchedulerInterface):
                 end = aligned_end
 
         next_block_boundary = (start // block_size + 1) * block_size
+        retention_interval = getattr(
+            self.cache_config, "prefix_cache_retention_interval", None
+        )
+        next_retention_boundary = (
+            (start // retention_interval + 1) * retention_interval
+            if retention_interval is not None and retention_interval > 0
+            else 0
+        )
         tail_boundary = (
             request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
             if self.mamba_partial_cache_hit
@@ -494,6 +502,10 @@ class Scheduler(SchedulerInterface):
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary if start % block_size != 0 else 0,
+            # Sparse recurrent-state retention makes these boundaries part of
+            # the external cache contract. A fragmented scheduler budget must
+            # not jump over one without materializing its exact state.
+            next_retention_boundary,
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,
             # Fine-grained hits: the prompt's partial-tail entry can only be

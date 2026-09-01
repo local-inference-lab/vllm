@@ -84,10 +84,14 @@ def _split(
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
     allow_speculative_checkpoints: bool = False,
+    retention_interval: int | None = None,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     stub = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
+        cache_config=SimpleNamespace(
+            block_size=MAMBA_BLOCK_SIZE,
+            prefix_cache_retention_interval=retention_interval,
+        ),
         use_eagle=use_eagle,
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
@@ -170,6 +174,45 @@ def test_dflash_checkpoint_keeps_intermediate_chunks_aligned_and_joins_prompt_ta
             allow_speculative_checkpoints=True,
         )
         == 17
+    )
+
+
+def test_dflash_fragmented_budget_stops_at_external_retention_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DFlash target chunk cannot jump over an externally retained state.
+
+    Seven parallel draft queries leave 4089 target slots in a 4096-token input
+    budget. The first target step therefore ends at 3584. The next step must
+    stop after 512 tokens so the recurrent state at token 4096 is materialized
+    for an external cache connector.
+    """
+    block_size = 512
+    (request,) = create_requests(1, num_tokens=16384, block_size=ATTN_BLOCK_SIZE)
+    monkeypatch.setattr(sys.modules[__name__], "MAMBA_BLOCK_SIZE", block_size)
+
+    assert (
+        _split(
+            request,
+            4089,
+            use_eagle=True,
+            num_prefill_checkpoint_blocks=1,
+            allow_speculative_checkpoints=True,
+            retention_interval=4096,
+        )
+        == 3584
+    )
+    request.num_computed_tokens = 3584
+    assert (
+        _split(
+            request,
+            4089,
+            use_eagle=True,
+            num_prefill_checkpoint_blocks=1,
+            allow_speculative_checkpoints=True,
+            retention_interval=4096,
+        )
+        == 512
     )
 
 
