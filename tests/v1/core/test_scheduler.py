@@ -6171,7 +6171,8 @@ def test_encoder_input_skipped_when_connector_already_has_the_item(ec_role: str)
 @pytest.fixture
 def lp11_model_path(tmp_path):
     (tmp_path / "config.json").write_text(
-        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt", '
+        '"max_position_embeddings": 32768}'
     )
     return str(tmp_path)
 
@@ -6215,31 +6216,70 @@ def _empty_output_for_schedule(output: SchedulerOutput) -> ModelRunnerOutput:
     )
 
 
-def test_mixed_prefill_budget_is_shared_across_waiting_requests(lp11_model_path):
+def _prepare_lp11_prefills(
+    lp11_model_path,
+    num_prefills: int,
+    mixed_prefill_budget: int,
+):
     scheduler = create_scheduler(
         model=lp11_model_path,
         skip_tokenizer_init=True,
         device="cpu",
-        max_num_seqs=8,
-        max_num_batched_tokens=64,
-        max_model_len=256,
-        max_num_prefill_tokens_per_step=16,
+        max_num_seqs=4,
+        max_num_batched_tokens=8192,
+        max_model_len=32768,
+        long_prefill_token_threshold=2304,
+        max_num_prefill_tokens_per_step=0,
     )
     _establish_decode_request(scheduler)
 
     prefills = create_requests(
-        num_requests=4,
-        num_tokens=160,
-        req_ids=["p0", "p1", "p2", "p3"],
+        num_requests=num_prefills,
+        num_tokens=12000,
+        req_ids=[f"p{index}" for index in range(num_prefills)],
     )
     for request in prefills:
         scheduler.add_request(request)
 
     output = scheduler.schedule()
+    scheduler.update_from_output(output, _empty_output_for_schedule(output))
+    assert all(request in scheduler.running for request in prefills)
 
-    assert "decode" in output.num_scheduled_tokens
-    assert [output.num_scheduled_tokens[r.request_id] for r in prefills] == [4] * 4
-    assert sum(output.num_scheduled_tokens[r.request_id] for r in prefills) == 16
+    scheduler.max_num_prefill_tokens_per_step = mixed_prefill_budget
+    scheduler._prefill_budget_quantum = 2304
+    scheduler._prefill_budget_rotation = 0
+    return scheduler, prefills
+
+
+def test_mixed_prefill_budget_reserves_waiter_then_rotates_running(
+    lp11_model_path,
+):
+    scheduler, (p0, p1) = _prepare_lp11_prefills(
+        lp11_model_path,
+        num_prefills=2,
+        mixed_prefill_budget=4608,
+    )
+    (waiter,) = create_requests(
+        num_requests=1,
+        num_tokens=12000,
+        req_ids=["waiter"],
+    )
+    scheduler.add_request(waiter)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {
+        "decode": 1,
+        p0.request_id: 2304,
+        waiter.request_id: 2304,
+    }
+    assert p1.request_id not in output.num_scheduled_tokens
+    assert [request.request_id for request in scheduler.running] == [
+        "decode",
+        "p0",
+        "p1",
+        "waiter",
+    ]
 
 
 def test_mixed_prefill_budget_does_not_limit_prefill_only_step(lp11_model_path):
@@ -6247,92 +6287,42 @@ def test_mixed_prefill_budget_does_not_limit_prefill_only_step(lp11_model_path):
         model=lp11_model_path,
         skip_tokenizer_init=True,
         device="cpu",
-        max_num_batched_tokens=64,
-        max_model_len=256,
-        max_num_prefill_tokens_per_step=16,
+        max_num_batched_tokens=8192,
+        max_model_len=32768,
+        max_num_prefill_tokens_per_step=2304,
     )
     (request,) = create_requests(
         num_requests=1,
-        num_tokens=64,
+        num_tokens=8192,
         req_ids=["prefill"],
     )
     scheduler.add_request(request)
 
     output = scheduler.schedule()
 
-    assert output.num_scheduled_tokens[request.request_id] == 64
+    assert output.num_scheduled_tokens[request.request_id] == 8192
 
 
-def test_mixed_prefill_budget_reserves_a_waiting_slot(lp11_model_path):
-    scheduler = create_scheduler(
-        model=lp11_model_path,
-        skip_tokenizer_init=True,
-        device="cpu",
-        max_num_seqs=4,
-        max_num_batched_tokens=64,
-        max_model_len=256,
-        max_num_prefill_tokens_per_step=16,
-    )
-    _establish_decode_request(scheduler)
-    p0, p1 = create_requests(
-        num_requests=2,
-        num_tokens=160,
-        req_ids=["p0", "p1"],
-    )
-    scheduler.add_request(p0)
-    scheduler.add_request(p1)
-    output = scheduler.schedule()
-    scheduler.update_from_output(output, _empty_output_for_schedule(output))
-    assert p0 in scheduler.running and p1 in scheduler.running
-
-    (p2,) = create_requests(
-        num_requests=1,
-        num_tokens=160,
-        req_ids=["p2"],
-    )
-    scheduler.add_request(p2)
-    output = scheduler.schedule()
-
-    assert "decode" in output.num_scheduled_tokens
-    assert all(
-        req_id in output.num_scheduled_tokens for req_id in ("p0", "p1", "p2")
-    )
-    assert (
-        sum(
-            output.num_scheduled_tokens[req_id] for req_id in ("p0", "p1", "p2")
-        )
-        <= 16
+def test_mixed_prefill_budget_rotates_one_quantum_after_slots_fill(
+    lp11_model_path,
+):
+    scheduler, prefills = _prepare_lp11_prefills(
+        lp11_model_path,
+        num_prefills=3,
+        mixed_prefill_budget=2304,
     )
 
-
-def test_mixed_prefill_budget_rotates_extra_tokens_without_reordering(lp11_model_path):
-    scheduler = create_scheduler(
-        model=lp11_model_path,
-        skip_tokenizer_init=True,
-        device="cpu",
-        max_num_seqs=4,
-        max_num_batched_tokens=64,
-        max_model_len=256,
-        max_num_prefill_tokens_per_step=16,
-    )
-    _establish_decode_request(scheduler)
-    prefills = create_requests(
-        num_requests=3,
-        num_tokens=160,
-        req_ids=["p0", "p1", "p2"],
-    )
-    for request in prefills:
-        scheduler.add_request(request)
-
-    largest_share_ids = []
+    selected_ids = []
     for _ in range(3):
         output = scheduler.schedule()
-        shares = {
-            request.request_id: output.num_scheduled_tokens[request.request_id]
+        selected = [
+            request.request_id
             for request in prefills
-        }
-        assert sorted(shares.values()) == [5, 5, 6]
-        largest_share_ids.append(max(shares, key=shares.get))
+            if request.request_id in output.num_scheduled_tokens
+        ]
+        assert len(selected) == 1
+        assert output.num_scheduled_tokens[selected[0]] == 2304
+        selected_ids.extend(selected)
         assert [request.request_id for request in scheduler.running] == [
             "decode",
             "p0",
@@ -6341,35 +6331,34 @@ def test_mixed_prefill_budget_rotates_extra_tokens_without_reordering(lp11_model
         ]
         scheduler.update_from_output(output, _empty_output_for_schedule(output))
 
-    assert largest_share_ids == ["p0", "p1", "p2"]
+    assert selected_ids == ["p0", "p1", "p2"]
 
 
-def test_mixed_prefill_budget_distributes_mamba_aligned_candidate_values():
+def test_mixed_prefill_budget_selects_2304_token_running_quanta():
     scheduler = Mock(
-        need_mamba_block_aligned_split=True,
-        mamba_block_size=256,
+        _prefill_budget_quantum=2304,
         _prefill_budget_rotation=0,
     )
+    request_ids = ["p0", "p1", "p2"]
 
-    small = Scheduler._distribute_prefill_token_budget(scheduler, 2304, 7)
-    assert sum(small) == 2304
-    assert sorted(small) == [256, 256, 256, 256, 256, 512, 512]
-    assert small[:2] == [512, 512]
+    assert Scheduler._select_running_prefill_limits(scheduler, request_ids, 1) == {
+        "p0": 2304
+    }
+    assert Scheduler._select_running_prefill_limits(scheduler, request_ids, 2) == {
+        "p1": 2304,
+        "p2": 2304,
+    }
+    assert Scheduler._select_running_prefill_limits(scheduler, request_ids, 1) == {
+        "p0": 2304
+    }
 
-    large = Scheduler._distribute_prefill_token_budget(scheduler, 4608, 7)
-    assert sum(large) == 4608
-    assert sorted(large) == [512, 512, 512, 768, 768, 768, 768]
-    assert large[2:6] == [768, 768, 768, 768]
 
-    assert all(tokens % 256 == 0 for tokens in small + large)
-
-
-@pytest.mark.parametrize("value", [-1, 65])
+@pytest.mark.parametrize("value", [-1, 8193])
 def test_max_num_prefill_tokens_per_step_validation(value: int):
     with pytest.raises(ValueError):
         SchedulerConfig(
-            max_model_len=256,
+            max_model_len=32768,
             is_encoder_decoder=False,
-            max_num_batched_tokens=64,
+            max_num_batched_tokens=8192,
             max_num_prefill_tokens_per_step=value,
         )
