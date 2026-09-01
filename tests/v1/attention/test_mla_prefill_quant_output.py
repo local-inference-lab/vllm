@@ -10,7 +10,7 @@ Covers two things:
     + standalone static-FP8-quant path it replaces (GPU-only, SM100/SM110).
 """
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -23,7 +23,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 from vllm.v1.attention.backends.mla.prefill.flash_attn import (
+    FA4_MLA_PREFILL_KERNEL,
     FlashAttnPrefillBackend,
+    _use_sm120_fa4_prefill,
 )
 
 _FA_MODULE = "vllm.v1.attention.backends.mla.prefill.flash_attn"
@@ -113,6 +115,64 @@ def test_flash_attn_prefill_backend_signature_accepts_fused_kwargs():
     base_params = inspect.signature(MLAPrefillBackend.run_prefill_new_tokens).parameters
     assert "out" in base_params
     assert "output_scale" in base_params
+
+
+def test_sm120_fa4_prefill_is_opt_in_and_shape_scoped(monkeypatch):
+    with patch(f"{_FA_MODULE}.current_platform") as plat:
+        plat.is_device_capability_family.return_value = True
+        monkeypatch.setenv("VLLM_MLA_SM120_FA4_PREFILL", "0")
+        assert not _use_sm120_fa4_prefill(192, 128)
+
+        monkeypatch.setenv("VLLM_MLA_SM120_FA4_PREFILL", "1")
+        assert _use_sm120_fa4_prefill(192, 128)
+        assert not _use_sm120_fa4_prefill(256, 128)
+        assert not _use_sm120_fa4_prefill(192, 192)
+
+        plat.is_device_capability_family.return_value = False
+        assert not _use_sm120_fa4_prefill(192, 128)
+
+
+def test_sm120_fa4_prefill_forces_one_split_without_padding():
+    backend = object.__new__(FlashAttnPrefillBackend)
+    backend.requires_v_padding = False
+    backend._is_vllm_fa = True
+    backend._sm120_fa4_prefill = True
+    output = torch.empty(2, 3, 128)
+    runtime = MagicMock(return_value=output)
+    backend.flash_attn_varlen_func = runtime
+    q = torch.empty(2, 3, 192)
+    k = torch.empty(4, 3, 192)
+    v = torch.empty(4, 3, 128)
+
+    actual = backend._flash_attn_varlen_diff_headdims(q=q, k=k, v=v)
+
+    assert actual is output
+    runtime.assert_called_once()
+    kwargs = runtime.call_args.kwargs
+    assert kwargs["v"] is v
+    assert kwargs["num_splits"] == 1
+
+
+def test_sm120_fa4_prefill_warmup_covers_lse(monkeypatch):
+    from vllm.model_executor.layers.attention import mla_attention
+
+    monkeypatch.setenv("VLLM_MLA_SM120_FA4_PREFILL", "1")
+    config = MagicMock()
+    config.model_config.dtype = torch.bfloat16
+    config.model_config.get_num_attention_heads.return_value = 12
+    dims = MagicMock(qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128)
+    with (
+        patch(f"{_FA_MODULE}.current_platform") as plat,
+        patch.object(mla_attention, "get_mla_dims", return_value=dims),
+    ):
+        plat.is_device_capability.return_value = False
+        plat.is_device_capability_family.side_effect = lambda family: family == 120
+        keys = FA4_MLA_PREFILL_KERNEL.get_warmup_keys(config)
+
+    assert keys
+    assert {key.fa_version for key in keys} == {4}
+    assert {key.num_splits for key in keys} == {1}
+    assert {key.return_softmax_lse for key in keys} == {False, True}
 
 
 def test_mla_impl_forward_mha_accepts_output_scale():

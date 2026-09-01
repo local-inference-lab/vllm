@@ -3160,12 +3160,26 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         model_config = vllm_config.model_config
 
         configured_workspace_size = envs.VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE
+        internal_workspace_size = envs.VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE
         if configured_workspace_size < 0:
             raise ValueError(
                 "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE must be non-negative, "
                 f"got {configured_workspace_size}."
             )
-        if configured_workspace_size:
+        if internal_workspace_size < 0:
+            raise ValueError(
+                "VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE must be non-negative, "
+                f"got {internal_workspace_size}."
+            )
+        if internal_workspace_size:
+            chunked_prefill_workspace_size = internal_workspace_size
+            logger.info_once(
+                "MLA internal context workspace is %d tokens; scheduler and "
+                "recompute budgets remain %d tokens.",
+                internal_workspace_size,
+                scheduler_config.max_num_batched_tokens,
+            )
+        elif configured_workspace_size:
             chunked_prefill_workspace_size = configured_workspace_size
         else:
             chunked_prefill_workspace_size = min(

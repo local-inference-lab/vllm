@@ -589,6 +589,15 @@ def test_mla_chunk_workspace_honors_configured_token_limit(monkeypatch):
         == 4096
     )
 
+    # The internal tile is deliberately independent of the externally visible
+    # scheduler/recompute budget and takes precedence over the legacy knob.
+    monkeypatch.setenv("VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE", "16384")
+    assert (
+        MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(config)
+        == 16384
+    )
+    monkeypatch.setenv("VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE", "0")
+
     monkeypatch.setenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", "0")
     assert (
         MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(config)
@@ -597,6 +606,11 @@ def test_mla_chunk_workspace_honors_configured_token_limit(monkeypatch):
 
     monkeypatch.setenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", "-1")
     with pytest.raises(ValueError, match="must be non-negative"):
+        MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(config)
+
+    monkeypatch.setenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", "4096")
+    monkeypatch.setenv("VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE", "-1")
+    with pytest.raises(ValueError, match="INTERNAL_CONTEXT.*non-negative"):
         MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(config)
 
 

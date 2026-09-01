@@ -65,6 +65,8 @@ if TYPE_CHECKING:
     VLLM_B12X_ABSORB_BMM: bool = False
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE: int = 0
+    VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE: int = 0
+    VLLM_MLA_SM120_FA4_PREFILL: bool = False
     VLLM_K3_KV_GROUP_SIZE: int = 0
     VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
     VLLM_DSPARK_COMPACT_ROPE: bool = False
@@ -1159,6 +1161,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per attention call. Zero selects the automatic memory bound.
     "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE": lambda: int(
         os.getenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", "0")
+    ),
+    # Override only the transient MLA context tile. Unlike the scheduler token
+    # budget, this does not change admission, preemption, prefix-commit, Mamba
+    # snapshot, or LMCache recompute granularity.
+    "VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE": lambda: int(
+        os.getenv("VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE", "0")
+    ),
+    # Opt in to the SM120 FA4 kernel for dense MLA prefill only. Decode and
+    # non-MLA attention retain their configured FlashAttention version.
+    "VLLM_MLA_SM120_FA4_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_MLA_SM120_FA4_PREFILL", "0"))
     ),
     # Bound the number of physical Kimi-K3 layers sharing each hybrid-cache
     # block table. Zero preserves the general grouping heuristic.

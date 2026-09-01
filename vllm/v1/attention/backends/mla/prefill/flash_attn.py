@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
 )
@@ -38,6 +39,8 @@ if is_flash_attn_varlen_func_available():
 else:
     flash_attn_varlen_func = None  # type: ignore[assignment]
 
+logger = init_logger(__name__)
+
 
 FA4_STANDARD_DTYPES = (torch.bfloat16, torch.float16)
 
@@ -55,6 +58,15 @@ FA4_MLA_PREFILL_LONG_K_BLOCKS = 32
 FA4_MLA_PREFILL_VERY_LONG_K_BLOCKS = 64
 FA4_MLA_PREFILL_CAUSAL_OPTIONS = (False, True)
 FA4_MLA_PREFILL_LSE_OPTIONS = (False, True)
+
+
+def _use_sm120_fa4_prefill(qk_head_dim: int, v_head_dim: int) -> bool:
+    """Select the qualified SM120 FA4 MLA shape without changing global FA."""
+    return (
+        envs.VLLM_MLA_SM120_FA4_PREFILL
+        and current_platform.is_device_capability_family(120)
+        and (qk_head_dim, v_head_dim) == (192, 128)
+    )
 
 
 @dataclass(frozen=True)
@@ -157,7 +169,15 @@ class FA4MLAPrefillKernel(VllmJitKernel["FA4MLAPrefillKernel.CompileKey"]):
 
         mla_dims = get_mla_dims(vllm_config.model_config)
         qk_head_dim = mla_dims.qk_nope_head_dim + mla_dims.qk_rope_head_dim
-        fa_version = get_flash_attn_version(head_size=qk_head_dim)
+        force_sm120_fa4 = _use_sm120_fa4_prefill(qk_head_dim, mla_dims.v_head_dim)
+        fa_version = (
+            4
+            if force_sm120_fa4
+            else get_flash_attn_version(
+                head_size=qk_head_dim,
+                head_size_v=mla_dims.v_head_dim,
+            )
+        )
         if fa_version != 4:
             return []
 
@@ -171,7 +191,7 @@ class FA4MLAPrefillKernel(VllmJitKernel["FA4MLAPrefillKernel.CompileKey"]):
         if not (is_sm90 or is_sm100_family or is_sm120):
             return []
 
-        num_splits = 1 if envs.VLLM_BATCH_INVARIANT else 0
+        num_splits = 1 if envs.VLLM_BATCH_INVARIANT or force_sm120_fa4 else 0
         if is_sm120 and num_splits != 1:
             return []
 
@@ -336,10 +356,23 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             "Ensure FlashAttnPrefillBackend.is_available() is checked first."
         )
         qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self._sm120_fa4_prefill = _use_sm120_fa4_prefill(qk_head_dim, v_head_dim)
         self.flash_attn_varlen_func = flash_attn_varlen_func
-        self.vllm_flash_attn_version = get_flash_attn_version(
-            head_size=qk_head_dim, head_size_v=v_head_dim
+        self.vllm_flash_attn_version = (
+            4
+            if self._sm120_fa4_prefill
+            else get_flash_attn_version(
+                head_size=qk_head_dim,
+                head_size_v=v_head_dim,
+            )
         )
+        if self._sm120_fa4_prefill:
+            logger.info_once(
+                "Using SM120 FA4 for dense MLA prefill (QK=%d, V=%d, "
+                "num_splits=1); global FlashAttention selection is unchanged.",
+                qk_head_dim,
+                v_head_dim,
+            )
         if self.vllm_flash_attn_version is not None:
             self.flash_attn_varlen_func = functools.partial(
                 flash_attn_varlen_func, fa_version=self.vllm_flash_attn_version
@@ -399,7 +432,11 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             # called "return_attn_probs" instead of return_softmax_lse
             kwargs["return_attn_probs"] = return_softmax_lse
             assert out is None and output_scale is None
-        if envs.VLLM_BATCH_INVARIANT:
+        if self._sm120_fa4_prefill:
+            # The consumer-Blackwell kernel currently supports one deterministic
+            # split. This also avoids batch-shape-dependent split heuristics.
+            kwargs["num_splits"] = 1
+        elif envs.VLLM_BATCH_INVARIANT:
             kwargs["num_splits"] = 1
 
         attn_out = FA4_MLA_PREFILL_KERNEL(
