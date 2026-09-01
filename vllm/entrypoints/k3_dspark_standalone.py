@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import threading
 import time
@@ -233,6 +234,10 @@ def _build_vllm_config(args: argparse.Namespace):
         "rejection_sample_method": "block",
         "max_model_len": args.max_model_len,
     }
+    if args.draft_quantization != "none":
+        speculative_config["quantization"] = args.draft_quantization
+    if args.draft_fp8_head:
+        os.environ["VLLM_DSPARK_FP8_DRAFT_HEAD"] = "1"
     engine_args = EngineArgs(
         model=str(args.target_config),
         tokenizer_mode="skip",
@@ -761,6 +766,29 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-kv-window", type=int, default=32768)
     parser.add_argument("--proposal-address", default="tcp://127.0.0.1:8092")
     parser.add_argument("--disable-proposal-transport", action="store_true")
+    parser.add_argument(
+        "--draft-quantization",
+        choices=("none", "fp8_per_channel", "fp8_per_tensor", "mxfp8"),
+        default="none",
+        help=(
+            "Online weight quantization for the draft's linear layers (vLLM "
+            "online-quantization shorthand): fp8_per_channel quantizes each "
+            "BF16 weight to float8_e4m3 with one scale per output channel and "
+            "dynamic per-token activation scaling. Draft-time only: the "
+            "target's verification pass is unchanged, so accepted outputs "
+            "keep the target distribution; only the proposal quality (and "
+            "therefore acceptance length) can move."
+        ),
+    )
+    parser.add_argument(
+        "--draft-fp8-head",
+        action="store_true",
+        help=(
+            "Score draft proposals with a rowwise-fp8 copy of the LM head "
+            "(VLLM_DSPARK_FP8_DRAFT_HEAD=1); same draft-time-only contract "
+            "as --draft-quantization."
+        ),
+    )
     parser.add_argument("--enable-cuda-graph", action="store_true")
     parser.add_argument("--cuda-graph-warmups", type=int, default=2)
     parser.add_argument("--skip-smoke-test", action="store_true")

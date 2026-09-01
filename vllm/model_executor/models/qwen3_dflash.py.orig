@@ -11,7 +11,6 @@ from torch import nn
 from transformers import Qwen3Config
 
 from vllm import _custom_ops as ops
-from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -186,28 +185,6 @@ def _resolve_layer_attention(
             )
 
     return sliding_window, _dflash_layer_causal(config, layer_idx)
-
-
-def _qkv_weight_out_major(qkv_proj: nn.Module) -> torch.Tensor:
-    """Return the QKV projection weight as ``[out_features, in_features]``.
-
-    Online fp8 quantization (``Fp8PtpcOnlineLinearMethod``) replaces the BF16
-    ``[out, in]`` parameter with a transposed float8 ``[in, out]`` tensor and
-    a ``[out, 1]`` per-channel scale. The fused context K/V projection reads
-    the weight directly, so dequantize it back to the model dtype here; the
-    values are exactly the ones the quantized query path multiplies with.
-    """
-    weight = qkv_proj.weight
-    if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
-        return weight
-    scale = getattr(qkv_proj, "weight_scale", None)
-    if scale is None:
-        raise RuntimeError("fp8 qkv_proj has no weight_scale to dequantize with")
-    dtype = qkv_proj.params_dtype if hasattr(qkv_proj, "params_dtype") else torch.bfloat16
-    if scale.dim() == 2 and scale.shape[0] == weight.shape[1]:
-        # Transposed [in, out] fp8 with [out, 1] scales.
-        return (weight.to(dtype) * scale.to(dtype).t()).t().contiguous()
-    return (weight.to(dtype) * scale.to(dtype)).contiguous()
 
 
 class DFlashAttention(Attention):
@@ -567,9 +544,7 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [
-            _qkv_weight_out_major(a.qkv_proj)[a.q_size :] for a in layers_attn
-        ]
+        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
@@ -831,40 +806,6 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             )
         else:
             self.draft_id_to_target_id = None
-        # Rowwise-fp8 copy of the (possibly shared) LM head, materialized by
-        # maybe_init_fp8_draft_head(); None keeps the BF16 head.
-        self._fp8_draft_head = None
-        self._logit_scale = float(logit_scale)
-
-    def maybe_init_fp8_draft_head(self) -> None:
-        """Materialize the rowwise-fp8 draft lm_head copy (opt-in).
-
-        Called by ``load_dflash_model`` after the target's lm_head may have
-        been aliased onto this model, and before the proposal CUDA graphs
-        are captured: the quantized copy must exist when the graph records
-        ``compute_logits``. Draft-time only: proposals are scored with the
-        fp8 head, the target's verification never sees it, so accepted
-        tokens keep the target distribution; a rare argmax flip costs one
-        rejected draft token.
-        """
-        from vllm.model_executor.layers.fp8_draft_head import (
-            fp8_draft_head_supported,
-            quantize_draft_head,
-        )
-
-        if not envs.VLLM_DSPARK_FP8_DRAFT_HEAD:
-            return
-        if not fp8_draft_head_supported(self.lm_head.weight.device):
-            logger.warning(
-                "VLLM_DSPARK_FP8_DRAFT_HEAD is set but this device has no "
-                "fp8 support (SM89+ required); using the BF16 draft lm_head."
-            )
-            return
-        self._fp8_draft_head = quantize_draft_head(self.lm_head.weight)
-        logger.info_once(
-            "DFlash draft logits use a rowwise-fp8 copy of the lm_head "
-            "(draft-time only; the target's verify pass is untouched)."
-        )
 
     def embed_input_ids(
         self,
@@ -894,21 +835,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        if self._fp8_draft_head is not None:
-            from vllm.model_executor.layers.fp8_draft_head import (
-                fp8_draft_head_logits,
-            )
-
-            # Mirrors LogitsProcessor._get_logits: local (shard) logits, the
-            # same TP gather and vocab-padding slice, then the logit scale.
-            local_logits = fp8_draft_head_logits(hidden_states, self._fp8_draft_head)
-            logits = self.logits_processor._gather_logits(local_logits)
-            if logits is not None:
-                logits = logits[..., : self.logits_processor.org_vocab_size]
-                if self._logit_scale != 1.0:
-                    logits = logits * self._logit_scale
-        else:
-            logits = self.logits_processor(self.lm_head, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
         if self.draft_id_to_target_id is None:
             return logits
 
