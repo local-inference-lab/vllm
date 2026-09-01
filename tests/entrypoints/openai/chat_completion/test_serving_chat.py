@@ -1043,6 +1043,7 @@ async def _collect_glm47_stream(tokens, *, holdback_arg_value_end: bool = False)
         "indexes": set(),
         "names": [],
         "arguments": [],
+        "reasoning": [],
         "content": [],
         "finish_reasons": [],
         "stop_reasons": [],
@@ -1074,6 +1075,8 @@ async def _collect_glm47_stream(tokens, *, holdback_arg_value_end: bool = False)
             if choice.get("token_ids") is not None:
                 result["token_ids"].append(choice["token_ids"])
             delta = choice.get("delta") or {}
+            if isinstance(delta.get("reasoning"), str):
+                result["reasoning"].append(delta["reasoning"])
             if isinstance(delta.get("content"), str):
                 result["content"].append(delta["content"])
             for call in delta.get("tool_calls") or []:
@@ -1119,6 +1122,7 @@ async def test_glm47_full_response_with_literal_arg_value_end():
     assert isinstance(response, ChatCompletionResponse)
     choice = response.choices[0]
     message = choice.message
+    assert message.reasoning == _GLM47_REASONING
     assert message.content == "after"
     assert len(message.tool_calls or []) == 1
     call = message.tool_calls[0].function
@@ -1138,6 +1142,7 @@ async def test_glm47_stream_response_with_literal_arg_value_end():
     assert result["indexes"] == {0}
     assert len(result["call_ids"]) == 1
     assert "".join(result["names"]) == "record_value"
+    assert "".join(result["reasoning"]) == _GLM47_REASONING
     assert len(result["arguments"]) > 1
     assert json.loads("".join(result["arguments"])) == {
         "value": _GLM47_LITERAL_ARG_END_VALUE
@@ -1159,11 +1164,46 @@ async def test_glm47_stream_literal_arg_value_end_with_detokenizer_holdback():
     assert result["indexes"] == {0}
     assert len(result["call_ids"]) == 1
     assert "".join(result["names"]) == "record_value"
+    assert "".join(result["reasoning"]) == _GLM47_REASONING
     assert json.loads("".join(result["arguments"])) == {
         "value": _GLM47_LITERAL_ARG_END_VALUE
     }
     assert "".join(result["content"]) == "after"
     assert result["finish_reasons"] == ["tool_calls"]
+
+
+@pytest.mark.asyncio
+async def test_glm47_stream_actual_delimiter_ids_with_stripped_stop():
+    tokens = [
+        (_GLM47_REASONING_ID, _GLM47_REASONING),
+        (_GLM47_THINK_END_ID, _GLM47_THINK_END),
+        (_GLM47_TOOL_START_ID, _GLM47_TOOL_START),
+        (_GLM47_NAME_ID, "record_value"),
+        (_GLM47_ARG_KEY_START_ID, _GLM47_ARG_KEY_START),
+        (_GLM47_KEY_ID, "value"),
+        (_GLM47_ARG_KEY_END_ID, _GLM47_ARG_KEY_END),
+        (_GLM47_ARG_VALUE_START_ID, _GLM47_ARG_VALUE_START),
+        (_GLM47_TOOL_END_ID, _GLM47_TOOL_END),
+        (307, " then "),
+        (_GLM47_TOOL_START_ID, _GLM47_TOOL_START),
+        (_GLM47_ARG_VALUE_END_ID, _GLM47_ARG_VALUE_END),
+        (_GLM47_TOOL_END_ID, _GLM47_TOOL_END),
+        (309, "after"),
+    ]
+    result = await _collect_glm47_stream(tokens)
+    assert result["done"]
+    assert result["indexes"] == {0}
+    assert len(result["call_ids"]) == 1
+    assert "".join(result["names"]) == "record_value"
+    assert len(result["arguments"]) > 1
+    assert json.loads("".join(result["arguments"])) == {
+        "value": "</tool_call> then <tool_call>"
+    }
+    assert "".join(result["reasoning"]) == _GLM47_REASONING
+    assert "".join(result["content"]) == "after"
+    assert result["finish_reasons"] == ["tool_calls"]
+    assert result["stop_reasons"] == [_GLM47_OBSERVATION_ID]
+    assert result["token_ids"][-1] == [_GLM47_OBSERVATION_ID]
 
 
 @pytest.mark.asyncio
@@ -1202,6 +1242,7 @@ async def test_glm47_full_response_with_stripped_trailing_drop():
         assert isinstance(response, ChatCompletionResponse)
         choice = response.choices[0]
         message = choice.message
+        assert message.reasoning == _GLM47_REASONING
         assert message.content in (None, "")
         assert len(message.tool_calls or []) == 1
         call = message.tool_calls[0].function

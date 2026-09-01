@@ -134,9 +134,14 @@ def run_glm_output(glm_parser, output: str, *, mode: str):
             )
             for index, call in enumerate(result.tool_calls)
         ]
-        return SimpleNamespace(calls=calls, content=result.content or "")
+        return SimpleNamespace(
+            calls=calls,
+            content=result.content or "",
+            empty_token_deltas=0,
+        )
 
     _reset(parser)
+    empty_token_deltas = 0
     stream_steps: list[tuple[str, list[int]]]
     if mode == "character":
         stream_steps = [(chunk, []) for chunk in output]
@@ -161,6 +166,8 @@ def run_glm_output(glm_parser, output: str, *, mode: str):
                     spaces_between_special_tokens=True,
                 )
             )
+            if not delta_text:
+                empty_token_deltas += 1
             stream_steps.append((delta_text, [token_id]))
             previous_tokens = (
                 previous_tokens + new_tokens if previous_tokens else new_tokens
@@ -203,7 +210,11 @@ def run_glm_output(glm_parser, output: str, *, mode: str):
         for index in sorted(call_parts)
     ]
     content = "".join(delta.content or "" for delta in deltas)
-    return SimpleNamespace(calls=calls, content=content)
+    return SimpleNamespace(
+        calls=calls,
+        content=content,
+        empty_token_deltas=empty_token_deltas,
+    )
 
 
 def collect_calls(result):
@@ -533,6 +544,33 @@ class TestGlm47ExtractToolCalls:
             "path": "/tmp/x",
         }
         assert collect_content(result) == ""
+
+    @pytest.mark.parametrize("mode", GLM_OUTPUT_MODES)
+    def test_unterminated_second_argument_remains_valid(self, mode, glm_parser):
+        output = (
+            "</think><tool_call>record_value"
+            "<arg_key>value</arg_key><arg_value>first</arg_value>"
+            "<arg_key>path</arg_key><arg_value>/tmp/x"
+            "</tool_call>tail"
+        )
+        result = run_glm_output(glm_parser, output, mode=mode)
+        assert json.loads(collect_arguments(collect_calls(result))) == {
+            "value": "first",
+            "path": "/tmp/x</tool_call>tail",
+        }
+        assert collect_content(result) == ""
+
+    def test_token_mode_exercises_multibyte_holdback(self, glm_parser):
+        value = "ok 🎉 ∮ 𠀋 done"
+        output = (
+            "</think><tool_call>record_value"
+            "<arg_key>value</arg_key><arg_value>"
+            f"{value}</arg_value></tool_call>after"
+        )
+        result = run_glm_output(glm_parser, output, mode="token")
+        assert result.empty_token_deltas > 0
+        assert json.loads(collect_arguments(collect_calls(result))) == {"value": value}
+        assert collect_content(result) == "after"
 
     def test_literal_arg_value_end_round_trips_to_responses_output(
         self,
