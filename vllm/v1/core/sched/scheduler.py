@@ -576,15 +576,23 @@ class Scheduler(SchedulerInterface):
             return {}
 
         start = self._prefill_budget_rotation % len(request_ids)
-        limits: dict[str, int] = {}
-        for offset in range(num_quanta):
+        base_quanta, remainder = divmod(num_quanta, len(request_ids))
+        limits = {
+            request_id: base_quanta * self._prefill_budget_quantum
+            for request_id in request_ids
+            if base_quanta > 0
+        }
+        for offset in range(remainder):
             request_id = request_ids[(start + offset) % len(request_ids)]
             limits[request_id] = (
                 limits.get(request_id, 0) + self._prefill_budget_quantum
             )
-        self._prefill_budget_rotation = (
-            start + num_quanta
-        ) % len(request_ids)
+        if remainder:
+            self._prefill_budget_rotation = (
+                start + remainder
+            ) % len(request_ids)
+        elif base_quanta:
+            self._prefill_budget_rotation = (start + 1) % len(request_ids)
         return limits
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
