@@ -109,6 +109,16 @@ def test_b12x_sparse_mla_accepts_glm_dsa_contract(monkeypatch) -> None:
     )
 
 
+def test_b12x_dsa_requires_layer_compact_cache_layout() -> None:
+    assert B12xMLASparseBackend.supported_kv_cache_layouts() == (KVCacheLayout.LBNHC,)
+
+
+def test_b12x_glm5_next_requires_block_outermost_cache_layout() -> None:
+    assert B12xGLM5NextMLASparseBackend.supported_kv_cache_layouts() == (
+        KVCacheLayout.BLHNC,
+    )
+
+
 def _glm5_next_config(
     *,
     dcp_size: int = 1,

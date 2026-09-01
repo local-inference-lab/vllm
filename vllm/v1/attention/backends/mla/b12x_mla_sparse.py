@@ -453,11 +453,8 @@ class B12xMLASparseBackend(AttentionBackend):
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
-        # Sparse index caches share manager blocks with their MLA layer. Keep
-        # the layer dimension inside the manager's block so block copies and
-        # swaps carry both cache regions together. DeepSeek-V4's index backend
-        # already imposes the same constraint, so this preserves its layout.
-        return (KVCacheLayout.BLHNC,)
+        # The DSA kernels consume one layer-compact, token-major cache view.
+        return (KVCacheLayout.LBNHC,)
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
@@ -520,6 +517,13 @@ class B12xMLASparseBackend(AttentionBackend):
 
 
 class B12xGLM5NextMLASparseBackend(B12xMLASparseBackend):
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # GLM-Next's pooled index tail shares manager blocks with its MLA
+        # latent page. Keep the layer dimension inside the manager block so
+        # copies and swaps carry both cache regions together.
+        return (KVCacheLayout.BLHNC,)
+
     @staticmethod
     def get_builder_cls() -> type["B12xGLM5NextMLASparseMetadataBuilder"]:
         return B12xGLM5NextMLASparseMetadataBuilder
