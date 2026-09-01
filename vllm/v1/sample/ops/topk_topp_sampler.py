@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from functools import cache
+
 import torch
 import torch.nn as nn
 
@@ -72,6 +74,12 @@ def flashinfer_sampler_supported() -> bool:
         unsupported_reason,
     )
     return False
+
+
+@cache
+def _flashinfer_probability_renorm_supported() -> bool:
+    """Return the process-stable availability of FlashInfer renormalization."""
+    return flashinfer_sampler_supported()
 
 
 class TopKTopPSampler(nn.Module):
@@ -385,6 +393,18 @@ def apply_top_k_top_p_probs(
     """
     if p is None:
         return apply_top_k_top_p(logits, k, p).softmax(dim=-1, dtype=torch.float32)
+
+    # Standard rejection sampling needs the complete constrained probability
+    # distribution.  The target CUDA sampler already uses FlashInfer's
+    # deterministic top-p implementation, so the corresponding renormalizer
+    # both matches that distribution and avoids sorting the full vocabulary.
+    # One-row PyTorch sorting is marginally faster; top-k combinations retain
+    # the existing path until their FlashInfer ordering contract is qualified.
+    if k is None and logits.shape[0] > 1 and _flashinfer_probability_renorm_supported():
+        from flashinfer.sampling import top_p_renorm_probs
+
+        probs = logits.softmax(dim=-1, dtype=torch.float32)
+        return top_p_renorm_probs(probs, p, is_deterministic=True)
 
     if current_platform.is_cpu() or (HAS_TRITON and logits.shape[0] >= 8):
         return apply_top_k_top_p(logits, k, p).softmax(dim=-1, dtype=torch.float32)
