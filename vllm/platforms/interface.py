@@ -816,23 +816,30 @@ class Platform:
                     "Glm5NextForConditionalGeneration."
                 )
             if split_target_block_size.lower() == "auto":
-                retention_interval = cache_config.prefix_cache_retention_interval
+                geometry_interval = cache_config.prefix_cache_retention_interval
+                if geometry_interval is None:
+                    scheduler_config = vllm_config.scheduler_config
+                    geometry_interval = scheduler_config.max_num_scheduled_tokens
+                    if geometry_interval is None:
+                        geometry_interval = scheduler_config.max_num_batched_tokens
                 dcp_world_size = parallel_config.decode_context_parallel_size
                 if (
-                    retention_interval is None
-                    or retention_interval <= 0
-                    or retention_interval % dcp_world_size != 0
+                    geometry_interval is None
+                    or geometry_interval <= 0
+                    or geometry_interval % dcp_world_size != 0
                 ):
                     raise ValueError(
                         "Automatic GLM-5.3 split-cache geometry requires a "
-                        "positive prefix_cache_retention_interval divisible by "
-                        "decode_context_parallel_size."
+                        "positive prefix_cache_retention_interval or scheduler "
+                        "token budget divisible by decode_context_parallel_size."
                     )
                 # A DCP-sharded target block covers block_size * DCP global
-                # tokens. Fill one retention interval with exactly one target
-                # block per rank so packed NVFP4 pages use the shared pool
-                # efficiently and connector stores land on whole pages.
-                target_block_size = retention_interval // dcp_world_size
+                # tokens. Fill one retention interval, or one scheduler token
+                # budget when no external-cache retention policy is active,
+                # with exactly one target block per rank. This makes packed
+                # NVFP4 pages use the shared pool efficiently while connector
+                # stores still land on whole pages when retention is enabled.
+                target_block_size = geometry_interval // dcp_world_size
             else:
                 target_block_size = int(split_target_block_size)
 

@@ -434,6 +434,50 @@ def test_glm5_next_split_cache_auto_aligns_to_dcp_retention(monkeypatch) -> None
     assert config.cache_config.mamba_page_size_padded is None
 
 
+@pytest.mark.parametrize(
+    ("dcp", "scheduled_tokens", "batched_tokens", "expected_block_size"),
+    [
+        (1, None, 4096, 4096),
+        (2, None, 4096, 2048),
+        (4, None, 4096, 1024),
+        (8, None, 4096, 512),
+        (4, 4096, 4352, 1024),
+    ],
+)
+def test_glm5_next_split_cache_auto_falls_back_to_scheduler_budget(
+    monkeypatch,
+    dcp: int,
+    scheduled_tokens: int | None,
+    batched_tokens: int,
+    expected_block_size: int,
+) -> None:
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architecture="Glm5NextForConditionalGeneration",
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+        scheduler_config=SimpleNamespace(
+            max_num_scheduled_tokens=scheduled_tokens,
+            max_num_batched_tokens=batched_tokens,
+        ),
+        cache_config=SimpleNamespace(
+            block_size=256,
+            mamba_block_size=None,
+            mamba_cache_mode="align",
+            mamba_page_size_padded=1234,
+            prefix_cache_retention_interval=None,
+        ),
+    )
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "auto")
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE", "auto")
+
+    Platform._align_hybrid_block_size(config, B12xGLM5NextMLASparseBackend)
+
+    assert config.cache_config.block_size == expected_block_size
+    assert config.cache_config.mamba_block_size == expected_block_size
+    assert config.cache_config.mamba_page_size_padded is None
+
+
 def test_glm5_next_split_cache_auto_requires_dcp_aligned_retention(
     monkeypatch,
 ) -> None:
