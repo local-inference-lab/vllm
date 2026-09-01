@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
 
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
@@ -141,6 +143,34 @@ def _active_dense_mla_splits(plan: Any, max_seq_len: int | None) -> int:
     )
 
 
+def _dense_mla_plan_row_caps(max_rows: int) -> tuple[int, ...]:
+    """Return CUDA-graph-friendly row capacities through ``max_rows``."""
+    if max_rows <= 0:
+        raise ValueError("dense MLA row capacity must be positive")
+    caps: list[int] = []
+    row_cap = 1
+    while row_cap < max_rows:
+        caps.append(row_cap)
+        row_cap *= 2
+    caps.append(max_rows)
+    return tuple(caps)
+
+
+def _select_dense_mla_plan(
+    plans: dict[int, Any],
+    total_rows: int,
+) -> Any:
+    """Select the smallest launch plan that covers the live query rows."""
+    row_caps = tuple(sorted(plans))
+    index = bisect_left(row_caps, total_rows)
+    if total_rows <= 0 or index >= len(row_caps):
+        raise ValueError(
+            "B12X_MLA query rows exceed the planned capacities: "
+            f"rows={total_rows}, capacities={row_caps}"
+        )
+    return plans[row_caps[index]]
+
+
 def _create_dense_mla_plan(
     vllm_config: VllmConfig,
     device: torch.device,
@@ -148,6 +178,9 @@ def _create_dense_mla_plan(
     page_size: int,
     num_q_heads: int,
     max_total_q: int | None = None,
+    max_batch: int | None = None,
+    mode: str = "decode",
+    uses_query_cache_seqlens: bool = False,
     dcp_size: int | None = None,
     max_cache_tokens: int | None = None,
 ) -> Any:
@@ -162,6 +195,40 @@ def _create_dense_mla_plan(
         if max_cache_tokens is not None
         else _max_dcp_local_cache_tokens(vllm_config, dcp_size=dcp_size)
     )
+    max_batch = int(max_total_q if max_batch is None else max_batch)
+    dcp_size = int(
+        vllm_config.parallel_config.decode_context_parallel_size
+        if dcp_size is None
+        else dcp_size
+    )
+
+    def local_tokens(global_tokens: int) -> int:
+        return (max(int(global_tokens), 0) + dcp_size - 1) // dcp_size
+
+    sparse_stride = int(envs.VLLM_K3_DYNAMIC_SPARSE_STRIDE)
+    if sparse_stride > 1:
+        logger.warning_once(
+            "Kimi-K3 dynamic sparse MLA is enabled with stride=%d. This "
+            "changes attention semantics and requires model-quality "
+            "qualification; stride=1 is the exact production default.",
+            sparse_stride,
+        )
+    sparse_min_tokens = local_tokens(envs.VLLM_K3_DYNAMIC_SPARSE_MIN_TOKENS)
+    sparse_sink_chunks = (
+        local_tokens(envs.VLLM_K3_DYNAMIC_SPARSE_SINK_TOKENS) + 63
+    ) // 64
+    sparse_recent_chunks = (
+        local_tokens(envs.VLLM_K3_DYNAMIC_SPARSE_RECENT_TOKENS) + 63
+    ) // 64
+    # A local DCP shard length can differ from its peers at an interleave
+    # boundary. Until the kernel accepts a global refresh clock, disabling the
+    # periodic dense refresh under DCP avoids mixing dense and sparse shards in
+    # one exact LSE reduction. The sparse policy itself remains rank-consistent.
+    sparse_refresh_interval = (
+        local_tokens(envs.VLLM_K3_DYNAMIC_SPARSE_REFRESH_INTERVAL)
+        if dcp_size == 1
+        else 0
+    )
     if max_total_q > _MAX_B12X_QUERY_ROWS:
         raise ValueError(
             "B12X_MLA supports at most "
@@ -175,17 +242,23 @@ def _create_dense_mla_plan(
 
     caps = dense_mla.Caps(
         device=device,
-        mode="decode",
+        mode=mode,
         dtype=torch.bfloat16,
         kv_dtype=_planned_kv_dtype(vllm_config),
         num_q_heads=num_q_heads,
         page_size=page_size,
         max_total_q=max_total_q,
-        max_batch=max_total_q,
+        max_batch=max_batch,
         max_cache_tokens=max_cache_tokens,
         max_page_table_width=_page_table_width(max_cache_tokens, page_size),
         num_cache_pages=_MAX_I32,
         use_cuda_graph=True,
+        uses_query_cache_seqlens=uses_query_cache_seqlens,
+        sparse_stride=sparse_stride,
+        sparse_min_tokens=sparse_min_tokens,
+        sparse_sink_chunks=sparse_sink_chunks,
+        sparse_recent_chunks=sparse_recent_chunks,
+        sparse_refresh_interval=sparse_refresh_interval,
     )
     return dense_mla.plan(caps)
 
@@ -201,6 +274,8 @@ class B12xMLAMetadata(MLACommonMetadata):
     dense_mla_flat_block_table: torch.Tensor | None = None
     dense_mla_flat_seq_lens: torch.Tensor | None = None
     dense_mla_flat_query_start_loc: torch.Tensor | None = None
+    dense_mla_verify_block_table: torch.Tensor | None = None
+    dense_mla_query_cache_seq_lens: torch.Tensor | None = None
     dense_mla_dcp_world_size: int = 1
 
 
@@ -245,19 +320,55 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         sliding_window = getattr(kv_cache_spec, "sliding_window", None)
         if sliding_window is not None:
             max_cache_tokens = min(max_cache_tokens, int(sliding_window))
-        self._dense_mla_plan = _create_dense_mla_plan(
-            vllm_config,
-            device,
-            page_size=self.page_size,
-            num_q_heads=self._kernel_heads,
-            max_total_q=max_dense_mla_rows,
-            dcp_size=self.dcp_world_size,
-            max_cache_tokens=max_cache_tokens,
+        self._dense_mla_plans = {
+            rows: _create_dense_mla_plan(
+                vllm_config,
+                device,
+                page_size=self.page_size,
+                num_q_heads=self._kernel_heads,
+                max_total_q=rows,
+                dcp_size=self.dcp_world_size,
+                max_cache_tokens=max_cache_tokens,
+            )
+            for rows in _dense_mla_plan_row_caps(max_dense_mla_rows)
+        }
+        self._dense_mla_verify_plans: dict[int, Any] = {}
+        if _planned_kv_dtype(vllm_config) == torch.float8_e4m3fn:
+            self._dense_mla_verify_plans = {
+                batch: _create_dense_mla_plan(
+                    vllm_config,
+                    device,
+                    page_size=self.page_size,
+                    num_q_heads=self._kernel_heads,
+                    max_total_q=batch * 4,
+                    max_batch=batch,
+                    mode="verify",
+                    uses_query_cache_seqlens=True,
+                    dcp_size=self.dcp_world_size,
+                    max_cache_tokens=max_cache_tokens,
+                )
+                for batch in range(
+                    1,
+                    int(vllm_config.scheduler_config.max_num_seqs) + 1,
+                )
+            }
+        self._dense_mla_plan = self._dense_mla_plans[max_dense_mla_rows]
+        workspace_specs = [
+            plan.shapes_and_dtypes()
+            for plan in (
+                *self._dense_mla_plans.values(),
+                *self._dense_mla_verify_plans.values(),
+            )
+        ]
+        if any(len(specs) != 1 for specs in workspace_specs):
+            raise RuntimeError("B12X_MLA expected exactly one scratch buffer per plan.")
+        scratch_dtype = workspace_specs[0][0][1]
+        if any(specs[0][1] != scratch_dtype for specs in workspace_specs):
+            raise RuntimeError("B12X_MLA plan scratch dtypes do not match.")
+        scratch_shape = max(
+            (specs[0][0] for specs in workspace_specs),
+            key=lambda shape: shape[0],
         )
-        self._workspace_specs = self._dense_mla_plan.shapes_and_dtypes()
-        if len(self._workspace_specs) != 1:
-            raise RuntimeError("B12X_MLA expected exactly one scratch buffer.")
-        scratch_shape, scratch_dtype = self._workspace_specs[0]
         # Every attention layer represented by this builder executes serially
         # on the model stream. One builder-owned buffer therefore gives each
         # eager bind a stable caller-owned address without a backend workspace
@@ -321,17 +432,82 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             else None
         )
         logger.info_once(
-            "B12X dense K3 MLA plan: local_heads=%d, effective_heads=%d, "
+            "B12X dense K3 MLA plans: local_heads=%d, effective_heads=%d, "
             "kernel_heads=%d, page_size=%d, "
-            "max_decode_rows=%d, max_cache_tokens=%d, splits=%d",
+            "max_decode_rows=%d, max_cache_tokens=%d, rows/splits=%s, "
+            "verify_batch/splits=%s",
             self.num_heads,
             self._effective_heads,
             self._kernel_heads,
             self.page_size,
             max_dense_mla_rows,
             max_cache_tokens,
-            self._dense_mla_plan.num_splits,
+            ",".join(
+                f"{rows}/{plan.num_splits}"
+                for rows, plan in self._dense_mla_plans.items()
+            ),
+            ",".join(
+                f"{batch}/{plan.num_splits}"
+                for batch, plan in self._dense_mla_verify_plans.items()
+            )
+            or "disabled",
         )
+
+    def _materialize_query_cache_seq_lens(
+        self,
+        metadata: B12xMLAMetadata,
+        decode_metadata: Any,
+        *,
+        query_len: int,
+        total_q: int,
+    ) -> torch.Tensor:
+        flat_lens = self._dense_mla_flat_seq_lens[:total_q]
+        if not metadata.causal:
+            flat_lens.copy_(
+                decode_metadata.seq_lens[:, None].expand(-1, query_len).reshape(total_q)
+            )
+            return flat_lens
+
+        offsets = self._dense_mla_causal_offsets[-query_len:]
+        if self.dcp_world_size == 1:
+            torch.add(
+                decode_metadata.seq_lens[:, None],
+                offsets,
+                out=flat_lens.view(metadata.num_decodes, query_len),
+            )
+            return flat_lens
+
+        global_source_lens = decode_metadata.dcp_tot_seq_lens
+        if global_source_lens is None:
+            raise RuntimeError(
+                "B12X_MLA causal DCP verification requires global decode "
+                "sequence lengths."
+            )
+        assert self._dense_mla_flat_global_seq_lens is not None
+        assert self._dense_mla_flat_dcp_remainder is not None
+        global_flat_lens = self._dense_mla_flat_global_seq_lens[:total_q]
+        torch.add(
+            global_source_lens[:, None],
+            offsets,
+            out=global_flat_lens.view(metadata.num_decodes, query_len),
+        )
+        virtual_block = self.dcp_world_size * self.cp_kv_cache_interleave_size
+        torch.div(
+            global_flat_lens,
+            virtual_block,
+            rounding_mode="floor",
+            out=flat_lens,
+        )
+        flat_lens.mul_(self.cp_kv_cache_interleave_size)
+        remainder = self._dense_mla_flat_dcp_remainder[:total_q]
+        torch.remainder(global_flat_lens, virtual_block, out=remainder)
+        remainder.sub_(self._dcp_rank * self.cp_kv_cache_interleave_size)
+        remainder.clamp_(
+            min=0,
+            max=self.cp_kv_cache_interleave_size,
+        )
+        flat_lens.add_(remainder)
+        return flat_lens
 
     def build(
         self,
@@ -347,95 +523,74 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
                 fast_build=fast_build,
             ),
         )
-        metadata.dense_mla_plan = self._dense_mla_plan
+        live_rows = max(1, int(metadata.num_decode_tokens))
+        plans = getattr(
+            self,
+            "_dense_mla_plans",
+            {self._max_dense_mla_rows: self._dense_mla_plan},
+        )
+        metadata.dense_mla_plan = _select_dense_mla_plan(plans, live_rows)
         metadata.dense_mla_scratch = self._dense_mla_scratch
         metadata.dense_mla_padded_q = self._dense_mla_padded_q
         metadata.dense_mla_padded_output = self._dense_mla_padded_output
         metadata.dense_mla_dcp_world_size = self.dcp_world_size
         decode_metadata = metadata.decode
-        flatten_decode = False
-        if decode_metadata is not None and metadata.num_decodes > 0:
-            flatten_decode = metadata.num_decode_tokens > metadata.num_decodes or int(
-                decode_metadata.block_table.shape[1]
-            ) > int(self._dense_mla_plan.caps.max_page_table_width)
-        if flatten_decode:
-            assert decode_metadata is not None
-            total_q = int(metadata.num_decode_tokens)
-            if total_q > self._max_dense_mla_rows:
-                raise ValueError(
-                    "B12X_MLA query block exceeds its flattened capacity: "
-                    f"rows={total_q}, capacity={self._max_dense_mla_rows}."
-                )
-            if total_q % metadata.num_decodes:
-                raise ValueError(
-                    "B12X_MLA requires a uniform query block, got "
-                    f"tokens={total_q}, requests={metadata.num_decodes}."
-                )
-            query_len = total_q // metadata.num_decodes
-            source_table = decode_metadata.block_table
-            flat_table = self._dense_mla_flat_block_table[:total_q]
-            # A bounded speculative cache can retain a position-indexed worker
-            # table wider than the resident cache. Sequence lengths make the
-            # omitted suffix unreachable by the dense-MLA kernel.
-            source_width = min(int(source_table.shape[1]), int(flat_table.shape[1]))
-            flat_table[:, :source_width].copy_(
-                source_table[:, None, :source_width]
-                .expand(-1, query_len, -1)
-                .reshape(total_q, source_width)
+        if decode_metadata is None or metadata.num_decodes <= 0:
+            return metadata
+        multi_query = metadata.num_decode_tokens > metadata.num_decodes
+        table_too_wide = int(decode_metadata.block_table.shape[1]) > int(
+            self._dense_mla_plan.caps.max_page_table_width
+        )
+        if not (multi_query or table_too_wide):
+            return metadata
+
+        total_q = int(metadata.num_decode_tokens)
+        if total_q > self._max_dense_mla_rows:
+            raise ValueError(
+                "B12X_MLA query block exceeds its flattened capacity: "
+                f"rows={total_q}, capacity={self._max_dense_mla_rows}."
             )
-            flat_lens = self._dense_mla_flat_seq_lens[:total_q]
-            if metadata.causal:
-                offsets = self._dense_mla_causal_offsets[-query_len:]
-                if self.dcp_world_size > 1:
-                    global_source_lens = decode_metadata.dcp_tot_seq_lens
-                    if global_source_lens is None:
-                        raise RuntimeError(
-                            "B12X_MLA causal DCP verification requires global "
-                            "decode sequence lengths."
-                        )
-                    assert self._dense_mla_flat_global_seq_lens is not None
-                    assert self._dense_mla_flat_dcp_remainder is not None
-                    global_flat_lens = self._dense_mla_flat_global_seq_lens[:total_q]
-                    torch.add(
-                        global_source_lens[:, None],
-                        offsets,
-                        out=global_flat_lens.view(metadata.num_decodes, query_len),
-                    )
-                    virtual_block = (
-                        self.dcp_world_size * self.cp_kv_cache_interleave_size
-                    )
-                    torch.div(
-                        global_flat_lens,
-                        virtual_block,
-                        rounding_mode="floor",
-                        out=flat_lens,
-                    )
-                    flat_lens.mul_(self.cp_kv_cache_interleave_size)
-                    remainder = self._dense_mla_flat_dcp_remainder[:total_q]
-                    torch.remainder(global_flat_lens, virtual_block, out=remainder)
-                    remainder.sub_(self._dcp_rank * self.cp_kv_cache_interleave_size)
-                    remainder.clamp_(
-                        min=0,
-                        max=self.cp_kv_cache_interleave_size,
-                    )
-                    flat_lens.add_(remainder)
-                else:
-                    torch.add(
-                        decode_metadata.seq_lens[:, None],
-                        offsets,
-                        out=flat_lens.view(metadata.num_decodes, query_len),
-                    )
-            else:
-                flat_lens.copy_(
-                    decode_metadata.seq_lens[:, None]
-                    .expand(-1, query_len)
-                    .reshape(total_q)
-                )
-            metadata.dense_mla_flat_block_table = flat_table
-            metadata.dense_mla_flat_seq_lens = flat_lens
-            metadata.dense_mla_flat_query_start_loc = (
-                self._dense_mla_flat_query_start_loc[: total_q + 1]
+        if total_q % metadata.num_decodes:
+            raise ValueError(
+                "B12X_MLA requires a uniform query block, got "
+                f"tokens={total_q}, requests={metadata.num_decodes}."
             )
+        query_len = total_q // metadata.num_decodes
+        source_table = decode_metadata.block_table
+        flat_lens = self._materialize_query_cache_seq_lens(
+            metadata,
+            decode_metadata,
+            query_len=query_len,
+            total_q=total_q,
+        )
+        verify_plans = getattr(self, "_dense_mla_verify_plans", {})
+        tiled_verify = (
+            metadata.causal and query_len == 4 and metadata.num_decodes in verify_plans
+        )
+        if tiled_verify:
+            verify_table = self._dense_mla_flat_block_table[: metadata.num_decodes]
+            source_width = min(
+                int(source_table.shape[1]),
+                int(verify_table.shape[1]),
+            )
+            verify_table[:, :source_width].copy_(source_table[:, :source_width])
+            metadata.dense_mla_plan = verify_plans[metadata.num_decodes]
+            metadata.dense_mla_verify_block_table = verify_table
+            metadata.dense_mla_query_cache_seq_lens = flat_lens
+            return metadata
+
+        flat_table = self._dense_mla_flat_block_table[:total_q]
+        source_width = min(int(source_table.shape[1]), int(flat_table.shape[1]))
+        flat_table[:, :source_width].copy_(
+            source_table[:, None, :source_width]
+            .expand(-1, query_len, -1)
+            .reshape(total_q, source_width)
+        )
+        metadata.dense_mla_flat_block_table = flat_table
+        metadata.dense_mla_flat_seq_lens = flat_lens
+        metadata.dense_mla_flat_query_start_loc = self._dense_mla_flat_query_start_loc[
+            : total_q + 1
+        ]
         return metadata
 
 
@@ -638,6 +793,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         self._dense_mla = _load_dense_mla()
         self._dcp_comm_backend = vllm_config.parallel_config.dcp_comm_backend
         self._dcp_max_batch_size = vllm_config.scheduler_config.max_num_batched_tokens
+        self.dcp_q_replicate = False
         self._compiled_bindings: set[tuple[object, ...]] = set()
 
     def forward_mqa(
@@ -663,6 +819,18 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         block_table = attn_metadata.decode.block_table
         seq_lens = attn_metadata.decode.seq_lens
         query_start_loc = attn_metadata.query_start_loc
+        query_cache_seq_lens = getattr(
+            attn_metadata,
+            "dense_mla_query_cache_seq_lens",
+            None,
+        )
+        verify_block_table = getattr(
+            attn_metadata,
+            "dense_mla_verify_block_table",
+            None,
+        )
+        if verify_block_table is not None:
+            block_table = verify_block_table
         flat_block_table = getattr(attn_metadata, "dense_mla_flat_block_table", None)
         if flat_block_table is not None:
             block_table = flat_block_table
@@ -677,16 +845,11 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
 
         batch = int(seq_lens.shape[0])
         total_q = int(q.shape[0])
-        if total_q != batch:
+        if query_cache_seq_lens is None and total_q != batch:
             raise ValueError(
                 "B12X_MLA requires one query row per prepared decode sequence, "
                 f"got {total_q} rows for {batch} sequences."
             )
-        if int(q.shape[1]) != self.num_heads:
-            raise ValueError(
-                f"B12X_MLA expected {self.num_heads} query heads, got {q.shape[1]}."
-            )
-
         metadata_dcp_world_size = int(
             getattr(attn_metadata, "dense_mla_dcp_world_size", self.dcp_world_size)
         )
@@ -697,33 +860,41 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             )
         effective_heads = self.num_heads * metadata_dcp_world_size
         kernel_heads = _kernel_query_heads(self.num_heads, metadata_dcp_world_size)
+        qrep_decode = self.dcp_q_replicate and metadata_dcp_world_size > 1
+        expected_input_heads = effective_heads if qrep_decode else self.num_heads
+        if int(q.shape[1]) != expected_input_heads:
+            raise ValueError(
+                f"B12X_MLA expected {expected_input_heads} query heads, "
+                f"got {q.shape[1]}."
+            )
 
         dcp_group = None
         if metadata_dcp_world_size > 1:
             dcp_group = get_dcp_group()
-            gathered_q = getattr(attn_metadata, "dense_mla_padded_q", None)
-            if gathered_q is None:
-                raise RuntimeError(
-                    "B12X_MLA DCP metadata is missing caller-owned query storage."
+            if not qrep_decode:
+                gathered_q = getattr(attn_metadata, "dense_mla_padded_q", None)
+                if gathered_q is None:
+                    raise RuntimeError(
+                        "B12X_MLA DCP metadata is missing caller-owned query storage."
+                    )
+                if int(gathered_q.shape[0]) < total_q:
+                    raise ValueError(
+                        "B12X_MLA DCP query capacity is smaller than the decode "
+                        f"batch: capacity={gathered_q.shape[0]}, required={total_q}."
+                    )
+                if gathered_q.dtype != q.dtype:
+                    raise TypeError(
+                        "B12X_MLA DCP query storage does not match the live query: "
+                        f"buffer={gathered_q.dtype}, query={q.dtype}."
+                    )
+                gathered_q = gathered_q[:total_q, :effective_heads]
+                q = dcp_b12x_all_gather_heads(
+                    q,
+                    dcp_group,
+                    max_batch_size=self._dcp_max_batch_size,
+                    output_head_dim=self.kv_lora_rank,
+                    out=gathered_q,
                 )
-            if int(gathered_q.shape[0]) < total_q:
-                raise ValueError(
-                    "B12X_MLA DCP query capacity is smaller than the decode "
-                    f"batch: capacity={gathered_q.shape[0]}, required={total_q}."
-                )
-            if gathered_q.dtype != q.dtype:
-                raise TypeError(
-                    "B12X_MLA DCP query storage does not match the live query: "
-                    f"buffer={gathered_q.dtype}, query={q.dtype}."
-                )
-            gathered_q = gathered_q[:total_q, :effective_heads]
-            q = dcp_b12x_all_gather_heads(
-                q,
-                dcp_group,
-                max_batch_size=self._dcp_max_batch_size,
-                output_head_dim=self.kv_lora_rank,
-                out=gathered_q,
-            )
 
         actual_heads = int(q.shape[1])
         if actual_heads != effective_heads:
@@ -790,6 +961,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             output=output,
             page_table=block_table,
             cache_seqlens=seq_lens,
+            query_cache_seqlens=query_cache_seq_lens,
             cu_seqlens_q=query_start_loc[: batch + 1],
             q_scale=layer._q_scale if quantized else None,
             kv_scale=layer._k_scale if quantized else None,
