@@ -282,6 +282,9 @@ class Worker(WorkerBase):
         if current_platform.is_cpu():
             return nullcontext()
 
+        if tag == "weights" and not self.vllm_config.model_config.enable_sleep_mode:
+            return nullcontext()
+
         allocator = get_mem_allocator_instance()
         if tag == "weights":
             assert allocator.get_current_usage() == 0, (

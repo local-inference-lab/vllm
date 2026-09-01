@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import gpu_worker, startup_plan
+from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
@@ -144,3 +145,75 @@ def test_b12x_warmup_precedes_cudagraph_memory_profile(monkeypatch):
         "profile_cudagraph_memory",
     ]
     assert available == 80
+
+
+def _pool_context_worker(*, enable_cumem_allocator: bool, enable_sleep_mode: bool):
+    worker = object.__new__(Worker)
+    worker.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            enable_cumem_allocator=enable_cumem_allocator,
+            enable_sleep_mode=enable_sleep_mode,
+        )
+    )
+    return worker
+
+
+def _cuda_platform():
+    platform = MagicMock()
+    platform.is_cuda_alike.return_value = True
+    platform.is_xpu.return_value = False
+    platform.is_cpu.return_value = False
+    return platform
+
+
+def test_manual_cumem_allocator_routes_only_kv_cache():
+    """Manual --enable-cumem-allocator must not force model weights into
+    the private cuMem pool (large InstantTensor loads OOM there). KV still
+    uses the pool so connectors can export shareable handles."""
+    worker = _pool_context_worker(enable_cumem_allocator=True, enable_sleep_mode=False)
+    pool_ctx = object()
+    allocator = MagicMock()
+    allocator.use_memory_pool.return_value = pool_ctx
+    allocator.get_current_usage.return_value = 0
+
+    with (
+        patch("vllm.v1.worker.gpu_worker.current_platform", _cuda_platform()),
+        patch(
+            "vllm.v1.worker.gpu_worker.get_mem_allocator_instance",
+            return_value=allocator,
+        ),
+    ):
+        weights_ctx = worker._maybe_get_memory_pool_context("weights")
+        assert isinstance(weights_ctx, nullcontext)
+        allocator.use_memory_pool.assert_not_called()
+
+        kv_ctx = worker._maybe_get_memory_pool_context("kv_cache")
+        assert kv_ctx is pool_ctx
+        allocator.use_memory_pool.assert_called_once_with(tag="kv_cache")
+
+
+def test_sleep_mode_still_routes_weights_and_kv_through_allocator():
+    """Sleep mode continues to own both weights and KV via the configured
+    sleep-mode allocator."""
+    worker = _pool_context_worker(enable_cumem_allocator=True, enable_sleep_mode=True)
+    allocator = MagicMock()
+    allocator.use_memory_pool.side_effect = lambda tag=None: (tag, "pool")
+    allocator.get_current_usage.return_value = 0
+
+    with (
+        patch("vllm.v1.worker.gpu_worker.current_platform", _cuda_platform()),
+        patch(
+            "vllm.v1.worker.gpu_worker.get_mem_allocator_instance",
+            return_value=allocator,
+        ),
+    ):
+        assert worker._maybe_get_memory_pool_context("weights") == (
+            "weights",
+            "pool",
+        )
+        assert worker._maybe_get_memory_pool_context("kv_cache") == (
+            "kv_cache",
+            "pool",
+        )
+        allocator.use_memory_pool.assert_any_call(tag="weights")
+        allocator.use_memory_pool.assert_any_call(tag="kv_cache")
