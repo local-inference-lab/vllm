@@ -356,6 +356,7 @@ def test_remote_probabilistic_sampler_uses_standard_draft_stream(monkeypatch):
         for actual, expected in zip(
             recorded["args"],
             (logits, idx_mapping, temperature, seeds, positions + 1000),
+            strict=True,
         )
     )
     assert recorded["kwargs"]["apply_temperature"] is True
