@@ -39,6 +39,24 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 PROTOCOL_VERSION = 2
+LOGITS_CAPABILITY = "dflash_logits_bf16_v1"
+
+
+def _encode_bfloat16_logits_frame(
+    logits: torch.Tensor,
+) -> tuple[dict[str, Any], bytes]:
+    """Encode contiguous draft logits as a versioned binary RPC frame."""
+    if logits.dtype != torch.bfloat16:
+        raise ValueError(f"Draft logits must be bfloat16, got {logits.dtype}")
+    logits_cpu = logits.detach().contiguous().cpu()
+    frame = logits_cpu.view(torch.uint16).numpy().tobytes()
+    metadata = {
+        "capability": LOGITS_CAPABILITY,
+        "dtype": "bfloat16",
+        "shape": list(logits_cpu.shape),
+        "nbytes": len(frame),
+    }
+    return metadata, frame
 
 
 class ProjectedContextCache:
@@ -964,7 +982,7 @@ class K3DSparkDraftEngine:
         anchor_positions: list[int],
         anchor_token_ids: list[int],
         num_speculative_tokens: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch_size = len(states)
         sample_from_anchor = self.method == "dspark"
         query_len = (
@@ -1016,7 +1034,15 @@ class K3DSparkDraftEngine:
                 assert graph_state.graph is not None
                 graph_state.graph.replay()
                 self.cuda_graph_replay_count += 1
-                return graph_state.output_tokens
+                logits = graph_state.captured_logits
+                if self.method == "dflash":
+                    assert logits is not None
+                    logits = logits.view(
+                        batch_size,
+                        num_speculative_tokens,
+                        -1,
+                    )
+                return graph_state.output_tokens, logits
             self.cuda_graph_eager_fallback_count += 1
 
         max_blocks = max(len(row) for row in block_rows)
@@ -1097,13 +1123,11 @@ class K3DSparkDraftEngine:
 
         if self.method == "dflash":
             sample_hidden = hidden.view(batch_size, query_len, -1)[:, 1:]
-            return (
-                self.model.compute_logits(
-                    sample_hidden.reshape(batch_size * num_speculative_tokens, -1)
-                )
-                .argmax(dim=-1)
-                .view(batch_size, num_speculative_tokens)
+            logits = self.model.compute_logits(
+                sample_hidden.reshape(batch_size * num_speculative_tokens, -1)
             )
+            logits = logits.view(batch_size, num_speculative_tokens, -1)
+            return logits.argmax(dim=-1), logits
 
         base_logits = self.model.compute_draft_logits(hidden).view(
             batch_size, query_len, -1
@@ -1116,7 +1140,7 @@ class K3DSparkDraftEngine:
             markov = self.model.markov_bias(self.model.markov_embed(previous))
             previous = (base_logits[:, step] + markov).argmax(dim=-1)
             draft_tokens[:, step].copy_(previous)
-        return draft_tokens
+        return draft_tokens, None
 
     @torch.inference_mode()
     def propose(self, header: dict[str, Any], frames: list[bytes]) -> dict[str, Any]:
@@ -1136,6 +1160,9 @@ class K3DSparkDraftEngine:
             raise ValueError(
                 f"num_speculative_tokens must be in [1, {self.max_speculative_tokens}]"
             )
+        return_logits = bool(header.get("return_logits", False))
+        if return_logits and self.method != "dflash":
+            raise ValueError("Probabilistic logits are supported only for DFlash")
         projected = bool(header.get("projected", False))
         context_counts = [int(req.get("context_count", 0)) for req in requests]
         if any(count < 0 for count in context_counts):
@@ -1197,7 +1224,7 @@ class K3DSparkDraftEngine:
             context_end.record()
             anchor_positions = [int(req["anchor_position"]) for req in requests]
             anchor_token_ids = [int(req["anchor_token_id"]) for req in requests]
-            draft_tokens = self._run_query_block(
+            draft_tokens, draft_logits = self._run_query_block(
                 states,
                 anchor_positions,
                 anchor_token_ids,
@@ -1209,8 +1236,23 @@ class K3DSparkDraftEngine:
             sync_done = time.perf_counter()
             tokens = draft_tokens.cpu().tolist()
             tokens_copied = time.perf_counter()
+            logits_metadata = None
+            logits_frame = None
+            if return_logits:
+                assert draft_logits is not None
+                logits_metadata, logits_frame = _encode_bfloat16_logits_frame(
+                    draft_logits
+                )
+                logits_metadata["sample_positions"] = [
+                    [
+                        anchor_position + step + 1
+                        for step in range(num_speculative_tokens)
+                    ]
+                    for anchor_position in anchor_positions
+                ]
+            logits_copied = time.perf_counter()
             self.proposal_count += 1
-            self.last_latency_ms = (tokens_copied - started) * 1000
+            self.last_latency_ms = (logits_copied - started) * 1000
             timing_ms = {
                 "decode_frames": (decoded_at - started) * 1000,
                 "lock_wait": (lock_acquired - lock_started) * 1000,
@@ -1219,17 +1261,22 @@ class K3DSparkDraftEngine:
                 "gpu_query": context_end.elapsed_time(query_end),
                 "gpu_wait": (sync_done - submit_done) * 1000,
                 "tokens_d2h": (tokens_copied - sync_done) * 1000,
+                "logits_d2h": (logits_copied - tokens_copied) * 1000,
                 "total": self.last_latency_ms,
             }
             self._record_timing(timing_ms)
-        return {
+        response = {
             "ok": True,
             "protocol": PROTOCOL_VERSION,
             "tokens": tokens,
+            "logits": logits_metadata,
             "latency_ms": self.last_latency_ms,
             "timing_ms": timing_ms,
             "active_requests": self.allocator.active_requests,
         }
+        if logits_frame is not None:
+            response["_logits_frame"] = logits_frame
+        return response
 
 
 class K3DSparkZMQServer:
@@ -1288,6 +1335,9 @@ class K3DSparkZMQServer:
                 "cold_bootstrap_count": self.engine.cold_bootstrap_count,
                 "cuda_graph_enabled": self.engine.cuda_graph_enabled,
                 "cuda_graph_shapes": self.engine.cuda_graph_shapes,
+                "capabilities": (
+                    [LOGITS_CAPABILITY] if self.engine.method == "dflash" else []
+                ),
             }
         if op == "CLEAR":
             self.engine.clear()
@@ -1353,7 +1403,11 @@ class K3DSparkZMQServer:
                         "protocol": PROTOCOL_VERSION,
                         "error": f"{type(exc).__name__}: {exc}",
                     }
-                socket.send_json(response)
+                logits_frame = response.pop("_logits_frame", None)
+                if logits_frame is None:
+                    socket.send_json(response)
+                else:
+                    socket.send_multipart([json.dumps(response).encode(), logits_frame])
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
             logger.exception("K3 DSpark proposal server failed")

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -24,6 +26,7 @@ from vllm.v1.worker.gpu.spec_decode.speculator import (
     BaseSpeculator,
     CUDAGraphCapturePhase,
 )
+from vllm.v1.worker.gpu.spec_decode.utils import draft_gumbel_pos
 
 logger = init_logger(__name__)
 
@@ -88,8 +91,42 @@ def _contiguous_draft_output(
     return draft_tokens[:num_reqs, :num_speculative_tokens].contiguous()
 
 
+LOGITS_CAPABILITY = "dflash_logits_bf16_v1"
+
+
+def _decode_bfloat16_logits_frame(
+    response: dict[str, Any],
+    expected_shape: tuple[int, int, int],
+) -> torch.Tensor:
+    """Decode and validate a BF16 draft-logit multipart frame."""
+    metadata = response.get("logits")
+    frame = response.get("_logits_frame")
+    if not isinstance(metadata, dict) or not isinstance(frame, bytes):
+        raise ValueError("Remote DFlash response is missing its logits frame")
+    if metadata.get("capability") != LOGITS_CAPABILITY:
+        raise ValueError(f"Unsupported logits capability: {metadata}")
+    if metadata.get("dtype") != "bfloat16":
+        raise ValueError(f"Unsupported logits dtype: {metadata}")
+    if tuple(metadata.get("shape", ())) != expected_shape:
+        raise ValueError(
+            f"Remote DFlash logits shape mismatch: expected={expected_shape}, "
+            f"metadata={metadata}"
+        )
+    expected_nbytes = math.prod(expected_shape) * 2
+    if metadata.get("nbytes") != expected_nbytes or len(frame) != expected_nbytes:
+        raise ValueError(
+            "Remote DFlash logits byte count mismatch: "
+            f"expected={expected_nbytes}, metadata={metadata}, frame={len(frame)}"
+        )
+    return (
+        torch.frombuffer(bytearray(frame), dtype=torch.uint16)
+        .view(torch.bfloat16)
+        .reshape(expected_shape)
+    )
+
+
 class RemoteK3DSparkSpeculator(BaseSpeculator):
-    """Forward target auxiliary states to a standalone greedy draft server."""
+    """Forward target auxiliary states to a standalone draft server."""
 
     def __init__(
         self,
@@ -105,8 +142,12 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         self.method = str(self.speculative_config.method)
         if self.method not in ("dspark", "dflash"):
             raise ValueError(f"Unsupported remote K3 draft method: {self.method}")
-        if self.speculative_config.draft_sample_method != "greedy":
-            raise ValueError("Remote K3 draft currently supports greedy drafting only")
+        sample_method = self.speculative_config.draft_sample_method
+        if sample_method not in ("greedy", "probabilistic"):
+            raise ValueError(f"Unsupported remote draft sample method: {sample_method}")
+        self._probabilistic = sample_method == "probabilistic"
+        if self._probabilistic and self.method != "dflash":
+            raise ValueError("Remote probabilistic sampling supports DFlash only")
         if self.speculative_config.rejection_sample_method != "block":
             raise ValueError(
                 "Remote K3 draft currently requires block rejection sampling"
@@ -128,6 +169,8 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             or draft_hf_config.hidden_size
         )
         self.raw_context_width = int(target_hidden_size * self.num_aux_layers)
+        self.vocab_size = int(draft_hf_config.vocab_size)
+        self.use_fp64_gumbel = bool(vllm_config.model_config.use_fp64_gumbel)
         self.address = address
         self.timeout_ms = int(
             os.environ.get(
@@ -137,6 +180,28 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         )
         self.supports_mm_inputs = False
         self.draft_logits: torch.Tensor | None = None
+        self._remote_logits: torch.Tensor | None = None
+        self._remote_sample_positions: torch.Tensor | None = None
+        if self._probabilistic:
+            head_dtype = vllm_config.model_config.head_dtype
+            if head_dtype != torch.bfloat16:
+                raise ValueError(
+                    "Remote probabilistic DFlash transport requires a BF16 head, "
+                    f"got {head_dtype}"
+                )
+            shape = (
+                self.max_num_reqs,
+                self.num_speculative_steps,
+                self.vocab_size,
+            )
+            self.draft_logits = torch.zeros(shape, dtype=head_dtype, device=device)
+            self._remote_logits = torch.zeros(shape, dtype=head_dtype, device=device)
+            self._remote_sample_positions = torch.full(
+                shape[:2],
+                -1,
+                dtype=torch.int64,
+                device=device,
+            )
         self.draft_tokens = torch.full(
             (self.max_num_reqs, self.num_speculative_steps),
             -1,
@@ -189,6 +254,16 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 dtype=torch.int64,
                 pin_memory=True,
             )
+            if self._probabilistic:
+                self._logits_staging = torch.empty(
+                    (
+                        self.max_num_reqs,
+                        self.num_speculative_steps,
+                        self.vocab_size,
+                    ),
+                    dtype=torch.bfloat16,
+                    pin_memory=True,
+                )
             self._zmq_context = zmq.Context()
             self._connect()
             response = self._rpc(
@@ -200,6 +275,11 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 raise RuntimeError(
                     "Remote K3 draft method mismatch: "
                     f"target={self.method}, server={response.get('method')}"
+                )
+            capabilities = response.get("capabilities", [])
+            if self._probabilistic and LOGITS_CAPABILITY not in capabilities:
+                raise RuntimeError(
+                    "Remote DFlash server does not advertise probabilistic logits"
                 )
             self._remote_max_requests = int(
                 response.get("max_requests", self.max_num_reqs)
@@ -239,10 +319,17 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         assert self._socket is not None
         try:
             self._socket.send_multipart(frames)
-            response = self._socket.recv_json()
+            response_frames = self._socket.recv_multipart()
         except Exception:
             self._connect()
             raise
+        if not 1 <= len(response_frames) <= 2:
+            raise RuntimeError(
+                f"K3 draft RPC returned {len(response_frames)} response frames"
+            )
+        response = json.loads(response_frames[0])
+        if len(response_frames) == 2:
+            response["_logits_frame"] = response_frames[1]
         if not isinstance(response, dict) or not response.get("ok", False):
             raise RuntimeError(f"K3 DSpark RPC failed: {response}")
         if int(response.get("protocol", -1)) != PROTOCOL_VERSION:
@@ -452,6 +539,106 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             0, active_gpu, remote_tokens
         )
 
+    def _copy_logits_from_response(
+        self,
+        response: dict[str, Any],
+        active_indices: list[int],
+        num_speculative_tokens: int,
+    ) -> None:
+        assert self._remote_logits is not None
+        assert self._remote_sample_positions is not None
+        expected_shape = (
+            len(active_indices),
+            num_speculative_tokens,
+            self.vocab_size,
+        )
+        logits = _decode_bfloat16_logits_frame(response, expected_shape)
+        sample_positions = response["logits"].get("sample_positions")
+        expected_positions = expected_shape[:2]
+        if (
+            not isinstance(sample_positions, list)
+            or len(sample_positions) != expected_positions[0]
+            or any(
+                not isinstance(row, list) or len(row) != expected_positions[1]
+                for row in sample_positions
+            )
+        ):
+            raise ValueError(
+                "Remote DFlash sample positions have the wrong shape: "
+                f"expected={expected_positions}, got={sample_positions!r}"
+            )
+        active_gpu = torch.tensor(active_indices, dtype=torch.int64, device=self.device)
+        logits_staging = self._logits_staging[
+            : len(active_indices), :num_speculative_tokens
+        ]
+        logits_staging.copy_(logits)
+        self._remote_logits.index_copy_(
+            0,
+            active_gpu,
+            logits_staging.to(self.device, non_blocking=True),
+        )
+        positions = torch.tensor(
+            sample_positions,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._remote_sample_positions.index_copy_(0, active_gpu, positions)
+
+    def _sample_remote_probabilistic(
+        self,
+        input_batch: InputBatch,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        num_speculative_tokens: int,
+    ) -> None:
+        assert self.draft_logits is not None
+        assert self._remote_logits is not None
+        assert self._remote_sample_positions is not None
+        logger.info_once(
+            "Remote K3 DFlash probabilistic sampling is active with "
+            "full-vocabulary BF16 logits"
+        )
+        num_reqs = input_batch.num_reqs
+        positions = self._remote_sample_positions[:num_reqs, :num_speculative_tokens]
+        request_rows, draft_steps = torch.where(positions >= 0)
+        if request_rows.numel() == 0:
+            return
+        idx_mapping = input_batch.idx_mapping[:num_reqs].index_select(0, request_rows)
+        logits = self._remote_logits[request_rows, draft_steps].contiguous()
+        sampled = self._sample_probabilistic_draft(
+            logits=logits,
+            positions=positions[request_rows, draft_steps] - 2,
+            idx_mapping=idx_mapping,
+            temperature=temperature,
+            seeds=seeds,
+            draft_step=draft_steps,
+            draft_logits=self.draft_logits,
+        )
+        self.draft_tokens[request_rows, draft_steps] = sampled
+
+    def _sample_probabilistic_draft(
+        self,
+        logits: torch.Tensor,
+        positions: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        draft_step: torch.Tensor,
+        draft_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sample remote logits from the standard disjoint draft stream."""
+        return gumbel_sample(
+            logits,
+            idx_mapping,
+            temperature,
+            seeds,
+            draft_gumbel_pos(positions),
+            apply_temperature=True,
+            logits_cache=draft_logits,
+            logits_cache_col=draft_step,
+            use_fp64=self.use_fp64_gumbel,
+        )
+
     def _record_timing(self, timing_ms: dict[str, float]) -> None:
         if self._timing_log_interval <= 0:
             return
@@ -650,6 +837,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             "op": "PROPOSE",
             "projected": False,
             "num_speculative_tokens": num_speculative_tokens,
+            "return_logits": self._probabilistic,
             "requests": requests,
         }
         response = self._rpc(
@@ -661,6 +849,12 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             active_indices,
             num_speculative_tokens,
         )
+        if self._probabilistic:
+            self._copy_logits_from_response(
+                response,
+                active_indices,
+                num_speculative_tokens,
+            )
         output_copied = time.perf_counter()
         timing_ms = {
             "metadata_d2h": (metadata_ready - started) * 1000,
@@ -717,8 +911,6 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             attn_metadata,
             slot_mappings,
             last_hidden_states,
-            temperature,
-            seeds,
             num_tokens_across_dp,
             skip_attn_for_dummy_run,
             mm_inputs,
@@ -740,6 +932,13 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             )
         output = self.draft_tokens[: input_batch.num_reqs, :active_k]
         output.fill_(-1)
+        if self._probabilistic:
+            assert self.draft_logits is not None
+            assert self._remote_logits is not None
+            assert self._remote_sample_positions is not None
+            self.draft_logits.zero_()
+            self._remote_logits.zero_()
+            self._remote_sample_positions.fill_(-1)
         if self._tp_rank == 0 and not (dummy_run or is_profile):
             try:
                 self._rank0_propose(
@@ -762,6 +961,17 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                     "Remote K3 DSpark proposal failed; drafting is disabled for "
                     "this step"
                 )
+        if self._probabilistic and not (dummy_run or is_profile):
+            assert self._remote_logits is not None
+            assert self._remote_sample_positions is not None
+            self._tp_group.broadcast(self._remote_logits, src=0)
+            self._tp_group.broadcast(self._remote_sample_positions, src=0)
+            self._sample_remote_probabilistic(
+                input_batch,
+                temperature,
+                seeds,
+                active_k,
+            )
         # Slicing the active depth from the max-width persistent buffer leaves
         # a larger row stride whenever adaptive K is below the configured
         # maximum. NCCL broadcast requires a contiguous tensor. Materialize

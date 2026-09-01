@@ -9,6 +9,7 @@ import torch
 from vllm.entrypoints.k3_dspark_rpc import (
     DraftKVSlotAllocator,
     ProjectedContextCache,
+    _encode_bfloat16_logits_frame,
 )
 from vllm.entrypoints.k3_dspark_standalone import (
     EMBED_TENSOR,
@@ -170,3 +171,30 @@ def test_projected_context_cache_rejects_device_mismatch():
 
     with pytest.raises(ValueError, match="device mismatch"):
         cache.append(0, states)
+
+
+def test_encode_bfloat16_logits_frame_preserves_shape_and_bits():
+    logits = torch.tensor(
+        [[[1.0, -2.0], [3.5, 0.25]]],
+        dtype=torch.bfloat16,
+    )
+
+    metadata, frame = _encode_bfloat16_logits_frame(logits)
+
+    assert metadata == {
+        "capability": "dflash_logits_bf16_v1",
+        "dtype": "bfloat16",
+        "shape": [1, 2, 2],
+        "nbytes": 8,
+    }
+    decoded = (
+        torch.frombuffer(bytearray(frame), dtype=torch.uint16)
+        .view(torch.bfloat16)
+        .reshape(1, 2, 2)
+    )
+    assert torch.equal(decoded, logits)
+
+
+def test_encode_logits_rejects_non_bfloat16_input():
+    with pytest.raises(ValueError, match="must be bfloat16"):
+        _encode_bfloat16_logits_frame(torch.zeros(1, 2, dtype=torch.float32))
