@@ -6280,6 +6280,43 @@ def test_mixed_prefill_budget_reserves_waiter_then_rotates_running(
     ]
 
 
+def test_partial_prefill_limit_keeps_excess_waiter_queued(lp11_model_path):
+    scheduler, (p0, p1) = _prepare_lp11_prefills(
+        lp11_model_path,
+        num_prefills=2,
+        mixed_prefill_budget=4608,
+    )
+    scheduler.max_num_partial_prefills = 2
+    assert len(scheduler._inflight_prefills) == 2
+    (waiter,) = create_requests(
+        num_requests=1,
+        num_tokens=12000,
+        req_ids=["waiter"],
+    )
+    scheduler.add_request(waiter)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {
+        "decode": 1,
+        p0.request_id: 2304,
+        p1.request_id: 2304,
+    }
+    assert waiter not in scheduler.running
+    assert waiter in scheduler.waiting
+    assert len(scheduler._inflight_prefills) == 2
+
+
+def test_max_num_partial_prefills_validation():
+    with pytest.raises(ValueError, match="max_num_partial_prefills"):
+        SchedulerConfig(
+            max_model_len=32768,
+            is_encoder_decoder=False,
+            max_num_seqs=2,
+            max_num_partial_prefills=3,
+        )
+
+
 def test_mixed_prefill_budget_does_not_limit_prefill_only_step(lp11_model_path):
     scheduler = create_scheduler(
         model=lp11_model_path,

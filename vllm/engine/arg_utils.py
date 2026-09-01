@@ -637,6 +637,7 @@ class EngineArgs:
     max_num_prefill_tokens_per_step: int = (
         SchedulerConfig.max_num_prefill_tokens_per_step
     )
+    max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
 
     watermark: float = SchedulerConfig.watermark
 
@@ -1594,6 +1595,10 @@ class EngineArgs:
             **scheduler_kwargs["max_num_prefill_tokens_per_step"],
         )
         scheduler_group.add_argument(
+            "--max-num-partial-prefills",
+            **scheduler_kwargs["max_num_partial_prefills"],
+        )
+        scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
         )
@@ -2377,6 +2382,7 @@ class EngineArgs:
             max_num_prefill_tokens_per_step=(
                 self.max_num_prefill_tokens_per_step
             ),
+            max_num_partial_prefills=self.max_num_partial_prefills,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
