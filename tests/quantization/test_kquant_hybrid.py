@@ -132,6 +132,31 @@ def test_config_accepts_tp_independent_qsrt() -> None:
     assert config.trellis_codebook == "sqg_xor_cheb_t12"
 
 
+def test_mxfp8_dense_config_keeps_multimodal_modules_unquantized() -> None:
+    config = KQuantHybridConfig.from_config(
+        _base_config(
+            dense_format="mxfp8",
+            ignored_layers=["kv_b_proj", "vision_tower"],
+        )
+    )
+
+    assert config.dense_ignored_layers == [
+        "kv_b_proj",
+        "vision_tower",
+        "mm_projector",
+    ]
+    assert _is_dense_layer_ignored(
+        "vision_tower.encoder.blocks.0.wqkv",
+        config.dense_ignored_layers,
+        {},
+    )
+    assert _is_dense_layer_ignored(
+        "mm_projector.linear_1",
+        config.dense_ignored_layers,
+        {},
+    )
+
+
 def test_config_accepts_atoms_v2_revision() -> None:
     descriptor = _qsrt_descriptor(
         schema="qsrt_kimi_k3_qsrt_atoms_v2",

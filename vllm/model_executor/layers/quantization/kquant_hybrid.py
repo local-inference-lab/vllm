@@ -63,6 +63,10 @@ _QSRT_X4T_W13_EXCEPTION_ROW_ROTATION = 0
 _QSRT_ATOMS_V2_PROFILE_H308 = "k3x22_k4x2"
 _QSRT_ATOMS_V2_PROFILE_COUPLED_K2 = "k2_coupled_h512_h128"
 _QSRT_ATOMS_V2_PROFILE_COUPLED_H308 = "k3x22_k4x2_coupled_h512_h128"
+_UNSERIALIZED_MULTIMODAL_DENSE_COMPONENTS = (
+    "vision_tower",
+    "mm_projector",
+)
 
 
 def _qsrt_atoms_v2_w4a8_prefill_enabled(*, pure_k2: bool) -> bool:
@@ -523,7 +527,12 @@ class KQuantHybridConfig(ModelOptNvFp4Config):
                 raise ValueError(f"unsupported dense_format {dense_format!r}")
             config.dense_format = dense_format
             config.dense_ignored_layers = list(
-                original_config.get("ignored_layers") or []
+                dict.fromkeys(
+                    [
+                        *(original_config.get("ignored_layers") or []),
+                        *_UNSERIALIZED_MULTIMODAL_DENSE_COMPONENTS,
+                    ]
+                )
             )
         return config
 
