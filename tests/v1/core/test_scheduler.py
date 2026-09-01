@@ -6166,3 +6166,210 @@ def test_encoder_input_skipped_when_connector_already_has_the_item(ec_role: str)
 
     assert output.num_scheduled_tokens[req_id] > 0
     assert not output.scheduled_encoder_inputs.get(req_id)
+
+
+@pytest.fixture
+def lp11_model_path(tmp_path):
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    return str(tmp_path)
+
+
+def _establish_decode_request(scheduler, req_id: str = "decode"):
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=200,
+        req_ids=[req_id],
+    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[req_id],
+            req_id_to_index={req_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert request in scheduler.running
+    assert not request.is_prefill_chunk
+    return request
+
+
+def _empty_output_for_schedule(output: SchedulerOutput) -> ModelRunnerOutput:
+    req_ids = list(output.num_scheduled_tokens)
+    return ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
+        sampled_token_ids=[
+            [0] if req_id == "decode" else [] for req_id in req_ids
+        ],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def test_mixed_prefill_budget_is_shared_across_waiting_requests(lp11_model_path):
+    scheduler = create_scheduler(
+        model=lp11_model_path,
+        skip_tokenizer_init=True,
+        device="cpu",
+        max_num_seqs=8,
+        max_num_batched_tokens=64,
+        max_model_len=256,
+        max_num_prefill_tokens_per_step=16,
+    )
+    _establish_decode_request(scheduler)
+
+    prefills = create_requests(
+        num_requests=4,
+        num_tokens=160,
+        req_ids=["p0", "p1", "p2", "p3"],
+    )
+    for request in prefills:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert "decode" in output.num_scheduled_tokens
+    assert [output.num_scheduled_tokens[r.request_id] for r in prefills] == [4] * 4
+    assert sum(output.num_scheduled_tokens[r.request_id] for r in prefills) == 16
+
+
+def test_mixed_prefill_budget_does_not_limit_prefill_only_step(lp11_model_path):
+    scheduler = create_scheduler(
+        model=lp11_model_path,
+        skip_tokenizer_init=True,
+        device="cpu",
+        max_num_batched_tokens=64,
+        max_model_len=256,
+        max_num_prefill_tokens_per_step=16,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        req_ids=["prefill"],
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 64
+
+
+def test_mixed_prefill_budget_reserves_a_waiting_slot(lp11_model_path):
+    scheduler = create_scheduler(
+        model=lp11_model_path,
+        skip_tokenizer_init=True,
+        device="cpu",
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
+        max_model_len=256,
+        max_num_prefill_tokens_per_step=16,
+    )
+    _establish_decode_request(scheduler)
+    p0, p1 = create_requests(
+        num_requests=2,
+        num_tokens=160,
+        req_ids=["p0", "p1"],
+    )
+    scheduler.add_request(p0)
+    scheduler.add_request(p1)
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, _empty_output_for_schedule(output))
+    assert p0 in scheduler.running and p1 in scheduler.running
+
+    (p2,) = create_requests(
+        num_requests=1,
+        num_tokens=160,
+        req_ids=["p2"],
+    )
+    scheduler.add_request(p2)
+    output = scheduler.schedule()
+
+    assert "decode" in output.num_scheduled_tokens
+    assert all(
+        req_id in output.num_scheduled_tokens for req_id in ("p0", "p1", "p2")
+    )
+    assert (
+        sum(
+            output.num_scheduled_tokens[req_id] for req_id in ("p0", "p1", "p2")
+        )
+        <= 16
+    )
+
+
+def test_mixed_prefill_budget_rotates_extra_tokens_without_reordering(lp11_model_path):
+    scheduler = create_scheduler(
+        model=lp11_model_path,
+        skip_tokenizer_init=True,
+        device="cpu",
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
+        max_model_len=256,
+        max_num_prefill_tokens_per_step=16,
+    )
+    _establish_decode_request(scheduler)
+    prefills = create_requests(
+        num_requests=3,
+        num_tokens=160,
+        req_ids=["p0", "p1", "p2"],
+    )
+    for request in prefills:
+        scheduler.add_request(request)
+
+    largest_share_ids = []
+    for _ in range(3):
+        output = scheduler.schedule()
+        shares = {
+            request.request_id: output.num_scheduled_tokens[request.request_id]
+            for request in prefills
+        }
+        assert sorted(shares.values()) == [5, 5, 6]
+        largest_share_ids.append(max(shares, key=shares.get))
+        assert [request.request_id for request in scheduler.running] == [
+            "decode",
+            "p0",
+            "p1",
+            "p2",
+        ]
+        scheduler.update_from_output(output, _empty_output_for_schedule(output))
+
+    assert largest_share_ids == ["p0", "p1", "p2"]
+
+
+def test_mixed_prefill_budget_distributes_mamba_aligned_candidate_values():
+    scheduler = Mock(
+        need_mamba_block_aligned_split=True,
+        mamba_block_size=256,
+        _prefill_budget_rotation=0,
+    )
+
+    small = Scheduler._distribute_prefill_token_budget(scheduler, 2304, 7)
+    assert sum(small) == 2304
+    assert sorted(small) == [256, 256, 256, 256, 256, 512, 512]
+    assert small[:2] == [512, 512]
+
+    large = Scheduler._distribute_prefill_token_budget(scheduler, 4608, 7)
+    assert sum(large) == 4608
+    assert sorted(large) == [512, 512, 512, 768, 768, 768, 768]
+    assert large[2:6] == [768, 768, 768, 768]
+
+    assert all(tokens % 256 == 0 for tokens in small + large)
+
+
+@pytest.mark.parametrize("value", [-1, 65])
+def test_max_num_prefill_tokens_per_step_validation(value: int):
+    with pytest.raises(ValueError):
+        SchedulerConfig(
+            max_model_len=256,
+            is_encoder_decoder=False,
+            max_num_batched_tokens=64,
+            max_num_prefill_tokens_per_step=value,
+        )
