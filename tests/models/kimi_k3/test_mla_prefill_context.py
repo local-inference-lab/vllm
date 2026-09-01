@@ -9,6 +9,7 @@ would, chunk for chunk.
 """
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -135,6 +136,7 @@ class _FusedLayer:
         self._k_scale = k_scale
         self.kv_lora_rank = _KV_LORA_RANK
         self.num_local_heads = _NUM_HEADS
+        self.dcp_world_size = 1
         self.qk_nope_head_dim = _QK_NOPE
         self.v_head_dim = _V_HEAD_DIM
 
@@ -317,3 +319,62 @@ def test_fused_context_rejects_an_unquantized_query() -> None:
     )
     with pytest.raises(AssertionError, match="new-token epilogue"):
         layer._compute_prefill_context(q, SimpleNamespace(prefill=prefill))
+
+
+@torch.inference_mode()
+def test_fused_context_consumes_direct_dcp_final_layout(monkeypatch) -> None:
+    """The K3 loop must consume compact DCP planes without rank-major reorg."""
+    device = torch.device("cuda")
+    workspace = torch.empty((2, _ENTRY), device=device, dtype=torch.bfloat16)
+    kv_c = torch.randn((3, 1, _KV_LORA_RANK), device=device, dtype=torch.bfloat16)
+    k_pe = torch.randn((3, 1, _QK_ROPE), device=device, dtype=torch.bfloat16)
+    dcp_kv_gather = MagicMock(use_direct_kv_gather=True)
+    dcp_kv_gather.direct_kv_gather.return_value = (kv_c, k_pe)
+    chunk = SimpleNamespace(
+        request_slice=slice(0, 1),
+        padded_local_cu_seq_lens=torch.tensor([0, 2], device=device),
+        padded_local_token_to_seq=torch.zeros(2, dtype=torch.int32, device=device),
+        final_layout_dst_rows=torch.tensor([0, 2], dtype=torch.int32, device=device),
+        num_local_context_tokens=2,
+        num_context_tokens=3,
+        num_requests=1,
+        starts=torch.tensor([0], dtype=torch.int32, device=device),
+        index=5,
+    )
+    prefill = SimpleNamespace(
+        block_table=torch.zeros((1, 1), dtype=torch.int32, device=device),
+        chunked_context=SimpleNamespace(
+            workspace=workspace,
+            dcp_manager=dcp_kv_gather,
+        ),
+    )
+    gather_cache = MagicMock()
+    monkeypatch.setattr(
+        "vllm.models.kimi_k3.nvidia.mla.ops.cp_gather_cache", gather_cache
+    )
+    layer = _FusedLayer(
+        _KVBProj(device, weight_dtype=torch.bfloat16),
+        torch.empty((1, _BLOCK_SIZE, _ENTRY), device=device, dtype=torch.bfloat16),
+        "auto",
+        torch.ones(1, dtype=torch.float32, device=device),
+    )
+    layer.dcp_world_size = 2
+
+    actual_kv_c, actual_k_pe = layer._gather_context_latent(
+        chunk,
+        layer.kv_cache,
+        prefill,
+        fp8_prefill=False,
+    )
+
+    assert actual_kv_c is kv_c
+    assert actual_k_pe is k_pe
+    gather_cache.assert_called_once()
+    dcp_kv_gather.direct_kv_gather.assert_called_once()
+    local_rows, dst_rows, output_tokens, slot = (
+        dcp_kv_gather.direct_kv_gather.call_args.args
+    )
+    assert local_rows.data_ptr() == workspace.data_ptr()
+    assert dst_rows is chunk.final_layout_dst_rows
+    assert output_tokens == 3
+    assert slot == 1

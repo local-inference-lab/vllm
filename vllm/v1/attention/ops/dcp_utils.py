@@ -538,17 +538,18 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
 
         kv_shape = (num_ubatches, 2, max_gathered_tokens, token_dim)
         signal_shape = (num_ubatches, 2, self.world_size)
-        self.received_kv, _ = self._allocate(kv_shape, dtype)
-        self.received_signal, _ = self._allocate(signal_shape, torch.int32)
+        self.received_kv, self.peer_kv_ptrs = self._allocate(kv_shape, dtype)
+        self.received_signal, self.peer_signal_ptrs = self._allocate(
+            signal_shape, torch.int32
+        )
         kv_multicast_ptrs = self._multicast_ptrs(self.received_kv)
         signal_multicast_ptrs = self._multicast_ptrs(self.received_signal)
         self.multicast_ptrs = list(
             zip(kv_multicast_ptrs, signal_multicast_ptrs, strict=True)
         )
-        if not all(kv_ptr and signal_ptr for kv_ptr, signal_ptr in self.multicast_ptrs):
-            raise RuntimeError(
-                "Direct DCP kv-gather requires NVLS symmetric-memory multicast."
-            )
+        self.uses_multicast = all(
+            kv_ptr and signal_ptr for kv_ptr, signal_ptr in self.multicast_ptrs
+        )
         self.completion = self.received_signal.new_zeros((num_ubatches, 2))
         torch.accelerator.synchronize()
 
@@ -574,6 +575,8 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
         torch.ops._C.direct_dcp_kv_gather(
             local_kv,
             dst_rows,
+            self.peer_kv_ptrs[ubatch],
+            self.peer_signal_ptrs[ubatch],
             self.received_kv[ubatch],
             self.received_signal[ubatch],
             self.completion[ubatch],
@@ -606,7 +609,7 @@ def get_direct_dcp_kv_gather_workspace(
     dtype: torch.dtype,
     num_ubatches: int,
 ) -> DirectDCPKVGatherWorkspace | None:
-    if not _direct_dcp_multicast_enabled(
+    if not _direct_dcp_enabled(
         group,
         dtype,
         envs.VLLM_USE_DIRECT_DCP_KV_GATHER,
@@ -626,6 +629,110 @@ def get_direct_dcp_kv_gather_workspace(
     )
 
 
+class MLADCPKVGather:
+    """Own the exact DCP context-KV collective independently of decode DCP.
+
+    Backends such as B12X own their decode query/output exchange, but chunked
+    prefill still needs to exchange compressed KV. Keeping that collective in
+    a small standalone object lets those backends use the final-layout
+    symmetric publisher without duplicating the decode collectives.
+    """
+
+    def __init__(
+        self,
+        group: GroupCoordinator,
+        device: torch.device,
+        num_ubatches: int,
+    ) -> None:
+        self.group = group
+        self.device = torch.device(device)
+        self.num_ubatches = max(num_ubatches, 1)
+        self._direct_kv_gather_workspace: DirectDCPKVGatherWorkspace | None = None
+        self._kv_gather: Callable[[torch.Tensor, torch.Tensor], object] | None = None
+
+    def init_kv_gather(
+        self,
+        max_gathered_tokens: int,
+        token_dim: int,
+        plane_split_dim: int,
+        dtype: torch.dtype,
+    ) -> bool:
+        """Select the KV collective before allocating its local scratch.
+
+        Returns whether the direct final-layout publisher was selected. That
+        path only needs one rank's local rows; the fallback additionally needs
+        a rank-major all-gather destination.
+        """
+        world_size = self.group.world_size
+        if max_gathered_tokens <= 0 or max_gathered_tokens % world_size != 0:
+            raise ValueError(
+                "DCP KV gather capacity must be positive and divide evenly "
+                f"across {world_size} ranks, got {max_gathered_tokens}"
+            )
+        if token_dim <= 0:
+            raise ValueError(
+                f"DCP KV gather token dimension must be positive: {token_dim}"
+            )
+
+        direct_workspace = get_direct_dcp_kv_gather_workspace(
+            self.group,
+            self.device,
+            max_gathered_tokens,
+            token_dim,
+            plane_split_dim,
+            dtype,
+            self.num_ubatches,
+        )
+        self._direct_kv_gather_workspace = direct_workspace
+        if direct_workspace is not None:
+            transport = (
+                "NVLS multicast" if direct_workspace.uses_multicast else "PCIe peer"
+            )
+            logger.info_once(
+                "Using direct symmetric-memory DCP final-layout KV %s publisher "
+                "for MLA.",
+                transport,
+            )
+            self._kv_gather = None
+        else:
+            self._kv_gather = functools.partial(
+                torch.distributed.all_gather_into_tensor,
+                group=self.group.device_group,
+            )
+        return direct_workspace is not None
+
+    @property
+    def use_direct_kv_gather(self) -> bool:
+        return self._direct_kv_gather_workspace is not None
+
+    def kv_gather(
+        self,
+        gathered_kv: torch.Tensor,
+        local_kv: torch.Tensor,
+    ) -> object:
+        kv_gather = self._kv_gather
+        if kv_gather is None:
+            raise RuntimeError("NCCL DCP KV gather is not selected")
+        return kv_gather(gathered_kv, local_kv)
+
+    def direct_kv_gather(
+        self,
+        local_kv: torch.Tensor,
+        dst_rows: torch.Tensor,
+        output_tokens: int,
+        buffer_slot: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        workspace = self._direct_kv_gather_workspace
+        if workspace is None:
+            raise RuntimeError("direct DCP KV gather is not enabled")
+        return workspace.gather(
+            local_kv,
+            dst_rows,
+            output_tokens,
+            buffer_slot,
+        )
+
+
 class DCPCombine(Protocol):
     def __call__(
         self,
@@ -637,10 +744,8 @@ class DCPCombine(Protocol):
     ) -> torch.Tensor: ...
 
 
-class MLADCPManager:
+class MLADCPManager(MLADCPKVGather):
     """Select and own layer-level collective implementations for MLA DCP."""
-
-    _kv_gather: Callable[[torch.Tensor, torch.Tensor], object] | None
 
     def __init__(
         self,
@@ -656,15 +761,14 @@ class MLADCPManager:
         use_pcp: bool,
     ) -> None:
         parallel_config = vllm_config.parallel_config
-        self.group = get_dcp_group()
-        self.device = torch.device(device)
-        self.num_ubatches = max(parallel_config.num_ubatches, 1)
+        super().__init__(
+            get_dcp_group(),
+            device,
+            parallel_config.num_ubatches,
+        )
         self.max_num_tokens = get_dcp_workspace_max_num_tokens(vllm_config)
         self.use_a2a = parallel_config.dcp_comm_backend == "a2a"
         self.padded_num_heads = padded_num_heads
-        self._direct_kv_gather_workspace: DirectDCPKVGatherWorkspace | None = None
-        self._kv_gather = None
-
         self.combine = self._init_combine(
             num_heads,
             output_head_dim,
@@ -747,80 +851,3 @@ class MLADCPManager:
         if self.padded_num_heads is not None:
             query = reserve_query_head_storage(query, self.padded_num_heads)
         return query
-
-    def init_kv_gather(
-        self,
-        max_gathered_tokens: int,
-        token_dim: int,
-        plane_split_dim: int,
-        dtype: torch.dtype,
-    ) -> bool:
-        """Select the KV collective before allocating its local scratch.
-
-        Returns whether the direct final-layout publisher was selected.  That
-        path only needs one rank's local rows; the fallback additionally needs
-        a rank-major all-gather destination.
-        """
-        world_size = self.group.world_size
-        if max_gathered_tokens <= 0 or max_gathered_tokens % world_size != 0:
-            raise ValueError(
-                "DCP KV gather capacity must be positive and divide evenly "
-                f"across {world_size} ranks, got {max_gathered_tokens}"
-            )
-        if token_dim <= 0:
-            raise ValueError(
-                f"DCP KV gather token dimension must be positive: {token_dim}"
-            )
-
-        direct_workspace = get_direct_dcp_kv_gather_workspace(
-            self.group,
-            self.device,
-            max_gathered_tokens,
-            token_dim,
-            plane_split_dim,
-            dtype,
-            self.num_ubatches,
-        )
-        self._direct_kv_gather_workspace = direct_workspace
-        if direct_workspace is not None:
-            logger.info_once(
-                "Using direct symmetric-memory DCP final-layout KV multicast for MLA."
-            )
-            self._kv_gather = None
-        else:
-            self._kv_gather = functools.partial(
-                torch.distributed.all_gather_into_tensor,
-                group=self.group.device_group,
-            )
-        return direct_workspace is not None
-
-    @property
-    def use_direct_kv_gather(self) -> bool:
-        return self._direct_kv_gather_workspace is not None
-
-    def kv_gather(
-        self,
-        gathered_kv: torch.Tensor,
-        local_kv: torch.Tensor,
-    ) -> object:
-        kv_gather = self._kv_gather
-        if kv_gather is None:
-            raise RuntimeError("NCCL DCP KV gather is not selected")
-        return kv_gather(gathered_kv, local_kv)
-
-    def direct_kv_gather(
-        self,
-        local_kv: torch.Tensor,
-        dst_rows: torch.Tensor,
-        output_tokens: int,
-        buffer_slot: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        workspace = self._direct_kv_gather_workspace
-        if not self.use_direct_kv_gather or workspace is None:
-            raise RuntimeError("direct DCP KV gather is not enabled")
-        return workspace.gather(
-            local_kv,
-            dst_rows,
-            output_tokens,
-            buffer_slot,
-        )

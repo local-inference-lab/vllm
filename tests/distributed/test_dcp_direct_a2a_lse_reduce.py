@@ -31,6 +31,20 @@ def _has_multicast_support() -> bool:
         return False
 
 
+def _has_peer_access_support(device_count: int) -> bool:
+    if torch.cuda.device_count() < device_count:
+        return False
+    try:
+        return all(
+            source == destination
+            or torch.cuda.can_device_access_peer(source, destination)
+            for source in range(device_count)
+            for destination in range(device_count)
+        )
+    except Exception:
+        return False
+
+
 def _dtype_from_name(dtype_name: str) -> torch.dtype:
     return {
         "float16": torch.float16,
@@ -260,30 +274,9 @@ class TestDirectDCPGating:
 
         assert result is workspace
 
-    @pytest.mark.parametrize(
-        ("flag_name", "factory_name", "factory_args"),
-        [
-            (
-                "VLLM_USE_DIRECT_DCP_Q_GATHER",
-                "get_direct_dcp_q_gather_workspace",
-                (16, 2, 32, torch.bfloat16, 1),
-            ),
-            (
-                "VLLM_USE_DIRECT_DCP_KV_GATHER",
-                "get_direct_dcp_kv_gather_workspace",
-                (64, 576, 512, torch.bfloat16, 1),
-            ),
-        ],
-    )
-    def test_gather_requires_multicast(
-        self,
-        monkeypatch,
-        flag_name,
-        factory_name,
-        factory_args,
-    ):
-        factory = getattr(dcp_utils, factory_name)
-        monkeypatch.setenv(flag_name, "1")
+    def test_q_gather_requires_multicast(self, monkeypatch):
+        factory = dcp_utils.get_direct_dcp_q_gather_workspace
+        monkeypatch.setenv("VLLM_USE_DIRECT_DCP_Q_GATHER", "1")
         monkeypatch.setattr(dcp_utils, "_symm_mem_spans_group", lambda group: False)
         factory.cache_clear()
 
@@ -291,10 +284,38 @@ class TestDirectDCPGating:
             factory(
                 _FakeGroupCoordinator(),
                 torch.device("cpu"),
-                *factory_args,
+                16,
+                2,
+                32,
+                torch.bfloat16,
+                1,
             )
             is None
         )
+
+    def test_kv_gather_accepts_peer_path_without_multicast(self, monkeypatch):
+        monkeypatch.setenv("VLLM_USE_DIRECT_DCP_KV_GATHER", "1")
+        monkeypatch.setattr(dcp_utils, "_symm_mem_spans_group", lambda group: False)
+        dcp_utils.get_direct_dcp_kv_gather_workspace.cache_clear()
+        workspace = object()
+        init_workspace = MagicMock(return_value=workspace)
+        monkeypatch.setattr(
+            dcp_utils,
+            "DirectDCPKVGatherWorkspace",
+            init_workspace,
+        )
+
+        result = dcp_utils.get_direct_dcp_kv_gather_workspace(
+            _FakeGroupCoordinator(),
+            torch.device("cpu"),
+            64,
+            576,
+            512,
+            torch.bfloat16,
+            1,
+        )
+
+        assert result is workspace
 
     def test_kv_gather_rejects_invalid_workspace_geometry(self):
         with pytest.raises(ValueError, match="ubatch"):
@@ -1141,8 +1162,8 @@ def _distributed_direct_kv_gather_worker(env: dict[str, str]) -> None:
         pytest.param(
             4,
             marks=pytest.mark.skipif(
-                torch.accelerator.device_count() < 4 or not _has_multicast_support(),
-                reason="Need 4 GPUs with symmetric-memory multicast.",
+                not _has_peer_access_support(4),
+                reason="Need 4 GPUs with mutual CUDA peer access.",
             ),
         ),
     ],

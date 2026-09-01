@@ -1111,23 +1111,21 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         )
 
         fp8_prefill = q.dtype == current_platform.fp8_dtype()
-        workspace = chunked_context.workspace
         kv_cache = self._attn_read_kv_cache()
         kv_b_proj_input_dtype = _get_kv_b_proj_input_dtype(self.kv_b_proj, fp8_prefill)
 
         def run_chunk(
             chunk, out: torch.Tensor | None = None
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            self._gather_context_latent(chunk, kv_cache, prefill, fp8_prefill)
-            gathered = workspace[: chunk.num_context_tokens]
-            kv_c_normed = gathered[..., : self.kv_lora_rank]
+            kv_c_normed, k_pe = self._gather_context_latent(
+                chunk, kv_cache, prefill, fp8_prefill
+            )
             if kv_b_proj_input_dtype is not None:
                 kv_c_normed = kv_c_normed.to(kv_b_proj_input_dtype)
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k_pe = gathered[..., self.kv_lora_rank :]
             if fp8_prefill:
                 k, v = fused_mla_kv_concat_quant_fp8(k_nope, k_pe, v)
             else:
@@ -1201,16 +1199,62 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         kv_cache: torch.Tensor,
         prefill,
         fp8_prefill: bool,
-    ) -> None:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather one chunk's paged context latent into the workspace.
 
-        Dispatched exactly as in ``impl._compute_prefill_context``: an fp8 query
-        reads the plain fp8 cache in its stored layout, anything else lands in the
-        workspace as the model dtype.
+        Under DCP, gather the local paged shard and let the exact direct
+        publisher place every rank's valid rows straight into compact
+        request-major KV planes. Non-DCP keeps the merged-row workspace layout.
         """
-        workspace = prefill.chunked_context.workspace
-        toks = chunk.num_context_tokens
+        chunked_context = prefill.chunked_context
+        assert chunked_context is not None
+        workspace = chunked_context.workspace
         block_table = prefill.block_table[chunk.request_slice]
+        if self.dcp_world_size > 1:
+            dcp_kv_gather = chunked_context.dcp_manager
+            assert dcp_kv_gather is not None and dcp_kv_gather.use_direct_kv_gather
+            assert chunk.padded_local_cu_seq_lens is not None
+            assert chunk.padded_local_token_to_seq is not None
+            assert chunk.final_layout_dst_rows is not None
+            toks = chunk.num_local_context_tokens
+            if self.kv_cache_dtype == "fp8_ds_mla":
+                ops.cp_gather_and_upconvert_fp8_kv_cache(
+                    src_cache=kv_cache,
+                    dst=workspace[:toks],
+                    block_table=block_table,
+                    workspace_starts=chunk.padded_local_cu_seq_lens,
+                    batch_size=chunk.num_requests,
+                    seq_starts=chunk.starts,
+                )
+            elif is_quantized_kv_cache(self.kv_cache_dtype):
+                ops.gather_and_maybe_dequant_cache(
+                    src_cache=kv_cache,
+                    dst=workspace,
+                    block_table=block_table,
+                    cu_seq_lens=chunk.padded_local_cu_seq_lens,
+                    token_to_seq=chunk.padded_local_token_to_seq,
+                    num_tokens=toks,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=self._k_scale,
+                    seq_starts=chunk.starts,
+                )
+            else:
+                ops.cp_gather_cache(
+                    src_cache=kv_cache,
+                    dst=workspace,
+                    block_table=block_table,
+                    cu_seq_lens=chunk.padded_local_cu_seq_lens,
+                    batch_size=chunk.num_requests,
+                    seq_starts=chunk.starts,
+                )
+            return dcp_kv_gather.direct_kv_gather(
+                workspace[:toks],
+                chunk.final_layout_dst_rows,
+                chunk.num_context_tokens,
+                chunk.index & 1,
+            )
+
+        toks = chunk.num_context_tokens
         if self.kv_cache_dtype == "fp8_ds_mla":
             ops.cp_gather_and_upconvert_fp8_kv_cache(
                 src_cache=kv_cache,
@@ -1241,6 +1285,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 batch_size=chunk.num_requests,
                 seq_starts=chunk.starts,
             )
+        gathered = workspace[:toks]
+        return (
+            gathered[..., : self.kv_lora_rank],
+            gathered[..., self.kv_lora_rank :],
+        )
 
     def _forward_prefill_fused(
         self,
@@ -1256,9 +1305,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         """Prefill using the fused key-concat + cache-insert kernel.
 
         Replaces ``_concat_k_nope_k_pe`` and the prefill cache write with one
-        fused kernel launch, dispatched by cache dtype. Chunked context runs
-        through this layer's ``_compute_prefill_context``, except under DCP where
-        it is delegated to the impl.
+        fused kernel launch, dispatched by cache dtype. Chunked context uses
+        this layer's fused packing loop for non-DCP and direct final-layout DCP;
+        only the NCCL rank-major fallback remains delegated to the impl.
 
         Supported configs (K3 fp8 policy):
           - bf16 cache        -> bf16 prefill query
@@ -1376,7 +1425,10 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             # need to be live at the same time.
             out.copy_(suffix_output[..., : self.v_head_dim])
             del output_prefill, suffix_output
-            if self.dcp_world_size > 1:
+            dcp_kv_gather = prefill.chunked_context.dcp_manager
+            if self.dcp_world_size > 1 and not (
+                dcp_kv_gather is not None and dcp_kv_gather.use_direct_kv_gather
+            ):
                 context_output, context_lse = (
                     self.impl._context_parallel_compute_prefill_context(  # type: ignore[attr-defined]
                         q,
