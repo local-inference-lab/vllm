@@ -5,13 +5,22 @@ import pytest
 import torch
 
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
+import vllm.v1.attention.backends.mla.indexer as indexer_backend
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
-from vllm.v1.attention.backends.mla.indexer import build_prefill_chunk_metadata
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepSeekV32IndexerDecodeMetadata,
+    DeepseekV32IndexerMetadata,
+    DeepseekV32IndexerMetadataBuilder,
+    build_prefill_chunk_metadata,
+)
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_filter_and_convert_dcp_index,
 )
-from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+from vllm.v1.attention.backends.utils import (
+    get_dcp_local_seq_lens,
+    refresh_dcp_local_seq_lens_,
+)
 from vllm.v1.attention.ops.dcp import CPTritonContext, correct_attn_out
 
 
@@ -325,6 +334,99 @@ def test_get_dcp_local_seq_lens_must_run_after_decode_expansion():
     torch.testing.assert_close(
         localized_after_expansion, torch.tensor([4, 4, 5], dtype=torch.int32)
     )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("rank", [0, 2, 3])
+def test_refresh_dcp_local_seq_lens_updates_storage_in_place(rank: int):
+    global_seq_lens = torch.arange(33, dtype=torch.int32, device="cuda")
+    local_seq_lens = torch.full((40,), -1, dtype=torch.int32, device="cuda")
+    storage_ptr = local_seq_lens.data_ptr()
+
+    refresh_dcp_local_seq_lens_(
+        local_seq_lens,
+        global_seq_lens,
+        global_seq_lens.numel(),
+        4,
+        rank,
+        2,
+    )
+
+    expected = get_dcp_local_seq_lens(global_seq_lens, 4, rank, 2)
+    torch.testing.assert_close(local_seq_lens[: global_seq_lens.numel()], expected)
+    assert torch.count_nonzero(local_seq_lens[global_seq_lens.numel() :]) == 0
+    assert local_seq_lens.data_ptr() == storage_ptr
+
+
+def test_update_draft_decode_metadata_refreshes_dcp_lens_and_schedule(monkeypatch):
+    class _KVCacheSpec:
+        num_states = 64
+
+    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    builder.dcp_world_size = 4
+    builder.dcp_rank = 2
+    builder.cp_kv_cache_interleave_size = 1
+    builder.kv_cache_spec = _KVCacheSpec()
+    builder.num_sms = 8
+
+    global_seq_lens = torch.tensor([11, 14, 0], dtype=torch.int32)
+    decode_seq_lens = torch.full((3, 1), -1, dtype=torch.int32)
+    schedule_metadata = torch.zeros((4, 2), dtype=torch.int32)
+    decode = DeepSeekV32IndexerDecodeMetadata(
+        block_table=torch.zeros((3, 1), dtype=torch.int32),
+        seq_lens=decode_seq_lens,
+        decode_lens=torch.ones(3, dtype=torch.int32),
+        requires_padding=False,
+        schedule_metadata=schedule_metadata,
+        global_seq_lens=global_seq_lens,
+    )
+    metadata = DeepseekV32IndexerMetadata(
+        seq_lens=global_seq_lens,
+        max_seq_len=14,
+        slot_mapping=torch.zeros(3, dtype=torch.int64),
+        num_decodes=3,
+        num_decode_tokens=3,
+        num_prefills=0,
+        num_prefill_tokens=0,
+        decode=decode,
+    )
+
+    planned_lens = []
+
+    def _fake_plan(context_lens, block_size, num_sms, indices=None):
+        assert block_size == 64
+        assert num_sms == 8
+        assert indices is None
+        planned_lens.append(context_lens.clone())
+        return torch.full_like(schedule_metadata, len(planned_lens))
+
+    monkeypatch.setattr(indexer_backend, "get_paged_mqa_logits_metadata", _fake_plan)
+    monkeypatch.setattr(
+        indexer_backend,
+        "refresh_dcp_local_seq_lens_",
+        lambda out, seq_lens, num_reqs, world, rank, interleave: out.copy_(
+            get_dcp_local_seq_lens(seq_lens[:num_reqs], world, rank, interleave)
+        ),
+    )
+    seq_lens_ptr = decode_seq_lens.data_ptr()
+    schedule_ptr = schedule_metadata.data_ptr()
+
+    builder.update_draft_decode_metadata(metadata)
+    torch.testing.assert_close(
+        decode_seq_lens[:, 0], torch.tensor([3, 3, 0], dtype=torch.int32)
+    )
+    torch.testing.assert_close(planned_lens[-1], decode_seq_lens)
+    assert torch.all(schedule_metadata == 1)
+
+    global_seq_lens.copy_(torch.tensor([15, 18, 0], dtype=torch.int32))
+    builder.update_draft_decode_metadata(metadata)
+    torch.testing.assert_close(
+        decode_seq_lens[:, 0], torch.tensor([4, 4, 0], dtype=torch.int32)
+    )
+    torch.testing.assert_close(planned_lens[-1], decode_seq_lens)
+    assert torch.all(schedule_metadata == 2)
+    assert decode_seq_lens.data_ptr() == seq_lens_ptr
+    assert schedule_metadata.data_ptr() == schedule_ptr
 
 
 @pytest.mark.parametrize("interleave", [1, 2])
