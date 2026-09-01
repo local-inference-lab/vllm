@@ -422,6 +422,7 @@ class Glm4MoeModel(nn.Module):
         quant_config = vllm_config.quant_config
         enable_eplb = vllm_config.parallel_config.enable_eplb
         self.config = config
+        self.quant_config = quant_config
 
         self.vocab_size = config.vocab_size
 
@@ -497,6 +498,21 @@ class Glm4MoeModel(nn.Module):
             n_shared_experts=self.config.n_shared_experts or 1,
             enabled=self.is_fused_shared_expert_enabled,
         )
+        rank_sliced_name = getattr(
+            self.quant_config,
+            "normalize_rank_sliced_weight_name",
+            None,
+        )
+        if rank_sliced_name is not None:
+            source_weights = weights
+
+            def normalized_weights():
+                for name, weight in source_weights:
+                    normalized_name = rank_sliced_name(name)
+                    if normalized_name is not None:
+                        yield normalized_name, weight
+
+            weights = normalized_weights()
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 

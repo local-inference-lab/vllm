@@ -323,7 +323,22 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         _pending_wk_fp8: dict = {}  # FP8 indexer wk dequant buffer
+        # Rank-sliced EXL3 checkpoints ship one tensor per TP rank
+        # (`....rank{r}.{trellis|suh|svh|mcg}`), while Exl3MoEMethod registers a
+        # single fused param per projection group (`w13_mcg`, `w2_trellis`, ...).
+        # Strip the `.rank{r}` segment before expert mapping, exactly as the
+        # target model (deepseek_v2.load_weights) does; otherwise the MTP loader
+        # looks up `...routed_experts.w2_rank0.mcg` and KeyErrors.
+        rank_sliced_name = getattr(
+            self.quant_config,
+            "normalize_rank_sliced_weight_name",
+            None,
+        )
         for name, loaded_weight in weights:
+            if rank_sliced_name is not None:
+                name = rank_sliced_name(name)
+                if name is None:
+                    continue
             if "rotary_emb.inv_freq" in name:
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
