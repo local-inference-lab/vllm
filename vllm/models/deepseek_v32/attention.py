@@ -567,19 +567,28 @@ class DeepseekV32Attention(MLAAttention):
         else:
             mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
 
-        if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
-            if isinstance(mqa_q_arg, tuple):
-                mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
-            mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
+        if self.impl.dcp_world_size > 1:
+            assert self.dcp_manager is not None
+            if self.use_pcp:
+                if self.impl.dcp_world_size > self.impl.pcp_world_size:
+                    if isinstance(mqa_q_arg, tuple):
+                        mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
+                    mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
+            else:
+                if isinstance(mqa_q_arg, tuple):
+                    mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
+                assert self.dcp_manager.query_gather is not None
+                mqa_q_arg = self.dcp_manager.query_gather(mqa_q_arg)
         attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
             mqa_q_arg, kv_cache, attn_metadata, self
         )
 
-        if self.use_pcp and self.impl.dcp_world_size > 1:
+        if self.impl.dcp_world_size > 1:
             assert lse is not None and self.dcp_manager is not None
+            decode_metadata = getattr(attn_metadata, "decode", None)
             seq_lens = (
-                attn_metadata.decode.seq_lens
-                if attn_metadata.decode is not None
+                decode_metadata.seq_lens
+                if decode_metadata is not None
                 else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
                     : attn_metadata.num_decodes
                 ]
@@ -593,7 +602,8 @@ class DeepseekV32Attention(MLAAttention):
                 seq_lens=seq_lens,
                 query_start_loc=query_start_loc,
             )
-            attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
+            if self.use_pcp:
+                attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
 
         # NOTE(woosuk): While the below does not need to be in the eager region,
         # we put it here to avoid copying the attention output. Move this back to the
