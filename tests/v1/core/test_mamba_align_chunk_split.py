@@ -85,17 +85,17 @@ def _split(
     request: Request,
     num_new_tokens: int,
     drop_last_prefix_cache_block: bool = True,
+    use_eagle: bool | None = None,
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
     allow_speculative_checkpoints: bool = False,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
+    if use_eagle is None:
+        use_eagle = drop_last_prefix_cache_block
     stub = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
-        # This helper models the speculative path used by its original tests.
-        # DFlash remains ``use_eagle`` for scheduling even though it no longer
-        # drops the target's last prefix-cache block.
-        use_eagle=True,
+        use_eagle=use_eagle,
         drop_last_prefix_cache_block=drop_last_prefix_cache_block,
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
@@ -165,6 +165,7 @@ def test_dflash_checkpoint_keeps_intermediate_chunks_aligned_and_joins_prompt_ta
             request,
             4089,
             drop_last_prefix_cache_block=False,
+            use_eagle=True,
             num_prefill_checkpoint_blocks=1,
             allow_speculative_checkpoints=True,
         )
@@ -177,6 +178,7 @@ def test_dflash_checkpoint_keeps_intermediate_chunks_aligned_and_joins_prompt_ta
             request,
             17,
             drop_last_prefix_cache_block=False,
+            use_eagle=True,
             num_prefill_checkpoint_blocks=1,
             allow_speculative_checkpoints=True,
         )
