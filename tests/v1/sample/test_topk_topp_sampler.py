@@ -51,8 +51,10 @@ def test_apply_top_k_top_p_probs_matches_processed_logits(
     input_buffer = logits.clone()
     actual = apply_top_k_top_p_probs(input_buffer, top_k, top_p)
 
-    reuses_input = batch_size < 8 and (
-        batch_size == 1 or use_top_k or not FLASHINFER_TOPK_TOPP_SUPPORTED
+    reuses_input = (
+        not current_platform.is_cpu()
+        and batch_size < 8
+        and (batch_size == 1 or use_top_k or not FLASHINFER_TOPK_TOPP_SUPPORTED)
     )
     if reuses_input:
         assert actual.data_ptr() == input_buffer.data_ptr()

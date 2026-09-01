@@ -78,7 +78,11 @@ def flashinfer_sampler_supported() -> bool:
 
 @cache
 def _flashinfer_probability_renorm_supported() -> bool:
-    """Return the process-stable availability of FlashInfer renormalization."""
+    """Return the process-stable availability of FlashInfer renormalization.
+
+    Returns:
+        Whether the configured platform can use the FlashInfer sampler.
+    """
     return flashinfer_sampler_supported()
 
 
