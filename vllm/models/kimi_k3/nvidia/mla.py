@@ -29,6 +29,7 @@ Out of scope (extension points, not wired here): prefill context parallelism
 """
 
 import math
+import re
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -43,6 +44,7 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.distributed import (
+    get_dcp_group,
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context
@@ -60,6 +62,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    DCPGroupColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -115,6 +118,64 @@ logger = init_logger(__name__)
 # hides it); at or above it, run the gate on the main stream.
 _GATE_MULTI_STREAM_TOKEN_THRESHOLD = 512
 _MLA_CALLER_OUTPUT_MIN_TOKENS = 1024
+
+
+def _parse_k3_qrep_layers(spec: str) -> frozenset[int] | None:
+    if spec.strip().lower() == "all":
+        return None
+    layers: set[int] = set()
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start_text, end_text = item.split("-", 1)
+            start = int(start_text)
+            end = int(end_text)
+            if start < 0 or end < start:
+                raise ValueError(f"Invalid K3 qrep layer range: {item!r}")
+            layers.update(range(start, end + 1))
+        else:
+            layer = int(item)
+            if layer < 0:
+                raise ValueError(f"Invalid K3 qrep layer: {item!r}")
+            layers.add(layer)
+    return frozenset(layers)
+
+
+def _k3_dcp_qrep_enabled(prefix: str, vllm_config: VllmConfig) -> bool:
+    parallel_config = vllm_config.parallel_config
+    if (
+        not envs.VLLM_DCP_Q_REPLICATE
+        or parallel_config.decode_context_parallel_size <= 1
+        or parallel_config.prefill_context_parallel_size > 1
+    ):
+        return False
+    layer_spec = envs.VLLM_K3_DCP_Q_REPLICATE_LAYERS
+    if layer_spec is None:
+        raise ValueError(
+            "Kimi-K3 DCP query replication duplicates query and absorbed "
+            "projection weights. Set VLLM_K3_DCP_Q_REPLICATE_LAYERS to an "
+            "explicit layer list/range, or to 'all' after verifying the VRAM "
+            "budget."
+        )
+    match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", prefix)
+    if match is None:
+        raise ValueError(
+            "VLLM_K3_DCP_Q_REPLICATE_LAYERS requires a layer-qualified prefix, "
+            f"got {prefix!r}"
+        )
+    layers = _parse_k3_qrep_layers(layer_spec)
+    return layers is None or int(match.group(1)) in layers
+
+
+def _k3_projected_query_heads(
+    num_local_heads: int,
+    dcp_world_size: int,
+    dcp_q_replicate: bool,
+) -> int:
+    """Return the DCP-group head width emitted by the query projection."""
+    return int(num_local_heads) * (int(dcp_world_size) if dcp_q_replicate else 1)
 
 
 @torch.compile(backend=current_platform.simple_compile_backend)
@@ -294,6 +355,13 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         assert num_heads % tp_size == 0
         self.num_heads = num_heads
         self.num_local_heads = num_heads // tp_size
+        vllm_config = get_current_vllm_config()
+        self.dcp_q_replicate = _k3_dcp_qrep_enabled(prefix, vllm_config)
+        q_proj_cls = (
+            DCPGroupColumnParallelLinear
+            if self.dcp_q_replicate
+            else ColumnParallelLinear
+        )
 
         # ---- Pre-attention projections (fusable front-end) ----
         # Two query variants: a low-rank q-LoRA path (Kimi-K3) fused with the
@@ -325,7 +393,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                     disable_tp=True,
                 )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(
+            self.q_b_proj = q_proj_cls(
                 self.q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
@@ -335,7 +403,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         else:
             # Uncompressed query: full-rank q_proj (TP-split over heads) plus a
             # replicated kv-down projection (shared latent across TP ranks).
-            self.q_proj = ColumnParallelLinear(
+            self.q_proj = q_proj_cls(
                 self.hidden_size,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
@@ -440,7 +508,6 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             self.impl.dcp_rank = 0
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
 
-        vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
         assert parallel_config.prefill_context_parallel_size == 1, (
             "Kimi-K3 MultiHeadLatentAttention does not support prefill context "
@@ -450,6 +517,13 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.backend_owns_decode_dcp = _backend_owns_decode_dcp(
             self.impl, self.dcp_world_size
         )
+        if self.dcp_q_replicate:
+            if not self.backend_owns_decode_dcp:
+                raise NotImplementedError(
+                    "Kimi-K3 DCP query replication requires a backend-owned "
+                    "decode DCP path."
+                )
+            self.impl.dcp_q_replicate = True
         assert (
             self.dcp_world_size <= 1
             or self.rotary_emb is None
@@ -639,6 +713,12 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             pre_w_uk_t.copy_(w_uk_t)
             w_uk_t = pre_w_uk_t
         replace_parameter(self, "W_UK_T", w_uk_t, prefer_copy=True)
+        self.W_UK_T_dcp_qrep: torch.Tensor | None = None
+        if self.dcp_q_replicate:
+            self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
+                self.W_UK_T.contiguous(),
+                dim=0,
+            )
 
         quant_method = (
             self.quant_config.get_quant_method(self, prefix=self.layer_name)
@@ -678,9 +758,15 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         """
         query = q_nope.transpose(0, 1).contiguous()
         output = query.new_empty((query.shape[0], query.shape[1], self.kv_lora_rank))
+        weight = (
+            self.W_UK_T_dcp_qrep
+            if getattr(self, "dcp_q_replicate", False)
+            else self.W_UK_T
+        )
+        assert weight is not None
         _run_mla_query_bmm(
             query,
-            self.W_UK_T,
+            weight,
             output,
             use_safe_op=True,
         )
@@ -730,13 +816,21 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 self.kv_a_layernorm.weight.data,
                 self.rms_norm_eps,
             )
-            q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            q_heads = _k3_projected_query_heads(
+                self.num_local_heads,
+                self.dcp_world_size,
+                self.dcp_q_replicate,
+            )
+            q = self.q_b_proj(q_c)[0].view(-1, q_heads, self.qk_head_dim)
         else:
             # Uncompressed query: project directly (no q-LoRA, no q norm) and
             # normalize only the kv latent.
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
+            q_heads = _k3_projected_query_heads(
+                self.num_local_heads,
+                self.dcp_world_size,
+                self.dcp_q_replicate,
             )
+            q = self.q_proj(hidden_states)[0].view(-1, q_heads, self.qk_head_dim)
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             kv_c, k_pe = kv_lora.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
@@ -855,8 +949,12 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
 
         # ---- Prefill: fused key-concat + cache-insert + attention ----
         if num_mha_tokens > 0:
+            prefill_q = q[num_mqa_tokens:]
+            if getattr(self, "dcp_q_replicate", False):
+                q_proj = self.q_b_proj if self.q_lora_rank is not None else self.q_proj
+                prefill_q = q_proj._local_view(prefill_q)
             self._forward_prefill_fused(
-                q[num_mqa_tokens:],
+                prefill_q,
                 kv_c_normed[num_mqa_tokens:],
                 k_pe[num_mqa_tokens:],
                 rope_positions[num_mqa_tokens:] if rope_positions is not None else None,
