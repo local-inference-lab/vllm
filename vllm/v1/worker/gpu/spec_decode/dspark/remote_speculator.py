@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue  # kimi-k3-draft-async-ingest
+import threading  # kimi-k3-draft-async-ingest
 import time
 from dataclasses import dataclass
 from pathlib import Path as _Path
@@ -339,6 +341,52 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 dtype=torch.int64,
                 pin_memory=True,
             )
+            # kimi-k3-draft-async-ingest: begin
+            self._sampled_staging = torch.empty(
+                self.max_num_reqs,
+                dtype=torch.int32,
+                pin_memory=True,
+            )
+            self._async_depth = int(
+                os.environ.get("VLLM_K3_DRAFT_ASYNC_PREFILL_INGEST", "2") or 0
+            )
+            self._async_ring: list[tuple[torch.Tensor, torch.Tensor]] = []
+            self._async_slot_free: list[threading.Event] = []
+            self._async_slot = 0
+            self._async_queue: queue.Queue = queue.Queue()
+            self._async_error: tuple[BaseException, list[str]] | None = None
+            self._async_lock = threading.Lock()
+            self._async_stats = {"deferred": 0, "deferred_ms": 0.0}
+            for _ in range(self._async_depth):
+                self._async_ring.append(
+                    (
+                        torch.empty(
+                            self.max_num_tokens,
+                            dtype=torch.int64,
+                            pin_memory=True,
+                        ),
+                        torch.empty(
+                            (self.max_num_tokens, self.raw_context_width),
+                            dtype=vllm_config.model_config.dtype,
+                            pin_memory=True,
+                        ),
+                    )
+                )
+                free = threading.Event()
+                free.set()
+                self._async_slot_free.append(free)
+            if self._async_depth > 0:
+                threading.Thread(
+                    target=self._async_ingest_worker,
+                    name="k3-draft-async-ingest",
+                    daemon=True,
+                ).start()
+                logger.info(
+                    "Remote K3 %s deferred prefill ingest enabled: ring depth %d",
+                    self.method,
+                    self._async_depth,
+                )
+            # kimi-k3-draft-async-ingest: end
             if self._probabilistic:
                 self._logits_staging = torch.empty(
                     (
@@ -400,14 +448,63 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         socket.connect(self.address)
         self._socket = socket
 
+    # kimi-k3-draft-async-ingest: begin
+    def _drain_async_ingest(self) -> None:
+        pending = getattr(self, "_async_queue", None)
+        if pending is not None:
+            pending.join()
+
+    def _apply_async_error(self) -> None:
+        error = getattr(self, "_async_error", None)
+        if error is None:
+            return
+        self._async_error = None
+        exc, request_ids = error
+        self._disabled_requests.update(request_ids)
+        logger.warning(
+            "Remote K3 %s deferred prefill ingest failed (%s); drafting is "
+            "disabled for %d request(s) until they leave the batch",
+            self.method,
+            exc,
+            len(request_ids),
+        )
+
+    def _async_ingest_worker(self) -> None:
+        while True:
+            job = self._async_queue.get()
+            slot, frames, request_ids, enqueued = job
+            try:
+                with self._async_lock:
+                    try:
+                        self._socket.send_multipart(frames, copy=False)
+                        response_frames = self._socket.recv_multipart()
+                    except Exception:
+                        self._connect()
+                        raise
+                response = json.loads(response_frames[0])
+                if not isinstance(response, dict) or not response.get("ok", False):
+                    raise RuntimeError(f"K3 draft deferred ingest failed: {response}")
+                self._async_stats["deferred_ms"] += (
+                    time.perf_counter() - enqueued
+                ) * 1000
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Remote K3 deferred prefill ingest raised")
+                self._async_error = (exc, request_ids)
+            finally:
+                self._async_slot_free[slot].set()
+                self._async_queue.task_done()
+    # kimi-k3-draft-async-ingest: end
+
     def _rpc(self, frames: list[bytes]) -> dict[str, Any]:
         assert self._socket is not None
-        try:
-            self._socket.send_multipart(frames)
-            response_frames = self._socket.recv_multipart()
-        except Exception:
-            self._connect()
-            raise
+        self._drain_async_ingest()
+        with self._async_lock:
+            try:
+                self._socket.send_multipart(frames)
+                response_frames = self._socket.recv_multipart()
+            except Exception:
+                self._connect()
+                raise
         if not 1 <= len(response_frames) <= 2:
             raise RuntimeError(
                 f"K3 draft RPC returned {len(response_frames)} response frames"
@@ -823,15 +920,19 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         _detail_prep_t0 = time.perf_counter()
         torch.cuda.current_stream(self.device).synchronize()
         self._detail_prep_drain = time.perf_counter() - _detail_prep_t0
+        self._apply_async_error()  # kimi-k3-draft-async-ingest
         rejected_staging = self._rejected_staging[:num_reqs]
         anchor_staging = self._anchor_staging[:num_reqs]
+        sampled_staging = self._sampled_staging[:num_reqs]  # kimi-k3-draft-async-ingest
         rejected_staging.copy_(num_rejected[:num_reqs], non_blocking=True)
         anchor_staging.copy_(anchor_tokens, non_blocking=True)
+        sampled_staging.copy_(sampled_counts, non_blocking=True)  # kimi-k3-draft-async-ingest
         _detail_copy_t0 = time.perf_counter()
         torch.cuda.current_stream(self.device).synchronize()
         self._detail_copy_sync = time.perf_counter() - _detail_copy_t0
         rejected_counts = rejected_staging.tolist()
         anchor_tokens_cpu = anchor_staging.tolist()
+        sampled_counts_cpu = sampled_staging.tolist()  # kimi-k3-draft-async-ingest
         gather_indices, valid_counts = _build_valid_context_plan(
             input_batch, rejected_counts
         )
@@ -948,8 +1049,24 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 f"{self.raw_context_width}"
             )
         context_ready = time.perf_counter()
-        positions_staging = self._positions_staging[:num_context_rows]
-        context_staging = self._context_staging[:num_context_rows]
+        # kimi-k3-draft-async-ingest: a step in which no active request sampled a token is a
+        # pure mid-prefill step; its proposal is never consumed, so only the
+        # context ingest matters and it can complete off the critical path.
+        deferred = self._async_depth > 0 and not _K3_CAPTURE_DIR and all(
+            sampled_counts_cpu[request_idx] == 0 for request_idx in active_indices
+        )
+        if deferred:
+            slot = self._async_slot
+            self._async_slot = (slot + 1) % self._async_depth
+            self._async_slot_free[slot].wait()
+            self._async_slot_free[slot].clear()
+            positions_full, context_full = self._async_ring[slot]
+            positions_staging = positions_full[:num_context_rows]
+            context_staging = context_full[:num_context_rows]
+        else:
+            slot = -1
+            positions_staging = self._positions_staging[:num_context_rows]
+            context_staging = self._context_staging[:num_context_rows]
         positions_staging.copy_(positions, non_blocking=True)
         context_staging.copy_(context, non_blocking=True)
         torch.cuda.current_stream(self.device).synchronize()
@@ -960,9 +1077,13 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         )
         for request, anchor_position in zip(requests, anchor_positions):
             request["anchor_position"] = anchor_position
-        positions_frame = positions_staging.numpy().tobytes()
-        # NumPy has inconsistent bfloat16 support; preserve its exact bits as u16.
-        context_frame = context_staging.view(torch.uint16).numpy().tobytes()
+        if deferred:  # kimi-k3-draft-async-ingest: the ring slot stays reserved until the reply
+            positions_frame = memoryview(positions_staging.numpy())
+            context_frame = memoryview(context_staging.view(torch.uint16).numpy())
+        else:
+            positions_frame = positions_staging.numpy().tobytes()
+            # NumPy has inconsistent bfloat16 support; preserve its exact bits as u16.
+            context_frame = context_staging.view(torch.uint16).numpy().tobytes()
         # kimi-k3-dflash-feature-capture: persist the exact served feature
         # stream for offline draft training. Inert without the env var.
         if _K3_CAPTURE_DIR:
@@ -982,22 +1103,34 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             "return_logits": self._probabilistic,
             "requests": requests,
         }
-        response = self._rpc(
-            [json.dumps(header).encode(), positions_frame, context_frame]
-        )
-        rpc_done = time.perf_counter()
-        self._copy_tokens_from_response(
-            response,
-            active_indices,
-            num_speculative_tokens,
-        )
-        if self._probabilistic:
-            self._copy_logits_from_response(
+        frames = [json.dumps(header).encode(), positions_frame, context_frame]
+        if deferred:  # kimi-k3-draft-async-ingest
+            self._async_queue.put(
+                (
+                    slot,
+                    frames,
+                    [str(request["request_id"]) for request in requests],
+                    time.perf_counter(),
+                )
+            )
+            self._async_stats["deferred"] += 1
+            response = {}
+            rpc_done = output_copied = time.perf_counter()
+        else:
+            response = self._rpc(frames)
+            rpc_done = time.perf_counter()
+            self._copy_tokens_from_response(
                 response,
                 active_indices,
                 num_speculative_tokens,
             )
-        output_copied = time.perf_counter()
+            if self._probabilistic:
+                self._copy_logits_from_response(
+                    response,
+                    active_indices,
+                    num_speculative_tokens,
+                )
+            output_copied = time.perf_counter()
         timing_ms = {
             "entry_drain": getattr(self, "_detail_entry_drain", 0.0) * 1000,
             "prep_drain": getattr(self, "_detail_prep_drain", 0.0) * 1000,
@@ -1010,6 +1143,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             "rpc_roundtrip": (rpc_done - serialized) * 1000,
             "tokens_h2d": (output_copied - rpc_done) * 1000,
             "client_total": (output_copied - started) * 1000,
+            "deferred": 1.0 if deferred else 0.0,  # kimi-k3-draft-async-ingest
         }
         server_timing = response.get("timing_ms")
         if isinstance(server_timing, dict):
