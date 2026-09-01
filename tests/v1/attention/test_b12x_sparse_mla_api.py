@@ -435,18 +435,26 @@ def test_glm5_next_split_cache_auto_aligns_to_dcp_retention(monkeypatch) -> None
 
 
 @pytest.mark.parametrize(
-    ("dcp", "scheduled_tokens", "batched_tokens", "expected_block_size"),
+    (
+        "dcp",
+        "retention_interval",
+        "scheduled_tokens",
+        "batched_tokens",
+        "expected_block_size",
+    ),
     [
-        (1, None, 4096, 4096),
-        (2, None, 4096, 2048),
-        (4, None, 4096, 1024),
-        (8, None, 4096, 512),
-        (4, 4096, 4352, 1024),
+        (1, None, None, 4096, 4096),
+        (2, None, None, 4096, 2048),
+        (4, None, None, 4096, 1024),
+        (8, None, None, 4096, 512),
+        (4, 0, None, 4096, 1024),
+        (4, 0, 4096, 4352, 1024),
     ],
 )
 def test_glm5_next_split_cache_auto_falls_back_to_scheduler_budget(
     monkeypatch,
     dcp: int,
+    retention_interval: int | None,
     scheduled_tokens: int | None,
     batched_tokens: int,
     expected_block_size: int,
@@ -465,7 +473,7 @@ def test_glm5_next_split_cache_auto_falls_back_to_scheduler_budget(
             mamba_block_size=None,
             mamba_cache_mode="align",
             mamba_page_size_padded=1234,
-            prefix_cache_retention_interval=None,
+            prefix_cache_retention_interval=retention_interval,
         ),
     )
     monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "auto")

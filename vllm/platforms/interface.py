@@ -817,7 +817,11 @@ class Platform:
                 )
             if split_target_block_size.lower() == "auto":
                 geometry_interval = cache_config.prefix_cache_retention_interval
-                if geometry_interval is None:
+                # ``0`` is a valid semantic-only retention policy, but it does
+                # not provide a periodic geometry interval. In that mode (and
+                # when retention is unset), derive the block from the worker's
+                # scheduler budget instead.
+                if geometry_interval is None or geometry_interval == 0:
                     scheduler_config = vllm_config.scheduler_config
                     geometry_interval = scheduler_config.max_num_scheduled_tokens
                     if geometry_interval is None:
