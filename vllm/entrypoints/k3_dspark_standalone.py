@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import signal
 import threading
 import time
@@ -38,6 +39,66 @@ logger = init_logger(__name__)
 EMBED_TENSOR = "language_model.model.embed_tokens.weight"
 LM_HEAD_TENSOR = "language_model.lm_head.weight"
 SHARED_TENSORS = (EMBED_TENSOR, LM_HEAD_TENSOR)
+DRAFT_KV_BLOCK_SIZE = 16
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be at least 1")
+    return parsed
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive and finite")
+    return parsed
+
+
+def _positive_block_multiple(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed % DRAFT_KV_BLOCK_SIZE != 0:
+        raise argparse.ArgumentTypeError(
+            f"value must be a multiple of {DRAFT_KV_BLOCK_SIZE}"
+        )
+    return parsed
+
+
+def _tcp_port(value: str) -> int:
+    parsed = int(value)
+    if not 1 <= parsed <= 65535:
+        raise argparse.ArgumentTypeError("port must be in [1, 65535]")
+    return parsed
+
+
+def _validate_single_block_smoke_span(
+    context_len: int,
+    query_len: int,
+    block_size: int,
+) -> None:
+    """Ensure the DSpark smoke test's one-row block table is sufficient."""
+    if context_len < 0 or query_len < 1 or block_size < 1:
+        raise ValueError("Smoke-test context, query, and block sizes are invalid")
+    if context_len + query_len > block_size:
+        raise ValueError(
+            "DSpark smoke sequence exceeds its single mapped KV block: "
+            f"context={context_len}, query={query_len}, block_size={block_size}"
+        )
+
+
+def _status_http_code(path: str, ready: bool) -> int:
+    """Keep liveness independent from model readiness."""
+    if path == "/healthz":
+        return 200
+    return 200 if ready else 503
 
 
 @dataclass
@@ -57,6 +118,7 @@ class RuntimeStatus:
     allocated_gib: float = 0.0
     reserved_gib: float = 0.0
     draft_kv_cache_gib: float = 0.0
+    draft_prefix_cache_gib: float = 0.0
     draft_kv_cache_blocks: int = 0
     draft_kv_cache_token_capacity: int = 0
     draft_kv_cache_smoke: bool = False
@@ -244,7 +306,7 @@ def _build_vllm_config(args: argparse.Namespace):
         decode_context_parallel_size=1,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
-        block_size=16,
+        block_size=DRAFT_KV_BLOCK_SIZE,
         enable_prefix_caching=False,
         enforce_eager=True,
         compilation_config={"custom_ops": ["none"]},
@@ -423,6 +485,11 @@ def _load_runtime(args: argparse.Namespace, status: RuntimeStatus) -> Standalone
 
         status.phase = "allocating_draft_kv_cache"
         block_size = int(vllm_config.cache_config.block_size)
+        if args.draft_kv_window % block_size != 0:
+            raise ValueError(
+                "--draft-kv-window must be a cache-block multiple: "
+                f"window={args.draft_kv_window}, block_size={block_size}"
+            )
         kv_caches, num_blocks = _allocate_draft_kv_cache(
             model,
             method=args.method,
@@ -496,6 +563,11 @@ def _run_eager_smoke(runtime: StandaloneRuntime, device: torch.device) -> int:
     query_len = runtime.vllm_config.speculative_config.num_speculative_tokens
     if not sample_from_anchor:
         query_len += 1
+    _validate_single_block_smoke_span(
+        context_len,
+        query_len,
+        runtime.kv_cache_block_size,
+    )
     mask_token_id = get_parallel_drafting_token_id(draft_config)
     input_ids = torch.tensor(
         [draft_config.bos_token_id] + [mask_token_id] * (query_len - 1),
@@ -652,18 +724,22 @@ def _run_dflash_eager_smoke(
     return token
 
 
-def _make_handler(status: RuntimeStatus, proposal_engine: Any | None = None):
+def _make_handler(
+    status: RuntimeStatus,
+    proposal_engine_ref: list[Any | None] | None = None,
+):
     class StatusHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             if self.path not in ("/", "/healthz", "/readyz", "/v1/status"):
                 self.send_error(404)
                 return
             payload = asdict(status)
+            proposal_engine = (
+                proposal_engine_ref[0] if proposal_engine_ref is not None else None
+            )
             if proposal_engine is not None:
                 payload["proposal_count"] = proposal_engine.proposal_count
-                payload["proposal_active_requests"] = (
-                    proposal_engine.allocator.active_requests
-                )
+                payload["proposal_active_requests"] = proposal_engine.active_requests
                 payload["proposal_max_requests"] = (
                     proposal_engine.allocator.max_requests
                 )
@@ -679,6 +755,9 @@ def _make_handler(status: RuntimeStatus, proposal_engine: Any | None = None):
                 )
                 payload["proposal_prefix_cache_tokens"] = (
                     proposal_engine.prefix_cache_tokens
+                )
+                payload["proposal_prefix_cache_capacity_gib"] = (
+                    proposal_engine.prefix_cache_capacity_bytes / 1024**3
                 )
                 payload["proposal_prefix_cache_host_gib"] = (
                     proposal_engine.prefix_cache_host_bytes / 1024**3
@@ -701,46 +780,36 @@ def _make_handler(status: RuntimeStatus, proposal_engine: Any | None = None):
                 payload["proposal_cuda_graph_replay_count"] = (
                     proposal_engine.cuda_graph_replay_count
                 )
-                payload["proposal_cuda_graph_eager_fallback_count"] = (
-                    proposal_engine.cuda_graph_eager_fallback_count
-                )
             body = json.dumps(payload, sort_keys=True).encode()
-            code = 200 if status.ready else 503
+            code = _status_http_code(self.path, status.ready)
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, format: str, *args: object) -> None:
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             logger.info("DSpark status HTTP: %s", format % args)
 
     return StatusHandler
 
 
 def _serve_status(
-    args: argparse.Namespace,
-    status: RuntimeStatus,
+    server: ThreadingHTTPServer,
     stop: threading.Event,
-    proposal_engine: Any | None = None,
 ) -> None:
-    server = ThreadingHTTPServer(
-        (args.host, args.port), _make_handler(status, proposal_engine)
-    )
     server.timeout = 0.5
-
-    def request_stop(signum: int, _frame: object) -> None:
-        logger.info("Received signal %d; stopping DSpark status server", signum)
-        stop.set()
-
-    signal.signal(signal.SIGINT, request_stop)
-    signal.signal(signal.SIGTERM, request_stop)
+    host, port = server.server_address[:2]
     logger.info(
-        "DSpark status endpoint listening on http://%s:%d", args.host, args.port
+        "DSpark status endpoint listening on http://%s:%d",
+        host,
+        port,
     )
-    while not stop.is_set():
-        server.handle_request()
-    server.server_close()
+    try:
+        while not stop.is_set():
+            server.handle_request()
+    finally:
+        server.server_close()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -749,20 +818,35 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-model", type=Path, required=True)
     parser.add_argument("--target-weights", type=Path, required=True)
     parser.add_argument("--target-config", type=Path, required=True)
-    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--device", type=_non_negative_int, default=0)
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8091)
-    parser.add_argument("--num-speculative-tokens", type=int, default=3)
-    parser.add_argument("--max-model-len", type=int, default=32768)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=64)
-    parser.add_argument("--max-num-seqs", type=int, default=2)
-    parser.add_argument("--max-retained-requests", type=int)
-    parser.add_argument("--draft-kv-cache-gib", type=float, default=1.0)
-    parser.add_argument("--draft-kv-window", type=int, default=32768)
+    parser.add_argument("--port", type=_tcp_port, default=8091)
+    parser.add_argument("--num-speculative-tokens", type=_positive_int, default=3)
+    parser.add_argument("--max-model-len", type=_positive_int, default=32768)
+    parser.add_argument("--max-num-batched-tokens", type=_positive_int, default=64)
+    parser.add_argument("--max-num-seqs", type=_positive_int, default=2)
+    parser.add_argument("--max-retained-requests", type=_positive_int)
+    parser.add_argument("--draft-kv-cache-gib", type=_positive_float, default=1.0)
+    parser.add_argument(
+        "--draft-prefix-cache-gib",
+        type=_positive_float,
+        default=4.0,
+        help="Aggregate GPU budget for retained projected context states.",
+    )
+    parser.add_argument(
+        "--draft-kv-window",
+        type=_positive_block_multiple,
+        default=32768,
+    )
     parser.add_argument("--proposal-address", default="tcp://127.0.0.1:8092")
+    parser.add_argument(
+        "--allow-unsafe-remote-rpc",
+        action="store_true",
+        help="Allow unauthenticated proposal RPC on a non-loopback address.",
+    )
     parser.add_argument("--disable-proposal-transport", action="store_true")
     parser.add_argument("--enable-cuda-graph", action="store_true")
-    parser.add_argument("--cuda-graph-warmups", type=int, default=2)
+    parser.add_argument("--cuda-graph-warmups", type=_positive_int, default=2)
     parser.add_argument("--skip-smoke-test", action="store_true")
     parser.add_argument("--exit-after-load", action="store_true")
     args = parser.parse_args()
@@ -776,15 +860,40 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    stop = threading.Event()
+    proposal_server = None
+    status_server = None
+    status_thread = None
     status = RuntimeStatus(
         draft_model=str(args.draft_model),
         method=args.method,
         target_weights=str(args.target_weights),
         num_speculative_tokens=args.num_speculative_tokens,
         max_model_len=args.max_model_len,
+        draft_prefix_cache_gib=args.draft_prefix_cache_gib,
         draft_kv_window=args.draft_kv_window,
     )
     try:
+        proposal_engine_ref: list[Any | None] = [None]
+        status_server = ThreadingHTTPServer(
+            (args.host, args.port),
+            _make_handler(status, proposal_engine_ref),
+        )
+        status_thread = threading.Thread(
+            target=_serve_status,
+            args=(status_server, stop),
+            name="k3-draft-status-http",
+            daemon=True,
+        )
+
+        def request_stop(signum: int, _frame: object) -> None:
+            logger.info("Received signal %d; stopping K3 draft server", signum)
+            stop.set()
+
+        signal.signal(signal.SIGINT, request_stop)
+        signal.signal(signal.SIGTERM, request_stop)
+        status_thread.start()
+
         runtime = _load_runtime(args, status)
         if not args.skip_smoke_test:
             status.phase = "eager_smoke_test"
@@ -792,9 +901,7 @@ def main() -> None:
                 runtime, torch.device("cuda", args.device)
             )
             status.draft_kv_cache_smoke = True
-        stop = threading.Event()
         proposal_engine = None
-        proposal_server = None
         if not args.disable_proposal_transport:
             status.phase = "starting_proposal_transport"
             from vllm.entrypoints.k3_dspark_rpc import (
@@ -810,15 +917,20 @@ def main() -> None:
                     else args.max_num_seqs
                 ),
                 window_size=args.draft_kv_window,
+                prefix_cache_gib=args.draft_prefix_cache_gib,
                 device=torch.device("cuda", args.device),
             )
             if args.enable_cuda_graph:
                 status.phase = f"capturing_{args.method}_cuda_graphs"
-                proposal_engine.capture_cuda_graphs(warmups=args.cuda_graph_warmups)
+                proposal_engine.capture_cuda_graphs(
+                    warmups=args.cuda_graph_warmups,
+                )
+            proposal_engine_ref[0] = proposal_engine
             proposal_server = K3DSparkZMQServer(
                 proposal_engine,
                 address=args.proposal_address,
                 stop=stop,
+                allow_unsafe_remote=args.allow_unsafe_remote_rpc,
             )
             proposal_server.start()
             status.proposal_transport_ready = True
@@ -833,14 +945,20 @@ def main() -> None:
         if args.exit_after_load:
             print(json.dumps(asdict(status), sort_keys=True), flush=True)
             return
-        _serve_status(args, status, stop, proposal_engine)
-        if proposal_server is not None:
-            proposal_server.join()
+        status_thread.join()
     except Exception as exc:
         status.phase = "failed"
         status.error = f"{type(exc).__name__}: {exc}"
         logger.exception("Standalone K3 draft startup failed")
         raise
+    finally:
+        stop.set()
+        if proposal_server is not None:
+            proposal_server.join()
+        if status_thread is not None and status_thread.ident is not None:
+            status_thread.join(timeout=5.0)
+        elif status_server is not None:
+            status_server.server_close()
 
 
 if __name__ == "__main__":

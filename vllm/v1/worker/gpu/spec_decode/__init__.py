@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
-
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 
 
@@ -11,7 +10,7 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     if speculative_config.method == "dflash":
-        remote_address = os.environ.get("VLLM_K3_DRAFT_REMOTE_ADDRESS")
+        remote_address = envs.VLLM_K3_DRAFT_REMOTE_ADDRESS
         if remote_address:
             from vllm.v1.worker.gpu.spec_decode.dspark.remote_speculator import (
                 RemoteK3DSparkSpeculator,
@@ -28,9 +27,9 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
 
         return DFlashSpeculator(vllm_config, device)
     elif speculative_config.method == "dspark":
-        remote_address = os.environ.get(
-            "VLLM_K3_DRAFT_REMOTE_ADDRESS"
-        ) or os.environ.get("VLLM_K3_DSPARK_REMOTE_ADDRESS")
+        remote_address = (
+            envs.VLLM_K3_DRAFT_REMOTE_ADDRESS or envs.VLLM_K3_DSPARK_REMOTE_ADDRESS
+        )
         if remote_address:
             from vllm.v1.worker.gpu.spec_decode.dspark.remote_speculator import (
                 RemoteK3DSparkSpeculator,

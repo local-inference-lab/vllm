@@ -10,12 +10,16 @@ server protocol.
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import math
 import os
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 import torch
 import zmq
@@ -40,6 +44,61 @@ logger = init_logger(__name__)
 
 PROTOCOL_VERSION = 2
 LOGITS_CAPABILITY = "dflash_logits_bf16_v1"
+PROJECTED_CONTEXT_CHUNK_SIZE = 256
+
+
+def _projected_context_capacity_bytes(
+    *,
+    max_requests: int,
+    max_tokens: int,
+    hidden_size: int,
+    chunk_size: int = PROJECTED_CONTEXT_CHUNK_SIZE,
+) -> int:
+    """Return the worst-case aggregate projected-context allocation."""
+    if min(max_requests, max_tokens, hidden_size, chunk_size) <= 0:
+        raise ValueError("Projected context cache dimensions must be positive")
+    # A retained interval can straddle one more chunk than max_tokens alone
+    # would suggest (for example [1, chunk_size + 1)).
+    chunks_per_request = (max_tokens + 2 * chunk_size - 2) // chunk_size
+    return max_requests * chunks_per_request * chunk_size * hidden_size * 2
+
+
+def _cuda_graph_shapes(
+    max_batch_size: int,
+    max_speculative_tokens: int,
+) -> list[tuple[int, int]]:
+    """Enumerate every draft shape accepted by the standalone server."""
+    if max_batch_size < 1 or max_speculative_tokens < 1:
+        raise ValueError("CUDA graph batch size and depth must be positive")
+    shapes = [
+        (batch_size, depth)
+        for batch_size in range(1, max_batch_size + 1)
+        for depth in range(1, max_speculative_tokens + 1)
+    ]
+    return sorted(shapes, reverse=True)
+
+
+def _validate_proposal_address(
+    address: str,
+    *,
+    allow_unsafe_remote: bool,
+) -> None:
+    """Reject unauthenticated non-local proposal sockets by default."""
+    parsed = urlsplit(address)
+    if parsed.scheme in ("ipc", "inproc"):
+        return
+    if parsed.scheme != "tcp" or parsed.hostname is None or parsed.port is None:
+        raise ValueError(f"Unsupported K3 proposal address: {address!r}")
+    hostname = parsed.hostname
+    is_loopback = hostname.lower() == "localhost"
+    with suppress(ValueError):
+        is_loopback = is_loopback or ipaddress.ip_address(hostname).is_loopback
+    if not is_loopback and not allow_unsafe_remote:
+        raise ValueError(
+            "K3 proposal RPC has no authentication; refusing non-loopback "
+            f"address {address!r}. Pass --allow-unsafe-remote-rpc only on a "
+            "trusted, isolated network."
+        )
 
 
 def _encode_bfloat16_logits_frame(
@@ -125,8 +184,16 @@ class ProjectedContextCache:
         if first_position < self.end_position:
             self._truncate(first_position)
 
-        offset = 0
         num_rows = int(states.shape[0])
+        final_end = first_position + num_rows
+        new_start = max(self.start_position, final_end - self.max_tokens)
+        # Evict before allocating incoming chunks so the configured retained
+        # capacity is also a bound on transient device allocation.
+        for chunk_idx in list(self._chunks):
+            if (chunk_idx + 1) * self.chunk_size <= new_start:
+                del self._chunks[chunk_idx]
+
+        offset = max(0, new_start - first_position)
         while offset < num_rows:
             position = first_position + offset
             chunk_idx, chunk_offset = divmod(position, self.chunk_size)
@@ -144,14 +211,8 @@ class ProjectedContextCache:
             )
             offset += count
 
-        self.end_position = first_position + num_rows
-        self.start_position = max(
-            self.start_position,
-            self.end_position - self.max_tokens,
-        )
-        for chunk_idx in list(self._chunks):
-            if (chunk_idx + 1) * self.chunk_size <= self.start_position:
-                del self._chunks[chunk_idx]
+        self.end_position = final_end
+        self.start_position = new_start
 
     def has_range(self, start_position: int, end_position: int) -> bool:
         return (
@@ -289,6 +350,28 @@ class DraftKVSlotAllocator:
             position % self.block_size
         )
 
+    def cache_slots(
+        self,
+        state: DraftRequestState,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vectorize rolling physical-slot mapping for one request."""
+        if positions.ndim != 1 or positions.dtype != torch.int64:
+            raise ValueError("Draft cache positions must be a 1D int64 tensor")
+        absolute_blocks = torch.div(
+            positions,
+            self.block_size,
+            rounding_mode="floor",
+        )
+        physical_blocks = (
+            1
+            + state.slot * self.blocks_per_request
+            + torch.remainder(absolute_blocks, self.blocks_per_request)
+        )
+        return physical_blocks * self.block_size + torch.remainder(
+            positions, self.block_size
+        )
+
     def block_table(
         self, state: DraftRequestState, sequence_end: int
     ) -> tuple[list[int], int]:
@@ -399,6 +482,7 @@ class K3DSparkDraftEngine:
         *,
         max_requests: int,
         window_size: int,
+        prefix_cache_gib: float,
         device: torch.device,
     ) -> None:
         self.runtime = runtime
@@ -435,6 +519,12 @@ class K3DSparkDraftEngine:
         self.max_context_tokens = int(
             runtime.vllm_config.scheduler_config.max_num_batched_tokens
         )
+        self.max_batch_size = int(runtime.vllm_config.scheduler_config.max_num_seqs)
+        if max_requests < self.max_batch_size:
+            raise ValueError(
+                "Retained request capacity must cover every accepted batch: "
+                f"retained={max_requests}, batch={self.max_batch_size}"
+            )
         self.prefix_cache_tokens = int(
             os.environ.get(
                 "VLLM_K3_DRAFT_PREFIX_CACHE_TOKENS",
@@ -447,6 +537,24 @@ class K3DSparkDraftEngine:
                 f"draft KV window ({self.allocator.window_size}), got "
                 f"{self.prefix_cache_tokens}"
             )
+        if not math.isfinite(prefix_cache_gib) or prefix_cache_gib <= 0:
+            raise ValueError("Draft prefix cache GiB must be positive and finite")
+        self.prefix_cache_capacity_bytes = int(prefix_cache_gib * 1024**3)
+        self.prefix_cache_required_bytes = _projected_context_capacity_bytes(
+            max_requests=max_requests,
+            max_tokens=self.prefix_cache_tokens,
+            hidden_size=self.hidden_size,
+        )
+        if self.prefix_cache_required_bytes > self.prefix_cache_capacity_bytes:
+            raise ValueError(
+                "Projected context cache can exceed its configured aggregate "
+                "budget: required="
+                f"{self.prefix_cache_required_bytes / 1024**3:.3f} GiB, "
+                f"budget={prefix_cache_gib:.3f} GiB, requests={max_requests}, "
+                f"tokens={self.prefix_cache_tokens}, width={self.hidden_size}"
+            )
+        self._validate_prefix_cache_available_memory()
+
         self._positions_staging = torch.empty(
             self.max_context_tokens,
             dtype=torch.int64,
@@ -457,7 +565,7 @@ class K3DSparkDraftEngine:
             dtype=torch.bfloat16,
             pin_memory=True,
         )
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.proposal_count = 0
         self.last_latency_ms = 0.0
         self.last_timing_ms: dict[str, float] = {}
@@ -469,8 +577,20 @@ class K3DSparkDraftEngine:
         self.cuda_graph_capture_seconds = 0.0
         self.cuda_graph_memory_gib = 0.0
         self.cuda_graph_replay_count = 0
-        self.cuda_graph_eager_fallback_count = 0
         self._cuda_graphs: dict[tuple[int, int], _DraftCudaGraphState] = {}
+
+    def _validate_prefix_cache_available_memory(self) -> None:
+        """Account for model, draft KV, and any captured graph allocations."""
+        if self.device.type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info(self.device)
+            if self.prefix_cache_required_bytes > free_bytes:
+                raise ValueError(
+                    "Projected context cache worst case does not fit after model "
+                    "and draft runtime allocation: "
+                    "required="
+                    f"{self.prefix_cache_required_bytes / 1024**3:.3f} GiB, "
+                    f"free={free_bytes / 1024**3:.3f} GiB"
+                )
 
     def _make_cuda_graph_state(
         self,
@@ -485,6 +605,12 @@ class K3DSparkDraftEngine:
             if self.method == "dspark"
             else 1 + num_speculative_tokens
         )
+        if query_len > self.allocator.block_size:
+            raise ValueError(
+                "Draft CUDA graph dummy sequence must fit in one mapped KV "
+                f"block: query_len={query_len}, "
+                f"block_size={self.allocator.block_size}"
+            )
         num_tokens = batch_size * query_len
         max_blocks = self.allocator.blocks_per_request
         input_ids = torch.empty(num_tokens, dtype=torch.int64, device=self.device)
@@ -649,8 +775,12 @@ class K3DSparkDraftEngine:
         state.captured_logits = logits
 
     @torch.inference_mode()
-    def capture_cuda_graphs(self, *, warmups: int = 2) -> None:
-        """Capture all DSpark or DFlash shapes selectable by this server."""
+    def capture_cuda_graphs(
+        self,
+        *,
+        warmups: int = 2,
+    ) -> None:
+        """Capture every DSpark or DFlash shape accepted by this server."""
         if warmups < 1:
             raise ValueError("Draft CUDA graph capture requires at least one warmup")
         if self._cuda_graphs:
@@ -664,15 +794,10 @@ class K3DSparkDraftEngine:
         # buffers on demand; capturing a smaller shape first and then resizing
         # that workspace for B2/K3 leaves the earlier graph with stale device
         # pointers and causes an illegal access on replay.
-        shapes = [
-            (batch_size, depth)
-            for batch_size in range(
-                self.runtime.vllm_config.scheduler_config.max_num_seqs,
-                0,
-                -1,
-            )
-            for depth in range(self.max_speculative_tokens, 0, -1)
-        ]
+        shapes = _cuda_graph_shapes(
+            self.max_batch_size,
+            self.max_speculative_tokens,
+        )
         logger.info(
             "Capturing %d standalone K3 %s CUDA graphs on %s: %s",
             len(shapes),
@@ -711,6 +836,7 @@ class K3DSparkDraftEngine:
             0.0,
             (torch.cuda.memory_allocated(self.device) - allocated_before) / 1024**3,
         )
+        self._validate_prefix_cache_available_memory()
         logger.info(
             "Standalone K3 %s CUDA graphs ready in %.2fs; allocated_delta=%.3f GiB",
             self.method,
@@ -750,39 +876,55 @@ class K3DSparkDraftEngine:
                 self.allocator.free(request_id)
 
     def clear(self) -> None:
-        self.free(self.allocator.request_ids)
+        with self._lock:
+            for request_id in self.allocator.request_ids:
+                self.allocator.free(request_id)
+
+    def _prefix_cache_bytes_by_device(self) -> tuple[int, int]:
+        total = 0
+        host = 0
+        for request_id in self.allocator.request_ids:
+            state = self.allocator.get(request_id)
+            if state is None or state.context_cache is None:
+                continue
+            allocated = state.context_cache.allocated_bytes
+            total += allocated
+            if state.context_cache.device.type == "cpu":
+                host += allocated
+        return total, host
 
     @property
     def prefix_cache_bytes(self) -> int:
-        return sum(
-            state.context_cache.allocated_bytes
-            for request_id in self.allocator.request_ids
-            if (state := self.allocator.get(request_id)) is not None
-            and state.context_cache is not None
-        )
+        with self._lock:
+            total, _ = self._prefix_cache_bytes_by_device()
+            return total
+
+    @property
+    def active_requests(self) -> int:
+        with self._lock:
+            return self.allocator.active_requests
 
     @property
     def prefix_cache_host_bytes(self) -> int:
-        return sum(
-            state.context_cache.allocated_bytes
-            for request_id in self.allocator.request_ids
-            if (state := self.allocator.get(request_id)) is not None
-            and state.context_cache is not None
-            and state.context_cache.device.type == "cpu"
-        )
+        with self._lock:
+            _, host = self._prefix_cache_bytes_by_device()
+            return host
 
     @property
     def prefix_cache_device_bytes(self) -> int:
-        return self.prefix_cache_bytes - self.prefix_cache_host_bytes
+        with self._lock:
+            total, host = self._prefix_cache_bytes_by_device()
+            return total - host
 
     @property
     def mean_timing_ms(self) -> dict[str, float]:
-        if self.proposal_count <= 0:
-            return {}
-        return {
-            key: value / self.proposal_count
-            for key, value in self._timing_totals_ms.items()
-        }
+        with self._lock:
+            if self.proposal_count <= 0:
+                return {}
+            return {
+                key: value / self.proposal_count
+                for key, value in self._timing_totals_ms.items()
+            }
 
     def _record_timing(self, timing_ms: dict[str, float]) -> None:
         self.last_timing_ms = timing_ms
@@ -817,13 +959,9 @@ class K3DSparkDraftEngine:
             positions = torch.arange(start, end, dtype=torch.int64)
             context_gpu = context_states.to(self.device, non_blocking=True)
             positions_gpu = positions.to(self.device, non_blocking=True)
-            slots = torch.tensor(
-                [
-                    self.allocator.cache_slot(state, position)
-                    for position in range(start, end)
-                ],
-                dtype=torch.int64,
-                device=self.device,
+            slots = self.allocator.cache_slots(state, positions).to(
+                self.device,
+                non_blocking=True,
             )
             self.model.precompute_and_store_context_kv(
                 context_gpu,
@@ -931,9 +1069,9 @@ class K3DSparkDraftEngine:
             else self.model.combine_hidden_states(context_input)
         )
 
-        slots: list[int] = []
+        slots_cpu = torch.empty_like(positions_cpu)
         offset = 0
-        for state, count in zip(states, context_counts):
+        for state, count in zip(states, context_counts, strict=True):
             req_positions = positions_cpu[offset : offset + count]
             if count:
                 first = int(req_positions[0])
@@ -948,19 +1086,18 @@ class K3DSparkDraftEngine:
                         f"Context positions for {state.request_id!r} are not contiguous"
                     )
                 state.committed_end = int(req_positions[-1]) + 1
-                slots.extend(
-                    self.allocator.cache_slot(state, int(position))
-                    for position in req_positions
+                slots_cpu[offset : offset + count].copy_(
+                    self.allocator.cache_slots(state, req_positions)
                 )
             offset += count
-        slot_mapping = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        slot_mapping = slots_cpu.to(self.device, non_blocking=True)
         self.model.precompute_and_store_context_kv(
             context_states,
             positions,
             slot_mapping,
         )
         offset = 0
-        for state, count in zip(states, context_counts):
+        for state, count in zip(states, context_counts, strict=True):
             if count:
                 first_position = int(positions_cpu[offset])
                 if state.context_cache is None:
@@ -995,7 +1132,10 @@ class K3DSparkDraftEngine:
         seq_lens: list[int] = []
 
         for state, anchor_position, anchor_token_id in zip(
-            states, anchor_positions, anchor_token_ids
+            states,
+            anchor_positions,
+            anchor_token_ids,
+            strict=True,
         ):
             if anchor_position != state.committed_end:
                 raise ValueError(
@@ -1023,27 +1163,30 @@ class K3DSparkDraftEngine:
 
         if self.cuda_graph_enabled:
             graph_state = self._cuda_graphs.get((batch_size, num_speculative_tokens))
-            if graph_state is not None:
-                graph_state.stage(
-                    input_ids=input_ids,
-                    positions=positions,
-                    slots=slots,
-                    block_rows=block_rows,
-                    seq_lens=seq_lens,
+            if graph_state is None:
+                raise AssertionError(
+                    "Accepted K3 request shape was not captured: "
+                    f"B{batch_size}K{num_speculative_tokens}"
                 )
-                assert graph_state.graph is not None
-                graph_state.graph.replay()
-                self.cuda_graph_replay_count += 1
-                logits = graph_state.captured_logits
-                if self.method == "dflash":
-                    assert logits is not None
-                    logits = logits.view(
-                        batch_size,
-                        num_speculative_tokens,
-                        -1,
-                    )
-                return graph_state.output_tokens, logits
-            self.cuda_graph_eager_fallback_count += 1
+            graph_state.stage(
+                input_ids=input_ids,
+                positions=positions,
+                slots=slots,
+                block_rows=block_rows,
+                seq_lens=seq_lens,
+            )
+            assert graph_state.graph is not None
+            graph_state.graph.replay()
+            self.cuda_graph_replay_count += 1
+            logits = graph_state.captured_logits
+            if self.method == "dflash":
+                assert logits is not None
+                logits = logits.view(
+                    batch_size,
+                    num_speculative_tokens,
+                    -1,
+                )
+            return graph_state.output_tokens, logits
 
         max_blocks = max(len(row) for row in block_rows)
         block_table = torch.zeros(
@@ -1148,10 +1291,9 @@ class K3DSparkDraftEngine:
         requests = header.get("requests")
         if not isinstance(requests, list) or not requests:
             raise ValueError("PROPOSE requires a non-empty requests list")
-        if len(requests) > self.allocator.max_requests:
+        if len(requests) > self.max_batch_size:
             raise ValueError(
-                f"Batch has {len(requests)} requests, max is "
-                f"{self.allocator.max_requests}"
+                f"Batch has {len(requests)} requests, max is {self.max_batch_size}"
             )
         num_speculative_tokens = int(
             header.get("num_speculative_tokens", self.max_speculative_tokens)
@@ -1174,23 +1316,26 @@ class K3DSparkDraftEngine:
                 f"PROPOSE expected {expected_frames} tensor frames, got {len(frames)}"
             )
         context_width = self.hidden_size if projected else self.raw_context_width
-        if total_context:
-            positions_cpu = self._decode_host_tensor(
-                frames[0], dtype=torch.int64, shape=(total_context,)
-            )
-            context_cpu = self._decode_host_tensor(
-                frames[1],
-                dtype=torch.bfloat16,
-                shape=(total_context, context_width),
-            )
-        else:
-            positions_cpu = torch.empty(0, dtype=torch.int64)
-            context_cpu = torch.empty((0, context_width), dtype=torch.bfloat16)
-        decoded_at = time.perf_counter()
-
         lock_started = time.perf_counter()
         with self._lock:
             lock_acquired = time.perf_counter()
+            decode_started = time.perf_counter()
+            # Both decoders reuse shared pinned staging tensors, so frame
+            # decoding must remain inside the same serialization boundary as
+            # the GPU submission that consumes those views.
+            if total_context:
+                positions_cpu = self._decode_host_tensor(
+                    frames[0], dtype=torch.int64, shape=(total_context,)
+                )
+                context_cpu = self._decode_host_tensor(
+                    frames[1],
+                    dtype=torch.bfloat16,
+                    shape=(total_context, context_width),
+                )
+            else:
+                positions_cpu = torch.empty(0, dtype=torch.int64)
+                context_cpu = torch.empty((0, context_width), dtype=torch.bfloat16)
+            decoded_at = time.perf_counter()
             gpu_start = torch.cuda.Event(enable_timing=True)
             context_end = torch.cuda.Event(enable_timing=True)
             query_end = torch.cuda.Event(enable_timing=True)
@@ -1252,9 +1397,10 @@ class K3DSparkDraftEngine:
                 ]
             logits_copied = time.perf_counter()
             self.proposal_count += 1
-            self.last_latency_ms = (logits_copied - started) * 1000
+            latency_ms = (logits_copied - started) * 1000
+            self.last_latency_ms = latency_ms
             timing_ms = {
-                "decode_frames": (decoded_at - started) * 1000,
+                "decode_frames": (decoded_at - decode_started) * 1000,
                 "lock_wait": (lock_acquired - lock_started) * 1000,
                 "host_submit": (submit_done - lock_acquired) * 1000,
                 "gpu_context": gpu_start.elapsed_time(context_end),
@@ -1262,17 +1408,18 @@ class K3DSparkDraftEngine:
                 "gpu_wait": (sync_done - submit_done) * 1000,
                 "tokens_d2h": (tokens_copied - sync_done) * 1000,
                 "logits_d2h": (logits_copied - tokens_copied) * 1000,
-                "total": self.last_latency_ms,
+                "total": latency_ms,
             }
             self._record_timing(timing_ms)
+            active_requests = self.allocator.active_requests
         response = {
             "ok": True,
             "protocol": PROTOCOL_VERSION,
             "tokens": tokens,
             "logits": logits_metadata,
-            "latency_ms": self.last_latency_ms,
+            "latency_ms": latency_ms,
             "timing_ms": timing_ms,
-            "active_requests": self.allocator.active_requests,
+            "active_requests": active_requests,
         }
         if logits_frame is not None:
             response["_logits_frame"] = logits_frame
@@ -1286,7 +1433,12 @@ class K3DSparkZMQServer:
         *,
         address: str,
         stop: threading.Event,
+        allow_unsafe_remote: bool = False,
     ) -> None:
+        _validate_proposal_address(
+            address,
+            allow_unsafe_remote=allow_unsafe_remote,
+        )
         self.engine = engine
         self.address = address
         self.stop = stop
@@ -1306,7 +1458,8 @@ class K3DSparkZMQServer:
             raise RuntimeError(self.error)
 
     def join(self, timeout: float = 5.0) -> None:
-        self._thread.join(timeout=timeout)
+        if self._thread.ident is not None:
+            self._thread.join(timeout=timeout)
 
     def _handle(self, parts: list[bytes]) -> dict[str, Any]:
         if not parts:
@@ -1326,11 +1479,19 @@ class K3DSparkZMQServer:
                 "protocol": PROTOCOL_VERSION,
                 "op": "PONG",
                 "method": self.engine.method,
-                "active_requests": self.engine.allocator.active_requests,
+                "active_requests": self.engine.active_requests,
                 "max_requests": self.engine.allocator.max_requests,
+                "max_batch_size": self.engine.max_batch_size,
+                "max_speculative_tokens": self.engine.max_speculative_tokens,
                 "block_size": self.engine.allocator.block_size,
                 "window_size": self.engine.allocator.window_size,
                 "prefix_cache_tokens": self.engine.prefix_cache_tokens,
+                "prefix_cache_capacity_bytes": (
+                    self.engine.prefix_cache_capacity_bytes
+                ),
+                "prefix_cache_required_bytes": (
+                    self.engine.prefix_cache_required_bytes
+                ),
                 "prefix_cache_device": str(self.engine.device),
                 "cold_bootstrap_count": self.engine.cold_bootstrap_count,
                 "cuda_graph_enabled": self.engine.cuda_graph_enabled,
@@ -1359,7 +1520,7 @@ class K3DSparkZMQServer:
             return {
                 "ok": True,
                 "protocol": PROTOCOL_VERSION,
-                "active_requests": self.engine.allocator.active_requests,
+                "active_requests": self.engine.active_requests,
             }
         if op == "RECONNECT":
             source_request_id = header.get("source_request_id")

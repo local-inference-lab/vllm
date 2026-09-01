@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +13,7 @@ from typing import Any
 import torch
 import zmq
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
@@ -52,7 +52,11 @@ def _build_valid_context_plan(
     valid_counts: list[int] = []
     offset = 0
     for request_idx, (scheduled, rejected) in enumerate(
-        zip(input_batch.num_scheduled_tokens.tolist(), rejected_counts)
+        zip(
+            input_batch.num_scheduled_tokens.tolist(),
+            rejected_counts,
+            strict=True,
+        )
     ):
         valid = int(scheduled) - int(rejected)
         if not 0 <= valid <= int(scheduled):
@@ -169,15 +173,18 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             or draft_hf_config.hidden_size
         )
         self.raw_context_width = int(target_hidden_size * self.num_aux_layers)
-        self.vocab_size = int(draft_hf_config.vocab_size)
+        self.vocab_size = int(vllm_config.model_config.get_vocab_size())
+        draft_vocab_size = int(draft_hf_config.vocab_size)
+        if draft_vocab_size != self.vocab_size:
+            raise ValueError(
+                "Remote K3 draft and target vocabulary sizes must match: "
+                f"draft={draft_vocab_size}, target={self.vocab_size}"
+            )
         self.use_fp64_gumbel = bool(vllm_config.model_config.use_fp64_gumbel)
         self.address = address
-        self.timeout_ms = int(
-            os.environ.get(
-                "VLLM_K3_DRAFT_REMOTE_TIMEOUT_MS",
-                os.environ.get("VLLM_K3_DSPARK_REMOTE_TIMEOUT_MS", "30000"),
-            )
-        )
+        self.timeout_ms = envs.VLLM_K3_DRAFT_REMOTE_TIMEOUT_MS
+        if self.timeout_ms < 1:
+            raise ValueError("VLLM_K3_DRAFT_REMOTE_TIMEOUT_MS must be positive")
         self.supports_mm_inputs = False
         self.draft_logits: torch.Tensor | None = None
         self._remote_logits: torch.Tensor | None = None
@@ -217,9 +224,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         self._remote_block_size = 1
         self._remote_window_size = 0
         self._remote_prefix_cache_tokens = 0
-        self._timing_log_interval = int(
-            os.environ.get("VLLM_K3_DRAFT_TIMING_LOG_INTERVAL", "0")
-        )
+        self._timing_log_interval = envs.VLLM_K3_DRAFT_TIMING_LOG_INTERVAL
         if self._timing_log_interval < 0:
             raise ValueError("VLLM_K3_DRAFT_TIMING_LOG_INTERVAL must be >= 0")
         self._timing_count = 0
@@ -284,6 +289,26 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             self._remote_max_requests = int(
                 response.get("max_requests", self.max_num_reqs)
             )
+            remote_max_batch_size = int(
+                response.get("max_batch_size", self._remote_max_requests)
+            )
+            if self.max_num_reqs > remote_max_batch_size:
+                raise RuntimeError(
+                    "Remote K3 draft batch capacity is smaller than the target "
+                    f"scheduler: remote={remote_max_batch_size}, "
+                    f"target={self.max_num_reqs}"
+                )
+            remote_max_depth = int(
+                response.get(
+                    "max_speculative_tokens",
+                    self.num_speculative_steps,
+                )
+            )
+            if self.num_speculative_steps > remote_max_depth:
+                raise RuntimeError(
+                    "Remote K3 draft depth is smaller than the target scheduler: "
+                    f"remote={remote_max_depth}, target={self.num_speculative_steps}"
+                )
             self._remote_block_size = int(response.get("block_size", 1))
             self._remote_window_size = int(response.get("window_size", 0))
             self._remote_prefix_cache_tokens = int(
@@ -359,6 +384,15 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         )
         self._known_requests.difference_update(remote_request_ids)
         for request_id in remote_request_ids:
+            self._retained_prefixes.pop(request_id, None)
+
+    def _discard_failed_requests(self, request_ids: list[str]) -> None:
+        """Forget all local state whose remote mutation is now uncertain."""
+        failed = set(request_ids)
+        self._disabled_requests.update(failed)
+        self._known_requests.difference_update(failed)
+        self._active_requests.difference_update(failed)
+        for request_id in failed:
             self._retained_prefixes.pop(request_id, None)
 
     def _ensure_remote_capacity(self, current_request_ids: set[str]) -> None:
@@ -528,6 +562,15 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             raise ValueError(
                 f"Remote DSpark token response has the wrong shape; "
                 f"expected={expected_shape}, got={tokens!r}"
+            )
+        if any(
+            type(token) is not int or not 0 <= token < self.vocab_size
+            for row in tokens
+            for token in row
+        ):
+            raise ValueError(
+                "Remote DSpark token response contains an out-of-vocabulary "
+                f"token; vocab_size={self.vocab_size}, tokens={tokens!r}"
             )
         remote_tokens = torch.tensor(tokens, dtype=torch.int64, device=self.device)
         active_gpu = torch.tensor(active_indices, dtype=torch.int64, device=self.device)
@@ -826,7 +869,11 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             [int(request["context_count"]) for request in requests],
             positions_staging,
         )
-        for request, anchor_position in zip(requests, anchor_positions):
+        for request, anchor_position in zip(
+            requests,
+            anchor_positions,
+            strict=True,
+        ):
             request["anchor_position"] = anchor_position
         positions_frame = positions_staging.numpy().tobytes()
         # NumPy has inconsistent bfloat16 support; preserve its exact bits as u16.
@@ -877,6 +924,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             requests,
             anchor_positions,
             request_context_starts,
+            strict=True,
         ):
             self._remember_prefix(
                 input_batch,
@@ -953,10 +1001,10 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             except Exception:
                 output.fill_(-1)
                 # The verifier cannot know whether a timed-out request mutated
-                # remote KV. Fail closed for those requests until they leave
-                # the active batch; FREE remains safe even if the server never
-                # created the state.
-                self._disabled_requests.update(input_batch.req_ids)
+                # remote KV. Fail closed until those requests leave the active
+                # batch, and discard every local record tied to that uncertain
+                # remote state.
+                self._discard_failed_requests(input_batch.req_ids)
                 logger.exception(
                     "Remote K3 DSpark proposal failed; drafting is disabled for "
                     "this step"

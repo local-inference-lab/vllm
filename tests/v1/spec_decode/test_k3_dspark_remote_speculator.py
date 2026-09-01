@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import vllm.v1.worker.gpu.spec_decode.dspark.remote_speculator as remote_speculator
+from vllm import envs
 from vllm.v1.worker.gpu.spec_decode.dspark.remote_speculator import (
     RemoteK3DSparkSpeculator,
     _anchor_positions_from_context,
@@ -31,6 +32,23 @@ def test_build_valid_context_plan_drops_rejected_tail_rows():
     assert counts == [2, 3]
 
 
+def test_remote_k3_environment_registry_preserves_legacy_fallback(monkeypatch):
+    monkeypatch.delenv("VLLM_K3_DRAFT_REMOTE_TIMEOUT_MS", raising=False)
+    monkeypatch.setenv("VLLM_K3_DSPARK_REMOTE_TIMEOUT_MS", "1234")
+    monkeypatch.setenv("VLLM_K3_DRAFT_REMOTE_ADDRESS", "tcp://127.0.0.1:9000")
+    monkeypatch.setenv("VLLM_K3_DSPARK_REMOTE_ADDRESS", "tcp://127.0.0.1:9001")
+    monkeypatch.setenv("VLLM_K3_DRAFT_TIMING_LOG_INTERVAL", "7")
+    envs.disable_envs_cache()
+    try:
+        assert envs.VLLM_K3_DRAFT_REMOTE_TIMEOUT_MS == 1234
+        assert envs.VLLM_K3_DSPARK_REMOTE_TIMEOUT_MS == 1234
+        assert envs.VLLM_K3_DRAFT_REMOTE_ADDRESS == "tcp://127.0.0.1:9000"
+        assert envs.VLLM_K3_DSPARK_REMOTE_ADDRESS == "tcp://127.0.0.1:9001"
+        assert envs.VLLM_K3_DRAFT_TIMING_LOG_INTERVAL == 7
+    finally:
+        envs.disable_envs_cache()
+
+
 def test_anchor_positions_follow_actual_valid_context_rows():
     positions = torch.tensor([24, 25, 26, 80, 81], dtype=torch.int64)
 
@@ -42,6 +60,7 @@ def test_anchor_positions_follow_actual_valid_context_rows():
 def test_remote_tokens_copy_supports_adaptive_depth():
     proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
     proxy.device = torch.device("cpu")
+    proxy.vocab_size = 100
     proxy.draft_tokens = torch.full((3, 8), -1, dtype=torch.int64)
 
     proxy._copy_tokens_from_response(
@@ -55,6 +74,73 @@ def test_remote_tokens_copy_supports_adaptive_depth():
         [-1, -1, -1, -1, -1, -1, -1, -1],
         [21, 22, -1, -1, -1, -1, -1, -1],
     ]
+
+
+@pytest.mark.parametrize("invalid_token", [-1, 100, True, 1.5])
+def test_remote_tokens_reject_invalid_vocab_ids(invalid_token):
+    proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy.device = torch.device("cpu")
+    proxy.vocab_size = 100
+    proxy.draft_tokens = torch.full((1, 2), -1, dtype=torch.int64)
+
+    with pytest.raises(ValueError, match="out-of-vocabulary"):
+        proxy._copy_tokens_from_response(
+            {"tokens": [[1, invalid_token]]},
+            active_indices=[0],
+            num_speculative_tokens=2,
+        )
+
+
+def test_failed_proposal_discards_all_uncertain_local_state():
+    proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy.num_speculative_steps = 2
+    proxy.draft_tokens = torch.full((2, 2), 7, dtype=torch.int64)
+    proxy._probabilistic = False
+    proxy._tp_rank = 0
+    proxy._known_requests = {"first", "second", "retained"}
+    proxy._disabled_requests = set()
+    proxy._active_requests = {"first", "second"}
+    proxy._retained_prefixes = {
+        request_id: _RetainedRequestPrefix(
+            token_ids=torch.arange(2),
+            committed_end=2,
+            context_start=0,
+            serial=index,
+        )
+        for index, request_id in enumerate(proxy._known_requests)
+    }
+    broadcasts = []
+    proxy._tp_group = SimpleNamespace(
+        broadcast=lambda tensor, src: broadcasts.append((tensor.clone(), src))
+    )
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("transport failed")
+
+    proxy._rank0_propose = fail
+    batch = SimpleNamespace(num_reqs=2, req_ids=["first", "second"])
+    empty = torch.empty(0)
+
+    output = proxy.propose(
+        batch,
+        {},
+        {},
+        empty,
+        None,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+    )
+
+    assert output.tolist() == [[-1, -1], [-1, -1]]
+    assert proxy._disabled_requests == {"first", "second"}
+    assert proxy._known_requests == {"retained"}
+    assert proxy._active_requests == set()
+    assert set(proxy._retained_prefixes) == {"retained"}
+    assert len(broadcasts) == 1
 
 
 def test_remote_speculator_accepts_scheduler_selected_zero_depth():
