@@ -18,7 +18,10 @@ from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+from vllm.v1.sample.ops.topk_topp_sampler import (
+    apply_top_k_top_p,
+    apply_top_k_top_p_probs,
+)
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
@@ -164,10 +167,12 @@ class RejectionSampler(nn.Module):
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
         # `apply_sampling_constraints` function.
+        target_is_probs = sampling_metadata.max_num_logprobs is None
         target_logits = apply_sampling_constraints(
             target_logits,
             metadata.cu_num_draft_tokens,
             sampling_metadata,
+            return_probs=target_is_probs,
         )
 
         output_token_ids = rejection_sample(
@@ -179,6 +184,7 @@ class RejectionSampler(nn.Module):
             target_logits,
             bonus_token_ids,
             sampling_metadata,
+            target_is_probs=target_is_probs,
             synthetic_mode=self.synthetic_mode,
             synthetic_conditional_rates=self.synthetic_conditional_rates,
             use_fp64_gumbel=self.use_fp64_gumbel,
@@ -406,6 +412,7 @@ def rejection_sample(
     # [batch_size, 1]
     bonus_token_ids: torch.Tensor,
     sampling_metadata: SamplingMetadata,
+    target_is_probs: bool = False,
     synthetic_mode: bool = False,
     synthetic_conditional_rates: torch.Tensor | None = None,
     use_fp64_gumbel: bool = False,
@@ -468,8 +475,13 @@ def rejection_sample(
         if sampling_metadata.all_greedy:
             return output_token_ids
 
-    # Compute probability distribution from target logits.
-    target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+    # The small-batch top-p fast path can pass normalized probabilities
+    # directly and avoid repeating a full-vocabulary softmax here.
+    target_probs = (
+        target_logits
+        if target_is_probs
+        else target_logits.softmax(dim=-1, dtype=torch.float32)
+    )
     assert target_probs.is_contiguous()
 
     # Sample recovered tokens for each position.
@@ -511,6 +523,7 @@ def apply_sampling_constraints(
     logits: torch.Tensor,  # [num_tokens, vocab_size]
     cu_num_draft_tokens: torch.Tensor,  # [batch_size]
     sampling_metadata: SamplingMetadata,
+    return_probs: bool = False,
 ) -> torch.Tensor:
     """Process logits based on sampling metadata.
 
@@ -525,8 +538,8 @@ def apply_sampling_constraints(
             temperature and whether greedy sampling is used.
 
     Returns:
-        torch.Tensor: Processed logits if non-greedy sampling is used,
-        otherwise returns the original logits.
+        torch.Tensor: Processed logits, or normalized probabilities when
+        ``return_probs`` is true. Greedy sampling returns the original logits.
     """
     assert logits.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
@@ -562,6 +575,8 @@ def apply_sampling_constraints(
 
     # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
     # which is slow for large vocab sizes. This may cause performance issues.
+    if return_probs:
+        return apply_top_k_top_p_probs(logits, top_k, top_p)
     return apply_top_k_top_p(logits, top_k, top_p)
 
 
