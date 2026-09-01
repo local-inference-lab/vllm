@@ -10,6 +10,8 @@ from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.kquant_hybrid import (
     KQuantHybridConfig,
     _qsrt_atoms_v2_w4a8_prefill_enabled,
+    _w4a16_prefill_route_block_m,
+    _w4a16_prefill_route_min_m,
     _b12x_tiles_for_geometry,
     _is_dense_layer_ignored,
     _read_hybrid_keys,
@@ -167,6 +169,28 @@ def test_qsrt_w4a8_prefill_is_opt_in_and_pure_k2_only(monkeypatch) -> None:
     assert _qsrt_atoms_v2_w4a8_prefill_enabled(pure_k2=True)
     with pytest.raises(ValueError, match="uniform coupled pure-K2"):
         _qsrt_atoms_v2_w4a8_prefill_enabled(pure_k2=False)
+
+
+def test_w4a16_prefill_route_block_defaults_and_validation(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_KQUANT_W4A16_PREFILL_BLOCK_M", raising=False)
+    monkeypatch.delenv("VLLM_KQUANT_W4A16_PREFILL_MIN_M", raising=False)
+    # Unset defers to b12x's routed-size policy at plan time.
+    assert _w4a16_prefill_route_block_m() is None
+    monkeypatch.setenv("VLLM_KQUANT_W4A16_PREFILL_BLOCK_M", "32")
+    assert _w4a16_prefill_route_block_m() == 32
+    # The threshold must stay above every CUDA-graph capture size so that
+    # captured decode graphs never bind the prefill route plan.
+    assert _w4a16_prefill_route_min_m() == 256
+
+    monkeypatch.setenv("VLLM_KQUANT_W4A16_PREFILL_BLOCK_M", "0")
+    assert _w4a16_prefill_route_block_m() == 0
+    monkeypatch.setenv("VLLM_KQUANT_W4A16_PREFILL_BLOCK_M", "16")
+    assert _w4a16_prefill_route_block_m() == 16
+    monkeypatch.setenv("VLLM_KQUANT_W4A16_PREFILL_BLOCK_M", "24")
+    with pytest.raises(ValueError, match="0 \\(off\\), 16, 32, 48, or 64"):
+        _w4a16_prefill_route_block_m()
+    monkeypatch.setenv("VLLM_KQUANT_W4A16_PREFILL_MIN_M", "512")
+    assert _w4a16_prefill_route_min_m() == 512
 
 
 def test_atoms_v2_profiles_have_canonical_row_strides() -> None:

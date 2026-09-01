@@ -77,6 +77,47 @@ def _qsrt_atoms_v2_w4a8_prefill_enabled(*, pure_k2: bool) -> bool:
     return enabled
 
 
+def _w4a16_prefill_route_block_m() -> int | None:
+    """Route-block rows for W4A16 trellis launches above the prefill threshold.
+
+    The W4A16 fused kernel decodes an expert's trellis weights once per
+    route block, so the 8-row TC-decode geometry re-decodes every expert
+    ``ceil(rows_per_expert / 8)`` times. That decode work dominates
+    prefill-size launches: one TP8 shard of a real K3 layer at 1,536 tokens
+    measures 7.5 ms with 8-row blocks and 2.9 ms with 32-row blocks, with
+    bitwise-identical outputs (the K reduction order per row is unchanged).
+    Decode-size launches keep the 8-row plan.
+
+    Returns ``None`` when ``VLLM_KQUANT_W4A16_PREFILL_BLOCK_M`` is unset, in
+    which case ``_ensure_runtime`` asks b12x's own routed-size policy
+    (``select_route_block_size_m``) for the block that fits the planned
+    capacity and falls back to the next smaller block when the kernel
+    rejects one (48- and 64-row blocks are rejected on SM120 at the pinned
+    128x128 CTA tile by the register table / shared-memory limit). ``0``
+    disables the second plan.
+    """
+    raw = os.getenv("VLLM_KQUANT_W4A16_PREFILL_BLOCK_M", "").strip()
+    if not raw:
+        return None
+    value = int(raw)
+    if value not in (0, 16, 32, 48, 64):
+        raise ValueError(
+            "VLLM_KQUANT_W4A16_PREFILL_BLOCK_M must be 0 (off), 16, 32, 48, or 64"
+        )
+    return value
+
+
+def _w4a16_prefill_route_min_m() -> int:
+    """Launches with more tokens than this bind the prefill route plan.
+
+    Must exceed every CUDA-graph capture size so captured decode graphs
+    replay the 8-row plan only; the 8-row plan also stays faster below
+    roughly 256 tokens (real-layer measurement: 1.8 vs 1.9 ms at 128
+    tokens, 3.1 vs 2.2 ms at 512).
+    """
+    return int(os.getenv("VLLM_KQUANT_W4A16_PREFILL_MIN_M", "256"))
+
+
 def _stack_exl3_intermediate_rotations(
     w13_svh: torch.Tensor,
     w2_suh: torch.Tensor,
@@ -266,6 +307,10 @@ class _HybridLayerState:
         self.uses_qsrt_atoms = False
         self.trellis_weights: Any = None
         self.trellis_plan: Any = None
+        # W4A16 plan with the wide route block for launches above
+        # _w4a16_prefill_route_min_m(); None when disabled or when the
+        # W4A8-MX prefill tier owns prefill.
+        self.trellis_w4a16_prefill_plan: Any = None
         self.trellis_prefill_weights: Any = None
         self.trellis_prefill_plan: Any = None
         self.trellis_use_w4a8_prefill = False
@@ -1592,6 +1637,98 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                     dtype=torch.float32,
                     device=spec.device,
                 )
+            prefill_block_m = _w4a16_prefill_route_block_m()
+            if prefill_block_m is None:
+                from b12x.moe._shared.kernels.w4a16.host import (
+                    select_route_block_size_m,
+                )
+
+                prefill_block_m = int(
+                    select_route_block_size_m(
+                        runtime.max_m, runtime.topk, self.moe.num_experts
+                    )
+                )
+            state.trellis_w4a16_prefill_plan = None
+            if (
+                state.trellis_prefill_weights is None
+                and prefill_block_m > 8
+                and runtime.max_m > _w4a16_prefill_route_min_m()
+            ):
+                prefill16_key = (
+                    "trellis-w4a16-prefill",
+                    state.num_secondary,
+                    state.hidden_size,
+                    state.intermediate_size,
+                    self.moe.num_experts,
+                    self.moe.activation.value,
+                    state.tiles,
+                    runtime.topk,
+                    runtime.max_m,
+                )
+                if prefill16_key in runtime.launches:
+                    prefill16_plan = runtime.launches[prefill16_key]
+                else:
+                    prefill16_plan = None
+                    # Widest block first; a rejected geometry (kernel register
+                    # table or shared-memory fit) falls back to the next
+                    # narrower one, and 8 rows means "no second plan".
+                    for block_m in (64, 48, 32, 16):
+                        if block_m > prefill_block_m:
+                            continue
+                        try:
+                            prefill16_plan = fused_moe.plan(
+                                fused_moe.Caps(
+                                    max_tokens=runtime.max_m,
+                                    num_topk=runtime.topk,
+                                    device=torch.accelerator.current_device_index(),
+                                    weight_plan=state.trellis_weights.plan,
+                                    quant_mode="w4a16",
+                                    route_num_experts=self.moe.num_experts,
+                                    w4a16_block_size_m=block_m,
+                                )
+                            )
+                        except (KeyError, ValueError) as exc:
+                            logger.warning_once(
+                                "kquant_hybrid: W4A16 prefill route block %d "
+                                "rejected by b12x (%s); trying a narrower block",
+                                block_m,
+                                exc,
+                            )
+                            continue
+                        prefill_block_m = block_m
+                        break
+                    runtime.launches[prefill16_key] = prefill16_plan
+                    if prefill16_plan is not None:
+                        logger.info_once(
+                            "kquant_hybrid: W4A16 prefill route plan ready "
+                            "(block_size_m=%d, min_m=%d, capacity=%d)",
+                            prefill_block_m,
+                            _w4a16_prefill_route_min_m(),
+                            runtime.max_m,
+                        )
+                    else:
+                        logger.warning_once(
+                            "kquant_hybrid: no W4A16 prefill route block wider "
+                            "than 8 rows compiled; prefill keeps the decode plan"
+                        )
+                state.trellis_w4a16_prefill_plan = prefill16_plan
+            if state.trellis_w4a16_prefill_plan is not None:
+                # Both W4A16 plans bind the same scratch buffer, sized to the
+                # larger arena: launches are stream-ordered and every bind
+                # re-zeroes its own grid-barrier state, so no per-plan state
+                # survives between calls. A second buffer would cost ~420 MiB
+                # per rank against a KV budget that is pinned in bytes.
+                spec16 = state.trellis_w4a16_prefill_plan.scratch_specs()[0]
+                need16 = int(torch.Size(spec16.shape).numel())
+                shared = runtime.trellis_scratch
+                if shared is None or (
+                    shared.numel() < need16 or shared.dtype != spec16.dtype
+                ):
+                    runtime.trellis_scratch = torch.empty(
+                        (max(need16, 0 if shared is None else shared.numel()),),
+                        dtype=spec16.dtype,
+                        device=spec16.device,
+                    )
             if state.trellis_prefill_weights is not None:
                 prefill_output_shape = (runtime.max_m, state.hidden_size)
                 prefill_key = (
@@ -1920,9 +2057,16 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             use_w4a8_prefill = (
                 state.trellis_prefill_weights is not None and not decode
             )
+            use_w4a16_prefill = (
+                not use_w4a8_prefill
+                and state.trellis_w4a16_prefill_plan is not None
+                and m > _w4a16_prefill_route_min_m()
+            )
             trellis_plan = (
                 state.trellis_prefill_plan
                 if use_w4a8_prefill
+                else state.trellis_w4a16_prefill_plan
+                if use_w4a16_prefill
                 else state.trellis_plan
             )
             trellis_weights = (
