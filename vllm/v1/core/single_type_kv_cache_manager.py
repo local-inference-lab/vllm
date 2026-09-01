@@ -71,6 +71,13 @@ class SingleTypeKVCacheManager(ABC):
                 block until the request finishes.
         """
         self.scheduler_block_size = scheduler_block_size
+        # The coordinator may lower this to the shared hash granularity when
+        # every group supports fine-grained prefix lookup.
+        self.prefix_cache_alignment_tokens = scheduler_block_size
+        # Additional offsets from prompt and shared-prefix boundaries that this
+        # group must retain. Hybrid coordinators use this for a target Mamba
+        # state that precedes a DFlash EAGLE lookahead block.
+        self.extra_replay_boundary_offsets: tuple[int, ...] = ()
         # The block size for this manager; used for actual block allocation.
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
@@ -426,6 +433,7 @@ class SingleTypeKVCacheManager(ABC):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        reached_tokens: int | None = None,
     ) -> None:
         """
         Cache the blocks for the request.
@@ -437,23 +445,53 @@ class SingleTypeKVCacheManager(ABC):
             retention_interval: Sparse local-checkpoint granularity. ``None``
                 keeps dense checkpointing; ``0`` keeps only the latest replay
                 boundary; a positive multiple of ``scheduler_block_size`` keeps
-                a tail once per that-sized segment. Only SWA acts on it.
+                a tail once per that-sized segment. SWA and aligned Mamba
+                managers act on it.
+            reached_tokens: Optimistic finalized progress for this scheduling
+                step before cache alignment. Defaults to the greater of
+                ``num_tokens`` and processed request progress.
         """
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
 
-        if num_cached_blocks >= num_full_blocks:
-            return
-
         # Token boundaries whose reachable tail must be retained under sparse
         # retention: the replay boundary (``num_prompt - 1``, capped by
         # ``get_computed_blocks``) and any detected shared-prefix junction.
-        reachable_boundaries = [request.num_prompt_tokens - 1]
+        base_boundaries = [request.num_prompt_tokens - 1]
         if request.shared_prefix_boundary:
-            reachable_boundaries.append(request.shared_prefix_boundary)
+            base_boundaries.append(request.shared_prefix_boundary)
+        candidate_boundaries = list(base_boundaries)
+        for boundary in base_boundaries:
+            candidate_boundaries.extend(
+                shifted
+                for offset in self.extra_replay_boundary_offsets
+                if (shifted := boundary + offset) > 0
+            )
+        # Filter derived boundaries independently. A DFlash target backoff
+        # checkpoint becomes reachable before its parent prompt boundary.
+        # ``num_tokens`` can be cache-aligned below actual request progress.
+        if reached_tokens is None:
+            reached_tokens = max(num_tokens, request.num_computed_tokens)
+        reachable_boundaries = [
+            boundary for boundary in candidate_boundaries if boundary < reached_tokens
+        ]
 
+        # A sparse boundary can become reachable after its blocks were first
+        # visited and deliberately left unhashed. Re-scan those allocated
+        # blocks once the boundary is reached so its tail can be promoted.
+        scan_start_block = (
+            0
+            if (
+                retention_interval is not None
+                and isinstance(self.kv_cache_spec, (MambaSpec, SlidingWindowSpec))
+                and reachable_boundaries
+            )
+            else num_cached_blocks
+        )
+        if scan_start_block >= num_full_blocks:
+            return
         block_mask = self.reachable_block_mask(
-            start_block=num_cached_blocks,
+            start_block=scan_start_block,
             end_block=num_full_blocks,
             alignment_tokens=self.scheduler_block_size,
             kv_cache_spec=self.kv_cache_spec,
@@ -464,7 +502,7 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool.cache_full_blocks(
             request=request,
             blocks=self.req_to_blocks[request.request_id],
-            num_cached_blocks=num_cached_blocks,
+            num_cached_blocks=scan_start_block,
             num_full_blocks=num_full_blocks,
             block_size=self.block_size,
             kv_cache_group_id=self.kv_cache_group_id,
@@ -783,8 +821,14 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        reached_tokens: int | None = None,
     ) -> None:
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            reached_tokens=reached_tokens,
+        )
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return
@@ -1058,8 +1102,12 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         if retention_interval is not None:
             for boundary_tokens in reachable_boundaries:
                 aligned = boundary_tokens // alignment_tokens * alignment_tokens
-                end = aligned // block_size + shift
-                for j in range(max(start_block, end - need), min(end_block, end)):
+                # The EAGLE lookahead block can extend past the finalized
+                # prompt tail. Clamp first so sparse retention keeps the full
+                # reachable window before that tail instead of retaining only
+                # the last block of a window that cannot exist yet.
+                end = min(aligned // block_size + shift, end_block)
+                for j in range(max(start_block, end - need), end):
                     mask[j - start_block] = True
 
         return mask
@@ -1716,9 +1764,15 @@ class MambaManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        reached_tokens: int | None = None,
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            reached_tokens=reached_tokens,
+        )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
             partial_hash = self._cache_partial_tail_block(request, num_tokens)
@@ -1811,6 +1865,7 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        reached_tokens: int | None = None,
     ) -> None:
         # We do not cache blocks for cross-attention to be shared between
         # requests, so this method is not relevant.

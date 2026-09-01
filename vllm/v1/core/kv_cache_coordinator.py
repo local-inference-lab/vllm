@@ -320,6 +320,7 @@ class KVCacheCoordinator(ABC):
                 request,
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
+                reached_tokens=num_computed_tokens,
             )
 
     def free(self, request_id: str) -> None:
@@ -656,6 +657,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     "cache managers require block-aligned lookups: %s.",
                     ", ".join(sorted(unsupported_partial_hit_managers)),
                 )
+        prefix_cache_alignment_tokens = self._cache_hit_alignment_tokens
+        for manager in self.single_type_managers:
+            manager.prefix_cache_alignment_tokens = prefix_cache_alignment_tokens
+            if self.has_replicated_sliding_group and isinstance(
+                manager.kv_cache_spec, MambaSpec
+            ):
+                # The DFlash group drops one EAGLE lookahead unit. Retain the
+                # target recurrent state at that common replay boundary without
+                # making every historical Mamba checkpoint dense.
+                manager.extra_replay_boundary_offsets = (
+                    -prefix_cache_alignment_tokens,
+                )
         self.verify_and_split_kv_cache_groups()
 
     @property
@@ -771,6 +784,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 request,
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
+                reached_tokens=num_computed_tokens,
             )
 
     def find_longest_cache_hit(

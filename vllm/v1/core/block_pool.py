@@ -268,6 +268,7 @@ class BlockPool:
         new_hashes: list[ExternalBlockHash] | None = (
             [] if self.enable_kv_cache_events else None
         )
+        newly_cached_indices: list[int] = []
         for i, blk in enumerate(new_full_blocks):
             # Some blocks may be null or masked out when enabling sparse attention
             # like sliding window attention, or Mamba models with prefix-caching
@@ -281,6 +282,13 @@ class BlockPool:
             block_hash_with_group_id = make_block_hash_with_group_id(
                 block_hash, kv_cache_group_id
             )
+            if (
+                blk.block_hash == block_hash_with_group_id
+                and blk.block_hash_num_tokens == num_hash_tokens
+            ):
+                # Sparse boundary promotion can revisit an already registered
+                # block while adding a newly reachable neighbor.
+                continue
             if blk.block_hash is not None:
                 # The only valid case where a "new full block" already has a
                 # hash is partial->full promotion of the same cache block.
@@ -295,6 +303,7 @@ class BlockPool:
                 blk,
                 num_tokens=num_hash_tokens,
             )
+            newly_cached_indices.append(num_cached_blocks + i)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -313,14 +322,9 @@ class BlockPool:
             # Generate extra keys for each block individually.
             # Each block may have different extra_keys (e.g., different MM
             # features, or cache_salt only for the first block).
-            # Skip null/masked-out blocks to match the length of new_hashes.
             extra_keys_list: list[tuple[Any, ...] | None] = []
             curr_mm_idx = 0
-            for i in range(num_cached_blocks, num_full_blocks):
-                if blocks[i].is_null:
-                    continue
-                if block_mask is not None and not block_mask[i - num_cached_blocks]:
-                    continue
+            for i in newly_cached_indices:
                 block_start = i * block_size
                 block_end = block_start + block_size
                 extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
