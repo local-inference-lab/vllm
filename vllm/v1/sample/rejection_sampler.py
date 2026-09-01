@@ -536,6 +536,7 @@ def apply_sampling_constraints(
         cu_num_draft_tokens: Cumulative number of draft tokens.
         sampling_metadata: Metadata containing sampling parameters such as
             temperature and whether greedy sampling is used.
+        return_probs: Return normalized probabilities instead of processed logits.
 
     Returns:
         torch.Tensor: Processed logits, or normalized probabilities when
