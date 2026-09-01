@@ -500,7 +500,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         self._drain_async_ingest()
         with self._async_lock:
             try:
-                self._socket.send_multipart(frames)
+                self._socket.send_multipart(frames, copy=False)  # kimi-k3-draft-zero-copy-sync
                 response_frames = self._socket.recv_multipart()
             except Exception:
                 self._connect()
@@ -1080,10 +1080,10 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         if deferred:  # kimi-k3-draft-async-ingest: the ring slot stays reserved until the reply
             positions_frame = memoryview(positions_staging.numpy())
             context_frame = memoryview(context_staging.view(torch.uint16).numpy())
-        else:
-            positions_frame = positions_staging.numpy().tobytes()
+        else:  # kimi-k3-draft-zero-copy-sync: staging memory stays valid until the reply arrives
+            positions_frame = memoryview(positions_staging.numpy())
             # NumPy has inconsistent bfloat16 support; preserve its exact bits as u16.
-            context_frame = context_staging.view(torch.uint16).numpy().tobytes()
+            context_frame = memoryview(context_staging.view(torch.uint16).numpy())
         # kimi-k3-dflash-feature-capture: persist the exact served feature
         # stream for offline draft training. Inert without the env var.
         if _K3_CAPTURE_DIR:
