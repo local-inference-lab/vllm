@@ -14,7 +14,6 @@ from vllm.models.glm5next.nvidia.ops import glm_kpool
 from vllm.models.glm5next.nvidia.ops.glm_kpool import (
     expand_c4_block_table,
     expand_pool_ids,
-    fwht128_quant_fp8,
     gather_c4_block_table_rows,
     pool_seq_lens,
     update_decode_pools,
@@ -68,10 +67,10 @@ def test_glm53_fused_fwht_weight_scaling_is_bitwise(rows: int) -> None:
     actual_weights = initial_weights.clone()
     legacy_weights = initial_weights.clone()
 
-    fwht128_quant_fp8(query, expected_query, expected_scales)
+    glm_kpool.fwht128_quant_fp8(query, expected_query, expected_scales)
     expected_weights.mul_(expected_scales)
     expected_weights.mul_((128 * 32) ** -0.5)
-    fwht128_quant_fp8(
+    glm_kpool.fwht128_quant_fp8(
         query,
         actual_query,
         actual_scales,
@@ -111,7 +110,7 @@ def test_glm53_fused_fwht_weight_scaling_graph_replays_live_inputs() -> None:
     scales = torch.empty(rows, dtype=torch.float32, device=device)
 
     def transform() -> None:
-        fwht128_quant_fp8(query, query_out, scales, weights=weights)
+        glm_kpool.fwht128_quant_fp8(query, query_out, scales, weights=weights)
 
     transform()
     device_module = torch.get_device_module(device)
@@ -139,7 +138,7 @@ def test_glm53_fused_fwht_weight_scaling_graph_replays_live_inputs() -> None:
     expected_query = torch.empty_like(query_out)
     expected_scales = torch.empty_like(scales)
     expected_weights = input_weights.clone()
-    fwht128_quant_fp8(query, expected_query, expected_scales)
+    glm_kpool.fwht128_quant_fp8(query, expected_query, expected_scales)
     expected_weights.mul_(expected_scales)
     expected_weights.mul_((128 * 32) ** -0.5)
     torch.testing.assert_close(query_out, expected_query, rtol=0, atol=0)
