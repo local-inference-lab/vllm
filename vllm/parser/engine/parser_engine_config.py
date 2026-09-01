@@ -65,10 +65,6 @@ class ParserEngineConfig:
         default_factory=dict,
     )
 
-    non_whitespace_transitions: dict[ParserState, Transition] = field(
-        default_factory=dict,
-    )
-
     content_events: dict[ParserState, EventType] = field(
         default_factory=lambda: {
             ParserState.CONTENT: EventType.TEXT_CHUNK,
@@ -102,6 +98,10 @@ class ParserEngineConfig:
 
     # Reject tool calls whose names are absent from the request tools.
     validate_tool_names: bool = False
+
+    non_whitespace_transitions: dict[ParserState, Transition] = field(
+        default_factory=dict,
+    )
 
     @cached_property
     def terminal_defs(self):

@@ -22,6 +22,13 @@ from vllm.parser.engine.parser_engine_config import (
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
 
 
+def test_parser_engine_config_positional_content_events_compatibility():
+    content_events = {ParserState.CONTENT: EventType.TEXT_CHUNK}
+    config = ParserEngineConfig("positional", {}, {}, {}, content_events)
+    assert config.content_events is content_events
+    assert config.non_whitespace_transitions == {}
+
+
 def _hermes_config() -> ParserEngineConfig:
     """Simple Hermes-style config: <tool_call>JSON</tool_call>."""
     return ParserEngineConfig(
