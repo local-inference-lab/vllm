@@ -52,6 +52,7 @@ def test_parser_selection_thinking_disabled():
     )
 
     assert parser._thinking_enabled is False
+    assert parser.thinking_enabled is False
 
 
 def test_extract_reasoning_with_xtml_tags():
@@ -117,6 +118,103 @@ def test_is_reasoning_end_ignores_stale_close_from_prior_turn():
     assert parser.is_reasoning_end([*stale_close, *new_open, *stale_close])
     # open with no close yet -> not ended
     assert not parser.is_reasoning_end([*new_open])
+
+
+def test_fresh_assistant_prompt_does_not_inherit_closed_reasoning():
+    parser = KimiK3ReasoningParser(
+        DummyTokenizer(),
+        chat_template_kwargs={
+            "thinking": True,
+            "add_generation_prompt": True,
+            "continue_final_message": False,
+        },
+    )
+
+    assert not parser.is_reasoning_end_for_prompt(CLOSE_IDS)
+
+
+def test_continued_assistant_prompt_uses_rendered_reasoning_state():
+    parser = KimiK3ReasoningParser(
+        DummyTokenizer(),
+        chat_template_kwargs={
+            "thinking": True,
+            "add_generation_prompt": False,
+            "continue_final_message": True,
+        },
+    )
+
+    assert parser.is_reasoning_end_for_prompt(CLOSE_IDS)
+    assert not parser.is_reasoning_end_for_prompt(OPEN_IDS)
+
+
+def test_fresh_assistant_stream_classifies_first_tokens_as_reasoning():
+    parser = ReasoningOnlyParser(
+        DummyTokenizer(),
+        chat_template_kwargs={
+            "thinking": True,
+            "add_generation_prompt": True,
+        },
+    )
+    request = ChatCompletionRequest(model="test-model", messages=[])
+
+    first = parser.parse_delta(
+        delta_text=".",
+        delta_token_ids=[9],
+        request=request,
+        prompt_token_ids=CLOSE_IDS,
+        finished=False,
+    )
+    partial_close = parser.parse_delta(
+        delta_text=f"{CLOSE}think",
+        delta_token_ids=CLOSE_IDS[:2],
+        request=request,
+        prompt_token_ids=CLOSE_IDS,
+        finished=False,
+    )
+    closed = parser.parse_delta(
+        delta_text=f"{SEP}{RESPONSE_OPEN}",
+        delta_token_ids=[CLOSE_IDS[2], 10],
+        request=request,
+        prompt_token_ids=CLOSE_IDS,
+        finished=False,
+    )
+
+    assert first is not None
+    assert first.reasoning == "."
+    assert first.content is None
+    assert partial_close is None
+    assert closed is None
+
+
+def test_content_filter_holds_and_removes_split_protocol_markers():
+    parser = ReasoningOnlyParser(
+        DummyTokenizer(),
+        chat_template_kwargs={
+            "thinking": True,
+            "add_generation_prompt": False,
+            "continue_final_message": True,
+        },
+    )
+    request = ChatCompletionRequest(model="test-model", messages=[])
+    chunks = [".", f"{CLOSE}think", SEP, RESPONSE_OPEN]
+    messages: list[DeltaMessage] = []
+
+    for index, chunk in enumerate(chunks):
+        delta = parser.parse_delta(
+            delta_text=chunk,
+            delta_token_ids=[9 + index],
+            request=request,
+            prompt_token_ids=CLOSE_IDS,
+            finished=index == len(chunks) - 1,
+        )
+        if delta is not None:
+            messages.append(delta)
+
+    content = "".join(message.content or "" for message in messages)
+    assert content == "."
+    assert OPEN not in content
+    assert CLOSE not in content
+    assert SEP not in content
 
 
 def test_streaming_split_open_marker_is_held_back():

@@ -395,15 +395,20 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.max_num_splits = 0  # No upper bound on the number of splits.
         self.aot_schedule = get_flash_attn_version() == 3
 
-        try:
-            from vllm.distributed.parallel_state import get_dcp_group
-
-            self.dcp_world_size = get_dcp_group().world_size
-            self.dcp_rank = get_dcp_group().rank_in_group
-        except AssertionError:
-            # DCP might not be initialized in testing
+        # A DCP-replicated KV group stores the complete sequence on every
+        # rank. Build ordinary local-attention metadata for that group instead
+        # of partitioning its sequence lengths for a second time.
+        if getattr(kv_cache_spec, "dcp_replicated", False):
             self.dcp_world_size = 1
             self.dcp_rank = 0
+        else:
+            try:
+                self.dcp_world_size = get_dcp_group().world_size
+                self.dcp_rank = get_dcp_group().rank_in_group
+            except AssertionError:
+                # DCP might not be initialized in testing
+                self.dcp_world_size = 1
+                self.dcp_rank = 0
 
         self.cp_kv_cache_interleave_size = (
             self.parallel_config.cp_kv_cache_interleave_size

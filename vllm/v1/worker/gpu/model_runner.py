@@ -65,7 +65,6 @@ from vllm.multimodal.encoder_budget import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
-from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -511,6 +510,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_logits=self.max_num_reqs * self.decode_query_len,
                 vocab_size=self.vocab_size,
                 device=self.device,
+                num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
             )
 
         if self.is_pooling_model and self.is_last_pp_rank:
@@ -619,19 +619,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
-            # One local block covers `block_size * dcp_shard_count` tokens in
-            # the global sequence. Replicated groups keep the full cache on
-            # every rank instead.
             group_cp_size = get_kv_cache_dcp_shard_count(spec, self.dcp_size)
             group_cp_sizes.append(group_cp_size)
-            max_num_blocks = cdiv(
-                block_table_max_model_len, spec.block_size * group_cp_size
+            # Cache specifications own their block-table geometry. Attention
+            # caches account for their token-position DCP shards, while
+            # recurrent state and replicated attention caches remain unscaled.
+            max_num_blocks = spec.max_num_blocks_per_req(
+                self.vllm_config, block_table_max_model_len
             )
-            # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
             if isinstance(spec, MambaSpec):
-                max_num_blocks = (
-                    max_num_blocks if self.cache_config.enable_prefix_caching else 1
-                ) + spec.num_speculative_blocks
                 max_num_blocks = get_block_table_width(
                     max_num_blocks, spec.block_size, token_alignment=None
                 )
@@ -1562,6 +1558,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_lens=prompt_lens,
             max_req_tokens=max_req_tokens,
             valid_num_draft_tokens_per_req=valid_num_draft_tokens_per_req,
+            all_token_ids_cpu=self.req_states.all_token_ids.cpu,
         )
         # InputBuffers are reused across real, dummy, and captured batches.
         # Clear stale padding before a capacity manager optionally marks a
@@ -1646,6 +1643,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch,
                     grammar_output.structured_output_request_ids,
                     grammar_output.grammar_bitmask,
+                    grammar_output.num_spec_tokens,
                 )
 
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
