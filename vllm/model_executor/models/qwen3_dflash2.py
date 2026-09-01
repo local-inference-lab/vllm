@@ -153,6 +153,7 @@ def _grouped_conv(
         and hidden_states.is_contiguous()
         and base.is_contiguous()
         and delta.ndim == 3
+        and delta.shape == (hidden_states.shape[0], taps, num_groups)
         and delta.stride(2) == 1
         and taps == 2
         and group_size == 16

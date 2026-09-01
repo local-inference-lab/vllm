@@ -5,10 +5,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import vllm.model_executor.models.qwen3_dflash2 as dflash2_module
 from vllm.model_executor.models.qwen3_dflash2 import _grouped_conv
 
 pytestmark = pytest.mark.skipif(
-    not torch.accelerator.is_available(),
+    not torch.cuda.is_available(),
     reason="The fused grouped convolution requires CUDA",
 )
 
@@ -69,6 +70,60 @@ def test_dflash2_grouped_conv_taps2_matches_bf16_reference(rows: int) -> None:
         num_groups=num_groups,
         group_size=group_size,
         taps=taps,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("broadcast_axis", ["row", "tap", "group"])
+def test_dflash2_grouped_conv_broadcast_delta_uses_generic_path(
+    broadcast_axis: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    torch.manual_seed(20260901)
+    rows = 8
+    block_size = 8
+    num_groups = 256
+    group_size = 16
+    taps = 2
+    hidden_size = num_groups * group_size
+    delta_shapes = {
+        "row": (1, taps, num_groups),
+        "tap": (rows, 1, num_groups),
+        "group": (rows, taps, 1),
+    }
+    hidden_states = torch.randn(
+        rows, hidden_size, device="cuda", dtype=torch.bfloat16
+    ).contiguous()
+    delta = torch.randn(
+        delta_shapes[broadcast_axis], device="cuda", dtype=torch.bfloat16
+    ).contiguous()
+    base = torch.randn(
+        taps, hidden_size, device="cuda", dtype=torch.bfloat16
+    ).contiguous()
+    expected = _reference_grouped_conv(
+        hidden_states,
+        delta,
+        base,
+        block_size=block_size,
+        num_groups=num_groups,
+        group_size=group_size,
+        taps=taps,
+    )
+
+    def reject_fused_path(*args: object, **kwargs: object) -> torch.Tensor:
+        pytest.fail("broadcast delta must use the generic grouped convolution")
+
+    monkeypatch.setattr(
+        dflash2_module, "_dflash2_grouped_conv_taps2", reject_fused_path
+    )
+    actual = _grouped_conv(
+        hidden_states,
+        delta,
+        base,
+        block_size,
+        num_groups,
+        group_size,
+        taps,
     )
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
