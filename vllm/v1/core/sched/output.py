@@ -206,6 +206,21 @@ class ScheduledEncoderInputStats:
 
 
 @dataclass
+class KVConnectorBlockState:
+    """Authoritative scheduler-side KV source state for external stores.
+
+    ``block_ids`` is a full per-group snapshot for every request scheduled in
+    this step. ``boundary_state_offloads`` identifies the exact recurrent
+    state block at each durable token boundary; connectors must not reconstruct
+    these sources from allocation deltas because align-mode Mamba tables are
+    sparse and mutable.
+    """
+
+    block_ids: dict[str, tuple[list[int], ...]]
+    boundary_state_offloads: dict[str, list[tuple[int, int, int]]]
+
+
+@dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
     # We cache the request's data in each worker process, so that we don't
@@ -279,6 +294,11 @@ class SchedulerOutput:
     # the durable boundary block of a producer's last-prompt-boundary partial
     # tail (mamba "align" CoW target). None unless partial hash hits are active.
     partial_tail_offloads: dict[str, list[tuple[int, int, int]]] | None = None
+
+    # Authoritative source tables and recurrent boundary blocks for external
+    # KV stores. This is scheduler-only metadata consumed while connector
+    # metadata is built; workers use the resulting opaque connector metadata.
+    kv_connector_block_state: KVConnectorBlockState | None = None
 
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
