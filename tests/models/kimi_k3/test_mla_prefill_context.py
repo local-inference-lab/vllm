@@ -19,7 +19,10 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonPrefillMetadata,
     build_mla_chunked_context_metadata,
 )
-from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
+from vllm.models.kimi_k3.nvidia.mla import (
+    KimiK3PrefillProjectionWorkspace,
+    MultiHeadLatentAttention,
+)
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -100,6 +103,8 @@ class _KVBProj(torch.nn.Module):
 
     def __init__(self, device: torch.device, weight_dtype: torch.dtype) -> None:
         super().__init__()
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
         weight = (
             torch.randn(
                 _NUM_HEADS * (_QK_NOPE + _V_HEAD_DIM),
@@ -110,8 +115,13 @@ class _KVBProj(torch.nn.Module):
             * 0.05
         )
         self.register_buffer("weight", weight.to(weight_dtype))
+        self.quant_method = UnquantizedLinearMethod()
+        self.bias = None
+        self.gather_output = False
+        self.forward_calls = 0
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+        self.forward_calls += 1
         if self.weight.dtype == torch.bfloat16 and x.dtype != torch.bfloat16:
             raise RuntimeError(
                 "a bfloat16 kv_b_proj cannot consume the gathered latent as "
@@ -129,7 +139,14 @@ class _FusedLayer:
     _gather_context_latent = MultiHeadLatentAttention._gather_context_latent
     _attn_read_kv_cache = MultiHeadLatentAttention._attn_read_kv_cache
 
-    def __init__(self, kv_b_proj, kv_cache, kv_cache_dtype, k_scale) -> None:
+    def __init__(
+        self,
+        kv_b_proj,
+        kv_cache,
+        kv_cache_dtype,
+        k_scale,
+        prefill_projection_workspace=None,
+    ) -> None:
         self.kv_b_proj = kv_b_proj
         self.kv_cache = kv_cache
         self.kv_cache_dtype = kv_cache_dtype
@@ -139,6 +156,7 @@ class _FusedLayer:
         self.dcp_world_size = 1
         self.qk_nope_head_dim = _QK_NOPE
         self.v_head_dim = _V_HEAD_DIM
+        self.prefill_projection_workspace = prefill_projection_workspace
 
 
 class _ReferenceImpl:
@@ -252,7 +270,24 @@ def test_fused_context_matches_generic_impl(
         * 0.2
     ).to(q_data_type)
 
-    layer = _FusedLayer(kv_b_proj, kv_cache, kv_cache_dtype, k_scale)
+    projection_workspace = None
+    if not kv_b_proj_quantized:
+        projection_workspace = KimiK3PrefillProjectionWorkspace(
+            num_ubatches=1, min_tokens=0
+        )
+        projection_workspace.reserve(
+            max_tokens=_WORKSPACE_TOKENS,
+            output_size=_NUM_HEADS * (_QK_NOPE + _V_HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+    layer = _FusedLayer(
+        kv_b_proj,
+        kv_cache,
+        kv_cache_dtype,
+        k_scale,
+        prefill_projection_workspace=projection_workspace,
+    )
     fused_out, fused_lse = layer._compute_prefill_context(
         q, SimpleNamespace(prefill=prefill_fused)
     )
@@ -278,6 +313,10 @@ def test_fused_context_matches_generic_impl(
             )
     torch.testing.assert_close(fused_out, ref_out, atol=0, rtol=0)
     torch.testing.assert_close(fused_lse, ref_lse, atol=0, rtol=0)
+    expected_projection_calls = len(prefill_ref.chunked_context.chunks)
+    if kv_b_proj_quantized:
+        expected_projection_calls *= 2
+    assert kv_b_proj.forward_calls == expected_projection_calls
 
     # Every chunk but the continuation should have been written in place, i.e.
     # straight into the returned accumulator, with no intermediate copy.
@@ -319,6 +358,22 @@ def test_fused_context_rejects_an_unquantized_query() -> None:
     )
     with pytest.raises(AssertionError, match="new-token epilogue"):
         layer._compute_prefill_context(q, SimpleNamespace(prefill=prefill))
+
+
+def test_prefill_projection_workspace_reuses_reserved_storage() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    workspace = KimiK3PrefillProjectionWorkspace(num_ubatches=1, min_tokens=4)
+    workspace.reserve(8, 16, torch.bfloat16, device)
+
+    assert workspace.get(3, 16, torch.bfloat16, device) is None
+    short = workspace.get(4, 16, torch.bfloat16, device)
+    full = workspace.get(8, 16, torch.bfloat16, device)
+    assert short is not None and full is not None
+    assert short.data_ptr() == full.data_ptr()
+    assert workspace.nbytes == 8 * 16 * torch.bfloat16.itemsize
+
+    with pytest.raises(ValueError, match="needs 9 rows"):
+        workspace.get(9, 16, torch.bfloat16, device)
 
 
 @torch.inference_mode()

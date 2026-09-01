@@ -25,6 +25,9 @@ from vllm.distributed.utils import split_tensor_along_last_dim
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
+from vllm.model_executor.layers.attention.mla_attention import (
+    align_mla_chunked_context_workspace_size,
+)
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     fused_moe_make_expert_params_mapping,
@@ -111,7 +114,10 @@ from vllm.models.kimi_k3.nvidia.latent_moe_runner import (
 from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
     enable_kimi_k3_low_latency_gemm,
 )
-from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
+from vllm.models.kimi_k3.nvidia.mla import (
+    KimiK3PrefillProjectionWorkspace,
+    MultiHeadLatentAttention,
+)
 from vllm.models.kimi_k3.nvidia.ops import attn_res
 from vllm.models.kimi_k3.nvidia.tp_projection import (
     gather_kimi_sharded_projection,
@@ -1467,6 +1473,7 @@ class KimiDecoderLayer(nn.Module):
         vllm_config: VllmConfig,
         prefix: str = "",
         aux_stream: torch.cuda.Stream | None = None,
+        prefill_projection_workspace: KimiK3PrefillProjectionWorkspace | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1537,6 +1544,7 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
                 aux_stream=aux_stream,
+                prefill_projection_workspace=prefill_projection_workspace,
             )
             self._self_attn_writes_output = False
 
@@ -1791,6 +1799,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         config = vllm_config.model_config.hf_text_config
         self.config = config
+        self._vllm_config = vllm_config
         self.attn_res_block_size: int | None = config.attn_res_block_size
         self.use_attn_res = self.attn_res_block_size is not None
         self.reuse_attn_res_output = (
@@ -1820,6 +1829,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         # attention front-end (DeepseekV4 convention: created at the model
         # level and threaded into each attention layer).
         aux_stream = torch.cuda.Stream()
+        self._mla_prefill_projection_workspace = KimiK3PrefillProjectionWorkspace(
+            num_ubatches=2 if parallel_config.enable_dbo else 1,
+            min_tokens=int(vllm_config.scheduler_config.max_num_batched_tokens) + 1,
+        )
 
         def get_layer(prefix: str):
             return KimiDecoderLayer(
@@ -1827,6 +1840,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 vllm_config,
                 prefix,
                 aux_stream=aux_stream,
+                prefill_projection_workspace=self._mla_prefill_projection_workspace,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -2058,6 +2072,48 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 / (1024**2),
                 self._max_num_batched_tokens,
             )
+
+    def reserve_mla_prefill_projection_workspace(self) -> None:
+        """Reserve one large context projection output shared by MLA layers."""
+        internal_tokens = envs.VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE
+        if internal_tokens <= self._max_num_batched_tokens:
+            return
+        workspace_tokens = align_mla_chunked_context_workspace_size(
+            self._vllm_config, internal_tokens
+        )
+        mla_layers = [
+            layer.self_attn
+            for layer in self.layers
+            if isinstance(getattr(layer, "self_attn", None), MultiHeadLatentAttention)
+        ]
+        if not mla_layers:
+            return
+        first = mla_layers[0]
+        if envs.VLLM_BATCH_INVARIANT or not all(
+            isinstance(layer.kv_b_proj.quant_method, UnquantizedLinearMethod)
+            and layer.kv_b_proj.bias is None
+            and not layer.kv_b_proj.gather_output
+            for layer in mla_layers
+        ):
+            logger.warning_once(
+                "Kimi-K3 retained context projection is unavailable for the "
+                "configured kv_b_proj method."
+            )
+            return
+        weight = first.kv_b_proj.weight
+        _release_cuda_cache_before_retained_allocation(weight.device)
+        self._mla_prefill_projection_workspace.reserve(
+            max_tokens=workspace_tokens,
+            output_size=weight.shape[0],
+            dtype=weight.dtype,
+            device=weight.device,
+        )
+        logger.info_once(
+            "Kimi-K3 retained %.2f MiB/rank for the %d-token MLA context "
+            "projection workspace shared across layers.",
+            self._mla_prefill_projection_workspace.nbytes / (1024**2),
+            workspace_tokens,
+        )
 
     def forward(
         self,
@@ -2533,6 +2589,7 @@ class KimiLinearForCausalLM(
         return loaded
 
     def process_weights_after_loading(self) -> None:
+        self.model.reserve_mla_prefill_projection_workspace()
         self.model.reserve_attn_res_workspace()
 
 

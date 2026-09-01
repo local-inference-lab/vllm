@@ -114,6 +114,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     get_kv_quant_mode,
 )
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
@@ -125,6 +126,77 @@ logger = init_logger(__name__)
 # hides it); at or above it, run the gate on the main stream.
 _GATE_MULTI_STREAM_TOKEN_THRESHOLD = 512
 _MLA_CALLER_OUTPUT_MIN_TOKENS = 1024
+
+
+class KimiK3PrefillProjectionWorkspace:
+    """Retained output storage for large dense context projections."""
+
+    def __init__(self, num_ubatches: int, min_tokens: int) -> None:
+        if num_ubatches < 1:
+            raise ValueError("num_ubatches must be positive")
+        if min_tokens < 0:
+            raise ValueError("min_tokens must be non-negative")
+        self.num_ubatches = num_ubatches
+        self.min_tokens = min_tokens
+        self._buffer: torch.Tensor | None = None
+
+    def reserve(
+        self,
+        max_tokens: int,
+        output_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        if max_tokens < self.min_tokens:
+            raise ValueError(
+                f"max_tokens ({max_tokens}) must be at least min_tokens "
+                f"({self.min_tokens})"
+            )
+        self._buffer = torch.empty(
+            (self.num_ubatches, max_tokens, output_size),
+            dtype=dtype,
+            device=device,
+        )
+
+    @property
+    def nbytes(self) -> int:
+        buffer = self._buffer
+        return 0 if buffer is None else buffer.numel() * buffer.element_size()
+
+    def get(
+        self,
+        num_tokens: int,
+        output_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if num_tokens < self.min_tokens:
+            return None
+        buffer = self._buffer
+        if buffer is None:
+            raise RuntimeError("Kimi-K3 prefill projection workspace is not reserved")
+        if num_tokens > buffer.shape[1]:
+            raise ValueError(
+                f"context projection needs {num_tokens} rows, but the retained "
+                f"workspace has {buffer.shape[1]}"
+            )
+        if output_size != buffer.shape[2]:
+            raise ValueError(
+                f"context projection needs {output_size} columns, but the retained "
+                f"workspace has {buffer.shape[2]}"
+            )
+        if dtype != buffer.dtype or device != buffer.device:
+            raise ValueError(
+                "context projection input and retained workspace must have the "
+                "same dtype and device"
+            )
+        ubatch_id = dbo_current_ubatch_id()
+        if ubatch_id >= self.num_ubatches:
+            raise RuntimeError(
+                f"ubatch {ubatch_id} has no Kimi-K3 prefill projection workspace; "
+                f"configured slots: {self.num_ubatches}"
+            )
+        return buffer[ubatch_id, :num_tokens]
 
 
 def _parse_k3_qrep_layers(spec: str) -> frozenset[int] | None:
@@ -295,6 +367,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         aux_stream: torch.cuda.Stream | None = None,
+        prefill_projection_workspace: KimiK3PrefillProjectionWorkspace | None = None,
         use_rope: bool = False,
         non_causal_multi_token_decode: bool = False,
     ) -> None:
@@ -322,6 +395,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.scale = self.qk_head_dim**-0.5
         self.rms_norm_eps = config.rms_norm_eps
         self.layer_name = prefix
+        self.prefill_projection_workspace = prefill_projection_workspace
 
         self.rotary_emb: RotaryEmbedding | None = None
         if use_rope:
@@ -1114,6 +1188,37 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         kv_cache = self._attn_read_kv_cache()
         kv_b_proj_input_dtype = _get_kv_b_proj_input_dtype(self.kv_b_proj, fp8_prefill)
 
+        def project_context(kv_c_normed: torch.Tensor) -> torch.Tensor:
+            workspace = self.prefill_projection_workspace
+            weight = getattr(self.kv_b_proj, "weight", None)
+            if workspace is None or not isinstance(weight, torch.Tensor):
+                return self.kv_b_proj(kv_c_normed)[0]
+            rows = kv_c_normed.numel() // self.kv_lora_rank
+            projection = workspace.get(
+                rows,
+                self.num_local_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                kv_c_normed.dtype,
+                kv_c_normed.device,
+            )
+            if projection is None:
+                return self.kv_b_proj(kv_c_normed)[0]
+            if not isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod):
+                raise RuntimeError(
+                    "Kimi-K3 retained context projection requires an "
+                    "unquantized kv_b_proj"
+                )
+            if self.kv_b_proj.bias is not None or self.kv_b_proj.gather_output:
+                raise RuntimeError(
+                    "Kimi-K3 retained context projection requires a local, "
+                    "bias-free kv_b_proj"
+                )
+            torch.mm(
+                kv_c_normed.reshape(rows, self.kv_lora_rank),
+                weight.t(),
+                out=projection,
+            )
+            return projection
+
         def run_chunk(
             chunk, out: torch.Tensor | None = None
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1122,7 +1227,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             )
             if kv_b_proj_input_dtype is not None:
                 kv_c_normed = kv_c_normed.to(kv_b_proj_input_dtype)
-            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+            kv_nope = project_context(kv_c_normed).view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
