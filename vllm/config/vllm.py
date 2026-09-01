@@ -1071,6 +1071,17 @@ class VllmConfig:
         if self.model_config is not None and (self.model_config.enable_cumem_allocator):
             return
 
+        # Engine-driven LMCache MP transport does not pin or register KV
+        # addresses; GPU gather/scatter remains in the vLLM worker.
+        if (
+            self.kv_transfer_config.kv_connector == "LMCacheMPConnector"
+            and self.kv_transfer_config.kv_connector_extra_config.get(
+                "lmcache.mp.mp_transfer_mode"
+            )
+            == "engine_driven"
+        ):
+            return
+
         raise ValueError(
             f"KV connector {self.kv_transfer_config.kv_connector} is "
             "incompatible with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
