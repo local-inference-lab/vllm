@@ -671,17 +671,16 @@ class CustomAllreduce:
                 getattr(pcie_runtime, "supports_all_peer_auxiliary", True)
             )
             dma_min_bytes = (
-                _b12x_pcie_dma_min_bytes()
-                if pcie_backend == "b12x" and supports_all_peer_auxiliary
-                else None
+                _b12x_pcie_dma_min_bytes() if supports_all_peer_auxiliary else None
             )
             dma_cls = None if dma_min_bytes is None else _load_b12x_pcie_dma()
-            if pcie_backend != "b12x":
+            if pcie_backend == "flashinfer-ipc" and dma_min_bytes is not None:
                 logger.info(
-                    "FlashInfer PCIe IPC handles only tuned one-shot shapes; "
-                    "larger allreduces stay on PyNCCL."
+                    "FlashInfer PCIe IPC handles tuned one-shot shapes; "
+                    "B12X DMA is enabled for larger allreduces at %d bytes.",
+                    dma_min_bytes,
                 )
-            elif not supports_all_peer_auxiliary:
+            if not supports_all_peer_auxiliary:
                 logger.info(
                     "B12X PCIe %s all-reduce does not expose the all-peer "
                     "topology required by DMA; larger tensors use PyNCCL.",
@@ -1081,7 +1080,11 @@ class CustomAllreduce:
     def backend_name(self) -> str:
         if self._pcie_runtime is not None:
             if self._pcie_backend_name == "flashinfer-ipc":
-                return "FLASHINFER_PCIE_IPC"
+                return (
+                    "FLASHINFER_PCIE_IPC_B12X_DMA"
+                    if self._pcie_dma is not None
+                    else "FLASHINFER_PCIE_IPC"
+                )
             if getattr(self._pcie_runtime, "algorithm", "oneshot") != "oneshot":
                 return "B12X_PCIE_HIERARCHICAL"
             if self._pcie_dma is not None:
