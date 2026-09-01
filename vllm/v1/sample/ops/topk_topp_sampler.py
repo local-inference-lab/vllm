@@ -374,6 +374,14 @@ def apply_top_k_top_p_probs(
     full-vocabulary softmax in callers that need probabilities rather than
     processed logits. ``logits`` may be reused as the output buffer when it is
     float32.
+
+    Args:
+        logits: Unnormalized token scores with shape ``[batch_size, vocab_size]``.
+        k: Per-row top-k limits, or ``None`` when top-k is disabled.
+        p: Per-row top-p thresholds, or ``None`` when top-p is disabled.
+
+    Returns:
+        Normalized constrained probabilities with the same shape as ``logits``.
     """
     if p is None:
         return apply_top_k_top_p(logits, k, p).softmax(dim=-1, dtype=torch.float32)
