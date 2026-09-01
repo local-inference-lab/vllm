@@ -15,6 +15,7 @@ from vllm.models.glm5next.nvidia.ops.glm_kpool import (
     expand_pool_ids,
     gather_c4_block_table_rows,
     pool_seq_lens,
+    prepare_c4_decode_metadata,
     update_decode_pools,
 )
 from vllm.models.glm5next.nvidia.pooled_indexer import Glm5NextPooledIndexer
@@ -197,18 +198,233 @@ def test_glm53_packed_c4_metadata_uses_parent_stride() -> None:
         )
 
 
+@pytest.mark.parametrize(("rows", "requests"), [(1, 1), (7, 4), (32, 32)])
+@pytest.mark.parametrize(
+    ("dcp_size", "dcp_rank", "pool_interleave"),
+    [(1, 0, 1), (4, 2, 1), (4, 3, 2)],
+)
+def test_glm53_c4_decode_metadata_matches_reference(
+    rows: int,
+    requests: int,
+    dcp_size: int,
+    dcp_rank: int,
+    pool_interleave: int,
+) -> None:
+    device = _require_glm_gpu()
+    source_width = 5
+    subpages_per_parent = 9
+    parent_stride_pages = 37
+    source = torch.arange(
+        requests * source_width, dtype=torch.int32, device=device
+    ).reshape(requests, source_width)
+    source[0, -1] = -1
+    source[-1, 0] = 58_000_000
+    request_ids = torch.arange(rows, dtype=torch.int32, device=device) % requests
+    positions = torch.arange(rows, dtype=torch.int64, device=device) * 257 + 3
+
+    expanded = torch.empty(
+        (requests, source_width * subpages_per_parent),
+        dtype=torch.int32,
+        device=device,
+    )
+    expected_table = torch.empty(
+        (rows, source_width * subpages_per_parent),
+        dtype=torch.int32,
+        device=device,
+    )
+    expected_seq_lens = torch.empty(rows, dtype=torch.int32, device=device)
+    actual_table = torch.empty_like(expected_table)
+    actual_seq_lens = torch.empty_like(expected_seq_lens)
+
+    expand_c4_block_table(
+        source,
+        expanded,
+        rows=requests,
+        subpages_per_parent=subpages_per_parent,
+        parent_stride_pages=parent_stride_pages,
+    )
+    gather_c4_block_table_rows(expanded, request_ids, expected_table)
+    pool_seq_lens(
+        positions,
+        expected_seq_lens,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        pool_interleave=pool_interleave,
+    )
+    prepare_c4_decode_metadata(
+        source,
+        request_ids,
+        positions,
+        actual_table,
+        actual_seq_lens,
+        subpages_per_parent=subpages_per_parent,
+        parent_stride_pages=parent_stride_pages,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        pool_interleave=pool_interleave,
+    )
+
+    torch.testing.assert_close(actual_table, expected_table, rtol=0, atol=0)
+    torch.testing.assert_close(actual_seq_lens, expected_seq_lens, rtol=0, atol=0)
+
+
+def test_glm53_c4_decode_metadata_graph_replays_live_inputs() -> None:
+    device = _require_glm_gpu()
+    rows = 7
+    requests = 4
+    source_width = 5
+    subpages_per_parent = 9
+    parent_stride_pages = 37
+    source = torch.arange(
+        requests * source_width, dtype=torch.int32, device=device
+    ).reshape(requests, source_width)
+    request_ids = torch.arange(rows, dtype=torch.int32, device=device) % requests
+    positions = torch.arange(rows, dtype=torch.int64, device=device) * 4 + 3
+    output_table = torch.empty(
+        (rows, source_width * subpages_per_parent),
+        dtype=torch.int32,
+        device=device,
+    )
+    output_seq_lens = torch.empty(rows, dtype=torch.int32, device=device)
+
+    def prepare() -> None:
+        prepare_c4_decode_metadata(
+            source,
+            request_ids,
+            positions,
+            output_table,
+            output_seq_lens,
+            subpages_per_parent=subpages_per_parent,
+            parent_stride_pages=parent_stride_pages,
+            dcp_size=4,
+            dcp_rank=2,
+            pool_interleave=2,
+        )
+
+    prepare()
+    device_module = torch.get_device_module(device)
+    graph = device_module.CUDAGraph()
+    with device_module.graph(graph):
+        prepare()
+
+    source.add_(100)
+    source[1, -1] = -1
+    request_ids.copy_(
+        torch.tensor([3, 1, 2, 0, 3, 2, 1], dtype=torch.int32, device=device)
+    )
+    positions.add_(4096)
+    output_table.fill_(37)
+    output_seq_lens.fill_(37)
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    expanded = torch.empty(
+        (requests, source_width * subpages_per_parent),
+        dtype=torch.int32,
+        device=device,
+    )
+    expected_table = torch.empty_like(output_table)
+    expected_seq_lens = torch.empty_like(output_seq_lens)
+    expand_c4_block_table(
+        source,
+        expanded,
+        rows=requests,
+        subpages_per_parent=subpages_per_parent,
+        parent_stride_pages=parent_stride_pages,
+    )
+    gather_c4_block_table_rows(expanded, request_ids, expected_table)
+    pool_seq_lens(
+        positions,
+        expected_seq_lens,
+        dcp_size=4,
+        dcp_rank=2,
+        pool_interleave=2,
+    )
+    torch.testing.assert_close(output_table, expected_table, rtol=0, atol=0)
+    torch.testing.assert_close(output_seq_lens, expected_seq_lens, rtol=0, atol=0)
+
+    allocated = torch.accelerator.memory_allocated()
+    graph.replay()
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert torch.accelerator.memory_allocated() == allocated
+
+
+def test_glm53_physical_selection_provider_is_explicit() -> None:
+    indexer = Glm5NextPooledIndexer.__new__(Glm5NextPooledIndexer)
+    nn.Module.__init__(indexer)
+    indexer.dcp_world_size = 1
+    indexer._emit_physical_selection = True
+    indexer.topk_indices_buffer = torch.empty((8, 2051), dtype=torch.int32)
+    indexer._physical_active_counts = torch.empty(8, dtype=torch.int32)
+
+    selected = indexer.get_b12x_physical_selection(
+        num_tokens=3,
+        num_prefills=0,
+        num_decode_tokens=3,
+    )
+    assert selected is not None
+    assert selected[0].shape == (3, 2051)
+    assert selected[1].shape == (3,)
+    assert (
+        indexer.get_b12x_physical_selection(
+            num_tokens=3,
+            num_prefills=1,
+            num_decode_tokens=2,
+        )
+        is None
+    )
+
+    indexer._emit_physical_selection = False
+    assert (
+        indexer.get_b12x_physical_selection(
+            num_tokens=3,
+            num_prefills=0,
+            num_decode_tokens=3,
+        )
+        is None
+    )
+
+
 def _packed_main_cache(
-    *, device: torch.device, blocks: int, layers: int, block_size: int, layer: int
+    *,
+    device: torch.device,
+    blocks: int,
+    layers: int,
+    block_size: int,
+    layer: int,
+    record_bytes: int = 528,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    page_bytes = block_size * (528 + 33)
+    semantic_page_bytes = block_size * record_bytes
+    content_page_bytes = ((semantic_page_bytes + 8447) // 8448) * 8448
+    page_bytes = content_page_bytes + block_size * 33
     raw = torch.zeros(blocks * layers * page_bytes, dtype=torch.uint8, device=device)
     main = torch.as_strided(
         raw,
-        size=(blocks, block_size, 528),
-        stride=(layers * page_bytes, 528, 1),
+        size=(blocks, block_size, record_bytes),
+        stride=(layers * page_bytes, record_bytes, 1),
         storage_offset=layer * page_bytes,
     )
     return raw, main
+
+
+def test_glm53_packed_tail_accepts_nvfp4_main_record() -> None:
+    _, main = _packed_main_cache(
+        device=torch.device("cpu"),
+        blocks=2,
+        layers=3,
+        block_size=3328,
+        layer=1,
+        record_bytes=304,
+    )
+
+    index_cache, subpages, parent_stride_pages = (
+        Glm5NextPooledIndexer._index_cache_view(main)
+    )
+
+    assert subpages == 13
+    assert parent_stride_pages == 399
+    assert index_cache.stride() == (8448, 132, 1)
 
 
 def test_glm53_decode_table_capacity_uses_batched_token_limit() -> None:

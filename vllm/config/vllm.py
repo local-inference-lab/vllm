@@ -2678,6 +2678,7 @@ class VllmConfig:
             return self
         if (
             self.cache_config.cache_dtype.startswith("nvfp4")
+            and self.cache_config.cache_dtype != "nvfp4_ds_mla"
             and self.model_config.use_mla
         ):
             raise ValueError(

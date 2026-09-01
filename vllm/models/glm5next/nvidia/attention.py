@@ -61,6 +61,7 @@ class Glm5NextMLAAttention(nn.Module):
         pool_topk_indices_buffer: torch.Tensor | None = None,
         input_size: int | None = None,
         skip_rope: bool | None = False,
+        is_mtp_layer: bool = False,
         attn_backend: type | None = None,
     ) -> None:
         super().__init__()
@@ -168,6 +169,8 @@ class Glm5NextMLAAttention(nn.Module):
                 pool_topk_indices_buffer,
                 main_layer_name=f"{prefix}.attn",
                 prefix=f"{prefix}.indexer",
+                # MTP compacts and reuses request-relative selections.
+                emit_physical_selection=not is_mtp_layer,
             )
         else:
             self.indexer = None

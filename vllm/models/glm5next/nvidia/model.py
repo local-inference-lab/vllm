@@ -384,6 +384,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 topk_indices_buffer=topk_indices_buffer,
                 pool_topk_indices_buffer=pool_topk_indices_buffer,
                 skip_rope=getattr(config, "mla_nope", False),
+                is_mtp_layer=is_mtp_layer,
             )
 
         # MTP layers sit past the base model's hidden layers (layer_idx >=

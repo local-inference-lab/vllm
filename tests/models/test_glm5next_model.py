@@ -1005,7 +1005,10 @@ def test_b12x_kda_binds_live_invocations_and_shares_metadata(monkeypatch) -> Non
     assert layers[0]._b12x_kda_num_tokens.item() == 2
 
 
-def test_glm5next_sparse_mla_selects_b12x_backend(monkeypatch) -> None:
+@pytest.mark.parametrize("is_mtp_layer", [False, True])
+def test_glm5next_sparse_mla_selects_b12x_backend(
+    monkeypatch, is_mtp_layer: bool
+) -> None:
     captured: dict[str, object] = {}
 
     class FakeLinear(torch.nn.Module):
@@ -1013,11 +1016,14 @@ def test_glm5next_sparse_mla_selects_b12x_backend(monkeypatch) -> None:
             super().__init__()
             self.qrep_active = False
 
+    indexer_kwargs: dict[str, object] = {}
+
     class FakeIndexer(torch.nn.Module):
         topk_tokens = 2048
 
         def __init__(self, *args: object, **kwargs: object) -> None:
             super().__init__()
+            indexer_kwargs.update(kwargs)
             self.indexer_op = None
 
     class FakeMLAAttention(torch.nn.Module):
@@ -1055,10 +1061,12 @@ def test_glm5next_sparse_mla_selects_b12x_backend(monkeypatch) -> None:
         cache_config=SimpleNamespace(),
         topk_indices_buffer=torch.empty((2, 2051), dtype=torch.int32),
         skip_rope=True,
+        is_mtp_layer=is_mtp_layer,
     )
 
     assert captured["attn_backend"] is B12xGLM5NextMLASparseBackend
     assert captured["use_sparse"] is True
+    assert indexer_kwargs["emit_physical_selection"] == (not is_mtp_layer)
 
 
 def test_glm5next_rejects_pipeline_parallelism() -> None:

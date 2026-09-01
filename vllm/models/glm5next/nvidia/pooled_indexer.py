@@ -21,6 +21,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.models.deepseek_v4.nvidia.b12x_indexer import (
     B12xC4SparseIndexer,
 )
+from vllm.utils.b12x import get_b12x_sparse_mla
 from vllm.v1.attention.backends.mla.b12x_indexer import _merge_dcp_topk
 
 if TYPE_CHECKING:
@@ -34,6 +35,7 @@ from .ops.glm_kpool import (
     fwht128_quant_fp8,
     gather_c4_block_table_rows,
     pool_seq_lens,
+    prepare_c4_decode_metadata,
     update_decode_pools,
 )
 
@@ -46,7 +48,6 @@ _SELECTION_WIDTH = 2051
 _INDEX_CACHE_WIDTH = 132
 _INDEX_PAGE_SIZE = 64
 _INDEX_PAGE_BYTES = _INDEX_PAGE_SIZE * _INDEX_CACHE_WIDTH
-_MLA_RECORD_BYTES = 528
 
 
 class Glm5NextPooledIndexer(nn.Module):
@@ -65,6 +66,7 @@ class Glm5NextPooledIndexer(nn.Module):
         *,
         main_layer_name: str,
         prefix: str,
+        emit_physical_selection: bool = True,
     ) -> None:
         super().__init__()
         if cache_config is None:
@@ -121,12 +123,24 @@ class Glm5NextPooledIndexer(nn.Module):
                 f"divisible by {_POOL_SIZE}, got {token_interleave}"
             )
         self.pool_interleave = max(token_interleave // _POOL_SIZE, 1)
+        self._emit_physical_selection = bool(emit_physical_selection)
         if int(topk_indices_buffer.shape[0]) != self.max_tokens:
             raise ValueError("GLM token selection buffer has the wrong row capacity")
         if int(pool_topk_indices_buffer.shape[0]) != self.max_tokens:
             raise ValueError("GLM pool selection buffer has the wrong row capacity")
 
         device = topk_indices_buffer.device
+        b12x_sparse_mla = get_b12x_sparse_mla()
+        if b12x_sparse_mla is None or not hasattr(
+            b12x_sparse_mla, "expand_pooled_topk_to_physical_slots"
+        ):
+            raise RuntimeError(
+                "GLM pooled selection requires a B12X build with pooled "
+                "physical-selection support."
+            )
+        self._expand_pooled_topk_to_physical_slots = (
+            b12x_sparse_mla.expand_pooled_topk_to_physical_slots
+        )
         self.index_kpool_compress_ape = nn.Parameter(
             torch.empty(
                 (_POOL_SIZE, _INDEX_HEAD_DIM),
@@ -202,6 +216,11 @@ class Glm5NextPooledIndexer(nn.Module):
             persistent=False,
         )
         self.register_buffer(
+            "_physical_active_counts",
+            torch.empty(self.max_tokens, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
             "_q_scale",
             torch.empty(
                 (self.max_tokens, _INDEX_HEADS),
@@ -243,6 +262,7 @@ class Glm5NextPooledIndexer(nn.Module):
         self._parent_table_width = 0
         self._subpages_per_parent = 0
         self._parent_stride_pages = 0
+        self._main_cache_num_blocks = 0
 
     @property
     def _aligned_max_seq_len(self) -> int:
@@ -262,7 +282,14 @@ class Glm5NextPooledIndexer(nn.Module):
 
     @staticmethod
     def _active_index_page_count(seq_len: int) -> int:
-        """Return FP8 C4 pages that can contain completed visible pools."""
+        """Return FP8 C4 pages that can contain completed visible pools.
+
+        Args:
+            seq_len: Visible sequence length in tokens.
+
+        Returns:
+            Number of index pages that may contain completed pools.
+        """
         completed_pools = seq_len // _POOL_SIZE
         return max(1, math.ceil(completed_pools / _INDEX_PAGE_SIZE))
 
@@ -273,22 +300,25 @@ class Glm5NextPooledIndexer(nn.Module):
         if (
             main_cache.ndim != 3
             or main_cache.dtype != torch.uint8
-            or int(main_cache.shape[-1]) != _MLA_RECORD_BYTES
+            or int(main_cache.shape[-1]) <= 0
         ):
-            raise ValueError("GLM MLA cache must be uint8 [pages, block, 528]")
-        pages, block_size, _ = map(int, main_cache.shape)
+            raise ValueError("GLM MLA cache must be uint8 [pages, block, record_bytes]")
+        pages, block_size, record_bytes = map(int, main_cache.shape)
         if pages <= 0 or block_size % (_POOL_SIZE * _INDEX_PAGE_SIZE):
             raise ValueError(
                 "GLM MLA pages must contain a whole number of 64-pool C4 pages"
             )
-        if tuple(map(int, main_cache.stride()[1:])) != (_MLA_RECORD_BYTES, 1):
+        if tuple(map(int, main_cache.stride()[1:])) != (record_bytes, 1):
             raise ValueError("GLM MLA cache records must be contiguous within a page")
 
         subpages_per_parent = block_size // (_POOL_SIZE * _INDEX_PAGE_SIZE)
         parent_stride_bytes = int(main_cache.stride(0))
-        semantic_page_bytes = block_size * _MLA_RECORD_BYTES
+        semantic_page_bytes = block_size * record_bytes
+        index_tail_offset_bytes = (
+            (semantic_page_bytes + _INDEX_PAGE_BYTES - 1) // _INDEX_PAGE_BYTES
+        ) * _INDEX_PAGE_BYTES
         index_tail_bytes = subpages_per_parent * _INDEX_PAGE_BYTES
-        if parent_stride_bytes < semantic_page_bytes + index_tail_bytes:
+        if parent_stride_bytes < index_tail_offset_bytes + index_tail_bytes:
             raise ValueError("GLM MLA cache page does not contain its FP8 index tail")
         if parent_stride_bytes % _INDEX_PAGE_BYTES:
             raise ValueError(
@@ -301,7 +331,7 @@ class Glm5NextPooledIndexer(nn.Module):
                 "GLM virtual C4 page IDs exceed the int32 page-table range"
             )
 
-        tail_offset = int(main_cache.storage_offset()) + semantic_page_bytes
+        tail_offset = int(main_cache.storage_offset()) + index_tail_offset_bytes
         tail_end = (
             tail_offset + max_virtual_page * _INDEX_PAGE_BYTES + _INDEX_PAGE_BYTES
         )
@@ -339,10 +369,42 @@ class Glm5NextPooledIndexer(nn.Module):
         self._parent_table_width = parent_table_width
         self._subpages_per_parent = subpages
         self._parent_stride_pages = parent_stride_pages
+        self._main_cache_num_blocks = int(main_cache.shape[0])
         self.block_size = block_size
 
     def unbind_main_kv_cache(self) -> None:
         self._index_cache = None
+        self._main_cache_num_blocks = 0
+
+    def get_b12x_physical_selection(
+        self,
+        *,
+        num_tokens: int,
+        num_prefills: int,
+        num_decode_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Return the direct physical selection produced for pure decode.
+
+        Args:
+            num_tokens: Number of active token rows.
+            num_prefills: Number of prefill requests.
+            num_decode_tokens: Number of decode token rows.
+
+        Returns:
+            Physical selected slots and active counts, or ``None`` when direct
+            selection is unavailable for the current batch geometry.
+        """
+        if (
+            not self._emit_physical_selection
+            or self.dcp_world_size != 1
+            or num_prefills != 0
+            or num_decode_tokens != num_tokens
+        ):
+            return None
+        return (
+            self.topk_indices_buffer[:num_tokens],
+            self._physical_active_counts[:num_tokens],
+        )
 
     def _project_head_weights(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._weights_proj_fp32 is None:
@@ -441,32 +503,48 @@ class Glm5NextPooledIndexer(nn.Module):
             model_block_size=self.block_size,
             parent_stride_pages=self._parent_stride_pages,
         )
-        expand_c4_block_table(
-            main_metadata.block_table[:num_reqs, : self._parent_table_width],
-            self._pool_block_table,
-            rows=num_reqs,
-            subpages_per_parent=self._subpages_per_parent,
-            parent_stride_pages=self._parent_stride_pages,
-        )
+        parent_table = main_metadata.block_table[:num_reqs, : self._parent_table_width]
         seq_lens = self._pool_seq_lens[:live_rows]
-        pool_seq_lens(
-            positions[:live_rows],
-            seq_lens,
-            dcp_size=self.dcp_world_size,
-            dcp_rank=self.dcp_rank,
-            pool_interleave=self.pool_interleave,
-        )
+        decode_only = decode_rows == live_rows
+        decode_table = self._decode_block_table[:decode_rows]
+        if decode_only:
+            prepare_c4_decode_metadata(
+                parent_table,
+                main_metadata.req_id_per_token[:decode_rows],
+                positions[:decode_rows],
+                decode_table,
+                seq_lens,
+                subpages_per_parent=self._subpages_per_parent,
+                parent_stride_pages=self._parent_stride_pages,
+                dcp_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                pool_interleave=self.pool_interleave,
+            )
+        else:
+            expand_c4_block_table(
+                parent_table,
+                self._pool_block_table,
+                rows=num_reqs,
+                subpages_per_parent=self._subpages_per_parent,
+                parent_stride_pages=self._parent_stride_pages,
+            )
+            pool_seq_lens(
+                positions[:live_rows],
+                seq_lens,
+                dcp_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                pool_interleave=self.pool_interleave,
+            )
         pool_ids = self.pool_topk_indices_buffer[:rows]
-        pool_ids.fill_(-1)
         pool_scores = self._pool_scores[:rows] if self.dcp_world_size > 1 else None
 
         if decode_rows:
-            decode_table = self._decode_block_table[:decode_rows]
-            gather_c4_block_table_rows(
-                self._pool_block_table,
-                main_metadata.req_id_per_token[:decode_rows],
-                decode_table,
-            )
+            if not decode_only:
+                gather_c4_block_table_rows(
+                    self._pool_block_table,
+                    main_metadata.req_id_per_token[:decode_rows],
+                    decode_table,
+                )
             self.indexer_op.run_paged_topk(
                 q=q_fp8[:decode_rows],
                 weights=weights[:decode_rows],
@@ -546,8 +624,27 @@ class Glm5NextPooledIndexer(nn.Module):
                 )
 
         output = self.topk_indices_buffer[:rows]
-        output.fill_(-1)
-        expand_pool_ids(pool_ids[:live_rows], positions[:live_rows], output[:live_rows])
+        if live_rows < rows:
+            output[live_rows:].fill_(-1)
+        if decode_only and self.dcp_world_size == 1 and self._emit_physical_selection:
+            if self._main_cache_num_blocks < 1:
+                raise RuntimeError("GLM selector main cache is not bound")
+            self._expand_pooled_topk_to_physical_slots(
+                pool_ids[:live_rows],
+                positions[:live_rows],
+                main_metadata.req_id_per_token[:live_rows],
+                main_metadata.block_table,
+                output[:live_rows],
+                self._physical_active_counts[:live_rows],
+                pool_size=_POOL_SIZE,
+                block_size=self.block_size,
+                block_stride_rows=self.block_size,
+                num_cache_blocks=self._main_cache_num_blocks,
+            )
+        else:
+            expand_pool_ids(
+                pool_ids[:live_rows], positions[:live_rows], output[:live_rows]
+            )
         return output
 
     def snapshot_speculative_interval_starts(self) -> None:

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """B12x sparse indexer for DeepSeek V4."""
 
-from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
@@ -30,11 +29,6 @@ _INDEX_PAGE_WIDTH = _INDEX_PAGE_SIZE * (_INDEX_HEAD_DIM + _INDEX_SCALE_BYTES)
 _PREFILL_ROUTE = "packed_contiguous"
 
 
-@dataclass
-class DeepseekV4B12xIndexerDecodeMetadata(DeepSeekV32IndexerDecodeMetadata):
-    active_width: torch.Tensor | None = None
-
-
 class DeepseekV4B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
     @classmethod
     def get_cudagraph_support(
@@ -51,9 +45,6 @@ class DeepseekV4B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
         self.prefill_k_rows = _require_b12x_indexer().resolve_paged_prefill_k_rows(
             max_page_table_width=block_table_width,
             page_size=_INDEX_PAGE_SIZE,
-        )
-        self.active_width_buffer = torch.zeros(
-            (1,), dtype=torch.int32, device=self.device
         )
 
     def _supports_native_decode(self, next_n: int) -> bool:
@@ -99,16 +90,9 @@ class DeepseekV4B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
                     self.num_sms,
                     out=self.scheduler_metadata_buffer,
                 )
-            active_width = (
-                int(metadata.max_seq_len) + int(self.compress_ratio) - 1
-            ) // int(self.compress_ratio)
-            self.active_width_buffer.fill_(active_width)
             decode_fields = vars(decode).copy()
             decode_fields["schedule_metadata"] = schedule_metadata
-            metadata.decode = DeepseekV4B12xIndexerDecodeMetadata(
-                **decode_fields,
-                active_width=self.active_width_buffer,
-            )
+            metadata.decode = DeepSeekV32IndexerDecodeMetadata(**decode_fields)
         return metadata
 
 
@@ -195,7 +179,6 @@ def _run_paged_topk(
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
     schedule_metadata: torch.Tensor | None,
-    active_width: torch.Tensor | None,
     output: torch.Tensor,
     scores: torch.Tensor | None,
     topk: int,
@@ -208,7 +191,6 @@ def _run_paged_topk(
         scratch=scratch,
         real_page_table=block_table,
         cache_seqlens_int32=seq_lens,
-        active_width=active_width,
         schedule_metadata=schedule_metadata,
         expected_num_q_heads=int(q.shape[1]),
         shared_page_table=shared_page_table,
@@ -341,7 +323,6 @@ class B12xC4SparseIndexer(nn.Module):
         scores: torch.Tensor | None = None,
         shared_page_table: bool,
         schedule_metadata: torch.Tensor | None = None,
-        active_width: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the shared C4 scorer against caller-owned paged metadata."""
         if output.shape != (int(q.shape[0]), self.topk_tokens):
@@ -355,7 +336,6 @@ class B12xC4SparseIndexer(nn.Module):
             raise ValueError(
                 "B12x C4 scores must be float32 with the same shape as output"
             )
-        output.fill_(-1)
         _run_paged_topk(
             module=self._b12x_indexer,
             plan=self._plan_paged_topk(
@@ -369,7 +349,6 @@ class B12xC4SparseIndexer(nn.Module):
             seq_lens=seq_lens,
             block_table=block_table,
             schedule_metadata=schedule_metadata,
-            active_width=active_width,
             output=output,
             scores=scores,
             topk=self.topk_tokens,
@@ -427,7 +406,6 @@ class B12xC4SparseIndexer(nn.Module):
                 block_table = chunk.block_table[:1, :active_pages].expand(
                     int(q_chunk.shape[0]), active_pages
                 )
-                output.fill_(-1)
                 _run_paged_topk(
                     module=self._b12x_indexer,
                     plan=self._plan_paged_topk(
@@ -441,7 +419,6 @@ class B12xC4SparseIndexer(nn.Module):
                     seq_lens=seq_lens,
                     block_table=block_table,
                     schedule_metadata=None,
-                    active_width=None,
                     output=output,
                     scores=None,
                     topk=self.topk_tokens,
@@ -465,8 +442,6 @@ class B12xC4SparseIndexer(nn.Module):
                 )
             num_tokens = metadata.num_decode_tokens
             output = self.topk_indices_buffer[:num_tokens, : self.topk_tokens]
-            output.fill_(-1)
-            active_width = getattr(decode, "active_width", None)
             _run_paged_topk(
                 module=self._b12x_indexer,
                 plan=self._plan_paged_topk(
@@ -480,7 +455,6 @@ class B12xC4SparseIndexer(nn.Module):
                 seq_lens=seq_lens[:num_tokens],
                 block_table=block_table[:num_tokens].contiguous(),
                 schedule_metadata=decode.schedule_metadata,
-                active_width=active_width,
                 output=output,
                 scores=None,
                 topk=self.topk_tokens,
