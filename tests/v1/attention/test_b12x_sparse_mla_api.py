@@ -410,6 +410,49 @@ def test_b12x_glm5_next_keeps_hybrid_manager_page_unsplit() -> None:
     )
 
 
+def test_glm5_next_split_cache_auto_aligns_to_dcp_retention(monkeypatch) -> None:
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architecture="Glm5NextForConditionalGeneration",
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        cache_config=SimpleNamespace(
+            block_size=256,
+            mamba_block_size=None,
+            mamba_cache_mode="align",
+            mamba_page_size_padded=1234,
+            prefix_cache_retention_interval=4096,
+        ),
+    )
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "auto")
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE", "auto")
+
+    Platform._align_hybrid_block_size(config, B12xGLM5NextMLASparseBackend)
+
+    assert config.cache_config.block_size == 1024
+    assert config.cache_config.mamba_block_size == 1024
+    assert config.cache_config.mamba_page_size_padded is None
+
+
+def test_glm5_next_split_cache_auto_requires_dcp_aligned_retention(
+    monkeypatch,
+) -> None:
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architecture="Glm5NextForConditionalGeneration",
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        cache_config=SimpleNamespace(
+            mamba_cache_mode="align",
+            prefix_cache_retention_interval=4097,
+        ),
+    )
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "auto")
+
+    with pytest.raises(ValueError, match="divisible by decode_context_parallel_size"):
+        Platform._align_hybrid_block_size(config, B12xGLM5NextMLASparseBackend)
+
+
 def test_b12x_glm5_next_nvfp4_aligns_hybrid_page_to_packed_record(
     monkeypatch,
 ) -> None:

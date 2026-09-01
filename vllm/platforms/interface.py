@@ -815,22 +815,41 @@ class Platform:
                     "VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE is supported only for "
                     "Glm5NextForConditionalGeneration."
                 )
-            target_block_size = int(split_target_block_size)
-            split_mamba_block_size = int(
-                os.getenv(
-                    "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE",
-                    split_target_block_size,
-                )
+            if split_target_block_size.lower() == "auto":
+                retention_interval = cache_config.prefix_cache_retention_interval
+                dcp_world_size = parallel_config.decode_context_parallel_size
+                if (
+                    retention_interval is None
+                    or retention_interval <= 0
+                    or retention_interval % dcp_world_size != 0
+                ):
+                    raise ValueError(
+                        "Automatic GLM-5.3 split-cache geometry requires a "
+                        "positive prefix_cache_retention_interval divisible by "
+                        "decode_context_parallel_size."
+                    )
+                # A DCP-sharded target block covers block_size * DCP global
+                # tokens. Fill one retention interval with exactly one target
+                # block per rank so packed NVFP4 pages use the shared pool
+                # efficiently and connector stores land on whole pages.
+                target_block_size = retention_interval // dcp_world_size
+            else:
+                target_block_size = int(split_target_block_size)
+
+            split_mamba_block_size = os.getenv(
+                "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE", "auto"
+            )
+            mamba_block_size = (
+                target_block_size
+                if split_mamba_block_size.lower() == "auto"
+                else int(split_mamba_block_size)
             )
             if target_block_size <= 0 or target_block_size % 64 != 0:
                 raise ValueError(
                     "VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE must be a positive "
-                    "multiple of 64."
+                    "multiple of 64 after automatic resolution."
                 )
-            if (
-                split_mamba_block_size <= 0
-                or split_mamba_block_size % target_block_size != 0
-            ):
+            if mamba_block_size <= 0 or mamba_block_size % target_block_size != 0:
                 raise ValueError(
                     "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE must be a positive "
                     "multiple of VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE."
@@ -845,13 +864,13 @@ class Platform:
             # physical pages. Their token block sizes remain scheduler-visible,
             # so the recurrent block must be a multiple of the target block.
             cache_config.block_size = target_block_size
-            cache_config.mamba_block_size = split_mamba_block_size
+            cache_config.mamba_block_size = mamba_block_size
             cache_config.mamba_page_size_padded = None
             logger.warning(
                 "Using split GLM-5.3 cache pages: target block size %d tokens, "
                 "recurrent-state block size %d tokens.",
                 target_block_size,
-                split_mamba_block_size,
+                mamba_block_size,
             )
             return
 
