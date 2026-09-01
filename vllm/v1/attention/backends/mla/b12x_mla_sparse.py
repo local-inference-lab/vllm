@@ -1154,6 +1154,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if not module.is_supported():
             raise RuntimeError("B12X sparse MLA is not supported on this device.")
         required_symbols = ["Caps", "plan", "run_decode", "run_extend"]
+        if self._is_glm_next:
+            required_symbols.append(
+                "concat_and_cache_glm_next_mla_nvfp4"
+                if uses_nvfp4_cache
+                else "concat_and_cache_glm_next_mla_fp8"
+            )
         if self._uses_glm_dsa_nvfp4_cache:
             required_symbols.append("concat_and_cache_nvfp4_mla_fp8_rope")
         for name in required_symbols:
@@ -1165,7 +1171,11 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self._concat_and_cache_glm_next_mla = None
         if self._is_glm_next:
             self._model_type = int(module.ModelType.GLM_NEXT)
-            self._concat_and_cache_glm_next_mla = module.concat_and_cache_glm_next_mla
+            self._concat_and_cache_glm_next_mla = (
+                module.concat_and_cache_glm_next_mla_nvfp4
+                if self._uses_nvfp4_cache
+                else module.concat_and_cache_glm_next_mla_fp8
+            )
         elif self._uses_glm_dsa_nvfp4_cache:
             self._model_type = int(module.ModelType.GLM_NSA)
             self._concat_and_cache_nvfp4_mla_fp8_rope = (
@@ -1245,6 +1255,11 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             )
             if self._model_type is not None:
                 caps_kwargs["model_type"] = self._model_type
+            if self._uses_nvfp4_cache:
+                caps_kwargs.update(
+                    _nvfp4_run_options(is_glm_next=self._is_glm_next)
+                )
+            caps_kwargs["cache_record_bytes"] = self._cache_record_bytes
             return self._module.plan(self._module.Caps(**caps_kwargs))
 
         decode_plan = make_plan("decode")
@@ -1702,20 +1717,16 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             selected_indices=selected_indices,
             cache_seqlens_int32=cache_seq_lens,
             nsa_cache_seqlens_int32=active_counts,
+            kv_cache=kv_cache_for_run,
         )
         run = self._run_decode if plan is self._decode_plan else self._run_extend
         run_kwargs = dict(
             binding=binding,
-            kv_cache=kv_cache_for_run,
             sm_scale=self.scale,
             v_head_dim=self.kv_lora_rank,
             return_lse=self.need_to_return_lse_for_decode,
             lse_scale="natural",
         )
-        if self._model_type is not None:
-            run_kwargs["model_type"] = self._model_type
-        if self._uses_nvfp4_cache:
-            run_kwargs.update(_nvfp4_run_options(is_glm_next=self._is_glm_next))
         result = run(**run_kwargs)
         if self.need_to_return_lse_for_decode:
             output, lse = result

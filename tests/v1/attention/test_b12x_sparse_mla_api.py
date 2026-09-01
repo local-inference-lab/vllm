@@ -835,6 +835,7 @@ def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> 
 
     impl = object.__new__(B12xMLASparseImpl)
     impl._is_glm_next = True
+    impl._uses_nvfp4_cache = False
     impl._cache_record_bytes = 528
     impl._module = FakeModule
     impl._kernel_page_size = 64
