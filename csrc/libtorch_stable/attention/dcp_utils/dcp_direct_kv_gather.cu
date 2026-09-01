@@ -98,6 +98,13 @@ __global__ void direct_dcp_kv_gather_multimem_kernel(
 // publishes its valid rows directly into every peer's compact, request-major
 // planes. This moves the same payload volume as an all-gather while avoiding
 // the rank-major materialization and the subsequent reorganization pass.
+//
+// Destinations are assigned per thread block and rotated by the source rank
+// (block b serves destination (b + rank) mod world_size). All ranks run the
+// same schedule at the same time, so with a destination-major walk every
+// source would push into one destination's inbound link while the other
+// links idle; the rotation keeps every inbound link busy with a different
+// source. The host launches a block count that is a multiple of world_size.
 __global__ void direct_dcp_kv_gather_peer_kernel(
     const uint4* local_kv, const int32_t* dst_rows,
     const int64_t* peer_kv_ptrs, const int64_t* peer_signal_ptrs,
@@ -108,13 +115,15 @@ __global__ void direct_dcp_kv_gather_peer_kernel(
     int64_t buffer_slot, int64_t slot_stride_items) {
   uint32_t epoch = static_cast<uint32_t>(epoch_ptr[0]);
   int64_t source_items = num_tokens * items_per_row;
-  int64_t total_items = world_size * source_items;
-  int64_t item_stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
-  for (int64_t linear =
-           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       linear < total_items; linear += item_stride) {
-    int64_t destination_rank = linear / source_items;
-    int64_t item = linear - destination_rank * source_items;
+  int64_t destination_rank =
+      (static_cast<int64_t>(blockIdx.x) + rank) % world_size;
+  int64_t blocks_per_destination = static_cast<int64_t>(gridDim.x) / world_size;
+  int64_t block_in_destination = static_cast<int64_t>(blockIdx.x) / world_size;
+  int64_t item_stride = blocks_per_destination * blockDim.x;
+  uint4* peer_kv = get_peer_ptr<uint4>(peer_kv_ptrs, destination_rank) +
+                   buffer_slot * slot_stride_items;
+  for (int64_t item = block_in_destination * blockDim.x + threadIdx.x;
+       item < source_items; item += item_stride) {
     int64_t src_row = item / items_per_row;
     int32_t dst_row = dst_rows[src_row];
     if (dst_row < 0) {
@@ -138,8 +147,7 @@ __global__ void direct_dcp_kv_gather_peer_kernel(
                  static_cast<int64_t>(dst_row) * k_pe_items_per_row +
                  row_item - kv_c_items_per_row;
     }
-    uint4* peer_kv = get_peer_ptr<uint4>(peer_kv_ptrs, destination_rank);
-    peer_kv[buffer_slot * slot_stride_items + dst_item] = local_kv[item];
+    peer_kv[dst_item] = local_kv[item];
   }
 
   // Every block publishes its system-scope payload before contributing to the
@@ -302,6 +310,8 @@ void direct_dcp_kv_gather(const torch::stable::Tensor& local_kv,
     int64_t peer_item_count = world_size * item_count;
     blocks = (peer_item_count + kThreads - 1) / kThreads;
     blocks = blocks < kMaxPeerBlocks ? blocks : kMaxPeerBlocks;
+    // One block set per destination: round up to a multiple of world_size.
+    blocks = ((blocks + world_size - 1) / world_size) * world_size;
     direct_dcp_kv_gather_peer_kernel<<<blocks, kThreads, 0, stream>>>(
         reinterpret_cast<const uint4*>(local_kv.data_ptr()),
         dst_rows.const_data_ptr<int32_t>(),
