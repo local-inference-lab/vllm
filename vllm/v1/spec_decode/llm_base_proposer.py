@@ -45,7 +45,7 @@ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import (
-    apply_top_k_top_p,
+    apply_top_k_top_p_probs,
     empty_exponential_noise_like,
     sample_with_exponential_noise,
 )
@@ -1893,12 +1893,11 @@ def compute_probs_and_sample_next_token(
         is_greedy = temperature < _SAMPLING_EPS
         temperature = torch.where(is_greedy, 1.0, temperature)
     logits.div_(temperature.view(-1, 1))
-    logits = apply_top_k_top_p(
+    probs = apply_top_k_top_p_probs(
         logits,
         sampling_metadata.top_k,
         sampling_metadata.top_p,
     )
-    probs = logits.softmax(dim=-1, dtype=torch.float32)
 
     # Logits processors that depend on request history remain target-only.
     # Temperature, top-k, and top-p are position-local, so the drafter can
