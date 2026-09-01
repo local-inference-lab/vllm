@@ -3035,16 +3035,31 @@ class Scheduler(SchedulerInterface):
             if self.kv_metrics_collector is not None
             else []
         )
+        hybrid_prefix_cache_stats = (
+            self.kv_metrics_collector.drain_prefix_lookup_stats()
+            if self.kv_metrics_collector is not None
+            else None
+        )
         spec_stats = spec_decoding_stats
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        decode_prefill_stats = self.drain_decode_prefill_stats()
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
+            scheduled_prefill_tokens=decode_prefill_stats[
+                "scheduled_prefill_tokens"
+            ],
+            active_partial_prefills=decode_prefill_stats[
+                "active_partial_prefills"
+            ],
+            decode_only_steps=decode_prefill_stats["decode_only_steps"],
+            fairness_bypasses=decode_prefill_stats["fairness_bypasses"],
             prefix_cache_stats=prefix_cache_stats,
+            hybrid_prefix_cache_stats=hybrid_prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
             spec_decoding_stats=spec_stats,

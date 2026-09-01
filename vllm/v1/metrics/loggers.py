@@ -568,6 +568,42 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_kv_cache_usage, per_engine_labelvalues
         )
 
+        counter_decode_prefill_scheduled_tokens = self._counter_cls(
+            name="vllm:decode_prefill_scheduled_tokens",
+            documentation=(
+                "Prefill tokens scheduled while decode-burst control is enabled."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_decode_prefill_scheduled_tokens = create_metric_per_engine(
+            counter_decode_prefill_scheduled_tokens, per_engine_labelvalues
+        )
+        gauge_decode_prefill_active_partial_prefills = self._gauge_cls(
+            name="vllm:decode_prefill_active_partial_prefills",
+            documentation="Active requests that remain partially prefilling.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_decode_prefill_active_partial_prefills = create_metric_per_engine(
+            gauge_decode_prefill_active_partial_prefills, per_engine_labelvalues
+        )
+        counter_decode_prefill_decode_only_steps = self._counter_cls(
+            name="vllm:decode_prefill_decode_only_steps",
+            documentation="Scheduler steps where decode-burst control deferred prefill.",
+            labelnames=labelnames,
+        )
+        self.counter_decode_prefill_decode_only_steps = create_metric_per_engine(
+            counter_decode_prefill_decode_only_steps, per_engine_labelvalues
+        )
+        counter_decode_prefill_fairness_bypasses = self._counter_cls(
+            name="vllm:decode_prefill_fairness_bypasses",
+            documentation="Prefill releases caused by the oldest-waiter deadline.",
+            labelnames=labelnames,
+        )
+        self.counter_decode_prefill_fairness_bypasses = create_metric_per_engine(
+            counter_decode_prefill_fairness_bypasses, per_engine_labelvalues
+        )
+
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
                 name="vllm:corrupted_requests",
@@ -599,6 +635,49 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.counter_prefix_cache_hits = create_metric_per_engine(
             counter_prefix_cache_hits, per_engine_labelvalues
+        )
+
+        counter_prefix_cache_cacheable_tokens = self._counter_cls(
+            name="vllm:prefix_cache_cacheable_tokens",
+            documentation=(
+                "Prefix tokens that could be reused after mandatory alignment "
+                "and speculative-decoding replay adjustment."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_prefix_cache_cacheable_tokens = create_metric_per_engine(
+            counter_prefix_cache_cacheable_tokens, per_engine_labelvalues
+        )
+
+        counter_prefix_cache_reconciled_hits = self._counter_cls(
+            name="vllm:prefix_cache_reconciled_hits",
+            documentation=(
+                "Prefix-cache hit tokens available in every hybrid cache group."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_prefix_cache_reconciled_hits = create_metric_per_engine(
+            counter_prefix_cache_reconciled_hits, per_engine_labelvalues
+        )
+
+        self.counter_prefix_cache_group_hits = self._counter_cls(
+            name="vllm:prefix_cache_group_hits",
+            documentation="Prefix-cache hit tokens by bounded hybrid cache group.",
+            labelnames=labelnames + ["kv_cache_group"],
+        )
+        self.counter_prefix_cache_boundary_registrations = self._counter_cls(
+            name="vllm:prefix_cache_boundary_registrations",
+            documentation=(
+                "Replay-boundary cache registrations by bounded hybrid cache group."
+            ),
+            labelnames=labelnames + ["kv_cache_group"],
+        )
+        self.counter_prefix_cache_boundary_evictions = self._counter_cls(
+            name="vllm:prefix_cache_boundary_evictions",
+            documentation=(
+                "Registered replay-boundary evictions by bounded hybrid cache group."
+            ),
+            labelnames=labelnames + ["kv_cache_group"],
         )
 
         #
@@ -1121,6 +1200,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            self.counter_decode_prefill_scheduled_tokens[engine_idx].inc(
+                scheduler_stats.scheduled_prefill_tokens
+            )
+            self.gauge_decode_prefill_active_partial_prefills[engine_idx].set(
+                scheduler_stats.active_partial_prefills
+            )
+            self.counter_decode_prefill_decode_only_steps[engine_idx].inc(
+                scheduler_stats.decode_only_steps
+            )
+            self.counter_decode_prefill_fairness_bypasses[engine_idx].inc(
+                scheduler_stats.fairness_bypasses
+            )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries
@@ -1128,6 +1219,28 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.counter_prefix_cache_hits[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.hits
             )
+
+            hybrid_stats = scheduler_stats.hybrid_prefix_cache_stats
+            if hybrid_stats is not None:
+                self.counter_prefix_cache_cacheable_tokens[engine_idx].inc(
+                    hybrid_stats.cacheable_prefix_tokens
+                )
+                self.counter_prefix_cache_reconciled_hits[engine_idx].inc(
+                    hybrid_stats.reconciled_hit_tokens
+                )
+                engine_labels = self.per_engine_labelvalues[engine_idx]
+                for group, hits in hybrid_stats.prefix_cache_group_hits.items():
+                    self.counter_prefix_cache_group_hits.labels(
+                        *engine_labels, group
+                    ).inc(hits)
+                for group, count in hybrid_stats.boundary_registrations.items():
+                    self.counter_prefix_cache_boundary_registrations.labels(
+                        *engine_labels, group
+                    ).inc(count)
+                for group, count in hybrid_stats.boundary_evictions.items():
+                    self.counter_prefix_cache_boundary_evictions.labels(
+                        *engine_labels, group
+                    ).inc(count)
 
             if scheduler_stats.connector_prefix_cache_stats is not None:
                 self.counter_connector_prefix_cache_queries[engine_idx].inc(

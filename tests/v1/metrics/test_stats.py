@@ -3,6 +3,7 @@
 from vllm.v1.core.sched.output import ScheduledEncoderInputStats, SchedulerOutput
 from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.stats import (
+    HybridPrefixCacheStats,
     IterationStats,
     PrefillStats,
     PromptTokenStats,
@@ -34,6 +35,10 @@ def test_scheduler_iteration_details_serialization():
         scheduler_stats=SchedulerStats(
             kv_cache_usage=0.5,
             iteration_details=iteration_details,
+            scheduled_prefill_tokens=2304,
+            active_partial_prefills=2,
+            decode_only_steps=4,
+            fairness_bypasses=1,
         )
     )
 
@@ -43,6 +48,29 @@ def test_scheduler_iteration_details_serialization():
     assert decoded.scheduler_stats is not None
     assert decoded.scheduler_stats.kv_cache_usage == 0.5
     assert decoded.scheduler_stats.iteration_details == iteration_details
+    assert decoded.scheduler_stats.scheduled_prefill_tokens == 2304
+    assert decoded.scheduler_stats.active_partial_prefills == 2
+    assert decoded.scheduler_stats.decode_only_steps == 4
+    assert decoded.scheduler_stats.fairness_bypasses == 1
+
+
+def test_hybrid_prefix_cache_stats_serialization():
+    stats = HybridPrefixCacheStats(
+        cacheable_prefix_tokens=119808,
+        reconciled_hit_tokens=117504,
+        prefix_cache_group_hits={"full_attention:0": 119808, "mamba:1": 117504},
+        boundary_registrations={"mamba:1": 2},
+        boundary_evictions={"mamba:1": 1},
+    )
+    outputs = EngineCoreOutputs(
+        scheduler_stats=SchedulerStats(hybrid_prefix_cache_stats=stats)
+    )
+
+    encoded = MsgpackEncoder().encode(outputs)
+    decoded = MsgpackDecoder(EngineCoreOutputs).decode(encoded)
+
+    assert decoded.scheduler_stats is not None
+    assert decoded.scheduler_stats.hybrid_prefix_cache_stats == stats
 
 
 def test_compute_iteration_details_includes_encoder_stats():
