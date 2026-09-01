@@ -785,6 +785,18 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
             == 0
         )
 
+        # kimi-k3-external-hit-align: admit external hits only at the local
+        # hit-alignment grid so the restored boundary (and its recurrent
+        # state) is cacheable and later turns can resume locally.
+        align = getattr(self, "_external_hit_align", None)
+        if align is None:
+            align = int(os.environ.get("LMCACHE_EXTERNAL_HIT_ALIGN", "0") or 0)
+            self._external_hit_align = align
+        if align > 0:
+            ret = ret // align * align
+            if ret == 0:
+                return 0, False
+
         # Update num stored blocks for the tracker
         num_vllm_blocks = num_computed_tokens // self.vllm_block_size
         num_lmcache_blocks = ret // self.vllm_block_size
