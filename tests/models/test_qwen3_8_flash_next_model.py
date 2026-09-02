@@ -120,6 +120,30 @@ def test_explicit_ple_table_memory_overrides_env_alias(monkeypatch) -> None:
     )
 
 
+def test_ple_registers_request_dependent_piecewise_splitting_ops_once() -> None:
+    compilation_config = SimpleNamespace(
+        static_forward_context={},
+        splitting_ops=[],
+    )
+
+    ple_layer_module._register_ple_compilation_context(
+        compilation_config,
+        "model.layers.1.ple",
+        nn.Identity(),
+    )
+    ple_layer_module._register_ple_compilation_context(
+        compilation_config,
+        "model.layers.5.ple",
+        nn.Identity(),
+    )
+
+    assert compilation_config.splitting_ops == list(ple_layer_module._PLE_SPLITTING_OPS)
+    assert set(compilation_config.static_forward_context) == {
+        "model.layers.1.ple",
+        "model.layers.5.ple",
+    }
+
+
 def test_gated_residual_uses_canonical_combine_ops(monkeypatch) -> None:
     combined = torch.full((2, 8), 3.0, dtype=torch.bfloat16)
     normalized = torch.full((2, 8), 5.0, dtype=torch.bfloat16)

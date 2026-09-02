@@ -42,6 +42,36 @@ from .config import Qwen3_8FlashNextTextConfig
 
 logger = init_logger(__name__)
 
+_PLE_SPLITTING_OPS = (
+    "vllm::qwen3_8_flash_next_ple_embedding",
+    "vllm::qwen3_8_flash_next_ple",
+)
+
+
+def _register_ple_compilation_context(
+    compilation_config: Any,
+    layer_name: str,
+    layer: nn.Module,
+) -> None:
+    """Keep request-dependent PLE transactions outside piecewise graphs.
+
+    Piecewise graph dispatch is keyed by padded token count, while PLE hashing
+    and recurrent-state routing also depend on the live request count and query
+    boundaries.  Both custom operators must therefore execute as partition
+    boundaries so a graph compiled for one request layout cannot replay stale
+    PLE metadata for another layout.
+    """
+    static_context = compilation_config.static_forward_context
+    if layer_name in static_context:
+        raise ValueError(f"duplicate layer name: {layer_name}")
+    static_context[layer_name] = layer
+
+    splitting_ops = compilation_config.splitting_ops
+    if splitting_ops is not None:
+        for op_name in _PLE_SPLITTING_OPS:
+            if op_name not in splitting_ops:
+                splitting_ops.append(op_name)
+
 
 def _b12x_module(name: str) -> Any:
     api = {
@@ -747,9 +777,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         self.kv_cache = (torch.tensor([]),)
 
         compilation_config = get_current_vllm_config().compilation_config
-        if prefix in compilation_config.static_forward_context:
-            raise ValueError(f"duplicate layer name: {prefix}")
-        compilation_config.static_forward_context[prefix] = self
+        _register_ple_compilation_context(compilation_config, prefix, self)
 
     def _make_plan(self, max_state_slots: int):
         api = _b12x_module("ple")
