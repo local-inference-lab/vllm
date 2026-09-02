@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -87,6 +88,117 @@ def test_kimi_mla_decode_query_materializes_interleaved_heads(monkeypatch):
     torch.testing.assert_close(result, expected.transpose(0, 1))
 
 
+def test_kimi_mla_decode_query_uses_replicated_absorbed_weight(monkeypatch):
+    from vllm.models.kimi_k3.nvidia import mla
+
+    attention = object.__new__(mla.MultiHeadLatentAttention)
+    torch.nn.Module.__init__(attention)
+    attention.kv_lora_rank = 5
+    attention.dcp_q_replicate = True
+    attention.W_UK_T = torch.nn.Parameter(
+        torch.randn((2, 3, 5), dtype=torch.bfloat16), requires_grad=False
+    )
+    attention.W_UK_T_dcp_qrep = torch.randn((4, 3, 5), dtype=torch.bfloat16)
+    query = torch.randn((3, 4, 3), dtype=torch.bfloat16)
+    captured = {}
+
+    def safe_bmm(q, weight, output, *, use_safe_op):
+        captured["weight"] = weight
+        torch.bmm(q.contiguous(), weight, out=output)
+
+    monkeypatch.setattr(mla, "_run_mla_query_bmm", safe_bmm)
+
+    result = attention._absorb_decode_query(query)
+
+    assert captured["weight"] is attention.W_UK_T_dcp_qrep
+    expected = torch.bmm(
+        query.transpose(0, 1).contiguous(),
+        attention.W_UK_T_dcp_qrep,
+    )
+    torch.testing.assert_close(result, expected.transpose(0, 1))
+
+
+def test_kimi_mla_qrep_layer_allowlist(monkeypatch):
+    from vllm.models.kimi_k3.nvidia import mla
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=8,
+            prefill_context_parallel_size=1,
+        )
+    )
+    monkeypatch.setattr(mla.envs, "VLLM_DCP_Q_REPLICATE", True)
+    monkeypatch.setattr(
+        mla.envs,
+        "VLLM_K3_DCP_Q_REPLICATE_LAYERS",
+        "4,12-16,92",
+    )
+
+    assert mla._k3_dcp_qrep_enabled("model.layers.4.self_attn", config)
+    assert mla._k3_dcp_qrep_enabled("model.layers.14.self_attn", config)
+    assert not mla._k3_dcp_qrep_enabled("model.layers.20.self_attn", config)
+    assert mla._k3_dcp_qrep_enabled("model.layers.92.self_attn", config)
+
+
+def test_kimi_mla_qrep_requires_explicit_memory_policy(monkeypatch):
+    from vllm.models.kimi_k3.nvidia import mla
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=8,
+            prefill_context_parallel_size=1,
+        )
+    )
+    monkeypatch.setattr(mla.envs, "VLLM_DCP_Q_REPLICATE", True)
+    monkeypatch.setattr(mla.envs, "VLLM_K3_DCP_Q_REPLICATE_LAYERS", None)
+
+    with pytest.raises(ValueError, match="explicit layer list"):
+        mla._k3_dcp_qrep_enabled("model.layers.4.self_attn", config)
+
+
+def test_kimi_mla_qrep_explicit_all(monkeypatch):
+    from vllm.models.kimi_k3.nvidia import mla
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=8,
+            prefill_context_parallel_size=1,
+        )
+    )
+    monkeypatch.setattr(mla.envs, "VLLM_DCP_Q_REPLICATE", True)
+    monkeypatch.setattr(mla.envs, "VLLM_K3_DCP_Q_REPLICATE_LAYERS", "all")
+
+    assert mla._k3_dcp_qrep_enabled("model.layers.4.self_attn", config)
+
+
+def test_kimi_mla_qrep_uses_dcp_group_head_width():
+    from vllm.models.kimi_k3.nvidia import mla
+
+    assert mla._k3_projected_query_heads(12, 8, True) == 96
+    assert mla._k3_projected_query_heads(6, 8, True) == 48
+    assert mla._k3_projected_query_heads(6, 8, False) == 6
+
+
+def test_kimi_mla_qrep_rejects_invalid_layer_range(monkeypatch):
+    from vllm.models.kimi_k3.nvidia import mla
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=8,
+            prefill_context_parallel_size=1,
+        )
+    )
+    monkeypatch.setattr(mla.envs, "VLLM_DCP_Q_REPLICATE", True)
+    monkeypatch.setattr(
+        mla.envs,
+        "VLLM_K3_DCP_Q_REPLICATE_LAYERS",
+        "16-12",
+    )
+
+    with pytest.raises(ValueError, match="Invalid K3 qrep layer range"):
+        mla._k3_dcp_qrep_enabled("model.layers.12.self_attn", config)
+
+
 def test_kimi_mla_defines_graph_padding_before_output_projection(monkeypatch):
     from vllm.models.kimi_k3.nvidia import mla
 
@@ -120,6 +232,41 @@ def test_kimi_mla_defines_graph_padding_before_output_projection(monkeypatch):
 
     torch.testing.assert_close(output[:2], torch.full_like(output[:2], 3))
     torch.testing.assert_close(output[2:], torch.zeros_like(output[2:]))
+
+
+@pytest.mark.parametrize(
+    ("query_dtype", "aliases_query"),
+    [(torch.bfloat16, True), (torch.float8_e4m3fn, False)],
+)
+def test_kimi_mla_context_output_reuses_consumed_query_bytes(
+    query_dtype, aliases_query
+):
+    """The Kimi-K3 query row (192 elements) backs the bf16 context output
+    row (128 elements) only in bf16; an fp8 query holds 192 bytes per row
+    against the 256 the output needs, so it gets its own storage."""
+    from vllm.models.kimi_k3.nvidia import mla
+
+    query = torch.empty((4, 2, 192), dtype=query_dtype)
+    output = torch.randn((4, 2, 128), dtype=torch.bfloat16)
+
+    compact = mla._reuse_consumed_query_for_context_output(query, output)
+    compact.copy_(output)
+
+    assert (compact.data_ptr() == query.data_ptr()) is aliases_query
+    assert compact.shape == output.shape
+    assert compact.dtype == output.dtype
+    assert compact.is_contiguous()
+    torch.testing.assert_close(compact, output)
+
+
+def test_kimi_mla_context_output_requires_a_contiguous_query():
+    from vllm.models.kimi_k3.nvidia import mla
+
+    query = torch.empty((4, 2, 384), dtype=torch.bfloat16)[..., ::2]
+    output = torch.empty((4, 2, 128), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="contiguous"):
+        mla._reuse_consumed_query_for_context_output(query, output)
 
 
 def test_kimi_mla_caller_output_selection_preserves_decode_and_sp_paths():
