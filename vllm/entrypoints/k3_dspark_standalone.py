@@ -236,8 +236,6 @@ def _build_vllm_config(args: argparse.Namespace):
     }
     if args.draft_quantization != "none":
         speculative_config["quantization"] = args.draft_quantization
-    if args.draft_fp8_head:
-        os.environ["VLLM_DSPARK_FP8_DRAFT_HEAD"] = "1"
     engine_args = EngineArgs(
         model=str(args.target_config),
         tokenizer_mode="skip",
@@ -804,6 +802,10 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if args.draft_fp8_head:
+        # Read by the draft loader (envs.VLLM_DSPARK_FP8_DRAFT_HEAD) while
+        # _load_runtime builds the draft head, so it is set before that.
+        os.environ["VLLM_DSPARK_FP8_DRAFT_HEAD"] = "1"
     status = RuntimeStatus(
         draft_model=str(args.draft_model),
         method=args.method,
