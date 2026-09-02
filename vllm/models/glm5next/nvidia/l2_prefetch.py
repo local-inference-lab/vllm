@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """L2 weight prefetch for GLM-5.3 decode on SM120.
 
-At decode batch sizes (M <= 256) the dense projections are pure device-memory (GDDR7) streams
-(in_proj_qkvgfab is 50 MB per GPU: 28.8 us at M=8) while the all-reduces, mHC,
-routing chain and small kernels leave device memory idle for roughly half of each layer.
+At decode batch sizes (M <= 256) the dense projections are pure device-memory
+(GDDR7) streams (in_proj_qkvgfab is 50 MB per GPU: 28.8 us at M=8) while the
+all-reduces, mHC, routing chain and small kernels leave device memory idle for
+roughly half of each layer.
 This module issues ``cp.async.bulk.prefetch.L2`` with an ``evict_last`` cache
 policy for the *upcoming* dense weights on a side stream inside those idle
 windows, sized so the fills finish before the routed-expert stream starts.
@@ -56,11 +57,29 @@ _MIN_BYTES = 64 * 1024
 _CHUNK_BYTES = 4096
 _GRID = 16
 _BLOCK = 128
-_MAX_TOKENS = int(os.getenv("VLLM_GLM53_L2_PREFETCH_MAX_TOKENS", "256"))
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("[l2_prefetch] ignoring %s=%r", name, raw)
+        return default
 
 
 def _mb(name: str, default: str) -> int:
-    return int(float(os.getenv(name, default)) * 1e6)
+    raw = os.getenv(name, default)
+    try:
+        return int(float(raw) * 1e6)
+    except ValueError:
+        logger.warning("[l2_prefetch] ignoring %s=%r", name, raw)
+        return int(float(default) * 1e6)
+
+
+_MAX_TOKENS = _int_env("VLLM_GLM53_L2_PREFETCH_MAX_TOKENS", 256)
 
 
 BUDGET_A = _mb("VLLM_GLM53_L2_PREFETCH_BUDGET_A_MB", "20")
@@ -135,7 +154,8 @@ if _CUTE_OK:
                 size.ir_value(loc=loc, ip=ip),
                 policy.ir_value(loc=loc, ip=ip),
             ],
-            "cp.async.bulk.prefetch.L2.global.L2::cache_hint [$0], $1, $2; mov.u32 $3, 0;",
+            "cp.async.bulk.prefetch.L2.global.L2::cache_hint "
+            "[$0], $1, $2; mov.u32 $3, 0;",
             "l,r,l,=r",
             has_side_effects=True,
             loc=loc,
@@ -146,7 +166,12 @@ if _CUTE_OK:
         """grid x block threads walk the (ptr, bytes) segment table and issue
         one bulk L2 prefetch per 4 KB chunk (fire-and-forget)."""
 
-        def __init__(self, chunk_bytes: int = _CHUNK_BYTES, grid: int = _GRID, block: int = _BLOCK):
+        def __init__(
+            self,
+            chunk_bytes: int = _CHUNK_BYTES,
+            grid: int = _GRID,
+            block: int = _BLOCK,
+        ):
             self.chunk_bytes = int(chunk_bytes)
             self.grid = int(grid)
             self.block = int(block)
@@ -209,15 +234,24 @@ def _get_launcher():
         n = cute.sym_int(divisibility=2)
         fake = make_fake_tensor(cutlass.Int64, (n,), divisibility=2)
         stream = CUstream(torch.cuda.current_stream().cuda_stream)
-        compiled = cute.compile(L2PrefetchKernel(), fake, stream, options="--enable-tvm-ffi")
+        compiled = cute.compile(
+            L2PrefetchKernel(), fake, stream, options="--enable-tvm-ffi"
+        )
 
         def launch(segs: torch.Tensor, stream_handle: int) -> None:
             compiled(segs, CUstream(stream_handle))
 
         _compiled = launch
         logger.info(
-            "[l2_prefetch] CuTe kernel ready (grid=%d block=%d chunk=%d; budgets A/B/C/A_mla=%.0f/%.0f/%.0f/%.0f MB)",
-            _GRID, _BLOCK, _CHUNK_BYTES, BUDGET_A / 1e6, BUDGET_B / 1e6, BUDGET_C / 1e6, BUDGET_A_MLA / 1e6,
+            "[l2_prefetch] CuTe kernel ready (grid=%d block=%d chunk=%d; "
+            "budgets A/B/C/A_mla=%.0f/%.0f/%.0f/%.0f MB)",
+            _GRID,
+            _BLOCK,
+            _CHUNK_BYTES,
+            BUDGET_A / 1e6,
+            BUDGET_B / 1e6,
+            BUDGET_C / 1e6,
+            BUDGET_A_MLA / 1e6,
         )
         return _compiled
     except Exception as exc:  # noqa: BLE001
@@ -231,7 +265,9 @@ def _get_launcher():
 # ---------------------------------------------------------------------------
 
 
-def segments_of(module: torch.nn.Module, prefix: str = "", skip: tuple[str, ...] = ()) -> list[Segment]:
+def segments_of(
+    module: torch.nn.Module, prefix: str = "", skip: tuple[str, ...] = ()
+) -> list[Segment]:
     """Large, contiguous CUDA parameters/buffers under ``module``."""
     out: list[Segment] = []
     seen: set[int] = set()
@@ -258,7 +294,9 @@ def segments_of(module: torch.nn.Module, prefix: str = "", skip: tuple[str, ...]
     return out
 
 
-def take_budget(segments: list[Segment], budget: int) -> tuple[list[Segment], list[Segment]]:
+def take_budget(
+    segments: list[Segment], budget: int
+) -> tuple[list[Segment], list[Segment]]:
     """Split segments into (fits in budget, remainder); the straddling segment
     is sliced so no byte is prefetched twice."""
     taken: list[Segment] = []
@@ -292,13 +330,19 @@ class L2PrefetchPlan:
         self.total_bytes = sum(s[2] for s in segments)
         self.names = [f"{n}:{b / 1e6:.1f}MB" for n, _, b in segments]
         flat = [v for _, ptr, nbytes in segments for v in (ptr, nbytes)]
-        self.segs = torch.tensor(flat, dtype=torch.int64, device=device) if flat else None
+        self.segs = (
+            torch.tensor(flat, dtype=torch.int64, device=device) if flat else None
+        )
 
     def describe(self) -> str:
-        return f"{self.nseg} segs {self.total_bytes / 1e6:.1f} MB: " + ", ".join(self.names[:8])
+        return f"{self.nseg} segs {self.total_bytes / 1e6:.1f} MB: " + ", ".join(
+            self.names[:8]
+        )
 
 
-def make_plan(segments: list[Segment], budget: int, device: torch.device) -> tuple[L2PrefetchPlan | None, list[Segment]]:
+def make_plan(
+    segments: list[Segment], budget: int, device: torch.device
+) -> tuple[L2PrefetchPlan | None, list[Segment]]:
     taken, rest = take_budget(segments, budget)
     plan = L2PrefetchPlan(taken, device)
     return (plan if plan.nseg else None), rest
@@ -346,7 +390,11 @@ def configure_persisting_l2(device: torch.device, request: str | None = None) ->
     (logged, never raised).  The env-driven call (``request=None``) is applied
     once per device; an explicit ``request`` is always applied.
     """
-    idx = device.index if device.index is not None else torch.cuda.current_device()
+    idx = (
+        device.index
+        if device.index is not None
+        else torch.accelerator.current_device_index()
+    )
     if request is None and idx in _persisting_l2_applied:
         return _persisting_l2_applied[idx]
     raw = PERSIST_L2 if request is None else request
@@ -417,10 +465,15 @@ def _prefetch_allowed() -> bool:
         cap = BreakableCUDAGraphCapture.current()
         if cap is not None and bool(getattr(cap, "_capturing", False)):
             from vllm.config import CUDAGraphMode
-            from vllm.forward_context import get_forward_context, is_forward_context_available
+            from vllm.forward_context import (
+                get_forward_context,
+                is_forward_context_available,
+            )
 
             if is_forward_context_available():
-                return get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+                return (
+                    get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+                )
             return False
     except Exception:  # noqa: BLE001
         return not torch.cuda.is_current_stream_capturing()
@@ -431,7 +484,7 @@ class L2Prefetcher:
     """One side stream per device: issue() forks it off the current stream and
     launches the prefetch; join() (model end) rejoins."""
 
-    _instances: dict[int, "L2Prefetcher"] = {}
+    _instances: dict[int, L2Prefetcher] = {}
 
     def __init__(self, device: torch.device):
         self.device = device
@@ -442,8 +495,12 @@ class L2Prefetcher:
         self.persisting_l2_bytes = configure_persisting_l2(device)
 
     @classmethod
-    def get(cls, device: torch.device | None = None) -> "L2Prefetcher":
-        idx = device.index if device is not None and device.index is not None else torch.cuda.current_device()
+    def get(cls, device: torch.device | None = None) -> L2Prefetcher:
+        idx = (
+            device.index
+            if device is not None and device.index is not None
+            else torch.accelerator.current_device_index()
+        )
         inst = cls._instances.get(idx)
         if inst is None:
             inst = cls(torch.device("cuda", idx))
@@ -482,8 +539,20 @@ def join_all() -> None:
 
 
 __all__ = [
-    "ENABLED", "BUDGET_A", "BUDGET_B", "BUDGET_C", "BUDGET_A_MLA", "A_NEXT_BYTES",
-    "PERSIST_L2", "L2PrefetchPlan", "L2Prefetcher", "segments_of", "take_budget",
-    "make_plan", "issue", "join_all", "persisting_l2_request",
+    "ENABLED",
+    "BUDGET_A",
+    "BUDGET_B",
+    "BUDGET_C",
+    "BUDGET_A_MLA",
+    "A_NEXT_BYTES",
+    "PERSIST_L2",
+    "L2PrefetchPlan",
+    "L2Prefetcher",
+    "segments_of",
+    "take_budget",
+    "make_plan",
+    "issue",
+    "join_all",
+    "persisting_l2_request",
     "configure_persisting_l2",
 ]

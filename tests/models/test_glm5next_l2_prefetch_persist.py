@@ -36,6 +36,13 @@ def test_default_request_is_device_maximum():
     assert l2pf.PERSIST_L2 == "max"
 
 
+def test_invalid_numeric_environment_values_use_defaults(monkeypatch):
+    monkeypatch.setenv("VLLM_GLM53_L2_PREFETCH_MAX_TOKENS", "invalid")
+    monkeypatch.setenv("VLLM_GLM53_L2_PREFETCH_BUDGET_A_MB", "invalid")
+    assert l2pf._int_env("VLLM_GLM53_L2_PREFETCH_MAX_TOKENS", 256) == 256
+    assert l2pf._mb("VLLM_GLM53_L2_PREFETCH_BUDGET_A_MB", "20") == 20_000_000
+
+
 def _driver():
     from cuda.bindings import driver as cu
 
@@ -43,7 +50,7 @@ def _driver():
 
 
 def _read_limit(cu, device: torch.device) -> int:
-    with torch.cuda.device(device):
+    with torch.accelerator.device_index(device.index):
         torch.empty(1, device=device)  # make the primary context current
         err, value = cu.cuCtxGetLimit(cu.CUlimit.CU_LIMIT_PERSISTING_L2_CACHE_SIZE)
     assert err == cu.CUresult.CUDA_SUCCESS
@@ -51,7 +58,7 @@ def _read_limit(cu, device: torch.device) -> int:
 
 
 def _set_limit(cu, device: torch.device, value: int) -> None:
-    with torch.cuda.device(device):
+    with torch.accelerator.device_index(device.index):
         torch.empty(1, device=device)
         (err,) = cu.cuCtxSetLimit(cu.CUlimit.CU_LIMIT_PERSISTING_L2_CACHE_SIZE, value)
     assert err == cu.CUresult.CUDA_SUCCESS
@@ -89,6 +96,15 @@ def test_prefetcher_applies_the_env_request_once(monkeypatch):
     cu = _driver()
     device = torch.device("cuda", 0)
     before = _read_limit(cu, device)
+    err, dev = cu.cuDeviceGet(0)
+    assert err == cu.CUresult.CUDA_SUCCESS
+    err, max_bytes = cu.cuDeviceGetAttribute(
+        cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE,
+        dev,
+    )
+    assert err == cu.CUresult.CUDA_SUCCESS
+    if max_bytes <= 0:
+        pytest.skip("device has no persisting L2 set-aside")
     calls: list[str | None] = []
     real = l2pf.configure_persisting_l2
 
@@ -99,11 +115,15 @@ def test_prefetcher_applies_the_env_request_once(monkeypatch):
     monkeypatch.setattr(l2pf, "configure_persisting_l2", spy)
     monkeypatch.setattr(l2pf.L2Prefetcher, "_instances", {})
     monkeypatch.setattr(l2pf, "_persisting_l2_applied", {})
+    monkeypatch.setattr(l2pf, "PERSIST_L2", "1")
     try:
         first = l2pf.L2Prefetcher.get(device)
         second = l2pf.L2Prefetcher.get(device)
         assert first is second
         assert calls == [None]
-        assert first.persisting_l2_bytes == _read_limit(cu, device)
+        applied = _read_limit(cu, device)
+        assert first.persisting_l2_bytes == applied
+        # CUDA rounds the request up to the device's allocation granularity.
+        assert 1_000_000 <= applied < int(max_bytes)
     finally:
         _set_limit(cu, device, before)
