@@ -145,6 +145,9 @@ class KVCacheManager:
         self.use_eagle = use_eagle
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
+        self._pending_prefix_lookup_metrics: dict[
+            str, tuple[int, int, dict[str, int]]
+        ] = {}
         # FIXME: make prefix cache stats conditional on log_stats. We still need
         # this comment because when the log stats is enabled there are still
         # potential configs we could expose in the future.
@@ -219,8 +222,17 @@ class KVCacheManager:
         return self.enable_caching and not request.skip_reading_prefix_cache
 
     def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
-        # Don't count a request that skipped the cache lookup.
-        if not self.log_stats or not self.prefix_cache_lookup_enabled(request):
+        # Emit hybrid diagnostics at admission, matching the legacy counter.
+        # Waiting requests can be looked up repeatedly before they are admitted.
+        if not self.prefix_cache_lookup_enabled(request):
+            self._pending_prefix_lookup_metrics.pop(request.request_id, None)
+            return
+        if self.metrics_collector is not None:
+            if lookup := self._pending_prefix_lookup_metrics.pop(
+                request.request_id, None
+            ):
+                self.metrics_collector.on_prefix_cache_lookup(*lookup)
+        if not self.log_stats:
             return
         assert self.prefix_cache_stats is not None
         self.prefix_cache_stats.record(
@@ -265,6 +277,13 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+        if (
+            self.metrics_collector is not None
+            and self.coordinator.last_prefix_lookup_metrics is not None
+        ):
+            self._pending_prefix_lookup_metrics[request.request_id] = (
+                self.coordinator.last_prefix_lookup_metrics
+            )
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
@@ -575,6 +594,7 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        self._pending_prefix_lookup_metrics.pop(request.request_id, None)
         pins = self._partial_tail_pins.pop(request.request_id, None)
         if pins:
             self.block_pool.free_blocks(pins)

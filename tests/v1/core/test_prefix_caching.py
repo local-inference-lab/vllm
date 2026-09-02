@@ -4545,6 +4545,7 @@ def exercise_history_replays(
                 request.block_hashes, request.num_tokens - 1
             )
             _, hit_tokens, _ = manager.get_computed_blocks(request)
+            manager.record_prefix_cache_stats(request, hit_tokens)
             reconciled_hits += hit_tokens
             for group_id, group_hit in enumerate(group_hits):
                 per_group_hits[group_id] += group_hit
@@ -4574,6 +4575,20 @@ def exercise_history_replays(
         dense_intermediate_checkpoints=dense_intermediate_checkpoints,
         lookup_stats=lookup_stats,
     )
+
+
+def test_hybrid_metrics_emit_once_at_admission():
+    manager = make_glm53_dflash_manager(num_blocks=2400)
+    request = make_distinct_history_requests(agents=1, turns=1)[0][0]
+
+    _, hit_tokens, _ = manager.get_computed_blocks(request)
+    manager.get_computed_blocks(request)
+    before_admission = manager.metrics_collector.drain_prefix_lookup_stats()
+    assert before_admission.cacheable_prefix_tokens == 0
+
+    manager.record_prefix_cache_stats(request, hit_tokens)
+    admitted = manager.metrics_collector.drain_prefix_lookup_stats()
+    assert admitted.cacheable_prefix_tokens == 57 * 2304
 
 
 def test_dflash_multi_history_retains_cacheable_replay_boundaries():
