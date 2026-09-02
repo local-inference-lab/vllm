@@ -70,6 +70,31 @@ from vllm.v1.utils import compute_iteration_details, record_function_or_nullcont
 logger = init_logger(__name__)
 
 
+def use_eagle_for_target_cache(
+    speculative_config: Any | None,
+    kv_cache_groups: Iterable[Any],
+) -> bool:
+    """Whether target KV groups require EAGLE's last-hash drop.
+
+    DSpark and DFlash use EAGLE-style scheduling/lookahead but can keep their
+    draft KV outside the target cache groups. In that layout, falling back from
+    an empty ``is_eagle_group`` set to all target groups drops one valid target
+    prefix hash. Classic EAGLE keeps the historical unannotated fallback.
+
+    Args:
+        speculative_config: Active speculative-decoding configuration, if any.
+        kv_cache_groups: Target-cache groups inspected for explicit EAGLE state.
+
+    Returns:
+        Whether target-cache prefix matching must drop EAGLE's trailing hash.
+    """
+    if speculative_config is None or not speculative_config.use_eagle():
+        return False
+    if any(group.is_eagle_group for group in kv_cache_groups):
+        return True
+    return speculative_config.method not in ("dspark", "dflash")
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -270,6 +295,11 @@ class Scheduler(SchedulerInterface):
                 )
             self.use_eagle = speculative_config.use_eagle()
 
+        self.use_eagle_for_target_cache = use_eagle_for_target_cache(
+            speculative_config,
+            kv_cache_config.kv_cache_groups,
+        )
+
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
@@ -279,7 +309,7 @@ class Scheduler(SchedulerInterface):
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            use_eagle=self.use_eagle_for_target_cache,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
@@ -406,7 +436,7 @@ class Scheduler(SchedulerInterface):
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle:
+        if getattr(self, "use_eagle_for_target_cache", self.use_eagle):
             # EAGLE drops the last complete draft-attention block. Convert the
             # resulting maximum reusable prefix to the recurrent-state grid.
             # Older configurations without an annotated EAGLE group retain
@@ -1262,6 +1292,30 @@ class Scheduler(SchedulerInterface):
                 scheduled_encoder_inputs
             )
 
+        # Skip speculative decoding when every scheduled request needs at most
+        # one output token. Drafting cannot pay off for a 1-token output, so the
+        # draft pass plus verification is pure added latency. Only fires when no
+        # running request is scheduled, so an in-flight multi-token generation
+        # can never lose its draft tokens.
+        if (
+            num_spec_tokens_to_schedule > 0
+            and scheduled_new_reqs
+            and not scheduled_running_reqs
+            and all(req.max_tokens <= 1 for req in scheduled_new_reqs)
+        ):
+            num_spec_tokens_to_schedule = 0
+            # NOTE: allocate_slots (called above for each request) already
+            # reserved KV blocks for self.num_lookahead_tokens speculative
+            # slots. We cannot retroactively shrink that reservation here
+            # because it was made per-request during the scheduling loop,
+            # before this aggregate skip condition is evaluated. The
+            # reservation is harmless: these are single-token requests
+            # (max_tokens <= 1) that finish immediately after one decode
+            # step, so the extra blocks are released at the next scheduling
+            # iteration. Zeroing num_spec_tokens_to_schedule prevents the
+            # draft model from running, which is the source of the wasted
+            # latency we are avoiding.
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1723,7 +1777,15 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
         )
-        return GrammarOutput(structured_output_request_ids, bitmask)
+        num_spec_tokens = [
+            len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
+            for req_id in structured_output_request_ids
+        ]
+        return GrammarOutput(
+            structured_output_request_ids,
+            bitmask,
+            num_spec_tokens,
+        )
 
     def update_from_output(
         self,
@@ -1835,9 +1897,13 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
+            observed_spec_decode = False
+            num_draft_tokens = 0
+            num_accepted = 0
             if scheduled_spec_token_ids and (
                 generated_token_ids or self.num_sampled_tokens_per_step == 0
             ):
+                observed_spec_decode = True
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
@@ -1855,13 +1921,6 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens -= num_rejected
                     if request.num_output_placeholders > 0:
                         request.num_output_placeholders -= num_rejected
-                spec_decoding_stats = self.make_spec_decoding_stats(
-                    spec_decoding_stats,
-                    num_draft_tokens=num_draft_tokens,
-                    num_accepted_tokens=num_accepted,
-                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
-                    request_id=req_id,
-                )
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
@@ -1876,6 +1935,40 @@ class Scheduler(SchedulerInterface):
             prefill_stats = None
             status_before_stop = request.status
             num_output_tokens_before = len(request._output_token_ids)
+
+            if (
+                len(new_token_ids) > 1
+                and scheduled_spec_token_ids
+                and request.use_structured_output
+                and not output_is_stale
+            ):
+                new_token_ids, num_grammar_rejected = (
+                    self.structured_output_manager.filter_speculative_grammar_tokens(
+                        request, new_token_ids
+                    )
+                )
+                if num_grammar_rejected > 0:
+                    if request.num_computed_tokens > 0:
+                        request.num_computed_tokens -= num_grammar_rejected
+                    if request.num_output_placeholders > 0:
+                        request.num_output_placeholders -= num_grammar_rejected
+                    # Target-sampled tokens occupy the end of the output block.
+                    # Removing that tail changes the accepted-draft count only
+                    # when the rejected suffix extends into draft positions.
+                    num_accepted -= max(
+                        num_grammar_rejected - self.num_sampled_tokens_per_step,
+                        0,
+                    )
+                    assert num_accepted >= 0
+
+            if observed_spec_decode:
+                spec_decoding_stats = self.make_spec_decoding_stats(
+                    spec_decoding_stats,
+                    num_draft_tokens=num_draft_tokens,
+                    num_accepted_tokens=num_accepted,
+                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
+                    request_id=req_id,
+                )
 
             # Check for stop and update request status.
             if new_token_ids:
@@ -2946,50 +3039,73 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
-            # We iterate only over blocks that may contain externally computed
-            # tokens
+            req_block_ids_by_group = self.kv_cache_manager.get_block_ids(req_id)
+            # We iterate only over blocks that may contain externally
+            # computed tokens.
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
-
-            req_num_computed_blocks = (
-                req_num_computed_tokens + self.block_size - 1
-            ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-                if block_id not in invalid_block_ids:
-                    continue
-
-                is_affected = True
-
-                if block_id in marked_invalid_block_ids:
-                    # This invalid block is shared with a previous request
-                    # and was already marked for recomputation.
-                    # This means this request can still consider this block
-                    # as computed when rescheduled.
-                    # Currently this only applies to sync loading; Async
-                    # loading does not yet support block sharing
-                    continue
-
-                marked_invalid_block_ids.add(block_id)
-
-                if marked_invalid_block:
-                    # This request has already marked an invalid block for
-                    # recomputation and updated its num_computed_tokens.
-                    continue
-
-                marked_invalid_block = True
-                # Truncate the computed tokens at the first failed block
-                request.num_computed_tokens = idx * self.block_size
-                num_affected_tokens = (
-                    req_num_computed_tokens - request.num_computed_tokens
+            computed_block_ids_by_group = (
+                self.kv_cache_manager.get_block_ids_for_computed_tokens(
+                    req_id,
+                    req_num_computed_tokens,
                 )
-                total_affected_tokens += num_affected_tokens
+            )
 
-                # collect invalid block and all downstream dependent blocks
-                if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
+            # Map each invalid block to the earliest scheduler-aligned token
+            # boundary from which this request must be recomputed.
+            invalid_block_boundaries: dict[int, int] = {}
+            for group, group_block_ids in zip(
+                self.kv_cache_config.kv_cache_groups,
+                computed_block_ids_by_group,
+                strict=True,
+            ):
+                group_block_size = group.kv_cache_spec.block_size
+                for block_idx, block_id in enumerate(group_block_ids):
+                    if block_id not in invalid_block_ids:
+                        continue
+
+                    block_start = block_idx * group_block_size
+                    recompute_from = block_start // self.block_size * self.block_size
+                    previous_boundary = invalid_block_boundaries.get(block_id)
+                    invalid_block_boundaries[block_id] = (
+                        recompute_from
+                        if previous_boundary is None
+                        else min(previous_boundary, recompute_from)
+                    )
+
+            if invalid_block_boundaries:
+                is_affected = True
+                new_invalid_block_ids = (
+                    invalid_block_boundaries.keys() - marked_invalid_block_ids
+                )
+                marked_invalid_block_ids.update(new_invalid_block_ids)
+
+                if new_invalid_block_ids:
+                    marked_invalid_block = True
+                    request.num_computed_tokens = min(
+                        invalid_block_boundaries[block_id]
+                        for block_id in new_invalid_block_ids
+                    )
+                    num_affected_tokens = (
+                        req_num_computed_tokens - request.num_computed_tokens
+                    )
+                    total_affected_tokens += num_affected_tokens
+
+                    # Every KV group after the common recomputation boundary
+                    # depends on the failed prefix, so collect downstream
+                    # blocks from all groups.
+                    if evict_blocks:
+                        for group, group_block_ids in zip(
+                            self.kv_cache_config.kv_cache_groups,
+                            req_block_ids_by_group,
+                            strict=True,
+                        ):
+                            group_block_size = group.kv_cache_spec.block_size
+                            first_block_idx = (
+                                request.num_computed_tokens // group_block_size
+                            )
+                            blocks_to_evict.update(group_block_ids[first_block_idx:])
 
             if is_affected:
                 if not marked_invalid_block:

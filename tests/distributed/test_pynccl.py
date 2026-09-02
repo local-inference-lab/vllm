@@ -257,7 +257,9 @@ def all_gatherv_worker_fn():
     device = f"cuda:{pynccl_comm.rank}"
 
     assert world_size <= 8
-    sizes = [81, 20, 57, 52, 81, 5, 49, 49][:world_size]
+    # A zero-length rank is required when fewer multimodal inputs than TP
+    # ranks are distributed across the model-parallel group.
+    sizes = [81, 0, 57, 52, 81, 5, 49, 49][:world_size]
     num_elems = sizes[rank]
     tensor = torch.arange(num_elems, dtype=torch.float32, device=device) + rank * 100
     result = torch.zeros(sum(sizes), dtype=torch.float32, device=device)
