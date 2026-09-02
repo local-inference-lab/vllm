@@ -547,13 +547,21 @@ class SingleTypeKVCacheManager(ABC):
         )
         if scan_start_block >= num_full_blocks:
             return
+        retention_use_eagle = self.use_eagle or self.lookup_drops_eagle_block
+        if (
+            isinstance(self.kv_cache_spec, MambaSpec)
+            and self.replay_boundary_alignment_tokens is not None
+        ):
+            # The coordinator already added the one-alignment-unit lower
+            # candidate. Applying reachable_hit_positions() again would retain
+            # a second, unreachable predecessor state.
+            retention_use_eagle = False
         block_mask = self.reachable_block_mask(
             start_block=scan_start_block,
             end_block=num_full_blocks,
             alignment_tokens=self.scheduler_block_size,
             kv_cache_spec=self.kv_cache_spec,
-            # Retention, unlike lookup, cares whether the drop happens anywhere.
-            use_eagle=self.use_eagle or self.lookup_drops_eagle_block,
+            use_eagle=retention_use_eagle,
             retention_interval=retention_interval,
             reachable_boundaries=reachable_boundaries,
         )
@@ -562,7 +570,7 @@ class SingleTypeKVCacheManager(ABC):
             end_block=num_full_blocks,
             alignment_tokens=self.prefix_cache_alignment_tokens,
             kv_cache_spec=self.kv_cache_spec,
-            use_eagle=self.use_eagle,
+            use_eagle=retention_use_eagle,
             retention_interval=0,
             reachable_boundaries=reachable_boundaries,
         )

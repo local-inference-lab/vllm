@@ -155,13 +155,15 @@ class KVCacheCoordinator(ABC):
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
 
-        # Sparse retention must key off "some group's lookup applies the EAGLE
-        # drop", not "this group holds draft layers": the coordinator reconciles
-        # every group to ONE hit length, so a drop anywhere shortens the
-        # candidate offered to all of them. A group that kept only its own
-        # boundary state would then sit above every reachable candidate.
+        # A full-attention EAGLE drop shortens the candidate offered to every
+        # group. SWA's own proof-block pop instead lands back on that candidate.
+        lookup_drops_eagle_block = any(
+            group_id in self.eagle_group_ids
+            and isinstance(group.kv_cache_spec, FullAttentionSpec)
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+        )
         for manager in self.single_type_managers:
-            manager.lookup_drops_eagle_block = bool(self.eagle_group_ids)
+            manager.lookup_drops_eagle_block = lookup_drops_eagle_block
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -682,11 +684,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         )
         for manager in self.single_type_managers:
             manager.prefix_cache_alignment_tokens = prefix_cache_alignment_tokens
-            if self.has_replicated_sliding_group and (
-                isinstance(manager.kv_cache_spec, MambaSpec)
-                or (
-                    isinstance(manager.kv_cache_spec, SlidingWindowSpec)
-                    and manager.kv_cache_spec.dcp_replicated
+            if (
+                manager.lookup_drops_eagle_block
+                and isinstance(
+                    manager.kv_cache_spec, (MambaSpec, SlidingWindowSpec)
                 )
             ):
                 # The target page and EAGLE quantum define the common DFlash
