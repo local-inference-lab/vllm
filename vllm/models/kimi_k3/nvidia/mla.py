@@ -216,17 +216,30 @@ def _reuse_consumed_query_for_context_output(
     query: torch.Tensor,
     output: torch.Tensor,
 ) -> torch.Tensor:
-    """Return contiguous semantic-output storage backed by a consumed query."""
+    """Return contiguous storage for the compact context output.
+
+    The consumed query backs the output when it holds enough bytes (a bf16
+    query row is wider than its bf16 output row); otherwise the output gets
+    fresh storage, as for an fp8 query whose 192-byte head rows cannot hold
+    the 256-byte bf16 output rows.
+
+    Args:
+        query: The contiguous prefill query the attention kernels have consumed.
+        output: The output tensor whose shape and dtype the storage must match.
+
+    Returns:
+        A contiguous tensor shaped like ``output``, aliasing ``query`` when it
+        fits and newly allocated otherwise.
+
+    Raises:
+        ValueError: If ``query`` is not contiguous.
+    """
     if not query.is_contiguous():
         raise ValueError("Kimi-K3 MLA prefill query storage must be contiguous")
     required_bytes = output.numel() * output.element_size()
     query_bytes = query.view(torch.uint8).flatten()
     if query_bytes.numel() < required_bytes:
-        raise ValueError(
-            "Kimi-K3 MLA prefill query storage is too small for compact context "
-            f"output: available={query_bytes.numel()} bytes, "
-            f"required={required_bytes} bytes"
-        )
+        return torch.empty(output.shape, dtype=output.dtype, device=output.device)
     return query_bytes[:required_bytes].view(output.dtype).view_as(output)
 
 
