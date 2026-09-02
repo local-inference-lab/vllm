@@ -138,6 +138,7 @@ class _FusedLayer:
     _compute_prefill_context = MultiHeadLatentAttention._compute_prefill_context
     _gather_context_latent = MultiHeadLatentAttention._gather_context_latent
     _attn_read_kv_cache = MultiHeadLatentAttention._attn_read_kv_cache
+    _context_gather_pipeline = MultiHeadLatentAttention._context_gather_pipeline
 
     def __init__(
         self,

@@ -1414,10 +1414,13 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         staging)."""
         staging = _dma_staging_buffers.get(workspace.device)
         rows = workspace.shape[0]
+        pe_width = workspace.shape[1] - self.kv_lora_rank
         if (
             staging is None
             or staging[0].shape[0] < rows
             or staging[0].dtype != workspace.dtype
+            or staging[0].shape[1] != self.kv_lora_rank
+            or staging[1].shape[1] != pe_width
         ):
             staging = (
                 torch.empty(
@@ -1426,7 +1429,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                     device=workspace.device,
                 ),
                 torch.empty(
-                    (rows, workspace.shape[1] - self.kv_lora_rank),
+                    (rows, pe_width),
                     dtype=workspace.dtype,
                     device=workspace.device,
                 ),

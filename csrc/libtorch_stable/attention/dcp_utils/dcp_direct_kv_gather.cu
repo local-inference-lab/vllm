@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #include "dcp_direct_common.cuh"
 
@@ -372,27 +373,41 @@ void direct_dcp_kv_gather(const torch::stable::Tensor& local_kv,
 // per destination. `runs` is a CPU int64 [n, 3] tensor of
 // (source row, destination row, rows) per request; destination rows are the
 // compact request-major layout of build_dcp_kv_final_layout_dst_rows.
+// Release `source_rank`'s slot entry (= epoch) at every destination in
+// `destination_mask`. The writer is the rank whose copies of that source's
+// rows completed on this stream: the source itself, or its relay.
 __global__ void direct_dcp_kv_signal_kernel(const int64_t* peer_signal_ptrs,
                                             const int64_t* epoch_ptr,
-                                            int64_t world_size, int64_t rank,
-                                            int64_t buffer_slot) {
+                                            int64_t world_size,
+                                            int64_t source_rank,
+                                            int64_t buffer_slot,
+                                            int64_t destination_mask) {
   uint32_t epoch = static_cast<uint32_t>(epoch_ptr[0]);
-  int64_t signal_item = buffer_slot * world_size + rank;
+  int64_t signal_item = buffer_slot * world_size + source_rank;
   for (int64_t destination_rank = threadIdx.x; destination_rank < world_size;
        destination_rank += blockDim.x) {
+    if (((destination_mask >> destination_rank) & 1) == 0) {
+      continue;
+    }
     uint32_t* peer_signal =
         get_peer_ptr<uint32_t>(peer_signal_ptrs, destination_rank);
     store_release_system(peer_signal + signal_item, epoch);
   }
 }
 
+// Wait until every source in `source_mask` shows the epoch in this rank's
+// slot entries.
 __global__ void direct_dcp_kv_wait_kernel(const uint32_t* received_signal,
                                           const int64_t* epoch_ptr,
                                           int64_t world_size,
-                                          int64_t buffer_slot) {
+                                          int64_t buffer_slot,
+                                          int64_t source_mask) {
   uint32_t epoch = static_cast<uint32_t>(epoch_ptr[0]);
   for (int64_t source_rank = threadIdx.x; source_rank < world_size;
        source_rank += blockDim.x) {
+    if (((source_mask >> source_rank) & 1) == 0) {
+      continue;
+    }
     int64_t source_signal_item = buffer_slot * world_size + source_rank;
     if (!wait_for_epoch(received_signal + source_signal_item, epoch)) {
       printf("direct DCP DMA final-layout timeout source=%lld epoch=%u\n",
@@ -402,6 +417,52 @@ __global__ void direct_dcp_kv_wait_kernel(const uint32_t* received_signal,
   }
 }
 
+// Copy `runs` (source row, destination row, rows) of the plane-separated
+// source (`src_kv_c`/`src_k_pe`, row-major, `src_*_row_bytes` per row) into
+// the slot of `destination_rank`.
+void copy_runs_to(const int64_t* peer_kv, int64_t destination_rank,
+                  int64_t buffer_slot, int64_t slot_stride_bytes,
+                  int64_t k_pe_plane_offset, const char* src_kv_c,
+                  const char* src_k_pe, int64_t src_kv_c_row_bytes,
+                  int64_t src_k_pe_row_bytes, int64_t kv_c_row_bytes,
+                  int64_t k_pe_row_bytes, const int64_t* run_data,
+                  int64_t num_runs, cudaStream_t stream) {
+  char* slot_base = reinterpret_cast<char*>(
+                        static_cast<uintptr_t>(peer_kv[destination_rank])) +
+                    buffer_slot * slot_stride_bytes;
+  for (int64_t i = 0; i < num_runs; ++i) {
+    int64_t src = run_data[3 * i], dst = run_data[3 * i + 1],
+            rows = run_data[3 * i + 2];
+    if (rows == 0) {
+      continue;
+    }
+    cudaError_t err = cudaMemcpyAsync(
+        slot_base + dst * kv_c_row_bytes, src_kv_c + src * src_kv_c_row_bytes,
+        rows * kv_c_row_bytes, cudaMemcpyDefault, stream);
+    STD_TORCH_CHECK(err == cudaSuccess,
+                    std::string("direct DCP DMA kv_c copy failed: ") +
+                        cudaGetErrorString(err));
+    err = cudaMemcpyAsync(slot_base + k_pe_plane_offset + dst * k_pe_row_bytes,
+                          src_k_pe + src * src_k_pe_row_bytes,
+                          rows * k_pe_row_bytes, cudaMemcpyDefault, stream);
+    STD_TORCH_CHECK(err == cudaSuccess,
+                    std::string("direct DCP DMA k_pe copy failed: ") +
+                        cudaGetErrorString(err));
+  }
+}
+
+// `relay_partner` >= 0 selects the two-cluster relay: the ranks whose bits
+// are set in `mates_mask` share a PCIe switch with this rank, and
+// `relay_partner` is this rank's counterpart behind the inter-switch link.
+// Phase 1 copies this rank's rows to its mates and to the partner and
+// releases this rank's entry there; phase 2 waits for the partner's rows,
+// forwards them from this rank's own slot to the mates and releases the
+// partner's entry there. Every row then crosses the inter-switch link once
+// instead of once per peer behind it (with the flat all-to-all schedule the
+// cross-switch copies ran at 7-9 GB/s while the switch-local ones ran at
+// 27 GB/s). `partner_runs` are the partner's runs in the same layout. With
+// `relay_partner` < 0 the flat schedule publishes to every destination
+// directly (rotated by the source rank) and `partner_runs` is unused.
 void direct_dcp_kv_gather_dma(const torch::stable::Tensor& local_kv_c,
                               const torch::stable::Tensor& local_k_pe,
                               const torch::stable::Tensor& runs,
@@ -412,7 +473,9 @@ void direct_dcp_kv_gather_dma(const torch::stable::Tensor& local_kv_c,
                               torch::stable::Tensor& epoch,
                               int64_t output_tokens, int64_t plane_split_dim,
                               int64_t buffer_slot, int64_t world_size,
-                              int64_t rank, int64_t max_gathered_tokens) {
+                              int64_t rank, int64_t max_gathered_tokens,
+                              int64_t relay_partner, int64_t mates_mask,
+                              const torch::stable::Tensor& partner_runs) {
   using torch::headeronly::ScalarType;
 
   STD_TORCH_CHECK(local_kv_c.is_cuda() && local_k_pe.is_cuda(),
@@ -506,45 +569,116 @@ void direct_dcp_kv_gather_dma(const torch::stable::Tensor& local_kv_c,
 
   const char* src_kv_c = static_cast<const char*>(local_kv_c.data_ptr());
   const char* src_k_pe = static_cast<const char*>(local_k_pe.data_ptr());
-  // Destinations rotated by the source rank: all ranks issue their copies at
-  // the same time, and with a common order every source would write into
-  // the same destination's inbound link at once (measured 2026-09-03:
-  // 113-156 us per 3 MB copy for the first destinations, 437-445 us for
-  // the last ones). Starting each source one rank past itself keeps every
-  // inbound link busy with a different source. The local copy goes first.
-  for (int64_t step = 0; step < world_size; ++step) {
-    int64_t destination_rank = (rank + step) % world_size;
-    char* slot_base = reinterpret_cast<char*>(
-                          static_cast<uintptr_t>(peer_kv[destination_rank])) +
-                      buffer_slot * slot_stride_bytes;
-    for (int64_t i = 0; i < num_runs; ++i) {
-      int64_t src = run_data[3 * i], dst = run_data[3 * i + 1],
-              rows = run_data[3 * i + 2];
-      if (rows == 0) {
-        continue;
-      }
-      cudaError_t err = cudaMemcpyAsync(
-          slot_base + dst * kv_c_row_bytes, src_kv_c + src * kv_c_row_bytes,
-          rows * kv_c_row_bytes, cudaMemcpyDefault, stream);
-      STD_TORCH_CHECK(err == cudaSuccess,
-                      std::string("direct DCP DMA kv_c copy failed: ") +
-                          cudaGetErrorString(err));
-      err = cudaMemcpyAsync(slot_base + k_pe_plane_offset + dst * k_pe_row_bytes,
-                            src_k_pe + src * k_pe_row_bytes,
-                            rows * k_pe_row_bytes, cudaMemcpyDefault, stream);
-      STD_TORCH_CHECK(err == cudaSuccess,
-                      std::string("direct DCP DMA k_pe copy failed: ") +
-                          cudaGetErrorString(err));
+  STD_TORCH_CHECK(world_size <= 62, "DCP world size exceeds the signal mask");
+  const int64_t all_mask = (int64_t{1} << world_size) - 1;
+  if (relay_partner < 0) {
+    // Flat schedule. Destinations rotated by the source rank: all ranks
+    // issue their copies at the same time, and with a common order every
+    // source would write into the same destination's inbound link at once
+    // (measured 2026-09-03: 113-156 us per 3 MB copy for the first
+    // destinations, 437-445 us for the last ones). Starting each source one
+    // rank past itself keeps every inbound link busy with a different
+    // source. The local copy goes first.
+    for (int64_t step = 0; step < world_size; ++step) {
+      int64_t destination_rank = (rank + step) % world_size;
+      copy_runs_to(peer_kv, destination_rank, buffer_slot, slot_stride_bytes,
+                   k_pe_plane_offset, src_kv_c, src_k_pe, kv_c_row_bytes,
+                   k_pe_row_bytes, kv_c_row_bytes, k_pe_row_bytes, run_data,
+                   num_runs, stream);
     }
+    direct_dcp_kv_signal_kernel<<<1, 32, 0, stream>>>(
+        peer_signal_ptrs.const_data_ptr<int64_t>(),
+        epoch.const_data_ptr<int64_t>(), world_size, rank, buffer_slot,
+        all_mask);
+    check_cuda_launch("direct DCP DMA final-layout signal");
+    direct_dcp_kv_wait_kernel<<<1, 32, 0, stream>>>(
+        reinterpret_cast<const uint32_t*>(
+            received_signal.const_data_ptr<int32_t>()),
+        epoch.const_data_ptr<int64_t>(), world_size, buffer_slot, all_mask);
+    check_cuda_launch("direct DCP DMA final-layout wait");
+    return;
   }
+
+  STD_TORCH_CHECK(relay_partner < world_size && relay_partner != rank,
+                  "invalid relay partner");
+  STD_TORCH_CHECK(((mates_mask >> rank) & 1) == 0 &&
+                      ((mates_mask >> relay_partner) & 1) == 0 &&
+                      (mates_mask & ~all_mask) == 0,
+                  "the mates mask must name other ranks on this rank's switch");
+  STD_TORCH_CHECK(partner_runs.dim() == 2 && partner_runs.size(1) == 3 &&
+                      partner_runs.is_contiguous() &&
+                      partner_runs.scalar_type() == ScalarType::Long &&
+                      !partner_runs.is_cuda(),
+                  "partner runs must be a contiguous CPU int64 [n, 3] tensor");
+  const int64_t* partner_run_data = partner_runs.const_data_ptr<int64_t>();
+  int64_t num_partner_runs = partner_runs.size(0);
+  for (int64_t i = 0; i < num_partner_runs; ++i) {
+    int64_t dst = partner_run_data[3 * i + 1], rows = partner_run_data[3 * i + 2];
+    STD_TORCH_CHECK(rows >= 0 && dst >= 0 && dst + rows <= output_tokens,
+                    "partner run exceeds the output");
+  }
+  // Phase 1: own rows to the mates (rotated by rank within the switch) and
+  // to the partner; the local copy first.
+  copy_runs_to(peer_kv, rank, buffer_slot, slot_stride_bytes,
+               k_pe_plane_offset, src_kv_c, src_k_pe, kv_c_row_bytes,
+               k_pe_row_bytes, kv_c_row_bytes, k_pe_row_bytes, run_data,
+               num_runs, stream);
+  for (int64_t step = 1; step < world_size; ++step) {
+    int64_t destination_rank = (rank + step) % world_size;
+    if (((mates_mask >> destination_rank) & 1) == 0) {
+      continue;
+    }
+    copy_runs_to(peer_kv, destination_rank, buffer_slot, slot_stride_bytes,
+                 k_pe_plane_offset, src_kv_c, src_k_pe, kv_c_row_bytes,
+                 k_pe_row_bytes, kv_c_row_bytes, k_pe_row_bytes, run_data,
+                 num_runs, stream);
+  }
+  copy_runs_to(peer_kv, relay_partner, buffer_slot, slot_stride_bytes,
+               k_pe_plane_offset, src_kv_c, src_k_pe, kv_c_row_bytes,
+               k_pe_row_bytes, kv_c_row_bytes, k_pe_row_bytes, run_data,
+               num_runs, stream);
   direct_dcp_kv_signal_kernel<<<1, 32, 0, stream>>>(
-      peer_signal_ptrs.const_data_ptr<int64_t>(), epoch.const_data_ptr<int64_t>(),
-      world_size, rank, buffer_slot);
-  check_cuda_launch("direct DCP DMA final-layout signal");
+      peer_signal_ptrs.const_data_ptr<int64_t>(),
+      epoch.const_data_ptr<int64_t>(), world_size, rank, buffer_slot,
+      mates_mask | (int64_t{1} << relay_partner) | (int64_t{1} << rank));
+  check_cuda_launch("direct DCP DMA relay phase-1 signal");
+  // Phase 2: the partner's rows, once they landed in this rank's own slot,
+  // go to the mates from there (same positions in every slot).
   direct_dcp_kv_wait_kernel<<<1, 32, 0, stream>>>(
       reinterpret_cast<const uint32_t*>(
           received_signal.const_data_ptr<int32_t>()),
-      epoch.const_data_ptr<int64_t>(), world_size, buffer_slot);
+      epoch.const_data_ptr<int64_t>(), world_size, buffer_slot,
+      int64_t{1} << relay_partner);
+  check_cuda_launch("direct DCP DMA relay phase-2 wait");
+  const char* own_slot = static_cast<const char*>(received_kv.data_ptr()) +
+                         buffer_slot * slot_stride_bytes;
+  // Source rows of the forwarded runs are their destination rows.
+  std::vector<int64_t> forward_runs(3 * num_partner_runs);
+  for (int64_t i = 0; i < num_partner_runs; ++i) {
+    forward_runs[3 * i] = partner_run_data[3 * i + 1];
+    forward_runs[3 * i + 1] = partner_run_data[3 * i + 1];
+    forward_runs[3 * i + 2] = partner_run_data[3 * i + 2];
+  }
+  for (int64_t step = 1; step < world_size; ++step) {
+    int64_t destination_rank = (rank + step) % world_size;
+    if (((mates_mask >> destination_rank) & 1) == 0) {
+      continue;
+    }
+    copy_runs_to(peer_kv, destination_rank, buffer_slot, slot_stride_bytes,
+                 k_pe_plane_offset, own_slot, own_slot + k_pe_plane_offset,
+                 kv_c_row_bytes, k_pe_row_bytes, kv_c_row_bytes,
+                 k_pe_row_bytes, forward_runs.data(), num_partner_runs,
+                 stream);
+  }
+  direct_dcp_kv_signal_kernel<<<1, 32, 0, stream>>>(
+      peer_signal_ptrs.const_data_ptr<int64_t>(),
+      epoch.const_data_ptr<int64_t>(), world_size, relay_partner, buffer_slot,
+      mates_mask);
+  check_cuda_launch("direct DCP DMA relay phase-2 signal");
+  direct_dcp_kv_wait_kernel<<<1, 32, 0, stream>>>(
+      reinterpret_cast<const uint32_t*>(
+          received_signal.const_data_ptr<int32_t>()),
+      epoch.const_data_ptr<int64_t>(), world_size, buffer_slot, all_mask);
   check_cuda_launch("direct DCP DMA final-layout wait");
 }
 
@@ -568,7 +702,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, direct_dcp_kv_gather_dma_ops) {
       "Tensor peer_kv_ptrs_host, Tensor peer_signal_ptrs, Tensor! received_kv, "
       "Tensor! received_signal, Tensor! epoch, "
       "int output_tokens, int plane_split_dim, int buffer_slot, "
-      "int world_size, int rank, int max_gathered_tokens) -> ()");
+      "int world_size, int rank, int max_gathered_tokens, "
+      "int relay_partner, int mates_mask, Tensor partner_runs) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, direct_dcp_kv_gather_ops) {
