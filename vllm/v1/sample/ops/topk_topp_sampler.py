@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from functools import cache
+
 import torch
 import torch.nn as nn
 
@@ -72,6 +74,16 @@ def flashinfer_sampler_supported() -> bool:
         unsupported_reason,
     )
     return False
+
+
+@cache
+def _flashinfer_probability_renorm_supported() -> bool:
+    """Return the process-stable availability of FlashInfer renormalization.
+
+    Returns:
+        Whether the configured platform can use the FlashInfer sampler.
+    """
+    return flashinfer_sampler_supported()
 
 
 class TopKTopPSampler(nn.Module):
@@ -362,6 +374,64 @@ def apply_top_k_top_p(
 
     # Use pytorch sort implementation for small batch sizes.
     return apply_top_k_top_p_pytorch(logits, k, p)
+
+
+def apply_top_k_top_p_probs(
+    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+) -> torch.Tensor:
+    """Apply top-k/top-p and return normalized probabilities.
+
+    The small-batch PyTorch top-p path already computes probabilities to find
+    the nucleus cutoff. Returning those probabilities directly avoids a second
+    full-vocabulary softmax in callers that need probabilities rather than
+    processed logits. ``logits`` may be reused as the output buffer when it is
+    float32.
+
+    Args:
+        logits: Unnormalized token scores with shape ``[batch_size, vocab_size]``.
+        k: Per-row top-k limits, or ``None`` when top-k is disabled.
+        p: Per-row top-p thresholds, or ``None`` when top-p is disabled.
+
+    Returns:
+        Normalized constrained probabilities with the same shape as ``logits``.
+    """
+    if p is None:
+        return apply_top_k_top_p(logits, k, p).softmax(dim=-1, dtype=torch.float32)
+
+    # Standard rejection sampling needs the complete constrained probability
+    # distribution.  The target CUDA sampler already uses FlashInfer's
+    # deterministic top-p implementation, so the corresponding renormalizer
+    # both matches that distribution and avoids sorting the full vocabulary.
+    # One-row PyTorch sorting is marginally faster; top-k combinations retain
+    # the existing path until their FlashInfer ordering contract is qualified.
+    if k is None and logits.shape[0] > 1 and _flashinfer_probability_renorm_supported():
+        from flashinfer.sampling import top_p_renorm_probs
+
+        probs = logits.softmax(dim=-1, dtype=torch.float32)
+        return top_p_renorm_probs(probs, p, is_deterministic=True)
+
+    if current_platform.is_cpu() or (HAS_TRITON and logits.shape[0] >= 8):
+        return apply_top_k_top_p(logits, k, p).softmax(dim=-1, dtype=torch.float32)
+
+    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+
+    if k is not None:
+        top_k_mask = logits_sort.size(1) - k.to(torch.long)
+        top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
+        logits_sort.masked_fill_(logits_sort < top_k_mask, -float("inf"))
+
+    probs_sort = logits_sort.softmax(dim=-1, dtype=torch.float32)
+    probs_cumsum = probs_sort.cumsum(dim=-1)
+    top_p_mask = probs_cumsum <= 1 - p.unsqueeze(dim=1)
+    top_p_mask[:, -1] = False
+    probs_sort.masked_fill_(top_p_mask, 0.0)
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+
+    if logits.dtype == torch.float32:
+        probs = logits.zero_()
+    else:
+        probs = torch.zeros_like(logits, dtype=torch.float32)
+    return probs.scatter_(dim=-1, index=logits_idx, src=probs_sort)
 
 
 def apply_top_k_top_p_pytorch(

@@ -9,6 +9,8 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.sample.ops.topk_topp_sampler import (
+    apply_top_k_top_p,
+    apply_top_k_top_p_probs,
     apply_top_k_top_p_pytorch,
     random_sample,
 )
@@ -18,6 +20,52 @@ DEVICE_TYPE = current_platform.device_type
 
 BATCH_SIZE = 1024
 VOCAB_SIZE = 128 * 1024
+
+
+@pytest.mark.parametrize("batch_size", [1, 3, 7, 8])
+@pytest.mark.parametrize("use_top_k", [False, True])
+def test_apply_top_k_top_p_probs_matches_processed_logits(
+    batch_size: int,
+    use_top_k: bool,
+):
+    vocab_size = 257
+    generator = torch.Generator(device=DEVICE_TYPE).manual_seed(41 + batch_size)
+    logits = torch.randn(
+        batch_size,
+        vocab_size,
+        dtype=torch.float32,
+        device=DEVICE_TYPE,
+        generator=generator,
+    )
+    top_k = (
+        torch.arange(17, 17 + batch_size, dtype=torch.int32, device=DEVICE_TYPE)
+        if use_top_k
+        else None
+    )
+    top_p = torch.linspace(0.55, 0.95, batch_size, device=DEVICE_TYPE)
+
+    expected = apply_top_k_top_p(logits.clone(), top_k, top_p).softmax(
+        dim=-1,
+        dtype=torch.float32,
+    )
+    input_buffer = logits.clone()
+    actual = apply_top_k_top_p_probs(input_buffer, top_k, top_p)
+
+    reuses_input = (
+        not current_platform.is_cpu()
+        and batch_size < 8
+        and (batch_size == 1 or use_top_k or not FLASHINFER_TOPK_TOPP_SUPPORTED)
+    )
+    if reuses_input:
+        assert actual.data_ptr() == input_buffer.data_ptr()
+    assert torch.equal(actual != 0, expected != 0)
+    assert torch.allclose(actual, expected, atol=2e-7, rtol=2e-6)
+    assert torch.allclose(
+        actual.sum(dim=-1),
+        torch.ones(batch_size, device=DEVICE_TYPE),
+        atol=3e-7,
+        rtol=0,
+    )
 
 
 def _flashinfer_topk_topp_supported() -> bool:
@@ -42,6 +90,90 @@ def _flashinfer_topk_topp_supported() -> bool:
 
 
 FLASHINFER_TOPK_TOPP_SUPPORTED = _flashinfer_topk_topp_supported()
+
+
+@pytest.mark.skipif(
+    not FLASHINFER_TOPK_TOPP_SUPPORTED,
+    reason="FlashInfer top-p renormalization requires a supported CUDA device",
+)
+@pytest.mark.parametrize("batch_size", [2, 7, 8, 64])
+def test_probability_helper_matches_flashinfer_target_distribution(
+    batch_size: int,
+):
+    """The rejection distribution must match the CUDA target sampler."""
+    from flashinfer.sampling import top_p_renorm_probs
+
+    device = torch.device(DEVICE_TYPE)
+    vocab_size = 154880
+    generator = torch.Generator(device=device).manual_seed(73 + batch_size)
+    logits = torch.randn(
+        batch_size,
+        vocab_size,
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    )
+    top_p = torch.linspace(0.55, 0.95, batch_size, device=device)
+
+    expected = top_p_renorm_probs(
+        logits.softmax(dim=-1, dtype=torch.float32),
+        top_p,
+        is_deterministic=True,
+    )
+    actual = apply_top_k_top_p_probs(logits.clone(), None, top_p)
+    python_reference = apply_top_k_top_p_pytorch(logits.clone(), None, top_p).softmax(
+        dim=-1, dtype=torch.float32
+    )
+
+    assert torch.equal(actual, expected)
+    assert torch.allclose(
+        actual.sum(dim=-1),
+        torch.ones(batch_size, device=device),
+        atol=3e-7,
+        rtol=0,
+    )
+    total_variation = 0.5 * torch.abs(actual - python_reference).sum(dim=-1)
+    # FP32 cumulative sums can select an adjacent cutoff token. Bound the
+    # affected probability mass while requiring exact target-sampler parity.
+    assert total_variation.max() < 2e-5
+
+
+@pytest.mark.skipif(
+    not FLASHINFER_TOPK_TOPP_SUPPORTED,
+    reason="FlashInfer top-p renormalization requires a supported CUDA device",
+)
+def test_probability_helper_respects_flashinfer_sampler_disable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The rejection path must honor the existing sampler feature gate."""
+    from vllm.v1.sample.ops import topk_topp_sampler as sampler_ops
+
+    device = torch.device(DEVICE_TYPE)
+    generator = torch.Generator(device=device).manual_seed(107)
+    logits = torch.randn(
+        7,
+        257,
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    )
+    top_p = torch.linspace(0.55, 0.95, 7, device=device)
+    expected = apply_top_k_top_p_pytorch(logits.clone(), None, top_p).softmax(
+        dim=-1,
+        dtype=torch.float32,
+    )
+
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")
+    sampler_ops._flashinfer_probability_renorm_supported.cache_clear()
+    try:
+        input_buffer = logits.clone()
+        actual = apply_top_k_top_p_probs(input_buffer, None, top_p)
+    finally:
+        sampler_ops._flashinfer_probability_renorm_supported.cache_clear()
+
+    assert actual.data_ptr() == input_buffer.data_ptr()
+    assert torch.equal(actual != 0, expected != 0)
+    assert torch.allclose(actual, expected, atol=2e-7, rtol=2e-6)
 
 
 def _seed_default_generator(seed: int) -> None:
