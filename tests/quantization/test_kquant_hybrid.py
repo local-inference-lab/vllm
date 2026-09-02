@@ -11,6 +11,8 @@ from vllm.model_executor.layers.quantization.kquant_hybrid import (
     KQuantHybridConfig,
     _b12x_tiles_for_geometry,
     _is_dense_layer_ignored,
+    _qsrt_atoms_v2_w4a8_prefill_enabled,
+    _qsrt_atoms_v2_w4a8_prequantized_input_enabled,
     _read_hybrid_keys,
     _require_rank_local_kept_kernel,
     _stack_exl3_intermediate_rotations,
@@ -130,6 +132,31 @@ def test_config_accepts_tp_independent_qsrt() -> None:
     assert config.trellis_codebook == "sqg_xor_cheb_t12"
 
 
+def test_mxfp8_dense_config_keeps_multimodal_modules_unquantized() -> None:
+    config = KQuantHybridConfig.from_config(
+        _base_config(
+            dense_format="mxfp8",
+            ignored_layers=["kv_b_proj", "vision_tower"],
+        )
+    )
+
+    assert config.dense_ignored_layers == [
+        "kv_b_proj",
+        "vision_tower",
+        "mm_projector",
+    ]
+    assert _is_dense_layer_ignored(
+        "vision_tower.encoder.blocks.0.wqkv",
+        config.dense_ignored_layers,
+        {},
+    )
+    assert _is_dense_layer_ignored(
+        "mm_projector.linear_1",
+        config.dense_ignored_layers,
+        {},
+    )
+
+
 def test_config_accepts_atoms_v2_revision() -> None:
     descriptor = _qsrt_descriptor(
         schema="qsrt_kimi_k3_qsrt_atoms_v2",
@@ -156,6 +183,30 @@ def test_config_accepts_coupled_pure_k2_atoms_v2_profile() -> None:
     )
     assert config.hybrid_bit_map == {"1": [2, 2]}
     assert config.qsrt == descriptor
+
+
+def test_qsrt_w4a8_prefill_is_opt_in_and_pure_k2_only(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_KQUANT_QSRT_W4A8_PREFILL", raising=False)
+    assert not _qsrt_atoms_v2_w4a8_prefill_enabled(pure_k2=True)
+
+    monkeypatch.setenv("VLLM_KQUANT_QSRT_W4A8_PREFILL", "1")
+    assert _qsrt_atoms_v2_w4a8_prefill_enabled(pure_k2=True)
+    with pytest.raises(ValueError, match="uniform coupled pure-K2"):
+        _qsrt_atoms_v2_w4a8_prefill_enabled(pure_k2=False)
+
+
+def test_qsrt_w4a8_prequantized_input_requires_prefill(monkeypatch) -> None:
+    monkeypatch.delenv(
+        "VLLM_KQUANT_QSRT_W4A8_PREQUANTIZED_INPUT", raising=False
+    )
+    assert not _qsrt_atoms_v2_w4a8_prequantized_input_enabled(
+        prefill_enabled=True
+    )
+
+    monkeypatch.setenv("VLLM_KQUANT_QSRT_W4A8_PREQUANTIZED_INPUT", "1")
+    assert _qsrt_atoms_v2_w4a8_prequantized_input_enabled(prefill_enabled=True)
+    with pytest.raises(ValueError, match="requires W4A8 prefill"):
+        _qsrt_atoms_v2_w4a8_prequantized_input_enabled(prefill_enabled=False)
 
 
 def test_atoms_v2_profiles_have_canonical_row_strides() -> None:

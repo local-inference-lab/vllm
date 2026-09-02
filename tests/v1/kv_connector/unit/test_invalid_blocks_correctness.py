@@ -15,8 +15,18 @@ from collections.abc import Callable
 from unittest.mock import Mock
 
 import pytest
+import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
+    NixlBaseConnector,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    SlidingWindowSpec,
+)
 from vllm.v1.request import FinishReason, Request, RequestStatus
 
 from .utils import (
@@ -24,6 +34,7 @@ from .utils import (
     create_request,
     create_scheduler,
     create_vllm_config,
+    make_kv_cache_config,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -54,6 +65,121 @@ def recompute_scheduler():
     vllm_config = create_vllm_config()
     vllm_config.kv_transfer_config.kv_load_failure_policy = "recompute"
     return create_scheduler(vllm_config)
+
+
+def _create_invalid_block_test_scheduler(
+    scheduler_block_size: int,
+    group_block_sizes: tuple[int, ...],
+) -> Scheduler:
+    """Create the scheduler state required by invalid-block mapping tests."""
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.block_size = scheduler_block_size
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                [f"full_attention_{group_idx}"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            )
+            for group_idx, block_size in enumerate(group_block_sizes)
+        ],
+    )
+    return scheduler
+
+
+def test_hybrid_cache_invalid_block_truncates_and_evicts_all_groups():
+    """A failed hybrid-cache group invalidates the shared logical suffix."""
+    scheduler = _create_invalid_block_test_scheduler(16, (16, 16))
+    scheduler.kv_cache_manager.get_block_ids.return_value = (
+        [1, 2, 3, 4],
+        [11, 12, 13, 14],
+    )
+    scheduler.kv_cache_manager.get_block_ids_for_computed_tokens.return_value = (
+        [1, 2, 3, 4],
+        [11, 12, 13, 14],
+    )
+
+    request = Mock(spec=Request)
+    request.request_id = "hybrid-request"
+    request.num_computed_tokens = 64
+
+    affected, affected_tokens, evicted = scheduler._update_requests_with_invalid_blocks(
+        [request],
+        invalid_block_ids={12},
+        num_scheduled_tokens={},
+    )
+
+    assert affected == {request.request_id}
+    assert request.num_computed_tokens == 16
+    assert affected_tokens == 48
+    assert evicted == {2, 3, 4, 12, 13, 14}
+
+
+def test_hybrid_cache_shared_invalid_block_is_recomputed_once():
+    """A shared failed block contributes one recomputation interval."""
+    scheduler = _create_invalid_block_test_scheduler(16, (16, 16))
+    scheduler.kv_cache_manager.get_block_ids.side_effect = (
+        ([1, 2, 3], [11, 12, 13]),
+        ([21, 22, 23], [31, 12, 33]),
+    )
+    scheduler.kv_cache_manager.get_block_ids_for_computed_tokens.side_effect = (
+        ([1, 2, 3], [11, 12, 13]),
+        ([21, 22, 23], [31, 12, 33]),
+    )
+
+    first_request = Mock(spec=Request)
+    first_request.request_id = "first-request"
+    first_request.num_computed_tokens = 48
+    second_request = Mock(spec=Request)
+    second_request.request_id = "second-request"
+    second_request.num_computed_tokens = 48
+
+    affected, affected_tokens, evicted = scheduler._update_requests_with_invalid_blocks(
+        [first_request, second_request],
+        invalid_block_ids={12},
+        num_scheduled_tokens={},
+    )
+
+    assert affected == {first_request.request_id, second_request.request_id}
+    assert first_request.num_computed_tokens == 16
+    assert second_request.num_computed_tokens == 48
+    assert affected_tokens == 32
+    assert evicted == {2, 3, 12, 13}
+
+
+def test_hybrid_cache_ignores_invalid_blocks_after_external_prefix():
+    """Blocks used only by scheduled local tokens are not load failures."""
+    scheduler = _create_invalid_block_test_scheduler(32, (16, 32))
+    scheduler.kv_cache_manager.get_block_ids.return_value = (
+        [1, 2, 3, 4],
+        [11, 12],
+    )
+    scheduler.kv_cache_manager.get_block_ids_for_computed_tokens.return_value = (
+        [1, 2],
+        [11],
+    )
+
+    request = Mock(spec=Request)
+    request.request_id = "local-suffix"
+    request.num_computed_tokens = 64
+
+    affected, affected_tokens, evicted = scheduler._update_requests_with_invalid_blocks(
+        [request],
+        invalid_block_ids={3, 12},
+        num_scheduled_tokens={request.request_id: 32},
+    )
+
+    assert affected == set()
+    assert request.num_computed_tokens == 64
+    assert affected_tokens == 0
+    assert evicted == set()
 
 
 def test_sync_recompute_blocks_not_freed_for_running_requests(
@@ -478,3 +604,296 @@ def test_async_recompute_blocks_not_cached_when_invalid(
 
     # request should be in the running queue
     assert request in recompute_scheduler.running
+
+
+def test_sync_recompute_handles_invalid_block_in_second_kv_cache_group():
+    """Invalid blocks in any hybrid KV group must trigger recomputation."""
+    block_size = 16
+    num_blocks = 128
+    num_prompt_blocks = 8
+    num_external_computed_blocks = 7
+    invalid_block_idx = 3
+
+    vllm_config = create_vllm_config(
+        block_size=block_size,
+        kv_load_failure_policy="recompute",
+    )
+    scheduler = create_scheduler(
+        vllm_config,
+        num_blocks=num_blocks,
+        kv_cache_config=make_kv_cache_config(
+            block_size=block_size,
+            swa_enabled=True,
+            sw_size=num_prompt_blocks * block_size,
+            num_blocks=num_blocks,
+        ),
+    )
+
+    request = create_request(
+        num_tokens=num_prompt_blocks * block_size,
+        block_size=block_size,
+    )
+    scheduler.add_request(request)
+
+    num_external_computed_tokens = num_external_computed_blocks * block_size
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(
+            {
+                request.request_id: num_external_computed_tokens,
+            },
+            False,
+        )
+    )
+    scheduler.connector.request_finished.return_value = (False, None)
+    scheduler.connector.request_finished_all_groups.return_value = (
+        False,
+        None,
+    )
+    scheduler.connector.take_events.return_value = ()
+
+    scheduler_output = scheduler.schedule()
+
+    assert request.status == RequestStatus.RUNNING
+    assert len(scheduler_output.scheduled_new_reqs) == 1
+
+    block_ids_by_group = scheduler_output.scheduled_new_reqs[0].block_ids
+    assert len(block_ids_by_group) == 2
+    assert all(
+        len(group_block_ids) > invalid_block_idx
+        for group_block_ids in block_ids_by_group
+    )
+
+    # Report a load failure in the second KV cache group, not the first.
+    invalid_block_id = block_ids_by_group[1][invalid_block_idx]
+    model_runner_output = create_model_runner_output(
+        [request],
+        invalid_block_ids={invalid_block_id},
+        use_eos=False,
+    )
+
+    scheduler.update_from_output(
+        scheduler_output,
+        model_runner_output,
+    )
+
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_computed_tokens == invalid_block_idx * block_size
+    assert request in scheduler.running
+    assert request.request_id in scheduler.requests
+
+
+def test_sync_fail_handles_invalid_block_in_seventeenth_kv_cache_group():
+    """A hybrid-cache load failure must fail one request, not the scheduler."""
+    block_size = 16
+    num_blocks = 512
+    num_prompt_blocks = 8
+    num_external_computed_blocks = 7
+    invalid_block_idx = 3
+    num_kv_cache_groups = 17
+
+    vllm_config = create_vllm_config(
+        block_size=block_size,
+        kv_load_failure_policy="fail",
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            *[
+                KVCacheGroupSpec(
+                    [f"full_attention_layer_{group_idx}"],
+                    FullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                )
+                for group_idx in range(num_kv_cache_groups - 1)
+            ],
+            KVCacheGroupSpec(
+                ["sliding_window_layer"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=num_prompt_blocks * block_size,
+                ),
+            ),
+        ],
+    )
+    scheduler = create_scheduler(
+        vllm_config,
+        num_blocks=num_blocks,
+        kv_cache_config=kv_cache_config,
+    )
+
+    failed_request = create_request(
+        num_tokens=num_prompt_blocks * block_size,
+        block_size=block_size,
+    )
+    scheduler.add_request(failed_request)
+
+    num_external_computed_tokens = num_external_computed_blocks * block_size
+    scheduler.connector = Mock(spec=NixlBaseConnector)
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(
+            {
+                failed_request.request_id: num_external_computed_tokens,
+            },
+            False,
+        )
+    )
+    scheduler.connector.request_finished.return_value = (False, None)
+    scheduler.connector.request_finished_all_groups.return_value = (
+        False,
+        None,
+    )
+    scheduler.connector.take_events.return_value = ()
+
+    scheduler_output = scheduler.schedule()
+    block_ids_by_group = scheduler_output.scheduled_new_reqs[0].block_ids
+
+    assert len(block_ids_by_group) == num_kv_cache_groups
+    invalid_block_id = block_ids_by_group[-1][invalid_block_idx]
+    model_runner_output = create_model_runner_output(
+        [failed_request],
+        invalid_block_ids={invalid_block_id},
+        use_eos=False,
+    )
+
+    outputs = scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    assert failed_request.status == RequestStatus.FINISHED_ERROR
+    assert failed_request.request_id not in scheduler.requests
+    assert failed_request not in scheduler.running
+    assert len(outputs) == 1
+    engine_output = next(iter(outputs.values())).outputs[0]
+    assert engine_output.request_id == failed_request.request_id
+    assert engine_output.finish_reason == FinishReason.ERROR
+
+    healthy_request = create_request(
+        num_tokens=2 * block_size,
+        block_size=block_size,
+    )
+    scheduler.add_request(healthy_request)
+    next_scheduler_output = scheduler.schedule()
+
+    assert healthy_request.request_id in next_scheduler_output.num_scheduled_tokens
+    assert healthy_request.status == RequestStatus.RUNNING
+
+
+def test_sync_recompute_handles_mixed_kv_group_block_sizes():
+    """Recompute from a common boundary for mixed KV block sizes."""
+    hash_block_size = 16
+    scheduler_block_size = 64
+    num_blocks = 512
+    num_prompt_tokens = 8 * scheduler_block_size
+    num_external_computed_tokens = 7 * scheduler_block_size
+
+    # The invalid block begins at token 3 * 32 = 96.
+    # Scheduling granularity is 64, so recomputation must restart at 64.
+    invalid_group_idx = 1
+    invalid_block_idx = 3
+
+    vllm_config = create_vllm_config(
+        block_size=scheduler_block_size,
+        kv_load_failure_policy="recompute",
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full_16"],
+                FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=4,
+                    head_size=16,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["window_32"],
+                SlidingWindowSpec(
+                    block_size=32,
+                    num_kv_heads=4,
+                    head_size=16,
+                    dtype=torch.float16,
+                    sliding_window=num_prompt_tokens,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["full_64"],
+                FullAttentionSpec(
+                    block_size=64,
+                    num_kv_heads=1,
+                    head_size=32,
+                    dtype=torch.float16,
+                ),
+            ),
+        ],
+    )
+    scheduler = create_scheduler(
+        vllm_config,
+        num_blocks=num_blocks,
+        kv_cache_config=kv_cache_config,
+        hash_block_size=hash_block_size,
+    )
+
+    request = create_request(
+        num_tokens=num_prompt_tokens,
+        block_size=hash_block_size,
+    )
+    scheduler.add_request(request)
+
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(
+            {
+                request.request_id: num_external_computed_tokens,
+            },
+            False,
+        )
+    )
+    scheduler.connector.request_finished.return_value = (
+        False,
+        None,
+    )
+    scheduler.connector.request_finished_all_groups.return_value = (
+        False,
+        None,
+    )
+    scheduler.connector.take_events.return_value = ()
+
+    scheduler_output = scheduler.schedule()
+
+    assert request.status == RequestStatus.RUNNING
+    assert len(scheduler_output.scheduled_new_reqs) == 1
+
+    block_ids_by_group = scheduler_output.scheduled_new_reqs[0].block_ids
+    assert len(block_ids_by_group) == 3
+    assert len(block_ids_by_group[invalid_group_idx]) > invalid_block_idx
+
+    invalid_block_id = block_ids_by_group[invalid_group_idx][invalid_block_idx]
+    model_runner_output = create_model_runner_output(
+        [request],
+        invalid_block_ids={invalid_block_id},
+        use_eos=False,
+    )
+
+    scheduler.update_from_output(
+        scheduler_output,
+        model_runner_output,
+    )
+
+    expected_recompute_from = (
+        invalid_block_idx * 32 // scheduler_block_size * scheduler_block_size
+    )
+
+    assert request.num_computed_tokens == expected_recompute_from
+    assert request.status == RequestStatus.RUNNING
+    assert request in scheduler.running
+    assert request.request_id in scheduler.requests
