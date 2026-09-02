@@ -66,6 +66,11 @@ if TYPE_CHECKING:
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE: int = 0
     VLLM_K3_KV_GROUP_SIZE: int = 0
+    VLLM_K3_DRAFT_REMOTE_ADDRESS: str | None = None
+    VLLM_K3_DSPARK_REMOTE_ADDRESS: str | None = None
+    VLLM_K3_DRAFT_REMOTE_TIMEOUT_MS: int = 30000
+    VLLM_K3_DSPARK_REMOTE_TIMEOUT_MS: int = 30000
+    VLLM_K3_DRAFT_TIMING_LOG_INTERVAL: int = 0
     VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
     VLLM_DSPARK_COMPACT_ROPE: bool = False
     VLLM_DSPARK_SHARD_MARKOV_HEAD: bool = False
@@ -1156,6 +1161,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Bound the number of physical Kimi-K3 layers sharing each hybrid-cache
     # block table. Zero preserves the general grouping heuristic.
     "VLLM_K3_KV_GROUP_SIZE": lambda: int(os.getenv("VLLM_K3_KV_GROUP_SIZE", "0")),
+    # Route Kimi-K3 draft work to a dedicated standalone GPU process. Keep the
+    # DSpark-prefixed names as compatibility aliases for existing deployments.
+    "VLLM_K3_DRAFT_REMOTE_ADDRESS": lambda: os.getenv("VLLM_K3_DRAFT_REMOTE_ADDRESS"),
+    "VLLM_K3_DSPARK_REMOTE_ADDRESS": lambda: os.getenv("VLLM_K3_DSPARK_REMOTE_ADDRESS"),
+    "VLLM_K3_DRAFT_REMOTE_TIMEOUT_MS": lambda: int(
+        os.getenv(
+            "VLLM_K3_DRAFT_REMOTE_TIMEOUT_MS",
+            os.getenv("VLLM_K3_DSPARK_REMOTE_TIMEOUT_MS", "30000"),
+        )
+    ),
+    "VLLM_K3_DSPARK_REMOTE_TIMEOUT_MS": lambda: int(
+        os.getenv("VLLM_K3_DSPARK_REMOTE_TIMEOUT_MS", "30000")
+    ),
+    "VLLM_K3_DRAFT_TIMING_LOG_INTERVAL": lambda: int(
+        os.getenv("VLLM_K3_DRAFT_TIMING_LOG_INTERVAL", "0")
+    ),
     # Limit an external DSpark draft to a replicated rolling MLA KV tail while
     # the target model retains its complete context. Target verification makes
     # the setting quality-safe, but acceptance may change with the window.

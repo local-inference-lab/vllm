@@ -34,6 +34,8 @@ def limit_draft_tokens(
             "Speculator returned unsupported draft shape "
             f"{tuple(draft_tokens.shape)}; expected a 2D tensor."
         )
+    if num_speculative_tokens == 0:
+        return draft_tokens[:, :0]
     if not 1 <= num_speculative_tokens <= max_num_speculative_tokens:
         raise RuntimeError(
             "Scheduler selected an invalid speculative-token count "
@@ -109,6 +111,23 @@ class DraftTokensHandler:
             # worker retains the actual token ids for verification.
             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
         return DraftTokenIds(self.req_ids, draft_token_ids)
+
+
+def draft_query_len(method: str, num_speculative_tokens: int) -> int:
+    """Return the draft query rows one proposal step runs.
+
+    Args:
+        method: ``"dspark"`` samples every draft token from the anchor row,
+            so the query holds ``num_speculative_tokens`` rows; ``"dflash"``
+            prepends the anchor to the mask rows.
+        num_speculative_tokens: Draft depth of the step.
+
+    Returns:
+        The number of query rows, including the anchor row for DFlash.
+    """
+    if method == "dspark":
+        return int(num_speculative_tokens)
+    return 1 + int(num_speculative_tokens)
 
 
 def get_parallel_drafting_token_id(hf_config) -> int:
