@@ -9,6 +9,7 @@ import torch
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.kquant_hybrid import (
     KQuantHybridConfig,
+    _qsrt_atoms_v2_w4a8_prefill_enabled,
     _b12x_tiles_for_geometry,
     _is_dense_layer_ignored,
     _read_hybrid_keys,
@@ -156,6 +157,16 @@ def test_config_accepts_coupled_pure_k2_atoms_v2_profile() -> None:
     )
     assert config.hybrid_bit_map == {"1": [2, 2]}
     assert config.qsrt == descriptor
+
+
+def test_qsrt_w4a8_prefill_is_opt_in_and_pure_k2_only(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_KQUANT_QSRT_W4A8_PREFILL", raising=False)
+    assert not _qsrt_atoms_v2_w4a8_prefill_enabled(pure_k2=True)
+
+    monkeypatch.setenv("VLLM_KQUANT_QSRT_W4A8_PREFILL", "1")
+    assert _qsrt_atoms_v2_w4a8_prefill_enabled(pure_k2=True)
+    with pytest.raises(ValueError, match="uniform coupled pure-K2"):
+        _qsrt_atoms_v2_w4a8_prefill_enabled(pure_k2=False)
 
 
 def test_atoms_v2_profiles_have_canonical_row_strides() -> None:

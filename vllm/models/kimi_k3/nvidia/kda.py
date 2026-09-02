@@ -693,6 +693,11 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             projected = projected_qkvgfab.split(split_sizes, dim=-1)
             mixed_qkv, g_proj_states, f_a, beta = projected[:4]
 
+        # Optional model-installed callback (Kimi-K3 L2 weight prefetch of
+        # o_proj while f_b, the convolution and the recurrence run).
+        _hook = getattr(self, "_l2_prefetch_hook", None)
+        if _hook is not None:
+            _hook(hidden_states.shape[0])
         if self.shard_f_a:
             f_a = gather_kimi_sharded_projection(f_a)
         g1 = self.f_b_proj(f_a)[0]
@@ -716,6 +721,11 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             output_parallel = self.o_proj(core_attn_out)[0]
         else:
             output_parallel = self._project_output_into(core_attn_out, output)
+        # Optional model-installed callback fired before the all-reduce (Kimi-K3
+        # L2 weight prefetch: the reduction leaves device memory idle).
+        _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
+        if _hook is not None:
+            _hook(output_parallel.shape[0])
         return reduce_kimi_full_width_projection(output_parallel, self.tp_size)
 
     @eager_break_during_capture
