@@ -755,6 +755,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> None:
         num_tokens = hidden_states.size(0)
         projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
+        # Optional model-installed callback (e.g. GLM-5.3 L2 weight prefetch of
+        # o_proj while the small projections and the recurrence run).
+        _hook = getattr(self, "_l2_prefetch_hook", None)
+        if _hook is not None:
+            _hook(hidden_states.shape[0])
         if self.use_full_rank_gate:
             split_sizes = [
                 3 * self.local_projection_size,

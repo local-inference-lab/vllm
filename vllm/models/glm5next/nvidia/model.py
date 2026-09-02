@@ -87,6 +87,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.utils.b12x import get_b12x_mhc
 
+from . import l2_prefetch as _l2pf
+
 from .attention import Glm5NextMLAAttention
 from .kda import Glm5NextLinearAttention
 from .multimodal import (
@@ -415,6 +417,12 @@ class Glm5NextDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # Cached for the hot forward path (isinstance per layer per step).
         self._mlp_is_moe = isinstance(self.mlp, Glm5NextMoE)
+        # L2 weight prefetch (see l2_prefetch.py); plans are built lazily on
+        # the first forward, after weights are loaded and post-processed.
+        object.__setattr__(self, "_l2pf_next", None)
+        self._l2pf_ready = False
+        self._l2pf_plan_b = None
+        self._l2pf_plan_c = None
         # In SP, the attention output projection leaves a partial sum; the
         # decoder-layer reduce_scatter after attention completes it (DSv4 pattern).
         # MTP layers use the non-mHC path which has no sp_reduce_scatter, so
@@ -525,6 +533,8 @@ class Glm5NextDecoderLayer(nn.Module):
         # hc_post inputs (its ffn-pre outputs); when present, fuse that
         # hc_post with this layer's attn hc_pre into one kernel (inter-layer
         # fusion). Layer 0 has no incoming state -> standalone hc_pre.
+        if _l2pf.ENABLED and not self._l2pf_ready:
+            self._l2pf_build_plans()
         x = hidden_states
         if post is None:
             if self._b12x_mhc is not None:
@@ -575,6 +585,10 @@ class Glm5NextDecoderLayer(nn.Module):
         if self.is_sequence_parallel:
             x = sp_reduce_scatter(x)
 
+        # L2 prefetch window B (fallback issue point when no pre-reduce hook).
+        if _l2pf.ENABLED and not getattr(self, "_l2pf_hooked_b", False):
+            _l2pf.issue(self._l2pf_plan_b, x.shape[0])
+
         # Fuse post-attn hc_post + pre-FFN hc_pre (+ RMSNorm) into one kernel.
         residual, post, comb, x = self.hc_fused_post_pre(
             x,
@@ -597,12 +611,91 @@ class Glm5NextDecoderLayer(nn.Module):
         # mHC end. The last mHC layer materializes its final hc_post (nothing
         # to fuse with) then contracts; every other layer defers its hc_post to
         # the next layer's fused pre, returning the state.
+        # L2 prefetch window C (fallback issue point when no pre-reduce hook).
+        if _l2pf.ENABLED and not getattr(self, "_l2pf_hooked_c", False):
+            _l2pf.issue(self._l2pf_plan_c, x.shape[0])
+
         if self.layer_idx == self.num_hidden_layers - 1:
             x = self.hc_post(x, residual, post, comb)
             x = hc_contract(x, self.n)
             return x, None, None, None
 
         return x, residual, post, comb
+
+    # ---- L2 weight prefetch planning (see l2_prefetch.py) -------------------
+    _ATTN_SKIP = ("o_proj", "kv_b_proj", "indexer.index_kpool", "indexer.weights_proj")
+
+    def _l2pf_build_plans(self) -> None:
+        self._l2pf_ready = True
+        try:
+            device = next(self.parameters()).device
+            segs_b: list[_l2pf.Segment] = []
+            if self._mlp_is_moe:
+                # Router weight is read right after the post-attention mHC.
+                segs_b += _l2pf.segments_of(self.mlp.gate, "mlp.gate.")
+            # Dense-MLP layers (first 3): their 75 MB MLP weights are consumed
+            # right after attention with no idle window -> never prefetched.
+            nxt = self._l2pf_next
+            nxt_segs: list[_l2pf.Segment] = []
+            if nxt is not None:
+                # The next layer's o_proj (and MLA kv_b, unused at decode) are
+                # prefetched inside that layer's own attention window (A).
+                nxt_segs = _l2pf.segments_of(
+                    nxt.self_attn, f"L{nxt.layer_idx}.self_attn.", skip=self._ATTN_SKIP
+                )
+            # Window A of this layer's attention: its o_proj plus a head slice
+            # of the next layer's first projection (it survives the expert
+            # stream and shortens window C so the tail is resident in time).
+            segs_a = _l2pf.segments_of(self.self_attn.o_proj, "o_proj.")
+            attn_impl = getattr(getattr(self.self_attn, "mla_attn", None), "impl", None)
+            for attr in ("W_UK_T", "W_UV"):
+                t = getattr(attn_impl, attr, None) if attn_impl is not None else None
+                if isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous():
+                    segs_a.append((f"impl.{attr}", t.data_ptr(), t.numel() * t.element_size()))
+            is_mla = hasattr(self.self_attn, "mla_attn")
+            if nxt_segs and _l2pf.A_NEXT_BYTES > 0 and not is_mla:
+                head_a, rest_first = _l2pf.take_budget(nxt_segs[:1], _l2pf.A_NEXT_BYTES)
+                segs_a += head_a
+                nxt_segs = rest_first + nxt_segs[1:]
+            plan_a, _ = _l2pf.make_plan(segs_a, _l2pf.BUDGET_A_MLA if is_mla else _l2pf.BUDGET_A, device)
+            plan_b, rest = _l2pf.make_plan(segs_b + nxt_segs, _l2pf.BUDGET_B, device)
+            plan_c, dropped = _l2pf.make_plan(rest, _l2pf.BUDGET_C, device)
+            self._l2pf_plan_b = plan_b
+            self._l2pf_plan_c = plan_c
+            # Fire windows B/C before the all-reduces (+10 us of idle window
+            # each): hooks on this layer's o_proj and on the MoE runner (or the
+            # dense MLP's down_proj).  The in-forward issue points below stay
+            # as the fallback when a hook target is missing.
+            self._l2pf_hooked_b = False
+            self._l2pf_hooked_c = False
+            o_proj = getattr(self.self_attn, "o_proj", None)
+            if o_proj is not None and plan_b is not None and getattr(o_proj, "reduce_results", False):
+                object.__setattr__(o_proj, "_l2_prefetch_pre_reduce_hook", lambda n, p=plan_b: _l2pf.issue(p, n))
+                self._l2pf_hooked_b = True
+            target_c = self.mlp.experts if self._mlp_is_moe else getattr(self.mlp, "down_proj", None)
+            if target_c is not None and plan_c is not None:
+                object.__setattr__(target_c, "_l2_prefetch_pre_reduce_hook", lambda n, p=plan_c: _l2pf.issue(p, n))
+                self._l2pf_hooked_c = True
+            # Window A fires inside the attention layer, right after its first
+            # projection (hook in the shared KDA / MLA layers).
+            target = self.self_attn.mla_attn if is_mla else self.self_attn
+            if plan_a is not None:
+                object.__setattr__(
+                    target, "_l2_prefetch_hook", lambda n, p=plan_a: _l2pf.issue(p, n)
+                )
+            if self.layer_idx in (0, 3, 4) or self.layer_idx == self.num_hidden_layers - 1:
+                logger.info(
+                    "[l2_prefetch] layer %d A: %s | B: %s | C: %s | dropped %.1f MB",
+                    self.layer_idx,
+                    plan_a.describe() if plan_a else "-",
+                    plan_b.describe() if plan_b else "-",
+                    plan_c.describe() if plan_c else "-",
+                    sum(s[2] for s in dropped) / 1e6,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[l2_prefetch] layer %d plan failed: %s", self.layer_idx, exc)
+            self._l2pf_plan_b = None
+            self._l2pf_plan_c = None
 
     def hc_pre(
         self,
@@ -747,6 +840,12 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         # The active slice is fixed after construction; cache it so forward
         # doesn't rebuild the slice (a fresh list) every step.
         self._active_layers = self.layers[self.start_layer : self.end_layer]
+        # L2 prefetch chain: each layer prefetches its successor's projections;
+        # the last layer prefetches the first layer's for the next step.
+        # (object.__setattr__ keeps the link out of the nn.Module registry.)
+        active = list(self._active_layers)
+        for i, layer in enumerate(active):
+            object.__setattr__(layer, "_l2pf_next", active[(i + 1) % len(active)])
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -850,6 +949,11 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 if self.is_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 aux_hidden_states.append(aux_hidden_state)
+
+        # Rejoin the L2 prefetch side stream once per forward, before any
+        # early return, so a CUDA-graph capture never ends with a forked
+        # side stream (capture safety on every PP rank).
+        _l2pf.join_all()
 
         if not get_pp_group().is_last_rank:
             # Pipeline parallelism is rejected because post/comb are the
