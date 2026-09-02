@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """LP14 regressions for EAGLE hybrid prefix-cache replay boundaries."""
 
-
-
 import pytest
 import torch
 
@@ -76,7 +74,11 @@ def test_mamba_retains_eagle_reachable_boundary(annotation: str | None) -> None:
             computed,
             num_lookahead_tokens=num_spec,
         )
-        assert blocks is not None, (request.request_id, request.num_computed_tokens, manager.usage)
+        assert blocks is not None, (
+            producer.request_id,
+            producer.num_computed_tokens,
+            manager.usage,
+        )
         producer.num_computed_tokens = chunk_end
     manager.free(producer)
 
@@ -131,7 +133,11 @@ def test_mamba_eagle_backoff_uses_alignment_unit() -> None:
             num_computed,
             computed,
         )
-        assert blocks is not None, (request.request_id, request.num_computed_tokens, manager.usage)
+        assert blocks is not None, (
+            producer.request_id,
+            producer.num_computed_tokens,
+            manager.usage,
+        )
         producer.num_computed_tokens = chunk_end
     manager.free(producer)
 
@@ -144,7 +150,11 @@ def _compute_in_chunks(manager, request, chunk_size: int) -> None:
     while request.num_computed_tokens < request.num_tokens:
         chunk = min(chunk_size, request.num_tokens - request.num_computed_tokens)
         blocks = manager.allocate_slots(request, chunk)
-        assert blocks is not None, (request.request_id, request.num_computed_tokens, manager.usage)
+        assert blocks is not None, (
+            request.request_id,
+            request.num_computed_tokens,
+            manager.usage,
+        )
         request.num_computed_tokens += chunk
         manager.new_step_starts()
     manager.cache_blocks(request, request.num_computed_tokens)
@@ -217,7 +227,6 @@ def test_dcp1_dflash_growing_history_reuses_warm_boundary() -> None:
     assert hit_tokens == 119808, hit_tokens
 
 
-
 def _make_dcp1_glm_manager(num_blocks: int = 10000):
     block_size = 2304
     return make_kv_cache_manager(
@@ -283,7 +292,11 @@ def _resume_compute_and_release(manager, request, expected_hit: int) -> None:
             num_new_computed_tokens=hit_tokens if first else 0,
             new_computed_blocks=computed if first else None,
         )
-        assert blocks is not None, (request.request_id, request.num_computed_tokens, manager.usage)
+        assert blocks is not None, (
+            request.request_id,
+            request.num_computed_tokens,
+            manager.usage,
+        )
         request.num_computed_tokens = already + chunk
         manager.new_step_starts()
         first = False
@@ -318,7 +331,6 @@ def test_dcp1_twenty_growing_histories_reuse_each_turn() -> None:
             total_hits += expected
 
     assert total_hits == 7_879_680
-
 
 
 def test_dcp4_dflash_growing_history_reuses_warm_boundary() -> None:

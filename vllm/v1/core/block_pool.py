@@ -710,9 +710,7 @@ class BlockPool:
         Returns:
             True if the block is evicted, False otherwise.
         """
-        boundary_labels = self.replay_boundary_labels_by_block.pop(
-            block.block_id, ()
-        )
+        boundary_labels = self.replay_boundary_labels_by_block.pop(block.block_id, ())
         if self.metrics_collector:
             for label in boundary_labels:
                 self.metrics_collector.on_replay_boundary_evicted(label)

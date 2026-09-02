@@ -95,9 +95,7 @@ class KVCacheCoordinator(ABC):
         self.scheduler_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
         self.metrics_collector = metrics_collector
-        self.last_prefix_lookup_metrics: tuple[
-            int, int, dict[str, int]
-        ] | None = None
+        self.last_prefix_lookup_metrics: tuple[int, int, dict[str, int]] | None = None
         self.prefix_cache_group_labels = tuple(
             f"group_{group_id}_{type(group.kv_cache_spec).__name__.lower()}"
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
@@ -687,11 +685,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         )
         for manager in self.single_type_managers:
             manager.prefix_cache_alignment_tokens = prefix_cache_alignment_tokens
-            if (
-                manager.lookup_drops_eagle_block
-                and isinstance(
-                    manager.kv_cache_spec, (MambaSpec, SlidingWindowSpec)
-                )
+            if manager.lookup_drops_eagle_block and isinstance(
+                manager.kv_cache_spec, (MambaSpec, SlidingWindowSpec)
             ):
                 # The target page and EAGLE quantum define the common DFlash
                 # replay boundary. Retain only the recurrent state and draft

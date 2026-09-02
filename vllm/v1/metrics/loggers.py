@@ -589,7 +589,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         counter_decode_prefill_decode_only_steps = self._counter_cls(
             name="vllm:decode_prefill_decode_only_steps",
-            documentation="Scheduler steps where decode-burst control deferred prefill.",
+            documentation=(
+                "Scheduler steps where decode-burst control deferred prefill."
+            ),
             labelnames=labelnames,
         )
         self.counter_decode_prefill_decode_only_steps = create_metric_per_engine(

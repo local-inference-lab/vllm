@@ -528,8 +528,7 @@ class SingleTypeKVCacheManager(ABC):
             for boundary in candidate_boundaries
             if boundary < reached_tokens
             or (
-                boundary == reached_tokens
-                and isinstance(self.kv_cache_spec, MambaSpec)
+                boundary == reached_tokens and isinstance(self.kv_cache_spec, MambaSpec)
             )
         ]
 

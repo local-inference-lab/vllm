@@ -227,11 +227,10 @@ class KVCacheManager:
         if not self.prefix_cache_lookup_enabled(request):
             self._pending_prefix_lookup_metrics.pop(request.request_id, None)
             return
-        if self.metrics_collector is not None:
-            if lookup := self._pending_prefix_lookup_metrics.pop(
-                request.request_id, None
-            ):
-                self.metrics_collector.on_prefix_cache_lookup(*lookup)
+        if self.metrics_collector is not None and (
+            lookup := self._pending_prefix_lookup_metrics.pop(request.request_id, None)
+        ):
+            self.metrics_collector.on_prefix_cache_lookup(*lookup)
         if not self.log_stats:
             return
         assert self.prefix_cache_stats is not None

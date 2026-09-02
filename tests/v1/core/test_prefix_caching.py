@@ -4599,9 +4599,10 @@ def test_dflash_multi_history_retains_cacheable_replay_boundaries():
     assert result.reconciled_hit_tokens >= 0.90 * result.cacheable_prefix_tokens
     assert result.reconciled_hit_tokens == min(result.per_group_hit_tokens.values())
     assert result.dense_intermediate_checkpoints == 0
-    assert min(
-        result.per_group_hit_tokens, key=result.per_group_hit_tokens.get
-    ) == "group_0_mlaattentionspec"
+    assert (
+        min(result.per_group_hit_tokens, key=result.per_group_hit_tokens.get)
+        == "group_0_mlaattentionspec"
+    )
     assert result.lookup_stats.cacheable_prefix_tokens == result.cacheable_prefix_tokens
     assert result.lookup_stats.reconciled_hit_tokens == result.reconciled_hit_tokens
     assert result.lookup_stats.prefix_cache_group_hits == result.per_group_hit_tokens

@@ -83,7 +83,9 @@ def _seed(manager, request, stops: tuple[int, ...]) -> None:
 
 
 def _hits(manager, token_ids: list[int]) -> tuple[int, tuple[int, ...]]:
-    follower = make_request("follower", token_ids, manager.block_pool.hash_block_size, sha256)
+    follower = make_request(
+        "follower", token_ids, manager.block_pool.hash_block_size, sha256
+    )
     _, joint, _ = manager.get_computed_blocks(follower)
     _, per_group = manager.coordinator.find_longest_cache_hit_per_group(
         follower.block_hashes, follower.num_tokens - 1
