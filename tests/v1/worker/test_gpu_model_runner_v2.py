@@ -116,3 +116,88 @@ def test_append_block_ids_rejects_write_past_row_capacity():
         )
 
     assert block_tables.num_blocks.np[0, 1] == 3
+
+
+@pytest.mark.parametrize("dummy_run_fails", [False, True])
+def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    dummy_run_fails: bool,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(
+        architecture="Glm5NextForConditionalGeneration"
+    )
+    runner.dcp_size = 4
+    runner.cp_interleave = 4
+    runner.max_num_tokens = 4096
+    events: list[object] = []
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "_init_minimal_kv_cache_for_profiling",
+        lambda _: events.append("init-kv"),
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "_teardown_profiling_state",
+        lambda _: events.append("cleanup"),
+    )
+
+    def dummy_run(*args, **kwargs):
+        events.append(("dummy-run", args, kwargs))
+        if dummy_run_fails:
+            raise RuntimeError("expected DCP profile failure")
+        return torch.empty(1), torch.empty(1)
+
+    runner._dummy_run = dummy_run
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+
+    if dummy_run_fails:
+        with pytest.raises(RuntimeError, match="expected DCP profile failure"):
+            runner.profile_glm_dcp_attention()
+    else:
+        runner.profile_glm_dcp_attention()
+
+    assert events[0] == "init-kv"
+    assert events[1] == (
+        "dummy-run",
+        (4096,),
+        {
+            "context_len": 16,
+            "skip_eplb": True,
+            "is_profile": True,
+            "single_request_prefill": True,
+        },
+    )
+    assert events[-1] == "cleanup"
+    if not dummy_run_fails:
+        assert events[-2] == "sync"
+
+
+@pytest.mark.parametrize(
+    ("architecture", "dcp_size"),
+    [("OtherArchitecture", 4), ("Glm5NextForConditionalGeneration", 1)],
+)
+def test_glm_dcp_attention_profile_skips_irrelevant_configurations(
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+    dcp_size: int,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(architecture=architecture)
+    runner.dcp_size = dcp_size
+    initialized = False
+
+    def record_initialization(_):
+        nonlocal initialized
+        initialized = True
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "_init_minimal_kv_cache_for_profiling",
+        record_initialization,
+    )
+
+    runner.profile_glm_dcp_attention()
+
+    assert not initialized
