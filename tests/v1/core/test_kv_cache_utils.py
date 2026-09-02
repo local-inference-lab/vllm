@@ -2362,6 +2362,50 @@ def test_glm5next_split_cache_preserves_physical_pages(
     )
 
 
+def test_glm5next_nvfp4_auto_geometry_capacity() -> None:
+    """DCP4 4K retention geometry recovers the expected 12.67M capacity."""
+    target = MLAAttentionSpec(
+        block_size=1024,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+        state_content_bytes=304,
+        model_version="glm5_next",
+        page_tail_bytes_per_token=33,
+        alignment=64 * 132,
+    )
+    recurrent = MambaSpec(
+        block_size=1024,
+        shapes=((1_085_440,),),
+        dtypes=(torch.uint8,),
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=1,
+    )
+    groups = [
+        KVCacheGroupSpec([f"recurrent.{i}.{j}" for j in range(width)], recurrent)
+        for i, width in enumerate((9, 9, 8, 8))
+    ]
+    groups.append(KVCacheGroupSpec([f"target.{i}" for i in range(11)], target))
+    config = KVCacheConfig(
+        num_blocks=3873,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        prefix_cache_retention_interval=4096,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=202_752),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+    )
+
+    capacity, concurrency = get_kv_cache_capacity(vllm_config, config)
+
+    assert target.page_size_bytes == 346_368
+    assert capacity == 12_665_459
+    assert concurrency == pytest.approx(62.46774193548387)
+
+
 def new_indexer_mla_spec(block_size=16):
     # Sparse-attention indexer k_cache: an MLAAttentionSpec with a much smaller
     # page size than the main MLA attention (uint8, small head), so their pages

@@ -923,10 +923,12 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         assert pcp_world_size == 1 or kv_cache_spec.dcp_replicated, (
             "PCP only supports sliding-window KV when it is replicated."
         )
-        # Fine-grained partial hits are not supported for sliding window now
-        assert alignment_tokens % kv_cache_spec.block_size == 0, (
-            "SlidingWindowManager does not support fine-grained (partial) cache hits"
-        )
+        # Fine-grained partial hits are not supported for sliding window now.
+        # Fall back to block-aligned hits instead of crashing the engine when
+        # the coordinator alignment is finer than this group's block size
+        # (e.g. a hybrid mamba target with a finer `prefix_match_unit`).
+        if alignment_tokens % kv_cache_spec.block_size != 0:
+            alignment_tokens = kv_cache_spec.block_size
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,

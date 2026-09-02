@@ -496,17 +496,44 @@ def test_glm53_physical_selection_provider_is_explicit() -> None:
 
 
 def _packed_main_cache(
-    *, device: torch.device, blocks: int, layers: int, block_size: int, layer: int
+    *,
+    device: torch.device,
+    blocks: int,
+    layers: int,
+    block_size: int,
+    layer: int,
+    record_bytes: int = 528,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    page_bytes = block_size * (528 + 33)
+    semantic_page_bytes = block_size * record_bytes
+    content_page_bytes = ((semantic_page_bytes + 8447) // 8448) * 8448
+    page_bytes = content_page_bytes + block_size * 33
     raw = torch.zeros(blocks * layers * page_bytes, dtype=torch.uint8, device=device)
     main = torch.as_strided(
         raw,
-        size=(blocks, block_size, 528),
-        stride=(layers * page_bytes, 528, 1),
+        size=(blocks, block_size, record_bytes),
+        stride=(layers * page_bytes, record_bytes, 1),
         storage_offset=layer * page_bytes,
     )
     return raw, main
+
+
+def test_glm53_packed_tail_accepts_nvfp4_main_record() -> None:
+    _, main = _packed_main_cache(
+        device=torch.device("cpu"),
+        blocks=2,
+        layers=3,
+        block_size=3328,
+        layer=1,
+        record_bytes=304,
+    )
+
+    index_cache, subpages, parent_stride_pages = (
+        Glm5NextPooledIndexer._index_cache_view(main)
+    )
+
+    assert subpages == 13
+    assert parent_stride_pages == 399
+    assert index_cache.stride() == (8448, 132, 1)
 
 
 def test_glm53_decode_table_capacity_uses_batched_token_limit() -> None:

@@ -353,7 +353,17 @@ def _select_mqa_query(
     num_mqa_tokens: int,
     full_ckv_dcp: bool,
 ) -> tuple[torch.Tensor, bool]:
-    """Select local or replicated query geometry for MLA decode/prefill."""
+    """Select local or replicated query geometry for MLA decode/prefill.
+
+    Args:
+        q: Query tensor in the local DCP geometry.
+        q_dcp_replicated: Optional query tensor replicated across DCP ranks.
+        num_mqa_tokens: Number of active query tokens.
+        full_ckv_dcp: Whether the backend gathers the complete CKV cache.
+
+    Returns:
+        The selected query rows and whether replicated geometry was selected.
+    """
     if q_dcp_replicated is not None and not full_ckv_dcp:
         return q_dcp_replicated[:num_mqa_tokens], True
     return q[:num_mqa_tokens], False
@@ -379,6 +389,55 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     ):
         return "fp8_ds_mla"
     return kv_cache_dtype
+
+
+_PACKED_SPARSE_MLA_CACHE_DTYPES = frozenset({"fp8_ds_mla", "nvfp4_ds_mla"})
+
+
+def _is_packed_sparse_mla_cache_dtype(kv_cache_dtype: CacheDType) -> bool:
+    """Return whether an MLA cache uses an opaque packed-byte record.
+
+    Args:
+        kv_cache_dtype: Resolved cache dtype name.
+
+    Returns:
+        Whether the dtype represents a packed sparse MLA record.
+    """
+    return kv_cache_dtype in _PACKED_SPARSE_MLA_CACHE_DTYPES
+
+
+def _uses_packed_sparse_mla_workspace(kv_cache_spec: AttentionSpec) -> bool:
+    """Determine workspace layout from the resolved layer cache spec.
+
+    Args:
+        kv_cache_spec: Cache specification for the builder's layer group.
+
+    Returns:
+        Whether the layer group uses packed sparse MLA records.
+    """
+    cache_dtype = getattr(kv_cache_spec, "cache_dtype_str", None)
+    return cache_dtype is not None and _is_packed_sparse_mla_cache_dtype(cache_dtype)
+
+
+def _maybe_view_mla_cache_as_fp8(
+    kv_cache: torch.Tensor,
+    kv_cache_dtype: CacheDType,
+) -> torch.Tensor:
+    """View ordinary FP8 caches as FP8 while preserving packed byte records.
+
+    Args:
+        kv_cache: Cache tensor supplied by the allocator.
+        kv_cache_dtype: Resolved cache dtype name for the layer.
+
+    Returns:
+        An FP8 view for ordinary quantized caches, or the original tensor for
+        packed sparse MLA and unquantized caches.
+    """
+    if is_quantized_kv_cache(kv_cache_dtype) and not (
+        _is_packed_sparse_mla_cache_dtype(kv_cache_dtype)
+    ):
+        return kv_cache.view(current_platform.fp8_dtype())
+    return kv_cache
 
 
 def _get_kv_b_proj_input_dtype(
@@ -628,7 +687,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             query_dtype = (
                 current_platform.fp8_dtype()
                 if is_quantized_kv_cache(self.kv_cache_dtype)
-                and self.kv_cache_dtype != "fp8_ds_mla"
+                and not _is_packed_sparse_mla_cache_dtype(self.kv_cache_dtype)
                 and self.impl.supports_quant_query_input
                 else dtype
             )
@@ -845,8 +904,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
 
-        if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
-            kv_cache = kv_cache.view(current_platform.fp8_dtype())
+        kv_cache = _maybe_view_mla_cache_as_fp8(kv_cache, self.kv_cache_dtype)
 
         assert (
             attn_metadata.num_decodes is not None
@@ -2231,7 +2289,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             self.determine_chunked_prefill_workspace_size(vllm_config)
         )
 
-        use_packed_fp8_cache = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        use_packed_sparse_mla_cache = _uses_packed_sparse_mla_workspace(
+            self.kv_cache_spec
+        )
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:
             # Note(hc): The local kvcache is incomplete when DCP is triggered,
@@ -2245,9 +2305,11 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     + self.chunked_prefill_workspace_size // self.dcp_world_size,
                     self.mla_dims.kv_lora_rank + self.mla_dims.qk_rope_head_dim,
                 ),
-                dtype=torch.bfloat16
-                if use_packed_fp8_cache
-                else self.model_config.dtype,
+                dtype=(
+                    torch.bfloat16
+                    if use_packed_sparse_mla_cache
+                    else self.model_config.dtype
+                ),
                 device=device,
             )
             self.dcp_manager = getattr(attention_layer, "dcp_manager", None)
@@ -2262,7 +2324,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     self.chunked_prefill_workspace_size,
                     self.mla_dims.kv_lora_rank + self.mla_dims.qk_rope_head_dim,
                 ),
-                dtype=torch.bfloat16 if use_packed_fp8_cache else self.q_data_type,
+                dtype=(
+                    torch.bfloat16 if use_packed_sparse_mla_cache else self.q_data_type
+                ),
                 device=device,
             )
 

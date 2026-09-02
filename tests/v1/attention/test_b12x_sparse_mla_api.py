@@ -8,10 +8,12 @@ from typing import Any
 import pytest
 import torch
 
-from vllm.config import AttentionConfig, set_current_vllm_config
+from vllm.config import AttentionConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
     _canonicalize_sparse_mla_kv_cache_dtype,
+    _maybe_view_mla_cache_as_fp8,
+    _uses_packed_sparse_mla_workspace,
 )
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonMetadataBuilder,
@@ -23,7 +25,7 @@ from vllm.models.deepseek_v32.attention import (
     _select_sparse_components,
 )
 from vllm.models.deepseek_v32.b12x import B12xDeepseekV32Indexer
-from vllm.platforms.interface import DeviceCapability
+from vllm.platforms.interface import DeviceCapability, Platform
 from vllm.v1.attention.backends.b12x import B12xPagedAttentionBackend
 from vllm.v1.attention.backends.mla import b12x_indexer as generic_b12x_indexer
 from vllm.v1.attention.backends.mla import b12x_mla_sparse
@@ -31,6 +33,7 @@ from vllm.v1.attention.backends.mla.b12x_indexer import B12xIndexerBackend
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xGLM5NextMLASparseBackend,
     B12xGLM5NextMLASparseMetadataBuilder,
+    B12xGLMDSAMLASparseBackend,
     B12xMLASparseBackend,
     B12xMLASparseImpl,
     B12xMLASparseMetadata,
@@ -71,6 +74,15 @@ def test_b12x_selector_routes_supported_attention_families() -> None:
     assert indexer_cls is B12xDeepseekV32Indexer
     assert backend_cls is B12xMLASparseBackend
 
+    config.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(model_type="glm_moe_dsa")
+    )
+    indexer_cls, backend_cls = _select_sparse_components(
+        config, None, DeepseekV32Indexer
+    )
+    assert indexer_cls is B12xDeepseekV32Indexer
+    assert backend_cls is B12xGLMDSAMLASparseBackend
+
 
 def test_b12x_sparse_mla_accepts_glm_dsa_contract(monkeypatch) -> None:
     monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
@@ -106,6 +118,93 @@ def test_b12x_sparse_mla_accepts_glm_dsa_contract(monkeypatch) -> None:
     assert (
         _canonicalize_sparse_mla_kv_cache_dtype(B12xMLASparseBackend, "auto")
         == "fp8_ds_mla"
+    )
+
+    with set_current_vllm_config(config):
+        invalid_reasons = B12xMLASparseBackend.validate_configuration(
+            head_size=576,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="nvfp4_ds_mla",
+            block_size=64,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            use_mm_prefix=False,
+            use_per_head_quant_scales=False,
+            device_capability=DeviceCapability(12, 0),
+            attn_type="decoder",
+        )
+
+    assert invalid_reasons == []
+
+
+def test_b12x_glm_dsa_nvfp4_cache_spec(monkeypatch) -> None:
+    monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="glm_moe_dsa")
+        )
+    )
+    probe = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+    )
+
+    with set_current_vllm_config(config):
+        packed = B12xMLASparseBackend.customize_spec(probe)
+
+    assert packed.state_content_bytes == 368
+    assert packed.page_size_bytes == 64 * 368
+    assert packed.model_version == "glm_moe_dsa"
+    assert B12xMLASparseBackend.customize_spec(packed) == packed
+
+    packed_without_config = B12xGLMDSAMLASparseBackend.customize_spec(probe)
+    assert packed_without_config == packed
+
+
+def test_b12x_nvfp4_rejects_non_glm_dsa_architecture(monkeypatch) -> None:
+    monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                model_type="deepseek_v32",
+                index_topk=2048,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+            )
+        )
+    )
+
+    with set_current_vllm_config(config):
+        invalid_reasons = B12xMLASparseBackend.validate_configuration(
+            head_size=576,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="nvfp4_ds_mla",
+            block_size=64,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            use_mm_prefix=False,
+            use_per_head_quant_scales=False,
+            device_capability=DeviceCapability(12, 0),
+            attn_type="decoder",
+        )
+
+    assert invalid_reasons == [
+        ("B12X nvfp4_ds_mla requires GLM5Next or the GLM-5.2/5.3 DSA architecture")
+    ]
+
+
+def test_b12x_dsa_requires_layer_compact_cache_layout() -> None:
+    assert B12xMLASparseBackend.supported_kv_cache_layouts() == (KVCacheLayout.LBNHC,)
+
+
+def test_b12x_glm5_next_requires_block_outermost_cache_layout() -> None:
+    assert B12xGLM5NextMLASparseBackend.supported_kv_cache_layouts() == (
+        KVCacheLayout.BLHNC,
     )
 
 
@@ -151,7 +250,6 @@ def test_b12x_glm5_next_cache_spec_and_layout(monkeypatch) -> None:
         cache_dtype_str="fp8_ds_mla",
         state_content_bytes=656,
     )
-
     unidentified = B12xMLASparseBackend.customize_spec(probe)
     packed_by_glm_backend = B12xGLM5NextMLASparseBackend.customize_spec(probe)
     with set_current_vllm_config(config):
@@ -169,7 +267,7 @@ def test_b12x_glm5_next_cache_spec_and_layout(monkeypatch) -> None:
             attn_type="decoder",
         )
         packed = B12xMLASparseBackend.customize_spec(probe)
-        layouts = B12xMLASparseBackend.supported_kv_cache_layouts()
+        layouts = B12xGLM5NextMLASparseBackend.supported_kv_cache_layouts()
     packed_without_config_context = B12xMLASparseBackend.customize_spec(packed)
 
     assert invalid_reasons == []
@@ -186,6 +284,119 @@ def test_b12x_glm5_next_cache_spec_and_layout(monkeypatch) -> None:
     assert packed.model_version == "glm5_next"
     assert packed_without_config_context == packed
     assert layouts == (KVCacheLayout.BLHNC,)
+    assert "nvfp4_ds_mla" in B12xMLASparseBackend.supported_kv_cache_dtypes
+
+
+def test_b12x_glm5_next_nvfp4_cache_spec() -> None:
+    probe = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+        state_content_bytes=656,
+    )
+
+    with set_current_vllm_config(_glm5_next_config()):
+        packed = B12xMLASparseBackend.customize_spec(probe)
+
+    assert packed.state_content_bytes == 304
+    assert packed.page_tail_bytes_per_token == 33
+    assert packed.page_size_padded == 3 * 64 * 132
+    assert packed.page_size_bytes == 3 * 64 * 132 + 64 * 33
+    assert packed.model_version == "glm5_next"
+
+
+def test_b12x_glm5_next_binds_nvfp4_record_width(monkeypatch) -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._cache_record_bytes = 304
+    impl._ckv_gather_enabled = False
+    planned: list[int] = []
+    monkeypatch.setattr(impl, "_set_kernel_page_size", planned.append)
+
+    impl.bind_kv_cache(torch.empty((2, 64, 304), dtype=torch.uint8))
+
+    assert planned == [64]
+    with pytest.raises(ValueError, match="page_size, 304"):
+        impl.bind_kv_cache(torch.empty((2, 64, 528), dtype=torch.uint8))
+
+
+def test_b12x_glm_dsa_binds_nvfp4_fp8_rope_record() -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = False
+    impl._uses_glm_dsa_nvfp4_cache = True
+
+    impl.bind_kv_cache(torch.empty((2, 64, 368), dtype=torch.uint8))
+
+    with pytest.raises(ValueError, match="page_size, 368"):
+        impl.bind_kv_cache(torch.empty((2, 64, 432), dtype=torch.uint8))
+
+
+def test_b12x_nvfp4_run_options_match_each_glm_record_abi() -> None:
+    assert b12x_mla_sparse._nvfp4_run_options(is_glm_next=False) == {
+        "scale_format": 2,
+        "fp8_rope": True,
+    }
+    assert b12x_mla_sparse._nvfp4_run_options(is_glm_next=True) == {
+        "scale_format": 2,
+        "fp8_rope": False,
+        "latent_scale_per_token": True,
+    }
+
+
+def test_packed_nvfp4_mla_dtype_bypasses_generic_layout_guard() -> None:
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=True),
+        cache_config=SimpleNamespace(cache_dtype="nvfp4_ds_mla"),
+    )
+
+    assert VllmConfig.validate_nvfp4_kv_cache_with_mla(config) is config
+
+    config.cache_config.cache_dtype = "nvfp4"
+    with pytest.raises(ValueError, match="not supported with MLA"):
+        VllmConfig.validate_nvfp4_kv_cache_with_mla(config)
+
+
+@pytest.mark.parametrize("cache_dtype", ["fp8_ds_mla", "nvfp4_ds_mla"])
+def test_packed_mla_cache_keeps_uint8_forward_view(cache_dtype: str) -> None:
+    cache = torch.empty((2, 64, 304), dtype=torch.uint8)
+
+    forwarded = _maybe_view_mla_cache_as_fp8(cache, cache_dtype)
+
+    assert forwarded is cache
+    assert forwarded.dtype == torch.uint8
+
+
+def test_plain_fp8_mla_cache_uses_native_fp8_forward_view(monkeypatch) -> None:
+    cache = torch.empty((2, 64, 512), dtype=torch.uint8)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.attention.mla_attention.current_platform.fp8_dtype",
+        lambda: torch.float8_e4m3fn,
+    )
+
+    forwarded = _maybe_view_mla_cache_as_fp8(cache, "fp8")
+
+    assert forwarded.data_ptr() == cache.data_ptr()
+    assert forwarded.dtype == torch.float8_e4m3fn
+
+
+@pytest.mark.parametrize(
+    ("resolved_cache_dtype", "expected"),
+    [
+        ("fp8_ds_mla", True),
+        ("nvfp4_ds_mla", True),
+        ("auto", False),
+        (None, False),
+    ],
+)
+def test_packed_workspace_uses_resolved_layer_cache_spec(
+    resolved_cache_dtype: str | None,
+    expected: bool,
+) -> None:
+    spec = SimpleNamespace(cache_dtype_str=resolved_cache_dtype)
+
+    assert _uses_packed_sparse_mla_workspace(spec) is expected
 
 
 def test_b12x_glm5_next_keeps_hybrid_manager_page_unsplit() -> None:
@@ -197,6 +408,147 @@ def test_b12x_glm5_next_keeps_hybrid_manager_page_unsplit() -> None:
     assert B12xGLM5NextMLASparseBackend.supported_kv_cache_layouts() == (
         KVCacheLayout.BLHNC,
     )
+
+
+def test_glm5_next_split_cache_auto_aligns_to_dcp_retention(monkeypatch) -> None:
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architecture="Glm5NextForConditionalGeneration",
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        cache_config=SimpleNamespace(
+            block_size=256,
+            mamba_block_size=None,
+            mamba_cache_mode="align",
+            mamba_page_size_padded=1234,
+            prefix_cache_retention_interval=4096,
+        ),
+    )
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "auto")
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE", "auto")
+
+    Platform._align_hybrid_block_size(config, B12xGLM5NextMLASparseBackend)
+
+    assert config.cache_config.block_size == 1024
+    assert config.cache_config.mamba_block_size == 1024
+    assert config.cache_config.mamba_page_size_padded is None
+
+
+@pytest.mark.parametrize(
+    (
+        "dcp",
+        "retention_interval",
+        "scheduled_tokens",
+        "batched_tokens",
+        "expected_block_size",
+    ),
+    [
+        (1, None, None, 4096, 4096),
+        (2, None, None, 4096, 2048),
+        (4, None, None, 4096, 1024),
+        (8, None, None, 4096, 512),
+        (4, 0, None, 4096, 1024),
+        (4, 0, 4096, 4352, 1024),
+    ],
+)
+def test_glm5_next_split_cache_auto_falls_back_to_scheduler_budget(
+    monkeypatch,
+    dcp: int,
+    retention_interval: int | None,
+    scheduled_tokens: int | None,
+    batched_tokens: int,
+    expected_block_size: int,
+) -> None:
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architecture="Glm5NextForConditionalGeneration",
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+        scheduler_config=SimpleNamespace(
+            max_num_scheduled_tokens=scheduled_tokens,
+            max_num_batched_tokens=batched_tokens,
+        ),
+        cache_config=SimpleNamespace(
+            block_size=256,
+            mamba_block_size=None,
+            mamba_cache_mode="align",
+            mamba_page_size_padded=1234,
+            prefix_cache_retention_interval=retention_interval,
+        ),
+    )
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "auto")
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE", "auto")
+
+    Platform._align_hybrid_block_size(config, B12xGLM5NextMLASparseBackend)
+
+    assert config.cache_config.block_size == expected_block_size
+    assert config.cache_config.mamba_block_size == expected_block_size
+    assert config.cache_config.mamba_page_size_padded is None
+
+
+def test_glm5_next_split_cache_auto_requires_dcp_aligned_retention(
+    monkeypatch,
+) -> None:
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architecture="Glm5NextForConditionalGeneration",
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        cache_config=SimpleNamespace(
+            mamba_cache_mode="align",
+            prefix_cache_retention_interval=4097,
+        ),
+    )
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "auto")
+
+    with pytest.raises(ValueError, match="divisible by decode_context_parallel_size"):
+        Platform._align_hybrid_block_size(config, B12xGLM5NextMLASparseBackend)
+
+
+def test_b12x_glm5_next_nvfp4_aligns_hybrid_page_to_packed_record(
+    monkeypatch,
+) -> None:
+    mamba_page_size = 1_085_440
+    config = _glm5_next_config(dcp_size=4, cp_interleave=4)
+    config.model_config.is_hybrid = True
+    config.model_config.use_mla = True
+    config.model_config.architecture = "Glm5NextForConditionalGeneration"
+    config.model_config.dtype = torch.bfloat16
+    config.model_config.get_num_kv_heads = lambda parallel_config: 1
+    config.model_config.get_head_size = lambda: 512
+    config.cache_config.cache_dtype = "nvfp4_ds_mla"
+    config.cache_config.block_size = 256
+    config.cache_config.mamba_block_size = None
+    config.cache_config.user_specified_mamba_block_size = False
+    config.cache_config.mamba_cache_mode = "align"
+    config.cache_config.mamba_page_size_padded = None
+
+    model_cls = SimpleNamespace(
+        get_mamba_state_shape_from_config=lambda vllm_config: ((mamba_page_size,),),
+        get_mamba_state_dtype_from_config=lambda vllm_config: (torch.uint8,),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+        lambda *args, **kwargs: (model_cls, None),
+    )
+
+    Platform._align_hybrid_block_size(config, B12xGLM5NextMLASparseBackend)
+
+    materialized_probe = MLAAttentionSpec(
+        block_size=config.cache_config.block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+        state_content_bytes=656,
+    )
+    with set_current_vllm_config(config):
+        materialized = B12xGLM5NextMLASparseBackend.customize_spec(materialized_probe)
+
+    assert config.cache_config.block_size == 3328
+    assert config.cache_config.mamba_block_size == 3328
+    assert materialized.page_size_bytes == 1_123_584
+    assert config.cache_config.mamba_page_size_padded == materialized.page_size_bytes
 
 
 def test_b12x_glm5_next_rejects_unaligned_dcp(monkeypatch) -> None:
@@ -386,8 +738,98 @@ def test_b12x_glm5_next_ckv_source_layout() -> None:
         size=(2, 64, 528),
         stride=(37888, 528, 1),
     )
-    assert _is_glm_next_ckv_source_layout(cache, page_size=64)
-    assert not _is_glm_next_ckv_source_layout(cache[:, :, ::2], page_size=64)
+    assert _is_glm_next_ckv_source_layout(cache, page_size=64, record_bytes=528)
+    assert not _is_glm_next_ckv_source_layout(
+        cache[:, :, ::2], page_size=64, record_bytes=528
+    )
+
+
+@pytest.mark.parametrize("record_bytes", [528, 304])
+def test_b12x_glm5_next_full_ckv_workspaces_follow_cache_format(
+    record_bytes: int,
+) -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._max_tokens = 32
+    impl._q_head_dim = 512
+    impl._ckv_local_capacity = 128
+    impl.dcp_world_size = 4
+    impl._cache_record_bytes = record_bytes
+    plan = SimpleNamespace(shapes_and_dtypes=lambda: (((16,), torch.uint8),))
+
+    specs = impl._workspace_specs(plan, input_num_heads=8, include_ckv=True)
+
+    assert specs[-2:] == (
+        ((128, record_bytes), torch.uint8),
+        ((512, record_bytes), torch.uint8),
+    )
+
+
+@pytest.mark.parametrize("record_bytes", [528, 304])
+def test_b12x_glm5_next_full_ckv_gather_preserves_native_records(
+    monkeypatch: pytest.MonkeyPatch,
+    record_bytes: int,
+) -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._kernel_page_size = 2
+    impl._ckv_local_capacity = 4
+    impl._cache_record_bytes = record_bytes
+    impl.dcp_world_size = 2
+    impl.uses_full_ckv_dcp = lambda *_: True
+
+    kv_cache = (
+        torch.arange(4 * record_bytes, dtype=torch.int64)
+        .to(torch.uint8)
+        .view(2, 2, record_bytes)
+    )
+    local_buffer = torch.full((4, record_bytes), 255, dtype=torch.uint8)
+    gathered_buffer = torch.empty((8, record_bytes), dtype=torch.uint8)
+    metadata = SimpleNamespace(
+        num_actual_tokens=3,
+        dcp_local_total_tokens=3,
+        dcp_padded_total_tokens=4,
+        dcp_local_cu_seq_lens=torch.tensor([0, 3], dtype=torch.int32),
+        block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+        num_reqs=1,
+    )
+
+    def fake_cp_gather_cache(**kwargs: Any) -> None:
+        kwargs["dst"].copy_(kwargs["src_cache"].view(-1, record_bytes)[:3])
+
+    def fake_all_gather(_group: Any, src: torch.Tensor, dst: torch.Tensor) -> None:
+        dst.copy_(src.repeat(2))
+
+    monkeypatch.setattr(b12x_mla_sparse.ops, "cp_gather_cache", fake_cp_gather_cache)
+    monkeypatch.setattr(
+        b12x_mla_sparse, "_dcp_all_gather_current_stream", fake_all_gather
+    )
+    monkeypatch.setattr(b12x_mla_sparse, "get_dcp_group", lambda: object())
+
+    gathered = impl._gather_full_ckv(kv_cache, metadata, local_buffer, gathered_buffer)
+
+    expected_rank = torch.cat(
+        (kv_cache.view(-1, record_bytes)[:3], torch.zeros((1, record_bytes))),
+        dim=0,
+    )
+    assert gathered.shape == (4, 2, record_bytes)
+    assert torch.equal(gathered.view(-1, record_bytes), expected_rank.repeat(2, 1))
+
+
+def test_b12x_glm5_next_full_ckv_gather_rejects_wrong_record_width() -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._kernel_page_size = 2
+    impl._ckv_local_capacity = 4
+    impl._cache_record_bytes = 304
+    impl.dcp_world_size = 2
+    impl.uses_full_ckv_dcp = lambda *_: True
+    metadata = SimpleNamespace(num_actual_tokens=1)
+
+    with pytest.raises(ValueError, match="requires native 304-byte records"):
+        impl._gather_full_ckv(
+            torch.empty((2, 2, 528), dtype=torch.uint8),
+            metadata,
+            torch.empty((4, 304), dtype=torch.uint8),
+            torch.empty((8, 304), dtype=torch.uint8),
+        )
 
 
 @pytest.mark.parametrize("record_bytes", [528, 656])
@@ -425,6 +867,36 @@ def test_b12x_glm5_next_cache_writer_ignores_empty_rope() -> None:
     assert calls == [(kv_c, kv_cache, slots)]
 
 
+def test_b12x_glm_dsa_nvfp4_cache_writer_keeps_rope() -> None:
+    calls: list[tuple[torch.Tensor, ...]] = []
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = False
+    impl._uses_glm_dsa_nvfp4_cache = True
+    impl._concat_and_cache_nvfp4_mla_fp8_rope = lambda *args: calls.append(args)
+    kv_c = torch.empty((3, 512), dtype=torch.bfloat16)
+    k_pe = torch.empty((3, 1, 64), dtype=torch.bfloat16)
+    kv_cache = torch.empty((2, 64, 368), dtype=torch.uint8)
+    slots = torch.tensor([0, 64, -1], dtype=torch.int64)
+    scale = torch.ones((), dtype=torch.float32)
+
+    impl.do_kv_cache_update(
+        kv_c,
+        k_pe,
+        kv_cache,
+        slots,
+        "nvfp4_ds_mla",
+        scale,
+    )
+
+    assert len(calls) == 1
+    actual_kv_c, actual_k_pe, actual_cache, actual_slots, actual_scale = calls[0]
+    assert actual_kv_c is kv_c
+    assert torch.equal(actual_k_pe, k_pe.squeeze(1))
+    assert actual_cache is kv_cache
+    assert torch.equal(actual_slots, slots)
+    assert actual_scale is scale
+
+
 def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> None:
     planned: list[SimpleNamespace] = []
     reservations: list[tuple[tuple[tuple[int, ...], torch.dtype], ...]] = []
@@ -458,6 +930,8 @@ def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> 
 
     impl = object.__new__(B12xMLASparseImpl)
     impl._is_glm_next = True
+    impl._uses_nvfp4_cache = False
+    impl._cache_record_bytes = 528
     impl._module = FakeModule
     impl._kernel_page_size = 64
     impl._kernel_page_size_finalized = False
@@ -522,6 +996,7 @@ def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> 
 def test_b12x_glm5_next_full_ckv_bind_requires_geometry_finalization() -> None:
     impl = object.__new__(B12xMLASparseImpl)
     impl._is_glm_next = True
+    impl._cache_record_bytes = 528
     impl._ckv_gather_enabled = True
     impl._kernel_page_size_finalized = False
 

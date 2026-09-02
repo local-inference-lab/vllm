@@ -15,13 +15,17 @@ import pytest
 import torch
 
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    SlidingWindowSpec,
 )
 from vllm.v1.request import Request
 
@@ -80,19 +84,23 @@ def _make_hybrid_kv_cache_manager(
 def _split(
     request: Request,
     num_new_tokens: int,
-    use_eagle: bool = True,
+    drop_last_prefix_cache_block: bool = True,
+    use_eagle: bool | None = None,
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
     allow_speculative_checkpoints: bool = False,
     retention_interval: int | None = None,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
+    if use_eagle is None:
+        use_eagle = drop_last_prefix_cache_block
     stub = SimpleNamespace(
         cache_config=SimpleNamespace(
             block_size=MAMBA_BLOCK_SIZE,
             prefix_cache_retention_interval=retention_interval,
         ),
         use_eagle=use_eagle,
+        drop_last_prefix_cache_block=drop_last_prefix_cache_block,
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         # `prefix_match_unit` finer than the block size (#46384).
@@ -100,14 +108,14 @@ def _split(
         hash_block_size=ATTN_BLOCK_SIZE,
         mamba_has_prefill_checkpoint_blocks=(
             num_prefill_checkpoint_blocks > 0
-            and (not use_eagle or allow_speculative_checkpoints)
+            and (not drop_last_prefix_cache_block or allow_speculative_checkpoints)
         ),
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
 
 
 @pytest.mark.parametrize(
-    ("prompt_len", "num_new_tokens", "use_eagle", "expected"),
+    ("prompt_len", "num_new_tokens", "drop_last_prefix_cache_block", "expected"),
     [
         (2002, 2002, False, 2002),
         (3602, 2000, False, 2000),
@@ -115,19 +123,22 @@ def _split(
     ],
 )
 def test_internal_checkpoint_split(
-    prompt_len: int, num_new_tokens: int, use_eagle: bool, expected: int
+    prompt_len: int,
+    num_new_tokens: int,
+    drop_last_prefix_cache_block: bool,
+    expected: int,
 ) -> None:
     (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
     assert (
         _split(
             request,
             num_new_tokens,
-            use_eagle=use_eagle,
+            drop_last_prefix_cache_block=drop_last_prefix_cache_block,
             num_prefill_checkpoint_blocks=1,
         )
         == expected
     )
-    if not use_eagle:
+    if not drop_last_prefix_cache_block:
         manager = _make_hybrid_kv_cache_manager(num_prefill_checkpoint_blocks=1)
         assert manager.allocate_slots(request, expected) is not None
         mamba_manager = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
@@ -157,6 +168,7 @@ def test_dflash_checkpoint_keeps_intermediate_chunks_aligned_and_joins_prompt_ta
         _split(
             request,
             4089,
+            drop_last_prefix_cache_block=False,
             use_eagle=True,
             num_prefill_checkpoint_blocks=1,
             allow_speculative_checkpoints=True,
@@ -169,6 +181,7 @@ def test_dflash_checkpoint_keeps_intermediate_chunks_aligned_and_joins_prompt_ta
         _split(
             request,
             17,
+            drop_last_prefix_cache_block=False,
             use_eagle=True,
             num_prefill_checkpoint_blocks=1,
             allow_speculative_checkpoints=True,
@@ -235,12 +248,72 @@ def test_glm_mtp_checkpoint_joins_unaligned_prompt_tail(
         _split(
             request,
             prompt_len - request.num_computed_tokens,
-            use_eagle=True,
+            drop_last_prefix_cache_block=True,
             num_prefill_checkpoint_blocks=1,
             allow_speculative_checkpoints=True,
         )
         == 3648
     )
+
+
+def test_dflash_does_not_back_off_last_cache_position() -> None:
+    """DFlash/DSpark never write target blocks, so the split must not back
+    off the last prefix-cache position by a mamba block.
+
+    Regression for #53477: the old `use_eagle` back-off made prompts shorter
+    than two mamba blocks skip the final block-aligned chunk, so the mamba
+    recurrent state was never materialized at a block boundary and the next
+    turn's prefix-cache lookup recomputed the whole context.
+    """
+    (request,) = create_requests(1, num_tokens=PROMPT_LEN, block_size=ATTN_BLOCK_SIZE)
+    assert (
+        _split(request, PROMPT_LEN, drop_last_prefix_cache_block=False)
+        == MAMBA_BLOCK_SIZE
+    )
+    assert _split(request, PROMPT_LEN, drop_last_prefix_cache_block=True) == PROMPT_LEN
+
+
+def test_sliding_window_group_tolerates_finer_alignment() -> None:
+    """A coordinator alignment finer than a sliding-window group's block size
+    must fall back to block-aligned hits instead of crashing the EngineCore.
+
+    Regression for #53505: with a hybrid mamba target configured with a
+    `prefix_match_unit` finer than the draft model's sliding-window block,
+    `alignment_tokens % block_size != 0` used to hit an assert and kill all
+    in-flight requests.
+    """
+    block_size = 560
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=4 * block_size,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=block_size
+    )
+    manager = SlidingWindowManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+        needs_kv_cache_zeroing=False,
+        max_admission_blocks_per_request=10**9,
+    )
+    block_hashes = [BlockHash(str(i).encode()) for i in range(4)]
+    computed_blocks, hit_length = manager.find_longest_cache_hit(
+        block_hashes=block_hashes,
+        max_length=4 * block_size,
+        kv_cache_group_ids=[0],
+        block_pool=block_pool,
+        kv_cache_spec=spec,
+        drop_eagle_block=False,
+        alignment_tokens=16,
+    )
+    assert computed_blocks == ([],)
+    assert hit_length == 0
 
 
 def _run_chunked_prefill(
@@ -363,14 +436,14 @@ def test_poisoning_is_block_size_independent(
 @pytest.mark.parametrize("partial_hit", [False, True])
 @pytest.mark.parametrize("resume_at", [331, 1599, 1601, 2531, 3011])
 @pytest.mark.parametrize(
-    ("num_prefill_checkpoint_blocks", "use_eagle"),
+    ("num_prefill_checkpoint_blocks", "drop_last_prefix_cache_block"),
     [(0, True), (1, False)],
 )
 def test_unaligned_resume_never_runs_past_its_block(
     partial_hit: bool,
     resume_at: int,
     num_prefill_checkpoint_blocks: int,
-    use_eagle: bool,
+    drop_last_prefix_cache_block: bool,
 ) -> None:
     """A prefill resuming mid-block must re-align before crossing a boundary.
 
@@ -388,7 +461,7 @@ def test_unaligned_resume_never_runs_past_its_block(
         num_new = _split(
             request,
             prompt_len - pos,
-            use_eagle=use_eagle,
+            drop_last_prefix_cache_block=drop_last_prefix_cache_block,
             partial_hit=partial_hit,
             num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
         )
