@@ -31,6 +31,7 @@ Out of scope (extension points, not wired here): prefill context parallelism
 
 import math
 import re
+import time
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -133,6 +134,30 @@ _GATE_MULTI_STREAM_TOKEN_THRESHOLD = 512
 _MLA_CALLER_OUTPUT_MIN_TOKENS = 1024
 # Plane-separated staging of the copy-engine DCP publisher, per device.
 _dma_staging_buffers: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+_dma_min_rows_cache: list = [0.0, 0]  # (last read time, value)
+
+
+def _dma_min_rows() -> int:
+    """Smallest padded local row count a window must have for the copy-engine
+    publisher; smaller windows use the push kernel, whose single launch and
+    single rendezvous cost less than the copy-engine schedule's memcpy issue
+    and two signal phases when the payload is a few hundred kilobytes.
+    ``VLLM_K3_DCP_GATHER_DMA_MIN_ROWS`` sets it; the file named by
+    ``VLLM_K3_DCP_GATHER_DMA_MIN_ROWS_FILE`` (first integer) overrides it and
+    is re-read at most once per second, so the threshold can be swept on a
+    running server."""
+    path = envs.VLLM_K3_DCP_GATHER_DMA_MIN_ROWS_FILE
+    if not path:
+        return envs.VLLM_K3_DCP_GATHER_DMA_MIN_ROWS
+    now = time.monotonic()
+    if now - _dma_min_rows_cache[0] > 1.0:
+        _dma_min_rows_cache[0] = now
+        try:
+            with open(path) as handle:
+                _dma_min_rows_cache[1] = int(handle.read().split()[0])
+        except (OSError, ValueError, IndexError):
+            _dma_min_rows_cache[1] = envs.VLLM_K3_DCP_GATHER_DMA_MIN_ROWS
+    return _dma_min_rows_cache[1]
 
 
 class KimiK3PrefillProjectionWorkspace:
@@ -1463,7 +1488,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                     seq_starts=chunk.starts,
                 )
             slot = chunk.index & 1 if buffer_slot is None else buffer_slot
-            if envs.VLLM_K3_DCP_GATHER_DMA:
+            if envs.VLLM_K3_DCP_GATHER_DMA and toks >= _dma_min_rows():
                 # Copy-engine publisher: plane-separated staging and per-request
                 # runs instead of the row map. The staging copies run on the
                 # publishing stream ahead of the memcpys.

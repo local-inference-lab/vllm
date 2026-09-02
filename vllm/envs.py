@@ -251,6 +251,8 @@ if TYPE_CHECKING:
     VLLM_K3_DCP_GATHER_PIPELINE: bool = True
     VLLM_K3_DCP_GATHER_DMA: bool = False
     VLLM_K3_DCP_GATHER_CLUSTERS: str = ""
+    VLLM_K3_DCP_GATHER_DMA_MIN_ROWS: int = 2048
+    VLLM_K3_DCP_GATHER_DMA_MIN_ROWS_FILE: str = ""
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -2498,6 +2500,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the inter-switch link once (through the same-position partner) instead
     # of once per peer behind it. Empty = flat all-to-all schedule.
     "VLLM_K3_DCP_GATHER_CLUSTERS": lambda: os.getenv("VLLM_K3_DCP_GATHER_CLUSTERS", ""),
+    # Windows with fewer padded local rows than this use the push kernel
+    # instead of the copy-engine publisher (one launch and one rendezvous
+    # beat the memcpy issue and two signal phases for small payloads). The
+    # file, when named, overrides the value and is re-read once per second.
+    "VLLM_K3_DCP_GATHER_DMA_MIN_ROWS": lambda: int(
+        os.getenv("VLLM_K3_DCP_GATHER_DMA_MIN_ROWS", "2048")
+    ),
+    "VLLM_K3_DCP_GATHER_DMA_MIN_ROWS_FILE": lambda: os.getenv(
+        "VLLM_K3_DCP_GATHER_DMA_MIN_ROWS_FILE", ""
+    ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
     # overlap the base layer compute with the LoRA fast path).
