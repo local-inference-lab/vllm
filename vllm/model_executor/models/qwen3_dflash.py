@@ -86,6 +86,33 @@ def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
     )
 
 
+def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
+    """Return the target model's rotary-embedding layout when it is exposed.
+
+    A DFlash-family draft must rotate query and key tensors with the same
+    dimension layout as the target model used during hidden-state extraction.
+    Draft checkpoints do not encode this property. A mismatch changes every
+    drafted attention result without raising an error and collapses token
+    acceptance.
+
+    Args:
+        target_model: Target model that can expose rotary layout modules.
+
+    Returns:
+        The exposed NeoX rotary-layout setting, or ``None`` when unavailable.
+    """
+    language_model = (
+        target_model.get_language_model()
+        if hasattr(target_model, "get_language_model")
+        else target_model
+    )
+    for module in language_model.modules():
+        style = getattr(module, "is_neox_style", None)
+        if isinstance(style, bool):
+            return style
+    return None
+
+
 def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
     spec_config = vllm_config.speculative_config
     config = spec_config.draft_model_config.hf_config
@@ -216,6 +243,7 @@ class DFlashQwen3Attention(nn.Module):
         add_swa_attention_sink_bias: bool = False,
         sliding_window: int | None = None,
         causal: bool = False,
+        is_neox_style: bool = True,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -259,6 +287,7 @@ class DFlashQwen3Attention(nn.Module):
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=max_position,
+            is_neox_style=is_neox_style,
             rope_parameters=rope_parameters,
         )
 
@@ -342,6 +371,12 @@ class DFlashQwen3DecoderLayer(nn.Module):
         # non-causal) from the draft config.
         sliding_window, causal = _resolve_layer_attention(config, layer_idx)
 
+        # The loader copies this value from the built target model. Kimi-K3
+        # uses interleaved rotary dimensions while Qwen3 defaults to NeoX
+        # rotary dimensions, so relying on the Qwen3 default is not valid for
+        # a Kimi-trained DFlash-family checkpoint.
+        is_neox_style = getattr(config, "is_neox_style", True)
+
         self.self_attn = DFlashQwen3Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -352,6 +387,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
             add_swa_attention_sink_bias=add_swa_attention_sink_bias,
             sliding_window=sliding_window,
             causal=causal,
+            is_neox_style=is_neox_style,
             head_dim=getattr(config, "head_dim", None),
             cache_config=cache_config,
             quant_config=quant_config,
