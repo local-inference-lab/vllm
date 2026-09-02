@@ -2337,7 +2337,7 @@ def test_glm5next_split_cache_preserves_physical_pages(
 
     monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "512")
     groups = get_kv_cache_groups(
-        _grouping_config(),
+        _glm5next_split_config(),
         {"model.target": target, "model.recurrent": recurrent},
     )
 
@@ -2360,6 +2360,78 @@ def test_glm5next_split_cache_preserves_physical_pages(
     assert kv_cache_utils._get_kv_cache_bytes_per_block(groups) == (
         expected_pool_stride
     )
+
+
+def _glm5next_split_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        speculative_config=None,
+        model_config=SimpleNamespace(max_model_len=202_752),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+    )
+
+
+def _glm5next_split_specs(cache_dtype: str) -> dict[str, KVCacheSpec]:
+    target = MLAAttentionSpec(
+        block_size=2048,
+        num_kv_heads=1,
+        head_size=512 if cache_dtype == "nvfp4_ds_mla" else 528,
+        dtype=torch.uint8,
+        cache_dtype_str=cache_dtype,
+        state_content_bytes=304 if cache_dtype == "nvfp4_ds_mla" else None,
+        model_version="glm5_next",
+        page_tail_bytes_per_token=33,
+        alignment=64 * 132,
+    )
+    recurrent = MambaSpec(
+        block_size=2048,
+        shapes=((1_122_304,),),
+        dtypes=(torch.uint8,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=3,
+        num_prefill_checkpoint_blocks=1,
+    )
+    return {
+        **{f"model.recurrent.{i}": recurrent for i in range(34)},
+        **{f"model.target.{i}": target for i in range(12)},
+    }
+
+
+def test_glm5next_nvfp4_weights_split_cache_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "2048")
+    specs = _glm5next_split_specs("nvfp4_ds_mla")
+    groups = get_kv_cache_groups(_glm5next_split_config(), specs)
+
+    recurrent_groups = [
+        group for group in groups if isinstance(group.kv_cache_spec, MambaSpec)
+    ]
+    target_groups = [
+        group for group in groups if isinstance(group.kv_cache_spec, MLAAttentionSpec)
+    ]
+    assert [len(group.layer_names) for group in recurrent_groups] == [7, 7, 7, 7, 6]
+    assert [len(group.layer_names) for group in target_groups] == [12]
+    assert {name for group in groups for name in group.layer_names} == set(specs)
+    assert kv_cache_utils._get_kv_cache_bytes_per_block(groups) == 8_312_832
+    assert (
+        kv_cache_utils._get_kv_cache_group_allocation_cost(
+            _glm5next_split_config(), groups
+        )
+        == 457_205_760
+    )
+
+
+def test_glm5next_fp8_keeps_lower_group_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "2048")
+    specs = _glm5next_split_specs("fp8_ds_mla")
+    groups = get_kv_cache_groups(_glm5next_split_config(), specs)
+
+    assert len(groups) == 4
+    assert [len(group.layer_names) for group in groups] == [12, 11, 11, 12]
 
 
 def test_glm5next_nvfp4_auto_geometry_capacity() -> None:
