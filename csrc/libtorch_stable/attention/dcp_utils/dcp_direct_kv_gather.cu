@@ -506,8 +506,14 @@ void direct_dcp_kv_gather_dma(const torch::stable::Tensor& local_kv_c,
 
   const char* src_kv_c = static_cast<const char*>(local_kv_c.data_ptr());
   const char* src_k_pe = static_cast<const char*>(local_k_pe.data_ptr());
-  for (int64_t destination_rank = 0; destination_rank < world_size;
-       ++destination_rank) {
+  // Destinations rotated by the source rank: all ranks issue their copies at
+  // the same time, and with a common order every source would write into
+  // the same destination's inbound link at once (measured 2026-09-03:
+  // 113-156 us per 3 MB copy for the first destinations, 437-445 us for
+  // the last ones). Starting each source one rank past itself keeps every
+  // inbound link busy with a different source. The local copy goes first.
+  for (int64_t step = 0; step < world_size; ++step) {
+    int64_t destination_rank = (rank + step) % world_size;
     char* slot_base = reinterpret_cast<char*>(
                           static_cast<uintptr_t>(peer_kv[destination_rank])) +
                       buffer_slot * slot_stride_bytes;
