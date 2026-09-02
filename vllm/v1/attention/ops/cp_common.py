@@ -9,6 +9,9 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.distributed.device_communicators.all_reduce_utils import (
+    gpu_p2p_access_check,
+)
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -57,6 +60,40 @@ def _symm_mem_spans_group(group: GroupCoordinator) -> bool:
     return spans
 
 
+@functools.cache
+def _cuda_p2p_spans_group(group: GroupCoordinator) -> bool:
+    """Return whether every rank can directly access every peer GPU."""
+    if not current_platform.is_cuda():
+        return False
+    if group.world_size <= 1:
+        return True
+
+    try:
+        local_ranks: list[int | None] = [None] * group.world_size
+        torch.distributed.all_gather_object(
+            local_ranks,
+            group.local_rank,
+            group=group.cpu_group,
+        )
+        if any(rank is None for rank in local_ranks):
+            return False
+        spans = all(
+            src == dst or gpu_p2p_access_check(src, dst)
+            for src in local_ranks
+            for dst in local_ranks
+            if src is not None and dst is not None
+        )
+    except Exception as error:
+        logger.debug("Direct CP CUDA P2P probe failed: %s", error)
+        return False
+    logger.debug_once(
+        "Direct CP CUDA P2P across %d ranks: %s",
+        group.world_size,
+        "available" if spans else "unavailable",
+    )
+    return spans
+
+
 def direct_cp_enabled(
     group: GroupCoordinator,
     dtype: torch.dtype,
@@ -74,6 +111,24 @@ def direct_cp_enabled(
             or _symm_mem_spans_group(group)
         )
     )
+
+
+def direct_cp_peer_access_enabled(
+    group: GroupCoordinator,
+    dtype: torch.dtype,
+    use_direct: bool | None,
+    supported_dtypes: tuple[torch.dtype, ...] | None = None,
+) -> bool:
+    """Gate direct CP operations that dereference peer GPU pointers."""
+    if use_direct is not None:
+        return use_direct
+    enabled = direct_cp_enabled(group, dtype, None, supported_dtypes)
+    if enabled and not _cuda_p2p_spans_group(group):
+        logger.info_once(
+            "Direct CP peer access is unavailable; falling back to collectives."
+        )
+        return False
+    return enabled
 
 
 def direct_cp_multicast_enabled(
