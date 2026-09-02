@@ -167,6 +167,7 @@ def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
             "skip_eplb": True,
             "is_profile": True,
             "single_request_prefill": True,
+            "profile_all_kv_cache_groups": True,
         },
     )
     assert events[-1] == "cleanup"

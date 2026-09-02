@@ -700,6 +700,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_eplb: bool = False,
         is_profile: bool = False,
         single_request_prefill: bool = False,
+        profile_all_kv_cache_groups: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -758,6 +759,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_attn_for_dummy_run=skip_attn,
                 is_profile=is_profile,
                 context_len=context_len,
+                profile_all_kv_cache_groups=profile_all_kv_cache_groups,
             )
         self.kv_connector.set_disabled(False)
 
@@ -905,6 +907,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_eplb=True,
                 is_profile=True,
                 single_request_prefill=True,
+                profile_all_kv_cache_groups=True,
             )
             torch.accelerator.synchronize()
         finally:
@@ -1541,6 +1544,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
         context_len: int = 0,
+        profile_all_kv_cache_groups: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             # Update the request states.
@@ -1661,7 +1665,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             assert block_tables is not None
             attn_groups = self.attn_groups
-            if dummy_run and is_profile:
+            if dummy_run and is_profile and not profile_all_kv_cache_groups:
                 # Mamba layers take a cheap warmup path with no metadata;
                 # attention metadata is still built so those kernels tune.
                 attn_groups = [
