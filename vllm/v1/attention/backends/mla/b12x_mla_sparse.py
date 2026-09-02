@@ -1256,9 +1256,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             if self._model_type is not None:
                 caps_kwargs["model_type"] = self._model_type
             if self._uses_nvfp4_cache:
-                caps_kwargs.update(
-                    _nvfp4_run_options(is_glm_next=self._is_glm_next)
-                )
+                caps_kwargs.update(_nvfp4_run_options(is_glm_next=self._is_glm_next))
             caps_kwargs["cache_record_bytes"] = self._cache_record_bytes
             return self._module.plan(self._module.Caps(**caps_kwargs))
 
