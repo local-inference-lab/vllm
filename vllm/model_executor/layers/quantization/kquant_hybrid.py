@@ -1991,9 +1991,15 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             # normalize both contracts for downstream layers.
             out_trellis = fused_moe.run(binding=binding)[:m]
             if use_w4a8_prefill:
+                # The kernel wrote model-dtype rows into the runtime's shared
+                # prefill output buffer; the outer transform is the last pass
+                # over them, so it writes into a fresh tensor and the routed
+                # result never aliases storage that the next layer's launch
+                # overwrites. The W4A16 paths get the same ownership from the
+                # fp32 -> model-dtype conversion below.
                 out_trellis = run_w4a8_coupled_outer_transform(
                     out_trellis,
-                    out_trellis,
+                    torch.empty_like(out_trellis),
                     prepared_value.down_svh,
                     output_transform=True,
                 )

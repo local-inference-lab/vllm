@@ -198,6 +198,12 @@ template <typename scalar_t>
 __device__ __forceinline__ void copyChunk8UnitFp8(uint8_t* dst,
                                                   const scalar_t* src) {
 #ifndef USE_ROCM
+#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800)
+  // _typeConvert<BFloat16> is unavailable on pre-Ampere, as in copyChunk8.
+  if constexpr (std::is_same_v<scalar_t, c10::BFloat16>) {
+    return;
+  } else {
+#endif
   uint4 const input = *reinterpret_cast<const uint4*>(src);
   using Converter = vllm::_typeConvert<scalar_t>;
   auto const* input2 =
@@ -216,6 +222,9 @@ __device__ __forceinline__ void copyChunk8UnitFp8(uint8_t* dst,
     }
   }
   *reinterpret_cast<uint2*>(dst) = output;
+#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800)
+  }
+#endif
 #else
   copyChunk8<scalar_t, true>(dst, src, 1.0f);
 #endif

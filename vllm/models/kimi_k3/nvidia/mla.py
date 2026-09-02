@@ -327,17 +327,30 @@ def _reuse_consumed_query_for_context_output(
     query: torch.Tensor,
     output: torch.Tensor,
 ) -> torch.Tensor:
-    """Return contiguous semantic-output storage backed by a consumed query."""
+    """Return contiguous storage for the compact context output.
+
+    The consumed query backs the output when it holds enough bytes (a bf16
+    query row is wider than its bf16 output row); otherwise the output gets
+    fresh storage, as for an fp8 query whose 192-byte head rows cannot hold
+    the 256-byte bf16 output rows.
+
+    Args:
+        query: The contiguous prefill query the attention kernels have consumed.
+        output: The output tensor whose shape and dtype the storage must match.
+
+    Returns:
+        A contiguous tensor shaped like ``output``, aliasing ``query`` when it
+        fits and newly allocated otherwise.
+
+    Raises:
+        ValueError: If ``query`` is not contiguous.
+    """
     if not query.is_contiguous():
         raise ValueError("Kimi-K3 MLA prefill query storage must be contiguous")
     required_bytes = output.numel() * output.element_size()
     query_bytes = query.view(torch.uint8).flatten()
     if query_bytes.numel() < required_bytes:
-        raise ValueError(
-            "Kimi-K3 MLA prefill query storage is too small for compact context "
-            f"output: available={query_bytes.numel()} bytes, "
-            f"required={required_bytes} bytes"
-        )
+        return torch.empty(output.shape, dtype=output.dtype, device=output.device)
     return query_bytes[:required_bytes].view(output.dtype).view_as(output)
 
 
@@ -1230,11 +1243,24 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         kv_cache = self._attn_read_kv_cache()
         kv_b_proj_input_dtype = _get_kv_b_proj_input_dtype(self.kv_b_proj, fp8_prefill)
 
+        # The retained workspace is reserved only for a local, bias-free,
+        # unquantized kv_b_proj outside batch-invariant mode; every other
+        # configuration projects through the layer's own path.
+        retained_projection = (
+            self.prefill_projection_workspace is not None
+            and isinstance(getattr(self.kv_b_proj, "weight", None), torch.Tensor)
+            and not envs.VLLM_BATCH_INVARIANT
+            and isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod)
+            and self.kv_b_proj.bias is None
+            and not self.kv_b_proj.gather_output
+        )
+
         def project_context(kv_c_normed: torch.Tensor) -> torch.Tensor:
-            workspace = self.prefill_projection_workspace
-            weight = getattr(self.kv_b_proj, "weight", None)
-            if workspace is None or not isinstance(weight, torch.Tensor):
+            if not retained_projection:
                 return self.kv_b_proj(kv_c_normed)[0]
+            workspace = self.prefill_projection_workspace
+            assert workspace is not None
+            weight = self.kv_b_proj.weight
             rows = kv_c_normed.numel() // self.kv_lora_rank
             projection = workspace.get(
                 rows,
@@ -1244,16 +1270,6 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             )
             if projection is None:
                 return self.kv_b_proj(kv_c_normed)[0]
-            if not isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod):
-                raise RuntimeError(
-                    "Kimi-K3 retained context projection requires an "
-                    "unquantized kv_b_proj"
-                )
-            if self.kv_b_proj.bias is not None or self.kv_b_proj.gather_output:
-                raise RuntimeError(
-                    "Kimi-K3 retained context projection requires a local, "
-                    "bias-free kv_b_proj"
-                )
             torch.mm(
                 kv_c_normed.reshape(rows, self.kv_lora_rank),
                 weight.t(),
@@ -1407,10 +1423,13 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         staging)."""
         staging = _dma_staging_buffers.get(workspace.device)
         rows = workspace.shape[0]
+        pe_width = workspace.shape[1] - self.kv_lora_rank
         if (
             staging is None
             or staging[0].shape[0] < rows
             or staging[0].dtype != workspace.dtype
+            or staging[0].shape[1] != self.kv_lora_rank
+            or staging[1].shape[1] != pe_width
         ):
             staging = (
                 torch.empty(
@@ -1419,7 +1438,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                     device=workspace.device,
                 ),
                 torch.empty(
-                    (rows, workspace.shape[1] - self.kv_lora_rank),
+                    (rows, pe_width),
                     dtype=workspace.dtype,
                     device=workspace.device,
                 ),

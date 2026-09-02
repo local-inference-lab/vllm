@@ -138,6 +138,7 @@ class _FusedLayer:
     _compute_prefill_context = MultiHeadLatentAttention._compute_prefill_context
     _gather_context_latent = MultiHeadLatentAttention._gather_context_latent
     _attn_read_kv_cache = MultiHeadLatentAttention._attn_read_kv_cache
+    _context_gather_pipeline = MultiHeadLatentAttention._context_gather_pipeline
 
     def __init__(
         self,
@@ -181,7 +182,7 @@ def _build_prefill_metadata(
     workspace_dtype: torch.dtype,
     q_data_type: torch.dtype,
     backend: _RecordingPrefillBackend,
-) -> MLACommonPrefillMetadata:
+) -> tuple[MLACommonPrefillMetadata, int]:
     query_start_loc_cpu = torch.zeros(len(_QUERY_LENS) + 1, dtype=torch.int32)
     query_start_loc_cpu[1:] = torch.tensor(_QUERY_LENS, dtype=torch.int32).cumsum(0)
     workspace = torch.empty(
@@ -358,6 +359,45 @@ def test_fused_context_rejects_an_unquantized_query() -> None:
     )
     with pytest.raises(AssertionError, match="new-token epilogue"):
         layer._compute_prefill_context(q, SimpleNamespace(prefill=prefill))
+
+
+@torch.inference_mode()
+def test_fused_context_projects_through_kv_b_proj_when_unreserved() -> None:
+    """A workspace that was never reserved (the model skips the reservation
+    for a gathering, biased or quantized kv_b_proj) must not be consulted:
+    chunks at or above its row threshold project through the layer."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    kv_b_proj = _KVBProj(device, weight_dtype=torch.bfloat16)
+    kv_b_proj.gather_output = True
+    k_scale = torch.ones(1, dtype=torch.float32, device=device)
+    backend = _RecordingPrefillBackend()
+    prefill, num_blocks = _build_prefill_metadata(
+        device, torch.bfloat16, torch.bfloat16, backend
+    )
+    kv_cache = torch.randn(
+        (num_blocks, _BLOCK_SIZE, _ENTRY), device=device, dtype=torch.bfloat16
+    )
+    q = torch.randn(
+        (sum(_QUERY_LENS), _NUM_HEADS, _QK_NOPE + _QK_ROPE),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    layer = _FusedLayer(
+        kv_b_proj,
+        kv_cache,
+        "auto",
+        k_scale,
+        prefill_projection_workspace=KimiK3PrefillProjectionWorkspace(
+            num_ubatches=1, min_tokens=1
+        ),
+    )
+
+    out, lse = layer._compute_prefill_context(q, SimpleNamespace(prefill=prefill))
+
+    assert kv_b_proj.forward_calls == len(backend.calls) > 0
+    assert out.shape[0] == lse.shape[-1] == sum(_QUERY_LENS)
+    assert torch.isfinite(out).all()
 
 
 def test_prefill_projection_workspace_reuses_reserved_storage() -> None:
