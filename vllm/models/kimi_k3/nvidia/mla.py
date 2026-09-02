@@ -1201,11 +1201,24 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         kv_cache = self._attn_read_kv_cache()
         kv_b_proj_input_dtype = _get_kv_b_proj_input_dtype(self.kv_b_proj, fp8_prefill)
 
+        # The retained workspace is reserved only for a local, bias-free,
+        # unquantized kv_b_proj outside batch-invariant mode; every other
+        # configuration projects through the layer's own path.
+        retained_projection = (
+            self.prefill_projection_workspace is not None
+            and isinstance(getattr(self.kv_b_proj, "weight", None), torch.Tensor)
+            and not envs.VLLM_BATCH_INVARIANT
+            and isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod)
+            and self.kv_b_proj.bias is None
+            and not self.kv_b_proj.gather_output
+        )
+
         def project_context(kv_c_normed: torch.Tensor) -> torch.Tensor:
-            workspace = self.prefill_projection_workspace
-            weight = getattr(self.kv_b_proj, "weight", None)
-            if workspace is None or not isinstance(weight, torch.Tensor):
+            if not retained_projection:
                 return self.kv_b_proj(kv_c_normed)[0]
+            workspace = self.prefill_projection_workspace
+            assert workspace is not None
+            weight = self.kv_b_proj.weight
             rows = kv_c_normed.numel() // self.kv_lora_rank
             projection = workspace.get(
                 rows,
@@ -1215,16 +1228,6 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             )
             if projection is None:
                 return self.kv_b_proj(kv_c_normed)[0]
-            if not isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod):
-                raise RuntimeError(
-                    "Kimi-K3 retained context projection requires an "
-                    "unquantized kv_b_proj"
-                )
-            if self.kv_b_proj.bias is not None or self.kv_b_proj.gather_output:
-                raise RuntimeError(
-                    "Kimi-K3 retained context projection requires a local, "
-                    "bias-free kv_b_proj"
-                )
             torch.mm(
                 kv_c_normed.reshape(rows, self.kv_lora_rank),
                 weight.t(),
