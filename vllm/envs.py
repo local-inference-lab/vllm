@@ -65,6 +65,8 @@ if TYPE_CHECKING:
     VLLM_B12X_ABSORB_BMM: bool = False
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE: int = 0
+    VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE: int = 0
+    VLLM_MLA_SM120_FA4_PREFILL: bool = False
     VLLM_K3_KV_GROUP_SIZE: int = 0
     VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
     VLLM_DSPARK_COMPACT_ROPE: bool = False
@@ -236,9 +238,21 @@ if TYPE_CHECKING:
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
     VLLM_DCP_Q_REPLICATE: bool = False
+    VLLM_K3_DCP_Q_REPLICATE_LAYERS: str | None = None
+    VLLM_K3_DYNAMIC_SPARSE_STRIDE: int = 1
+    VLLM_K3_DYNAMIC_SPARSE_MIN_TOKENS: int = 0
+    VLLM_K3_DYNAMIC_SPARSE_SINK_TOKENS: int = 4096
+    VLLM_K3_DYNAMIC_SPARSE_RECENT_TOKENS: int = 32768
+    VLLM_K3_DYNAMIC_SPARSE_REFRESH_INTERVAL: int = 128
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
+    VLLM_DCP_KV_GATHER_SLOTS: int = 3
+    VLLM_K3_DCP_GATHER_PIPELINE: bool = True
+    VLLM_K3_DCP_GATHER_DMA: bool = False
+    VLLM_K3_DCP_GATHER_CLUSTERS: str = ""
+    VLLM_K3_DCP_GATHER_DMA_MIN_ROWS: int = 2048
+    VLLM_K3_DCP_GATHER_DMA_MIN_ROWS_FILE: str = ""
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -247,6 +261,7 @@ if TYPE_CHECKING:
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
+    VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -1153,6 +1168,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE": lambda: int(
         os.getenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", "0")
     ),
+    # Override only the transient MLA context tile. Unlike the scheduler token
+    # budget, this does not change admission, preemption, prefix-commit, Mamba
+    # snapshot, or LMCache recompute granularity.
+    "VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE": lambda: int(
+        os.getenv("VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE", "0")
+    ),
+    # Opt in to the SM120 FA4 kernel for dense MLA prefill only. Decode and
+    # non-MLA attention retain their configured FlashAttention version.
+    "VLLM_MLA_SM120_FA4_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_MLA_SM120_FA4_PREFILL", "0"))
+    ),
     # Bound the number of physical Kimi-K3 layers sharing each hybrid-cache
     # block table. Zero preserves the general grouping heuristic.
     "VLLM_K3_KV_GROUP_SIZE": lambda: int(os.getenv("VLLM_K3_KV_GROUP_SIZE", "0")),
@@ -1804,6 +1830,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Opt-in MLA DCP query replication: skip the decode query all-gather.
     "VLLM_DCP_Q_REPLICATE": lambda: bool(int(os.getenv("VLLM_DCP_Q_REPLICATE", "0"))),
+    # Required Kimi-K3 layer allow-list when DCP query replication is enabled.
+    # Use "all" only after explicitly qualifying the persistent VRAM cost.
+    "VLLM_K3_DCP_Q_REPLICATE_LAYERS": lambda: os.getenv(
+        "VLLM_K3_DCP_Q_REPLICATE_LAYERS"
+    ),
+    # Experimental Kimi-K3 dense-MLA sparsity. Stride 1 is exact and leaves
+    # the production path unchanged.
+    "VLLM_K3_DYNAMIC_SPARSE_STRIDE": lambda: int(
+        os.getenv("VLLM_K3_DYNAMIC_SPARSE_STRIDE", "1")
+    ),
+    "VLLM_K3_DYNAMIC_SPARSE_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_K3_DYNAMIC_SPARSE_MIN_TOKENS", "0")
+    ),
+    "VLLM_K3_DYNAMIC_SPARSE_SINK_TOKENS": lambda: int(
+        os.getenv("VLLM_K3_DYNAMIC_SPARSE_SINK_TOKENS", "4096")
+    ),
+    "VLLM_K3_DYNAMIC_SPARSE_RECENT_TOKENS": lambda: int(
+        os.getenv("VLLM_K3_DYNAMIC_SPARSE_RECENT_TOKENS", "32768")
+    ),
+    "VLLM_K3_DYNAMIC_SPARSE_REFRESH_INTERVAL": lambda: int(
+        os.getenv("VLLM_K3_DYNAMIC_SPARSE_REFRESH_INTERVAL", "128")
+    ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
     # JIT'ing in the hot-path. However, this warmup increases the engine
@@ -1843,6 +1891,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # serving.
     "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT": lambda: bool(
         int(os.getenv("VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT", "0"))
+    ),
+    # Kimi K3 only, and unrelated to the MoE flags above. Tap the pre-norm
+    # AttnRes mixture, rather than the post-mixture sum, as the auxiliary
+    # hidden state handed to a DFlash drafter. This changes the numerics the
+    # speculator sees, so it is off by default while the effect is measured.
+    "VLLM_KIMI_K3_AUX_ATTN_RES_STREAM": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_AUX_ATTN_RES_STREAM", "0"))
     ),
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
@@ -2423,6 +2478,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_USE_DIRECT_DCP_KV_GATHER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_DIRECT_DCP_KV_GATHER")
+    ),
+    # Symmetric slots per ubatch in the direct DCP KV gather workspace. Each
+    # slot holds one gathered context window; the Kimi-K3 chunked-context
+    # pipeline needs three, the serial loop two.
+    "VLLM_DCP_KV_GATHER_SLOTS": lambda: int(os.getenv("VLLM_DCP_KV_GATHER_SLOTS", "3")),
+    # Publish the next Kimi-K3 chunked-context window on a side stream while
+    # the current one is projected and attended (needs three gather slots).
+    "VLLM_K3_DCP_GATHER_PIPELINE": lambda: bool(
+        int(os.getenv("VLLM_K3_DCP_GATHER_PIPELINE", "1"))
+    ),
+    # Publish Kimi-K3 chunked-context windows with the copy engines
+    # (cudaMemcpyAsync per destination) instead of the SM push kernel, so the
+    # PCIe-bound gather leaves the SM memory pipelines to the attention and
+    # projection kernels it overlaps.
+    "VLLM_K3_DCP_GATHER_DMA": lambda: bool(
+        int(os.getenv("VLLM_K3_DCP_GATHER_DMA", "0"))
+    ),
+    # Two groups of DCP ranks that share a PCIe switch each, e.g.
+    # "0,1,2,3;4,5,6,7": the copy-engine publisher then relays rows across
+    # the inter-switch link once (through the same-position partner) instead
+    # of once per peer behind it. Empty = flat all-to-all schedule.
+    "VLLM_K3_DCP_GATHER_CLUSTERS": lambda: os.getenv("VLLM_K3_DCP_GATHER_CLUSTERS", ""),
+    # Windows with fewer padded local rows than this use the push kernel
+    # instead of the copy-engine publisher (one launch and one rendezvous
+    # beat the memcpy issue and two signal phases for small payloads). The
+    # file, when named, overrides the value and is re-read once per second.
+    "VLLM_K3_DCP_GATHER_DMA_MIN_ROWS": lambda: int(
+        os.getenv("VLLM_K3_DCP_GATHER_DMA_MIN_ROWS", "2048")
+    ),
+    "VLLM_K3_DCP_GATHER_DMA_MIN_ROWS_FILE": lambda: os.getenv(
+        "VLLM_K3_DCP_GATHER_DMA_MIN_ROWS_FILE", ""
     ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
