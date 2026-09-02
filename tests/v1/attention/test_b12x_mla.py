@@ -518,6 +518,67 @@ def test_b12x_mla_builder_preserves_tiled_q4_dcp_verification(
     assert getattr(result, "dense_mla_flat_block_table", None) is None
 
 
+def test_b12x_mla_builder_selects_the_covering_verify_plan(monkeypatch) -> None:
+    """Verify plans are bucketed by power-of-two batch capacity; a batch of
+    three uses the four-request plan, and a batch beyond every capacity
+    keeps the flattened decode path."""
+    builder = object.__new__(B12xMLAMetadataBuilder)
+    builder._dense_mla_plan = _FakePlan()
+    builder._dense_mla_plans = {32: _FakePlan()}
+    plans = {
+        batch: SimpleNamespace(
+            caps=SimpleNamespace(max_page_table_width=4), batch=batch
+        )
+        for batch in (1, 2, 4)
+    }
+    builder._dense_mla_verify_plans = plans
+    builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
+    builder._dense_mla_padded_q = None
+    builder._dense_mla_padded_output = None
+    builder._max_dense_mla_rows = 32
+    builder._dense_mla_flat_block_table = torch.zeros(32, 4, dtype=torch.int32)
+    builder._dense_mla_flat_seq_lens = torch.empty(32, dtype=torch.int32)
+    builder._dense_mla_flat_query_start_loc = torch.arange(33, dtype=torch.int32)
+    builder._dense_mla_causal_offsets = torch.arange(-3, 1, dtype=torch.int32)
+    builder._dense_mla_flat_global_seq_lens = torch.empty(32, dtype=torch.int32)
+    builder._dense_mla_flat_dcp_remainder = torch.empty(32, dtype=torch.int32)
+    builder.dcp_world_size = 1
+    builder._dcp_rank = 0
+    builder.cp_kv_cache_interleave_size = 1
+
+    def metadata_for(num_decodes: int):
+        return SimpleNamespace(
+            causal=True,
+            num_decodes=num_decodes,
+            num_decode_tokens=4 * num_decodes,
+            decode=SimpleNamespace(
+                block_table=torch.arange(
+                    4 * num_decodes, dtype=torch.int32
+                ).view(num_decodes, 4),
+                seq_lens=torch.full((num_decodes,), 4, dtype=torch.int32),
+                dcp_tot_seq_lens=None,
+            ),
+        )
+
+    monkeypatch.setattr(
+        b12x_mla.MLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: metadata_for(3),
+    )
+    result = builder.build(0, SimpleNamespace())
+    assert result.dense_mla_plan is plans[4]
+    assert result.dense_mla_verify_block_table.shape == (3, 4)
+
+    monkeypatch.setattr(
+        b12x_mla.MLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: metadata_for(5),
+    )
+    result = builder.build(0, SimpleNamespace())
+    assert result.dense_mla_plan is builder._dense_mla_plans[32]
+    assert result.dense_mla_flat_block_table.shape == (20, 4)
+
+
 def test_b12x_mla_builder_bounds_single_token_draft_table(monkeypatch) -> None:
     builder = object.__new__(B12xMLAMetadataBuilder)
     builder._dense_mla_plan = _FakePlan()
