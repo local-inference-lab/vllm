@@ -25,6 +25,9 @@ from vllm.distributed.utils import split_tensor_along_last_dim
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
+from vllm.model_executor.layers.attention.mla_attention import (
+    align_mla_chunked_context_workspace_size,
+)
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     fused_moe_make_expert_params_mapping,
@@ -111,7 +114,10 @@ from vllm.models.kimi_k3.nvidia.latent_moe_runner import (
 from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
     enable_kimi_k3_low_latency_gemm,
 )
-from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
+from vllm.models.kimi_k3.nvidia.mla import (
+    KimiK3PrefillProjectionWorkspace,
+    MultiHeadLatentAttention,
+)
 from vllm.models.kimi_k3.nvidia.ops import attn_res
 from vllm.models.kimi_k3.nvidia.tp_projection import (
     gather_kimi_sharded_projection,
@@ -1467,6 +1473,7 @@ class KimiDecoderLayer(nn.Module):
         vllm_config: VllmConfig,
         prefix: str = "",
         aux_stream: torch.cuda.Stream | None = None,
+        prefill_projection_workspace: KimiK3PrefillProjectionWorkspace | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1537,6 +1544,7 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
                 aux_stream=aux_stream,
+                prefill_projection_workspace=prefill_projection_workspace,
             )
             self._self_attn_writes_output = False
 
@@ -1579,6 +1587,11 @@ class KimiDecoderLayer(nn.Module):
             self.attn_res_block_size = attn_res_block_size
             self.is_block_write_layer = layer_idx % self.attn_res_block_size == 0
             self.block_write_idx = layer_idx // self.attn_res_block_size
+            self.is_final_block_write_layer = (
+                self.is_block_write_layer
+                and self.block_write_idx
+                == cdiv(config.num_hidden_layers, self.attn_res_block_size) - 1
+            )
             self.prev_valid_blocks = cdiv(layer_idx, self.attn_res_block_size)
             self.self_attention_res_norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -1694,7 +1707,14 @@ class KimiDecoderLayer(nn.Module):
 
         assert prefix_sum is not None
         if self.is_block_write_layer:
-            output = prefix_sum if self.reuse_attn_res_output else None
+            # The old prefix becomes the last committed residual block at the
+            # final block boundary. It must remain immutable for every later
+            # AttnRes mixture and therefore cannot also hold the new delta.
+            output = (
+                prefix_sum
+                if self.reuse_attn_res_output and not self.is_final_block_write_layer
+                else None
+            )
             prefix_sum = hidden_states
             prefix_delta = None
         else:
@@ -1779,6 +1799,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         config = vllm_config.model_config.hf_text_config
         self.config = config
+        self._vllm_config = vllm_config
         self.attn_res_block_size: int | None = config.attn_res_block_size
         self.use_attn_res = self.attn_res_block_size is not None
         self.reuse_attn_res_output = (
@@ -1808,6 +1829,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         # attention front-end (DeepseekV4 convention: created at the model
         # level and threaded into each attention layer).
         aux_stream = torch.cuda.Stream()
+        self._mla_prefill_projection_workspace = KimiK3PrefillProjectionWorkspace(
+            num_ubatches=2 if parallel_config.enable_dbo else 1,
+            min_tokens=int(vllm_config.scheduler_config.max_num_batched_tokens) + 1,
+        )
 
         def get_layer(prefix: str):
             return KimiDecoderLayer(
@@ -1815,6 +1840,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 vllm_config,
                 prefix,
                 aux_stream=aux_stream,
+                prefill_projection_workspace=self._mla_prefill_projection_workspace,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -1891,6 +1917,94 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             }
         )
 
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        super()._set_aux_hidden_state_layers(layers)
+        if self.use_attn_res:
+            # Emitted once, at configuration time. Which layers are tapped and
+            # which convention is in force are the two things you need to
+            # confirm from a running process, and neither is recoverable from
+            # the served output.
+            logger.info_once(
+                "Kimi-K3 aux hidden capture: layers=%s mode=%s "
+                "(VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=%d)",
+                layers,
+                "attn_res_stream" if self._aux_attn_res_stream else "prefix_only",
+                int(self._aux_attn_res_stream),
+            )
+
+    @property
+    def _aux_attn_res_stream(self) -> bool:
+        return envs.VLLM_KIMI_K3_AUX_ATTN_RES_STREAM
+
+    def _capture_aux_hidden_stream(
+        self,
+        layer_idx: int,
+        prefix_sum: torch.Tensor,
+        pending_mlp_out: torch.Tensor | None,
+        block_residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """Auxiliary feature tapped after ``layer_idx`` under AttnRes.
+
+        The wire between layers only carries the current block's running prefix;
+        the committed blocks live in the bank. The value the next consumer
+        actually reads is the pre-norm AttnRes mixture over
+        ``bank[:num_blocks] + prefix``, which is what the DFlash drafters were
+        trained against. ``attn_res`` with no delta, no block write and no
+        output norm computes exactly that and leaves both the prefix and the
+        bank untouched.
+
+        Folding the pending MLP output into the prefix rather than passing it as
+        ``delta`` is deliberate: the kernel writes an applied delta back into
+        the prefix in place, which would double-add it into the live residual
+        stream.
+
+        Args:
+            layer_idx: Index of the layer that produced the pending MLP output.
+            prefix_sum: Running prefix for the active AttnRes block.
+            pending_mlp_out: MLP output to fold into the running prefix, if any.
+            block_residual: Committed AttnRes block bank for the active rows.
+
+        Returns:
+            Auxiliary hidden states for the configured DFlash capture mode.
+        """
+        prefix = prefix_sum if pending_mlp_out is None else prefix_sum + pending_mlp_out
+        # `use_attn_res` is what constructs the norm and projection weights this
+        # reads; without it there is no mixture to compute and the attribute
+        # lookups below would raise.
+        if not (self._aux_attn_res_stream and self.use_attn_res):
+            return prefix
+
+        if layer_idx + 1 < self.end_layer:
+            consumer = self.layers[layer_idx + 1]
+            score_norm = consumer.self_attention_res_norm
+            score_proj = consumer.self_attention_res_proj
+            num_blocks = consumer.prev_valid_blocks
+        elif get_pp_group().is_last_rank:
+            # Nothing downstream but the model's own output-side aggregation.
+            score_norm = self.output_attn_res_norm
+            score_proj = self.output_attn_res_proj
+            num_blocks = self.num_attn_res_blocks
+        else:
+            # Last layer of a non-final pipeline stage: the consumer lives on
+            # the next rank and the output-side aggregation only exists on the
+            # last one, so there is nothing here to mix against. Falling back
+            # to the running prefix keeps the tap defined rather than reaching
+            # for weights this rank does not construct.
+            return prefix
+
+        return attn_res(
+            prefix,
+            None,
+            block_residual,
+            score_norm.weight,
+            score_proj.weight.squeeze(0),
+            None,
+            num_blocks=num_blocks,
+            block_write_idx=-1,
+            eps=score_norm.variance_epsilon,
+            output_norm_eps=0.0,
+        )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1959,6 +2073,48 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 self._max_num_batched_tokens,
             )
 
+    def reserve_mla_prefill_projection_workspace(self) -> None:
+        """Reserve one large context projection output shared by MLA layers."""
+        internal_tokens = envs.VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE
+        if internal_tokens <= self._max_num_batched_tokens:
+            return
+        workspace_tokens = align_mla_chunked_context_workspace_size(
+            self._vllm_config, internal_tokens
+        )
+        mla_layers = [
+            layer.self_attn
+            for layer in self.layers
+            if isinstance(getattr(layer, "self_attn", None), MultiHeadLatentAttention)
+        ]
+        if not mla_layers:
+            return
+        first = mla_layers[0]
+        if envs.VLLM_BATCH_INVARIANT or not all(
+            isinstance(layer.kv_b_proj.quant_method, UnquantizedLinearMethod)
+            and layer.kv_b_proj.bias is None
+            and not layer.kv_b_proj.gather_output
+            for layer in mla_layers
+        ):
+            logger.warning_once(
+                "Kimi-K3 retained context projection is unavailable for the "
+                "configured kv_b_proj method."
+            )
+            return
+        weight = first.kv_b_proj.weight
+        _release_cuda_cache_before_retained_allocation(weight.device)
+        self._mla_prefill_projection_workspace.reserve(
+            max_tokens=workspace_tokens,
+            output_size=weight.shape[0],
+            dtype=weight.dtype,
+            device=weight.device,
+        )
+        logger.info_once(
+            "Kimi-K3 retained %.2f MiB/rank for the %d-token MLA context "
+            "projection workspace shared across layers.",
+            self._mla_prefill_projection_workspace.nbytes / (1024**2),
+            workspace_tokens,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1993,6 +2149,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         pp_group = get_pp_group()
         stream_aux_hidden_states = bool(
             projector is not None
+            # The streaming projector consumes plain residual sums. DFlash
+            # AttnRes capture requires the pre-norm mixture computed below.
+            and not self._aux_attn_res_stream
             and not self.use_sequence_parallel
             and pp_group.is_first_rank
             and pp_group.is_last_rank
@@ -2054,7 +2213,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                     projector.accumulate_auxiliary_state(hidden_states, residual)
                 elif self.use_attn_res:
                     assert prefix_sum is not None
-                    aux_hidden_state = prefix_sum + hidden_states
+                    assert residual is not None
+                    aux_hidden_state = self._capture_aux_hidden_stream(
+                        layer_idx, prefix_sum, hidden_states, residual
+                    )
                     aux_hidden_states.append(aux_hidden_state)
                 else:
                     assert residual is not None
@@ -2427,6 +2589,7 @@ class KimiLinearForCausalLM(
         return loaded
 
     def process_weights_after_loading(self) -> None:
+        self.model.reserve_mla_prefill_projection_workspace()
         self.model.reserve_attn_res_workspace()
 
 
