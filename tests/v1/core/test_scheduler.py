@@ -6168,7 +6168,7 @@ def test_encoder_input_skipped_when_connector_already_has_the_item(ec_role: str)
 
 
 @pytest.fixture
-def lp11_model_path(tmp_path):
+def long_context_opt_model_path(tmp_path):
     (tmp_path / "config.json").write_text(
         '{"architectures": ["OPTForCausalLM"], "model_type": "opt", '
         '"max_position_embeddings": 32768}'
@@ -6213,13 +6213,13 @@ def _empty_output_for_schedule(output: SchedulerOutput) -> ModelRunnerOutput:
     )
 
 
-def _prepare_lp11_prefills(
-    lp11_model_path,
+def _prepare_mixed_prefill_scheduler(
+    long_context_opt_model_path,
     num_prefills: int,
     mixed_prefill_budget: int,
 ):
     scheduler = create_scheduler(
-        model=lp11_model_path,
+        model=long_context_opt_model_path,
         skip_tokenizer_init=True,
         device="cpu",
         max_num_seqs=4,
@@ -6249,10 +6249,10 @@ def _prepare_lp11_prefills(
 
 
 def test_mixed_prefill_budget_reserves_waiter_then_rotates_running(
-    lp11_model_path,
+    long_context_opt_model_path,
 ):
-    scheduler, (p0, p1) = _prepare_lp11_prefills(
-        lp11_model_path,
+    scheduler, (p0, p1) = _prepare_mixed_prefill_scheduler(
+        long_context_opt_model_path,
         num_prefills=2,
         mixed_prefill_budget=4608,
     )
@@ -6279,9 +6279,11 @@ def test_mixed_prefill_budget_reserves_waiter_then_rotates_running(
     ]
 
 
-def test_partial_prefill_limit_keeps_excess_waiter_queued(lp11_model_path):
-    scheduler, (p0, p1) = _prepare_lp11_prefills(
-        lp11_model_path,
+def test_partial_prefill_limit_keeps_excess_waiter_queued(
+    long_context_opt_model_path,
+):
+    scheduler, (p0, p1) = _prepare_mixed_prefill_scheduler(
+        long_context_opt_model_path,
         num_prefills=2,
         mixed_prefill_budget=4608,
     )
@@ -6316,9 +6318,11 @@ def test_max_num_partial_prefills_validation():
         )
 
 
-def test_mixed_prefill_budget_does_not_limit_prefill_only_step(lp11_model_path):
+def test_mixed_prefill_budget_does_not_limit_prefill_only_step(
+    long_context_opt_model_path,
+):
     scheduler = create_scheduler(
-        model=lp11_model_path,
+        model=long_context_opt_model_path,
         skip_tokenizer_init=True,
         device="cpu",
         max_num_batched_tokens=8192,
@@ -6339,10 +6343,10 @@ def test_mixed_prefill_budget_does_not_limit_prefill_only_step(lp11_model_path):
 
 
 def test_mixed_prefill_budget_rotates_one_quantum_after_slots_fill(
-    lp11_model_path,
+    long_context_opt_model_path,
 ):
-    scheduler, prefills = _prepare_lp11_prefills(
-        lp11_model_path,
+    scheduler, prefills = _prepare_mixed_prefill_scheduler(
+        long_context_opt_model_path,
         num_prefills=3,
         mixed_prefill_budget=2304,
     )
@@ -6416,9 +6420,11 @@ def test_decode_burst_requires_mixed_prefill_budget():
         )
 
 
-def test_decode_burst_controller_balances_prefill_and_decode(lp11_model_path):
-    scheduler, prefills = _prepare_lp11_prefills(
-        lp11_model_path, num_prefills=2, mixed_prefill_budget=2304
+def test_decode_burst_controller_balances_prefill_and_decode(
+    long_context_opt_model_path,
+):
+    scheduler, prefills = _prepare_mixed_prefill_scheduler(
+        long_context_opt_model_path, num_prefills=2, mixed_prefill_budget=2304
     )
     scheduler.max_num_partial_prefills = 2
     scheduler.decode_prefill_min_decode_steps = 4
