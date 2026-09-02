@@ -427,9 +427,8 @@ class Glm5NextPooledIndexer(nn.Module):
             query.contiguous().view(-1, _INDEX_HEAD_DIM),
             q_fp8.view(-1, _INDEX_HEAD_DIM),
             q_scale.view(-1),
+            weights=weights.view(-1),
         )
-        weights.mul_(q_scale)
-        weights.mul_((_INDEX_HEAD_DIM * _INDEX_HEADS) ** -0.5)
 
         forward_context = get_forward_context()
         raw_metadata = forward_context.attn_metadata
