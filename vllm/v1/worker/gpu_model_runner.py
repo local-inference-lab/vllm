@@ -5955,6 +5955,7 @@ class GPUModelRunner(
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         randomize_inputs: bool = False,
+        single_request_prefill: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5982,6 +5983,10 @@ class GPUModelRunner(
             profile_seq_lens: If provided, use this value for seq_lens instead
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
+            single_request_prefill: If True, place the complete token budget in
+                one prefill request. This exposes attention and collective
+                workspace peaks that are hidden when the ordinary profile
+                distributes the same token budget across many requests.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -6014,7 +6019,13 @@ class GPUModelRunner(
         # has num_tokens in total.
         assert num_tokens <= self.max_num_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
-        if create_mixed_batch:
+        if single_request_prefill:
+            assert not create_mixed_batch
+            assert not uniform_decode
+            num_reqs = 1
+            num_scheduled_tokens_list = [num_tokens]
+            max_query_len = num_tokens
+        elif create_mixed_batch:
             assert not uniform_decode
             # Create mixed batch:
             # first half decode tokens, second half one prefill
@@ -6089,6 +6100,7 @@ class GPUModelRunner(
             create_mixed_batch,
             is_graph_capturing,
             uniform_decode,
+            single_request_prefill,
         )
         ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
             should_ubatch,
@@ -6632,6 +6644,39 @@ class GPUModelRunner(
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
+
+    @torch.inference_mode()
+    def profile_glm_dcp_attention(self) -> None:
+        """Profile GLM split-cache DCP attention before KV cache sizing.
+
+        The generic activation profile omits attention metadata and spreads the
+        scheduler token budget across many requests. GLM sparse MLA can instead
+        receive one full prefill quantum and gather its query heads across the
+        decode-context-parallel group. A minimal temporary cache makes that
+        backend path reachable without reserving production KV storage.
+        """
+        if (
+            self.model_config.architecture != "Glm5NextForConditionalGeneration"
+            or self.dcp_world_size <= 1
+        ):
+            return
+
+        with set_current_vllm_config(self.vllm_config):
+            self._init_minimal_kv_cache_for_profiling()
+
+        model_output: tuple[torch.Tensor, torch.Tensor] | None = None
+        try:
+            model_output = self._dummy_run(
+                self.max_num_tokens,
+                force_attention=True,
+                skip_eplb=True,
+                is_profile=True,
+                single_request_prefill=True,
+            )
+            self._sync_device()
+        finally:
+            del model_output
+            self._cleanup_profiling_kv_cache()
 
     def _init_minimal_kv_cache_for_profiling(self) -> None:
         from vllm.v1.core.kv_cache_utils import (
