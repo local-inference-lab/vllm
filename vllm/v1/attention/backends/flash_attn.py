@@ -4,6 +4,7 @@
 
 import copy
 import functools
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -298,6 +299,152 @@ def _maybe_symmetrize_window(
     if window is not None and window[0] >= 0 and window[1] == 0 and non_causal:
         return (window[0], window[0])
     return window
+
+
+# ---------------------------------------------------------------------------
+# GLM-5.3 DFlash draft: split-KV paged decode attention fast path.
+# Opt-in with VLLM_GLM53_DFLASH_ATTN=1; every other configuration keeps the
+# FlashAttention call below. See vllm/v1/attention/backends/dflash_attn.
+# ---------------------------------------------------------------------------
+_DFLASH_ATTN = os.getenv("VLLM_GLM53_DFLASH_ATTN", "0") == "1"
+_DFLASH_ATTN_MAX_REQS = int(os.getenv("VLLM_GLM53_DFLASH_ATTN_MAX_REQS", "12"))
+_DFLASH_WS_REQS = int(os.getenv("VLLM_GLM53_DFLASH_ATTN_WS_REQS", "64"))
+_dflash_ops: dict[tuple[int, int, int], object] = {}
+_dflash_stats = {"hits": 0, "fallbacks": 0, "unavailable": False}
+
+
+def _dflash_get_op(impl, key_cache):
+    from vllm.v1.attention.backends import dflash_attn as dfa
+
+    sw = impl.sliding_window
+    key = (key_cache.device.index, impl.num_kv_heads, sw[0] + 1)
+    op = _dflash_ops.get(key)
+    if op is None:
+        op = dfa.DFlashDecodeAttention(
+            key_cache.device,
+            impl.num_kv_heads,
+            max_batch=_DFLASH_WS_REQS,
+            window=sw[0] + 1,
+        )
+        _dflash_ops[key] = op
+        logger.info(
+            "[dflash_attn] split-KV draft attention enabled: hkv=%d window=%d "
+            "max_reqs=%d ws_reqs=%d",
+            impl.num_kv_heads,
+            sw[0] + 1,
+            _DFLASH_ATTN_MAX_REQS,
+            _DFLASH_WS_REQS,
+        )
+    return op
+
+
+def _dflash_fast_path_ok(
+    impl,
+    md,
+    key_cache,
+    causal,
+    is_dynamic_causal,
+    mm_mask_mod,
+    rswa_mask_mod_fn,
+    cu_seqlens_q,
+):
+    if not _DFLASH_ATTN or _dflash_stats["unavailable"]:
+        return False
+    from vllm.v1.attention.backends import dflash_attn as dfa
+
+    sw = getattr(impl, "sliding_window", None)
+    b_pad = int(cu_seqlens_q.shape[0]) - 1
+    shape_ok = (
+        sw is not None
+        and sw[0] > 0
+        and sw[1] == 0
+        and key_cache.dtype == torch.bfloat16
+        and impl.head_size == dfa.HEAD_DIM
+        and impl.num_heads == dfa.GQA * impl.num_kv_heads
+    )
+    # Allocate the workspace (and build/load the library) on the first eager
+    # call: warmup runs at large batch first, and graph capture at small batch
+    # must find it ready.
+    if shape_ok and not torch.cuda.is_current_stream_capturing():
+        if not dfa.is_available(key_cache.device):
+            _dflash_stats["unavailable"] = True
+            return False
+        _dflash_get_op(impl, key_cache)
+    nreq = int(getattr(md, "num_decode_reqs", 0) or 0) + int(
+        getattr(md, "num_prefill_reqs", 0) or 0
+    )
+    if nreq <= 0:
+        nreq = b_pad
+    reason = None
+    if getattr(impl, "vllm_flash_attn_version", 0) != 2:
+        reason = "fa_version"
+    elif is_dynamic_causal or causal not in (True, False):
+        reason = f"causal={causal!r}"
+    elif mm_mask_mod is not None or rswa_mask_mod_fn is not None:
+        reason = "mask_mod"
+    elif not shape_ok:
+        reason = (
+            f"shape h={impl.num_heads} hkv={impl.num_kv_heads} d={impl.head_size} "
+            f"sliding_window={sw} kv={key_cache.dtype}"
+        )
+    elif md.max_query_len > dfa.MAX_QUERY_LEN or md.max_query_len < 1:
+        reason = f"max_query_len={md.max_query_len}"
+    elif getattr(impl, "alibi_slopes", None) is not None or getattr(
+        impl, "logits_soft_cap", None
+    ):
+        reason = "alibi/softcap"
+    elif nreq > _DFLASH_ATTN_MAX_REQS:
+        reason = f"nreq={nreq}"
+    elif b_pad > _DFLASH_WS_REQS:
+        reason = f"B_pad={b_pad}"
+    else:
+        key = (key_cache.device.index, impl.num_kv_heads, sw[0] + 1)
+        if key not in _dflash_ops:
+            reason = "first call during capture"
+    if reason is not None:
+        _dflash_stats["fallbacks"] += 1
+        if _dflash_stats["fallbacks"] <= 3:
+            logger.info(
+                "[dflash_attn] fallback #%d: %s (B_pad=%d nreq=%d max_query_len=%s "
+                "capturing=%s)",
+                _dflash_stats["fallbacks"],
+                reason,
+                b_pad,
+                nreq,
+                getattr(md, "max_query_len", None),
+                torch.cuda.is_current_stream_capturing(),
+            )
+        return False
+    return True
+
+
+def _dflash_run(
+    impl,
+    q,
+    key_cache,
+    value_cache,
+    block_table,
+    seqused_k,
+    cu_seqlens_q,
+    out,
+    causal=True,
+):
+    op = _dflash_get_op(impl, key_cache)
+    op(
+        q,
+        key_cache,
+        value_cache,
+        block_table,
+        seqused_k,
+        cu_seqlens_q,
+        impl.scale,
+        out,
+        num_reqs=int(cu_seqlens_q.shape[0]) - 1,
+        causal=bool(causal),
+    )
+    _dflash_stats["hits"] += 1
+    if _dflash_stats["hits"] == 200:
+        logger.info("[dflash_attn] fast path taken %d times", _dflash_stats["hits"])
 
 
 class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetadata]):
@@ -1086,6 +1233,28 @@ class FlashAttentionImpl(AttentionImpl):
                     )
                     causal = not has_window
 
+                if _dflash_fast_path_ok(
+                    self,
+                    attn_metadata,
+                    key_cache,
+                    causal,
+                    is_dynamic_causal,
+                    mm_mask_mod,
+                    rswa_mask_mod_fn,
+                    cu_seqlens_q,
+                ):
+                    _dflash_run(
+                        self,
+                        query[:num_actual_tokens],
+                        key_cache,
+                        value_cache,
+                        block_table,
+                        seqused_k,
+                        cu_seqlens_q,
+                        output[:num_actual_tokens],
+                        causal=causal,
+                    )
+                    return output
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
