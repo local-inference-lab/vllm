@@ -32,15 +32,18 @@ Environment:
   VLLM_GLM53_L2_PREFETCH_MAX_TOKENS   only prefetch for batches up to this (256)
   VLLM_GLM53_L2_PREFETCH_BUDGET_{A,B,C,A_MLA}_MB   per-window fill budgets
   VLLM_GLM53_L2_PREFETCH_A_NEXT_MB    next-layer head bytes carried in window A
-  VLLM_GLM53_L2_PREFETCH_PERSIST_MB   persisting-L2 set-aside per rank: "max"
-                                      (default, device maximum), megabytes, or 0
+  VLLM_GLM53_L2_PREFETCH_PERSIST_MB   persisting-L2 set-aside per rank: "max",
+                                      megabytes, or 0 (default)
 
 The ``evict_last`` policy only protects lines inside the CUDA persisting-L2
-set-aside, whose default size is 0.  Without a set-aside roughly a third of a
-prefetched 50 MB projection is evicted by the routed-expert stream before
-cuBLAS reads it (in_proj 17.3 us instead of 11 us fully hot), so the prefetcher
-sizes the set-aside once per device through ``cuCtxSetLimit``.  This is a
-cache-residency policy only; kernels and numerics are unchanged.
+set-aside, whose default size is 0. A nonzero
+``VLLM_GLM53_L2_PREFETCH_PERSIST_MB`` value sizes that process-wide set-aside
+once per device through ``cuCtxSetLimit``. The default leaves the driver limit
+unchanged because reserving the SM120 maximum (84 MB) reduced a 32k GLM-5.3
+prefill from 14,439 to 13,963 tok/s and C12 DFlash verifier throughput from
+350.60 to 339.38 steps/s; it improved C1 verifier throughput from 86.63 to
+88.54 steps/s. This is a cache-residency policy only; kernels and numerics are
+unchanged.
 """
 
 from __future__ import annotations
@@ -93,7 +96,7 @@ A_NEXT_BYTES = _mb("VLLM_GLM53_L2_PREFETCH_A_NEXT_MB", "0")
 # Persisting-L2 set-aside request: "max" = device maximum (84 MB of the 128 MB
 # L2 on RTX PRO 6000 Blackwell), a number = megabytes clamped to that maximum,
 # 0/"off" = leave the driver default (no set-aside).
-PERSIST_L2 = os.getenv("VLLM_GLM53_L2_PREFETCH_PERSIST_MB", "max")
+PERSIST_L2 = os.getenv("VLLM_GLM53_L2_PREFETCH_PERSIST_MB", "0")
 
 Segment = tuple[str, int, int]  # (name, ptr, bytes)
 

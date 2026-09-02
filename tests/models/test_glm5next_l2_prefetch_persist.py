@@ -32,8 +32,8 @@ def test_persisting_l2_request(raw, max_bytes, expected):
     assert l2pf.persisting_l2_request(raw, max_bytes) == expected
 
 
-def test_default_request_is_device_maximum():
-    assert l2pf.PERSIST_L2 == "max"
+def test_default_request_leaves_the_driver_limit_unchanged():
+    assert l2pf.PERSIST_L2 == "0"
 
 
 def test_invalid_numeric_environment_values_use_defaults(monkeypatch):
