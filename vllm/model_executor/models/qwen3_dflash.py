@@ -203,7 +203,11 @@ def _qkv_weight_out_major(qkv_proj: nn.Module) -> torch.Tensor:
     scale = getattr(qkv_proj, "weight_scale", None)
     if scale is None:
         raise RuntimeError("fp8 qkv_proj has no weight_scale to dequantize with")
-    dtype = qkv_proj.params_dtype if hasattr(qkv_proj, "params_dtype") else torch.bfloat16
+    dtype = (
+        qkv_proj.params_dtype
+        if hasattr(qkv_proj, "params_dtype")
+        else torch.bfloat16
+    )
     if scale.dim() == 2 and scale.shape[0] == weight.shape[1]:
         # Transposed [in, out] fp8 with [out, 1] scales.
         return (weight.to(dtype) * scale.to(dtype).t()).t().contiguous()
