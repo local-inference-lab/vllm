@@ -35,6 +35,14 @@ def test_tail_length_reuses_aligned_specialization() -> None:
     _, _, _, _, binder = kernel.create_binder()
 
     def bind(length: int):
+        """Specialization key of the gated-norm kernel for ``length`` rows.
+
+        Args:
+            length: the row count (token count) of the launch.
+
+        Returns:
+            The specialization key; the other launch arguments are fixed.
+        """
         return binder(
             x,
             x,

@@ -15,6 +15,17 @@ from vllm.third_party.flash_linear_attention.ops.l2norm import (
 
 
 def _specialization(kernel, *args):
+    """Resolve the Triton specialization key a kernel would compile for.
+
+    Args:
+        kernel: the Triton JIT function whose binder is created.
+        *args: the launch arguments, in the kernel's signature order, that
+            determine the specialization (tensors, scalars, constexprs).
+
+    Returns:
+        The specialization key the binder derives from ``args``; two launches
+        share a compiled kernel exactly when their keys are equal.
+    """
     _, _, _, _, binder = kernel.create_binder()
     return binder(*args)[1]
 
@@ -39,6 +50,14 @@ def test_kda_gated_norm_tail_length_reuses_aligned_specialization() -> None:
     kernel = cast(Any, layer_norm_gated_fwd_kernel).fn
 
     def bind(length: int):
+        """Specialization key of the gated-norm kernel for ``length`` rows.
+
+        Args:
+            length: the row count (token count) of the launch.
+
+        Returns:
+            The specialization key; the other launch arguments are fixed.
+        """
         return _specialization(
             kernel,
             x,
