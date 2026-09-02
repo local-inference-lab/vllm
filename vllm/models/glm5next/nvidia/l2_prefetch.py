@@ -31,6 +31,15 @@ Environment:
   VLLM_GLM53_L2_PREFETCH_MAX_TOKENS   only prefetch for batches up to this (256)
   VLLM_GLM53_L2_PREFETCH_BUDGET_{A,B,C,A_MLA}_MB   per-window fill budgets
   VLLM_GLM53_L2_PREFETCH_A_NEXT_MB    next-layer head bytes carried in window A
+  VLLM_GLM53_L2_PREFETCH_PERSIST_MB   persisting-L2 set-aside per rank: "max"
+                                      (default, device maximum), megabytes, or 0
+
+The ``evict_last`` policy only protects lines inside the CUDA persisting-L2
+set-aside, whose default size is 0.  Without a set-aside roughly a third of a
+prefetched 50 MB projection is evicted by the routed-expert stream before
+cuBLAS reads it (in_proj 17.3 us instead of 11 us fully hot), so the prefetcher
+sizes the set-aside once per device through ``cuCtxSetLimit``.  This is a
+cache-residency policy only; kernels and numerics are unchanged.
 """
 
 from __future__ import annotations
@@ -62,6 +71,10 @@ BUDGET_C = _mb("VLLM_GLM53_L2_PREFETCH_BUDGET_C_MB", "15")
 BUDGET_A_MLA = _mb("VLLM_GLM53_L2_PREFETCH_BUDGET_A_MLA_MB", "36")
 # Measured neutral-to-negative on C1 (fills overlap the KDA core); off by default.
 A_NEXT_BYTES = _mb("VLLM_GLM53_L2_PREFETCH_A_NEXT_MB", "0")
+# Persisting-L2 set-aside request: "max" = device maximum (84 MB of the 128 MB
+# L2 on RTX PRO 6000 Blackwell), a number = megabytes clamped to that maximum,
+# 0/"off" = leave the driver default (no set-aside).
+PERSIST_L2 = os.getenv("VLLM_GLM53_L2_PREFETCH_PERSIST_MB", "max")
 
 Segment = tuple[str, int, int]  # (name, ptr, bytes)
 
@@ -292,6 +305,105 @@ def make_plan(segments: list[Segment], budget: int, device: torch.device) -> tup
 
 
 # ---------------------------------------------------------------------------
+# Persisting-L2 set-aside
+# ---------------------------------------------------------------------------
+
+
+def persisting_l2_request(raw: str | None, max_bytes: int) -> int:
+    """Bytes of persisting-L2 set-aside to request for the env value ``raw``.
+
+    ``max`` maps to ``max_bytes`` (the device attribute), a number is
+    megabytes clamped to ``[0, max_bytes]``, and empty/0/off/invalid values
+    map to 0 (do not touch the driver default).
+    """
+    if raw is None or max_bytes <= 0:
+        return 0
+    value = raw.strip().lower()
+    if value in ("", "0", "off", "none", "false"):
+        return 0
+    if value in ("max", "all"):
+        return int(max_bytes)
+    try:
+        want = int(float(value) * 1e6)
+    except ValueError:
+        logger.warning(
+            "[l2_prefetch] ignoring VLLM_GLM53_L2_PREFETCH_PERSIST_MB=%r "
+            "(expected megabytes, max or 0)",
+            raw,
+        )
+        return 0
+    return max(0, min(want, int(max_bytes)))
+
+
+_persisting_l2_applied: dict[int, int] = {}
+
+
+def configure_persisting_l2(device: torch.device, request: str | None = None) -> int:
+    """Size the persisting-L2 set-aside of ``device``'s primary context.
+
+    Returns the set-aside in bytes read back from the driver, or 0 when the
+    request is 0, the device has no persisting L2, or the driver call failed
+    (logged, never raised).  The env-driven call (``request=None``) is applied
+    once per device; an explicit ``request`` is always applied.
+    """
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    if request is None and idx in _persisting_l2_applied:
+        return _persisting_l2_applied[idx]
+    raw = PERSIST_L2 if request is None else request
+    applied = 0
+    try:
+        from cuda.bindings import driver as cu
+
+        def check(result, what: str):
+            if result[0] != cu.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"{what} failed: {result[0]}")
+            return result[1] if len(result) > 1 else None
+
+        dev = check(cu.cuDeviceGet(idx), "cuDeviceGet")
+        attr = cu.CUdevice_attribute
+        l2_bytes = check(
+            cu.cuDeviceGetAttribute(attr.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, dev),
+            "cuDeviceGetAttribute(L2_CACHE_SIZE)",
+        )
+        max_bytes = check(
+            cu.cuDeviceGetAttribute(
+                attr.CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE, dev
+            ),
+            "cuDeviceGetAttribute(MAX_PERSISTING_L2_CACHE_SIZE)",
+        )
+        want = persisting_l2_request(raw, max_bytes)
+        if want > 0:
+            # Operate on the primary context torch uses for this device;
+            # push/pop keeps the calling thread's current context unchanged.
+            limit = cu.CUlimit.CU_LIMIT_PERSISTING_L2_CACHE_SIZE
+            ctx = check(cu.cuDevicePrimaryCtxRetain(dev), "cuDevicePrimaryCtxRetain")
+            check(cu.cuCtxPushCurrent(ctx), "cuCtxPushCurrent")
+            try:
+                check(cu.cuCtxSetLimit(limit, want), "cuCtxSetLimit")
+                applied = int(check(cu.cuCtxGetLimit(limit), "cuCtxGetLimit"))
+            finally:
+                cu.cuCtxPopCurrent()
+                cu.cuDevicePrimaryCtxRelease(dev)
+        logger.info(
+            "[l2_prefetch] persisting L2 set-aside on cuda:%d: L2 %.0f MB, "
+            "max %.0f MB, requested %.0f MB, now %.0f MB",
+            idx,
+            l2_bytes / 1e6,
+            max_bytes / 1e6,
+            want / 1e6,
+            applied / 1e6,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[l2_prefetch] persisting L2 set-aside not applied on cuda:%d: %s", idx, exc
+        )
+        applied = 0
+    if request is None:
+        _persisting_l2_applied[idx] = applied
+    return applied
+
+
+# ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
 
@@ -325,6 +437,9 @@ class L2Prefetcher:
         self.device = device
         self.side = torch.cuda.Stream(device=device)
         self.pending = False
+        # Before the first prefetch (and therefore before any graph capture):
+        # a context limit, not a captured operation.
+        self.persisting_l2_bytes = configure_persisting_l2(device)
 
     @classmethod
     def get(cls, device: torch.device | None = None) -> "L2Prefetcher":
@@ -368,5 +483,7 @@ def join_all() -> None:
 
 __all__ = [
     "ENABLED", "BUDGET_A", "BUDGET_B", "BUDGET_C", "BUDGET_A_MLA", "A_NEXT_BYTES",
-    "L2PrefetchPlan", "L2Prefetcher", "segments_of", "take_budget", "make_plan", "issue", "join_all",
+    "PERSIST_L2", "L2PrefetchPlan", "L2Prefetcher", "segments_of", "take_budget",
+    "make_plan", "issue", "join_all", "persisting_l2_request",
+    "configure_persisting_l2",
 ]
