@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import torch
 from torch import nn
 
+from vllm.models.deepseek_v32 import attention as deepseek_v32_attention
 from vllm.models.deepseek_v32.nvidia import model as deepseek_v32_model
 from vllm.models.deepseek_v32.nvidia import mtp as deepseek_v32_mtp
 
@@ -80,6 +81,26 @@ def _mock_sequence_parallel_collectives(monkeypatch, module):
         "sp_all_gather",
         lambda tensor: torch.cat([tensor, tensor], dim=0),
     )
+
+
+def test_sparse_mla_dcp_gathers_query_without_pcp():
+    q_nope = torch.arange(8, dtype=torch.float32).view(1, 2, 4)
+    q_pe = torch.arange(4, dtype=torch.float32).view(1, 2, 2)
+    query_gather = Mock(side_effect=lambda query: torch.cat([query, query], dim=1))
+    dcp_manager = SimpleNamespace(query_gather=query_gather)
+
+    gathered = deepseek_v32_attention._gather_mqa_query_for_dcp(
+        (q_nope, q_pe),
+        use_pcp=False,
+        dcp_world_size=2,
+        pcp_world_size=1,
+        dcp_manager=dcp_manager,
+    )
+
+    local_query = torch.cat((q_nope, q_pe), dim=-1)
+    torch.testing.assert_close(gathered, torch.cat((local_query, local_query), dim=1))
+    assert query_gather.call_count == 1
+    torch.testing.assert_close(query_gather.call_args.args[0], local_query)
 
 
 def test_decoder_layer_keeps_dense_states_sequence_sharded(monkeypatch):

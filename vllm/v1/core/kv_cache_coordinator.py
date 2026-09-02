@@ -987,6 +987,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle,
                 alignment_tokens=self._cache_hit_alignment_tokens,
+                dcp_world_size=(
+                    self.dcp_world_size if isinstance(spec, FullAttentionSpec) else 1
+                ),
             )
             for gid, blks in zip(group_ids, blocks):
                 hit_blocks[gid] = blks

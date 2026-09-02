@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
@@ -43,6 +43,27 @@ from vllm.v1.attention.ops.pcp import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
+
+
+def _gather_mqa_query_for_dcp(
+    mqa_q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    *,
+    use_pcp: bool,
+    dcp_world_size: int,
+    pcp_world_size: int,
+    dcp_manager: Any,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if dcp_world_size <= 1:
+        return mqa_q
+    if isinstance(mqa_q, tuple):
+        mqa_q = torch.cat(mqa_q, dim=-1)
+    if use_pcp:
+        if dcp_world_size > pcp_world_size:
+            return get_tp_group().all_gather(mqa_q, dim=1)
+        return mqa_q
+    assert dcp_manager is not None
+    assert dcp_manager.query_gather is not None
+    return dcp_manager.query_gather(mqa_q)
 
 
 class DeepseekV32Indexer(nn.Module):
@@ -567,18 +588,13 @@ class DeepseekV32Attention(MLAAttention):
         else:
             mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
 
-        if self.impl.dcp_world_size > 1:
-            assert self.dcp_manager is not None
-            if self.use_pcp:
-                if self.impl.dcp_world_size > self.impl.pcp_world_size:
-                    if isinstance(mqa_q_arg, tuple):
-                        mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
-                    mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
-            else:
-                if isinstance(mqa_q_arg, tuple):
-                    mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
-                assert self.dcp_manager.query_gather is not None
-                mqa_q_arg = self.dcp_manager.query_gather(mqa_q_arg)
+        mqa_q_arg = _gather_mqa_query_for_dcp(
+            mqa_q_arg,
+            use_pcp=self.use_pcp,
+            dcp_world_size=self.impl.dcp_world_size,
+            pcp_world_size=self.impl.pcp_world_size,
+            dcp_manager=self.dcp_manager,
+        )
         attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
             mqa_q_arg, kv_cache, attn_metadata, self
         )

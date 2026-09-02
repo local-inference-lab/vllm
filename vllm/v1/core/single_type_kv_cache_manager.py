@@ -558,7 +558,7 @@ class SingleTypeKVCacheManager(ABC):
         block_mask = self.reachable_block_mask(
             start_block=scan_start_block,
             end_block=num_full_blocks,
-            alignment_tokens=self.scheduler_block_size,
+            alignment_tokens=self.prefix_cache_alignment_tokens,
             kv_cache_spec=self.kv_cache_spec,
             use_eagle=retention_use_eagle,
             retention_interval=retention_interval,
