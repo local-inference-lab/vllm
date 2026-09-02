@@ -128,11 +128,13 @@ def _kernel_query_heads(local_heads: int, dcp_size: int = 1) -> int:
 def _active_dense_mla_splits(plan: Any, max_seq_len: int | None) -> int:
     """Return the number of splits to launch for the longest live sequence.
 
-    The dense MLA kernel shares each request's live 64-token chunks evenly
-    across the launched splits, so a sequence needs at most one split per
-    chunk: launching min(num_splits, live chunks) splits partitions the
-    chunks exactly as the full-plan (CUDA-graph) launch does, whose extra
-    splits are empty.
+    A sequence whose live 64-token chunks fit the plan's single-split
+    threshold is scanned by one split, which then writes the output directly.
+    Above it the kernel shares each request's chunks evenly across the
+    launched splits, so a sequence needs at most one split per chunk:
+    launching min(num_splits, live chunks) splits partitions the chunks
+    exactly as the full-plan (CUDA-graph) launch does, whose extra splits
+    are empty.
     """
     num_splits = int(getattr(plan, "num_splits", 1))
     if num_splits <= 0:
@@ -142,6 +144,8 @@ def _active_dense_mla_splits(plan: Any, max_seq_len: int | None) -> int:
     if max_seq_len is None:
         return num_splits
     valid_chunks = max(1, (max(0, int(max_seq_len)) + 63) // 64)
+    if valid_chunks <= int(getattr(plan, "single_split_chunks", 0)):
+        return 1
     return min(num_splits, valid_chunks)
 
 
@@ -261,8 +265,27 @@ def _create_dense_mla_plan(
         sparse_sink_chunks=sparse_sink_chunks,
         sparse_recent_chunks=sparse_recent_chunks,
         sparse_refresh_interval=sparse_refresh_interval,
+        **_dense_mla_split_precision_caps(),
     )
     return dense_mla.plan(caps)
+
+
+def _dense_mla_split_precision_caps() -> dict[str, Any]:
+    """Return the split-partial element type and single-split threshold."""
+    dtype_name = str(envs.VLLM_K3_DENSE_MLA_PARTIAL_DTYPE)
+    partial_dtypes = {"bf16": torch.bfloat16, "fp32": torch.float32}
+    if dtype_name not in partial_dtypes:
+        raise ValueError(
+            "VLLM_K3_DENSE_MLA_PARTIAL_DTYPE must be 'bf16' or 'fp32', got "
+            f"{dtype_name!r}."
+        )
+    single_split_chunks = int(envs.VLLM_K3_DENSE_MLA_SINGLE_SPLIT_CHUNKS)
+    return {
+        "partial_dtype": partial_dtypes[dtype_name],
+        "single_split_chunks": (
+            None if single_split_chunks < 0 else single_split_chunks
+        ),
+    }
 
 
 @dataclass

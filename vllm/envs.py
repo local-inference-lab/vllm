@@ -242,6 +242,8 @@ if TYPE_CHECKING:
     VLLM_K3_DYNAMIC_SPARSE_SINK_TOKENS: int = 4096
     VLLM_K3_DYNAMIC_SPARSE_RECENT_TOKENS: int = 32768
     VLLM_K3_DYNAMIC_SPARSE_REFRESH_INTERVAL: int = 128
+    VLLM_K3_DENSE_MLA_PARTIAL_DTYPE: str = "bf16"
+    VLLM_K3_DENSE_MLA_SINGLE_SPLIT_CHUNKS: int = -1
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
@@ -1832,6 +1834,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_K3_DYNAMIC_SPARSE_REFRESH_INTERVAL": lambda: int(
         os.getenv("VLLM_K3_DYNAMIC_SPARSE_REFRESH_INTERVAL", "128")
+    ),
+    # Element type of the Kimi-K3 dense-MLA split partials ("bf16" or
+    # "fp32"). bf16 rounds every multi-split result twice; fp32 keeps the
+    # partials exact so a merged result is rounded once, at the output.
+    "VLLM_K3_DENSE_MLA_PARTIAL_DTYPE": lambda: os.getenv(
+        "VLLM_K3_DENSE_MLA_PARTIAL_DTYPE", "bf16"
+    ).lower(),
+    # Largest live 64-token chunk count of a request that one dense-MLA split
+    # scans alone (the fixed-range association); longer requests spread
+    # their chunks over the launched splits. -1 = the plan's chunks per
+    # split, 0 = balance every request.
+    "VLLM_K3_DENSE_MLA_SINGLE_SPLIT_CHUNKS": lambda: int(
+        os.getenv("VLLM_K3_DENSE_MLA_SINGLE_SPLIT_CHUNKS", "-1")
     ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no

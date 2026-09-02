@@ -63,6 +63,38 @@ def test_b12x_mla_launches_one_split_per_live_chunk(
     assert b12x_mla._active_dense_mla_splits(plan, max_seq_len) == expected
 
 
+@pytest.mark.parametrize(
+    ("max_seq_len", "expected"),
+    ((None, 8), (0, 1), (64, 1), (65, 1), (256, 1), (257, 5), (4096, 8)),
+)
+def test_b12x_mla_launches_one_split_within_the_single_split_threshold(
+    max_seq_len: int | None, expected: int
+) -> None:
+    """Requests whose live chunks fit the plan's single-split threshold are
+    scanned by one split (a direct write, no merge); longer requests launch
+    one split per live chunk."""
+    plan = SimpleNamespace(num_splits=8, chunks_per_split=4, single_split_chunks=4)
+    assert b12x_mla._active_dense_mla_splits(plan, max_seq_len) == expected
+
+
+def test_b12x_mla_split_precision_caps_follow_env(monkeypatch) -> None:
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_DENSE_MLA_PARTIAL_DTYPE", "bf16")
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_DENSE_MLA_SINGLE_SPLIT_CHUNKS", -1)
+    assert b12x_mla._dense_mla_split_precision_caps() == {
+        "partial_dtype": torch.bfloat16,
+        "single_split_chunks": None,
+    }
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_DENSE_MLA_PARTIAL_DTYPE", "fp32")
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_DENSE_MLA_SINGLE_SPLIT_CHUNKS", 0)
+    assert b12x_mla._dense_mla_split_precision_caps() == {
+        "partial_dtype": torch.float32,
+        "single_split_chunks": 0,
+    }
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_DENSE_MLA_PARTIAL_DTYPE", "fp16")
+    with pytest.raises(ValueError, match="VLLM_K3_DENSE_MLA_PARTIAL_DTYPE"):
+        b12x_mla._dense_mla_split_precision_caps()
+
+
 def test_b12x_mla_row_caps_cover_full_graph_shapes() -> None:
     assert b12x_mla._dense_mla_plan_row_caps(28) == (1, 2, 4, 8, 16, 28)
 
