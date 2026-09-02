@@ -225,6 +225,9 @@ if TYPE_CHECKING:
     VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
     VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x"] = "b12x"
     VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
+    VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
+    VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
+    VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
     VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
     VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
     VLLM_PCIE_DMA_FP8: str | None = None
@@ -1902,6 +1905,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_PCIE_ALLREDUCE_BACKEND", "b12x", ["b12x"]
     ),
     # Maximum input sizes dispatched to the low-latency one-shot kernels.
+    # Enable the b12x one-shot RoCE all-reduce for multi-node TP (DGX Spark).
+    "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
+    ),
+    "VLLM_ROCE_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLREDUCE_MAX_SIZE", "2MB"
+    ),
+    # Largest per-rank shard routed to the RoCE all-gather
+    # (e.g. logits [rows, vocab/tp]).
+    "VLLM_ROCE_ALLGATHER_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLGATHER_MAX_SIZE", "16MB"
+    ),
     "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
         "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "84KB"
     ),
