@@ -118,18 +118,34 @@ def test_flash_attn_prefill_backend_signature_accepts_fused_kwargs():
 
 
 def test_sm120_fa4_prefill_is_opt_in_and_shape_scoped(monkeypatch):
+    fa_interface = "vllm.vllm_flash_attn.flash_attn_interface"
     with patch(f"{_FA_MODULE}.current_platform") as plat:
         plat.is_device_capability_family.return_value = True
         monkeypatch.setenv("VLLM_MLA_SM120_FA4_PREFILL", "0")
         assert not _use_sm120_fa4_prefill(192, 128)
 
         monkeypatch.setenv("VLLM_MLA_SM120_FA4_PREFILL", "1")
-        assert _use_sm120_fa4_prefill(192, 128)
+        with patch(f"{fa_interface}.FA4_AVAILABLE", True):
+            assert _use_sm120_fa4_prefill(192, 128)
         assert not _use_sm120_fa4_prefill(256, 128)
         assert not _use_sm120_fa4_prefill(192, 192)
 
         plat.is_device_capability_family.return_value = False
         assert not _use_sm120_fa4_prefill(192, 128)
+
+
+def test_sm120_fa4_prefill_refuses_a_missing_fa4_interface(monkeypatch):
+    """The opt-in fails instead of silently running another FA version."""
+    fa_interface = "vllm.vllm_flash_attn.flash_attn_interface"
+    monkeypatch.setenv("VLLM_MLA_SM120_FA4_PREFILL", "1")
+    with (
+        patch(f"{_FA_MODULE}.current_platform") as plat,
+        patch(f"{fa_interface}.FA4_AVAILABLE", False),
+        patch(f"{fa_interface}.FA4_UNAVAILABLE_REASON", "cute missing"),
+    ):
+        plat.is_device_capability_family.return_value = True
+        with pytest.raises(RuntimeError, match="cute missing"):
+            _use_sm120_fa4_prefill(192, 128)
 
 
 def test_sm120_fa4_prefill_forces_one_split_without_padding():
