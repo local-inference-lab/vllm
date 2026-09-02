@@ -527,6 +527,7 @@ class Worker(WorkerBase):
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             self.model_runner.profile_run()
+            self.model_runner.profile_glm_dcp_attention()
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -556,13 +557,23 @@ class Worker(WorkerBase):
             else 0
         )
 
-        self.total_consumed = profile_result.total_consumed
+        # Backend and CUDA-graph profiling can initialize communication pools,
+        # compiled modules, and other persistent device allocations after the
+        # main activation profile. Include their retained footprint before the
+        # remaining memory is assigned to production KV cache storage.
+        final_profile_snapshot = MemorySnapshot(device=self.device)
+        late_persistent_memory = max(
+            profile_result.after_profile.free_memory
+            - final_profile_snapshot.free_memory,
+            0,
+        )
+        self.total_consumed = profile_result.total_consumed + late_persistent_memory
         self.peak_activation_memory = (
             profile_result.transient_peak_headroom + cudagraph_memory_estimate_applied
         )
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
-        free_gpu_memory = profile_result.after_profile.free_memory
+        free_gpu_memory = final_profile_snapshot.free_memory
         # NOTE(woosuk): Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.
         assert self.init_snapshot.free_memory >= free_gpu_memory, (
@@ -577,6 +588,7 @@ class Worker(WorkerBase):
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
+            - late_persistent_memory
             - cudagraph_memory_estimate_applied
         )
 
