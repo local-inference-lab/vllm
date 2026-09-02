@@ -465,6 +465,19 @@ def get_direct_dcp_q_gather_workspace(
     )
 
 
+def kv_gather_slots() -> int:
+    """Number of symmetric KV-gather slots per ubatch.
+
+    A slot holds one gathered context window. The serial chunked-context loop
+    alternates two; the Kimi-K3 pipelined loop publishes one window while the
+    previous one is consumed and needs three (``VLLM_DCP_KV_GATHER_SLOTS``).
+    """
+    slots = int(envs.VLLM_DCP_KV_GATHER_SLOTS)
+    if slots < 2:
+        raise ValueError(f"VLLM_DCP_KV_GATHER_SLOTS must be at least 2, got {slots}")
+    return slots
+
+
 _KV_GATHER_SUPPORTED_DTYPES = (
     torch.float16,
     torch.bfloat16,
@@ -492,10 +505,12 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
 
     Storage is owned by ``(DBO ubatch, buffer slot)``. Different ubatches have
     disjoint buffers and may run independently. Within one ubatch, publishing
-    and consumption must remain stream ordered. Before reusing the same slot,
-    every rank must have consumed it and reached either a gather on the other
-    slot or another all-rank rendezvous. Concurrent same-ubatch use from
-    multiple streams is not supported.
+    and consumption must remain stream ordered. Before reusing a slot, every
+    rank must have consumed it and reached either a gather on another slot or
+    another all-rank rendezvous: with S slots a gather into slot s may be
+    issued once the rank has consumed the window S-2 gathers back and the
+    gather before it has completed. Concurrent same-ubatch gathers from
+    multiple streams are not supported.
     """
 
     def __init__(
@@ -536,8 +551,10 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
         self.token_dim = token_dim
         self.plane_split_dim = plane_split_dim
 
-        kv_shape = (num_ubatches, 2, max_gathered_tokens, token_dim)
-        signal_shape = (num_ubatches, 2, self.world_size)
+        num_slots = kv_gather_slots()
+        self.num_slots = num_slots
+        kv_shape = (num_ubatches, num_slots, max_gathered_tokens, token_dim)
+        signal_shape = (num_ubatches, num_slots, self.world_size)
         self.received_kv, self.peer_kv_ptrs = self._allocate(kv_shape, dtype)
         self.received_signal, self.peer_signal_ptrs = self._allocate(
             signal_shape, torch.int32
@@ -550,7 +567,7 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
         self.uses_multicast = all(
             kv_ptr and signal_ptr for kv_ptr, signal_ptr in self.multicast_ptrs
         )
-        self.completion = self.received_signal.new_zeros((num_ubatches, 2))
+        self.completion = self.received_signal.new_zeros((num_ubatches, num_slots))
         torch.accelerator.synchronize()
 
     def gather(
@@ -597,6 +614,104 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
             self.max_gathered_tokens, 1, token_dim - plane_split_dim
         )
         return kv_c[:output_tokens], k_pe[:output_tokens]
+
+
+class DCPKVGatherPipeline:
+    """Publish gathered context windows on a side stream, one window ahead of
+    their consumption on the compute stream.
+
+    Windows are numbered globally across chunks, layers and forwards; window w
+    is published into slot ``w % S`` of the direct DCP KV-gather workspace
+    (S slots). Before the side stream publishes window w it waits for the
+    compute stream's release of window ``w - (S - 1)``, and by stream order
+    for the publication of window ``w - 1``. Releases are recorded in window
+    order, so the release of ``w - (S - 1)`` also covers ``w - S``, the
+    slot's previous occupant, on this rank.
+
+    Peers are covered by the rendezvous inside every gather: a rank's
+    publication of window w starts only after its gather of ``w - 1``
+    completed, which requires every rank to have published ``w - 1``, and a
+    rank publishes ``w - 1`` only after releasing ``w - 1 - (S - 1) = w - S``.
+    No rank can therefore overwrite a peer's slot before the peer released
+    it. With S = 3 the gather of window w runs while windows ``w - 2`` and
+    ``w - 1`` are still being projected and attended.
+
+    The side stream never allocates: the gather kernels read the chunk
+    metadata and the paged cache and write persistent workspaces, and the
+    published planes are views of the symmetric buffer.
+    """
+
+    MIN_SLOTS = 3
+
+    def __init__(self, device: torch.device, num_slots: int) -> None:
+        if num_slots < self.MIN_SLOTS:
+            raise ValueError(
+                "The DCP KV-gather pipeline needs at least "
+                f"{self.MIN_SLOTS} gather slots, got {num_slots} "
+                "(VLLM_DCP_KV_GATHER_SLOTS)."
+            )
+        self.stream = torch.cuda.Stream(device=device)
+        self.num_slots = num_slots
+        self.window = 0
+        self._published = [torch.cuda.Event() for _ in range(num_slots)]
+        self._released = [torch.cuda.Event() for _ in range(num_slots)]
+
+    def begin(self) -> None:
+        """Order the side stream after the compute stream's work so far: the
+        chunk metadata, the paged-cache writes and the workspace reads of the
+        previous layer."""
+        self.stream.wait_stream(torch.cuda.current_stream())
+
+    def publish(self, gather) -> tuple[int, tuple[torch.Tensor, torch.Tensor]]:
+        """Run ``gather(slot)`` on the side stream once window
+        ``w - (S - 1)`` has been released; return the slot and the result."""
+        window = self.window
+        self.window = window + 1
+        slot = window % self.num_slots
+        # Window w - (S - 1) occupies slot (w + 1) % S; its release is the
+        # latest record on that slot's event when this window is published
+        # (the compute stream releases window w - 1 only afterwards).
+        guard = (slot + 1) % self.num_slots
+        with torch.cuda.stream(self.stream):
+            self.stream.wait_event(self._released[guard])
+            result = gather(slot)
+            self._published[slot].record(self.stream)
+        return slot, result
+
+    def acquire(self, slot: int) -> None:
+        """Make the compute stream wait for the slot's published window."""
+        torch.cuda.current_stream().wait_event(self._published[slot])
+
+    def release(self, slot: int) -> None:
+        """Record that the compute stream has finished reading the slot."""
+        self._released[slot].record(torch.cuda.current_stream())
+
+
+_kv_gather_pipelines: dict[tuple[torch.device, int], DCPKVGatherPipeline] = {}
+
+
+def get_dcp_kv_gather_pipeline(
+    device: torch.device, num_slots: int
+) -> DCPKVGatherPipeline:
+    """One pipeline per device and DBO ubatch: the layers of a ubatch share
+    its gather buffers, so they share the window counter and the slot
+    events."""
+    key = (device, dbo_current_ubatch_id())
+    pipeline = _kv_gather_pipelines.get(key)
+    if pipeline is None:
+        pipeline = DCPKVGatherPipeline(device, num_slots)
+        _kv_gather_pipelines[key] = pipeline
+        logger.info_once(
+            "Direct DCP KV gather: publishing context windows one ahead on a "
+            "side stream (%d slots).",
+            num_slots,
+        )
+    elif pipeline.num_slots != num_slots:
+        raise RuntimeError(
+            "DCP KV-gather slot count changed between layers: "
+            f"{pipeline.num_slots} vs {num_slots}"
+        )
+    return pipeline
 
 
 @functools.cache
@@ -704,6 +819,12 @@ class MLADCPKVGather:
     @property
     def use_direct_kv_gather(self) -> bool:
         return self._direct_kv_gather_workspace is not None
+
+    @property
+    def kv_gather_slots(self) -> int:
+        """Symmetric slots per ubatch of the direct publisher (0 without it)."""
+        workspace = self._direct_kv_gather_workspace
+        return 0 if workspace is None else workspace.num_slots
 
     def kv_gather(
         self,

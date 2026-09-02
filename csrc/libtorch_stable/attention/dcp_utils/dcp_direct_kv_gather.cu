@@ -221,8 +221,6 @@ void direct_dcp_kv_gather(const torch::stable::Tensor& local_kv,
       "signal peer pointer table must be CUDA int64 [world_size]");
   STD_TORCH_CHECK(world_size > 1, "world_size must be greater than 1");
   STD_TORCH_CHECK(rank >= 0 && rank < world_size, "invalid rank");
-  STD_TORCH_CHECK(buffer_slot == 0 || buffer_slot == 1,
-                  "final-layout buffer slot must be 0 or 1");
   STD_TORCH_CHECK(output_tokens > 0 && output_tokens <= max_gathered_tokens,
                   "final-layout output exceeds symmetric buffer capacity");
 
@@ -236,22 +234,28 @@ void direct_dcp_kv_gather(const torch::stable::Tensor& local_kv,
   STD_TORCH_CHECK(num_tokens * world_size <= max_gathered_tokens,
                   "padded gathered kv exceeds symmetric buffer capacity");
 
+  // The symmetric buffer holds num_slots independent [T, D] slots; the
+  // caller rotates through them so a gather can publish into one slot while
+  // consumers still read another.
   STD_TORCH_CHECK(received_kv.is_cuda() && received_kv.scalar_type() == dtype &&
                       received_kv.is_contiguous() && received_kv.dim() == 3 &&
-                      received_kv.size(0) == 2 &&
+                      received_kv.size(0) >= 2 &&
                       received_kv.size(1) == max_gathered_tokens &&
                       received_kv.size(2) == token_dim,
                   "received kv has the wrong symmetric buffer layout");
+  int64_t num_slots = received_kv.size(0);
+  STD_TORCH_CHECK(buffer_slot >= 0 && buffer_slot < num_slots,
+                  "final-layout buffer slot is out of range");
   STD_TORCH_CHECK(
       received_signal.is_cuda() && received_signal.is_contiguous() &&
           received_signal.scalar_type() == ScalarType::Int &&
-          received_signal.dim() == 2 && received_signal.size(0) == 2 &&
+          received_signal.dim() == 2 && received_signal.size(0) == num_slots &&
           received_signal.size(1) == world_size,
       "received signal has the wrong symmetric buffer layout");
   STD_TORCH_CHECK(completion.is_cuda() && completion.is_contiguous() &&
                       completion.scalar_type() == ScalarType::Int &&
-                      completion.numel() == 2,
-                  "completion counter must be a two-element CUDA int32 tensor");
+                      completion.numel() == num_slots,
+                  "completion counter must hold one CUDA int32 per slot");
   STD_TORCH_CHECK(epoch.is_cuda() && epoch.is_contiguous() &&
                       epoch.scalar_type() == ScalarType::Long &&
                       epoch.numel() == 1,

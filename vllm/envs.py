@@ -247,6 +247,8 @@ if TYPE_CHECKING:
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
+    VLLM_DCP_KV_GATHER_SLOTS: int = 3
+    VLLM_K3_DCP_GATHER_PIPELINE: bool = True
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -2472,6 +2474,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_USE_DIRECT_DCP_KV_GATHER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_DIRECT_DCP_KV_GATHER")
+    ),
+    # Symmetric slots per ubatch in the direct DCP KV gather workspace. Each
+    # slot holds one gathered context window; the Kimi-K3 chunked-context
+    # pipeline needs three, the serial loop two.
+    "VLLM_DCP_KV_GATHER_SLOTS": lambda: int(os.getenv("VLLM_DCP_KV_GATHER_SLOTS", "3")),
+    # Publish the next Kimi-K3 chunked-context window on a side stream while
+    # the current one is projected and attended (needs three gather slots).
+    "VLLM_K3_DCP_GATHER_PIPELINE": lambda: bool(
+        int(os.getenv("VLLM_K3_DCP_GATHER_PIPELINE", "1"))
     ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to

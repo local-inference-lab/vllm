@@ -105,7 +105,11 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
-from vllm.v1.attention.ops.dcp_utils import MLADCPManager
+from vllm.v1.attention.ops.dcp_utils import (
+    DCPKVGatherPipeline,
+    MLADCPManager,
+    get_dcp_kv_gather_pipeline,
+)
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
@@ -1219,12 +1223,13 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             )
             return projection
 
-        def run_chunk(
-            chunk, out: torch.Tensor | None = None
+        def attend_chunk(
+            chunk,
+            kv_c_normed: torch.Tensor,
+            k_pe: torch.Tensor,
+            out: torch.Tensor | None,
+            release=None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            kv_c_normed, k_pe = self._gather_context_latent(
-                chunk, kv_cache, prefill, fp8_prefill
-            )
             if kv_b_proj_input_dtype is not None:
                 kv_c_normed = kv_c_normed.to(kv_b_proj_input_dtype)
             kv_nope = project_context(kv_c_normed).view(
@@ -1235,6 +1240,10 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 k, v = fused_mla_kv_concat_quant_fp8(k_nope, k_pe, v)
             else:
                 k = fused_mla_kv_concat(k_nope, k_pe)
+            if release is not None:
+                # The projection and the concat were the last reads of the
+                # gathered planes; the attention reads the packed key.
+                release()
             attn_output, attn_lse = prefill_backend.run_prefill_context_chunk(
                 chunk=chunk, q=q[chunk.token_slice], k=k, v=v, out=out
             )
@@ -1245,6 +1254,59 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             return attn_output, attn_lse
 
         chunks = chunked_context.chunks
+        pipeline = self._context_gather_pipeline(chunked_context)
+        if pipeline is None:
+
+            def run_chunk(
+                chunk, out: torch.Tensor | None = None
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                kv_c_normed, k_pe = self._gather_context_latent(
+                    chunk, kv_cache, prefill, fp8_prefill
+                )
+                return attend_chunk(chunk, kv_c_normed, k_pe, out)
+
+        else:
+            # Window i + 1 is published while window i is projected and
+            # attended. Chunk order is the workspace's slot order, so the
+            # publish of each chunk is issued exactly once, in order. The
+            # loop below may drop the first chunk from `chunks`; the
+            # publication schedule indexes the full list.
+            all_chunks = chunks
+            pending: list[tuple[int, tuple[torch.Tensor, torch.Tensor]] | None] = [
+                None
+            ] * len(all_chunks)
+
+            def publish(index: int) -> None:
+                chunk = all_chunks[index]
+                pending[index] = pipeline.publish(
+                    lambda slot: self._gather_context_latent(
+                        chunk, kv_cache, prefill, fp8_prefill, buffer_slot=slot
+                    )
+                )
+
+            pipeline.begin()
+            publish(0)
+
+            def run_chunk(
+                chunk, out: torch.Tensor | None = None
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                index = chunk.index
+                assert all_chunks[index] is chunk
+                if index + 1 < len(all_chunks):
+                    publish(index + 1)
+                published = pending[index]
+                assert published is not None
+                pending[index] = None
+                slot, (kv_c_normed, k_pe) = published
+                pipeline.acquire(slot)
+                return attend_chunk(
+                    chunk,
+                    kv_c_normed,
+                    k_pe,
+                    out,
+                    release=lambda: pipeline.release(slot),
+                )
+
         if len(chunks) == 1 and not chunked_context.empty_token_slices:
             # One chunk covering every prefill token: its partial *is* the context
             # partial, so it needs neither an accumulator nor a copy.
@@ -1298,18 +1360,33 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             )
         return output, output_lse
 
+    def _context_gather_pipeline(self, chunked_context) -> DCPKVGatherPipeline | None:
+        """The shared gather pipeline when the direct DCP publisher serves this
+        layer's chunked context and ``VLLM_K3_DCP_GATHER_PIPELINE`` is on."""
+        if self.dcp_world_size <= 1 or not envs.VLLM_K3_DCP_GATHER_PIPELINE:
+            return None
+        dcp_kv_gather = chunked_context.dcp_manager
+        if dcp_kv_gather is None or not dcp_kv_gather.use_direct_kv_gather:
+            return None
+        return get_dcp_kv_gather_pipeline(
+            chunked_context.workspace.device, dcp_kv_gather.kv_gather_slots
+        )
+
     def _gather_context_latent(
         self,
         chunk,
         kv_cache: torch.Tensor,
         prefill,
         fp8_prefill: bool,
+        buffer_slot: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather one chunk's paged context latent into the workspace.
 
         Under DCP, gather the local paged shard and let the exact direct
         publisher place every rank's valid rows straight into compact
-        request-major KV planes. Non-DCP keeps the merged-row workspace layout.
+        request-major KV planes, into ``buffer_slot`` of the symmetric buffer
+        (the chunk's parity when None: the serial loop alternates two slots).
+        Non-DCP keeps the merged-row workspace layout.
         """
         chunked_context = prefill.chunked_context
         assert chunked_context is not None
@@ -1356,7 +1433,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 workspace[:toks],
                 chunk.final_layout_dst_rows,
                 chunk.num_context_tokens,
-                chunk.index & 1,
+                chunk.index & 1 if buffer_slot is None else buffer_slot,
             )
 
         toks = chunk.num_context_tokens

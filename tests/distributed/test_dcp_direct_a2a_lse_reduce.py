@@ -857,6 +857,10 @@ def test_distributed_direct_q_gather_cuda_graph_replay(world_size: int):
     )
 
 
+def _gather_into_slot(workspace, local_kv, dst_rows, output_tokens, slot):
+    return workspace.gather(local_kv, dst_rows, output_tokens, slot)
+
+
 def _distributed_direct_kv_gather_worker(env: dict[str, str]) -> None:
     update_environment_variables(env)
     local_rank = int(env["LOCAL_RANK"])
@@ -1089,6 +1093,54 @@ def _distributed_direct_kv_gather_worker(env: dict[str, str]) -> None:
                 torch.accelerator.synchronize()
                 torch.testing.assert_close(consumed, expected_consumed * world_size)
                 assert_planes(reused, expected)
+                dist.barrier()
+
+                # Pipelined ring: a side stream publishes each window one
+                # ahead of its consumption on the compute stream, cycling
+                # through every slot several times. Rank 0 consumes late on
+                # the GPU (a spin kernel before each read) so a faster peer
+                # would overwrite a slot it still reads if the release guard
+                # were wrong; every consumed window must stay byte-exact.
+                ring_layouts = [full_layout, alternate_layout, small_layout] * 3
+                ring_inputs = []
+                for index, layout in enumerate(ring_layouts):
+                    maps, output_tokens = layout_maps(layout)
+                    ring_inputs.append(
+                        (
+                            make_local(rank, 40 + index, len(maps[rank]), dtype),
+                            torch.tensor(maps[rank], dtype=torch.int32, device=device),
+                            output_tokens,
+                        )
+                    )
+                pipeline = dcp_utils.DCPKVGatherPipeline(device, workspace.num_slots)
+                assert workspace.num_slots >= pipeline.MIN_SLOTS
+                pending: list = [None] * len(ring_layouts)
+                publishes = [
+                    functools.partial(_gather_into_slot, workspace, *ring_input)
+                    for ring_input in ring_inputs
+                ]
+
+                consumed_windows = []
+                torch.accelerator.synchronize()
+                dist.barrier()
+                pipeline.begin()
+                pending[0] = pipeline.publish(publishes[0])
+                for index in range(len(ring_layouts)):
+                    if index + 1 < len(ring_layouts):
+                        pending[index + 1] = pipeline.publish(publishes[index + 1])
+                    slot, (kv_c, k_pe) = pending[index]
+                    assert slot == index % workspace.num_slots
+                    pipeline.acquire(slot)
+                    if rank == 0:
+                        torch.cuda._sleep(20_000_000)
+                    consumed_windows.append((kv_c.clone(), k_pe.clone()))
+                    pipeline.release(slot)
+                torch.accelerator.synchronize()
+                for index, layout in enumerate(ring_layouts):
+                    assert_planes(
+                        consumed_windows[index],
+                        expected_planes(layout, 40 + index, dtype),
+                    )
                 dist.barrier()
 
             if env.get("TEST_CUDA_GRAPH") != "1" or dtype != torch.bfloat16:
@@ -1457,3 +1509,44 @@ def test_distributed_direct_a2a_matches_reference(world_size: int):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_kv_gather_pipeline_orders_publication_and_consumption():
+    """On one device the pipeline must publish window w only after window
+    ``w - (S - 1)`` was released, and every consumer must read its own
+    window: a slow consumer (spin kernel before each read) never observes
+    a later window in its slot, and the publisher never stalls on a window
+    it does not need (the release of ``w - (S - 2)`` and later)."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    num_slots = 3
+    pipeline = dcp_utils.DCPKVGatherPipeline(device, num_slots)
+    slots = torch.zeros(num_slots, dtype=torch.int64, device=device)
+    windows = 12
+
+    def gather(window: int):
+        def publish(slot: int):
+            torch.cuda._sleep(2_000_000)
+            slots[slot].fill_(window + 1)
+            return slots[slot]
+
+        return publish
+
+    reads = []
+    pipeline.begin()
+    pending = [pipeline.publish(gather(0))]
+    for window in range(windows):
+        if window + 1 < windows:
+            pending.append(pipeline.publish(gather(window + 1)))
+        slot, view = pending[window]
+        assert slot == window % num_slots
+        pipeline.acquire(slot)
+        torch.cuda._sleep(6_000_000)
+        reads.append(view.clone())
+        pipeline.release(slot)
+    torch.cuda.synchronize(device)
+    assert [int(value) for value in reads] == list(range(1, windows + 1))
+    assert pipeline.window == windows
+
+    with pytest.raises(ValueError, match="at least 3"):
+        dcp_utils.DCPKVGatherPipeline(device, 2)
