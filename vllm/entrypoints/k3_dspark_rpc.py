@@ -372,6 +372,31 @@ class _DraftCudaGraphState:
         self.block_table.copy_(self.block_table_host, non_blocking=True)
 
 
+def _ingest_graphs_enabled() -> bool:
+    """K3_DRAFT_INGEST_GRAPH=0 keeps the eager context ingest (diagnostics)."""
+    return os.environ.get("K3_DRAFT_INGEST_GRAPH", "1") == "1"
+
+
+@dataclass
+class _DraftIngestGraphState:
+    """Address-stable inputs and outputs of one captured context ingest.
+
+    One graph per appended row count: the raw target auxiliary rows are
+    combined into draft hidden states, projected to every layer's K/V,
+    normalized, rotated and written into the draft KV cache at the staged
+    slots. The combined states stay in ``context_states`` for the caller's
+    projected-context cache until the next replay overwrites them.
+    """
+
+    rows: int
+    context_in: torch.Tensor
+    positions_in: torch.Tensor
+    slots_in: torch.Tensor
+    slots_host: torch.Tensor
+    context_states: torch.Tensor | None = None
+    graph: torch.cuda.CUDAGraph | None = None
+
+
 class K3DSparkDraftEngine:
     """Minimal greedy K3 draft scheduler backed by the 3090 KV cache."""
 
@@ -453,6 +478,11 @@ class K3DSparkDraftEngine:
         self.cuda_graph_replay_count = 0
         self.cuda_graph_eager_fallback_count = 0
         self._cuda_graphs: dict[tuple[int, int], _DraftCudaGraphState] = {}
+        # Context ingest graphs keyed by appended row count (raw aux rows only;
+        # projected rows and larger appends run eagerly).
+        self._ingest_graphs: dict[int, _DraftIngestGraphState] = {}
+        self.ingest_graph_replay_count = 0
+        self.ingest_graph_eager_count = 0
 
     def _make_cuda_graph_state(
         self,
@@ -678,6 +708,8 @@ class K3DSparkDraftEngine:
                 state.graph = graph
                 self._cuda_graphs[(batch_size, depth)] = state
 
+        if self.method == "dflash" and _ingest_graphs_enabled():
+            self._capture_ingest_graphs(capture_stream, warmups=warmups)
         torch.cuda.current_stream(self.device).wait_stream(capture_stream)
         torch.cuda.synchronize(self.device)
         # Dummy capture rows only touch these reserved low blocks. Block zero
@@ -894,6 +926,62 @@ class K3DSparkDraftEngine:
         output.copy_(source)
         return output.view(shape)
 
+    @property
+    def max_ingest_graph_rows(self) -> int:
+        """Largest per-proposal context append that replays a captured graph:
+        every request contributes at most 1 + K accepted rows per step."""
+        return int(self.runtime.vllm_config.scheduler_config.max_num_seqs) * (
+            1 + self.max_speculative_tokens
+        )
+
+    def _run_ingest_graph_state(self, state: _DraftIngestGraphState) -> None:
+        context_states = self.model.combine_hidden_states(state.context_in)
+        self.model.precompute_and_store_context_kv(
+            context_states,
+            state.positions_in,
+            state.slots_in,
+        )
+        state.context_states = context_states
+
+    def _capture_ingest_graphs(
+        self, capture_stream: torch.cuda.Stream, *, warmups: int
+    ) -> None:
+        """Capture the raw-context ingest for every row count of one decode step.
+
+        Capture rows write dummy K/V into block zero, which no live request
+        ever owns; the caller zeroes the reserved blocks afterwards.
+        """
+        max_rows = self.max_ingest_graph_rows
+        block_size = self.allocator.block_size
+        if max_rows > block_size:
+            # Dummy slots must stay inside the reserved block-zero range.
+            max_rows = block_size
+        with torch.cuda.stream(capture_stream):
+            for rows in range(max_rows, 0, -1):
+                state = _DraftIngestGraphState(
+                    rows=rows,
+                    context_in=torch.zeros(
+                        (rows, self.raw_context_width),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    ),
+                    positions_in=torch.arange(rows, dtype=torch.int64, device=self.device),
+                    slots_in=torch.arange(rows, dtype=torch.int64, device=self.device),
+                    slots_host=torch.empty(rows, dtype=torch.int64, pin_memory=True),
+                )
+                for _ in range(warmups):
+                    self._run_ingest_graph_state(state)
+                capture_stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=capture_stream):
+                    self._run_ingest_graph_state(state)
+                state.graph = graph
+                self._ingest_graphs[rows] = state
+        logger.info(
+            "Standalone K3 dflash context-ingest CUDA graphs ready for 1..%d rows",
+            max_rows,
+        )
+
     def _append_context(
         self,
         states: list[DraftRequestState],
@@ -905,13 +993,24 @@ class K3DSparkDraftEngine:
     ) -> None:
         if positions_cpu.numel() == 0:
             return
-        positions = positions_cpu.to(self.device, non_blocking=True)
-        context_input = context_cpu.to(self.device, non_blocking=True)
-        context_states = (
-            context_input
-            if projected
-            else self.model.combine_hidden_states(context_input)
-        )
+        total_rows = int(positions_cpu.numel())
+        ingest = None if projected else self._ingest_graphs.get(total_rows)
+        if ingest is None:
+            positions = positions_cpu.to(self.device, non_blocking=True)
+            context_input = context_cpu.to(self.device, non_blocking=True)
+            context_states = (
+                context_input
+                if projected
+                else self.model.combine_hidden_states(context_input)
+            )
+            if not projected:
+                self.ingest_graph_eager_count += 1
+        else:
+            # Both host tensors are views of the pinned RPC staging buffers,
+            # which the next (serialized) RPC overwrites only after this
+            # proposal's final event has been synchronized.
+            ingest.context_in.copy_(context_cpu, non_blocking=True)
+            ingest.positions_in.copy_(positions_cpu, non_blocking=True)
 
         slots: list[int] = []
         offset = 0
@@ -935,12 +1034,21 @@ class K3DSparkDraftEngine:
                     for position in req_positions
                 )
             offset += count
-        slot_mapping = torch.tensor(slots, dtype=torch.int64, device=self.device)
-        self.model.precompute_and_store_context_kv(
-            context_states,
-            positions,
-            slot_mapping,
-        )
+        if ingest is None:
+            slot_mapping = torch.tensor(slots, dtype=torch.int64, device=self.device)
+            self.model.precompute_and_store_context_kv(
+                context_states,
+                positions,
+                slot_mapping,
+            )
+        else:
+            ingest.slots_host.copy_(torch.tensor(slots, dtype=torch.int64))
+            ingest.slots_in.copy_(ingest.slots_host, non_blocking=True)
+            assert ingest.graph is not None
+            ingest.graph.replay()
+            self.ingest_graph_replay_count += 1
+            context_states = ingest.context_states
+            assert context_states is not None
         offset = 0
         for state, count in zip(states, context_counts):
             if count:

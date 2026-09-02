@@ -252,13 +252,18 @@ def _build_vllm_config(args: argparse.Namespace):
         block_size=16,
         enable_prefix_caching=False,
         enforce_eager=True,
-        compilation_config={"custom_ops": ["none"]},
+        # Fused kernels for the draft's per-projection work: the CUDA
+        # per-token fp8 quantization op, the CUTLASS fp8 GEMM with the
+        # per-token x per-channel scaling in its epilogue, and the vLLM C
+        # RMSNorm kernels. The torch-native equivalents issue 8-13 tiny
+        # kernels per projection inside the captured proposal graph.
+        compilation_config={"custom_ops": ["none", "+quant_fp8"]},
         kernel_config={
             "ir_op_priority": {
-                "rms_norm": ["native"],
-                "fused_add_rms_norm": ["native"],
+                "rms_norm": ["vllm_c", "native"],
+                "fused_add_rms_norm": ["vllm_c", "native"],
             },
-            "linear_backend": "torch",
+            "linear_backend": "cutlass",
         },
         load_format="safetensors",
         use_tqdm_on_load=False,
@@ -390,6 +395,10 @@ def _load_runtime(args: argparse.Namespace, status: RuntimeStatus) -> Standalone
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_config = speculative_config.draft_model_config.hf_config
+    # vLLM workers install the configured IR op priorities at init; this
+    # runtime has no worker, so install them here or every IR op (RMSNorm)
+    # silently runs its torch-native implementation.
+    vllm_config.kernel_config.ir_op_priority.set_default()
 
     status.phase = "loading_shared_target_weights"
     with set_current_vllm_config(vllm_config):
