@@ -61,12 +61,37 @@ FA4_MLA_PREFILL_LSE_OPTIONS = (False, True)
 
 
 def _use_sm120_fa4_prefill(qk_head_dim: int, v_head_dim: int) -> bool:
-    """Select the qualified SM120 FA4 MLA shape without changing global FA."""
-    return (
+    """Select the qualified SM120 FA4 MLA shape without changing global FA.
+
+    Args:
+        qk_head_dim: Combined nope + rope query/key head width.
+        v_head_dim: Value head width.
+
+    Returns:
+        True when ``VLLM_MLA_SM120_FA4_PREFILL`` is set on an SM120-family
+        device and the shape is the qualified (192, 128) Kimi-K3 layout.
+
+    Raises:
+        RuntimeError: If the selection is requested but the FA4 CuTe interface
+            cannot be imported; the opt-in never falls back silently.
+    """
+    selected = bool(
         envs.VLLM_MLA_SM120_FA4_PREFILL
         and current_platform.is_device_capability_family(120)
         and (qk_head_dim, v_head_dim) == (192, 128)
     )
+    if selected:
+        from vllm.vllm_flash_attn.flash_attn_interface import (
+            FA4_AVAILABLE,
+            FA4_UNAVAILABLE_REASON,
+        )
+
+        if not FA4_AVAILABLE:
+            raise RuntimeError(
+                "VLLM_MLA_SM120_FA4_PREFILL=1 requires the FA4 CuTe interface: "
+                f"{FA4_UNAVAILABLE_REASON}"
+            )
+    return selected
 
 
 @dataclass(frozen=True)

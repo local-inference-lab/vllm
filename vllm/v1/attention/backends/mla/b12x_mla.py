@@ -314,12 +314,22 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         self._max_dense_mla_rows = max_dense_mla_rows
         self._effective_heads = self.num_heads * self.dcp_world_size
         self._kernel_heads = _kernel_query_heads(self.num_heads, self.dcp_world_size)
-        max_cache_tokens = _max_dcp_local_cache_tokens(
+        local_shard_tokens = _max_dcp_local_cache_tokens(
             vllm_config, dcp_size=self.dcp_world_size
         )
+        max_cache_tokens = local_shard_tokens
         sliding_window = getattr(kv_cache_spec, "sliding_window", None)
         if sliding_window is not None:
             max_cache_tokens = min(max_cache_tokens, int(sliding_window))
+        if max_cache_tokens < local_shard_tokens:
+            # The kernel attends to every local token of a request; the plan's
+            # page table (and the flattened copy `build` makes of the worker's
+            # block table) must therefore cover the largest local shard.
+            raise ValueError(
+                "B12X_MLA plans must cover the largest local KV shard: "
+                f"planned={max_cache_tokens} tokens, shard={local_shard_tokens} "
+                f"(sliding_window={sliding_window})."
+            )
         self._dense_mla_plans = {
             rows: _create_dense_mla_plan(
                 vllm_config,
@@ -332,8 +342,19 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             )
             for rows in _dense_mla_plan_row_caps(max_dense_mla_rows)
         }
+        # Four-query verify tiles (fp8 KV): one plan per power-of-two batch
+        # capacity, selected by the smallest covering capacity at build time
+        # like the decode plans. A batch needs four flattened rows per
+        # request, so the batch range is bounded by the row capacity.
         self._dense_mla_verify_plans: dict[int, Any] = {}
-        if _planned_kv_dtype(vllm_config) == torch.float8_e4m3fn:
+        max_verify_batch = min(
+            int(vllm_config.scheduler_config.max_num_seqs),
+            max_dense_mla_rows // 4,
+        )
+        if (
+            _planned_kv_dtype(vllm_config) == torch.float8_e4m3fn
+            and max_verify_batch >= 1
+        ):
             self._dense_mla_verify_plans = {
                 batch: _create_dense_mla_plan(
                     vllm_config,
@@ -347,10 +368,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
                     dcp_size=self.dcp_world_size,
                     max_cache_tokens=max_cache_tokens,
                 )
-                for batch in range(
-                    1,
-                    int(vllm_config.scheduler_config.max_num_seqs) + 1,
-                )
+                for batch in _dense_mla_plan_row_caps(max_verify_batch)
             }
         self._dense_mla_plan = self._dense_mla_plans[max_dense_mla_rows]
         workspace_specs = [
@@ -565,8 +583,15 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         )
         verify_plans = getattr(self, "_dense_mla_verify_plans", {})
         tiled_verify = (
-            metadata.causal and query_len == 4 and metadata.num_decodes in verify_plans
+            metadata.causal
+            and query_len == 4
+            and bool(verify_plans)
+            and metadata.num_decodes <= max(verify_plans)
         )
+        # The worker's block table can be wider than the plan's page table
+        # when the KV block size rounds the per-request row up; every local
+        # sequence fits the plan (it covers the largest local shard), so the
+        # columns past the plan width are never referenced and are dropped.
         if tiled_verify:
             verify_table = self._dense_mla_flat_block_table[: metadata.num_decodes]
             source_width = min(
@@ -574,7 +599,9 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
                 int(verify_table.shape[1]),
             )
             verify_table[:, :source_width].copy_(source_table[:, :source_width])
-            metadata.dense_mla_plan = verify_plans[metadata.num_decodes]
+            metadata.dense_mla_plan = _select_dense_mla_plan(
+                verify_plans, metadata.num_decodes
+            )
             metadata.dense_mla_verify_block_table = verify_table
             metadata.dense_mla_query_cache_seq_lens = flat_lens
             return metadata
