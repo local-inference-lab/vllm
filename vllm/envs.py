@@ -249,6 +249,7 @@ if TYPE_CHECKING:
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
     VLLM_DCP_KV_GATHER_SLOTS: int = 3
     VLLM_K3_DCP_GATHER_PIPELINE: bool = True
+    VLLM_K3_DCP_GATHER_DMA: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -2483,6 +2484,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the current one is projected and attended (needs three gather slots).
     "VLLM_K3_DCP_GATHER_PIPELINE": lambda: bool(
         int(os.getenv("VLLM_K3_DCP_GATHER_PIPELINE", "1"))
+    ),
+    # Publish Kimi-K3 chunked-context windows with the copy engines
+    # (cudaMemcpyAsync per destination) instead of the SM push kernel, so the
+    # PCIe-bound gather leaves the SM memory pipelines to the attention and
+    # projection kernels it overlaps.
+    "VLLM_K3_DCP_GATHER_DMA": lambda: bool(
+        int(os.getenv("VLLM_K3_DCP_GATHER_DMA", "0"))
     ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to

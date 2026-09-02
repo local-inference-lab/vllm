@@ -6,6 +6,8 @@
 #include <torch/headeronly/core/ScalarType.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 
 #include "dcp_direct_common.cuh"
 
@@ -23,6 +25,22 @@ constexpr int kThreads = 256;
 // KV chunks need many blocks in flight to saturate the fabric.
 constexpr int64_t kMaxMulticastBlocks = 128;
 constexpr int64_t kMaxPeerBlocks = 1024;
+
+// Bound on the peer-path launch grid. The kernel is PCIe-bound, so a few
+// dozen blocks per destination move the payload as fast as a thousand, and
+// the remaining resident blocks only hold SM thread and register slots that
+// the attention and projection kernels running concurrently on the compute
+// stream (the pipelined chunked-context loop) need.
+// VLLM_DCP_KV_GATHER_MAX_BLOCKS overrides it; clamped to [world_size,
+// kMaxPeerBlocks] at launch.
+int64_t max_peer_blocks() {
+  static const int64_t cap = [] {
+    const char* value = std::getenv("VLLM_DCP_KV_GATHER_MAX_BLOCKS");
+    int64_t parsed = value ? std::atoll(value) : kMaxPeerBlocks;
+    return parsed > 0 ? parsed : kMaxPeerBlocks;
+  }();
+  return cap;
+}
 
 // Multicast each rank's valid local rows directly into compact, request-major
 // kv_c and k_pe planes. dst_rows maps every padded local input row to its final
@@ -313,7 +331,10 @@ void direct_dcp_kv_gather(const torch::stable::Tensor& local_kv,
   } else {
     int64_t peer_item_count = world_size * item_count;
     blocks = (peer_item_count + kThreads - 1) / kThreads;
-    blocks = blocks < kMaxPeerBlocks ? blocks : kMaxPeerBlocks;
+    int64_t cap = max_peer_blocks();
+    cap = cap < kMaxPeerBlocks ? cap : kMaxPeerBlocks;
+    cap = cap > world_size ? cap : world_size;
+    blocks = blocks < cap ? blocks : cap;
     // One block set per destination: round up to a multiple of world_size.
     blocks = ((blocks + world_size - 1) / world_size) * world_size;
     direct_dcp_kv_gather_peer_kernel<<<blocks, kThreads, 0, stream>>>(
@@ -332,6 +353,195 @@ void direct_dcp_kv_gather(const torch::stable::Tensor& local_kv,
   check_cuda_launch("direct DCP final-layout kv-gather");
 }
 
+// ---------------------------------------------------------------------------
+// Copy-engine variant of the final-layout publisher.
+//
+// The peer kernel above pushes rows with SM stores over PCIe. Those
+// stores occupy the SMs' memory pipelines for the whole PCIe-bound gather,
+// which slows every kernel that runs concurrently on the compute stream
+// (measured 2026-09-02: FlashAttention 1.13 -> 3.48 ms, kv_b_proj 0.29 ->
+// 1.96 ms per window at 1,024 blocks; 1.20 / 0.33 ms at 16 blocks). This
+// variant moves the payload with cudaMemcpyAsync on the copy engines, which
+// do not touch the SMs, and only launches two single-block kernels: one that
+// releases this rank's epoch into every peer's signal slot after the copies
+// completed (stream order; PCIe keeps the flag behind the data on the same
+// link), and one that waits until every source's signal shows the epoch.
+//
+// The payload is plane-separated on the source side (contiguous kv_c rows
+// and contiguous k_pe rows), so each request's rows are two linear copies
+// per destination. `runs` is a CPU int64 [n, 3] tensor of
+// (source row, destination row, rows) per request; destination rows are the
+// compact request-major layout of build_dcp_kv_final_layout_dst_rows.
+__global__ void direct_dcp_kv_signal_kernel(const int64_t* peer_signal_ptrs,
+                                            const int64_t* epoch_ptr,
+                                            int64_t world_size, int64_t rank,
+                                            int64_t buffer_slot) {
+  uint32_t epoch = static_cast<uint32_t>(epoch_ptr[0]);
+  int64_t signal_item = buffer_slot * world_size + rank;
+  for (int64_t destination_rank = threadIdx.x; destination_rank < world_size;
+       destination_rank += blockDim.x) {
+    uint32_t* peer_signal =
+        get_peer_ptr<uint32_t>(peer_signal_ptrs, destination_rank);
+    store_release_system(peer_signal + signal_item, epoch);
+  }
+}
+
+__global__ void direct_dcp_kv_wait_kernel(const uint32_t* received_signal,
+                                          const int64_t* epoch_ptr,
+                                          int64_t world_size,
+                                          int64_t buffer_slot) {
+  uint32_t epoch = static_cast<uint32_t>(epoch_ptr[0]);
+  for (int64_t source_rank = threadIdx.x; source_rank < world_size;
+       source_rank += blockDim.x) {
+    int64_t source_signal_item = buffer_slot * world_size + source_rank;
+    if (!wait_for_epoch(received_signal + source_signal_item, epoch)) {
+      printf("direct DCP DMA final-layout timeout source=%lld epoch=%u\n",
+             static_cast<long long>(source_rank), epoch);
+      asm volatile("trap;");
+    }
+  }
+}
+
+void direct_dcp_kv_gather_dma(const torch::stable::Tensor& local_kv_c,
+                              const torch::stable::Tensor& local_k_pe,
+                              const torch::stable::Tensor& runs,
+                              const torch::stable::Tensor& peer_kv_ptrs_host,
+                              const torch::stable::Tensor& peer_signal_ptrs,
+                              torch::stable::Tensor& received_kv,
+                              torch::stable::Tensor& received_signal,
+                              torch::stable::Tensor& epoch,
+                              int64_t output_tokens, int64_t plane_split_dim,
+                              int64_t buffer_slot, int64_t world_size,
+                              int64_t rank, int64_t max_gathered_tokens) {
+  using torch::headeronly::ScalarType;
+
+  STD_TORCH_CHECK(local_kv_c.is_cuda() && local_k_pe.is_cuda(),
+                  "local planes must be CUDA tensors");
+  ScalarType dtype = local_kv_c.scalar_type();
+  STD_TORCH_CHECK(dtype == ScalarType::Half || dtype == ScalarType::BFloat16 ||
+                      dtype == ScalarType::Float8_e4m3fn,
+                  "direct DCP DMA kv-gather only supports FP16, BF16, and FP8");
+  STD_TORCH_CHECK(local_k_pe.scalar_type() == dtype,
+                  "local planes must share a dtype");
+  STD_TORCH_CHECK(local_kv_c.dim() == 2 && local_kv_c.is_contiguous() &&
+                      local_k_pe.dim() == 2 && local_k_pe.is_contiguous() &&
+                      local_kv_c.size(0) == local_k_pe.size(0),
+                  "local planes must be contiguous [T, D] tensors of equal T");
+  STD_TORCH_CHECK(runs.dim() == 2 && runs.size(1) == 3 && runs.is_contiguous() &&
+                      runs.scalar_type() == ScalarType::Long && !runs.is_cuda(),
+                  "runs must be a contiguous CPU int64 [n, 3] tensor");
+  STD_TORCH_CHECK(
+      peer_kv_ptrs_host.dim() == 1 && peer_kv_ptrs_host.is_contiguous() &&
+          peer_kv_ptrs_host.scalar_type() == ScalarType::Long &&
+          !peer_kv_ptrs_host.is_cuda() &&
+          peer_kv_ptrs_host.numel() == world_size,
+      "KV peer pointer table must be a CPU int64 [world_size] tensor");
+  STD_TORCH_CHECK(
+      peer_signal_ptrs.is_cuda() && peer_signal_ptrs.is_contiguous() &&
+          peer_signal_ptrs.scalar_type() == ScalarType::Long &&
+          peer_signal_ptrs.dim() == 1 && peer_signal_ptrs.numel() == world_size,
+      "signal peer pointer table must be CUDA int64 [world_size]");
+  STD_TORCH_CHECK(world_size > 1, "world_size must be greater than 1");
+  STD_TORCH_CHECK(rank >= 0 && rank < world_size, "invalid rank");
+  STD_TORCH_CHECK(output_tokens > 0 && output_tokens <= max_gathered_tokens,
+                  "final-layout output exceeds symmetric buffer capacity");
+
+  int64_t num_tokens = local_kv_c.size(0);
+  int64_t kv_c_dim = local_kv_c.size(1);
+  int64_t k_pe_dim = local_k_pe.size(1);
+  int64_t token_dim = kv_c_dim + k_pe_dim;
+  int64_t element_size = local_kv_c.element_size();
+  STD_TORCH_CHECK(kv_c_dim == plane_split_dim && k_pe_dim > 0,
+                  "local planes must split the token row at plane_split_dim");
+  STD_TORCH_CHECK(received_kv.is_cuda() && received_kv.scalar_type() == dtype &&
+                      received_kv.is_contiguous() && received_kv.dim() == 3 &&
+                      received_kv.size(0) >= 2 &&
+                      received_kv.size(1) == max_gathered_tokens &&
+                      received_kv.size(2) == token_dim,
+                  "received kv has the wrong symmetric buffer layout");
+  int64_t num_slots = received_kv.size(0);
+  STD_TORCH_CHECK(buffer_slot >= 0 && buffer_slot < num_slots,
+                  "final-layout buffer slot is out of range");
+  STD_TORCH_CHECK(
+      received_signal.is_cuda() && received_signal.is_contiguous() &&
+          received_signal.scalar_type() == ScalarType::Int &&
+          received_signal.dim() == 2 && received_signal.size(0) == num_slots &&
+          received_signal.size(1) == world_size,
+      "received signal has the wrong symmetric buffer layout");
+  STD_TORCH_CHECK(epoch.is_cuda() && epoch.is_contiguous() &&
+                      epoch.scalar_type() == ScalarType::Long &&
+                      epoch.numel() == 1,
+                  "epoch must be a one-element CUDA int64 tensor");
+  int64_t device_index = local_kv_c.get_device_index();
+  STD_TORCH_CHECK(local_k_pe.get_device_index() == device_index &&
+                      peer_signal_ptrs.get_device_index() == device_index &&
+                      received_kv.get_device_index() == device_index &&
+                      received_signal.get_device_index() == device_index &&
+                      epoch.get_device_index() == device_index,
+                  "direct DCP final-layout tensors must share a CUDA device");
+
+  const int64_t* run_data = runs.const_data_ptr<int64_t>();
+  int64_t num_runs = runs.size(0);
+  for (int64_t i = 0; i < num_runs; ++i) {
+    int64_t src = run_data[3 * i], dst = run_data[3 * i + 1],
+            rows = run_data[3 * i + 2];
+    STD_TORCH_CHECK(rows >= 0 && src >= 0 && dst >= 0 &&
+                        src + rows <= num_tokens && dst + rows <= output_tokens,
+                    "final-layout run exceeds the local rows or the output");
+  }
+  const int64_t* peer_kv = peer_kv_ptrs_host.const_data_ptr<int64_t>();
+  int64_t kv_c_row_bytes = kv_c_dim * element_size;
+  int64_t k_pe_row_bytes = k_pe_dim * element_size;
+  int64_t slot_stride_bytes = max_gathered_tokens * token_dim * element_size;
+  int64_t k_pe_plane_offset = max_gathered_tokens * kv_c_row_bytes;
+  STD_TORCH_CHECK(static_cast<uintptr_t>(peer_kv[rank]) ==
+                      reinterpret_cast<uintptr_t>(received_kv.data_ptr()),
+                  "the local entry of the peer pointer table must be received_kv");
+
+  const torch::stable::accelerator::DeviceGuard device_guard(device_index);
+  cudaStream_t stream = get_current_cuda_stream();
+  increment_epoch_kernel<<<1, 1, 0, stream>>>(
+      epoch.mutable_data_ptr<int64_t>());
+  check_cuda_launch("direct DCP DMA final-layout kv-gather");
+
+  const char* src_kv_c = static_cast<const char*>(local_kv_c.data_ptr());
+  const char* src_k_pe = static_cast<const char*>(local_k_pe.data_ptr());
+  for (int64_t destination_rank = 0; destination_rank < world_size;
+       ++destination_rank) {
+    char* slot_base = reinterpret_cast<char*>(
+                          static_cast<uintptr_t>(peer_kv[destination_rank])) +
+                      buffer_slot * slot_stride_bytes;
+    for (int64_t i = 0; i < num_runs; ++i) {
+      int64_t src = run_data[3 * i], dst = run_data[3 * i + 1],
+              rows = run_data[3 * i + 2];
+      if (rows == 0) {
+        continue;
+      }
+      cudaError_t err = cudaMemcpyAsync(
+          slot_base + dst * kv_c_row_bytes, src_kv_c + src * kv_c_row_bytes,
+          rows * kv_c_row_bytes, cudaMemcpyDefault, stream);
+      STD_TORCH_CHECK(err == cudaSuccess,
+                      std::string("direct DCP DMA kv_c copy failed: ") +
+                          cudaGetErrorString(err));
+      err = cudaMemcpyAsync(slot_base + k_pe_plane_offset + dst * k_pe_row_bytes,
+                            src_k_pe + src * k_pe_row_bytes,
+                            rows * k_pe_row_bytes, cudaMemcpyDefault, stream);
+      STD_TORCH_CHECK(err == cudaSuccess,
+                      std::string("direct DCP DMA k_pe copy failed: ") +
+                          cudaGetErrorString(err));
+    }
+  }
+  direct_dcp_kv_signal_kernel<<<1, 32, 0, stream>>>(
+      peer_signal_ptrs.const_data_ptr<int64_t>(), epoch.const_data_ptr<int64_t>(),
+      world_size, rank, buffer_slot);
+  check_cuda_launch("direct DCP DMA final-layout signal");
+  direct_dcp_kv_wait_kernel<<<1, 32, 0, stream>>>(
+      reinterpret_cast<const uint32_t*>(
+          received_signal.const_data_ptr<int32_t>()),
+      epoch.const_data_ptr<int64_t>(), world_size, buffer_slot);
+  check_cuda_launch("direct DCP DMA final-layout wait");
+}
+
 }  // namespace
 
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, direct_dcp_kv_gather_ops) {
@@ -345,7 +555,22 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, direct_dcp_kv_gather_ops) {
       "int kv_mc_ptr, int signal_mc_ptr) -> ()");
 }
 
+STABLE_TORCH_LIBRARY_FRAGMENT(_C, direct_dcp_kv_gather_dma_ops) {
+  direct_dcp_kv_gather_dma_ops.def(
+      "direct_dcp_kv_gather_dma("
+      "Tensor local_kv_c, Tensor local_k_pe, Tensor runs, "
+      "Tensor peer_kv_ptrs_host, Tensor peer_signal_ptrs, Tensor! received_kv, "
+      "Tensor! received_signal, Tensor! epoch, "
+      "int output_tokens, int plane_split_dim, int buffer_slot, "
+      "int world_size, int rank, int max_gathered_tokens) -> ()");
+}
+
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, direct_dcp_kv_gather_ops) {
   direct_dcp_kv_gather_ops.impl("direct_dcp_kv_gather",
                                 TORCH_BOX(&direct_dcp_kv_gather));
+}
+
+STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, direct_dcp_kv_gather_dma_ops) {
+  direct_dcp_kv_gather_dma_ops.impl("direct_dcp_kv_gather_dma",
+                                    TORCH_BOX(&direct_dcp_kv_gather_dma));
 }

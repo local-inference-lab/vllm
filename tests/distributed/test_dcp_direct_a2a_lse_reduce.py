@@ -3,6 +3,7 @@
 """Tests for direct symmetric-memory DCP collectives."""
 
 import functools
+import os
 import time
 from unittest.mock import MagicMock
 
@@ -861,6 +862,10 @@ def _gather_into_slot(workspace, local_kv, dst_rows, output_tokens, slot):
     return workspace.gather(local_kv, dst_rows, output_tokens, slot)
 
 
+def _gather_dma_into_slot(workspace, kv_c, k_pe, runs, output_tokens, slot):
+    return workspace.gather_dma(kv_c, k_pe, runs, output_tokens, slot)
+
+
 def _distributed_direct_kv_gather_worker(env: dict[str, str]) -> None:
     update_environment_variables(env)
     local_rank = int(env["LOCAL_RANK"])
@@ -1142,6 +1147,78 @@ def _distributed_direct_kv_gather_worker(env: dict[str, str]) -> None:
                         expected_planes(layout, 40 + index, dtype),
                     )
                 dist.barrier()
+
+                if os.getenv("VLLM_K3_DCP_GATHER_ROTATE_LIB"):
+                    # Copy-engine publisher: the same layouts, serial then the
+                    # pipelined ring, through gather_dma (plane-separated
+                    # sources and per-request runs).
+                    def dma_inputs(index: int, layout, dtype=dtype):
+                        maps, output_tokens = layout_maps(layout)
+                        local = make_local(rank, 60 + index, len(maps[rank]), dtype)
+                        padded_lens, local_starts_, context_lens = layout
+                        runs = dcp_utils.build_dcp_kv_final_layout_runs(
+                            list(padded_lens),
+                            [list(lens) for lens in context_lens],
+                            list(local_starts_),
+                            rank,
+                        )
+                        return (
+                            local[:, :plane_split_dim].contiguous(),
+                            local[:, plane_split_dim:].contiguous(),
+                            runs,
+                            output_tokens,
+                        )
+
+                    torch.accelerator.synchronize()
+                    dist.barrier()
+                    for index, layout in enumerate(ring_layouts[:3]):
+                        kv_c_src, k_pe_src, runs, output_tokens = dma_inputs(
+                            index, layout
+                        )
+                        torch.accelerator.synchronize()
+                        actual = workspace.gather_dma(
+                            kv_c_src, k_pe_src, runs, output_tokens, index % 3
+                        )
+                        torch.accelerator.synchronize()
+                        assert_planes(
+                            actual, expected_planes(layout, 60 + index, dtype)
+                        )
+                        dist.barrier()
+
+                    dma_sources = [
+                        dma_inputs(i, layout) for i, layout in enumerate(ring_layouts)
+                    ]
+                    torch.accelerator.synchronize()
+                    dist.barrier()
+                    dma_pipeline = dcp_utils.DCPKVGatherPipeline(
+                        device, workspace.num_slots
+                    )
+                    dma_publishes = [
+                        functools.partial(_gather_dma_into_slot, workspace, *source)
+                        for source in dma_sources
+                    ]
+                    dma_pending: list = [None] * len(ring_layouts)
+                    dma_consumed = []
+                    dma_pipeline.begin()
+                    dma_pending[0] = dma_pipeline.publish(dma_publishes[0])
+                    for index in range(len(ring_layouts)):
+                        if index + 1 < len(ring_layouts):
+                            dma_pending[index + 1] = dma_pipeline.publish(
+                                dma_publishes[index + 1]
+                            )
+                        slot, (kv_c, k_pe) = dma_pending[index]
+                        dma_pipeline.acquire(slot)
+                        if rank == 0:
+                            torch.cuda._sleep(20_000_000)
+                        dma_consumed.append((kv_c.clone(), k_pe.clone()))
+                        dma_pipeline.release(slot)
+                    torch.accelerator.synchronize()
+                    for index, layout in enumerate(ring_layouts):
+                        assert_planes(
+                            dma_consumed[index],
+                            expected_planes(layout, 60 + index, dtype),
+                        )
+                    dist.barrier()
 
             if env.get("TEST_CUDA_GRAPH") != "1" or dtype != torch.bfloat16:
                 continue

@@ -108,6 +108,7 @@ from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
 from vllm.v1.attention.ops.dcp_utils import (
     DCPKVGatherPipeline,
     MLADCPManager,
+    build_dcp_kv_final_layout_runs,
     get_dcp_kv_gather_pipeline,
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
@@ -130,6 +131,8 @@ logger = init_logger(__name__)
 # hides it); at or above it, run the gate on the main stream.
 _GATE_MULTI_STREAM_TOKEN_THRESHOLD = 512
 _MLA_CALLER_OUTPUT_MIN_TOKENS = 1024
+# Plane-separated staging of the copy-engine DCP publisher, per device.
+_dma_staging_buffers: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 class KimiK3PrefillProjectionWorkspace:
@@ -599,6 +602,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             "parallelism."
         )
         self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.backend_owns_decode_dcp = _backend_owns_decode_dcp(
             self.impl, self.dcp_world_size
         )
@@ -1360,6 +1364,35 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             )
         return output, output_lse
 
+    def _dma_staging(
+        self, workspace: torch.Tensor, toks: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Plane-separated staging for the copy-engine publisher, sized to
+        the chunked-context workspace and shared by every layer on the
+        device (the publishing stream consumes it before the next window's
+        staging)."""
+        staging = _dma_staging_buffers.get(workspace.device)
+        rows = workspace.shape[0]
+        if (
+            staging is None
+            or staging[0].shape[0] < rows
+            or staging[0].dtype != workspace.dtype
+        ):
+            staging = (
+                torch.empty(
+                    (rows, self.kv_lora_rank),
+                    dtype=workspace.dtype,
+                    device=workspace.device,
+                ),
+                torch.empty(
+                    (rows, workspace.shape[1] - self.kv_lora_rank),
+                    dtype=workspace.dtype,
+                    device=workspace.device,
+                ),
+            )
+            _dma_staging_buffers[workspace.device] = staging
+        return staging[0][:toks], staging[1][:toks]
+
     def _context_gather_pipeline(self, chunked_context) -> DCPKVGatherPipeline | None:
         """The shared gather pipeline when the direct DCP publisher serves this
         layer's chunked context and ``VLLM_K3_DCP_GATHER_PIPELINE`` is on."""
@@ -1429,11 +1462,31 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                     batch_size=chunk.num_requests,
                     seq_starts=chunk.starts,
                 )
+            slot = chunk.index & 1 if buffer_slot is None else buffer_slot
+            if envs.VLLM_K3_DCP_GATHER_DMA:
+                # Copy-engine publisher: plane-separated staging and per-request
+                # runs instead of the row map. The staging copies run on the
+                # publishing stream ahead of the memcpys.
+                runs = getattr(chunk, "final_layout_runs", None)
+                if runs is None:
+                    runs = build_dcp_kv_final_layout_runs(
+                        chunk.padded_local_seq_lens,
+                        chunk.local_context_lens_allranks,
+                        chunk.local_starts,
+                        self.dcp_rank,
+                    )
+                    chunk.final_layout_runs = runs
+                stage_kv_c, stage_k_pe = self._dma_staging(workspace, toks)
+                stage_kv_c.copy_(workspace[:toks, : self.kv_lora_rank])
+                stage_k_pe.copy_(workspace[:toks, self.kv_lora_rank :])
+                return dcp_kv_gather.direct_kv_gather_dma(
+                    stage_kv_c, stage_k_pe, runs, chunk.num_context_tokens, slot
+                )
             return dcp_kv_gather.direct_kv_gather(
                 workspace[:toks],
                 chunk.final_layout_dst_rows,
                 chunk.num_context_tokens,
-                chunk.index & 1 if buffer_slot is None else buffer_slot,
+                slot,
             )
 
         toks = chunk.num_context_tokens

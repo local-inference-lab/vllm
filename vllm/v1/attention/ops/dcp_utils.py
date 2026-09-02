@@ -556,6 +556,9 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
         kv_shape = (num_ubatches, num_slots, max_gathered_tokens, token_dim)
         signal_shape = (num_ubatches, num_slots, self.world_size)
         self.received_kv, self.peer_kv_ptrs = self._allocate(kv_shape, dtype)
+        # Host copy for the copy-engine publisher, whose memcpys are issued
+        # from the host.
+        self.peer_kv_ptrs_host = self.peer_kv_ptrs.cpu()
         self.received_signal, self.peer_signal_ptrs = self._allocate(
             signal_shape, torch.int32
         )
@@ -586,7 +589,6 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
         # The custom op validates the dynamic tensor geometry, dtype, device,
         # capacity, and slot before launching. Avoid duplicating those checks on
         # this latency-sensitive host path.
-        token_dim = self.token_dim
         plane_split_dim = self.plane_split_dim
         kv_multicast_ptr, signal_multicast_ptr = self.multicast_ptrs[ubatch]
         torch.ops._C.direct_dcp_kv_gather(
@@ -607,6 +609,55 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
             kv_multicast_ptr,
             signal_multicast_ptr,
         )
+        return self._slot_planes(ubatch, buffer_slot, output_tokens)
+
+    def gather_dma(
+        self,
+        local_kv_c: torch.Tensor,
+        local_k_pe: torch.Tensor,
+        runs: torch.Tensor,
+        output_tokens: int,
+        buffer_slot: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Publish plane-separated local rows with the copy engines.
+
+        ``local_kv_c`` [T, plane_split_dim] and ``local_k_pe``
+        [T, token_dim - plane_split_dim] hold the padded local rows;
+        ``runs`` (CPU int64 [n, 3]: source row, destination row, rows) maps
+        each request's valid rows to the compact request-major layout. The
+        payload moves with cudaMemcpyAsync, so no SM memory pipeline is busy
+        while it is in flight; two single-block kernels release this rank's
+        epoch to every peer and wait for every source. Same layout, epoch and
+        signal protocol as :meth:`gather`.
+        """
+        ubatch = dbo_current_ubatch_id()
+        if not 0 <= ubatch < self.num_ubatches:
+            raise ValueError(
+                f"DCP kv-gather ubatch {ubatch} exceeds {self.num_ubatches} slots"
+            )
+        _dma_kv_gather_op()(
+            local_kv_c,
+            local_k_pe,
+            runs,
+            self.peer_kv_ptrs_host[ubatch],
+            self.peer_signal_ptrs[ubatch],
+            self.received_kv[ubatch],
+            self.received_signal[ubatch],
+            self.epoch[ubatch : ubatch + 1],
+            output_tokens,
+            self.plane_split_dim,
+            buffer_slot,
+            self.world_size,
+            self.rank,
+            self.max_gathered_tokens,
+        )
+        return self._slot_planes(ubatch, buffer_slot, output_tokens)
+
+    def _slot_planes(
+        self, ubatch: int, buffer_slot: int, output_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_dim = self.token_dim
+        plane_split_dim = self.plane_split_dim
         slot = self.received_kv[ubatch, buffer_slot].view(-1)
         kv_c_capacity = self.max_gathered_tokens * plane_split_dim
         kv_c = slot[:kv_c_capacity].view(self.max_gathered_tokens, 1, plane_split_dim)
@@ -614,6 +665,53 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
             self.max_gathered_tokens, 1, token_dim - plane_split_dim
         )
         return kv_c[:output_tokens], k_pe[:output_tokens]
+
+
+@functools.cache
+def _dma_kv_gather_op():
+    """The copy-engine final-layout publisher: ``_C.direct_dcp_kv_gather_dma``
+    when the built extension provides it, else the same op from the side
+    extension named by ``VLLM_K3_DCP_GATHER_ROTATE_LIB``."""
+    if hasattr(torch.ops._C, "direct_dcp_kv_gather_dma"):
+        return torch.ops._C.direct_dcp_kv_gather_dma
+    import os
+
+    path = os.getenv("VLLM_K3_DCP_GATHER_ROTATE_LIB", "")
+    if not path:
+        raise RuntimeError(
+            "The copy-engine DCP KV gather needs direct_dcp_kv_gather_dma "
+            "(rebuild the _C extension or set VLLM_K3_DCP_GATHER_ROTATE_LIB)."
+        )
+    torch.ops.load_library(path)
+    op = torch.ops._C_k3ext.direct_dcp_kv_gather_dma
+    logger.info_once("DCP KV gather: copy-engine publisher from %s", path)
+    return op
+
+
+def build_dcp_kv_final_layout_runs(
+    padded_local_seq_lens: list[int],
+    local_context_lens_allranks: list[list[int]],
+    local_starts: list[int],
+    dcp_rank: int,
+) -> torch.Tensor:
+    """Per-request runs (source row, destination row, rows) of this rank's
+    valid rows in the compact request-major layout, as a CPU int64 [n, 3]
+    tensor. The same layout as build_dcp_kv_final_layout_dst_rows: requests
+    outermost, and within a request the ranks' valid rows in rank order."""
+    runs: list[tuple[int, int, int]] = []
+    src_start = 0
+    dst_start = 0
+    for padded_len, context_lens, local_start in zip(
+        padded_local_seq_lens, local_context_lens_allranks, local_starts, strict=True
+    ):
+        valid = [
+            min(max(0, context_len - local_start), padded_len)
+            for context_len in context_lens
+        ]
+        runs.append((src_start, dst_start + sum(valid[:dcp_rank]), valid[dcp_rank]))
+        src_start += padded_len
+        dst_start += sum(valid)
+    return torch.tensor(runs, dtype=torch.int64)
 
 
 class DCPKVGatherPipeline:
@@ -825,6 +923,21 @@ class MLADCPKVGather:
         """Symmetric slots per ubatch of the direct publisher (0 without it)."""
         workspace = self._direct_kv_gather_workspace
         return 0 if workspace is None else workspace.num_slots
+
+    def direct_kv_gather_dma(
+        self,
+        local_kv_c: torch.Tensor,
+        local_k_pe: torch.Tensor,
+        runs: torch.Tensor,
+        output_tokens: int,
+        buffer_slot: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        workspace = self._direct_kv_gather_workspace
+        if workspace is None:
+            raise RuntimeError("direct DCP KV gather is not enabled")
+        return workspace.gather_dma(
+            local_kv_c, local_k_pe, runs, output_tokens, buffer_slot
+        )
 
     def kv_gather(
         self,
