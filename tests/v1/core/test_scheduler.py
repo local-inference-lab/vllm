@@ -6206,9 +6206,7 @@ def _empty_output_for_schedule(output: SchedulerOutput) -> ModelRunnerOutput:
     return ModelRunnerOutput(
         req_ids=req_ids,
         req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
-        sampled_token_ids=[
-            [0] if req_id == "decode" else [] for req_id in req_ids
-        ],
+        sampled_token_ids=[[0] if req_id == "decode" else [] for req_id in req_ids],
         logprobs=None,
         prompt_logprobs_dict={},
         pooler_output=[],
@@ -6391,9 +6389,7 @@ def test_mixed_prefill_budget_selects_2304_token_running_quanta():
 
     scheduler._prefill_budget_quantum = 1
     scheduler._prefill_budget_rotation = 0
-    assert Scheduler._select_running_prefill_limits(
-        scheduler, request_ids, 8192
-    ) == {
+    assert Scheduler._select_running_prefill_limits(scheduler, request_ids, 8192) == {
         "p0": 2731,
         "p1": 2731,
         "p2": 2730,
@@ -6437,10 +6433,16 @@ def test_decode_burst_controller_balances_prefill_and_decode(lp11_model_path):
     prefill_ids = {request.request_id for request in prefills}
 
     outputs = []
+    interval_stats = []
     for _ in range(5):
         output = scheduler.schedule()
         outputs.append(output)
-        scheduler.update_from_output(output, _empty_output_for_schedule(output))
+        engine_outputs = scheduler.update_from_output(
+            output, _empty_output_for_schedule(output)
+        )
+        stats = next(iter(engine_outputs.values())).scheduler_stats
+        assert stats is not None
+        interval_stats.append(stats)
 
     prefill_tokens = [
         sum(
@@ -6457,13 +6459,27 @@ def test_decode_burst_controller_balances_prefill_and_decode(lp11_model_path):
 
     waiter.arrival_time = time.time() - 30.001
     fairness_output = scheduler.schedule()
-    assert sum(
-        count
-        for request_id, count in fairness_output.num_scheduled_tokens.items()
-        if request_id in prefill_ids
-    ) == 2304
+    assert (
+        sum(
+            count
+            for request_id, count in fairness_output.num_scheduled_tokens.items()
+            if request_id in prefill_ids
+        )
+        == 2304
+    )
 
-    stats = scheduler.drain_decode_prefill_stats()
+    final_stats = scheduler.drain_decode_prefill_stats()
+    stats = {
+        "scheduled_prefill_tokens": sum(
+            row.scheduled_prefill_tokens for row in interval_stats
+        )
+        + final_stats["scheduled_prefill_tokens"],
+        "active_partial_prefills": final_stats["active_partial_prefills"],
+        "decode_only_steps": sum(row.decode_only_steps for row in interval_stats)
+        + final_stats["decode_only_steps"],
+        "fairness_bypasses": sum(row.fairness_bypasses for row in interval_stats)
+        + final_stats["fairness_bypasses"],
+    }
     assert stats == {
         "scheduled_prefill_tokens": 4608,
         "active_partial_prefills": 2,

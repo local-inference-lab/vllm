@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -335,9 +336,7 @@ class Scheduler(SchedulerInterface):
         self.max_num_prefill_tokens_per_step = (
             self.scheduler_config.max_num_prefill_tokens_per_step
         )
-        self.max_num_partial_prefills = (
-            self.scheduler_config.max_num_partial_prefills
-        )
+        self.max_num_partial_prefills = self.scheduler_config.max_num_partial_prefills
         self.decode_prefill_min_decode_steps = (
             self.scheduler_config.decode_prefill_min_decode_steps
         )
@@ -373,8 +372,7 @@ class Scheduler(SchedulerInterface):
         if (
             self.need_mamba_block_aligned_split
             and self.max_num_prefill_tokens_per_step
-            and self.max_num_prefill_tokens_per_step % self._prefill_budget_quantum
-            != 0
+            and self.max_num_prefill_tokens_per_step % self._prefill_budget_quantum != 0
         ):
             raise ValueError(
                 "max_num_prefill_tokens_per_step must be a multiple of "
@@ -601,9 +599,7 @@ class Scheduler(SchedulerInterface):
                 limits.get(request_id, 0) + self._prefill_budget_quantum
             )
         if remainder:
-            self._prefill_budget_rotation = (
-                start + remainder
-            ) % len(request_ids)
+            self._prefill_budget_rotation = (start + remainder) % len(request_ids)
         elif base_quanta:
             self._prefill_budget_rotation = (start + 1) % len(request_ids)
         return limits
@@ -640,9 +636,7 @@ class Scheduler(SchedulerInterface):
         The active-partial-prefill value is a gauge and is not reset.
         """
         stats = {
-            "scheduled_prefill_tokens": (
-                self._decode_prefill_scheduled_prefill_tokens
-            ),
+            "scheduled_prefill_tokens": (self._decode_prefill_scheduled_prefill_tokens),
             "active_partial_prefills": self.decode_prefill_active_partial_prefills,
             "decode_only_steps": self._decode_prefill_decode_only_steps,
             "fairness_bypasses": self._decode_prefill_fairness_bypasses,
@@ -740,9 +734,7 @@ class Scheduler(SchedulerInterface):
                 token_budget,
                 input_budget,
             )
-            mixed_prefill_quanta = (
-                mixed_prefill_budget // self._prefill_budget_quantum
-            )
+            mixed_prefill_quanta = mixed_prefill_budget // self._prefill_budget_quantum
             running_prefill_ids = [
                 request.request_id
                 for request in self.running
@@ -827,6 +819,7 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
             if running_prefill_limit is not None:
+                assert prefill_budget_remaining is not None
                 num_new_tokens = min(
                     num_new_tokens,
                     running_prefill_limit,
@@ -932,12 +925,8 @@ class Scheduler(SchedulerInterface):
                                 assert prefill_budget_remaining is not None
                                 prefill_budget_remaining += restored
                                 mixed_prefill_tokens_scheduled -= restored
-                                scheduled_prefill_req_ids.remove(
-                                    preempted_req_id
-                                )
-                            all_scheduled_prefill_req_ids.discard(
-                                preempted_req_id
-                            )
+                                scheduled_prefill_req_ids.remove(preempted_req_id)
+                            all_scheduled_prefill_req_ids.discard(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -1200,8 +1189,7 @@ class Scheduler(SchedulerInterface):
                 pad_spec_decode = False
                 waiting_prefill_limit = None
                 has_local_prefill = (
-                    not load_kv_async
-                    and num_computed_tokens < request.num_tokens - 1
+                    not load_kv_async and num_computed_tokens < request.num_tokens - 1
                 )
 
                 if load_kv_async:
@@ -1216,8 +1204,7 @@ class Scheduler(SchedulerInterface):
                     request_token_budget = min(token_budget, input_budget - draft_slots)
                     if has_local_prefill and prefill_budget_remaining is not None:
                         if (
-                            waiting_prefill_limit_index
-                            >= len(waiting_prefill_limits)
+                            waiting_prefill_limit_index >= len(waiting_prefill_limits)
                             or prefill_budget_remaining <= 0
                         ):
                             break
@@ -1502,8 +1489,7 @@ class Scheduler(SchedulerInterface):
         if prefill_budget_remaining is not None:
             assert prefill_budget_remaining >= 0
             assert (
-                mixed_prefill_tokens_scheduled
-                <= self.max_num_prefill_tokens_per_step
+                mixed_prefill_tokens_scheduled <= self.max_num_prefill_tokens_per_step
             )
 
         assert token_budget >= 0
@@ -1641,9 +1627,7 @@ class Scheduler(SchedulerInterface):
             for request_id in all_scheduled_prefill_req_ids
         )
         self._decode_prefill_scheduled_prefill_tokens += scheduled_prefill_tokens
-        scheduled_decode_tokens = (
-            total_num_scheduled_tokens - scheduled_prefill_tokens
-        )
+        scheduled_decode_tokens = total_num_scheduled_tokens - scheduled_prefill_tokens
         if decode_prefill_enabled:
             if scheduled_prefill_tokens > 0:
                 self._decode_prefill_steps_since_prefill = 0
@@ -3039,11 +3023,16 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        decode_prefill_stats = self.drain_decode_prefill_stats()
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
+            scheduled_prefill_tokens=decode_prefill_stats["scheduled_prefill_tokens"],
+            active_partial_prefills=decode_prefill_stats["active_partial_prefills"],
+            decode_only_steps=decode_prefill_stats["decode_only_steps"],
+            fairness_bypasses=decode_prefill_stats["fairness_bypasses"],
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,

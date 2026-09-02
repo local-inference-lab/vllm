@@ -2391,13 +2391,9 @@ class EngineArgs:
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
-            max_num_prefill_tokens_per_step=(
-                self.max_num_prefill_tokens_per_step
-            ),
+            max_num_prefill_tokens_per_step=(self.max_num_prefill_tokens_per_step),
             max_num_partial_prefills=self.max_num_partial_prefills,
-            decode_prefill_min_decode_steps=(
-                self.decode_prefill_min_decode_steps
-            ),
+            decode_prefill_min_decode_steps=(self.decode_prefill_min_decode_steps),
             decode_prefill_max_wait_ms=self.decode_prefill_max_wait_ms,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
