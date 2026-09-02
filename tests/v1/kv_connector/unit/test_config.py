@@ -101,15 +101,32 @@ def test_kv_connector(
 def _build_config(
     *,
     kv_connector: str | None,
+    kv_connector_extra_config: dict | None = None,
     enable_sleep_mode: bool = False,
     enable_cumem_allocator: bool = False,
 ) -> VllmConfig:
-    """Build a VllmConfig that exercises _verify_kv_transfer_compat without
-    requiring a real model (avoids HF downloads in CI)."""
+    """Build a model-free config for KV-transfer compatibility checks.
+
+    Args:
+        kv_connector: KV connector name, or None to disable KV transfer.
+        kv_connector_extra_config: Optional connector-specific configuration.
+        enable_sleep_mode: Whether sleep mode is enabled.
+        enable_cumem_allocator: Whether the cuMem allocator is enabled.
+
+    Returns:
+        A VllmConfig suitable for exercising KV-transfer compatibility checks.
+
+    Raises:
+        ValueError: If the requested KV-transfer configuration is incompatible.
+    """
     from types import SimpleNamespace
 
     kv_transfer_config = (
-        KVTransferConfig(kv_connector=kv_connector, kv_role="kv_both")
+        KVTransferConfig(
+            kv_connector=kv_connector,
+            kv_role="kv_both",
+            kv_connector_extra_config=kv_connector_extra_config or {},
+        )
         if kv_connector is not None
         else None
     )
@@ -135,6 +152,31 @@ def test_kv_connector_rejects_expandable_segments(monkeypatch, kv_connector):
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     with pytest.raises(ValueError, match="expandable_segments"):
         _build_config(kv_connector=kv_connector)
+
+
+def test_lmcache_mp_engine_driven_allows_expandable_segments(monkeypatch):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    _build_config(
+        kv_connector="LMCacheMPConnector",
+        kv_connector_extra_config={
+            "lmcache.mp.mp_transfer_mode": "engine_driven",
+        },
+    )
+
+
+@pytest.mark.parametrize("transfer_mode", [None, "auto", "lmcache_driven"])
+def test_lmcache_mp_non_engine_driven_rejects_expandable_segments(
+    monkeypatch, transfer_mode
+):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    extra_config = (
+        {} if transfer_mode is None else {"lmcache.mp.mp_transfer_mode": transfer_mode}
+    )
+    with pytest.raises(ValueError, match="expandable_segments"):
+        _build_config(
+            kv_connector="LMCacheMPConnector",
+            kv_connector_extra_config=extra_config,
+        )
 
 
 def test_kv_connector_allows_expandable_segments_with_sleep_mode(monkeypatch):
