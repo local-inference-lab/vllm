@@ -216,8 +216,16 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             device=device,
         )
         self._known_requests: set[str] = set()
+        # Requests skipped by proposals: a failed RPC left their remote state
+        # uncertain, or a reconnect failed. Each id stays here until it leaves
+        # the batch or the stale sweep below releases it.
         self._disabled_requests: set[str] = set()
         self._active_requests: set[str] = set()
+        # Ids whose remote slot may still exist after a failed RPC. The next
+        # proposal frees them first (FREE is a no-op for unknown ids), which
+        # reclaims the slot and re-enables the requests: their next proposal
+        # then resets the remote state from fresh context rows.
+        self._stale_remote_requests: set[str] = set()
         self._retained_prefixes: dict[str, _RetainedRequestPrefix] = {}
         self._retained_serial = 0
         self._remote_max_requests = self.max_num_reqs
@@ -309,6 +317,16 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                     "Remote K3 draft depth is smaller than the target scheduler: "
                     f"remote={remote_max_depth}, target={self.num_speculative_steps}"
                 )
+            remote_max_context_tokens = response.get("max_context_tokens")
+            if remote_max_context_tokens is not None and self.max_num_tokens > int(
+                remote_max_context_tokens
+            ):
+                raise RuntimeError(
+                    "Remote K3 draft context-row capacity is smaller than the "
+                    "target scheduler's batch: "
+                    f"remote={int(remote_max_context_tokens)}, "
+                    f"target={self.max_num_tokens}"
+                )
             self._remote_block_size = int(response.get("block_size", 1))
             self._remote_window_size = int(response.get("window_size", 0))
             self._remote_prefix_cache_tokens = int(
@@ -367,8 +385,24 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
     def capture(self, *, capture_phase: CUDAGraphCapturePhase) -> None:
         """The verifier has no local draft graph to capture."""
 
-    def _free_remote_requests(self, request_ids: set[str] | list[str]) -> None:
-        remote_request_ids = sorted(set(request_ids) & self._known_requests)
+    def _free_remote_requests(
+        self,
+        request_ids: set[str] | list[str],
+        *,
+        known_only: bool = True,
+    ) -> None:
+        """Free remote draft state.
+
+        Args:
+            request_ids: Request ids whose remote state is released.
+            known_only: Free only ids the verifier still tracks. ``False``
+                also frees ids dropped after a failed RPC; the server treats
+                an unknown id as already free.
+        """
+        remote_request_ids = set(request_ids)
+        if known_only:
+            remote_request_ids &= self._known_requests
+        remote_request_ids = sorted(remote_request_ids)
         if not remote_request_ids:
             return
         self._rpc(
@@ -390,10 +424,27 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         """Forget all local state whose remote mutation is now uncertain."""
         failed = set(request_ids)
         self._disabled_requests.update(failed)
+        self._stale_remote_requests.update(failed & self._known_requests)
         self._known_requests.difference_update(failed)
         self._active_requests.difference_update(failed)
         for request_id in failed:
             self._retained_prefixes.pop(request_id, None)
+
+    def _release_stale_remote_requests(self) -> None:
+        """Free remote slots left by failed RPCs and re-enable their requests.
+
+        Runs before a proposal. A transport failure here raises to the
+        proposal's failure path, which keeps every id stale for a later
+        attempt. After a successful FREE the requests draft again: nothing
+        local refers to their old remote state, so their next proposal is a
+        reset or a cold bootstrap.
+        """
+        if not self._stale_remote_requests:
+            return
+        stale = set(self._stale_remote_requests)
+        self._free_remote_requests(stale, known_only=False)
+        self._stale_remote_requests.clear()
+        self._disabled_requests.difference_update(stale)
 
     def _ensure_remote_capacity(self, current_request_ids: set[str]) -> None:
         while len(self._known_requests) >= self._remote_max_requests:
@@ -498,6 +549,12 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 request_id,
                 prefix_end,
             )
+            # The server may or may not have rebound the source slot. Neither
+            # id is trusted any more: both are freed before the next proposal,
+            # after which the request cold-bootstraps.
+            self._retained_prefixes.pop(source_request_id, None)
+            self._known_requests.discard(source_request_id)
+            self._stale_remote_requests.update({source_request_id, request_id})
             return False
 
         self._retained_prefixes.pop(source_request_id)
@@ -724,6 +781,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         current_request_ids = set(input_batch.req_ids)
         previous_active_requests = self._active_requests
         self._disabled_requests.intersection_update(current_request_ids)
+        self._release_stale_remote_requests()
         idx_mapping = input_batch.idx_mapping[:num_reqs].long()
         sampled_counts = num_sampled[:num_reqs]
         sampled_anchors = last_sampled[idx_mapping, 0]

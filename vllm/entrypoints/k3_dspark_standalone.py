@@ -535,13 +535,17 @@ def _run_eager_smoke(runtime: StandaloneRuntime, device: torch.device) -> int:
         MLACommonMetadata,
     )
     from vllm.v1.worker.gpu.spec_decode.utils import (
+        draft_query_len,
         get_parallel_drafting_token_id,
     )
 
     model = runtime.model
     draft_config = runtime.vllm_config.speculative_config.draft_model_config.hf_config
     num_aux_layers = int(draft_config.num_target_layers)
-    hidden_size = int(draft_config.hidden_size)
+    # The context projection consumes target-width auxiliary states.
+    hidden_size = int(
+        getattr(draft_config, "target_hidden_size", None) or draft_config.hidden_size
+    )
 
     aux = torch.zeros(
         (1, num_aux_layers * hidden_size),
@@ -559,10 +563,10 @@ def _run_eager_smoke(runtime: StandaloneRuntime, device: torch.device) -> int:
     )
     model.precompute_and_store_context_kv(context, positions, context_slots)
 
-    sample_from_anchor = bool(getattr(draft_config, "sample_from_anchor", True))
-    query_len = runtime.vllm_config.speculative_config.num_speculative_tokens
-    if not sample_from_anchor:
-        query_len += 1
+    query_len = draft_query_len(
+        runtime.method,
+        runtime.vllm_config.speculative_config.num_speculative_tokens,
+    )
     _validate_single_block_smoke_span(
         context_len,
         query_len,
@@ -642,6 +646,7 @@ def _run_dflash_eager_smoke(
         get_eagle3_aux_layers_from_config,
     )
     from vllm.v1.worker.gpu.spec_decode.utils import (
+        draft_query_len,
         get_parallel_drafting_token_id,
     )
 
@@ -667,7 +672,10 @@ def _run_dflash_eager_smoke(
         context_slot,
     )
 
-    query_len = int(speculative_config.num_speculative_tokens) + 1
+    query_len = draft_query_len(
+        runtime.method,
+        int(speculative_config.num_speculative_tokens),
+    )
     sequence_end = 1 + query_len
     block_ids = list(range(1, 1 + (sequence_end + block_size - 1) // block_size))
     input_ids = torch.tensor(
@@ -946,6 +954,13 @@ def main() -> None:
             print(json.dumps(asdict(status), sort_keys=True), flush=True)
             return
         status_thread.join()
+        if proposal_server is not None and proposal_server.error is not None:
+            # The proposal loop stopped the process: surface its failure as
+            # the exit status instead of a clean shutdown.
+            status.proposal_transport_ready = False
+            raise RuntimeError(
+                f"K3 draft proposal transport failed: {proposal_server.error}"
+            )
     except Exception as exc:
         status.phase = "failed"
         status.error = f"{type(exc).__name__}: {exc}"

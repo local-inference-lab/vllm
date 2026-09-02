@@ -113,6 +113,23 @@ class DraftTokensHandler:
         return DraftTokenIds(self.req_ids, draft_token_ids)
 
 
+def draft_query_len(method: str, num_speculative_tokens: int) -> int:
+    """Return the draft query rows one proposal step runs.
+
+    Args:
+        method: ``"dspark"`` samples every draft token from the anchor row,
+            so the query holds ``num_speculative_tokens`` rows; ``"dflash"``
+            prepends the anchor to the mask rows.
+        num_speculative_tokens: Draft depth of the step.
+
+    Returns:
+        The number of query rows, including the anchor row for DFlash.
+    """
+    if method == "dspark":
+        return int(num_speculative_tokens)
+    return 1 + int(num_speculative_tokens)
+
+
 def get_parallel_drafting_token_id(hf_config) -> int:
     """Resolve the mask token id used for parallel drafting slots.
 

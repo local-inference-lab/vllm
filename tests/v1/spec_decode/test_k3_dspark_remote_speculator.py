@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -100,6 +101,7 @@ def test_failed_proposal_discards_all_uncertain_local_state():
     proxy._known_requests = {"first", "second", "retained"}
     proxy._disabled_requests = set()
     proxy._active_requests = {"first", "second"}
+    proxy._stale_remote_requests = set()
     proxy._retained_prefixes = {
         request_id: _RetainedRequestPrefix(
             token_ids=torch.arange(2),
@@ -137,6 +139,7 @@ def test_failed_proposal_discards_all_uncertain_local_state():
 
     assert output.tolist() == [[-1, -1], [-1, -1]]
     assert proxy._disabled_requests == {"first", "second"}
+    assert proxy._stale_remote_requests == {"first", "second"}
     assert proxy._known_requests == {"retained"}
     assert proxy._active_requests == set()
     assert set(proxy._retained_prefixes) == {"retained"}
@@ -363,3 +366,91 @@ def test_remote_probabilistic_sampler_uses_standard_draft_stream(monkeypatch):
     assert recorded["kwargs"]["use_fp64"] is True
     assert recorded["kwargs"]["logits_cache"] is draft_logits
     assert torch.equal(recorded["kwargs"]["logits_cache_col"], draft_step)
+
+
+def _make_stale_proxy() -> RemoteK3DSparkSpeculator:
+    proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy._known_requests = {"live"}
+    proxy._disabled_requests = {"failed", "gone"}
+    proxy._active_requests = {"live"}
+    proxy._stale_remote_requests = {"failed", "gone"}
+    proxy._retained_prefixes = {}
+    return proxy
+
+
+def test_failed_proposal_marks_known_requests_stale():
+    proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy._known_requests = {"first", "retained"}
+    proxy._disabled_requests = set()
+    proxy._active_requests = {"first"}
+    proxy._stale_remote_requests = set()
+    proxy._retained_prefixes = {}
+
+    proxy._discard_failed_requests(["first", "never_sent"])
+
+    assert proxy._disabled_requests == {"first", "never_sent"}
+    assert proxy._stale_remote_requests == {"first"}
+    assert proxy._known_requests == {"retained"}
+
+
+def test_stale_release_frees_remote_slots_and_re_enables_requests():
+    proxy = _make_stale_proxy()
+    sent = []
+
+    def rpc(parts):
+        sent.append(json.loads(parts[0]))
+        return {"ok": True}
+
+    proxy._rpc = rpc
+
+    proxy._release_stale_remote_requests()
+
+    assert sent == [
+        {
+            "protocol": remote_speculator.PROTOCOL_VERSION,
+            "op": "FREE",
+            "request_ids": ["failed", "gone"],
+        }
+    ]
+    assert proxy._stale_remote_requests == set()
+    assert proxy._disabled_requests == set()
+    assert proxy._known_requests == {"live"}
+
+
+def test_stale_release_keeps_requests_disabled_until_free_succeeds():
+    proxy = _make_stale_proxy()
+
+    def fail(_parts):
+        raise RuntimeError("transport down")
+
+    proxy._rpc = fail
+
+    with pytest.raises(RuntimeError, match="transport down"):
+        proxy._release_stale_remote_requests()
+
+    assert proxy._stale_remote_requests == {"failed", "gone"}
+    assert proxy._disabled_requests == {"failed", "gone"}
+
+
+def test_failed_reconnect_forgets_the_source_and_marks_both_ids_stale():
+    proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy._known_requests = {"source"}
+    proxy._stale_remote_requests = set()
+    proxy._retained_prefixes = {
+        "source": _RetainedRequestPrefix(
+            token_ids=torch.arange(4),
+            committed_end=4,
+            context_start=0,
+            serial=1,
+        )
+    }
+
+    def fail(_parts):
+        raise RuntimeError("transport down")
+
+    proxy._rpc = fail
+
+    assert not proxy._reconnect_request("source", "request", 4, torch.arange(4))
+    assert proxy._known_requests == set()
+    assert proxy._retained_prefixes == {}
+    assert proxy._stale_remote_requests == {"source", "request"}

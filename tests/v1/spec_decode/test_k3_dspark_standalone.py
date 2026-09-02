@@ -3,16 +3,19 @@
 
 import json
 import sys
+import threading
 
 import pytest
 import torch
 
 from vllm.entrypoints.k3_dspark_rpc import (
     DraftKVSlotAllocator,
+    K3DSparkDraftEngine,
     ProjectedContextCache,
     _cuda_graph_shapes,
     _encode_bfloat16_logits_frame,
     _projected_context_capacity_bytes,
+    _required_int_field,
     _validate_proposal_address,
 )
 from vllm.entrypoints.k3_dspark_standalone import (
@@ -23,6 +26,7 @@ from vllm.entrypoints.k3_dspark_standalone import (
     _validate_single_block_smoke_span,
     resolve_shared_weight_files,
 )
+from vllm.v1.worker.gpu.spec_decode.utils import draft_query_len
 
 
 def _write_index(root, weight_map):
@@ -336,3 +340,47 @@ def test_encode_bfloat16_logits_frame_preserves_shape_and_bits():
 def test_encode_logits_rejects_non_bfloat16_input():
     with pytest.raises(ValueError, match="must be bfloat16"):
         _encode_bfloat16_logits_frame(torch.zeros(1, 2, dtype=torch.float32))
+
+
+@pytest.mark.parametrize(
+    "header",
+    (
+        {"anchor_token_id": 3},
+        {"anchor_position": "7"},
+        {"anchor_position": True},
+    ),
+)
+def test_propose_request_integer_fields_are_validated(header):
+    with pytest.raises(ValueError, match="anchor_position"):
+        _required_int_field(header, "anchor_position")
+    assert _required_int_field({"anchor_position": 7}, "anchor_position") == 7
+
+
+def test_reset_of_unknown_request_is_a_no_op():
+    engine = K3DSparkDraftEngine.__new__(K3DSparkDraftEngine)
+    engine._lock = threading.Lock()
+    engine.allocator = DraftKVSlotAllocator(
+        num_cache_blocks=6,
+        block_size=4,
+        window_size=16,
+        max_requests=1,
+    )
+    cleared = []
+    engine._clear_state_cache = lambda state, **_kwargs: cleared.append(
+        state.request_id
+    )
+    known, _ = engine.allocator.get_or_allocate("known")
+
+    engine.reset(["unknown", "known"])
+
+    assert cleared == ["known"]
+    assert engine.allocator.get("unknown") is None
+    assert engine.allocator.get("known") is known
+
+
+@pytest.mark.parametrize(
+    ("method", "depth", "expected"),
+    (("dspark", 3, 3), ("dflash", 3, 4)),
+)
+def test_draft_query_len_follows_the_anchor_sampling_rule(method, depth, expected):
+    assert draft_query_len(method, depth) == expected

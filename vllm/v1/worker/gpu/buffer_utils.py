@@ -132,6 +132,7 @@ class StagedWriteTensor:
         self.device = device
         self.max_concurrency = max_concurrency
 
+        self._uva_buf: UvaBuffer | None = None
         if not uva_instead_of_gpu:
             # Create a GPU tensor (default)
             self.gpu = torch.zeros(size, dtype=dtype, device=device)
@@ -155,8 +156,7 @@ class StagedWriteTensor:
     @property
     def cpu(self) -> torch.Tensor | None:
         """Return the host backing tensor when this tensor uses UVA."""
-        uva_buf = getattr(self, "_uva_buf", None)
-        return None if uva_buf is None else uva_buf.cpu
+        return None if self._uva_buf is None else self._uva_buf.cpu
 
     def stage_write(
         self, index: int, start: int, x: Iterable[int] | Iterable[float]

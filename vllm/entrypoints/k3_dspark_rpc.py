@@ -35,7 +35,10 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
-from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
+from vllm.v1.worker.gpu.spec_decode.utils import (
+    draft_query_len,
+    get_parallel_drafting_token_id,
+)
 
 if TYPE_CHECKING:
     from vllm.entrypoints.k3_dspark_standalone import StandaloneRuntime
@@ -473,6 +476,25 @@ class _DraftCudaGraphState:
         self.block_table.copy_(self.block_table_host, non_blocking=True)
 
 
+def _required_int_field(request: dict[str, Any], name: str) -> int:
+    """Return an integer request field, rejecting a missing or non-integer one.
+
+    Args:
+        request: One PROPOSE request header entry.
+        name: Field name.
+
+    Returns:
+        The field value as ``int``.
+
+    Raises:
+        ValueError: The field is absent or not an integer.
+    """
+    value = request.get(name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"PROPOSE request field {name!r} must be an integer")
+    return value
+
+
 class K3DSparkDraftEngine:
     """Minimal greedy K3 draft scheduler backed by the 3090 KV cache."""
 
@@ -865,10 +887,12 @@ class K3DSparkDraftEngine:
             state.context_cache = None
 
     def reset(self, request_ids: list[str]) -> None:
+        """Drop the retained state of known requests; unknown ids are no-ops."""
         with self._lock:
             for request_id in request_ids:
-                state, _ = self.allocator.get_or_allocate(request_id)
-                self._clear_state_cache(state)
+                state = self.allocator.get(request_id)
+                if state is not None:
+                    self._clear_state_cache(state)
 
     def free(self, request_ids: list[str]) -> None:
         with self._lock:
@@ -931,6 +955,11 @@ class K3DSparkDraftEngine:
         for key, value in timing_ms.items():
             self._timing_totals_ms[key] = self._timing_totals_ms.get(key, 0.0) + value
 
+    def _window_restore_start(self, prefix_end: int) -> int:
+        """Return the block-aligned first position a window restore rebuilds."""
+        start = max(0, prefix_end - self.allocator.window_size)
+        return start // self.allocator.block_size * self.allocator.block_size
+
     def _restore_projected_context(
         self,
         state: DraftRequestState,
@@ -941,10 +970,7 @@ class K3DSparkDraftEngine:
             raise ValueError(
                 f"No projected context is retained for {state.request_id!r}"
             )
-        restore_start = max(0, prefix_end - self.allocator.window_size)
-        restore_start = (
-            restore_start // self.allocator.block_size * self.allocator.block_size
-        )
+        restore_start = self._window_restore_start(prefix_end)
         if not context_cache.has_range(restore_start, prefix_end):
             raise ValueError(
                 f"Projected context for {state.request_id!r} cannot restore "
@@ -985,10 +1011,7 @@ class K3DSparkDraftEngine:
             if state is None:
                 raise KeyError(f"Unknown DSpark source request {source_request_id!r}")
             context_cache = state.context_cache
-            restore_start = max(0, prefix_end - self.allocator.window_size)
-            restore_start = (
-                restore_start // self.allocator.block_size * self.allocator.block_size
-            )
+            restore_start = self._window_restore_start(prefix_end)
             if (
                 prefix_end <= 0
                 or context_cache is None
@@ -1121,10 +1144,7 @@ class K3DSparkDraftEngine:
         num_speculative_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch_size = len(states)
-        sample_from_anchor = self.method == "dspark"
-        query_len = (
-            num_speculative_tokens if sample_from_anchor else 1 + num_speculative_tokens
-        )
+        query_len = draft_query_len(self.method, num_speculative_tokens)
         input_ids: list[int] = []
         positions: list[int] = []
         slots: list[int] = []
@@ -1367,8 +1387,12 @@ class K3DSparkDraftEngine:
                 projected=projected,
             )
             context_end.record()
-            anchor_positions = [int(req["anchor_position"]) for req in requests]
-            anchor_token_ids = [int(req["anchor_token_id"]) for req in requests]
+            anchor_positions = [
+                _required_int_field(req, "anchor_position") for req in requests
+            ]
+            anchor_token_ids = [
+                _required_int_field(req, "anchor_token_id") for req in requests
+            ]
             draft_tokens, draft_logits = self._run_query_block(
                 states,
                 anchor_positions,
@@ -1483,6 +1507,7 @@ class K3DSparkZMQServer:
                 "max_requests": self.engine.allocator.max_requests,
                 "max_batch_size": self.engine.max_batch_size,
                 "max_speculative_tokens": self.engine.max_speculative_tokens,
+                "max_context_tokens": self.engine.max_context_tokens,
                 "block_size": self.engine.allocator.block_size,
                 "window_size": self.engine.allocator.window_size,
                 "prefix_cache_tokens": self.engine.prefix_cache_tokens,
@@ -1555,8 +1580,11 @@ class K3DSparkZMQServer:
             while not self.stop.is_set():
                 if not dict(poller.poll(250)).get(socket):
                     continue
+                # A REP socket may reply only after a receive succeeded, so a
+                # receive failure is a transport failure, not a request error.
+                parts = socket.recv_multipart()
                 try:
-                    response = self._handle(socket.recv_multipart())
+                    response = self._handle(parts)
                 except Exception as exc:
                     logger.exception("K3 DSpark proposal request failed")
                     response = {
@@ -1573,6 +1601,10 @@ class K3DSparkZMQServer:
             self.error = f"{type(exc).__name__}: {exc}"
             logger.exception("K3 DSpark proposal server failed")
             self.ready.set()
+            # Without a proposal loop the process serves nothing; stopping it
+            # makes the failure visible to the supervisor instead of leaving
+            # a status endpoint that still reports the transport as ready.
+            self.stop.set()
         finally:
             socket.close()
             context.term()
