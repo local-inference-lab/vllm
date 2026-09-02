@@ -169,11 +169,15 @@ class FlashInferPcieIpcAllReducePool:
     ) -> None:
         del stream
         channel_id = self._active_channel_id or self._EAGER_CHANNEL_ID
-        if not self._workspace(channel_id).supports(inp):
+        workspace = self._workspace(channel_id)
+        if not workspace.supports(inp):
             raise ValueError(
                 "FlashInfer PCIe IPC graph warmup received an unsupported "
                 f"shape {tuple(inp.shape)}"
             )
+        hidden = inp.shape[-1]
+        batch = inp.numel() // hidden
+        workspace.prepare([(batch, hidden)], dtype=inp.dtype)
 
     def all_reduce(
         self,
