@@ -395,7 +395,18 @@ def test_causal_conv1d_varlen(
 
 
 def _run_update_both_paths(monkeypatch, run):
-    """Run ``run`` with the hoisted decode path and with the generic loop."""
+    """Run ``run`` with the hoisted decode path and with the generic loop.
+
+    Args:
+        monkeypatch: pytest fixture used to toggle the module-level
+            ``_UPDATE_HOIST_ENABLED`` switch around each run.
+        run: zero-argument callable that executes one ``causal_conv1d_update``
+            call and returns its result.
+
+    Returns:
+        A ``(hoisted, generic)`` pair with the results of the hoisted decode
+        path and of the generic per-token loop.
+    """
     from vllm.model_executor.layers.mamba.ops import causal_conv1d as conv_module
 
     monkeypatch.setattr(conv_module, "_UPDATE_HOIST_ENABLED", True)

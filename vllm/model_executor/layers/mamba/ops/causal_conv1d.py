@@ -1066,7 +1066,12 @@ def _causal_conv1d_update_kernel(
                 col2 = xr
                 if SILU_ACTIVATION:
                     acc = acc / (1 + tl.exp(-acc))
-                o_ptrs = o_ptr + o_offset + t * stride_o_token + (idx_feats * stride_o_dim)
+                o_ptrs = (
+                    o_ptr
+                    + o_offset
+                    + t * stride_o_token
+                    + (idx_feats * stride_o_dim)
+                )
                 tl.store(o_ptrs, acc, mask=mask_x_1d)
         return
 
