@@ -88,13 +88,18 @@ def _w4a16_prefill_route_block_m() -> int | None:
     bitwise-identical outputs (the K reduction order per row is unchanged).
     Decode-size launches keep the 8-row plan.
 
-    Returns ``None`` when ``VLLM_KQUANT_W4A16_PREFILL_BLOCK_M`` is unset, in
-    which case ``_ensure_runtime`` asks b12x's own routed-size policy
-    (``select_route_block_size_m``) for the block that fits the planned
-    capacity and falls back to the next smaller block when the kernel
-    rejects one (48- and 64-row blocks are rejected on SM120 at the pinned
-    128x128 CTA tile by the register table / shared-memory limit). ``0``
-    disables the second plan.
+    Returns:
+        ``None`` when ``VLLM_KQUANT_W4A16_PREFILL_BLOCK_M`` is unset, in
+        which case ``_ensure_runtime`` asks b12x's own routed-size policy
+        (``select_route_block_size_m``) for the block that fits the planned
+        capacity and falls back to the next smaller block when the kernel
+        rejects one (48- and 64-row blocks are rejected on SM120 at the
+        pinned 128x128 CTA tile by the register table / shared-memory
+        limit). ``0`` disables the second plan; otherwise the configured
+        block rows.
+
+    Raises:
+        ValueError: if the variable holds anything but 0, 16, 32, 48 or 64.
     """
     raw = os.getenv("VLLM_KQUANT_W4A16_PREFILL_BLOCK_M", "").strip()
     if not raw:
@@ -113,9 +118,23 @@ def _w4a16_prefill_route_min_m() -> int:
     Must exceed every CUDA-graph capture size so captured decode graphs
     replay the 8-row plan only; the 8-row plan also stays faster below
     roughly 256 tokens (real-layer measurement: 1.8 vs 1.9 ms at 128
-    tokens, 3.1 vs 2.2 ms at 512).
+    tokens, 3.1 vs 2.2 ms at 512). Launches in the decode band
+    (``m <= _B12X_DECODE_M``) keep the 8-row plan whatever this value.
+
+    Returns:
+        The token count above which the prefill route plan is bound
+        (``VLLM_KQUANT_W4A16_PREFILL_MIN_M``, default 256).
+
+    Raises:
+        ValueError: if the variable is below ``_B12X_DECODE_M``.
     """
-    return int(os.getenv("VLLM_KQUANT_W4A16_PREFILL_MIN_M", "256"))
+    value = int(os.getenv("VLLM_KQUANT_W4A16_PREFILL_MIN_M", "256"))
+    if value < _B12X_DECODE_M:
+        raise ValueError(
+            "VLLM_KQUANT_W4A16_PREFILL_MIN_M must be at least "
+            f"{_B12X_DECODE_M} so decode-band launches keep the 8-row plan"
+        )
+    return value
 
 
 def _stack_exl3_intermediate_rotations(
@@ -308,9 +327,11 @@ class _HybridLayerState:
         self.trellis_weights: Any = None
         self.trellis_plan: Any = None
         # W4A16 plan with the wide route block for launches above
-        # _w4a16_prefill_route_min_m(); None when disabled or when the
-        # W4A8-MX prefill tier owns prefill.
+        # trellis_w4a16_prefill_min_m tokens; None when disabled or when the
+        # W4A8-MX prefill tier owns prefill. The threshold is resolved once
+        # with the plan so the dispatch path never re-reads the environment.
         self.trellis_w4a16_prefill_plan: Any = None
+        self.trellis_w4a16_prefill_min_m: int = 0
         self.trellis_prefill_weights: Any = None
         self.trellis_prefill_plan: Any = None
         self.trellis_use_w4a8_prefill = False
@@ -1649,10 +1670,11 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                     )
                 )
             state.trellis_w4a16_prefill_plan = None
+            state.trellis_w4a16_prefill_min_m = _w4a16_prefill_route_min_m()
             if (
                 state.trellis_prefill_weights is None
                 and prefill_block_m > 8
-                and runtime.max_m > _w4a16_prefill_route_min_m()
+                and runtime.max_m > state.trellis_w4a16_prefill_min_m
             ):
                 prefill16_key = (
                     "trellis-w4a16-prefill",
@@ -1703,7 +1725,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                             "kquant_hybrid: W4A16 prefill route plan ready "
                             "(block_size_m=%d, min_m=%d, capacity=%d)",
                             prefill_block_m,
-                            _w4a16_prefill_route_min_m(),
+                            state.trellis_w4a16_prefill_min_m,
                             runtime.max_m,
                         )
                     else:
@@ -2058,9 +2080,10 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 state.trellis_prefill_weights is not None and not decode
             )
             use_w4a16_prefill = (
-                not use_w4a8_prefill
+                not decode
+                and not use_w4a8_prefill
                 and state.trellis_w4a16_prefill_plan is not None
-                and m > _w4a16_prefill_route_min_m()
+                and m > state.trellis_w4a16_prefill_min_m
             )
             trellis_plan = (
                 state.trellis_prefill_plan

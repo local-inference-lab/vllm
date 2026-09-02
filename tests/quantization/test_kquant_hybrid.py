@@ -191,6 +191,13 @@ def test_w4a16_prefill_route_block_defaults_and_validation(monkeypatch) -> None:
         _w4a16_prefill_route_block_m()
     monkeypatch.setenv("VLLM_KQUANT_W4A16_PREFILL_MIN_M", "512")
     assert _w4a16_prefill_route_min_m() == 512
+    # Thresholds inside the decode band would let captured decode graphs
+    # bind the prefill route plan.
+    monkeypatch.setenv("VLLM_KQUANT_W4A16_PREFILL_MIN_M", "7")
+    with pytest.raises(ValueError, match="at least 8"):
+        _w4a16_prefill_route_min_m()
+    monkeypatch.setenv("VLLM_KQUANT_W4A16_PREFILL_MIN_M", "8")
+    assert _w4a16_prefill_route_min_m() == 8
 
 
 def test_atoms_v2_profiles_have_canonical_row_strides() -> None:
