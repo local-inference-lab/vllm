@@ -368,9 +368,11 @@ def test_update_draft_decode_metadata_refreshes_dcp_lens_and_schedule(monkeypatc
     builder.cp_kv_cache_interleave_size = 1
     builder.kv_cache_spec = _KVCacheSpec()
     builder.num_sms = 8
+    builder.offsets_buffer = torch.arange(4, dtype=torch.int32)
+    builder.global_decode_seq_lens_buffer = torch.empty(12, dtype=torch.int32)
 
     global_seq_lens = torch.tensor([11, 14, 0], dtype=torch.int32)
-    decode_seq_lens = torch.full((3, 1), -1, dtype=torch.int32)
+    decode_seq_lens = torch.full((3, 3), -1, dtype=torch.int32)
     schedule_metadata = torch.zeros((4, 2), dtype=torch.int32)
     decode = DeepSeekV32IndexerDecodeMetadata(
         block_table=torch.zeros((3, 1), dtype=torch.int32),
@@ -385,7 +387,7 @@ def test_update_draft_decode_metadata_refreshes_dcp_lens_and_schedule(monkeypatc
         max_seq_len=14,
         slot_mapping=torch.zeros(3, dtype=torch.int64),
         num_decodes=3,
-        num_decode_tokens=3,
+        num_decode_tokens=9,
         num_prefills=0,
         num_prefill_tokens=0,
         decode=decode,
@@ -413,7 +415,8 @@ def test_update_draft_decode_metadata_refreshes_dcp_lens_and_schedule(monkeypatc
 
     builder.update_draft_decode_metadata(metadata)
     torch.testing.assert_close(
-        decode_seq_lens[:, 0], torch.tensor([3, 3, 0], dtype=torch.int32)
+        decode_seq_lens,
+        torch.tensor([[2, 2, 3], [3, 3, 3], [0, 0, 0]], dtype=torch.int32),
     )
     torch.testing.assert_close(planned_lens[-1], decode_seq_lens)
     assert torch.all(schedule_metadata == 1)
@@ -421,12 +424,64 @@ def test_update_draft_decode_metadata_refreshes_dcp_lens_and_schedule(monkeypatc
     global_seq_lens.copy_(torch.tensor([15, 18, 0], dtype=torch.int32))
     builder.update_draft_decode_metadata(metadata)
     torch.testing.assert_close(
-        decode_seq_lens[:, 0], torch.tensor([4, 4, 0], dtype=torch.int32)
+        decode_seq_lens,
+        torch.tensor([[3, 3, 4], [4, 4, 4], [0, 0, 0]], dtype=torch.int32),
     )
     torch.testing.assert_close(planned_lens[-1], decode_seq_lens)
     assert torch.all(schedule_metadata == 2)
     assert decode_seq_lens.data_ptr() == seq_lens_ptr
     assert schedule_metadata.data_ptr() == schedule_ptr
+
+
+def test_update_draft_decode_metadata_presents_rank_two_lens_to_native_planner(
+    monkeypatch,
+):
+    class _KVCacheSpec:
+        num_states = 64
+
+    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    builder.dcp_world_size = 1
+    builder.dcp_rank = 0
+    builder.cp_kv_cache_interleave_size = 1
+    builder.kv_cache_spec = _KVCacheSpec()
+    builder.num_sms = 8
+    builder.offsets_buffer = torch.arange(4, dtype=torch.int32)
+    builder.global_decode_seq_lens_buffer = torch.empty(8, dtype=torch.int32)
+
+    global_seq_lens = torch.tensor([11, 14], dtype=torch.int32)
+    decode_seq_lens = torch.full((2,), -1, dtype=torch.int32)
+    schedule_metadata = torch.zeros((4, 2), dtype=torch.int32)
+    decode = DeepSeekV32IndexerDecodeMetadata(
+        block_table=torch.zeros((2, 1), dtype=torch.int32),
+        seq_lens=decode_seq_lens,
+        decode_lens=torch.ones(2, dtype=torch.int32),
+        requires_padding=False,
+        schedule_metadata=schedule_metadata,
+        global_seq_lens=None,
+    )
+    metadata = DeepseekV32IndexerMetadata(
+        seq_lens=global_seq_lens,
+        max_seq_len=14,
+        slot_mapping=torch.zeros(2, dtype=torch.int64),
+        num_decodes=2,
+        num_decode_tokens=2,
+        num_prefills=0,
+        num_prefill_tokens=0,
+        decode=decode,
+    )
+
+    planned_shapes = []
+
+    def _fake_plan(context_lens, block_size, num_sms, indices=None):
+        planned_shapes.append(context_lens.shape)
+        return torch.ones_like(schedule_metadata)
+
+    monkeypatch.setattr(indexer_backend, "get_paged_mqa_logits_metadata", _fake_plan)
+
+    builder.update_draft_decode_metadata(metadata)
+
+    assert planned_shapes == [torch.Size((2, 1))]
+    torch.testing.assert_close(decode_seq_lens, global_seq_lens)
 
 
 @pytest.mark.parametrize("interleave", [1, 2])

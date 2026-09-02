@@ -1105,10 +1105,23 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         decode = metadata.decode
         assert decode is not None
-        # Fused autoregressive drafting builds one query row per request. The
-        # shared sequence-length tensor is advanced by update_draft_inputs;
-        # refresh the indexer's persistent per-row view without reallocating it.
-        assert decode.seq_lens.ndim == 2 and decode.seq_lens.shape[1] == 1
+        # The shared sequence-length tensor is advanced by update_draft_inputs.
+        # Rebuild the indexer's persistent per-token view in preallocated
+        # storage: ordinary fused drafting has width 1, while capture and native
+        # MTP metadata may retain the full speculative width.
+        if decode.seq_lens.ndim == 1:
+            seq_lens = decode.seq_lens.view(metadata.num_decodes, 1)
+        elif (
+            decode.seq_lens.ndim == 2
+            and decode.seq_lens.shape[0] == metadata.num_decodes
+        ):
+            seq_lens = decode.seq_lens
+        else:
+            raise RuntimeError(
+                "Fused indexer decode sequence lengths must have shape "
+                f"[{metadata.num_decodes}] or [{metadata.num_decodes}, N]; "
+                f"got {tuple(decode.seq_lens.shape)}"
+            )
         global_seq_lens = decode.global_seq_lens
         if global_seq_lens is None:
             if self.dcp_world_size > 1:
@@ -1118,22 +1131,34 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             global_seq_lens = metadata.seq_lens[: metadata.num_decodes]
         else:
             global_seq_lens = global_seq_lens[: metadata.num_decodes]
+
+        width = seq_lens.shape[1]
+        num_seq_lens = metadata.num_decodes * width
+        expanded_global_seq_lens = self.global_decode_seq_lens_buffer[
+            :num_seq_lens
+        ].view_as(seq_lens)
+        torch.add(
+            global_seq_lens.unsqueeze(1),
+            self.offsets_buffer[:width],
+            out=expanded_global_seq_lens,
+        )
+        expanded_global_seq_lens.add_(1 - width).clamp_(min=0)
         if self.dcp_world_size > 1:
             refresh_dcp_local_seq_lens_(
-                decode.seq_lens[:, 0],
-                global_seq_lens,
-                metadata.num_decodes,
+                seq_lens.reshape(-1),
+                expanded_global_seq_lens.reshape(-1),
+                num_seq_lens,
                 self.dcp_world_size,
                 self.dcp_rank,
                 self.cp_kv_cache_interleave_size,
             )
         else:
-            decode.seq_lens[:, 0].copy_(global_seq_lens)
+            seq_lens.copy_(expanded_global_seq_lens)
 
         # The scheduler table depends on the effective context lengths. Keep
         # its address stable so the same metadata is valid for CUDA replay.
         schedule_metadata = get_paged_mqa_logits_metadata(
-            decode.seq_lens,
+            seq_lens,
             self.kv_cache_spec.num_states,
             self.num_sms,
             indices=decode.indices,
