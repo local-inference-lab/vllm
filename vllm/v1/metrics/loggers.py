@@ -568,6 +568,44 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_kv_cache_usage, per_engine_labelvalues
         )
 
+        counter_decode_prefill_scheduled_tokens = self._counter_cls(
+            name="vllm:decode_prefill_scheduled_tokens",
+            documentation=(
+                "Prefill tokens scheduled while decode-burst control is enabled."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_decode_prefill_scheduled_tokens = create_metric_per_engine(
+            counter_decode_prefill_scheduled_tokens, per_engine_labelvalues
+        )
+        gauge_decode_prefill_active_partial_prefills = self._gauge_cls(
+            name="vllm:decode_prefill_active_partial_prefills",
+            documentation="Active requests that remain partially prefilling.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_decode_prefill_active_partial_prefills = create_metric_per_engine(
+            gauge_decode_prefill_active_partial_prefills, per_engine_labelvalues
+        )
+        counter_decode_prefill_decode_only_steps = self._counter_cls(
+            name="vllm:decode_prefill_decode_only_steps",
+            documentation=(
+                "Scheduler steps where decode-burst control deferred prefill."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_decode_prefill_decode_only_steps = create_metric_per_engine(
+            counter_decode_prefill_decode_only_steps, per_engine_labelvalues
+        )
+        counter_decode_prefill_fairness_bypasses = self._counter_cls(
+            name="vllm:decode_prefill_fairness_bypasses",
+            documentation="Prefill releases caused by the oldest-waiter deadline.",
+            labelnames=labelnames,
+        )
+        self.counter_decode_prefill_fairness_bypasses = create_metric_per_engine(
+            counter_decode_prefill_fairness_bypasses, per_engine_labelvalues
+        )
+
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
                 name="vllm:corrupted_requests",
@@ -1121,6 +1159,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            self.counter_decode_prefill_scheduled_tokens[engine_idx].inc(
+                scheduler_stats.scheduled_prefill_tokens
+            )
+            self.gauge_decode_prefill_active_partial_prefills[engine_idx].set(
+                scheduler_stats.active_partial_prefills
+            )
+            self.counter_decode_prefill_decode_only_steps[engine_idx].inc(
+                scheduler_stats.decode_only_steps
+            )
+            self.counter_decode_prefill_fairness_bypasses[engine_idx].inc(
+                scheduler_stats.fairness_bypasses
+            )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries
