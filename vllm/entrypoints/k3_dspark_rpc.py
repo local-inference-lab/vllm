@@ -40,15 +40,92 @@ logger = init_logger(__name__)
 
 PROTOCOL_VERSION = 2
 LOGITS_CAPABILITY = "dflash_logits_bf16_v1"
+TOPK_LOGITS_CAPABILITY = "dflash_logits_topk_bf16_v1"
+
+
+def _logits_mass_diag_ks() -> list[int]:
+    """K3_DRAFT_LOGITS_MASS_DIAG=k1,k2,...: log the draft probability mass
+    outside the top-k of every proposed position (temperature 1) so the
+    top-k transport width can be chosen from served traffic. Off when unset."""
+    raw = os.environ.get("K3_DRAFT_LOGITS_MASS_DIAG", "").strip()
+    if not raw:
+        return []
+    ks = sorted({int(v) for v in raw.split(",") if v.strip()})
+    if any(k <= 0 for k in ks):
+        raise ValueError("K3_DRAFT_LOGITS_MASS_DIAG entries must be positive")
+    return ks
+
+
+def _encode_topk_logits_frame(
+    logits: torch.Tensor,
+    k: int,
+    values_host: torch.Tensor | None = None,
+    indices_host: torch.Tensor | None = None,
+) -> tuple[dict[str, Any], bytes]:
+    """Encode the k largest draft logits per position as one binary frame.
+
+    Layout: BF16 values [requests, K, k] followed by int32 vocabulary
+    indices of the same shape. The target scatters them over a fill logit
+    and samples/verifies against that truncated distribution, so the
+    transport shrinks from vocab_size to k entries per position without
+    changing the target's output distribution.
+    """
+    if logits.dtype != torch.bfloat16:
+        raise ValueError(f"Draft logits must be bfloat16, got {logits.dtype}")
+    if logits.ndim != 3:
+        raise ValueError(f"Draft logits must be [requests, K, vocab], got {logits.shape}")
+    vocab = int(logits.shape[-1])
+    if not 1 <= k <= vocab:
+        raise ValueError(f"logits_topk must be in [1, {vocab}], got {k}")
+    values, indices = torch.topk(logits.reshape(-1, vocab), k, dim=-1, sorted=False)
+    count = values.numel()
+    if values_host is not None and values_host.numel() >= count:
+        values_cpu = values_host[:count].view(values.shape)
+        values_cpu.copy_(values, non_blocking=True)
+    else:
+        values_cpu = values.cpu()
+    indices32 = indices.to(torch.int32)
+    if indices_host is not None and indices_host.numel() >= count:
+        indices_cpu = indices_host[:count].view(indices32.shape)
+        indices_cpu.copy_(indices32, non_blocking=True)
+    else:
+        indices_cpu = indices32.cpu()
+    torch.cuda.current_stream(logits.device).synchronize()
+    frame = (
+        values_cpu.view(torch.uint16).numpy().tobytes()
+        + indices_cpu.numpy().tobytes()
+    )
+    shape = [int(logits.shape[0]), int(logits.shape[1]), k]
+    metadata = {
+        "capability": TOPK_LOGITS_CAPABILITY,
+        "dtype": "bfloat16",
+        "shape": shape,
+        "topk": k,
+        "nbytes_values": count * 2,
+        "nbytes_indices": count * 4,
+        "nbytes": len(frame),
+    }
+    return metadata, frame
 
 
 def _encode_bfloat16_logits_frame(
     logits: torch.Tensor,
+    host_buffer: torch.Tensor | None = None,
 ) -> tuple[dict[str, Any], bytes]:
-    """Encode contiguous draft logits as a versioned binary RPC frame."""
+    """Encode contiguous draft logits as a versioned binary RPC frame.
+
+    ``host_buffer`` is an optional pinned staging tensor: the device-to-host
+    copy then runs as a DMA instead of a pageable staged copy.
+    """
     if logits.dtype != torch.bfloat16:
         raise ValueError(f"Draft logits must be bfloat16, got {logits.dtype}")
-    logits_cpu = logits.detach().contiguous().cpu()
+    logits = logits.detach().contiguous()
+    if host_buffer is not None and host_buffer.numel() >= logits.numel():
+        logits_cpu = host_buffer[: logits.numel()].view(logits.shape)
+        logits_cpu.copy_(logits, non_blocking=True)
+        torch.cuda.current_stream(logits.device).synchronize()
+    else:
+        logits_cpu = logits.cpu()
     frame = logits_cpu.view(torch.uint16).numpy().tobytes()
     metadata = {
         "capability": LOGITS_CAPABILITY,
@@ -471,6 +548,13 @@ class K3DSparkDraftEngine:
         self.cuda_graph_replay_count = 0
         self.cuda_graph_eager_fallback_count = 0
         self._cuda_graphs: dict[tuple[int, int], _DraftCudaGraphState] = {}
+        self._logits_host: torch.Tensor | None = None
+        self._topk_values_host: torch.Tensor | None = None
+        self._topk_indices_host: torch.Tensor | None = None
+        self._mass_diag_ks = _logits_mass_diag_ks()
+        self._mass_diag_rows = 0
+        self._mass_diag_sum: dict[int, float] = {k: 0.0 for k in self._mass_diag_ks}
+        self._mass_diag_max: dict[int, float] = {k: 0.0 for k in self._mass_diag_ks}
 
     def _make_cuda_graph_state(
         self,
@@ -783,6 +867,36 @@ class K3DSparkDraftEngine:
             key: value / self.proposal_count
             for key, value in self._timing_totals_ms.items()
         }
+
+    def _record_logits_mass(self, draft_logits: torch.Tensor) -> None:
+        """Accumulate the draft probability mass outside each diagnostic top-k."""
+        rows = draft_logits.reshape(-1, draft_logits.shape[-1]).float()
+        probs = torch.softmax(rows, dim=-1)
+        sorted_probs = torch.sort(probs, dim=-1, descending=True).values
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        outside = {
+            k: (1.0 - cumulative[:, k - 1]).clamp_(min=0.0)
+            for k in self._mass_diag_ks
+            if k <= rows.shape[-1]
+        }
+        for k, values in outside.items():
+            self._mass_diag_sum[k] += float(values.sum())
+            self._mass_diag_max[k] = max(self._mass_diag_max[k], float(values.max()))
+        self._mass_diag_rows += int(rows.shape[0])
+        if self._mass_diag_rows >= 1024:
+            logger.info(
+                "Draft logits mass outside top-k over %d positions (T=1): %s",
+                self._mass_diag_rows,
+                ", ".join(
+                    f"k={k}: mean {self._mass_diag_sum[k] / self._mass_diag_rows:.2e} "
+                    f"max {self._mass_diag_max[k]:.2e}"
+                    for k in self._mass_diag_ks
+                ),
+            )
+            self._mass_diag_rows = 0
+            for k in self._mass_diag_ks:
+                self._mass_diag_sum[k] = 0.0
+                self._mass_diag_max[k] = 0.0
 
     def _record_timing(self, timing_ms: dict[str, float]) -> None:
         self.last_timing_ms = timing_ms
@@ -1185,6 +1299,9 @@ class K3DSparkDraftEngine:
         return_logits = bool(header.get("return_logits", False))
         if return_logits and self.method != "dflash":
             raise ValueError("Probabilistic logits are supported only for DFlash")
+        logits_topk = int(header.get("logits_topk", 0))
+        if logits_topk < 0:
+            raise ValueError("logits_topk cannot be negative")
         projected = bool(header.get("projected", False))
         context_counts = [int(req.get("context_count", 0)) for req in requests]
         if any(count < 0 for count in context_counts):
@@ -1260,11 +1377,35 @@ class K3DSparkDraftEngine:
             tokens_copied = time.perf_counter()
             logits_metadata = None
             logits_frame = None
-            if return_logits:
+            if return_logits and logits_topk > 0:
                 assert draft_logits is not None
-                logits_metadata, logits_frame = _encode_bfloat16_logits_frame(
-                    draft_logits
+                count = int(draft_logits.shape[0]) * int(draft_logits.shape[1]) * logits_topk
+                if self._topk_values_host is None or self._topk_values_host.numel() < count:
+                    self._topk_values_host = torch.empty(
+                        count, dtype=torch.bfloat16, pin_memory=True
+                    )
+                    self._topk_indices_host = torch.empty(
+                        count, dtype=torch.int32, pin_memory=True
+                    )
+                logits_metadata, logits_frame = _encode_topk_logits_frame(
+                    draft_logits,
+                    logits_topk,
+                    self._topk_values_host,
+                    self._topk_indices_host,
                 )
+            elif return_logits:
+                assert draft_logits is not None
+                if (
+                    self._logits_host is None
+                    or self._logits_host.numel() < draft_logits.numel()
+                ):
+                    self._logits_host = torch.empty(
+                        draft_logits.numel(), dtype=torch.bfloat16, pin_memory=True
+                    )
+                logits_metadata, logits_frame = _encode_bfloat16_logits_frame(
+                    draft_logits, self._logits_host
+                )
+            if logits_metadata is not None:
                 logits_metadata["sample_positions"] = [
                     [
                         anchor_position + step + 1
@@ -1272,6 +1413,8 @@ class K3DSparkDraftEngine:
                     ]
                     for anchor_position in anchor_positions
                 ]
+            if self._mass_diag_ks and draft_logits is not None:
+                self._record_logits_mass(draft_logits)
             logits_copied = time.perf_counter()
             self.proposal_count += 1
             self.last_latency_ms = (logits_copied - started) * 1000

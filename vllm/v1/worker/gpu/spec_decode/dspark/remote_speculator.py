@@ -97,6 +97,58 @@ def _contiguous_draft_output(
 LOGITS_CAPABILITY = "dflash_logits_bf16_v1"
 
 
+TOPK_LOGITS_CAPABILITY = "dflash_logits_topk_bf16_v1"
+# Logit assigned to vocabulary entries outside the draft's transmitted top-k.
+# Finite (bf16 -10048) so the logsumexp blocks of the rejection sampler never
+# see an all -inf block; exp(-1e4 - max) underflows to exactly zero, so the
+# draft distribution is the top-k slice renormalized, i.e. q(x) = 0 outside it.
+TOPK_LOGITS_FILL = -1.0e4
+
+
+def _decode_topk_logits_frame(
+    response: dict[str, Any],
+    expected_shape: tuple[int, int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode a top-k draft-logit frame: BF16 values then int32 indices,
+    both shaped [requests, K, k]."""
+    metadata = response.get("logits")
+    frame = response.get("_logits_frame")
+    if not isinstance(metadata, dict) or not isinstance(frame, bytes):
+        raise ValueError("Remote DFlash response is missing its logits frame")
+    if metadata.get("capability") != TOPK_LOGITS_CAPABILITY:
+        raise ValueError(f"Unsupported logits capability: {metadata}")
+    if metadata.get("dtype") != "bfloat16":
+        raise ValueError(f"Unsupported logits dtype: {metadata}")
+    if tuple(metadata.get("shape", ())) != expected_shape:
+        raise ValueError(
+            f"Remote DFlash top-k logits shape mismatch: expected={expected_shape}, "
+            f"metadata={metadata}"
+        )
+    count = math.prod(expected_shape)
+    values_nbytes = count * 2
+    indices_nbytes = count * 4
+    if (
+        metadata.get("nbytes_values") != values_nbytes
+        or metadata.get("nbytes_indices") != indices_nbytes
+        or len(frame) != values_nbytes + indices_nbytes
+    ):
+        raise ValueError(
+            "Remote DFlash top-k logits byte count mismatch: "
+            f"expected={values_nbytes}+{indices_nbytes}, metadata={metadata}, "
+            f"frame={len(frame)}"
+        )
+    buffer = bytearray(frame)
+    values = (
+        torch.frombuffer(buffer, dtype=torch.uint16, count=count)
+        .view(torch.bfloat16)
+        .reshape(expected_shape)
+    )
+    indices = torch.frombuffer(
+        buffer, dtype=torch.int32, count=count, offset=values_nbytes
+    ).reshape(expected_shape)
+    return values, indices
+
+
 def _decode_bfloat16_logits_frame(
     response: dict[str, Any],
     expected_shape: tuple[int, int, int],
@@ -252,6 +304,18 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         self.draft_logits: torch.Tensor | None = None
         self._remote_logits: torch.Tensor | None = None
         self._remote_sample_positions: torch.Tensor | None = None
+        # Top-k draft distribution transport (VLLM_K3_DRAFT_LOGITS_TOPK=k > 0):
+        # the draft returns its k largest logits per position instead of the
+        # full vocabulary; every rank scatters them over TOPK_LOGITS_FILL into
+        # its dense logits buffer, so the draft is sampled from, and verified
+        # against, the same truncated distribution. Rejection sampling stays
+        # exact with respect to the target for any draft distribution; only
+        # the acceptance rate depends on the mass outside the top-k.
+        self._logits_topk = int(os.environ.get("VLLM_K3_DRAFT_LOGITS_TOPK", "0"))
+        if self._logits_topk < 0:
+            raise ValueError("VLLM_K3_DRAFT_LOGITS_TOPK must be >= 0")
+        self._remote_topk_values: torch.Tensor | None = None
+        self._remote_topk_indices: torch.Tensor | None = None
         if self._probabilistic:
             head_dtype = vllm_config.model_config.head_dtype
             if head_dtype != torch.bfloat16:
@@ -272,6 +336,23 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 dtype=torch.int64,
                 device=device,
             )
+            if self._logits_topk > 0:
+                if self._logits_topk > self.vocab_size:
+                    raise ValueError(
+                        "VLLM_K3_DRAFT_LOGITS_TOPK exceeds the draft vocabulary: "
+                        f"{self._logits_topk} > {self.vocab_size}"
+                    )
+                topk_shape = (
+                    self.max_num_reqs,
+                    self.num_speculative_steps,
+                    self._logits_topk,
+                )
+                self._remote_topk_values = torch.full(
+                    topk_shape, TOPK_LOGITS_FILL, dtype=head_dtype, device=device
+                )
+                self._remote_topk_indices = torch.zeros(
+                    topk_shape, dtype=torch.int64, device=device
+                )
         self.draft_tokens = torch.full(
             (self.max_num_reqs, self.num_speculative_steps),
             -1,
@@ -387,7 +468,19 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                     self._async_depth,
                 )
             # kimi-k3-draft-async-ingest: end
-            if self._probabilistic:
+            if self._probabilistic and self._logits_topk > 0:
+                topk_shape = (
+                    self.max_num_reqs,
+                    self.num_speculative_steps,
+                    self._logits_topk,
+                )
+                self._topk_values_staging = torch.empty(
+                    topk_shape, dtype=torch.bfloat16, pin_memory=True
+                )
+                self._topk_indices_staging = torch.empty(
+                    topk_shape, dtype=torch.int32, pin_memory=True
+                )
+            elif self._probabilistic:
                 self._logits_staging = torch.empty(
                     (
                         self.max_num_reqs,
@@ -764,6 +857,11 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
     ) -> None:
         assert self._remote_logits is not None
         assert self._remote_sample_positions is not None
+        if self._logits_topk > 0:
+            self._copy_topk_logits_from_response(
+                response, active_indices, num_speculative_tokens
+            )
+            return
         expected_shape = (
             len(active_indices),
             num_speculative_tokens,
@@ -801,6 +899,74 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         )
         self._remote_sample_positions.index_copy_(0, active_gpu, positions)
 
+    def _copy_topk_logits_from_response(
+        self,
+        response: dict[str, Any],
+        active_indices: list[int],
+        num_speculative_tokens: int,
+    ) -> None:
+        """Stage the draft's top-k logits (rank 0) for the TP broadcast."""
+        assert self._remote_topk_values is not None
+        assert self._remote_topk_indices is not None
+        assert self._remote_sample_positions is not None
+        expected_shape = (
+            len(active_indices),
+            num_speculative_tokens,
+            self._logits_topk,
+        )
+        values, indices = _decode_topk_logits_frame(response, expected_shape)
+        sample_positions = response["logits"].get("sample_positions")
+        expected_positions = expected_shape[:2]
+        if (
+            not isinstance(sample_positions, list)
+            or len(sample_positions) != expected_positions[0]
+            or any(
+                not isinstance(row, list) or len(row) != expected_positions[1]
+                for row in sample_positions
+            )
+        ):
+            raise ValueError(
+                "Remote DFlash sample positions have the wrong shape: "
+                f"expected={expected_positions}, got={sample_positions!r}"
+            )
+        active_gpu = torch.tensor(active_indices, dtype=torch.int64, device=self.device)
+        values_staging = self._topk_values_staging[
+            : len(active_indices), :num_speculative_tokens
+        ]
+        indices_staging = self._topk_indices_staging[
+            : len(active_indices), :num_speculative_tokens
+        ]
+        values_staging.copy_(values)
+        indices_staging.copy_(indices)
+        self._remote_topk_values[:, :num_speculative_tokens].index_copy_(
+            0, active_gpu, values_staging.to(self.device, non_blocking=True)
+        )
+        self._remote_topk_indices[:, :num_speculative_tokens].index_copy_(
+            0,
+            active_gpu,
+            indices_staging.to(self.device, non_blocking=True).to(torch.int64),
+        )
+        positions = torch.tensor(
+            sample_positions,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._remote_sample_positions.index_copy_(0, active_gpu, positions)
+
+    def _materialize_topk_logits(self, num_speculative_tokens: int) -> None:
+        """Expand the broadcast top-k slice into the dense logits buffer:
+        TOPK_LOGITS_FILL everywhere, the draft's values at their indices."""
+        assert self._remote_logits is not None
+        assert self._remote_topk_values is not None
+        assert self._remote_topk_indices is not None
+        logits = self._remote_logits[:, :num_speculative_tokens]
+        logits.fill_(TOPK_LOGITS_FILL)
+        logits.scatter_(
+            -1,
+            self._remote_topk_indices[:, :num_speculative_tokens],
+            self._remote_topk_values[:, :num_speculative_tokens],
+        )
+
     def _sample_remote_probabilistic(
         self,
         input_batch: InputBatch,
@@ -811,10 +977,18 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         assert self.draft_logits is not None
         assert self._remote_logits is not None
         assert self._remote_sample_positions is not None
-        logger.info_once(
-            "Remote K3 DFlash probabilistic sampling is active with "
-            "full-vocabulary BF16 logits"
-        )
+        if self._logits_topk > 0:
+            logger.info_once(
+                "Remote K3 DFlash probabilistic sampling is active with top-%d "
+                "BF16 draft logits (entries outside the top-k carry logit %g)",
+                self._logits_topk,
+                TOPK_LOGITS_FILL,
+            )
+        else:
+            logger.info_once(
+                "Remote K3 DFlash probabilistic sampling is active with "
+                "full-vocabulary BF16 logits"
+            )
         num_reqs = input_batch.num_reqs
         positions = self._remote_sample_positions[:num_reqs, :num_speculative_tokens]
         request_rows, draft_steps = torch.where(positions >= 0)
@@ -1101,6 +1275,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             "projected": False,
             "num_speculative_tokens": num_speculative_tokens,
             "return_logits": self._probabilistic,
+            "logits_topk": self._logits_topk,
             "requests": requests,
         }
         frames = [json.dumps(header).encode(), positions_frame, context_frame]
@@ -1216,7 +1391,8 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             assert self._remote_logits is not None
             assert self._remote_sample_positions is not None
             self.draft_logits.zero_()
-            self._remote_logits.zero_()
+            if self._logits_topk == 0:
+                self._remote_logits.zero_()
             self._remote_sample_positions.fill_(-1)
         if self._tp_rank == 0 and not (dummy_run or is_profile):
             try:
@@ -1243,7 +1419,14 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         if self._probabilistic and not (dummy_run or is_profile):
             assert self._remote_logits is not None
             assert self._remote_sample_positions is not None
-            self._tp_group.broadcast(self._remote_logits, src=0)
+            if self._logits_topk > 0:
+                assert self._remote_topk_values is not None
+                assert self._remote_topk_indices is not None
+                self._tp_group.broadcast(self._remote_topk_values, src=0)
+                self._tp_group.broadcast(self._remote_topk_indices, src=0)
+                self._materialize_topk_logits(active_k)
+            else:
+                self._tp_group.broadcast(self._remote_logits, src=0)
             self._tp_group.broadcast(self._remote_sample_positions, src=0)
             self._sample_remote_probabilistic(
                 input_batch,
