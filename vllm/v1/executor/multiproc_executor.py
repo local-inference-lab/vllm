@@ -118,6 +118,7 @@ class MultiprocExecutor(Executor):
     def _init_executor(self) -> None:
         # Call self.shutdown at exit to clean up
         # and ensure workers will be terminated.
+        self._workers_initialized = False
         self._finalizer = weakref.finalize(self, self.shutdown)
         self.is_failed = False
         self.failure_callback: FailureCallback | None = None
@@ -264,6 +265,7 @@ class MultiprocExecutor(Executor):
                 self._ensure_worker_termination([uw.proc for uw in unready_workers])
 
         self.output_rank = self._get_output_rank()
+        self._workers_initialized = True
 
     def get_response_mqs(self, unique_reply_rank: int = -1) -> list[MessageQueue]:
         assert unique_reply_rank >= -1 and unique_reply_rank < self.world_size, (
@@ -511,6 +513,23 @@ class MultiprocExecutor(Executor):
 
             # Make sure all the worker processes are terminated first.
             if workers := getattr(self, "workers", None):
+                if (
+                    getattr(self, "_workers_initialized", False)
+                    and getattr(self, "rpc_broadcast_mq", None) is not None
+                    and getattr(self, "response_mqs", None) is not None
+                    and getattr(self, "futures_queue", None) is not None
+                ):
+                    try:
+                        self.collective_rpc(
+                            "shutdown",
+                            timeout=envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[shutdown] Executor: failed to shut down workers "
+                            "gracefully"
+                        )
+
                 for w in workers:
                     # Close death_writer to signal child processes to exit
                     if w.death_writer is not None:
