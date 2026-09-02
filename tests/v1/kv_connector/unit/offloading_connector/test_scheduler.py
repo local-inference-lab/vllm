@@ -3614,9 +3614,12 @@ class TestSharedGroupMTPOffload:
 
 
 class TestMambaHybridOffloadServing:
-    """Store->finish->lookup flows on a full-attention + mamba-align hybrid,
-    with a manager that only HITs keys that were actually stored. Guards the
-    two collapse routes of issue #52735."""
+    """Exercise durable round trips for full-attention + Mamba align caches.
+
+    The offloading manager reports a hit only for keys stored by the connector.
+    This verifies the shared-group and explicitly annotated drafter layouts
+    described by vLLM issue #52735.
+    """
 
     BLOCK = 4
     MAMBA_BLOCK = 16
@@ -3715,7 +3718,14 @@ class TestMambaHybridOffloadServing:
         out = SimpleNamespace(
             num_scheduled_tokens={"A": self.PROMPT_TOKENS},
             finished_req_ids=set(),
+            kv_connector_block_state=KVConnectorBlockState(
+                block_ids={},
+                # Align-mode recurrent state must use the scheduler-owned
+                # source block captured at the durable 16-token boundary.
+                boundary_state_offloads={"A": [(1, 101, self.MAMBA_BLOCK)]},
+            ),
         )
+        scheduler._build_partial_tail_store_jobs(out)
         scheduler._build_store_jobs(out)
         complete_all_jobs()
 
@@ -3736,10 +3746,11 @@ class TestMambaHybridOffloadServing:
         return served if served is not None else 0
 
     def test_shared_group_mtp_serves_like_non_speculative(self):
-        """Route 1 of #52735: with spec decode on and no drafter annotation,
-        serving must equal the non-speculative baseline (was 0 before the
-        fix: the all-groups fallback marked the mamba group as a drafter and
-        the volatile-tail pop consumed its only servable chunk)."""
+        """Shared-group MTP preserves the non-speculative offload hit.
+
+        A layout without a drafter-group annotation must not treat every cache
+        group as volatile; doing so would consume the only servable Mamba chunk.
+        """
         baseline = self._roundtrip_served_tokens(self._make_scheduler(None))
         assert baseline == 16
         served = self._roundtrip_served_tokens(
@@ -3748,11 +3759,12 @@ class TestMambaHybridOffloadServing:
         assert served == baseline
 
     def test_annotated_eagle_group_does_not_starve_coarse_sibling(self):
-        """Route 2 of #52735 (F1): a genuinely annotated eagle full-attention
-        group must not drag the confirmed boundary below a coarser sibling's
-        chunk granularity. The widened query makes the volatile-tail pop
-        land on an extra queried chunk, holding the boundary at 16 tokens
-        (was 0 before the fix: 4 hits -> pop -> 12 tokens < mamba chunk)."""
+        """A drafter group preserves a coarser sibling's confirmed boundary.
+
+        The lookup includes one extra drafter chunk before removing the
+        volatile tail, so the confirmed boundary remains aligned to the
+        16-token Mamba chunk.
+        """
         scheduler = self._make_scheduler(None, mamba_eagle=True)
         assert [c.is_eagle_group for c in scheduler.config.kv_group_configs] == [
             True,
