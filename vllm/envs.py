@@ -250,6 +250,7 @@ if TYPE_CHECKING:
     VLLM_DCP_KV_GATHER_SLOTS: int = 3
     VLLM_K3_DCP_GATHER_PIPELINE: bool = True
     VLLM_K3_DCP_GATHER_DMA: bool = False
+    VLLM_K3_DCP_GATHER_CLUSTERS: str = ""
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -2492,6 +2493,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_K3_DCP_GATHER_DMA": lambda: bool(
         int(os.getenv("VLLM_K3_DCP_GATHER_DMA", "0"))
     ),
+    # Two groups of DCP ranks that share a PCIe switch each, e.g.
+    # "0,1,2,3;4,5,6,7": the copy-engine publisher then relays rows across
+    # the inter-switch link once (through the same-position partner) instead
+    # of once per peer behind it. Empty = flat all-to-all schedule.
+    "VLLM_K3_DCP_GATHER_CLUSTERS": lambda: os.getenv("VLLM_K3_DCP_GATHER_CLUSTERS", ""),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
     # overlap the base layer compute with the LoRA fast path).

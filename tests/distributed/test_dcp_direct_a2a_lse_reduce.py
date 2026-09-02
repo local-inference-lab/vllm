@@ -862,8 +862,12 @@ def _gather_into_slot(workspace, local_kv, dst_rows, output_tokens, slot):
     return workspace.gather(local_kv, dst_rows, output_tokens, slot)
 
 
-def _gather_dma_into_slot(workspace, kv_c, k_pe, runs, output_tokens, slot):
-    return workspace.gather_dma(kv_c, k_pe, runs, output_tokens, slot)
+def _gather_dma_into_slot(
+    workspace, kv_c, k_pe, runs, output_tokens, relay, partner_runs, slot
+):
+    return workspace.gather_dma(
+        kv_c, k_pe, runs, output_tokens, slot, relay=relay, partner_runs=partner_runs
+    )
 
 
 def _distributed_direct_kv_gather_worker(env: dict[str, str]) -> None:
@@ -1148,37 +1152,48 @@ def _distributed_direct_kv_gather_worker(env: dict[str, str]) -> None:
                     )
                 dist.barrier()
 
-                if os.getenv("VLLM_K3_DCP_GATHER_ROTATE_LIB"):
-                    # Copy-engine publisher: the same layouts, serial then the
-                    # pipelined ring, through gather_dma (plane-separated
-                    # sources and per-request runs).
-                    def dma_inputs(index: int, layout, dtype=dtype):
+                # Copy-engine publisher: the same layouts, serial then the
+                # pipelined ring, through gather_dma (plane-separated sources
+                # and per-request runs); the flat schedule, and with four
+                # ranks also the two-switch relay (switches {0,1} and {2,3}).
+                relays: list = [None]
+                if world_size == 4:
+                    relays.append({r: (r ^ 2, 1 << (r ^ 1)) for r in range(4)})
+                if not os.getenv("VLLM_K3_DCP_GATHER_ROTATE_LIB"):
+                    relays = []
+                for relay_map in relays:
+                    relay = None if relay_map is None else relay_map[rank]
+
+                    def dma_inputs(index: int, layout, dtype=dtype, relay=relay):
                         maps, output_tokens = layout_maps(layout)
                         local = make_local(rank, 60 + index, len(maps[rank]), dtype)
                         padded_lens, local_starts_, context_lens = layout
+                        lens = [list(item) for item in context_lens]
                         runs = dcp_utils.build_dcp_kv_final_layout_runs(
-                            list(padded_lens),
-                            [list(lens) for lens in context_lens],
-                            list(local_starts_),
-                            rank,
+                            list(padded_lens), lens, list(local_starts_), rank
+                        )
+                        partner_runs = (
+                            None
+                            if relay is None
+                            else dcp_utils.build_dcp_kv_final_layout_runs(
+                                list(padded_lens), lens, list(local_starts_), relay[0]
+                            )
                         )
                         return (
                             local[:, :plane_split_dim].contiguous(),
                             local[:, plane_split_dim:].contiguous(),
                             runs,
                             output_tokens,
+                            relay,
+                            partner_runs,
                         )
 
                     torch.accelerator.synchronize()
                     dist.barrier()
                     for index, layout in enumerate(ring_layouts[:3]):
-                        kv_c_src, k_pe_src, runs, output_tokens = dma_inputs(
-                            index, layout
-                        )
+                        source = dma_inputs(index, layout)
                         torch.accelerator.synchronize()
-                        actual = workspace.gather_dma(
-                            kv_c_src, k_pe_src, runs, output_tokens, index % 3
-                        )
+                        actual = _gather_dma_into_slot(workspace, *source, index % 3)
                         torch.accelerator.synchronize()
                         assert_planes(
                             actual, expected_planes(layout, 60 + index, dtype)

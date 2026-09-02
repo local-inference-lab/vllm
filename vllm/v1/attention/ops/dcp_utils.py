@@ -618,6 +618,8 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
         runs: torch.Tensor,
         output_tokens: int,
         buffer_slot: int,
+        relay: tuple[int, int] | None = None,
+        partner_runs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Publish plane-separated local rows with the copy engines.
 
@@ -626,15 +628,28 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
         ``runs`` (CPU int64 [n, 3]: source row, destination row, rows) maps
         each request's valid rows to the compact request-major layout. The
         payload moves with cudaMemcpyAsync, so no SM memory pipeline is busy
-        while it is in flight; two single-block kernels release this rank's
-        epoch to every peer and wait for every source. Same layout, epoch and
+        while it is in flight; single-block kernels release this rank's
+        epoch to the peers and wait for every source. Same layout, epoch and
         signal protocol as :meth:`gather`.
+
+        ``relay`` = (partner rank, mates mask) selects the two-switch relay
+        schedule (see :func:`dcp_gather_relay_layout`): this rank's rows go
+        to its switch mates and to the partner across the inter-switch link,
+        and the partner's rows (``partner_runs``, the partner's runs in the
+        same layout) are forwarded to the mates from this rank's own slot.
         """
         ubatch = dbo_current_ubatch_id()
         if not 0 <= ubatch < self.num_ubatches:
             raise ValueError(
                 f"DCP kv-gather ubatch {ubatch} exceeds {self.num_ubatches} slots"
             )
+        if relay is None:
+            partner, mates_mask = -1, 0
+            partner_runs = runs
+        else:
+            partner, mates_mask = relay
+            if partner_runs is None:
+                raise ValueError("the relay schedule needs the partner's runs")
         _dma_kv_gather_op()(
             local_kv_c,
             local_k_pe,
@@ -650,6 +665,9 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
             self.world_size,
             self.rank,
             self.max_gathered_tokens,
+            partner,
+            mates_mask,
+            partner_runs,
         )
         return self._slot_planes(ubatch, buffer_slot, output_tokens)
 
@@ -686,6 +704,33 @@ def _dma_kv_gather_op():
     op = torch.ops._C_k3ext.direct_dcp_kv_gather_dma
     logger.info_once("DCP KV gather: copy-engine publisher from %s", path)
     return op
+
+
+def dcp_gather_relay_layout(world_size: int, rank: int) -> tuple[int, int] | None:
+    """(partner rank, mates mask) of the two-switch relay schedule for
+    ``VLLM_K3_DCP_GATHER_CLUSTERS`` (``"0,1,2,3;4,5,6,7"`` in DCP ranks: two
+    equal groups sharing a PCIe switch each; the partner is the other
+    group's member at the same position), or None when unset."""
+    spec = envs.VLLM_K3_DCP_GATHER_CLUSTERS
+    if not spec:
+        return None
+    groups = [
+        [int(r) for r in group.split(",") if r.strip()] for group in spec.split(";")
+    ]
+    if len(groups) != 2 or len(groups[0]) != len(groups[1]):
+        raise ValueError(
+            "VLLM_K3_DCP_GATHER_CLUSTERS must name two equal groups of DCP ranks"
+        )
+    if sorted(groups[0] + groups[1]) != list(range(world_size)):
+        raise ValueError(
+            f"VLLM_K3_DCP_GATHER_CLUSTERS must cover ranks 0..{world_size - 1} once"
+        )
+    for mine, other in ((groups[0], groups[1]), (groups[1], groups[0])):
+        if rank in mine:
+            partner = other[mine.index(rank)]
+            mates_mask = sum(1 << r for r in mine if r != rank)
+            return partner, mates_mask
+    raise AssertionError("unreachable")
 
 
 def build_dcp_kv_final_layout_runs(
@@ -931,13 +976,34 @@ class MLADCPKVGather:
         runs: torch.Tensor,
         output_tokens: int,
         buffer_slot: int,
+        partner_runs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         workspace = self._direct_kv_gather_workspace
         if workspace is None:
             raise RuntimeError("direct DCP KV gather is not enabled")
         return workspace.gather_dma(
-            local_kv_c, local_k_pe, runs, output_tokens, buffer_slot
+            local_kv_c,
+            local_k_pe,
+            runs,
+            output_tokens,
+            buffer_slot,
+            relay=self.kv_gather_relay,
+            partner_runs=partner_runs,
         )
+
+    @functools.cached_property
+    def kv_gather_relay(self) -> tuple[int, int] | None:
+        """The two-switch relay schedule of the copy-engine publisher
+        (``VLLM_K3_DCP_GATHER_CLUSTERS``), or None for the flat schedule."""
+        relay = dcp_gather_relay_layout(self.group.world_size, self.group.rank_in_group)
+        if relay is not None:
+            logger.info_once(
+                "DCP KV gather: two-switch relay schedule, partner rank %d, "
+                "mates mask %#x",
+                relay[0],
+                relay[1],
+            )
+        return relay
 
     def kv_gather(
         self,

@@ -1476,11 +1476,27 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                         self.dcp_rank,
                     )
                     chunk.final_layout_runs = runs
+                    relay = dcp_kv_gather.kv_gather_relay
+                    chunk.final_layout_partner_runs = (
+                        None
+                        if relay is None
+                        else build_dcp_kv_final_layout_runs(
+                            chunk.padded_local_seq_lens,
+                            chunk.local_context_lens_allranks,
+                            chunk.local_starts,
+                            relay[0],
+                        )
+                    )
                 stage_kv_c, stage_k_pe = self._dma_staging(workspace, toks)
                 stage_kv_c.copy_(workspace[:toks, : self.kv_lora_rank])
                 stage_k_pe.copy_(workspace[:toks, self.kv_lora_rank :])
                 return dcp_kv_gather.direct_kv_gather_dma(
-                    stage_kv_c, stage_k_pe, runs, chunk.num_context_tokens, slot
+                    stage_kv_c,
+                    stage_k_pe,
+                    runs,
+                    chunk.num_context_tokens,
+                    slot,
+                    partner_runs=chunk.final_layout_partner_runs,
                 )
             return dcp_kv_gather.direct_kv_gather(
                 workspace[:toks],
