@@ -54,9 +54,9 @@ def test_b12x_mla_uses_gathered_dcp_head_geometry() -> None:
 
 @pytest.mark.parametrize(
     ("max_seq_len", "expected"),
-    ((None, 8), (0, 1), (64, 1), (65, 1), (256, 1), (257, 2), (4096, 8)),
+    ((None, 8), (0, 1), (64, 1), (65, 2), (256, 4), (257, 5), (4096, 8)),
 )
-def test_b12x_mla_limits_active_cache_splits(
+def test_b12x_mla_launches_one_split_per_live_chunk(
     max_seq_len: int | None, expected: int
 ) -> None:
     plan = SimpleNamespace(num_splits=8, chunks_per_split=4)

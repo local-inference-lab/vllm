@@ -126,21 +126,23 @@ def _kernel_query_heads(local_heads: int, dcp_size: int = 1) -> int:
 
 
 def _active_dense_mla_splits(plan: Any, max_seq_len: int | None) -> int:
-    """Return the split-plan prefix that can contain live cache rows."""
+    """Return the number of splits to launch for the longest live sequence.
+
+    The dense MLA kernel shares each request's live 64-token chunks evenly
+    across the launched splits, so a sequence needs at most one split per
+    chunk: launching min(num_splits, live chunks) splits partitions the
+    chunks exactly as the full-plan (CUDA-graph) launch does, whose extra
+    splits are empty.
+    """
     num_splits = int(getattr(plan, "num_splits", 1))
-    chunks_per_split = int(getattr(plan, "chunks_per_split", 1))
-    if num_splits <= 0 or chunks_per_split <= 0:
+    if num_splits <= 0:
         raise ValueError(
-            "B12X_MLA received invalid split geometry: "
-            f"splits={num_splits}, chunks_per_split={chunks_per_split}."
+            f"B12X_MLA received invalid split geometry: splits={num_splits}."
         )
     if max_seq_len is None:
         return num_splits
     valid_chunks = max(1, (max(0, int(max_seq_len)) + 63) // 64)
-    return min(
-        num_splits,
-        (valid_chunks + chunks_per_split - 1) // chunks_per_split,
-    )
+    return min(num_splits, valid_chunks)
 
 
 def _dense_mla_plan_row_caps(max_rows: int) -> tuple[int, ...]:
