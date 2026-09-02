@@ -47,6 +47,29 @@ def _parse_byte_size(value: str) -> int:
         raise ValueError(f"invalid byte-size suffix: {suffix!r}") from exc
 
 
+def _twoshot_max_bytes() -> int:
+    """Largest all-reduce routed to the lossless bf16 two-shot (0 disables).
+
+    Measured on four RTX PRO 6000 Blackwell (PCIe, TP4): the pull two-shot
+    beats the NCCL ring from the one-shot ceiling up to 768 KB (128 KB 15.0
+    vs 16.7 us, 512 KB 32.8 vs 41.7, 768 KB 44.5 vs 54.5) and matches it at
+    1 MB and above, so the default stops at 768 KB.
+    """
+    raw = os.getenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", "768KB").strip().lower()
+    if raw in ("", "0", "off", "none", "disabled"):
+        return 0
+    return _parse_byte_size(raw)
+
+
+@lru_cache(maxsize=1)
+def _load_b12x_twoshot_bf16() -> Any | None:
+    try:
+        from b12x.comm.pcie.pcie_twoshot_bf16 import PCIeTwoShotBF16
+    except Exception:  # pragma: no cover - optional
+        return None
+    return PCIeTwoShotBF16
+
+
 @lru_cache(maxsize=1)
 def _load_b12x_pcie() -> tuple[Any, Any, Any] | None:
     try:
@@ -212,15 +235,19 @@ class B12xPcieAllReduce:
         assert runtime is not None
         self._runtime = runtime
         self._initialize_dma(dma_cls)
+        self._twoshot: Any | None = None
+        self.twoshot_max_bytes = 0
+        self._initialize_twoshot()
         self.disabled = False
 
         if self.rank == 0:
             logger.info(
                 "Using B12X PCIe all-reduce (algorithm=%s, one-shot max=%d, "
-                "fused max=%d, DMA min=%s).",
+                "fused max=%d, two-shot bf16 max=%s, DMA min=%s).",
                 getattr(runtime, "algorithm", "oneshot"),
                 self.allreduce_max_bytes,
                 self.fused_max_bytes,
+                self.twoshot_max_bytes if self._twoshot is not None else "off",
                 getattr(self._dma, "min_bytes", "off"),
             )
 
@@ -272,6 +299,57 @@ class B12xPcieAllReduce:
         dma.min_bytes = min_bytes
         self._dma = dma
 
+    def _initialize_twoshot(self) -> None:
+        """Lossless bf16 two-shot for payloads above the one-shot ceiling."""
+        max_bytes = _twoshot_max_bytes()
+        if max_bytes <= 0 or self.world_size not in (2, 4, 8):
+            return
+        twoshot_cls = _load_b12x_twoshot_bf16()
+        if twoshot_cls is None:
+            logger.warning("B12X PCIe two-shot bf16 requested but unavailable.")
+            return
+        row_elems = int(os.getenv("VLLM_PCIE_TWOSHOT_ROW_ELEMS", "4096"))
+        # Rows are counted in row_elems-wide bf16 rows; keep a multiple of the
+        # world size and enough capacity for the configured byte ceiling.
+        max_rows = max_bytes // (row_elems * 2)
+        max_rows -= max_rows % self.world_size
+        if max_rows < self.world_size:
+            return
+        twoshot: Any | None = None
+        init_error: Exception | None = None
+        try:
+            twoshot = twoshot_cls.from_exchange_group(
+                exchange_group=self.device_group,
+                device=self.device,
+                max_rows=max_rows,
+                row_elems=row_elems,
+            )
+            twoshot.prepare_graph()
+        except Exception as exc:
+            init_error = exc
+        if not self._all_ranks_succeeded(init_error):
+            if twoshot is not None:
+                twoshot.close()
+            logger.warning(
+                "B12X PCIe two-shot bf16 initialization failed on rank %d: %s; "
+                "mid-size tensors will use PyNCCL.",
+                self.rank,
+                init_error,
+            )
+            return
+        assert twoshot is not None
+        self._twoshot = twoshot
+        self.twoshot_max_bytes = max_rows * row_elems * 2
+
+    def _twoshot_accepts(self, inp: torch.Tensor) -> bool:
+        twoshot = self._twoshot
+        return bool(
+            twoshot is not None
+            and inp.nbytes > self.allreduce_max_bytes
+            and inp.nbytes <= self.twoshot_max_bytes
+            and twoshot.accepts(inp)
+        )
+
     def _runtime_stream(self) -> torch.cuda.Stream | None:
         stream = self._capture_stream
         if stream is None:
@@ -295,6 +373,8 @@ class B12xPcieAllReduce:
             return False
         if self._oneshot_accepts(inp):
             return True
+        if self._twoshot_accepts(inp):
+            return True
         return self._dma is not None and self._dma.should_allreduce(inp)
 
     def custom_all_reduce(self, inp: torch.Tensor) -> torch.Tensor | None:
@@ -304,14 +384,19 @@ class B12xPcieAllReduce:
         runtime = self._runtime
         assert runtime is not None
         use_oneshot = self._oneshot_accepts(inp)
+        use_twoshot = (not use_oneshot) and self._twoshot_accepts(inp)
         if self._is_capturing and not torch.cuda.is_current_stream_capturing():
             if _is_piecewise_cudagraph_runtime():
+                if use_twoshot:
+                    return self._twoshot.all_reduce(inp)
                 return self._all_reduce(inp, use_oneshot=use_oneshot)
             if use_oneshot:
                 prepare = getattr(runtime, "prepare_graph_all_reduce", None)
                 if prepare is not None:
                     prepare(inp, stream=self._runtime_stream())
             return torch.empty_like(inp)
+        if use_twoshot:
+            return self._twoshot.all_reduce(inp)
         return self._all_reduce(inp, use_oneshot=use_oneshot)
 
     def _all_reduce(self, inp: torch.Tensor, *, use_oneshot: bool) -> torch.Tensor:
@@ -390,12 +475,19 @@ class B12xPcieAllReduce:
         self._is_capturing = True
         try:
             with self._runtime.capture(stream=stream):
-                yield
+                if self._twoshot is not None:
+                    with self._twoshot.capture():
+                        yield
+                else:
+                    yield
         finally:
             self._capture_stream = old_stream
             self._is_capturing = old_capturing
 
     def close(self) -> None:
+        if getattr(self, "_twoshot", None) is not None:
+            self._twoshot.close()
+            self._twoshot = None
         if self._dma is not None:
             self._dma.close()
             self._dma = None

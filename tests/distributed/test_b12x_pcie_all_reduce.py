@@ -17,6 +17,7 @@ from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
     _dma_min_bytes,
     _oneshot_limits,
     _parse_byte_size,
+    _twoshot_max_bytes,
     get_b12x_pcie_allreduce,
 )
 from vllm.distributed.parallel_state import (
@@ -48,7 +49,19 @@ def _make_communicator(
     communicator._capture_stream = None
     communicator.allreduce_max_bytes = allreduce_max_bytes
     communicator.fused_max_bytes = fused_max_bytes
+    communicator._twoshot = None
+    communicator.twoshot_max_bytes = 0
     return communicator, runtime
+
+
+def _attach_twoshot(
+    communicator: B12xPcieAllReduce, *, max_bytes: int, accepts: bool = True
+) -> MagicMock:
+    twoshot = MagicMock()
+    twoshot.accepts.return_value = accepts
+    communicator._twoshot = twoshot
+    communicator.twoshot_max_bytes = max_bytes
+    return twoshot
 
 
 @pytest.mark.parametrize(
@@ -320,3 +333,81 @@ def test_b12x_fused_allreduce_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
         nprocs=2,
         join=True,
     )
+
+
+def test_twoshot_limit_defaults_to_768kb(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", raising=False)
+    assert _twoshot_max_bytes() == 768 << 10
+    monkeypatch.setenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", "2MB")
+    assert _twoshot_max_bytes() == 2 << 20
+    for disabled in ("0", "off", " NONE ", "", "disabled"):
+        monkeypatch.setenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", disabled)
+        assert _twoshot_max_bytes() == 0
+
+
+def test_midsize_allreduce_dispatches_twoshot() -> None:
+    communicator, runtime = _make_communicator(allreduce_max_bytes=16)
+    twoshot = _attach_twoshot(communicator, max_bytes=1 << 20)
+    expected = torch.empty(64)
+    twoshot.all_reduce.return_value = expected
+    inp = torch.randn(64)  # 256 bytes: above the one-shot ceiling
+
+    assert communicator.should_custom_ar(inp)
+    assert communicator.custom_all_reduce(inp) is expected
+    twoshot.all_reduce.assert_called_once_with(inp)
+    runtime.all_reduce.assert_not_called()
+
+
+def test_oneshot_keeps_priority_below_its_ceiling() -> None:
+    communicator, runtime = _make_communicator(allreduce_max_bytes=1024)
+    twoshot = _attach_twoshot(communicator, max_bytes=1 << 20)
+    expected = torch.empty(64)
+    runtime.all_reduce.return_value = expected
+    inp = torch.randn(64)
+
+    assert communicator.custom_all_reduce(inp) is expected
+    runtime.all_reduce.assert_called_once_with(inp, stream=None)
+    twoshot.all_reduce.assert_not_called()
+
+
+def test_twoshot_window_ends_at_its_limit() -> None:
+    communicator, runtime = _make_communicator(allreduce_max_bytes=16)
+    twoshot = _attach_twoshot(communicator, max_bytes=128)
+    dma = MagicMock()
+    dma.should_allreduce.return_value = True
+    expected = torch.empty(64)
+    dma.all_reduce.return_value = expected
+    communicator._dma = dma
+    inp = torch.randn(64)  # 256 bytes: above the two-shot window
+
+    assert communicator.custom_all_reduce(inp) is expected
+    twoshot.all_reduce.assert_not_called()
+    dma.all_reduce.assert_called_once_with(inp)
+
+
+def test_twoshot_respects_runtime_acceptance() -> None:
+    communicator, _ = _make_communicator(allreduce_max_bytes=16)
+    twoshot = _attach_twoshot(communicator, max_bytes=1 << 20, accepts=False)
+    inp = torch.randn(64)
+
+    assert not communicator.should_custom_ar(inp)
+    assert communicator.custom_all_reduce(inp) is None
+    twoshot.all_reduce.assert_not_called()
+
+
+def test_graph_warmup_returns_placeholder_for_twoshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    communicator, runtime = _make_communicator(allreduce_max_bytes=16)
+    twoshot = _attach_twoshot(communicator, max_bytes=1 << 20)
+    communicator._is_capturing = True
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        b12x_pcie_all_reduce, "_is_piecewise_cudagraph_runtime", lambda: False
+    )
+    inp = torch.randn(64)
+
+    out = communicator.custom_all_reduce(inp)
+    assert out is not None and out.shape == inp.shape and out is not inp
+    twoshot.all_reduce.assert_not_called()
+    runtime.all_reduce.assert_not_called()
