@@ -920,6 +920,12 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         """
         if self.q_lora_rank is not None:
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            # Optional model-installed callback (Kimi-K3 L2 weight prefetch of
+            # o_proj and the absorbed W_UK_T / W_UV while q_b and the attention
+            # core run).
+            _hook = getattr(self, "_l2_prefetch_hook", None)
+            if _hook is not None:
+                _hook(hidden_states.shape[0])
             q_c, kv_c, k_pe = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
@@ -946,6 +952,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             )
             q = self.q_proj(hidden_states)[0].view(-1, q_heads, self.qk_head_dim)
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+            _hook = getattr(self, "_l2_prefetch_hook", None)
+            if _hook is not None:
+                _hook(hidden_states.shape[0])
             kv_c, k_pe = kv_lora.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )

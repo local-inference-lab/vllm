@@ -107,6 +107,7 @@ from vllm.models.common.ops.sequence_parallel import (
 )
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.kimi_k3.nvidia import l2_prefetch as _l2pf
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.nvidia.latent_moe_runner import (
     LatentMoERunner,
@@ -1450,6 +1451,12 @@ class KimiMoE(nn.Module):
             final_hidden_states = self.routed_output_transform(
                 final_hidden_states, residual=shared_output
             )
+            # Optional model-installed callback fired before the all-reduce
+            # (Kimi-K3 L2 weight prefetch: the reduction leaves device memory
+            # idle).
+            _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
+            if _hook is not None:
+                _hook(final_hidden_states.shape[0])
             if self.routed_output_transform.output_is_tp_partial:
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
@@ -1573,6 +1580,11 @@ class KimiDecoderLayer(nn.Module):
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # L2 weight prefetch (see l2_prefetch.py): the successor layer is linked
+        # by the model; plans are built on the first forward, after the weights
+        # are loaded and post-processed.
+        object.__setattr__(self, "_l2pf_next", None)
+        self._l2pf_ready = False
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -1745,6 +1757,8 @@ class KimiDecoderLayer(nn.Module):
         attn_res_scratch: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        if _l2pf.ENABLED and not self._l2pf_ready:
+            self._l2pf_build_plans()
         hidden_states, prefix_sum, residual = self._pre_attn_norm(
             hidden_states, residual, prefix_sum, attn_res_scratch
         )
@@ -1782,6 +1796,107 @@ class KimiDecoderLayer(nn.Module):
         else:
             hidden_states = self.mlp(hidden_states)
         return hidden_states, prefix_sum, residual
+
+    def _l2pf_build_plans(self) -> None:
+        _KimiL2PrefetchPlanner.build(self)
+
+
+class _KimiL2PrefetchPlanner:
+    """Per-layer L2 prefetch plans and hook installation (see l2_prefetch.py).
+
+    Window A (inside this layer's attention, after its first projection):
+    this layer's ``o_proj`` and, for MLA, the absorbed ``W_UK_T`` / ``W_UV``.
+    Window B (before this layer's attention-output all-reduce): this layer's
+    MoE router weight and the next layer's first projections. Window C
+    (before this layer's MoE all-reduce): the remainder of the next layer's
+    dense weights. The routed-expert weights and the prefill-only
+    ``kv_b_proj`` are never prefetched.
+    """
+
+    # o_proj and the absorbed decode weights belong to their own layer's window
+    # A; kv_b_proj is prefill-only.
+    ATTN_SKIP = ("o_proj", "kv_b_proj", "W_UK_T", "W_UV")
+
+    @staticmethod
+    def build(layer: "KimiDecoderLayer") -> None:
+        layer._l2pf_ready = True
+        try:
+            device = next(layer.parameters()).device
+            attn = layer.self_attn
+            segs_b: list[_l2pf.Segment] = []
+            gate = getattr(layer.mlp, "gate", None)
+            if gate is not None:
+                segs_b += _l2pf.segments_of(gate, "mlp.gate.")
+            nxt = layer._l2pf_next
+            nxt_segs: list[_l2pf.Segment] = []
+            if nxt is not None:
+                nxt_segs = _l2pf.segments_of(
+                    nxt.self_attn,
+                    f"L{nxt.layer_idx}.self_attn.",
+                    skip=_KimiL2PrefetchPlanner.ATTN_SKIP,
+                )
+            segs_a = _l2pf.segments_of(attn.o_proj, "o_proj.")
+            for attr in ("W_UK_T", "W_UV"):
+                t = getattr(attn, attr, None)
+                if isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous():
+                    segs_a.append(
+                        (f"attn.{attr}", t.data_ptr(), t.numel() * t.element_size())
+                    )
+            is_mla = hasattr(attn, "kv_b_proj")
+            if nxt_segs and _l2pf.A_NEXT_BYTES > 0 and not is_mla:
+                head_a, rest_first = _l2pf.take_budget(nxt_segs[:1], _l2pf.A_NEXT_BYTES)
+                segs_a += head_a
+                nxt_segs = rest_first + nxt_segs[1:]
+            budget_a = _l2pf.BUDGET_A_MLA if is_mla else _l2pf.BUDGET_A
+            plan_a, _ = _l2pf.make_plan(segs_a, budget_a, device)
+            plan_b, rest = _l2pf.make_plan(segs_b + nxt_segs, _l2pf.BUDGET_B, device)
+            plan_c, dropped = _l2pf.make_plan(rest, _l2pf.BUDGET_C, device)
+            # Window A: inside the attention module after its first projection.
+            if plan_a is not None:
+                object.__setattr__(
+                    attn, "_l2_prefetch_hook", lambda n, p=plan_a: _l2pf.issue(p, n)
+                )
+            # Window B: before the attention-output all-reduce. The MLA o_proj
+            # reduces inside RowParallelLinear; the KDA module reduces after
+            # its o_proj through reduce_kimi_full_width_projection.
+            if plan_b is not None:
+                target_b = (
+                    attn.o_proj
+                    if getattr(attn.o_proj, "reduce_results", False)
+                    else attn
+                )
+                object.__setattr__(
+                    target_b,
+                    "_l2_prefetch_pre_reduce_hook",
+                    lambda n, p=plan_b: _l2pf.issue(p, n),
+                )
+            # Window C: before the MoE all-reduce (KimiMoE) or the dense MLP's
+            # down projection reduce (RowParallelLinear).
+            if plan_c is not None:
+                target_c = (
+                    layer.mlp
+                    if isinstance(layer.mlp, KimiMoE)
+                    else getattr(layer.mlp, "down_proj", None)
+                )
+                if target_c is not None:
+                    object.__setattr__(
+                        target_c,
+                        "_l2_prefetch_pre_reduce_hook",
+                        lambda n, p=plan_c: _l2pf.issue(p, n),
+                    )
+            if layer.layer_idx in (0, 1, 2, 3) or nxt is None:
+                logger.info(
+                    "[k3 l2_prefetch] layer %d A: %s | B: %s | C: %s | dropped %.1f MB",
+                    layer.layer_idx,
+                    plan_a.describe() if plan_a else "-",
+                    plan_b.describe() if plan_b else "-",
+                    plan_c.describe() if plan_c else "-",
+                    sum(seg[2] for seg in dropped) / 1e6,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[k3 l2_prefetch] layer %d plan failed: %s", layer.layer_idx, exc
+            )
 
 
 class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
@@ -1848,6 +1963,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             get_layer,
             prefix=f"{prefix}.layers",
         )
+        # L2 prefetch chain: each layer prefetches its successor's projections.
+        if _l2pf.ENABLED:
+            prev = None
+            for layer in self.layers[self.start_layer : self.end_layer]:
+                if prev is not None and isinstance(layer, KimiDecoderLayer):
+                    object.__setattr__(prev, "_l2pf_next", layer)
+                prev = layer if isinstance(layer, KimiDecoderLayer) else None
         self.num_attn_res_blocks = (
             cdiv(self.end_layer, self.attn_res_block_size)
             if self.attn_res_block_size is not None
@@ -2222,6 +2344,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                     assert residual is not None
                     aux_hidden_state = hidden_states + residual
                     aux_hidden_states.append(aux_hidden_state)
+
+        # Rejoin the L2 prefetch side stream (no-op when nothing was issued).
+        if _l2pf.ENABLED:
+            _l2pf.join_all()
 
         assert hidden_states is not None
         assert residual is not None
