@@ -93,10 +93,17 @@ BUDGET_C = _mb("VLLM_GLM53_L2_PREFETCH_BUDGET_C_MB", "15")
 BUDGET_A_MLA = _mb("VLLM_GLM53_L2_PREFETCH_BUDGET_A_MLA_MB", "36")
 # Measured neutral-to-negative on C1 (fills overlap the KDA core); off by default.
 A_NEXT_BYTES = _mb("VLLM_GLM53_L2_PREFETCH_A_NEXT_MB", "0")
+
+
+def _persisting_l2_env_request() -> str:
+    """Return the process request, leaving the driver limit unchanged by default."""
+    return os.getenv("VLLM_GLM53_L2_PREFETCH_PERSIST_MB", "0")
+
+
 # Persisting-L2 set-aside request: "max" = device maximum (84 MB of the 128 MB
 # L2 on RTX PRO 6000 Blackwell), a number = megabytes clamped to that maximum,
 # 0/"off" = leave the driver default (no set-aside).
-PERSIST_L2 = os.getenv("VLLM_GLM53_L2_PREFETCH_PERSIST_MB", "0")
+PERSIST_L2 = _persisting_l2_env_request()
 
 Segment = tuple[str, int, int]  # (name, ptr, bytes)
 
@@ -158,8 +165,8 @@ if _CUTE_OK:
                 policy.ir_value(loc=loc, ip=ip),
             ],
             "cp.async.bulk.prefetch.L2.global.L2::cache_hint "
-            "[$0], $1, $2; mov.u32 $3, 0;",
-            "l,r,l,=r",
+            "[$1], $2, $3; mov.u32 $0, 0;",
+            "=r,l,r,l",
             has_side_effects=True,
             loc=loc,
             ip=ip,

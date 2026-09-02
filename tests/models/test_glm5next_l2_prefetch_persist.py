@@ -32,8 +32,10 @@ def test_persisting_l2_request(raw, max_bytes, expected):
     assert l2pf.persisting_l2_request(raw, max_bytes) == expected
 
 
-def test_default_request_leaves_the_driver_limit_unchanged():
-    assert l2pf.PERSIST_L2 == "0"
+def test_default_request_leaves_the_driver_limit_unchanged(monkeypatch):
+    monkeypatch.delenv("VLLM_GLM53_L2_PREFETCH_PERSIST_MB", raising=False)
+    assert l2pf._persisting_l2_env_request() == "0"
+    assert l2pf.persisting_l2_request("0", MAX) == 0
 
 
 def test_invalid_numeric_environment_values_use_defaults(monkeypatch):

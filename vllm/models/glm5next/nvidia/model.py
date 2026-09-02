@@ -88,7 +88,6 @@ from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.utils.b12x import get_b12x_mhc
 
 from . import l2_prefetch as _l2pf
-
 from .attention import Glm5NextMLAAttention
 from .kda import Glm5NextLinearAttention
 from .multimodal import (
@@ -421,8 +420,8 @@ class Glm5NextDecoderLayer(nn.Module):
         # the first forward, after weights are loaded and post-processed.
         object.__setattr__(self, "_l2pf_next", None)
         self._l2pf_ready = False
-        self._l2pf_plan_b = None
-        self._l2pf_plan_c = None
+        self._l2pf_plan_b: _l2pf.L2PrefetchPlan | None = None
+        self._l2pf_plan_c: _l2pf.L2PrefetchPlan | None = None
         # In SP, the attention output projection leaves a partial sum; the
         # decoder-layer reduce_scatter after attention completes it (DSv4 pattern).
         # MTP layers use the non-mHC path which has no sp_reduce_scatter, so
@@ -651,13 +650,20 @@ class Glm5NextDecoderLayer(nn.Module):
             for attr in ("W_UK_T", "W_UV"):
                 t = getattr(attn_impl, attr, None) if attn_impl is not None else None
                 if isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous():
-                    segs_a.append((f"impl.{attr}", t.data_ptr(), t.numel() * t.element_size()))
+                    segs_a.append(
+                        (
+                            f"impl.{attr}",
+                            t.data_ptr(),
+                            t.numel() * t.element_size(),
+                        )
+                    )
             is_mla = hasattr(self.self_attn, "mla_attn")
             if nxt_segs and _l2pf.A_NEXT_BYTES > 0 and not is_mla:
                 head_a, rest_first = _l2pf.take_budget(nxt_segs[:1], _l2pf.A_NEXT_BYTES)
                 segs_a += head_a
                 nxt_segs = rest_first + nxt_segs[1:]
-            plan_a, _ = _l2pf.make_plan(segs_a, _l2pf.BUDGET_A_MLA if is_mla else _l2pf.BUDGET_A, device)
+            budget_a = _l2pf.BUDGET_A_MLA if is_mla else _l2pf.BUDGET_A
+            plan_a, _ = _l2pf.make_plan(segs_a, budget_a, device)
             plan_b, rest = _l2pf.make_plan(segs_b + nxt_segs, _l2pf.BUDGET_B, device)
             plan_c, dropped = _l2pf.make_plan(rest, _l2pf.BUDGET_C, device)
             self._l2pf_plan_b = plan_b
@@ -669,12 +675,28 @@ class Glm5NextDecoderLayer(nn.Module):
             self._l2pf_hooked_b = False
             self._l2pf_hooked_c = False
             o_proj = getattr(self.self_attn, "o_proj", None)
-            if o_proj is not None and plan_b is not None and getattr(o_proj, "reduce_results", False):
-                object.__setattr__(o_proj, "_l2_prefetch_pre_reduce_hook", lambda n, p=plan_b: _l2pf.issue(p, n))
+            if (
+                o_proj is not None
+                and plan_b is not None
+                and getattr(o_proj, "reduce_results", False)
+            ):
+                object.__setattr__(
+                    o_proj,
+                    "_l2_prefetch_pre_reduce_hook",
+                    lambda n, p=plan_b: _l2pf.issue(p, n),
+                )
                 self._l2pf_hooked_b = True
-            target_c = self.mlp.experts if self._mlp_is_moe else getattr(self.mlp, "down_proj", None)
+            target_c = (
+                self.mlp.experts
+                if self._mlp_is_moe
+                else getattr(self.mlp, "down_proj", None)
+            )
             if target_c is not None and plan_c is not None:
-                object.__setattr__(target_c, "_l2_prefetch_pre_reduce_hook", lambda n, p=plan_c: _l2pf.issue(p, n))
+                object.__setattr__(
+                    target_c,
+                    "_l2_prefetch_pre_reduce_hook",
+                    lambda n, p=plan_c: _l2pf.issue(p, n),
+                )
                 self._l2pf_hooked_c = True
             # Window A fires inside the attention layer, right after its first
             # projection (hook in the shared KDA / MLA layers).
@@ -683,7 +705,8 @@ class Glm5NextDecoderLayer(nn.Module):
                 object.__setattr__(
                     target, "_l2_prefetch_hook", lambda n, p=plan_a: _l2pf.issue(p, n)
                 )
-            if self.layer_idx in (0, 3, 4) or self.layer_idx == self.num_hidden_layers - 1:
+            is_logged_layer = self.layer_idx in (0, 3, 4)
+            if is_logged_layer or self.layer_idx == self.num_hidden_layers - 1:
                 logger.info(
                     "[l2_prefetch] layer %d A: %s | B: %s | C: %s | dropped %.1f MB",
                     self.layer_idx,
@@ -693,7 +716,9 @@ class Glm5NextDecoderLayer(nn.Module):
                     sum(s[2] for s in dropped) / 1e6,
                 )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[l2_prefetch] layer %d plan failed: %s", self.layer_idx, exc)
+            logger.warning(
+                "[l2_prefetch] layer %d plan failed: %s", self.layer_idx, exc
+            )
             self._l2pf_plan_b = None
             self._l2pf_plan_c = None
 
