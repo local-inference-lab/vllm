@@ -128,6 +128,22 @@ def _prepare_dspark_quant_config(
     vllm_config: VllmConfig,
     start_layer_id: int,
 ) -> QuantizationConfig | None:
+    """Resolve the draft quantization config for runtime layer names.
+
+    The draft's quantization config is the one the vLLM config carries, else
+    the draft-model one. A config with per-tensor storage keyed by checkpoint
+    layer index (``...layers.<i>...``) gains an alias for each entry under the
+    runtime index ``start_layer_id + i``, so the draft layers, which are named
+    after the target layers they follow, resolve their own storage entries.
+
+    Args:
+        vllm_config: Configuration of the draft model run.
+        start_layer_id: Runtime index of the first draft layer.
+
+    Returns:
+        The quantization config with runtime-name aliases, or ``None`` when
+        the draft is not quantized.
+    """
     quant_config = getattr(vllm_config, "quant_config", None)
     if quant_config is None:
         quant_config = get_draft_quant_config(vllm_config)
