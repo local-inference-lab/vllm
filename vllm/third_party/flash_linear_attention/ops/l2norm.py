@@ -75,7 +75,7 @@ def l2norm_fwd_kernel(
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["M"])
 def l2norm_fwd_kernel2(
     X, Y, eps, M, N: tl.constexpr, BD: tl.constexpr, MBLOCK: tl.constexpr
 ):
