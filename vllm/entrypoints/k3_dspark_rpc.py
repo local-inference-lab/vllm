@@ -1234,7 +1234,8 @@ class K3DSparkDraftEngine:
         slots, max_requests, max_steps, topk = (int(v) for v in buffers.values.shape)
         if topk != logits_topk:
             raise ValueError(
-                f"Peer reply slots hold top-{topk} logits, proposal asks for {logits_topk}"
+                f"Peer reply slots hold top-{topk} logits, proposal asks for "
+                f"{logits_topk}"
             )
         if requests > max_requests or steps > max_steps:
             raise ValueError("Proposal exceeds the peer reply slot geometry")

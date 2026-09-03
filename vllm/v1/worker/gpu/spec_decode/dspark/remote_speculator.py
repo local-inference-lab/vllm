@@ -534,7 +534,8 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             self._async_slot_free: list[threading.Event] = []
             self._async_slot = 0
             self._async_queue: queue.Queue = queue.Queue()
-            self._async_error: tuple[BaseException, list[str]] | None = None
+            self._async_errors: list[tuple[BaseException, list[str]]] = []
+            self._async_error_lock = threading.Lock()
             self._async_lock = threading.Lock()
             self._async_stats = {"deferred": 0, "deferred_ms": 0.0}
             for _ in range(self._async_depth):
@@ -681,19 +682,20 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             pending.join()
 
     def _apply_async_error(self) -> None:
-        error = getattr(self, "_async_error", None)
-        if error is None:
+        with self._async_error_lock:
+            errors = self._async_errors
+            self._async_errors = []
+        if not errors:
             return
-        self._async_error = None
-        exc, request_ids = error
-        self._disabled_requests.update(request_ids)
-        logger.warning(
-            "Remote K3 %s deferred prefill ingest failed (%s); drafting is "
-            "disabled for %d request(s) until they leave the batch",
-            self.method,
-            exc,
-            len(request_ids),
-        )
+        for exc, request_ids in errors:
+            self._disabled_requests.update(request_ids)
+            logger.warning(
+                "Remote K3 %s deferred prefill ingest failed (%s); drafting is "
+                "disabled for %d request(s) until they leave the batch",
+                self.method,
+                exc,
+                len(request_ids),
+            )
 
     def _async_ingest_worker(self) -> None:
         while True:
@@ -715,7 +717,8 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 ) * 1000
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Remote K3 deferred prefill ingest raised")
-                self._async_error = (exc, request_ids)
+                with self._async_error_lock:
+                    self._async_errors.append((exc, list(request_ids)))
             finally:
                 self._async_slot_free[slot].set()
                 self._async_queue.task_done()
@@ -727,9 +730,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         self._drain_async_ingest()
         with self._async_lock:
             try:
-                self._socket.send_multipart(
-                    frames, copy=False
-                )  # kimi-k3-draft-zero-copy-sync
+                self._socket.send_multipart(frames, copy=False)
                 response_frames = self._socket.recv_multipart()
             except Exception:
                 self._connect()
@@ -784,6 +785,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         self._known_requests.difference_update(remote_request_ids)
         for request_id in remote_request_ids:
             self._retained_prefixes.pop(request_id, None)
+            _K3_CAPTURE_STATE.pop(request_id, None)
 
     def _ensure_remote_capacity(self, current_request_ids: set[str]) -> None:
         while len(self._known_requests) >= self._remote_max_requests:
@@ -972,6 +974,40 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
 
     def _peer_context_slots(self) -> int:
         return int(getattr(self, "_async_depth", 0)) + 1
+
+    def _configure_proposal_reply(
+        self,
+        header: dict[str, Any],
+        *,
+        deferred_ingest: bool,
+        peer_context: bool,
+        peer_context_slot: int,
+    ) -> int:
+        """Set the reply contract and reserve a peer slot when consumed.
+
+        Args:
+            header: Mutable proposal header sent to the draft process.
+            deferred_ingest: Whether the caller only consumes the ingest result.
+            peer_context: Whether context rows use the mapped peer ring.
+            peer_context_slot: Ring slot containing the context rows.
+
+        Returns:
+            The reserved peer reply slot, or ``-1`` when no reply is pulled.
+        """
+        return_logits = self._probabilistic and not deferred_ingest
+        header["return_logits"] = return_logits
+        header["logits_topk"] = self._logits_topk if return_logits else 0
+        if not peer_context:
+            return -1
+        header["p2p_context_slot"] = peer_context_slot
+        if not return_logits:
+            return -1
+        assert self._peer is not None
+        reply_slot = self._peer_reply_slot
+        self._peer_reply_slot = (reply_slot + 1) % self._peer.reply_slots
+        header["p2p_reply"] = True
+        header["p2p_reply_slot"] = reply_slot
+        return reply_slot
 
     def _open_peer_transport(self) -> None:
         """Open the draft server's context ring and reply slots.
@@ -1776,9 +1812,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         sampled_staging = self._sampled_staging[:num_reqs]  # kimi-k3-draft-async-ingest
         rejected_staging.copy_(num_rejected[:num_reqs], non_blocking=True)
         anchor_staging.copy_(anchor_tokens, non_blocking=True)
-        sampled_staging.copy_(
-            sampled_counts, non_blocking=True
-        )  # kimi-k3-draft-async-ingest
+        sampled_staging.copy_(sampled_counts, non_blocking=True)
         _detail_copy_t0 = time.perf_counter()
         torch.cuda.current_stream(self.device).synchronize()
         self._detail_copy_sync = time.perf_counter() - _detail_copy_t0
@@ -1978,20 +2012,15 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             "op": "PROPOSE",
             "projected": False,
             "num_speculative_tokens": num_speculative_tokens,
-            "return_logits": self._probabilistic,
-            "logits_topk": self._logits_topk,
             "requests": requests,
         }
-        peer_reply_slot = -1
+        peer_reply_slot = self._configure_proposal_reply(
+            header,
+            deferred_ingest=deferred,
+            peer_context=peer_context,
+            peer_context_slot=peer_slot,
+        )
         if peer_context:
-            assert self._peer is not None
-            # The verifier names the reply slot so the pull can be enqueued
-            # behind the gate before the reply arrives.
-            peer_reply_slot = self._peer_reply_slot
-            self._peer_reply_slot = (peer_reply_slot + 1) % self._peer.reply_slots
-            header["p2p_context_slot"] = peer_slot
-            header["p2p_reply"] = True
-            header["p2p_reply_slot"] = peer_reply_slot
             frames = [json.dumps(header).encode(), positions_frame]
         else:
             frames = [json.dumps(header).encode(), positions_frame, context_frame]
@@ -2018,7 +2047,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 seeds,
                 p2p_reply=(
                     (peer_reply_slot, len(active_indices), num_speculative_tokens)
-                    if peer_context and self._probabilistic and self._logits_topk > 0
+                    if peer_reply_slot >= 0
                     else None
                 ),
             )
