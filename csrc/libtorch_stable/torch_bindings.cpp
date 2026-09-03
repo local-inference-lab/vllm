@@ -457,6 +457,13 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
       "Tensor fp8_scale, Tensor q_fp8_scale_inv, float eps, "
       "int cache_block_size) -> ()");
+#if defined(VLLM_DSV4_NVFP4_DIRECT_WRITER)
+  ops.def(
+      "fused_deepseek_v4_qnorm_rope_nvfp4_mla("
+      "Tensor! q, Tensor kv, Tensor! kv_cache, Tensor slot_mapping, "
+      "Tensor position_ids, Tensor cos_sin_cache, float eps, "
+      "int cache_block_size) -> ()");
+#endif
 
   // Kimi-K3 MLA epilogues: optional RoPE followed by concat/cache insertion.
   ops.def(
@@ -770,6 +777,10 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl(
       "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
       TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert));
+#if defined(VLLM_DSV4_NVFP4_DIRECT_WRITER)
+  ops.impl("fused_deepseek_v4_qnorm_rope_nvfp4_mla",
+           TORCH_BOX(&fused_deepseek_v4_qnorm_rope_nvfp4_mla));
+#endif
   ops.impl("fused_kimi_k3_mla_key_concat_kv_cache_insert",
            TORCH_BOX(&fused_kimi_k3_mla_key_concat_kv_cache_insert));
   ops.impl("fused_kimi_k3_mla_key_concat_ds_mla_insert",

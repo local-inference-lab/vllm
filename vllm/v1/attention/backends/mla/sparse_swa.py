@@ -149,6 +149,10 @@ class DeepseekSparseSWABackend(AttentionBackend):
             # DeepseekV4 SWA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
             # head_size passed in is the semantic head_dim (512).
             return (num_blocks, block_size, 584)
+        if cache_dtype_str == "nvfp4_ds_mla":
+            # Compact native NVFP4 record: 256 NoPE payload + 32 scales +
+            # 16 bytes of alignment + 128 BF16 RoPE.
+            return (num_blocks, block_size, 432)
         else:
             return (num_blocks, block_size, head_size)
 
