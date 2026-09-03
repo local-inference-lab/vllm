@@ -534,7 +534,8 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             self._async_slot_free: list[threading.Event] = []
             self._async_slot = 0
             self._async_queue: queue.Queue = queue.Queue()
-            self._async_error: tuple[BaseException, list[str]] | None = None
+            self._async_errors: list[tuple[BaseException, list[str]]] = []
+            self._async_error_lock = threading.Lock()
             self._async_lock = threading.Lock()
             self._async_stats = {"deferred": 0, "deferred_ms": 0.0}
             for _ in range(self._async_depth):
@@ -681,19 +682,20 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             pending.join()
 
     def _apply_async_error(self) -> None:
-        error = getattr(self, "_async_error", None)
-        if error is None:
+        with self._async_error_lock:
+            errors = self._async_errors
+            self._async_errors = []
+        if not errors:
             return
-        self._async_error = None
-        exc, request_ids = error
-        self._disabled_requests.update(request_ids)
-        logger.warning(
-            "Remote K3 %s deferred prefill ingest failed (%s); drafting is "
-            "disabled for %d request(s) until they leave the batch",
-            self.method,
-            exc,
-            len(request_ids),
-        )
+        for exc, request_ids in errors:
+            self._disabled_requests.update(request_ids)
+            logger.warning(
+                "Remote K3 %s deferred prefill ingest failed (%s); drafting is "
+                "disabled for %d request(s) until they leave the batch",
+                self.method,
+                exc,
+                len(request_ids),
+            )
 
     def _async_ingest_worker(self) -> None:
         while True:
@@ -715,7 +717,8 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 ) * 1000
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Remote K3 deferred prefill ingest raised")
-                self._async_error = (exc, request_ids)
+                with self._async_error_lock:
+                    self._async_errors.append((exc, list(request_ids)))
             finally:
                 self._async_slot_free[slot].set()
                 self._async_queue.task_done()
@@ -727,9 +730,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         self._drain_async_ingest()
         with self._async_lock:
             try:
-                self._socket.send_multipart(
-                    frames, copy=False
-                )  # kimi-k3-draft-zero-copy-sync
+                self._socket.send_multipart(frames, copy=False)
                 response_frames = self._socket.recv_multipart()
             except Exception:
                 self._connect()
@@ -1776,9 +1777,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         sampled_staging = self._sampled_staging[:num_reqs]  # kimi-k3-draft-async-ingest
         rejected_staging.copy_(num_rejected[:num_reqs], non_blocking=True)
         anchor_staging.copy_(anchor_tokens, non_blocking=True)
-        sampled_staging.copy_(
-            sampled_counts, non_blocking=True
-        )  # kimi-k3-draft-async-ingest
+        sampled_staging.copy_(sampled_counts, non_blocking=True)
         _detail_copy_t0 = time.perf_counter()
         torch.cuda.current_stream(self.device).synchronize()
         self._detail_copy_sync = time.perf_counter() - _detail_copy_t0
