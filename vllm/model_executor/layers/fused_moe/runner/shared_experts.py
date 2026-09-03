@@ -52,6 +52,7 @@ class SharedExperts(torch.nn.Module):
         # index is always 0 and the second output list element is ignored.
         self.enable_dbo = enable_dbo
         self._output: list[torch.Tensor | None] = [None, None]
+        self._prelaunched = [False, False]
         self._layer = layer
         self._moe_config = moe_config
 
@@ -115,6 +116,8 @@ class SharedExperts(torch.nn.Module):
         self,
         shared_experts_input: torch.Tensor,
     ):
+        if self._prelaunched[self._output_idx]:
+            return
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
         if experts_order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
@@ -128,6 +131,37 @@ class SharedExperts(torch.nn.Module):
             # Mark sync start point for the aux stream since we will
             # run in parallel with router/gate.
             self._stream.wait_stream(current_stream())
+
+    def prelaunch(self, shared_experts_input: torch.Tensor) -> bool:
+        """Launch the async shared branch before routed preparation.
+
+        The normal shared/routed join remains the consumer synchronization
+        point; this only advances the independent branch's start time.
+        """
+        experts_order = self._determine_shared_experts_order(shared_experts_input)
+        if experts_order != SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
+            return False
+        assert self._stream is not None
+        output_idx = self._output_idx
+        if self._output[output_idx] is not None or self._prelaunched[output_idx]:
+            raise RuntimeError("Shared experts already have an outstanding output")
+        shared_experts_input.record_stream(self._stream)
+        self._stream.wait_stream(current_stream())
+        with torch.cuda.stream(self._stream):
+            self._output[output_idx] = self._layer(shared_experts_input)
+        self._prelaunched[output_idx] = True
+        return True
+
+    def _finish_prelaunch(self) -> None:
+        output_idx = self._output_idx
+        assert self._prelaunched[output_idx]
+        assert self._stream is not None
+        output = self._output[output_idx]
+        assert output is not None
+        consumer_stream = current_stream()
+        consumer_stream.wait_stream(self._stream)
+        output.record_stream(consumer_stream)
+        self._prelaunched[output_idx] = False
 
     def _run_in_aux_stream(
         self,
@@ -189,8 +223,15 @@ class SharedExperts(torch.nn.Module):
         if order != experts_order:
             return None
 
-        assert self._output[self._output_idx] is None
+        output_idx = self._output_idx
+        if (
+            order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+            and self._prelaunched[output_idx]
+        ):
+            self._finish_prelaunch()
+            return None
 
+        assert self._output[output_idx] is None
         if reuse_input:
             if order != SharedExpertsOrder.NO_OVERLAP or not self.can_reuse_input(
                 shared_experts_input
@@ -199,15 +240,13 @@ class SharedExperts(torch.nn.Module):
                     "Shared-expert input reuse requires synchronous execution "
                     "and an input-reuse-capable layer"
                 )
-            self._output[self._output_idx] = self._layer(
+            self._output[output_idx] = self._layer(
                 shared_experts_input,
                 output=shared_experts_input,
             )
         elif order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
-            self._output[self._output_idx] = self._run_in_aux_stream(
-                shared_experts_input
-            )
-        else:
-            self._output[self._output_idx] = self._layer(shared_experts_input)
+            self._output[output_idx] = self._run_in_aux_stream(shared_experts_input)
 
-        assert self._output[self._output_idx] is not None
+        else:
+            self._output[output_idx] = self._layer(shared_experts_input)
+        assert self._output[output_idx] is not None

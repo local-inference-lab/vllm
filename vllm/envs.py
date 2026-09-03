@@ -339,6 +339,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_FUSED_MOE_OUTPUT_ALIAS: bool = False
+    VLLM_KIMI_PRELAUNCH_SHARED_EXPERTS: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -2295,6 +2296,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # has a lifetime that overlaps the expert kernel's writeback.
     "VLLM_DISABLE_FUSED_MOE_OUTPUT_ALIAS": lambda: bool(
         int(os.getenv("VLLM_DISABLE_FUSED_MOE_OUTPUT_ALIAS", "0"))
+    ),
+    # Begin Kimi-K3's read-only shared-expert branch before the independent
+    # router and routed-down projection; the normal stream join still owns it.
+    "VLLM_KIMI_PRELAUNCH_SHARED_EXPERTS": lambda: bool(
+        int(os.getenv("VLLM_KIMI_PRELAUNCH_SHARED_EXPERTS", "0"))
     ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream

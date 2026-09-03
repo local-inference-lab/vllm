@@ -839,6 +839,12 @@ class MoERunner(MoERunnerInterface):
             assert shared_experts_input is not None
             self._shared_experts.maybe_sync_shared_experts_stream(shared_experts_input)
 
+    def prelaunch_shared_experts(self, shared_experts_input: torch.Tensor) -> bool:
+        """Start an eligible shared-expert branch before routed preparation."""
+        if self._shared_experts is None:
+            return False
+        return self._shared_experts.prelaunch(shared_experts_input)
+
     def _maybe_add_zero_expert_output(
         self,
         result: torch.Tensor,
