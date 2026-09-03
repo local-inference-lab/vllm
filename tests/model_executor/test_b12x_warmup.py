@@ -249,7 +249,8 @@ def test_b12x_warmup_deduplicates_registered_signatures(monkeypatch) -> None:
         ),
         model_config=SimpleNamespace(dtype=torch.float32),
         vllm_config=SimpleNamespace(
-            compilation_config=SimpleNamespace(compile_sizes=[4, 16])
+            compilation_config=SimpleNamespace(compile_sizes=[4, 16]),
+            num_speculative_tokens=3,
         ),
     )
     platform = SimpleNamespace(
@@ -268,8 +269,8 @@ def test_b12x_warmup_deduplicates_registered_signatures(monkeypatch) -> None:
 
     assert scans == 1
     assert calls == [
-        ("first", (1, 2, 4, 8, 16, 32), torch.bfloat16),
-        ("second", (1, 2, 4, 8, 16, 32), torch.bfloat16),
+        ("first", (1, 2, 4, 8, 16, 29, 32), torch.bfloat16),
+        ("second", (1, 2, 4, 8, 16, 29, 32), torch.bfloat16),
     ]
     assert synchronized == [True]
 

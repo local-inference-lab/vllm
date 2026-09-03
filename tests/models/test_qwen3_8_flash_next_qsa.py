@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 import os
 from types import SimpleNamespace
 from typing import Any
@@ -216,6 +217,15 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     binding = object()
 
     class FakePlan:
+        def __init__(self, caps):
+            self.caps = caps
+            self.caps.main_table_width = math.ceil(
+                caps.max_seq_len / caps.main_page_size
+            )
+            self.caps.compressed_table_width = math.ceil(
+                (caps.max_seq_len // caps.compress_ratio) / caps.compressed_page_size
+            )
+
         def scratch_specs(self):
             return (SimpleNamespace(shape=(32,), dtype=torch.uint8),)
 
@@ -225,7 +235,7 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
 
     def plan(caps):
         planned_caps.append(caps)
-        return FakePlan()
+        return FakePlan(caps)
 
     fake_qsa = SimpleNamespace(
         Caps=lambda **kwargs: SimpleNamespace(**kwargs),
@@ -316,6 +326,7 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     assert owner._compressed_cache is None
     assert owner._qsa_plan is None
     assert owner._qsa_binding is None
+    assert owner._qsa_prefill_bindings == ()
     assert owner._qsa_scratch is None
 
     replacement_cache = torch.empty_like(kv_cache)
@@ -350,6 +361,50 @@ def test_qsa_registers_piecewise_splitting_op_once() -> None:
         "model.layers.3.attn",
         "model.layers.7.attn",
     }
+
+
+def test_qsa_prefill_context_capacities_cover_the_configured_limit() -> None:
+    assert qsa_module._qsa_prefill_context_capacities(262144, 4096) == (
+        4096,
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+    )
+    assert qsa_module._qsa_prefill_context_capacities(40000, 32768) == (
+        32768,
+        40000,
+    )
+    assert qsa_module._qsa_prefill_context_capacities(262144, 6019) == (
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+    )
+
+
+def test_qsa_selects_the_smallest_sufficient_prefill_context_plan() -> None:
+    owner = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
+    owner.max_decode_rows = 6
+    owner.max_seq_len = 64
+    binding_32 = object()
+    binding_64 = object()
+    table_32 = torch.empty(2, 4, dtype=torch.int32)
+    table_64 = torch.empty(2, 8, dtype=torch.int32)
+    owner._qsa_prefill_bindings = (
+        qsa_module._QSAContextBinding(32, binding_32, table_32, table_32),
+        qsa_module._QSAContextBinding(64, binding_64, table_64, table_64),
+    )
+
+    assert owner._qsa_binding_for_workload(rows=1, max_seq_len=20).binding is binding_64
+    assert owner._qsa_binding_for_workload(rows=7, max_seq_len=20).binding is binding_32
+    assert owner._qsa_binding_for_workload(rows=7, max_seq_len=40).binding is binding_64
+    with pytest.raises(ValueError, match="exceeds the configured limit"):
+        owner._qsa_binding_for_workload(rows=7, max_seq_len=65)
 
 
 def test_qsa_prefill_dispatches_through_the_b12x_transaction(monkeypatch) -> None:
