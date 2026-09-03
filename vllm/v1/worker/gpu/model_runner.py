@@ -2302,7 +2302,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # reply. The async output's draft copy is recorded once the
                 # reply has been consumed instead.
                 self.speculator.deferred_resolve_allowed = (
-                    self.verification_capacity_manager is None
+                    self._late_input_ids
                     and (
                         copy_draft_with_output
                         or not self.draft_tokens_handler.needs_host_copy(input_batch)
