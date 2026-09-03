@@ -2433,6 +2433,7 @@ def test_glm5next_fp8_keeps_lower_group_count(
     assert len(groups) == 4
     assert [len(group.layer_names) for group in groups] == [12, 11, 11, 12]
 
+
 def test_glm5next_weighted_groups_replace_over_limit_baseline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2466,6 +2467,7 @@ def test_glm5next_weighted_groups_reject_more_than_eight_buckets(
         kv_cache_utils._get_weighted_shared_pool_kv_cache_groups(
             _glm5next_split_config(), {}
         )
+
 
 def test_glm5next_nvfp4_auto_geometry_capacity() -> None:
     """DCP4 4K retention geometry recovers the expected 12.67M capacity."""
