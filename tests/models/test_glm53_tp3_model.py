@@ -16,7 +16,10 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
+    GroupQuantScaleParameter,
+    ModelWeightParameter,
     PackedvLLMParameter,
+    PerTensorScaleParameter,
 )
 from vllm.models.glm5next.nvidia import attention as glm_attention
 from vllm.models.glm5next.nvidia import model as glm_model
@@ -188,6 +191,72 @@ def test_padded_loader_rejects_unaligned_quantized_boundaries_before_write(
 
     torch.testing.assert_close(
         quantized_param, quantized_param.new_full((1, 1), 23)
+    )
+
+
+def test_padded_v2_loader_preserves_unsharded_per_tensor_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_tp3_rank2(monkeypatch)
+    row = RowParallelLinear(6, 1, bias=False, loaded_input_size=4)
+    scale = PerTensorScaleParameter(
+        data=torch.zeros(1, dtype=torch.float32),
+        weight_loader=lambda *_args, **_kwargs: None,
+    )
+
+    row.weight_loader_v2(scale, torch.tensor([3.0]))
+
+    torch.testing.assert_close(scale, torch.tensor([3.0]))
+
+
+@pytest.mark.parametrize(
+    ("parameter_type", "storage_factor", "physical_size", "loaded_size", "dtype"),
+    [
+        (ModelWeightParameter, 2, 6, 4, torch.uint8),
+        (GroupQuantScaleParameter, 16, 96, 64, torch.float8_e4m3fn),
+    ],
+)
+def test_padded_nvfp4_row_loader_converts_logical_to_storage_width(
+    monkeypatch: pytest.MonkeyPatch,
+    parameter_type: type[parameter.BasevLLMParameter],
+    storage_factor: int,
+    physical_size: int,
+    loaded_size: int,
+    dtype: torch.dtype,
+) -> None:
+    for module in (linear, parameter):
+        monkeypatch.setattr(
+            module, "get_tensor_model_parallel_world_size", lambda: 3
+        )
+        monkeypatch.setattr(
+            module, "get_tensor_model_parallel_rank", lambda: 1
+        )
+    row = RowParallelLinear(
+        physical_size,
+        1,
+        bias=False,
+        loaded_input_size=loaded_size,
+    )
+    local_storage_size = physical_size // 3 // storage_factor
+    loaded_storage_size = loaded_size // storage_factor
+    quantized_param = parameter_type(
+        data=torch.zeros((1, local_storage_size), dtype=dtype),
+        input_dim=1,
+        input_dim_storage_factor=storage_factor,
+        output_dim=0,
+        weight_loader=lambda *_args, **_kwargs: None,
+    )
+    loaded = torch.arange(
+        1,
+        loaded_storage_size + 1,
+        dtype=torch.uint8,
+    ).to(dtype)
+
+    row.weight_loader_v2(quantized_param, loaded.unsqueeze(0))
+
+    torch.testing.assert_close(
+        quantized_param,
+        loaded[local_storage_size : 2 * local_storage_size].unsqueeze(0),
     )
 
 

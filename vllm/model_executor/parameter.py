@@ -305,16 +305,26 @@ class RowvLLMParameter(BasevLLMParameter):
     Parameter class defining weight_loading functionality
     (load_row_parallel_weight) for parameters being loaded
     into linear layers with row parallel functionality.
-    Requires an input_dim to be defined.
+    Requires an input dimension to be defined.
     """
 
-    def __init__(self, input_dim: int, **kwargs):
+    def __init__(
+        self, input_dim: int, input_dim_storage_factor: int = 1, **kwargs
+    ):
+        if input_dim_storage_factor < 1:
+            raise ValueError("input_dim_storage_factor must be positive")
         self._input_dim = input_dim
+        self._input_dim_storage_factor = input_dim_storage_factor
         super().__init__(**kwargs)
 
     @property
     def input_dim(self):
         return self._input_dim
+
+    @property
+    def input_dim_storage_factor(self):
+        """Logical input-axis elements represented by one storage element."""
+        return self._input_dim_storage_factor
 
     def load_row_parallel_weight(
         self,

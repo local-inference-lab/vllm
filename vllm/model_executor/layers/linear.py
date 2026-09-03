@@ -115,6 +115,25 @@ def _validate_padded_axis_layout(
             )
         return (loaded_size + block_size - 1) // block_size
 
+    storage_factor = (
+        getattr(param, "input_dim_storage_factor", 1)
+        if dim == getattr(param, "input_dim", None)
+        else 1
+    )
+    if storage_factor != 1:
+        shard_end = physical_shard_offset + physical_shard_size
+        for boundary_name, boundary in (
+            ("loaded size", loaded_size),
+            ("physical shard offset", physical_shard_offset),
+            ("physical shard end", shard_end),
+        ):
+            if boundary % storage_factor:
+                raise ValueError(
+                    f"{name} {boundary_name} {boundary} is not aligned to "
+                    f"input_dim_storage_factor={storage_factor}"
+                )
+        return loaded_size // storage_factor
+
     if getattr(param, "packed_dim", None) == dim:
         packed_factor = getattr(param, "packed_factor", 1)
         shard_end = physical_shard_offset + physical_shard_size
@@ -702,12 +721,8 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
-        if self._allow_loaded_output_padding:
-            output_dim = getattr(param, "output_dim", None)
-            if output_dim is None:
-                raise ValueError(
-                    "Padded column-parallel loading requires an output dimension"
-                )
+        output_dim = getattr(param, "output_dim", None)
+        if self._allow_loaded_output_padding and output_dim is not None:
             expected_loaded_size = _validate_padded_axis_layout(
                 param,
                 output_dim,
@@ -1202,11 +1217,16 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         shard_size = self.output_sizes[loaded_shard_id]
         shard_offset //= self.tp_size
         shard_size //= self.tp_size
+        output_dim = getattr(param, "output_dim", None)
+        has_padded_axis = (
+            self._allow_loaded_output_shard_padding[loaded_shard_id]
+            and output_dim is not None
+        )
         expected_loaded_size = None
-        if self._allow_loaded_output_shard_padding[loaded_shard_id]:
+        if has_padded_axis:
             expected_loaded_size = _validate_padded_axis_layout(
                 param,
-                param.output_dim,
+                output_dim,
                 self.loaded_output_sizes[loaded_shard_id],
                 sum(self.output_sizes) // self.tp_size,
                 shard_size,
@@ -1227,7 +1247,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             "shard_offset": shard_offset,
             "shard_size": shard_size,
         }
-        if self._allow_loaded_output_shard_padding[loaded_shard_id]:
+        if has_padded_axis:
             load_kwargs["allow_padding"] = True
             load_kwargs["expected_loaded_size"] = expected_loaded_size
         param.load_merged_column_weight(**load_kwargs)
@@ -1535,11 +1555,16 @@ class QKVParallelLinear(ColumnParallelLinear):
         shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
         shard_size = self._get_shard_size_mapping(loaded_shard_id)
         assert shard_offset is not None and shard_size is not None
+        output_dim = getattr(param, "output_dim", None)
+        has_padded_axis = (
+            self._allow_loaded_qkv_padding[loaded_shard_id]
+            and output_dim is not None
+        )
         expected_loaded_size = None
-        if self._allow_loaded_qkv_padding[loaded_shard_id]:
+        if has_padded_axis:
             expected_loaded_size = self._validate_padded_qkv_layout(
                 param,
-                param.output_dim,
+                output_dim,
                 loaded_shard_id,
                 shard_offset,
                 shard_size,
@@ -1558,7 +1583,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             "shard_offset": shard_offset,
             "shard_size": shard_size,
         }
-        if self._allow_loaded_qkv_padding[loaded_shard_id]:
+        if has_padded_axis:
             load_kwargs["allow_padding"] = True
             load_kwargs["expected_loaded_size"] = expected_loaded_size
         param.load_qkv_weight(**load_kwargs)
@@ -2116,12 +2141,8 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        if self._allow_loaded_input_padding:
-            input_dim = getattr(param, "input_dim", None)
-            if input_dim is None:
-                raise ValueError(
-                    "Padded row-parallel loading requires an input dimension"
-                )
+        input_dim = getattr(param, "input_dim", None)
+        if self._allow_loaded_input_padding and input_dim is not None:
             expected_loaded_size = _validate_padded_axis_layout(
                 param,
                 input_dim,
