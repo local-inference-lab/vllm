@@ -139,8 +139,8 @@ class FileSystemTierManager(SecondaryTierManager):
                 cache events are enabled globally (kv_events_config).
             locality: Whether this tier's storage is LOCAL or REMOTE relative
                 to the publishing vLLM instance.
-            gc_max_size_gb: On-disk budget for this tier, in GiB. None (the
-                default) leaves the tier unbounded, as before. When set, a
+            gc_max_size_gb: On-disk budget for this tier, in GiB. None leaves
+                the tier unbounded. When set, a
                 background sweep evicts least-recently-used blocks to stay under
                 it; see FsGCManager. The budget is per engine rather than per
                 rank: the tier is constructed once on the scheduler side

@@ -71,6 +71,20 @@ def _make_gc(mapper: FileMapper, **kwargs) -> FsGCManager:
     return FsGCManager(mapper, **params)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"max_bytes": 0}, "max_bytes must be positive"),
+        ({"interval_s": 0}, "interval_s must be positive"),
+        ({"stamp_interval_s": 0}, "stamp_interval_s must be positive"),
+        ({"max_tracked": 0}, "max_tracked must be positive"),
+    ],
+)
+def test_rejects_nonpositive_limits(mapper, overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _make_gc(mapper, **overrides)
+
+
 def test_rejects_grace_not_exceeding_stamp_interval(mapper):
     # Otherwise a block in active use can be stamped, then age past the grace
     # window before its next stamp is due, and be swept while still hot.

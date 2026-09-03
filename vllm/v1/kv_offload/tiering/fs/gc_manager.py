@@ -4,8 +4,8 @@
 Garbage collection for the fs secondary tier.
 
 The fs tier keeps no index of its own -- the filesystem *is* the index, since
-`lookup()` is a plain existence check -- so out of the box it has neither a
-capacity limit nor eviction, and grows until the filesystem fills.
+`lookup()` is a plain existence check. Without an `FsGCManager`, the tier has
+no capacity limit or eviction and grows until the filesystem fills.
 
 `FsGCManager` adds both, using file mtime as the single source of truth for
 recency:
@@ -92,14 +92,24 @@ class FsGCManager:
         grace_s: float = 300.0,
         max_tracked: int = 200_000,
     ) -> None:
+        if max_bytes <= 0:
+            raise ValueError(f"max_bytes must be positive, got {max_bytes}")
         if not 0.0 < low_watermark <= 1.0:
             raise ValueError(f"low_watermark must be in (0, 1], got {low_watermark}")
+        if interval_s <= 0:
+            raise ValueError(f"interval_s must be positive, got {interval_s}")
+        if stamp_interval_s <= 0:
+            raise ValueError(
+                f"stamp_interval_s must be positive, got {stamp_interval_s}"
+            )
         if grace_s <= stamp_interval_s:
             raise ValueError(
                 f"grace_s ({grace_s}) must exceed stamp_interval_s "
                 f"({stamp_interval_s}), otherwise a block in active use can "
                 f"have an mtime old enough to be swept"
             )
+        if max_tracked <= 0:
+            raise ValueError(f"max_tracked must be positive, got {max_tracked}")
 
         self.file_mapper = file_mapper
         self.max_bytes = max_bytes
