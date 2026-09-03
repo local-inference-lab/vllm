@@ -205,6 +205,7 @@ if TYPE_CHECKING:
     VLLM_MLA_DISABLE: bool = False
     VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH: bool = False
     VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW: int = 8
+    VLLM_DSPARK_DYNAMIC_DRAFT_MIN_DEPTH: int = 1
     VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE: int = 0
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
@@ -1664,6 +1665,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW": lambda: int(
         os.getenv("VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW", "8")
+    ),
+    "VLLM_DSPARK_DYNAMIC_DRAFT_MIN_DEPTH": lambda: int(
+        os.getenv("VLLM_DSPARK_DYNAMIC_DRAFT_MIN_DEPTH", "1")
     ),
     # Capture low-load DSpark draft graphs without confidence/capacity kernels.
     # 0 keeps capacity active at every batch size; a positive value must match

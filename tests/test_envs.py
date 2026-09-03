@@ -49,6 +49,16 @@ def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch)
     assert envs.VLLM_P2P_SIDE_CHANNEL_PORT == 5799
 
 
+def test_dspark_dynamic_draft_min_depth_default_and_override(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("VLLM_DSPARK_DYNAMIC_DRAFT_MIN_DEPTH", raising=False)
+    assert envs.VLLM_DSPARK_DYNAMIC_DRAFT_MIN_DEPTH == 1
+
+    monkeypatch.setenv("VLLM_DSPARK_DYNAMIC_DRAFT_MIN_DEPTH", "5")
+    assert envs.VLLM_DSPARK_DYNAMIC_DRAFT_MIN_DEPTH == 5
+
+
 def _clear_unknown_vllm_envs(monkeypatch: pytest.MonkeyPatch) -> None:
     """Remove inherited VLLM variables not known by this source tree."""
     for name in list(os.environ):

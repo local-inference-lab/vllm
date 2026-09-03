@@ -93,13 +93,19 @@ class DSparkDynamicDraftDepthController:
 
     _PROBE_AFTER_WINDOWS = 8
 
-    def __init__(self, max_depth: int, observation_window: int) -> None:
+    def __init__(
+        self,
+        max_depth: int,
+        observation_window: int,
+        min_depth: int = 1,
+    ) -> None:
         if max_depth < 1:
             raise ValueError("max_depth must be at least one")
         if observation_window < 1:
             raise ValueError("observation_window must be at least one")
         self.max_depth = max_depth
         self.observation_window = observation_window
+        self.min_depth = min(max(1, min_depth), max_depth)
         self.depth = max_depth
         self._steps = 0
         self._max_capacity = 0
@@ -193,7 +199,9 @@ class DSparkDynamicDraftDepthController:
         mean_capacity = self._capacity_sum / self._num_drafts
         mean_attempted = self._attempted_sum / self._num_drafts
         load_limited_depth = self._load_limited_depth(batch_size)
-        target = max(1, min(load_limited_depth, self._max_capacity))
+        # The floor is a soft lower bound; the load/token budget stays hard
+        # and may still force the target below it.
+        target = min(load_limited_depth, max(self.min_depth, self._max_capacity))
 
         previous_depth = self.depth
         if target < self.depth:
@@ -266,6 +274,7 @@ class CapacityBasedVerificationManager:
             DSparkDynamicDraftDepthController(
                 req_states.num_speculative_steps,
                 envs.VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW,
+                min_depth=envs.VLLM_DSPARK_DYNAMIC_DRAFT_MIN_DEPTH,
             )
             if envs.VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH
             else None
