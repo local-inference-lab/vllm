@@ -6,6 +6,23 @@ Thin shim: capability voting, construction, and size gating live here; the
 protocol lives in ``b12x.comm.roce``.  Enabled with
 ``VLLM_ENABLE_ROCE_ALLREDUCE=1`` for tensor-parallel groups whose ranks span
 nodes; single-node groups keep their existing backends.
+
+Contract with the runtime (``b12x.comm.roce.API_VERSION`` ==
+``REQUIRED_B12X_ROCE_API_VERSION``):
+
+- Every rank parses the size limits and checks the API version before the
+  vote; the parsed limits are exchanged and must be identical, and the
+  runtime itself refuses ranks whose ABI, HCA count, slot geometry, spin
+  limit or launch geometry differ.  Any rank that cannot take part disables
+  the backend on every rank, at initialization only.
+- Dispatch is rank-invariant: eligibility depends on dtype, shape, contiguity
+  and size, never on pointer values, so all ranks route the same collective.
+- Failures are fail-stop, never a fallback: a wait that times out freezes the
+  runtime, later launches do nothing, and ``check_health`` (called by the
+  worker after each step's host synchronization) raises so the step's output
+  never leaves the worker.  Peers starve on the stalled rank and raise too.
+- The runtime orders collectives across streams with an event and requires a
+  single stream inside a CUDA graph capture, which is how vLLM captures.
 """
 
 from __future__ import annotations
@@ -24,6 +41,9 @@ from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+REQUIRED_B12X_ROCE_API_VERSION = 1
 
 
 class B12xRoceAllReduce:
@@ -55,21 +75,19 @@ class B12xRoceAllReduce:
             return
 
         # Vote before the collective constructor so a rank that cannot take
-        # part fails every rank cleanly instead of leaving peers in a gather.
-        reason = self._local_capability()
-        if not self._all_ranks_succeeded(reason):
-            if reason is not None:
-                logger.warning(
-                    "RoCEnante unavailable on rank %d: %s", self.rank, reason
-                )
-            else:
-                logger.warning("RoCEnante unavailable on another rank.")
+        # part (missing package, wrong API version, unsupported device, or an
+        # unparsable limit) disables the backend on every rank instead of
+        # leaving peers in the runtime's setup exchange.  The parsed limits
+        # travel with the vote and must be identical everywhere.
+        reason, limits = self._local_capability()
+        verdict = self._exchange_vote(reason, limits)
+        if verdict is not None:
+            logger.warning("RoCEnante disabled on every rank: %s", verdict)
             return
+        max_size, max_gather = limits
 
         from b12x.comm import roce
 
-        max_size = _parse_byte_size(envs.VLLM_ROCE_ALLREDUCE_MAX_SIZE)
-        max_gather = _parse_byte_size(envs.VLLM_ROCE_ALLGATHER_MAX_SIZE)
         try:
             # Exchange setup over the CPU (gloo) group: using the torch NCCL
             # group would create a torch NCCL communicator that vLLM otherwise
@@ -94,19 +112,54 @@ class B12xRoceAllReduce:
                 max_gather,
             )
 
-    def _local_capability(self) -> str | None:
+    def _local_capability(self) -> tuple[str | None, tuple[int, int] | None]:
+        """(reason this rank cannot take part, parsed (max_size, max_gather))."""
         try:
             from b12x.comm import roce
         except ModuleNotFoundError:
-            return "b12x.comm.roce is not installed"
+            return "b12x.comm.roce is not installed", None
+        api = getattr(roce, "API_VERSION", None)
+        if api != REQUIRED_B12X_ROCE_API_VERSION:
+            needed = REQUIRED_B12X_ROCE_API_VERSION
+            return f"b12x.comm.roce API version {api}, adapter needs {needed}", None
         if not roce.is_supported(self.device):
-            return "needs an integrated GPU with an active RDMA device"
+            return "needs an integrated GPU with an active RDMA device", None
+        try:
+            limits = (
+                _parse_byte_size(envs.VLLM_ROCE_ALLREDUCE_MAX_SIZE),
+                _parse_byte_size(envs.VLLM_ROCE_ALLGATHER_MAX_SIZE),
+            )
+        except Exception as exc:  # noqa: BLE001 - reported through the vote
+            return f"invalid RoCEnante size limit: {exc}", None
+        return None, limits
+
+    def _exchange_vote(
+        self, reason: str | None, limits: tuple[int, int] | None
+    ) -> str | None:
+        """Gather every rank's reason and limits; None when all can proceed."""
+        votes: list[tuple[str | None, tuple[int, int] | None]] = [
+            (None, None)
+        ] * self.world_size
+        dist.all_gather_object(votes, (reason, limits), group=self.group)
+        failures = [f"rank {i}: {r}" for i, (r, _) in enumerate(votes) if r]
+        if failures:
+            return "; ".join(failures)
+        reference = votes[0][1]
+        differing = [
+            f"rank {i}: {lim}" for i, (_, lim) in enumerate(votes) if lim != reference
+        ]
+        if differing:
+            return (
+                f"size limits differ across ranks (rank 0: {reference}; "
+                + "; ".join(differing)
+                + ")"
+            )
         return None
 
-    def _all_ranks_succeeded(self, reason: str | None) -> bool:
-        failed = torch.tensor([int(reason is not None)], dtype=torch.int32)
-        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=self.group)
-        return int(failed.item()) == 0
+    def check_health(self) -> None:
+        """Raise if a RoCEnante wait timed out or the proxy died (fail-stop)."""
+        if not self.disabled and self._runtime is not None:
+            self._runtime.check_health()
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         return not self.disabled and self._runtime.should_allreduce(inp)
@@ -153,7 +206,9 @@ class B12xRoceAllReduce:
         if self.disabled:
             yield
             return
-        # Compile before capture; the runtime refuses to compile inside a graph.
+        # Compile and allocate scratch before capture; the runtime refuses both
+        # inside a graph.  vLLM's gather shards have 16-byte rows (direct
+        # layout), so the padded-gather scratch is not requested here.
         self._runtime.prepare((torch.bfloat16, torch.float16, torch.float32))
         with self._runtime.capture(stream=stream):
             yield

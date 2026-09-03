@@ -1066,7 +1066,26 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        output = self.model_runner.sample_tokens(grammar_output)
+        self._check_b12x_roce_health()
+        return output
+
+    def _check_b12x_roce_health(self) -> None:
+        """Fail-stop check for RoCEnante collectives, after the step's host sync.
+
+        A RoCEnante wait that timed out records itself and freezes the runtime;
+        the sampled tokens are on the host here, so every collective of the step
+        has completed and raising now keeps the step's output from leaving the
+        worker.  Every rank reaches the same state on its own (a stalled rank
+        starves its peers' waits), so the raise is coordinated without a
+        supervisor.  With async scheduling the copy to host is deferred and the
+        check lands one step late.  Two pinned-memory reads; no synchronization.
+        """
+        communicator = get_tp_group().device_communicator
+        comm = getattr(communicator, "b12x_ar_comm", None)
+        check = getattr(comm, "check_health", None)
+        if check is not None:
+            check()
 
     @torch.inference_mode()
     @with_gpu_sync_check
@@ -1142,6 +1161,7 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
+                self._check_b12x_roce_health()
                 return output
 
         assert isinstance(output, IntermediateTensors)
