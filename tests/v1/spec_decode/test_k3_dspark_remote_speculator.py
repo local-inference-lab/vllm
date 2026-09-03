@@ -245,7 +245,7 @@ def _make_deferred_proxy(*, max_reqs=3, steps=2, vocab=64, topk=4):
         torch.full((max_reqs, steps), -1, dtype=torch.int64, pin_memory=True)
         for _ in range(2)
     ]
-    proxy._positions_staging = [
+    proxy._sample_positions_staging = [
         torch.full((max_reqs, steps), -1, dtype=torch.int64, pin_memory=True)
         for _ in range(2)
     ]

@@ -586,7 +586,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 )
                 for _ in range(2)
             ]
-            self._positions_staging = [
+            self._sample_positions_staging = [
                 torch.full(
                     (self.max_num_reqs, self.num_speculative_steps),
                     -1,
@@ -1002,7 +1002,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 "Remote DFlash sample positions have the wrong shape: "
                 f"expected={expected_positions}, got={sample_positions!r}"
             )
-        self._positions_staging[slot][
+        self._sample_positions_staging[slot][
             : len(active_indices), :num_speculative_tokens
         ] = torch.tensor(sample_positions, dtype=torch.int64)
 
@@ -1034,7 +1034,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         rows = len(pending.active_indices)
         k = pending.num_speculative_tokens
         self._tokens_staging[slot][:rows, :k].fill_(-1)
-        self._positions_staging[slot][:rows, :k].fill_(-1)
+        self._sample_positions_staging[slot][:rows, :k].fill_(-1)
         if self._probabilistic:
             if self._logits_topk > 0:
                 self._topk_values_staging[:rows, :k].fill_(TOPK_LOGITS_FILL)
@@ -1194,7 +1194,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 self._remote_sample_positions[:, :active_k].index_copy_(
                     0,
                     active_gpu,
-                    self._positions_staging[slot][:rows, :active_k].to(
+                    self._sample_positions_staging[slot][:rows, :active_k].to(
                         self.device, non_blocking=True
                     ),
                 )
@@ -1523,7 +1523,10 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         self._apply_pending_failure()
         # kimi-k3-metadata-d2h-detail: drain the stream at entry to measure
         # how much pending GPU/UVA work the runner queued before propose().
-        torch.cuda.current_stream(self.device).synchronize()
+        # The measurement is the only reader; the copies below synchronize
+        # before any host read.
+        if self._timing_log_interval > 0:
+            torch.cuda.current_stream(self.device).synchronize()
         self._detail_entry_drain = time.perf_counter() - started
         if aux_hidden_states is None or len(aux_hidden_states) != self.num_aux_layers:
             raise ValueError(
