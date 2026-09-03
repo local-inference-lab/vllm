@@ -196,17 +196,24 @@ class AsyncLookupManager(ABC):
                 state.result = False
 
     def mark_present(self, keys: Iterable[OffloadKey]) -> None:
-        """Refresh cached states after an authoritative successful store.
+        """Replace cached verdicts after an authoritative successful store.
 
         A failed load marks an entry absent so the request can recompute it.
         Overlapping requests may keep that shared state alive after the
         recomputed block has been stored again, so waiting for cleanup would
-        leave a stale miss until all of them finish. Only update existing
-        states; a key nobody has looked up does not need a cache entry.
+        leave a stale miss until all of them finish.
+
+        A store can also finish while the first existence probe is in flight.
+        Advancing that state's generation makes the older probe result stale,
+        so it cannot overwrite the store's authoritative presence verdict.
+        Keys without lookup state do not need a cache entry.
         """
         for key in keys:
             state = self._lookup_state.get(key)
             if state is not None:
+                if state.result is None:
+                    state.generation = self._next_generation
+                    self._next_generation += 1
                 state.result = True
 
     def cleanup(self, req_id: str) -> None:

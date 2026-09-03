@@ -222,6 +222,32 @@ class TestAsyncLookupManager:
         assert "reqA" not in mgr._req_keys
         mgr.shutdown()
 
+    def test_mark_present_supersedes_miss_and_pending_probe(self):
+        """A completed store is authoritative over cached and in-flight
+        absence checks for the same key."""
+        mgr = InMemoryLookupManager(existing_keys=set())
+        ctx = _ctx("reqA")
+
+        assert mgr.lookup(_key(1), ctx) is None
+        probe_generation = mgr._lookup_state[_key(1)].generation
+        mgr.mark_present([_key(1)])
+        assert mgr.lookup(_key(1), ctx) is True
+        assert mgr._lookup_state[_key(1)].generation != probe_generation
+
+        mgr.flush()
+        mgr._results_ready.wait()
+        mgr._results_ready.clear()
+        assert mgr.lookup(_key(1), ctx) is True
+
+        mgr.mark_miss([_key(1)])
+        assert mgr.lookup(_key(1), ctx) is False
+        mgr.mark_present([_key(1)])
+        assert mgr.lookup(_key(1), ctx) is True
+
+        mgr.mark_present([_key(99)])
+        assert _key(99) not in mgr._lookup_state
+        mgr.shutdown()
+
     def test_enqueue_once_invariant_enforced(self):
         """A key is enqueued for probing exactly once, so drain_results() may
         receive at most one result per key. Normal operation resolves a key a
