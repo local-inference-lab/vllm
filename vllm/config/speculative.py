@@ -437,6 +437,12 @@ class SpeculativeConfig:
                 {"n_predict": n_predict, "architectures": ["DeepSeekMTPModel"]}
             )
         if hf_config.model_type == "deepseek_v4":
+            if getattr(hf_config, "vision_n_layers", 0) > 0:
+                # The vision variant retains its deepseek_v4 identity here.
+                # The in-checkpoint draft method assigns its own model type
+                # and architecture. Unsupported methods are rejected after
+                # the draft config has been created.
+                return hf_config
             hf_config.model_type = "deepseek_mtp"
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
             hf_config.update(
@@ -1146,6 +1152,15 @@ class SpeculativeConfig:
                     self.draft_model_config.hf_config.architectures = [
                         "DSparkDraftModel"
                     ]
+                    if (
+                        getattr(self.draft_model_config.hf_config, "vision_n_layers", 0)
+                        > 0
+                    ):
+                        # Use the text-only draft model, rather than the
+                        # multimodal wrapper. The marker prevents the
+                        # architecture converter from applying the wrapper
+                        # rewrite to this inner configuration.
+                        self.draft_model_config.hf_config._dsv4_vl_inner = True
                     self.update_arch_()
                 elif (
                     self.method == "dspark"
@@ -1167,6 +1182,21 @@ class SpeculativeConfig:
 
                 if self.method in ("dflash", "dspark"):
                     self.parallel_drafting = True
+
+                # Fail closed: a vision draft configuration is currently
+                # supported only by the in-checkpoint draft method.
+                draft_hf = getattr(self.draft_model_config, "hf_config", None)
+                if (
+                    draft_hf is not None
+                    and getattr(draft_hf, "vision_n_layers", 0) > 0
+                    and self.method != "dspark"
+                ):
+                    raise ValueError(
+                        "Speculative decoding with the DeepSeek-V4 vision "
+                        "variant (DeepseekV4ForConditionalGeneration) is only "
+                        "supported for the in-checkpoint draft method; got method "
+                        f"{self.method!r}."
+                    )
 
                 if (
                     self.method == "dspark"

@@ -513,3 +513,23 @@ def test_deepseek_v4_matches_reference_golden_fixtures(case_id, kwargs):
 
     expected = (FIXTURES_DIR / f"test_output_{case_id}.txt").read_text()
     assert prompt == expected
+
+
+def test_deepseek_v4_image_blocks_become_placeholders():
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first:"},
+                    {"type": "image_url", "image_url": {"url": "file:///a.png"}},
+                    {"type": "text", "text": "second:"},
+                    {"type": "image", "source": {"data": "AAAA"}},
+                ],
+            }
+        ],
+        tokenize=False,
+        thinking=False,
+    )
+
+    assert "<｜User｜>first:<｜deepseek_image｜>second:<｜deepseek_image｜>" in prompt
