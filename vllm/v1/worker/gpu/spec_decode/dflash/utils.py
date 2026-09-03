@@ -152,4 +152,11 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             del dflash_model.lm_head
         dflash_model.lm_head = target_lm_head
 
+    # Opt-in rowwise-fp8 draft head (VLLM_DSPARK_FP8_DRAFT_HEAD). Runs after
+    # the lm_head aliasing above and before CUDA-graph capture, because the
+    # captured draft step must not quantize lazily.
+    maybe_init_fp8_draft_head = getattr(dflash_model, "maybe_init_fp8_draft_head", None)
+    if maybe_init_fp8_draft_head is not None:
+        maybe_init_fp8_draft_head()
+
     return dflash_model

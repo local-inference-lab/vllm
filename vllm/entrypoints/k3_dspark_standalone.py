@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import threading
 import time
@@ -233,6 +234,8 @@ def _build_vllm_config(args: argparse.Namespace):
         "rejection_sample_method": "block",
         "max_model_len": args.max_model_len,
     }
+    if args.draft_quantization != "none":
+        speculative_config["quantization"] = args.draft_quantization
     engine_args = EngineArgs(
         model=str(args.target_config),
         tokenizer_mode="skip",
@@ -247,13 +250,18 @@ def _build_vllm_config(args: argparse.Namespace):
         block_size=16,
         enable_prefix_caching=False,
         enforce_eager=True,
-        compilation_config={"custom_ops": ["none"]},
+        # Fused kernels for the draft's per-projection work: the CUDA
+        # per-token fp8 quantization op, the CUTLASS fp8 GEMM with the
+        # per-token x per-channel scaling in its epilogue, and the vLLM C
+        # RMSNorm kernels. The torch-native equivalents issue 8-13 tiny
+        # kernels per projection inside the captured proposal graph.
+        compilation_config={"custom_ops": ["none", "+quant_fp8"]},
         kernel_config={
             "ir_op_priority": {
-                "rms_norm": ["native"],
-                "fused_add_rms_norm": ["native"],
+                "rms_norm": ["vllm_c", "native"],
+                "fused_add_rms_norm": ["vllm_c", "native"],
             },
-            "linear_backend": "torch",
+            "linear_backend": "cutlass",
         },
         load_format="safetensors",
         use_tqdm_on_load=False,
@@ -385,6 +393,10 @@ def _load_runtime(args: argparse.Namespace, status: RuntimeStatus) -> Standalone
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_config = speculative_config.draft_model_config.hf_config
+    # vLLM workers install the configured IR op priorities at init; this
+    # runtime has no worker, so install them here or every IR op (RMSNorm)
+    # silently runs its torch-native implementation.
+    vllm_config.kernel_config.ir_op_priority.set_default()
 
     status.phase = "loading_shared_target_weights"
     with set_current_vllm_config(vllm_config):
@@ -761,6 +773,29 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-kv-window", type=int, default=32768)
     parser.add_argument("--proposal-address", default="tcp://127.0.0.1:8092")
     parser.add_argument("--disable-proposal-transport", action="store_true")
+    parser.add_argument(
+        "--draft-quantization",
+        choices=("none", "fp8_per_channel", "fp8_per_tensor", "mxfp8"),
+        default="none",
+        help=(
+            "Online weight quantization for the draft's linear layers (vLLM "
+            "online-quantization shorthand): fp8_per_channel quantizes each "
+            "BF16 weight to float8_e4m3 with one scale per output channel and "
+            "dynamic per-token activation scaling. Draft-time only: the "
+            "target's verification pass is unchanged, so accepted outputs "
+            "keep the target distribution; only the proposal quality (and "
+            "therefore acceptance length) can move."
+        ),
+    )
+    parser.add_argument(
+        "--draft-fp8-head",
+        action="store_true",
+        help=(
+            "Score draft proposals with a rowwise-fp8 copy of the LM head "
+            "(VLLM_DSPARK_FP8_DRAFT_HEAD=1); same draft-time-only contract "
+            "as --draft-quantization."
+        ),
+    )
     parser.add_argument("--enable-cuda-graph", action="store_true")
     parser.add_argument("--cuda-graph-warmups", type=int, default=2)
     parser.add_argument("--skip-smoke-test", action="store_true")
@@ -776,6 +811,10 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if args.draft_fp8_head:
+        # Read by the draft loader (envs.VLLM_DSPARK_FP8_DRAFT_HEAD) while
+        # _load_runtime builds the draft head, so it is set before that.
+        os.environ["VLLM_DSPARK_FP8_DRAFT_HEAD"] = "1"
     status = RuntimeStatus(
         draft_model=str(args.draft_model),
         method=args.method,
