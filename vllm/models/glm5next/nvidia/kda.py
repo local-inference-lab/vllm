@@ -25,8 +25,36 @@ _GATE_SIDE_STREAM = os.getenv("VLLM_GLM53_KDA_GATE_SIDE_STREAM", "1") != "0"
 _side_streams: dict[int, torch.cuda.Stream] = {}
 
 
+def _gate_overlap_allowed() -> bool:
+    """Use the gate side stream only in runtime or regular FULL capture.
+
+    Breakable capture alternates captured segments with eager operations.  A
+    side-stream fork in either portion can outlive a segment boundary even when
+    the main stream has enqueued a later event wait.  Graph preparation also
+    runs uncaptured warmup forwards; overlapping multiple auxiliary streams in
+    those forwards can race allocator reuse before the following capture.
+    Regular FULL capture and serving execution retain the overlapped path.
+    """
+    try:
+        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+        from vllm.compilation.monitor import is_cudagraph_capturing_enabled
+
+        if BreakableCUDAGraphCapture.current() is not None:
+            return False
+        return (
+            not is_cudagraph_capturing_enabled()
+            or torch.cuda.is_current_stream_capturing()
+        )
+    except Exception:  # noqa: BLE001
+        return not torch.cuda.is_current_stream_capturing()
+
+
 def _gate_stream(device: torch.device) -> torch.cuda.Stream:
-    index = device.index if device.index is not None else torch.cuda.current_device()
+    index = (
+        device.index
+        if device.index is not None
+        else torch.accelerator.current_device_index()
+    )
     stream = _side_streams.get(index)
     if stream is None:
         stream = torch.cuda.Stream(device=torch.device("cuda", index))
@@ -46,7 +74,11 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         output = torch.empty_like(hidden_states)
-        if _GATE_SIDE_STREAM and not self.use_full_rank_gate:
+        if (
+            _GATE_SIDE_STREAM
+            and not self.use_full_rank_gate
+            and _gate_overlap_allowed()
+        ):
             self._forward_gate_overlap(hidden_states, output)
         else:
             super().forward(hidden_states, positions, output)
@@ -67,7 +99,13 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
         # eager/warmup mode; a no-op inside graph capture).
         hidden_states.record_stream(side)
         with torch.cuda.stream(side):
-            g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
+            g_a_states = self.g_a_proj(hidden_states)[0]
+            # Some linear backends allocate their caller-owned output before
+            # entering the active CUDA stream. Record the asynchronous consumer
+            # explicitly so the caching allocator cannot recycle this
+            # intermediate while g_b_proj is still reading it.
+            g_a_states.record_stream(side)
+            g_proj_states = self.g_b_proj(g_a_states)[0]
 
         projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
         # Same optional callback the shared forward offers after its first
