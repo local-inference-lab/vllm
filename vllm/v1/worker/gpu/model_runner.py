@@ -1782,6 +1782,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # Enqueue the pending reply while its request-to-slot mapping still
+        # belongs to the batch that produced it. Subsequent slot removal and
+        # initialization remain ordered behind these operations on the stream.
+        self._resolve_pending_draft()
         if not dummy_run:
             with record_function_or_nullcontext("vllm:v2/target/update_batch"):
                 # Update the request states.
@@ -1793,11 +1797,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
-                self._resolve_pending_draft()
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
-        else:
-            self._resolve_pending_draft()
 
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
@@ -1884,7 +1885,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
-            self._resolve_pending_draft()
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
 
@@ -1972,13 +1972,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     ),
                 )
 
-        if not dummy_run:
-            self._resolve_pending_draft()
-            if self._late_input_ids:
-                with record_function_or_nullcontext(
-                    f"vllm:v2/target/{phase}/finalize_input_ids"
-                ):
-                    self._finalize_input_ids(input_batch)
+        if not dummy_run and self._late_input_ids:
+            with record_function_or_nullcontext(
+                f"vllm:v2/target/{phase}/finalize_input_ids"
+            ):
+                self._finalize_input_ids(input_batch)
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
