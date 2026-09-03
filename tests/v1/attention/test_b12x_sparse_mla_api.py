@@ -142,6 +142,14 @@ def _glm5_next_config(
 
 
 def _glm_moe_dsa_config(*, dcp_size: int = 4) -> SimpleNamespace:
+    """Build a minimal GLM-MoE-DSA test model configuration.
+
+    Args:
+        dcp_size: Number of decode-context-parallel ranks.
+
+    Returns:
+        Configuration namespace for GLM-MoE-DSA sparse-MLA tests.
+    """
     return SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(
