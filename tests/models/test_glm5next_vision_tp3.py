@@ -13,6 +13,15 @@ from vllm.models.glm5next.nvidia import multimodal as glm5next_multimodal
 
 @pytest.fixture
 def tp3_linear_state(monkeypatch):
+    compilation_config = SimpleNamespace(
+        custom_ops=["none"],
+        enabled_custom_ops=set(),
+        disabled_custom_ops=set(),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.custom_op.get_cached_compilation_config",
+        lambda: compilation_config,
+    )
     monkeypatch.setattr(
         glm5next_multimodal, "get_tensor_model_parallel_world_size", lambda: 3
     )
