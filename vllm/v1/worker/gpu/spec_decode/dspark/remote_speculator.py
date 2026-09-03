@@ -137,6 +137,46 @@ def _k3_capture_safe_name(request_id: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in request_id)[:180]
 
 
+def _k3_capture_new_state(
+    directory: _Path, request_id: str, width: int
+) -> dict[str, Any]:
+    """Create empty binary and JSON capture files for one request."""
+    name = _k3_capture_safe_name(request_id)
+    state = {
+        "request_id": request_id,
+        "width": width,
+        "bytes": 0,
+        "record_count": 0,
+        "bin": str(directory / (name + ".bin")),
+        "index": str(directory / (name + ".json")),
+    }
+    metadata = {
+        key: state[key] for key in ("request_id", "width", "bin", "index")
+    }
+    prefix = json.dumps(metadata, separators=(",", ":"))[:-1] + ',"records":['
+    tail = '],"bytes":0}'
+    _Path(state["bin"]).write_bytes(b"")
+    _Path(state["index"]).write_text(prefix + tail)
+    state["index_tail_bytes"] = len(tail.encode())
+    return state
+
+
+def _k3_capture_append_index(
+    state: dict[str, Any], record: dict[str, Any], total_bytes: int
+) -> None:
+    """Append one record while keeping the compact index valid JSON."""
+    separator = "," if state["record_count"] else ""
+    tail = f'],"bytes":{total_bytes}}}'
+    payload = (separator + json.dumps(record, separators=(",", ":")) + tail).encode()
+    with _Path(state["index"]).open("r+b") as handle:
+        handle.seek(-int(state["index_tail_bytes"]), os.SEEK_END)
+        handle.write(payload)
+        handle.truncate()
+    state["bytes"] = total_bytes
+    state["record_count"] += 1
+    state["index_tail_bytes"] = len(tail.encode())
+
+
 def _k3_capture_records(
     requests: list[dict],
     positions_frame: bytes,
@@ -145,9 +185,6 @@ def _k3_capture_records(
     anchor_positions: list[int],
 ) -> None:
     """Split one PROPOSE payload back into its per-request row ranges."""
-
-    import json as _json
-
     directory = _Path(_K3_CAPTURE_DIR)
     directory.mkdir(parents=True, exist_ok=True)
     row_bytes = width * 2
@@ -157,20 +194,10 @@ def _k3_capture_records(
         if count <= 0:
             continue
         request_id = str(request["request_id"])
-        name = _k3_capture_safe_name(request_id)
         state = _K3_CAPTURE_STATE.get(request_id)
-        if state is None:
-            state = {
-                "request_id": request_id,
-                "width": width,
-                "records": [],
-                "bytes": 0,
-                "bin": str(directory / (name + ".bin")),
-                "index": str(directory / (name + ".json")),
-            }
+        if state is None or bool(request["reset"]):
+            state = _k3_capture_new_state(directory, request_id, width)
             _K3_CAPTURE_STATE[request_id] = state
-            # A reset means the remote state was rebuilt; start the file over.
-            _Path(state["bin"]).write_bytes(b"")
         positions_slice = positions_frame[row_offset * 8 : (row_offset + count) * 8]
         context_slice = context_frame[
             row_offset * row_bytes : (row_offset + count) * row_bytes
@@ -178,20 +205,18 @@ def _k3_capture_records(
         with open(state["bin"], "ab") as handle:
             handle.write(positions_slice)
             handle.write(context_slice)
-        state["records"].append(
-            {
-                "offset": state["bytes"],
-                "rows": count,
-                "positions_bytes": len(positions_slice),
-                "context_bytes": len(context_slice),
-                "reset": bool(request["reset"]),
-                "reset_position": int(request["reset_position"]),
-                "anchor_token_id": int(request["anchor_token_id"]),
-                "anchor_position": int(anchor_position),
-            }
-        )
-        state["bytes"] += len(positions_slice) + len(context_slice)
-        _Path(state["index"]).write_text(_json.dumps(state))
+        record = {
+            "offset": state["bytes"],
+            "rows": count,
+            "positions_bytes": len(positions_slice),
+            "context_bytes": len(context_slice),
+            "reset": bool(request["reset"]),
+            "reset_position": int(request["reset_position"]),
+            "anchor_token_id": int(request["anchor_token_id"]),
+            "anchor_position": int(anchor_position),
+        }
+        total_bytes = state["bytes"] + len(positions_slice) + len(context_slice)
+        _k3_capture_append_index(state, record, total_bytes)
         row_offset += count
 
 
@@ -545,6 +570,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         self._known_requests.difference_update(remote_request_ids)
         for request_id in remote_request_ids:
             self._retained_prefixes.pop(request_id, None)
+            _K3_CAPTURE_STATE.pop(request_id, None)
 
     def _ensure_remote_capacity(self, current_request_ids: set[str]) -> None:
         while len(self._known_requests) >= self._remote_max_requests:
