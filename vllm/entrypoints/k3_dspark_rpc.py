@@ -10,7 +10,6 @@ server protocol.
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import threading
@@ -29,6 +28,13 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadata,
 )
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.worker.gpu.spec_decode.dspark.p2p_transport import (
+    P2P_CAPABILITY,
+    TOPK_LOGITS_P2P_CAPABILITY,
+)
+from vllm.v1.worker.gpu.spec_decode.dspark.p2p_transport import (
+    export_tensor as _export_cuda_tensor,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -40,49 +46,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 PROTOCOL_VERSION = 2
-P2P_CAPABILITY = "dflash_p2p_v1"
-TOPK_LOGITS_P2P_CAPABILITY = "dflash_logits_topk_p2p_v1"
-
-
-_CUDA_IPC_HANDLE_BYTES = 64
-
-
-def _ipc_handle_from_share(blob: bytes) -> bytes:
-    """Extract the ``cudaIpcMemHandle_t`` from a storage's share blob.
-
-    ``UntypedStorage._share_cuda_`` returns a two-byte header (format
-    version, allocation kind) followed by the handle; only allocations the
-    CUDA caching allocator made with ``cudaMalloc`` (kind ``c``) carry an IPC
-    memory handle. Expandable segments (kind ``e``) export a file descriptor
-    instead and cannot be mapped with ``cudaIpcOpenMemHandle``.
-    """
-    if len(blob) == _CUDA_IPC_HANDLE_BYTES:
-        return bytes(blob)
-    if len(blob) == _CUDA_IPC_HANDLE_BYTES + 2 and blob[1:2] == b"c":
-        return bytes(blob[2:])
-    raise ValueError(
-        "exported storage is not a cudaMalloc allocation (set "
-        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False in the exporting "
-        f"process); share blob of {len(blob)} bytes, kind {blob[1:2]!r}"
-    )
-
-
-def _export_cuda_tensor(tensor: torch.Tensor) -> dict[str, Any]:
-    """Describe a contiguous CUDA tensor for the verifier process: the base64
-    CUDA IPC handle of its allocation, the tensor's byte offset in it, and
-    its geometry. The engine keeps the tensor alive while it is exported."""
-    if not tensor.is_cuda or not tensor.is_contiguous():
-        raise ValueError("only contiguous CUDA tensors can be exported")
-    shared = tensor.untyped_storage()._share_cuda_()
-    handle = _ipc_handle_from_share(shared[1])
-    offset = int(shared[3]) + tensor.storage_offset() * tensor.element_size()
-    return {
-        "handle": base64.b64encode(handle).decode("ascii"),
-        "offset_bytes": offset,
-        "shape": list(tensor.shape),
-        "dtype": str(tensor.dtype).removeprefix("torch."),
-        "nbytes": tensor.numel() * tensor.element_size(),
-    }
 
 
 @dataclass
