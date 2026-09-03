@@ -15,6 +15,7 @@ from vllm.entrypoints.k3_dspark_standalone import (
     EMBED_TENSOR,
     LM_HEAD_TENSOR,
     _effective_aux_geometry,
+    _smoke_block_ids,
     resolve_shared_weight_files,
 )
 
@@ -31,6 +32,12 @@ def test_effective_aux_geometry_uses_layer_ids_and_target_hidden_width():
     )
 
     assert _effective_aux_geometry(speculative_config) == (3, 3584)
+
+
+def test_smoke_block_ids_cover_query_spillover():
+    assert _smoke_block_ids(4, 1) == [1]
+    assert _smoke_block_ids(4, 4) == [1]
+    assert _smoke_block_ids(4, 5) == [1, 2]
 
 
 def _write_index(root, weight_map):

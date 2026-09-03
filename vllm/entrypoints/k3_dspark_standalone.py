@@ -497,6 +497,25 @@ def _effective_aux_geometry(speculative_config: Any) -> tuple[int, int]:
     return len(aux_layers), hidden_size
 
 
+def _smoke_block_ids(block_size: int, sequence_tokens: int) -> list[int]:
+    """Return draft-cache block IDs touched by a smoke sequence.
+
+    Args:
+        block_size: Number of token slots in one cache block.
+        sequence_tokens: Context and query tokens written by the smoke run.
+
+    Returns:
+        Contiguous cache block IDs beginning at the reserved block 1.
+
+    Raises:
+        ValueError: If either input is non-positive.
+    """
+    if block_size <= 0 or sequence_tokens <= 0:
+        raise ValueError("smoke block size and sequence length must be positive")
+    blocks = (sequence_tokens + block_size - 1) // block_size
+    return list(range(1, 1 + blocks))
+
+
 @torch.inference_mode()
 def _run_eager_smoke(runtime: StandaloneRuntime, device: torch.device) -> int:
     if runtime.method == "dflash":
@@ -522,11 +541,12 @@ def _run_eager_smoke(runtime: StandaloneRuntime, device: torch.device) -> int:
         device=device,
     )
     context_len = 1
+    block_size = runtime.kv_cache_block_size
     positions = torch.zeros(context_len, dtype=torch.int64, device=device)
     context = model.combine_hidden_states(aux)
     data_block = 1
     context_slots = torch.tensor(
-        [data_block * runtime.kv_cache_block_size],
+        [data_block * block_size],
         dtype=torch.int64,
         device=device,
     )
@@ -549,13 +569,14 @@ def _run_eager_smoke(runtime: StandaloneRuntime, device: torch.device) -> int:
         device=device,
     )
     query_slots = torch.arange(
-        data_block * runtime.kv_cache_block_size + context_len,
-        data_block * runtime.kv_cache_block_size + context_len + query_len,
+        data_block * block_size + context_len,
+        data_block * block_size + context_len + query_len,
         dtype=torch.int64,
         device=device,
     )
     query_start_loc = torch.tensor([0, query_len], dtype=torch.int32, device=device)
-    block_table = torch.tensor([[data_block]], dtype=torch.int32, device=device)
+    block_ids = _smoke_block_ids(block_size, context_len + query_len)
+    block_table = torch.tensor([block_ids], dtype=torch.int32, device=device)
     seq_lens = torch.tensor([context_len + query_len], dtype=torch.int32, device=device)
     metadata = MLACommonMetadata(
         num_reqs=1,
@@ -596,7 +617,7 @@ def _run_eager_smoke(runtime: StandaloneRuntime, device: torch.device) -> int:
     token = int((base_logits + markov).argmax(dim=-1).item())
     torch.accelerator.synchronize()
     for cache in runtime.kv_caches.values():
-        cache[data_block].zero_()
+        cache[data_block : data_block + len(block_ids)].zero_()
     return token
 
 
@@ -632,7 +653,7 @@ def _run_dflash_eager_smoke(
 
     query_len = int(speculative_config.num_speculative_tokens) + 1
     sequence_end = 1 + query_len
-    block_ids = list(range(1, 1 + (sequence_end + block_size - 1) // block_size))
+    block_ids = _smoke_block_ids(block_size, sequence_end)
     input_ids = torch.tensor(
         [draft_config.bos_token_id]
         + [get_parallel_drafting_token_id(draft_config)] * (query_len - 1),
