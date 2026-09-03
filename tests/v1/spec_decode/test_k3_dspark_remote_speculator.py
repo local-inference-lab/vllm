@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -88,6 +89,22 @@ def test_adaptive_depth_output_is_contiguous_for_tp_broadcast():
 
     assert output.is_contiguous()
     assert output.tolist() == [[0, 1, 2], [8, 9, 10]]
+
+
+def test_deferred_ingest_failures_disable_every_affected_request():
+    proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy.method = "dflash"
+    proxy._disabled_requests = set()
+    proxy._async_error_lock = threading.Lock()
+    proxy._async_errors = [
+        (RuntimeError("first failure"), ["request-a"]),
+        (RuntimeError("second failure"), ["request-b", "request-c"]),
+    ]
+
+    proxy._apply_async_error()
+
+    assert proxy._disabled_requests == {"request-a", "request-b", "request-c"}
+    assert proxy._async_errors == []
 
 
 @pytest.mark.parametrize("rejected", [[5, 0], [-1, 0]])
