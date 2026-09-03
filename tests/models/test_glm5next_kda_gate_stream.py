@@ -6,10 +6,9 @@ gate projections off the main stream, graph-capturable."""
 import pytest
 import torch
 
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 from vllm.models.glm5next.nvidia import kda as kda_module
 from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
-
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 HIDDEN, HEADS, HEAD_DIM, GATE_RANK = 64, 2, 16, 8
 PROJ = HEADS * HEAD_DIM
@@ -58,10 +57,46 @@ def _make_layer(device, log, generator):
 
 def _run(layer, hidden_states):
     out = layer(hidden_states, positions=None)
-    torch.cuda.synchronize(hidden_states.device)
+    torch.accelerator.synchronize(hidden_states.device)
     return out
 
 
+def test_gate_overlap_is_disabled_for_the_entire_breakable_capture(monkeypatch):
+    monkeypatch.setattr(
+        BreakableCUDAGraphCapture,
+        "current",
+        classmethod(lambda cls: object()),
+    )
+    assert not kda_module._gate_overlap_allowed()
+
+
+def test_gate_overlap_is_disabled_for_uncaptured_graph_warmup(monkeypatch):
+    from vllm.compilation import monitor
+
+    monkeypatch.setattr(
+        BreakableCUDAGraphCapture,
+        "current",
+        classmethod(lambda cls: None),
+    )
+    monkeypatch.setattr(monitor, "is_cudagraph_capturing_enabled", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert not kda_module._gate_overlap_allowed()
+
+
+def test_gate_overlap_is_enabled_for_regular_full_capture(monkeypatch):
+    from vllm.compilation import monitor
+
+    monkeypatch.setattr(
+        BreakableCUDAGraphCapture,
+        "current",
+        classmethod(lambda cls: None),
+    )
+    monkeypatch.setattr(monitor, "is_cudagraph_capturing_enabled", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert kda_module._gate_overlap_allowed()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_gate_side_stream_matches_sequential_forward(monkeypatch):
     device = torch.device("cuda", 0)
     generator = torch.Generator().manual_seed(11)
@@ -83,6 +118,7 @@ def test_gate_side_stream_matches_sequential_forward(monkeypatch):
     assert torch.equal(overlapped, sequential)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_gate_side_stream_is_graph_capturable(monkeypatch):
     device = torch.device("cuda", 0)
     generator = torch.Generator().manual_seed(5)
@@ -98,11 +134,11 @@ def test_gate_side_stream_is_graph_capturable(monkeypatch):
         for _ in range(2):
             layer(static, positions=None)
     torch.cuda.current_stream(device).wait_stream(stream)
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         captured = layer(static, positions=None)
     for _ in range(3):
         graph.replay()
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
         assert torch.equal(captured, eager)

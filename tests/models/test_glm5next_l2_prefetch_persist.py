@@ -5,6 +5,7 @@
 import pytest
 import torch
 
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 from vllm.models.glm5next.nvidia import l2_prefetch as l2pf
 
 MAX = 84_000_000
@@ -43,6 +44,41 @@ def test_invalid_numeric_environment_values_use_defaults(monkeypatch):
     monkeypatch.setenv("VLLM_GLM53_L2_PREFETCH_BUDGET_A_MB", "invalid")
     assert l2pf._int_env("VLLM_GLM53_L2_PREFETCH_MAX_TOKENS", 256) == 256
     assert l2pf._mb("VLLM_GLM53_L2_PREFETCH_BUDGET_A_MB", "20") == 20_000_000
+
+
+def test_prefetch_is_disabled_for_the_entire_breakable_capture(monkeypatch):
+    monkeypatch.setattr(
+        BreakableCUDAGraphCapture,
+        "current",
+        classmethod(lambda cls: object()),
+    )
+    assert not l2pf._prefetch_allowed()
+
+
+def test_prefetch_is_disabled_for_uncaptured_graph_warmup(monkeypatch):
+    from vllm.compilation import monitor
+
+    monkeypatch.setattr(
+        BreakableCUDAGraphCapture,
+        "current",
+        classmethod(lambda cls: None),
+    )
+    monkeypatch.setattr(monitor, "is_cudagraph_capturing_enabled", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert not l2pf._prefetch_allowed()
+
+
+def test_prefetch_is_enabled_for_regular_full_capture(monkeypatch):
+    from vllm.compilation import monitor
+
+    monkeypatch.setattr(
+        BreakableCUDAGraphCapture,
+        "current",
+        classmethod(lambda cls: None),
+    )
+    monkeypatch.setattr(monitor, "is_cudagraph_capturing_enabled", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert l2pf._prefetch_allowed()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")

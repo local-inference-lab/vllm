@@ -530,27 +530,29 @@ def configure_persisting_l2(device: torch.device, request: str | None = None) ->
 
 
 def _prefetch_allowed() -> bool:
-    """False inside a breakable (PIECEWISE) capture, where eager breaks end
-    the capture segment and an un-joined side stream would be illegal."""
+    """Use the prefetch stream only in runtime or regular FULL capture.
+
+    A breakable graph temporarily ends capture while it executes each eager
+    operation, then immediately begins another segment.  A prefetch issued in
+    that eager interval would remain in flight across the next ``capture_begin``
+    because the model-level join occurs only after all layers.  Uncaptured graph
+    warmups also avoid auxiliary-stream overlap so their allocations cannot race
+    reuse by the following capture.  Regular FULL capture and serving execution
+    remain eligible.
+    """
     try:
         from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+        from vllm.compilation.monitor import is_cudagraph_capturing_enabled
 
         cap = BreakableCUDAGraphCapture.current()
-        if cap is not None and bool(getattr(cap, "_capturing", False)):
-            from vllm.config import CUDAGraphMode
-            from vllm.forward_context import (
-                get_forward_context,
-                is_forward_context_available,
-            )
-
-            if is_forward_context_available():
-                return (
-                    get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
-                )
+        if cap is not None:
             return False
+        return (
+            not is_cudagraph_capturing_enabled()
+            or torch.cuda.is_current_stream_capturing()
+        )
     except Exception:  # noqa: BLE001
         return not torch.cuda.is_current_stream_capturing()
-    return True
 
 
 class L2Prefetcher:

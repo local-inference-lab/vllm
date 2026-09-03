@@ -537,6 +537,12 @@ class CudaGraphManager:
 
                     # Warmup
                     forward_fn(CUDAGraphMode.NONE)
+                    # A model forward may fork work onto auxiliary streams and
+                    # join them with events queued on the compute stream.  CUDA
+                    # graph capture must not begin while those warmup kernels
+                    # are still executing, even though the queued event waits
+                    # preserve normal stream ordering.
+                    torch.accelerator.synchronize()
 
                     # Capture
                     logger.debug(
