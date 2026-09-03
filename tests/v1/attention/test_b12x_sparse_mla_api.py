@@ -35,8 +35,9 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseImpl,
     B12xMLASparseMetadata,
     B12xMLASparseMetadataBuilder,
+    _full_ckv_record_bytes,
     _global_causal_lens_for_ckv_gather,
-    _is_glm_next_ckv_source_layout,
+    _is_full_ckv_source_layout,
     _is_speculative_decode_batch,
     _max_speculative_decode_query_len,
     _selected_index_block_stride_rows,
@@ -137,6 +138,32 @@ def _glm5_next_config(
         ),
         speculative_config=object() if speculative else None,
         cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
+    )
+
+
+def _glm_moe_dsa_config(*, dcp_size: int = 4) -> SimpleNamespace:
+    """Build a minimal GLM-MoE-DSA test model configuration.
+
+    Args:
+        dcp_size: Number of decode-context-parallel ranks.
+
+    Returns:
+        Configuration namespace for GLM-MoE-DSA sparse-MLA tests.
+    """
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                model_type="glm_moe_dsa",
+                index_topk=2048,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+            )
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp_size,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=None,
     )
 
 
@@ -284,7 +311,7 @@ def test_b12x_full_ckv_gather_excludes_decode_and_mtp_batches(
     assert (
         _use_b12x_full_ckv_gather(
             enabled=True,
-            is_glm_next=True,
+            supported_model=True,
             dcp_world_size=4,
             max_query_len=max_query_len,
             num_tokens=num_tokens,
@@ -379,15 +406,55 @@ def test_b12x_glm5_next_rejects_recipe_drift(monkeypatch) -> None:
     ]
 
 
-def test_b12x_glm5_next_ckv_source_layout() -> None:
-    storage = torch.empty((2 * 37888,), dtype=torch.uint8)
+@pytest.mark.parametrize("record_bytes", [528, 656])
+def test_b12x_full_ckv_source_layout(record_bytes: int) -> None:
+    page_stride = 64 * record_bytes + 4096
+    storage = torch.empty((2 * page_stride,), dtype=torch.uint8)
     cache = torch.as_strided(
         storage,
-        size=(2, 64, 528),
-        stride=(37888, 528, 1),
+        size=(2, 64, record_bytes),
+        stride=(page_stride, record_bytes, 1),
     )
-    assert _is_glm_next_ckv_source_layout(cache, page_size=64)
-    assert not _is_glm_next_ckv_source_layout(cache[:, :, ::2], page_size=64)
+    assert _is_full_ckv_source_layout(cache, page_size=64, record_bytes=record_bytes)
+    assert not _is_full_ckv_source_layout(
+        cache[:, :, ::2], page_size=64, record_bytes=record_bytes
+    )
+
+
+def test_b12x_full_ckv_record_width_is_model_specific() -> None:
+    assert _full_ckv_record_bytes(_glm5_next_config()) == 528
+    assert _full_ckv_record_bytes(_glm_moe_dsa_config()) == 656
+
+    target = _glm_moe_dsa_config().model_config
+    draft = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="deepseek_mtp")
+        ),
+        speculative_config=SimpleNamespace(target_model_config=target),
+    )
+    assert _full_ckv_record_bytes(draft) == 656
+
+
+def test_b12x_nonflash_full_ckv_workspace_uses_native_record_width() -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._max_tokens = 1024
+    impl._q_head_dim = 576
+    impl._ckv_local_capacity = 131200
+    impl._full_ckv_record_bytes = 656
+    impl.dcp_world_size = 4
+    plan = SimpleNamespace(shapes_and_dtypes=lambda: ())
+
+    specs = impl._workspace_specs(
+        plan,
+        input_num_heads=16,
+        include_ckv=True,
+    )
+
+    assert specs == (
+        ((1024, 16, 576), torch.bfloat16),
+        ((131200, 656), torch.uint8),
+        ((524800, 656), torch.uint8),
+    )
 
 
 @pytest.mark.parametrize("record_bytes", [528, 656])
