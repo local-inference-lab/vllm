@@ -491,6 +491,7 @@ def test_fused_topk_softplus_sqrt_bias_vl(
 @pytest.mark.parametrize(
     ("num_experts", "topk", "renormalize", "dtype", "indices_dtype"),
     [
+        (64, 6, True, torch.float32, torch.long),  # two rows per CUDA warp
         (256, 6, True, torch.float32, torch.long),  # specialized hash kernel
         (384, 6, True, torch.float32, torch.int32),  # specialized hash kernel
         (384, 8, False, torch.bfloat16, torch.long),  # generic hash kernel

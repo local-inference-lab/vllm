@@ -447,13 +447,13 @@ def test_flashinfer_mixed_sparse_indices_with_image_spans():
         max_image_tokens=MAX_IMG,
     )
 
-    swa_total = WINDOW + MAX_IMG
+    swa_total = WINDOW + (MAX_IMG + 3) // 4 * 4
     assert sparse_indices.shape == (40, swa_total)
     assert sparse_lens.cpu().tolist() == [swa_total] * 40
     # Decode row: slots copied, image-extension columns padded with -1.
     decode_row = sparse_indices[0].cpu().tolist()
     assert decode_row[:WINDOW] == list(range(100, 108))
-    assert decode_row[WINDOW:] == [-1] * MAX_IMG
+    assert decode_row[WINDOW:] == [-1] * (swa_total - WINDOW)
     # Prefill rows: paged slot ids over the widened window.
     exp_rows, _ = ref_swa_slot_rows(
         seq_lens, query_lens, spans, block_table, WINDOW, MAX_IMG, swa_total

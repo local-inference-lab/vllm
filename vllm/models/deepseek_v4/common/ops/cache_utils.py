@@ -1007,7 +1007,7 @@ def build_flashinfer_mixed_sparse_indices(
     swa_index_width = decode_swa_indices.shape[-1]
     assert swa_index_width >= window_size
     has_image = prefill_left_visible is not None
-    image_width = max_image_tokens if has_image else 0
+    image_width = (max_image_tokens + 3) // 4 * 4 if has_image else 0
     swa_total_width = swa_index_width + image_width
     if has_image:
         assert prefill_right_visible is not None

@@ -364,6 +364,12 @@ def looks_like_chw(shape) -> bool:
     ``np.transpose(pil, (2, 0, 1))`` of a 4-wide image) as a 3-pixel-tall
     RGBA image. Prefer CHW when the leading axis is RGB (C=3); gray/RGBA
     leading 1/4 keep the unambiguous last-axis rule.
+
+    Args:
+        shape: Candidate array shape.
+
+    Returns:
+        Whether the shape is unambiguously channel-first.
     """
     if len(shape) != 3:
         return False

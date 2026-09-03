@@ -60,19 +60,19 @@ def test_image_get_image_size_chw_hwc(array, expected_size):
     assert items.get_image_size(0) == expected_size
 
 
-def test_plain_text_image_token_mention_stays_text():
-    """A textual placeholder mention must not be treated as image input."""
+def test_plain_text_image_token_mention_is_rejected():
+    """A reserved image marker in user text cannot bind supplied image data."""
     from vllm.tokenizers.deepseek_v4_encoding import (
         IMAGE_PLACEHOLDER,
         flatten_content_blocks,
     )
 
-    # Image blocks become placeholders; text stays literal.
-    content = [
-        {"type": "text", "text": f"text containing {IMAGE_PLACEHOLDER}"},
-    ]
-    out = flatten_content_blocks(content)
-    assert IMAGE_PLACEHOLDER in out  # Literal text, not an injected image block.
+    for content in (
+        f"text containing {IMAGE_PLACEHOLDER}",
+        [{"type": "text", "text": f"text containing {IMAGE_PLACEHOLDER}"}],
+    ):
+        with pytest.raises(ValueError, match="reserved image placeholder"):
+            flatten_content_blocks(content)
 
     # An image block does insert a placeholder.
     content2 = [

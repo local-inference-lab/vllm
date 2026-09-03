@@ -217,9 +217,11 @@ def flatten_content_blocks(content: Any) -> Any:
 
     Image blocks are inlined as IMAGE_PLACEHOLDER at their position. The image
     data itself travels out of band (multi_modal_data) and is matched to
-    placeholders by order. Plain-string content passes through unchanged.
+    placeholders by order. User text must not contain this reserved marker.
     """
     if not isinstance(content, list):
+        if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
+            raise ValueError("Text content contains a reserved image placeholder.")
         return content
     parts: List[str] = []
     for block in content:
@@ -228,7 +230,10 @@ def flatten_content_blocks(content: Any) -> Any:
         elif block.get("type") in ("image", "image_url"):
             parts.append(IMAGE_PLACEHOLDER)
         elif block.get("type") == "text":
-            parts.append(block.get("text", ""))
+            text = block.get("text", "")
+            if IMAGE_PLACEHOLDER in text:
+                raise ValueError("Text content contains a reserved image placeholder.")
+            parts.append(text)
         else:
             raise ValueError(
                 f"Unsupported content block type: {block.get('type')!r}"

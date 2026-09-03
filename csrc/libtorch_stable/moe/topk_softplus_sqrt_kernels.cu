@@ -71,6 +71,16 @@ __device__ __forceinline__ float toFloat(T value) {
   }
 }
 
+template <typename T>
+__device__ __forceinline__ T shfl_xor_active_width(T value, int lane_mask,
+                                                   int width) {
+#ifndef USE_ROCM
+  return __shfl_xor_sync(__activemask(), value, lane_mask, width);
+#else
+  return __shfl_xor(value, lane_mask, width);
+#endif
+}
+
 #ifndef USE_ROCM
 // Adapted from:
 // https://github.com/sgl-project/sglang/blob/main/python/sglang/jit_kernel/csrc/deepseek_v4/hash_topk.cuh
@@ -461,7 +471,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
 #pragma unroll
       for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
         selected_sum +=
-            VLLM_SHFL_XOR_SYNC_WIDTH(selected_sum, mask, THREADS_PER_ROW);
+            shfl_xor_active_width(selected_sum, mask, THREADS_PER_ROW);
       }
     }
     float scale = static_cast<float>(routed_scaling_factor);
@@ -552,10 +562,8 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
 // their max with -inf and the warp can run more iterations...
 #pragma unroll
       for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
-        float other_max =
-            VLLM_SHFL_XOR_SYNC_WIDTH(max_val, mask, THREADS_PER_ROW);
-        int other_expert =
-            VLLM_SHFL_XOR_SYNC_WIDTH(expert, mask, THREADS_PER_ROW);
+        float other_max = shfl_xor_active_width(max_val, mask, THREADS_PER_ROW);
+        int other_expert = shfl_xor_active_width(expert, mask, THREADS_PER_ROW);
 
         // We want lower indices to "win" in every thread so we break ties this
         // way
