@@ -51,6 +51,7 @@ _B12X_SUBMODULES = {
         "b12x.moe.fused_moe",
         "b12x.norm.hyperconnection",
         "b12x.sequence.gdn_decode",
+        "b12x.sequence.kda_prefill",
         "b12x.sequence.mtp_feedback",
         "b12x.sequence.ple",
         "b12x.sequence.ple_embedding",
@@ -130,6 +131,10 @@ def get_b12x_hyperconnection() -> ModuleType | None:
 
 def get_b12x_gdn_decode() -> ModuleType | None:
     return _get_submodule("b12x.sequence.gdn_decode")
+
+
+def get_b12x_kda_prefill() -> ModuleType | None:
+    return _get_submodule("b12x.sequence.kda_prefill")
 
 
 def get_b12x_mtp_feedback() -> ModuleType | None:
