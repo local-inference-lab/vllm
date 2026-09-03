@@ -5,6 +5,8 @@ processes with device copies: the verifier pushes context rows into the
 draft's ring slot and pulls the draft's top-k reply slot, both through CUDA
 IPC mappings opened from the exported handles."""
 
+import base64
+import copy
 import multiprocessing as mp
 import os
 from unittest import mock
@@ -13,6 +15,105 @@ import pytest
 import torch
 
 from vllm.v1.worker.gpu.spec_decode.dspark import p2p_transport as p2p
+
+_CONTEXT_SHAPE = (3, 8, 16)
+_REPLY_SHAPE = (2, 4, 3, 5)
+
+
+class _FakeCudart:
+    allocation_nbytes = 4096
+
+    def __init__(self) -> None:
+        self._next_ptr = 0x100000
+
+    def open(self, handle: bytes) -> int:
+        assert len(handle) == 64
+        self._next_ptr += 0x10000
+        return self._next_ptr
+
+    def allocation_range(self, ptr: int) -> tuple[int, int]:
+        return ptr, self.allocation_nbytes
+
+    def close(self, ptr: int) -> None:
+        pass
+
+    def memcpy_async(self, dst: int, src: int, nbytes: int, stream: int) -> None:
+        pass
+
+
+def _fake_spec(shape: tuple[int, ...], dtype: torch.dtype) -> dict[str, object]:
+    element_size = torch.empty(0, dtype=dtype).element_size()
+    nbytes = element_size
+    for size in shape:
+        nbytes *= size
+    return {
+        "handle": base64.b64encode(bytes(64)).decode("ascii"),
+        "offset_bytes": 64,
+        "shape": list(shape),
+        "dtype": str(dtype).removeprefix("torch."),
+        "nbytes": nbytes,
+    }
+
+
+def _fake_info() -> dict[str, dict[str, object]]:
+    return {
+        "context": _fake_spec(_CONTEXT_SHAPE, torch.bfloat16),
+        "values": _fake_spec(_REPLY_SHAPE, torch.bfloat16),
+        "indices": _fake_spec(_REPLY_SHAPE, torch.int32),
+    }
+
+
+def _open_fake_peer(monkeypatch: pytest.MonkeyPatch, info):
+    monkeypatch.setattr(p2p, "_Cudart", _FakeCudart)
+    return p2p.DraftPeerBuffers(
+        info,
+        context_shape=_CONTEXT_SHAPE,
+        reply_shape=_REPLY_SHAPE,
+    )
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value", "message"),
+    [
+        ("context", "shape", [3, 9, 16], "shape"),
+        ("values", "dtype", "float32", "dtype"),
+        ("indices", "nbytes", 1, "byte count"),
+        ("context", "offset_bytes", -1, "offset"),
+        ("values", "offset_bytes", 4096, "CUDA allocation"),
+        ("indices", "handle", "not base64!", "base64"),
+    ],
+)
+def test_peer_buffers_reject_untrusted_tensor_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    section: str,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    """Mapped tensors must match requested geometry and CUDA allocation bounds."""
+    info = copy.deepcopy(_fake_info())
+    info[section][field] = value
+
+    with pytest.raises(ValueError, match=message):
+        _open_fake_peer(monkeypatch, info)
+
+
+def test_peer_tensor_rejects_copy_ranges_outside_its_logical_storage() -> None:
+    tensor = p2p.PeerTensor(
+        base_ptr=0x1000,
+        offset_bytes=64,
+        shape=(2, 4),
+        dtype=torch.float32,
+        nbytes=32,
+        allocation_nbytes=96,
+    )
+
+    assert tensor.data_ptr == 0x1040
+    assert tensor.address(16, 16) == 0x1050
+    with pytest.raises(ValueError, match="exported tensor"):
+        tensor.address(16, 17)
+    with pytest.raises(ValueError, match="non-negative"):
+        tensor.address(-1, 1)
 
 
 def _draft_process(conn, seed: int) -> None:
@@ -62,7 +163,11 @@ def test_peer_buffers_push_context_and_pull_reply():
         assert parent.poll(180), "exporter did not report its handles"
         info = parent.recv()
         torch.cuda.set_device(0)
-        peer = p2p.DraftPeerBuffers(info)
+        peer = p2p.DraftPeerBuffers(
+            info,
+            context_shape=(3, 8, 16),
+            reply_shape=(2, 4, 3, 5),
+        )
         assert (peer.context_slots, peer.context_rows, peer.context_width) == (3, 8, 16)
         assert (peer.reply_slots, peer.max_requests, peer.num_steps, peer.topk) == (
             2,
