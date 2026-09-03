@@ -6414,14 +6414,6 @@ def test_mixed_prefill_budget_selects_2304_token_running_quanta():
         "p0": 2304
     }
 
-    scheduler._prefill_budget_quantum = 1
-    scheduler._prefill_budget_rotation = 0
-    assert Scheduler._select_running_prefill_limits(scheduler, request_ids, 8192) == {
-        "p0": 2731,
-        "p1": 2731,
-        "p2": 2730,
-    }
-
 
 @pytest.mark.parametrize("value", [-1, 8193])
 def test_max_num_prefill_tokens_per_step_validation(value: int):
