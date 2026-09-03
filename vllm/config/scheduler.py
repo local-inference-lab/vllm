@@ -159,20 +159,6 @@ class SchedulerConfig:
     current step may still be admitted when the limit is full.
     """
 
-    decode_prefill_min_decode_steps: int = Field(default=0, ge=0)
-    """Minimum decode-only steps between mixed-prefill steps.
-
-    Zero disables decode-burst scheduling. This applies only while decode is
-    eligible. Prefill-only steps continue to use max_num_batched_tokens.
-    """
-
-    decode_prefill_max_wait_ms: int = Field(default=0, ge=0)
-    """Maximum waiter age before bypassing a decode burst, in milliseconds.
-
-    Zero disables the fairness deadline. The deadline has an effect only when
-    decode-burst scheduling is enabled.
-    """
-
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.
@@ -322,15 +308,6 @@ class SchedulerConfig:
                 "max_num_partial_prefills "
                 f"({self.max_num_partial_prefills}) cannot be greater than "
                 f"max_num_seqs ({self.max_num_seqs})."
-            )
-
-        if (
-            self.decode_prefill_min_decode_steps > 0
-            and self.max_num_prefill_tokens_per_step == 0
-        ):
-            raise ValueError(
-                "decode_prefill_min_decode_steps requires "
-                "max_num_prefill_tokens_per_step to be greater than zero."
             )
 
         return self

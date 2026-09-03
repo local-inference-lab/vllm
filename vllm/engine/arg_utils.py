@@ -638,10 +638,6 @@ class EngineArgs:
         SchedulerConfig.max_num_prefill_tokens_per_step
     )
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
-    decode_prefill_min_decode_steps: int = (
-        SchedulerConfig.decode_prefill_min_decode_steps
-    )
-    decode_prefill_max_wait_ms: int = SchedulerConfig.decode_prefill_max_wait_ms
 
     watermark: float = SchedulerConfig.watermark
 
@@ -1603,14 +1599,6 @@ class EngineArgs:
             **scheduler_kwargs["max_num_partial_prefills"],
         )
         scheduler_group.add_argument(
-            "--decode-prefill-min-decode-steps",
-            **scheduler_kwargs["decode_prefill_min_decode_steps"],
-        )
-        scheduler_group.add_argument(
-            "--decode-prefill-max-wait-ms",
-            **scheduler_kwargs["decode_prefill_max_wait_ms"],
-        )
-        scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
         )
@@ -2393,8 +2381,6 @@ class EngineArgs:
             prefill_schedule_interval=self.prefill_schedule_interval,
             max_num_prefill_tokens_per_step=(self.max_num_prefill_tokens_per_step),
             max_num_partial_prefills=self.max_num_partial_prefills,
-            decode_prefill_min_decode_steps=(self.decode_prefill_min_decode_steps),
-            decode_prefill_max_wait_ms=self.decode_prefill_max_wait_ms,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
