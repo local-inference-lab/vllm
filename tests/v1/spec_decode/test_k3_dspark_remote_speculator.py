@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import threading
 from types import SimpleNamespace
 
@@ -105,6 +106,36 @@ def test_deferred_ingest_failures_disable_every_affected_request():
 
     assert proxy._disabled_requests == {"request-a", "request-b", "request-c"}
     assert proxy._async_errors == []
+
+
+def test_capture_index_appends_records_without_retaining_the_record_list(
+    monkeypatch, tmp_path
+):
+    from vllm.v1.worker.gpu.spec_decode.dspark import remote_speculator as rs
+
+    monkeypatch.setattr(rs, "_K3_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setattr(rs, "_K3_CAPTURE_STATE", {})
+    request = {
+        "request_id": "request-a",
+        "context_count": 1,
+        "reset": True,
+        "reset_position": 0,
+        "anchor_token_id": 7,
+    }
+
+    rs._k3_capture_records([request], b"p" * 8, b"c" * 4, 2, [1])
+    request["reset"] = False
+    rs._k3_capture_records([request], b"q" * 8, b"d" * 4, 2, [2])
+
+    index = json.loads((tmp_path / "request-a.json").read_text())
+    assert index["bytes"] == 24
+    assert [record["offset"] for record in index["records"]] == [0, 12]
+    assert (tmp_path / "request-a.bin").read_bytes() == (
+        b"p" * 8 + b"c" * 4 + b"q" * 8 + b"d" * 4
+    )
+    state = rs._K3_CAPTURE_STATE["request-a"]
+    assert state["record_count"] == 2
+    assert "records" not in state
 
 
 @pytest.mark.parametrize("rejected", [[5, 0], [-1, 0]])
