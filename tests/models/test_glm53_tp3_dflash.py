@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 import torch
 
+from vllm.config import AttentionConfig, ParallelConfig
 from vllm.config.compilation import CompilationMode
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor import custom_op
@@ -19,6 +22,8 @@ from vllm.model_executor.models.qwen3_dflash import (
     _get_glm53_tp3_head_geometry,
     _get_glm53_tp3_vocab_kwargs,
 )
+from vllm.v1.spec_decode.dflash import DFlashProposer
+from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
@@ -289,9 +294,10 @@ def test_dense_dflash_tp3_drops_target_expert_parallel(monkeypatch) -> None:
     target_parallel = SimpleNamespace(
         tensor_parallel_size=3,
         enable_expert_parallel=True,
+        rank=2,
         **placement,
     )
-    draft_parallel = SimpleNamespace(
+    draft_parallel = ParallelConfig(
         tensor_parallel_size=3,
         enable_expert_parallel=True,
     )
@@ -308,6 +314,39 @@ def test_dense_dflash_tp3_drops_target_expert_parallel(monkeypatch) -> None:
     for name, value in placement.items():
         assert getattr(draft_parallel, name) == value
     assert len(applied) == 1
+
+    @dataclass
+    class DraftVllmConfig:
+        model_config: Any
+        parallel_config: Any
+        attention_config: AttentionConfig
+
+    base = DraftVllmConfig(
+        model_config=SimpleNamespace(
+            model_arch_config=SimpleNamespace(is_mm_prefix_lm=False)
+        ),
+        parallel_config=target_parallel,
+        attention_config=AttentionConfig(),
+    )
+    proposer = object.__new__(DFlashProposer)
+    proposer.speculative_config = spec
+    proposer.vllm_config = base
+    proposer.dflash_causal = True
+    monkeypatch.setattr(
+        SpecDecodeBaseProposer,
+        "_create_draft_vllm_config",
+        lambda _: base,
+    )
+
+    draft_vllm_config = proposer._create_draft_vllm_config()
+
+    assert draft_vllm_config.parallel_config is not draft_parallel
+    assert draft_vllm_config.parallel_config.tensor_parallel_size == 3
+    assert not draft_vllm_config.parallel_config.enable_expert_parallel
+    assert draft_vllm_config.parallel_config.rank == target_parallel.rank
+    assert draft_parallel.rank == 0
+    assert target_parallel.tensor_parallel_size == 3
+    assert target_parallel.enable_expert_parallel
 
 
 def test_dflash7_uses_eight_target_kda_state_columns(monkeypatch) -> None:

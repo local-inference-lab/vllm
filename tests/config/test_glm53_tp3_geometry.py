@@ -215,6 +215,56 @@ def test_glm53_tp3_invalid_target_checkpoint_geometry_fails_closed(
     assert _snapshot(glm53_model_config) == before
 
 
+@pytest.mark.parametrize(
+    ("attribute", "invalid_value"),
+    [
+        ("num_heads", 15),
+        ("hidden_size", 1023),
+        ("intermediate_size", 4095),
+        ("projection_intermediate_size", 10239),
+    ],
+)
+def test_glm53_tp3_invalid_vision_geometry_is_transactional(
+    glm53_model_config: FakeGlm53ModelConfig,
+    tp3_ep_parallel_config: ParallelConfig,
+    attribute: str,
+    invalid_value: int,
+) -> None:
+    vision_config = glm53_model_config.hf_config.vision_config
+    setattr(vision_config, attribute, invalid_value)
+    before = _snapshot(glm53_model_config)
+
+    with pytest.raises(ValueError, match=rf"expected {attribute}="):
+        apply_glm53_tp3_target_geometry(
+            cast(Any, glm53_model_config), tp3_ep_parallel_config
+        )
+
+    assert _snapshot(glm53_model_config) == before
+    assert not hasattr(glm53_model_config.hf_text_config, "glm53_tp3_padding")
+    assert not hasattr(glm53_model_config.hf_config, "glm53_tp3_padding")
+    assert not hasattr(vision_config, "glm53_tp3_padding")
+
+
+def test_glm53_tp3_invalid_wrapper_geometry_is_transactional(
+    glm53_model_config: FakeGlm53ModelConfig,
+    tp3_ep_parallel_config: ParallelConfig,
+) -> None:
+    glm53_model_config.hf_config.hidden_size = 4095
+    before = _snapshot(glm53_model_config)
+
+    with pytest.raises(ValueError, match=r"expected hidden_size=4096"):
+        apply_glm53_tp3_target_geometry(
+            cast(Any, glm53_model_config), tp3_ep_parallel_config
+        )
+
+    assert _snapshot(glm53_model_config) == before
+    assert not hasattr(glm53_model_config.hf_text_config, "glm53_tp3_padding")
+    assert not hasattr(glm53_model_config.hf_config, "glm53_tp3_padding")
+    assert not hasattr(
+        glm53_model_config.hf_config.vision_config, "glm53_tp3_padding"
+    )
+
+
 def test_glm53_tp4_parallel_config_is_an_exact_attribute_noop(
     glm53_model_config: FakeGlm53ModelConfig,
 ) -> None:
