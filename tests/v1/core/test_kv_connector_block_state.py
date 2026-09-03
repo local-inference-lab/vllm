@@ -51,7 +51,7 @@ def test_connector_block_state_has_snapshot_and_retained_boundaries() -> None:
     state = _build_kv_connector_block_state(
         _hybrid_config(),
         manager,
-        ["req"],
+        {"req": 8192},
         {"req": [(1, 999, 7680)]},
         retention_interval=4096,
     )
@@ -70,12 +70,27 @@ def test_connector_block_state_preserves_explicit_boundary_source() -> None:
     state = _build_kv_connector_block_state(
         _hybrid_config(),
         manager,
-        ["req"],
+        {"req": 3584},
         {"req": [(1, 777, 4096)]},
         retention_interval=4096,
     )
 
     assert state.boundary_state_offloads == {"req": [(1, 777, 4096)]}
+
+
+def test_connector_block_state_excludes_uncomputed_allocated_boundary() -> None:
+    grouped_ids = ([201, 202], [0, 0, 0, 0, 0, 0, 0, 107])
+    manager = SimpleNamespace(get_block_ids=MagicMock(return_value=grouped_ids))
+
+    state = _build_kv_connector_block_state(
+        _hybrid_config(),
+        manager,
+        {"req": 3584},
+        None,
+        retention_interval=4096,
+    )
+
+    assert state.boundary_state_offloads == {"req": []}
 
 
 def test_connector_block_state_rejects_misaligned_retention() -> None:
@@ -85,7 +100,7 @@ def test_connector_block_state_rejects_misaligned_retention() -> None:
         _build_kv_connector_block_state(
             _hybrid_config(),
             manager,
-            ["req"],
+            {"req": 0},
             None,
             retention_interval=4100,
         )

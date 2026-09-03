@@ -3,7 +3,7 @@
 import itertools
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from typing import Any
 
@@ -77,13 +77,25 @@ logger = init_logger(__name__)
 def _build_kv_connector_block_state(
     kv_cache_config: KVCacheConfig,
     kv_cache_manager: KVCacheManager,
-    request_ids: Iterable[str],
+    computed_token_extents: Mapping[str, int],
     partial_tail_offloads: dict[str, list[tuple[int, int, int]]] | None,
     retention_interval: int | None,
 ) -> KVConnectorBlockState:
-    """Snapshot exact source blocks for connector stores in this step."""
+    """Snapshot exact source blocks for connector stores in this step.
+
+    Args:
+        kv_cache_config: Physical cache groups owned by the scheduler.
+        kv_cache_manager: Manager providing the current request block tables.
+        computed_token_extents: Token extent produced after this scheduled step.
+        partial_tail_offloads: Explicit copy-on-write recurrent state sources.
+        retention_interval: Token interval for durable recurrent state boundaries.
+
+    Returns:
+        Authoritative block tables and recurrent boundary sources.
+    """
     current_block_ids = {
-        req_id: kv_cache_manager.get_block_ids(req_id) for req_id in request_ids
+        req_id: kv_cache_manager.get_block_ids(req_id)
+        for req_id in computed_token_extents
     }
     boundary_state_offloads = {
         req_id: list(entries)
@@ -115,6 +127,8 @@ def _build_kv_connector_block_state(
                 ):
                     block_id = grouped_ids[group_id][block_index]
                     boundary_tokens = (block_index + 1) * spec.block_size
+                    if boundary_tokens > computed_token_extents[req_id]:
+                        break
                     if block_id > 0 and (group_id, boundary_tokens) not in existing:
                         entries.append((group_id, block_id, boundary_tokens))
     return KVConnectorBlockState(
@@ -1345,7 +1359,12 @@ class Scheduler(SchedulerInterface):
             kv_connector_block_state = _build_kv_connector_block_state(
                 self.kv_cache_config,
                 self.kv_cache_manager,
-                num_scheduled_tokens,
+                {
+                    req_id: (
+                        self.requests[req_id].num_computed_tokens + num_scheduled_token
+                    )
+                    for req_id, num_scheduled_token in num_scheduled_tokens.items()
+                },
                 pending_partial_tail_offloads,
                 self.cache_config.prefix_cache_retention_interval,
             )
