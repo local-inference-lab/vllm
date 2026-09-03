@@ -330,6 +330,7 @@ class B12xMHCResidual:
 
 
 def _get_dspark_decode_row_capacity(vllm_config: VllmConfig) -> int | None:
+    """Return the largest target-verifier row count the scheduler can emit."""
     speculative_config = vllm_config.speculative_config
     if speculative_config is None or not speculative_config.use_dspark():
         return None
@@ -337,11 +338,9 @@ def _get_dspark_decode_row_capacity(vllm_config: VllmConfig) -> int | None:
     if num_speculative_tokens <= 0:
         return None
     scheduler_config = vllm_config.scheduler_config
-    # Kernel warmup adds one row to the decode query length per request.
-    warmup_rows_per_request = 2 + num_speculative_tokens
     return min(
         int(scheduler_config.max_num_batched_tokens),
-        int(scheduler_config.max_num_seqs) * warmup_rows_per_request,
+        int(scheduler_config.max_num_seqs) * (1 + num_speculative_tokens),
     )
 
 

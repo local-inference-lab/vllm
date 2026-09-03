@@ -71,7 +71,7 @@ Usage: $0 [launcher options] [-- vLLM options]
 Launch GLM-5.3-Flash with native MTP and TP=2 across tachyon and luxon. The
 Spark cluster launcher starts one native vLLM rank per node, uses the
 management LAN for bootstrap, and combines the two RoCE rails on their direct
-ConnectX-7 link in NCCL. Ray and TrafficControl are not used.
+ConnectX-7 link in NCCL. No external scheduler is used.
 
 Launcher options:
   --sync-code   Mirror local vllm/ and b12x/ runtime packages to luxon.

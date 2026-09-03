@@ -77,7 +77,7 @@ Usage: $0 [launcher options] [-- vLLM options]
 Launch GLM-5.3 NVFP4 with TP=4 across tachyon, luxon, graviton, and chroniton.
 The Spark cluster launcher starts one native vLLM rank per node, uses the
 management LAN for bootstrap, and exposes both RoCE twins on both physical
-ring links to NCCL. Ray and TrafficControl are not used. MTP is opt-in by
+ring links to NCCL. No external scheduler is used. MTP is opt-in by
 setting NUM_SPECULATIVE_TOKENS to a positive value.
 
 Launcher options:

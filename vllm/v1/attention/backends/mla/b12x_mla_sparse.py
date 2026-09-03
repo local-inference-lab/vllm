@@ -1153,7 +1153,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             raise RuntimeError("B12X sparse MLA requires `pip install vllm[b12x]`.")
         if not module.is_supported():
             raise RuntimeError("B12X sparse MLA is not supported on this device.")
-        required_symbols = ["Caps", "plan", "run_decode", "run_extend"]
+        required_symbols = ["Caps", "bind", "plan", "run"]
         if self._is_glm_next:
             required_symbols.append(
                 "concat_and_cache_glm_next_mla_nvfp4"
@@ -1164,8 +1164,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             required_symbols.append("concat_and_cache_nvfp4_mla_fp8_rope")
         for name in required_symbols:
             getattr(module, name)
-        self._run_decode = module.run_decode
-        self._run_extend = module.run_extend
+        self._bind = module.bind
+        self._run = module.run
         self._model_type: int | None = None
         self._concat_and_cache_nvfp4_mla_fp8_rope = None
         self._concat_and_cache_glm_next_mla = None
@@ -1244,6 +1244,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 num_q_heads=num_q_heads,
                 max_q_rows=max_rows,
                 max_width=self._topk_tokens,
+                softmax_scale=self.scale,
                 dtype=torch.bfloat16,
                 kv_dtype=self._kv_dtype,
                 head_dim=self._q_head_dim,
@@ -1252,6 +1253,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 max_batch=max_rows,
                 max_chunks_per_row=max(1, (self._topk_tokens + 63) // 64),
                 page_size=kernel_page_size,
+                return_lse=self.need_to_return_lse_for_decode,
+                lse_scale="natural",
             )
             if self._model_type is not None:
                 caps_kwargs["model_type"] = self._model_type
@@ -1267,6 +1270,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self._ckv_extend_plan = (
             make_plan("extend", self.num_heads) if self._ckv_gather_enabled else None
         )
+        plans = [decode_plan, extend_plan]
+        if self._ckv_extend_plan is not None:
+            plans.append(self._ckv_extend_plan)
+        self._scratch_nbytes = max(int(plan.layout.nbytes) for plan in plans)
         self._ckv_local_capacity = (
             (self._ckv_capacity_tokens + kernel_page_size - 1)
             // kernel_page_size
@@ -1278,11 +1285,13 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
     def _base_workspace_specs(
         self, plan
     ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        del plan
         q_spec = (
             (self._max_tokens, self._input_num_heads, self._q_head_dim),
             torch.bfloat16,
         )
-        return (q_spec, *plan.shapes_and_dtypes())
+        scratch_spec = ((self._scratch_nbytes,), torch.uint8)
+        return (q_spec, scratch_spec)
 
     @staticmethod
     def _workspace_nbytes(
@@ -1325,11 +1334,17 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         input_num_heads: int,
         include_ckv: bool,
     ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        del plan
         q_spec = (
             (self._max_tokens, input_num_heads, self._q_head_dim),
             torch.bfloat16,
         )
-        ckv_specs = (
+        scratch_spec = ((self._scratch_nbytes,), torch.uint8)
+        if not include_ckv:
+            return (q_spec, scratch_spec)
+        return (
+            q_spec,
+            scratch_spec,
             (
                 (self._ckv_local_capacity, self._cache_record_bytes),
                 torch.uint8,
@@ -1341,11 +1356,6 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 ),
                 torch.uint8,
             ),
-        )
-        return (
-            q_spec,
-            *plan.shapes_and_dtypes(),
-            *(ckv_specs if include_ckv else ()),
         )
 
     def _reserve_attention_workspaces(self) -> None:
@@ -1365,6 +1375,121 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     include_ckv=include_ckv,
                 )
             )
+
+    def _borrow_workspaces(
+        self,
+        *,
+        input_num_heads: int | None = None,
+        include_ckv: bool = False,
+    ) -> list[torch.Tensor]:
+        input_num_heads = (
+            self._input_num_heads if input_num_heads is None else input_num_heads
+        )
+        specs = self._workspace_specs(
+            self._decode_plan,
+            input_num_heads=input_num_heads,
+            include_ckv=include_ckv,
+        )
+        return current_workspace_manager().get_simultaneous(*specs)
+
+    def supports_fused_mla_query_output(
+        self,
+        num_heads: int,
+        output_dtype: torch.dtype,
+    ) -> bool:
+        return bool(
+            self.dcp_world_size == 1
+            and output_dtype == torch.bfloat16
+            and num_heads == self._input_num_heads
+            and self._q_head_dim == 576
+        )
+
+    def get_fused_mla_query_output(
+        self,
+        num_tokens: int,
+        num_heads: int,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        if (
+            not self.supports_fused_mla_query_output(num_heads, output_dtype)
+            or num_tokens <= 0
+            or num_tokens > self._max_tokens
+        ):
+            return None
+        q_buffer = self._borrow_workspaces()[0]
+        output = q_buffer[:num_tokens, :num_heads]
+        if not output.is_contiguous():
+            raise RuntimeError("B12X fused MLA query output must be contiguous.")
+        return output
+
+    def b12x_warmup_key(self) -> tuple[object, ...]:
+        return (
+            type(self),
+            self._decode_plan.caps.device,
+            self._input_num_heads,
+            self._q_head_dim,
+            self._topk_tokens,
+            self._max_tokens,
+            self._decode_plan.caps.max_q_rows,
+            self.need_to_return_lse_for_decode,
+            self._model_type,
+            self._kernel_page_size,
+            self._ckv_gather_enabled,
+        )
+
+    def warmup(self, token_counts: tuple[int, ...]) -> None:
+        decode_capacity = int(self._decode_plan.caps.max_q_rows)
+        decode_rows = {
+            int(rows) for rows in token_counts if 0 < int(rows) <= decode_capacity
+        }
+        decode_rows.add(1)
+        extend_rows = {1, 2, 4, self._max_tokens}
+        kv_cache = torch.zeros(
+            (1, self._kernel_page_size, self._cache_record_bytes),
+            dtype=torch.uint8,
+            device=self._decode_plan.caps.device,
+        )
+
+        plans: list[tuple[Any, list[int], int]] = [
+            (self._decode_plan, sorted(decode_rows), self._input_num_heads),
+            (self._extend_plan, sorted(extend_rows), self._input_num_heads),
+        ]
+        if self._ckv_extend_plan is not None:
+            plans.append((self._ckv_extend_plan, sorted(extend_rows), self.num_heads))
+
+        for plan, rows_to_warm, input_num_heads in plans:
+            q_buffer, scratch = self._borrow_workspaces(
+                input_num_heads=input_num_heads
+            )[:2]
+            for rows in rows_to_warm:
+                if rows > int(plan.caps.max_q_rows):
+                    continue
+                q = q_buffer[:rows]
+                q.zero_()
+                selected_indices = torch.zeros(
+                    (rows, self._topk_tokens),
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                cache_lengths = torch.full(
+                    (rows if plan is self._decode_plan else 1,),
+                    self._kernel_page_size,
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                selected_lengths = torch.ones(
+                    (rows,), dtype=torch.int32, device=q.device
+                )
+                binding = self._bind(
+                    plan,
+                    scratch=scratch,
+                    q=q,
+                    kv_cache=kv_cache,
+                    selected_indices=selected_indices,
+                    cache_lengths=cache_lengths,
+                    selected_lengths=selected_lengths,
+                )
+                self._run(binding)
 
     def finalize_kv_cache_geometry(self, kernel_page_size: int) -> None:
         """Finalize kernel plans and workspace memory before KV profiling.
@@ -1598,8 +1723,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         )
         workspaces = current_workspace_manager().get_simultaneous(*workspace_specs)
         q_buffer = workspaces[0]
-        scratch_end = len(workspace_specs) - (2 if use_ckv_gather else 0)
-        scratch = workspaces[1:scratch_end]
+        scratch = workspaces[1]
 
         if isinstance(q, tuple):
             q_nope, q_pe = q
@@ -1610,7 +1734,16 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 ops.concat_mla_q(q_nope, q_pe, q_all)
         else:
             q_all = q_buffer[:num_tokens]
-            q_all.copy_(q)
+            exact_workspace_alias = (
+                tuple(q.shape) == tuple(q_all.shape)
+                and tuple(q.stride()) == tuple(q_all.stride())
+                and q.dtype == q_all.dtype
+                and q.device == q_all.device
+                and q.untyped_storage().data_ptr() == q_all.untyped_storage().data_ptr()
+                and q.storage_offset() == q_all.storage_offset()
+            )
+            if not exact_workspace_alias:
+                q_all.copy_(q)
 
         if int(q_all.shape[1]) != input_num_heads:
             raise ValueError(
@@ -1622,7 +1755,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         topk_indices = self.topk_indices_buffer[:num_tokens]
         kv_cache_for_run = kv_c_and_k_pe_cache
         if use_ckv_gather:
-            local_buffer, gathered_buffer = workspaces[scratch_end:]
+            local_buffer, gathered_buffer = workspaces[2:]
             kv_cache_for_run = self._gather_full_ckv(
                 kv_c_and_k_pe_cache,
                 attn_metadata,
@@ -1688,6 +1821,11 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     NUM_TOPK_TOKENS=topk_indices.shape[1],
                     return_valid_counts=True,
                 )
+            elif not self._is_glm_next:
+                selected_indices = topk_indices
+                cache_seq_lens_per_token = attn_metadata.cache_seq_lens_per_token
+                assert cache_seq_lens_per_token is not None
+                active_counts = cache_seq_lens_per_token[:num_tokens]
             else:
                 block_stride_rows = _selected_index_block_stride_rows(
                     kv_c_and_k_pe_cache,
@@ -1706,26 +1844,24 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 )
 
         if not use_ckv_gather:
-            cache_seq_lens = attn_metadata.cache_seq_lens_per_token
-            assert cache_seq_lens is not None
-            cache_seq_lens = cache_seq_lens[:num_tokens].contiguous()
-        binding = plan.bind(
+            if self._is_glm_next:
+                cache_seq_lens = attn_metadata.cache_seq_lens_per_token
+                assert cache_seq_lens is not None
+                cache_seq_lens = cache_seq_lens[:num_tokens].contiguous()
+            else:
+                cache_seq_lens = attn_metadata.seq_lens[
+                    : attn_metadata.num_reqs
+                ].contiguous()
+        binding = self._bind(
+            plan,
             scratch=scratch,
             q=q_all,
-            selected_indices=selected_indices,
-            cache_seqlens_int32=cache_seq_lens,
-            nsa_cache_seqlens_int32=active_counts,
             kv_cache=kv_cache_for_run,
+            selected_indices=selected_indices,
+            cache_lengths=cache_seq_lens,
+            selected_lengths=active_counts,
         )
-        run = self._run_decode if plan is self._decode_plan else self._run_extend
-        run_kwargs = dict(
-            binding=binding,
-            sm_scale=self.scale,
-            v_head_dim=self.kv_lora_rank,
-            return_lse=self.need_to_return_lse_for_decode,
-            lse_scale="natural",
-        )
-        result = run(**run_kwargs)
+        result = self._run(binding)
         if self.need_to_return_lse_for_decode:
             output, lse = result
             return output, lse

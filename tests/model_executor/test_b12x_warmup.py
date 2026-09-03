@@ -272,3 +272,54 @@ def test_b12x_warmup_deduplicates_registered_signatures(monkeypatch) -> None:
         ("second", (1, 2, 4, 8, 16, 32), torch.bfloat16),
     ]
     assert synchronized == [True]
+
+
+def test_b12x_dsa_indexer_warmup_unit_compiles_before_the_index_cache(
+    monkeypatch,
+) -> None:
+    import vllm.v1.attention.backends.mla.b12x_indexer as indexer_mod
+
+    calls = []
+    monkeypatch.setattr(
+        indexer_mod, "_run_paged_topk", lambda **kwargs: calls.append(kwargs)
+    )
+    device = torch.device("cpu")
+    plan = SimpleNamespace(
+        caps=SimpleNamespace(
+            max_q_rows=4,
+            mode="decode",
+            num_q_heads=8,
+            device=device,
+            max_page_table_width=16,
+        ),
+        layout=SimpleNamespace(route="paged_fused"),
+    )
+    indexer = SimpleNamespace(
+        k_cache=SimpleNamespace(kv_cache=torch.empty(0, dtype=torch.uint8)),
+        _decode_plans={4: plan},
+        _prefill_plans={},
+        max_model_len=4096,
+        topk_tokens=512,
+        dcp_world_size=1,
+        _module=object(),
+        active_width_cap=torch.zeros(1, dtype=torch.int32),
+        topk_indices_buffer=torch.zeros((4, 512), dtype=torch.int32),
+        output_physical_slots=False,
+    )
+    unit = indexer_mod.B12xSparseIndexer.get_b12x_warmup_unit(
+        indexer, None, (1,), torch.bfloat16
+    )
+
+    # Memory profiling runs warmup before the index cache exists: the unit
+    # compiles against a placeholder cache with the production page layout.
+    unit.compile()
+    assert len(calls) == 1
+    assert calls[0]["plan"] is plan
+    assert tuple(calls[0]["kv_cache"].shape) == (2, 64, 132)
+    assert calls[0]["kv_cache"].dtype == torch.uint8
+    assert tuple(calls[0]["q"].shape) == (4, 8, 128)
+
+    indexer.k_cache.kv_cache = torch.zeros((3, 64, 132), dtype=torch.uint8)
+    unit.compile()
+    assert len(calls) == 2
+    assert calls[1]["kv_cache"] is indexer.k_cache.kv_cache

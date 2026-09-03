@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import os
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -45,6 +46,140 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
+
+_DEBUG_GRAPH_MEMORY_ACCOUNTING = (
+    os.getenv("VLLM_DEBUG_GRAPH_MEMORY_ACCOUNTING", "0") == "1"
+)
+
+
+def _graph_pool_snapshot_totals() -> tuple[int, int, int, int]:
+    segments = [
+        segment
+        for segment in torch.cuda.memory_snapshot()
+        if tuple(segment["segment_pool_id"]) != (0, 0)
+    ]
+    return (
+        sum(segment["total_size"] for segment in segments),
+        sum(segment["allocated_size"] for segment in segments),
+        sum(segment["active_size"] for segment in segments),
+        sum(
+            block["size"]
+            for segment in segments
+            for block in segment["blocks"]
+            if block["state"] == "inactive"
+        ),
+    )
+
+
+def _log_graph_pool_growth(
+    progress_bar_desc: str,
+    desc: "BatchExecutionDescriptor",
+    before: tuple[int, int, int, int] | None,
+) -> None:
+    if before is None:
+        return
+    after = _graph_pool_snapshot_totals()
+    delta = tuple(end - start for start, end in zip(before, after))
+    mib = 1 << 20
+    logger.info(
+        "[CG MEM] %s %s tokens=%d reqs=%s: "
+        "pool=%+.1f MiB allocated=%+.1f MiB active=%+.1f MiB "
+        "inactive=%+.1f MiB",
+        progress_bar_desc,
+        desc.cg_mode.name,
+        desc.num_tokens,
+        desc.num_reqs,
+        *(value / mib for value in delta),
+    )
+
+
+def _memory_frame(frames: list[dict[str, Any]]) -> str:
+    for frame in frames:
+        filename = frame.get("filename", "")
+        if "/vllm/" in filename and "/site-packages/" not in filename:
+            relative_filename = filename.rsplit("/vllm/", 1)[-1]
+            return f"{relative_filename}:{frame.get('line')}:{frame.get('name')}"
+    if frames:
+        frame = frames[0]
+        return f"{frame.get('filename')}:{frame.get('line')}:{frame.get('name')}"
+    return "<no Python frame>"
+
+
+def _log_graph_pool_snapshot() -> None:
+    snapshot = torch.cuda.memory._snapshot()
+    segments = [
+        segment
+        for segment in snapshot["segments"]
+        if tuple(segment["segment_pool_id"]) != (0, 0)
+    ]
+    mib = 1 << 20
+    by_pool: defaultdict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+    for segment in segments:
+        by_pool[tuple(segment["segment_pool_id"])].append(segment)
+    for pool_id, pool_segments in sorted(by_pool.items()):
+        total = sum(segment["total_size"] for segment in pool_segments)
+        allocated = sum(segment["allocated_size"] for segment in pool_segments)
+        active = sum(segment["active_size"] for segment in pool_segments)
+        requested = sum(segment["requested_size"] for segment in pool_segments)
+        inactive = sum(
+            block["size"]
+            for segment in pool_segments
+            for block in segment["blocks"]
+            if block["state"] == "inactive"
+        )
+        logger.info(
+            "[CG MEM] pool=%s segments=%d total=%.1f MiB allocated=%.1f MiB "
+            "active=%.1f MiB requested=%.1f MiB inactive=%.1f MiB",
+            pool_id,
+            len(pool_segments),
+            total / mib,
+            allocated / mib,
+            active / mib,
+            requested / mib,
+            inactive / mib,
+        )
+
+    active_sites: defaultdict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
+    for segment in segments:
+        for block in segment["blocks"]:
+            if block["state"] == "inactive":
+                continue
+            site = _memory_frame(block.get("frames", []))
+            totals = active_sites[site]
+            totals[0] += block["size"]
+            totals[1] += block["requested_size"]
+            totals[2] += 1
+    for site, (size, requested, count) in sorted(
+        active_sites.items(), key=lambda item: item[1][0], reverse=True
+    )[:30]:
+        logger.info(
+            "[CG MEM] active site=%s blocks=%d size=%.1f MiB requested=%.1f MiB",
+            site,
+            count,
+            size / mib,
+            requested / mib,
+        )
+
+    segment_sites: defaultdict[str, list[int]] = defaultdict(lambda: [0, 0])
+    for device_trace in snapshot["device_traces"]:
+        for event in device_trace:
+            if event["action"] != "segment_alloc":
+                continue
+            if tuple(event.get("pool_id", (0, 0))) == (0, 0):
+                continue
+            site = _memory_frame(event.get("frames", []))
+            totals = segment_sites[site]
+            totals[0] += event["size"]
+            totals[1] += 1
+    for site, (size, count) in sorted(
+        segment_sites.items(), key=lambda item: item[1][0], reverse=True
+    )[:30]:
+        logger.info(
+            "[CG MEM] segment site=%s segments=%d size=%.1f MiB",
+            site,
+            count,
+            size / mib,
+        )
 
 
 def normalize_model_token_inputs(
@@ -407,6 +542,11 @@ class CudaGraphManager:
                     logger.debug(
                         "CG Capture: mode=%s, batch_desc=%s", desc.cg_mode.name, desc
                     )
+                    pool_before = (
+                        _graph_pool_snapshot_totals()
+                        if _DEBUG_GRAPH_MEMORY_ACCOUNTING and is_global_first_rank()
+                        else None
+                    )
                     if (
                         desc.cg_mode == CUDAGraphMode.PIECEWISE
                         and not self.use_breakable_cg
@@ -417,6 +557,7 @@ class CudaGraphManager:
                         forward_fn = create_forward_fn(desc, warmup=False)
                         if desc.cg_mode == CUDAGraphMode.PIECEWISE:
                             forward_fn(CUDAGraphMode.PIECEWISE)
+                            _log_graph_pool_growth(progress_bar_desc, desc, pool_before)
                             continue
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
@@ -447,6 +588,7 @@ class CudaGraphManager:
                         self.graphs[desc] = graph
                         self.graph_capture_resources[desc] = resources
                         compilation_counter.num_cudagraph_captured += 1
+                    _log_graph_pool_growth(progress_bar_desc, desc, pool_before)
         self._graphs_captured = True
 
     def captured_token_counts(self) -> list[int]:
@@ -854,19 +996,40 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         for wrapper in all_wrappers:
             original_pools[id(wrapper)] = wrapper.graph_pool
             wrapper.graph_pool = manager.pool
-        manager._max_full_descs_to_capture = _FULL_GRAPH_PROFILING_SAMPLES
+        manager._max_full_descs_to_capture = (
+            None if _DEBUG_GRAPH_MEMORY_ACCOUNTING else _FULL_GRAPH_PROFILING_SAMPLES
+        )
         mem_samples: list[int] = []
         manager._capture_mem_samples = mem_samples
 
+        if _DEBUG_GRAPH_MEMORY_ACCOUNTING and is_global_first_rank():
+            torch.cuda.memory._record_memory_history(
+                enabled="all",
+                context="alloc",
+                stacks="python",
+                max_entries=10000,
+                clear_history=True,
+                skip_actions=[
+                    "alloc",
+                    "free_requested",
+                    "free_completed",
+                    "segment_free",
+                    "oom",
+                    "snapshot",
+                ],
+            )
         measured = int(runner.capture_model())
+        if _DEBUG_GRAPH_MEMORY_ACCOUNTING and is_global_first_rank():
+            _log_graph_pool_snapshot()
+            torch.cuda.memory._record_memory_history(enabled=None)
 
         # The measured delta covers PIECEWISE, encoder and speculator graphs
         # plus the sampled FULL graphs; swap the sampled FULL cost for the
         # extrapolated total. FULL and PIECEWISE share one pool here just as
         # they share the global pool at runtime, so the overlap is not
         # double-counted.
-        num_full_graphs = len(manager._capture_descs.get(CUDAGraphMode.FULL, []))
-        full_estimate = _extrapolate_full_graph_memory(mem_samples, num_full_graphs)
+        full_graph_descs = manager._capture_descs.get(CUDAGraphMode.FULL, [])
+        full_estimate = _extrapolate_full_graph_memory(mem_samples, full_graph_descs)
         return max(measured - sum(mem_samples) + full_estimate, 0)
     finally:
         compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
@@ -899,15 +1062,30 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         _teardown_profiling_state(runner)
 
 
-def _extrapolate_full_graph_memory(mem_samples: list[int], total_graphs: int) -> int:
-    """Extrapolate the total FULL capture cost from samples of the largest
-    graphs. The first capture allocates the pool baseline; later graphs mostly
-    reuse it, so the second sample is taken as the per-graph cost."""
-    if not mem_samples:
+def _extrapolate_full_graph_memory(
+    mem_samples: list[int],
+    graph_descs: list[BatchExecutionDescriptor],
+) -> int:
+    """Project unsampled FULL graph costs from their descriptor token counts."""
+    if not mem_samples or not graph_descs:
         return 0
-    first_capture = mem_samples[0]
-    per_graph = max(mem_samples[1], _MIN_PER_GRAPH_BYTES) if len(mem_samples) > 1 else 0
-    return first_capture + (total_graphs - 1) * per_graph
+    assert len(mem_samples) <= len(graph_descs)
+
+    estimate = mem_samples[0] + sum(
+        max(sample, _MIN_PER_GRAPH_BYTES) for sample in mem_samples[1:]
+    )
+    if len(mem_samples) == len(graph_descs) or len(mem_samples) < 2:
+        return estimate
+
+    reference_desc = graph_descs[len(mem_samples) - 1]
+    reference_cost = max(mem_samples[-1], _MIN_PER_GRAPH_BYTES)
+    reference_tokens = reference_desc.num_tokens
+    for desc in graph_descs[len(mem_samples) :]:
+        scaled_cost = (
+            reference_cost * desc.num_tokens + reference_tokens - 1
+        ) // reference_tokens
+        estimate += max(scaled_cost, _MIN_PER_GRAPH_BYTES)
+    return estimate
 
 
 def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:

@@ -50,7 +50,7 @@ Usage: $0 [launcher options] [-- vLLM options]
 
 Launch Qwen 3.8 Flash Next with TP=2 across tachyon and luxon. The Spark
 cluster launcher starts one native vLLM rank per node and configures NCCL RDMA
-over both ConnectX-7 RoCE interfaces. Ray and TrafficControl are not used.
+over both ConnectX-7 RoCE interfaces. No external scheduler is used.
 
 Launcher options:
   --sync-code   Mirror local vllm/ and b12x/ to the worker, removing stale files

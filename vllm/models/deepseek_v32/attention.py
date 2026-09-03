@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
@@ -35,7 +35,6 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
     maybe_gather_mla_latent_cache_inputs,
@@ -50,7 +49,7 @@ class DeepseekV32Indexer(nn.Module):
     indexer_op_cls = SparseAttnIndexer
 
     @staticmethod
-    def get_indexer_op_kwargs(vllm_config: VllmConfig) -> dict[str, bool]:
+    def get_indexer_op_kwargs(vllm_config: VllmConfig) -> dict[str, Any]:
         del vllm_config
         return {}
 
@@ -164,32 +163,6 @@ class DeepseekV32Indexer(nn.Module):
         )
 
 
-def _select_sparse_components(
-    vllm_config: VllmConfig,
-    attn_backend: type | None,
-    indexer_cls: type[DeepseekV32Indexer],
-) -> tuple[type[DeepseekV32Indexer], type | None]:
-    if (
-        attn_backend is None
-        and vllm_config.attention_config.backend == AttentionBackendEnum.B12X
-    ):
-        from vllm.models.deepseek_v32.b12x import B12xDeepseekV32Indexer
-        from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
-            B12xGLMDSAMLASparseBackend,
-            B12xMLASparseBackend,
-        )
-
-        model_config = getattr(vllm_config, "model_config", None)
-        hf_config = getattr(model_config, "hf_text_config", None)
-        backend_cls = (
-            B12xGLMDSAMLASparseBackend
-            if getattr(hf_config, "model_type", None) == "glm_moe_dsa"
-            else B12xMLASparseBackend
-        )
-        return B12xDeepseekV32Indexer, backend_cls
-    return indexer_cls, attn_backend
-
-
 class DeepseekV32Attention(MLAAttention):
     indexer: "DeepseekV32Indexer | None"
     indexer_cls: "type[DeepseekV32Indexer]" = DeepseekV32Indexer
@@ -207,9 +180,7 @@ class DeepseekV32Attention(MLAAttention):
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
 
-        indexer_cls, attn_backend = _select_sparse_components(
-            vllm_config, attn_backend, type(self).indexer_cls
-        )
+        indexer_cls = type(self).indexer_cls
 
         hidden_size = config.hidden_size
         qk_nope_head_dim = config.qk_nope_head_dim
