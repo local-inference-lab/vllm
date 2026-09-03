@@ -244,6 +244,7 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                 quant_mode=self._quant_mode,
                 table_memory=table_memory,
                 output_dtype=dtype,
+                metadata_validation="trusted",
             )
         )
         # The plan and checkpoint loader share these exact tensors.  Loading a
@@ -794,6 +795,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
                 kernel_size=self.conv_kernel_size,
                 dilation=self.short_conv_dilation,
                 dtype=self.model_config.dtype,
+                metadata_validation="trusted",
             )
         )
 

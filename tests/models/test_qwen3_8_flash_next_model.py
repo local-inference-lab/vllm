@@ -120,6 +120,115 @@ def test_explicit_ple_table_memory_overrides_env_alias(monkeypatch) -> None:
     )
 
 
+def test_b12x_ple_embedding_trusts_scheduler_metadata(monkeypatch) -> None:
+    captured_caps: dict[str, Any] = {}
+
+    class FakePlan:
+        multipliers = torch.empty(0, dtype=torch.int64)
+        table_offsets = torch.empty(0, dtype=torch.int64)
+        prime_sizes = torch.empty(0, dtype=torch.int64)
+        output_shape = (8, 64)
+        output_dtype = torch.bfloat16
+
+        @staticmethod
+        def bind(**_kwargs):
+            return object()
+
+    class FakeApi:
+        @staticmethod
+        def Caps(**kwargs):
+            captured_caps.update(kwargs)
+            return kwargs
+
+        @staticmethod
+        def plan(_caps):
+            return FakePlan()
+
+    class FakeStorage(nn.Module):
+        mapped_host_nbytes = 0
+
+        def __init__(self, _plan) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(0), requires_grad=False)
+            self.register_parameter("weight_scale", None)
+            self.register_parameter("weight_scale_2", None)
+
+    config = SimpleNamespace(
+        ngram_size=3,
+        heads_per_ngram=2,
+        eos_token_id=31,
+        split_ngram_parts=8,
+        ple_embedding_dtype="bfloat16",
+        vocab_size=32,
+        ngram_vocab_size_base=5,
+        make_ngram_vocab_size_divisible_by=8,
+    )
+    monkeypatch.setattr(ple_layer_module, "_b12x_module", lambda _name: FakeApi())
+    monkeypatch.setattr(ple_layer_module, "_NGramEmbeddingStorage", FakeStorage)
+    monkeypatch.setattr(
+        ple_layer_module, "get_b12x_scratch_buffers", lambda _plan: (torch.empty(1),)
+    )
+    monkeypatch.setattr(
+        ple_layer_module,
+        "current_platform",
+        SimpleNamespace(current_device=lambda: "cpu"),
+    )
+    monkeypatch.setattr(
+        ple_layer_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(ple_layer_module, "get_tensor_model_parallel_rank", lambda: 0)
+
+    ple_layer_module.Qwen3_8FlashNextNGramEmbedding(
+        config,
+        embedding_dim=64,
+        ple_dense_layer_id=0,
+        max_total_tokens=8,
+        max_num_reqs=4,
+        owner_prefix="model.layers.1",
+        prefix="model.layers.1.ple_embedding",
+        dtype=torch.bfloat16,
+        table_memory="device",
+    )
+
+    assert captured_caps["metadata_validation"] == "trusted"
+
+
+def test_b12x_ple_state_plan_trusts_scheduler_metadata(monkeypatch) -> None:
+    captured_caps: dict[str, Any] = {}
+
+    class FakeApi:
+        @staticmethod
+        def Caps(**kwargs):
+            captured_caps.update(kwargs)
+            return kwargs
+
+        @staticmethod
+        def plan(caps):
+            return caps
+
+    layer = Qwen3_8FlashNextPLELayer.__new__(Qwen3_8FlashNextPLELayer)
+    nn.Module.__init__(layer)
+    layer.max_tokens = 16
+    layer.max_seqs = 4
+    layer.num_spec_tokens = 3
+    layer.hc_count = 4
+    layer.hidden_size = 64
+    layer.conv_kernel_size = 4
+    layer.short_conv_dilation = 3
+    layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    monkeypatch.setattr(ple_layer_module, "_b12x_module", lambda _name: FakeApi())
+    monkeypatch.setattr(
+        ple_layer_module,
+        "current_platform",
+        SimpleNamespace(current_device=lambda: "cuda:0"),
+    )
+
+    plan = layer._make_plan(max_state_slots=32)
+
+    assert plan == captured_caps
+    assert captured_caps["metadata_validation"] == "trusted"
+
+
 def test_ple_registers_request_dependent_piecewise_splitting_ops_once() -> None:
     compilation_config = SimpleNamespace(
         static_forward_context={},
