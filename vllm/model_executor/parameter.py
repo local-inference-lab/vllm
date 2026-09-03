@@ -147,10 +147,30 @@ class BasevLLMParameter(Parameter):
         )
         self.data.copy_(loaded_weight)
 
-    def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
+    def load_column_parallel_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        *,
+        allow_padding: bool = False,
+    ):
+        if allow_padding and self.data.shape != loaded_weight.shape:
+            raise ValueError(
+                "Padded column-parallel loading requires a parameter with an "
+                "output sharding dimension"
+            )
         self._assert_and_load(loaded_weight)
 
-    def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
+    def load_row_parallel_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        *,
+        allow_padding: bool = False,
+    ):
+        if allow_padding and self.data.shape != loaded_weight.shape:
+            raise ValueError(
+                "Padded row-parallel loading requires a parameter with an "
+                "input sharding dimension"
+            )
         self._assert_and_load(loaded_weight)
 
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):

@@ -627,10 +627,13 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
-        param.load_column_parallel_weight(
-            loaded_weight=loaded_weight,
-            allow_padding=self._allow_loaded_output_padding,
-        )
+        if self._allow_loaded_output_padding:
+            param.load_column_parallel_weight(
+                loaded_weight=loaded_weight,
+                allow_padding=True,
+            )
+        else:
+            param.load_column_parallel_weight(loaded_weight=loaded_weight)
 
     def forward(
         self,
@@ -1044,13 +1047,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 weight_block_size, shard_size, shard_offset
             )
 
-        param.load_merged_column_weight(
-            loaded_weight=loaded_weight,
-            shard_id=loaded_shard_id,
-            shard_offset=shard_offset,
-            shard_size=shard_size,
-            allow_padding=self._allow_loaded_output_shard_padding[loaded_shard_id],
-        )
+        load_kwargs = {
+            "loaded_weight": loaded_weight,
+            "shard_id": loaded_shard_id,
+            "shard_offset": shard_offset,
+            "shard_size": shard_size,
+        }
+        if self._allow_loaded_output_shard_padding[loaded_shard_id]:
+            load_kwargs["allow_padding"] = True
+        param.load_merged_column_weight(**load_kwargs)
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
@@ -1305,14 +1310,16 @@ class QKVParallelLinear(ColumnParallelLinear):
                 weight_block_size, shard_size, shard_offset
             )
 
-        param.load_qkv_weight(
-            loaded_weight=loaded_weight,
-            num_heads=self.num_kv_head_replicas,
-            shard_id=loaded_shard_id,
-            shard_offset=shard_offset,
-            shard_size=shard_size,
-            allow_padding=self._allow_loaded_qkv_padding[loaded_shard_id],
-        )
+        load_kwargs = {
+            "loaded_weight": loaded_weight,
+            "num_heads": self.num_kv_head_replicas,
+            "shard_id": loaded_shard_id,
+            "shard_offset": shard_offset,
+            "shard_size": shard_size,
+        }
+        if self._allow_loaded_qkv_padding[loaded_shard_id]:
+            load_kwargs["allow_padding"] = True
+        param.load_qkv_weight(**load_kwargs)
 
     def weight_loader(
         self,
@@ -1827,10 +1834,13 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        param.load_row_parallel_weight(
-            loaded_weight=loaded_weight,
-            allow_padding=self._allow_loaded_input_padding,
-        )
+        if self._allow_loaded_input_padding:
+            param.load_row_parallel_weight(
+                loaded_weight=loaded_weight,
+                allow_padding=True,
+            )
+        else:
+            param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
     def forward(
         self,
