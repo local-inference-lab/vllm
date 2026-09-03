@@ -116,6 +116,7 @@ def test_dflash_loader_propagates_target_rope_layout(monkeypatch):
     """DFlash configures the target rotary layout before draft construction."""
     from vllm.v1.worker.gpu.spec_decode.dflash import utils as loader_module
 
+    draft_load_config = object()
     draft_hf_config = SimpleNamespace(
         num_hidden_layers=1,
         layer_types=["sliding_attention"],
@@ -125,7 +126,7 @@ def test_dflash_loader_propagates_target_rope_layout(monkeypatch):
         draft_model_config=SimpleNamespace(hf_config=draft_hf_config),
         attention_backend=None,
         kv_cache_dtype=None,
-        draft_load_config=None,
+        draft_load_config=draft_load_config,
     )
     vllm_config = SimpleNamespace(
         speculative_config=speculative_config,
@@ -142,8 +143,9 @@ def test_dflash_loader_propagates_target_rope_layout(monkeypatch):
     class DraftConstructionObserved(Exception):
         pass
 
-    def fake_get_model(**_kwargs):
+    def fake_get_model(**kwargs):
         assert draft_hf_config.is_neox_style is False
+        assert kwargs["load_config"] is draft_load_config
         raise DraftConstructionObserved
 
     monkeypatch.setattr(loader_module, "replace", fake_replace)
