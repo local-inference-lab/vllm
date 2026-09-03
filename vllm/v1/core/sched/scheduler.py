@@ -92,6 +92,10 @@ def _build_kv_connector_block_state(
 
     Returns:
         Authoritative block tables and recurrent boundary sources.
+
+    Raises:
+        ValueError: If the retention interval is not aligned to a recurrent
+            cache block boundary.
     """
     current_block_ids = {
         req_id: kv_cache_manager.get_block_ids(req_id)
