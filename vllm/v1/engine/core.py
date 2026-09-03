@@ -245,6 +245,7 @@ class EngineCore:
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+        self._last_model_completion_time: float | None = None
 
         self.is_ec_consumer = (
             vllm_config.ec_transfer_config is None
@@ -665,9 +666,27 @@ class EngineCore:
             return
         service_class = scheduler_output.compute_service_class
         assert service_class is not None
+        completed_at = timing.completed_at
+        if completed_at is None:
+            raise RuntimeError("model execution timing read before completion")
+
+        # Multiple batches can already be queued on the executor when this
+        # batch is dispatched. Attribute only the wall-clock interval this
+        # completion adds after the previous batch, rather than charging the
+        # same executor queue residency to every in-flight batch.
+        previous_completion = self._last_model_completion_time
+        service_started_at = timing.started_at
+        if previous_completion is not None:
+            service_started_at = max(service_started_at, previous_completion)
+        elapsed_seconds = max(completed_at - service_started_at, 0.0)
+        self._last_model_completion_time = (
+            completed_at
+            if previous_completion is None
+            else max(completed_at, previous_completion)
+        )
         self.scheduler.record_compute_time(
             service_class,
-            timing.elapsed_seconds,
+            elapsed_seconds,
             contended=scheduler_output.compute_contention,
         )
 

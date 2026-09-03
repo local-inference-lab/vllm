@@ -69,21 +69,25 @@ def test_enabled_execution_timer_waits_for_final_batch_future():
 def test_queued_feedback_stays_paired_with_exact_batch():
     engine = object.__new__(EngineCore)
     engine.scheduler = Mock()
+    engine._last_model_completion_time = None
     decode_output = _scheduler_output("decode", contended=True)
     prefill_output = _scheduler_output("prefill", contended=True)
     decode_timing = _ModelExecutionTiming()
-    decode_timing.completed_at = decode_timing.started_at + 0.1
+    decode_timing.started_at = 10.0
+    decode_timing.completed_at = 10.1
     prefill_timing = _ModelExecutionTiming()
-    prefill_timing.completed_at = prefill_timing.started_at + 0.3
+    prefill_timing.started_at = 10.01
+    prefill_timing.completed_at = 10.3
 
     # Queued batches are consumed oldest-first; each carries its own timing and
-    # class tag even when a later batch has already completed.
+    # class tag even when a later batch has already completed. The second
+    # charge excludes its 90 ms queued behind the first batch.
     engine._record_compute_time(decode_output, decode_timing)
     engine._record_compute_time(prefill_output, prefill_timing)
 
     assert engine.scheduler.record_compute_time.call_args_list == [
         call("decode", pytest.approx(0.1), contended=True),
-        call("prefill", pytest.approx(0.3), contended=True),
+        call("prefill", pytest.approx(0.2), contended=True),
     ]
 
 
