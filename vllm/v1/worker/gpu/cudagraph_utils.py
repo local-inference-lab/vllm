@@ -492,6 +492,16 @@ class CudaGraphManager:
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
 
+    def planned_token_counts(self) -> list[int]:
+        """Return model-row counts staged for decoder graph capture."""
+        return sorted(
+            {
+                desc.num_tokens
+                for descs in self._capture_descs.values()
+                for desc in descs
+            }
+        )
+
     def reset_graphs(self) -> None:
         """Destroy FULL graph executables while retaining captured resources."""
         for graph in self.graphs.values():

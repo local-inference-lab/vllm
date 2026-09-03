@@ -321,6 +321,12 @@ def test_uniform_decode_exact_match_is_not_over_padded(monkeypatch):
     assert desc.num_reqs == 3
 
 
+def test_planned_token_counts_include_speculative_decode_rows(monkeypatch):
+    manager = _make_spec_decode_manager(monkeypatch)
+
+    assert manager.planned_token_counts() == [1, 2, 3, 4, 6, 8, 9, 16, 18, 24]
+
+
 def test_mixed_batch_never_selects_a_uniform_decode_graph(monkeypatch):
     manager = _make_spec_decode_manager(monkeypatch)
 
