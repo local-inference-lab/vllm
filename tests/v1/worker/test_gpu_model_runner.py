@@ -11,6 +11,7 @@ import pytest
 import torch
 
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
+import vllm.v1.worker.utils as worker_utils
 from vllm.config import (
     AttentionConfig,
     CacheConfig,
@@ -77,6 +78,80 @@ def _restore_default_dtype():
     old = torch.get_default_dtype()
     yield
     torch.set_default_dtype(old)
+
+
+@pytest.mark.parametrize("collective_enabled", (True, False))
+def test_glm53_r17_tp3_runtime_proof_is_observed_and_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    collective_enabled: bool,
+) -> None:
+    class Glm5NextLinearAttention(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self._b12x_kda_api = object()
+            self.kda_prefill_backend = "flashkda"
+
+    messages = []
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            multimodal_config=SimpleNamespace(mm_encoder_tp_mode="weights"),
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=3,
+            enable_expert_parallel=True,
+        ),
+    )
+    model = torch.nn.Sequential(Glm5NextLinearAttention())
+    b12x_ar = object.__new__(worker_utils.B12xPcieAllReduce)
+    b12x_ar.disabled = not collective_enabled
+    b12x_ar.world_size = 3
+    b12x_ar._runtime = object()
+    b12x_ar.allreduce_max_bytes = 65536
+    monkeypatch.setenv("GLM53_R17_REQUIRE_RUNTIME_PROOF", "1")
+    monkeypatch.setattr(worker_utils, "is_glm53_config", lambda _: True)
+    monkeypatch.setattr(
+        worker_utils,
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=3),
+    )
+    monkeypatch.setattr(
+        worker_utils,
+        "get_tp_group",
+        lambda: SimpleNamespace(
+            device_communicator=SimpleNamespace(b12x_ar_comm=b12x_ar)
+        ),
+    )
+    monkeypatch.setattr(
+        worker_utils.logger,
+        "info_once",
+        lambda message, payload, **kwargs: messages.append(message % payload),
+    )
+
+    if not collective_enabled:
+        with pytest.raises(RuntimeError, match="runtime proof failed"):
+            worker_utils.log_glm53_r17_tp3_runtime_proof(vllm_config, model)
+        return
+
+    worker_utils.log_glm53_r17_tp3_runtime_proof(vllm_config, model)
+    assert messages == [
+        "GLM53_R17_TP3_RUNTIME_PROOF "
+        '{"collective_backend":"b12x_pcie_oneshot","expert_parallel_size":3,'
+        '"kda_decode_backend":"b12x","kda_prefill_backend":"flashkda",'
+        '"mm_encoder_tp_mode":"weights"}'
+    ]
+
+
+def test_glm53_r17_runtime_proof_does_not_change_tp4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GLM53_R17_REQUIRE_RUNTIME_PROOF", "1")
+    monkeypatch.setattr(worker_utils, "is_glm53_config", pytest.fail)
+    vllm_config = SimpleNamespace(
+        model_config=pytest.fail,
+        parallel_config=SimpleNamespace(tensor_parallel_size=4),
+    )
+
+    worker_utils.log_glm53_r17_tp3_runtime_proof(vllm_config, pytest.fail)
 
 
 def initialize_kv_cache(runner: GPUModelRunner):

@@ -117,6 +117,40 @@ def test_glm5next_checkpoint_weight_name_remapping(
 ) -> None:
     assert _remap_glm5next_weight_name(checkpoint_name) == parameter_name
 
+def test_glm5next_kda_a_log_loader_pads_tp3_tail(monkeypatch) -> None:
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn, "get_tensor_model_parallel_rank", lambda: 2
+    )
+    param = torch.nn.Parameter(torch.full((22,), -1.0))
+    loaded_weight = torch.arange(64, dtype=torch.float32)
+
+    kimi_gdn_linear_attn.a_log_weight_loader(0, logical_size=64)(
+        param, loaded_weight
+    )
+
+    torch.testing.assert_close(param[:20], loaded_weight[44:64])
+    torch.testing.assert_close(param[20:], torch.zeros(2))
+
+
+def test_glm5next_kda_conv_loader_pads_tp3_tail() -> None:
+    param = torch.nn.Parameter(torch.full((132, 1, 3), -1.0))
+    loaded_weight = torch.arange(128, dtype=torch.float32).view(128, 1, 1)
+    loaded_weight = loaded_weight.expand(-1, 1, 3)
+
+    loader = kimi_gdn_linear_attn._make_fused_conv1d_weight_loader(
+        [132, 132, 132],
+        tp_size=3,
+        tp_rank=2,
+        loaded_dims=[128, 128, 128],
+    )
+    loader(param, loaded_weight, loaded_shard_id=1)
+
+    torch.testing.assert_close(param[44:84], loaded_weight[88:128])
+    torch.testing.assert_close(param[84:88], torch.zeros(4, 1, 3))
+    torch.testing.assert_close(param[:44], torch.full((44, 1, 3), -1.0))
+    torch.testing.assert_close(param[88:], torch.full((44, 1, 3), -1.0))
+
+
 
 def test_glm5next_mixed_precision_resolves_fused_attention_projections() -> None:
     quant_config = ModelOptMixedPrecisionConfig.__new__(ModelOptMixedPrecisionConfig)
@@ -1186,7 +1220,7 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
 
 
 def test_b12x_kda_binds_live_invocations_and_shares_metadata(monkeypatch) -> None:
-    calls: dict[str, list] = {"bind": [], "run": []}
+    calls: dict[str, list] = {"bind": [], "retain": [], "run": []}
 
     class FakeApi:
         @staticmethod
@@ -1204,6 +1238,11 @@ def test_b12x_kda_binds_live_invocations_and_shares_metadata(monkeypatch) -> Non
         kimi_gdn_linear_attn,
         "get_forward_context",
         lambda: forward_context,
+    )
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn,
+        "retain_cuda_graph_capture_resource",
+        calls["retain"].append,
     )
 
     plan = SimpleNamespace(caps=SimpleNamespace(max_state_slots=32))
@@ -1256,6 +1295,7 @@ def test_b12x_kda_binds_live_invocations_and_shares_metadata(monkeypatch) -> Non
 
     assert len(calls["bind"]) == 2
     assert len(calls["run"]) == 2
+    assert calls["retain"] == calls["bind"]
     for binding, output in zip(calls["bind"], outputs):
         assert binding.mixed_qkv is mixed_qkv
         assert binding.raw_g is raw_g

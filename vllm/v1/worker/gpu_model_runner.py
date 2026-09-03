@@ -235,6 +235,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import (
     EncoderTimingStats,
     is_residual_scattered_for_sp,
+    log_glm53_r17_tp3_runtime_proof,
     raise_if_nan_logits,
 )
 from vllm.v1.worker.workspace import lock_workspace
@@ -5520,6 +5521,8 @@ class GPUModelRunner(
             format_gib(self.model_memory_usage),
             time_after_load - time_before_load,
         )
+        log_glm53_r17_tp3_runtime_proof(self.vllm_config, self.model)
+
 
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
