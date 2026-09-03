@@ -1230,6 +1230,19 @@ class Worker(WorkerBase):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
 
+    def flush_deferred_output(self) -> None:
+        """Complete the previous step's output before an out-of-band RPC.
+
+        With a remote speculator that resolves its proposal lazily, the
+        asynchronous output of a step is finished by the next step. The
+        executor answers RPCs in order, so the engine cannot receive the reply
+        to an RPC issued between two steps before it receives that output;
+        with the next step not yet issued, both sides would wait forever.
+        """
+        flush = getattr(self.model_runner, "flush_deferred_draft", None)
+        if flush is not None:
+            flush()
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         # Check if profiling is enabled
         if self.profiler_config is None or self.profiler_config.profiler is None:
@@ -1239,6 +1252,13 @@ class Worker(WorkerBase):
                 "'--profiler-config.profiler=torch --profiler-config.torch_profiler_dir"
                 "=YOUR_DIR_PATH_TO_DUMP_TRACE'"
             )
+
+        # Start and stop from a drained device: the trace then begins and ends
+        # at a step boundary, and the profiler's device-wide waits (CUPTI
+        # initialization, activity flush) do not overlap a stream parked on a
+        # deferred proposal.
+        self.flush_deferred_output()
+        torch.cuda.synchronize()
 
         if is_start:
             # Generate the trace name by combining prefix with comprehensive rank suffix

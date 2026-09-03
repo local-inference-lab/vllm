@@ -1652,6 +1652,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if pending.async_output is not None:
             pending.async_output.add_draft_token_ids(pending.req_ids, stored)
 
+    @torch.inference_mode()
+    def flush_deferred_draft(self) -> None:
+        """Consume a deferred proposal outside a step.
+
+        The output of the step that issued the proposal is not complete until
+        the proposal has been consumed, which the next step normally does. A
+        worker that has to answer another RPC first (profiling, LoRA, sleep,
+        a generic collective_rpc) consumes it here, because the engine waits
+        for that output before it issues the next step.
+        """
+        self._resolve_pending_draft()
+
     def prepare_attn(
         self, input_batch: InputBatch
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:

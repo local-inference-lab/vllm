@@ -90,3 +90,20 @@ def test_late_input_ids_only_without_pcp_and_capacity_manager():
     assert mrv2.GPUModelRunner._late_input_ids.fget(runner)
     runner.verification_capacity_manager = object()
     assert not mrv2.GPUModelRunner._late_input_ids.fget(runner)
+
+
+def test_flush_consumes_the_pending_proposal_outside_a_step():
+    output = _Output()
+    draft = torch.tensor([[7, 8, 9], [3, 4, 5]])
+    runner = _runner(draft, num_draft_tokens=3, output=output)
+
+    runner.flush_deferred_draft()
+
+    assert runner._pending_draft is None
+    assert runner.req_states.draft_tokens[4].tolist() == [7, 8, 9]
+    ((req_ids, copied),) = output.recorded
+    assert req_ids == ["a", "b"]
+    assert copied.tolist() == [[7, 8, 9], [3, 4, 5]]
+
+    runner.flush_deferred_draft()
+    assert runner.speculator.calls == 1
