@@ -668,7 +668,7 @@ class CustomAllreduce:
             # preflight can tune its crossover or disable it when lossless DMA
             # never beats NCCL on the selected PCIe topology.
             supports_all_peer_auxiliary = bool(
-                getattr(pcie_runtime, "supports_all_peer_auxiliary", True)
+                getattr(pcie_runtime, "supports_all_peer_auxiliary", False)
             )
             dma_min_bytes = (
                 _b12x_pcie_dma_min_bytes() if supports_all_peer_auxiliary else None
