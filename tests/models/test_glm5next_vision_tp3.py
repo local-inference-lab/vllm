@@ -28,7 +28,7 @@ def tp3_linear_state(monkeypatch):
 
 
 def test_glm5next_vision_tp3_attention_shards_and_zeros_local_tail(
-    monkeypatch, tp3_linear_state, default_vllm_config
+    monkeypatch, tp3_linear_state
 ) -> None:
     class FakeEncoderAttention(torch.nn.Module):
         def __init__(self, **kwargs) -> None:
@@ -75,7 +75,7 @@ def test_glm5next_vision_tp3_attention_shards_and_zeros_local_tail(
 
 
 def test_glm5next_vision_tp3_mlp_shards_and_zeros_local_tail(
-    monkeypatch, tp3_linear_state, default_vllm_config
+    monkeypatch, tp3_linear_state
 ) -> None:
     monkeypatch.setattr(glm5next_multimodal, "is_vit_use_data_parallel", lambda: False)
     mlp = glm5next_multimodal.Glm5NextVisionMLP(
@@ -107,7 +107,7 @@ def test_glm5next_vision_tp3_mlp_shards_and_zeros_local_tail(
 
 
 def test_glm5next_vision_tp3_merger_shards_only_divisible_weights(
-    monkeypatch, tp3_linear_state, default_vllm_config
+    monkeypatch, tp3_linear_state
 ) -> None:
     class FakeProjection(torch.nn.Module):
         def __init__(self, *args, **kwargs) -> None:
