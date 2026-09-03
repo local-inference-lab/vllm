@@ -18,6 +18,7 @@ from .qwen3_dflash import (
     DFlashQwen3DecoderLayer,
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
+    _get_dflash_draft_vocab_size,
 )
 from .utils import maybe_prefix
 
@@ -398,7 +399,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
         with set_model_tag("dflash2_candidate_selector"):
             self.candidate_selector = CandidateSelector(
                 hidden_size=self.config.hidden_size,
-                vocab_size=self.config.vocab_size,
+                vocab_size=_get_dflash_draft_vocab_size(self.config),
                 rank=int(draft_config["selector_rank"]),
                 top_k=int(draft_config["selector_top_k"]),
                 params_dtype=vllm_config.model_config.dtype,
@@ -418,7 +419,7 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         draft_config = self.config.dflash_config
         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
         self.candidate_logits_processor = LogitsProcessor(
-            vllm_config.model_config.get_vocab_size(),
+            _get_dflash_draft_vocab_size(self.config),
             scale=float(draft_config.get("output_multiplier", 1.0)),
             soft_cap=softcap if softcap > 0 else None,
         )

@@ -101,6 +101,41 @@ def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
             return style
     return None
 
+def _get_dflash_draft_vocab_size(config: Qwen3Config) -> int:
+    """Return the logical draft vocabulary across old and current config APIs."""
+    draft_vocab_size = getattr(config, "draft_vocab_size", None)
+    if draft_vocab_size is None:
+        draft_vocab_size = getattr(config, "original_vocab_size", None)
+    if draft_vocab_size is None:
+        draft_vocab_size = config.vocab_size
+    return int(draft_vocab_size)
+
+
+def _get_glm53_tp3_head_geometry(
+    config: Qwen3Config,
+) -> tuple[int, int] | None:
+    if not getattr(config, "glm53_tp3_padding", False):
+        return None
+
+    physical = (int(config.num_attention_heads), int(config.num_key_value_heads))
+    logical = (
+        int(config.original_num_attention_heads),
+        int(config.original_num_key_value_heads),
+    )
+    if (*physical, *logical) != (36, 9, 32, 8):
+        raise ValueError(
+            "GLM-5.3 DFlash TP3 requires physical/logical Q/KV heads "
+            f"36/9 from 32/8, got {physical[0]}/{physical[1]} from "
+            f"{logical[0]}/{logical[1]}."
+        )
+    return logical
+
+
+def _get_glm53_tp3_vocab_kwargs(config: Qwen3Config) -> dict[str, int]:
+    if not getattr(config, "glm53_tp3_padding", False):
+        return {}
+    return {"padding_size": int(config.glm53_tp3_vocab_padding_size)}
+
 
 def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
     spec_config = vllm_config.speculative_config
@@ -218,6 +253,7 @@ class DFlashQwen3Attention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
+        config: Qwen3Config,
         rope_parameters: dict,
         max_position: int = 4096 * 32,
         head_dim: int | None = None,
@@ -245,11 +281,23 @@ class DFlashQwen3Attention(nn.Module):
         else:
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = head_dim or hidden_size // self.total_num_heads
+        head_geometry = _get_glm53_tp3_head_geometry(config)
+        loaded_num_heads = (
+            head_geometry[0] if head_geometry is not None else self.total_num_heads
+        )
+        self.head_dim = head_dim or hidden_size // loaded_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
+        qkv_loader_kwargs = (
+            {
+                "loaded_total_num_heads": head_geometry[0],
+                "loaded_total_num_kv_heads": head_geometry[1],
+            }
+            if head_geometry is not None
+            else {}
+        )
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -258,6 +306,12 @@ class DFlashQwen3Attention(nn.Module):
             bias=attention_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            **qkv_loader_kwargs,
+        )
+        o_proj_loader_kwargs = (
+            {"loaded_input_size": head_geometry[0] * self.head_dim}
+            if head_geometry is not None
+            else {}
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -265,6 +319,7 @@ class DFlashQwen3Attention(nn.Module):
             bias=attention_bias,  # DFlash has o_proj bias when using attention bias
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            **o_proj_loader_kwargs,
         )
 
         self.rotary_emb = get_rope(
@@ -362,6 +417,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
 
         self.self_attn = DFlashQwen3Attention(
             hidden_size=self.hidden_size,
+            config=config,
             num_heads=config.num_attention_heads,
             max_position=config.max_position_embeddings,
             num_kv_heads=config.num_key_value_heads,
@@ -460,6 +516,7 @@ class DFlashQwen3Model(nn.Module):
             self.config.vocab_size,
             self.config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
+            **_get_glm53_tp3_vocab_kwargs(self.config),
         )
 
         # Masked query slots are fed to the draft as `mask_token_id`. Most DFlash
@@ -800,11 +857,27 @@ class DFlashQwen3Model(nn.Module):
         for name, loaded_weight in weights:
             if "attention_sink_bias" in name:
                 # Sink bias is per-head; shard it across TP ranks like the
-                # attention heads themselves.
-                heads_per_rank = loaded_weight.shape[0] // tp_size
-                loaded_weight = loaded_weight.narrow(
-                    0, tp_rank * heads_per_rank, heads_per_rank
+                # attention heads themselves. GLM-5.3 TP3 writes the short
+                # rank-2 source shard into a zeroed physical destination.
+                heads_per_rank = self.config.num_attention_heads // tp_size
+                source_start = tp_rank * heads_per_rank
+                source_size = min(
+                    heads_per_rank,
+                    max(loaded_weight.shape[0] - source_start, 0),
                 )
+                if source_size == heads_per_rank:
+                    loaded_weight = loaded_weight.narrow(
+                        0, source_start, heads_per_rank
+                    )
+                else:
+                    local_weight = loaded_weight.new_zeros(
+                        heads_per_rank, *loaded_weight.shape[1:]
+                    )
+                    if source_size:
+                        local_weight[:source_size].copy_(
+                            loaded_weight.narrow(0, source_start, source_size)
+                        )
+                    loaded_weight = local_weight
             yield name, loaded_weight
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -821,8 +894,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         nn.Module.__init__(self)
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
-        if getattr(self.config, "draft_vocab_size", None) is None:
-            self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
+        self.config.draft_vocab_size = _get_dflash_draft_vocab_size(self.config)
         target_layer_num = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
@@ -837,6 +909,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             self.config.draft_vocab_size,
             self.config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
+            **_get_glm53_tp3_vocab_kwargs(self.config),
         )
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
