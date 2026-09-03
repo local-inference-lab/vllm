@@ -198,6 +198,18 @@ def _log_gdn_backend_decision(
         )
 
 
+def _prepare_flashinfer_cu_seqlens(
+    cu_seqlens: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if (
+        cu_seqlens is not None
+        and cu_seqlens.dtype != torch.int64
+        and current_platform.is_device_capability_family(120)
+    ):
+        return cu_seqlens.to(torch.int64)
+    return cu_seqlens
+
+
 def fi_chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -227,6 +239,7 @@ def fi_chunk_gated_delta_rule(
     fi_state = initial_state.to(torch.float32)
     fi_g = g.to(torch.float32)
     fi_beta = beta.to(torch.float32)
+    cu_seqlens = _prepare_flashinfer_cu_seqlens(cu_seqlens)
     result = chunk_gated_delta_rule_fi(
         q=q,
         k=k,

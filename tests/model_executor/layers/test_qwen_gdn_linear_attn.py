@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn
 
@@ -50,3 +51,29 @@ def test_resolve_gdn_prefill_backend(
         )
 
     assert active_backend == expected
+
+
+@pytest.mark.parametrize(
+    "sm120,input_dtype,expected_dtype,preserves_storage",
+    [
+        (True, torch.int32, torch.int64, False),
+        (True, torch.int64, torch.int64, True),
+        (False, torch.int32, torch.int32, True),
+    ],
+)
+def test_prepare_flashinfer_cu_seqlens(
+    sm120: bool,
+    input_dtype: torch.dtype,
+    expected_dtype: torch.dtype,
+    preserves_storage: bool,
+) -> None:
+    platform = MagicMock()
+    platform.is_device_capability_family.return_value = sm120
+    cu_seqlens = torch.tensor([0, 64], dtype=input_dtype)
+
+    with patch.object(qwen_gdn_linear_attn, "current_platform", platform):
+        result = qwen_gdn_linear_attn._prepare_flashinfer_cu_seqlens(cu_seqlens)
+
+    assert result is not None
+    assert result.dtype == expected_dtype
+    assert (result is cu_seqlens) == preserves_storage
