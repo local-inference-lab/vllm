@@ -152,13 +152,6 @@ class SchedulerConfig:
     to use max_num_batched_tokens.
     """
 
-    max_num_partial_prefills: int = Field(default=0, ge=0)
-    """Maximum requests allowed to remain partially prefilling.
-
-    Zero disables the separate limit. A request that can finish prefill in the
-    current step may still be admitted when the limit is full.
-    """
-
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.
@@ -301,13 +294,6 @@ class SchedulerConfig:
                 "max_num_prefill_tokens_per_step "
                 f"({self.max_num_prefill_tokens_per_step}) cannot be greater "
                 f"than max_num_batched_tokens ({self.max_num_batched_tokens})."
-            )
-
-        if self.max_num_partial_prefills > self.max_num_seqs:
-            raise ValueError(
-                "max_num_partial_prefills "
-                f"({self.max_num_partial_prefills}) cannot be greater than "
-                f"max_num_seqs ({self.max_num_seqs})."
             )
 
         return self
