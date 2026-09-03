@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import math
 import os
@@ -19,6 +20,7 @@ import zmq
 
 from vllm.config import VllmConfig
 from vllm.distributed import get_tp_group
+from vllm.distributed.device_communicators.cuda_wrapper import find_loaded_library
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
@@ -247,6 +249,73 @@ def _k3_capture_records(
         row_offset += count
 
 
+class _StreamGate:
+    """Parks a CUDA stream until a reply thread publishes.
+
+    ``arm(stream)`` enqueues ``cudaLaunchHostFunc(pthread_barrier_wait)`` on
+    the stream: work enqueued afterwards runs only after ``release()`` is
+    called from another thread. The two-party barrier resets itself after
+    every cycle, so one gate serves one proposal at a time; every ``arm``
+    must be matched by exactly one ``release`` (a reply thread releases in
+    its ``finally`` clause). ``pthread_barrier_wait`` cannot return EINTR,
+    so a signal delivered to the driver thread cannot open the gate early.
+    """
+
+    _BARRIER_BYTES = 64
+
+    def __init__(self) -> None:
+        self._libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        self._libc.pthread_barrier_init.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
+        self._libc.pthread_barrier_wait.argtypes = [ctypes.c_void_p]
+        self._barrier = ctypes.create_string_buffer(self._BARRIER_BYTES)
+        if self._libc.pthread_barrier_init(self._barrier, None, 2) != 0:
+            raise OSError(ctypes.get_errno(), "pthread_barrier_init failed")
+        self._wait_fn = ctypes.cast(self._libc.pthread_barrier_wait, ctypes.c_void_p)
+        cudart_path = find_loaded_library("libcudart")
+        if cudart_path is None:
+            raise RuntimeError("libcudart is not loaded; cannot arm a stream gate")
+        self._cudart = ctypes.CDLL(cudart_path)
+        self._cudart.cudaLaunchHostFunc.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        self._cudart.cudaLaunchHostFunc.restype = ctypes.c_int
+
+    def arm(self, stream: torch.cuda.Stream) -> None:
+        err = self._cudart.cudaLaunchHostFunc(
+            ctypes.c_void_p(stream.cuda_stream),
+            self._wait_fn,
+            ctypes.cast(self._barrier, ctypes.c_void_p),
+        )
+        if err != 0:
+            raise RuntimeError(f"cudaLaunchHostFunc failed with error {err}")
+
+    def release(self) -> None:
+        self._libc.pthread_barrier_wait(self._barrier)
+
+
+@dataclass
+class _PendingProposal:
+    """A proposal whose reply is consumed by the next step in stream order."""
+
+    epoch: int
+    num_reqs: int
+    num_speculative_tokens: int
+    active_indices: list[int]
+    request_ids: list[str]
+    idx_mapping: torch.Tensor
+    temperature: torch.Tensor
+    seeds: torch.Tensor
+    thread: threading.Thread | None = None
+    failed: bool = False
+    timing_ms: dict[str, float] | None = None
+
+
 class RemoteK3DSparkSpeculator(BaseSpeculator):
     """Forward target auxiliary states to a standalone draft server."""
 
@@ -375,6 +444,17 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             raise ValueError("VLLM_K3_DRAFT_TIMING_LOG_INTERVAL must be >= 0")
         self._timing_count = 0
         self._timing_totals_ms: dict[str, float] = {}
+        self._deferred_resolve = (
+            os.environ.get("VLLM_K3_DRAFT_DEFERRED_RESOLVE", "1") == "1"
+            and not _K3_CAPTURE_DIR
+        )
+        # Set by the model runner before propose(): False when the scheduler
+        # needs the real draft token ids on the host after this step.
+        self.deferred_resolve_allowed = True
+        self._pending: _PendingProposal | None = None
+        self._pending_failure: tuple[BaseException, list[str]] | None = None
+        self._pending_epoch = 0
+        self._last_resolved: _PendingProposal | None = None
 
         tp_group = get_tp_group()
         self._tp_group = tp_group
@@ -490,6 +570,33 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                     dtype=torch.bfloat16,
                     pin_memory=True,
                 )
+            # Deferred resolve (VLLM_K3_DRAFT_DEFERRED_RESOLVE=1): the RPC runs
+            # on a reply thread while the runner prepares the next step; the
+            # next step's stream is parked on the gate until the reply is
+            # staged. Rank 0 stages every reply field through pinned memory
+            # so the copies enqueued behind the gate never touch pageable
+            # memory (a pageable H2D copy would synchronize the host with the
+            # parked stream).
+            self._tokens_staging = [
+                torch.full(
+                    (self.max_num_reqs, self.num_speculative_steps),
+                    -1,
+                    dtype=torch.int64,
+                    pin_memory=True,
+                )
+                for _ in range(2)
+            ]
+            self._positions_staging = [
+                torch.full(
+                    (self.max_num_reqs, self.num_speculative_steps),
+                    -1,
+                    dtype=torch.int64,
+                    pin_memory=True,
+                )
+                for _ in range(2)
+            ]
+            self._staging_slot = 0
+            self._gate = _StreamGate() if self._deferred_resolve else None
             self._zmq_context = zmq.Context()
             self._connect()
             response = self._rpc(
@@ -819,6 +926,349 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             serial=self._retained_serial,
         )
 
+    # Deferred resolve -----------------------------------------------------
+
+    def has_pending_proposal(self) -> bool:
+        return self._pending is not None
+
+    def _join_reply_thread(self) -> None:
+        resolved = getattr(self, "_last_resolved", None)
+        if resolved is None:
+            return
+        self._last_resolved = None
+        if resolved.thread is not None:
+            resolved.thread.join()
+        if resolved.timing_ms:
+            self._record_timing(resolved.timing_ms)
+
+    def _apply_pending_failure(self) -> None:
+        failure = self._pending_failure
+        if failure is None:
+            return
+        self._pending_failure = None
+        exc, request_ids = failure
+        self._disabled_requests.update(request_ids)
+        logger.warning(
+            "Remote K3 %s deferred proposal failed (%s); drafting is disabled "
+            "for %d request(s) until they leave the batch",
+            self.method,
+            exc,
+            len(request_ids),
+        )
+
+    def _stage_tokens_from_response(
+        self,
+        response: dict[str, Any],
+        active_indices: list[int],
+        num_speculative_tokens: int,
+        slot: int,
+    ) -> None:
+        tokens = response.get("tokens")
+        expected_shape = (len(active_indices), num_speculative_tokens)
+        if (
+            not isinstance(tokens, list)
+            or len(tokens) != expected_shape[0]
+            or any(
+                not isinstance(row, list) or len(row) != expected_shape[1]
+                for row in tokens
+            )
+        ):
+            raise ValueError(
+                f"Remote DSpark token response has the wrong shape; "
+                f"expected={expected_shape}, got={tokens!r}"
+            )
+        self._tokens_staging[slot][: len(active_indices), :num_speculative_tokens] = (
+            torch.tensor(tokens, dtype=torch.int64)
+        )
+
+    def _stage_positions_from_response(
+        self,
+        response: dict[str, Any],
+        active_indices: list[int],
+        num_speculative_tokens: int,
+        slot: int,
+    ) -> None:
+        sample_positions = response["logits"].get("sample_positions")
+        expected_positions = (len(active_indices), num_speculative_tokens)
+        if (
+            not isinstance(sample_positions, list)
+            or len(sample_positions) != expected_positions[0]
+            or any(
+                not isinstance(row, list) or len(row) != expected_positions[1]
+                for row in sample_positions
+            )
+        ):
+            raise ValueError(
+                "Remote DFlash sample positions have the wrong shape: "
+                f"expected={expected_positions}, got={sample_positions!r}"
+            )
+        self._positions_staging[slot][
+            : len(active_indices), :num_speculative_tokens
+        ] = torch.tensor(sample_positions, dtype=torch.int64)
+
+    def _stage_logits_from_response(
+        self,
+        response: dict[str, Any],
+        active_indices: list[int],
+        num_speculative_tokens: int,
+        slot: int,
+    ) -> None:
+        rows = len(active_indices)
+        if self._logits_topk > 0:
+            values, indices = _decode_topk_logits_frame(
+                response, (rows, num_speculative_tokens, self._logits_topk)
+            )
+            self._topk_values_staging[:rows, :num_speculative_tokens].copy_(values)
+            self._topk_indices_staging[:rows, :num_speculative_tokens].copy_(indices)
+        else:
+            logits = _decode_bfloat16_logits_frame(
+                response, (rows, num_speculative_tokens, self.vocab_size)
+            )
+            self._logits_staging[:rows, :num_speculative_tokens].copy_(logits)
+        self._stage_positions_from_response(
+            response, active_indices, num_speculative_tokens, slot
+        )
+
+    def _stage_no_draft(self, pending: _PendingProposal, slot: int) -> None:
+        """Stage the reply of a failed proposal: no draft for any request."""
+        rows = len(pending.active_indices)
+        k = pending.num_speculative_tokens
+        self._tokens_staging[slot][:rows, :k].fill_(-1)
+        self._positions_staging[slot][:rows, :k].fill_(-1)
+        if self._probabilistic:
+            if self._logits_topk > 0:
+                self._topk_values_staging[:rows, :k].fill_(TOPK_LOGITS_FILL)
+                self._topk_indices_staging[:rows, :k].zero_()
+            else:
+                self._logits_staging[:rows, :k].zero_()
+
+    def _start_reply_thread(
+        self,
+        frames: list[Any],
+        active_indices: list[int],
+        request_ids: list[str],
+        num_speculative_tokens: int,
+        input_batch: InputBatch,
+        temperature: torch.Tensor | None,
+        seeds: torch.Tensor | None,
+    ) -> None:
+        assert temperature is not None and seeds is not None
+        slot = self._staging_slot
+        self._staging_slot = (slot + 1) % len(self._tokens_staging)
+        self._pending_epoch += 1
+        pending = _PendingProposal(
+            epoch=self._pending_epoch,
+            num_reqs=input_batch.num_reqs,
+            num_speculative_tokens=num_speculative_tokens,
+            active_indices=active_indices,
+            request_ids=request_ids,
+            idx_mapping=input_batch.idx_mapping[: input_batch.num_reqs],
+            temperature=temperature,
+            seeds=seeds,
+        )
+        pending.active_gpu = torch.tensor(  # type: ignore[attr-defined]
+            active_indices, dtype=torch.int64, device=self.device
+        )
+        pending.slot = slot  # type: ignore[attr-defined]
+        thread = threading.Thread(
+            target=self._reply_worker,
+            args=(frames, pending, slot),
+            name="k3-draft-reply",
+            daemon=True,
+        )
+        pending.thread = thread
+        self._pending = pending
+        thread.start()
+
+    def _reply_worker(
+        self, frames: list[Any], pending: _PendingProposal, slot: int
+    ) -> None:
+        assert self._gate is not None
+        started = time.perf_counter()
+        try:
+            response = self._rpc(frames)
+            rpc_done = time.perf_counter()
+            self._stage_tokens_from_response(
+                response, pending.active_indices, pending.num_speculative_tokens, slot
+            )
+            if self._probabilistic:
+                self._stage_logits_from_response(
+                    response,
+                    pending.active_indices,
+                    pending.num_speculative_tokens,
+                    slot,
+                )
+            timing_ms = {
+                "reply_rpc": (rpc_done - started) * 1000,
+                "reply_stage": (time.perf_counter() - rpc_done) * 1000,
+            }
+            server_timing = response.get("timing_ms")
+            if isinstance(server_timing, dict):
+                for key, value in server_timing.items():
+                    if isinstance(value, int | float):
+                        timing_ms[f"server_{key}"] = float(value)
+            pending.timing_ms = timing_ms
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Remote K3 deferred proposal raised")
+            pending.failed = True
+            self._pending_failure = (exc, list(pending.request_ids))
+            self._stage_no_draft(pending, slot)
+        finally:
+            self._gate.release()
+
+    def resolve_pending(self) -> torch.Tensor | None:
+        """Enqueue the consumption of the pending proposal on the current stream.
+
+        Rank 0 parks the stream on the gate, then copies the staged reply to
+        the device; every rank broadcasts the frames, samples the draft and
+        returns the ``[num_reqs, K]`` draft tokens. Nothing here waits on the
+        host: the caller keeps enqueuing work that does not read the draft
+        tokens, and the stream itself waits for the reply.
+
+        Returns:
+            The draft token tensor for the proposal, or ``None`` when no
+            proposal is pending.
+        """
+        if self._pending is None:
+            return None
+        return self._resolve_pending_locked()
+
+    def _resolve_pending_locked(self) -> torch.Tensor:
+        pending = self._pending
+        assert pending is not None
+        self._pending = None
+        num_reqs = pending.num_reqs
+        active_k = pending.num_speculative_tokens
+        if self._tp_rank == 0 and pending.thread is not None:
+            assert self._gate is not None
+            self._last_resolved = pending
+            slot = pending.slot  # type: ignore[attr-defined]
+            active_gpu = pending.active_gpu  # type: ignore[attr-defined]
+            rows = len(pending.active_indices)
+            if torch.cuda.is_current_stream_capturing():
+                # A host function cannot be captured: open the gate on a side
+                # stream and wait for the reply on the host instead
+                # (proposals are never issued during capture, so this only
+                # covers a stale proposal).
+                side_stream = torch.cuda.Stream(self.device)
+                self._gate.arm(side_stream)
+                pending.thread.join()
+                side_stream.synchronize()
+            else:
+                self._gate.arm(torch.cuda.current_stream(self.device))
+            self.draft_tokens[:, :active_k].index_copy_(
+                0,
+                active_gpu,
+                self._tokens_staging[slot][:rows, :active_k].to(
+                    self.device, non_blocking=True
+                ),
+            )
+            if self._probabilistic:
+                assert self._remote_sample_positions is not None
+                if self._logits_topk > 0:
+                    assert self._remote_topk_values is not None
+                    assert self._remote_topk_indices is not None
+                    self._remote_topk_values[:, :active_k].index_copy_(
+                        0,
+                        active_gpu,
+                        self._topk_values_staging[:rows, :active_k].to(
+                            self.device, non_blocking=True
+                        ),
+                    )
+                    self._remote_topk_indices[:, :active_k].index_copy_(
+                        0,
+                        active_gpu,
+                        self._topk_indices_staging[:rows, :active_k]
+                        .to(self.device, non_blocking=True)
+                        .to(torch.int64),
+                    )
+                else:
+                    assert self._remote_logits is not None
+                    self._remote_logits[:, :active_k].index_copy_(
+                        0,
+                        active_gpu,
+                        self._logits_staging[:rows, :active_k].to(
+                            self.device, non_blocking=True
+                        ),
+                    )
+                self._remote_sample_positions[:, :active_k].index_copy_(
+                    0,
+                    active_gpu,
+                    self._positions_staging[slot][:rows, :active_k].to(
+                        self.device, non_blocking=True
+                    ),
+                )
+        if self._probabilistic:
+            self._broadcast_remote_logits(active_k)
+            self._sample_remote_probabilistic_masked(
+                pending.idx_mapping,
+                num_reqs,
+                pending.temperature,
+                pending.seeds,
+                active_k,
+            )
+        output = _contiguous_draft_output(self.draft_tokens, num_reqs, active_k)
+        self._tp_group.broadcast(output, src=0)
+        return output
+
+    def _broadcast_remote_logits(self, active_k: int) -> None:
+        assert self._remote_logits is not None
+        assert self._remote_sample_positions is not None
+        if self._logits_topk > 0:
+            assert self._remote_topk_values is not None
+            assert self._remote_topk_indices is not None
+            self._tp_group.broadcast(self._remote_topk_values, src=0)
+            self._tp_group.broadcast(self._remote_topk_indices, src=0)
+            self._materialize_topk_logits(active_k)
+        else:
+            self._tp_group.broadcast(self._remote_logits, src=0)
+        self._tp_group.broadcast(self._remote_sample_positions, src=0)
+
+    def _sample_remote_probabilistic_masked(
+        self,
+        idx_mapping: torch.Tensor,
+        num_reqs: int,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        num_speculative_tokens: int,
+    ) -> None:
+        """Sample every (request, step) slot without a host round trip.
+
+        Slots whose sample position is negative carry no draft: they sample
+        with request index -1, which keeps the Gumbel kernel from writing
+        their logits cache row, and their token stays -1.
+        """
+        assert self.draft_logits is not None
+        assert self._remote_logits is not None
+        assert self._remote_sample_positions is not None
+        positions = self._remote_sample_positions[:num_reqs, :num_speculative_tokens]
+        valid = positions >= 0
+        rows = torch.arange(num_reqs, device=self.device).repeat_interleave(
+            num_speculative_tokens
+        )
+        steps = torch.arange(num_speculative_tokens, device=self.device).repeat(
+            num_reqs
+        )
+        request_idx = torch.where(
+            valid.reshape(-1), idx_mapping[:num_reqs].index_select(0, rows), -1
+        )
+        logits = self._remote_logits[:num_reqs, :num_speculative_tokens].reshape(
+            num_reqs * num_speculative_tokens, self.vocab_size
+        )
+        sampled = self._sample_probabilistic_draft(
+            logits=logits.contiguous(),
+            positions=positions.reshape(-1) - 2,
+            idx_mapping=request_idx,
+            temperature=temperature,
+            seeds=seeds,
+            draft_step=steps,
+            draft_logits=self.draft_logits,
+        )
+        tokens = self.draft_tokens[:num_reqs, :num_speculative_tokens]
+        tokens.copy_(
+            torch.where(valid, sampled.view(num_reqs, num_speculative_tokens), tokens)
+        )
+
     def _copy_tokens_from_response(
         self,
         response: dict[str, Any],
@@ -1063,8 +1513,14 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         last_sampled: torch.Tensor,
         next_prefill_tokens: torch.Tensor,
         num_speculative_tokens: int,
+        *,
+        defer_resolve: bool = False,
+        temperature: torch.Tensor | None = None,
+        seeds: torch.Tensor | None = None,
     ) -> None:
         started = time.perf_counter()
+        self._join_reply_thread()
+        self._apply_pending_failure()
         # kimi-k3-metadata-d2h-detail: drain the stream at entry to measure
         # how much pending GPU/UVA work the runner queued before propose().
         torch.cuda.current_stream(self.device).synchronize()
@@ -1291,6 +1747,18 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             self._async_stats["deferred"] += 1
             response = {}
             rpc_done = output_copied = time.perf_counter()
+        elif defer_resolve:
+            self._start_reply_thread(
+                frames,
+                active_indices,
+                [str(request["request_id"]) for request in requests],
+                num_speculative_tokens,
+                input_batch,
+                temperature,
+                seeds,
+            )
+            response = {}
+            rpc_done = output_copied = time.perf_counter()
         else:
             response = self._rpc(frames)
             rpc_done = time.perf_counter()
@@ -1384,6 +1852,11 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 f"Remote DSpark depth must be in [1, "
                 f"{self.num_speculative_steps}], got {active_k}"
             )
+        if self._pending is not None:
+            # The runner did not consume the previous proposal (a step without
+            # a forward). Consume it here so its reply thread is released and
+            # the buffers are free for this proposal.
+            self._resolve_pending_locked()
         output = self.draft_tokens[: input_batch.num_reqs, :active_k]
         output.fill_(-1)
         if self._probabilistic:
@@ -1394,6 +1867,11 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             if self._logits_topk == 0:
                 self._remote_logits.zero_()
             self._remote_sample_positions.fill_(-1)
+        defer_resolve = (
+            self._deferred_resolve
+            and self.deferred_resolve_allowed
+            and not (dummy_run or is_profile)
+        )
         if self._tp_rank == 0 and not (dummy_run or is_profile):
             try:
                 self._rank0_propose(
@@ -1404,6 +1882,9 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                     last_sampled,
                     next_prefill_tokens,
                     active_k,
+                    defer_resolve=defer_resolve,
+                    temperature=temperature,
+                    seeds=seeds,
                 )
             except Exception:
                 output.fill_(-1)
@@ -1416,6 +1897,22 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                     "Remote K3 DSpark proposal failed; drafting is disabled for "
                     "this step"
                 )
+        if defer_resolve:
+            if self._pending is None:
+                # No reply thread was started (rank > 0, a pure ingest step,
+                # or a failed plan): the broadcast and sampling still run at
+                # resolve time so every rank executes the same collectives.
+                self._pending = _PendingProposal(
+                    epoch=self._pending_epoch,
+                    num_reqs=input_batch.num_reqs,
+                    num_speculative_tokens=active_k,
+                    active_indices=[],
+                    request_ids=[],
+                    idx_mapping=input_batch.idx_mapping[: input_batch.num_reqs],
+                    temperature=temperature,
+                    seeds=seeds,
+                )
+            return output
         if self._probabilistic and not (dummy_run or is_profile):
             assert self._remote_logits is not None
             assert self._remote_sample_positions is not None

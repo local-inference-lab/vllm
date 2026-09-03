@@ -401,6 +401,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        self._pending_draft: _PendingDraft | None = None
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -1478,18 +1479,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
-        logits_indices = combine_sampled_and_draft_tokens(
-            self.input_buffers.input_ids,
-            idx_mapping,
-            self.req_states.last_sampled_tokens,
-            query_start_loc,
-            seq_lens,
-            self.req_states.prefill_len.gpu,
-            self.req_states.draft_tokens,
-            cu_num_logits,
-            total_num_logits,
-            self.model_state.num_new_sampled_tokens_per_step,
-        )
+        # With late input ids the combine runs after the attention metadata,
+        # once a pending remote draft has been consumed in stream order.
+        if self._late_input_ids:
+            logits_indices = self.input_buffers.query_start_loc[:0]
+        else:
+            logits_indices = combine_sampled_and_draft_tokens(
+                self.input_buffers.input_ids,
+                idx_mapping,
+                self.req_states.last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                self.req_states.prefill_len.gpu,
+                self.req_states.draft_tokens,
+                cu_num_logits,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+            )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
         num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
@@ -1592,6 +1598,59 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 True
             )
         return pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)
+
+    @property
+    def _late_input_ids(self) -> bool:
+        """Whether input ids are combined after the attention metadata.
+
+        The combine reads the draft tokens; running it last lets a remote
+        speculator's reply be consumed in stream order after every host-side
+        preparation of the step. Context-parallel partitioning and the
+        capacity manager read the combined batch inside prepare_inputs, so
+        they keep the early combine.
+        """
+        return self.pcp_manager is None and self.verification_capacity_manager is None
+
+    def _finalize_input_ids(self, input_batch: InputBatch) -> None:
+        input_batch.logits_indices = combine_sampled_and_draft_tokens(
+            self.input_buffers.input_ids,
+            input_batch.idx_mapping,
+            self.req_states.last_sampled_tokens,
+            input_batch.query_start_loc,
+            input_batch.seq_lens,
+            self.req_states.prefill_len.gpu,
+            self.req_states.draft_tokens,
+            input_batch.cu_num_logits,
+            int(input_batch.cu_num_logits_np[-1]),
+            self.model_state.num_new_sampled_tokens_per_step,
+        )
+
+    def _resolve_pending_draft(self) -> None:
+        """Consume a deferred remote proposal on the current stream.
+
+        The speculator parks the stream until its reply thread has staged the
+        draft, then the draft tokens are stored for the proposed batch and,
+        when the scheduler needs them on the host, appended to that step's
+        output copy. No host wait happens here.
+        """
+        pending = self._pending_draft
+        if pending is None:
+            return
+        self._pending_draft = None
+        assert self.speculator is not None
+        draft_tokens = self.speculator.resolve_pending()
+        num_draft_tokens = pending.num_draft_tokens
+        if draft_tokens is None or num_draft_tokens == 0:
+            stored = self.req_states.draft_tokens[pending.idx_mapping, :0]
+        else:
+            self.req_states.draft_tokens[pending.idx_mapping, :num_draft_tokens] = (
+                draft_tokens[:, :num_draft_tokens]
+            )
+            stored = self.req_states.draft_tokens[
+                pending.idx_mapping, :num_draft_tokens
+            ]
+        if pending.async_output is not None:
+            pending.async_output.add_draft_token_ids(pending.req_ids, stored)
 
     def prepare_attn(
         self, input_batch: InputBatch
@@ -1734,8 +1793,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
+                self._resolve_pending_draft()
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
+        else:
+            self._resolve_pending_draft()
 
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
@@ -1822,6 +1884,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
+            self._resolve_pending_draft()
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
 
@@ -1908,6 +1971,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL
                     ),
                 )
+
+        if not dummy_run:
+            self._resolve_pending_draft()
+            if self._late_input_ids:
+                with record_function_or_nullcontext(
+                    f"vllm:v2/target/{phase}/finalize_input_ids"
+                ):
+                    self._finalize_input_ids(input_batch)
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -2223,6 +2294,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            deferring = hasattr(self.speculator, "resolve_pending")
+            if deferring:
+                # The capacity manager reads the proposal right after
+                # propose(), and a synchronous host copy for the scheduler
+                # would read it before the reply; neither can use a deferred
+                # reply. The async output's draft copy is recorded once the
+                # reply has been consumed instead.
+                self.speculator.deferred_resolve_allowed = (
+                    self.verification_capacity_manager is None
+                    and (
+                        copy_draft_with_output
+                        or not self.draft_tokens_handler.needs_host_copy(input_batch)
+                    )
+                )
             with (
                 use_workspace_lane(1),
                 record_function_or_nullcontext(f"vllm:v2/speculator/{phase}/propose"),
@@ -2247,11 +2332,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     num_spec_tokens_to_schedule,
                     self.num_speculative_steps,
                 )
+            pending_draft = deferring and self.speculator.has_pending_proposal()
             with record_function_or_nullcontext(
                 f"vllm:v2/speculator/{phase}/store_draft_tokens"
             ):
                 num_draft_tokens = draft_tokens.shape[1]
-                if num_draft_tokens > 0:
+                if pending_draft:
+                    # The tokens arrive in stream order during the next
+                    # execute_model; the store and the host copy follow there.
+                    self._pending_draft = _PendingDraft(
+                        idx_mapping=input_batch.idx_mapping,
+                        req_ids=input_batch.req_ids,
+                        num_draft_tokens=num_draft_tokens,
+                        async_output=async_output if copy_draft_with_output else None,
+                    )
+                    draft_tokens_for_next_step = draft_tokens
+                elif num_draft_tokens > 0:
                     self.req_states.draft_tokens[
                         input_batch.idx_mapping, :num_draft_tokens
                     ] = draft_tokens
@@ -2289,7 +2385,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if draft_tokens_for_next_step is not None
                     else self.req_states.draft_tokens[input_batch.idx_mapping]
                 )
-                if copy_draft_with_output:
+                if self._pending_draft is not None and copy_draft_with_output:
+                    pass  # recorded by _resolve_pending_draft
+                elif copy_draft_with_output:
                     async_output.add_draft_token_ids(
                         input_batch.req_ids, next_draft_tokens
                     )
@@ -2418,6 +2516,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @property
     def pcp_manager_cls(self) -> type[pcp.PCPManager]:
         return pcp.PCPManager
+
+
+class _PendingDraft(NamedTuple):
+    """A proposal whose draft tokens arrive in stream order during the next step.
+
+    ``idx_mapping`` and ``req_ids`` describe the batch that was proposed for;
+    ``async_output`` is the step's output whose draft copy is recorded once the
+    tokens exist on the device.
+    """
+
+    idx_mapping: torch.Tensor
+    req_ids: list[str]
+    num_draft_tokens: int
+    async_output: AsyncOutput | None
 
 
 class ExecuteModelState(NamedTuple):

@@ -104,6 +104,7 @@ def test_build_valid_context_plan_rejects_invalid_counts(rejected):
 
 def _make_prefix_matcher() -> RemoteK3DSparkSpeculator:
     proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy.method = "dflash"
     proxy._known_requests = {"old"}
     proxy._remote_block_size = 16
     proxy._remote_window_size = 32
@@ -150,3 +151,243 @@ def test_remote_prefix_match_rejects_history_before_cold_bootstrap():
         proxy._find_reconnect_source(torch.arange(96, dtype=torch.int32), 96, {"new"})
         == "old"
     )
+
+
+# --- deferred resolve: the reply is consumed in stream order -----------------
+
+
+def _requires_cuda():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the stream gate")
+
+
+def _topk_response(tokens, values, indices, positions):
+    """A PROPOSE reply in the top-k transport format."""
+    from vllm.v1.worker.gpu.spec_decode.dspark import remote_speculator as rs
+
+    shape = tuple(values.shape)
+    frame = (
+        values.contiguous().view(torch.uint16).numpy().tobytes()
+        + indices.contiguous().to(torch.int32).numpy().tobytes()
+    )
+    return {
+        "ok": True,
+        "protocol": rs.PROTOCOL_VERSION,
+        "tokens": tokens,
+        "logits": {
+            "capability": rs.TOPK_LOGITS_CAPABILITY,
+            "dtype": "bfloat16",
+            "shape": list(shape),
+            "nbytes_values": values.numel() * 2,
+            "nbytes_indices": indices.numel() * 4,
+            "sample_positions": positions,
+        },
+        "_logits_frame": frame,
+        "timing_ms": {"total": 1.0},
+    }
+
+
+class _NoBroadcast:
+    def broadcast(self, tensor, src=0):
+        return tensor
+
+
+def _make_deferred_proxy(*, max_reqs=3, steps=2, vocab=64, topk=4):
+    """A rank-0 proxy with the transport buffers of the probabilistic top-k path."""
+    import threading
+
+    from vllm.v1.worker.gpu.spec_decode.dspark import remote_speculator as rs
+
+    device = torch.device("cuda")
+    proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy.device = device
+    proxy.method = "dflash"
+    proxy._tp_rank = 0
+    proxy._tp_group = _NoBroadcast()
+    proxy._probabilistic = True
+    proxy._logits_topk = topk
+    proxy.vocab_size = vocab
+    proxy.use_fp64_gumbel = False
+    proxy.max_num_reqs = max_reqs
+    proxy.num_speculative_steps = steps
+    proxy._timing_log_interval = 0
+    proxy._timing_count = 0
+    proxy._timing_totals_ms = {}
+    proxy._disabled_requests = set()
+    proxy._async_queue = None
+    proxy._async_lock = threading.Lock()
+    proxy.draft_tokens = torch.full(
+        (max_reqs, steps), -1, dtype=torch.int64, device=device
+    )
+    proxy.draft_logits = torch.zeros(
+        (max_reqs, steps, vocab), dtype=torch.bfloat16, device=device
+    )
+    proxy._remote_logits = torch.zeros_like(proxy.draft_logits)
+    proxy._remote_sample_positions = torch.full(
+        (max_reqs, steps), -1, dtype=torch.int64, device=device
+    )
+    proxy._remote_topk_values = torch.full(
+        (max_reqs, steps, topk),
+        rs.TOPK_LOGITS_FILL,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    proxy._remote_topk_indices = torch.zeros(
+        (max_reqs, steps, topk), dtype=torch.int64, device=device
+    )
+    proxy._topk_values_staging = torch.empty(
+        (max_reqs, steps, topk), dtype=torch.bfloat16, pin_memory=True
+    )
+    proxy._topk_indices_staging = torch.empty(
+        (max_reqs, steps, topk), dtype=torch.int32, pin_memory=True
+    )
+    proxy._tokens_staging = [
+        torch.full((max_reqs, steps), -1, dtype=torch.int64, pin_memory=True)
+        for _ in range(2)
+    ]
+    proxy._positions_staging = [
+        torch.full((max_reqs, steps), -1, dtype=torch.int64, pin_memory=True)
+        for _ in range(2)
+    ]
+    proxy._staging_slot = 0
+    proxy._gate = rs._StreamGate()
+    proxy._deferred_resolve = True
+    proxy.deferred_resolve_allowed = True
+    proxy._pending = None
+    proxy._pending_failure = None
+    proxy._pending_epoch = 0
+    proxy._last_resolved = None
+    return proxy
+
+
+def _canned_reply(active, steps, topk, vocab, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    tokens = torch.randint(0, vocab, (active, steps), generator=g).tolist()
+    values = (torch.randn(active, steps, topk, generator=g) * 2).to(torch.bfloat16)
+    indices = torch.stack(
+        [torch.randperm(vocab, generator=g)[:topk] for _ in range(active * steps)]
+    ).view(active, steps, topk)
+    positions = [
+        [
+            5 + r * 10 + s if not (r == 0 and s == steps - 1) else -1
+            for s in range(steps)
+        ]
+        for r in range(active)
+    ]
+    return tokens, values, indices, positions
+
+
+def test_stream_gate_parks_the_stream_until_released():
+    """Work enqueued behind the gate runs only after another thread releases it."""
+    _requires_cuda()
+    import threading
+    import time
+
+    from vllm.v1.worker.gpu.spec_decode.dspark.remote_speculator import _StreamGate
+
+    gate = _StreamGate()
+    stream = torch.cuda.Stream()
+    x = torch.zeros(1024, device="cuda")
+    with torch.cuda.stream(stream):
+        gate.arm(stream)
+        x.fill_(7.0)
+        done = torch.cuda.Event()
+        done.record(stream)
+    time.sleep(0.05)
+    assert not done.query()
+    threading.Thread(target=gate.release, daemon=True).start()
+    done.synchronize()
+    assert torch.all(x == 7.0)
+
+
+def test_deferred_resolve_reproduces_the_immediate_reply_path():
+    """The gate-ordered copies, broadcast and masked sampling yield the same
+    draft tokens and cached draft logits as consuming the reply immediately."""
+    _requires_cuda()
+    import time
+
+    steps, topk, vocab, max_reqs = 2, 4, 64, 3
+    active = [0, 2]
+    reply = _canned_reply(len(active), steps, topk, vocab)
+    response = _topk_response(*reply)
+    idx_mapping = torch.tensor([1, 4, 2], dtype=torch.int64, device="cuda")
+    temperature = torch.full((8,), 0.7, device="cuda")
+    seeds = torch.arange(8, device="cuda", dtype=torch.int64) * 977
+    batch = SimpleNamespace(num_reqs=max_reqs, idx_mapping=idx_mapping)
+
+    immediate = _make_deferred_proxy(
+        max_reqs=max_reqs, steps=steps, vocab=vocab, topk=topk
+    )
+    immediate._copy_tokens_from_response(response, active, steps)
+    immediate._copy_logits_from_response(response, active, steps)
+    immediate._broadcast_remote_logits(steps)
+    immediate._sample_remote_probabilistic(batch, temperature, seeds, steps)
+    torch.cuda.synchronize()
+
+    deferred = _make_deferred_proxy(
+        max_reqs=max_reqs, steps=steps, vocab=vocab, topk=topk
+    )
+    # Compile the sampling kernels before the timed run: a kernel compiled
+    # behind the gate would only delay the host, not the check below.
+    deferred._sample_remote_probabilistic_masked(
+        idx_mapping, max_reqs, temperature, seeds, steps
+    )
+    deferred.draft_tokens.fill_(-1)
+    deferred.draft_logits.zero_()
+    torch.cuda.synchronize()
+
+    def slow_rpc(frames):
+        time.sleep(0.3)
+        return response
+
+    deferred._rpc = slow_rpc
+    deferred._start_reply_thread(
+        [b"header"], active, ["a", "c"], steps, batch, temperature, seeds
+    )
+    assert deferred.has_pending_proposal()
+    output = deferred.resolve_pending()
+    marker = torch.cuda.Event()
+    marker.record()
+    assert not marker.query()  # the stream is parked until the reply is staged
+    torch.cuda.synchronize()
+    assert not deferred.has_pending_proposal()
+    assert torch.equal(output, immediate.draft_tokens[:max_reqs, :steps])
+    assert torch.equal(deferred.draft_tokens, immediate.draft_tokens)
+    assert torch.equal(deferred.draft_logits, immediate.draft_logits)
+    assert torch.equal(
+        deferred._remote_sample_positions, immediate._remote_sample_positions
+    )
+    deferred._join_reply_thread()
+
+
+def test_deferred_resolve_failure_yields_no_draft_and_disables_requests():
+    """A reply thread that fails still releases the gate with a no-draft reply,
+    and the failed requests are disabled at the next proposal."""
+    _requires_cuda()
+    steps, topk, vocab, max_reqs = 2, 4, 64, 2
+    proxy = _make_deferred_proxy(max_reqs=max_reqs, steps=steps, vocab=vocab, topk=topk)
+    proxy.draft_tokens.fill_(3)
+
+    def failing_rpc(frames):
+        raise RuntimeError("draft server unreachable")
+
+    proxy._rpc = failing_rpc
+    batch = SimpleNamespace(
+        num_reqs=max_reqs,
+        idx_mapping=torch.tensor([0, 1], dtype=torch.int64, device="cuda"),
+    )
+    proxy._start_reply_thread(
+        [b"header"],
+        [0, 1],
+        ["a", "b"],
+        steps,
+        batch,
+        torch.ones(4, device="cuda"),
+        torch.zeros(4, dtype=torch.int64, device="cuda"),
+    )
+    output = proxy.resolve_pending()
+    torch.cuda.synchronize()
+    assert output.tolist() == [[-1, -1], [-1, -1]]
+    proxy._join_reply_thread()
+    proxy._apply_pending_failure()
+    assert proxy._disabled_requests == {"a", "b"}
