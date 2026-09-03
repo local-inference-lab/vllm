@@ -73,7 +73,9 @@ def _encode_topk_logits_frame(
     if logits.dtype != torch.bfloat16:
         raise ValueError(f"Draft logits must be bfloat16, got {logits.dtype}")
     if logits.ndim != 3:
-        raise ValueError(f"Draft logits must be [requests, K, vocab], got {logits.shape}")
+        raise ValueError(
+            f"Draft logits must be [requests, K, vocab], got {logits.shape}"
+        )
     vocab = int(logits.shape[-1])
     if not 1 <= k <= vocab:
         raise ValueError(f"logits_topk must be in [1, {vocab}], got {k}")
@@ -1379,8 +1381,15 @@ class K3DSparkDraftEngine:
             logits_frame = None
             if return_logits and logits_topk > 0:
                 assert draft_logits is not None
-                count = int(draft_logits.shape[0]) * int(draft_logits.shape[1]) * logits_topk
-                if self._topk_values_host is None or self._topk_values_host.numel() < count:
+                count = (
+                    int(draft_logits.shape[0])
+                    * int(draft_logits.shape[1])
+                    * logits_topk
+                )
+                if (
+                    self._topk_values_host is None
+                    or self._topk_values_host.numel() < count
+                ):
                     self._topk_values_host = torch.empty(
                         count, dtype=torch.bfloat16, pin_memory=True
                     )
