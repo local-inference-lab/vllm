@@ -133,6 +133,93 @@ def _write_pool(
     tl.store(cache_fp32 + scale_byte_offset // 4, scale, mask=write_mask)
 
 
+class DecodeTailRing:
+    """Per-request-slot bookkeeping that lets the C4 tail ring be rebuilt
+    after speculative-decode rejection.
+
+    ``_decode_update_kernel`` writes ``tail[slot][pos % 4]`` for every row it
+    processes, including draft rows that verification later rejects. The
+    ring therefore ends a step holding keys of rejected positions and the
+    next completed pool is averaged from wrong keys. Before processing a
+    step, the kernel restores ``snapshot`` (the ring as it was at the start
+    of the previous step) and replays only the accepted prefix of the
+    previous step's saved rows.
+
+    snapshot: [max_seqs, 2, POOL_SIZE, HEAD_DIM]  copy of ``tail`` at step start
+    rows:     [max_seqs, max_rows, 2, HEAD_DIM]   key/gate of each processed row
+    slots:    [max_seqs, max_rows] int32          pos % POOL_SIZE of each row
+    start:    [max_seqs] int64                    position of the first row
+    count:    [max_seqs] int32                    rows saved (0 = no restore)
+    """
+
+    def __init__(
+        self,
+        tail: torch.Tensor,
+        max_rows: int,
+    ) -> None:
+        """Allocate ring bookkeeping matching a ``[max_seqs, 2, 4, 128]`` tail.
+
+        Args:
+            tail: The live C4 tail ring ``[max_seqs, 2, POOL_SIZE, HEAD_DIM]``
+                (index 0 = keys, index 1 = gates) whose device, dtype and
+                shape the snapshot mirrors.
+            max_rows: Rows saved per request slot per step, normally
+                ``1 + num_speculative_tokens``. Values below 1 are clamped to 1.
+
+        Raises:
+            ValueError: If ``tail`` is not ``[max_seqs, 2, 4, 128]``.
+        """
+        max_seqs, two, pool_size, head_dim = map(int, tail.shape)
+        if two != 2 or pool_size != _POOL_SIZE or head_dim != _HEAD_DIM:
+            raise ValueError("GLM tail ring must be [max_seqs, 2, 4, 128]")
+        self.max_rows = max(int(max_rows), 1)
+        self.snapshot = torch.zeros_like(tail)
+        self.rows = torch.zeros(
+            (max_seqs, self.max_rows, 2, head_dim), dtype=tail.dtype, device=tail.device
+        )
+        self.slots = torch.zeros(
+            (max_seqs, self.max_rows), dtype=torch.int32, device=tail.device
+        )
+        self.start = torch.zeros(max_seqs, dtype=torch.int64, device=tail.device)
+        self.count = torch.zeros(max_seqs, dtype=torch.int32, device=tail.device)
+
+
+@triton.jit
+def _copy_ring(
+    src,
+    dst,
+    state_slot,
+    dim,
+    mask,
+    stride_0,
+    stride_1,
+    stride_2,
+    POOL_SIZE: tl.constexpr,
+):
+    """Copy one request slot's key and gate ring between two ring buffers.
+
+    Args:
+        src: Source ring tensor (``tail`` or its snapshot), same layout as ``dst``.
+        dst: Destination ring tensor.
+        state_slot: Request state slot (int64 scalar) selecting the ring.
+        dim: ``tl.arange(0, BLOCK_D)`` head-dim lane offsets.
+        mask: Per-lane store mask; all-false skips the copy for this slot.
+        stride_0: Element stride between request slots.
+        stride_1: Element stride between the key plane and the gate plane.
+        stride_2: Element stride between ring positions.
+        POOL_SIZE: Ring positions per slot (4 for GLM C4).
+
+    Returns:
+        None. Writes ``dst`` in place.
+    """
+    for slot in tl.static_range(0, POOL_SIZE):
+        base = state_slot * stride_0 + slot * stride_2 + dim
+        value = tl.load(src + base, mask=mask, other=0.0)
+        tl.store(dst + base, value, mask=mask)
+        score = tl.load(src + base + stride_1, mask=mask, other=0.0)
+        tl.store(dst + base + stride_1, score, mask=mask)
+
+
 @triton.jit
 def _decode_update_kernel(
     cache_fp8,
@@ -145,6 +232,12 @@ def _decode_update_kernel(
     ape,
     slot_mapping,
     positions,
+    ring_snapshot,
+    ring_rows,
+    ring_slots,
+    ring_start,
+    ring_count,
+    num_accepted,
     page_stride_bytes,
     model_block_size,
     parent_stride_pages,
@@ -160,13 +253,135 @@ def _decode_update_kernel(
     FP8_MAX: tl.constexpr,
     BLOCK_D: tl.constexpr,
     PACKED_MAIN_SLOTS: tl.constexpr,
+    MAX_SAVED: tl.constexpr,
 ):
+    """Write completed FP8 C4 pools and maintain the tail ring for decode rows.
+
+    One program per decode (or speculative-decode) request; rows are processed
+    in position order. Before the first row the ring is rebuilt from the
+    previous step's snapshot plus the accepted prefix of that step's saved rows,
+    so keys of rejected draft tokens never reach a completed pool. After the
+    rebuild the ring is snapshotted again and this step's rows are saved.
+
+    Args:
+        cache_fp8: FP8 view of the C4 index cache (pooled keys).
+        cache_fp32: FP32 view of the same cache (per-pool scales).
+        tail: Tail ring ``[max_seqs, 2, POOL_SIZE, HEAD_DIM]``.
+        state_slots: ``[num_requests]`` int32 request state slot per batch row;
+            ``-1`` marks a padded request that must not write.
+        query_start_loc: ``[num_requests + 1]`` int32 row offsets per request.
+        key: ``[rows, HEAD_DIM]`` normalized index keys.
+        gate: ``[rows, HEAD_DIM]`` pooling gate logits.
+        ape: ``[POOL_SIZE, HEAD_DIM]`` absolute pool-position embedding.
+        slot_mapping: ``[rows]`` main-cache slot of every row.
+        positions: ``[rows]`` int64 token positions.
+        ring_snapshot: ``DecodeTailRing.snapshot``, ring state at step start.
+        ring_rows: ``DecodeTailRing.rows``, saved key/gate per processed row.
+        ring_slots: ``DecodeTailRing.slots``, ``pos % POOL_SIZE`` per saved row.
+        ring_start: ``DecodeTailRing.start``, first position of the saved step.
+        ring_count: ``DecodeTailRing.count``, rows saved (0 disables restore).
+        num_accepted: ``[num_requests]`` int32 committed accepted-row count of
+            the previous step; cross-checked against the position-derived count.
+        page_stride_bytes: Byte stride between C4 index pages.
+        model_block_size: Tokens per main-cache block (packed layout only).
+        parent_stride_pages: C4 pages per main-cache block (packed layout only).
+        tail_stride_0: ``tail`` element stride between request slots.
+        tail_stride_1: ``tail`` element stride between the key and gate planes.
+        tail_stride_2: ``tail`` element stride between ring positions.
+        key_stride_0: Row stride of ``key``.
+        gate_stride_0: Row stride of ``gate``.
+        ape_stride_0: Row stride of ``ape``.
+        PAGE_SIZE: Pooled entries per C4 index page (64).
+        HEAD_DIM: Index head dimension (128).
+        POOL_SIZE: Tokens per pool and ring positions per slot (4).
+        FP8_MAX: Largest finite value of the FP8 cache dtype.
+        BLOCK_D: Lane block covering ``HEAD_DIM``.
+        PACKED_MAIN_SLOTS: Whether ``slot_mapping`` addresses the packed main
+            cache (pools are then written only at ``pos % POOL_SIZE == 3``).
+        MAX_SAVED: Capacity of ``ring_rows`` per slot; requests with more rows
+            are processed but not saved (no speculative rejection is possible).
+
+    Returns:
+        None. Writes the index cache, ``tail`` and the ring bookkeeping in place.
+    """
     request = tl.program_id(0)
     state_slot = tl.load(state_slots + request).to(tl.int64)
     start = tl.load(query_start_loc + request)
     end = tl.load(query_start_loc + request + 1)
     dim = tl.arange(0, BLOCK_D)
-    dim_mask = (dim < HEAD_DIM) & (state_slot >= 0)
+    valid_slot = state_slot >= 0
+    dim_mask = (dim < HEAD_DIM) & valid_slot
+    count = end - start
+
+    # ---- Rebuild the ring from the previous speculative step. ----
+    # The previous step saved the ring at its start plus every row it wrote.
+    # Verification accepted a prefix of those rows; this step's first position
+    # is ``prev_start + accepted``, so the accepted length is position-derived
+    # and ``num_accepted`` (the runner's committed count) only cross-checks it.
+    prev_count = tl.load(ring_count + state_slot, mask=valid_slot, other=0)
+    prev_start = tl.load(ring_start + state_slot, mask=valid_slot, other=0)
+    first_position = tl.load(positions + start, mask=valid_slot, other=0).to(tl.int64)
+    accepted = tl.load(num_accepted + request, mask=valid_slot, other=1)
+    replay = first_position - prev_start
+    restore = valid_slot & (prev_count > 0) & (replay >= 0) & (replay <= prev_count)
+    # A committed count that disagrees with the positions means the runner
+    # re-based the request (resume/replay); positions are authoritative.
+    replay = tl.where(accepted == replay, accepted, replay)
+    ring_mask = dim_mask & restore
+    _copy_ring(
+        ring_snapshot,
+        tail,
+        state_slot,
+        dim,
+        ring_mask,
+        tail_stride_0,
+        tail_stride_1,
+        tail_stride_2,
+        POOL_SIZE,
+    )
+    # Names in this static loop are distinct from everything assigned inside
+    # the runtime row loop below: Triton treats any pre-existing name that is
+    # reassigned in a tl.range body as loop-carried and requires one type.
+    for replay_i in tl.static_range(0, MAX_SAVED):
+        replay_use = ring_mask & (replay_i < replay)
+        replay_slot = tl.load(
+            ring_slots + state_slot * MAX_SAVED + replay_i,
+            mask=restore & (replay_i < replay),
+            other=0,
+        ).to(tl.int64)
+        replay_base = ((state_slot * MAX_SAVED + replay_i) * 2) * HEAD_DIM + dim
+        replay_key = tl.load(ring_rows + replay_base, mask=replay_use, other=0.0)
+        replay_gate = tl.load(
+            ring_rows + replay_base + HEAD_DIM, mask=replay_use, other=0.0
+        )
+        replay_tail = state_slot * tail_stride_0 + replay_slot * tail_stride_2 + dim
+        tl.store(tail + replay_tail, replay_key, mask=replay_use)
+        tl.store(tail + replay_tail + tail_stride_1, replay_gate, mask=replay_use)
+
+    # ---- Snapshot the (restored) ring and this step's row range. ----
+    _copy_ring(
+        tail,
+        ring_snapshot,
+        state_slot,
+        dim,
+        dim_mask,
+        tail_stride_0,
+        tail_stride_1,
+        tail_stride_2,
+        POOL_SIZE,
+    )
+    save_rows = valid_slot & (count <= MAX_SAVED)
+    one = tl.arange(0, 1)
+    tl.store(
+        ring_start + state_slot + one,
+        tl.zeros([1], tl.int64) + first_position,
+        mask=(one == 0) & valid_slot,
+    )
+    tl.store(
+        ring_count + state_slot + one,
+        tl.zeros([1], tl.int32) + tl.where(save_rows, count, 0),
+        mask=(one == 0) & valid_slot,
+    )
     for row in tl.range(start, end):
         position = tl.load(positions + row).to(tl.int64)
         physical_slot = position % POOL_SIZE
@@ -249,6 +464,17 @@ def _decode_update_kernel(
         base = state_slot * tail_stride_0 + physical_slot * tail_stride_2
         tl.store(tail + base + dim, current_key, mask=dim_mask)
         tl.store(tail + base + tail_stride_1 + dim, current_gate, mask=dim_mask)
+        row_ordinal = (row - start).to(tl.int64)
+        save_mask = dim_mask & save_rows & (row_ordinal < MAX_SAVED)
+        save_index = tl.minimum(row_ordinal, MAX_SAVED - 1)
+        save_base = ((state_slot * MAX_SAVED + save_index) * 2) * HEAD_DIM + dim
+        tl.store(ring_rows + save_base, current_key, mask=save_mask)
+        tl.store(ring_rows + save_base + HEAD_DIM, current_gate, mask=save_mask)
+        tl.store(
+            ring_slots + state_slot * MAX_SAVED + save_index + one,
+            tl.zeros([1], tl.int32) + physical_slot.to(tl.int32),
+            mask=(one == 0) & save_rows & (row_ordinal < MAX_SAVED),
+        )
 
 
 @triton.jit
@@ -395,6 +621,7 @@ def _prefill_tail_kernel(
     key,
     gate,
     positions,
+    ring_count,
     request_offset,
     tail_stride_0,
     tail_stride_1,
@@ -405,6 +632,33 @@ def _prefill_tail_kernel(
     POOL_SIZE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
+    """Write a prefill request's trailing partial pool into the tail ring.
+
+    One program per prefill request. Also zeroes the slot's saved-row count so
+    the next decode step does not restore a speculative snapshot taken before
+    this chunk.
+
+    Args:
+        tail: Tail ring ``[max_seqs, 2, POOL_SIZE, HEAD_DIM]``.
+        state_slots: ``[num_requests]`` int32 request state slot per batch row.
+        query_start_loc: ``[num_requests + 1]`` int32 row offsets per request.
+        key: ``[rows, HEAD_DIM]`` normalized index keys.
+        gate: ``[rows, HEAD_DIM]`` pooling gate logits.
+        positions: ``[rows]`` int64 token positions.
+        ring_count: ``DecodeTailRing.count``; set to 0 for this slot.
+        request_offset: Batch index of the first prefill request.
+        tail_stride_0: ``tail`` element stride between request slots.
+        tail_stride_1: ``tail`` element stride between the key and gate planes.
+        tail_stride_2: ``tail`` element stride between ring positions.
+        key_stride_0: Row stride of ``key``.
+        gate_stride_0: Row stride of ``gate``.
+        HEAD_DIM: Index head dimension (128).
+        POOL_SIZE: Tokens per pool and ring positions per slot (4).
+        BLOCK_D: Lane block covering ``HEAD_DIM``.
+
+    Returns:
+        None. Writes ``tail`` and ``ring_count`` in place.
+    """
     request = request_offset + tl.program_id(0)
     state_slot = tl.load(state_slots + request).to(tl.int64)
     start = tl.load(query_start_loc + request).to(tl.int64)
@@ -438,6 +692,14 @@ def _prefill_tail_kernel(
         tail_offset = state_slot * tail_stride_0 + slot * tail_stride_2 + dim
         tl.store(tail + tail_offset, value, mask=write_slot)
         tl.store(tail + tail_offset + tail_stride_1, score, mask=write_slot)
+    # A prefill chunk rewrites the ring directly; drop any speculative
+    # snapshot so the next decode step does not restore a stale ring.
+    one = tl.arange(0, 1)
+    tl.store(
+        ring_count + state_slot + one,
+        tl.zeros([1], tl.int32),
+        mask=(one == 0) & has_rows & (state_slot >= 0),
+    )
 
 
 def update_decode_pools(
@@ -452,6 +714,8 @@ def update_decode_pools(
     positions: torch.Tensor,
     num_requests: int,
     *,
+    tail_ring: DecodeTailRing,
+    num_accepted_tokens: torch.Tensor | None = None,
     num_decode_requests: int | None = None,
     max_query_len: int | None = None,
     model_block_size: int | None = None,
@@ -459,10 +723,41 @@ def update_decode_pools(
 ) -> None:
     """Update request tails and write every newly completed FP8 C4 pool.
 
-    Decode and speculative-decode requests retain ordered row processing. Prefill
-    requests use one program per completed pool and a separate final-tail update;
-    their positions must be consecutive within each request, as required by the
-    packed GLM MLA cache contract.
+    Decode and speculative-decode requests retain ordered row processing and
+    rebuild their tail ring from the previous step's snapshot so rejected draft
+    rows never contribute to a pool. Prefill requests use one program per
+    completed pool and a separate final-tail update; their positions must be
+    consecutive within each request, as required by the packed GLM MLA cache
+    contract.
+
+    Args:
+        kv_cache: C4 index cache ``[pages, 64, 132]`` uint8 (FP8 keys + scales).
+        tail: Tail ring ``[max_seqs, 2, 4, 128]`` bf16.
+        state_slots: ``[num_requests]`` int32 request state slot per batch row.
+        query_start_loc: ``[num_requests + 1]`` int32 row offsets per request.
+        key: ``[rows, 128]`` normalized index keys.
+        gate: ``[rows, 128]`` pooling gate logits.
+        ape: ``[4, 128]`` absolute pool-position embedding.
+        slot_mapping: ``[rows]`` main-cache slot of every row.
+        positions: ``[rows]`` int64 token positions.
+        num_requests: Number of batch rows in ``state_slots``.
+        tail_ring: Speculative-decode ring bookkeeping for ``tail``.
+        num_accepted_tokens: ``[>= num_requests]`` int32 committed accepted-row
+            count of the previous step; defaults to all ones.
+        num_decode_requests: Leading decode requests; the rest are prefills.
+            Defaults to ``num_requests``.
+        max_query_len: Longest request in rows; required with prefills.
+        model_block_size: Tokens per main-cache block for the packed layout.
+        parent_stride_pages: C4 pages per main-cache block for the packed layout.
+
+    Returns:
+        None. Writes ``kv_cache``, ``tail`` and ``tail_ring`` in place.
+
+    Raises:
+        ValueError: If the page size is not 64, the packed-layout arguments are
+            inconsistent, the decode request count exceeds the batch, prefill
+            requests lack ``max_query_len`` or packed slots, ``tail_ring`` does
+            not match ``tail``, or ``num_accepted_tokens`` has the wrong shape.
     """
     if num_requests <= 0:
         return
@@ -493,6 +788,18 @@ def update_decode_pools(
         raise ValueError("parallel GLM prefill requires packed main-cache slots")
     if num_prefill_requests and (max_query_len is None or max_query_len <= 0):
         raise ValueError("parallel GLM prefill requires a positive max_query_len")
+    if tuple(tail_ring.snapshot.shape) != tuple(tail.shape):
+        raise ValueError("GLM tail ring snapshot must match the tail buffer")
+    if num_accepted_tokens is None:
+        num_accepted_tokens = torch.ones(
+            num_requests, dtype=torch.int32, device=tail.device
+        )
+    elif (
+        num_accepted_tokens.dtype != torch.int32
+        or num_accepted_tokens.ndim != 1
+        or int(num_accepted_tokens.shape[0]) < num_requests
+    ):
+        raise ValueError("GLM num_accepted_tokens must be int32 [>= num_requests]")
 
     common_args = (
         kv_cache.view(torch.float8_e4m3fn),
@@ -525,8 +832,16 @@ def update_decode_pools(
     )
     if num_decode_requests:
         _decode_update_kernel[(num_decode_requests,)](
-            *common_args,
+            *common_args[:10],
+            tail_ring.snapshot,
+            tail_ring.rows,
+            tail_ring.slots,
+            tail_ring.start,
+            tail_ring.count,
+            num_accepted_tokens,
+            *common_args[10:],
             PACKED_MAIN_SLOTS=packed_main_slots,
+            MAX_SAVED=tail_ring.max_rows,
             **common_meta,
         )
     if num_prefill_requests:
@@ -546,6 +861,7 @@ def update_decode_pools(
             key,
             gate,
             positions,
+            tail_ring.count,
             num_decode_requests,
             int(tail.stride(0)),
             int(tail.stride(1)),
@@ -913,6 +1229,7 @@ def expand_pool_ids(
 
 
 __all__ = [
+    "DecodeTailRing",
     "expand_c4_block_table",
     "expand_pool_ids",
     "fwht128_quant_fp8",
