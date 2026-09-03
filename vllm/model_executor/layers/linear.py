@@ -39,11 +39,41 @@ from vllm.model_executor.parameter import (
     PackedvLLMParameter,
     PerTensorScaleParameter,
     RowvLLMParameter,
+    load_tensor_parallel_weight,
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+def _validate_loaded_axis_size(
+    name: str,
+    loaded_size: int,
+    physical_size: int,
+) -> None:
+    if loaded_size <= 0:
+        raise ValueError(f"{name} must be positive, got {loaded_size}")
+    if loaded_size > physical_size:
+        raise ValueError(
+            f"{name}={loaded_size} exceeds physical size {physical_size}"
+        )
+
+
+def _validate_packed_loaded_size(
+    param: Parameter,
+    dim: int,
+    loaded_size: int,
+    name: str,
+) -> None:
+    """Reject a padded packed layout before any destination writes occur."""
+    if getattr(param, "packed_dim", None) != dim:
+        return
+    packed_factor = getattr(param, "packed_factor", 1)
+    if loaded_size % packed_factor:
+        raise ValueError(
+            f"{name}={loaded_size} is not divisible by packed_factor="
+            f"{packed_factor}"
+        )
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "UnquantizedLinearMethod",
@@ -431,6 +461,9 @@ class ColumnParallelLinear(LinearBase):
             shard per rank (see ``DCPGroupColumnParallelLinear``).
         tp_size: Override the tensor-parallel world size used for sharding.
             Defaults to the global TP world size.
+        loaded_output_size: Output dimension represented by the checkpoint.
+            Defaults to ``output_size``. A smaller explicit value enables
+            destination-local zero padding for the physical TP shard tail.
     """
 
     # --8<-- [end:column_parallel_linear]
@@ -450,6 +483,7 @@ class ColumnParallelLinear(LinearBase):
         disable_tp: bool = False,
         tp_rank: int | None = None,
         tp_size: int | None = None,
+        loaded_output_size: int | None = None,
     ):
         # Divide the weight matrix along the last dimension.
         if disable_tp:
@@ -463,6 +497,16 @@ class ColumnParallelLinear(LinearBase):
                 if tp_size is not None
                 else get_tensor_model_parallel_world_size()
             )
+        self.loaded_output_size = (
+            output_size if loaded_output_size is None else loaded_output_size
+        )
+        _validate_loaded_axis_size(
+            "loaded_output_size", self.loaded_output_size, output_size
+        )
+        self._allow_loaded_output_padding = (
+            loaded_output_size is not None
+            and self.loaded_output_size != output_size
+        )
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
         self.output_partition_sizes = [self.output_size_per_partition]
@@ -552,9 +596,22 @@ class ColumnParallelLinear(LinearBase):
 
         param_data = param.data
         if output_dim is not None and not is_sharded_weight:
+            _validate_packed_loaded_size(
+                param,
+                output_dim,
+                self.loaded_output_size,
+                "loaded_output_size",
+            )
             shard_size = param_data.shape[output_dim]
             start_idx = self.tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            load_tensor_parallel_weight(
+                param_data,
+                loaded_weight,
+                output_dim,
+                start_idx,
+                allow_padding=self._allow_loaded_output_padding,
+            )
+            return
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
@@ -570,7 +627,10 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
-        param.load_column_parallel_weight(loaded_weight=loaded_weight)
+        param.load_column_parallel_weight(
+            loaded_weight=loaded_weight,
+            allow_padding=self._allow_loaded_output_padding,
+        )
 
     def forward(
         self,
@@ -666,6 +726,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         return_bias: If true, return bias together with outputs in forward pass.
         disable_tp: If true, all weights matrix won't be sharded, this layer
                     will be treated as a "Replicated" MergedLinear.
+        loaded_output_sizes: Output dimensions represented by the checkpoint.
+            Defaults to ``output_sizes``. Smaller explicit values enable
+            destination-local zero padding for physical TP shard tails.
     """
 
     def __init__(
@@ -681,8 +744,30 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        loaded_output_sizes: list[int] | None = None,
     ):
         self.output_sizes = output_sizes
+        self.loaded_output_sizes = (
+            output_sizes if loaded_output_sizes is None else loaded_output_sizes
+        )
+        if len(self.loaded_output_sizes) != len(self.output_sizes):
+            raise ValueError(
+                "loaded_output_sizes must have the same length as output_sizes"
+            )
+        for shard_id, (loaded_size, physical_size) in enumerate(
+            zip(self.loaded_output_sizes, self.output_sizes)
+        ):
+            _validate_loaded_axis_size(
+                f"loaded_output_sizes[{shard_id}]",
+                loaded_size,
+                physical_size,
+            )
+        self._allow_loaded_output_padding = [
+            loaded_output_sizes is not None and loaded_size != physical_size
+            for loaded_size, physical_size in zip(
+                self.loaded_output_sizes, self.output_sizes
+            )
+        ]
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
 
@@ -753,15 +838,16 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 param_data.copy_(loaded_weight)
                 return
 
-            output_sizes = (
-                self.output_sizes[loaded_shard_id[0] : loaded_shard_id[-1] + 1]
+            shard_ids = (
+                list(loaded_shard_id)
                 if loaded_shard_id is not None
-                else self.output_sizes
+                else list(range(len(self.loaded_output_sizes)))
             )
+            output_sizes = [self.loaded_output_sizes[idx] for idx in shard_ids]
             current_shard_offset = 0
             shard_offsets: list[tuple[int, int, int]] = []
-            for i, output_size in enumerate(output_sizes):
-                shard_offsets.append((i, current_shard_offset, output_size))
+            for shard_id, output_size in zip(shard_ids, output_sizes):
+                shard_offsets.append((shard_id, current_shard_offset, output_size))
                 current_shard_offset += output_size
             packed_dim = getattr(param, "packed_dim", None)
             for shard_id, shard_offset, shard_size in shard_offsets:
@@ -776,6 +862,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     )
 
                 if packed_dim == output_dim:
+                    _validate_packed_loaded_size(
+                        param,
+                        output_dim,
+                        self.loaded_output_sizes[shard_id],
+                        f"loaded_output_sizes[{shard_id}]",
+                    )
                     shard_size = shard_size // param.packed_factor
                     shard_offset = shard_offset // param.packed_factor
                     # Special case for Marlin.
@@ -818,7 +910,16 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
             if not is_sharded_weight:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                load_tensor_parallel_weight(
+                    param_data,
+                    loaded_weight,
+                    output_dim,
+                    start_idx,
+                    allow_padding=self._allow_loaded_output_padding[
+                        loaded_shard_id
+                    ],
+                )
+                return
         # Special case for per-tensor scales in fused case.
         elif needs_scalar_to_array:
             param_data, loaded_weight = adjust_scalar_to_fused_array(
@@ -842,6 +943,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         param: BasevLLMParameter,
         loaded_weight: torch.Tensor,
         output_sizes: list[int] | None = None,
+        shard_ids: list[int] | None = None,
     ):
         """
         Handle special case for models where MLP layers are already
@@ -855,9 +957,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         current_shard_offset = 0
         shard_offsets: list[tuple[int, int, int]] = []
-        output_sizes = output_sizes or self.output_sizes
-        for i, output_size in enumerate(output_sizes):
-            shard_offsets.append((i, current_shard_offset, output_size))
+        output_sizes = output_sizes or self.loaded_output_sizes
+        shard_ids = shard_ids or list(range(len(output_sizes)))
+        if len(shard_ids) != len(output_sizes):
+            raise ValueError("shard_ids and output_sizes must have the same length")
+        for shard_id, output_size in zip(shard_ids, output_sizes):
+            shard_offsets.append((shard_id, current_shard_offset, output_size))
             current_shard_offset += output_size
 
         for shard_id, shard_offset, shard_size in shard_offsets:
@@ -905,20 +1010,24 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 param.load_merged_column_weight(loaded_weight=loaded_weight)
                 return
-            output_sizes = (
-                [self.output_sizes[idx] for idx in loaded_shard_id]
-                if loaded_shard_id
-                else None
+            shard_ids = (
+                list(loaded_shard_id)
+                if loaded_shard_id is not None
+                else list(range(len(self.loaded_output_sizes)))
             )
+            output_sizes = [self.loaded_output_sizes[idx] for idx in shard_ids]
             if isinstance(param, BlockQuantScaleParameter):
                 weight_block_size = getattr(self, "weight_block_size", None)
                 output_sizes = [
                     adjust_block_scale_shard(weight_block_size, size, 0)[0]
-                    for size in (output_sizes or self.output_sizes)
+                    for size in output_sizes
                 ]
             # TODO: @dsikka - move to parameter.py
             self._load_fused_module_from_checkpoint(
-                param, loaded_weight, output_sizes=output_sizes
+                param,
+                loaded_weight,
+                output_sizes=output_sizes,
+                shard_ids=shard_ids,
             )
             return
 
@@ -940,6 +1049,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_id=loaded_shard_id,
             shard_offset=shard_offset,
             shard_size=shard_size,
+            allow_padding=self._allow_loaded_output_padding[loaded_shard_id],
         )
 
     def load_weights(
@@ -994,6 +1104,10 @@ class QKVParallelLinear(ColumnParallelLinear):
                         (e.g. model.layers.0.qkv_proj)
         return_bias: If true, return bias together with outputs in forward pass.
         disable_tp: If true, weights matrix won't be sharded through tp rank.
+        loaded_total_num_heads: Query-head count represented by the checkpoint.
+            Defaults to ``total_num_heads``.
+        loaded_total_num_kv_heads: KV-head count represented by the checkpoint.
+            Defaults to ``total_num_kv_heads``.
     """
 
     def __init__(
@@ -1011,6 +1125,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         return_bias: bool = True,
         disable_tp: bool = False,
         v_head_size: int | None = None,
+        loaded_total_num_heads: int | None = None,
+        loaded_total_num_kv_heads: int | None = None,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -1019,6 +1135,34 @@ class QKVParallelLinear(ColumnParallelLinear):
         if total_num_kv_heads is None:
             total_num_kv_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
+        self.loaded_total_num_heads = (
+            total_num_heads
+            if loaded_total_num_heads is None
+            else loaded_total_num_heads
+        )
+        self.loaded_total_num_kv_heads = (
+            total_num_kv_heads
+            if loaded_total_num_kv_heads is None
+            else loaded_total_num_kv_heads
+        )
+        _validate_loaded_axis_size(
+            "loaded_total_num_heads",
+            self.loaded_total_num_heads,
+            self.total_num_heads,
+        )
+        _validate_loaded_axis_size(
+            "loaded_total_num_kv_heads",
+            self.loaded_total_num_kv_heads,
+            self.total_num_kv_heads,
+        )
+        self._allow_loaded_qkv_padding = {
+            "q": loaded_total_num_heads is not None
+            and self.loaded_total_num_heads != self.total_num_heads,
+            "k": loaded_total_num_kv_heads is not None
+            and self.loaded_total_num_kv_heads != self.total_num_kv_heads,
+            "v": loaded_total_num_kv_heads is not None
+            and self.loaded_total_num_kv_heads != self.total_num_kv_heads,
+        }
         # Divide the weight matrix along the last dimension.
         tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.num_heads = divide(self.total_num_heads, tp_size)
@@ -1089,16 +1233,17 @@ class QKVParallelLinear(ColumnParallelLinear):
         """
         shard_offsets = [
             # (shard_id, shard_offset, shard_size)
-            ("q", 0, self.total_num_heads * self.head_size),
+            ("q", 0, self.loaded_total_num_heads * self.head_size),
             (
                 "k",
-                self.total_num_heads * self.head_size,
-                self.total_num_kv_heads * self.head_size,
+                self.loaded_total_num_heads * self.head_size,
+                self.loaded_total_num_kv_heads * self.head_size,
             ),
             (
                 "v",
-                (self.total_num_heads + self.total_num_kv_heads) * self.head_size,
-                self.total_num_kv_heads * self.v_head_size,
+                (self.loaded_total_num_heads + self.loaded_total_num_kv_heads)
+                * self.head_size,
+                self.loaded_total_num_kv_heads * self.v_head_size,
             ),
         ]
 
@@ -1166,6 +1311,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             shard_id=loaded_shard_id,
             shard_offset=shard_offset,
             shard_size=shard_size,
+            allow_padding=self._allow_loaded_qkv_padding[loaded_shard_id],
         )
 
     def weight_loader(
@@ -1196,16 +1342,17 @@ class QKVParallelLinear(ColumnParallelLinear):
                 return
             shard_offsets = [
                 # (shard_id, shard_offset, shard_size)
-                ("q", 0, self.total_num_heads * self.head_size),
+                ("q", 0, self.loaded_total_num_heads * self.head_size),
                 (
                     "k",
-                    self.total_num_heads * self.head_size,
-                    self.total_num_kv_heads * self.head_size,
+                    self.loaded_total_num_heads * self.head_size,
+                    self.loaded_total_num_kv_heads * self.head_size,
                 ),
                 (
                     "v",
-                    (self.total_num_heads + self.total_num_kv_heads) * self.head_size,
-                    self.total_num_kv_heads * self.v_head_size,
+                    (self.loaded_total_num_heads + self.loaded_total_num_kv_heads)
+                    * self.head_size,
+                    self.loaded_total_num_kv_heads * self.v_head_size,
                 ),
             ]
             packed_dim = getattr(param, "packed_dim", None)
@@ -1221,6 +1368,14 @@ class QKVParallelLinear(ColumnParallelLinear):
                     )
 
                 if packed_dim == output_dim:
+                    loaded_size = {
+                        "q": self.loaded_total_num_heads * self.head_size,
+                        "k": self.loaded_total_num_kv_heads * self.head_size,
+                        "v": self.loaded_total_num_kv_heads * self.v_head_size,
+                    }[shard_id]
+                    _validate_packed_loaded_size(
+                        param, output_dim, loaded_size, f"loaded {shard_id} size"
+                    )
                     shard_size = round(shard_size // param.packed_factor)
                     shard_offset = round(shard_offset // param.packed_factor)
 
@@ -1277,7 +1432,16 @@ class QKVParallelLinear(ColumnParallelLinear):
             start_idx = shard_rank * shard_size
 
             if not is_sharded_weight:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                load_tensor_parallel_weight(
+                    param_data,
+                    loaded_weight,
+                    output_dim,
+                    start_idx,
+                    allow_padding=self._allow_loaded_qkv_padding[
+                        loaded_shard_id
+                    ],
+                )
+                return
 
         # Special case for per-tensor scales in fused case.
         elif needs_scalar_to_array:
@@ -1538,6 +1702,9 @@ class RowParallelLinear(LinearBase):
                         (e.g. model.layers.0.down_proj)
         return_bias: If true, return bias together with outputs in forward pass.
         disable_tp: If true, weights matrix won't be sharded through tp rank.
+        loaded_input_size: Input dimension represented by the checkpoint.
+            Defaults to ``input_size``. A smaller explicit value enables
+            destination-local zero padding for the physical TP shard tail.
     """
 
     # --8<-- [end:row_parallel_linear]
@@ -1556,10 +1723,21 @@ class RowParallelLinear(LinearBase):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        loaded_input_size: int | None = None,
     ):
         # Divide the weight matrix along the first dimension.
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+        self.loaded_input_size = (
+            input_size if loaded_input_size is None else loaded_input_size
+        )
+        _validate_loaded_axis_size(
+            "loaded_input_size", self.loaded_input_size, input_size
+        )
+        self._allow_loaded_input_padding = (
+            loaded_input_size is not None
+            and self.loaded_input_size != input_size
+        )
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
@@ -1617,9 +1795,22 @@ class RowParallelLinear(LinearBase):
 
         param_data = param.data
         if input_dim is not None and not is_sharded_weight:
+            _validate_packed_loaded_size(
+                param,
+                input_dim,
+                self.loaded_input_size,
+                "loaded_input_size",
+            )
             shard_size = param_data.shape[input_dim]
             start_idx = self.tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
+            load_tensor_parallel_weight(
+                param_data,
+                loaded_weight,
+                input_dim,
+                start_idx,
+                allow_padding=self._allow_loaded_input_padding,
+            )
+            return
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
@@ -1636,7 +1827,10 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        param.load_row_parallel_weight(loaded_weight=loaded_weight)
+        param.load_row_parallel_weight(
+            loaded_weight=loaded_weight,
+            allow_padding=self._allow_loaded_input_padding,
+        )
 
     def forward(
         self,

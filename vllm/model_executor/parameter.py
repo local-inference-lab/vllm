@@ -28,6 +28,57 @@ __all__ = [
 
 logger = init_logger(__name__)
 
+def load_tensor_parallel_weight(
+    param_data: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    dim: int,
+    start_idx: int,
+    *,
+    allow_padding: bool = False,
+) -> None:
+    """Copy one TP shard, optionally zero-filling its unavailable tail.
+
+    Padding is opt-in so ordinary loaders retain strict ``Tensor.narrow``
+    failures.  The padded path writes directly into the rank-local destination
+    rather than allocating a checkpoint-sized or padded source tensor.
+    """
+    shard_size = param_data.shape[dim]
+    if not allow_padding:
+        loaded_shard = loaded_weight.narrow(dim, start_idx, shard_size)
+        assert param_data.shape == loaded_shard.shape
+        param_data.copy_(loaded_shard)
+        return
+
+    if start_idx < 0:
+        raise ValueError(f"TP shard start must be non-negative, got {start_idx}")
+    if loaded_weight.ndim != param_data.ndim:
+        raise ValueError(
+            "Padded TP weight rank mismatch: "
+            f"destination {tuple(param_data.shape)}, "
+            f"checkpoint {tuple(loaded_weight.shape)}"
+        )
+    dim = dim if dim >= 0 else loaded_weight.ndim + dim
+    if dim < 0 or dim >= loaded_weight.ndim:
+        raise IndexError(
+            f"TP shard dimension {dim} is invalid for rank {loaded_weight.ndim}"
+        )
+    for axis, (destination_size, loaded_size) in enumerate(
+        zip(param_data.shape, loaded_weight.shape)
+    ):
+        if axis != dim and destination_size != loaded_size:
+            raise ValueError(
+                "Padded TP weight shape mismatch outside the sharded axis: "
+                f"destination {tuple(param_data.shape)}, "
+                f"checkpoint {tuple(loaded_weight.shape)}"
+            )
+
+    available = max(0, loaded_weight.shape[dim] - start_idx)
+    copy_size = min(shard_size, available)
+    param_data.zero_()
+    if copy_size:
+        loaded_shard = loaded_weight.narrow(dim, start_idx, copy_size)
+        param_data.narrow(dim, 0, copy_size).copy_(loaded_shard)
+
 
 class BasevLLMParameter(Parameter):
     """
@@ -145,17 +196,24 @@ class _ColumnvLLMParameter(BasevLLMParameter):
     def output_dim(self):
         return self._output_dim
 
-    def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
-        shard_size = self.data.shape[self.output_dim]
-        loaded_weight = loaded_weight.narrow(
-            self.output_dim, self.tp_rank * shard_size, shard_size
+    def load_column_parallel_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        *,
+        allow_padding: bool = False,
+    ):
+        load_tensor_parallel_weight(
+            self.data,
+            loaded_weight,
+            self.output_dim,
+            self.tp_rank * self.data.shape[self.output_dim],
+            allow_padding=allow_padding,
         )
-        assert self.data.shape == loaded_weight.shape
-        self.data.copy_(loaded_weight)
 
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
         shard_offset: int = kwargs["shard_offset"]
         shard_size: int = kwargs["shard_size"]
+        allow_padding: bool = kwargs.get("allow_padding", False)
 
         # TODO: move these to PackedColumnParameter and PackedvLLMParameter
         if (
@@ -166,20 +224,23 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 shard_offset=shard_offset, shard_size=shard_size
             )
 
-        param_data = self.data
-
-        param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.narrow(
-            self.output_dim, self.tp_rank * shard_size, shard_size
+        param_data = self.data.narrow(
+            self.output_dim, shard_offset, shard_size
         )
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        load_tensor_parallel_weight(
+            param_data,
+            loaded_weight,
+            self.output_dim,
+            self.tp_rank * shard_size,
+            allow_padding=allow_padding,
+        )
 
     def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
         shard_offset: int = kwargs["shard_offset"]
         shard_size: int = kwargs["shard_size"]
         shard_id: str = kwargs["shard_id"]
         num_heads: int = kwargs["num_heads"]
+        allow_padding: bool = kwargs.get("allow_padding", False)
 
         # TODO: move these to PackedColumnParameter and PackedvLLMParameter
         if (
@@ -190,15 +251,17 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 shard_offset=shard_offset, shard_size=shard_size
             )
 
-        param_data = self.data
         shard_id_int = self.tp_rank if shard_id == "q" else self.tp_rank // num_heads
-        param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.narrow(
-            self.output_dim, shard_id_int * shard_size, shard_size
+        param_data = self.data.narrow(
+            self.output_dim, shard_offset, shard_size
         )
-
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        load_tensor_parallel_weight(
+            param_data,
+            loaded_weight,
+            self.output_dim,
+            shard_id_int * shard_size,
+            allow_padding=allow_padding,
+        )
 
 
 class RowvLLMParameter(BasevLLMParameter):
@@ -217,17 +280,20 @@ class RowvLLMParameter(BasevLLMParameter):
     def input_dim(self):
         return self._input_dim
 
-    def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
-        shard_size = self.data.shape[self.input_dim]
-        loaded_weight = loaded_weight.narrow(
-            self.input_dim, self.tp_rank * shard_size, shard_size
+    def load_row_parallel_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        *,
+        allow_padding: bool = False,
+    ):
+        param_data = self.data
+        load_tensor_parallel_weight(
+            param_data,
+            loaded_weight,
+            self.input_dim,
+            self.tp_rank * param_data.shape[self.input_dim],
+            allow_padding=allow_padding,
         )
-
-        if len(loaded_weight.shape) == 0:
-            loaded_weight = loaded_weight.reshape(1)
-
-        assert self.data.shape == loaded_weight.shape
-        self.data.copy_(loaded_weight)
 
 
 class ModelWeightParameter(_ColumnvLLMParameter, RowvLLMParameter):
