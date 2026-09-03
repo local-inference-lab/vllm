@@ -1836,6 +1836,7 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
                 dtype=MXFP8_SCALE_DTYPE,
             ),
             input_dim=1,
+            input_dim_storage_factor=MXFP8_BLOCK_SIZE,
             output_dim=0,
             weight_loader=weight_loader,
         )

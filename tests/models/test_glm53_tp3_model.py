@@ -325,6 +325,41 @@ def test_modelopt_nvfp4_row_parameters_declare_storage_widths(
             loaded[local_width : 2 * local_width].unsqueeze(0),
         )
 
+
+def test_modelopt_mxfp8_scale_loads_padded_tp3_storage_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for module in (linear, parameter):
+        monkeypatch.setattr(
+            module, "get_tensor_model_parallel_world_size", lambda: 3
+        )
+        monkeypatch.setattr(
+            module, "get_tensor_model_parallel_rank", lambda: 1
+        )
+    monkeypatch.setattr(modelopt, "init_mxfp8_linear_kernel", lambda: object())
+    config = modelopt.ModelOptMxFp8Config(
+        is_checkpoint_mxfp8_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+    )
+    holder = torch.nn.Module()
+    modelopt.ModelOptMxFp8LinearMethod(config).create_weights(
+        holder,
+        input_size_per_partition=4096,
+        output_partition_sizes=[1],
+        input_size=12288,
+        output_size=1,
+        params_dtype=torch.bfloat16,
+        weight_loader=lambda *_args, **_kwargs: None,
+    )
+
+    assert holder.weight_scale.input_dim_storage_factor == 32
+    loaded = torch.arange(1, 129, dtype=holder.weight_scale.dtype).unsqueeze(0)
+    row = RowParallelLinear(12288, 1, bias=False, loaded_input_size=4096)
+    row.weight_loader_v2(holder.weight_scale, loaded)
+    torch.testing.assert_close(holder.weight_scale, torch.zeros_like(holder.weight_scale))
+
+
 @pytest.mark.parametrize("tp3", [False, True])
 def test_mla_projection_loaded_sizes_are_tp3_only(
     monkeypatch: pytest.MonkeyPatch,
