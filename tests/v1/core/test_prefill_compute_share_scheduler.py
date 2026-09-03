@@ -23,11 +23,12 @@ def opt_model_path(tmp_path):
 
 
 def _create_fair_scheduler(opt_model_path, **kwargs):
+    prefill_compute_share = kwargs.pop("prefill_compute_share", 0.5)
     return create_scheduler(
         model=opt_model_path,
         skip_tokenizer_init=True,
         fairness_engine="compute_share",
-        prefill_compute_share=0.5,
+        prefill_compute_share=prefill_compute_share,
         device="cpu",
         **kwargs,
     )
@@ -93,6 +94,72 @@ def test_prefill_compute_share_cli_contract():
 
     assert engine_args.prefill_compute_share == pytest.approx(0.65)
     assert engine_args.fairness_engine == "compute_share"
+
+
+def test_prefill_compute_share_cli_accepts_auto():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    namespace = parser.parse_args(
+        [
+            "--fairness-engine",
+            "compute_share",
+            "--prefill-compute-share",
+            "auto",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(namespace)
+
+    assert engine_args.prefill_compute_share == "auto"
+
+
+def test_prefill_compute_share_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="prefill_compute_share"):
+        SchedulerConfig(
+            max_model_len=128,
+            is_encoder_decoder=False,
+            fairness_engine="compute_share",
+            prefill_compute_share="fast",
+        )
+
+
+def test_auto_mode_receives_scheduler_cost_feedback(opt_model_path):
+    scheduler = _create_fair_scheduler(
+        opt_model_path,
+        prefill_compute_share="auto",
+        max_num_batched_tokens=16,
+        max_model_len=128,
+    )
+    _establish_decode(scheduler)
+    (prefill,) = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        req_ids=["auto-prefill"],
+    )
+    scheduler.add_request(prefill)
+
+    decode_output = scheduler.schedule()
+    scheduler.record_compute_time(
+        "decode",
+        0.01,
+        contended=True,
+        scheduled_tokens=decode_output.compute_service_tokens,
+    )
+    _update(scheduler, decode_output)
+    prefill_output = scheduler.schedule()
+    scheduler.record_compute_time(
+        "prefill",
+        0.16,
+        contended=True,
+        scheduled_tokens=prefill_output.compute_service_tokens,
+    )
+
+    controller = scheduler.compute_share_controller
+    assert controller is not None
+    assert prefill_output.compute_service_tokens == 16
+    assert controller.prefill_seconds_per_token == pytest.approx(0.01)
+    config = scheduler.get_prefill_fairness()
+    assert config["prefill_compute_share"] == "auto"
+    assert config["effective_prefill_compute_share"] == pytest.approx(0.5)
 
 
 def test_prefill_compute_share_rejects_fixed_cadence():
@@ -354,6 +421,7 @@ def test_async_external_load_does_not_consume_service_credit(opt_model_path):
     assert controller is not None
     assert controller.decode_virtual_runtime == 0.0
     assert controller.prefill_virtual_runtime == 0.0
+    assert controller.local_prefill_backlog_tokens == 0
 
 
 def test_partial_external_hit_is_prefill_compute(opt_model_path):

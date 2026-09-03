@@ -166,6 +166,23 @@ def optional_type(return_type: Callable[[str], T]) -> Callable[[str], T | None]:
     return _optional_type
 
 
+def prefill_compute_share_type(value: str) -> float | Literal["auto"]:
+    """Parse a fixed prefill compute share or the adaptive mode."""
+    if value == "auto":
+        return "auto"
+    try:
+        share = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "prefill compute share must be 'auto' or a number between zero and one"
+        ) from exc
+    if not 0.0 < share < 1.0:
+        raise argparse.ArgumentTypeError(
+            "prefill compute share must be strictly between zero and one"
+        )
+    return share
+
+
 def union_dict_and_str(val: str) -> str | dict[str, str] | None:
     if not re.match(r"(?s)^\s*{.*}\s*$", val):
         return str(val)
@@ -634,8 +651,12 @@ class EngineArgs:
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
-    fairness_engine: str | None = SchedulerConfig.fairness_engine
-    prefill_compute_share: float | None = SchedulerConfig.prefill_compute_share
+    fairness_engine: Literal["compute_share", "micro_slicing"] | None = (
+        SchedulerConfig.fairness_engine
+    )
+    prefill_compute_share: float | Literal["auto"] | None = (
+        SchedulerConfig.prefill_compute_share
+    )
     max_num_prefill_tokens_per_step: int = (
         SchedulerConfig.max_num_prefill_tokens_per_step
     )
@@ -1600,9 +1621,11 @@ class EngineArgs:
             "--fairness-engine",
             **scheduler_kwargs["fairness_engine"],
         )
+        prefill_compute_share_kwargs = scheduler_kwargs["prefill_compute_share"]
+        prefill_compute_share_kwargs.pop("choices", None)
+        prefill_compute_share_kwargs["type"] = prefill_compute_share_type
         scheduler_group.add_argument(
-            "--prefill-compute-share",
-            **scheduler_kwargs["prefill_compute_share"],
+            "--prefill-compute-share", **prefill_compute_share_kwargs
         )
         scheduler_group.add_argument(
             "--max-num-prefill-tokens-per-step",

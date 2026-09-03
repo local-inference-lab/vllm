@@ -606,6 +606,33 @@ class Scheduler(SchedulerInterface):
             for request in (*self.running, *self.waiting, *self.skipped_waiting)
         )
 
+    def _local_prefill_pressure(self, now: float) -> tuple[float, int]:
+        """Estimate user-visible local-prefill slowdown and queued work."""
+        controller = self.compute_share_controller
+        if controller is None:
+            return 1.0, 0
+
+        seconds_per_token = controller.prefill_seconds_per_token
+        quantum_seconds = controller.last_prefill_seconds or 0.0
+        pressure = 1.0
+        backlog_tokens = 0
+        for request in (*self.running, *self.waiting, *self.skipped_waiting):
+            if not self._request_has_local_prefill(request):
+                continue
+            remaining_tokens = max(
+                request.num_tokens - 1 - request.num_computed_tokens, 0
+            )
+            backlog_tokens += remaining_tokens
+            if seconds_per_token is None or remaining_tokens == 0:
+                continue
+            expected_seconds = max(
+                remaining_tokens * seconds_per_token, quantum_seconds
+            )
+            if expected_seconds > 0.0:
+                age_seconds = max(now - request.arrival_time, 0.0)
+                pressure = max(pressure, 1.0 + age_seconds / expected_seconds)
+        return pressure, backlog_tokens
+
     def _oldest_local_prefill_waiter_age_ms(self, now: float) -> float:
         arrival_times = (
             request.arrival_time
@@ -673,7 +700,9 @@ class Scheduler(SchedulerInterface):
         )
         selected_compute_class: ComputeServiceClass | None = None
         compute_contention = False
+        compute_contention_started = False
         if self.compute_share_controller is not None:
+            prior_contention = self.compute_share_controller.contention_active
             has_prefill_candidate = self._pause_state != PauseState.PAUSED_ALL and (
                 any(
                     request.is_prefill_chunk
@@ -690,6 +719,7 @@ class Scheduler(SchedulerInterface):
                 prefill_runnable=has_prefill_candidate,
             )
             compute_contention = has_eligible_decode and has_prefill_candidate
+            compute_contention_started = compute_contention and not prior_contention
 
         legacy_defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
@@ -1726,6 +1756,27 @@ class Scheduler(SchedulerInterface):
                 scheduled_encoder_inputs
             )
 
+        compute_service_class: ComputeServiceClass | None = None
+        compute_service_tokens = 0
+        if (
+            self.compute_share_controller is not None
+            and compute_contention
+            and total_num_scheduled_tokens > 0
+        ):
+            has_scheduled_prefill = any(
+                req_id in num_scheduled_tokens for req_id in scheduled_prefill_req_ids
+            )
+            if has_scheduled_prefill:
+                compute_service_class = "prefill"
+                if self.compute_share_controller.auto_enabled:
+                    compute_service_tokens = sum(
+                        num_tokens
+                        for req_id, num_tokens in num_scheduled_tokens.items()
+                        if req_id in scheduled_prefill_req_ids
+                    )
+            else:
+                compute_service_class = "decode"
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1747,21 +1798,9 @@ class Scheduler(SchedulerInterface):
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
-            compute_service_class=(
-                (
-                    "prefill"
-                    if any(
-                        req_id in num_scheduled_tokens
-                        for req_id in scheduled_prefill_req_ids
-                    )
-                    else "decode"
-                )
-                if self.compute_share_controller is not None
-                and compute_contention
-                and total_num_scheduled_tokens > 0
-                else None
-            ),
+            compute_service_class=compute_service_class,
             compute_contention=compute_contention,
+            compute_service_tokens=compute_service_tokens,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1786,11 +1825,27 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        controller = self.compute_share_controller
+        if controller is not None and controller.auto_enabled:
+            # Sample after cache lookup and request-state transitions. Before
+            # this point a new request that becomes an asynchronous external
+            # restore is indistinguishable from local model prefill.
+            prefill_pressure, local_prefill_backlog_tokens = (
+                self._local_prefill_pressure(time.time())
+            )
+            controller.observe_demand(
+                prefill_pressure=prefill_pressure,
+                local_prefill_backlog_tokens=local_prefill_backlog_tokens,
+                decode_runnable=has_eligible_decode,
+                prefill_runnable=self._has_pending_local_prefill(),
+                contention_started=compute_contention_started,
+                now=time.monotonic(),
+            )
         if (
-            self.compute_share_controller is not None
+            controller is not None
             and scheduler_output.compute_service_class is not None
         ):
-            self.compute_share_controller.dispatch(
+            controller.dispatch(
                 scheduler_output.compute_service_class,
                 contended=scheduler_output.compute_contention,
             )
@@ -1802,6 +1857,7 @@ class Scheduler(SchedulerInterface):
         elapsed_seconds: float,
         *,
         contended: bool,
+        scheduled_tokens: int = 0,
     ) -> None:
         """Apply execution feedback and accumulate metric deltas."""
         if self.compute_share_controller is None:
@@ -1814,14 +1870,32 @@ class Scheduler(SchedulerInterface):
             else:
                 self._decode_compute_seconds += elapsed_seconds
         self.compute_share_controller.record(
-            service_class, elapsed_seconds, contended=True
+            service_class,
+            elapsed_seconds,
+            contended=True,
+            scheduled_tokens=scheduled_tokens,
         )
 
     def get_prefill_fairness(self) -> dict[str, Any]:
         """Return the active fairness policy and its complete tuning state."""
+        controller = self.compute_share_controller
         return {
             "fairness_engine": self.scheduler_config.fairness_engine,
             "prefill_compute_share": self.scheduler_config.prefill_compute_share,
+            "effective_prefill_compute_share": (
+                controller.effective_prefill_compute_share
+                if controller is not None
+                else None
+            ),
+            "decode_pressure": (
+                controller.decode_pressure if controller is not None else None
+            ),
+            "prefill_pressure": (
+                controller.prefill_pressure if controller is not None else None
+            ),
+            "local_prefill_backlog_tokens": (
+                controller.local_prefill_backlog_tokens if controller is not None else 0
+            ),
             "max_num_prefill_tokens_per_step": (
                 self.scheduler_config.max_num_prefill_tokens_per_step
             ),
@@ -1864,9 +1938,15 @@ class Scheduler(SchedulerInterface):
                     "is disabled"
                 )
         elif fairness_engine == "compute_share":
-            if prefill_compute_share is None or not 0.0 < prefill_compute_share < 1.0:
+            valid_compute_share = prefill_compute_share == "auto"
+            if isinstance(prefill_compute_share, (int, float)) and not isinstance(
+                prefill_compute_share, bool
+            ):
+                valid_compute_share = 0.0 < float(prefill_compute_share) < 1.0
+            if not valid_compute_share:
                 raise ValueError(
-                    "prefill_compute_share must be strictly between zero and one"
+                    "prefill_compute_share must be 'auto' or strictly between "
+                    "zero and one"
                 )
             if micro_configured:
                 raise ValueError(
@@ -3281,10 +3361,20 @@ class Scheduler(SchedulerInterface):
         decode_compute_seconds = 0.0
         prefill_compute_seconds = 0.0
         prefill_compute_share = 0.0
+        decode_compute_pressure = 1.0
+        prefill_compute_pressure = 1.0
+        local_prefill_backlog_tokens = 0
         if self.compute_share_controller is not None:
             decode_compute_seconds = self._decode_compute_seconds
             prefill_compute_seconds = self._prefill_compute_seconds
-            prefill_compute_share = self.compute_share_controller.prefill_compute_share
+            prefill_compute_share = (
+                self.compute_share_controller.effective_prefill_compute_share
+            )
+            decode_compute_pressure = self.compute_share_controller.decode_pressure
+            prefill_compute_pressure = self.compute_share_controller.prefill_pressure
+            local_prefill_backlog_tokens = (
+                self.compute_share_controller.local_prefill_backlog_tokens
+            )
             self._decode_compute_seconds = 0.0
             self._prefill_compute_seconds = 0.0
         micro_stats = {
@@ -3312,6 +3402,9 @@ class Scheduler(SchedulerInterface):
             decode_compute_seconds=decode_compute_seconds,
             prefill_compute_seconds=prefill_compute_seconds,
             prefill_compute_share=prefill_compute_share,
+            decode_compute_pressure=decode_compute_pressure,
+            prefill_compute_pressure=prefill_compute_pressure,
+            local_prefill_backlog_tokens=local_prefill_backlog_tokens,
             scheduled_prefill_tokens=micro_stats["scheduled_prefill_tokens"],
             active_partial_prefills=micro_stats["active_partial_prefills"],
             decode_only_steps=micro_stats["decode_only_steps"],

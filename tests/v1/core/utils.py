@@ -57,7 +57,7 @@ def create_scheduler(
     enable_prefix_caching: bool = False,
     long_prefill_token_threshold: int = 0,
     fairness_engine: str | None = None,
-    prefill_compute_share: float | None = None,
+    prefill_compute_share: float | str | None = None,
     max_num_prefill_tokens_per_step: int = 0,
     max_num_partial_prefills: int = 0,
     decode_prefill_min_decode_steps: int = 0,

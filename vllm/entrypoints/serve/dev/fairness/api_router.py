@@ -16,7 +16,9 @@ class PrefillFairnessRequest(BaseModel):
     """Complete replacement configuration for prefill fairness."""
 
     fairness_engine: Literal["compute_share", "micro_slicing"] | None = None
-    prefill_compute_share: Annotated[float | None, Field(gt=0.0, lt=1.0)] = None
+    prefill_compute_share: (
+        Annotated[float, Field(gt=0.0, lt=1.0)] | Literal["auto"] | None
+    ) = None
     max_num_prefill_tokens_per_step: Annotated[int, Field(ge=0)] = 0
     max_num_partial_prefills: Annotated[int, Field(ge=0)] = 0
     decode_prefill_min_decode_steps: Annotated[int, Field(ge=0)] = 0

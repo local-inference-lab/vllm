@@ -3,7 +3,7 @@
 
 from collections.abc import Callable
 from dataclasses import InitVar
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, cast
 
 from pydantic import Field, field_validator
 from typing_extensions import Self
@@ -21,6 +21,7 @@ logger = init_logger(__name__)
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority"]
 FairnessEngine = Literal["compute_share", "micro_slicing"]
+PrefillComputeShare = Annotated[float, Field(gt=0.0, lt=1.0)] | Literal["auto"]
 
 
 @config
@@ -153,11 +154,12 @@ class SchedulerConfig:
     When unset, the legacy scheduler path is unchanged.
     """
 
-    prefill_compute_share: float | None = Field(default=None, gt=0.0, lt=1.0)
+    prefill_compute_share: PrefillComputeShare | None = None
     """Target fraction of contended model-execution time assigned to prefill.
 
-    When unset, scheduling behavior is unchanged. Values must be strictly
-    between zero and one so both decode and prefill continue to make progress.
+    ``auto`` balances observed decode delay against local-prefill slowdown and
+    stays within conservative bounds. Numeric values must be strictly between
+    zero and one. When unset, scheduling behavior is unchanged.
     """
 
     max_num_prefill_tokens_per_step: int = Field(default=0, ge=0)

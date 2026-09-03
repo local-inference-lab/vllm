@@ -143,3 +143,166 @@ def test_zero_elapsed_completion_releases_reservation():
 
     assert not controller.decode_reservations
     assert controller.decode_virtual_runtime == 0.0
+
+
+def _primed_auto_controller() -> PrefillComputeShareController:
+    controller = PrefillComputeShareController("auto")
+    controller.last_decode_seconds = 0.1
+    controller.last_decode_completed_at = 0.0
+    controller.prefill_seconds_per_token = 0.001
+    return controller
+
+
+def test_auto_starts_at_half_and_waits_for_service_feedback():
+    controller = PrefillComputeShareController("auto")
+
+    controller.observe_demand(
+        prefill_pressure=10.0,
+        local_prefill_backlog_tokens=1000,
+        decode_runnable=True,
+        prefill_runnable=True,
+        now=0.0,
+    )
+    controller.observe_demand(
+        prefill_pressure=10.0,
+        local_prefill_backlog_tokens=1000,
+        decode_runnable=True,
+        prefill_runnable=True,
+        now=1.0,
+    )
+
+    assert controller.effective_prefill_compute_share == pytest.approx(0.5)
+
+
+def test_auto_does_not_treat_idle_or_single_class_time_as_decode_starvation():
+    controller = _primed_auto_controller()
+    controller.observe_demand(
+        prefill_pressure=1.0,
+        local_prefill_backlog_tokens=0,
+        decode_runnable=True,
+        prefill_runnable=False,
+        now=100.0,
+    )
+    controller.observe_demand(
+        prefill_pressure=1.0,
+        local_prefill_backlog_tokens=1000,
+        decode_runnable=True,
+        prefill_runnable=True,
+        contention_started=True,
+        now=101.0,
+    )
+
+    assert controller.decode_pressure == pytest.approx(1.0)
+    assert controller.effective_prefill_compute_share == pytest.approx(0.5)
+
+
+def test_auto_moves_toward_the_class_with_more_pressure():
+    controller = _primed_auto_controller()
+    controller.observe_demand(
+        prefill_pressure=1.0,
+        local_prefill_backlog_tokens=1000,
+        decode_runnable=True,
+        prefill_runnable=True,
+        now=0.0,
+    )
+    controller.last_decode_completed_at = 1.0
+    controller.observe_demand(
+        prefill_pressure=4.0,
+        local_prefill_backlog_tokens=1000,
+        decode_runnable=True,
+        prefill_runnable=True,
+        now=1.0,
+    )
+    assert 0.5 < controller.effective_prefill_compute_share <= 0.55
+
+    controller.observe_demand(
+        prefill_pressure=1.0,
+        local_prefill_backlog_tokens=1000,
+        decode_runnable=True,
+        prefill_runnable=True,
+        now=2.0,
+    )
+    assert controller.effective_prefill_compute_share < 0.55
+
+
+def test_auto_is_bounded_and_slew_limited():
+    controller = _primed_auto_controller()
+    controller.observe_demand(
+        prefill_pressure=1.0,
+        local_prefill_backlog_tokens=1000,
+        decode_runnable=True,
+        prefill_runnable=True,
+        now=0.0,
+    )
+
+    previous = controller.effective_prefill_compute_share
+    for now in range(1, 101):
+        controller.last_decode_completed_at = float(now)
+        controller.observe_demand(
+            prefill_pressure=1000.0,
+            local_prefill_backlog_tokens=1000,
+            decode_runnable=True,
+            prefill_runnable=True,
+            now=float(now),
+        )
+        assert controller.effective_prefill_compute_share - previous <= 0.0500001
+        previous = controller.effective_prefill_compute_share
+
+    assert controller.effective_prefill_compute_share == pytest.approx(0.8)
+
+
+def test_auto_deadband_prevents_churn():
+    controller = _primed_auto_controller()
+    controller.observe_demand(
+        prefill_pressure=1.0,
+        local_prefill_backlog_tokens=1000,
+        decode_runnable=True,
+        prefill_runnable=True,
+        now=0.0,
+    )
+    controller.last_decode_completed_at = 1.0
+    controller.observe_demand(
+        prefill_pressure=1.05,
+        local_prefill_backlog_tokens=1000,
+        decode_runnable=True,
+        prefill_runnable=True,
+        now=1.0,
+    )
+
+    assert controller.effective_prefill_compute_share == pytest.approx(0.5)
+
+
+def test_auto_reservation_uses_dispatch_share():
+    controller = PrefillComputeShareController("auto", last_prefill_seconds=1.0)
+    controller.effective_prefill_compute_share = 0.2
+    controller.dispatch("prefill", contended=True)
+    controller.effective_prefill_compute_share = 0.8
+
+    controller.record("prefill", 1.0, contended=True, scheduled_tokens=1000, now=1.0)
+
+    assert controller.prefill_virtual_runtime == pytest.approx(5.0)
+
+
+def test_numeric_share_never_adapts():
+    controller = PrefillComputeShareController(
+        0.65,
+        last_decode_seconds=0.1,
+        prefill_seconds_per_token=0.001,
+        last_decode_completed_at=0.0,
+    )
+    controller.observe_demand(
+        prefill_pressure=1000.0,
+        local_prefill_backlog_tokens=1000,
+        decode_runnable=True,
+        prefill_runnable=True,
+        now=0.0,
+    )
+    controller.observe_demand(
+        prefill_pressure=1000.0,
+        local_prefill_backlog_tokens=1000,
+        decode_runnable=True,
+        prefill_runnable=True,
+        now=100.0,
+    )
+
+    assert controller.effective_prefill_compute_share == pytest.approx(0.65)

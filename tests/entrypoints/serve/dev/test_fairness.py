@@ -40,6 +40,14 @@ def test_get_prefill_fairness_returns_current_config():
     assert json.loads(response.body) == current
 
 
+def test_request_accepts_auto_compute_share():
+    config = PrefillFairnessRequest(
+        fairness_engine="compute_share", prefill_compute_share="auto"
+    )
+
+    assert config.prefill_compute_share == "auto"
+
+
 @pytest.mark.parametrize(
     ("reason", "status_code"),
     [("busy", 409), ("invalid", 422)],
