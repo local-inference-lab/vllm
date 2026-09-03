@@ -80,21 +80,32 @@ def _restore_default_dtype():
     torch.set_default_dtype(old)
 
 
-@pytest.mark.parametrize("collective_enabled", (True, False))
+@pytest.mark.parametrize(
+    "broken_contract",
+    (None, "collective", "expert_parallel", "kda_decode", "kda_prefill", "vision"),
+)
 def test_glm53_r17_tp3_runtime_proof_is_observed_and_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
-    collective_enabled: bool,
+    broken_contract: str | None,
 ) -> None:
     class Glm5NextLinearAttention(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self._b12x_kda_api = object()
-            self.kda_prefill_backend = "flashkda"
+            self._b12x_kda_api = (
+                None if broken_contract == "kda_decode" else object()
+            )
+            self.kda_prefill_backend = (
+                "triton" if broken_contract == "kda_prefill" else "flashkda"
+            )
 
     messages = []
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
-            multimodal_config=SimpleNamespace(mm_encoder_tp_mode="weights"),
+            multimodal_config=SimpleNamespace(
+                mm_encoder_tp_mode=(
+                    "data" if broken_contract == "vision" else "weights"
+                )
+            ),
         ),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=3,
@@ -103,7 +114,7 @@ def test_glm53_r17_tp3_runtime_proof_is_observed_and_fail_closed(
     )
     model = torch.nn.Sequential(Glm5NextLinearAttention())
     b12x_ar = object.__new__(worker_utils.B12xPcieAllReduce)
-    b12x_ar.disabled = not collective_enabled
+    b12x_ar.disabled = broken_contract == "collective"
     b12x_ar.world_size = 3
     b12x_ar._runtime = object()
     b12x_ar.allreduce_max_bytes = 65536
@@ -112,7 +123,9 @@ def test_glm53_r17_tp3_runtime_proof_is_observed_and_fail_closed(
     monkeypatch.setattr(
         worker_utils,
         "get_ep_group",
-        lambda: SimpleNamespace(world_size=3),
+        lambda: SimpleNamespace(
+            world_size=2 if broken_contract == "expert_parallel" else 3
+        ),
     )
     monkeypatch.setattr(
         worker_utils,
@@ -127,7 +140,7 @@ def test_glm53_r17_tp3_runtime_proof_is_observed_and_fail_closed(
         lambda message, payload, **kwargs: messages.append(message % payload),
     )
 
-    if not collective_enabled:
+    if broken_contract is not None:
         with pytest.raises(RuntimeError, match="runtime proof failed"):
             worker_utils.log_glm53_r17_tp3_runtime_proof(vllm_config, model)
         return
