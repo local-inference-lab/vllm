@@ -5,11 +5,15 @@ from types import SimpleNamespace
 
 import torch
 
+from tests.utils import ensure_current_vllm_config
+
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.layers import vocab_parallel_embedding
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.models import qwen3_dflash
 from vllm.model_executor.models.qwen3_dflash import (
+    DFlashQwen3Attention,
     DFlashQwen3Model,
     _get_dflash_draft_vocab_size,
     _get_glm53_tp3_head_geometry,
@@ -35,6 +39,60 @@ def _tp3_dflash_config(**overrides):
     values.update(overrides)
     return SimpleNamespace(**values)
 
+def _capture_attention_projection_kwargs(monkeypatch, config, tp_size):
+    calls = {}
+
+    class FakeProjection(torch.nn.Module):
+        def __init__(self, kind, args, kwargs):
+            super().__init__()
+            calls[kind] = (args, kwargs)
+
+    monkeypatch.setattr(
+        qwen3_dflash,
+        "QKVParallelLinear",
+        lambda *args, **kwargs: FakeProjection("qkv", args, kwargs),
+    )
+    monkeypatch.setattr(
+        qwen3_dflash,
+        "RowParallelLinear",
+        lambda *args, **kwargs: FakeProjection("o", args, kwargs),
+    )
+    monkeypatch.setattr(
+        qwen3_dflash,
+        "DFlashAttention",
+        lambda *args, **kwargs: FakeProjection("attention", args, kwargs),
+    )
+    monkeypatch.setattr(qwen3_dflash, "get_rope", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        qwen3_dflash, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    DFlashQwen3Attention(
+        hidden_size=64,
+        num_heads=config.num_attention_heads,
+        num_kv_heads=config.num_key_value_heads,
+        config=config,
+        rope_parameters={},
+        head_dim=2,
+        prefix="model.layers.0.self_attn",
+    )
+    return calls
+
+
+def test_dflash_tp3_wires_logical_checkpoint_projection_sizes(monkeypatch) -> None:
+    calls = _capture_attention_projection_kwargs(
+        monkeypatch, _tp3_dflash_config(), tp_size=3
+    )
+    qkv_args, qkv_kwargs = calls["qkv"]
+    o_args, o_kwargs = calls["o"]
+
+    assert qkv_args[:4] == (64, 2, 36, 9)
+    assert qkv_kwargs["loaded_total_num_heads"] == 32
+    assert qkv_kwargs["loaded_total_num_kv_heads"] == 8
+    assert qkv_kwargs["prefix"] == "model.layers.0.self_attn.qkv_proj"
+    assert o_args[:2] == (72, 64)
+    assert o_kwargs["loaded_input_size"] == 64
+    assert o_kwargs["prefix"] == "model.layers.0.self_attn.o_proj"
+
 
 def test_dflash_tp3_geometry_and_vocab_storage(monkeypatch) -> None:
     config = _tp3_dflash_config()
@@ -54,11 +112,12 @@ def test_dflash_tp3_geometry_and_vocab_storage(monkeypatch) -> None:
         "get_tensor_model_parallel_rank",
         lambda: 2,
     )
-    embedding = VocabParallelEmbedding(
-        _get_dflash_draft_vocab_size(config),
-        8,
-        **vocab_kwargs,
-    )
+    with ensure_current_vllm_config():
+        embedding = VocabParallelEmbedding(
+            _get_dflash_draft_vocab_size(config),
+            8,
+            **vocab_kwargs,
+        )
     assert embedding.num_embeddings == 154880
     assert embedding.num_embeddings_padded == 154944
     assert embedding.num_embeddings_per_partition == 51648
@@ -82,6 +141,60 @@ def test_dflash_tp3_sink_bias_pads_only_rank_local_tail(monkeypatch) -> None:
     assert local.untyped_storage().data_ptr() != loaded.untyped_storage().data_ptr()
 
 
+def test_zero_padded_qkv_o_projection_matches_logical_reference() -> None:
+    generator = torch.Generator().manual_seed(17)
+    hidden_states = torch.randn(3, 64, generator=generator)
+    logical_q_weight = torch.randn(64, 64, generator=generator)
+    logical_kv_weight = torch.randn(16, 64, generator=generator)
+
+    logical_q = torch.nn.functional.linear(hidden_states, logical_q_weight)
+    logical_k = torch.nn.functional.linear(hidden_states, logical_kv_weight)
+    physical_q = torch.zeros(3, 72)
+    physical_k = torch.zeros(3, 18)
+    physical_q[:, :64] = logical_q
+    physical_k[:, :16] = logical_k
+
+    torch.testing.assert_close(physical_q[:, 64:], torch.zeros(3, 8))
+    torch.testing.assert_close(physical_k[:, 16:], torch.zeros(3, 2))
+
+    logical_o_weight = torch.randn(64, 64, generator=generator)
+    physical_o_weight = torch.zeros(64, 72)
+    physical_o_weight[:, :64] = logical_o_weight
+    logical_output = torch.nn.functional.linear(logical_q, logical_o_weight)
+    padded_output = torch.nn.functional.linear(physical_q, physical_o_weight)
+    torch.testing.assert_close(padded_output, logical_output)
+
+
+def test_dflash_logits_and_selector_exclude_physical_vocab_tail() -> None:
+    logical_vocab_size = _get_dflash_draft_vocab_size(_tp3_dflash_config())
+    storage_logits = torch.zeros(1, 154944)
+    storage_logits[:, logical_vocab_size - 1] = 2
+    storage_logits[:, logical_vocab_size:] = 100
+
+    processor = LogitsProcessor.__new__(LogitsProcessor)
+    torch.nn.Module.__init__(processor)
+    processor.org_vocab_size = logical_vocab_size
+    processor.scale = 1.0
+    processor.soft_cap = None
+    processor._apply_head = lambda *args, **kwargs: storage_logits.clone()
+    lm_head = SimpleNamespace(
+        tp_size=1,
+        shard_indices=SimpleNamespace(
+            num_org_vocab_padding=154944 - logical_vocab_size,
+            org_vocab_start_index=0,
+        ),
+    )
+
+    logits = processor._get_logits(torch.empty(1, 1), lm_head, None)
+    assert logits is not None
+    assert logits.shape == (1, logical_vocab_size)
+    token_ids, values = processor.get_top_k_tokens(
+        lm_head, torch.empty(1, 1), k=1
+    )
+    assert token_ids.item() == logical_vocab_size - 1
+    assert values.item() == 2
+
+
 def test_dflash_tp4_paths_are_exact_noops(monkeypatch) -> None:
     config = SimpleNamespace(
         num_attention_heads=32,
@@ -94,6 +207,15 @@ def test_dflash_tp4_paths_are_exact_noops(monkeypatch) -> None:
     assert _get_dflash_draft_vocab_size(config) == 154880
     assert vars(config) == original_fields
 
+    calls = _capture_attention_projection_kwargs(monkeypatch, config, tp_size=4)
+    qkv_args, qkv_kwargs = calls["qkv"]
+    o_args, o_kwargs = calls["o"]
+    assert qkv_args[:4] == (64, 2, 32, 8)
+    assert "loaded_total_num_heads" not in qkv_kwargs
+    assert "loaded_total_num_kv_heads" not in qkv_kwargs
+    assert o_args[:2] == (64, 64)
+    assert "loaded_input_size" not in o_kwargs
+
     monkeypatch.setattr(
         vocab_parallel_embedding,
         "get_tensor_model_parallel_world_size",
@@ -104,7 +226,8 @@ def test_dflash_tp4_paths_are_exact_noops(monkeypatch) -> None:
         "get_tensor_model_parallel_rank",
         lambda: 2,
     )
-    embedding = VocabParallelEmbedding(config.vocab_size, 8)
+    with ensure_current_vllm_config():
+        embedding = VocabParallelEmbedding(config.vocab_size, 8)
     assert embedding.num_embeddings == 154880
     assert embedding.num_embeddings_padded == 154880
     assert embedding.num_embeddings_per_partition == 38720
