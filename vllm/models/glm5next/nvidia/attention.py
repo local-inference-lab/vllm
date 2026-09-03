@@ -81,6 +81,22 @@ class Glm5NextMLAAttention(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
         proj_input_size = input_size if input_size is not None else hidden_size
+        column_head_kwargs = {}
+        row_head_kwargs = {}
+        if getattr(config, "glm53_tp3_padding", False):
+            logical_num_heads = config.original_num_attention_heads
+            column_head_kwargs["loaded_output_size"] = (
+                logical_num_heads * self.qk_head_dim
+            )
+            row_head_kwargs["loaded_input_size"] = (
+                logical_num_heads * self.v_head_dim
+            )
+        kv_column_head_kwargs = {}
+        if getattr(config, "glm53_tp3_padding", False):
+            kv_column_head_kwargs["loaded_output_size"] = logical_num_heads * (
+                qk_nope_head_dim + v_head_dim
+            )
+
 
         if q_lora_rank is not None:
             self.fused_qkv_a_proj = DeepSeekV2FusedQkvAProjLinear(
@@ -96,6 +112,7 @@ class Glm5NextMLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_b_proj",
+                **column_head_kwargs,
             )
         else:
             self.kv_a_proj_with_mqa = ReplicatedLinear(
@@ -111,6 +128,7 @@ class Glm5NextMLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
+                **column_head_kwargs,
             )
 
         self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=config.rms_norm_eps)
@@ -120,6 +138,7 @@ class Glm5NextMLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
+            **kv_column_head_kwargs,
         )
         self.o_proj = RowParallelLinear(
             num_heads * v_head_dim,
@@ -127,6 +146,7 @@ class Glm5NextMLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            **row_head_kwargs,
         )
 
         if not skip_rope:

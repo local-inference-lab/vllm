@@ -11,8 +11,10 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import (
@@ -36,6 +38,21 @@ from .model import (
 from .pooled_indexer import Glm5NextPooledIndexer
 
 
+class _Glm53TP3SharedHead(nn.Module):
+    """MTP shared head with TP3-divisible physical vocabulary storage."""
+
+    def __init__(self, config, prefix: str, quant_config=None) -> None:
+        super().__init__()
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            padding_size=config.glm53_tp3_vocab_padding_size,
+            prefix=maybe_prefix(prefix, "head"),
+        )
+
+
 class Glm5NextMultiTokenPredictorLayer(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
         super().__init__()
@@ -46,8 +63,24 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
-
+        self.eh_proj_output_size = getattr(
+            config, "glm53_tp3_mtp_projection_size", config.hidden_size
+        )
+        if getattr(config, "glm53_tp3_padding", False):
+            self.eh_proj = ColumnParallelLinear(
+                config.hidden_size * 2,
+                self.eh_proj_output_size,
+                gather_output=True,
+                bias=False,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.eh_proj",
+                loaded_output_size=config.hidden_size,
+            )
+        else:
+            self.eh_proj = nn.Linear(
+                config.hidden_size * 2, config.hidden_size, bias=False
+            )
         topk_tokens = config.index_topk
         kpool = getattr(config, "index_kpool", 1) or 1
         buffer_width = topk_tokens + (kpool - 1 if kpool > 1 else 0)
@@ -63,9 +96,14 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             dtype=torch.int32,
             device=current_platform.device_type,
         )
-        self.shared_head = SharedHead(
-            config=config, prefix=prefix, quant_config=quant_config
-        )
+        if getattr(config, "glm53_tp3_padding", False):
+            self.shared_head = _Glm53TP3SharedHead(
+                config=config, prefix=prefix, quant_config=quant_config
+            )
+        else:
+            self.shared_head = SharedHead(
+                config=config, prefix=prefix, quant_config=quant_config
+            )
         # MTP layers sit past the base model's hidden layers; parse the index
         # from the prefix (e.g. "...layers.32") so the decoder builds an MLA
         # (DSA) layer rather than KDA for the MTP path.
@@ -95,6 +133,10 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             dim=-1,
         )
         hidden_states = self.eh_proj(eh_input)
+        if hidden_states.shape[-1] != previous_hidden_states.shape[-1]:
+            hidden_states = hidden_states[
+                ..., : previous_hidden_states.shape[-1]
+            ].contiguous()
         # Fuse the residual add and final RMSNorm. Glm5NextMoE already performs
         # its all-reduce, so no collective is needed here. The post-norm result
         # feeds both draft logits and the next recycled hidden state.
@@ -125,10 +167,14 @@ class Glm5NextMultiTokenPredictor(nn.Module):
                 )
             }
         )
+        vocab_kwargs = {}
+        if getattr(config, "glm53_tp3_padding", False):
+            vocab_kwargs["padding_size"] = config.glm53_tp3_vocab_padding_size
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
+            **vocab_kwargs,
         )
         # Plain list for the per-propose lookup: ModuleDict[str(...)] builds a
         # string and hashes it on every draft step.

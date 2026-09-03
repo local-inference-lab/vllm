@@ -153,8 +153,25 @@ class Glm5NextMLP(nn.Module):
         is_sequence_parallel=False,
         prefix: str = "",
         swiglu_limit: float | None = None,
+        loaded_intermediate_size: int | None = None,
     ) -> None:
         super().__init__()
+        if loaded_intermediate_size is None:
+            loaded_intermediate_size = intermediate_size
+        if not 0 < loaded_intermediate_size <= intermediate_size:
+            raise ValueError(
+                "loaded_intermediate_size must be positive and no greater than "
+                f"intermediate_size, got {loaded_intermediate_size} and "
+                f"{intermediate_size}"
+            )
+        gate_up_kwargs = {}
+        down_kwargs = {}
+        if loaded_intermediate_size != intermediate_size:
+            gate_up_kwargs["loaded_output_sizes"] = [
+                loaded_intermediate_size
+            ] * 2
+            down_kwargs["loaded_input_size"] = loaded_intermediate_size
+
 
         # If is_sequence_parallel, the input and output tensors are sharded
         # across the ranks within the tp_group. In this case the weights are
@@ -167,6 +184,7 @@ class Glm5NextMLP(nn.Module):
             quant_config=quant_config,
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.gate_up_proj",
+            **gate_up_kwargs,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -176,6 +194,7 @@ class Glm5NextMLP(nn.Module):
             reduce_results=reduce_results,
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
+            **down_kwargs,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -256,7 +275,14 @@ class Glm5NextMoE(nn.Module):
         if config.n_shared_experts is None:
             self.shared_experts = None
         else:
-            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            checkpoint_intermediate_size = (
+                config.moe_intermediate_size * config.n_shared_experts
+            )
+            intermediate_size = getattr(
+                config,
+                "glm53_tp3_shared_expert_intermediate_size",
+                checkpoint_intermediate_size,
+            )
 
             self.shared_experts = Glm5NextMLP(
                 hidden_size=config.hidden_size,
@@ -267,6 +293,7 @@ class Glm5NextMoE(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
                 swiglu_limit=swiglu_limit,
+                loaded_intermediate_size=checkpoint_intermediate_size,
             )
 
         self.experts = FusedMoEFactory(
@@ -928,10 +955,16 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             pool_topk_indices_buffer = None
 
         if get_pp_group().is_first_rank:
+            vocab_kwargs = {}
+            if getattr(config, "glm53_tp3_padding", False):
+                vocab_kwargs["padding_size"] = (
+                    config.glm53_tp3_vocab_padding_size
+                )
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 prefix=f"{prefix}.embed_tokens",
+                **vocab_kwargs,
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -1285,11 +1318,17 @@ class Glm5NextForCausalLM(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         if get_pp_group().is_last_rank:
+            vocab_kwargs = {}
+            if getattr(self.config, "glm53_tp3_padding", False):
+                vocab_kwargs["padding_size"] = (
+                    self.config.glm53_tp3_vocab_padding_size
+                )
             self.lm_head = ParallelLMHead(
                 self.config.vocab_size,
                 self.config.hidden_size,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
+                **vocab_kwargs,
             )
         else:
             self.lm_head = PPMissingLayer()
