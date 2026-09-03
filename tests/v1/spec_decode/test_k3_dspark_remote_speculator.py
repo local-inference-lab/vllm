@@ -91,6 +91,72 @@ def test_adaptive_depth_output_is_contiguous_for_tp_broadcast():
     assert output.tolist() == [[0, 1, 2], [8, 9, 10]]
 
 
+def test_deferred_peer_ingest_does_not_reserve_or_compute_a_reply():
+    proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy._probabilistic = True
+    proxy._logits_topk = 128
+    proxy._peer = SimpleNamespace(reply_slots=2)
+    proxy._peer_reply_slot = 1
+    header = {}
+
+    reply_slot = proxy._configure_proposal_reply(
+        header,
+        deferred_ingest=True,
+        peer_context=True,
+        peer_context_slot=2,
+    )
+
+    assert reply_slot == -1
+    assert proxy._peer_reply_slot == 1
+    assert header == {
+        "return_logits": False,
+        "logits_topk": 0,
+        "p2p_context_slot": 2,
+    }
+
+
+def test_consumed_peer_proposal_reserves_the_named_reply_slot():
+    proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy._probabilistic = True
+    proxy._logits_topk = 128
+    proxy._peer = SimpleNamespace(reply_slots=2)
+    proxy._peer_reply_slot = 1
+    header = {}
+
+    reply_slot = proxy._configure_proposal_reply(
+        header,
+        deferred_ingest=False,
+        peer_context=True,
+        peer_context_slot=2,
+    )
+
+    assert reply_slot == 1
+    assert proxy._peer_reply_slot == 0
+    assert header == {
+        "return_logits": True,
+        "logits_topk": 128,
+        "p2p_context_slot": 2,
+        "p2p_reply": True,
+        "p2p_reply_slot": 1,
+    }
+
+
+def test_free_remote_request_releases_capture_bookkeeping(monkeypatch):
+    from vllm.v1.worker.gpu.spec_decode.dspark import remote_speculator as rs
+
+    proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy._known_requests = {"finished"}
+    proxy._retained_prefixes = {"finished": object()}
+    proxy._rpc = lambda frames: {"ok": True}
+    monkeypatch.setitem(rs._K3_CAPTURE_STATE, "finished", {"records": []})
+
+    proxy._free_remote_requests({"finished"})
+
+    assert "finished" not in proxy._known_requests
+    assert "finished" not in proxy._retained_prefixes
+    assert "finished" not in rs._K3_CAPTURE_STATE
+
+
 def test_deferred_ingest_failures_disable_every_affected_request():
     proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
     proxy.method = "dflash"

@@ -785,6 +785,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         self._known_requests.difference_update(remote_request_ids)
         for request_id in remote_request_ids:
             self._retained_prefixes.pop(request_id, None)
+            _K3_CAPTURE_STATE.pop(request_id, None)
 
     def _ensure_remote_capacity(self, current_request_ids: set[str]) -> None:
         while len(self._known_requests) >= self._remote_max_requests:
@@ -973,6 +974,40 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
 
     def _peer_context_slots(self) -> int:
         return int(getattr(self, "_async_depth", 0)) + 1
+
+    def _configure_proposal_reply(
+        self,
+        header: dict[str, Any],
+        *,
+        deferred_ingest: bool,
+        peer_context: bool,
+        peer_context_slot: int,
+    ) -> int:
+        """Set the reply contract and reserve a peer slot when consumed.
+
+        Args:
+            header: Mutable proposal header sent to the draft process.
+            deferred_ingest: Whether the caller only consumes the ingest result.
+            peer_context: Whether context rows use the mapped peer ring.
+            peer_context_slot: Ring slot containing the context rows.
+
+        Returns:
+            The reserved peer reply slot, or ``-1`` when no reply is pulled.
+        """
+        return_logits = self._probabilistic and not deferred_ingest
+        header["return_logits"] = return_logits
+        header["logits_topk"] = self._logits_topk if return_logits else 0
+        if not peer_context:
+            return -1
+        header["p2p_context_slot"] = peer_context_slot
+        if not return_logits:
+            return -1
+        assert self._peer is not None
+        reply_slot = self._peer_reply_slot
+        self._peer_reply_slot = (reply_slot + 1) % self._peer.reply_slots
+        header["p2p_reply"] = True
+        header["p2p_reply_slot"] = reply_slot
+        return reply_slot
 
     def _open_peer_transport(self) -> None:
         """Open the draft server's context ring and reply slots.
@@ -1977,20 +2012,15 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             "op": "PROPOSE",
             "projected": False,
             "num_speculative_tokens": num_speculative_tokens,
-            "return_logits": self._probabilistic,
-            "logits_topk": self._logits_topk,
             "requests": requests,
         }
-        peer_reply_slot = -1
+        peer_reply_slot = self._configure_proposal_reply(
+            header,
+            deferred_ingest=deferred,
+            peer_context=peer_context,
+            peer_context_slot=peer_slot,
+        )
         if peer_context:
-            assert self._peer is not None
-            # The verifier names the reply slot so the pull can be enqueued
-            # behind the gate before the reply arrives.
-            peer_reply_slot = self._peer_reply_slot
-            self._peer_reply_slot = (peer_reply_slot + 1) % self._peer.reply_slots
-            header["p2p_context_slot"] = peer_slot
-            header["p2p_reply"] = True
-            header["p2p_reply_slot"] = peer_reply_slot
             frames = [json.dumps(header).encode(), positions_frame]
         else:
             frames = [json.dumps(header).encode(), positions_frame, context_frame]
@@ -2017,7 +2047,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 seeds,
                 p2p_reply=(
                     (peer_reply_slot, len(active_indices), num_speculative_tokens)
-                    if peer_context and self._probabilistic and self._logits_topk > 0
+                    if peer_reply_slot >= 0
                     else None
                 ),
             )
