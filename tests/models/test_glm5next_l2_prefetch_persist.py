@@ -45,6 +45,39 @@ def test_invalid_numeric_environment_values_use_defaults(monkeypatch):
     assert l2pf._mb("VLLM_GLM53_L2_PREFETCH_BUDGET_A_MB", "20") == 20_000_000
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_segments_include_backend_tensors_and_skip_runtime_caches():
+    class PackedLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty(64, device="cuda"))
+            self.register_buffer("weight_scale", torch.empty(32, device="cuda"))
+            self.register_buffer(
+                "runtime_scratch", torch.empty(48, device="cuda"), persistent=False
+            )
+            self.packed_weight = torch.empty(48, device="cuda")
+            self.topk_indices_buffer = torch.empty(48, device="cuda")
+            self.kv_cache = torch.empty(48, device="cuda")
+
+    module = PackedLinear()
+    segments = l2pf.segments_of(module, min_bytes=0)
+    names = [name for name, _, _ in segments]
+    pointers = [pointer for _, pointer, _ in segments]
+
+    assert names == ["weight", "weight_scale", "packed_weight"]
+    assert len(pointers) == len(set(pointers))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_tensor_segment_limits_noncontiguous_views_to_their_storage():
+    storage = torch.empty((16, 8), dtype=torch.float32, device="cuda")
+    view = storage.transpose(0, 1)
+
+    segment = l2pf.tensor_segment("transposed", view)
+
+    assert segment == ("transposed", view.data_ptr(), view.numel() * 4)
+
+
 def _driver():
     from cuda.bindings import driver as cu
 

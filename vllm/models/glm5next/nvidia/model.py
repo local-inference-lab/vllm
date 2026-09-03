@@ -628,42 +628,75 @@ class Glm5NextDecoderLayer(nn.Module):
         self._l2pf_ready = True
         try:
             device = next(self.parameters()).device
-            segs_b: list[_l2pf.Segment] = []
+            router_segments: list[_l2pf.Segment] = []
             if self._mlp_is_moe:
                 # Router weight is read right after the post-attention mHC.
-                segs_b += _l2pf.segments_of(self.mlp.gate, "mlp.gate.")
+                router_segments = _l2pf.segments_of(
+                    self.mlp.gate, "mlp.gate.", min_bytes=0
+                )
+            # Window B starts before the attention-output reduction. These
+            # tensors are consumed by the post-attention mHC immediately after
+            # that reduction, so carrying them ahead avoids latency-bound cold
+            # reads without displacing the following projection materially.
+            segs_b = _l2pf.segments_of(
+                self.post_attention_layernorm,
+                "post_attention_layernorm.",
+                min_bytes=0,
+            )
+            for attr in ("hc_ffn_base", "hc_ffn_scale", "hc_ffn_fn"):
+                segment = _l2pf.tensor_segment(attr, getattr(self, attr, None))
+                if segment is not None:
+                    segs_b.append(segment)
+            segs_b += router_segments
             # Dense-MLP layers (first 3): their 75 MB MLP weights are consumed
             # right after attention with no idle window -> never prefetched.
             nxt = self._l2pf_next
             nxt_segs: list[_l2pf.Segment] = []
             if nxt is not None:
+                # The next layer consumes its mHC and normalization state before
+                # its first attention projection. Preserve that consumption
+                # order in the prefetch plan, including sub-64-KiB parameters.
+                for attr in (
+                    "hc_attn_fn_broadcast",
+                    "hc_attn_fn",
+                    "hc_attn_scale",
+                    "hc_attn_base",
+                ):
+                    segment = _l2pf.tensor_segment(
+                        f"L{nxt.layer_idx}.{attr}", getattr(nxt, attr, None)
+                    )
+                    if segment is not None:
+                        nxt_segs.append(segment)
+                nxt_segs += _l2pf.segments_of(
+                    nxt.input_layernorm,
+                    f"L{nxt.layer_idx}.input_layernorm.",
+                    min_bytes=0,
+                )
                 # The next layer's o_proj (and MLA kv_b, unused at decode) are
                 # prefetched inside that layer's own attention window (A).
-                nxt_segs = _l2pf.segments_of(
-                    nxt.self_attn, f"L{nxt.layer_idx}.self_attn.", skip=self._ATTN_SKIP
+                nxt_segs += _l2pf.segments_of(
+                    nxt.self_attn,
+                    f"L{nxt.layer_idx}.self_attn.",
+                    skip=self._ATTN_SKIP,
+                    min_bytes=0,
                 )
             # Window A of this layer's attention: its o_proj plus a head slice
             # of the next layer's first projection (it survives the expert
             # stream and shortens window C so the tail is resident in time).
-            segs_a = _l2pf.segments_of(self.self_attn.o_proj, "o_proj.")
-            attn_impl = getattr(getattr(self.self_attn, "mla_attn", None), "impl", None)
-            for attr in ("W_UK_T", "W_UV"):
-                t = getattr(attn_impl, attr, None) if attn_impl is not None else None
-                if isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous():
-                    segs_a.append(
-                        (
-                            f"impl.{attr}",
-                            t.data_ptr(),
-                            t.numel() * t.element_size(),
-                        )
-                    )
             is_mla = hasattr(self.self_attn, "mla_attn")
+            segs_a = _l2pf.segments_of(self.self_attn.o_proj, "o_proj.")
             if nxt_segs and _l2pf.A_NEXT_BYTES > 0 and not is_mla:
                 head_a, rest_first = _l2pf.take_budget(nxt_segs[:1], _l2pf.A_NEXT_BYTES)
                 segs_a += head_a
                 nxt_segs = rest_first + nxt_segs[1:]
             budget_a = _l2pf.BUDGET_A_MLA if is_mla else _l2pf.BUDGET_A
-            plan_a, _ = _l2pf.make_plan(segs_a, budget_a, device)
+            # MLA materializes its absorbed decode weights while executing the
+            # first query projection. Build that attention plan from the hook
+            # immediately after the projection, rather than permanently
+            # omitting tensors which did not exist at layer-entry time.
+            plan_a = None
+            if not is_mla:
+                plan_a, _ = _l2pf.make_plan(segs_a, budget_a, device)
             plan_b, rest = _l2pf.make_plan(segs_b + nxt_segs, _l2pf.BUDGET_B, device)
             plan_c, dropped = _l2pf.make_plan(rest, _l2pf.BUDGET_C, device)
             self._l2pf_plan_b = plan_b
@@ -701,16 +734,73 @@ class Glm5NextDecoderLayer(nn.Module):
             # Window A fires inside the attention layer, right after its first
             # projection (hook in the shared KDA / MLA layers).
             target = self.self_attn.mla_attn if is_mla else self.self_attn
-            if plan_a is not None:
+            if is_mla:
+                mla_state: dict[str, _l2pf.L2PrefetchPlan | bool | None] = {
+                    "ready": False,
+                    "plan": None,
+                }
+
+                def issue_mla_window_a(
+                    num_tokens: int,
+                    wrapper=target,
+                    state=mla_state,
+                    layer_idx=self.layer_idx,
+                    o_proj_segments=segs_a,
+                ) -> None:
+                    if not state["ready"]:
+                        mla_layer = getattr(wrapper, "mla_attn", None)
+                        attn_impl = getattr(mla_layer, "impl", None)
+                        resolved = list(o_proj_segments)
+                        seen = {segment[1] for segment in resolved}
+                        # The generic MLA layer owns W_UV/W_UK_T. Specialized
+                        # backends may instead own packed W_UV/W_UK variants
+                        # on their implementation object.
+                        for owner_name, owner in (
+                            ("mla_attn", mla_layer),
+                            ("impl", attn_impl),
+                        ):
+                            for attr in (
+                                "W_UV",
+                                "W_UK_T",
+                                "W_UK",
+                                "W_K",
+                                "W_V",
+                            ):
+                                tensor = (
+                                    getattr(owner, attr, None)
+                                    if owner is not None
+                                    else None
+                                )
+                                segment = _l2pf.tensor_segment(
+                                    f"{owner_name}.{attr}", tensor, min_bytes=0
+                                )
+                                if segment is not None and segment[1] not in seen:
+                                    resolved.append(segment)
+                                    seen.add(segment[1])
+                        state["plan"], _ = _l2pf.make_plan(
+                            resolved, _l2pf.BUDGET_A_MLA, device
+                        )
+                        state["ready"] = True
+                        if layer_idx in (0, 3, 4):
+                            dynamic_plan = state["plan"]
+                            logger.info(
+                                "[l2_prefetch] layer %d deferred MLA A: %s",
+                                layer_idx,
+                                dynamic_plan.describe() if dynamic_plan else "-",
+                            )
+                    _l2pf.issue(state["plan"], num_tokens)
+
+                object.__setattr__(target, "_l2_prefetch_hook", issue_mla_window_a)
+            elif plan_a is not None:
                 object.__setattr__(
                     target, "_l2_prefetch_hook", lambda n, p=plan_a: _l2pf.issue(p, n)
                 )
-            is_logged_layer = self.layer_idx in (0, 3, 4)
+            is_logged_layer = self.layer_idx in (0, 2, 3, 4)
             if is_logged_layer or self.layer_idx == self.num_hidden_layers - 1:
                 logger.info(
                     "[l2_prefetch] layer %d A: %s | B: %s | C: %s | dropped %.1f MB",
                     self.layer_idx,
-                    plan_a.describe() if plan_a else "-",
+                    "deferred" if is_mla else (plan_a.describe() if plan_a else "-"),
                     plan_b.describe() if plan_b else "-",
                     plan_c.describe() if plan_c else "-",
                     sum(s[2] for s in dropped) / 1e6,
@@ -871,6 +961,12 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         active = list(self._active_layers)
         for i, layer in enumerate(active):
             object.__setattr__(layer, "_l2pf_next", active[(i + 1) % len(active)])
+        if _l2pf.ENABLED and active:
+            prefetch_device = next(active[0].parameters()).device
+            if prefetch_device.type == "cuda":
+                # Create the side stream and apply the optional context-wide L2
+                # reservation before any CUDA graph capture can begin.
+                _l2pf.L2Prefetcher.get(prefetch_device)
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

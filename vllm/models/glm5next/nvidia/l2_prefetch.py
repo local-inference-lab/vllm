@@ -60,6 +60,18 @@ _MIN_BYTES = 64 * 1024
 _CHUNK_BYTES = 4096
 _GRID = 16
 _BLOCK = 128
+# Caches and lookup tables are either written immediately before use or read
+# sparsely. Streaming them into L2 would evict projection weights without
+# shortening their own critical path.
+_GLOBAL_SKIP = (
+    "rotary_emb",
+    "cos_sin_cache",
+    "kv_cache",
+    "block_table",
+    "buffer",
+    "inv_freq",
+    "cache",
+)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -275,32 +287,83 @@ def _get_launcher():
 # ---------------------------------------------------------------------------
 
 
+def tensor_segment(
+    name: str, tensor: torch.Tensor | None, min_bytes: int = 16
+) -> Segment | None:
+    """Describe one contiguous CUDA tensor for a cache-hint plan.
+
+    The prefetch kernel accepts byte ranges and does not dereference model
+    metadata. Rejecting unsupported storage here keeps every recorded segment
+    valid for graph replay.
+    """
+    if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+        return None
+    nbytes = tensor.numel() * tensor.element_size()
+    ptr = tensor.data_ptr()
+    if not tensor.is_contiguous():
+        # A transposed or sliced parameter can still provide a valid storage
+        # range for cache hints. Limit the hint to bytes following the view's
+        # storage offset so the prefetch never crosses its allocation.
+        try:
+            storage_bytes = tensor.untyped_storage().nbytes()
+            offset_bytes = tensor.storage_offset() * tensor.element_size()
+        except Exception:  # noqa: BLE001
+            return None
+        available_bytes = storage_bytes - offset_bytes
+        if available_bytes < 16:
+            return None
+        nbytes = min(nbytes, available_bytes)
+    if nbytes < max(int(min_bytes), 16) or ptr % 16 != 0:
+        return None
+    return name, ptr, nbytes
+
+
 def segments_of(
-    module: torch.nn.Module, prefix: str = "", skip: tuple[str, ...] = ()
+    module: torch.nn.Module,
+    prefix: str = "",
+    skip: tuple[str, ...] = (),
+    min_bytes: int | None = None,
+    include_attrs: bool = True,
 ) -> list[Segment]:
-    """Large, contiguous CUDA parameters/buffers under ``module``."""
+    """CUDA tensor storage ranges owned by ``module``.
+
+    ``min_bytes`` permits latency-sensitive scalar and normalization weights
+    to accompany a larger projection in the same launch. The default retains
+    the 64 KiB floor used for projection-only plans. Buffers and plain tensor
+    attributes are included because quantization backends may store processed
+    weights outside ``Parameter`` objects.
+    """
     out: list[Segment] = []
     seen: set[int] = set()
+    floor = _MIN_BYTES if min_bytes is None else int(min_bytes)
 
     def add(name: str, t: torch.Tensor) -> None:
-        if not isinstance(t, torch.Tensor) or not t.is_cuda or not t.is_contiguous():
+        segment = tensor_segment(name, t, floor)
+        if segment is None:
             return
-        nbytes = t.numel() * t.element_size()
-        ptr = t.data_ptr()
-        if nbytes < _MIN_BYTES or ptr % 16 != 0 or ptr in seen:
+        _, ptr, _ = segment
+        if ptr in seen:
             return
-        if any(s in name for s in skip):
+        if any(s in name for s in skip) or any(s in name for s in _GLOBAL_SKIP):
             return
         seen.add(ptr)
-        out.append((name, ptr, nbytes))
+        out.append(segment)
 
     for name, p in module.named_parameters():
         add(f"{prefix}{name}", p.data)
-    for m_name, m in module.named_modules():
-        for attr in ("W_UK_T", "W_UV", "W_UK", "W_K", "W_V"):
-            t = getattr(m, attr, None)
-            if isinstance(t, torch.Tensor):
-                add(f"{prefix}{m_name}.{attr}", t)
+    for module_name, child in module.named_modules():
+        owner = f"{module_name}." if module_name else ""
+        for name, buffer in child.named_buffers(recurse=False):
+            if name in child._non_persistent_buffers_set:
+                continue
+            add(f"{prefix}{owner}{name}", buffer)
+    if include_attrs:
+        for module_name, child in module.named_modules():
+            for attr, tensor in vars(child).items():
+                if attr.startswith("_") or not isinstance(tensor, torch.Tensor):
+                    continue
+                owner = f"{module_name}." if module_name else ""
+                add(f"{prefix}{owner}{attr}", tensor)
     return out
 
 
@@ -558,6 +621,7 @@ __all__ = [
     "PERSIST_L2",
     "L2PrefetchPlan",
     "L2Prefetcher",
+    "tensor_segment",
     "segments_of",
     "take_budget",
     "make_plan",
