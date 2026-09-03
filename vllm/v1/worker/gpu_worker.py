@@ -141,6 +141,30 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
+
+class _B12xRoceCheckedAsyncOutput(AsyncModelRunnerOutput):
+    """An asynchronous output whose completion is followed by the RoCEnante check."""
+
+    def __init__(
+        self, inner: AsyncModelRunnerOutput, check: Callable[[], None]
+    ) -> None:
+        self._inner = inner
+        self._check = check
+
+    def get_output(self) -> ModelRunnerOutput:
+        """Wait for the wrapped output, then run the fail-stop check.
+
+        Returns:
+            The completed ModelRunnerOutput.
+
+        Raises:
+            RuntimeError: When a RoCEnante wait timed out or its proxy died.
+        """
+        output = self._inner.get_output()
+        self._check()
+        return output
+
+
 class Worker(WorkerBase):
     def __init__(
         self,
@@ -1066,26 +1090,49 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        output = self.model_runner.sample_tokens(grammar_output)
-        self._check_b12x_roce_health()
-        return output
+        return self._b12x_roce_guarded(
+            self.model_runner.sample_tokens(grammar_output)
+        )
 
-    def _check_b12x_roce_health(self) -> None:
-        """Fail-stop check for RoCEnante collectives, after the step's host sync.
+    def _b12x_roce_health_check(self) -> Callable[[], None] | None:
+        """The RoCEnante health check of the TP communicator, if one is active.
 
-        A RoCEnante wait that timed out records itself and freezes the runtime;
-        the sampled tokens are on the host here, so every collective of the step
-        has completed and raising now keeps the step's output from leaving the
-        worker.  Every rank reaches the same state on its own (a stalled rank
-        starves its peers' waits), so the raise is coordinated without a
-        supervisor.  With async scheduling the copy to host is deferred and the
-        check lands one step late.  Two pinned-memory reads; no synchronization.
+        Returns:
+            The check callable, or None when RoCEnante is not in use.
         """
         communicator = get_tp_group().device_communicator
         comm = getattr(communicator, "b12x_ar_comm", None)
-        check = getattr(comm, "check_health", None)
-        if check is not None:
-            check()
+        return getattr(comm, "check_health", None)
+
+    def _b12x_roce_guarded(self, output):
+        """Fail-stop RoCEnante check once the step's output is on the host.
+
+        A RoCEnante wait that timed out records itself and freezes the runtime.
+        A synchronous output already holds the sampled tokens on the host, so
+        every collective of the step has completed and the check runs now; an
+        asynchronous output is wrapped so the check runs right after its
+        ``get_output()`` completes the copy.  Either way a failed collective's
+        output never leaves the worker.  Every rank reaches the same state on
+        its own (a stalled rank starves its peers' waits), so the raise is
+        coordinated without a supervisor.  Two pinned-memory reads; no added
+        synchronization.
+
+        Args:
+            output: The model runner's output for this step, possibly None.
+
+        Returns:
+            The same output, or a wrapper for an asynchronous output.
+
+        Raises:
+            RuntimeError: When a RoCEnante wait timed out or its proxy died.
+        """
+        check = self._b12x_roce_health_check()
+        if check is None:
+            return output
+        if isinstance(output, AsyncModelRunnerOutput):
+            return _B12xRoceCheckedAsyncOutput(output, check)
+        check()
+        return output
 
     @torch.inference_mode()
     @with_gpu_sync_check
@@ -1161,8 +1208,7 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
-                self._check_b12x_roce_health()
-                return output
+                return self._b12x_roce_guarded(output)
 
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config

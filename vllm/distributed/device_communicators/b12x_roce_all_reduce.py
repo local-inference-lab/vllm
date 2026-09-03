@@ -113,11 +113,16 @@ class B12xRoceAllReduce:
             )
 
     def _local_capability(self) -> tuple[str | None, tuple[int, int] | None]:
-        """(reason this rank cannot take part, parsed (max_size, max_gather))."""
+        """Evaluate this rank's ability to take part, without any collective.
+
+        Returns:
+            A pair of the reason this rank cannot take part (None when it can)
+            and the parsed ``(max_size, max_gather)`` limits (None on failure).
+        """
         try:
             from b12x.comm import roce
-        except ModuleNotFoundError:
-            return "b12x.comm.roce is not installed", None
+        except ImportError as exc:  # missing package or a broken native build
+            return f"b12x.comm.roce is not importable: {exc}", None
         api = getattr(roce, "API_VERSION", None)
         if api != REQUIRED_B12X_ROCE_API_VERSION:
             needed = REQUIRED_B12X_ROCE_API_VERSION
@@ -136,7 +141,16 @@ class B12xRoceAllReduce:
     def _exchange_vote(
         self, reason: str | None, limits: tuple[int, int] | None
     ) -> str | None:
-        """Gather every rank's reason and limits; None when all can proceed."""
+        """Gather every rank's capability result over the CPU group.
+
+        Args:
+            reason: This rank's reason for not taking part, or None.
+            limits: This rank's parsed ``(max_size, max_gather)``, or None.
+
+        Returns:
+            None when every rank can proceed with identical limits, else the
+            text naming the ranks that cannot or whose limits differ.
+        """
         votes: list[tuple[str | None, tuple[int, int] | None]] = [
             (None, None)
         ] * self.world_size
@@ -157,7 +171,11 @@ class B12xRoceAllReduce:
         return None
 
     def check_health(self) -> None:
-        """Raise if a RoCEnante wait timed out or the proxy died (fail-stop)."""
+        """Fail-stop check of the runtime.
+
+        Raises:
+            RuntimeError: When a RoCEnante wait timed out or its proxy died.
+        """
         if not self.disabled and self._runtime is not None:
             self._runtime.check_health()
 
