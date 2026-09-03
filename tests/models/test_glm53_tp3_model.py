@@ -8,13 +8,13 @@ import torch
 
 from vllm.model_executor import parameter
 from vllm.model_executor.layers import linear
-from vllm.model_executor.layers.quantization import modelopt
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.quantization import modelopt
 from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
     GroupQuantScaleParameter,
@@ -40,15 +40,11 @@ def test_explicit_loaded_sizes_zero_rank_local_destination_tails(
 ) -> None:
     _set_tp3_rank2(monkeypatch)
 
-    column = ColumnParallelLinear(
-        1, 6, bias=False, loaded_output_size=5
-    )
+    column = ColumnParallelLinear(1, 6, bias=False, loaded_output_size=5)
     column.weight.weight_loader(
         column.weight, torch.arange(1, 6, dtype=column.weight.dtype).unsqueeze(1)
     )
-    torch.testing.assert_close(
-        column.weight[:, 0], column.weight.new_tensor([5, 0])
-    )
+    torch.testing.assert_close(column.weight[:, 0], column.weight.new_tensor([5, 0]))
 
     merged = MergedColumnParallelLinear(
         1, [6, 6], bias=False, loaded_output_sizes=[5, 5]
@@ -58,9 +54,7 @@ def test_explicit_loaded_sizes_zero_rank_local_destination_tails(
         torch.arange(1, 6, dtype=merged.weight.dtype).unsqueeze(1),
         0,
     )
-    torch.testing.assert_close(
-        merged.weight[:2, 0], merged.weight.new_tensor([5, 0])
-    )
+    torch.testing.assert_close(merged.weight[:2, 0], merged.weight.new_tensor([5, 0]))
 
     qkv = QKVParallelLinear(
         hidden_size=1,
@@ -79,15 +73,11 @@ def test_explicit_loaded_sizes_zero_rank_local_destination_tails(
         )
     torch.testing.assert_close(qkv.weight[:, 0], qkv.weight.new_zeros(4))
 
-    row = RowParallelLinear(
-        6, 1, bias=False, loaded_input_size=5
-    )
+    row = RowParallelLinear(6, 1, bias=False, loaded_input_size=5)
     row.weight.weight_loader(
         row.weight, torch.arange(1, 6, dtype=row.weight.dtype).unsqueeze(0)
     )
-    torch.testing.assert_close(
-        row.weight[0], row.weight.new_tensor([5, 0])
-    )
+    torch.testing.assert_close(row.weight[0], row.weight.new_tensor([5, 0]))
 
 
 def test_loaded_sizes_reject_invalid_physical_layout(
@@ -97,9 +87,7 @@ def test_loaded_sizes_reject_invalid_physical_layout(
     with pytest.raises(ValueError, match="exceeds physical size"):
         ColumnParallelLinear(1, 6, bias=False, loaded_output_size=7)
     with pytest.raises(ValueError, match="same length"):
-        MergedColumnParallelLinear(
-            1, [6, 6], bias=False, loaded_output_sizes=[5]
-        )
+        MergedColumnParallelLinear(1, [6, 6], bias=False, loaded_output_sizes=[5])
     with pytest.raises(ValueError, match="exceeds physical size"):
         RowParallelLinear(6, 1, bias=False, loaded_input_size=7)
 
@@ -190,9 +178,7 @@ def test_padded_loader_rejects_unaligned_quantized_boundaries_before_write(
             torch.ones((1, 1), dtype=quantized_param.dtype),
         )
 
-    torch.testing.assert_close(
-        quantized_param, quantized_param.new_full((1, 1), 23)
-    )
+    torch.testing.assert_close(quantized_param, quantized_param.new_full((1, 1), 23))
 
 
 def test_padded_v2_loader_preserves_unsharded_per_tensor_scale(
@@ -226,12 +212,8 @@ def test_padded_nvfp4_row_loader_converts_logical_to_storage_width(
     dtype: torch.dtype,
 ) -> None:
     for module in (linear, parameter):
-        monkeypatch.setattr(
-            module, "get_tensor_model_parallel_world_size", lambda: 3
-        )
-        monkeypatch.setattr(
-            module, "get_tensor_model_parallel_rank", lambda: 1
-        )
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 3)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 1)
     row = RowParallelLinear(
         physical_size,
         1,
@@ -261,7 +243,6 @@ def test_padded_nvfp4_row_loader_converts_logical_to_storage_width(
     )
 
 
-
 @pytest.mark.parametrize(
     "method_type",
     (
@@ -274,12 +255,8 @@ def test_modelopt_nvfp4_row_parameters_declare_storage_widths(
     method_type: type,
 ) -> None:
     for module in (linear, parameter):
-        monkeypatch.setattr(
-            module, "get_tensor_model_parallel_world_size", lambda: 3
-        )
-        monkeypatch.setattr(
-            module, "get_tensor_model_parallel_rank", lambda: 1
-        )
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 3)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 1)
     monkeypatch.setattr(
         modelopt,
         "init_nvfp4_linear_kernel",
@@ -330,12 +307,8 @@ def test_modelopt_mxfp8_scale_loads_padded_tp3_storage_width(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     for module in (linear, parameter):
-        monkeypatch.setattr(
-            module, "get_tensor_model_parallel_world_size", lambda: 3
-        )
-        monkeypatch.setattr(
-            module, "get_tensor_model_parallel_rank", lambda: 1
-        )
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 3)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 1)
     monkeypatch.setattr(modelopt, "init_mxfp8_linear_kernel", lambda: object())
     config = modelopt.ModelOptMxFp8Config(
         is_checkpoint_mxfp8_serialized=True,
@@ -357,7 +330,9 @@ def test_modelopt_mxfp8_scale_loads_padded_tp3_storage_width(
     loaded = torch.arange(1, 129, dtype=holder.weight_scale.dtype).unsqueeze(0)
     row = RowParallelLinear(12288, 1, bias=False, loaded_input_size=4096)
     row.weight_loader_v2(holder.weight_scale, loaded)
-    torch.testing.assert_close(holder.weight_scale, torch.zeros_like(holder.weight_scale))
+    torch.testing.assert_close(
+        holder.weight_scale, torch.zeros_like(holder.weight_scale)
+    )
 
 
 @pytest.mark.parametrize("tp3", [False, True])
@@ -380,9 +355,7 @@ def test_mla_projection_loaded_sizes_are_tp3_only(
     monkeypatch.setattr(glm_attention, "RowParallelLinear", FakeLinear)
     monkeypatch.setattr(glm_attention, "DeepSeekV2FusedQkvAProjLinear", FakeLinear)
     monkeypatch.setattr(glm_attention, "RMSNorm", FakeModule)
-    monkeypatch.setattr(
-        glm_attention, "MultiHeadLatentAttentionWrapper", FakeModule
-    )
+    monkeypatch.setattr(glm_attention, "MultiHeadLatentAttentionWrapper", FakeModule)
     monkeypatch.setattr(
         glm_attention,
         "get_tensor_model_parallel_world_size",
@@ -442,7 +415,6 @@ def test_shared_expert_uses_physical_tp3_width_and_logical_load_width(
         def __init__(self, *args, **kwargs) -> None:
             super().__init__()
 
-
     monkeypatch.setattr(glm_model, "MergedColumnParallelLinear", FakeMerged)
     monkeypatch.setattr(glm_model, "RowParallelLinear", FakeRow)
     monkeypatch.setattr(glm_model, "SiluAndMul", FakeActivation)
@@ -495,9 +467,7 @@ def test_mtp_tp3_objects_are_created_only_for_active_geometry(
     monkeypatch.setattr(glm_mtp, "SharedHead", FakeSharedHead)
     monkeypatch.setattr(glm_mtp, "ParallelLMHead", FakeParallelLMHead)
     monkeypatch.setattr(glm_mtp, "Glm5NextDecoderLayer", FakeDecoder)
-    monkeypatch.setattr(
-        glm_mtp, "current_platform", SimpleNamespace(device_type="cpu")
-    )
+    monkeypatch.setattr(glm_mtp, "current_platform", SimpleNamespace(device_type="cpu"))
 
     config = SimpleNamespace(
         hidden_size=4096,
@@ -518,9 +488,7 @@ def test_mtp_tp3_objects_are_created_only_for_active_geometry(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
     )
 
-    layer = glm_mtp.Glm5NextMultiTokenPredictorLayer(
-        vllm_config, "model.layers.45"
-    )
+    layer = glm_mtp.Glm5NextMultiTokenPredictorLayer(vllm_config, "model.layers.45")
 
     if tp3:
         assert isinstance(layer.eh_proj, FakeColumn)

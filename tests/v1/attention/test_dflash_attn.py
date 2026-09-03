@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Split-KV draft attention against FlashAttention 2 at the DFlash draft shape."""
 
-import os
-
 import pytest
 import torch
 
@@ -140,4 +138,3 @@ def test_workspace_rejects_oversized_batch():
     op = dfa.DFlashDecodeAttention(device, HKV, max_batch=1, window=WINDOW)
     with pytest.raises(ValueError):
         op(q, k, v, block_table, seqused, cu, SCALE, torch.empty_like(q))
-    assert os.getenv("VLLM_GLM53_DFLASH_ATTN", "0") in ("0", "1")

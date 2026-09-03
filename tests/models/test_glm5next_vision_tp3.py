@@ -159,7 +159,9 @@ def test_glm5next_vision_tp3_merger_shards_only_divisible_weights(
     torch.testing.assert_close(merger.down_proj.weight[:, 3412:], torch.zeros(4, 2))
 
 
-def _record_vision_geometry(monkeypatch, vision_config, *, data_parallel: bool, tp: int):
+def _record_vision_geometry(
+    monkeypatch, vision_config, *, data_parallel: bool, tp: int
+):
     recorded = SimpleNamespace(block=None, merger=None, rope=None)
 
     class FakeModule(torch.nn.Module):
