@@ -510,6 +510,34 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_scheduler_waiting, per_engine_labelvalues
         )
 
+        gauge_prefill_compute_share = self._gauge_cls(
+            name="vllm:scheduler_prefill_compute_share",
+            documentation=(
+                "Configured target fraction of contended model execution "
+                "assigned to prefill; zero means disabled."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_prefill_compute_share = create_metric_per_engine(
+            gauge_prefill_compute_share, per_engine_labelvalues
+        )
+
+        counter_scheduler_compute_seconds = self._counter_cls(
+            name="vllm:scheduler_compute_seconds",
+            documentation="Model-execution time charged to each service class.",
+            labelnames=labelnames + ["class"],
+        )
+        self.counter_scheduler_compute_seconds = {
+            service_class: {
+                idx: counter_scheduler_compute_seconds.labels(
+                    model_name, str(idx), service_class
+                )
+                for idx in engine_indexes
+            }
+            for service_class in ("decode", "prefill")
+        }
+
         gauge_waiting_by_reason = self._gauge_cls(
             name="vllm:num_requests_waiting_by_reason",
             documentation=(
@@ -1121,6 +1149,15 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            self.gauge_prefill_compute_share[engine_idx].set(
+                scheduler_stats.prefill_compute_share
+            )
+            self.counter_scheduler_compute_seconds["decode"][engine_idx].inc(
+                scheduler_stats.decode_compute_seconds
+            )
+            self.counter_scheduler_compute_seconds["prefill"][engine_idx].inc(
+                scheduler_stats.prefill_compute_seconds
+            )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

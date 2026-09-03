@@ -213,6 +213,10 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    decode_compute_seconds: float = 0.0
+    prefill_compute_seconds: float = 0.0
+    prefill_compute_share: float = 0.0
+
 
 @dataclass
 class RequestStateStats:

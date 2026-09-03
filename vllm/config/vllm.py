@@ -1133,6 +1133,15 @@ class VllmConfig:
         # unset falls back to the stock ones.
         self.parallel_config.set_dcp_defaults()
 
+        if (
+            self.scheduler_config.prefill_compute_share is not None
+            and self.parallel_config.data_parallel_size > 1
+        ):
+            raise ValueError(
+                "prefill_compute_share does not yet support data parallelism; "
+                "all DP ranks must make one synchronized service-class decision"
+            )
+
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
             self.model_config.verify_dual_chunk_attention_config(self.load_config)

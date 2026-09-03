@@ -144,6 +144,13 @@ class SchedulerConfig:
     """Schedule prefill work once every N engine steps while decode requests
     are running. Data-parallel engines align the cadence across DP ranks."""
 
+    prefill_compute_share: float | None = Field(default=None, gt=0.0, lt=1.0)
+    """Target fraction of contended model-execution time assigned to prefill.
+
+    When unset, scheduling behavior is unchanged. Values must be strictly
+    between zero and one so both decode and prefill continue to make progress.
+    """
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.
@@ -224,6 +231,15 @@ class SchedulerConfig:
         return None if value is None else handler(value)
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
+        if (
+            self.prefill_compute_share is not None
+            and self.prefill_schedule_interval > 1
+        ):
+            raise ValueError(
+                "prefill_compute_share cannot be combined with "
+                "prefill_schedule_interval greater than one"
+            )
+
         if is_encoder_decoder:
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True
