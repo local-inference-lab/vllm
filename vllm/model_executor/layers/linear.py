@@ -65,7 +65,6 @@ def _validate_packed_loaded_size(
     loaded_size: int,
     name: str,
 ) -> None:
-    """Reject a padded packed layout before any destination writes occur."""
     if getattr(param, "packed_dim", None) != dim:
         return
     packed_factor = getattr(param, "packed_factor", 1)
@@ -74,6 +73,69 @@ def _validate_packed_loaded_size(
             f"{name}={loaded_size} is not divisible by packed_factor="
             f"{packed_factor}"
         )
+
+
+def _validate_padded_axis_layout(
+    param: Parameter,
+    dim: int,
+    loaded_size: int,
+    physical_size: int,
+    physical_shard_size: int,
+    physical_shard_offset: int,
+    name: str,
+    weight_block_size: tuple[int, ...] | None = None,
+) -> int:
+    """Validate a padded logical axis and return its checkpoint tensor size."""
+    if isinstance(param, BlockQuantScaleParameter):
+        if weight_block_size is None:
+            raise ValueError(f"{name} requires a weight block size")
+        if dim == getattr(param, "output_dim", None):
+            block_index = 0
+        elif dim == getattr(param, "input_dim", None):
+            block_index = 1
+        else:
+            raise ValueError(f"{name} does not identify a block-scaled axis")
+        if block_index >= len(weight_block_size):
+            raise ValueError(
+                f"{name} has no block size for parameter dimension {dim}"
+            )
+        block_size = weight_block_size[block_index]
+        shard_end = physical_shard_offset + physical_shard_size
+        boundaries = [
+            boundary
+            for boundary in (physical_shard_offset, shard_end)
+            if 0 < boundary < physical_size
+        ]
+        if physical_shard_size < physical_size:
+            boundaries.append(physical_shard_size)
+        if any(boundary % block_size for boundary in boundaries):
+            raise ValueError(
+                f"{name} physical TP boundaries are not aligned to "
+                f"quantization block size {block_size}"
+            )
+        return (loaded_size + block_size - 1) // block_size
+
+    if getattr(param, "packed_dim", None) == dim:
+        packed_factor = getattr(param, "packed_factor", 1)
+        shard_end = physical_shard_offset + physical_shard_size
+        for boundary_name, boundary in (
+            ("loaded size", loaded_size),
+            ("physical shard offset", physical_shard_offset),
+            ("physical shard end", shard_end),
+        ):
+            if boundary % packed_factor:
+                raise ValueError(
+                    f"{name} {boundary_name} {boundary} is not aligned to "
+                    f"packed_factor={packed_factor}"
+                )
+        if isinstance(param, (PackedColumnParameter, PackedvLLMParameter)):
+            packed_size, _ = param.adjust_shard_indexes_for_packing(
+                shard_size=loaded_size, shard_offset=0
+            )
+            return packed_size
+
+    return loaded_size
+
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "UnquantizedLinearMethod",
@@ -602,6 +664,18 @@ class ColumnParallelLinear(LinearBase):
                 self.loaded_output_size,
                 "loaded_output_size",
             )
+            expected_loaded_size = None
+            if self._allow_loaded_output_padding:
+                expected_loaded_size = _validate_padded_axis_layout(
+                    param,
+                    output_dim,
+                    self.loaded_output_size,
+                    self.output_size,
+                    self.output_size_per_partition,
+                    self.tp_rank * self.output_size_per_partition,
+                    "loaded_output_size",
+                    getattr(self, "weight_block_size", None),
+                )
             shard_size = param_data.shape[output_dim]
             start_idx = self.tp_rank * shard_size
             load_tensor_parallel_weight(
@@ -610,6 +684,7 @@ class ColumnParallelLinear(LinearBase):
                 output_dim,
                 start_idx,
                 allow_padding=self._allow_loaded_output_padding,
+                expected_loaded_size=expected_loaded_size,
             )
             return
 
@@ -628,9 +703,25 @@ class ColumnParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
         if self._allow_loaded_output_padding:
+            output_dim = getattr(param, "output_dim", None)
+            if output_dim is None:
+                raise ValueError(
+                    "Padded column-parallel loading requires an output dimension"
+                )
+            expected_loaded_size = _validate_padded_axis_layout(
+                param,
+                output_dim,
+                self.loaded_output_size,
+                self.output_size,
+                self.output_size_per_partition,
+                self.tp_rank * self.output_size_per_partition,
+                "loaded_output_size",
+                getattr(self, "weight_block_size", None),
+            )
             param.load_column_parallel_weight(
                 loaded_weight=loaded_weight,
                 allow_padding=True,
+                expected_loaded_size=expected_loaded_size,
             )
         else:
             param.load_column_parallel_weight(loaded_weight=loaded_weight)
@@ -852,32 +943,59 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             for shard_id, output_size in zip(shard_ids, output_sizes):
                 shard_offsets.append((shard_id, current_shard_offset, output_size))
                 current_shard_offset += output_size
+            requires_padding = any(
+                self._allow_loaded_output_shard_padding[shard_id]
+                for shard_id in shard_ids
+            )
             packed_dim = getattr(param, "packed_dim", None)
+            transformed_shards: list[tuple[int, int, int]] = []
             for shard_id, shard_offset, shard_size in shard_offsets:
-                # Special case for Quantization.
-                # If quantized, we need to adjust the offset and size to account
-                # for the packing.
-                # Add check to adjust the size/offset for FP8 block scales
+                _validate_packed_loaded_size(
+                    param,
+                    output_dim,
+                    self.loaded_output_sizes[shard_id],
+                    f"loaded_output_sizes[{shard_id}]",
+                )
+                if requires_padding:
+                    physical_shard_size = self.output_sizes[shard_id] // self.tp_size
+                    physical_shard_offset = (
+                        sum(self.output_sizes[:shard_id]) // self.tp_size
+                    )
+                    _validate_padded_axis_layout(
+                        param,
+                        output_dim,
+                        self.loaded_output_sizes[shard_id],
+                        sum(self.output_sizes) // self.tp_size,
+                        physical_shard_size,
+                        physical_shard_offset,
+                        f"loaded_output_sizes[{shard_id}]",
+                        getattr(self, "weight_block_size", None),
+                    )
                 if isinstance(param, BlockQuantScaleParameter):
                     weight_block_size = getattr(self, "weight_block_size", None)
                     shard_size, shard_offset = adjust_block_scale_shard(
                         weight_block_size, shard_size, shard_offset
                     )
-
                 if packed_dim == output_dim:
-                    _validate_packed_loaded_size(
-                        param,
-                        output_dim,
-                        self.loaded_output_sizes[shard_id],
-                        f"loaded_output_sizes[{shard_id}]",
-                    )
                     shard_size = shard_size // param.packed_factor
                     shard_offset = shard_offset // param.packed_factor
-                    # Special case for Marlin.
                     shard_size, shard_offset = adjust_marlin_shard(
                         param, shard_size, shard_offset
                     )
+                transformed_shards.append((shard_id, shard_offset, shard_size))
 
+            if requires_padding:
+                expected_loaded_size = sum(
+                    shard_size for _, _, shard_size in transformed_shards
+                )
+                if loaded_weight.shape[output_dim] != expected_loaded_size:
+                    raise ValueError(
+                        "Padded merged checkpoint axis size mismatch: "
+                        f"expected {expected_loaded_size}, "
+                        f"got {loaded_weight.shape[output_dim]}"
+                    )
+
+            for shard_id, shard_offset, shard_size in transformed_shards:
                 loaded_weight_shard = loaded_weight.narrow(
                     output_dim, shard_offset, shard_size
                 )
@@ -890,6 +1008,18 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_size = self.output_sizes[loaded_shard_id]
             shard_offset //= self.tp_size
             shard_size //= self.tp_size
+            expected_loaded_size = None
+            if self._allow_loaded_output_shard_padding[loaded_shard_id]:
+                expected_loaded_size = _validate_padded_axis_layout(
+                    param,
+                    output_dim,
+                    self.loaded_output_sizes[loaded_shard_id],
+                    sum(self.output_sizes) // self.tp_size,
+                    shard_size,
+                    shard_offset,
+                    f"loaded_output_sizes[{loaded_shard_id}]",
+                    getattr(self, "weight_block_size", None),
+                )
 
             if isinstance(param, BlockQuantScaleParameter):
                 weight_block_size = getattr(self, "weight_block_size", None)
@@ -897,14 +1027,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     weight_block_size, shard_size, shard_offset
                 )
 
-            # Special case for quantization.
-            # If quantized, we need to adjust the offset and size to account
-            # for the packing.
             packed_dim = getattr(param, "packed_dim", None)
             if packed_dim == output_dim:
                 shard_size = round(shard_size // param.packed_factor)
                 shard_offset = round(shard_offset // param.packed_factor)
-                # Special case for Marlin.
                 shard_size, shard_offset = adjust_marlin_shard(
                     param, shard_size, shard_offset
                 )
@@ -921,6 +1047,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     allow_padding=self._allow_loaded_output_shard_padding[
                         loaded_shard_id
                     ],
+                    expected_loaded_size=expected_loaded_size,
                 )
                 return
         # Special case for per-tensor scales in fused case.
@@ -947,6 +1074,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         output_sizes: list[int] | None = None,
         shard_ids: list[int] | None = None,
+        require_exact_axis: bool = False,
     ):
         """
         Handle special case for models where MLP layers are already
@@ -968,10 +1096,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_offsets.append((shard_id, current_shard_offset, output_size))
             current_shard_offset += output_size
 
+        transformed_shards: list[tuple[int, int, int]] = []
         for shard_id, shard_offset, shard_size in shard_offsets:
-            # Special case for Quantization.
-            # If quantized, we need to adjust the offset and size to account
-            # for the packing.
             if (
                 isinstance(param, (PackedColumnParameter, PackedvLLMParameter))
                 and param.packed_dim == param.output_dim
@@ -979,7 +1105,20 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_size, shard_offset = param.adjust_shard_indexes_for_packing(
                     shard_size=shard_size, shard_offset=shard_offset
                 )
+            transformed_shards.append((shard_id, shard_offset, shard_size))
 
+        if require_exact_axis:
+            expected_loaded_size = sum(
+                shard_size for _, _, shard_size in transformed_shards
+            )
+            if loaded_weight.shape[param.output_dim] != expected_loaded_size:
+                raise ValueError(
+                    "Padded merged checkpoint axis size mismatch: "
+                    f"expected {expected_loaded_size}, "
+                    f"got {loaded_weight.shape[param.output_dim]}"
+                )
+
+        for shard_id, shard_offset, shard_size in transformed_shards:
             loaded_weight_shard = loaded_weight.narrow(
                 param.output_dim, shard_offset, shard_size
             )
@@ -1019,6 +1158,28 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 else list(range(len(self.loaded_output_sizes)))
             )
             output_sizes = [self.loaded_output_sizes[idx] for idx in shard_ids]
+            requires_padding = any(
+                self._allow_loaded_output_shard_padding[shard_id]
+                for shard_id in shard_ids
+            )
+            for shard_id in shard_ids:
+                _validate_packed_loaded_size(
+                    param,
+                    param.output_dim,
+                    self.loaded_output_sizes[shard_id],
+                    f"loaded_output_sizes[{shard_id}]",
+                )
+                if requires_padding:
+                    _validate_padded_axis_layout(
+                        param,
+                        param.output_dim,
+                        self.loaded_output_sizes[shard_id],
+                        sum(self.output_sizes) // self.tp_size,
+                        self.output_sizes[shard_id] // self.tp_size,
+                        sum(self.output_sizes[:shard_id]) // self.tp_size,
+                        f"loaded_output_sizes[{shard_id}]",
+                        getattr(self, "weight_block_size", None),
+                    )
             if isinstance(param, BlockQuantScaleParameter):
                 weight_block_size = getattr(self, "weight_block_size", None)
                 output_sizes = [
@@ -1031,6 +1192,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 loaded_weight,
                 output_sizes=output_sizes,
                 shard_ids=shard_ids,
+                require_exact_axis=requires_padding,
             )
             return
 
@@ -1040,6 +1202,18 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         shard_size = self.output_sizes[loaded_shard_id]
         shard_offset //= self.tp_size
         shard_size //= self.tp_size
+        expected_loaded_size = None
+        if self._allow_loaded_output_shard_padding[loaded_shard_id]:
+            expected_loaded_size = _validate_padded_axis_layout(
+                param,
+                param.output_dim,
+                self.loaded_output_sizes[loaded_shard_id],
+                sum(self.output_sizes) // self.tp_size,
+                shard_size,
+                shard_offset,
+                f"loaded_output_sizes[{loaded_shard_id}]",
+                getattr(self, "weight_block_size", None),
+            )
 
         if isinstance(param, BlockQuantScaleParameter):
             weight_block_size = getattr(self, "weight_block_size", None)
@@ -1055,6 +1229,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         }
         if self._allow_loaded_output_shard_padding[loaded_shard_id]:
             load_kwargs["allow_padding"] = True
+            load_kwargs["expected_loaded_size"] = expected_loaded_size
         param.load_merged_column_weight(**load_kwargs)
 
     def load_weights(
@@ -1224,6 +1399,34 @@ class QKVParallelLinear(ColumnParallelLinear):
         }
         return shard_size_mapping.get(loaded_shard_id)
 
+    def _get_loaded_shard_size_mapping(self, loaded_shard_id: str) -> int:
+        return {
+            "q": self.loaded_total_num_heads * self.head_size,
+            "k": self.loaded_total_num_kv_heads * self.head_size,
+            "v": self.loaded_total_num_kv_heads * self.v_head_size,
+        }[loaded_shard_id]
+
+    def _validate_padded_qkv_layout(
+        self,
+        param: Parameter,
+        output_dim: int,
+        loaded_shard_id: str,
+        shard_offset: int,
+        shard_size: int,
+    ) -> int:
+        physical_size = self._get_shard_offset_mapping("total")
+        assert physical_size is not None
+        return _validate_padded_axis_layout(
+            param,
+            output_dim,
+            self._get_loaded_shard_size_mapping(loaded_shard_id),
+            physical_size,
+            shard_size,
+            shard_offset,
+            f"loaded {loaded_shard_id} size",
+            getattr(self, "weight_block_size", None),
+        )
+
     def _load_fused_module_from_checkpoint(
         self, param: BasevLLMParameter, loaded_weight: torch.Tensor
     ):
@@ -1252,10 +1455,26 @@ class QKVParallelLinear(ColumnParallelLinear):
             ),
         ]
 
+        requires_padding = any(self._allow_loaded_qkv_padding.values())
+        transformed_shards: list[tuple[str, int, int]] = []
         for shard_id, shard_offset, shard_size in shard_offsets:
-            # Special case for Quantization.
-            # If quantized, we need to adjust the offset and size to account
-            # for the packing.
+            local_shard_offset = self._get_shard_offset_mapping(shard_id)
+            local_shard_size = self._get_shard_size_mapping(shard_id)
+            assert local_shard_offset is not None and local_shard_size is not None
+            _validate_packed_loaded_size(
+                param,
+                param.output_dim,
+                self._get_loaded_shard_size_mapping(shard_id),
+                f"loaded {shard_id} size",
+            )
+            if requires_padding:
+                self._validate_padded_qkv_layout(
+                    param,
+                    param.output_dim,
+                    shard_id,
+                    local_shard_offset,
+                    local_shard_size,
+                )
             if isinstance(param, BlockQuantScaleParameter):
                 weight_block_size = getattr(self, "weight_block_size", None)
                 shard_size, shard_offset = adjust_block_scale_shard(
@@ -1268,7 +1487,20 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_size, shard_offset = param.adjust_shard_indexes_for_packing(
                     shard_size=shard_size, shard_offset=shard_offset
                 )
+            transformed_shards.append((shard_id, shard_offset, shard_size))
 
+        if requires_padding:
+            expected_loaded_size = sum(
+                shard_size for _, _, shard_size in transformed_shards
+            )
+            if loaded_weight.shape[param.output_dim] != expected_loaded_size:
+                raise ValueError(
+                    "Padded QKV checkpoint axis size mismatch: "
+                    f"expected {expected_loaded_size}, "
+                    f"got {loaded_weight.shape[param.output_dim]}"
+                )
+
+        for shard_id, shard_offset, shard_size in transformed_shards:
             loaded_weight_shard = loaded_weight.narrow(
                 param.output_dim, shard_offset, shard_size
             )
@@ -1303,6 +1535,15 @@ class QKVParallelLinear(ColumnParallelLinear):
         shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
         shard_size = self._get_shard_size_mapping(loaded_shard_id)
         assert shard_offset is not None and shard_size is not None
+        expected_loaded_size = None
+        if self._allow_loaded_qkv_padding[loaded_shard_id]:
+            expected_loaded_size = self._validate_padded_qkv_layout(
+                param,
+                param.output_dim,
+                loaded_shard_id,
+                shard_offset,
+                shard_size,
+            )
 
         if isinstance(param, BlockQuantScaleParameter):
             weight_block_size = getattr(self, "weight_block_size", None)
@@ -1319,6 +1560,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         }
         if self._allow_loaded_qkv_padding[loaded_shard_id]:
             load_kwargs["allow_padding"] = True
+            load_kwargs["expected_loaded_size"] = expected_loaded_size
         param.load_qkv_weight(**load_kwargs)
 
     def weight_loader(
@@ -1363,34 +1605,51 @@ class QKVParallelLinear(ColumnParallelLinear):
                 ),
             ]
             packed_dim = getattr(param, "packed_dim", None)
+            transformed_shards: list[tuple[str, int, int]] = []
+            requires_padding = any(self._allow_loaded_qkv_padding.values())
             for shard_id, shard_offset, shard_size in shard_offsets:
-                # Special case for Quantized Weights.
-                # If quantized, we need to adjust the offset and size to account
-                # for the packing.
-                # Add check to adjust the size/offset for FP8 block scales
+                local_shard_offset = self._get_shard_offset_mapping(shard_id)
+                local_shard_size = self._get_shard_size_mapping(shard_id)
+                assert local_shard_offset is not None and local_shard_size is not None
+                _validate_packed_loaded_size(
+                    param,
+                    output_dim,
+                    self._get_loaded_shard_size_mapping(shard_id),
+                    f"loaded {shard_id} size",
+                )
+                if requires_padding:
+                    self._validate_padded_qkv_layout(
+                        param,
+                        output_dim,
+                        shard_id,
+                        local_shard_offset,
+                        local_shard_size,
+                    )
                 if isinstance(param, BlockQuantScaleParameter):
                     weight_block_size = getattr(self, "weight_block_size", None)
                     shard_size, shard_offset = adjust_block_scale_shard(
                         weight_block_size, shard_size, shard_offset
                     )
-
                 if packed_dim == output_dim:
-                    loaded_size = {
-                        "q": self.loaded_total_num_heads * self.head_size,
-                        "k": self.loaded_total_num_kv_heads * self.head_size,
-                        "v": self.loaded_total_num_kv_heads * self.v_head_size,
-                    }[shard_id]
-                    _validate_packed_loaded_size(
-                        param, output_dim, loaded_size, f"loaded {shard_id} size"
-                    )
                     shard_size = round(shard_size // param.packed_factor)
                     shard_offset = round(shard_offset // param.packed_factor)
-
-                    # Special case for Marlin.
                     shard_size, shard_offset = adjust_marlin_shard(
                         param, shard_size, shard_offset
                     )
+                transformed_shards.append((shard_id, shard_offset, shard_size))
 
+            if requires_padding:
+                expected_loaded_size = sum(
+                    shard_size for _, _, shard_size in transformed_shards
+                )
+                if loaded_weight.shape[output_dim] != expected_loaded_size:
+                    raise ValueError(
+                        "Padded QKV checkpoint axis size mismatch: "
+                        f"expected {expected_loaded_size}, "
+                        f"got {loaded_weight.shape[output_dim]}"
+                    )
+
+            for shard_id, shard_offset, shard_size in transformed_shards:
                 loaded_weight_shard = loaded_weight.narrow(
                     output_dim, shard_offset, shard_size
                 )
@@ -1410,6 +1669,15 @@ class QKVParallelLinear(ColumnParallelLinear):
             elif loaded_shard_id == "v":
                 shard_offset = (self.num_heads + self.num_kv_heads) * self.head_size
                 shard_size = self.num_kv_heads * self.v_head_size
+            expected_loaded_size = None
+            if self._allow_loaded_qkv_padding[loaded_shard_id]:
+                expected_loaded_size = self._validate_padded_qkv_layout(
+                    param,
+                    output_dim,
+                    loaded_shard_id,
+                    shard_offset,
+                    shard_size,
+                )
 
             if isinstance(param, BlockQuantScaleParameter):
                 weight_block_size = getattr(self, "weight_block_size", None)
@@ -1447,6 +1715,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                     allow_padding=self._allow_loaded_qkv_padding[
                         loaded_shard_id
                     ],
+                    expected_loaded_size=expected_loaded_size,
                 )
                 return
 
@@ -1808,6 +2077,18 @@ class RowParallelLinear(LinearBase):
                 self.loaded_input_size,
                 "loaded_input_size",
             )
+            expected_loaded_size = None
+            if self._allow_loaded_input_padding:
+                expected_loaded_size = _validate_padded_axis_layout(
+                    param,
+                    input_dim,
+                    self.loaded_input_size,
+                    self.input_size,
+                    self.input_size_per_partition,
+                    self.tp_rank * self.input_size_per_partition,
+                    "loaded_input_size",
+                    getattr(self, "weight_block_size", None),
+                )
             shard_size = param_data.shape[input_dim]
             start_idx = self.tp_rank * shard_size
             load_tensor_parallel_weight(
@@ -1816,6 +2097,7 @@ class RowParallelLinear(LinearBase):
                 input_dim,
                 start_idx,
                 allow_padding=self._allow_loaded_input_padding,
+                expected_loaded_size=expected_loaded_size,
             )
             return
 
@@ -1835,9 +2117,25 @@ class RowParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         if self._allow_loaded_input_padding:
+            input_dim = getattr(param, "input_dim", None)
+            if input_dim is None:
+                raise ValueError(
+                    "Padded row-parallel loading requires an input dimension"
+                )
+            expected_loaded_size = _validate_padded_axis_layout(
+                param,
+                input_dim,
+                self.loaded_input_size,
+                self.input_size,
+                self.input_size_per_partition,
+                self.tp_rank * self.input_size_per_partition,
+                "loaded_input_size",
+                getattr(self, "weight_block_size", None),
+            )
             param.load_row_parallel_weight(
                 loaded_weight=loaded_weight,
                 allow_padding=True,
+                expected_loaded_size=expected_loaded_size,
             )
         else:
             param.load_row_parallel_weight(loaded_weight=loaded_weight)

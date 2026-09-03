@@ -35,6 +35,7 @@ def load_tensor_parallel_weight(
     start_idx: int,
     *,
     allow_padding: bool = False,
+    expected_loaded_size: int | None = None,
 ) -> None:
     """Copy one TP shard, optionally zero-filling its unavailable tail.
 
@@ -61,6 +62,15 @@ def load_tensor_parallel_weight(
     if dim < 0 or dim >= loaded_weight.ndim:
         raise IndexError(
             f"TP shard dimension {dim} is invalid for rank {loaded_weight.ndim}"
+        )
+    if expected_loaded_size is None:
+        raise ValueError(
+            "Padded TP loading requires the expected checkpoint axis size"
+        )
+    if loaded_weight.shape[dim] != expected_loaded_size:
+        raise ValueError(
+            "Padded TP checkpoint axis size mismatch: "
+            f"expected {expected_loaded_size}, got {loaded_weight.shape[dim]}"
         )
     for axis, (destination_size, loaded_size) in enumerate(
         zip(param_data.shape, loaded_weight.shape)
@@ -152,6 +162,7 @@ class BasevLLMParameter(Parameter):
         loaded_weight: torch.Tensor,
         *,
         allow_padding: bool = False,
+        expected_loaded_size: int | None = None,
     ):
         if allow_padding and self.data.shape != loaded_weight.shape:
             raise ValueError(
@@ -165,6 +176,7 @@ class BasevLLMParameter(Parameter):
         loaded_weight: torch.Tensor,
         *,
         allow_padding: bool = False,
+        expected_loaded_size: int | None = None,
     ):
         if allow_padding and self.data.shape != loaded_weight.shape:
             raise ValueError(
@@ -221,6 +233,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         loaded_weight: torch.Tensor,
         *,
         allow_padding: bool = False,
+        expected_loaded_size: int | None = None,
     ):
         load_tensor_parallel_weight(
             self.data,
@@ -228,6 +241,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             self.output_dim,
             self.tp_rank * self.data.shape[self.output_dim],
             allow_padding=allow_padding,
+            expected_loaded_size=expected_loaded_size,
         )
 
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
@@ -253,6 +267,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             self.output_dim,
             self.tp_rank * shard_size,
             allow_padding=allow_padding,
+            expected_loaded_size=kwargs.get("expected_loaded_size"),
         )
 
     def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
@@ -281,6 +296,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             self.output_dim,
             shard_id_int * shard_size,
             allow_padding=allow_padding,
+            expected_loaded_size=kwargs.get("expected_loaded_size"),
         )
 
 
@@ -305,6 +321,7 @@ class RowvLLMParameter(BasevLLMParameter):
         loaded_weight: torch.Tensor,
         *,
         allow_padding: bool = False,
+        expected_loaded_size: int | None = None,
     ):
         param_data = self.data
         load_tensor_parallel_weight(
@@ -313,6 +330,7 @@ class RowvLLMParameter(BasevLLMParameter):
             self.input_dim,
             self.tp_rank * param_data.shape[self.input_dim],
             allow_padding=allow_padding,
+            expected_loaded_size=expected_loaded_size,
         )
 
 

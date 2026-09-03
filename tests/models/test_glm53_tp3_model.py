@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.model_executor import parameter
 from vllm.model_executor.layers import linear
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -13,7 +14,10 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from vllm.model_executor import parameter
+from vllm.model_executor.parameter import (
+    BlockQuantScaleParameter,
+    PackedvLLMParameter,
+)
 from vllm.models.glm5next.nvidia import attention as glm_attention
 from vllm.models.glm5next.nvidia import model as glm_model
 from vllm.models.glm5next.nvidia import mtp as glm_mtp
@@ -94,6 +98,97 @@ def test_loaded_sizes_reject_invalid_physical_layout(
         )
     with pytest.raises(ValueError, match="exceeds physical size"):
         RowParallelLinear(6, 1, bias=False, loaded_input_size=7)
+
+
+def test_padded_loader_rejects_truncated_checkpoint_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_tp3_rank2(monkeypatch)
+    column = ColumnParallelLinear(1, 6, bias=False, loaded_output_size=5)
+    column.weight.data.fill_(17)
+
+    with pytest.raises(ValueError, match="expected 5, got 4"):
+        column.weight.weight_loader(
+            column.weight,
+            torch.ones((4, 1), dtype=column.weight.dtype),
+        )
+
+    torch.testing.assert_close(column.weight, column.weight.new_full((2, 1), 17))
+
+    merged = MergedColumnParallelLinear(
+        1, [6, 6], bias=False, loaded_output_sizes=[5, 5]
+    )
+    merged.weight.data.fill_(17)
+    with pytest.raises(ValueError, match="expected 5, got 4"):
+        merged.weight.weight_loader(
+            merged.weight,
+            torch.ones((4, 1), dtype=merged.weight.dtype),
+            0,
+        )
+    torch.testing.assert_close(merged.weight, merged.weight.new_full((4, 1), 17))
+
+    qkv = QKVParallelLinear(
+        hidden_size=1,
+        head_size=1,
+        total_num_heads=6,
+        total_num_kv_heads=3,
+        loaded_total_num_heads=4,
+        loaded_total_num_kv_heads=2,
+        bias=False,
+    )
+    qkv.weight.data.fill_(17)
+    with pytest.raises(ValueError, match="expected 4, got 3"):
+        qkv.weight.weight_loader(
+            qkv.weight,
+            torch.ones((3, 1), dtype=qkv.weight.dtype),
+            "q",
+        )
+    torch.testing.assert_close(qkv.weight, qkv.weight.new_full((4, 1), 17))
+
+    row = RowParallelLinear(6, 1, bias=False, loaded_input_size=5)
+    row.weight.data.fill_(17)
+    with pytest.raises(ValueError, match="expected 5, got 4"):
+        row.weight.weight_loader(
+            row.weight,
+            torch.ones((1, 4), dtype=row.weight.dtype),
+        )
+    torch.testing.assert_close(row.weight, row.weight.new_full((1, 2), 17))
+
+
+@pytest.mark.parametrize(
+    ("parameter_type", "error"),
+    [
+        (PackedvLLMParameter, "packed_factor=4"),
+        (BlockQuantScaleParameter, "quantization block size 4"),
+    ],
+)
+def test_padded_loader_rejects_unaligned_quantized_boundaries_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+    parameter_type: type[parameter.BasevLLMParameter],
+    error: str,
+) -> None:
+    _set_tp3_rank2(monkeypatch)
+    column = ColumnParallelLinear(1, 6, bias=False, loaded_output_size=4)
+    column.weight_block_size = (4, 4)
+    kwargs = {
+        "data": torch.full((1, 1), 23.0),
+        "input_dim": 1,
+        "output_dim": 0,
+        "weight_loader": lambda *_args, **_kwargs: None,
+    }
+    if parameter_type is PackedvLLMParameter:
+        kwargs.update(packed_factor=4, packed_dim=0)
+    quantized_param = parameter_type(**kwargs)
+
+    with pytest.raises(ValueError, match=error):
+        column.weight_loader(
+            quantized_param,
+            torch.ones((1, 1), dtype=quantized_param.dtype),
+        )
+
+    torch.testing.assert_close(
+        quantized_param, quantized_param.new_full((1, 1), 23)
+    )
 
 
 @pytest.mark.parametrize("tp3", [False, True])
