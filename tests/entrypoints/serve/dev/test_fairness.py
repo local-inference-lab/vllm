@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from vllm.entrypoints.serve.dev.fairness.api_router import (
     PrefillFairnessRequest,
@@ -34,10 +35,21 @@ def _request(client):
 
 
 def test_get_prefill_fairness_returns_current_config():
-    current = {"fairness_engine": "compute_share", "prefill_compute_share": 0.5}
+    current = {"prefill_compute_share": 0.5}
     response = asyncio.run(get_prefill_fairness(_request(_FakeEngineClient(current))))
     assert response.status_code == 200
     assert json.loads(response.body) == current
+
+
+def test_request_accepts_auto_compute_share():
+    config = PrefillFairnessRequest(prefill_compute_share="auto")
+
+    assert config.prefill_compute_share == "auto"
+
+
+def test_request_rejects_removed_selector():
+    with pytest.raises(ValidationError, match="fairness_engine"):
+        PrefillFairnessRequest(fairness_engine="micro_slicing")
 
 
 @pytest.mark.parametrize(
@@ -49,12 +61,10 @@ def test_set_prefill_fairness_maps_rejection_status(reason, status_code):
         "applied": False,
         "reason": reason,
         "message": "rejected",
-        "config": {"fairness_engine": None},
+        "config": {"prefill_compute_share": None},
     }
     client = _FakeEngineClient(result)
-    config = PrefillFairnessRequest(
-        fairness_engine="compute_share", prefill_compute_share=0.5
-    )
+    config = PrefillFairnessRequest(prefill_compute_share=0.5)
 
     response = asyncio.run(set_prefill_fairness(_request(client), config))
 

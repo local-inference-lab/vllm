@@ -688,6 +688,7 @@ class EngineCore:
             service_class,
             elapsed_seconds,
             contended=scheduler_output.compute_contention,
+            scheduled_tokens=scheduler_output.compute_service_tokens,
         )
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:

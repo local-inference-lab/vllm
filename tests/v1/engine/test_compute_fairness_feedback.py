@@ -86,8 +86,8 @@ def test_queued_feedback_stays_paired_with_exact_batch():
     engine._record_compute_time(prefill_output, prefill_timing)
 
     assert engine.scheduler.record_compute_time.call_args_list == [
-        call("decode", pytest.approx(0.1), contended=True),
-        call("prefill", pytest.approx(0.2), contended=True),
+        call("decode", pytest.approx(0.1), contended=True, scheduled_tokens=0),
+        call("prefill", pytest.approx(0.2), contended=True, scheduled_tokens=0),
     ]
 
 

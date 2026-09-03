@@ -5,7 +5,7 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from vllm.engine.protocol import EngineClient
 
@@ -13,14 +13,13 @@ router = APIRouter()
 
 
 class PrefillFairnessRequest(BaseModel):
-    """Complete replacement configuration for prefill fairness."""
+    """Replacement configuration for prefill compute sharing."""
 
-    fairness_engine: Literal["compute_share", "micro_slicing"] | None = None
-    prefill_compute_share: Annotated[float | None, Field(gt=0.0, lt=1.0)] = None
-    max_num_prefill_tokens_per_step: Annotated[int, Field(ge=0)] = 0
-    max_num_partial_prefills: Annotated[int, Field(ge=0)] = 0
-    decode_prefill_min_decode_steps: Annotated[int, Field(ge=0)] = 0
-    decode_prefill_max_wait_ms: Annotated[int, Field(ge=0)] = 0
+    model_config = ConfigDict(extra="forbid")
+
+    prefill_compute_share: (
+        Annotated[float, Field(gt=0.0, lt=1.0)] | Literal["auto"] | None
+    ) = None
 
 
 def engine_client(request: Request) -> EngineClient:
@@ -29,7 +28,7 @@ def engine_client(request: Request) -> EngineClient:
 
 @router.get("/prefill_fairness")
 async def get_prefill_fairness(raw_request: Request):
-    """Return the active fairness engine and all tuning parameters."""
+    """Return the active prefill compute-share configuration."""
     config = await engine_client(raw_request).get_prefill_fairness()
     return JSONResponse(content=config)
 

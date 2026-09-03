@@ -97,6 +97,7 @@ class SchedulerInterface(ABC):
         elapsed_seconds: float,
         *,
         contended: bool,
+        scheduled_tokens: int = 0,
     ) -> None:
         """Record model-execution feedback for adaptive scheduling."""
         raise NotImplementedError

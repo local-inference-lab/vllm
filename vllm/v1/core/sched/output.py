@@ -302,6 +302,7 @@ class SchedulerOutput:
     # None identifies a transfer-only or otherwise empty model step.
     compute_service_class: ComputeServiceClass | None = None
     compute_contention: bool = False
+    compute_service_tokens: int = 0
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
