@@ -34,10 +34,6 @@ def test_scheduler_iteration_details_serialization():
         scheduler_stats=SchedulerStats(
             kv_cache_usage=0.5,
             iteration_details=iteration_details,
-            scheduled_prefill_tokens=2304,
-            active_partial_prefills=2,
-            decode_only_steps=4,
-            fairness_bypasses=1,
         )
     )
 
@@ -47,10 +43,6 @@ def test_scheduler_iteration_details_serialization():
     assert decoded.scheduler_stats is not None
     assert decoded.scheduler_stats.kv_cache_usage == 0.5
     assert decoded.scheduler_stats.iteration_details == iteration_details
-    assert decoded.scheduler_stats.scheduled_prefill_tokens == 2304
-    assert decoded.scheduler_stats.active_partial_prefills == 2
-    assert decoded.scheduler_stats.decode_only_steps == 4
-    assert decoded.scheduler_stats.fairness_bypasses == 1
 
 
 def test_compute_iteration_details_includes_encoder_stats():

@@ -6499,16 +6499,10 @@ def test_decode_burst_controller_balances_prefill_and_decode(lp11_model_path):
     prefill_ids = {request.request_id for request in prefills}
 
     outputs = []
-    interval_stats = []
     for _ in range(5):
         output = scheduler.schedule()
         outputs.append(output)
-        engine_outputs = scheduler.update_from_output(
-            output, _empty_output_for_schedule(output)
-        )
-        stats = next(iter(engine_outputs.values())).scheduler_stats
-        assert stats is not None
-        interval_stats.append(stats)
+        scheduler.update_from_output(output, _empty_output_for_schedule(output))
 
     prefill_tokens = [
         sum(
@@ -6534,18 +6528,7 @@ def test_decode_burst_controller_balances_prefill_and_decode(lp11_model_path):
         == 2304
     )
 
-    final_stats = scheduler.drain_decode_prefill_stats()
-    stats = {
-        "scheduled_prefill_tokens": sum(
-            row.scheduled_prefill_tokens for row in interval_stats
-        )
-        + final_stats["scheduled_prefill_tokens"],
-        "active_partial_prefills": final_stats["active_partial_prefills"],
-        "decode_only_steps": sum(row.decode_only_steps for row in interval_stats)
-        + final_stats["decode_only_steps"],
-        "fairness_bypasses": sum(row.fairness_bypasses for row in interval_stats)
-        + final_stats["fairness_bypasses"],
-    }
+    stats = scheduler.drain_decode_prefill_stats()
     assert stats == {
         "scheduled_prefill_tokens": 4608,
         "active_partial_prefills": 2,

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -852,7 +851,6 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
             if running_prefill_limit is not None:
-                assert prefill_budget_remaining is not None
                 num_new_tokens = min(
                     num_new_tokens,
                     running_prefill_limit,
@@ -3078,16 +3076,11 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
-        decode_prefill_stats = self.drain_decode_prefill_stats()
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
-            scheduled_prefill_tokens=decode_prefill_stats["scheduled_prefill_tokens"],
-            active_partial_prefills=decode_prefill_stats["active_partial_prefills"],
-            decode_only_steps=decode_prefill_stats["decode_only_steps"],
-            fairness_bypasses=decode_prefill_stats["fairness_bypasses"],
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
