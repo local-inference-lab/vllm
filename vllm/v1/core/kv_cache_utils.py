@@ -1132,6 +1132,14 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
 def _get_kv_cache_layer_buckets(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[list[str]]:
+    """Group layers whose cache specifications can share one group.
+
+    Args:
+        kv_cache_spec: Cache specification keyed by layer name.
+
+    Returns:
+        Compatible layer-name buckets in input discovery order.
+    """
     # Group all layers by kv_cache_spec.
     # E.g., 2 full attention layers and 3 sliding window attention layers,
     # -> (full.0, full.1), (sw.0, sw.1, sw.2).
@@ -1167,6 +1175,16 @@ def _split_kv_cache_layer_buckets(
     layer_buckets: list[list[str]],
     group_counts: Sequence[int],
 ) -> list[KVCacheGroupSpec]:
+    """Split compatible layer buckets into round-robin cache groups.
+
+    Args:
+        kv_cache_spec: Cache specification keyed by layer name.
+        layer_buckets: Compatible layer-name buckets to split.
+        group_counts: Number of groups to create from each bucket.
+
+    Returns:
+        Cache-group specifications for the requested splits.
+    """
     grouped_layers = [
         layers[i::num_groups]
         for layers, num_groups in zip(layer_buckets, group_counts)
@@ -1387,7 +1405,15 @@ def _get_kv_cache_group_allocation_cost(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
-    """Return shared-pool bytes needed by one maximum-length request."""
+    """Calculate shared-pool bytes needed by a maximum-length request.
+
+    Args:
+        vllm_config: Serving configuration used to determine request capacity.
+        kv_cache_groups: Candidate cache groups sharing the physical pool.
+
+    Returns:
+        Required shared-pool bytes for one maximum-length request.
+    """
     num_blocks_per_request = sum(
         cdiv(
             group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
@@ -1402,7 +1428,18 @@ def _get_weighted_shared_pool_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
-    """Balance split-page groups by their actual shared-pool memory cost."""
+    """Balance split-page groups by their shared-pool memory cost.
+
+    Args:
+        vllm_config: Serving configuration used to evaluate candidate layouts.
+        kv_cache_spec: Cache specification keyed by layer name.
+
+    Returns:
+        Lowest-cost compatible layout within the cache-group limit.
+
+    Raises:
+        ValueError: If incompatible layer buckets cannot fit within the limit.
+    """
     layer_buckets = _get_kv_cache_layer_buckets(kv_cache_spec)
     if len(layer_buckets) > _MAX_WEIGHTED_SHARED_POOL_GROUPS:
         raise ValueError(
