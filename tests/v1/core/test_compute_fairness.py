@@ -80,13 +80,16 @@ def test_single_runnable_class_receives_full_service():
     assert controller.select(decode_runnable=False, prefill_runnable=False) is None
 
 
-def test_neither_class_starves_at_asymmetric_share():
-    controller = PrefillComputeShareController(0.9)
+@pytest.mark.parametrize("prefill_share", [0.2, 0.8, 0.9])
+def test_neither_class_starves_at_asymmetric_share(prefill_share: float):
+    controller = PrefillComputeShareController(prefill_share)
     totals = _run_controller(controller, decode_cost=0.1, prefill_cost=1.0, steps=1000)
 
     assert totals["decode"] > 0.0
     assert totals["prefill"] > 0.0
-    assert totals["prefill"] / sum(totals.values()) == pytest.approx(0.9, abs=0.02)
+    assert totals["prefill"] / sum(totals.values()) == pytest.approx(
+        prefill_share, abs=0.02
+    )
 
 
 def test_outlier_lead_is_bounded_to_one_service_quantum():
