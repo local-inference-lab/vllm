@@ -170,3 +170,102 @@ def test_projected_context_cache_rejects_device_mismatch():
 
     with pytest.raises(ValueError, match="device mismatch"):
         cache.append(0, states)
+
+
+# --- peer-memory transport: the draft side ------------------------------------
+
+
+def _p2p_engine(max_requests=4, steps=3, width=16):
+    import threading
+    from types import SimpleNamespace
+
+    from vllm.entrypoints.k3_dspark_rpc import K3DSparkDraftEngine
+
+    engine = K3DSparkDraftEngine.__new__(K3DSparkDraftEngine)
+    engine.method = "dflash"
+    engine.raw_context_width = width
+    engine.allocator = SimpleNamespace(max_requests=max_requests)
+    engine.max_speculative_tokens = steps
+    engine.device = torch.device("cuda")
+    engine._lock = threading.Lock()
+    engine._p2p = None
+    return engine
+
+
+def _p2p_open_header(**overrides):
+    header = {
+        "context_rows": 8,
+        "context_width": 16,
+        "context_slots": 3,
+        "max_requests": 4,
+        "num_speculative_tokens": 3,
+        "logits_topk": 5,
+        "reply_slots": 2,
+    }
+    header.update(overrides)
+    return header
+
+
+def test_open_p2p_exports_ring_and_reply_slots_and_reuses_matching_buffers(
+    monkeypatch,
+):
+    """P2P_OPEN allocates the peer buffers for the stated geometry, exports
+    IPC handles for them, and keeps the same buffers for a repeated open."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False")
+    engine = _p2p_engine()
+    from vllm.entrypoints.k3_dspark_rpc import P2P_CAPABILITY
+
+    try:
+        exported = engine.open_p2p(_p2p_open_header())
+    except ValueError as exc:
+        if "cudaMalloc" in str(exc):
+            pytest.skip("this process does not use cudaMalloc allocations")
+        raise
+    assert exported["ok"] and exported["capability"] == P2P_CAPABILITY
+    assert exported["context"]["shape"] == [3, 8, 16]
+    assert exported["values"]["shape"] == [2, 4, 3, 5]
+    assert exported["indices"]["dtype"] == "int32"
+    first = engine._p2p
+    engine.open_p2p(_p2p_open_header())
+    assert engine._p2p is first
+    engine.open_p2p(_p2p_open_header(reply_slots=3))
+    assert engine._p2p is not first
+    with pytest.raises(ValueError, match="width"):
+        engine.open_p2p(_p2p_open_header(context_width=32))
+    with pytest.raises(ValueError, match="requests"):
+        engine.open_p2p(_p2p_open_header(max_requests=9))
+
+
+def test_stage_p2p_reply_writes_top_k_into_alternating_slots():
+    """The reply slot holds exactly the top-k values and indices of the
+    draft logits, narrower depths fill a prefix, and slots alternate."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    from vllm.entrypoints.k3_dspark_rpc import (
+        TOPK_LOGITS_P2P_CAPABILITY,
+        _P2PBuffers,
+    )
+
+    engine = _p2p_engine()
+    engine._p2p = _P2PBuffers(
+        context=torch.zeros((3, 8, 16), dtype=torch.bfloat16, device="cuda"),
+        values=torch.zeros((2, 4, 3, 5), dtype=torch.bfloat16, device="cuda"),
+        indices=torch.zeros((2, 4, 3, 5), dtype=torch.int32, device="cuda"),
+    )
+    logits = torch.randn((2, 2, 64), device="cuda").to(torch.bfloat16)
+    metadata = engine._stage_p2p_reply(logits, 5)
+    assert metadata["capability"] == TOPK_LOGITS_P2P_CAPABILITY
+    assert metadata["shape"] == [2, 2, 5] and metadata["p2p_reply_slot"] == 0
+    values, indices = torch.topk(logits.reshape(-1, 64), 5, dim=-1, sorted=False)
+    slot = engine._p2p.values[0, :2, :2].reshape(-1, 5)
+    assert torch.equal(slot.sort(dim=-1).values, values.sort(dim=-1).values)
+    gathered = torch.gather(
+        logits.reshape(-1, 64), 1, engine._p2p.indices[0, :2, :2].reshape(-1, 5).long()
+    )
+    assert torch.equal(gathered, slot)
+    assert engine._stage_p2p_reply(logits, 5)["p2p_reply_slot"] == 1
+    assert engine._stage_p2p_reply(logits, 5)["p2p_reply_slot"] == 0
+    with pytest.raises(ValueError, match="top-5"):
+        engine._stage_p2p_reply(logits, 4)

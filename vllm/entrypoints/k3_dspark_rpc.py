@@ -10,6 +10,7 @@ server protocol.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import threading
@@ -39,6 +40,77 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 PROTOCOL_VERSION = 2
+P2P_CAPABILITY = "dflash_p2p_v1"
+TOPK_LOGITS_P2P_CAPABILITY = "dflash_logits_topk_p2p_v1"
+
+
+_CUDA_IPC_HANDLE_BYTES = 64
+
+def _ipc_handle_from_share(blob: bytes) -> bytes:
+    """Extract the ``cudaIpcMemHandle_t`` from a storage's share blob.
+
+    ``UntypedStorage._share_cuda_`` returns a two-byte header (format
+    version, allocation kind) followed by the handle; only allocations the
+    CUDA caching allocator made with ``cudaMalloc`` (kind ``c``) carry an IPC
+    memory handle. Expandable segments (kind ``e``) export a file descriptor
+    instead and cannot be mapped with ``cudaIpcOpenMemHandle``.
+    """
+    if len(blob) == _CUDA_IPC_HANDLE_BYTES:
+        return bytes(blob)
+    if len(blob) == _CUDA_IPC_HANDLE_BYTES + 2 and blob[1:2] == b"c":
+        return bytes(blob[2:])
+    raise ValueError(
+        "exported storage is not a cudaMalloc allocation (set "
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False in the exporting "
+        f"process); share blob of {len(blob)} bytes, kind {blob[1:2]!r}"
+    )
+
+
+def _export_cuda_tensor(tensor: torch.Tensor) -> dict[str, Any]:
+    """Describe a contiguous CUDA tensor for the verifier process: the base64
+    CUDA IPC handle of its allocation, the tensor's byte offset in it, and
+    its geometry. The engine keeps the tensor alive while it is exported."""
+    if not tensor.is_cuda or not tensor.is_contiguous():
+        raise ValueError("only contiguous CUDA tensors can be exported")
+    shared = tensor.untyped_storage()._share_cuda_()
+    handle = _ipc_handle_from_share(shared[1])
+    offset = int(shared[3]) + tensor.storage_offset() * tensor.element_size()
+    return {
+        "handle": base64.b64encode(handle).decode("ascii"),
+        "offset_bytes": offset,
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype).removeprefix("torch."),
+        "nbytes": tensor.numel() * tensor.element_size(),
+    }
+
+
+@dataclass
+class _P2PBuffers:
+    """Peer-accessible context ring and reply slots on the draft GPU.
+
+    The verifier pushes the rows of one proposal into ``context[slot]`` and
+    pulls the top-k draft logits of one proposal from ``values[slot]`` /
+    ``indices[slot]``; a proposal names the slots it uses.
+    """
+
+    context: torch.Tensor  # [slots, rows, width] bf16
+    values: torch.Tensor  # [slots, requests, K, topk] bf16
+    indices: torch.Tensor  # [slots, requests, K, topk] int32
+    reply_slot: int = 0
+
+    def export(self) -> dict[str, Any]:
+        return {
+            "capability": P2P_CAPABILITY,
+            "context": _export_cuda_tensor(self.context),
+            "values": _export_cuda_tensor(self.values),
+            "indices": _export_cuda_tensor(self.indices),
+        }
+
+    def matches(self, context_shape, reply_shape) -> bool:
+        return (
+            tuple(self.context.shape) == tuple(context_shape)
+            and tuple(self.values.shape) == tuple(reply_shape)
+        )
 LOGITS_CAPABILITY = "dflash_logits_bf16_v1"
 TOPK_LOGITS_CAPABILITY = "dflash_logits_topk_bf16_v1"
 
@@ -576,6 +648,7 @@ class K3DSparkDraftEngine:
         # Context ingest graphs keyed by appended row count (raw aux rows only;
         # projected rows and larger appends run eagerly).
         self._ingest_graphs: dict[int, _DraftIngestGraphState] = {}
+        self._p2p: _P2PBuffers | None = None
         self.ingest_graph_replay_count = 0
         self.ingest_graph_eager_count = 0
         self._logits_host: torch.Tensor | None = None
@@ -1136,14 +1209,53 @@ class K3DSparkDraftEngine:
             max_rows,
         )
 
+    def _stage_p2p_reply(
+        self, draft_logits: torch.Tensor, logits_topk: int
+    ) -> dict[str, Any]:
+        """Write the top-k draft logits of this proposal into a reply slot.
+
+        The verifier pulls the slot after this reply's header arrives; the
+        slot alternates per proposal so the pull of one reply never races the
+        write of the next.
+        """
+        buffers = self._p2p
+        if buffers is None:
+            raise ValueError("PROPOSE requests a peer reply before P2P_OPEN")
+        requests, steps, vocab = (int(v) for v in draft_logits.shape)
+        slots, max_requests, max_steps, topk = (int(v) for v in buffers.values.shape)
+        if topk != logits_topk:
+            raise ValueError(
+                f"Peer reply slots hold top-{topk} logits, proposal asks for {logits_topk}"
+            )
+        if requests > max_requests or steps > max_steps:
+            raise ValueError("Proposal exceeds the peer reply slot geometry")
+        values, indices = torch.topk(
+            draft_logits.reshape(-1, vocab), logits_topk, dim=-1, sorted=False
+        )
+        slot = buffers.reply_slot
+        buffers.reply_slot = (slot + 1) % slots
+        buffers.values[slot, :requests, :steps].copy_(values.view(requests, steps, topk))
+        buffers.indices[slot, :requests, :steps].copy_(
+            indices.view(requests, steps, topk).to(torch.int32)
+        )
+        torch.cuda.current_stream(draft_logits.device).synchronize()
+        return {
+            "capability": TOPK_LOGITS_P2P_CAPABILITY,
+            "dtype": "bfloat16",
+            "shape": [requests, steps, logits_topk],
+            "topk": logits_topk,
+            "p2p_reply_slot": slot,
+        }
+
     def _append_context(
         self,
         states: list[DraftRequestState],
         context_counts: list[int],
         positions_cpu: torch.Tensor,
-        context_cpu: torch.Tensor,
+        context_cpu: torch.Tensor | None,
         *,
         projected: bool,
+        context_gpu: torch.Tensor | None = None,
     ) -> None:
         if positions_cpu.numel() == 0:
             return
@@ -1151,7 +1263,11 @@ class K3DSparkDraftEngine:
         ingest = None if projected else self._ingest_graphs.get(total_rows)
         if ingest is None:
             positions = positions_cpu.to(self.device, non_blocking=True)
-            context_input = context_cpu.to(self.device, non_blocking=True)
+            if context_gpu is not None:
+                context_input = context_gpu
+            else:
+                assert context_cpu is not None
+                context_input = context_cpu.to(self.device, non_blocking=True)
             context_states = (
                 context_input
                 if projected
@@ -1160,10 +1276,15 @@ class K3DSparkDraftEngine:
             if not projected:
                 self.ingest_graph_eager_count += 1
         else:
-            # Both host tensors are views of the pinned RPC staging buffers,
-            # which the next (serialized) RPC overwrites only after this
+            # The host tensors are views of the pinned RPC staging buffers and
+            # the peer rows live in the ring slot named by the proposal; the
+            # next (serialized) RPC overwrites either only after this
             # proposal's final event has been synchronized.
-            ingest.context_in.copy_(context_cpu, non_blocking=True)
+            if context_gpu is not None:
+                ingest.context_in.copy_(context_gpu, non_blocking=True)
+            else:
+                assert context_cpu is not None
+                ingest.context_in.copy_(context_cpu, non_blocking=True)
             ingest.positions_in.copy_(positions_cpu, non_blocking=True)
 
         slots: list[int] = []
@@ -1387,6 +1508,67 @@ class K3DSparkDraftEngine:
         return draft_tokens, None
 
     @torch.inference_mode()
+    def open_p2p(self, header: dict[str, Any]) -> dict[str, Any]:
+        """Allocate (or reuse) the peer-accessible buffers and export them.
+
+        The verifier states the ring geometry it will push (context rows per
+        proposal, context width, ring slots) and the reply geometry it will
+        pull (requests, speculative steps, top-k width, reply slots).
+        """
+        if self.method != "dflash":
+            raise ValueError("Peer transport is supported only for DFlash")
+        rows = int(header.get("context_rows", 0))
+        width = int(header.get("context_width", 0))
+        context_slots = int(header.get("context_slots", 0))
+        requests = int(header.get("max_requests", 0))
+        steps = int(header.get("num_speculative_tokens", 0))
+        topk = int(header.get("logits_topk", 0))
+        reply_slots = int(header.get("reply_slots", 0))
+        if min(rows, width, context_slots, requests, steps, topk, reply_slots) <= 0:
+            raise ValueError(f"P2P_OPEN geometry must be positive: {header}")
+        if width != self.raw_context_width:
+            raise ValueError(
+                f"P2P context width {width} does not match the draft's "
+                f"{self.raw_context_width}"
+            )
+        if requests > self.allocator.max_requests:
+            raise ValueError(
+                f"P2P reply requests {requests} exceed the draft's "
+                f"{self.allocator.max_requests}"
+            )
+        if steps > self.max_speculative_tokens:
+            raise ValueError(
+                f"P2P reply depth {steps} exceeds the draft's "
+                f"{self.max_speculative_tokens}"
+            )
+        context_shape = (context_slots, rows, width)
+        reply_shape = (reply_slots, requests, steps, topk)
+        with self._lock:
+            buffers = self._p2p
+            if buffers is None or not buffers.matches(context_shape, reply_shape):
+                torch.cuda.synchronize(self.device)
+                self._p2p = _P2PBuffers(
+                    context=torch.zeros(
+                        context_shape, dtype=torch.bfloat16, device=self.device
+                    ),
+                    values=torch.zeros(
+                        reply_shape, dtype=torch.bfloat16, device=self.device
+                    ),
+                    indices=torch.zeros(
+                        reply_shape, dtype=torch.int32, device=self.device
+                    ),
+                )
+            assert self._p2p is not None
+            exported = self._p2p.export()
+        exported.update({"ok": True, "protocol": PROTOCOL_VERSION})
+        logger.info(
+            "K3 %s peer transport exported: context %s, reply %s",
+            self.method,
+            list(context_shape),
+            list(reply_shape),
+        )
+        return exported
+
     def propose(self, header: dict[str, Any], frames: list[bytes]) -> dict[str, Any]:
         started = time.perf_counter()
         requests = header.get("requests")
@@ -1416,20 +1598,43 @@ class K3DSparkDraftEngine:
             raise ValueError("context_count cannot be negative")
         total_context = sum(context_counts)
         expected_frames = 2 if total_context else 0
+        context_width = self.hidden_size if projected else self.raw_context_width
+        p2p_context_slot = header.get("p2p_context_slot")
+        context_gpu: torch.Tensor | None = None
+        if p2p_context_slot is not None:
+            # The verifier pushed the context rows into the peer ring before
+            # sending this header; only the positions travel as a frame.
+            if projected:
+                raise ValueError("Peer context transport carries raw rows only")
+            buffers = self._p2p
+            if buffers is None:
+                raise ValueError("PROPOSE names a peer context slot before P2P_OPEN")
+            slot = int(p2p_context_slot)
+            if not 0 <= slot < int(buffers.context.shape[0]):
+                raise ValueError(f"Peer context slot {slot} out of range")
+            if total_context > int(buffers.context.shape[1]):
+                raise ValueError(
+                    f"Peer context of {total_context} rows exceeds the ring slot"
+                )
+            expected_frames = 1 if total_context else 0
         if len(frames) != expected_frames:
             raise ValueError(
                 f"PROPOSE expected {expected_frames} tensor frames, got {len(frames)}"
             )
-        context_width = self.hidden_size if projected else self.raw_context_width
         if total_context:
             positions_cpu = self._decode_host_tensor(
                 frames[0], dtype=torch.int64, shape=(total_context,)
             )
-            context_cpu = self._decode_host_tensor(
-                frames[1],
-                dtype=torch.bfloat16,
-                shape=(total_context, context_width),
-            )
+            if p2p_context_slot is not None:
+                context_cpu = None
+                assert self._p2p is not None
+                context_gpu = self._p2p.context[int(p2p_context_slot), :total_context]
+            else:
+                context_cpu = self._decode_host_tensor(
+                    frames[1],
+                    dtype=torch.bfloat16,
+                    shape=(total_context, context_width),
+                )
         else:
             positions_cpu = torch.empty(0, dtype=torch.int64)
             context_cpu = torch.empty((0, context_width), dtype=torch.bfloat16)
@@ -1467,6 +1672,7 @@ class K3DSparkDraftEngine:
                 positions_cpu,
                 context_cpu,
                 projected=projected,
+                context_gpu=context_gpu,
             )
             context_end.record()
             anchor_positions = [int(req["anchor_position"]) for req in requests]
@@ -1485,7 +1691,11 @@ class K3DSparkDraftEngine:
             tokens_copied = time.perf_counter()
             logits_metadata = None
             logits_frame = None
-            if return_logits and logits_topk > 0:
+            p2p_reply = bool(header.get("p2p_reply", False))
+            if return_logits and logits_topk > 0 and p2p_reply:
+                assert draft_logits is not None
+                logits_metadata = self._stage_p2p_reply(draft_logits, logits_topk)
+            elif return_logits and logits_topk > 0:
                 assert draft_logits is not None
                 count = int(draft_logits.shape[0]) * int(draft_logits.shape[1]) * logits_topk
                 if self._topk_values_host is None or self._topk_values_host.numel() < count:
@@ -1609,9 +1819,13 @@ class K3DSparkZMQServer:
                 "cuda_graph_enabled": self.engine.cuda_graph_enabled,
                 "cuda_graph_shapes": self.engine.cuda_graph_shapes,
                 "capabilities": (
-                    [LOGITS_CAPABILITY] if self.engine.method == "dflash" else []
+                    [LOGITS_CAPABILITY, P2P_CAPABILITY]
+                    if self.engine.method == "dflash"
+                    else []
                 ),
             }
+        if op == "P2P_OPEN":
+            return self.engine.open_p2p(header)
         if op == "CLEAR":
             self.engine.clear()
             return {

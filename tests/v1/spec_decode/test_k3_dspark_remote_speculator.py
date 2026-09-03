@@ -257,6 +257,8 @@ def _make_deferred_proxy(*, max_reqs=3, steps=2, vocab=64, topk=4):
     proxy._pending_failure = None
     proxy._pending_epoch = 0
     proxy._last_resolved = None
+    proxy._peer = None
+    proxy._peer_stale = False
     return proxy
 
 
@@ -391,3 +393,90 @@ def test_deferred_resolve_failure_yields_no_draft_and_disables_requests():
     proxy._join_reply_thread()
     proxy._apply_pending_failure()
     assert proxy._disabled_requests == {"a", "b"}
+
+
+class _FakePeer:
+    """Stands in for the mapped draft buffers: the reply slot content is a
+    tensor here, the pull is a device copy on the caller's stream."""
+
+    def __init__(self, values: torch.Tensor, indices: torch.Tensor):
+        self._values = values  # [slots, requests, K, topk]
+        self._indices = indices
+        self.closed = False
+        self.pulled: list[tuple[int, int, int]] = []
+
+    def pull_reply(self, slot, rows, steps, values_out, indices_out, stream):
+        self.pulled.append((slot, rows, steps))
+        values_out.copy_(self._values[slot, :rows, :steps])
+        indices_out.copy_(self._indices[slot, :rows, :steps])
+
+    def close(self):
+        self.closed = True
+
+
+def test_deferred_resolve_pulls_a_peer_reply_like_the_frame_reply():
+    """A reply that names a peer slot instead of carrying a logits frame
+    yields the same draft tokens and cached logits as the frame transport."""
+    _requires_cuda()
+    from vllm.v1.worker.gpu.spec_decode.dspark import remote_speculator as rs
+
+    steps, topk, vocab, max_reqs = 2, 4, 64, 3
+    active = [0, 2]
+    tokens, values, indices, positions = _canned_reply(len(active), steps, topk, vocab)
+    frame_response = _topk_response(tokens, values, indices, positions)
+    idx_mapping = torch.tensor([1, 4, 2], dtype=torch.int64, device="cuda")
+    temperature = torch.full((8,), 0.7, device="cuda")
+    seeds = torch.arange(8, device="cuda", dtype=torch.int64) * 977
+    batch = SimpleNamespace(num_reqs=max_reqs, idx_mapping=idx_mapping)
+
+    via_frames = _make_deferred_proxy(
+        max_reqs=max_reqs, steps=steps, vocab=vocab, topk=topk
+    )
+    via_frames._rpc = lambda frames: frame_response
+    via_frames._start_reply_thread(
+        [b"h"], active, ["a", "c"], steps, batch, temperature, seeds
+    )
+    via_frames.resolve_pending()
+    torch.cuda.synchronize()
+    via_frames._join_reply_thread()
+
+    via_peer = _make_deferred_proxy(
+        max_reqs=max_reqs, steps=steps, vocab=vocab, topk=topk
+    )
+    slot_values = torch.zeros((2, max_reqs, steps, topk), dtype=torch.bfloat16)
+    slot_indices = torch.zeros((2, max_reqs, steps, topk), dtype=torch.int32)
+    slot_values[1, : len(active)] = values
+    slot_indices[1, : len(active)] = indices
+    via_peer._peer = _FakePeer(slot_values.cuda(), slot_indices.cuda())
+    via_peer._topk_values_peer = torch.empty(
+        max_reqs * steps * topk, dtype=torch.bfloat16, device="cuda"
+    )
+    via_peer._topk_indices_peer = torch.empty(
+        max_reqs * steps * topk, dtype=torch.int32, device="cuda"
+    )
+    peer_response = {
+        "ok": True,
+        "protocol": rs.PROTOCOL_VERSION,
+        "tokens": tokens,
+        "logits": {
+            "capability": rs.TOPK_LOGITS_P2P_CAPABILITY,
+            "dtype": "bfloat16",
+            "shape": [len(active), steps, topk],
+            "topk": topk,
+            "p2p_reply_slot": 1,
+            "sample_positions": positions,
+        },
+    }
+    via_peer._rpc = lambda frames: peer_response
+    via_peer._start_reply_thread(
+        [b"h"], active, ["a", "c"], steps, batch, temperature, seeds
+    )
+    output = via_peer.resolve_pending()
+    torch.cuda.synchronize()
+    via_peer._join_reply_thread()
+    assert via_peer._peer.pulled == [(1, len(active), steps)]
+    assert torch.equal(output, via_frames.draft_tokens[:max_reqs, :steps])
+    assert torch.equal(via_peer.draft_tokens, via_frames.draft_tokens)
+    assert torch.equal(via_peer.draft_logits, via_frames.draft_logits)
+    assert torch.equal(via_peer._remote_topk_values, via_frames._remote_topk_values)
+    assert torch.equal(via_peer._remote_topk_indices, via_frames._remote_topk_indices)
