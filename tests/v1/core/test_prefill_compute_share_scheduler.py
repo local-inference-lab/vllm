@@ -59,7 +59,7 @@ def _establish_decode(scheduler, req_id: str = "decode"):
     )
     scheduler.add_request(request)
     output = scheduler.schedule()
-    assert output.compute_service_class == "prefill"
+    assert output.compute_service_class is None
     assert not output.compute_contention
     _update(scheduler, output)
     assert not request.is_prefill_chunk
@@ -362,7 +362,10 @@ def test_partial_external_hit_is_prefill_compute(opt_model_path):
 
     output = scheduler.schedule()
 
-    assert output.compute_service_class == "prefill"
+    # The local remainder is prefill work, but there is no competing decode,
+    # so the controller does not install timing on this model step.
+    assert output.compute_service_class is None
+    assert not output.compute_contention
     assert output.num_scheduled_tokens[request.request_id] == 32
 
 

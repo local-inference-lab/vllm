@@ -1514,6 +1514,7 @@ class Scheduler(SchedulerInterface):
                     else "decode"
                 )
                 if self.compute_share_controller is not None
+                and compute_contention
                 and total_num_scheduled_tokens > 0
                 else None
             ),
