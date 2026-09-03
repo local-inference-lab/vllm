@@ -926,7 +926,7 @@ def test_b12x_glm_dsa_nvfp4_cache_writer_keeps_rope() -> None:
     impl._uses_glm_dsa_nvfp4_cache = True
     impl._concat_and_cache_nvfp4_mla_fp8_rope = lambda *args: calls.append(args)
     kv_c = torch.empty((3, 512), dtype=torch.bfloat16)
-    k_pe = torch.empty((3, 1, 64), dtype=torch.bfloat16)
+    k_pe = torch.zeros((3, 1, 64), dtype=torch.bfloat16)
     kv_cache = torch.empty((2, 64, 368), dtype=torch.uint8)
     slots = torch.tensor([0, 64, -1], dtype=torch.int64)
     scale = torch.ones((), dtype=torch.float32)

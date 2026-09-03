@@ -8,6 +8,7 @@ import torch
 
 from vllm.model_executor import parameter
 from vllm.model_executor.layers import linear
+from vllm.model_executor.layers.quantization import modelopt
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -259,6 +260,70 @@ def test_padded_nvfp4_row_loader_converts_logical_to_storage_width(
         loaded[local_storage_size : 2 * local_storage_size].unsqueeze(0),
     )
 
+
+
+@pytest.mark.parametrize(
+    "method_type",
+    (
+        modelopt.ModelOptNvFp4LinearMethod,
+        modelopt.ModelOptNvFp4W4A16LinearMethod,
+    ),
+)
+def test_modelopt_nvfp4_row_parameters_declare_storage_widths(
+    monkeypatch: pytest.MonkeyPatch,
+    method_type: type,
+) -> None:
+    for module in (linear, parameter):
+        monkeypatch.setattr(
+            module, "get_tensor_model_parallel_world_size", lambda: 3
+        )
+        monkeypatch.setattr(
+            module, "get_tensor_model_parallel_rank", lambda: 1
+        )
+    monkeypatch.setattr(
+        modelopt,
+        "init_nvfp4_linear_kernel",
+        lambda **_kwargs: SimpleNamespace(input_quant_key=lambda: None),
+    )
+    config = modelopt.ModelOptNvFp4Config(
+        quant_method=(
+            "NVFP4"
+            if method_type is modelopt.ModelOptNvFp4LinearMethod
+            else "W4A16_NVFP4"
+        ),
+        is_checkpoint_nvfp4_serialized=True,
+        group_size=16,
+    )
+    holder = torch.nn.Module()
+    method_type(config).create_weights(
+        holder,
+        input_size_per_partition=32,
+        output_partition_sizes=[1],
+        input_size=96,
+        output_size=1,
+        params_dtype=torch.bfloat16,
+        weight_loader=lambda *_args, **_kwargs: None,
+    )
+
+    assert holder.weight.input_dim_storage_factor == 2
+    assert holder.weight_scale.input_dim_storage_factor == 16
+
+    row = RowParallelLinear(96, 1, bias=False, loaded_input_size=64)
+    for param, storage_factor in (
+        (holder.weight, 2),
+        (holder.weight_scale, 16),
+    ):
+        loaded = torch.arange(
+            1,
+            64 // storage_factor + 1,
+            dtype=torch.uint8,
+        ).to(param.dtype)
+        row.weight_loader_v2(param, loaded.unsqueeze(0))
+        local_width = 32 // storage_factor
+        torch.testing.assert_close(
+            param,
+            loaded[local_width : 2 * local_width].unsqueeze(0),
+        )
 
 @pytest.mark.parametrize("tp3", [False, True])
 def test_mla_projection_loaded_sizes_are_tp3_only(
