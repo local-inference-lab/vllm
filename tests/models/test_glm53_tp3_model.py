@@ -174,8 +174,14 @@ def test_shared_expert_uses_physical_tp3_width_and_logical_load_width(
             super().__init__()
             calls["down"] = (input_size, output_size, kwargs)
 
+    class FakeActivation(torch.nn.Module):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+
+
     monkeypatch.setattr(glm_model, "MergedColumnParallelLinear", FakeMerged)
     monkeypatch.setattr(glm_model, "RowParallelLinear", FakeRow)
+    monkeypatch.setattr(glm_model, "SiluAndMul", FakeActivation)
 
     glm_model.Glm5NextMLP(
         hidden_size=4096,
