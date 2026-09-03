@@ -367,7 +367,11 @@ def warmup_kernels(
                 (len(req_ids), bitmask_width), fill_value=-1, dtype=np.int32
             )
             grammar_output = GrammarOutput(
-                structured_output_request_ids=req_ids, grammar_bitmask=grammar_bitmask
+                structured_output_request_ids=req_ids,
+                grammar_bitmask=grammar_bitmask,
+                num_spec_tokens=[0] * len(req_ids),
+                has_bonus_token=[True] * len(req_ids),
+                num_invalid_spec_tokens=[0] * len(req_ids),
             )
 
         worker_sample_tokens(grammar_output)
@@ -581,6 +585,7 @@ def _profile_sps_curve(
         if sps_debug:
             events = model_runner._sps_debug_events
             model_runner._sps_debug_events = None
+            assert events is not None
             # Skip the warmup iters; report mean verify/draft GPU ms.
             timed = events[warmup_iters:]
             if timed:

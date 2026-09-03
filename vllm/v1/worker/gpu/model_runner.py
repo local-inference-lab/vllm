@@ -230,6 +230,49 @@ def _profile_batch_phase(input_batch: InputBatch, dummy_run: bool = False) -> st
     return "prefill"
 
 
+def _get_invalid_draft_counts(
+    grammar_output: GrammarOutput | None, input_batch: InputBatch
+) -> list[int] | None:
+    """Map compact grammar-invalid suffixes to the active worker batch."""
+    if grammar_output is None or input_batch.num_draft_tokens_per_req is None:
+        return None
+    if grammar_output.num_invalid_spec_tokens is None:
+        raise ValueError("structured speculative batch is missing invalid draft counts")
+
+    request_ids = grammar_output.structured_output_request_ids
+    source_widths = grammar_output.num_spec_tokens
+    invalid_source_widths = grammar_output.num_invalid_spec_tokens
+    if not (len(request_ids) == len(source_widths) == len(invalid_source_widths)):
+        raise ValueError("grammar rejection counts must align with request ids")
+
+    invalid_by_request = dict(
+        zip(
+            request_ids,
+            zip(source_widths, invalid_source_widths, strict=True),
+            strict=True,
+        )
+    )
+    if len(invalid_by_request) != len(request_ids):
+        raise ValueError("grammar rejection counts contain duplicate request ids")
+
+    invalid_counts = []
+    for request_id, active_width in zip(
+        input_batch.req_ids, input_batch.num_draft_tokens_per_req, strict=True
+    ):
+        source_width, source_invalid = invalid_by_request.get(
+            request_id, (int(active_width), 0)
+        )
+        if not 0 <= source_invalid <= source_width:
+            raise ValueError("invalid draft count is outside its source width")
+        if not 0 <= active_width <= source_width:
+            raise ValueError("active draft width is outside its source width")
+        invalid_counts.append(
+            max(int(active_width) - (source_width - source_invalid), 0)
+        )
+
+    return invalid_counts if any(invalid_counts) else None
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -511,6 +554,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_logits=self.max_num_reqs * self.decode_query_len,
                 vocab_size=self.vocab_size,
                 device=self.device,
+                num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
             )
 
         if self.is_pooling_model and self.is_last_pp_rank:
@@ -1646,6 +1690,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch,
                     grammar_output.structured_output_request_ids,
                     grammar_output.grammar_bitmask,
+                    grammar_output.num_spec_tokens,
+                    grammar_output.has_bonus_token,
                 )
 
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
@@ -1656,6 +1702,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Rejection sampling for spec decoding.
             assert self.rejection_sampler is not None
             assert self.speculator is not None
+            num_invalid_draft_tokens = _get_invalid_draft_counts(
+                grammar_output, input_batch
+            )
             with record_function_or_nullcontext(
                 f"vllm:v2/target/{phase}/rejection_sample"
             ):
@@ -1664,6 +1713,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch,
                     # Draft logits are needed for probabilistic rejection sampling.
                     self.speculator.draft_logits,
+                    num_invalid_draft_tokens,
                 )
 
         online_sts = self.speculator.online_sts if self.speculator else None

@@ -367,6 +367,37 @@ def test_placeholder_draft_token_rejected():
     assert (recovered >= 0).all() and (recovered < VOCAB_SIZE).all()
 
 
+def test_placeholder_stochastic_recovery_matches_target_distribution():
+    """A forced grammar rejection must recover from p, not residual p - q."""
+    torch.manual_seed(0)
+    device = "cuda"
+    num_trials = 8192
+    K = 1
+
+    target_logits_1d = torch.full(
+        (VOCAB_SIZE,), float("-inf"), device=device, dtype=torch.float32
+    )
+    target_logits_1d[:4] = torch.tensor([0.7, 0.1, -0.4, -0.9], device=device)
+    draft_logits_1d = torch.full_like(target_logits_1d, float("-inf"))
+    draft_logits_1d[:4] = torch.tensor([-1.0, 1.5, -0.5, 0.5], device=device)
+
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d,
+        draft_logits_1d,
+        K,
+        temperature=1.0,
+        num_trials=num_trials,
+    )
+    inputs["draft_sampled"].view(num_trials, K + 1)[:, 1:] = -1
+
+    sampled, num_sampled = rejection_sample(**inputs, num_speculative_steps=K)
+
+    assert torch.equal(num_sampled, torch.ones_like(num_sampled))
+    _assert_distribution_match(
+        sampled[:, 0], torch.softmax(target_logits_1d, dim=0), device
+    )
+
+
 @pytest.mark.parametrize("has_draft_logits", [True, False])
 @pytest.mark.parametrize("num_placeholders", [1, 2])
 def test_block_verification_placeholder_truncates_block(

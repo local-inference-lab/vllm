@@ -256,6 +256,19 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _project_invalid_draft_suffix_count(
+    source_width: int,
+    source_invalid: int,
+    active_width: int,
+) -> int:
+    """Project a serialized invalid suffix onto the worker's compact width."""
+    if not 0 <= source_invalid <= source_width:
+        raise ValueError("invalid draft count is outside its source width")
+    if not 0 <= active_width <= source_width:
+        raise ValueError("active draft width is outside its source width")
+    return max(active_width - (source_width - source_invalid), 0)
+
+
 def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
     """Resolve checkpoint names without changing the model's module tree."""
     module_name, _, parameter_name = name.rpartition(".")
@@ -3792,6 +3805,7 @@ class GPUModelRunner(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        num_invalid_draft_tokens: list[int] | None = None,
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
@@ -3816,8 +3830,54 @@ class GPUModelRunner(
             draft_probs,
             logits,
             sampling_metadata,
+            num_invalid_draft_tokens,
         )
         return sampler_output
+
+    def _get_invalid_draft_counts(
+        self,
+        grammar_output: "GrammarOutput | None",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> list[int] | None:
+        """Translate scheduler grammar rejections to worker batch order."""
+        if grammar_output is None or spec_decode_metadata is None:
+            return None
+        if grammar_output.num_invalid_spec_tokens is None:
+            raise ValueError(
+                "structured speculative batch is missing invalid draft counts"
+            )
+
+        request_ids = grammar_output.structured_output_request_ids
+        source_widths = grammar_output.num_spec_tokens
+        invalid_source_widths = grammar_output.num_invalid_spec_tokens
+        if not (len(request_ids) == len(source_widths) == len(invalid_source_widths)):
+            raise ValueError("grammar rejection counts must align with request ids")
+
+        invalid_by_request = dict(
+            zip(
+                request_ids,
+                zip(source_widths, invalid_source_widths, strict=True),
+                strict=True,
+            )
+        )
+        if len(invalid_by_request) != len(request_ids):
+            raise ValueError("grammar rejection counts contain duplicate request ids")
+
+        invalid_counts = []
+        for request_id, active_width in zip(
+            self.input_batch.req_ids,
+            spec_decode_metadata.num_draft_tokens,
+            strict=True,
+        ):
+            source_width, source_invalid = invalid_by_request.get(
+                request_id, (active_width, 0)
+            )
+            invalid_counts.append(
+                _project_invalid_draft_suffix_count(
+                    source_width, source_invalid, active_width
+                )
+            )
+        return invalid_counts if any(invalid_counts) else None
 
     def _bookkeeping_sync(
         self,
@@ -4745,8 +4805,13 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        num_invalid_draft_tokens = self._get_invalid_draft_counts(
+            grammar_output, spec_decode_metadata
+        )
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(
+                logits, spec_decode_metadata, num_invalid_draft_tokens
+            )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output

@@ -13,6 +13,7 @@ from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
     _iter_request_chunks,
+    force_reject_invalid_draft_suffixes,
 )
 
 
@@ -24,6 +25,36 @@ def test_iter_request_chunks_preserves_request_boundaries():
         (2, 3),
         (3, 4),
     ]
+
+
+def test_force_reject_invalid_draft_suffixes_marks_only_compact_tail():
+    draft_sampled = torch.tensor([90, 91, 11, 12, 92, 21, 22, 23])
+    sanitized = force_reject_invalid_draft_suffixes(
+        draft_sampled,
+        np.array([0, 1, 4, 8], dtype=np.int32),
+        [0, 0, 2],
+    )
+
+    assert sanitized.tolist() == [90, 91, 11, 12, 92, 21, -1, -1]
+    assert draft_sampled.tolist() == [90, 91, 11, 12, 92, 21, 22, 23]
+
+
+@pytest.mark.parametrize(
+    "draft_sampled,cu_num_logits,invalid_counts",
+    [
+        (torch.tensor([1, 2]), np.array([0, 2], dtype=np.int32), [3]),
+        (torch.tensor([1, 2]), np.array([0, 2], dtype=np.int32), [1, 0]),
+        (torch.tensor([1]), np.array([0, 2], dtype=np.int32), [1]),
+        (torch.tensor([1, 2]), np.array([[0, 2]], dtype=np.int32), [1]),
+    ],
+)
+def test_force_reject_invalid_draft_suffixes_validates_metadata(
+    draft_sampled, cu_num_logits, invalid_counts
+):
+    with pytest.raises(ValueError):
+        force_reject_invalid_draft_suffixes(
+            draft_sampled, cu_num_logits, invalid_counts
+        )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")

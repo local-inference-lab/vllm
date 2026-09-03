@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 from concurrent.futures import Future
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -837,6 +838,251 @@ def test_stop_via_update_from_output():
     assert len(scheduler.running) == 1
     assert not requests[0].is_finished()
     assert list(requests[0].output_token_ids) == [EOS_TOKEN_ID, 10, 11]
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize(
+    "filtered_tokens,num_grammar_rejected,expected_accepted",
+    [
+        ([10, 11, 12], 1, 3),
+        ([10, 11], 2, 2),
+        ([], 4, 0),
+    ],
+)
+def test_speculative_grammar_filter_rolls_back_scheduler_state_and_stats(
+    async_scheduling: bool,
+    filtered_tokens: list[int],
+    num_grammar_rejected: int,
+    expected_accepted: int,
+):
+    """Rejected suffix tokens remain schedulable and are not accepted drafts."""
+    scheduler = create_scheduler(
+        num_speculative_tokens=3,
+        speculative_method="ngram_gpu",
+        async_scheduling=async_scheduling,
+    )
+    request = create_requests(num_requests=1)[0]
+    request.structured_output_request = Mock()
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = request.num_tokens + 4
+    request.num_output_placeholders = 4 if async_scheduling else 0
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+
+    manager = Mock()
+    manager.filter_speculative_grammar_tokens.return_value = (
+        filtered_tokens,
+        num_grammar_rejected,
+    )
+    manager.should_advance.return_value = False
+    scheduler.structured_output_manager = manager
+
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 4},
+        total_num_scheduled_tokens=4,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={request.request_id: [10, 11, 12]},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[10, 11, 12, 13]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    outputs = scheduler.update_from_output(scheduler_output, model_output)
+
+    assert request.num_computed_tokens == request.num_tokens
+    assert request.num_output_placeholders == 0
+    assert list(request.output_token_ids) == filtered_tokens
+    if filtered_tokens:
+        assert outputs[0].outputs[0].new_token_ids == filtered_tokens
+    manager.filter_speculative_grammar_tokens.assert_called_once_with(
+        request, [10, 11, 12, 13]
+    )
+    stats = outputs[0].scheduler_stats.spec_decoding_stats
+    assert stats is not None
+    assert stats.num_drafts == 1
+    assert stats.num_draft_tokens == 3
+    assert stats.num_accepted_tokens == expected_accepted
+    assert stats.num_accepted_tokens_per_pos == [
+        int(position < expected_accepted) for position in range(3)
+    ]
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize(
+    "filtered_tokens,num_grammar_rejected,expected_computed_tokens",
+    [
+        ([], 1, 0),
+        ([13], 0, 1),
+    ],
+)
+def test_speculative_grammar_filter_validates_single_token_bonus(
+    async_scheduling: bool,
+    filtered_tokens: list[int],
+    num_grammar_rejected: int,
+    expected_computed_tokens: int,
+):
+    """A single-token accepted block reaches the filter and rolls back cleanly.
+
+    Fails on the old call gate (len > 1): the invalid bonus token was
+    committed unvalidated and later surfaced as the accept_tokens 500.
+    """
+    scheduler = create_scheduler(
+        num_speculative_tokens=3,
+        speculative_method="ngram_gpu",
+        async_scheduling=async_scheduling,
+    )
+    request = create_requests(num_requests=1)[0]
+    request.structured_output_request = Mock()
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = request.num_tokens + 4
+    request.num_output_placeholders = 4 if async_scheduling else 0
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+
+    manager = Mock()
+    manager.filter_speculative_grammar_tokens.return_value = (
+        filtered_tokens,
+        num_grammar_rejected,
+    )
+    manager.should_advance.return_value = False
+    scheduler.structured_output_manager = manager
+
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 4},
+        total_num_scheduled_tokens=4,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={request.request_id: [10, 11, 12]},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[13]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    num_tokens = request.num_tokens
+    outputs = scheduler.update_from_output(scheduler_output, model_output)
+
+    assert request.num_computed_tokens == num_tokens + expected_computed_tokens
+    # Rejection rollback, the grammar drop, and the commit each consume the
+    # placeholders staged for the sampled block.
+    assert request.num_output_placeholders == 0
+    assert list(request.output_token_ids) == filtered_tokens
+    if filtered_tokens:
+        assert outputs[0].outputs[0].new_token_ids == filtered_tokens
+    manager.filter_speculative_grammar_tokens.assert_called_once_with(request, [13])
+    stats = outputs[0].scheduler_stats.spec_decoding_stats
+    assert stats is not None
+    assert stats.num_drafts == 1
+    assert stats.num_draft_tokens == 3
+    assert stats.num_accepted_tokens == 0
+    assert stats.num_accepted_tokens_per_pos == [0, 0, 0]
+
+
+def test_speculative_grammar_filter_is_not_called_for_unstructured_requests():
+    """Unstructured speculative decoding does not enter grammar validation."""
+    scheduler = create_scheduler(num_speculative_tokens=2)
+    request = create_requests(num_requests=1)[0]
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = request.num_tokens + 3
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+
+    manager = Mock()
+    manager.should_advance.return_value = False
+    scheduler.structured_output_manager = manager
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 3},
+        total_num_scheduled_tokens=3,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={request.request_id: [10, 11]},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[10, 11, 12]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    scheduler.update_from_output(scheduler_output, model_output)
+
+    assert list(request.output_token_ids) == [10, 11, 12]
+    manager.filter_speculative_grammar_tokens.assert_not_called()
+
+
+def test_speculative_grammar_filter_commits_and_advances_only_valid_prefix():
+    """Scheduler output and grammar state share the filtered token prefix."""
+    scheduler = create_scheduler(num_speculative_tokens=2)
+    request = create_requests(num_requests=1)[0]
+    grammar = Mock(spec=StructuredOutputGrammar)
+    grammar.accept_tokens.side_effect = lambda request_id, tokens: tokens == [10, 11]
+    request.structured_output_request = Mock(grammar=grammar)
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = request.num_tokens + 3
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+
+    manager = Mock()
+    manager.filter_speculative_grammar_tokens.return_value = ([10, 11], 1)
+    manager.should_advance.return_value = True
+    manager.trim_reasoning_for_advance.return_value = [10, 11]
+    scheduler.structured_output_manager = manager
+
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 3},
+        total_num_scheduled_tokens=3,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={request.request_id: [10, 11]},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[10, 11, 12]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    outputs = scheduler.update_from_output(scheduler_output, model_output)
+
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_computed_tokens == request.num_tokens
+    assert list(request.output_token_ids) == [10, 11]
+    assert outputs[0].outputs[0].new_token_ids == [10, 11]
+    grammar.accept_tokens.assert_called_once_with(request.request_id, [10, 11])
+    stats = outputs[0].scheduler_stats.spec_decoding_stats
+    assert stats is not None
+    assert stats.num_draft_tokens == 2
+    assert stats.num_accepted_tokens == 2
 
 
 def test_check_stop_min_tokens():
@@ -3258,6 +3504,47 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     assert [req.req_id for req in next_output.scheduled_new_reqs] == [
         healthy_request.request_id
     ]
+
+
+@pytest.mark.parametrize(
+    "invalid_spec_tokens,expected_invalid_counts",
+    [({"structured": 2}, [2]), (None, [0])],
+)
+def test_get_grammar_bitmask_forwards_invalid_draft_counts(
+    invalid_spec_tokens, expected_invalid_counts
+):
+    scheduler = object.__new__(Scheduler)
+    scheduler.requests = {
+        "plain": SimpleNamespace(use_structured_output=False, is_prefill_chunk=False),
+        "structured": SimpleNamespace(
+            use_structured_output=True, is_prefill_chunk=False
+        ),
+    }
+    scheduler.structured_output_manager = Mock()
+    scheduler.structured_output_manager.grammar_bitmask.return_value = Mock()
+    scheduler.structured_output_manager.has_grammar_bonus_token.return_value = True
+    scheduler_output = SimpleNamespace(
+        has_structured_output_requests=True,
+        num_scheduled_tokens={"plain": 1, "structured": 4},
+        scheduled_spec_decode_tokens={"structured": [1, 2, 3]},
+        num_invalid_spec_tokens=invalid_spec_tokens,
+    )
+
+    grammar_output = scheduler.get_grammar_bitmask(scheduler_output)
+
+    assert grammar_output is not None
+    assert grammar_output.structured_output_request_ids == ["structured"]
+    assert grammar_output.num_spec_tokens == [3]
+    assert grammar_output.has_bonus_token == [True]
+    assert grammar_output.num_invalid_spec_tokens == expected_invalid_counts
+    scheduler.structured_output_manager.grammar_bitmask.assert_called_once_with(
+        scheduler.requests,
+        ["structured"],
+        scheduler_output.scheduled_spec_decode_tokens,
+    )
+    scheduler.structured_output_manager.has_grammar_bonus_token.assert_called_once_with(
+        [1, 2, 3]
+    )
 
 
 def test_abort_request_when_structured_output_fsm_cannot_advance():
