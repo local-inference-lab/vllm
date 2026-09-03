@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.config.compilation import CompilationMode
 from vllm.model_executor import parameter
 from vllm.model_executor.layers import linear
 from vllm.models.glm5next.nvidia import multimodal as glm5next_multimodal
@@ -17,6 +18,7 @@ def tp3_linear_state(monkeypatch):
         custom_ops=["none"],
         enabled_custom_ops=set(),
         disabled_custom_ops=set(),
+        mode=CompilationMode.NONE,
     )
     monkeypatch.setattr(
         "vllm.model_executor.custom_op.get_cached_compilation_config",
