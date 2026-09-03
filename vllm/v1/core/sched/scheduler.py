@@ -1678,7 +1678,7 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id]
             for request_id in all_scheduled_prefill_req_ids
         )
-        self._decode_prefill_scheduled_prefill_tokens += mixed_prefill_tokens_scheduled
+        self._decode_prefill_scheduled_prefill_tokens += scheduled_prefill_tokens
         scheduled_decode_tokens = total_num_scheduled_tokens - scheduled_prefill_tokens
         if decode_prefill_enabled:
             if scheduled_prefill_tokens > 0:
