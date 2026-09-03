@@ -493,7 +493,11 @@ class CudaGraphManager:
         return len(self._capture_descs) > 0
 
     def planned_token_counts(self) -> list[int]:
-        """Return model-row counts staged for decoder graph capture."""
+        """Return model-row counts staged for decoder graph capture.
+
+        Returns:
+            Sorted, unique ``num_tokens`` values from the capture descriptors.
+        """
         return sorted(
             {
                 desc.num_tokens
