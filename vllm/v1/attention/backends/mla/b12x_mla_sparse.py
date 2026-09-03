@@ -3,7 +3,7 @@
 """B12x sparse MLA attention backend."""
 
 from dataclasses import dataclass, replace
-from math import prod
+from math import gcd, prod
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 import numpy as np
@@ -219,6 +219,28 @@ def _use_b12x_full_ckv_gather(
         and num_tokens > min_tokens
         and num_tokens <= max_tokens
     )
+
+
+def _ckv_rank_token_alignment(page_size: int, dcp_world_size: int) -> int:
+    """Per-rank padding that makes the gathered CKV page-addressable.
+
+    All-gather concatenates one equally sized token span from every DCP rank.
+    Individual rank boundaries do not need to coincide with KV-page boundaries;
+    only the concatenated span must contain an integral number of pages.
+    """
+    if page_size <= 0 or dcp_world_size <= 0:
+        raise ValueError("CKV page size and DCP world size must be positive")
+    return page_size // gcd(page_size, dcp_world_size)
+
+
+def _round_up_ckv_rank_tokens(
+    token_count: int,
+    *,
+    page_size: int,
+    dcp_world_size: int,
+) -> int:
+    alignment = _ckv_rank_token_alignment(page_size, dcp_world_size)
+    return (token_count + alignment - 1) // alignment * alignment
 
 
 def _dcp_all_gather_current_stream(
@@ -965,21 +987,17 @@ class B12xMLASparseMetadataBuilder(
             rank_totals = rank_req_lens.sum(dim=1).tolist()
             local_total_tokens = int(rank_totals[self.dcp_rank])
             page_size = int(self.kv_cache_spec.block_size)
-            padded_total_tokens = (
-                (max(int(total) for total in rank_totals) + page_size - 1)
-                // page_size
-                * page_size
+            padded_total_tokens = _round_up_ckv_rank_tokens(
+                max(int(total) for total in rank_totals),
+                page_size=page_size,
+                dcp_world_size=self.dcp_world_size,
             )
-            max_local_capacity = (
-                (
-                    (envs.VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS + self.dcp_world_size - 1)
-                    // self.dcp_world_size
-                    + self._ckv_max_reqs * self.cp_kv_cache_interleave_size
-                    + page_size
-                    - 1
-                )
-                // page_size
-                * page_size
+            max_local_capacity = _round_up_ckv_rank_tokens(
+                (envs.VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS + self.dcp_world_size - 1)
+                // self.dcp_world_size
+                + self._ckv_max_reqs * self.cp_kv_cache_interleave_size,
+                page_size=page_size,
+                dcp_world_size=self.dcp_world_size,
             )
             if 0 < padded_total_tokens <= max_local_capacity:
                 metadata.ckv_selected_indices = self.ckv_selected_indices_buffer[
@@ -1279,10 +1297,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if self._ckv_extend_plan is not None:
             plans.append(self._ckv_extend_plan)
         self._scratch_nbytes = max(int(plan.layout.nbytes) for plan in plans)
-        self._ckv_local_capacity = (
-            (self._ckv_capacity_tokens + kernel_page_size - 1)
-            // kernel_page_size
-            * kernel_page_size
+        self._ckv_local_capacity = _round_up_ckv_rank_tokens(
+            self._ckv_capacity_tokens,
+            page_size=kernel_page_size,
+            dcp_world_size=self.dcp_world_size,
         )
         self._kernel_page_size = kernel_page_size
         self._reserve_planned_workspaces()
