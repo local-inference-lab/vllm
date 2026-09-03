@@ -62,7 +62,14 @@ def _symm_mem_spans_group(group: GroupCoordinator) -> bool:
 
 @functools.cache
 def _cuda_p2p_spans_group(group: GroupCoordinator) -> bool:
-    """Return whether every rank can directly access every peer GPU."""
+    """Check whether every rank can directly access every peer GPU.
+
+    Args:
+        group: Process group whose local CUDA devices should be checked.
+
+    Returns:
+        Whether all directed device pairs in the group support CUDA P2P access.
+    """
     if not current_platform.is_cuda():
         return False
     if group.world_size <= 1:
@@ -119,7 +126,17 @@ def direct_cp_peer_access_enabled(
     use_direct: bool | None,
     supported_dtypes: tuple[torch.dtype, ...] | None = None,
 ) -> bool:
-    """Gate direct CP operations that dereference peer GPU pointers."""
+    """Check eligibility for direct CP operations that access peer pointers.
+
+    Args:
+        group: Process group used by the direct CP operation.
+        dtype: Data type transferred by the operation.
+        use_direct: Explicit direct-path override, or ``None`` for auto selection.
+        supported_dtypes: Data types supported by the direct implementation.
+
+    Returns:
+        Whether the direct peer-access path should be used.
+    """
     if use_direct is not None:
         return use_direct
     enabled = direct_cp_enabled(group, dtype, None, supported_dtypes)
