@@ -11,8 +11,11 @@ at ``max(pos - (window - 1) - max(left - (window - 1), 0), 0)`` and ends at
 ``pos + right`` (inclusive).
 """
 
+from pathlib import Path
+
 import pytest
 import torch
+from transformers import LlamaConfig
 from typing_extensions import TypedDict
 
 from tests.v1.attention.utils import create_vllm_config
@@ -462,11 +465,22 @@ def test_flashinfer_mixed_sparse_indices_with_image_spans():
     assert actual == exp_rows[1:]
 
 
-def make_builder(vision: bool) -> DeepseekSparseSWAMetadataBuilder:
+def make_builder(vision: bool, model_dir: Path) -> DeepseekSparseSWAMetadataBuilder:
+    LlamaConfig(
+        architectures=["LlamaForCausalLM"],
+        hidden_size=512,
+        intermediate_size=1024,
+        max_position_embeddings=4096,
+        num_attention_heads=1,
+        num_hidden_layers=1,
+        num_key_value_heads=1,
+        vocab_size=128,
+    ).save_pretrained(model_dir)
     overrides: dict = {"sliding_window": WINDOW}
     if vision:
         overrides.update(vision_n_layers=2, vision_max_n_token=MAX_IMG)
     vllm_config = create_vllm_config(
+        model_name=str(model_dir),
         max_model_len=4096,
         max_num_batched_tokens=64,
         max_num_seqs=8,
@@ -519,11 +533,11 @@ def build_metadata(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_builder_in_image_visibility():
+def test_builder_in_image_visibility(tmp_path: Path):
     seq_lens = [30, 12]
     query_lens = [30, 12]
     spans = [[(4, 12), (20, 24)], []]
-    builder = make_builder(vision=True)
+    builder = make_builder(vision=True, model_dir=tmp_path)
     md = build_metadata(builder, seq_lens, query_lens, {0: spans[0], 1: spans[1]})
     assert md.num_prefills == 2
     assert md.num_decode_tokens == 0
@@ -544,11 +558,11 @@ def test_builder_in_image_visibility():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_builder_no_image_spans_fast_path():
+def test_builder_no_image_spans_fast_path(tmp_path: Path):
     """Vision model, image-free batch: no visibility tensors, plain window."""
     seq_lens = [30, 12]
     query_lens = [30, 12]
-    builder = make_builder(vision=True)
+    builder = make_builder(vision=True, model_dir=tmp_path)
     md = build_metadata(builder, seq_lens, query_lens, {0: [], 1: []})
     assert md.prefill_left_visible is None
     assert md.prefill_right_visible is None
@@ -562,11 +576,11 @@ def test_builder_no_image_spans_fast_path():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_builder_text_model_unchanged():
+def test_builder_text_model_unchanged(tmp_path: Path):
     """Text-only model: buffers stay window-sized and spans are ignored."""
     seq_lens = [30, 12]
     query_lens = [30, 12]
-    builder = make_builder(vision=False)
+    builder = make_builder(vision=False, model_dir=tmp_path)
     assert builder.max_image_tokens == 0
     md = build_metadata(builder, seq_lens, query_lens, None)
     assert md.prefill_swa_indices.shape[-1] == WINDOW
