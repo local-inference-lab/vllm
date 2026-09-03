@@ -112,3 +112,35 @@ def test_flush_consumes_the_pending_proposal_outside_a_step():
 
     runner.flush_deferred_draft()
     assert runner.speculator.calls == 1
+
+
+def test_execute_resolves_pending_draft_before_request_slots_are_reused():
+    events = []
+    runner = object.__new__(mrv2.GPUModelRunner)
+    runner._resolve_pending_draft = lambda: events.append("resolve")
+    runner.update_pp_decode_requests = lambda: events.append("update_pp")
+    runner.finish_requests = lambda output: events.append("finish")
+    runner.free_states = lambda output: events.append("free")
+    runner.add_requests = lambda output: events.append("add")
+    runner.update_requests = lambda output: events.append("update")
+    runner.block_tables = SimpleNamespace(
+        apply_staged_writes=lambda: events.append("block_tables")
+    )
+    runner.kv_connector = SimpleNamespace(
+        no_forward=lambda output: events.append("no_forward") or "empty"
+    )
+    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=0)
+
+    result = mrv2.GPUModelRunner.execute_model(runner, scheduler_output)
+
+    assert result == "empty"
+    assert events == [
+        "resolve",
+        "update_pp",
+        "finish",
+        "free",
+        "add",
+        "update",
+        "block_tables",
+        "no_forward",
+    ]

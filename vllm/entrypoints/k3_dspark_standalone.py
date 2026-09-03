@@ -470,6 +470,33 @@ def _load_runtime(args: argparse.Namespace, status: RuntimeStatus) -> Standalone
     )
 
 
+def _effective_aux_geometry(speculative_config: Any) -> tuple[int, int]:
+    """Return the auxiliary layer count and target-state width.
+
+    Args:
+        speculative_config: Draft-model configuration used by the engine.
+
+    Returns:
+        The number of target auxiliary states and the width of each state.
+
+    Raises:
+        ValueError: If the draft configuration declares no auxiliary layers.
+    """
+    from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+        get_eagle3_aux_layers_from_config,
+    )
+
+    draft_config = speculative_config.draft_model_config.hf_config
+    aux_layers = get_eagle3_aux_layers_from_config(speculative_config)
+    if not aux_layers:
+        raise ValueError("K3 draft config does not declare target auxiliary layers")
+    hidden_size = int(
+        getattr(draft_config, "target_hidden_size", None)
+        or draft_config.hidden_size
+    )
+    return len(aux_layers), hidden_size
+
+
 @torch.inference_mode()
 def _run_eager_smoke(runtime: StandaloneRuntime, device: torch.device) -> int:
     if runtime.method == "dflash":
@@ -484,9 +511,10 @@ def _run_eager_smoke(runtime: StandaloneRuntime, device: torch.device) -> int:
     )
 
     model = runtime.model
-    draft_config = runtime.vllm_config.speculative_config.draft_model_config.hf_config
-    num_aux_layers = int(draft_config.num_target_layers)
-    hidden_size = int(draft_config.hidden_size)
+    speculative_config = runtime.vllm_config.speculative_config
+    assert speculative_config is not None
+    draft_config = speculative_config.draft_model_config.hf_config
+    num_aux_layers, hidden_size = _effective_aux_geometry(speculative_config)
 
     aux = torch.zeros(
         (1, num_aux_layers * hidden_size),
@@ -505,7 +533,7 @@ def _run_eager_smoke(runtime: StandaloneRuntime, device: torch.device) -> int:
     model.precompute_and_store_context_kv(context, positions, context_slots)
 
     sample_from_anchor = bool(getattr(draft_config, "sample_from_anchor", True))
-    query_len = runtime.vllm_config.speculative_config.num_speculative_tokens
+    query_len = speculative_config.num_speculative_tokens
     if not sample_from_anchor:
         query_len += 1
     mask_token_id = get_parallel_drafting_token_id(draft_config)
@@ -578,9 +606,6 @@ def _run_dflash_eager_smoke(
     device: torch.device,
 ) -> int:
     from vllm.v1.attention.backend import CommonAttentionMetadata
-    from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
-        get_eagle3_aux_layers_from_config,
-    )
     from vllm.v1.worker.gpu.spec_decode.utils import (
         get_parallel_drafting_token_id,
     )
@@ -588,12 +613,10 @@ def _run_dflash_eager_smoke(
     speculative_config = runtime.vllm_config.speculative_config
     assert speculative_config is not None
     draft_config = speculative_config.draft_model_config.hf_config
-    aux_layers = get_eagle3_aux_layers_from_config(speculative_config)
-    if not aux_layers:
-        raise ValueError("K3 DFlash config does not declare target auxiliary layers")
+    num_aux_layers, hidden_size = _effective_aux_geometry(speculative_config)
 
     raw_context = torch.zeros(
-        (1, len(aux_layers) * int(draft_config.hidden_size)),
+        (1, num_aux_layers * hidden_size),
         dtype=torch.bfloat16,
         device=device,
     )

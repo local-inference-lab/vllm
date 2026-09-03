@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,8 +14,23 @@ from vllm.entrypoints.k3_dspark_rpc import (
 from vllm.entrypoints.k3_dspark_standalone import (
     EMBED_TENSOR,
     LM_HEAD_TENSOR,
+    _effective_aux_geometry,
     resolve_shared_weight_files,
 )
+
+
+def test_effective_aux_geometry_uses_layer_ids_and_target_hidden_width():
+    hf_config = SimpleNamespace(
+        eagle_aux_hidden_state_layer_ids=(3, 7, 11),
+        hidden_size=4096,
+        target_hidden_size=3584,
+        num_target_layers=99,
+    )
+    speculative_config = SimpleNamespace(
+        draft_model_config=SimpleNamespace(hf_config=hf_config)
+    )
+
+    assert _effective_aux_geometry(speculative_config) == (3, 3584)
 
 
 def _write_index(root, weight_map):
