@@ -214,9 +214,7 @@ def test_dflash_logits_and_selector_exclude_physical_vocab_tail() -> None:
     logits = processor._get_logits(torch.empty(1, 1), lm_head, None)
     assert logits is not None
     assert logits.shape == (1, logical_vocab_size)
-    token_ids, values = processor.get_top_k_tokens(
-        lm_head, torch.empty(1, 1), k=1
-    )
+    token_ids, values = processor.get_top_k_tokens(lm_head, torch.empty(1, 1), k=1)
     assert token_ids.item() == logical_vocab_size - 1
     assert values.item() == 2
 
@@ -284,6 +282,7 @@ def test_dense_dflash_tp3_drops_target_expert_parallel(monkeypatch) -> None:
         "data_parallel_size_local": 2,
         "data_parallel_rank": 1,
         "data_parallel_rank_local": 1,
+        "data_parallel_index": 1,
         "data_parallel_master_ip": "127.0.0.1",
         "data_parallel_rpc_port": 1234,
         "data_parallel_master_port": 4321,
@@ -347,6 +346,31 @@ def test_dense_dflash_tp3_drops_target_expert_parallel(monkeypatch) -> None:
     assert draft_parallel.rank == 0
     assert target_parallel.tensor_parallel_size == 3
     assert target_parallel.enable_expert_parallel
+
+
+def test_engine_dp_identity_reaches_speculative_draft() -> None:
+    from vllm.v1.engine.core import EngineCoreProc
+
+    target = SimpleNamespace(
+        data_parallel_index=3,
+        data_parallel_rank=3,
+        data_parallel_rank_local=1,
+    )
+    draft = SimpleNamespace(
+        data_parallel_index=0,
+        data_parallel_rank=0,
+        data_parallel_rank_local=0,
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=target,
+        speculative_config=SimpleNamespace(draft_parallel_config=draft),
+    )
+
+    EngineCoreProc._sync_speculative_draft_dp_identity(vllm_config)
+
+    assert draft.data_parallel_index == 3
+    assert draft.data_parallel_rank == 3
+    assert draft.data_parallel_rank_local == 1
 
 
 def test_dflash7_uses_eight_target_kda_state_columns(monkeypatch) -> None:

@@ -1075,6 +1075,15 @@ class SpeculativeConfig:
         # will be detected automatically if possible. If the speculative method
         # can not be detected, it will be considered as the "draft_model" by
         # default.
+        # The target must expose its physical TP3 axes before a draft config is
+        # derived from it. This is an exact no-op for TP4 and other models.
+        from vllm.transformers_utils.configs.glm53_tp3 import (
+            apply_glm53_tp3_target_geometry,
+        )
+
+        apply_glm53_tp3_target_geometry(
+            self.target_model_config, self.target_parallel_config
+        )
 
         # infer method from user args
         if self.method is None and SpeculativeConfig._is_custom_proposer_path(
@@ -1537,6 +1546,7 @@ class SpeculativeConfig:
                 "adaptive_speculative_tokens_initial must not exceed "
                 "num_speculative_tokens."
             )
+        self._apply_glm53_tp3_draft_geometry()
 
         return self
 
@@ -1707,6 +1717,53 @@ class SpeculativeConfig:
         )
         self.draft_model_config._model_info = model_info
         self.draft_model_config._architecture = arch
+
+    def _apply_glm53_tp3_draft_geometry(self) -> None:
+        from vllm.transformers_utils.configs.glm53_tp3 import (
+            apply_glm53_tp3_draft_geometry,
+            is_glm53_config,
+        )
+
+        if (
+            self.method not in ("mtp", "dflash")
+            or self.target_model_config is None
+            or self.target_parallel_config is None
+            or self.draft_model_config is None
+            or self.draft_parallel_config is None
+            or self.target_parallel_config.tensor_parallel_size != 3
+            or not is_glm53_config(self.target_model_config)
+        ):
+            return
+
+        # MTP participates in the target MoE's topology. DFlash is dense, so it
+        # keeps DP/PCP placement but must not join the routed-expert EP group.
+        target = self.target_parallel_config
+        draft = self.draft_parallel_config
+        for name in (
+            "prefill_context_parallel_size",
+            "data_parallel_size",
+            "data_parallel_size_local",
+            "data_parallel_rank",
+            "data_parallel_rank_local",
+            "data_parallel_index",
+            "data_parallel_master_ip",
+            "data_parallel_rpc_port",
+            "data_parallel_master_port",
+            "data_parallel_backend",
+            "data_parallel_external_lb",
+            "data_parallel_hybrid_lb",
+        ):
+            setattr(draft, name, getattr(target, name))
+        draft.enable_expert_parallel = (
+            target.enable_expert_parallel if self.method == "mtp" else False
+        )
+
+        apply_glm53_tp3_draft_geometry(
+            self.target_model_config,
+            target,
+            self.draft_model_config,
+            draft,
+        )
 
     @staticmethod
     def create_draft_parallel_config(
