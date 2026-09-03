@@ -17,7 +17,7 @@ Thin multimodal wrapper around the text-only ``DeepseekV4ForCausalLM``:
   (``requires_raw_input_tokens``).
 """
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import torch
 from torch import nn
@@ -46,6 +46,20 @@ from ..common.mm_preprocess import (
 )
 from ..common.vision import DeepseekV4Aligner, DeepseekV4ViT
 from .model import _make_deepseek_v4_weights_mapper
+
+_LANGUAGE_MODEL_PREFIX = "language_model."
+
+
+def _stream_language_model_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    load_non_language_weight: Callable[[str, torch.Tensor], None],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Route a mapped checkpoint without retaining tensors between yields."""
+    for name, weight in weights:
+        if name.startswith(_LANGUAGE_MODEL_PREFIX):
+            yield name[len(_LANGUAGE_MODEL_PREFIX) :], weight
+        else:
+            load_non_language_weight(name, weight)
 
 
 def _make_deepseek_v4_vl_weights_mapper(
@@ -312,17 +326,30 @@ class DeepseekV4ForConditionalGeneration(
         return self.language_model.get_mtp_target_hidden_states()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Map HF names into this wrapper's namespace up front and sort, so
-        # the "language_model." group reaches the child loader as one
-        # contiguous block (AutoWeightsLoader delegates per contiguous group,
-        # and the child's load_weights finalizes fused expert weights, which
-        # must not run on a partially loaded model).
-        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
-        loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(mapped)
-        # The child's load_weights already ran its post-load finalization.
+        # TP2 cannot retain a second model-sized set of checkpoint tensors.
+        # Consume vision tensors where they occur and expose the text tensors
+        # as one lazy stream. Loading through AutoWeightsLoader rooted at the
+        # language model bypasses its load_weights wrapper, so fused expert
+        # state is finalized exactly once after the complete stream is read.
+        non_language_loader = AutoWeightsLoader(self)
+        loaded_non_language: set[str] = set()
+
+        def load_non_language_weight(name: str, weight: torch.Tensor) -> None:
+            loaded_non_language.update(
+                non_language_loader.load_weights(((name, weight),))
+            )
+
+        mapped = self.hf_to_vllm_mapper.apply(weights)
+        language_weights = _stream_language_model_weights(
+            mapped, load_non_language_weight
+        )
+        language_loader = AutoWeightsLoader(self.language_model)
+        loaded_language = language_loader.load_weights(language_weights)
+        self.language_model.process_weights_after_loading()
         self._weights_finalized = True
-        return loaded_params
+        return loaded_non_language | {
+            f"{_LANGUAGE_MODEL_PREFIX}{name}" for name in loaded_language
+        }
 
     def process_weights_after_loading(self) -> None:
         # Model-level post-load hook (called by the loader after any load
