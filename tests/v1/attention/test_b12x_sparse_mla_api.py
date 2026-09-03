@@ -1326,6 +1326,53 @@ def test_glm_selector_metadata_builder_stages_padded_rows_and_capture(
     )
 
 
+def test_b12x_sparse_mla_spec_decode_lengths_stay_in_builder_buffer(
+    monkeypatch,
+) -> None:
+    """Multi-row decode lengths must live in the builder buffer.
+
+    A FULL CUDA graph binds the tensor address at capture and replays against
+    whatever a later build wrote there, so a fresh tensor per build leaves the
+    replayed kernel reading stale lengths.
+    """
+    monkeypatch.setattr(
+        SparseMLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: SimpleNamespace(
+            num_prefills=0,
+            num_decodes=2,
+            num_decode_tokens=8,
+        ),
+    )
+    builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
+    builder.requires_glm_next_selector_metadata = False
+    builder._ckv_gather_requested = False
+    builder.dcp_world_size = 1
+    builder._max_speculative_decode_query_len = 4
+    builder.cache_seq_lens_per_token_buffer = torch.zeros(16, dtype=torch.int32)
+    positions = torch.tensor([28, 29, 30, 31, 36, 37, 38, 39], dtype=torch.int64)
+    common = SimpleNamespace(
+        num_reqs=2,
+        num_actual_tokens=8,
+        max_query_len=4,
+        seq_lens=torch.tensor([32, 40], dtype=torch.int32),
+        dcp_local_seq_lens=None,
+        positions=positions,
+        is_prefilling=torch.zeros(2, dtype=torch.bool),
+    )
+
+    first = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    lengths = first.cache_seq_lens_per_token
+    assert first.is_spec_decode
+    assert lengths.data_ptr() == builder.cache_seq_lens_per_token_buffer.data_ptr()
+    assert lengths.tolist() == [29, 30, 31, 32, 37, 38, 39, 40]
+
+    common.positions = positions + 8
+    second = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    assert second.cache_seq_lens_per_token.data_ptr() == lengths.data_ptr()
+    assert lengths.tolist() == [37, 38, 39, 40, 45, 46, 47, 48]
+
+
 def test_glm_selector_metadata_builder_requires_complete_runtime_state(
     monkeypatch,
 ) -> None:

@@ -863,7 +863,12 @@ class B12xMLASparseMetadataBuilder(
         if common.max_query_len <= 1 and num_tokens == common.num_reqs:
             per_token_lens = seq_lens[:num_tokens]
         elif not use_dcp and common.positions is not None:
-            per_token_lens = common.positions[:num_tokens].to(torch.int32) + 1
+            # The decode kernel binds these lengths, so they must live in the
+            # builder's buffer: a FULL CUDA graph captures the buffer address
+            # and replays against whatever a later build wrote there.
+            per_token_lens = self.cache_seq_lens_per_token_buffer[:num_tokens]
+            per_token_lens.copy_(common.positions[:num_tokens])
+            per_token_lens += 1
         else:
             starts = np.asarray(common.query_start_loc_cpu, dtype=np.int32)
             query_lens = np.diff(starts)
