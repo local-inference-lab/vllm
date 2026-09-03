@@ -301,7 +301,11 @@ class SchedulerOutput:
     # Explicit model-execution class used by adaptive compute fairness.
     # None identifies a transfer-only or otherwise empty model step.
     compute_service_class: ComputeServiceClass | None = None
+    # Auto mode tracks every executor completion boundary so transfer-only
+    # work cannot be charged to the following decode or local prefill.
+    compute_timing_enabled: bool = False
     compute_contention: bool = False
+    compute_service_tokens: int = 0
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

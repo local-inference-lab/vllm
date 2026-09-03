@@ -18,7 +18,7 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
-from vllm.config.scheduler import FairnessEngine
+from vllm.config.scheduler import PrefillComputeHalfLife, PrefillComputeShare
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -57,12 +57,8 @@ def create_scheduler(
     enable_chunked_prefill: bool = True,
     enable_prefix_caching: bool = False,
     long_prefill_token_threshold: int = 0,
-    fairness_engine: FairnessEngine | None = None,
-    prefill_compute_share: float | None = None,
-    max_num_prefill_tokens_per_step: int = 0,
-    max_num_partial_prefills: int = 0,
-    decode_prefill_min_decode_steps: int = 0,
-    decode_prefill_max_wait_ms: int = 0,
+    prefill_compute_share: PrefillComputeShare | None = None,
+    prefill_compute_half_life: PrefillComputeHalfLife | None = None,
     device: str = "auto",
     disable_chunked_mm_input: bool = False,
     use_kv_connector: None | bool | str | MockKVConfig = None,
@@ -115,12 +111,8 @@ def create_scheduler(
         max_num_batched_tokens=max_num_batched_tokens,
         max_model_len=max_model_len,
         long_prefill_token_threshold=long_prefill_token_threshold,
-        fairness_engine=fairness_engine,
         prefill_compute_share=prefill_compute_share,
-        max_num_prefill_tokens_per_step=max_num_prefill_tokens_per_step,
-        max_num_partial_prefills=max_num_partial_prefills,
-        decode_prefill_min_decode_steps=decode_prefill_min_decode_steps,
-        decode_prefill_max_wait_ms=decode_prefill_max_wait_ms,
+        prefill_compute_half_life=prefill_compute_half_life,
         disable_chunked_mm_input=disable_chunked_mm_input,
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,

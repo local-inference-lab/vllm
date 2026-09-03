@@ -1145,11 +1145,11 @@ class VllmConfig:
         self.parallel_config.set_dcp_defaults()
 
         if (
-            self.scheduler_config.fairness_engine is not None
+            self.scheduler_config.prefill_compute_share is not None
             and self.parallel_config.data_parallel_size > 1
         ):
             raise ValueError(
-                "fairness_engine does not yet support data parallelism; all DP "
+                "prefill_compute_share does not yet support data parallelism; all DP "
                 "ranks must make one synchronized fairness decision"
             )
 

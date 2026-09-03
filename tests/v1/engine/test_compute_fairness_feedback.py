@@ -17,9 +17,13 @@ def _scheduler_output(
     service_class: ComputeServiceClass | None,
     *,
     contended: bool = False,
+    timing_enabled: bool | None = None,
 ) -> SchedulerOutput:
     output = SchedulerOutput.make_empty()
     output.compute_service_class = service_class
+    output.compute_timing_enabled = (
+        service_class is not None if timing_enabled is None else timing_enabled
+    )
     output.compute_contention = contended
     return output
 
@@ -86,8 +90,8 @@ def test_queued_feedback_stays_paired_with_exact_batch():
     engine._record_compute_time(prefill_output, prefill_timing)
 
     assert engine.scheduler.record_compute_time.call_args_list == [
-        call("decode", pytest.approx(0.1), contended=True),
-        call("prefill", pytest.approx(0.2), contended=True),
+        call("decode", pytest.approx(0.1), contended=True, scheduled_tokens=0),
+        call("prefill", pytest.approx(0.2), contended=True, scheduled_tokens=0),
     ]
 
 
@@ -98,3 +102,31 @@ def test_empty_transfer_step_does_not_record_compute():
     engine._record_compute_time(_scheduler_output(None), None)
 
     engine.scheduler.record_compute_time.assert_not_called()
+
+
+def test_transfer_step_advances_completion_boundary_without_compute_charge():
+    engine = object.__new__(EngineCore)
+    engine.scheduler = Mock()
+    engine._last_model_completion_time = None
+
+    transfer_output = _scheduler_output(None, timing_enabled=True)
+    transfer_timing = _ModelExecutionTiming()
+    transfer_timing.started_at = 10.0
+    transfer_timing.completed_at = 10.2
+    engine._record_compute_time(transfer_output, transfer_timing)
+
+    engine.scheduler.record_compute_time.assert_not_called()
+    assert engine._last_model_completion_time == pytest.approx(10.2)
+
+    prefill_output = _scheduler_output("prefill", contended=True)
+    prefill_timing = _ModelExecutionTiming()
+    prefill_timing.started_at = 10.1
+    prefill_timing.completed_at = 10.5
+    engine._record_compute_time(prefill_output, prefill_timing)
+
+    engine.scheduler.record_compute_time.assert_called_once_with(
+        "prefill",
+        pytest.approx(0.3),
+        contended=True,
+        scheduled_tokens=0,
+    )
