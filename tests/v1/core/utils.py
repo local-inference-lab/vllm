@@ -7,7 +7,6 @@ import vllm.envs as envs
 from tests.v1.kv_connector.unit.utils import MockKVConfig
 from vllm.config import (
     CacheConfig,
-    DeviceConfig,
     ECTransferConfig,
     KVTransferConfig,
     ModelConfig,
@@ -56,8 +55,6 @@ def create_scheduler(
     enable_chunked_prefill: bool = True,
     enable_prefix_caching: bool = False,
     long_prefill_token_threshold: int = 0,
-    max_num_prefill_tokens_per_step: int = 0,
-    device: str = "auto",
     disable_chunked_mm_input: bool = False,
     use_kv_connector: None | bool | str | MockKVConfig = None,
     kv_role: str = "kv_both",
@@ -109,7 +106,6 @@ def create_scheduler(
         max_num_batched_tokens=max_num_batched_tokens,
         max_model_len=max_model_len,
         long_prefill_token_threshold=long_prefill_token_threshold,
-        max_num_prefill_tokens_per_step=max_num_prefill_tokens_per_step,
         disable_chunked_mm_input=disable_chunked_mm_input,
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,
@@ -186,7 +182,6 @@ def create_scheduler(
     )
 
     vllm_config = VllmConfig(
-        device_config=DeviceConfig(device=device),
         scheduler_config=scheduler_config,
         model_config=model_config,
         cache_config=cache_config,
