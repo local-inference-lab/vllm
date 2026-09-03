@@ -1408,6 +1408,8 @@ class KimiMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        if not self.use_mega_moe and envs.VLLM_KIMI_PRELAUNCH_SHARED_EXPERTS:
+            self.experts.prelaunch_shared_experts(hidden_states)
         # Overlap the gate with the routed down projection; the returned hidden
         # states are already down-projected. Keep the original ``hidden_states``
         # for the shared experts.
