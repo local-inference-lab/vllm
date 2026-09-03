@@ -1367,6 +1367,38 @@ def test_dspark_uses_separate_draft_input_budget(
     assert scheduler.schedule().num_scheduled_tokens == expected
 
 
+@pytest.mark.parametrize(
+    ("num_requests", "num_tokens", "expected"),
+    [
+        (2, 10, {"0": 10, "1": 10}),
+        (3, 1, {"0": 1, "1": 1}),
+    ],
+)
+def test_dflash_uses_separate_query_input_budget(
+    tmp_path, monkeypatch, num_requests, num_tokens, expected
+):
+    """DFlash target and query forwards share their input buffer sequentially."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_seqs=16,
+        max_num_batched_tokens=20,
+        num_speculative_tokens=7,
+        skip_tokenizer_init=True,
+    )
+    speculative_config = scheduler.vllm_config.speculative_config
+    assert speculative_config is not None
+    speculative_config.method = "dflash"
+
+    for request in create_requests(num_requests=num_requests, num_tokens=num_tokens):
+        scheduler.add_request(request)
+
+    assert scheduler.schedule().num_scheduled_tokens == expected
+
+
 # Note - these test cases mirror some of those in test_rejection_sampler.py
 @pytest.mark.parametrize(
     "spec_tokens,output_tokens,expected,expected_per_req",
