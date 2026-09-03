@@ -46,6 +46,7 @@ TOPK_LOGITS_P2P_CAPABILITY = "dflash_logits_topk_p2p_v1"
 
 _CUDA_IPC_HANDLE_BYTES = 64
 
+
 def _ipc_handle_from_share(blob: bytes) -> bytes:
     """Extract the ``cudaIpcMemHandle_t`` from a storage's share blob.
 
@@ -107,10 +108,11 @@ class _P2PBuffers:
         }
 
     def matches(self, context_shape, reply_shape) -> bool:
-        return (
-            tuple(self.context.shape) == tuple(context_shape)
-            and tuple(self.values.shape) == tuple(reply_shape)
-        )
+        return tuple(self.context.shape) == tuple(context_shape) and tuple(
+            self.values.shape
+        ) == tuple(reply_shape)
+
+
 LOGITS_CAPABILITY = "dflash_logits_bf16_v1"
 TOPK_LOGITS_CAPABILITY = "dflash_logits_topk_bf16_v1"
 
@@ -145,7 +147,9 @@ def _encode_topk_logits_frame(
     if logits.dtype != torch.bfloat16:
         raise ValueError(f"Draft logits must be bfloat16, got {logits.dtype}")
     if logits.ndim != 3:
-        raise ValueError(f"Draft logits must be [requests, K, vocab], got {logits.shape}")
+        raise ValueError(
+            f"Draft logits must be [requests, K, vocab], got {logits.shape}"
+        )
     vocab = int(logits.shape[-1])
     if not 1 <= k <= vocab:
         raise ValueError(f"logits_topk must be in [1, {vocab}], got {k}")
@@ -164,8 +168,7 @@ def _encode_topk_logits_frame(
         indices_cpu = indices32.cpu()
     torch.cuda.current_stream(logits.device).synchronize()
     frame = (
-        values_cpu.view(torch.uint16).numpy().tobytes()
-        + indices_cpu.numpy().tobytes()
+        values_cpu.view(torch.uint16).numpy().tobytes() + indices_cpu.numpy().tobytes()
     )
     shape = [int(logits.shape[0]), int(logits.shape[1]), k]
     metadata = {
@@ -1192,7 +1195,9 @@ class K3DSparkDraftEngine:
                         dtype=torch.bfloat16,
                         device=self.device,
                     ),
-                    positions_in=torch.arange(rows, dtype=torch.int64, device=self.device),
+                    positions_in=torch.arange(
+                        rows, dtype=torch.int64, device=self.device
+                    ),
                     slots_in=torch.arange(rows, dtype=torch.int64, device=self.device),
                     slots_host=torch.empty(rows, dtype=torch.int64, pin_memory=True),
                 )
@@ -1234,7 +1239,9 @@ class K3DSparkDraftEngine:
         )
         slot = buffers.reply_slot
         buffers.reply_slot = (slot + 1) % slots
-        buffers.values[slot, :requests, :steps].copy_(values.view(requests, steps, topk))
+        buffers.values[slot, :requests, :steps].copy_(
+            values.view(requests, steps, topk)
+        )
         buffers.indices[slot, :requests, :steps].copy_(
             indices.view(requests, steps, topk).to(torch.int32)
         )
@@ -1569,6 +1576,7 @@ class K3DSparkDraftEngine:
         )
         return exported
 
+    @torch.inference_mode()
     def propose(self, header: dict[str, Any], frames: list[bytes]) -> dict[str, Any]:
         started = time.perf_counter()
         requests = header.get("requests")
@@ -1697,8 +1705,15 @@ class K3DSparkDraftEngine:
                 logits_metadata = self._stage_p2p_reply(draft_logits, logits_topk)
             elif return_logits and logits_topk > 0:
                 assert draft_logits is not None
-                count = int(draft_logits.shape[0]) * int(draft_logits.shape[1]) * logits_topk
-                if self._topk_values_host is None or self._topk_values_host.numel() < count:
+                count = (
+                    int(draft_logits.shape[0])
+                    * int(draft_logits.shape[1])
+                    * logits_topk
+                )
+                if (
+                    self._topk_values_host is None
+                    or self._topk_values_host.numel() < count
+                ):
                     self._topk_values_host = torch.empty(
                         count, dtype=torch.bfloat16, pin_memory=True
                     )
@@ -1770,6 +1785,7 @@ class K3DSparkZMQServer:
         address: str,
         stop: threading.Event,
     ) -> None:
+        self.server_id = f"{os.getpid()}-{int(time.time() * 1000)}"
         self.engine = engine
         self.address = address
         self.stop = stop
@@ -1792,6 +1808,14 @@ class K3DSparkZMQServer:
         self._thread.join(timeout=timeout)
 
     def _handle(self, parts: list[bytes]) -> dict[str, Any]:
+        response = self._dispatch(parts)
+        # Every reply names the server process, so a verifier that kept its
+        # peer mappings across a draft restart reopens them (the exported
+        # allocations died with the old process).
+        response.setdefault("server_id", self.server_id)
+        return response
+
+    def _dispatch(self, parts: list[bytes]) -> dict[str, Any]:
         if not parts:
             raise ValueError("Empty DSpark RPC message")
         header = json.loads(parts[0])

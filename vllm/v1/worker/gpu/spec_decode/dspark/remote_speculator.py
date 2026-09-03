@@ -465,6 +465,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         )
         self._peer: DraftPeerBuffers | None = None
         self._peer_stale = False
+        self._peer_server_id: Any = None
         # Set by the model runner before propose(): False when the scheduler
         # needs the real draft token ids on the host after this step.
         self.deferred_resolve_allowed = True
@@ -737,10 +738,23 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         if len(response_frames) == 2:
             response["_logits_frame"] = response_frames[1]
         if not isinstance(response, dict) or not response.get("ok", False):
+            self._note_server_id(response)
             raise RuntimeError(f"K3 DSpark RPC failed: {response}")
         if int(response.get("protocol", -1)) != PROTOCOL_VERSION:
             raise RuntimeError(f"K3 DSpark protocol mismatch: {response}")
+        self._note_server_id(response)
         return response
+
+    def _note_server_id(self, response: Any) -> None:
+        """Mark the peer mappings stale when the draft server process changed."""
+        if not isinstance(response, dict):
+            return
+        server_id = response.get("server_id")
+        if server_id is None:
+            return
+        if self._peer is not None and server_id != self._peer_server_id:
+            self._peer_stale = True
+        self._peer_server_id = server_id
 
     def init_cudagraph_manager(self, cudagraph_mode=None) -> None:
         """The standalone drafter owns its CUDA graph lifecycle."""
@@ -1260,6 +1274,8 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             pending.failed = True
             self._pending_failure = (exc, list(pending.request_ids))
             self._stage_no_draft(pending, slot)
+            if self._peer is not None:
+                self._peer_stale = True
         finally:
             self._gate.release()
 
@@ -2098,6 +2114,8 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 # the active batch; FREE remains safe even if the server never
                 # created the state.
                 self._disabled_requests.update(input_batch.req_ids)
+                if self._peer is not None:
+                    self._peer_stale = True
                 logger.exception(
                     "Remote K3 DSpark proposal failed; drafting is disabled for "
                     "this step"
