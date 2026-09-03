@@ -1076,6 +1076,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
                 rms_norm_eps=float(self.indexer.q_layernorm.variance_epsilon),
                 dtype=torch.bfloat16,
                 kv_dtype=self.kv_cache_kernel_dtype,
+                metadata_validation="trusted",
             )
         )
         (scratch,) = get_b12x_scratch_buffers(plan)

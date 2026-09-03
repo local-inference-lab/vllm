@@ -298,6 +298,7 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     assert caps.max_q_rows == owner.max_tokens
     assert caps.num_main_cache_pages == planned_pages
     assert caps.num_compressed_cache_pages == planned_pages
+    assert caps.metadata_validation == "trusted"
     assert owner._main_block_table.shape == (owner.max_seqs, planned_pages)
     assert bind_kwargs["main_k_cache"] is main_k_cache
     assert bind_kwargs["main_v_cache"] is main_v_cache

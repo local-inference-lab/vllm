@@ -651,6 +651,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 state_dtype=self.get_state_dtype()[1],
                 gate_activation=self.norm.activation,
                 qk_l2norm=True,
+                qwen_metadata_validation="trusted",
             )
         )
 

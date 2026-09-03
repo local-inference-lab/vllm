@@ -16,6 +16,9 @@ import vllm.models.qwen3_8_flash_next.hyperconnection as hyperconnection_module
 import vllm.models.qwen3_8_flash_next.model as model_module
 import vllm.models.qwen3_8_flash_next.ple_layer as ple_layer_module
 from vllm.config.compilation import CompilationMode
+from vllm.model_executor.layers.mamba.gdn import (
+    qwen_gdn_linear_attn as qwen_gdn_module,
+)
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
     _resolve_gdn_decode_kernel,
@@ -430,6 +433,49 @@ def test_b12x_gdn_bind_preserves_exact_aligned_page_stride(monkeypatch) -> None:
     assert layer.kv_cache == ()
     assert layer._b12x_plan is None
     assert layer._b12x_binding is None
+
+
+def test_b12x_gdn_plan_trusts_scheduler_metadata(monkeypatch) -> None:
+    captured_caps: dict[str, Any] = {}
+
+    class FakeApi:
+        @staticmethod
+        def Caps(**kwargs):
+            captured_caps.update(kwargs)
+            return kwargs
+
+        @staticmethod
+        def plan(caps):
+            return caps
+
+    layer = QwenGatedDeltaNetAttention.__new__(QwenGatedDeltaNetAttention)
+    nn.Module.__init__(layer)
+    layer._b12x_gdn_api = FakeApi()
+    layer._b12x_max_tokens = 16
+    layer._b12x_max_seqs = 4
+    layer._b12x_state_index_columns = 4
+    layer._b12x_local_key_heads = 4
+    layer._b12x_local_value_heads = 4
+    layer.head_k_dim = 128
+    layer.head_v_dim = 128
+    layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    layer.norm = SimpleNamespace(activation="silu")
+
+    monkeypatch.setattr(
+        QwenGatedDeltaNetAttention,
+        "get_state_dtype",
+        lambda _: (torch.bfloat16, torch.float32),
+    )
+    monkeypatch.setattr(
+        qwen_gdn_module,
+        "current_platform",
+        SimpleNamespace(current_device=lambda: "cuda:0"),
+    )
+
+    plan = layer._make_b12x_gdn_plan(max_state_slots=32)
+
+    assert plan == captured_caps
+    assert captured_caps["qwen_metadata_validation"] == "trusted"
 
 
 def test_b12x_gdn_stages_speculative_rollback_metadata() -> None:
