@@ -307,6 +307,42 @@ def test_factory_forwards_locality_to_fs_tier(tmp_path):
         tier.shutdown()
 
 
+def test_capacity_config_bounds_stored_blocks(tmp_path):
+    """The public tier config constructs GC and enforces its byte budget."""
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    block_bytes = tensor.stride(0) * tensor.element_size()
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+        gc_max_size_gb=(2 * block_bytes) / 2**30,
+        gc_low_watermark=0.5,
+        gc_interval_s=3600.0,
+        gc_stamp_interval_s=1.0,
+        gc_grace_s=60.0,
+    )
+    try:
+        keys = [key(1), key(2), key(3)]
+        tier.submit_store(make_job(1, keys, [0, 1, 2]))
+        assert all(result.success for result in drain(tier))
+
+        paths = [tier.file_mapper.get_file_name(block_key) for block_key in keys]
+        old = time.time() - 1000
+        for path in paths:
+            os.utime(path, (old, old))
+
+        assert tier._gc_manager is not None
+        assert tier._gc_manager.sweep() == 2 * block_bytes
+        assert sum(os.path.getsize(path) for path in paths if os.path.exists(path)) == (
+            block_bytes
+        )
+    finally:
+        tier.shutdown()
+
+
 def test_failed_load_missing_file(fs_tier):
     """Test that loading a block whose file does not exist results in a failed job."""
     tier, _ = fs_tier
