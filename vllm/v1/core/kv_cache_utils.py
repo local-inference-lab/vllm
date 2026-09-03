@@ -4,7 +4,6 @@
 
 import copy
 import hashlib
-import itertools
 import math
 import os
 from collections import defaultdict
@@ -1347,6 +1346,43 @@ def _get_kv_cache_bytes_per_block(
 _MAX_WEIGHTED_SHARED_POOL_GROUPS = 8
 
 
+def _iter_bounded_group_counts(
+    group_count_ranges: Sequence[range],
+    max_total: int,
+) -> Iterator[tuple[int, ...]]:
+    """Yield group-count combinations whose sum does not exceed a limit.
+
+    Args:
+        group_count_ranges: Ascending positive group counts for each layer bucket.
+        max_total: Maximum sum permitted across one combination.
+
+    Yields:
+        A group-count tuple whose sum is at most ``max_total``.
+    """
+
+    def visit(
+        bucket_index: int,
+        running_total: int,
+        counts: tuple[int, ...],
+    ) -> Iterator[tuple[int, ...]]:
+        if bucket_index == len(group_count_ranges):
+            yield counts
+            return
+
+        remaining_buckets = len(group_count_ranges) - bucket_index - 1
+        for group_count in group_count_ranges[bucket_index]:
+            new_total = running_total + group_count
+            if new_total + remaining_buckets > max_total:
+                break
+            yield from visit(
+                bucket_index + 1,
+                new_total,
+                (*counts, group_count),
+            )
+
+    yield from visit(0, 0, ())
+
+
 def _get_kv_cache_group_allocation_cost(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1368,30 +1404,43 @@ def _get_weighted_shared_pool_kv_cache_groups(
 ) -> list[KVCacheGroupSpec]:
     """Balance split-page groups by their actual shared-pool memory cost."""
     layer_buckets = _get_kv_cache_layer_buckets(kv_cache_spec)
+    if len(layer_buckets) > _MAX_WEIGHTED_SHARED_POOL_GROUPS:
+        raise ValueError(
+            "Cannot represent split KV cache within the group limit: "
+            f"{len(layer_buckets)} incompatible layer buckets require at least "
+            f"{len(layer_buckets)} groups, but the limit is "
+            f"{_MAX_WEIGHTED_SHARED_POOL_GROUPS}."
+        )
     baseline_groups = _get_kv_cache_groups_uniform_page_size(
         kv_cache_spec, log_padding=False
     )
     baseline_cost = _get_kv_cache_group_allocation_cost(vllm_config, baseline_groups)
-    best_groups = baseline_groups
-    best_key = (baseline_cost, len(baseline_groups))
+    baseline_within_limit = len(baseline_groups) <= _MAX_WEIGHTED_SHARED_POOL_GROUPS
+    best_groups = baseline_groups if baseline_within_limit else None
+    best_key = (baseline_cost, len(baseline_groups)) if baseline_within_limit else None
 
     group_count_ranges = [
         range(1, min(len(layers), _MAX_WEIGHTED_SHARED_POOL_GROUPS) + 1)
         for layers in layer_buckets
     ]
-    for group_counts in itertools.product(*group_count_ranges):
+    for group_counts in _iter_bounded_group_counts(
+        group_count_ranges, _MAX_WEIGHTED_SHARED_POOL_GROUPS
+    ):
         total_groups = sum(group_counts)
-        if total_groups > _MAX_WEIGHTED_SHARED_POOL_GROUPS:
-            continue
         groups = _split_kv_cache_layer_buckets(
             kv_cache_spec, layer_buckets, group_counts
         )
         cost = _get_kv_cache_group_allocation_cost(vllm_config, groups)
         candidate_key = (cost, total_groups)
-        if candidate_key < best_key:
+        if best_key is None or candidate_key < best_key:
             best_key = candidate_key
             best_groups = groups
 
+    if best_groups is None or best_key is None:
+        raise ValueError(
+            "No compatible split KV cache layout fits within the "
+            f"{_MAX_WEIGHTED_SHARED_POOL_GROUPS}-group limit."
+        )
     if best_groups is not baseline_groups:
         logger.warning(
             "Rebalanced split KV cache groups from layer counts %s to %s; "
