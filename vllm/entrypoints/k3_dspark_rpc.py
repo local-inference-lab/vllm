@@ -1215,13 +1215,17 @@ class K3DSparkDraftEngine:
         )
 
     def _stage_p2p_reply(
-        self, draft_logits: torch.Tensor, logits_topk: int
+        self,
+        draft_logits: torch.Tensor,
+        logits_topk: int,
+        requested_slot: Any = None,
     ) -> dict[str, Any]:
         """Write the top-k draft logits of this proposal into a reply slot.
 
-        The verifier pulls the slot after this reply's header arrives; the
-        slot alternates per proposal so the pull of one reply never races the
-        write of the next.
+        The verifier names the slot (it enqueues the pull before the reply
+        arrives) and alternates it per proposal so the pull of one reply
+        never races the write of the next; without a named slot the server
+        alternates on its own.
         """
         buffers = self._p2p
         if buffers is None:
@@ -1237,8 +1241,13 @@ class K3DSparkDraftEngine:
         values, indices = torch.topk(
             draft_logits.reshape(-1, vocab), logits_topk, dim=-1, sorted=False
         )
-        slot = buffers.reply_slot
-        buffers.reply_slot = (slot + 1) % slots
+        if requested_slot is None:
+            slot = buffers.reply_slot
+            buffers.reply_slot = (slot + 1) % slots
+        else:
+            slot = int(requested_slot)
+            if not 0 <= slot < slots:
+                raise ValueError(f"Peer reply slot {slot} out of range")
         buffers.values[slot, :requests, :steps].copy_(
             values.view(requests, steps, topk)
         )
@@ -1702,7 +1711,9 @@ class K3DSparkDraftEngine:
             p2p_reply = bool(header.get("p2p_reply", False))
             if return_logits and logits_topk > 0 and p2p_reply:
                 assert draft_logits is not None
-                logits_metadata = self._stage_p2p_reply(draft_logits, logits_topk)
+                logits_metadata = self._stage_p2p_reply(
+                    draft_logits, logits_topk, header.get("p2p_reply_slot")
+                )
             elif return_logits and logits_topk > 0:
                 assert draft_logits is not None
                 count = (

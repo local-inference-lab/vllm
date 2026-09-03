@@ -267,5 +267,8 @@ def test_stage_p2p_reply_writes_top_k_into_alternating_slots():
     assert torch.equal(gathered, slot)
     assert engine._stage_p2p_reply(logits, 5)["p2p_reply_slot"] == 1
     assert engine._stage_p2p_reply(logits, 5)["p2p_reply_slot"] == 0
+    assert engine._stage_p2p_reply(logits, 5, 1)["p2p_reply_slot"] == 1
+    with pytest.raises(ValueError, match="out of range"):
+        engine._stage_p2p_reply(logits, 5, 2)
     with pytest.raises(ValueError, match="top-5"):
         engine._stage_p2p_reply(logits, 4)

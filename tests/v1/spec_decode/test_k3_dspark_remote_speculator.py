@@ -469,7 +469,14 @@ def test_deferred_resolve_pulls_a_peer_reply_like_the_frame_reply():
     }
     via_peer._rpc = lambda frames: peer_response
     via_peer._start_reply_thread(
-        [b"h"], active, ["a", "c"], steps, batch, temperature, seeds
+        [b"h"],
+        active,
+        ["a", "c"],
+        steps,
+        batch,
+        temperature,
+        seeds,
+        p2p_reply=(1, len(active), steps),
     )
     output = via_peer.resolve_pending()
     torch.cuda.synchronize()

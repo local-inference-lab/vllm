@@ -466,6 +466,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         self._peer: DraftPeerBuffers | None = None
         self._peer_stale = False
         self._peer_server_id: Any = None
+        self._peer_reply_slot = 0
         # Set by the model runner before propose(): False when the scheduler
         # needs the real draft token ids on the host after this step.
         self.deferred_resolve_allowed = True
@@ -718,6 +719,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             finally:
                 self._async_slot_free[slot].set()
                 self._async_queue.task_done()
+
     # kimi-k3-draft-async-ingest: end
 
     def _rpc(self, frames: list[bytes]) -> dict[str, Any]:
@@ -725,7 +727,9 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         self._drain_async_ingest()
         with self._async_lock:
             try:
-                self._socket.send_multipart(frames, copy=False)  # kimi-k3-draft-zero-copy-sync
+                self._socket.send_multipart(
+                    frames, copy=False
+                )  # kimi-k3-draft-zero-copy-sync
                 response_frames = self._socket.recv_multipart()
             except Exception:
                 self._connect()
@@ -1167,13 +1171,16 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                     f"Remote DFlash peer reply shape mismatch: expected={expected}, "
                     f"metadata={metadata}"
                 )
-            if pending is None:
-                raise ValueError("Peer reply received outside a deferred proposal")
-            pending.p2p_reply = (
-                int(metadata["p2p_reply_slot"]),
-                rows,
-                num_speculative_tokens,
-            )
+            if pending is None or pending.p2p_reply is None:
+                raise ValueError("Peer reply received for a frame-transport proposal")
+            got = int(metadata["p2p_reply_slot"])
+            if got != pending.p2p_reply[0]:
+                raise ValueError(
+                    f"Peer reply slot {got} differs from the requested "
+                    f"{pending.p2p_reply[0]}"
+                )
+        elif pending is not None and pending.p2p_reply is not None:
+            raise ValueError("Frame reply received for a peer-transport proposal")
         elif self._logits_topk > 0:
             values, indices = _decode_topk_logits_frame(
                 response, (rows, num_speculative_tokens, self._logits_topk)
@@ -1211,6 +1218,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         input_batch: InputBatch,
         temperature: torch.Tensor | None,
         seeds: torch.Tensor | None,
+        p2p_reply: tuple[int, int, int] | None = None,
     ) -> None:
         assert temperature is not None and seeds is not None
         slot = self._staging_slot
@@ -1225,6 +1233,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             idx_mapping=input_batch.idx_mapping[: input_batch.num_reqs],
             temperature=temperature,
             seeds=seeds,
+            p2p_reply=p2p_reply,
         )
         pending.active_gpu = torch.tensor(  # type: ignore[attr-defined]
             active_indices, dtype=torch.int64, device=self.device
@@ -1754,7 +1763,9 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         sampled_staging = self._sampled_staging[:num_reqs]  # kimi-k3-draft-async-ingest
         rejected_staging.copy_(num_rejected[:num_reqs], non_blocking=True)
         anchor_staging.copy_(anchor_tokens, non_blocking=True)
-        sampled_staging.copy_(sampled_counts, non_blocking=True)  # kimi-k3-draft-async-ingest
+        sampled_staging.copy_(
+            sampled_counts, non_blocking=True
+        )  # kimi-k3-draft-async-ingest
         _detail_copy_t0 = time.perf_counter()
         torch.cuda.current_stream(self.device).synchronize()
         self._detail_copy_sync = time.perf_counter() - _detail_copy_t0
@@ -1880,8 +1891,12 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         # kimi-k3-draft-async-ingest: a step in which no active request sampled a token is a
         # pure mid-prefill step; its proposal is never consumed, so only the
         # context ingest matters and it can complete off the critical path.
-        deferred = self._async_depth > 0 and not _K3_CAPTURE_DIR and all(
-            sampled_counts_cpu[request_idx] == 0 for request_idx in active_indices
+        deferred = (
+            self._async_depth > 0
+            and not _K3_CAPTURE_DIR
+            and all(
+                sampled_counts_cpu[request_idx] == 0 for request_idx in active_indices
+            )
         )
         if deferred:
             slot = self._async_slot
@@ -1906,7 +1921,9 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         if self._peer is not None and not _K3_CAPTURE_DIR:
             try:
                 self._peer.push_context(
-                    peer_slot, context, torch.cuda.current_stream(self.device).cuda_stream
+                    peer_slot,
+                    context,
+                    torch.cuda.current_stream(self.device).cuda_stream,
                 )
                 peer_context = True
             except Exception as exc:  # noqa: BLE001
@@ -1927,7 +1944,9 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         positions_frame = memoryview(positions_staging.numpy())
         # NumPy has inconsistent bfloat16 support; preserve its exact bits as u16.
         context_frame = (
-            None if peer_context else memoryview(context_staging.view(torch.uint16).numpy())
+            None
+            if peer_context
+            else memoryview(context_staging.view(torch.uint16).numpy())
         )
         # kimi-k3-dflash-feature-capture: persist the exact served feature
         # stream for offline draft training. Inert without the env var.
@@ -1950,9 +1969,16 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             "logits_topk": self._logits_topk,
             "requests": requests,
         }
+        peer_reply_slot = -1
         if peer_context:
+            assert self._peer is not None
+            # The verifier names the reply slot so the pull can be enqueued
+            # behind the gate before the reply arrives.
+            peer_reply_slot = self._peer_reply_slot
+            self._peer_reply_slot = (peer_reply_slot + 1) % self._peer.reply_slots
             header["p2p_context_slot"] = peer_slot
             header["p2p_reply"] = True
+            header["p2p_reply_slot"] = peer_reply_slot
             frames = [json.dumps(header).encode(), positions_frame]
         else:
             frames = [json.dumps(header).encode(), positions_frame, context_frame]
@@ -1977,6 +2003,11 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 input_batch,
                 temperature,
                 seeds,
+                p2p_reply=(
+                    (peer_reply_slot, len(active_indices), num_speculative_tokens)
+                    if peer_context and self._probabilistic and self._logits_topk > 0
+                    else None
+                ),
             )
             response = {}
             rpc_done = output_copied = time.perf_counter()
