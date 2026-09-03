@@ -1542,6 +1542,14 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if (
+            self.compute_share_controller is not None
+            and scheduler_output.compute_service_class is not None
+        ):
+            self.compute_share_controller.dispatch(
+                scheduler_output.compute_service_class,
+                contended=scheduler_output.compute_contention,
+            )
         return scheduler_output
 
     def record_compute_time(
@@ -1554,9 +1562,9 @@ class Scheduler(SchedulerInterface):
         """Apply execution feedback and accumulate metric deltas."""
         if self.compute_share_controller is None:
             return
-        if not contended or elapsed_seconds <= 0.0:
+        if not contended:
             return
-        if self.log_stats:
+        if self.log_stats and elapsed_seconds > 0.0:
             if service_class == "prefill":
                 self._prefill_compute_seconds += elapsed_seconds
             else:

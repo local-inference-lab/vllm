@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import deque
+
 import pytest
 
 from vllm.v1.core.sched.compute_fairness import PrefillComputeShareController
@@ -18,6 +20,7 @@ def _run_controller(
         service_class = controller.select(decode_runnable=True, prefill_runnable=True)
         assert service_class is not None
         elapsed = prefill_cost if service_class == "prefill" else decode_cost
+        controller.dispatch(service_class, contended=True)
         totals[service_class] += elapsed
         controller.record(service_class, elapsed, contended=True)
     return totals
@@ -57,6 +60,7 @@ def test_runtime_cost_change_changes_selected_cadence():
 def test_contention_transitions_reset_credit():
     controller = PrefillComputeShareController(0.5)
     controller.select(decode_runnable=True, prefill_runnable=True)
+    controller.dispatch("decode", contended=True)
     controller.record("decode", 1.0, contended=True)
     assert controller.decode_virtual_runtime > 0.0
 
@@ -88,6 +92,7 @@ def test_neither_class_starves_at_asymmetric_share():
 def test_outlier_lead_is_bounded_to_one_service_quantum():
     controller = PrefillComputeShareController(0.5)
     controller.select(decode_runnable=True, prefill_runnable=True)
+    controller.dispatch("prefill", contended=True)
     controller.record("prefill", 100.0, contended=True)
 
     normalized_quantum = 100.0 / controller.prefill_compute_share
@@ -99,3 +104,39 @@ def test_ties_favor_decode():
     controller = PrefillComputeShareController(0.5)
 
     assert controller.select(decode_runnable=True, prefill_runnable=True) == "decode"
+
+
+def test_two_deep_async_queue_converges_with_unequal_costs():
+    controller = PrefillComputeShareController(0.5)
+    pending: deque[str] = deque()
+    totals = {"decode": 0.0, "prefill": 0.0}
+
+    for _ in range(10_000):
+        while len(pending) < 2:
+            service_class = controller.select(
+                decode_runnable=True, prefill_runnable=True
+            )
+            assert service_class is not None
+            controller.dispatch(service_class, contended=True)
+            pending.append(service_class)
+
+        service_class = pending.popleft()
+        elapsed = 0.7 if service_class == "prefill" else 0.01
+        totals[service_class] += elapsed
+        controller.record(service_class, elapsed, contended=True)
+
+    prefill_fraction = totals["prefill"] / sum(totals.values())
+    assert prefill_fraction == pytest.approx(0.5, abs=0.01)
+
+
+def test_zero_elapsed_completion_releases_reservation():
+    controller = PrefillComputeShareController(0.5, last_decode_seconds=0.1)
+    service_class = controller.select(decode_runnable=True, prefill_runnable=True)
+    assert service_class == "decode"
+    controller.dispatch(service_class, contended=True)
+
+    assert controller.decode_reservations
+    controller.record(service_class, 0.0, contended=True)
+
+    assert not controller.decode_reservations
+    assert controller.decode_virtual_runtime == 0.0
