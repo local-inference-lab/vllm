@@ -88,6 +88,11 @@ def test_late_input_ids_only_without_pcp_and_capacity_manager():
     runner.pcp_manager = None
     runner.verification_capacity_manager = None
     assert mrv2.GPUModelRunner._late_input_ids.fget(runner)
+
+    runner.pcp_manager = object()
+    assert not mrv2.GPUModelRunner._late_input_ids.fget(runner)
+
+    runner.pcp_manager = None
     runner.verification_capacity_manager = object()
     assert not mrv2.GPUModelRunner._late_input_ids.fget(runner)
 

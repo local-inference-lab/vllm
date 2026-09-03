@@ -18,6 +18,7 @@ lazy peer access.
 from __future__ import annotations
 
 import base64
+import binascii
 import contextlib
 import ctypes
 from dataclasses import dataclass
@@ -85,7 +86,18 @@ class _Cudart:
         lib.cudaMemcpyAsync.restype = ctypes.c_int
         lib.cudaGetErrorString.argtypes = [ctypes.c_int]
         lib.cudaGetErrorString.restype = ctypes.c_char_p
+        driver_path = find_loaded_library("libcuda")
+        if driver_path is None:
+            raise RuntimeError("libcuda is not loaded")
+        driver = ctypes.CDLL(driver_path)
+        driver.cuMemGetAddressRange_v2.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_uint64,
+        ]
+        driver.cuMemGetAddressRange_v2.restype = ctypes.c_int
         self._lib = lib
+        self._driver = driver
 
     def check(self, err: int, what: str) -> None:
         if err != 0:
@@ -109,6 +121,19 @@ class _Cudart:
 
     def close(self, ptr: int) -> None:
         self.check(self._lib.cudaIpcCloseMemHandle(ctypes.c_void_p(ptr)), "close")
+
+    def allocation_range(self, ptr: int) -> tuple[int, int]:
+        """Return the CUDA allocation that contains an imported pointer."""
+        base = ctypes.c_uint64()
+        nbytes = ctypes.c_size_t()
+        result = self._driver.cuMemGetAddressRange_v2(
+            ctypes.byref(base), ctypes.byref(nbytes), ctypes.c_uint64(ptr)
+        )
+        if result != 0:
+            raise RuntimeError(f"cuMemGetAddressRange failed ({result})")
+        if base.value == 0 or nbytes.value <= 0:
+            raise RuntimeError("cuMemGetAddressRange returned an empty allocation")
+        return int(base.value), int(nbytes.value)
 
     def memcpy_async(self, dst: int, src: int, nbytes: int, stream: int) -> None:
         if nbytes == 0:
@@ -157,10 +182,33 @@ class PeerTensor:
     shape: tuple[int, ...]
     dtype: torch.dtype
     nbytes: int
+    allocation_nbytes: int
 
     @property
     def data_ptr(self) -> int:
-        return self.base_ptr + self.offset_bytes
+        return self.address(0, self.nbytes)
+
+    def address(self, relative_offset: int, nbytes: int) -> int:
+        """Return a bounded address within the peer tensor."""
+        relative_offset = int(relative_offset)
+        nbytes = int(nbytes)
+        if relative_offset < 0 or nbytes < 0:
+            raise ValueError("peer copy offset and length must be non-negative")
+        logical_end = relative_offset + nbytes
+        if logical_end > self.nbytes:
+            raise ValueError(
+                "peer copy exceeds the exported tensor: "
+                f"offset={relative_offset}, bytes={nbytes}, tensor={self.nbytes}"
+            )
+        allocation_offset = self.offset_bytes + relative_offset
+        allocation_end = allocation_offset + nbytes
+        if allocation_offset < 0 or allocation_end > self.allocation_nbytes:
+            raise ValueError(
+                "peer copy exceeds the imported CUDA allocation: "
+                f"offset={allocation_offset}, bytes={nbytes}, "
+                f"allocation={self.allocation_nbytes}"
+            )
+        return self.base_ptr + allocation_offset
 
     def element_size(self) -> int:
         return torch.empty(0, dtype=self.dtype).element_size()
@@ -176,13 +224,34 @@ class PeerTensor:
 class DraftPeerBuffers:
     """The draft server's context ring and reply slots, mapped for rank 0."""
 
-    def __init__(self, info: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        info: dict[str, Any],
+        *,
+        context_shape: tuple[int, int, int],
+        reply_shape: tuple[int, int, int, int],
+    ) -> None:
         self._cudart = _Cudart()
         self._opened: list[int] = []
         try:
-            self.context = self._open(info["context"])
-            self.values = self._open(info["values"])
-            self.indices = self._open(info["indices"])
+            self.context = self._open(
+                info["context"],
+                name="context",
+                expected_shape=context_shape,
+                expected_dtype=torch.bfloat16,
+            )
+            self.values = self._open(
+                info["values"],
+                name="values",
+                expected_shape=reply_shape,
+                expected_dtype=torch.bfloat16,
+            )
+            self.indices = self._open(
+                info["indices"],
+                name="indices",
+                expected_shape=reply_shape,
+                expected_dtype=torch.int32,
+            )
         except Exception:
             self.close()
             raise
@@ -196,17 +265,80 @@ class DraftPeerBuffers:
         if tuple(self.indices.shape) != tuple(self.values.shape):
             raise ValueError("reply value and index slots must share a shape")
 
-    def _open(self, spec: dict[str, Any]) -> PeerTensor:
-        handle = base64.b64decode(spec["handle"])
+    def _open(
+        self,
+        spec: dict[str, Any],
+        *,
+        name: str,
+        expected_shape: tuple[int, ...],
+        expected_dtype: torch.dtype,
+    ) -> PeerTensor:
+        """Validate and map one tensor exported by the draft process."""
+        shape_value = spec.get("shape")
+        if not isinstance(shape_value, list) or any(
+            not isinstance(size, int) or isinstance(size, bool)
+            for size in shape_value
+        ):
+            raise ValueError(f"peer {name} shape must be a list of integers")
+        shape = tuple(shape_value)
+        if shape != expected_shape:
+            raise ValueError(
+                f"peer {name} shape {shape} does not match {expected_shape}"
+            )
+        expected_dtype_name = str(expected_dtype).removeprefix("torch.")
+        if spec.get("dtype") != expected_dtype_name:
+            raise ValueError(
+                f"peer {name} dtype {spec.get('dtype')!r} does not match "
+                f"{expected_dtype_name!r}"
+            )
+        expected_nbytes = torch.empty(0, dtype=expected_dtype).element_size()
+        for size in expected_shape:
+            expected_nbytes *= size
+        nbytes_value = spec.get("nbytes")
+        if (
+            not isinstance(nbytes_value, int)
+            or isinstance(nbytes_value, bool)
+            or nbytes_value != expected_nbytes
+        ):
+            raise ValueError(
+                f"peer {name} byte count {nbytes_value!r} does not match "
+                f"{expected_nbytes}"
+            )
+        offset_value = spec.get("offset_bytes")
+        if (
+            not isinstance(offset_value, int)
+            or isinstance(offset_value, bool)
+            or offset_value < 0
+        ):
+            raise ValueError(f"peer {name} offset must be a non-negative integer")
+        handle_value = spec.get("handle")
+        if not isinstance(handle_value, str):
+            raise ValueError(f"peer {name} handle must be base64 text")
+        try:
+            handle = base64.b64decode(handle_value, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError(f"peer {name} handle is not valid base64") from exc
         base = self._cudart.open(handle)
         self._opened.append(base)
-        dtype = getattr(torch, spec["dtype"])
+        allocation_base, allocation_nbytes = self._cudart.allocation_range(base)
+        if allocation_base != base:
+            raise ValueError(
+                f"peer {name} IPC pointer is not the CUDA allocation base"
+            )
+        allocation_end = offset_value + expected_nbytes
+        if allocation_end > allocation_nbytes:
+            raise ValueError(
+                f"peer {name} range exceeds the imported CUDA allocation: "
+                f"offset={offset_value}, bytes={expected_nbytes}, "
+                f"allocation={allocation_nbytes}"
+            )
         return PeerTensor(
             base_ptr=base,
-            offset_bytes=int(spec["offset_bytes"]),
-            shape=tuple(int(v) for v in spec["shape"]),
-            dtype=dtype,
-            nbytes=int(spec["nbytes"]),
+            offset_bytes=offset_value,
+            shape=shape,
+            dtype=expected_dtype,
+            nbytes=expected_nbytes,
+            allocation_nbytes=allocation_nbytes,
         )
 
     def close(self) -> None:
@@ -228,9 +360,12 @@ class DraftPeerBuffers:
         if context.dtype != self.context.dtype:
             raise ValueError("context dtype does not match the ring")
         context = context.contiguous()
-        dst = self.context.data_ptr + slot * self.context.row_stride_bytes()
+        copy_nbytes = rows * width * context.element_size()
+        dst = self.context.address(
+            slot * self.context.row_stride_bytes(), copy_nbytes
+        )
         self._cudart.memcpy_async(
-            dst, context.data_ptr(), rows * width * context.element_size(), stream
+            dst, context.data_ptr(), copy_nbytes, stream
         )
 
     def pull_reply(
@@ -263,16 +398,23 @@ class DraftPeerBuffers:
                 raise ValueError("reply output tensor must be contiguous")
             row_bytes = self.num_steps * self.topk * out.element_size()
             step_bytes = self.topk * out.element_size()
-            base = src.data_ptr + slot * src.row_stride_bytes()
+            slot_offset = slot * src.row_stride_bytes()
             if num_steps == self.num_steps:
+                copy_nbytes = rows * row_bytes
                 self._cudart.memcpy_async(
-                    out.data_ptr(), base, rows * row_bytes, stream
+                    out.data_ptr(),
+                    src.address(slot_offset, copy_nbytes),
+                    copy_nbytes,
+                    stream,
                 )
             else:
                 for row in range(rows):
                     self._cudart.memcpy_async(
                         out.data_ptr() + row * num_steps * step_bytes,
-                        base + row * row_bytes,
+                        src.address(
+                            slot_offset + row * row_bytes,
+                            num_steps * step_bytes,
+                        ),
                         num_steps * step_bytes,
                         stream,
                     )

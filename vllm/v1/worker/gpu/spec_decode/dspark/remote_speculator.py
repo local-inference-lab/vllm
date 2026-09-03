@@ -1011,7 +1011,20 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         }
         try:
             response = self._rpc([json.dumps(header).encode()])
-            self._peer = DraftPeerBuffers(response)
+            self._peer = DraftPeerBuffers(
+                response,
+                context_shape=(
+                    header["context_slots"],
+                    header["context_rows"],
+                    header["context_width"],
+                ),
+                reply_shape=(
+                    header["reply_slots"],
+                    header["max_requests"],
+                    header["num_speculative_tokens"],
+                    header["logits_topk"],
+                ),
+            )
             count = self.max_num_reqs * self.num_speculative_steps * self._logits_topk
             self._topk_values_peer = torch.empty(
                 count, dtype=torch.bfloat16, device=self.device
@@ -1888,9 +1901,9 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 f"{self.raw_context_width}"
             )
         context_ready = time.perf_counter()
-        # kimi-k3-draft-async-ingest: a step in which no active request sampled a token is a
-        # pure mid-prefill step; its proposal is never consumed, so only the
-        # context ingest matters and it can complete off the critical path.
+        # A step in which no active request sampled a token is a pure mid-prefill
+        # step. Its proposal is never consumed, so only the context ingest matters
+        # and it can complete off the critical path.
         deferred = (
             self._async_depth > 0
             and not _K3_CAPTURE_DIR
