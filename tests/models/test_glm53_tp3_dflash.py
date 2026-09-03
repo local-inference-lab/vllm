@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import torch
 
-from tests.utils import ensure_current_vllm_config
-
+from vllm.config.compilation import CompilationMode
 from vllm.config.speculative import SpeculativeConfig
+from vllm.model_executor import custom_op
 from vllm.model_executor.layers import vocab_parallel_embedding
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -23,6 +23,20 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 
+def _disable_custom_ops(monkeypatch) -> None:
+    compilation_config = SimpleNamespace(
+        mode=CompilationMode.NONE,
+        custom_ops=["none"],
+        enabled_custom_ops=set(),
+        disabled_custom_ops=set(),
+    )
+    monkeypatch.setattr(
+        custom_op,
+        "get_cached_compilation_config",
+        lambda: compilation_config,
+    )
+
+
 def _tp3_dflash_config(**overrides):
     values = {
         "glm53_tp3_padding": True,
@@ -34,12 +48,16 @@ def _tp3_dflash_config(**overrides):
         "original_num_key_value_heads": 8,
         "original_vocab_size": 154880,
         "draft_vocab_size": 154880,
+        "hidden_size": 4096,
+        "intermediate_size": 12288,
         "vocab_size": 154880,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
 
+
 def _capture_attention_projection_kwargs(monkeypatch, config, tp_size):
+    _disable_custom_ops(monkeypatch)
     calls = {}
 
     class FakeProjection(torch.nn.Module):
@@ -95,12 +113,16 @@ def test_dflash_tp3_wires_logical_checkpoint_projection_sizes(monkeypatch) -> No
 
 
 def test_dflash_tp3_geometry_and_vocab_storage(monkeypatch) -> None:
+    _disable_custom_ops(monkeypatch)
     config = _tp3_dflash_config()
 
     assert _get_glm53_tp3_head_geometry(config) == (32, 8)
     assert _get_dflash_draft_vocab_size(config) == 154880
     vocab_kwargs = _get_glm53_tp3_vocab_kwargs(config)
     assert vocab_kwargs == {"padding_size": 192}
+    assert config.intermediate_size % 3 == 0
+    assert config.intermediate_size // 3 == 4096
+    assert config.intermediate_size % 4 == 0
 
     monkeypatch.setattr(
         vocab_parallel_embedding,
@@ -112,12 +134,11 @@ def test_dflash_tp3_geometry_and_vocab_storage(monkeypatch) -> None:
         "get_tensor_model_parallel_rank",
         lambda: 2,
     )
-    with ensure_current_vllm_config():
-        embedding = VocabParallelEmbedding(
-            _get_dflash_draft_vocab_size(config),
-            8,
-            **vocab_kwargs,
-        )
+    embedding = VocabParallelEmbedding(
+        _get_dflash_draft_vocab_size(config),
+        8,
+        **vocab_kwargs,
+    )
     assert embedding.num_embeddings == 154880
     assert embedding.num_embeddings_padded == 154944
     assert embedding.num_embeddings_per_partition == 51648
@@ -226,8 +247,7 @@ def test_dflash_tp4_paths_are_exact_noops(monkeypatch) -> None:
         "get_tensor_model_parallel_rank",
         lambda: 2,
     )
-    with ensure_current_vllm_config():
-        embedding = VocabParallelEmbedding(config.vocab_size, 8)
+    embedding = VocabParallelEmbedding(config.vocab_size, 8)
     assert embedding.num_embeddings == 154880
     assert embedding.num_embeddings_padded == 154880
     assert embedding.num_embeddings_per_partition == 38720
