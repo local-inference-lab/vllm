@@ -356,6 +356,26 @@ class AudioEmbeddingItems(EmbeddingItems):
         super().__init__(data, "audio", expected_hidden_size)
 
 
+def looks_like_chw(shape) -> bool:
+    """True when a 3-D array should be treated as CxHxW rather than HxWxC.
+
+    The last axis being in ``{1, 3, 4}`` also looks like HWC, so a plain
+    last-axis check misreads RGB CHW arrays whose width is 1, 3 or 4 (e.g.
+    ``np.transpose(pil, (2, 0, 1))`` of a 4-wide image) as a 3-pixel-tall
+    RGBA image. Prefer CHW when the leading axis is RGB (C=3); gray/RGBA
+    leading 1/4 keep the unambiguous last-axis rule.
+    """
+    if len(shape) != 3:
+        return False
+    channels = (1, 3, 4)
+    c, w = int(shape[0]), int(shape[2])
+    if c not in channels:
+        return False
+    if w not in channels:
+        return True
+    return c == 3
+
+
 class ImageSize(NamedTuple):
     width: int
     height: int
@@ -373,7 +393,7 @@ class ImageProcessorItems(ProcessorBatchItems[HfImageItem | None]):
         if isinstance(image, PILImage.Image):
             return ImageSize(*image.size)
         if isinstance(image, (np.ndarray, torch.Tensor)):
-            if image.ndim == 3 and image.shape[-1] in (1, 3, 4):
+            if image.ndim == 3 and not looks_like_chw(tuple(image.shape)):
                 # HWC format (e.g. from np.array(PIL.Image)).
                 # PIL images are always channels-last.
                 h, w = image.shape[0], image.shape[1]
@@ -437,7 +457,7 @@ class VideoProcessorItems(ProcessorBatchItems[HfVideoItem | None]):
         if isinstance(image, PILImage.Image):
             return ImageSize(*image.size)
         if isinstance(image, (np.ndarray, torch.Tensor)):
-            if image.ndim == 3 and image.shape[-1] in (1, 3, 4):
+            if image.ndim == 3 and not looks_like_chw(tuple(image.shape)):
                 # HWC format (e.g. from np.array(PIL.Image) via
                 # _get_video_with_metadata).  PIL images are always
                 # channels-last.
