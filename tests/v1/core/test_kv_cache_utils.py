@@ -2434,6 +2434,41 @@ def test_glm5next_fp8_keeps_lower_group_count(
     assert [len(group.layer_names) for group in groups] == [12, 11, 11, 12]
 
 
+def test_glm5next_weighted_groups_replace_over_limit_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "2048")
+    all_specs = _glm5next_split_specs("nvfp4_ds_mla")
+    specs = {
+        name: spec
+        for name, spec in all_specs.items()
+        if name == "model.target.0"
+        or name in {f"model.recurrent.{index}" for index in range(8)}
+    }
+
+    groups = kv_cache_utils._get_weighted_shared_pool_kv_cache_groups(
+        _glm5next_split_config(), specs
+    )
+
+    assert len(groups) <= kv_cache_utils._MAX_WEIGHTED_SHARED_POOL_GROUPS
+    assert {name for group in groups for name in group.layer_names} == set(specs)
+
+
+def test_glm5next_weighted_groups_reject_more_than_eight_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "_get_kv_cache_layer_buckets",
+        lambda _: [[f"layer.{index}"] for index in range(9)],
+    )
+
+    with pytest.raises(ValueError, match="9 incompatible layer buckets"):
+        kv_cache_utils._get_weighted_shared_pool_kv_cache_groups(
+            _glm5next_split_config(), {}
+        )
+
+
 def test_glm5next_nvfp4_auto_geometry_capacity() -> None:
     """DCP4 4K retention geometry recovers the expected 12.67M capacity."""
     target = MLAAttentionSpec(
