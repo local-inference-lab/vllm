@@ -70,12 +70,12 @@ def test_segments_include_backend_tensors_and_skip_runtime_caches():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_tensor_segment_limits_noncontiguous_views_to_their_storage():
-    storage = torch.empty((16, 8), dtype=torch.float32, device="cuda")
-    view = storage.transpose(0, 1)
+    storage = torch.empty(8, dtype=torch.float32, device="cuda")
+    view = storage.expand(16, 8)
 
-    segment = l2pf.tensor_segment("transposed", view)
+    segment = l2pf.tensor_segment("expanded", view)
 
-    assert segment == ("transposed", view.data_ptr(), view.numel() * 4)
+    assert segment == ("expanded", view.data_ptr(), storage.numel() * 4)
 
 
 def _driver():
