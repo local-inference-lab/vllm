@@ -423,8 +423,9 @@ def test_k3_dspark_streamed_auxiliary_normalization_uses_global_hidden_width(
     other_rank_projection = torch.randn_like(local_projection)
 
     def add_other_rank_squared_norm(tensor: torch.Tensor) -> torch.Tensor:
-        tensor.add_(other_rank_projection.float().square().sum(dim=-1, keepdim=True))
-        return tensor
+        return tensor + other_rank_projection.float().square().sum(
+            dim=-1, keepdim=True
+        )
 
     monkeypatch.setattr(
         dspark_mla,
@@ -514,8 +515,9 @@ def test_k3_dspark_projects_streamed_context_one_layer_at_a_time(
     reduced = []
 
     def record_all_reduce(tensor):
-        reduced.append(tensor.clone())
-        return tensor
+        result = tensor + 7
+        reduced.append(result)
+        return result
 
     monkeypatch.setattr(
         dspark_mla,
@@ -545,7 +547,7 @@ def test_k3_dspark_projects_streamed_context_one_layer_at_a_time(
         weight = model.context_kv_proj.weight[
             layer_index * 3 : (layer_index + 1) * 3, 2:4
         ]
-        expected.append(torch.nn.functional.linear(context, weight))
+        expected.append(torch.nn.functional.linear(context, weight) + 7)
     torch.testing.assert_close(reduced[0], expected[0])
     torch.testing.assert_close(reduced[1], expected[1])
     assert all(output.data_ptr() != input_.data_ptr() for output, input_ in rms_norm_io)
