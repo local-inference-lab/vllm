@@ -102,6 +102,29 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+class _ModelExecutionTiming:
+    """Capture model completion time without charging queue residency."""
+
+    def __init__(self) -> None:
+        self.started_at = time.perf_counter()
+        self.completed_at: float | None = None
+
+    def bind(self, future: Future[Any]) -> None:
+        future.add_done_callback(self._record_completion)
+
+    def complete(self) -> None:
+        self.completed_at = time.perf_counter()
+
+    def _record_completion(self, _future: Future[Any]) -> None:
+        self.complete()
+
+    @property
+    def elapsed_seconds(self) -> float:
+        if self.completed_at is None:
+            raise RuntimeError("model execution timing read before completion")
+        return max(self.completed_at - self.started_at, 0.0)
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -209,11 +232,20 @@ class EngineCore:
         # to eliminate pipeline bubbles.
         self.batch_queue_size = vllm_config.max_concurrent_batches
         self.batch_queue: (
-            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
+            deque[
+                tuple[
+                    Future[ModelRunnerOutput],
+                    SchedulerOutput,
+                    Future[Any],
+                    _ModelExecutionTiming | None,
+                ]
+            ]
+            | None
         ) = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+        self._last_model_completion_time: float | None = None
 
         self.is_ec_consumer = (
             vllm_config.ec_transfer_config is None
@@ -614,6 +646,50 @@ class EngineCore:
             )
         return current_step % interval != 0
 
+    def _execute_model(
+        self, scheduler_output: SchedulerOutput
+    ) -> tuple[Future[Any], _ModelExecutionTiming | None]:
+        timing = (
+            _ModelExecutionTiming()
+            if scheduler_output.compute_service_class is not None
+            else None
+        )
+        future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        return future, timing
+
+    def _record_compute_time(
+        self,
+        scheduler_output: SchedulerOutput,
+        timing: _ModelExecutionTiming | None,
+    ) -> None:
+        if timing is None:
+            return
+        service_class = scheduler_output.compute_service_class
+        assert service_class is not None
+        completed_at = timing.completed_at
+        if completed_at is None:
+            raise RuntimeError("model execution timing read before completion")
+
+        # Multiple batches can already be queued on the executor when this
+        # batch is dispatched. Attribute only the wall-clock interval this
+        # completion adds after the previous batch, rather than charging the
+        # same executor queue residency to every in-flight batch.
+        previous_completion = self._last_model_completion_time
+        service_started_at = timing.started_at
+        if previous_completion is not None:
+            service_started_at = max(service_started_at, previous_completion)
+        elapsed_seconds = max(completed_at - service_started_at, 0.0)
+        self._last_model_completion_time = (
+            completed_at
+            if previous_completion is None
+            else max(completed_at, previous_completion)
+        )
+        self.scheduler.record_compute_time(
+            service_class,
+            elapsed_seconds,
+            contended=scheduler_output.compute_contention,
+        )
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -626,7 +702,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        future, execution_timing = self._execute_model(scheduler_output)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
@@ -635,6 +711,9 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+            if execution_timing is not None:
+                execution_timing.complete()
+            self._record_compute_time(scheduler_output, execution_timing)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -682,12 +761,11 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        deferred_execution_timing = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
-                exec_future = self.model_executor.execute_model(
-                    scheduler_output, non_block=True
-                )
+                exec_future, execution_timing = self._execute_model(scheduler_output)
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -708,10 +786,15 @@ class EngineCore:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
+                    deferred_execution_timing = execution_timing
 
             if not deferred_scheduler_output:
+                if execution_timing is not None:
+                    execution_timing.bind(future)
                 # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
+                batch_queue.appendleft(
+                    (future, scheduler_output, exec_future, execution_timing)
+                )
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
                 ):
@@ -726,12 +809,13 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
-        future, scheduler_output, exec_model_fut = batch_queue.pop()
+        future, scheduler_output, exec_model_fut, execution_timing = batch_queue.pop()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
             model_output = future.result()
+            self._record_compute_time(scheduler_output, execution_timing)
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
@@ -767,7 +851,16 @@ class EngineCore:
                 deferred_scheduler_output
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+            if deferred_execution_timing is not None:
+                deferred_execution_timing.bind(future)
+            batch_queue.appendleft(
+                (
+                    future,
+                    deferred_scheduler_output,
+                    exec_future,
+                    deferred_execution_timing,
+                )
+            )
 
         return engine_core_outputs, model_executed
 
@@ -823,6 +916,31 @@ class EngineCore:
         return self.scheduler.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    def get_prefill_fairness(self) -> dict[str, Any]:
+        return self.scheduler.get_prefill_fairness()
+
+    def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Apply a complete fairness configuration only at an idle boundary."""
+        if self.scheduler.has_unfinished_requests() or bool(self.batch_queue):
+            return {
+                "applied": False,
+                "reason": "busy",
+                "message": (
+                    "fairness policy can only be changed while the engine is idle"
+                ),
+                "config": self.scheduler.get_prefill_fairness(),
+            }
+        try:
+            updated = self.scheduler.set_prefill_fairness(config)
+        except (TypeError, ValueError) as exc:
+            return {
+                "applied": False,
+                "reason": "invalid",
+                "message": str(exc),
+                "config": self.scheduler.get_prefill_fairness(),
+            }
+        return {"applied": True, "config": updated}
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.

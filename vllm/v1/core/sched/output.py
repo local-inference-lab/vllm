@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
+from vllm.v1.core.sched.compute_fairness import ComputeServiceClass
 
 if TYPE_CHECKING:
     import numpy as np
@@ -296,6 +297,11 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int | None = None
+
+    # Explicit model-execution class used by adaptive compute fairness.
+    # None identifies a transfer-only or otherwise empty model step.
+    compute_service_class: ComputeServiceClass | None = None
+    compute_contention: bool = False
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

@@ -161,6 +161,12 @@ class EngineCoreClient(ABC):
     ) -> bool:
         raise NotImplementedError
 
+    def get_prefill_fairness(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+        raise NotImplementedError
+
     def reset_encoder_cache(self) -> None:
         raise NotImplementedError
 
@@ -251,6 +257,14 @@ class EngineCoreClient(ABC):
     async def reset_prefix_cache_async(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
+        raise NotImplementedError
+
+    async def get_prefill_fairness_async(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def set_prefill_fairness_async(
+        self, config: dict[str, Any]
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
     async def reset_encoder_cache_async(self) -> None:
@@ -347,6 +361,12 @@ class InprocClient(EngineCoreClient):
         return self.engine_core.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    def get_prefill_fairness(self) -> dict[str, Any]:
+        return self.engine_core.get_prefill_fairness()
+
+    def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+        return self.engine_core.set_prefill_fairness(config)
 
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
@@ -927,6 +947,12 @@ class SyncMPClient(MPClient):
             "reset_prefix_cache", reset_running_requests, reset_connector
         )
 
+    def get_prefill_fairness(self) -> dict[str, Any]:
+        return self.call_utility("get_prefill_fairness")
+
+    def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+        return self.call_utility("set_prefill_fairness", config)
+
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
 
@@ -1180,6 +1206,14 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async(
             "reset_prefix_cache", reset_running_requests, reset_connector
         )
+
+    async def get_prefill_fairness_async(self) -> dict[str, Any]:
+        return await self.call_utility_async("get_prefill_fairness")
+
+    async def set_prefill_fairness_async(
+        self, config: dict[str, Any]
+    ) -> dict[str, Any]:
+        return await self.call_utility_async("set_prefill_fairness", config)
 
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")
