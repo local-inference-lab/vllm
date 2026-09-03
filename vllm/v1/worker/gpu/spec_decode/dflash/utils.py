@@ -116,7 +116,9 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     )
     with set_model_tag("dflash_head"):
         dflash_model = get_model(
-            vllm_config=draft_vllm_config, model_config=draft_model_config
+            vllm_config=draft_vllm_config,
+            model_config=draft_model_config,
+            load_config=speculative_config.draft_load_config,
         )
 
     target_language_model = (
