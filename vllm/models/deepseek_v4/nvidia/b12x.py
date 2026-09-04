@@ -69,7 +69,9 @@ def _require_compressed_mla_api() -> ModuleType:
         ) from exc
     required_symbols = ("Caps", "plan", "run", "split_chunks_for_contract")
     missing_symbols = [
-        symbol for symbol in required_symbols if not hasattr(compressed_sparse_mla, symbol)
+        symbol
+        for symbol in required_symbols
+        if not hasattr(compressed_sparse_mla, symbol)
     ]
     if missing_symbols:
         raise RuntimeError(

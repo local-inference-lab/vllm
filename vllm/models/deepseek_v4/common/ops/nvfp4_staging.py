@@ -45,6 +45,18 @@ def get_deepseek_v4_nvfp4_staging(
     a later layer needs a larger construction-time capacity, replace the cached
     entry with a larger workspace. Layers that already hold the smaller object
     retain its graph-stable address and only use their own declared capacity.
+
+    Args:
+        device: Device on which to allocate the persistent workspace.
+        max_num_tokens: Construction-time maximum number of cache rows.
+        producer: Workspace owner, either ``"swa"`` or ``"compressor"``.
+
+    Returns:
+        A graph-stable workspace with capacity for ``max_num_tokens`` rows.
+
+    Raises:
+        ValueError: If ``producer`` is unsupported or ``max_num_tokens`` is
+            not positive.
     """
     resolved = torch.device(device)
     key = (resolved.type, resolved.index, producer)

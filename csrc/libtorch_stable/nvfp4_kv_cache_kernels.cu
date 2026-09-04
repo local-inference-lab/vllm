@@ -394,7 +394,8 @@ __global__ void fused_deepseek_v4_qnorm_rope_nvfp4_mla_kernel(
     const float* __restrict__ cos_sin_cache, const float eps,
     const int num_tokens, const int num_insert_tokens, const int num_heads,
     const int block_size, const int64_t block_stride,
-    const int64_t token_stride, const int64_t cos_sin_rows) {
+    const int64_t token_stride, const int64_t cos_sin_rows,
+    const int64_t cache_num_slots) {
   using Converter = vllm::_typeConvert<scalar_t>;
   using CudaType = typename CUDATypeConverter<scalar_t>::Type;
   using PVec = PackedVec<CudaType, CVT_FP4_PACK16>;
@@ -518,7 +519,7 @@ __global__ void fused_deepseek_v4_qnorm_rope_nvfp4_mla_kernel(
   }
 
   const int64_t slot = slot_mapping[token_idx];
-  if (slot < 0) return;
+  if (slot < 0 || slot >= cache_num_slots) return;
   const int64_t block_idx = slot / block_size;
   const int64_t block_offset = slot % block_size;
   uint8_t* token_dst =
@@ -731,15 +732,19 @@ void fused_deepseek_v4_qnorm_rope_nvfp4_mla(
                   "kv_cache must be uint8 [num_blocks, block_size, 432]");
   STD_TORCH_CHECK(kv_cache.stride(1) == 432,
                   "kv_cache token stride must be 432");
+  STD_TORCH_CHECK(cache_block_size > 0,
+                  "cache_block_size must be positive");
   STD_TORCH_CHECK(slot_mapping.device().is_cuda() &&
                       slot_mapping.scalar_type() == ScalarType::Long &&
+                      slot_mapping.dim() == 1 &&
                       slot_mapping.is_contiguous(),
-                  "slot_mapping must be contiguous int64 CUDA");
+                  "slot_mapping must be contiguous rank-1 int64 CUDA");
   STD_TORCH_CHECK(position_ids.device().is_cuda() &&
                       position_ids.scalar_type() == ScalarType::Long &&
+                      position_ids.dim() == 1 &&
                       position_ids.is_contiguous() &&
                       position_ids.size(0) == q.size(0),
-                  "position_ids must be contiguous int64 CUDA with N entries");
+                  "position_ids must be contiguous rank-1 int64 CUDA with N entries");
   STD_TORCH_CHECK(cos_sin_cache.device().is_cuda() &&
                       cos_sin_cache.scalar_type() == ScalarType::Float &&
                       cos_sin_cache.is_contiguous() &&
@@ -774,6 +779,7 @@ void fused_deepseek_v4_qnorm_rope_nvfp4_mla(
                 cos_sin_cache.const_data_ptr<float>(), static_cast<float>(eps),
                 num_tokens, num_insert_tokens, num_heads,
                 static_cast<int>(cache_block_size), kv_cache.stride(0),
-                kv_cache.stride(1), cos_sin_cache.size(0));
+                kv_cache.stride(1), cos_sin_cache.size(0),
+                kv_cache.size(0) * cache_block_size);
       });
 }
