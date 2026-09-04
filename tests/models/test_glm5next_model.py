@@ -23,6 +23,8 @@ from vllm.model_executor.models.glm4_1v import Glm4vForConditionalGeneration
 from vllm.model_executor.models.interfaces import supports_eagle3, supports_pp
 from vllm.models.glm5next.nvidia import attention as glm5next_attention
 from vllm.models.glm5next.nvidia import model as glm5next_model
+from vllm.models.glm5next.nvidia import mtp as glm5next_mtp
+from vllm.models.glm5next.nvidia import mtp_draft_head
 from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
 from vllm.models.glm5next.nvidia.model import (
     GLM5NEXT_PACKED_MODULES_MAPPING,
@@ -262,6 +264,41 @@ def test_glm5next_mtp_requires_both_draft_layer_and_head_weights(
     match = "requires an unquantized" if missing_head else "layer 45 weights missing"
     with pytest.raises(ValueError, match=match):
         glm_mtp_head_loader.load_weights(weights)
+
+
+@pytest.mark.parametrize(
+    ("configured", "resolved"), (("bf16", "bf16"), ("NVFP4", "nvfp4"))
+)
+def test_glm5next_mtp_draft_head_mode(
+    monkeypatch, configured: str, resolved: str
+) -> None:
+    monkeypatch.setenv("VLLM_GLM53_MTP_DRAFT_HEAD", configured)
+
+    assert mtp_draft_head.configured_draft_head_mode() == resolved
+
+
+def test_glm5next_mtp_draft_head_rejects_unknown_mode(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_GLM53_MTP_DRAFT_HEAD", "int4")
+
+    with pytest.raises(ValueError, match="must be one of bf16, nvfp4"):
+        mtp_draft_head.configured_draft_head_mode()
+
+
+def test_glm5next_mtp_prepares_configured_draft_head(monkeypatch) -> None:
+    source_head = torch.nn.Linear(4, 8, bias=False)
+    quantized_head = torch.nn.Linear(4, 8, bias=False)
+    predictor = Glm5NextMultiTokenPredictor.__new__(Glm5NextMultiTokenPredictor)
+    torch.nn.Module.__init__(predictor)
+
+    monkeypatch.setattr(
+        glm5next_mtp,
+        "make_quantized_draft_head",
+        lambda actual_head: quantized_head if actual_head is source_head else None,
+    )
+
+    predictor.prepare_draft_lm_head(source_head)
+
+    assert predictor.quantized_draft_head is quantized_head
 
 
 def test_glm5next_mtp_preserves_position_zero_embedding() -> None:
