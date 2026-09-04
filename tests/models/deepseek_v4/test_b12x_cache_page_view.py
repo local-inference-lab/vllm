@@ -8,6 +8,7 @@ from vllm.models.deepseek_v4.nvidia.b12x import _b12x_cache_page_view
 
 _PAGE_SIZE = 64
 _PAYLOAD_BYTES = _PAGE_SIZE * 584
+_NVFP4_PAYLOAD_BYTES = _PAGE_SIZE * 432
 _PADDED_PAGE_BYTES = 37_440
 
 
@@ -18,6 +19,15 @@ def test_b12x_cache_page_view_accepts_contiguous_payload_pages() -> None:
 
     assert view.shape == (3, _PAYLOAD_BYTES)
     assert view.stride() == (_PAYLOAD_BYTES, 1)
+
+
+def test_b12x_cache_page_view_accepts_compact_nvfp4_pages() -> None:
+    cache = torch.empty((3, _PAGE_SIZE, 432), dtype=torch.uint8)
+
+    view = _b12x_cache_page_view(cache, _PAGE_SIZE, "cache", 432)
+
+    assert view.shape == (3, _NVFP4_PAYLOAD_BYTES)
+    assert view.stride() == (_NVFP4_PAYLOAD_BYTES, 1)
 
 
 def test_b12x_cache_page_view_preserves_padded_physical_stride() -> None:

@@ -889,6 +889,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self,
         vllm_config,
         prefix,
+        attn_cls: type[DeepseekV4Attention] | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         eager_scratch_pool: DeepseekV4EagerScratchPool | None = None,
@@ -913,7 +914,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
         self.rms_norm_eps = config.rms_norm_eps
-        self.attn = _select_dsv4_attn_cls(vllm_config)(
+        if attn_cls is None:
+            attn_cls = _select_dsv4_attn_cls(vllm_config)
+        self.attn = attn_cls(
             vllm_config,
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,

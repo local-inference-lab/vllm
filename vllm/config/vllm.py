@@ -2514,8 +2514,25 @@ class VllmConfig:
     def validate_nvfp4_kv_cache_with_mla(self) -> "VllmConfig":
         if self.model_config is None:
             return self
+        cache_dtype = self.cache_config.cache_dtype
+        if cache_dtype == "nvfp4_ds_mla":
+            from vllm.platforms import current_platform
+
+            if not self.model_config.use_mla or not current_platform.is_cuda():
+                raise ValueError(
+                    "nvfp4_ds_mla is only supported by the CUDA DeepSeek-V4 "
+                    "sparse MLA backend. Please use 'auto' or 'fp8' on this "
+                    "model or platform."
+                )
+            if self.parallel_config.decode_context_parallel_size != 1:
+                raise ValueError(
+                    "nvfp4_ds_mla does not support decode context parallelism. "
+                    "The DeepSeek-V4 compressor has no DCP-safe native NVFP4 "
+                    "write path; set --decode-context-parallel-size=1."
+                )
         if (
-            self.cache_config.cache_dtype.startswith("nvfp4")
+            cache_dtype.startswith("nvfp4")
+            and cache_dtype != "nvfp4_ds_mla"
             and self.model_config.use_mla
         ):
             raise ValueError(

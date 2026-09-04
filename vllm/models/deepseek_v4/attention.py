@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -28,6 +29,10 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
 )
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
+from vllm.models.deepseek_v4.common.ops.nvfp4_staging import (
+    get_deepseek_v4_nvfp4_staging,
+    use_deepseek_v4_nvfp4_direct_write,
+)
 
 if TYPE_CHECKING:
     from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
@@ -107,6 +112,16 @@ def _resolve_dsv4_kv_cache_dtype(
     page-size specs pick the 576B per-token slot). Plain-row backends store each
     token's KV row in its element dtype: bf16 or per-tensor FP8 E4M3.
     """
+    if kv_cache_dtype in ("nvfp4", "nvfp4_ds_mla"):
+        if not use_fp8_ds_mla_layout:
+            raise ValueError(
+                "DeepseekV4 nvfp4_ds_mla KV cache requires the sparse MLA layout"
+            )
+        if cache_config is not None:
+            cache_config.cache_dtype = "nvfp4_ds_mla"
+        logger.info_once("Using DeepSeek's nvfp4_ds_mla KV cache format.")
+        return "nvfp4_ds_mla", torch.uint8
+
     if use_fp8_ds_mla_layout:
         # fp8_ds_mla block format: UE8M0 block-scaled fp8 packed as uint8.
         assert kv_cache_dtype.startswith("fp8"), (
@@ -366,6 +381,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # resolution drives the SWA cache tensor dtype below.
         self.kv_cache_dtype, self.kv_cache_torch_dtype = _resolve_dsv4_kv_cache_dtype(
             self._uses_fp8_ds_mla_layout(), cache_config.cache_dtype, cache_config
+        )
+        self._nvfp4_direct_write = (
+            self.kv_cache_dtype == "nvfp4_ds_mla"
+            and use_deepseek_v4_nvfp4_direct_write()
+        )
+        self._nvfp4_swa_staging = (
+            get_deepseek_v4_nvfp4_staging(
+                device=vllm_config.device_config.device,
+                max_num_tokens=self.max_num_batched_tokens,
+                producer="swa",
+            )
+            if self.kv_cache_dtype == "nvfp4_ds_mla" and not self._nvfp4_direct_write
+            else None
         )
 
         self.swa_cache_layer = DeepseekV4SWACache(
@@ -892,6 +920,57 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         cache_dtype = swa_kv_cache.dtype
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
+        if self.kv_cache_dtype == "nvfp4_ds_mla":
+            if self._nvfp4_direct_write:
+                torch.ops._C.fused_deepseek_v4_qnorm_rope_nvfp4_mla(
+                    q,
+                    kv,
+                    swa_kv_cache,
+                    swa_metadata.slot_mapping,
+                    positions,
+                    cos_sin_cache,
+                    self.eps,
+                    self.swa_cache_layer.block_size,
+                )
+                if self.n_local_heads < self.padded_heads:
+                    return F.pad(
+                        q,
+                        (0, 0, 0, self.padded_heads - self.n_local_heads),
+                        value=0.0,
+                    )
+                return q
+
+            staging = self._nvfp4_swa_staging
+            assert staging is not None
+            num_insert = swa_metadata.slot_mapping.numel()
+            assert num_insert <= staging.cache.shape[1]
+            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+                q,
+                kv,
+                staging.cache,
+                staging.slot_mapping[:num_insert],
+                positions,
+                cos_sin_cache,
+                self.eps,
+                staging.cache.shape[1],
+            )
+            staged_kv = staging.cache[0, :num_insert]
+            ops.concat_and_cache_mla(
+                staged_kv,
+                staged_kv[:, self.nope_head_dim :],
+                swa_kv_cache,
+                swa_metadata.slot_mapping,
+                "nvfp4_ds_mla",
+                staging.scale,
+            )
+            if self.n_local_heads < self.padded_heads:
+                return F.pad(
+                    q,
+                    (0, 0, 0, self.padded_heads - self.n_local_heads),
+                    value=0.0,
+                )
+            return q
+
         if cache_dtype == torch.uint8:
             # fp8_ds_mla UE8M0 paged path. Horizontally fused:
             #   Q side:  per-head RMSNorm (no weight) + GPT-J RoPE, zero-filling

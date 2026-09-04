@@ -16,6 +16,8 @@ DSV4 compressed-MLA contract (== upstream/DeepGEMM): q_head_dim = 448 NoPE +
 """
 
 import os
+from functools import lru_cache
+from types import ModuleType
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 import torch
@@ -50,8 +52,34 @@ if TYPE_CHECKING:
 # DSV4 compressed-MLA dims (q_head_dim = 448 NoPE + 64 RoPE = 512; V = 512).
 _DSV4_HEAD_DIM = 512
 _DSV4_V_HEAD_DIM = 512
-_DSV4_CACHE_BYTES_PER_TOKEN = 584
+_DSV4_FP8_CACHE_BYTES_PER_TOKEN = 584
+_DSV4_NVFP4_CACHE_BYTES_PER_TOKEN = 432
 _VALIDATE_DCP_INDICES_ENV = "VLLM_DSV4_DCP_VALIDATE_INDICES"
+
+
+@lru_cache
+def _require_compressed_mla_api() -> ModuleType:
+    """Load B12X's public compressed-MLA API for the selected backend."""
+    try:
+        from b12x.attention import compressed_sparse_mla
+    except ImportError as exc:
+        raise RuntimeError(
+            "DeepSeek-V4 B12X sparse MLA requires the B12X package with its "
+            "public compressed_sparse_mla API installed."
+        ) from exc
+    required_symbols = ("Caps", "plan", "run", "split_chunks_for_contract")
+    missing_symbols = [
+        symbol
+        for symbol in required_symbols
+        if not hasattr(compressed_sparse_mla, symbol)
+    ]
+    if missing_symbols:
+        raise RuntimeError(
+            "DeepSeek-V4 B12X sparse MLA requires a compatible public "
+            "compressed_sparse_mla API; missing "
+            f"{', '.join(missing_symbols)}."
+        )
+    return compressed_sparse_mla
 
 
 def _get_dspark_decode_row_capacity(vllm_config: VllmConfig) -> int | None:
@@ -88,13 +116,13 @@ def _cdiv(x: int, y: int) -> int:
     return (int(x) + int(y) - 1) // int(y)
 
 
-def _dsv4_b12x_page_nbytes(page_size: int) -> int:
+def _dsv4_b12x_page_nbytes(page_size: int, record_bytes: int) -> int:
     """Return the logical DSV4 payload bytes in one cache page.
 
     vLLM may place padding between physical pages, but the padding is not part
     of the compressed-MLA payload.  Keeping it out of the exported view also
     supports standalone contiguous allocations, whose physical page stride is
-    exactly ``page_size * 584`` bytes.
+    exactly ``page_size * record_bytes`` bytes.
 
     Args:
         page_size: Number of tokens stored in one cache page.
@@ -102,13 +130,41 @@ def _dsv4_b12x_page_nbytes(page_size: int) -> int:
     Returns:
         The logical compressed-MLA payload size in bytes.
     """
-    return int(page_size) * _DSV4_CACHE_BYTES_PER_TOKEN
+    if int(record_bytes) not in (
+        _DSV4_FP8_CACHE_BYTES_PER_TOKEN,
+        _DSV4_NVFP4_CACHE_BYTES_PER_TOKEN,
+    ):
+        raise ValueError(
+            "DSV4 B12X cache record must be 584-byte FP8 or 432-byte NVFP4, "
+            f"got {record_bytes}"
+        )
+    return int(page_size) * int(record_bytes)
+
+
+def _dsv4_cache_record_bytes(cache: torch.Tensor, name: str) -> int:
+    """Return the physical DSV4 record ABI exposed by a paged cache."""
+    if cache.ndim < 3:
+        raise RuntimeError(
+            f"{name} must expose [pages, page_size, record_bytes], got "
+            f"shape {tuple(cache.shape)}"
+        )
+    record_bytes = int(cache.shape[-1]) * int(cache.element_size())
+    if record_bytes not in (
+        _DSV4_FP8_CACHE_BYTES_PER_TOKEN,
+        _DSV4_NVFP4_CACHE_BYTES_PER_TOKEN,
+    ):
+        raise RuntimeError(
+            f"{name} has unsupported DSV4 record width {record_bytes}; expected "
+            "584-byte FP8 or 432-byte NVFP4"
+        )
+    return record_bytes
 
 
 def _b12x_cache_page_view(
     cache: torch.Tensor,
     page_size: int,
     name: str,
+    record_bytes: int = _DSV4_FP8_CACHE_BYTES_PER_TOKEN,
 ) -> torch.Tensor:
     """Return a uint8 ``[pages, payload_bytes]`` view for SparkInfer kernels.
 
@@ -129,7 +185,7 @@ def _b12x_cache_page_view(
             logical payload, pages overlap, or the payload within a page is
             not contiguous.
     """
-    page_nbytes = _dsv4_b12x_page_nbytes(page_size)
+    page_nbytes = _dsv4_b12x_page_nbytes(page_size, record_bytes)
     if page_nbytes <= 0:
         raise ValueError(f"{name} page_size must be positive, got {page_size}")
 
@@ -189,7 +245,8 @@ def _b12x_cache_page_view(
 def _b12x_cache_page_view_key(
     cache: torch.Tensor,
     page_size: int,
-) -> tuple[int, int, torch.dtype, int, tuple[int, ...], tuple[int, ...]]:
+    record_bytes: int,
+) -> tuple[int, int, torch.dtype, int, int, tuple[int, ...], tuple[int, ...]]:
     """Stable key for cached KV page views.
 
     Packed DS4 KV tensors are stable after vLLM cache initialization. B12X only
@@ -202,6 +259,7 @@ def _b12x_cache_page_view_key(
         int(cache.storage_offset()),
         cache.dtype,
         int(page_size),
+        int(record_bytes),
         tuple(int(dim) for dim in cache.shape),
         tuple(int(stride) for stride in cache.stride()),
     )
@@ -308,6 +366,7 @@ def _run_compressed_mla(
     output: torch.Tensor,
     attn_sink: torch.Tensor | None,
     scale: float,
+    latent_scale: float = 1.0,
     swa_k_cache: torch.Tensor,
     swa_indices: torch.Tensor,
     swa_lens: torch.Tensor,
@@ -320,6 +379,7 @@ def _run_compressed_mla(
     decode_row_capacity: int | None = None,
     return_lse: bool = False,
     lse_scale: Literal["natural", "base2"] = "natural",
+    cache_record_bytes: int = _DSV4_FP8_CACHE_BYTES_PER_TOKEN,
 ) -> torch.Tensor | None:
     """Plan, bind, and call b12x compressed MLA in plain eager Python.
 
@@ -327,17 +387,12 @@ def _run_compressed_mla(
     {16,32,64,128} by the outer wrapper). Indices are global slot ids, so no
     indexed page table is needed.
     """
-    from b12x.attention.compressed_mla import (
-        Caps as B12XCompressedMLAScratchCaps,
-    )
-    from b12x.attention.compressed_mla import (
-        plan as plan_compressed_mla_scratch,
-    )
-    from b12x.attention.compressed_mla import (
-        run as compressed_mla_decode_forward,
-    )
-    from b12x.attention.compressed_mla import (
-        split_chunks_for_contract as compressed_mla_split_chunks_for_contract,
+    compressed_mla = _require_compressed_mla_api()
+    B12XCompressedMLAScratchCaps = compressed_mla.Caps
+    plan_compressed_mla_scratch = compressed_mla.plan
+    compressed_mla_decode_forward = compressed_mla.run
+    compressed_mla_split_chunks_for_contract = (
+        compressed_mla.split_chunks_for_contract
     )
 
     rows, heads = int(q.shape[0]), int(q.shape[1])
@@ -422,9 +477,11 @@ def _run_compressed_mla(
         indexed_page_size=indexed_page_size,
         attn_sink=sink,
         sm_scale=scale,
+        latent_scale=float(latent_scale),
         expected_num_q_heads=heads,
         return_lse=return_lse,
         lse_scale=lse_scale,
+        cache_record_bytes=int(cache_record_bytes),
         out=output,
     )
     if return_lse:
@@ -439,6 +496,7 @@ def _run_dcp_compressed_mla(
     output: torch.Tensor,
     attn_sink: torch.Tensor,
     scale: float,
+    latent_scale: float = 1.0,
     dcp_comm_backend: str,
     dcp_max_batch_size: int,
     swa_k_cache: torch.Tensor,
@@ -451,6 +509,7 @@ def _run_dcp_compressed_mla(
     indexed_page_size: int | None,
     mode: Literal["decode", "extend"] = "decode",
     decode_row_capacity: int | None = None,
+    cache_record_bytes: int = _DSV4_FP8_CACHE_BYTES_PER_TOKEN,
 ) -> None:
     from vllm.distributed.parallel_state import get_dcp_group
 
@@ -474,6 +533,7 @@ def _run_dcp_compressed_mla(
         output=partial_output,
         attn_sink=sink,
         scale=scale,
+        latent_scale=latent_scale,
         swa_k_cache=swa_k_cache,
         swa_indices=swa_indices,
         swa_lens=swa_lens,
@@ -486,6 +546,7 @@ def _run_dcp_compressed_mla(
         decode_row_capacity=decode_row_capacity,
         return_lse=True,
         lse_scale="natural",
+        cache_record_bytes=int(cache_record_bytes),
     )
     assert lse is not None
 
@@ -557,22 +618,20 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         if views is None:
             views = {}
             self._b12x_cache_page_views = views
-        key = _b12x_cache_page_view_key(cache, page_size)
+        record_bytes = _dsv4_cache_record_bytes(cache, name)
+        key = _b12x_cache_page_view_key(cache, page_size, record_bytes)
         view = views.get(key)
         if view is None:
-            view = _b12x_cache_page_view(cache, page_size, name)
+            view = _b12x_cache_page_view(cache, page_size, name, record_bytes)
             views[key] = view
         return view
 
     def _reserve_dummy_compressed_mla_scratch(self, q: torch.Tensor) -> None:
-        from b12x.attention.compressed_mla import (
-            Caps as B12XCompressedMLAScratchCaps,
-        )
-        from b12x.attention.compressed_mla import (
-            plan as plan_compressed_mla_scratch,
-        )
-        from b12x.attention.compressed_mla import (
-            split_chunks_for_contract as compressed_mla_split_chunks_for_contract,
+        compressed_mla = _require_compressed_mla_api()
+        B12XCompressedMLAScratchCaps = compressed_mla.Caps
+        plan_compressed_mla_scratch = compressed_mla.plan
+        compressed_mla_split_chunks_for_contract = (
+            compressed_mla.split_chunks_for_contract
         )
 
         indexed_width = 0
@@ -660,6 +719,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         topk_indices_buffer = self.topk_indices_buffer
         attn_sink = self.attn_sink
         scale = self.scale
+        latent_scale = float(getattr(self, "_nvfp4_mla_outer_scale", 1.0))
         vllm_config = self.vllm_config
 
         forward_context = get_forward_context()
@@ -703,6 +763,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 topk_indices_buffer=topk_indices_buffer,
                 attn_sink=attn_sink,
                 scale=scale,
+                latent_scale=latent_scale,
                 vllm_config=vllm_config,
             )
         if num_decodes > 0:
@@ -717,6 +778,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 topk_indices_buffer=topk_indices_buffer,
                 attn_sink=attn_sink,
                 scale=scale,
+                latent_scale=latent_scale,
                 output=output[:num_decode_tokens],
                 vllm_config=vllm_config,
             )
@@ -733,11 +795,13 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         topk_indices_buffer: torch.Tensor | None,
         attn_sink: torch.Tensor,
         scale: float,
+        latent_scale: float,
         output: torch.Tensor,
         vllm_config,
     ) -> None:
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
+        cache_record_bytes = _dsv4_cache_record_bytes(swa_kv_cache, "swa_kv_cache")
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
         decode_row_capacity = _get_dspark_decode_row_capacity(vllm_config)
         dcp_rank = 0
@@ -754,6 +818,13 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         if not swa_only:
             assert attn_metadata is not None
             assert kv_cache is not None
+            if (
+                _dsv4_cache_record_bytes(kv_cache, "indexed_k_cache")
+                != cache_record_bytes
+            ):
+                raise RuntimeError(
+                    "DSV4 SWA and indexed caches must use the same record ABI"
+                )
             assert swa_metadata.is_valid_token is not None
             block_size = attn_metadata.block_size // compress_ratio
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
@@ -804,6 +875,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 output=output,
                 attn_sink=attn_sink,
                 scale=scale,
+                latent_scale=latent_scale,
                 dcp_comm_backend=vllm_config.parallel_config.dcp_comm_backend,
                 dcp_max_batch_size=(
                     vllm_config.scheduler_config.max_num_batched_tokens
@@ -818,6 +890,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 indexed_page_size=indexed_page_size,
                 mode="decode",
                 decode_row_capacity=decode_row_capacity,
+                cache_record_bytes=cache_record_bytes,
             )
         else:
             _run_compressed_mla(
@@ -825,6 +898,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 output=output,
                 attn_sink=attn_sink,
                 scale=scale,
+                latent_scale=latent_scale,
                 swa_k_cache=swa_k_cache,
                 swa_indices=swa_indices,
                 swa_lens=swa_lens,
@@ -835,6 +909,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 indexed_page_size=indexed_page_size,
                 mode="decode",
                 decode_row_capacity=decode_row_capacity,
+                cache_record_bytes=cache_record_bytes,
             )
 
     def _forward_b12x_prefill(
@@ -849,9 +924,11 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         topk_indices_buffer: torch.Tensor | None,
         attn_sink: torch.Tensor,
         scale: float,
+        latent_scale: float,
         vllm_config,
     ) -> None:
         swa_only = compress_ratio <= 1
+        cache_record_bytes = _dsv4_cache_record_bytes(swa_k_cache, "swa_kv_cache")
         num_prefills = swa_metadata.num_prefills
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
@@ -875,6 +952,13 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         if not swa_only:
             assert attn_metadata is not None
             assert compressed_k_cache is not None
+            if (
+                _dsv4_cache_record_bytes(compressed_k_cache, "indexed_k_cache")
+                != cache_record_bytes
+            ):
+                raise RuntimeError(
+                    "DSV4 SWA and indexed caches must use the same record ABI"
+                )
             if compress_ratio == 4:
                 assert topk_indices_buffer is not None
                 local_topk_indices = topk_indices_buffer[
@@ -955,6 +1039,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                     output=output[query_start:query_end],
                     attn_sink=attn_sink,
                     scale=scale,
+                    latent_scale=latent_scale,
                     dcp_comm_backend=vllm_config.parallel_config.dcp_comm_backend,
                     dcp_max_batch_size=(
                         vllm_config.scheduler_config.max_num_batched_tokens
@@ -968,6 +1053,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                     indexed_lens=idx_lens_chunk,
                     indexed_page_size=indexed_page_size,
                     mode="extend",
+                    cache_record_bytes=cache_record_bytes,
                 )
             else:
                 _run_compressed_mla(
@@ -975,6 +1061,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                     output=output[query_start:query_end],
                     attn_sink=attn_sink,
                     scale=scale,
+                    latent_scale=latent_scale,
                     swa_k_cache=swa_k_cache,
                     swa_indices=swa_metadata.prefill_swa_indices[query_start:query_end],
                     swa_lens=swa_metadata.prefill_swa_lens[query_start:query_end],
@@ -984,4 +1071,5 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                     indexed_lens=idx_lens_chunk,
                     indexed_page_size=indexed_page_size,
                     mode="extend",
+                    cache_record_bytes=cache_record_bytes,
                 )

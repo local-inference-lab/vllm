@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -55,6 +56,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 
+from .b12x import DeepseekV4B12xMLAAttention
 from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4Model,
@@ -108,12 +110,15 @@ class DSparkDeepseekV4Model(nn.Module):
             dtype=torch.int32,
         )
 
-        current_vllm_config = get_current_vllm_config()
+        native_nvfp4 = vllm_config.cache_config.cache_dtype == "nvfp4_ds_mla"
+        current_vllm_config = vllm_config if native_nvfp4 else get_current_vllm_config()
+        draft_attn_cls = DeepseekV4B12xMLAAttention if native_nvfp4 else None
         self.layers = nn.ModuleList(
             [
                 DeepseekV4DecoderLayer(
                     current_vllm_config,
                     prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
+                    attn_cls=draft_attn_cls,
                     topk_indices_buffer=self.topk_indices_buffer,
                 )
                 for i in range(self.num_dspark_layers)
@@ -275,6 +280,43 @@ def _insert_context_kv(
         dtype=kv.dtype,
         device=kv.device,
     )
+    if getattr(attn, "kv_cache_dtype", None) == "nvfp4_ds_mla":
+        if attn._nvfp4_direct_write:
+            torch.ops._C.fused_deepseek_v4_qnorm_rope_nvfp4_mla(
+                dummy_q,
+                kv,
+                swa_cache,
+                slot_mapping,
+                positions,
+                cos_sin_cache,
+                attn.eps,
+                block_size,
+            )
+            return
+        staging = attn._nvfp4_swa_staging
+        assert staging is not None
+        num_insert = slot_mapping.numel()
+        assert num_insert <= staging.cache.shape[1]
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+            dummy_q,
+            kv,
+            staging.cache,
+            staging.slot_mapping[:num_insert],
+            positions,
+            cos_sin_cache,
+            attn.eps,
+            staging.cache.shape[1],
+        )
+        staged_kv = staging.cache[0, :num_insert]
+        ops.concat_and_cache_mla(
+            staged_kv,
+            staged_kv[:, attn.nope_head_dim :],
+            swa_cache,
+            slot_mapping,
+            "nvfp4_ds_mla",
+            staging.scale,
+        )
+        return
     if cache_dtype == torch.uint8:
         # fp8_ds_mla UE8M0 paged layout
         swa_2d = swa_cache.view(swa_cache.shape[0], -1)

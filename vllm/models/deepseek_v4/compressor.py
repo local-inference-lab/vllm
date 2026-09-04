@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
 from torch import nn
 
+from vllm import _custom_ops as ops
 from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -17,6 +18,10 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_two_stage_triton,
 )
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
+from vllm.models.deepseek_v4.common.ops.nvfp4_staging import (
+    DeepseekV4NVFP4Staging,
+    get_deepseek_v4_nvfp4_staging,
+)
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
@@ -265,6 +270,15 @@ class DeepseekCompressor(nn.Module):
         self.max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
         )
+        self._nvfp4_staging: DeepseekV4NVFP4Staging | None = (
+            get_deepseek_v4_nvfp4_staging(
+                device=self.device,
+                max_num_tokens=self.max_num_batched_tokens,
+                producer="compressor",
+            )
+            if vllm_config.cache_config.cache_dtype == "nvfp4_ds_mla"
+            else None
+        )
         self._compress_scratch: torch.Tensor | None = None
         if self._use_two_stage_fused_compressor:
             self._compress_scratch = torch.empty(
@@ -409,7 +423,19 @@ class DeepseekCompressor(nn.Module):
         cos_sin_cache = rotary_emb.cos_sin_cache
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         k_cache_layer = self._static_forward_context[self.k_cache_prefix]
-        kv_cache = k_cache_layer.kv_cache
+        target_kv_cache = k_cache_layer.kv_cache
+        native_nvfp4 = getattr(k_cache_layer, "kv_cache_dtype", None) == "nvfp4_ds_mla"
+        staging = self._nvfp4_staging if native_nvfp4 else None
+        if native_nvfp4:
+            assert staging is not None
+            assert num_actual <= staging.cache.shape[1]
+            kv_cache = staging.cache
+            k_cache_metadata = replace(
+                k_cache_metadata,
+                slot_mapping=staging.slot_mapping[:num_actual],
+            )
+        else:
+            kv_cache = target_kv_cache
 
         # Plain-row V4 reads a contiguous bf16 / per-tensor fp8 cache row; the
         # fp8_ds_mla path uses the UE8M0 paged uint8 layout.
@@ -502,3 +528,14 @@ class DeepseekCompressor(nn.Module):
             scale_dim=self._scale_dim,
             **extra_kwargs,
         )
+        if native_nvfp4:
+            assert staging is not None
+            staged_kv = staging.cache[0, :num_actual]
+            ops.concat_and_cache_mla(
+                staged_kv,
+                staged_kv[:, -self.rope_head_dim :],
+                target_kv_cache,
+                cast(Any, attn_metadata[self.k_cache_prefix]).slot_mapping,
+                "nvfp4_ds_mla",
+                staging.scale,
+            )

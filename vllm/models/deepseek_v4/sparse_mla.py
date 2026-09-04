@@ -42,6 +42,8 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
         "auto",
         "fp8_ds_mla",
         "fp8",  # alias for fp8_ds_mla
+        "nvfp4_ds_mla",
+        "nvfp4",  # alias for nvfp4_ds_mla
     ]
 
     @staticmethod
@@ -99,6 +101,8 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
             # DeepseekV4 main MLA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
             # head_size passed in is the semantic head_dim (512).
             return (num_blocks, block_size, 584)
+        if cache_dtype_str == "nvfp4_ds_mla":
+            return (num_blocks, block_size, 432)
         else:
             return (num_blocks, block_size, head_size)
 

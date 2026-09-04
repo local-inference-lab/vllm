@@ -142,7 +142,7 @@ def _install_fake_b12x_indexer(
     b12x_mod.__path__ = []
     attention_mod: Any = types.ModuleType("b12x.attention")
     attention_mod.__path__ = []
-    indexer_mod: Any = types.ModuleType("b12x.attention.nsa_indexer")
+    indexer_mod: Any = types.ModuleType("b12x.attention.dsa_indexer")
     indexer_mod.__path__ = []
 
     class _Caps:
@@ -243,22 +243,22 @@ def _install_fake_b12x_indexer(
     indexer_mod.plan_paged_schedule = build_paged_mqa_schedule_metadata
 
     b12x_mod.attention = attention_mod
-    attention_mod.nsa_indexer = indexer_mod
+    attention_mod.dsa_indexer = indexer_mod
     monkeypatch.setitem(sys.modules, "b12x", b12x_mod)
     monkeypatch.setitem(sys.modules, "b12x.attention", attention_mod)
     monkeypatch.setitem(
         sys.modules,
-        "b12x.attention.nsa_indexer",
+        "b12x.attention.dsa_indexer",
         indexer_mod,
     )
 
 
 def _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, *, world_size: int):
-    tiled_topk_mod: Any = types.ModuleType("b12x.attention.nsa_indexer.tiled_topk")
+    tiled_topk_mod: Any = types.ModuleType("b12x.attention.dsa_indexer.tiled_topk")
     tiled_topk_mod.run_row_topk = run_row_topk
     monkeypatch.setitem(
         sys.modules,
-        "b12x.attention.nsa_indexer.tiled_topk",
+        "b12x.attention.dsa_indexer.tiled_topk",
         tiled_topk_mod,
     )
 

@@ -290,6 +290,15 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
     torch::stable::Tensor const& cos_sin_cache, double eps,
     int64_t cache_block_size);
 
+#if defined(VLLM_DSV4_NVFP4_DIRECT_WRITER)
+void fused_deepseek_v4_qnorm_rope_nvfp4_mla(
+    torch::stable::Tensor& q, torch::stable::Tensor const& kv,
+    torch::stable::Tensor& kv_cache, torch::stable::Tensor const& slot_mapping,
+    torch::stable::Tensor const& position_ids,
+    torch::stable::Tensor const& cos_sin_cache, double eps,
+    int64_t cache_block_size);
+#endif
+
 void fused_kimi_k3_mla_key_concat_kv_cache_insert(
     torch::stable::Tensor& q, torch::stable::Tensor const& k_nope,
     torch::stable::Tensor const& k_pe, torch::stable::Tensor const& kv_c_normed,
