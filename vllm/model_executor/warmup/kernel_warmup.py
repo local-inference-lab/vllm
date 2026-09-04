@@ -213,7 +213,10 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
     from vllm.models.kimi_k3.nvidia.mla import (
         MultiHeadLatentAttention as KimiK3MLAAttention,
     )
-    from vllm.v1.attention.ops.dcp_alltoall import warmup_b12x_dcp_a2a
+    from vllm.v1.attention.ops.dcp_alltoall import (
+        warmup_b12x_dcp_a2a,
+        warmup_b12x_dcp_query_gather,
+    )
 
     model = worker.get_model()
     candidates = list(model.modules())
@@ -249,6 +252,33 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
             total_heads = int(module.num_local_heads) * module_dcp_world_size
             query_head_dim = int(module.head_size)
             output_head_dim = int(module.kv_lora_rank)
+            if getattr(module.impl, "_packed_query", False):
+                # The packed reader gathers pre-quantized 656-byte query
+                # records as E4M3 rows; that gather pool must exist before
+                # graph capture in addition to the bf16 channel below (the
+                # output reduction stays bf16 and is warmed there).
+                from vllm.v1.attention.backends.mla.b12x_mla import (
+                    _PACKED_QUERY_RECORD_BYTES,
+                )
+
+                packed_signature = (
+                    device,
+                    torch.float8_e4m3fn,
+                    total_heads,
+                    _PACKED_QUERY_RECORD_BYTES,
+                    output_head_dim,
+                )
+                if packed_signature not in warmed_signatures:
+                    warmup_b12x_dcp_query_gather(
+                        get_dcp_group(),
+                        device=device,
+                        dtype=torch.float8_e4m3fn,
+                        max_batch_size=worker.scheduler_config.max_num_batched_tokens,
+                        total_heads=total_heads,
+                        head_dim=output_head_dim,
+                        query_head_dim=_PACKED_QUERY_RECORD_BYTES,
+                    )
+                    warmed_signatures.add(packed_signature)
         else:
             continue
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 
 import torch.nn as nn
 
@@ -48,6 +48,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if hasattr(target_model, "get_language_model")
         else target_model
     )
+    rope_ownership: AbstractContextManager[None]
     if getattr(draft_model_config.hf_config, "model_type", None) == "k3_dspark":
         from vllm.models.kimi_k3.nvidia.dspark_mla import (
             protect_k3_compact_rope_sources,
@@ -59,7 +60,9 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     with rope_ownership, set_model_tag("dspark_head"):
         draft_model = get_model(
-            vllm_config=draft_vllm_config, model_config=draft_model_config
+            vllm_config=draft_vllm_config,
+            model_config=draft_model_config,
+            load_config=speculative_config.draft_load_config,
         )
 
     if get_pp_group().world_size != 1:

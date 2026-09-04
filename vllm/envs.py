@@ -236,6 +236,17 @@ if TYPE_CHECKING:
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
     VLLM_DCP_Q_REPLICATE: bool = False
+    VLLM_K3_DCP_Q_REPLICATE_LAYERS: str | None = None
+    VLLM_K3_DYNAMIC_SPARSE_STRIDE: int = 1
+    VLLM_K3_DYNAMIC_SPARSE_MIN_TOKENS: int = 0
+    VLLM_K3_DYNAMIC_SPARSE_SINK_TOKENS: int = 4096
+    VLLM_K3_DYNAMIC_SPARSE_RECENT_TOKENS: int = 32768
+    VLLM_K3_DYNAMIC_SPARSE_REFRESH_INTERVAL: int = 128
+    VLLM_K3_DENSE_MLA_PARTIAL_DTYPE: str = "bf16"
+    VLLM_K3_DENSE_MLA_SINGLE_SPLIT_CHUNKS: int = -1
+    VLLM_K3_PACKED_MLA_SPLIT_POLICY: str = "balanced"
+    VLLM_K3_PACKED_MLA_PARTIAL_DTYPE: str = "fp32"
+    VLLM_K3_PACKED_MLA_QUERY: str = "bf16"
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
@@ -247,6 +258,7 @@ if TYPE_CHECKING:
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
+    VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -1804,6 +1816,63 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Opt-in MLA DCP query replication: skip the decode query all-gather.
     "VLLM_DCP_Q_REPLICATE": lambda: bool(int(os.getenv("VLLM_DCP_Q_REPLICATE", "0"))),
+    # Required Kimi-K3 layer allow-list when DCP query replication is enabled.
+    # Use "all" only after explicitly qualifying the persistent VRAM cost.
+    "VLLM_K3_DCP_Q_REPLICATE_LAYERS": lambda: os.getenv(
+        "VLLM_K3_DCP_Q_REPLICATE_LAYERS"
+    ),
+    # Experimental Kimi-K3 dense-MLA sparsity. Stride 1 is exact and leaves
+    # the production path unchanged.
+    "VLLM_K3_DYNAMIC_SPARSE_STRIDE": lambda: int(
+        os.getenv("VLLM_K3_DYNAMIC_SPARSE_STRIDE", "1")
+    ),
+    "VLLM_K3_DYNAMIC_SPARSE_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_K3_DYNAMIC_SPARSE_MIN_TOKENS", "0")
+    ),
+    "VLLM_K3_DYNAMIC_SPARSE_SINK_TOKENS": lambda: int(
+        os.getenv("VLLM_K3_DYNAMIC_SPARSE_SINK_TOKENS", "4096")
+    ),
+    "VLLM_K3_DYNAMIC_SPARSE_RECENT_TOKENS": lambda: int(
+        os.getenv("VLLM_K3_DYNAMIC_SPARSE_RECENT_TOKENS", "32768")
+    ),
+    "VLLM_K3_DYNAMIC_SPARSE_REFRESH_INTERVAL": lambda: int(
+        os.getenv("VLLM_K3_DYNAMIC_SPARSE_REFRESH_INTERVAL", "128")
+    ),
+    # Element type of the Kimi-K3 dense-MLA split partials ("bf16" or
+    # "fp32"). bf16 rounds every multi-split result twice; fp32 keeps the
+    # partials exact so a merged result is rounded once, at the output.
+    "VLLM_K3_DENSE_MLA_PARTIAL_DTYPE": lambda: os.getenv(
+        "VLLM_K3_DENSE_MLA_PARTIAL_DTYPE", "bf16"
+    ).lower(),
+    # Largest live 64-token chunk count of a request that one dense-MLA split
+    # scans alone (the fixed-range association); longer requests spread
+    # their chunks over the launched splits. -1 = the plan's chunks per
+    # split, 0 = balance every request.
+    "VLLM_K3_DENSE_MLA_SINGLE_SPLIT_CHUNKS": lambda: int(
+        os.getenv("VLLM_K3_DENSE_MLA_SINGLE_SPLIT_CHUNKS", "-1")
+    ),
+    # Split partitioning of the Kimi-K3 packed (fp8_ds_mla) decode reader.
+    # "balanced": every CTA derives its 64-token chunk range from the row's
+    # live chunk count so at most one CTA wave of near-equal ranges is active;
+    # "static": fixed capacity-based ranges (short rows scan up to the plan's
+    # chunks-per-split serially in one CTA).
+    "VLLM_K3_PACKED_MLA_SPLIT_POLICY": lambda: os.getenv(
+        "VLLM_K3_PACKED_MLA_SPLIT_POLICY", "balanced"
+    ).lower(),
+    # Element type of the packed decode reader's split partials ("bf16" or
+    # "fp32"). fp32 keeps every split partial exact so the merged result is
+    # rounded once, at the output.
+    "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE": lambda: os.getenv(
+        "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE", "fp32"
+    ).lower(),
+    # Query format handed to the Kimi-K3 packed (fp8_ds_mla) decode reader.
+    # "packed": quantize each local query head into the reader's 656-byte
+    # record (E4M3 nope, pow2 tile scales, bf16 rope) before the DCP gather;
+    # bit-identical to "bf16" (the reader's own S0 quantization) and 43%
+    # fewer gathered bytes. Requires B12X_MLA_SM120_GLM_FASTPATH=1.
+    "VLLM_K3_PACKED_MLA_QUERY": lambda: os.getenv(
+        "VLLM_K3_PACKED_MLA_QUERY", "bf16"
+    ).lower(),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
     # JIT'ing in the hot-path. However, this warmup increases the engine
@@ -1843,6 +1912,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # serving.
     "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT": lambda: bool(
         int(os.getenv("VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT", "0"))
+    ),
+    # Kimi K3 only, and unrelated to the MoE flags above. Tap the pre-norm
+    # AttnRes mixture, rather than the post-mixture sum, as the auxiliary
+    # hidden state handed to a DFlash drafter. This changes the numerics the
+    # speculator sees, so it is off by default while the effect is measured.
+    "VLLM_KIMI_K3_AUX_ATTN_RES_STREAM": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_AUX_ATTN_RES_STREAM", "0"))
     ),
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).

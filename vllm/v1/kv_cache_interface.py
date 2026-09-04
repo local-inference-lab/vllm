@@ -148,6 +148,21 @@ class KVCacheSpec:
         """
         return cdiv(max_len, self.block_size)
 
+    def get_num_dcp_kv_shards(self, dcp_world_size: int) -> int:
+        """Return the number of unique token-position shards under DCP.
+
+        Cache types that store recurrent or otherwise rank-local state do not
+        shard that state by token position. Attention cache specifications
+        override this method because their default layout is DCP-sharded.
+        """
+        configured_dcp = int(dcp_world_size)
+        if configured_dcp < 1:
+            raise ValueError(
+                "Configured decode-context-parallel size must be positive: "
+                f"{configured_dcp}"
+            )
+        return 1
+
     def copy_with_new_block_size(self, block_size: int) -> Self:
         """
         Create a new KVCacheSpec from self but replacing the block size.
@@ -240,10 +255,37 @@ class AttentionSpec(KVCacheSpec):
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         parallel_config = vllm_config.parallel_config
-        kv_shard_count = get_kv_cache_dcp_shard_count(
-            self, parallel_config.decode_context_parallel_size
+        kv_shard_count = self.get_num_dcp_kv_shards(
+            parallel_config.decode_context_parallel_size
         )
         return cdiv(max_len, self.block_size * kv_shard_count)
+
+    def get_num_dcp_kv_shards(self, dcp_world_size: int) -> int:
+        """Return the configured or explicitly overridden attention shard count."""
+        configured_dcp = int(dcp_world_size)
+        if configured_dcp < 1:
+            raise ValueError(
+                "Configured decode-context-parallel size must be positive: "
+                f"{configured_dcp}"
+            )
+        replicated = bool(getattr(self, "dcp_replicated", False))
+        override = getattr(self, "dcp_kv_shard_count", None)
+        if replicated:
+            if override not in (None, 1):
+                raise ValueError(
+                    "dcp_replicated cannot be combined with "
+                    f"dcp_kv_shard_count={override}"
+                )
+            return 1
+        if override is None:
+            return configured_dcp
+        override = int(override)
+        if override < 1 or override > configured_dcp or configured_dcp % override != 0:
+            raise ValueError(
+                "dcp_kv_shard_count must be a positive divisor of the configured "
+                f"DCP size, got shards={override}, DCP={configured_dcp}"
+            )
+        return override
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -398,36 +440,24 @@ def get_kv_cache_dcp_shard_count(
     dcp_world_size: int,
 ) -> int:
     """Return the number of unique DCP token-position shards for a cache group."""
-    configured_dcp = int(dcp_world_size)
-    if configured_dcp < 1:
-        raise ValueError(
-            f"Configured decode-context-parallel size must be positive: "
-            f"{configured_dcp}"
-        )
-    replicated = bool(getattr(spec, "dcp_replicated", False))
-    override = getattr(spec, "dcp_kv_shard_count", None)
-    if replicated:
-        if override not in (None, 1):
-            raise ValueError(
-                f"dcp_replicated cannot be combined with dcp_kv_shard_count={override}"
-            )
-        return 1
-    if override is None:
-        return configured_dcp
-    override = int(override)
-    if override < 1 or override > configured_dcp or configured_dcp % override != 0:
-        raise ValueError(
-            "dcp_kv_shard_count must be a positive divisor of the configured "
-            f"DCP size, got shards={override}, DCP={configured_dcp}"
-        )
-    return override
+    return spec.get_num_dcp_kv_shards(dcp_world_size)
 
 
 def has_nondefault_kv_dcp_layout(
     spec: KVCacheSpec,
     dcp_world_size: int,
 ) -> bool:
-    return get_kv_cache_dcp_shard_count(spec, dcp_world_size) != int(dcp_world_size)
+    layer_specs = (
+        spec.kv_cache_specs.values()
+        if isinstance(spec, UniformTypeKVCacheSpecs)
+        else (spec,)
+    )
+    is_attention_group = all(
+        isinstance(layer_spec, AttentionSpec) for layer_spec in layer_specs
+    )
+    return is_attention_group and (
+        get_kv_cache_dcp_shard_count(spec, dcp_world_size) != int(dcp_world_size)
+    )
 
 
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
@@ -1045,6 +1075,18 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             f"of block table entries, got {sorted(widths)}."
         )
         return next(iter(widths))
+
+    def get_num_dcp_kv_shards(self, dcp_world_size: int) -> int:
+        shard_counts = {
+            spec.get_num_dcp_kv_shards(dcp_world_size)
+            for spec in self.kv_cache_specs.values()
+        }
+        if len(shard_counts) != 1:
+            raise ValueError(
+                "All layers in a uniform KV cache group must use the same "
+                f"number of DCP KV shards, got {sorted(shard_counts)}."
+            )
+        return next(iter(shard_counts))
 
     @classmethod
     def is_uniform_type(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> bool:

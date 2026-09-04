@@ -439,7 +439,9 @@ def test_cow_retentions_deferred_until_copy_step_processed():
     # and each endpoint stays alive only through its copy retention.
     src_block, dst_block = pool.get_new_blocks(2)
     block_copy = KVCacheBlockCopy(
-        src_block_id=src_block.block_id, dst_block_id=dst_block.block_id
+        src_block_id=src_block.block_id,
+        dst_block_id=dst_block.block_id,
+        kv_cache_group_id=0,
     )
     manager._pending_cow_copies.append((src_block, dst_block))
     out0 = scheduler.schedule()

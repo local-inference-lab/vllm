@@ -244,6 +244,7 @@ from .utils import (
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
     copy_kv_cache_blocks_inplace,
+    group_kv_caches_for_copy,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
 )
@@ -616,6 +617,7 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self.kv_caches_by_group: list[list[torch.Tensor | list[torch.Tensor]]] = []
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -1280,6 +1282,7 @@ class GPUModelRunner(
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
+                kv_cache_groups=self.kv_caches_by_group,
             )
 
         # Free the cached encoder outputs.
@@ -6768,6 +6771,8 @@ class GPUModelRunner(
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
             self.kv_caches.clear()
+        if hasattr(self, "kv_caches_by_group"):
+            self.kv_caches_by_group.clear()
         if hasattr(self, "cross_layers_kv_cache"):
             self.cross_layers_kv_cache = None
             self.cross_layers_attn_backend = None
@@ -8119,6 +8124,7 @@ class GPUModelRunner(
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
+        self.kv_caches_by_group = group_kv_caches_for_copy(kv_caches, kv_cache_config)
 
         if (
             self.speculative_config
