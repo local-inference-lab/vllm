@@ -23,11 +23,13 @@ def opt_model_path(tmp_path):
 
 
 def _create_fair_scheduler(opt_model_path, **kwargs):
+    prefill_compute_share = kwargs.pop("prefill_compute_share", 0.5)
+    prefill_compute_half_life = kwargs.pop("prefill_compute_half_life", None)
     return create_scheduler(
         model=opt_model_path,
         skip_tokenizer_init=True,
-        fairness_engine="compute_share",
-        prefill_compute_share=0.5,
+        prefill_compute_share=prefill_compute_share,
+        prefill_compute_half_life=prefill_compute_half_life,
         device="cpu",
         **kwargs,
     )
@@ -73,7 +75,6 @@ def test_prefill_compute_share_rejects_invalid_values(share: float):
         SchedulerConfig(
             max_model_len=128,
             is_encoder_decoder=False,
-            fairness_engine="compute_share",
             prefill_compute_share=share,
         )
 
@@ -81,26 +82,135 @@ def test_prefill_compute_share_rejects_invalid_values(share: float):
 def test_prefill_compute_share_cli_contract():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
 
+    namespace = parser.parse_args(["--prefill-compute-share", "0.65"])
+    engine_args = EngineArgs.from_cli_args(namespace)
+
+    assert engine_args.prefill_compute_share == pytest.approx(0.65)
+
+
+def test_prefill_compute_share_cli_accepts_auto():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    namespace = parser.parse_args(["--prefill-compute-share", "auto"])
+    engine_args = EngineArgs.from_cli_args(namespace)
+
+    assert engine_args.prefill_compute_share == "auto"
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected"),
+    [("smooth", "smooth"), ("responsive", "responsive"), ("5", 5.0), ("0.2", 0.2)],
+)
+def test_prefill_compute_half_life_cli_contract(setting, expected):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
     namespace = parser.parse_args(
         [
-            "--fairness-engine",
-            "compute_share",
             "--prefill-compute-share",
-            "0.65",
+            "auto",
+            "--prefill-compute-half-life",
+            setting,
         ]
     )
     engine_args = EngineArgs.from_cli_args(namespace)
 
-    assert engine_args.prefill_compute_share == pytest.approx(0.65)
-    assert engine_args.fairness_engine == "compute_share"
+    assert engine_args.prefill_compute_half_life == expected
 
 
-def test_prefill_compute_share_rejects_fixed_cadence():
-    with pytest.raises(ValueError, match="fairness_engine"):
+@pytest.mark.parametrize("setting", ["0", "-1", "nan", "inf", "fast"])
+def test_prefill_compute_half_life_cli_rejects_invalid_values(setting):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--prefill-compute-share",
+                "auto",
+                "--prefill-compute-half-life",
+                setting,
+            ]
+        )
+
+
+def test_prefill_compute_share_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="prefill_compute_share"):
         SchedulerConfig(
             max_model_len=128,
             is_encoder_decoder=False,
-            fairness_engine="compute_share",
+            prefill_compute_share="fast",
+        )
+
+
+@pytest.mark.parametrize("half_life", [0.0, -1.0, float("inf"), float("nan")])
+def test_prefill_compute_half_life_rejects_invalid_values(half_life):
+    with pytest.raises(ValueError, match="prefill_compute_half_life"):
+        SchedulerConfig(
+            max_model_len=128,
+            is_encoder_decoder=False,
+            prefill_compute_share="auto",
+            prefill_compute_half_life=half_life,
+        )
+
+
+@pytest.mark.parametrize("share", [None, 0.4])
+def test_prefill_compute_half_life_requires_auto(share):
+    with pytest.raises(ValueError, match="requires prefill_compute_share='auto'"):
+        SchedulerConfig(
+            max_model_len=128,
+            is_encoder_decoder=False,
+            prefill_compute_share=share,
+            prefill_compute_half_life="responsive",
+        )
+
+
+def test_auto_mode_receives_scheduler_cost_feedback(opt_model_path):
+    scheduler = _create_fair_scheduler(
+        opt_model_path,
+        prefill_compute_share="auto",
+        prefill_compute_half_life="smooth",
+        max_num_batched_tokens=16,
+        max_model_len=128,
+    )
+    _establish_decode(scheduler)
+    (prefill,) = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        req_ids=["auto-prefill"],
+    )
+    scheduler.add_request(prefill)
+
+    decode_output = scheduler.schedule()
+    scheduler.record_compute_time(
+        "decode",
+        0.01,
+        contended=True,
+        scheduled_tokens=decode_output.compute_service_tokens,
+    )
+    _update(scheduler, decode_output)
+    prefill_output = scheduler.schedule()
+    scheduler.record_compute_time(
+        "prefill",
+        0.16,
+        contended=True,
+        scheduled_tokens=prefill_output.compute_service_tokens,
+    )
+
+    controller = scheduler.compute_share_controller
+    assert controller is not None
+    assert prefill_output.compute_service_tokens == 16
+    assert controller.prefill_seconds_per_token == pytest.approx(0.01)
+    config = scheduler.get_prefill_fairness()
+    assert config["prefill_compute_share"] == "auto"
+    assert config["prefill_compute_half_life"] == "smooth"
+    assert config["effective_prefill_compute_half_life_seconds"] == pytest.approx(2.0)
+    assert config["effective_prefill_compute_share"] == pytest.approx(0.4)
+
+
+def test_prefill_compute_share_rejects_fixed_cadence():
+    with pytest.raises(ValueError, match="prefill_compute_share"):
+        SchedulerConfig(
+            max_model_len=128,
+            is_encoder_decoder=False,
             prefill_compute_share=0.5,
             prefill_schedule_interval=2,
         )
@@ -124,7 +234,73 @@ def test_disabled_scheduler_emits_no_compute_policy(opt_model_path):
 
     assert scheduler.compute_share_controller is None
     assert output.compute_service_class is None
+    assert not output.compute_timing_enabled
     assert not output.compute_contention
+
+
+def test_runtime_switch_is_live_and_preserves_inflight_accounting(opt_model_path):
+    scheduler = create_scheduler(
+        model=opt_model_path,
+        skip_tokenizer_init=True,
+        device="cpu",
+        prefill_compute_share=0.4,
+    )
+    controller = scheduler.compute_share_controller
+    assert controller is not None
+    controller.last_prefill_seconds = 1.0
+    controller.dispatch("prefill", contended=True)
+
+    fixed = scheduler.set_prefill_fairness({"prefill_compute_share": 0.9})
+
+    assert fixed["prefill_compute_share"] == pytest.approx(0.9)
+    assert fixed["effective_prefill_compute_share"] == pytest.approx(0.9)
+    assert scheduler.compute_share_controller is controller
+    assert list(controller.prefill_reservations) == [(2.5, 0.4)]
+
+    smooth = scheduler.set_prefill_fairness(
+        {
+            "prefill_compute_share": "auto",
+            "prefill_compute_half_life": "smooth",
+        }
+    )
+    assert smooth["prefill_compute_share"] == "auto"
+    assert smooth["prefill_compute_half_life"] == "smooth"
+    assert smooth["effective_prefill_compute_half_life_seconds"] == pytest.approx(2.0)
+    assert smooth["effective_prefill_compute_share"] == pytest.approx(0.8)
+
+    responsive = scheduler.set_prefill_fairness(
+        {
+            "prefill_compute_share": "auto",
+            "prefill_compute_half_life": "responsive",
+        }
+    )
+    assert responsive["prefill_compute_share"] == "auto"
+    assert responsive["prefill_compute_half_life"] == "responsive"
+    assert responsive["effective_prefill_compute_half_life_seconds"] == pytest.approx(
+        0.5
+    )
+    assert responsive["effective_prefill_compute_share"] == pytest.approx(0.8)
+
+    numeric_half_life = scheduler.set_prefill_fairness(
+        {
+            "prefill_compute_share": "auto",
+            "prefill_compute_half_life": 0.2,
+        }
+    )
+    assert numeric_half_life["prefill_compute_half_life"] == pytest.approx(0.2)
+    assert numeric_half_life[
+        "effective_prefill_compute_half_life_seconds"
+    ] == pytest.approx(0.2)
+    assert scheduler.compute_share_controller is controller
+    assert list(controller.prefill_reservations) == [(2.5, 0.4)]
+
+    disabled = scheduler.set_prefill_fairness({"prefill_compute_share": None})
+
+    assert disabled["prefill_compute_share"] is None
+    assert disabled["prefill_compute_half_life"] is None
+    assert disabled["effective_prefill_compute_half_life_seconds"] is None
+    assert disabled["effective_prefill_compute_share"] is None
+    assert scheduler.compute_share_controller is None
 
 
 def test_decode_tie_then_prefill_and_work_conserving_fallback(opt_model_path):
@@ -334,6 +510,7 @@ def test_full_apc_hit_is_decode_not_prefill(opt_model_path):
 def test_async_external_load_does_not_consume_service_credit(opt_model_path):
     scheduler = _create_fair_scheduler(
         opt_model_path,
+        prefill_compute_share="auto",
         enable_prefix_caching=True,
         block_size=16,
         max_model_len=128,
@@ -349,11 +526,13 @@ def test_async_external_load_does_not_consume_service_credit(opt_model_path):
     output = scheduler.schedule()
     assert output.total_num_scheduled_tokens == 0
     assert output.compute_service_class is None
+    assert output.compute_timing_enabled
     assert not output.compute_contention
     controller = scheduler.compute_share_controller
     assert controller is not None
     assert controller.decode_virtual_runtime == 0.0
     assert controller.prefill_virtual_runtime == 0.0
+    assert controller.local_prefill_backlog_tokens == 0
 
 
 def test_partial_external_hit_is_prefill_compute(opt_model_path):
@@ -376,6 +555,7 @@ def test_partial_external_hit_is_prefill_compute(opt_model_path):
     # The local remainder is prefill work, but there is no competing decode,
     # so the controller does not install timing on this model step.
     assert output.compute_service_class is None
+    assert not output.compute_timing_enabled
     assert not output.compute_contention
     assert output.num_scheduled_tokens[request.request_id] == 32
 
