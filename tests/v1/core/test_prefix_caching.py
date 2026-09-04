@@ -3863,6 +3863,71 @@ def test_hybrid_sparse_retention_uses_fine_hit_alignment(monkeypatch):
     assert set(observed_alignments) == {hash_block_size}
 
 
+def test_hybrid_fine_hit_retention_preserves_materialized_fallback():
+    """A fine boundary without a state must not displace a usable snapshot."""
+    full = lambda size: FullAttentionSpec(
+        block_size=size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full128"], full(128)),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=64,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+            KVCacheGroupSpec(["full32"], full(32)),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=32,
+        retention_interval=0,
+    )
+    assert manager.coordinator._cache_hit_alignment_tokens == 32
+    request = make_request("producer", list(range(480)), 32, sha256)
+    scheduler = SimpleNamespace(
+        # EngineCore uses the smallest group block size here, not the LCM.
+        cache_config=SimpleNamespace(
+            block_size=min(g.kv_cache_spec.block_size for g in config.kv_cache_groups)
+        ),
+        use_eagle=False,
+        max_num_scheduled_tokens=384,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        mamba_partial_cache_hit=True,
+        hash_block_size=32,
+        mamba_has_prefill_checkpoint_blocks=False,
+    )
+    chunk_ends = []
+    while request.num_computed_tokens < request.num_tokens:
+        num_new_tokens = Scheduler._mamba_block_aligned_split(
+            scheduler,
+            request,
+            min(384, request.num_tokens - request.num_computed_tokens),
+        )
+        assert num_new_tokens > 0
+        assert manager.allocate_slots(request, num_new_tokens) is not None
+        request.num_computed_tokens += num_new_tokens
+        chunk_ends.append(request.num_computed_tokens)
+    assert chunk_ends == [384, 480]
+    # No chunk materialized state@448. State@480 exceeds replay's 479-token cap.
+    mamba = manager.coordinator.single_type_managers[1]
+    assert mamba.req_to_blocks[request.request_id][6].is_null
+    manager.free(request)
+
+    replay = make_request("replay", list(range(480)), 32, sha256)
+    _, hit_tokens, _ = manager.get_computed_blocks(replay)
+    assert hit_tokens == 384
+
+
 def test_block_lookup_cache_single_block_per_key():
     cache = BlockHashToBlockMap()
     key0 = BlockHashWithGroupId(b"hash0")

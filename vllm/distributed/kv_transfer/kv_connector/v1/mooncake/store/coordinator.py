@@ -262,8 +262,9 @@ class MooncakeStoreCoordinator:
                 spec,
                 use_eagle,
                 self.lookup_drops_eagle_block,
-                mask_alignment,
                 reachable_boundaries,
+                lookup_alignment_tokens=mask_alignment,
+                state_materialization_alignment_tokens=self.lcm_block_size,
             )
             mask = manager_cls.reachable_block_mask(
                 start_block=start_chunk,

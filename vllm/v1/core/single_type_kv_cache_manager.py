@@ -60,20 +60,44 @@ def resolve_sparse_retention_inputs(
     kv_cache_spec: KVCacheSpec,
     use_eagle: bool,
     lookup_drops_eagle_block: bool,
-    alignment_tokens: int,
     reachable_boundaries: Sequence[int],
+    *,
+    lookup_alignment_tokens: int,
+    state_materialization_alignment_tokens: int,
 ) -> tuple[bool, tuple[int, ...]]:
-    """Account for an EAGLE-reduced shared hit boundary."""
+    """Resolve the mask's EAGLE flag and retained token boundaries.
+
+    Lookup alignment can be finer than the scheduler alignment used to
+    materialize recurrent states. Keep both sets of Mamba positions so a
+    missing fine state does not displace a usable scheduler-aligned fallback.
+    """
     boundaries = tuple(reachable_boundaries)
+    if isinstance(kv_cache_spec, MambaSpec):
+        alignments = dict.fromkeys(
+            (lookup_alignment_tokens, state_materialization_alignment_tokens)
+        )
+        positions = tuple(
+            dict.fromkeys(
+                position
+                for boundary in boundaries
+                for alignment in alignments
+                for position in reachable_hit_positions(
+                    boundary, alignment, use_eagle or lookup_drops_eagle_block
+                )
+            )
+        )
+        # Each alignment's EAGLE predecessor is already included. The mask
+        # must not apply another lookup-sized drop to materialized positions.
+        return False, positions
     if not lookup_drops_eagle_block:
         return use_eagle, boundaries
-    if isinstance(kv_cache_spec, MambaSpec):
-        return True, boundaries
     if isinstance(kv_cache_spec, SlidingWindowSpec):
         boundaries = tuple(
             position
             for boundary in boundaries
-            for position in reachable_hit_positions(boundary, alignment_tokens, True)
+            for position in reachable_hit_positions(
+                boundary, lookup_alignment_tokens, True
+            )
             if position > 0
         )
     return use_eagle, boundaries
@@ -517,8 +541,9 @@ class SingleTypeKVCacheManager(ABC):
             self.kv_cache_spec,
             self.use_eagle,
             self.lookup_drops_eagle_block,
-            mask_alignment_tokens,
             reachable_boundaries,
+            lookup_alignment_tokens=mask_alignment_tokens,
+            state_materialization_alignment_tokens=self.scheduler_block_size,
         )
 
         block_mask = self.reachable_block_mask(

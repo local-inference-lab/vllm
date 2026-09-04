@@ -3,6 +3,7 @@
 
 from math import lcm
 
+import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
@@ -480,7 +481,29 @@ def test_store_mask_uses_fine_hit_alignment():
 
     masks = coord.store_mask(512, num_prompt_tokens=501)
     assert masks[0] is None
-    assert masks[1] == [i == 6 for i in range(8)]
+    assert masks[1] == [i in (5, 6) for i in range(8)]
+
+
+@pytest.mark.parametrize("use_eagle, retained", [(False, {5, 6}), (True, {3, 5, 6})])
+def test_store_mask_preserves_fine_and_materialized_boundaries(use_eagle, retained):
+    groups = [
+        KVCacheGroupSpec(["full128"], _full(128)),
+        KVCacheGroupSpec(["mamba"], _mamba_align(64)),
+        KVCacheGroupSpec(["full32"], _full(32)),
+    ]
+    coord = _make_coord(
+        groups, hash_block_size=32, use_eagle=use_eagle, retention_interval=0
+    )
+    assert coord.enable_partial_hash_hits
+    # Fine replay positions: 448 (and 416 under EAGLE).
+    # Materialized fallback positions: 384 (and 256 under EAGLE).
+    assert coord.store_mask(480, num_prompt_tokens=480)[1] == [
+        i in retained for i in range(7)
+    ]
+    assert coord.store_mask(384, num_prompt_tokens=480)[1] == [
+        i in retained for i in range(6)
+    ]
+    assert coord.store_mask(480, start_token=384, num_prompt_tokens=480)[1] == [True]
 
 
 def test_store_mask_disables_fine_hits_for_incompatible_swa():
