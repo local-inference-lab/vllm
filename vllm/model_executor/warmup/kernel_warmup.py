@@ -213,7 +213,10 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
     from vllm.models.kimi_k3.nvidia.mla import (
         MultiHeadLatentAttention as KimiK3MLAAttention,
     )
-    from vllm.v1.attention.ops.dcp_alltoall import warmup_b12x_dcp_a2a
+    from vllm.v1.attention.ops.dcp_alltoall import (
+        warmup_b12x_dcp_a2a,
+        warmup_b12x_dcp_query_gather,
+    )
 
     model = worker.get_model()
     candidates = list(model.modules())
@@ -251,8 +254,9 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
             output_head_dim = int(module.kv_lora_rank)
             if getattr(module.impl, "_packed_query", False):
                 # The packed reader gathers pre-quantized 656-byte query
-                # records as E4M3 rows; that pool signature must exist before
-                # graph capture in addition to the bf16 one below.
+                # records as E4M3 rows; that gather pool must exist before
+                # graph capture in addition to the bf16 channel below (the
+                # output reduction stays bf16 and is warmed there).
                 from vllm.v1.attention.backends.mla.b12x_mla import (
                     _PACKED_QUERY_RECORD_BYTES,
                 )
@@ -265,7 +269,7 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
                     output_head_dim,
                 )
                 if packed_signature not in warmed_signatures:
-                    warmup_b12x_dcp_a2a(
+                    warmup_b12x_dcp_query_gather(
                         get_dcp_group(),
                         device=device,
                         dtype=torch.float8_e4m3fn,
