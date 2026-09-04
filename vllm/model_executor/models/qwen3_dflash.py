@@ -11,6 +11,7 @@ from torch import nn
 from transformers import Qwen3Config
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -84,6 +85,33 @@ def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
     return not all(
         _dflash_layer_causal(config, i) for i in range(config.num_hidden_layers)
     )
+
+
+def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
+    """Return the target model's rotary-embedding layout when it is exposed.
+
+    A DFlash-family draft must rotate query and key tensors with the same
+    dimension layout as the target model used during hidden-state extraction.
+    Draft checkpoints do not encode this property. A mismatch changes every
+    drafted attention result without raising an error and collapses token
+    acceptance.
+
+    Args:
+        target_model: Target model that can expose rotary layout modules.
+
+    Returns:
+        The exposed NeoX rotary-layout setting, or ``None`` when unavailable.
+    """
+    language_model = (
+        target_model.get_language_model()
+        if hasattr(target_model, "get_language_model")
+        else target_model
+    )
+    for module in language_model.modules():
+        style = getattr(module, "is_neox_style", None)
+        if isinstance(style, bool):
+            return style
+    return None
 
 
 def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
@@ -160,6 +188,32 @@ def _resolve_layer_attention(
     return sliding_window, _dflash_layer_causal(config, layer_idx)
 
 
+def _qkv_weight_out_major(qkv_proj: nn.Module) -> torch.Tensor:
+    """Return the QKV projection weight as ``[out_features, in_features]``.
+
+    Online fp8 quantization (``Fp8PtpcOnlineLinearMethod``) replaces the BF16
+    ``[out, in]`` parameter with a transposed float8 ``[in, out]`` tensor and
+    a ``[out, 1]`` per-channel scale. The fused context K/V projection reads
+    the weight directly, so dequantize it back to the model dtype here; the
+    values are exactly the ones the quantized query path multiplies with.
+    """
+    weight = qkv_proj.weight
+    if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return weight
+    scale = getattr(qkv_proj, "weight_scale", None)
+    if scale is None:
+        raise RuntimeError("fp8 qkv_proj has no weight_scale to dequantize with")
+    dtype = (
+        qkv_proj.params_dtype
+        if hasattr(qkv_proj, "params_dtype")
+        else torch.bfloat16
+    )
+    if scale.dim() == 2 and scale.shape[0] == weight.shape[1]:
+        # Transposed [in, out] fp8 with [out, 1] scales.
+        return (weight.to(dtype) * scale.to(dtype).t()).t().contiguous()
+    return (weight.to(dtype) * scale.to(dtype)).contiguous()
+
+
 class DFlashAttention(Attention):
     """Attention with DFlash-specific KV allocation semantics.
 
@@ -216,6 +270,7 @@ class DFlashQwen3Attention(nn.Module):
         add_swa_attention_sink_bias: bool = False,
         sliding_window: int | None = None,
         causal: bool = False,
+        is_neox_style: bool = True,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -259,6 +314,7 @@ class DFlashQwen3Attention(nn.Module):
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=max_position,
+            is_neox_style=is_neox_style,
             rope_parameters=rope_parameters,
         )
 
@@ -342,6 +398,12 @@ class DFlashQwen3DecoderLayer(nn.Module):
         # non-causal) from the draft config.
         sliding_window, causal = _resolve_layer_attention(config, layer_idx)
 
+        # The loader copies this value from the built target model. Kimi-K3
+        # uses interleaved rotary dimensions while Qwen3 defaults to NeoX
+        # rotary dimensions, so relying on the Qwen3 default is not valid for
+        # a Kimi-trained DFlash-family checkpoint.
+        is_neox_style = getattr(config, "is_neox_style", True)
+
         self.self_attn = DFlashQwen3Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -352,6 +414,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
             add_swa_attention_sink_bias=add_swa_attention_sink_bias,
             sliding_window=sliding_window,
             causal=causal,
+            is_neox_style=is_neox_style,
             head_dim=getattr(config, "head_dim", None),
             cache_config=cache_config,
             quant_config=quant_config,
@@ -508,7 +571,9 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+        kv_weights = [
+            _qkv_weight_out_major(a.qkv_proj)[a.q_size :] for a in layers_attn
+        ]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
@@ -770,6 +835,40 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             )
         else:
             self.draft_id_to_target_id = None
+        # Rowwise-fp8 copy of the (possibly shared) LM head, materialized by
+        # maybe_init_fp8_draft_head(); None keeps the BF16 head.
+        self._fp8_draft_head = None
+        self._logit_scale = float(logit_scale)
+
+    def maybe_init_fp8_draft_head(self) -> None:
+        """Materialize the rowwise-fp8 draft lm_head copy (opt-in).
+
+        Called by ``load_dflash_model`` after the target's lm_head may have
+        been aliased onto this model, and before the proposal CUDA graphs
+        are captured: the quantized copy must exist when the graph records
+        ``compute_logits``. Draft-time only: proposals are scored with the
+        fp8 head, the target's verification never sees it, so accepted
+        tokens keep the target distribution; a rare argmax flip costs one
+        rejected draft token.
+        """
+        from vllm.model_executor.layers.fp8_draft_head import (
+            fp8_draft_head_supported,
+            quantize_draft_head,
+        )
+
+        if not envs.VLLM_DSPARK_FP8_DRAFT_HEAD:
+            return
+        if not fp8_draft_head_supported(self.lm_head.weight.device):
+            logger.warning(
+                "VLLM_DSPARK_FP8_DRAFT_HEAD is set but this device has no "
+                "fp8 support (SM89+ required); using the BF16 draft lm_head."
+            )
+            return
+        self._fp8_draft_head = quantize_draft_head(self.lm_head.weight)
+        logger.info_once(
+            "DFlash draft logits use a rowwise-fp8 copy of the lm_head "
+            "(draft-time only; the target's verify pass is untouched)."
+        )
 
     def embed_input_ids(
         self,
@@ -799,7 +898,21 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        logits = self.logits_processor(self.lm_head, hidden_states)
+        if self._fp8_draft_head is not None:
+            from vllm.model_executor.layers.fp8_draft_head import (
+                fp8_draft_head_logits,
+            )
+
+            # Mirrors LogitsProcessor._get_logits: local (shard) logits, the
+            # same TP gather and vocab-padding slice, then the logit scale.
+            local_logits = fp8_draft_head_logits(hidden_states, self._fp8_draft_head)
+            logits = self.logits_processor._gather_logits(local_logits)
+            if logits is not None:
+                logits = logits[..., : self.logits_processor.org_vocab_size]
+                if self._logit_scale != 1.0:
+                    logits = logits * self._logit_scale
+        else:
+            logits = self.logits_processor(self.lm_head, hidden_states)
         if self.draft_id_to_target_id is None:
             return logits
 

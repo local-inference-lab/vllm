@@ -74,6 +74,11 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
 
+# RPCs that form a scheduled step. Every other RPC arrives between steps and
+# is answered after the outputs already in flight, so a worker completes
+# those outputs before it handles one (see Worker.flush_deferred_output).
+_STEP_RPCS = frozenset({"execute_model", "sample_tokens"})
+
 
 class FutureWrapper(Future):
     def __init__(
@@ -1037,6 +1042,10 @@ class WorkerProc:
                 elif isinstance(method, bytes):
                     func = partial(cloudpickle.loads(method), self.worker)
 
+                if method not in _STEP_RPCS:
+                    flush = getattr(self.worker, "flush_deferred_output", None)
+                    if flush is not None:
+                        flush()
                 output = func(*args, **kwargs)
 
                 if output_rank is None or self.rank == output_rank:

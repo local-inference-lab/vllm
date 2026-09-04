@@ -151,6 +151,24 @@ def _restore_merged_output_order(
     )
 
 
+def _reuse_consumed_query_for_context_output(
+    query: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Return contiguous semantic-output storage backed by a consumed query."""
+    if not query.is_contiguous():
+        raise ValueError("Kimi-K3 MLA prefill query storage must be contiguous")
+    required_bytes = output.numel() * output.element_size()
+    query_bytes = query.view(torch.uint8).flatten()
+    if query_bytes.numel() < required_bytes:
+        raise ValueError(
+            "Kimi-K3 MLA prefill query storage is too small for compact context "
+            f"output: available={query_bytes.numel()} bytes, "
+            f"required={required_bytes} bytes"
+        )
+    return query_bytes[:required_bytes].view(output.dtype).view_as(output)
+
+
 class KimiShardedMergedColumnParallelLinear(MergedColumnParallelLinear):
     """Merged column projection with one gather and logical-shard reorder."""
 
@@ -1066,6 +1084,16 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         )
 
         if has_context:
+            suffix_output, suffix_lse = output_prefill
+            out = out.view(-1, self.num_local_heads, self.v_head_dim)
+            # FlashAttention 2 pads Kimi-K3's 128-wide V to the 256-wide
+            # query/key head dimension. Preserve only the semantic V slice in
+            # caller-owned output storage before context attention allocates
+            # its equally large padded result. The merge kernel supports
+            # output aliasing its suffix input, so both padded results never
+            # need to be live at the same time.
+            out.copy_(suffix_output[..., : self.v_head_dim])
+            del output_prefill, suffix_output
             if self.dcp_world_size > 1:
                 context_output, context_lse = (
                     self.impl._context_parallel_compute_prefill_context(  # type: ignore[attr-defined]
@@ -1080,13 +1108,14 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 context_output, context_lse = self.impl._compute_prefill_context(  # type: ignore[attr-defined]
                     q, self._attn_read_kv_cache(), attn_metadata, self._k_scale
                 )
-            suffix_output, suffix_lse = output_prefill
-            out = out.view(-1, self.num_local_heads, self.v_head_dim)
+            compact_context_output = _reuse_consumed_query_for_context_output(q, out)
+            compact_context_output.copy_(context_output[..., : self.v_head_dim])
+            del context_output
             merge_attn_states(
                 output=out,
-                prefix_output=context_output[..., : self.v_head_dim],
+                prefix_output=compact_context_output,
                 prefix_lse=context_lse,
-                suffix_output=suffix_output[..., : self.v_head_dim],
+                suffix_output=out,
                 suffix_lse=suffix_lse,
             )
         elif not writes_out:

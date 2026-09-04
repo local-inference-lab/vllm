@@ -15,7 +15,7 @@ from vllm.v1.structured_output.backend_types import StructuredOutputOptions
 
 class MockReasoner:
     def __init__(self, tokenizer):
-        self.is_reasoning_end = Mock(return_value=False)
+        self.is_reasoning_end_for_prompt = Mock(return_value=False)
         self.is_reasoning_end_streaming = Mock(return_value=False)
 
 
@@ -137,7 +137,7 @@ class TestReasoningStructuredOutput:
             def __init__(self, tokenizer, chat_template_kwargs=None):
                 self.chat_template_kwargs = chat_template_kwargs or {}
 
-            def is_reasoning_end(self, input_ids):
+            def is_reasoning_end_for_prompt(self, input_ids):
                 return not self.chat_template_kwargs.get("enable_thinking", False)
 
         manager = StructuredOutputManager(mock_vllm_config)
