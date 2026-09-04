@@ -1846,6 +1846,97 @@ def test_sliding_window_fine_grained_reachable_mask():
     )
 
 
+def test_attention_only_hybrid_keeps_block_aligned_hits():
+    """Without a recurrent group, hashing finer than an attention block does
+    not turn partial hits on: attention-only hybrids keep the block-aligned
+    behaviour they had before sliding-window groups learned fine-grained
+    lookups."""
+    hash_block_size = 2
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=2 * hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["swa"],
+                SlidingWindowSpec(
+                    block_size=4 * hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=4 * hash_block_size,
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    coordinator = manager.coordinator
+    assert not coordinator.enable_partial_hash_hits
+    assert all(
+        m.hit_alignment_tokens == coordinator.scheduler_block_size
+        for m in coordinator.single_type_managers
+    )
+
+
+def test_sliding_window_eagle_margin_is_one_hash_unit_under_partial_hits():
+    """With partial hits on, the coordinator hands the EAGLE sliding-window
+    group a one-hash-unit lookahead margin (not a whole draft block) and the
+    reconciled hit lands back on the candidate length."""
+    hash_block_size = 2
+    manager = make_kv_cache_manager(
+        kv_cache_config=_make_hybrid_swa_eagle_config(
+            hash_block_size=hash_block_size,
+            attn_block_size=16,
+            mamba_block_size=hash_block_size,
+            sliding_window=16,
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+    coordinator = manager.coordinator
+    assert coordinator.enable_partial_hash_hits
+    base = list(range(1000, 1045))
+    _prefill_and_free(manager, make_request("0", base, hash_block_size, sha256), 2)
+
+    seen_max_lengths: list[int] = []
+    swa_manager = coordinator.single_type_managers[2]
+    original = type(swa_manager).find_longest_cache_hit
+
+    def spy(cls, *args, **kwargs):
+        seen_max_lengths.append(kwargs["max_length"])
+        return original(*args, **kwargs)
+
+    type(swa_manager).find_longest_cache_hit = classmethod(spy)
+    try:
+        req = make_request("1", base, hash_block_size, sha256)
+        _, hit_length, _ = coordinator.find_longest_cache_hit(
+            req.block_hashes, len(base) - 1
+        )
+    finally:
+        type(swa_manager).find_longest_cache_hit = original
+    # Candidate 44 (the tail): the draft is asked for 44 + one hash unit
+    # (capped by max_length 44), rewinds to 42; the re-query asks for exactly
+    # the rewound length. Nothing is queried a whole draft block ahead.
+    assert hit_length == 42
+    assert seen_max_lengths and max(seen_max_lengths) <= 44
+    assert 42 in seen_max_lengths
+
+
 @pytest.mark.parametrize("num_prompt_tokens", [13, 45, 48])
 def test_hybrid_decoupled_blocks_keep_fine_grained_reuse(num_prompt_tokens: int):
     """Large attention/draft blocks (page parity with the recurrent state)
