@@ -1,0 +1,200 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import json
+import threading
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from vllm.v1.worker.gpu.spec_decode.dspark.remote_speculator import (
+    RemoteK3DSparkSpeculator,
+    _anchor_positions_from_context,
+    _build_valid_context_plan,
+    _contiguous_draft_output,
+    _RetainedRequestPrefix,
+)
+
+
+def test_build_valid_context_plan_drops_rejected_tail_rows():
+    batch = SimpleNamespace(
+        num_reqs=2,
+        num_scheduled_tokens=np.array([4, 3], dtype=np.int32),
+        num_computed_tokens_np=np.array([10, 20], dtype=np.int32),
+    )
+
+    indices, counts = _build_valid_context_plan(batch, [2, 0])
+
+    assert indices == [0, 1, 4, 5, 6]
+    assert counts == [2, 3]
+
+
+def test_anchor_positions_follow_actual_valid_context_rows():
+    positions = torch.tensor([24, 25, 26, 80, 81], dtype=torch.int64)
+
+    anchors = _anchor_positions_from_context([3, 2], positions)
+
+    assert anchors == [27, 82]
+
+
+def test_remote_tokens_copy_supports_adaptive_depth():
+    proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy.device = torch.device("cpu")
+    proxy.draft_tokens = torch.full((3, 8), -1, dtype=torch.int64)
+
+    proxy._copy_tokens_from_response(
+        {"tokens": [[11, 12], [21, 22]]},
+        active_indices=[0, 2],
+        num_speculative_tokens=2,
+    )
+
+    assert proxy.draft_tokens.tolist() == [
+        [11, 12, -1, -1, -1, -1, -1, -1],
+        [-1, -1, -1, -1, -1, -1, -1, -1],
+        [21, 22, -1, -1, -1, -1, -1, -1],
+    ]
+
+
+def test_remote_speculator_accepts_scheduler_selected_zero_depth():
+    proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy.num_speculative_steps = 3
+    proxy.draft_tokens = torch.full((4, 3), -1, dtype=torch.int64)
+    batch = SimpleNamespace(num_reqs=2)
+    empty = torch.empty(0)
+
+    output = proxy.propose(
+        batch,
+        {},
+        {},
+        empty,
+        None,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        num_speculative_tokens=0,
+    )
+
+    assert output.shape == (2, 0)
+    assert output.is_contiguous()
+
+
+def test_adaptive_depth_output_is_contiguous_for_tp_broadcast():
+    draft_tokens = torch.arange(24, dtype=torch.int64).view(3, 8)
+
+    output = _contiguous_draft_output(draft_tokens, 2, 3)
+
+    assert output.is_contiguous()
+    assert output.tolist() == [[0, 1, 2], [8, 9, 10]]
+
+
+def test_deferred_ingest_failures_disable_every_affected_request():
+    proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy.method = "dflash"
+    proxy._disabled_requests = set()
+    proxy._async_error_lock = threading.Lock()
+    proxy._async_errors = [
+        (RuntimeError("first failure"), ["request-a"]),
+        (RuntimeError("second failure"), ["request-b", "request-c"]),
+    ]
+
+    proxy._apply_async_error()
+
+    assert proxy._disabled_requests == {"request-a", "request-b", "request-c"}
+    assert proxy._async_errors == []
+
+
+def test_capture_index_appends_records_without_retaining_the_record_list(
+    monkeypatch, tmp_path
+):
+    from vllm.v1.worker.gpu.spec_decode.dspark import remote_speculator as rs
+
+    monkeypatch.setattr(rs, "_K3_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setattr(rs, "_K3_CAPTURE_STATE", {})
+    request = {
+        "request_id": "request-a",
+        "context_count": 1,
+        "reset": True,
+        "reset_position": 0,
+        "anchor_token_id": 7,
+    }
+
+    rs._k3_capture_records([request], b"p" * 8, b"c" * 4, 2, [1])
+    request["reset"] = False
+    rs._k3_capture_records([request], b"q" * 8, b"d" * 4, 2, [2])
+
+    index = json.loads((tmp_path / "request-a.json").read_text())
+    assert index["bytes"] == 24
+    assert [record["offset"] for record in index["records"]] == [0, 12]
+    assert (tmp_path / "request-a.bin").read_bytes() == (
+        b"p" * 8 + b"c" * 4 + b"q" * 8 + b"d" * 4
+    )
+    state = rs._K3_CAPTURE_STATE["request-a"]
+    assert state["record_count"] == 2
+    assert "records" not in state
+
+
+@pytest.mark.parametrize("rejected", [[5, 0], [-1, 0]])
+def test_build_valid_context_plan_rejects_invalid_counts(rejected):
+    batch = SimpleNamespace(
+        num_reqs=2,
+        num_scheduled_tokens=np.array([4, 3], dtype=np.int32),
+        num_computed_tokens_np=np.array([0, 0], dtype=np.int32),
+    )
+
+    with pytest.raises(ValueError, match="Invalid valid-context length"):
+        _build_valid_context_plan(batch, rejected)
+
+
+def _make_prefix_matcher() -> RemoteK3DSparkSpeculator:
+    proxy = RemoteK3DSparkSpeculator.__new__(RemoteK3DSparkSpeculator)
+    proxy._known_requests = {"old"}
+    proxy._remote_block_size = 16
+    proxy._remote_window_size = 32
+    proxy._remote_prefix_cache_tokens = 128
+    proxy._retained_prefixes = {
+        "old": _RetainedRequestPrefix(
+            token_ids=torch.arange(96, dtype=torch.int32),
+            committed_end=96,
+            context_start=0,
+            serial=1,
+        )
+    }
+    return proxy
+
+
+def test_remote_prefix_match_requires_exact_token_identity():
+    proxy = _make_prefix_matcher()
+    matching = torch.arange(80, dtype=torch.int32)
+
+    assert proxy._find_reconnect_source(matching, 80, {"new"}) == "old"
+
+    mismatched = matching.clone()
+    mismatched[40] = -1
+    assert proxy._find_reconnect_source(mismatched, 80, {"new"}) is None
+
+
+def test_remote_prefix_match_rejects_range_evicted_from_projected_cache():
+    proxy = _make_prefix_matcher()
+    proxy._remote_prefix_cache_tokens = 48
+    matching = torch.arange(40, dtype=torch.int32)
+
+    assert proxy._find_reconnect_source(matching, 40, {"new"}) is None
+
+
+def test_remote_prefix_match_rejects_history_before_cold_bootstrap():
+    proxy = _make_prefix_matcher()
+    proxy._retained_prefixes["old"].context_start = 64
+
+    assert (
+        proxy._find_reconnect_source(torch.arange(80, dtype=torch.int32), 80, {"new"})
+        is None
+    )
+    assert (
+        proxy._find_reconnect_source(torch.arange(96, dtype=torch.int32), 96, {"new"})
+        == "old"
+    )

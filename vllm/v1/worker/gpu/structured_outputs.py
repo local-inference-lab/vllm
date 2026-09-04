@@ -9,8 +9,61 @@ from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
+def _build_grammar_row_mapping(
+    req_ids: list[str],
+    grammar_req_ids: list[str],
+    grammar_num_spec_tokens: list[int],
+    cu_num_logits_np: np.ndarray,
+    num_draft_tokens_per_req: np.ndarray | None,
+    num_bonus_tokens: int,
+) -> tuple[list[int], list[int]]:
+    """Map serialized grammar rows to the active compact logits layout."""
+    assert len(grammar_req_ids) == len(grammar_num_spec_tokens)
+    assert num_bonus_tokens in (0, 1)
+
+    req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}
+    source_indices: list[int] = []
+    logits_indices: list[int] = []
+    source_offset = 0
+
+    for grammar_req_id, num_source_drafts in zip(
+        grammar_req_ids,
+        grammar_num_spec_tokens,
+        strict=True,
+    ):
+        req_idx = req_id_to_idx[grammar_req_id]
+        num_active_drafts = (
+            0
+            if num_draft_tokens_per_req is None
+            else int(num_draft_tokens_per_req[req_idx])
+        )
+        assert 0 <= num_active_drafts <= num_source_drafts
+
+        logits_start = int(cu_num_logits_np[req_idx])
+        num_active_logits = int(
+            cu_num_logits_np[req_idx + 1] - cu_num_logits_np[req_idx]
+        )
+        assert num_active_logits == num_active_drafts + num_bonus_tokens
+
+        source_indices.extend(range(source_offset, source_offset + num_active_drafts))
+        logits_indices.extend(range(logits_start, logits_start + num_active_drafts))
+        if num_bonus_tokens:
+            source_indices.append(source_offset + num_source_drafts)
+            logits_indices.append(logits_start + num_active_drafts)
+
+        source_offset += num_source_drafts + num_bonus_tokens
+
+    return source_indices, logits_indices
+
+
 class StructuredOutputsWorker:
-    def __init__(self, max_num_logits: int, vocab_size: int, device: torch.device):
+    def __init__(
+        self,
+        max_num_logits: int,
+        vocab_size: int,
+        device: torch.device,
+        num_bonus_tokens: int,
+    ):
         self.logits_indices = torch.zeros(
             max_num_logits, dtype=torch.int32, device=device
         )
@@ -19,6 +72,7 @@ class StructuredOutputsWorker:
         )
         self.device = device
         self.copy_stream = torch.cuda.Stream()
+        self.num_bonus_tokens = num_bonus_tokens
 
     def apply_grammar_bitmask(
         self,
@@ -26,26 +80,30 @@ class StructuredOutputsWorker:
         input_batch: InputBatch,
         grammar_req_ids: list[str],
         grammar_bitmask: np.ndarray,
+        grammar_num_spec_tokens: list[int],
     ) -> None:
         if not grammar_req_ids:
             return
 
-        # Asynchronously copy the bitmask to GPU.
+        source_indices, mapping = _build_grammar_row_mapping(
+            input_batch.req_ids,
+            grammar_req_ids,
+            grammar_num_spec_tokens,
+            input_batch.cu_num_logits_np,
+            input_batch.num_draft_tokens_per_req,
+            self.num_bonus_tokens,
+        )
+        expected_source_rows = sum(
+            num_drafts + self.num_bonus_tokens for num_drafts in grammar_num_spec_tokens
+        )
+        assert grammar_bitmask.shape[0] == expected_source_rows
+        grammar_bitmask = grammar_bitmask[source_indices]
+
+        # Asynchronously copy the active bitmask rows to GPU.
         with torch.cuda.stream(self.copy_stream):
             bitmask = async_copy_to_gpu(
                 grammar_bitmask, out=self.grammar_bitmask[: grammar_bitmask.shape[0]]
             )
-
-        # Construct bitmask -> logits mapping
-        mapping: list[int] = []
-        req_ids = input_batch.req_ids
-        cu_num_logits = input_batch.cu_num_logits_np.tolist()
-        req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}
-        for grammar_req_id in grammar_req_ids:
-            req_idx = req_id_to_idx[grammar_req_id]
-            logits_start_idx = cu_num_logits[req_idx]
-            logits_end_idx = cu_num_logits[req_idx + 1]
-            mapping.extend(range(logits_start_idx, logits_end_idx))
 
         # Asynchronously copy the mapping to GPU.
         with torch.cuda.stream(self.copy_stream):
