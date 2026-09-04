@@ -4794,3 +4794,133 @@ def test_swa_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction window -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
+
+
+@pytest.mark.parametrize(
+    "start,mask,null_indices,runs",
+    [
+        pytest.param(
+            0,
+            [False, True, True, False, True, True],
+            (),
+            [(1, 3), (4, 6)],
+            id="leading-and-interior-mask",
+        ),
+        pytest.param(0, None, (2,), [(0, 2), (3, 6)], id="interior-null"),
+        pytest.param(0, None, (0,), [(1, 6)], id="leading-null"),
+        pytest.param(0, [False] * 6, (), [], id="all-masked"),
+        pytest.param(0, None, tuple(range(6)), [], id="all-null"),
+        pytest.param(
+            2, [False, True, False, True], (), [(3, 4), (5, 6)], id="cached-offset"
+        ),
+        pytest.param(5, [False], (), [], id="masked-decode"),
+        pytest.param(0, None, (), [(0, 6)], id="dense"),
+    ],
+)
+@pytest.mark.parametrize("events_enabled", [True, False])
+def test_sparse_block_stored_runs(start, mask, null_indices, runs, events_enabled):
+    import msgspec
+
+    from vllm.distributed.kv_events import KVEventBatch
+
+    block_size = 4
+    pool = BlockPool(16, True, block_size, events_enabled)
+    req = make_request(
+        "sparse-events",
+        list(range(24)),
+        block_size,
+        sha256,
+        mm_positions=[
+            PlaceholderRange(offset=4, length=4),
+            PlaceholderRange(offset=16, length=4),
+        ],
+        mm_hashes=["first-image", "second-image"],
+        cache_salt="tenant",
+    )
+    blocks = pool.get_new_blocks(6)
+    for i in null_indices:
+        blocks[i] = pool.null_block
+    pool.cache_full_blocks(req, blocks, start, 6, block_size, 2, mask)
+    retained = {i for lo, hi in runs for i in range(lo, hi)}
+    for i, block_hash in enumerate(req.block_hashes):
+        cached = pool.get_cached_block(block_hash, [2])
+        assert cached == ([blocks[i]] if i in retained else None)
+    events = pool.take_events()
+    assert len(events) == (len(runs) if events_enabled else 0)
+    for event, (lo, hi) in zip(events, runs):
+        assert isinstance(event, BlockStored)
+        assert event.block_hashes == [
+            kv_cache_utils.maybe_convert_block_hash(h) for h in req.block_hashes[lo:hi]
+        ]
+        assert event.token_ids == list(range(lo * block_size, hi * block_size))
+        assert event.parent_block_hash == (
+            kv_cache_utils.maybe_convert_block_hash(req.block_hashes[lo - 1])
+            if lo
+            else None
+        )
+        expected_keys = [
+            ("tenant",),
+            (("first-image", 0),),
+            None,
+            None,
+            (("second-image", 0),),
+            None,
+        ][lo:hi]
+        assert event.extra_keys == expected_keys
+        assert event.block_size == block_size
+        assert event.group_idx == 2
+        assert event.medium == MEDIUM_GPU
+        assert len(event.token_ids) == block_size * len(event.block_hashes)
+    batch = KVEventBatch(ts=0.0, events=events)
+    encoded = msgspec.msgpack.encode(batch)
+    assert (
+        msgspec.msgpack.encode(msgspec.msgpack.decode(encoded, type=KVEventBatch))
+        == encoded
+    )
+
+
+@pytest.mark.parametrize("kind", ["swa", "mamba"])
+def test_sparse_block_stored_manager_masks(kind):
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        MambaManager,
+        SlidingWindowManager,
+    )
+
+    if kind == "swa":
+        spec = SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=32,
+        )
+        mask = SlidingWindowManager.reachable_block_mask(0, 64, 512, spec, False)
+        runs = [(30, 32), (62, 64)]
+        count = 64
+    else:
+        spec = MambaSpec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        )
+        mask = MambaManager.reachable_block_mask(0, 8, 32, spec, True, 0, (127,))
+        runs = [(3, 4), (5, 6)]
+        count = 8
+    assert mask is not None
+    assert [i for i, keep in enumerate(mask) if keep] == [
+        i for lo, hi in runs for i in range(lo, hi)
+    ]
+    pool = BlockPool(count + 1, True, 16, True)
+    req = make_request("mask-events", list(range(count * 16)), 16, sha256)
+    pool.cache_full_blocks(req, pool.get_new_blocks(count), 0, count, 16, 0, mask)
+    events = pool.take_events()
+    assert len(events) == len(runs)
+    for event, (lo, hi) in zip(events, runs):
+        assert event.token_ids == list(range(lo * 16, hi * 16))
+        assert event.block_hashes == [
+            kv_cache_utils.maybe_convert_block_hash(h) for h in req.block_hashes[lo:hi]
+        ]
+        assert event.parent_block_hash == kv_cache_utils.maybe_convert_block_hash(
+            req.block_hashes[lo - 1]
+        )

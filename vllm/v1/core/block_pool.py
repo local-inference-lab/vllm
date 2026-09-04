@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
+from itertools import groupby
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -265,9 +266,7 @@ class BlockPool:
         )
 
         new_block_hashes = block_hashes[num_cached_blocks:]
-        new_hashes: list[ExternalBlockHash] | None = (
-            [] if self.enable_kv_cache_events else None
-        )
+        stored_indices: list[int] | None = [] if self.enable_kv_cache_events else None
         for i, blk in enumerate(new_full_blocks):
             # Some blocks may be null or masked out when enabling sparse attention
             # like sliding window attention, or Mamba models with prefix-caching
@@ -295,46 +294,51 @@ class BlockPool:
                 blk,
                 num_tokens=num_hash_tokens,
             )
-            if new_hashes is not None:
-                new_hashes.append(maybe_convert_block_hash(block_hash))
+            if stored_indices is not None:
+                stored_indices.append(num_cached_blocks + i)
 
-        if self.enable_kv_cache_events:
-            if num_cached_blocks == 0:
-                parent_block_hash: ExternalBlockHash | None = None
-            else:
-                parent_block_hash = maybe_convert_block_hash(
-                    block_hashes[num_cached_blocks - 1]
-                )
+        # Publish after all insertions and promotion removals, as for dense stores.
+        if stored_indices:
+            self._emit_stored_block_runs(
+                request, stored_indices, block_size, kv_cache_group_id
+            )
 
-            # Calculate token range for the blocks being cached
-            start_token_idx = num_cached_blocks * block_size
-            end_token_idx = num_full_blocks * block_size
-
-            # Generate extra keys for each block individually.
-            # Each block may have different extra_keys (e.g., different MM
-            # features, or cache_salt only for the first block).
-            # Skip null/masked-out blocks to match the length of new_hashes.
+    def _emit_stored_block_runs(
+        self,
+        request: Request,
+        block_indices: list[int],
+        block_size: int,
+        kv_cache_group_id: int,
+    ) -> None:
+        """Publish maximal contiguous runs of sorted retained block indices."""
+        block_hashes = resolve_block_hashes(
+            request.block_hashes, self.hash_block_size, block_size
+        )
+        curr_mm_idx = 0
+        for _, run in groupby(
+            enumerate(block_indices), key=lambda pair: pair[1] - pair[0]
+        ):
+            indices = [index for _, index in run]
+            start, end = indices[0], indices[-1] + 1
             extra_keys_list: list[tuple[Any, ...] | None] = []
-            curr_mm_idx = 0
-            for i in range(num_cached_blocks, num_full_blocks):
-                if blocks[i].is_null:
-                    continue
-                if block_mask is not None and not block_mask[i - num_cached_blocks]:
-                    continue
-                block_start = i * block_size
-                block_end = block_start + block_size
+            for i in indices:
                 extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
-                    request, block_start, block_end, curr_mm_idx
+                    request, i * block_size, (i + 1) * block_size, curr_mm_idx
                 )
                 extra_keys_list.append(extra_keys)
-
             self.kv_event_queue.append(
                 self._build_block_stored_event(
                     request,
-                    block_hashes=new_hashes,
-                    parent_block_hash=parent_block_hash,
-                    start_token_idx=start_token_idx,
-                    end_token_idx=end_token_idx,
+                    block_hashes=[
+                        maybe_convert_block_hash(block_hashes[i]) for i in indices
+                    ],
+                    parent_block_hash=(
+                        maybe_convert_block_hash(block_hashes[start - 1])
+                        if start
+                        else None
+                    ),
+                    start_token_idx=start * block_size,
+                    end_token_idx=end * block_size,
                     block_size=block_size,
                     kv_cache_group_id=kv_cache_group_id,
                     extra_keys_list=extra_keys_list,
