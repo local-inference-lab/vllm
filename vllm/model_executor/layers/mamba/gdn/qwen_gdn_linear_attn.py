@@ -59,11 +59,16 @@ from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
-from vllm.utils.b12x import get_b12x_gdn_decode, get_b12x_scratch_buffers
+from vllm.utils.b12x import (
+    get_b12x_gdn_decode,
+    get_b12x_mxfp8_linear,
+    get_b12x_scratch_buffers,
+)
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
     _resolve_layer_name,
+    aux_stream,
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -89,6 +94,10 @@ logger = init_logger(__name__)
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
+_b12x_mxfp8 = get_b12x_mxfp8_linear()
+_b12x_mxfp8_pair = (
+    getattr(_b12x_mxfp8, "mm_pair", None) if _b12x_mxfp8 is not None else None
+)
 
 
 def _resolve_gdn_decode_kernel(
@@ -453,6 +462,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.in_proj_ba",
         )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
+        pair_stream = aux_stream() if _b12x_mxfp8_pair is not None else None
+        self._b12x_mxfp8_pair_stream_handle = (
+            int(pair_stream.cuda_stream) if pair_stream is not None else None
+        )
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -1065,8 +1078,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+        if (
+            _b12x_mxfp8_pair is not None
+            and hasattr(self.in_proj_qkvz, "b12x_mxfp8_packed_weight")
+            and hasattr(self.in_proj_ba, "b12x_mxfp8_packed_weight")
+        ):
+            mixed_qkvz, ba = _b12x_mxfp8_pair(
+                hidden_states,
+                self.in_proj_qkvz.b12x_mxfp8_packed_weight,
+                self.in_proj_ba.b12x_mxfp8_packed_weight,
+                expected_m=max(1, int(hidden_states.shape[0])),
+                parallel_max_tokens=1023,
+                secondary_stream=self._b12x_mxfp8_pair_stream_handle,
+            )
+        else:
+            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            ba, _ = self.in_proj_ba(hidden_states)
 
         use_fused_gdn_decode = (
             self.enable_fused_gdn_decode
