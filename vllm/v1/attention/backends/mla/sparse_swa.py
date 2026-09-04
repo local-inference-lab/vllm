@@ -726,7 +726,20 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         query_start_loc: torch.Tensor,
         token_to_req_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Upload image spans and compute prefill visibility limits."""
+        """Upload image spans and compute prefill visibility limits.
+
+        Args:
+            num_reqs: Number of requests represented by the metadata batch.
+            mm_ranges: Inclusive image-token spans keyed by request index.
+            num_decode_tokens: Number of decode rows before the prefill rows.
+            num_prefill_tokens: Number of prefill rows to process.
+            seq_lens: Materialized sequence length for each request.
+            query_start_loc: Prefix sums for the flattened query rows.
+            token_to_req_indices: Request index for each flattened token row.
+
+        Returns:
+            Per-token additional visibility limits to the left and right.
+        """
         indptr = [0] * (num_reqs + 1)
         starts: list[int] = []
         ends: list[int] = []
@@ -912,7 +925,9 @@ def _compute_image_visibility_kernel(
         left = tl.where(
             in_span, tl.minimum(pos - span_start, max_image_tokens - 1), left
         )
-        right = tl.where(in_span, tl.minimum(span_end - pos, max_image_tokens), right)
+        materialized_right = tl.maximum(seq_len - pos - 1, 0)
+        span_right = tl.minimum(span_end - pos, max_image_tokens)
+        right = tl.where(in_span, tl.minimum(span_right, materialized_right), right)
     tl.store(left_visible_ptr + token_idx, left)
     tl.store(right_visible_ptr + token_idx, right)
 

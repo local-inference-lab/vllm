@@ -54,7 +54,11 @@ def ref_left_right(
             for span_start, span_end in spans:
                 if span_start <= pos <= span_end:
                     left = min(pos - span_start, max_image_tokens - 1)
-                    right = min(span_end - pos, max_image_tokens)
+                    right = min(
+                        span_end - pos,
+                        max_image_tokens,
+                        max(seq_len - pos - 1, 0),
+                    )
             lefts.append(left)
             rights.append(right)
     return lefts, rights
@@ -200,6 +204,13 @@ CASES: list[_Case] = [
         "seq_lens": [40, 9],
         "query_lens": [16, 9],
         "spans": [[(30, 38)], []],
+    },
+    # Defensive bound for metadata that names image tokens beyond the
+    # materialized prefill. The scheduler normally keeps each item atomic.
+    {
+        "seq_lens": [35],
+        "query_lens": [11],
+        "spans": [[(30, 38)]],
     },
     # span ending exactly at the prompt end; tiny request
     {

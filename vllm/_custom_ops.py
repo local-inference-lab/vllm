@@ -2455,6 +2455,26 @@ def topk_hash_softplus_sqrt(
     bias_vl: torch.Tensor | None = None,
     image_sentinel_lo: int = 0,
 ) -> None:
+    """Select routed experts with DeepSeek V4 softplus-sqrt scores.
+
+    Args:
+        topk_weights: Output tensor for selected routing weights.
+        topk_indices: Output tensor for selected expert indices.
+        token_expert_indices: Output tensor for token-to-expert mappings.
+        gating_output: Per-token router logits.
+        renormalize: Whether to normalize the selected routing weights.
+        routed_scaling_factor: Scale applied to the selected routing weights.
+        e_score_correction_bias: Optional text-token expert-selection bias.
+        input_tokens: Token IDs used by hash routing and vision routing.
+        hash_indices_table: Optional token-to-expert hash table.
+        is_padding: Optional mask identifying inactive rows.
+        bias_vl: Optional expert-selection bias for image sentinel tokens.
+        image_sentinel_lo: First ID in the five-token image sentinel range.
+            A value of zero disables image-token routing.
+
+    Returns:
+        None. The operation writes its results into the output tensors.
+    """
     torch.ops._moe_C.topk_softplus_sqrt(
         topk_weights,
         topk_indices,

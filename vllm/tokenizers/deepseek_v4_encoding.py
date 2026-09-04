@@ -209,6 +209,16 @@ def flatten_content_blocks(content: Any) -> Any:
     Image blocks are inlined as IMAGE_PLACEHOLDER at their position. The image
     data itself travels out of band (multi_modal_data) and is matched to
     placeholders by order. Plain-string content passes through unchanged.
+
+    Args:
+        content: Plain text or a list of OpenAI-compatible content blocks.
+
+    Returns:
+        Flattened text for block content, or the input unchanged when it is not
+        a list.
+
+    Raises:
+        ValueError: If a mapping has an unsupported content-block type.
     """
     if not isinstance(content, list):
         return content
