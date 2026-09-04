@@ -650,9 +650,7 @@ class EngineCore:
         self, scheduler_output: SchedulerOutput
     ) -> tuple[Future[Any], _ModelExecutionTiming | None]:
         timing = (
-            _ModelExecutionTiming()
-            if scheduler_output.compute_service_class is not None
-            else None
+            _ModelExecutionTiming() if scheduler_output.compute_timing_enabled else None
         )
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         return future, timing
@@ -664,8 +662,6 @@ class EngineCore:
     ) -> None:
         if timing is None:
             return
-        service_class = scheduler_output.compute_service_class
-        assert service_class is not None
         completed_at = timing.completed_at
         if completed_at is None:
             raise RuntimeError("model execution timing read before completion")
@@ -684,10 +680,14 @@ class EngineCore:
             if previous_completion is None
             else max(completed_at, previous_completion)
         )
+        service_class = scheduler_output.compute_service_class
+        if service_class is None:
+            return
         self.scheduler.record_compute_time(
             service_class,
             elapsed_seconds,
             contended=scheduler_output.compute_contention,
+            scheduled_tokens=scheduler_output.compute_service_tokens,
         )
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
@@ -921,16 +921,7 @@ class EngineCore:
         return self.scheduler.get_prefill_fairness()
 
     def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
-        """Apply a complete fairness configuration only at an idle boundary."""
-        if self.scheduler.has_unfinished_requests() or bool(self.batch_queue):
-            return {
-                "applied": False,
-                "reason": "busy",
-                "message": (
-                    "fairness policy can only be changed while the engine is idle"
-                ),
-                "config": self.scheduler.get_prefill_fairness(),
-            }
+        """Apply a fairness policy atomically between scheduler steps."""
         try:
             updated = self.scheduler.set_prefill_fairness(config)
         except (TypeError, ValueError) as exc:
