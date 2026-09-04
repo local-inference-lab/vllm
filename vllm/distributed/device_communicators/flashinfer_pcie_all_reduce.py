@@ -105,6 +105,12 @@ class FlashInferPcieIpcAllReducePool:
             return self._EAGER_CHANNEL_ID
         return channel_id
 
+    @property
+    def supports_all_peer_auxiliary(self) -> bool:
+        """Whether a workspace mapped every rank's CUDA IPC allocation."""
+
+        return bool(self._workspaces)
+
     def _verify_channel_id(self, channel_id: str) -> None:
         gathered: list[str | None] = [None] * self.world_size
         dist.all_gather_object(gathered, channel_id, group=self.group)
@@ -169,11 +175,15 @@ class FlashInferPcieIpcAllReducePool:
     ) -> None:
         del stream
         channel_id = self._active_channel_id or self._EAGER_CHANNEL_ID
-        if not self._workspace(channel_id).supports(inp):
+        workspace = self._workspace(channel_id)
+        if not workspace.supports(inp):
             raise ValueError(
                 "FlashInfer PCIe IPC graph warmup received an unsupported "
                 f"shape {tuple(inp.shape)}"
             )
+        hidden = inp.shape[-1]
+        batch = inp.numel() // hidden
+        workspace.prepare([(batch, hidden)], dtype=inp.dtype)
 
     def all_reduce(
         self,

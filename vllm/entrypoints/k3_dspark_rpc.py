@@ -1,0 +1,1903 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Host-staged RPC for a dedicated Kimi-K3 draft GPU.
+
+The verifier and RTX 3090 do not have CUDA peer access on the target host, so
+the first transport deliberately uses ZMQ multipart frames backed by host
+memory.  The protocol is small and versioned so a verifier-side proxy can be
+added without coupling the standalone process to the generic EAGLE draft
+server protocol.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+import torch
+import zmq
+
+from vllm.config.vllm import set_current_vllm_config
+from vllm.forward_context import set_forward_context
+from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.mla_attention import (
+    MLACommonDecodeMetadata,
+    MLACommonMetadata,
+)
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.worker.gpu.spec_decode.dspark.p2p_transport import (
+    P2P_CAPABILITY,
+    TOPK_LOGITS_P2P_CAPABILITY,
+)
+from vllm.v1.worker.gpu.spec_decode.dspark.p2p_transport import (
+    export_tensor as _export_cuda_tensor,
+)
+from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+    get_eagle3_aux_layers_from_config,
+)
+from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
+
+if TYPE_CHECKING:
+    from vllm.entrypoints.k3_dspark_standalone import StandaloneRuntime
+
+logger = init_logger(__name__)
+
+PROTOCOL_VERSION = 2
+
+
+@dataclass
+class _P2PBuffers:
+    """Peer-accessible context ring and reply slots on the draft GPU.
+
+    The verifier pushes the rows of one proposal into ``context[slot]`` and
+    pulls the top-k draft logits of one proposal from ``values[slot]`` /
+    ``indices[slot]``; a proposal names the slots it uses.
+    """
+
+    context: torch.Tensor  # [slots, rows, width] bf16
+    values: torch.Tensor  # [slots, requests, K, topk] bf16
+    indices: torch.Tensor  # [slots, requests, K, topk] int32
+    reply_slot: int = 0
+
+    def export(self) -> dict[str, Any]:
+        return {
+            "capability": P2P_CAPABILITY,
+            "context": _export_cuda_tensor(self.context),
+            "values": _export_cuda_tensor(self.values),
+            "indices": _export_cuda_tensor(self.indices),
+        }
+
+    def matches(self, context_shape, reply_shape) -> bool:
+        return tuple(self.context.shape) == tuple(context_shape) and tuple(
+            self.values.shape
+        ) == tuple(reply_shape)
+
+
+LOGITS_CAPABILITY = "dflash_logits_bf16_v1"
+TOPK_LOGITS_CAPABILITY = "dflash_logits_topk_bf16_v1"
+
+
+def _logits_mass_diag_ks() -> list[int]:
+    """K3_DRAFT_LOGITS_MASS_DIAG=k1,k2,...: log the draft probability mass
+    outside the top-k of every proposed position (temperature 1) so the
+    top-k transport width can be chosen from served traffic. Off when unset."""
+    raw = os.environ.get("K3_DRAFT_LOGITS_MASS_DIAG", "").strip()
+    if not raw:
+        return []
+    ks = sorted({int(v) for v in raw.split(",") if v.strip()})
+    if any(k <= 0 for k in ks):
+        raise ValueError("K3_DRAFT_LOGITS_MASS_DIAG entries must be positive")
+    return ks
+
+
+def _encode_topk_logits_frame(
+    logits: torch.Tensor,
+    k: int,
+    values_host: torch.Tensor | None = None,
+    indices_host: torch.Tensor | None = None,
+) -> tuple[dict[str, Any], bytes]:
+    """Encode the k largest draft logits per position as one binary frame.
+
+    Layout: BF16 values [requests, K, k] followed by int32 vocabulary
+    indices of the same shape. The target scatters them over a fill logit
+    and samples/verifies against that truncated distribution, so the
+    transport shrinks from vocab_size to k entries per position without
+    changing the target's output distribution.
+    """
+    if logits.dtype != torch.bfloat16:
+        raise ValueError(f"Draft logits must be bfloat16, got {logits.dtype}")
+    if logits.ndim != 3:
+        raise ValueError(
+            f"Draft logits must be [requests, K, vocab], got {logits.shape}"
+        )
+    vocab = int(logits.shape[-1])
+    if not 1 <= k <= vocab:
+        raise ValueError(f"logits_topk must be in [1, {vocab}], got {k}")
+    values, indices = torch.topk(logits.reshape(-1, vocab), k, dim=-1, sorted=False)
+    count = values.numel()
+    if values_host is not None and values_host.numel() >= count:
+        values_cpu = values_host[:count].view(values.shape)
+        values_cpu.copy_(values, non_blocking=True)
+    else:
+        values_cpu = values.cpu()
+    indices32 = indices.to(torch.int32)
+    if indices_host is not None and indices_host.numel() >= count:
+        indices_cpu = indices_host[:count].view(indices32.shape)
+        indices_cpu.copy_(indices32, non_blocking=True)
+    else:
+        indices_cpu = indices32.cpu()
+    torch.cuda.current_stream(logits.device).synchronize()
+    frame = (
+        values_cpu.view(torch.uint16).numpy().tobytes() + indices_cpu.numpy().tobytes()
+    )
+    shape = [int(logits.shape[0]), int(logits.shape[1]), k]
+    metadata = {
+        "capability": TOPK_LOGITS_CAPABILITY,
+        "dtype": "bfloat16",
+        "shape": shape,
+        "topk": k,
+        "nbytes_values": count * 2,
+        "nbytes_indices": count * 4,
+        "nbytes": len(frame),
+    }
+    return metadata, frame
+
+
+def _encode_bfloat16_logits_frame(
+    logits: torch.Tensor,
+    host_buffer: torch.Tensor | None = None,
+) -> tuple[dict[str, Any], bytes]:
+    """Encode contiguous draft logits as a versioned binary RPC frame.
+
+    ``host_buffer`` is an optional pinned staging tensor: the device-to-host
+    copy then runs as a DMA instead of a pageable staged copy.
+    """
+    if logits.dtype != torch.bfloat16:
+        raise ValueError(f"Draft logits must be bfloat16, got {logits.dtype}")
+    logits = logits.detach().contiguous()
+    if host_buffer is not None and host_buffer.numel() >= logits.numel():
+        logits_cpu = host_buffer[: logits.numel()].view(logits.shape)
+        logits_cpu.copy_(logits, non_blocking=True)
+        torch.cuda.current_stream(logits.device).synchronize()
+    else:
+        logits_cpu = logits.cpu()
+    frame = logits_cpu.view(torch.uint16).numpy().tobytes()
+    metadata = {
+        "capability": LOGITS_CAPABILITY,
+        "dtype": "bfloat16",
+        "shape": list(logits_cpu.shape),
+        "nbytes": len(frame),
+    }
+    return metadata, frame
+
+
+class ProjectedContextCache:
+    """Bounded, chunked cache of projected DSpark context states.
+
+    The standalone draft server keeps this cache on the draft device.  Keeping
+    the projected rows on CPU forced a blocking D2H copy after every proposal,
+    even though the rows are normally consumed again by the same GPU during a
+    prefix reconnect.  CPU remains the default for lightweight unit tests and
+    callers which explicitly want host storage.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        max_tokens: int,
+        chunk_size: int = 256,
+        initial_position: int = 0,
+        device: torch.device | str = "cpu",
+    ) -> None:
+        if hidden_size <= 0 or max_tokens <= 0 or chunk_size <= 0:
+            raise ValueError("Projected context cache dimensions must be positive")
+        if initial_position < 0:
+            raise ValueError("Projected context cache position cannot be negative")
+        self.hidden_size = hidden_size
+        self.max_tokens = max_tokens
+        self.chunk_size = chunk_size
+        self.device = torch.device(device)
+        self.start_position = initial_position
+        self.end_position = initial_position
+        self._chunks: dict[int, torch.Tensor] = {}
+
+    def _truncate(self, end_position: int) -> None:
+        if not self.start_position <= end_position <= self.end_position:
+            raise ValueError(
+                "Cannot truncate projected context outside its retained range: "
+                f"retained=[{self.start_position}, {self.end_position}), "
+                f"requested_end={end_position}"
+            )
+        first_discarded_chunk = (end_position + self.chunk_size - 1) // self.chunk_size
+        for chunk_idx in list(self._chunks):
+            if chunk_idx >= first_discarded_chunk:
+                del self._chunks[chunk_idx]
+        self.end_position = end_position
+
+    def append(self, first_position: int, states: torch.Tensor) -> None:
+        if states.device != self.device:
+            raise ValueError(
+                "Projected context cache device mismatch: "
+                f"cache={self.device}, states={states.device}"
+            )
+        if states.dtype != torch.bfloat16 or states.ndim != 2:
+            raise ValueError("Projected context states must be a 2D BF16 tensor")
+        if states.shape[1] != self.hidden_size:
+            raise ValueError(
+                f"Projected context width is {states.shape[1]}, expected "
+                f"{self.hidden_size}"
+            )
+        if first_position < self.start_position or first_position > self.end_position:
+            raise ValueError(
+                "Projected context append is not contiguous with retained state: "
+                f"retained=[{self.start_position}, {self.end_position}), "
+                f"first={first_position}"
+            )
+        if first_position < self.end_position:
+            self._truncate(first_position)
+
+        offset = 0
+        num_rows = int(states.shape[0])
+        while offset < num_rows:
+            position = first_position + offset
+            chunk_idx, chunk_offset = divmod(position, self.chunk_size)
+            count = min(num_rows - offset, self.chunk_size - chunk_offset)
+            chunk = self._chunks.get(chunk_idx)
+            if chunk is None:
+                chunk = torch.empty(
+                    (self.chunk_size, self.hidden_size),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+                self._chunks[chunk_idx] = chunk
+            chunk[chunk_offset : chunk_offset + count].copy_(
+                states[offset : offset + count]
+            )
+            offset += count
+
+        self.end_position = first_position + num_rows
+        self.start_position = max(
+            self.start_position,
+            self.end_position - self.max_tokens,
+        )
+        for chunk_idx in list(self._chunks):
+            if (chunk_idx + 1) * self.chunk_size <= self.start_position:
+                del self._chunks[chunk_idx]
+
+    def has_range(self, start_position: int, end_position: int) -> bool:
+        return (
+            self.start_position <= start_position <= end_position <= self.end_position
+        )
+
+    def read(self, start_position: int, end_position: int) -> torch.Tensor:
+        if not self.has_range(start_position, end_position):
+            raise ValueError(
+                "Projected context range is unavailable: "
+                f"retained=[{self.start_position}, {self.end_position}), "
+                f"requested=[{start_position}, {end_position})"
+            )
+        output = torch.empty(
+            (end_position - start_position, self.hidden_size),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        offset = 0
+        while start_position + offset < end_position:
+            position = start_position + offset
+            chunk_idx, chunk_offset = divmod(position, self.chunk_size)
+            count = min(
+                end_position - position,
+                self.chunk_size - chunk_offset,
+            )
+            chunk = self._chunks.get(chunk_idx)
+            if chunk is None:
+                raise RuntimeError(
+                    f"Projected context chunk {chunk_idx} is unexpectedly missing"
+                )
+            output[offset : offset + count].copy_(
+                chunk[chunk_offset : chunk_offset + count]
+            )
+            offset += count
+        return output
+
+    def truncate(self, end_position: int) -> None:
+        if end_position < self.end_position:
+            self._truncate(end_position)
+
+    @property
+    def allocated_bytes(self) -> int:
+        return sum(
+            chunk.numel() * chunk.element_size() for chunk in self._chunks.values()
+        )
+
+
+@dataclass
+class DraftRequestState:
+    request_id: str
+    slot: int
+    committed_end: int = 0
+    context_start: int = 0
+    context_cache: ProjectedContextCache | None = None
+
+
+class DraftKVSlotAllocator:
+    """Assign fixed rolling MLA block ranges to a small request batch."""
+
+    def __init__(
+        self,
+        *,
+        num_cache_blocks: int,
+        block_size: int,
+        window_size: int,
+        max_requests: int,
+    ) -> None:
+        if window_size <= 0 or window_size % block_size != 0:
+            raise ValueError(
+                "DSpark KV window must be a positive block-size multiple, got "
+                f"window={window_size}, block_size={block_size}"
+            )
+        self.block_size = block_size
+        self.window_size = window_size
+        self.max_requests = max_requests
+        # The vLLM rolling window may retain window + block_size - 1 tokens
+        # while it waits for the next whole-block shift.
+        self.blocks_per_request = window_size // block_size + 1
+        required = 1 + max_requests * self.blocks_per_request
+        if required > num_cache_blocks:
+            raise ValueError(
+                "Dedicated draft KV cache is too small for the requested rolling "
+                f"slots: required_blocks={required}, available={num_cache_blocks}"
+            )
+        self._free_slots = list(range(max_requests))
+        self._states: dict[str, DraftRequestState] = {}
+
+    def get_or_allocate(self, request_id: str) -> tuple[DraftRequestState, bool]:
+        state = self._states.get(request_id)
+        if state is not None:
+            return state, False
+        if not self._free_slots:
+            raise RuntimeError(
+                f"DSpark request capacity exhausted (max={self.max_requests})"
+            )
+        slot = self._free_slots.pop(0)
+        state = DraftRequestState(request_id=request_id, slot=slot)
+        self._states[request_id] = state
+        return state, True
+
+    def free(self, request_id: str) -> DraftRequestState | None:
+        state = self._states.pop(request_id, None)
+        if state is not None:
+            self._free_slots.append(state.slot)
+            self._free_slots.sort()
+        return state
+
+    def get(self, request_id: str) -> DraftRequestState | None:
+        return self._states.get(request_id)
+
+    def rebind(self, source_request_id: str, request_id: str) -> DraftRequestState:
+        state = self._states.get(source_request_id)
+        if state is None:
+            raise KeyError(f"Unknown DSpark source request {source_request_id!r}")
+        if source_request_id == request_id:
+            return state
+        if request_id in self._states:
+            raise ValueError(f"DSpark request {request_id!r} already exists")
+        del self._states[source_request_id]
+        state.request_id = request_id
+        self._states[request_id] = state
+        return state
+
+    def physical_block(self, state: DraftRequestState, position: int) -> int:
+        absolute_block = position // self.block_size
+        return (
+            1
+            + state.slot * self.blocks_per_request
+            + absolute_block % self.blocks_per_request
+        )
+
+    def cache_slot(self, state: DraftRequestState, position: int) -> int:
+        return self.physical_block(state, position) * self.block_size + (
+            position % self.block_size
+        )
+
+    def block_table(
+        self, state: DraftRequestState, sequence_end: int
+    ) -> tuple[list[int], int]:
+        if sequence_end <= 0:
+            raise ValueError(f"sequence_end must be positive, got {sequence_end}")
+        first_block = (
+            max(state.context_start, sequence_end - self.window_size) // self.block_size
+        )
+        end_block = (sequence_end + self.block_size - 1) // self.block_size
+        blocks = [
+            1
+            + state.slot * self.blocks_per_request
+            + absolute_block % self.blocks_per_request
+            for absolute_block in range(first_block, end_block)
+        ]
+        local_sequence_len = sequence_end - first_block * self.block_size
+        if local_sequence_len > self.window_size + self.block_size - 1:
+            raise AssertionError("rolling DSpark sequence length exceeded its window")
+        if len(blocks) > self.blocks_per_request:
+            raise AssertionError("rolling DSpark block table aliases a live block")
+        return blocks, local_sequence_len
+
+    def physical_block_range(self, state: DraftRequestState) -> slice:
+        start = 1 + state.slot * self.blocks_per_request
+        return slice(start, start + self.blocks_per_request)
+
+    @property
+    def active_requests(self) -> int:
+        return len(self._states)
+
+    @property
+    def request_ids(self) -> list[str]:
+        return list(self._states)
+
+
+@dataclass
+class _DraftCudaGraphState:
+    """Persistent inputs and output for one standalone draft graph shape."""
+
+    batch_size: int
+    num_speculative_tokens: int
+    query_len: int
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    slots: torch.Tensor
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    output_tokens: torch.Tensor
+    input_ids_host: torch.Tensor
+    positions_host: torch.Tensor
+    slots_host: torch.Tensor
+    seq_lens_host: torch.Tensor
+    block_table_host: torch.Tensor
+    attn_metadata: dict[str, Any]
+    slot_mapping: dict[str, torch.Tensor]
+    graph: torch.cuda.CUDAGraph | None = None
+    captured_hidden: torch.Tensor | None = None
+    captured_logits: torch.Tensor | None = None
+
+    def stage(
+        self,
+        *,
+        input_ids: list[int],
+        positions: list[int],
+        slots: list[int],
+        block_rows: list[list[int]],
+        seq_lens: list[int],
+    ) -> None:
+        """Copy one request batch into address-stable graph inputs."""
+        expected_tokens = self.batch_size * self.query_len
+        if not (
+            len(input_ids) == len(positions) == len(slots) == expected_tokens
+            and len(block_rows) == len(seq_lens) == self.batch_size
+        ):
+            raise ValueError("Draft CUDA graph input shape mismatch")
+
+        self.input_ids_host.copy_(torch.tensor(input_ids, dtype=torch.int64))
+        self.positions_host.copy_(torch.tensor(positions, dtype=torch.int64))
+        self.slots_host.copy_(torch.tensor(slots, dtype=torch.int64))
+        self.seq_lens_host.copy_(torch.tensor(seq_lens, dtype=torch.int32))
+        self.block_table_host.zero_()
+        for row_idx, row in enumerate(block_rows):
+            if len(row) > self.block_table_host.shape[1]:
+                raise ValueError(
+                    "Draft block table exceeds CUDA graph capacity: "
+                    f"row={len(row)}, capacity={self.block_table_host.shape[1]}"
+                )
+            self.block_table_host[row_idx, : len(row)].copy_(
+                torch.tensor(row, dtype=torch.int32)
+            )
+
+        # All copies and the replay are enqueued on the same stream. The
+        # proposal's final query event synchronizes before these pinned host
+        # buffers can be reused by the next (serialized) RPC.
+        self.input_ids.copy_(self.input_ids_host, non_blocking=True)
+        self.positions.copy_(self.positions_host, non_blocking=True)
+        self.slots.copy_(self.slots_host, non_blocking=True)
+        self.seq_lens.copy_(self.seq_lens_host, non_blocking=True)
+        self.block_table.copy_(self.block_table_host, non_blocking=True)
+
+
+def _ingest_graphs_enabled() -> bool:
+    """K3_DRAFT_INGEST_GRAPH=0 keeps the eager context ingest (diagnostics)."""
+    return os.environ.get("K3_DRAFT_INGEST_GRAPH", "1") == "1"
+
+
+@dataclass
+class _DraftIngestGraphState:
+    """Address-stable inputs and outputs of one captured context ingest.
+
+    One graph per appended row count: the raw target auxiliary rows are
+    combined into draft hidden states, projected to every layer's K/V,
+    normalized, rotated and written into the draft KV cache at the staged
+    slots. The combined states stay in ``context_states`` for the caller's
+    projected-context cache until the next replay overwrites them.
+    """
+
+    rows: int
+    context_in: torch.Tensor
+    positions_in: torch.Tensor
+    slots_in: torch.Tensor
+    slots_host: torch.Tensor
+    context_states: torch.Tensor | None = None
+    graph: torch.cuda.CUDAGraph | None = None
+
+
+class K3DSparkDraftEngine:
+    """Minimal greedy K3 draft scheduler backed by the 3090 KV cache."""
+
+    def __init__(
+        self,
+        runtime: StandaloneRuntime,
+        *,
+        max_requests: int,
+        window_size: int,
+        device: torch.device,
+    ) -> None:
+        self.runtime = runtime
+        self.model = runtime.model
+        self.method = runtime.method
+        self.device = device
+        self.max_model_len = int(runtime.vllm_config.model_config.max_model_len)
+        first_cache = next(iter(runtime.kv_caches.values()))
+        self.allocator = DraftKVSlotAllocator(
+            num_cache_blocks=int(first_cache.shape[0]),
+            block_size=runtime.kv_cache_block_size,
+            window_size=window_size,
+            max_requests=max_requests,
+        )
+        speculative_config = runtime.vllm_config.speculative_config
+        assert speculative_config is not None
+        draft_config = speculative_config.draft_model_config.hf_config
+        self.hidden_size = int(draft_config.hidden_size)
+        aux_layers = get_eagle3_aux_layers_from_config(speculative_config)
+        if not aux_layers:
+            raise ValueError(
+                f"K3 {self.method} config does not declare target auxiliary layers"
+            )
+        self.num_aux_layers = len(aux_layers)
+        target_hidden_size = int(
+            getattr(draft_config, "target_hidden_size", None)
+            or draft_config.hidden_size
+        )
+        self.raw_context_width = int(target_hidden_size * self.num_aux_layers)
+        self.mask_token_id = get_parallel_drafting_token_id(draft_config)
+        self.max_speculative_tokens = int(
+            runtime.vllm_config.speculative_config.num_speculative_tokens
+        )
+        self.max_context_tokens = int(
+            runtime.vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        self.prefix_cache_tokens = int(
+            os.environ.get(
+                "VLLM_K3_DRAFT_PREFIX_CACHE_TOKENS",
+                os.environ.get("VLLM_K3_DSPARK_PREFIX_CACHE_TOKENS", "131072"),
+            )
+        )
+        if self.prefix_cache_tokens < self.allocator.window_size:
+            raise ValueError(
+                "VLLM_K3_DRAFT_PREFIX_CACHE_TOKENS must be at least the "
+                f"draft KV window ({self.allocator.window_size}), got "
+                f"{self.prefix_cache_tokens}"
+            )
+        self._positions_staging = torch.empty(
+            self.max_context_tokens,
+            dtype=torch.int64,
+            pin_memory=True,
+        )
+        self._context_staging = torch.empty(
+            self.max_context_tokens * self.raw_context_width,
+            dtype=torch.bfloat16,
+            pin_memory=True,
+        )
+        self._lock = threading.Lock()
+        self.proposal_count = 0
+        self.last_latency_ms = 0.0
+        self.last_timing_ms: dict[str, float] = {}
+        self._timing_totals_ms: dict[str, float] = {}
+        self.cold_bootstrap_count = 0
+        self.reconnect_count = 0
+        self.last_reconnect_latency_ms = 0.0
+        self.cuda_graph_enabled = False
+        self.cuda_graph_capture_seconds = 0.0
+        self.cuda_graph_memory_gib = 0.0
+        self.cuda_graph_replay_count = 0
+        self.cuda_graph_eager_fallback_count = 0
+        self._cuda_graphs: dict[tuple[int, int], _DraftCudaGraphState] = {}
+        # Context ingest graphs keyed by appended row count (raw aux rows only;
+        # projected rows and larger appends run eagerly).
+        self._ingest_graphs: dict[int, _DraftIngestGraphState] = {}
+        self._p2p: _P2PBuffers | None = None
+        self.ingest_graph_replay_count = 0
+        self.ingest_graph_eager_count = 0
+        self._logits_host: torch.Tensor | None = None
+        self._topk_values_host: torch.Tensor | None = None
+        self._topk_indices_host: torch.Tensor | None = None
+        self._mass_diag_ks = _logits_mass_diag_ks()
+        self._mass_diag_rows = 0
+        self._mass_diag_sum: dict[int, float] = {k: 0.0 for k in self._mass_diag_ks}
+        self._mass_diag_max: dict[int, float] = {k: 0.0 for k in self._mass_diag_ks}
+
+    def _make_cuda_graph_state(
+        self,
+        batch_size: int,
+        num_speculative_tokens: int,
+    ) -> _DraftCudaGraphState:
+        if self.method == "dflash" and self.runtime.attn_metadata_builder is None:
+            raise RuntimeError("K3 DFlash attention metadata builder is missing")
+
+        query_len = (
+            num_speculative_tokens
+            if self.method == "dspark"
+            else 1 + num_speculative_tokens
+        )
+        num_tokens = batch_size * query_len
+        max_blocks = self.allocator.blocks_per_request
+        input_ids = torch.empty(num_tokens, dtype=torch.int64, device=self.device)
+        positions = torch.empty(num_tokens, dtype=torch.int64, device=self.device)
+        slots = torch.empty(num_tokens, dtype=torch.int64, device=self.device)
+        seq_lens = torch.empty(batch_size, dtype=torch.int32, device=self.device)
+        block_table = torch.zeros(
+            (batch_size, max_blocks), dtype=torch.int32, device=self.device
+        )
+        output_tokens = torch.empty(
+            (batch_size, num_speculative_tokens),
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+        input_ids_host = torch.empty(num_tokens, dtype=torch.int64, pin_memory=True)
+        positions_host = torch.empty(num_tokens, dtype=torch.int64, pin_memory=True)
+        slots_host = torch.empty(num_tokens, dtype=torch.int64, pin_memory=True)
+        seq_lens_host = torch.empty(batch_size, dtype=torch.int32, pin_memory=True)
+        block_table_host = torch.zeros(
+            (batch_size, max_blocks), dtype=torch.int32, pin_memory=True
+        )
+
+        # The graph's launch topology is shape-static, while seq_lens remains
+        # a live tensor. Triton BF16 attention uses seq_lens to bound the KV
+        # scan; this conservative upper bound therefore does not force every
+        # replay to scan the full rolling window.
+        max_seq_len = self.allocator.window_size + self.allocator.block_size - 1
+        query_start_cpu = torch.arange(
+            0,
+            (batch_size + 1) * query_len,
+            query_len,
+            dtype=torch.int32,
+        )
+        query_start_gpu = query_start_cpu.to(self.device)
+        if self.method == "dflash":
+            common = CommonAttentionMetadata(
+                query_start_loc=query_start_gpu,
+                query_start_loc_cpu=query_start_cpu,
+                seq_lens=seq_lens,
+                seq_lens_cpu_upper_bound=torch.full(
+                    (batch_size,), max_seq_len, dtype=torch.int32
+                ),
+                max_seq_len=max_seq_len,
+                num_reqs=batch_size,
+                num_actual_tokens=num_tokens,
+                max_query_len=query_len,
+                block_table_tensor=block_table,
+                slot_mapping=slots,
+                causal=True,
+            )
+            assert self.runtime.attn_metadata_builder is not None
+            metadata = self.runtime.attn_metadata_builder.build(0, common)
+        else:
+            metadata = MLACommonMetadata(
+                num_reqs=batch_size,
+                max_query_len=query_len,
+                max_seq_len=max_seq_len,
+                num_actual_tokens=num_tokens,
+                query_start_loc=query_start_gpu,
+                slot_mapping=slots,
+                num_decodes=batch_size,
+                num_decode_tokens=num_tokens,
+                num_prefills=0,
+                causal=False,
+                head_dim=int(next(iter(self.runtime.kv_caches.values())).shape[-1]),
+                prefill=None,
+                decode=MLACommonDecodeMetadata(
+                    block_table=block_table,
+                    seq_lens=seq_lens,
+                    dcp_tot_seq_lens=None,
+                ),
+            )
+        attn_metadata = {layer_name: metadata for layer_name in self.runtime.kv_caches}
+        slot_mapping = {layer_name: slots for layer_name in self.runtime.kv_caches}
+        state = _DraftCudaGraphState(
+            batch_size=batch_size,
+            num_speculative_tokens=num_speculative_tokens,
+            query_len=query_len,
+            input_ids=input_ids,
+            positions=positions,
+            slots=slots,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            output_tokens=output_tokens,
+            input_ids_host=input_ids_host,
+            positions_host=positions_host,
+            slots_host=slots_host,
+            seq_lens_host=seq_lens_host,
+            block_table_host=block_table_host,
+            attn_metadata=attn_metadata,
+            slot_mapping=slot_mapping,
+        )
+
+        # Seed capture with valid, isolated dummy sequences. Runtime replay
+        # overwrites every graph input before use.
+        dummy_input_ids: list[int] = []
+        dummy_positions: list[int] = []
+        dummy_slots: list[int] = []
+        dummy_rows: list[list[int]] = []
+        for request_idx in range(batch_size):
+            dummy_input_ids.append(0)
+            dummy_input_ids.extend([self.mask_token_id] * (query_len - 1))
+            dummy_positions.extend(range(query_len))
+            dummy_slots.extend(
+                request_idx * self.allocator.block_size + position
+                for position in range(query_len)
+            )
+            dummy_rows.append([request_idx])
+        state.stage(
+            input_ids=dummy_input_ids,
+            positions=dummy_positions,
+            slots=dummy_slots,
+            block_rows=dummy_rows,
+            seq_lens=[query_len] * batch_size,
+        )
+        return state
+
+    def _run_cuda_graph_state(
+        self,
+        state: _DraftCudaGraphState,
+    ) -> None:
+        num_tokens = state.batch_size * state.query_len
+        with (
+            set_current_vllm_config(self.runtime.draft_vllm_config),
+            set_forward_context(
+                state.attn_metadata,
+                self.runtime.draft_vllm_config,
+                num_tokens=num_tokens,
+                skip_compiled=True,
+                slot_mapping=state.slot_mapping,
+            ),
+        ):
+            hidden = self.model(
+                input_ids=state.input_ids,
+                positions=state.positions,
+            )
+        if self.method == "dflash":
+            sample_hidden = hidden.view(state.batch_size, state.query_len, -1)[:, 1:]
+            logits = self.model.compute_logits(
+                sample_hidden.reshape(
+                    state.batch_size * state.num_speculative_tokens, -1
+                )
+            )
+            state.output_tokens.copy_(
+                logits.argmax(dim=-1).view(
+                    state.batch_size, state.num_speculative_tokens
+                )
+            )
+        else:
+            logits = self.model.compute_draft_logits(hidden).view(
+                state.batch_size, state.query_len, -1
+            )
+            previous = state.input_ids.view(state.batch_size, state.query_len)[:, 0]
+            for step in range(state.query_len):
+                markov = self.model.markov_bias(self.model.markov_embed(previous))
+                previous = (logits[:, step] + markov).argmax(dim=-1)
+                state.output_tokens[:, step].copy_(previous)
+        # Retain graph-owned outputs so their backing allocations cannot be
+        # recycled while captured nodes still reference them.
+        state.captured_hidden = hidden
+        state.captured_logits = logits
+
+    @torch.inference_mode()
+    def capture_cuda_graphs(self, *, warmups: int = 2) -> None:
+        """Capture all DSpark or DFlash shapes selectable by this server."""
+        if warmups < 1:
+            raise ValueError("Draft CUDA graph capture requires at least one warmup")
+        if self._cuda_graphs:
+            return
+
+        started = time.perf_counter()
+        allocated_before = torch.cuda.memory_allocated(self.device)
+        capture_stream = torch.cuda.Stream(device=self.device)
+        capture_stream.wait_stream(torch.cuda.current_stream(self.device))
+        # Capture the largest shape first. Triton MLA grows shared workspace
+        # buffers on demand; capturing a smaller shape first and then resizing
+        # that workspace for B2/K3 leaves the earlier graph with stale device
+        # pointers and causes an illegal access on replay.
+        shapes = [
+            (batch_size, depth)
+            for batch_size in range(
+                self.runtime.vllm_config.scheduler_config.max_num_seqs,
+                0,
+                -1,
+            )
+            for depth in range(self.max_speculative_tokens, 0, -1)
+        ]
+        logger.info(
+            "Capturing %d standalone K3 %s CUDA graphs on %s: %s",
+            len(shapes),
+            self.method,
+            self.device,
+            ", ".join(f"B{batch_size}K{depth}" for batch_size, depth in shapes),
+        )
+        with torch.cuda.stream(capture_stream):
+            for batch_size, depth in shapes:
+                state = self._make_cuda_graph_state(batch_size, depth)
+                for _ in range(warmups):
+                    self._run_cuda_graph_state(state)
+                capture_stream.synchronize()
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(
+                    graph,
+                    stream=capture_stream,
+                ):
+                    self._run_cuda_graph_state(state)
+                state.graph = graph
+                self._cuda_graphs[(batch_size, depth)] = state
+
+        if self.method == "dflash" and _ingest_graphs_enabled():
+            self._capture_ingest_graphs(capture_stream, warmups=warmups)
+        torch.cuda.current_stream(self.device).wait_stream(capture_stream)
+        torch.cuda.synchronize(self.device)
+        # Dummy capture rows only touch these reserved low blocks. Block zero
+        # is never assigned; live request allocation clears its own full range.
+        max_dummy_blocks = int(self.runtime.vllm_config.scheduler_config.max_num_seqs)
+        for cache in self.runtime.kv_caches.values():
+            cache[:max_dummy_blocks].zero_()
+        torch.cuda.synchronize(self.device)
+
+        self.cuda_graph_enabled = True
+        self.cuda_graph_capture_seconds = time.perf_counter() - started
+        self.cuda_graph_memory_gib = max(
+            0.0,
+            (torch.cuda.memory_allocated(self.device) - allocated_before) / 1024**3,
+        )
+        logger.info(
+            "Standalone K3 %s CUDA graphs ready in %.2fs; allocated_delta=%.3f GiB",
+            self.method,
+            self.cuda_graph_capture_seconds,
+            self.cuda_graph_memory_gib,
+        )
+
+    @property
+    def cuda_graph_shapes(self) -> list[str]:
+        return [
+            f"B{batch_size}K{depth}" for batch_size, depth in sorted(self._cuda_graphs)
+        ]
+
+    def _clear_state_cache(
+        self,
+        state: DraftRequestState,
+        *,
+        clear_context: bool = True,
+    ) -> None:
+        block_range = self.allocator.physical_block_range(state)
+        for cache in self.runtime.kv_caches.values():
+            cache[block_range].zero_()
+        state.committed_end = 0
+        state.context_start = 0
+        if clear_context:
+            state.context_cache = None
+
+    def reset(self, request_ids: list[str]) -> None:
+        with self._lock:
+            for request_id in request_ids:
+                state, _ = self.allocator.get_or_allocate(request_id)
+                self._clear_state_cache(state)
+
+    def free(self, request_ids: list[str]) -> None:
+        with self._lock:
+            for request_id in request_ids:
+                self.allocator.free(request_id)
+
+    def clear(self) -> None:
+        self.free(self.allocator.request_ids)
+
+    @property
+    def prefix_cache_bytes(self) -> int:
+        return sum(
+            state.context_cache.allocated_bytes
+            for request_id in self.allocator.request_ids
+            if (state := self.allocator.get(request_id)) is not None
+            and state.context_cache is not None
+        )
+
+    @property
+    def prefix_cache_host_bytes(self) -> int:
+        return sum(
+            state.context_cache.allocated_bytes
+            for request_id in self.allocator.request_ids
+            if (state := self.allocator.get(request_id)) is not None
+            and state.context_cache is not None
+            and state.context_cache.device.type == "cpu"
+        )
+
+    @property
+    def prefix_cache_device_bytes(self) -> int:
+        return self.prefix_cache_bytes - self.prefix_cache_host_bytes
+
+    @property
+    def mean_timing_ms(self) -> dict[str, float]:
+        if self.proposal_count <= 0:
+            return {}
+        return {
+            key: value / self.proposal_count
+            for key, value in self._timing_totals_ms.items()
+        }
+
+    def _record_logits_mass(self, draft_logits: torch.Tensor) -> None:
+        """Accumulate the draft probability mass outside each diagnostic top-k."""
+        rows = draft_logits.reshape(-1, draft_logits.shape[-1]).float()
+        probs = torch.softmax(rows, dim=-1)
+        sorted_probs = torch.sort(probs, dim=-1, descending=True).values
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        outside = {
+            k: (1.0 - cumulative[:, k - 1]).clamp_(min=0.0)
+            for k in self._mass_diag_ks
+            if k <= rows.shape[-1]
+        }
+        for k, values in outside.items():
+            self._mass_diag_sum[k] += float(values.sum())
+            self._mass_diag_max[k] = max(self._mass_diag_max[k], float(values.max()))
+        self._mass_diag_rows += int(rows.shape[0])
+        if self._mass_diag_rows >= 1024:
+            logger.info(
+                "Draft logits mass outside top-k over %d positions (T=1): %s",
+                self._mass_diag_rows,
+                ", ".join(
+                    f"k={k}: mean {self._mass_diag_sum[k] / self._mass_diag_rows:.2e} "
+                    f"max {self._mass_diag_max[k]:.2e}"
+                    for k in self._mass_diag_ks
+                ),
+            )
+            self._mass_diag_rows = 0
+            for k in self._mass_diag_ks:
+                self._mass_diag_sum[k] = 0.0
+                self._mass_diag_max[k] = 0.0
+
+    def _record_timing(self, timing_ms: dict[str, float]) -> None:
+        self.last_timing_ms = timing_ms
+        for key, value in timing_ms.items():
+            self._timing_totals_ms[key] = self._timing_totals_ms.get(key, 0.0) + value
+
+    def _restore_projected_context(
+        self,
+        state: DraftRequestState,
+        prefix_end: int,
+    ) -> int:
+        context_cache = state.context_cache
+        if context_cache is None:
+            raise ValueError(
+                f"No projected context is retained for {state.request_id!r}"
+            )
+        restore_start = max(0, prefix_end - self.allocator.window_size)
+        restore_start = (
+            restore_start // self.allocator.block_size * self.allocator.block_size
+        )
+        # reconnect-partial-window: a source that was cold-bootstrapped from a
+        # cache-restored prefix retains context only from that position on.
+        # Start where the cache actually begins (rounded up to a whole block)
+        # instead of refusing the reconnect outright.
+        if restore_start < context_cache.start_position:
+            block_size = self.allocator.block_size
+            restore_start = (
+                (context_cache.start_position + block_size - 1)
+                // block_size
+                * block_size
+            )
+        if not context_cache.has_range(restore_start, prefix_end):
+            raise ValueError(
+                f"Projected context for {state.request_id!r} cannot restore "
+                f"prefix_end={prefix_end}; retained="
+                f"[{context_cache.start_position}, {context_cache.end_position})"
+            )
+
+        self._clear_state_cache(state, clear_context=False)
+        for start in range(restore_start, prefix_end, self.max_context_tokens):
+            end = min(prefix_end, start + self.max_context_tokens)
+            context_states = context_cache.read(start, end)
+            positions = torch.arange(start, end, dtype=torch.int64)
+            context_gpu = context_states.to(self.device, non_blocking=True)
+            positions_gpu = positions.to(self.device, non_blocking=True)
+            slots = torch.tensor(
+                [
+                    self.allocator.cache_slot(state, position)
+                    for position in range(start, end)
+                ],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.model.precompute_and_store_context_kv(
+                context_gpu,
+                positions_gpu,
+                slots,
+            )
+        state.committed_end = prefix_end
+        state.context_start = restore_start
+        context_cache.truncate(prefix_end)
+        return restore_start
+
+    def reconnect(
+        self,
+        source_request_id: str,
+        request_id: str,
+        prefix_end: int,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        with self._lock:
+            state = self.allocator.get(source_request_id)
+            if state is None:
+                raise KeyError(f"Unknown DSpark source request {source_request_id!r}")
+            context_cache = state.context_cache
+            restore_start = max(0, prefix_end - self.allocator.window_size)
+            restore_start = (
+                restore_start // self.allocator.block_size * self.allocator.block_size
+            )
+            # reconnect-partial-window: mirror the clamp applied by
+            # _restore_projected_context so this guard accepts the same range.
+            if context_cache is not None and restore_start < (
+                context_cache.start_position
+            ):
+                block_size = self.allocator.block_size
+                restore_start = (
+                    (context_cache.start_position + block_size - 1)
+                    // block_size
+                    * block_size
+                )
+            if (
+                prefix_end <= 0
+                or context_cache is None
+                or not context_cache.has_range(restore_start, prefix_end)
+            ):
+                retained = (
+                    None
+                    if context_cache is None
+                    else [context_cache.start_position, context_cache.end_position]
+                )
+                raise ValueError(
+                    f"Cannot reconnect {source_request_id!r} at {prefix_end}; "
+                    f"retained={retained}"
+                )
+            state = self.allocator.rebind(source_request_id, request_id)
+            restored_start = self._restore_projected_context(state, prefix_end)
+            torch.accelerator.synchronize()
+            self.reconnect_count += 1
+            self.last_reconnect_latency_ms = (time.perf_counter() - started) * 1000
+            return {
+                "ok": True,
+                "protocol": PROTOCOL_VERSION,
+                "request_id": request_id,
+                "restored_start": restored_start,
+                "prefix_end": prefix_end,
+                "latency_ms": self.last_reconnect_latency_ms,
+                "active_requests": self.allocator.active_requests,
+            }
+
+    def _decode_host_tensor(
+        self,
+        frame: bytes,
+        *,
+        dtype: torch.dtype,
+        shape: tuple[int, ...],
+    ) -> torch.Tensor:
+        element_size = torch.tensor([], dtype=dtype).element_size()
+        expected = element_size
+        for dim in shape:
+            expected *= dim
+        if len(frame) != expected:
+            raise ValueError(
+                f"Tensor frame has {len(frame)} bytes, expected {expected} for "
+                f"shape={shape}, dtype={dtype}"
+            )
+        source = torch.frombuffer(frame, dtype=dtype)
+        if dtype == torch.int64:
+            staging = self._positions_staging
+        elif dtype == torch.bfloat16:
+            staging = self._context_staging
+        else:
+            raise TypeError(f"Unsupported DSpark RPC tensor dtype: {dtype}")
+        if source.numel() > staging.numel():
+            raise ValueError(
+                f"Tensor frame exceeds pinned staging capacity: "
+                f"elements={source.numel()}, capacity={staging.numel()}"
+            )
+        output = staging[: source.numel()]
+        output.copy_(source)
+        return output.view(shape)
+
+    @property
+    def max_ingest_graph_rows(self) -> int:
+        """Largest per-proposal context append that replays a captured graph:
+        every request contributes at most 1 + K accepted rows per step."""
+        return int(self.runtime.vllm_config.scheduler_config.max_num_seqs) * (
+            1 + self.max_speculative_tokens
+        )
+
+    def _run_ingest_graph_state(self, state: _DraftIngestGraphState) -> None:
+        context_states = self.model.combine_hidden_states(state.context_in)
+        self.model.precompute_and_store_context_kv(
+            context_states,
+            state.positions_in,
+            state.slots_in,
+        )
+        state.context_states = context_states
+
+    def _capture_ingest_graphs(
+        self, capture_stream: torch.cuda.Stream, *, warmups: int
+    ) -> None:
+        """Capture the raw-context ingest for every row count of one decode step.
+
+        Capture rows write dummy K/V into block zero, which no live request
+        ever owns; the caller zeroes the reserved blocks afterwards.
+        """
+        max_rows = self.max_ingest_graph_rows
+        block_size = self.allocator.block_size
+        if max_rows > block_size:
+            # Dummy slots must stay inside the reserved block-zero range.
+            max_rows = block_size
+        with torch.cuda.stream(capture_stream):
+            for rows in range(max_rows, 0, -1):
+                state = _DraftIngestGraphState(
+                    rows=rows,
+                    context_in=torch.zeros(
+                        (rows, self.raw_context_width),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    ),
+                    positions_in=torch.arange(
+                        rows, dtype=torch.int64, device=self.device
+                    ),
+                    slots_in=torch.arange(rows, dtype=torch.int64, device=self.device),
+                    slots_host=torch.empty(rows, dtype=torch.int64, pin_memory=True),
+                )
+                for _ in range(warmups):
+                    self._run_ingest_graph_state(state)
+                capture_stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=capture_stream):
+                    self._run_ingest_graph_state(state)
+                state.graph = graph
+                self._ingest_graphs[rows] = state
+        logger.info(
+            "Standalone K3 dflash context-ingest CUDA graphs ready for 1..%d rows",
+            max_rows,
+        )
+
+    def _stage_p2p_reply(
+        self,
+        draft_logits: torch.Tensor,
+        logits_topk: int,
+        requested_slot: Any = None,
+    ) -> dict[str, Any]:
+        """Write the top-k draft logits of this proposal into a reply slot.
+
+        The verifier names the slot (it enqueues the pull before the reply
+        arrives) and alternates it per proposal so the pull of one reply
+        never races the write of the next; without a named slot the server
+        alternates on its own.
+        """
+        buffers = self._p2p
+        if buffers is None:
+            raise ValueError("PROPOSE requests a peer reply before P2P_OPEN")
+        requests, steps, vocab = (int(v) for v in draft_logits.shape)
+        slots, max_requests, max_steps, topk = (int(v) for v in buffers.values.shape)
+        if topk != logits_topk:
+            raise ValueError(
+                f"Peer reply slots hold top-{topk} logits, proposal asks for "
+                f"{logits_topk}"
+            )
+        if requests > max_requests or steps > max_steps:
+            raise ValueError("Proposal exceeds the peer reply slot geometry")
+        values, indices = torch.topk(
+            draft_logits.reshape(-1, vocab), logits_topk, dim=-1, sorted=False
+        )
+        if requested_slot is None:
+            slot = buffers.reply_slot
+            buffers.reply_slot = (slot + 1) % slots
+        else:
+            slot = int(requested_slot)
+            if not 0 <= slot < slots:
+                raise ValueError(f"Peer reply slot {slot} out of range")
+        buffers.values[slot, :requests, :steps].copy_(
+            values.view(requests, steps, topk)
+        )
+        buffers.indices[slot, :requests, :steps].copy_(
+            indices.view(requests, steps, topk).to(torch.int32)
+        )
+        torch.cuda.current_stream(draft_logits.device).synchronize()
+        return {
+            "capability": TOPK_LOGITS_P2P_CAPABILITY,
+            "dtype": "bfloat16",
+            "shape": [requests, steps, logits_topk],
+            "topk": logits_topk,
+            "p2p_reply_slot": slot,
+        }
+
+    def _append_context(
+        self,
+        states: list[DraftRequestState],
+        context_counts: list[int],
+        positions_cpu: torch.Tensor,
+        context_cpu: torch.Tensor | None,
+        *,
+        projected: bool,
+        context_gpu: torch.Tensor | None = None,
+    ) -> None:
+        if positions_cpu.numel() == 0:
+            return
+        total_rows = int(positions_cpu.numel())
+        ingest = None if projected else self._ingest_graphs.get(total_rows)
+        if ingest is None:
+            positions = positions_cpu.to(self.device, non_blocking=True)
+            if context_gpu is not None:
+                context_input = context_gpu
+            else:
+                assert context_cpu is not None
+                context_input = context_cpu.to(self.device, non_blocking=True)
+            context_states = (
+                context_input
+                if projected
+                else self.model.combine_hidden_states(context_input)
+            )
+            if not projected:
+                self.ingest_graph_eager_count += 1
+        else:
+            # The host tensors are views of the pinned RPC staging buffers and
+            # the peer rows live in the ring slot named by the proposal; the
+            # next (serialized) RPC overwrites either only after this
+            # proposal's final event has been synchronized.
+            if context_gpu is not None:
+                ingest.context_in.copy_(context_gpu, non_blocking=True)
+            else:
+                assert context_cpu is not None
+                ingest.context_in.copy_(context_cpu, non_blocking=True)
+            ingest.positions_in.copy_(positions_cpu, non_blocking=True)
+
+        slots: list[int] = []
+        offset = 0
+        for state, count in zip(states, context_counts):
+            req_positions = positions_cpu[offset : offset + count]
+            if count:
+                first = int(req_positions[0])
+                if first > state.committed_end:
+                    raise ValueError(
+                        f"Context gap for {state.request_id!r}: "
+                        f"expected <= {state.committed_end}, got {first}"
+                    )
+                expected = torch.arange(first, first + count, dtype=torch.int64)
+                if not torch.equal(req_positions, expected):
+                    raise ValueError(
+                        f"Context positions for {state.request_id!r} are not contiguous"
+                    )
+                state.committed_end = int(req_positions[-1]) + 1
+                slots.extend(
+                    self.allocator.cache_slot(state, int(position))
+                    for position in req_positions
+                )
+            offset += count
+        if ingest is None:
+            slot_mapping = torch.tensor(slots, dtype=torch.int64, device=self.device)
+            self.model.precompute_and_store_context_kv(
+                context_states,
+                positions,
+                slot_mapping,
+            )
+        else:
+            ingest.slots_host.copy_(torch.tensor(slots, dtype=torch.int64))
+            ingest.slots_in.copy_(ingest.slots_host, non_blocking=True)
+            assert ingest.graph is not None
+            ingest.graph.replay()
+            self.ingest_graph_replay_count += 1
+            context_states = ingest.context_states
+            assert context_states is not None
+        offset = 0
+        for state, count in zip(states, context_counts):
+            if count:
+                first_position = int(positions_cpu[offset])
+                if state.context_cache is None:
+                    state.context_cache = ProjectedContextCache(
+                        hidden_size=self.hidden_size,
+                        max_tokens=self.prefix_cache_tokens,
+                        initial_position=first_position,
+                        device=self.device,
+                    )
+                state.context_cache.append(
+                    first_position,
+                    context_states[offset : offset + count],
+                )
+            offset += count
+
+    def _run_query_block(
+        self,
+        states: list[DraftRequestState],
+        anchor_positions: list[int],
+        anchor_token_ids: list[int],
+        num_speculative_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        batch_size = len(states)
+        sample_from_anchor = self.method == "dspark"
+        query_len = (
+            num_speculative_tokens if sample_from_anchor else 1 + num_speculative_tokens
+        )
+        input_ids: list[int] = []
+        positions: list[int] = []
+        slots: list[int] = []
+        block_rows: list[list[int]] = []
+        seq_lens: list[int] = []
+
+        for state, anchor_position, anchor_token_id in zip(
+            states, anchor_positions, anchor_token_ids
+        ):
+            if anchor_position != state.committed_end:
+                raise ValueError(
+                    f"Anchor position for {state.request_id!r} must equal the "
+                    f"committed context end ({state.committed_end}), got "
+                    f"{anchor_position}"
+                )
+            sequence_end = anchor_position + query_len
+            if sequence_end > self.max_model_len:
+                raise ValueError(
+                    f"Draft query exceeds max_model_len={self.max_model_len}: "
+                    f"end={sequence_end}"
+                )
+            input_ids.append(anchor_token_id)
+            input_ids.extend([self.mask_token_id] * (query_len - 1))
+            req_positions = range(anchor_position, sequence_end)
+            positions.extend(req_positions)
+            slots.extend(
+                self.allocator.cache_slot(state, position)
+                for position in range(anchor_position, sequence_end)
+            )
+            row, local_seq_len = self.allocator.block_table(state, sequence_end)
+            block_rows.append(row)
+            seq_lens.append(local_seq_len)
+
+        if self.cuda_graph_enabled:
+            graph_state = self._cuda_graphs.get((batch_size, num_speculative_tokens))
+            if graph_state is not None:
+                graph_state.stage(
+                    input_ids=input_ids,
+                    positions=positions,
+                    slots=slots,
+                    block_rows=block_rows,
+                    seq_lens=seq_lens,
+                )
+                assert graph_state.graph is not None
+                graph_state.graph.replay()
+                self.cuda_graph_replay_count += 1
+                logits = graph_state.captured_logits
+                if self.method == "dflash":
+                    assert logits is not None
+                    logits = logits.view(
+                        batch_size,
+                        num_speculative_tokens,
+                        -1,
+                    )
+                return graph_state.output_tokens, logits
+            self.cuda_graph_eager_fallback_count += 1
+
+        max_blocks = max(len(row) for row in block_rows)
+        block_table = torch.zeros(
+            (batch_size, max_blocks), dtype=torch.int32, device=self.device
+        )
+        for row_idx, row in enumerate(block_rows):
+            block_table[row_idx, : len(row)] = torch.tensor(
+                row, dtype=torch.int32, device=self.device
+            )
+        input_ids_gpu = torch.tensor(input_ids, dtype=torch.int64, device=self.device)
+        positions_gpu = torch.tensor(positions, dtype=torch.int64, device=self.device)
+        slots_gpu = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        seq_lens_gpu = torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
+        query_start_loc = torch.arange(
+            0,
+            (batch_size + 1) * query_len,
+            query_len,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        if self.method == "dflash":
+            query_start_loc_cpu = torch.arange(
+                0,
+                (batch_size + 1) * query_len,
+                query_len,
+                dtype=torch.int32,
+            )
+            common = CommonAttentionMetadata(
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=seq_lens_gpu,
+                seq_lens_cpu_upper_bound=torch.tensor(seq_lens, dtype=torch.int32),
+                max_seq_len=max(seq_lens),
+                num_reqs=batch_size,
+                num_actual_tokens=batch_size * query_len,
+                max_query_len=query_len,
+                block_table_tensor=block_table,
+                slot_mapping=slots_gpu,
+                causal=True,
+            )
+            if self.runtime.attn_metadata_builder is None:
+                raise RuntimeError("K3 DFlash attention metadata builder is missing")
+            metadata = self.runtime.attn_metadata_builder.build(0, common)
+        else:
+            metadata = MLACommonMetadata(
+                num_reqs=batch_size,
+                max_query_len=query_len,
+                max_seq_len=max(seq_lens),
+                num_actual_tokens=batch_size * query_len,
+                query_start_loc=query_start_loc,
+                slot_mapping=slots_gpu,
+                num_decodes=batch_size,
+                num_decode_tokens=batch_size * query_len,
+                num_prefills=0,
+                causal=False,
+                head_dim=int(next(iter(self.runtime.kv_caches.values())).shape[-1]),
+                prefill=None,
+                decode=MLACommonDecodeMetadata(
+                    block_table=block_table,
+                    seq_lens=seq_lens_gpu,
+                    dcp_tot_seq_lens=None,
+                ),
+            )
+        attn_metadata = {layer_name: metadata for layer_name in self.runtime.kv_caches}
+        slot_mapping = {layer_name: slots_gpu for layer_name in self.runtime.kv_caches}
+        with (
+            set_current_vllm_config(self.runtime.draft_vllm_config),
+            set_forward_context(
+                attn_metadata,
+                self.runtime.draft_vllm_config,
+                num_tokens=batch_size * query_len,
+                skip_compiled=True,
+                slot_mapping=slot_mapping,
+            ),
+        ):
+            hidden = self.model(input_ids=input_ids_gpu, positions=positions_gpu)
+
+        if self.method == "dflash":
+            sample_hidden = hidden.view(batch_size, query_len, -1)[:, 1:]
+            logits = self.model.compute_logits(
+                sample_hidden.reshape(batch_size * num_speculative_tokens, -1)
+            )
+            logits = logits.view(batch_size, num_speculative_tokens, -1)
+            return logits.argmax(dim=-1), logits
+
+        base_logits = self.model.compute_draft_logits(hidden).view(
+            batch_size, query_len, -1
+        )
+        previous = torch.tensor(anchor_token_ids, dtype=torch.int64, device=self.device)
+        draft_tokens = torch.empty(
+            (batch_size, query_len), dtype=torch.int64, device=self.device
+        )
+        for step in range(query_len):
+            markov = self.model.markov_bias(self.model.markov_embed(previous))
+            previous = (base_logits[:, step] + markov).argmax(dim=-1)
+            draft_tokens[:, step].copy_(previous)
+        return draft_tokens, None
+
+    @torch.inference_mode()
+    def open_p2p(self, header: dict[str, Any]) -> dict[str, Any]:
+        """Allocate (or reuse) the peer-accessible buffers and export them.
+
+        The verifier states the ring geometry it will push (context rows per
+        proposal, context width, ring slots) and the reply geometry it will
+        pull (requests, speculative steps, top-k width, reply slots).
+        """
+        if self.method != "dflash":
+            raise ValueError("Peer transport is supported only for DFlash")
+        rows = int(header.get("context_rows", 0))
+        width = int(header.get("context_width", 0))
+        context_slots = int(header.get("context_slots", 0))
+        requests = int(header.get("max_requests", 0))
+        steps = int(header.get("num_speculative_tokens", 0))
+        topk = int(header.get("logits_topk", 0))
+        reply_slots = int(header.get("reply_slots", 0))
+        if min(rows, width, context_slots, requests, steps, topk, reply_slots) <= 0:
+            raise ValueError(f"P2P_OPEN geometry must be positive: {header}")
+        if width != self.raw_context_width:
+            raise ValueError(
+                f"P2P context width {width} does not match the draft's "
+                f"{self.raw_context_width}"
+            )
+        if requests > self.allocator.max_requests:
+            raise ValueError(
+                f"P2P reply requests {requests} exceed the draft's "
+                f"{self.allocator.max_requests}"
+            )
+        if steps > self.max_speculative_tokens:
+            raise ValueError(
+                f"P2P reply depth {steps} exceeds the draft's "
+                f"{self.max_speculative_tokens}"
+            )
+        context_shape = (context_slots, rows, width)
+        reply_shape = (reply_slots, requests, steps, topk)
+        with self._lock:
+            buffers = self._p2p
+            if buffers is None or not buffers.matches(context_shape, reply_shape):
+                torch.cuda.synchronize(self.device)
+                self._p2p = _P2PBuffers(
+                    context=torch.zeros(
+                        context_shape, dtype=torch.bfloat16, device=self.device
+                    ),
+                    values=torch.zeros(
+                        reply_shape, dtype=torch.bfloat16, device=self.device
+                    ),
+                    indices=torch.zeros(
+                        reply_shape, dtype=torch.int32, device=self.device
+                    ),
+                )
+            assert self._p2p is not None
+            exported = self._p2p.export()
+        exported.update({"ok": True, "protocol": PROTOCOL_VERSION})
+        logger.info(
+            "K3 %s peer transport exported: context %s, reply %s",
+            self.method,
+            list(context_shape),
+            list(reply_shape),
+        )
+        return exported
+
+    @torch.inference_mode()
+    def propose(self, header: dict[str, Any], frames: list[bytes]) -> dict[str, Any]:
+        started = time.perf_counter()
+        requests = header.get("requests")
+        if not isinstance(requests, list) or not requests:
+            raise ValueError("PROPOSE requires a non-empty requests list")
+        if len(requests) > self.allocator.max_requests:
+            raise ValueError(
+                f"Batch has {len(requests)} requests, max is "
+                f"{self.allocator.max_requests}"
+            )
+        num_speculative_tokens = int(
+            header.get("num_speculative_tokens", self.max_speculative_tokens)
+        )
+        if not 1 <= num_speculative_tokens <= self.max_speculative_tokens:
+            raise ValueError(
+                f"num_speculative_tokens must be in [1, {self.max_speculative_tokens}]"
+            )
+        return_logits = bool(header.get("return_logits", False))
+        if return_logits and self.method != "dflash":
+            raise ValueError("Probabilistic logits are supported only for DFlash")
+        logits_topk = int(header.get("logits_topk", 0))
+        if logits_topk < 0:
+            raise ValueError("logits_topk cannot be negative")
+        projected = bool(header.get("projected", False))
+        context_counts = [int(req.get("context_count", 0)) for req in requests]
+        if any(count < 0 for count in context_counts):
+            raise ValueError("context_count cannot be negative")
+        total_context = sum(context_counts)
+        expected_frames = 2 if total_context else 0
+        context_width = self.hidden_size if projected else self.raw_context_width
+        p2p_context_slot = header.get("p2p_context_slot")
+        context_gpu: torch.Tensor | None = None
+        if p2p_context_slot is not None:
+            # The verifier pushed the context rows into the peer ring before
+            # sending this header; only the positions travel as a frame.
+            if projected:
+                raise ValueError("Peer context transport carries raw rows only")
+            buffers = self._p2p
+            if buffers is None:
+                raise ValueError("PROPOSE names a peer context slot before P2P_OPEN")
+            slot = int(p2p_context_slot)
+            if not 0 <= slot < int(buffers.context.shape[0]):
+                raise ValueError(f"Peer context slot {slot} out of range")
+            if total_context > int(buffers.context.shape[1]):
+                raise ValueError(
+                    f"Peer context of {total_context} rows exceeds the ring slot"
+                )
+            expected_frames = 1 if total_context else 0
+        if len(frames) != expected_frames:
+            raise ValueError(
+                f"PROPOSE expected {expected_frames} tensor frames, got {len(frames)}"
+            )
+        if total_context:
+            positions_cpu = self._decode_host_tensor(
+                frames[0], dtype=torch.int64, shape=(total_context,)
+            )
+            if p2p_context_slot is not None:
+                context_cpu = None
+                assert self._p2p is not None
+                context_gpu = self._p2p.context[int(p2p_context_slot), :total_context]
+            else:
+                context_cpu = self._decode_host_tensor(
+                    frames[1],
+                    dtype=torch.bfloat16,
+                    shape=(total_context, context_width),
+                )
+        else:
+            positions_cpu = torch.empty(0, dtype=torch.int64)
+            context_cpu = torch.empty((0, context_width), dtype=torch.bfloat16)
+        decoded_at = time.perf_counter()
+
+        lock_started = time.perf_counter()
+        with self._lock:
+            lock_acquired = time.perf_counter()
+            gpu_start = torch.cuda.Event(enable_timing=True)
+            context_end = torch.cuda.Event(enable_timing=True)
+            query_end = torch.cuda.Event(enable_timing=True)
+            gpu_start.record()
+            states: list[DraftRequestState] = []
+            for req in requests:
+                request_id = req.get("request_id")
+                if not isinstance(request_id, str) or not request_id:
+                    raise ValueError("Every request requires a non-empty request_id")
+                state, created = self.allocator.get_or_allocate(request_id)
+                if bool(req.get("reset", False)) or created:
+                    self._clear_state_cache(state)
+                    reset_position = int(req.get("reset_position", 0))
+                    if not 0 <= reset_position <= self.max_model_len:
+                        raise ValueError(
+                            "Draft reset_position must be in model bounds, got "
+                            f"{reset_position}"
+                        )
+                    state.committed_end = reset_position
+                    state.context_start = reset_position
+                    if reset_position:
+                        self.cold_bootstrap_count += 1
+                states.append(state)
+            self._append_context(
+                states,
+                context_counts,
+                positions_cpu,
+                context_cpu,
+                projected=projected,
+                context_gpu=context_gpu,
+            )
+            context_end.record()
+            anchor_positions = [int(req["anchor_position"]) for req in requests]
+            anchor_token_ids = [int(req["anchor_token_id"]) for req in requests]
+            draft_tokens, draft_logits = self._run_query_block(
+                states,
+                anchor_positions,
+                anchor_token_ids,
+                num_speculative_tokens,
+            )
+            query_end.record()
+            submit_done = time.perf_counter()
+            query_end.synchronize()
+            sync_done = time.perf_counter()
+            tokens = draft_tokens.cpu().tolist()
+            tokens_copied = time.perf_counter()
+            logits_metadata = None
+            logits_frame = None
+            p2p_reply = bool(header.get("p2p_reply", False))
+            if return_logits and logits_topk > 0 and p2p_reply:
+                assert draft_logits is not None
+                logits_metadata = self._stage_p2p_reply(
+                    draft_logits, logits_topk, header.get("p2p_reply_slot")
+                )
+            elif return_logits and logits_topk > 0:
+                assert draft_logits is not None
+                count = (
+                    int(draft_logits.shape[0])
+                    * int(draft_logits.shape[1])
+                    * logits_topk
+                )
+                if (
+                    self._topk_values_host is None
+                    or self._topk_values_host.numel() < count
+                ):
+                    self._topk_values_host = torch.empty(
+                        count, dtype=torch.bfloat16, pin_memory=True
+                    )
+                    self._topk_indices_host = torch.empty(
+                        count, dtype=torch.int32, pin_memory=True
+                    )
+                logits_metadata, logits_frame = _encode_topk_logits_frame(
+                    draft_logits,
+                    logits_topk,
+                    self._topk_values_host,
+                    self._topk_indices_host,
+                )
+            elif return_logits:
+                assert draft_logits is not None
+                if (
+                    self._logits_host is None
+                    or self._logits_host.numel() < draft_logits.numel()
+                ):
+                    self._logits_host = torch.empty(
+                        draft_logits.numel(), dtype=torch.bfloat16, pin_memory=True
+                    )
+                logits_metadata, logits_frame = _encode_bfloat16_logits_frame(
+                    draft_logits, self._logits_host
+                )
+            if logits_metadata is not None:
+                logits_metadata["sample_positions"] = [
+                    [
+                        anchor_position + step + 1
+                        for step in range(num_speculative_tokens)
+                    ]
+                    for anchor_position in anchor_positions
+                ]
+            if self._mass_diag_ks and draft_logits is not None:
+                self._record_logits_mass(draft_logits)
+            logits_copied = time.perf_counter()
+            self.proposal_count += 1
+            self.last_latency_ms = (logits_copied - started) * 1000
+            timing_ms = {
+                "decode_frames": (decoded_at - started) * 1000,
+                "lock_wait": (lock_acquired - lock_started) * 1000,
+                "host_submit": (submit_done - lock_acquired) * 1000,
+                "gpu_context": gpu_start.elapsed_time(context_end),
+                "gpu_query": context_end.elapsed_time(query_end),
+                "gpu_wait": (sync_done - submit_done) * 1000,
+                "tokens_d2h": (tokens_copied - sync_done) * 1000,
+                "logits_d2h": (logits_copied - tokens_copied) * 1000,
+                "total": self.last_latency_ms,
+            }
+            self._record_timing(timing_ms)
+        response = {
+            "ok": True,
+            "protocol": PROTOCOL_VERSION,
+            "tokens": tokens,
+            "logits": logits_metadata,
+            "latency_ms": self.last_latency_ms,
+            "timing_ms": timing_ms,
+            "active_requests": self.allocator.active_requests,
+        }
+        if logits_frame is not None:
+            response["_logits_frame"] = logits_frame
+        return response
+
+
+class K3DSparkZMQServer:
+    def __init__(
+        self,
+        engine: K3DSparkDraftEngine,
+        *,
+        address: str,
+        stop: threading.Event,
+    ) -> None:
+        self.server_id = f"{os.getpid()}-{int(time.time() * 1000)}"
+        self.engine = engine
+        self.address = address
+        self.stop = stop
+        self.ready = threading.Event()
+        self.error: str | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="k3-draft-zmq",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+        if not self.ready.wait(timeout=10):
+            raise TimeoutError(f"K3 draft proposal socket did not bind: {self.address}")
+        if self.error is not None:
+            raise RuntimeError(self.error)
+
+    def join(self, timeout: float = 5.0) -> None:
+        self._thread.join(timeout=timeout)
+
+    def _handle(self, parts: list[bytes]) -> dict[str, Any]:
+        response = self._dispatch(parts)
+        # Every reply names the server process, so a verifier that kept its
+        # peer mappings across a draft restart reopens them (the exported
+        # allocations died with the old process).
+        response.setdefault("server_id", self.server_id)
+        return response
+
+    def _dispatch(self, parts: list[bytes]) -> dict[str, Any]:
+        if not parts:
+            raise ValueError("Empty DSpark RPC message")
+        header = json.loads(parts[0])
+        if not isinstance(header, dict):
+            raise ValueError("DSpark RPC header must be a JSON object")
+        if int(header.get("protocol", -1)) != PROTOCOL_VERSION:
+            raise ValueError(
+                f"Unsupported protocol {header.get('protocol')}; "
+                f"expected {PROTOCOL_VERSION}"
+            )
+        op = str(header.get("op", "")).upper()
+        if op == "PING":
+            return {
+                "ok": True,
+                "protocol": PROTOCOL_VERSION,
+                "op": "PONG",
+                "method": self.engine.method,
+                "active_requests": self.engine.allocator.active_requests,
+                "max_requests": self.engine.allocator.max_requests,
+                "block_size": self.engine.allocator.block_size,
+                "window_size": self.engine.allocator.window_size,
+                "prefix_cache_tokens": self.engine.prefix_cache_tokens,
+                "prefix_cache_device": str(self.engine.device),
+                "cold_bootstrap_count": self.engine.cold_bootstrap_count,
+                "cuda_graph_enabled": self.engine.cuda_graph_enabled,
+                "cuda_graph_shapes": self.engine.cuda_graph_shapes,
+                "capabilities": (
+                    [LOGITS_CAPABILITY, P2P_CAPABILITY]
+                    if self.engine.method == "dflash"
+                    else []
+                ),
+            }
+        if op == "P2P_OPEN":
+            return self.engine.open_p2p(header)
+        if op == "CLEAR":
+            self.engine.clear()
+            return {
+                "ok": True,
+                "protocol": PROTOCOL_VERSION,
+                "active_requests": 0,
+            }
+        if op in ("RESET", "FREE"):
+            request_ids = header.get("request_ids")
+            if not isinstance(request_ids, list) or not all(
+                isinstance(req_id, str) and req_id for req_id in request_ids
+            ):
+                raise ValueError(f"{op} requires request_ids: list[str]")
+            if op == "RESET":
+                self.engine.reset(request_ids)
+            else:
+                self.engine.free(request_ids)
+            return {
+                "ok": True,
+                "protocol": PROTOCOL_VERSION,
+                "active_requests": self.engine.allocator.active_requests,
+            }
+        if op == "RECONNECT":
+            source_request_id = header.get("source_request_id")
+            request_id = header.get("request_id")
+            if not isinstance(source_request_id, str) or not source_request_id:
+                raise ValueError("RECONNECT requires source_request_id")
+            if not isinstance(request_id, str) or not request_id:
+                raise ValueError("RECONNECT requires request_id")
+            return self.engine.reconnect(
+                source_request_id,
+                request_id,
+                int(header.get("prefix_end", 0)),
+            )
+        if op == "PROPOSE":
+            return self.engine.propose(header, parts[1:])
+        raise ValueError(f"Unknown K3 draft RPC operation: {op!r}")
+
+    def _run(self) -> None:
+        context = zmq.Context()
+        socket = context.socket(zmq.REP)
+        socket.setsockopt(zmq.LINGER, 0)
+        try:
+            socket.bind(self.address)
+            logger.info(
+                "K3 %s proposal RPC listening on %s",
+                self.engine.method,
+                self.address,
+            )
+            self.ready.set()
+            poller = zmq.Poller()
+            poller.register(socket, zmq.POLLIN)
+            while not self.stop.is_set():
+                if not dict(poller.poll(250)).get(socket):
+                    continue
+                try:
+                    response = self._handle(socket.recv_multipart())
+                except Exception as exc:
+                    logger.exception("K3 DSpark proposal request failed")
+                    response = {
+                        "ok": False,
+                        "protocol": PROTOCOL_VERSION,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                logits_frame = response.pop("_logits_frame", None)
+                if logits_frame is None:
+                    socket.send_json(response)
+                else:
+                    socket.send_multipart([json.dumps(response).encode(), logits_frame])
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+            logger.exception("K3 DSpark proposal server failed")
+            self.ready.set()
+        finally:
+            socket.close()
+            context.term()
