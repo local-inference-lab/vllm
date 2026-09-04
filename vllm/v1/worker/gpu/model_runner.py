@@ -159,7 +159,6 @@ from vllm.v1.worker.utils import (
     KVBlockZeroer,
     copy_kv_cache_blocks_inplace,
     group_kv_caches_for_copy,
-    should_defer_draft_after_partial_dcp_resume,
 )
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
@@ -2132,20 +2131,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.verification_capacity_manager.recommended_draft_depth(
                     num_spec_tokens_to_schedule
                 )
-            )
-        cached_tokens = self.req_states.num_cached_tokens_np[input_batch.idx_mapping_np]
-        if should_defer_draft_after_partial_dcp_resume(
-            cache_dtype=self.cache_config.cache_dtype,
-            dcp_size=self.dcp_size,
-            block_size=self.cache_config.block_size,
-            is_prefilling=input_batch.is_prefilling_np,
-            num_cached_tokens=cached_tokens,
-        ):
-            num_spec_tokens_to_schedule = 0
-            logger.info_once(
-                "Deferring one draft proposal after an fp8_ds_mla partial "
-                "DCP cache resume; speculative decoding resumes after the "
-                "target-only alignment token."
             )
 
         # Last rank: sample tokens

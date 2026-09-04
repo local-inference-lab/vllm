@@ -1,15 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import numpy as np
 import torch
 
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
-from vllm.v1.worker.utils import (
-    bind_kv_cache,
-    copy_kv_cache_blocks_inplace,
-    should_defer_draft_after_partial_dcp_resume,
-)
+from vllm.v1.worker.utils import bind_kv_cache, copy_kv_cache_blocks_inplace
 
 
 def test_bind_kv_cache(default_vllm_config):
@@ -147,30 +142,3 @@ def test_copy_kv_cache_blocks_scopes_tagged_copy_to_group() -> None:
 
     assert torch.equal(attention_cache[5], attention_cache[1])
     assert torch.equal(recurrent_cache[5], torch.full_like(recurrent_cache[5], 55))
-
-
-def test_defer_draft_only_for_partial_packed_dcp_resume() -> None:
-    kwargs = {
-        "cache_dtype": "fp8_ds_mla",
-        "dcp_size": 8,
-        "block_size": 1536,
-        "is_prefilling": np.array([True]),
-    }
-
-    assert should_defer_draft_after_partial_dcp_resume(
-        **kwargs, num_cached_tokens=np.array([4608])
-    )
-    assert not should_defer_draft_after_partial_dcp_resume(
-        **kwargs, num_cached_tokens=np.array([12288])
-    )
-    assert not should_defer_draft_after_partial_dcp_resume(
-        **kwargs, num_cached_tokens=np.array([0])
-    )
-    assert not should_defer_draft_after_partial_dcp_resume(
-        **(kwargs | {"cache_dtype": "fp8"}),
-        num_cached_tokens=np.array([4608]),
-    )
-    assert not should_defer_draft_after_partial_dcp_resume(
-        **(kwargs | {"is_prefilling": np.array([False])}),
-        num_cached_tokens=np.array([4608]),
-    )

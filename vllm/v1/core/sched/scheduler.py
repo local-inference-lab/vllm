@@ -70,6 +70,27 @@ from vllm.v1.utils import compute_iteration_details, record_function_or_nullcont
 logger = init_logger(__name__)
 
 
+def should_defer_draft_for_partial_packed_dcp_resume(
+    *,
+    cache_dtype: str,
+    dcp_size: int,
+    block_size: int,
+    cached_tokens: int,
+    num_computed_tokens: int,
+    num_scheduled_tokens: int,
+    num_prompt_tokens: int,
+) -> bool:
+    """Return whether the final resumed prefill must emit no draft placeholder."""
+    if cache_dtype != "fp8_ds_mla" or dcp_size <= 1 or cached_tokens <= 0:
+        return False
+    if cached_tokens % (block_size * dcp_size) == 0:
+        return False
+    return (
+        num_computed_tokens < num_prompt_tokens
+        and num_computed_tokens + num_scheduled_tokens == num_prompt_tokens
+    )
+
+
 def use_eagle_for_target_cache(
     speculative_config: Any | None,
     kv_cache_groups: Iterable[Any],
@@ -1281,6 +1302,34 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = min(
                 num_spec_tokens_to_schedule,
                 self.dynamic_sd_lookup[len(num_scheduled_tokens)],
+            )
+        scheduled_requests = itertools.chain(
+            scheduled_running_reqs,
+            scheduled_new_reqs,
+            scheduled_resumed_reqs,
+        )
+        if num_spec_tokens_to_schedule > 0 and any(
+            request.prefill_stats is not None
+            and should_defer_draft_for_partial_packed_dcp_resume(
+                cache_dtype=self.cache_config.cache_dtype,
+                dcp_size=self.dcp_world_size,
+                block_size=self.block_size,
+                cached_tokens=request.prefill_stats.num_cached_tokens,
+                num_computed_tokens=request.num_computed_tokens,
+                num_scheduled_tokens=num_scheduled_tokens[request.request_id],
+                num_prompt_tokens=request.num_prompt_tokens,
+            )
+            for request in scheduled_requests
+        ):
+            # Async scheduling creates the next step's fixed-width draft
+            # placeholders from this value before worker output arrives. The
+            # final partial-DCP resume step must therefore suppress the
+            # placeholder here; worker-side trimming is too late.
+            num_spec_tokens_to_schedule = 0
+            logger.info_once(
+                "Scheduling one target-only transition after an fp8_ds_mla "
+                "partial DCP cache resume; speculative decoding resumes on "
+                "the following step."
             )
 
         scheduled_encoder_input_stats = None
