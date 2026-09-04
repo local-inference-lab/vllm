@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.attention import mla_attention
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.mla import b12x_mla
@@ -73,6 +75,236 @@ def test_b12x_mla_plans_local_interleaved_dcp_cache() -> None:
     )
 
     assert b12x_mla._max_dcp_local_cache_tokens(config) == 131_072
+
+
+def test_b12x_mla_uses_distinct_packed_cache_and_query_dtypes() -> None:
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype="fp8_ds_mla"),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+
+    assert b12x_mla._planned_kv_dtype(config) is torch.uint8
+    assert b12x_mla._planned_query_dtype(config) is torch.bfloat16
+
+
+def test_b12x_mla_caps_packed_dense_split_scratch() -> None:
+    assert b12x_mla._packed_dense_split_capacity(1) == 1
+    assert b12x_mla._packed_dense_split_capacity(4096) == 64
+    assert b12x_mla._packed_dense_split_capacity(131_072) == 64
+
+
+def test_b12x_mla_plans_packed_reader_as_exact_dense(monkeypatch) -> None:
+    captured = SimpleNamespace(caps=None)
+
+    class FakeSparseMLA:
+        class Caps(SimpleNamespace):
+            __dataclass_fields__ = {"partial_dtype": None}
+
+        @staticmethod
+        def plan(caps):
+            captured.caps = caps
+            return SimpleNamespace(caps=caps)
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=8),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+    )
+    monkeypatch.setattr(b12x_mla, "_load_sparse_mla", lambda: FakeSparseMLA)
+
+    plan = b12x_mla._create_packed_dense_mla_plan(
+        config,
+        torch.device("cuda"),
+        page_size=1536,
+        num_q_heads=64,
+        max_total_q=16,
+        max_cache_tokens=131_072,
+    )
+
+    assert plan.caps is captured.caps
+    assert captured.caps.kv_dtype is torch.uint8
+    assert captured.caps.dtype is torch.bfloat16
+    assert captured.caps.max_width == 131_072
+    assert captured.caps.max_chunks_per_row == 64
+    assert captured.caps.max_page_table_width == 86
+    assert captured.caps.page_size == 1536
+    assert not captured.caps.head_major_output
+    assert captured.caps.partial_dtype is torch.float32
+
+
+def test_b12x_mla_packed_reader_partial_dtype_follows_env(monkeypatch) -> None:
+    class Caps(SimpleNamespace):
+        __dataclass_fields__ = {"partial_dtype": None}
+
+    class LegacyCaps(SimpleNamespace):
+        __dataclass_fields__: dict[str, object] = {}
+
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE", "fp32")
+    assert b12x_mla._packed_dense_plan_caps_kwargs(SimpleNamespace(Caps=Caps)) == {
+        "partial_dtype": torch.float32
+    }
+    with pytest.raises(RuntimeError, match="partial_dtype"):
+        b12x_mla._packed_dense_plan_caps_kwargs(SimpleNamespace(Caps=LegacyCaps))
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE", "bf16")
+    assert b12x_mla._packed_dense_plan_caps_kwargs(SimpleNamespace(Caps=Caps)) == {
+        "partial_dtype": torch.bfloat16
+    }
+    assert (
+        b12x_mla._packed_dense_plan_caps_kwargs(SimpleNamespace(Caps=LegacyCaps)) == {}
+    )
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE", "fp16")
+    with pytest.raises(ValueError, match="VLLM_K3_PACKED_MLA_PARTIAL_DTYPE"):
+        b12x_mla._packed_dense_partial_dtype()
+
+
+def test_b12x_mla_packed_reader_split_policy_follows_env(monkeypatch) -> None:
+    def run_decode_with_policy(*, binding, kv_cache, split_policy="static", **kwargs):
+        del binding, kv_cache, kwargs, split_policy
+
+    def run_decode_legacy(*, binding, kv_cache, **kwargs):
+        del binding, kv_cache, kwargs
+
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_SPLIT_POLICY", "balanced")
+    assert b12x_mla._packed_dense_run_kwargs(run_decode_with_policy) == {
+        "split_policy": "balanced"
+    }
+    with pytest.raises(RuntimeError, match="split_policy"):
+        b12x_mla._packed_dense_run_kwargs(run_decode_legacy)
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_SPLIT_POLICY", "static")
+    assert b12x_mla._packed_dense_run_kwargs(run_decode_with_policy) == {
+        "split_policy": "static"
+    }
+    assert b12x_mla._packed_dense_run_kwargs(run_decode_legacy) == {}
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_SPLIT_POLICY", "dynamic")
+    with pytest.raises(ValueError, match="VLLM_K3_PACKED_MLA_SPLIT_POLICY"):
+        b12x_mla._packed_dense_split_policy()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_b12x_mla_materializes_every_paged_dense_slot() -> None:
+    block_table = torch.tensor([[2, 5]], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([6], dtype=torch.int32, device="cuda")
+    output = torch.empty((1, 8), dtype=torch.int32, device="cuda")
+
+    b12x_mla._materialize_paged_dense_indices(
+        block_table,
+        seq_lens,
+        output,
+        page_size=4,
+    )
+
+    torch.testing.assert_close(
+        output.cpu(),
+        torch.tensor([[8, 9, 10, 11, 20, 21, -1, -1]], dtype=torch.int32),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "split_policy,partial_dtype",
+    [("static", "bf16"), ("balanced", "fp32")],
+)
+def test_b12x_mla_packed_reader_matches_reference_with_1536_token_pages(
+    monkeypatch, split_policy: str, partial_dtype: str
+) -> None:
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_SPLIT_POLICY", split_policy)
+    monkeypatch.setattr(
+        b12x_mla.envs, "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE", partial_dtype
+    )
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("requires SM120 or SM121")
+    sparse_mla = pytest.importorskip("b12x.attention.sparse_mla")
+    reference = pytest.importorskip("b12x.attention._shared.mla.reference")
+
+    torch.manual_seed(20260904)
+    device = torch.device("cuda")
+    page_size = 1536
+    num_tokens = 1600
+    selected_width = 1600
+    num_heads = 8
+    scale = 1.0 / math.sqrt(192)
+
+    block_table = torch.tensor([[1, 0]], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([num_tokens], dtype=torch.int32, device=device)
+    selected_indices = torch.empty(
+        (1, selected_width), dtype=torch.int32, device=device
+    )
+    b12x_mla._materialize_paged_dense_indices(
+        block_table,
+        seq_lens,
+        selected_indices,
+        page_size=page_size,
+    )
+
+    cache = torch.zeros((2, page_size, 656), dtype=torch.uint8, device=device)
+    kv_c = torch.randn((num_tokens, 512), dtype=torch.bfloat16, device=device).div_(4)
+    k_pe = torch.randn((num_tokens, 64), dtype=torch.bfloat16, device=device).div_(4)
+    ops.concat_and_cache_mla(
+        kv_c,
+        k_pe,
+        cache,
+        selected_indices[0].to(torch.int64),
+        "fp8_ds_mla",
+        torch.ones((), dtype=torch.float32, device=device),
+    )
+    q = torch.randn((1, num_heads, 576), dtype=torch.bfloat16, device=device).div_(4)
+
+    plan = sparse_mla.plan(
+        sparse_mla.Caps(
+            device=device,
+            num_q_heads=num_heads,
+            max_q_rows=1,
+            max_width=selected_width,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.uint8,
+            head_dim=576,
+            v_head_dim=512,
+            mode="decode",
+            max_batch=1,
+            max_page_table_width=2,
+            max_chunks_per_row=25,
+            page_size=page_size,
+            head_major_output=False,
+            **b12x_mla._packed_dense_plan_caps_kwargs(sparse_mla),
+        )
+    )
+    scratch_spec = plan.scratch_specs()[0]
+    metadata = SimpleNamespace(
+        dense_mla_plan=plan,
+        dense_mla_scratch=torch.empty(
+            scratch_spec.shape,
+            dtype=scratch_spec.dtype,
+            device=device,
+        ),
+        dense_mla_selected_indices=selected_indices,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        decode=SimpleNamespace(block_table=block_table, seq_lens=seq_lens),
+    )
+    impl, _ = _fake_packed_impl(num_heads=num_heads)
+    impl._packed_dense_run = sparse_mla.run_decode
+    impl._packed_dense_run_kwargs = b12x_mla._packed_dense_run_kwargs(
+        sparse_mla.run_decode
+    )
+
+    output, lse = impl.forward_mqa(q, cache, metadata, layer=SimpleNamespace())
+    expected, expected_lse = reference.sparse_mla_reference(
+        q_all=q,
+        kv_cache=cache.view(-1, 1, 656),
+        page_table_1=selected_indices,
+        active_token_counts=seq_lens,
+        sm_scale=scale,
+        v_head_dim=512,
+        return_lse=True,
+    )
+    torch.accelerator.synchronize()
+
+    cosine = torch.nn.functional.cosine_similarity(
+        output.float().flatten(), expected.float().flatten(), dim=0
+    )
+    assert float(cosine.item()) > 0.995
+    torch.testing.assert_close(output.float(), expected.float(), rtol=0.05, atol=0.05)
+    assert lse is not None
+    expected_lse_natural = expected_lse.float() * math.log(2.0)
+    torch.testing.assert_close(lse.float(), expected_lse_natural, rtol=0.02, atol=0.05)
 
 
 def test_mla_uses_one_kv_shard_for_replicated_dcp_cache() -> None:
@@ -199,6 +431,98 @@ def _fake_impl(monkeypatch, *, num_heads: int = 8) -> tuple[B12xMLAImpl, _FakeDe
     dense_mla = _FakeDenseMLA()
     impl._dense_mla = dense_mla
     return impl, dense_mla
+
+
+class _FakePackedPlan:
+    caps = SimpleNamespace(
+        max_page_table_width=4,
+        max_chunks_per_row=4,
+        page_size=16,
+    )
+
+    def __init__(self) -> None:
+        self.bindings: list[SimpleNamespace] = []
+
+    def bind(self, **kwargs):
+        binding = SimpleNamespace(**kwargs)
+        self.bindings.append(binding)
+        return binding
+
+
+class _FakePackedRun:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        q = kwargs["binding"].q
+        output = torch.zeros(
+            (q.shape[0], q.shape[1], 512),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        lse = torch.zeros(q.shape[:2], dtype=torch.float32, device=q.device)
+        return output, lse
+
+
+def _fake_packed_impl(*, num_heads: int = 8) -> tuple[B12xMLAImpl, _FakePackedRun]:
+    impl = object.__new__(B12xMLAImpl)
+    impl.num_heads = num_heads
+    impl.kv_lora_rank = 512
+    impl.scale = 192**-0.5
+    impl.dcp_world_size = 1
+    impl._dcp_comm_backend = "a2a"
+    impl._dcp_max_batch_size = 16
+    impl.dcp_q_replicate = False
+    impl._compiled_bindings = set()
+    impl._uses_packed_ds_mla = True
+    packed_run = _FakePackedRun()
+    impl._packed_dense_run = packed_run
+    impl._packed_dense_run_kwargs = {"split_policy": "balanced"}
+    impl._dense_mla = None
+    return impl, packed_run
+
+
+def test_b12x_mla_adapter_runs_packed_cache_as_exact_dense() -> None:
+    impl, packed_run = _fake_packed_impl()
+    plan = _FakePackedPlan()
+    batch = 2
+    q = torch.randn(batch, 8, 576, dtype=torch.bfloat16)
+    cache = torch.zeros(4, 16, 656, dtype=torch.uint8)
+    seq_lens = torch.tensor([17, 31], dtype=torch.int32)
+    selected_indices = torch.arange(32, dtype=torch.int32).expand(batch, -1).clone()
+    metadata = SimpleNamespace(
+        dense_mla_plan=plan,
+        dense_mla_scratch=torch.empty(256, dtype=torch.uint8),
+        dense_mla_selected_indices=selected_indices,
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        decode=SimpleNamespace(
+            block_table=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+            seq_lens=seq_lens,
+        ),
+    )
+    layer = SimpleNamespace(
+        _q_scale=torch.tensor(0.25),
+        _k_scale=torch.tensor(0.5),
+    )
+
+    output, lse = impl.forward_mqa(q, cache, metadata, layer)
+
+    assert output.shape == (batch, 8, 512)
+    assert lse is not None and lse.shape == (batch, 8)
+    binding = plan.bindings[0]
+    assert binding.q is q
+    assert binding.selected_indices is selected_indices
+    assert binding.cache_seqlens_int32 is seq_lens
+    assert binding.nsa_cache_seqlens_int32 is seq_lens
+    call = packed_run.calls[0]
+    assert call["kv_cache"].data_ptr() == cache.data_ptr()
+    assert call["kv_cache"].shape == cache.shape
+    assert call["kv_cache"].dtype is torch.uint8
+    assert call["forced_num_splits"] == 4
+    assert call["return_lse"] is True
+    assert call["lse_scale"] == "natural"
+    assert call["split_policy"] == "balanced"
 
 
 def test_b12x_mla_adapter_binds_common_decode_metadata(monkeypatch) -> None:
