@@ -136,6 +136,12 @@ if [[ "${lmcache_mode}" != "off" \
   && "${lmcache_transfer_mode}" != "engine_driven" ]]; then
   direct_lmcache=1
 fi
+engine_driven_lmcache=0
+if [[ "${lmcache_mode}" != "off" \
+  && "${lmcache_mode}" != "0" \
+  && "${lmcache_transfer_mode}" == "engine_driven" ]]; then
+  engine_driven_lmcache=1
+fi
 vision_direct_lmcache=0
 text_direct_lmcache=0
 if [[ "${direct_lmcache}" == "1" && "${model_variant}" == "vision" ]]; then
@@ -390,7 +396,16 @@ if [[ "${sp_async_tp}" == "1" ]]; then
 fi
 
 if [[ -z "${gpu_memory_utilization}" ]]; then
-  if [[ "${vision_direct_lmcache}" == "1" ]]; then
+  if [[ "${engine_driven_lmcache}" == "1" \
+    && "${mode}" == "dspark" \
+    && "${tp_size}" == "2" \
+    && "${max_model_len}" -ge 1048576 ]]; then
+    # Engine-driven transfer performs GPU gathers in the existing vLLM
+    # workers and keeps the standalone cache server CPU-only. A 0.970 budget
+    # provides more than one million GPU KV tokens on 96 GiB TP2 GPUs while
+    # retaining measured runtime headroom during a one-million-token store.
+    gpu_memory_utilization=0.970
+  elif [[ "${vision_direct_lmcache}" == "1" ]]; then
     # Direct LMCache transfer opens one CUDA IPC client per TP rank after the
     # vLLM memory estimate. The TP2 profile reserves enough physical memory for
     # those late allocations and an uncached 810k-token plus ten-image overlap.
@@ -437,7 +452,17 @@ allow_unqualified_lmcache_memory=$(bool_value \
   LMCACHE_ALLOW_UNQUALIFIED_MEMORY_PROFILE \
   "${LMCACHE_ALLOW_UNQUALIFIED_MEMORY_PROFILE:-0}")
 lmcache_memory_profile=standard
-if [[ "${text_direct_lmcache}" == "1" \
+if [[ "${engine_driven_lmcache}" == "1" \
+  && "${mode}" == "dspark" \
+  && "${tp_size}" == "2" \
+  && "${max_model_len}" -ge 1048576 ]]; then
+  if awk -v value="${gpu_memory_utilization}" \
+    'BEGIN { exit !((value + 0) <= 0.970) }'; then
+    lmcache_memory_profile=qualified
+  else
+    lmcache_memory_profile=unqualified
+  fi
+elif [[ "${text_direct_lmcache}" == "1" \
   && "${mode}" == "dspark" \
   && "${tp_size}" == "2" \
   && "${max_model_len}" -ge 1048576 ]]; then
@@ -597,11 +622,12 @@ if [[ -n "${EXTRA_VLLM_ARGS:-}" ]]; then
 fi
 command+=("$@")
 
-printf 'DS4 launch: variant=%s mode=%s depth=%s backend=%s allreduce=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s direct_lmcache=%s lmcache_memory_profile=%s native_l2=%s allocator=%s model=%s\n' \
+printf 'DS4 launch: variant=%s mode=%s depth=%s backend=%s allreduce=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s lmcache_transfer=%s direct_lmcache=%s lmcache_memory_profile=%s native_l2=%s allocator=%s model=%s\n' \
   "${model_variant}" "${mode}" "${dspark_depth_mode}" \
   "${backend}" "${allreduce_mode}" \
   "${tp_size}" "${dcp_size}" "${max_num_seqs}" \
   "${graph_cap}" "${load_format}" \
+  "${lmcache_transfer_mode}" \
   "${direct_lmcache}" "${lmcache_memory_profile}" \
   "${native_l2_enabled}" \
   "${PYTORCH_CUDA_ALLOC_CONF:-<unset>}" "${model}" >&2

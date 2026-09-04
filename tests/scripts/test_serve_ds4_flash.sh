@@ -47,9 +47,19 @@ assert_contains "${text_lmcache_output}" 'direct_lmcache=1'
 
 text_engine_driven_output="$(capture \
   MODEL=deepseek-ai/DeepSeek-V4-Flash-0731 DS4_MODEL_VARIANT=text \
-  LMCACHE_MODE=disk LMCACHE_TRANSFER_MODE=engine_driven)"
-assert_contains "${text_engine_driven_output}" '--gpu-memory-utilization 0.975'
+  LMCACHE_MODE=disk LMCACHE_TRANSFER_MODE=engine_driven \
+  MAX_MODEL_LEN=1048576 TP_SIZE=2)"
+assert_contains "${text_engine_driven_output}" '--gpu-memory-utilization 0.970'
 assert_contains "${text_engine_driven_output}" 'direct_lmcache=0'
+assert_contains "${text_engine_driven_output}" 'lmcache_transfer=engine_driven'
+assert_contains "${text_engine_driven_output}" 'lmcache_memory_profile=qualified'
+
+text_engine_override_output="$(capture \
+  MODEL=deepseek-ai/DeepSeek-V4-Flash-0731 DS4_MODEL_VARIANT=text \
+  LMCACHE_MODE=disk LMCACHE_TRANSFER_MODE=engine_driven \
+  MAX_MODEL_LEN=1048576 TP_SIZE=2 GPU_MEMORY_UTILIZATION=0.975)"
+assert_contains "${text_engine_override_output}" '--gpu-memory-utilization 0.975'
+assert_contains "${text_engine_override_output}" 'lmcache_memory_profile=unqualified'
 
 text_qualified_output="$(capture \
   MODEL=deepseek-ai/DeepSeek-V4-Flash-0731 DS4_MODEL_VARIANT=text \
@@ -81,9 +91,10 @@ assert_contains "${lmcache_output}" '--gpu-memory-utilization 0.951'
 assert_contains "${lmcache_output}" '--max-model-len 900000'
 
 engine_driven_output="$(capture \
-  LMCACHE_MODE=ram LMCACHE_TRANSFER_MODE=engine_driven)"
-assert_contains "${engine_driven_output}" '--gpu-memory-utilization 0.975'
+  LMCACHE_MODE=ram LMCACHE_TRANSFER_MODE=engine_driven TP_SIZE=2)"
+assert_contains "${engine_driven_output}" '--gpu-memory-utilization 0.970'
 assert_contains "${engine_driven_output}" '--max-model-len 1048576'
+assert_contains "${engine_driven_output}" 'lmcache_memory_profile=qualified'
 
 explicit_output="$(capture \
   LMCACHE_MODE=ram GPU_MEMORY_UTILIZATION=0.965 DSPARK_TOKENS=2)"
