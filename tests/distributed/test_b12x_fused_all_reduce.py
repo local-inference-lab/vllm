@@ -231,6 +231,7 @@ def test_b12x_oneshot_defaults_to_stream_isolation(
     ),
     [
         (2, "oneshot", True, False, 2),
+        (2, "oneshot", None, False, 2),
         (16, "hierarchical", False, False, 1),
         (16, "hierarchical", False, True, 1),
     ],
@@ -239,14 +240,17 @@ def test_b12x_dispatcher_prepares_single_stable_eager_owner(
     monkeypatch: pytest.MonkeyPatch,
     world_size: int,
     algorithm: str,
-    supports_all_peer_auxiliary: bool,
+    supports_all_peer_auxiliary: bool | None,
     single_channel: bool,
     expected_channel_capacity: int,
 ) -> None:
     captured = {}
     runtime = MagicMock()
     runtime.algorithm = algorithm
-    runtime.supports_all_peer_auxiliary = supports_all_peer_auxiliary
+    if supports_all_peer_auxiliary is not None:
+        runtime.supports_all_peer_auxiliary = supports_all_peer_auxiliary
+    else:
+        del runtime.supports_all_peer_auxiliary
     dma_min_bytes = MagicMock(return_value=None)
 
     class FakeDispatcher:
@@ -367,7 +371,7 @@ def test_b12x_dispatcher_prepares_single_stable_eager_owner(
     assert built.backend_name() == (
         "B12X_PCIE_ONESHOT" if algorithm == "oneshot" else "B12X_PCIE_HIERARCHICAL"
     )
-    assert dma_min_bytes.call_count == int(supports_all_peer_auxiliary)
+    assert dma_min_bytes.call_count == int(supports_all_peer_auxiliary is True)
 
 
 def test_b12x_channel_checkpoint_delegates_to_runtime() -> None:
