@@ -503,6 +503,7 @@ def _fake_impl(monkeypatch, *, num_heads: int = 8) -> tuple[B12xMLAImpl, _FakeDe
     impl.dcp_q_replicate = False
     impl._compiled_bindings = set()
     impl._uses_packed_ds_mla = False
+    impl._packed_query = False
     impl._packed_dense_run = None
     dense_mla = _FakeDenseMLA()
     impl._dense_mla = dense_mla
@@ -552,6 +553,7 @@ def _fake_packed_impl(*, num_heads: int = 8) -> tuple[B12xMLAImpl, _FakePackedRu
     impl.dcp_q_replicate = False
     impl._compiled_bindings = set()
     impl._uses_packed_ds_mla = True
+    impl._packed_query = False
     packed_run = _FakePackedRun()
     impl._packed_dense_run = packed_run
     impl._packed_dense_run_kwargs = {"split_policy": "balanced"}
@@ -758,6 +760,7 @@ def test_b12x_mla_builder_flattens_non_causal_draft_block(monkeypatch) -> None:
     builder._dense_mla_plan = _FakePlan()
     builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
     builder._dense_mla_padded_q = None
+    builder._dense_mla_packed_q_local = None
     builder._dense_mla_padded_output = None
     builder._max_dense_mla_rows = 16
     builder._dense_mla_flat_block_table = torch.zeros(16, 4, dtype=torch.int32)
@@ -803,6 +806,7 @@ def test_b12x_mla_builder_flattens_causal_verification_block(monkeypatch) -> Non
     builder._dense_mla_plan = _FakePlan()
     builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
     builder._dense_mla_padded_q = None
+    builder._dense_mla_packed_q_local = None
     builder._dense_mla_padded_output = None
     builder._max_dense_mla_rows = 16
     builder._dense_mla_flat_block_table = torch.zeros(16, 4, dtype=torch.int32)
@@ -852,6 +856,7 @@ def test_b12x_mla_builder_maps_causal_verification_lengths_to_dcp_rank(
     builder._dense_mla_plan = _FakePlan()
     builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
     builder._dense_mla_padded_q = None
+    builder._dense_mla_packed_q_local = None
     builder._dense_mla_padded_output = None
     builder._max_dense_mla_rows = 8
     builder._dense_mla_flat_block_table = torch.zeros(8, 4, dtype=torch.int32)
@@ -898,6 +903,7 @@ def test_b12x_mla_builder_preserves_tiled_q4_dcp_verification(
     builder._dense_mla_verify_plans = {1: verify_plan}
     builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
     builder._dense_mla_padded_q = None
+    builder._dense_mla_packed_q_local = None
     builder._dense_mla_padded_output = None
     builder._max_dense_mla_rows = 8
     builder._dense_mla_flat_block_table = torch.zeros(8, 4, dtype=torch.int32)
@@ -957,6 +963,7 @@ def test_b12x_mla_builder_selects_the_covering_verify_plan(monkeypatch) -> None:
     builder._dense_mla_verify_plans = plans
     builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
     builder._dense_mla_padded_q = None
+    builder._dense_mla_packed_q_local = None
     builder._dense_mla_padded_output = None
     builder._max_dense_mla_rows = 32
     builder._dense_mla_flat_block_table = torch.zeros(32, 4, dtype=torch.int32)
@@ -1007,6 +1014,7 @@ def test_b12x_mla_builder_bounds_single_token_draft_table(monkeypatch) -> None:
     builder._dense_mla_plan = _FakePlan()
     builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
     builder._dense_mla_padded_q = None
+    builder._dense_mla_packed_q_local = None
     builder._dense_mla_padded_output = None
     builder._max_dense_mla_rows = 2
     builder._dense_mla_flat_block_table = torch.zeros(2, 4, dtype=torch.int32)
@@ -1360,3 +1368,111 @@ def test_b12x_mla_adapter_requires_caller_owned_scratch(monkeypatch) -> None:
             metadata,
             SimpleNamespace(_q_scale=None, _k_scale=None),
         )
+
+
+def _pack_k3_query_reference(q: torch.Tensor) -> torch.Tensor:
+    """Torch replica of the packed query record (see ``pack_k3_query``)."""
+    fp8_max = 448.0
+    nope = q[..., :512].float().reshape(*q.shape[:2], 4, 128)
+    amax = nope.abs().amax(dim=-1, keepdim=True)
+    raw = torch.clamp_min(amax, 1e-4) * torch.tensor(
+        1.0 / fp8_max, dtype=torch.float32, device=q.device
+    )
+    bits = raw.view(torch.int32)
+    mant = bits & 0x007FFFFF
+    bumped = torch.where(mant != 0, (bits + 0x00800000) & 0x7F800000, bits)
+    rounded = bumped.view(torch.float32)
+    inv = ((254 - (bumped >> 23)) << 23).view(torch.float32)
+    scaled = (nope * inv).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    nope_bytes = scaled.reshape(*q.shape[:2], 512).view(torch.uint8)
+    scale_bytes = rounded.reshape(*q.shape[:2], 4).contiguous().view(torch.uint8)
+    rope_bytes = q[..., 512:].contiguous().view(torch.uint8)
+    return torch.cat([nope_bytes, scale_bytes, rope_bytes], dim=-1).contiguous()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_b12x_mla_pack_k3_query_matches_reference() -> None:
+    torch.manual_seed(20260905)
+    device = torch.device("cuda")
+    q = torch.randn((5, 8, 576), dtype=torch.bfloat16, device=device) * 3.0
+    q[0, 0, :128] = 0.0  # all-zero tile: scale floor 1e-4 / 448
+    q[1, 2, 300] = 4e4  # large outlier: saturation after pow2 scaling
+    out = torch.empty((5, 8, 656), dtype=torch.uint8, device=device)
+    b12x_mla.pack_k3_query(q, out)
+    torch.cuda.synchronize()
+    assert torch.equal(out, _pack_k3_query_reference(q))
+    scales = out[..., 512:528].contiguous().view(torch.float32)
+    assert torch.all((scales.view(torch.int32) & 0x007FFFFF) == 0)  # powers of two
+    assert torch.equal(out[..., 528:].contiguous().view(torch.bfloat16), q[..., 512:])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_b12x_mla_packed_query_matches_bf16_query(monkeypatch) -> None:
+    """The packed query record gives the bit-identical attention output."""
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("requires SM120 or SM121")
+    sparse_mla = pytest.importorskip("b12x.attention.sparse_mla")
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_FASTPATH", "1")
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_W_HW_DEQUANT", "1")
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_SPLIT_POLICY", "balanced")
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE", "fp32")
+    torch.manual_seed(20260905)
+    device = torch.device("cuda")
+    page_size = 1536
+    num_tokens = 1600
+    # 64 gathered heads: the HPB=16 generic arm that serves Kimi-K3 (8 heads
+    # would select the native H8 arm, which has no packed-query support).
+    num_heads = 64
+    block_table = torch.tensor([[1, 0]], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([num_tokens], dtype=torch.int32, device=device)
+    selected_indices = torch.empty((1, num_tokens), dtype=torch.int32, device=device)
+    b12x_mla._materialize_paged_dense_indices(
+        block_table, seq_lens, selected_indices, page_size=page_size
+    )
+    cache = torch.zeros((2, page_size, 656), dtype=torch.uint8, device=device)
+    kv_c = torch.randn((num_tokens, 512), dtype=torch.bfloat16, device=device).div_(4)
+    k_pe = torch.randn((num_tokens, 64), dtype=torch.bfloat16, device=device).div_(4)
+    ops.concat_and_cache_mla(
+        kv_c, k_pe, cache, selected_indices[0].to(torch.int64), "fp8_ds_mla",
+        torch.ones((), dtype=torch.float32, device=device),
+    )
+    q = torch.randn((1, num_heads, 576), dtype=torch.bfloat16, device=device).div_(4)
+    plan = sparse_mla.plan(
+        sparse_mla.Caps(
+            device=device, num_q_heads=num_heads, max_q_rows=1, max_width=num_tokens,
+            dtype=torch.bfloat16, kv_dtype=torch.uint8, head_dim=576, v_head_dim=512,
+            mode="decode", max_batch=1, max_page_table_width=2, max_chunks_per_row=25,
+            page_size=page_size, head_major_output=False, partial_dtype=torch.float32,
+        )
+    )
+    scratch_spec = plan.scratch_specs()[0]
+    scratch = torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=device)
+
+    def run(packed: bool):
+        monkeypatch.setattr(
+            b12x_mla.envs, "VLLM_K3_PACKED_MLA_QUERY", "packed" if packed else "bf16"
+        )
+        impl, _ = _fake_packed_impl(num_heads=num_heads)
+        impl._packed_dense_run = sparse_mla.run_decode
+        impl._packed_dense_run_kwargs = b12x_mla._packed_dense_run_kwargs(
+            sparse_mla.run_decode
+        )
+        impl._packed_query = packed
+        metadata = SimpleNamespace(
+            dense_mla_plan=plan,
+            dense_mla_scratch=scratch,
+            dense_mla_selected_indices=selected_indices,
+            dense_mla_packed_q_local=torch.empty(
+                (1, num_heads, 656), dtype=torch.uint8, device=device
+            ),
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device=device),
+            decode=SimpleNamespace(block_table=block_table, seq_lens=seq_lens),
+        )
+        output, lse = impl.forward_mqa(q.clone(), cache, metadata, layer=SimpleNamespace())
+        torch.cuda.synchronize()
+        return output.clone(), lse.clone()
+
+    out_bf16, lse_bf16 = run(False)
+    out_packed, lse_packed = run(True)
+    assert torch.equal(out_bf16, out_packed)
+    assert torch.equal(lse_bf16, lse_packed)

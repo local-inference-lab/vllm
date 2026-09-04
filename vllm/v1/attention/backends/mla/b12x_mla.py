@@ -53,6 +53,16 @@ _MAX_B12X_CACHE_TOKENS = 1_048_576
 _B12X_QUERY_HEAD_TILE = 8
 _FP8_DS_MLA_RECORD_BYTES = 656
 _PACKED_DENSE_MAX_SPLITS = 64
+# Packed query record consumed by the B12X packed reader: 512 E4M3 nope bytes
+# (per 128-dim tile, absmax -> max(amax, 1e-4) / 448 rounded up to a power of
+# two -> q * (1 / scale), round-to-nearest-even with saturation), the four
+# fp32 pow2 tile scales, then the 64 bf16 rope values. This is the kernel's
+# own S0 quantization performed before the DCP query gather, so the attention
+# result is bit-identical to the bf16-query path while the gather moves 656
+# instead of 1,152 bytes per head.
+_PACKED_QUERY_RECORD_BYTES = 656
+_PACKED_QUERY_TILE = 128
+_PACKED_QUERY_FP8_MAX = 448.0
 _PACKED_DENSE_INDEX_BLOCK = 256
 _MAX_I32 = torch.iinfo(torch.int32).max
 
@@ -180,6 +190,101 @@ def _materialize_paged_dense_indices(
         PAGE_SIZE=int(page_size),
         BLOCK_N=_PACKED_DENSE_INDEX_BLOCK,
     )
+
+
+@triton.jit
+def _pack_k3_query_kernel(
+    q_ptr,
+    out_ptr,
+    q_stride_row,
+    q_stride_head,
+    out_stride_row,
+    out_stride_head,
+    D_NOPE: tl.constexpr,
+    D_ROPE: tl.constexpr,
+    TILE: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    INV_FP8_MAX: tl.constexpr,
+):
+    """Quantize one (row, head) of a bf16 query into the packed record."""
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    q_base = q_ptr + row * q_stride_row + head * q_stride_head
+    out_base = out_ptr + row * out_stride_row + head * out_stride_head
+    offs = tl.arange(0, TILE)
+    nope_out = out_base.to(tl.pointer_type(tl.float8e4nv))
+    scale_out = (out_base + D_NOPE).to(tl.pointer_type(tl.float32))
+    for tile in tl.static_range(D_NOPE // TILE):
+        x = tl.load(q_base + tile * TILE + offs).to(tl.float32)
+        amax = tl.max(tl.abs(x), axis=0)
+        raw = tl.maximum(amax, 1e-4) * INV_FP8_MAX
+        bits = raw.to(tl.int32, bitcast=True)
+        mant = bits & 0x007FFFFF
+        bumped = tl.where(mant != 0, (bits + 0x00800000) & 0x7F800000, bits)
+        rounded = bumped.to(tl.float32, bitcast=True)
+        # 1 / 2^e is exact: build it from the exponent field.
+        inv = (((254 - (bumped >> 23)) << 23)).to(tl.float32, bitcast=True)
+        v = tl.minimum(tl.maximum(x * inv, -FP8_MAX), FP8_MAX)
+        tl.store(nope_out + tile * TILE + offs, v.to(tl.float8e4nv))
+        tl.store(scale_out + tile, rounded)
+    rope_offs = tl.arange(0, D_ROPE)
+    rope = tl.load(q_base + D_NOPE + rope_offs)
+    rope_out = (out_base + D_NOPE + (D_NOPE // TILE) * 4).to(tl.pointer_type(tl.bfloat16))
+    tl.store(rope_out + rope_offs, rope)
+
+
+def pack_k3_query(q: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Write the packed query record of ``q`` (rows, heads, 576) bf16 into ``out``.
+
+    ``out`` is a uint8 ``(rows, heads, 656)`` tensor whose last dimension is
+    contiguous. The record is the B12X packed reader's S0 quantization
+    performed on the host side (see ``_PACKED_QUERY_RECORD_BYTES``).
+    """
+    if q.ndim != 3 or q.dtype != torch.bfloat16 or int(q.shape[-1]) != _K3_ABSORBED_HEAD_DIM:
+        raise TypeError("pack_k3_query expects a (rows, heads, 576) bf16 query")
+    if q.stride(-1) != 1:
+        raise ValueError("pack_k3_query expects a query with a contiguous head dimension")
+    if (
+        out.ndim != 3
+        or out.dtype != torch.uint8
+        or tuple(out.shape) != (int(q.shape[0]), int(q.shape[1]), _PACKED_QUERY_RECORD_BYTES)
+        or out.stride(-1) != 1
+        or out.stride(1) % 4
+        or out.stride(0) % 4
+    ):
+        raise ValueError(
+            "pack_k3_query expects a uint8 (rows, heads, 656) output with a "
+            "contiguous, 4-byte-aligned record layout"
+        )
+    if q.device != out.device or not q.is_cuda:
+        raise ValueError("pack_k3_query requires CUDA tensors on one device")
+    rows, heads = int(q.shape[0]), int(q.shape[1])
+    if rows == 0:
+        return out
+    _pack_k3_query_kernel[(rows, heads)](
+        q,
+        out,
+        q.stride(0),
+        q.stride(1),
+        out.stride(0),
+        out.stride(1),
+        D_NOPE=_K3_KV_LORA_RANK,
+        D_ROPE=_K3_ABSORBED_HEAD_DIM - _K3_KV_LORA_RANK,
+        TILE=_PACKED_QUERY_TILE,
+        FP8_MAX=_PACKED_QUERY_FP8_MAX,
+        INV_FP8_MAX=1.0 / _PACKED_QUERY_FP8_MAX,
+    )
+    return out
+
+
+def _packed_query_enabled(vllm_config: VllmConfig) -> bool:
+    """Return whether the packed reader receives pre-quantized query records."""
+    mode = str(envs.VLLM_K3_PACKED_MLA_QUERY)
+    if mode not in ("bf16", "packed"):
+        raise ValueError(
+            "VLLM_K3_PACKED_MLA_QUERY must be 'bf16' or 'packed', got " f"{mode!r}."
+        )
+    return mode == "packed" and _uses_packed_ds_mla(vllm_config)
 
 
 def _max_dcp_local_cache_tokens(
@@ -531,6 +636,7 @@ class B12xMLAMetadata(MLACommonMetadata):
     dense_mla_plan: Any | None = None
     dense_mla_scratch: torch.Tensor | None = None
     dense_mla_padded_q: torch.Tensor | None = None
+    dense_mla_packed_q_local: torch.Tensor | None = None
     dense_mla_padded_output: torch.Tensor | None = None
     dense_mla_flat_block_table: torch.Tensor | None = None
     dense_mla_flat_seq_lens: torch.Tensor | None = None
@@ -666,12 +772,31 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         )
         self._dense_mla_padded_q: torch.Tensor | None = None
         self._dense_mla_padded_output: torch.Tensor | None = None
-        if self._kernel_heads != self.num_heads:
-            self._dense_mla_padded_q = torch.empty(
-                (max_dense_mla_rows, self._kernel_heads, _K3_ABSORBED_HEAD_DIM),
-                dtype=_planned_query_dtype(vllm_config),
+        self._dense_mla_packed_q_local: torch.Tensor | None = None
+        self._packed_query = self._uses_packed_ds_mla and _packed_query_enabled(
+            vllm_config
+        )
+        if self._packed_query:
+            # Pre-quantized query records: the local shard before the DCP
+            # gather and the gathered (or head-padded) kernel input.
+            self._dense_mla_packed_q_local = torch.empty(
+                (max_dense_mla_rows, self.num_heads, _PACKED_QUERY_RECORD_BYTES),
+                dtype=torch.uint8,
                 device=device,
             )
+        if self._kernel_heads != self.num_heads:
+            if self._packed_query:
+                self._dense_mla_padded_q = torch.empty(
+                    (max_dense_mla_rows, self._kernel_heads, _PACKED_QUERY_RECORD_BYTES),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+            else:
+                self._dense_mla_padded_q = torch.empty(
+                    (max_dense_mla_rows, self._kernel_heads, _K3_ABSORBED_HEAD_DIM),
+                    dtype=_planned_query_dtype(vllm_config),
+                    device=device,
+                )
             self._dense_mla_padded_output = torch.empty(
                 (max_dense_mla_rows, self._kernel_heads, _K3_KV_LORA_RANK),
                 dtype=torch.bfloat16,
@@ -850,6 +975,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         metadata.dense_mla_plan = _select_dense_mla_plan(plans, live_rows)
         metadata.dense_mla_scratch = self._dense_mla_scratch
         metadata.dense_mla_padded_q = self._dense_mla_padded_q
+        metadata.dense_mla_packed_q_local = self._dense_mla_packed_q_local
         metadata.dense_mla_padded_output = self._dense_mla_padded_output
         metadata.dense_mla_dcp_world_size = self.dcp_world_size
         decode_metadata = metadata.decode
@@ -1146,6 +1272,9 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             )
         self._uses_packed_ds_mla = kv_cache_dtype == "fp8_ds_mla"
         self._packed_dense_run_kwargs: dict[str, Any] = {}
+        self._packed_query = self._uses_packed_ds_mla and _packed_query_enabled(
+            vllm_config
+        )
         if self._uses_packed_ds_mla:
             sparse_mla = _load_sparse_mla()
             self._packed_dense_run = sparse_mla.run_decode
@@ -1233,6 +1362,22 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 f"got {q.shape[1]}."
             )
 
+        if self._uses_packed_ds_mla and self._packed_query:
+            # Quantize the local query shard into packed records before the
+            # DCP gather: the gather then moves 656 instead of 1,152 bytes per
+            # head and the kernel skips its S0 quantization (bit-identical).
+            if q.dtype != torch.bfloat16:
+                raise TypeError(
+                    f"B12X_MLA packed query requires a BF16 query; got {q.dtype}."
+                )
+            packed_local = getattr(attn_metadata, "dense_mla_packed_q_local", None)
+            if packed_local is None or int(packed_local.shape[0]) < total_q:
+                raise RuntimeError(
+                    "B12X_MLA metadata is missing packed query storage for "
+                    f"{total_q} rows."
+                )
+            q = pack_k3_query(q, packed_local[:total_q, : int(q.shape[1])])
+
         dcp_group = None
         if metadata_dcp_world_size > 1:
             dcp_group = get_dcp_group()
@@ -1253,13 +1398,24 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                         f"buffer={gathered_q.dtype}, query={q.dtype}."
                     )
                 gathered_q = gathered_q[:total_q, :effective_heads]
-                q = dcp_b12x_all_gather_heads(
-                    q,
-                    dcp_group,
-                    max_batch_size=self._dcp_max_batch_size,
-                    output_head_dim=self.kv_lora_rank,
-                    out=gathered_q,
-                )
+                if q.dtype == torch.uint8:
+                    # Packed records travel as E4M3 rows of 656 elements; the
+                    # gather only moves bytes.
+                    q = dcp_b12x_all_gather_heads(
+                        q.view(torch.float8_e4m3fn),
+                        dcp_group,
+                        max_batch_size=self._dcp_max_batch_size,
+                        output_head_dim=self.kv_lora_rank,
+                        out=gathered_q.view(torch.float8_e4m3fn),
+                    ).view(torch.uint8)
+                else:
+                    q = dcp_b12x_all_gather_heads(
+                        q,
+                        dcp_group,
+                        max_batch_size=self._dcp_max_batch_size,
+                        output_head_dim=self.kv_lora_rank,
+                        out=gathered_q,
+                    )
 
         actual_heads = int(q.shape[1])
         if actual_heads != effective_heads:
@@ -1307,7 +1463,13 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 "B12X_MLA metadata is missing caller-owned dense MLA scratch."
             )
         if self._uses_packed_ds_mla:
-            if q.dtype != torch.bfloat16:
+            if self._packed_query:
+                if q.dtype != torch.uint8 or int(q.shape[-1]) != _PACKED_QUERY_RECORD_BYTES:
+                    raise TypeError(
+                        "B12X_MLA packed query mode expects uint8 656-byte records; "
+                        f"got {q.dtype} {tuple(q.shape)}."
+                    )
+            elif q.dtype != torch.bfloat16:
                 raise TypeError(
                     f"B12X_MLA fp8_ds_mla requires BF16 queries; got {q.dtype}."
                 )

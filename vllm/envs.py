@@ -246,6 +246,7 @@ if TYPE_CHECKING:
     VLLM_K3_DENSE_MLA_SINGLE_SPLIT_CHUNKS: int = -1
     VLLM_K3_PACKED_MLA_SPLIT_POLICY: str = "balanced"
     VLLM_K3_PACKED_MLA_PARTIAL_DTYPE: str = "fp32"
+    VLLM_K3_PACKED_MLA_QUERY: str = "bf16"
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
@@ -1863,6 +1864,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rounded once, at the output.
     "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE": lambda: os.getenv(
         "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE", "fp32"
+    ).lower(),
+    # Query format handed to the Kimi-K3 packed (fp8_ds_mla) decode reader.
+    # "packed": quantize each local query head into the reader's 656-byte
+    # record (E4M3 nope, pow2 tile scales, bf16 rope) before the DCP gather;
+    # bit-identical to "bf16" (the reader's own S0 quantization) and 43%
+    # fewer gathered bytes. Requires B12X_MLA_SM120_GLM_FASTPATH=1.
+    "VLLM_K3_PACKED_MLA_QUERY": lambda: os.getenv(
+        "VLLM_K3_PACKED_MLA_QUERY", "bf16"
     ).lower(),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
