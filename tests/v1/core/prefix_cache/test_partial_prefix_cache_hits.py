@@ -1569,7 +1569,85 @@ def test_hybrid_partial_hit_with_eagle_stays_within_group_blocks():
     assert manager.allocate_slots(req1, 4, num_computed, computed_blocks) is not None
 
 
-def test_hybrid_sliding_window_group_disables_partial_hash_hits():
+def _make_hybrid_swa_eagle_config(
+    hash_block_size: int,
+    attn_block_size: int,
+    mamba_block_size: int,
+    sliding_window: int,
+    num_blocks: int = 512,
+) -> KVCacheConfig:
+    """Full attention target + mamba "align" + an EAGLE sliding-window draft
+    group (window == draft block), the GLM-5.3 + DFlash topology."""
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=attn_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["swa_draft"],
+                SlidingWindowSpec(
+                    block_size=attn_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=sliding_window,
+                ),
+                is_eagle_group=True,
+            ),
+        ],
+    )
+
+
+def _prefill_and_free(manager, request, chunk: int) -> int:
+    """Prefill ``request`` in ``chunk``-token steps (so the mamba group
+    checkpoints every block, as FlashKDA prefill checkpoints do), decode one
+    token, free it. Returns the prefix-cache hit it started from."""
+    num_tokens = len(request.prompt_token_ids)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(request)
+    done = num_computed
+    first = True
+    while done < num_tokens:
+        step = min(chunk, num_tokens - done)
+        if first:
+            result = manager.allocate_slots(
+                request, step, num_computed, computed_blocks
+            )
+            first = False
+        else:
+            result = manager.allocate_slots(request, step)
+        assert result is not None
+        done += step
+        request.num_computed_tokens = done
+        manager.new_step_starts()
+    assert manager.allocate_slots(request, 1) is not None
+    request.num_computed_tokens = done + 1
+    manager.new_step_starts()
+    manager.free(request)
+    manager.new_step_starts()
+    return num_computed
+
+
+def test_hybrid_sliding_window_group_enables_partial_hash_hits():
+    """A sliding-window draft group no longer forces block-aligned hits: with
+    the hash unit finer than the draft block, partial hash hits stay enabled
+    and the draft's EAGLE rewind is one hash unit, not one draft block."""
     hash_block_size = 2
     sliding_window_block_size = 2 * hash_block_size
     mamba_block_size = 2 * sliding_window_block_size
@@ -1615,29 +1693,212 @@ def test_hybrid_sliding_window_group_disables_partial_hash_hits():
         hash_block_size=hash_block_size,
         use_eagle=True,
     )
+    coordinator = manager.coordinator
+    assert coordinator.enable_partial_hash_hits
+    assert all(
+        m.hit_alignment_tokens == hash_block_size
+        for m in coordinator.single_type_managers
+    )
 
     tokens = list(range(3 * sliding_window_block_size))
     request = make_request("0", tokens, hash_block_size, sha256)
-    computed_blocks, num_computed, _ = manager.get_computed_blocks(request)
-    assert not manager.coordinator.enable_partial_hash_hits
-    assert (
-        manager.allocate_slots(request, mamba_block_size, num_computed, computed_blocks)
-        is not None
-    )
-    request.num_computed_tokens = mamba_block_size
-    manager.new_step_starts()
-    assert manager.allocate_slots(request, len(tokens) - mamba_block_size) is not None
-    request.num_computed_tokens = len(tokens)
-    manager.free(request)
-    manager.new_step_starts()
+    # Prefill in mamba-block steps, as the aligned scheduler split does.
+    assert _prefill_and_free(manager, request, mamba_block_size) == 0
 
     cached_request = make_request(
         "1", tokens + [len(tokens), len(tokens) + 1], hash_block_size, sha256
     )
     computed_blocks, num_computed, _ = manager.get_computed_blocks(cached_request)
-
+    # The mamba state at the last block boundary (8) is retained; the draft
+    # matches one hash unit past it (10, inside its cached block 2) and
+    # rewinds by that unit instead of by a whole draft block.
     assert num_computed == mamba_block_size
     assert len(computed_blocks.blocks[0]) * hash_block_size == num_computed
+
+
+def test_sliding_window_fine_grained_hits():
+    """Manager-level: hits on hash boundaries inside a draft block, the
+    window-coverage requirement, the EAGLE rewind by one hash unit, and a
+    covering entry registered further along the tail block."""
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+
+    hash_block_size = 2
+    block_size = 8
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=block_size,
+    )
+    pool = BlockPool(
+        num_gpu_blocks=16, enable_caching=True, hash_block_size=hash_block_size
+    )
+    req = make_request("0", list(range(100, 116)), hash_block_size, sha256)
+
+    def find(max_length, drop_eagle_block):
+        return SlidingWindowManager.find_longest_cache_hit(
+            block_hashes=req.block_hashes,
+            max_length=max_length,
+            kv_cache_group_ids=[0],
+            block_pool=pool,
+            kv_cache_spec=spec,
+            drop_eagle_block=drop_eagle_block,
+            alignment_tokens=hash_block_size,
+        )
+
+    blocks = pool.get_new_blocks(2)
+    # Block 0 fully cached (8 tokens); block 1 holds a partial entry at 14.
+    pool.cache_full_blocks(
+        request=req,
+        blocks=blocks[:1],
+        num_cached_blocks=0,
+        num_full_blocks=1,
+        block_size=block_size,
+        kv_cache_group_id=0,
+    )
+    assert (
+        pool.cache_partial_block(
+            request=req,
+            block=blocks[1],
+            num_tokens=14,
+            kv_cache_group_id=0,
+            block_size=block_size,
+        )
+        is not None
+    )
+
+    # Hit at the registered partial boundary; window [7, 14) needs block 0.
+    hit_blocks, hit_length = find(16, drop_eagle_block=False)
+    assert (hit_length, [b.block_id for b in hit_blocks[0]]) == (
+        14,
+        [blocks[0].block_id, blocks[1].block_id],
+    )
+    # EAGLE rewinds one hash unit; the tail block still covers 12.
+    hit_blocks, hit_length = find(16, drop_eagle_block=True)
+    assert (hit_length, len(hit_blocks[0])) == (12, 2)
+    # A re-query at the rewound length (no entry at 12) is served by the
+    # covering entry at 14 of the same append-only tail block.
+    hit_blocks, hit_length = find(12, drop_eagle_block=False)
+    assert (hit_length, len(hit_blocks[0])) == (12, 2)
+    # Block-aligned boundary: the full block 0 is the tail.
+    hit_blocks, hit_length = find(8, drop_eagle_block=False)
+    assert (hit_length, [b.block_id for b in hit_blocks[0]]) == (
+        8,
+        [blocks[0].block_id],
+    )
+    # Window coverage: with only the partial tail cached (no block 0), the
+    # tail alone cannot serve 14 since its window reaches into block 0.
+    pool = BlockPool(
+        num_gpu_blocks=16, enable_caching=True, hash_block_size=hash_block_size
+    )
+    blocks = pool.get_new_blocks(2)
+    assert (
+        pool.cache_partial_block(
+            request=req,
+            block=blocks[1],
+            num_tokens=14,
+            kv_cache_group_id=0,
+            block_size=block_size,
+        )
+        is not None
+    )
+    hit_blocks, hit_length = find(16, drop_eagle_block=False)
+    assert hit_length == 0
+
+
+def test_sliding_window_fine_grained_reachable_mask():
+    """Sparse retention keeps the full blocks a fine-grained hit at each
+    reachable boundary needs; dense retention keeps everything."""
+    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+
+    spec = SlidingWindowSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=8,
+    )
+    mask = SlidingWindowManager.reachable_block_mask(
+        start_block=0,
+        end_block=4,
+        alignment_tokens=2,
+        kv_cache_spec=spec,
+        use_eagle=True,
+        retention_interval=0,
+        reachable_boundaries=[27],  # aligned to 26, inside block 3
+    )
+    # Window (+1 EAGLE unit) before 26 spans [17, 26): blocks 2 and 3 (a
+    # fully cached block 3 covers the boundary inside it), blocks 0-1 not.
+    assert mask == [False, False, True, True]
+    assert (
+        SlidingWindowManager.reachable_block_mask(
+            start_block=0,
+            end_block=4,
+            alignment_tokens=2,
+            kv_cache_spec=spec,
+            use_eagle=True,
+            retention_interval=None,
+            reachable_boundaries=[27],
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("num_prompt_tokens", [13, 45, 48])
+def test_hybrid_decoupled_blocks_keep_fine_grained_reuse(num_prompt_tokens: int):
+    """Large attention/draft blocks (page parity with the recurrent state)
+    with a fine recurrent block and hash unit reuse prefixes exactly like an
+    all-fine-block layout: a repeat or a shared-prefix request resumes from
+    the last recurrent checkpoint before the prompt tail, minus the draft's
+    EAGLE unit, and once the shared prefix is registered the next request
+    resumes from the tail itself."""
+    hash_block_size = 2
+
+    def hits(attn_block_size: int, mamba_block_size: int) -> tuple[int, int, int]:
+        manager = make_kv_cache_manager(
+            kv_cache_config=_make_hybrid_swa_eagle_config(
+                hash_block_size=hash_block_size,
+                attn_block_size=attn_block_size,
+                mamba_block_size=mamba_block_size,
+                sliding_window=attn_block_size,
+            ),
+            max_model_len=8192,
+            enable_caching=True,
+            hash_block_size=hash_block_size,
+            use_eagle=True,
+        )
+        base = list(range(1000, 1000 + num_prompt_tokens))
+        _prefill_and_free(
+            manager, make_request("0", base, hash_block_size, sha256), mamba_block_size
+        )
+        identical = _prefill_and_free(
+            manager, make_request("1", base, hash_block_size, sha256), mamba_block_size
+        )
+        suffix = _prefill_and_free(
+            manager,
+            make_request("2", base + [7, 7], hash_block_size, sha256),
+            mamba_block_size,
+        )
+        suffix_again = _prefill_and_free(
+            manager,
+            make_request("3", base + [7, 7], hash_block_size, sha256),
+            mamba_block_size,
+        )
+        return identical, suffix, suffix_again
+
+    fine = hits(attn_block_size=2, mamba_block_size=2)
+    decoupled = hits(attn_block_size=16, mamba_block_size=2)
+    # A repeat may hit up to num_prompt - 1; a longer request up to the whole
+    # shared prompt. Either way the draft's EAGLE unit comes off the tail.
+    repeat_tail = (num_prompt_tokens - 1) // hash_block_size * hash_block_size
+    shared_tail = num_prompt_tokens // hash_block_size * hash_block_size
+    assert fine[:2] == (
+        repeat_tail - hash_block_size,
+        shared_tail - hash_block_size,
+    )
+    assert decoupled == fine
 
 
 @pytest.mark.parametrize("dcp_world_size", [1, 2, 4])

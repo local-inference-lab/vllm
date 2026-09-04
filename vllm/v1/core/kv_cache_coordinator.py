@@ -14,7 +14,9 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    FullAttentionManager,
     SingleTypeKVCacheManager,
+    SlidingWindowManager,
     get_manager_for_kv_cache_spec,
 )
 from vllm.v1.kv_cache_interface import (
@@ -641,7 +643,25 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             )
             for g in kv_cache_config.kv_cache_groups
         )
-        self.enable_partial_hash_hits = has_partial_mamba_group
+        # Recurrent hybrids may instead hash finer than their attention
+        # blocks (``prefix_match_unit`` at the recurrent block, attention
+        # pages grown to match the recurrent page): partial hits then keep
+        # prefix reuse at the recurrent checkpoint granularity. Attention-only
+        # hybrids keep block-aligned hits, as before.
+        has_mamba_align_group = any(
+            isinstance(g.kv_cache_spec, MambaSpec)
+            and g.kv_cache_spec.mamba_cache_mode == "align"
+            for g in kv_cache_config.kv_cache_groups
+        )
+        has_partial_attention_group = has_mamba_align_group and any(
+            isinstance(manager, (FullAttentionManager, SlidingWindowManager))
+            and manager.block_size > hash_block_size
+            and manager.supports_fine_grained_hash_lookup
+            for manager in self.single_type_managers
+        )
+        self.enable_partial_hash_hits = (
+            has_partial_mamba_group or has_partial_attention_group
+        )
         if self.enable_partial_hash_hits:
             unsupported_partial_hit_managers = {
                 type(manager).__name__
@@ -656,6 +676,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     "cache managers require block-aligned lookups: %s.",
                     ", ".join(sorted(unsupported_partial_hit_managers)),
                 )
+        for manager in self.single_type_managers:
+            manager.hit_alignment_tokens = self._cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
 
     @property
