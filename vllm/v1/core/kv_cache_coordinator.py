@@ -149,13 +149,17 @@ class KVCacheCoordinator(ABC):
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
 
-        # Sparse retention must key off "some group's lookup applies the EAGLE
-        # drop", not "this group holds draft layers": the coordinator reconciles
-        # every group to ONE hit length, so a drop anywhere shortens the
-        # candidate offered to all of them. A group that kept only its own
-        # boundary state would then sit above every reachable candidate.
+        # Sparse retention must account for a full-attention EAGLE drop because
+        # the coordinator reconciles every group to one hit length. A sparse
+        # group that kept only its own boundary would then sit above the shared
+        # candidate.
+        lookup_drops_eagle_block = any(
+            i in self.eagle_group_ids
+            and isinstance(group.kv_cache_spec, FullAttentionSpec)
+            for i, group in enumerate(self.kv_cache_config.kv_cache_groups)
+        )
         for manager in self.single_type_managers:
-            manager.lookup_drops_eagle_block = bool(self.eagle_group_ids)
+            manager.lookup_drops_eagle_block = lookup_drops_eagle_block
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -779,6 +783,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 request,
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
+                alignment_tokens=self._cache_hit_alignment_tokens,
             )
 
     def find_longest_cache_hit(

@@ -133,10 +133,10 @@ class SingleTypeKVCacheManager(ABC):
         # determining the attention groups.
         self.use_eagle = False
 
-        # Whether ANY group's lookup applies that drop, which is what sparse
-        # retention must key off: the coordinator reconciles every group to one
-        # hit length, so a drop anywhere shortens the candidate offered here.
-        # See ``reachable_hit_positions``. Set by the coordinator.
+        # Whether a full-attention lookup applies that drop. Sparse retention
+        # must account for it because the coordinator reconciles every group to
+        # one hit length. See ``reachable_hit_positions``. Set by the
+        # coordinator.
         self.lookup_drops_eagle_block = False
 
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
@@ -457,6 +457,7 @@ class SingleTypeKVCacheManager(ABC):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        alignment_tokens: int | None = None,
     ) -> None:
         """
         Cache the blocks for the request.
@@ -469,12 +470,18 @@ class SingleTypeKVCacheManager(ABC):
                 keeps dense checkpointing; ``0`` keeps only the latest replay
                 boundary; a positive multiple of ``scheduler_block_size`` keeps
                 a tail once per that-sized segment. Only SWA acts on it.
+            alignment_tokens: Cache-hit alignment. Defaults to the scheduler
+                block size for non-hybrid coordinators.
         """
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
 
         if num_cached_blocks >= num_full_blocks:
             return
+
+        mask_alignment_tokens = (
+            self.scheduler_block_size if alignment_tokens is None else alignment_tokens
+        )
 
         # Token boundaries whose reachable tail must be retained under sparse
         # retention: the replay boundary (``num_prompt - 1``, capped by
@@ -483,13 +490,26 @@ class SingleTypeKVCacheManager(ABC):
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
 
+        retention_use_eagle = self.use_eagle
+        if self.lookup_drops_eagle_block:
+            if isinstance(self.kv_cache_spec, MambaSpec):
+                retention_use_eagle = True
+            elif isinstance(self.kv_cache_spec, SlidingWindowSpec):
+                reachable_boundaries = [
+                    position
+                    for boundary in reachable_boundaries
+                    for position in reachable_hit_positions(
+                        boundary, mask_alignment_tokens, True
+                    )
+                    if position > 0
+                ]
+
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
             end_block=num_full_blocks,
-            alignment_tokens=self.scheduler_block_size,
+            alignment_tokens=mask_alignment_tokens,
             kv_cache_spec=self.kv_cache_spec,
-            # Retention, unlike lookup, cares whether the drop happens anywhere.
-            use_eagle=self.use_eagle or self.lookup_drops_eagle_block,
+            use_eagle=retention_use_eagle,
             retention_interval=retention_interval,
             reachable_boundaries=reachable_boundaries,
         )
@@ -815,8 +835,14 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        alignment_tokens: int | None = None,
     ) -> None:
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            alignment_tokens=alignment_tokens,
+        )
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return
@@ -1753,9 +1779,15 @@ class MambaManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        alignment_tokens: int | None = None,
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            alignment_tokens=alignment_tokens,
+        )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
             partial_hash = self._cache_partial_tail_block(request, num_tokens)
@@ -1848,6 +1880,7 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        alignment_tokens: int | None = None,
     ) -> None:
         # We do not cache blocks for cross-attention to be shared between
         # requests, so this method is not relevant.

@@ -3679,6 +3679,82 @@ def test_hybrid_mamba_retention_eagle_backoff_is_one_alignment_unit():
     assert num_computed_tokens == 128
 
 
+def _cache_in_chunks(manager, request, chunk_ends, num_lookahead_tokens=0):
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(request)
+    for chunk_end in chunk_ends:
+        blocks = manager.allocate_slots(
+            request,
+            chunk_end - request.num_computed_tokens,
+            num_computed_tokens,
+            computed_blocks,
+            num_lookahead_tokens=num_lookahead_tokens,
+        )
+        assert blocks is not None
+        request.num_computed_tokens = chunk_end
+
+
+def test_hybrid_swa_retention_keeps_eagle_reachable_predecessor():
+    """SWA and Mamba must retain the same post-drop replay boundary."""
+    block_size = 32
+    manager = make_kv_cache_manager(
+        kv_cache_config=_make_hybrid_kv_cache_config(
+            block_size, 300, ["full", "mamba_align", "sliding_window"]
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=0,
+        use_eagle=True,
+    )
+
+    token_ids = [i for i in range(3) for _ in range(block_size)] + [3] * 31
+    req0 = make_request("0", token_ids, block_size, sha256)
+    _cache_in_chunks(manager, req0, (32, 64, 96, 127), num_lookahead_tokens=3)
+    manager.free(req0)
+
+    req1 = make_request("1", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+    assert num_computed_tokens == 2 * block_size
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [2, 2, 2]
+
+
+def test_hybrid_sparse_retention_uses_fine_hit_alignment(monkeypatch):
+    """Sparse retention must use the same fine alignment as cache lookup."""
+    hash_block_size = 32
+    cache_block_size = 64
+    manager = make_kv_cache_manager(
+        kv_cache_config=_make_hybrid_kv_cache_config(
+            cache_block_size, 300, ["full", "mamba_align"]
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        retention_interval=0,
+        use_eagle=True,
+    )
+    assert manager.coordinator._cache_hit_alignment_tokens == hash_block_size
+
+    mamba_manager = manager.coordinator.single_type_managers[1]
+    original_mask = type(mamba_manager).reachable_block_mask
+    observed_alignments = []
+
+    def record_alignment(cls, **kwargs):
+        observed_alignments.append(kwargs["alignment_tokens"])
+        return original_mask(**kwargs)
+
+    monkeypatch.setattr(
+        type(mamba_manager),
+        "reachable_block_mask",
+        classmethod(record_alignment),
+    )
+
+    token_ids = [i for i in range(3) for _ in range(hash_block_size)] + [3] * 31
+    req0 = make_request("0", token_ids, hash_block_size, sha256)
+    _cache_in_chunks(manager, req0, (64, 127), num_lookahead_tokens=3)
+    assert observed_alignments
+    assert set(observed_alignments) == {hash_block_size}
+
+
 def test_block_lookup_cache_single_block_per_key():
     cache = BlockHashToBlockMap()
     key0 = BlockHashWithGroupId(b"hash0")
