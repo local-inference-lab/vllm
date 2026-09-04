@@ -348,7 +348,7 @@ class BlockPool:
     def _build_block_stored_event(
         self,
         request: Request,
-        block_hashes: list[ExternalBlockHash] | None,
+        block_hashes: list[ExternalBlockHash],
         parent_block_hash: ExternalBlockHash | None,
         start_token_idx: int,
         end_token_idx: int,
@@ -377,72 +377,71 @@ class BlockPool:
     def emit_cached_block_events(
         self,
         request: Request,
-        num_cached_blocks: int,
+        blocks: Sequence[KVCacheBlock],
+        num_cached_tokens: int,
         block_size: int,
         kv_cache_group_id: int,
     ) -> None:
-        """Generate BlockStored events for blocks reused from prefix cache.
+        """Publish retained entries returned by lookup without changing block state.
 
-        Unlike cache_full_blocks(), this does NOT modify block state —
-        the blocks are already cached. It only generates events so that
-        external consumers (e.g. gateway) can learn about reused blocks.
-
-        Args:
-            request: The request whose prefix cache blocks were reused.
-            num_cached_blocks: Number of blocks that were cache hits.
-            block_size: Number of tokens per block.
-            kv_cache_group_id: The KV cache group ID.
+        ``blocks`` includes sparse null placeholders. ``num_cached_tokens`` is
+        the reconciled hit length, which may end inside the last physical block.
+        Only registered hashes owned by the returned blocks are advertised.
         """
-        if not self.enable_kv_cache_events or num_cached_blocks == 0:
+        if not self.enable_kv_cache_events or not blocks or num_cached_tokens == 0:
             return
 
         block_hashes = resolve_block_hashes(
             request.block_hashes, self.hash_block_size, block_size
         )
-
-        # Collect external hashes and extra_keys for cached blocks.
-        cached_hashes: list[ExternalBlockHash] = []
-        extra_keys_list: list[tuple[Any, ...] | None] = []
-        curr_mm_idx = 0
-        for i in range(num_cached_blocks):
-            block_start = i * block_size
-            block_end = block_start + block_size
-            cached_hashes.append(maybe_convert_block_hash(block_hashes[i]))
-            extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
-                request, block_start, block_end, curr_mm_idx
+        num_full_blocks = num_cached_tokens // block_size
+        stored_indices = [
+            i
+            for i, block in enumerate(blocks[:num_full_blocks])
+            if not block.is_null
+            and self.cached_block_hash_to_block.contain(
+                make_block_hash_with_group_id(block_hashes[i], kv_cache_group_id),
+                block.block_id,
             )
-            extra_keys_list.append(extra_keys)
+        ]
+        if stored_indices:
+            self._emit_stored_block_runs(
+                request, stored_indices, block_size, kv_cache_group_id
+            )
 
-        if not cached_hashes:
+        if num_cached_tokens % block_size == 0 or num_full_blocks >= len(blocks):
             return
-
-        # Prefix-cache hits always form a contiguous prefix starting at block 0,
-        # so the first (and thus the whole group's) parent block hash is None.
-        parent_block_hash: ExternalBlockHash | None = None
-        start_token_idx = 0
-        end_token_idx = num_cached_blocks * block_size
-
-        logger.debug(
-            "EmitCachedBlock event: block_size=%d, "
-            "num_cached_blocks=%d, parent_block_hash=%s, "
-            "token_ids_len=%d, group_idx=%s",
-            block_size,
-            num_cached_blocks,
-            parent_block_hash,
-            len(request.all_token_ids[start_token_idx:end_token_idx]),
-            kv_cache_group_id,
+        block = blocks[num_full_blocks]
+        if block.is_null:
+            return
+        partial_hash = self._get_partial_block_hash(request, num_cached_tokens)
+        if not self.cached_block_hash_to_block.contain(
+            make_block_hash_with_group_id(partial_hash, kv_cache_group_id),
+            block.block_id,
+        ):
+            # A longer group's hit can be truncated inside a full block during
+            # reconciliation. Do not invent a partial entry for that boundary.
+            return
+        parent_hash, start = self._get_partial_block_parent_hash_and_start(
+            request, num_cached_tokens
         )
-
+        extra_keys, _ = generate_block_hash_extra_keys(
+            request, start, num_cached_tokens, 0
+        )
         self.kv_event_queue.append(
             self._build_block_stored_event(
                 request,
-                block_hashes=cached_hashes,
-                parent_block_hash=parent_block_hash,
-                start_token_idx=start_token_idx,
-                end_token_idx=end_token_idx,
-                block_size=block_size,
+                block_hashes=[maybe_convert_block_hash(partial_hash)],
+                parent_block_hash=(
+                    maybe_convert_block_hash(parent_hash)
+                    if parent_hash is not None
+                    else None
+                ),
+                start_token_idx=start,
+                end_token_idx=num_cached_tokens,
+                block_size=num_cached_tokens - start,
                 kv_cache_group_id=kv_cache_group_id,
-                extra_keys_list=extra_keys_list,
+                extra_keys_list=[extra_keys],
             )
         )
 

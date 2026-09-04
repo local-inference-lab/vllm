@@ -78,6 +78,7 @@ def make_full_mamba_manager(
     num_blocks: int = 32,
     use_eagle: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
+    enable_kv_cache_events: bool = False,
 ):
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
@@ -116,6 +117,7 @@ def make_full_mamba_manager(
         scheduler_block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
         use_eagle=use_eagle,
+        enable_kv_cache_events=enable_kv_cache_events,
     )
 
 
@@ -1786,3 +1788,62 @@ def test_dcp_partial_hit_with_eagle_rewinds_one_hash_unit():
     assert num_computed == 4
     assert [len(group) for group in computed_blocks.blocks] == [1, 1]
     assert manager.allocate_slots(req1, 4, num_computed, computed_blocks) is not None
+
+
+@pytest.mark.parametrize("dcp_world_size", [1, 2])
+@pytest.mark.parametrize("events_enabled", [True, False])
+def test_full_replay_reports_fine_hit(dcp_world_size, events_enabled):
+    from vllm.distributed.kv_events import BlockStored
+    from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
+
+    manager = make_full_mamba_manager(
+        dcp_world_size=dcp_world_size,
+        full_block_size=4,
+        mamba_block_size=16,
+        enable_kv_cache_events=events_enabled,
+    )
+    req = make_request("fine-replay", list(range(49)), 2, sha256)
+    req.kv_cache_report_mode = "full"
+    pool = manager.block_pool
+    hit_tokens = 46
+    for group_idx, single in enumerate(manager.coordinator.single_type_managers):
+        size = single.block_size
+        count = hit_tokens // size
+        blocks = pool.get_new_blocks(count + 1)
+        if group_idx == 0:
+            pool.cache_full_blocks(req, blocks, 0, count, size, group_idx)
+        pool.cache_partial_block(req, blocks[-1], hit_tokens, group_idx, size)
+    pool.take_events()
+    before = [(b.block_hash, b.block_hash_num_tokens, b.ref_cnt) for b in pool.blocks]
+    aliases = {
+        key: set(value) for key, value in pool.cached_block_hashes_by_block.items()
+    }
+    computed, hit, _ = manager.get_computed_blocks(req)
+    assert hit == hit_tokens
+    assert computed.blocks[1][0].is_null
+    events = manager.take_events()
+    assert [
+        (b.block_hash, b.block_hash_num_tokens, b.ref_cnt) for b in pool.blocks
+    ] == before
+    assert pool.cached_block_hashes_by_block == aliases
+    if not events_enabled:
+        assert events == []
+        return
+    assert len(events) == 3
+    assert all(isinstance(event, BlockStored) for event in events)
+    full, full_tail, mamba_tail = events
+    size = 4 * dcp_world_size
+    end = hit_tokens // size * size
+    assert full.block_size == size
+    assert full.token_ids == list(range(end))
+    assert full.block_hashes == [
+        maybe_convert_block_hash(req.block_hashes[i])
+        for i in range(size // 2 - 1, end // 2, size // 2)
+    ]
+    for event, group in [(full_tail, 0), (mamba_tail, 1)]:
+        assert event.group_idx == group
+        assert event.block_hashes == [maybe_convert_block_hash(req.block_hashes[22])]
+        assert event.parent_block_hash == maybe_convert_block_hash(req.block_hashes[21])
+        assert event.token_ids == [44, 45]
+        assert event.block_size == 2
+        assert event.extra_keys == [None]

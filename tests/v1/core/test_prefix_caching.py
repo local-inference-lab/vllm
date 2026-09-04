@@ -2509,21 +2509,28 @@ def test_emit_cached_block_events():
     )
     assert len(req.block_hashes) >= num_cached_blocks
 
+    blocks = pool.get_new_blocks(num_cached_blocks)
+    pool.cache_full_blocks(
+        req, blocks, 0, num_cached_blocks, block_size, kv_cache_group_id
+    )
+    pool.take_events()
+    before = [(block.block_hash, block.ref_cnt) for block in blocks]
     # Snapshot block state to prove emit_cached_block_events does not mutate it.
     free_before = pool.get_num_free_blocks()
-    assert len(pool.cached_block_hash_to_block) == 0
+    assert len(pool.cached_block_hash_to_block) == num_cached_blocks
 
     pool.emit_cached_block_events(
         request=req,
-        num_cached_blocks=num_cached_blocks,
+        blocks=blocks,
+        num_cached_tokens=num_cached_blocks * block_size,
         block_size=block_size,
         kv_cache_group_id=kv_cache_group_id,
     )
 
-    # No block-state mutation: nothing allocated, nothing inserted into the
-    # prefix-cache map.
+    assert [(block.block_hash, block.ref_cnt) for block in blocks] == before
+    # Replay does not allocate blocks or change cache membership.
     assert pool.get_num_free_blocks() == free_before
-    assert len(pool.cached_block_hash_to_block) == 0
+    assert len(pool.cached_block_hash_to_block) == num_cached_blocks
 
     events = pool.take_events()
     assert len(events) == 1
@@ -2563,7 +2570,8 @@ def test_emit_cached_block_events_disabled():
 
     pool.emit_cached_block_events(
         request=req,
-        num_cached_blocks=3,
+        blocks=pool.get_new_blocks(3),
+        num_cached_tokens=3 * block_size,
         block_size=block_size,
         kv_cache_group_id=0,
     )
@@ -2572,7 +2580,7 @@ def test_emit_cached_block_events_disabled():
 
 
 def test_emit_cached_block_events_zero_cached():
-    """No events are emitted when num_cached_blocks == 0."""
+    """No events are emitted when no blocks were reused."""
     block_size = 4
     pool = BlockPool(
         num_gpu_blocks=8,
@@ -2589,7 +2597,8 @@ def test_emit_cached_block_events_zero_cached():
 
     pool.emit_cached_block_events(
         request=req,
-        num_cached_blocks=0,
+        blocks=[],
+        num_cached_tokens=0,
         block_size=block_size,
         kv_cache_group_id=0,
     )
@@ -4924,3 +4933,82 @@ def test_sparse_block_stored_manager_masks(kind):
         assert event.parent_block_hash == kv_cache_utils.maybe_convert_block_hash(
             req.block_hashes[lo - 1]
         )
+
+
+@pytest.mark.parametrize("kind", ["swa", "mamba", "full"])
+@pytest.mark.parametrize("events_enabled", [True, False])
+def test_full_replay_reports_retained_blocks(kind, events_enabled):
+    block_size = 16
+    full_spec = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    if kind == "mamba":
+        spec = MambaSpec(
+            block_size=block_size,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        )
+        retained = [5]
+    elif kind == "swa":
+        spec = SlidingWindowSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=32,
+        )
+        retained = [4, 5]
+    else:
+        spec = full_spec
+        retained = list(range(6))
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=32,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(["layer"], spec)],
+        ),
+        max_model_len=256,
+        enable_caching=True,
+        enable_kv_cache_events=events_enabled,
+        hash_block_size=block_size,
+    )
+    req = make_request(
+        "replay", list(range(97)), block_size, sha256, cache_salt="tenant"
+    )
+    req.kv_cache_report_mode = "full"
+    pool = manager.block_pool
+    blocks = pool.get_new_blocks(6)
+    pool.cache_full_blocks(
+        req, blocks, 0, 6, block_size, 0, [i in retained for i in range(6)]
+    )
+    pool.take_events()
+    before = [(b.block_hash, b.ref_cnt) for b in blocks]
+    cache_size = len(pool.cached_block_hash_to_block)
+    computed, hit, _ = manager.get_computed_blocks(req)
+    assert hit == 96
+    assert [i for i, b in enumerate(computed.blocks[0]) if not b.is_null] == retained
+    events = manager.take_events()
+    assert [(b.block_hash, b.ref_cnt) for b in blocks] == before
+    assert len(pool.cached_block_hash_to_block) == cache_size
+    if not events_enabled:
+        assert events == []
+        return
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, BlockStored)
+    assert event.block_hashes == [
+        kv_cache_utils.maybe_convert_block_hash(req.block_hashes[i]) for i in retained
+    ]
+    assert event.token_ids == list(range(retained[0] * block_size, 96))
+    assert event.parent_block_hash == (
+        kv_cache_utils.maybe_convert_block_hash(req.block_hashes[retained[0] - 1])
+        if retained[0]
+        else None
+    )
+    assert event.extra_keys == (
+        [None] * len(retained) if retained[0] else [("tenant",)] + [None] * 5
+    )
+    assert event.kv_cache_spec_kind == kind.replace("full", "full_attention").replace(
+        "swa", "sliding_window"
+    )

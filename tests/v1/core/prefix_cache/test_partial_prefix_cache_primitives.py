@@ -460,3 +460,64 @@ def test_partial_block_promotes_to_direct_full_block_hash(dcp_world_size: int):
     )
     assert pool.get_cached_block(promoted_full_hash, [kv_cache_group_id]) == [blocks[1]]
     assert pool.get_cached_block(partial_hash, [kv_cache_group_id]) is None
+
+
+@pytest.mark.parametrize("tail", ["alias", "unregistered", "null"])
+def test_replay_preserves_partial_alias_residency(tail):
+    req = make_request("alias-replay", list(range(16)), 2, sha256)
+    pool = BlockPool(3, True, 2, True)
+    blocks = pool.get_new_blocks(2)
+    pool.cache_full_blocks(req, blocks, 0, 2, 8, 0)
+    if tail == "alias":
+        pool.cache_partial_block(req, blocks[1], 10, 0, 8)
+    pool.take_events()
+    primary_hash = blocks[1].block_hash
+    aliases = {
+        key: set(value) for key, value in pool.cached_block_hashes_by_block.items()
+    }
+    returned = [blocks[0], pool.null_block if tail == "null" else blocks[1]]
+    pool.emit_cached_block_events(req, returned, 10, 8, 0)
+    events = pool.take_events()
+    assert len(events) == (2 if tail == "alias" else 1)
+    assert events[0].token_ids == list(range(8))
+    if tail == "alias":
+        assert events[1].block_hashes == [
+            kv_cache_utils.maybe_convert_block_hash(req.block_hashes[4])
+        ]
+        assert events[1].parent_block_hash == kv_cache_utils.maybe_convert_block_hash(
+            req.block_hashes[3]
+        )
+        assert events[1].token_ids == [8, 9]
+        assert events[1].block_size == 2
+    assert blocks[1].block_hash == primary_hash
+    assert pool.cached_block_hashes_by_block == aliases
+
+
+def test_sparse_promotion_removes_aliases_before_stored_runs():
+    req = make_request("promotion-runs", list(range(24)), 2, sha256)
+    pool = BlockPool(4, True, 2, True)
+    blocks = pool.get_new_blocks(3)
+    pool.cache_partial_block(req, blocks[0], 6, 0, 8)
+    pool.cache_partial_block(req, blocks[2], 22, 0, 8)
+    pool.take_events()
+    pool.cache_full_blocks(req, blocks, 0, 3, 8, 0, [True, False, True])
+    events = pool.take_events()
+    assert [type(event) for event in events] == [
+        BlockRemoved,
+        BlockRemoved,
+        BlockStored,
+        BlockStored,
+    ]
+    assert [event.block_hashes for event in events] == [
+        [kv_cache_utils.maybe_convert_block_hash(req.block_hashes[i])]
+        for i in (2, 10, 3, 11)
+    ]
+    pool.free_blocks(blocks)
+    assert pool.take_events() == []
+    pool.get_new_blocks(3)
+    removed = pool.take_events()
+    assert len(removed) == 2
+    assert all(isinstance(event, BlockRemoved) for event in removed)
+    assert {h for event in removed for h in event.block_hashes} == {
+        kv_cache_utils.maybe_convert_block_hash(req.block_hashes[i]) for i in (3, 11)
+    }
