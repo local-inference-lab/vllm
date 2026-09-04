@@ -562,11 +562,22 @@ def bind_kv_cache(
         forward_context[layer_name].bind_kv_cache(kv_cache)
 
 
-def copy_kv_cache_blocks_inplace(
+def group_kv_caches_for_copy(
+    kv_caches: Mapping[str, Any],
+    kv_cache_config: KVCacheConfig,
+) -> list[list[torch.Tensor | list[torch.Tensor]]]:
+    """Index logical KV cache views by scheduler KV cache group."""
+    return [
+        [kv_caches[name] for name in group.layer_names if name in kv_caches]
+        for group in kv_cache_config.kv_cache_groups
+    ]
+
+
+def _copy_kv_cache_block_pairs(
     kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
     num_blocks: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
-) -> None:
+) -> tuple[int, int]:
     """Copy CoW pages through each cache tensor's logical block axis.
 
     Hybrid DCP caches can expose several differently shaped or padded views of
@@ -578,7 +589,7 @@ def copy_kv_cache_blocks_inplace(
     fallback for compatibility.
     """
     if not kv_cache_block_copies:
-        return
+        return 0, 0
 
     storage_tensors: dict[int, list[torch.Tensor]] = defaultdict(list)
     for entry in kv_caches:
@@ -591,10 +602,13 @@ def copy_kv_cache_blocks_inplace(
             storage_tensors[ptr].append(tensor)
 
     if not storage_tensors:
-        return
+        return 0, 0
     first_tensor = next(iter(storage_tensors.values()))[0]
     device = first_tensor.device
-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
+    indices_np = np.array(
+        [(copy.src_block_id, copy.dst_block_id) for copy in kv_cache_block_copies],
+        dtype=np.int64,
+    )
     indices = async_tensor_h2d(indices_np, device=device)
     src_indices, dst_indices = indices.unbind(dim=1)
     logical_copy_views = 0
@@ -647,10 +661,74 @@ def copy_kv_cache_blocks_inplace(
         blocks.index_copy_(0, dst_indices, source_pages)
         raw_fallback_storages += 1
 
+    return logical_copy_views, raw_fallback_storages
+
+
+def copy_kv_cache_blocks_inplace(
+    kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
+    num_blocks: int,
+    kv_cache_block_copies: Sequence[KVCacheBlockCopy],
+    *,
+    kv_cache_groups: Sequence[Iterable[torch.Tensor | list[torch.Tensor]]]
+    | None = None,
+) -> None:
+    """Copy CoW pages only within the scheduler group that created them.
+
+    Block IDs share one allocator namespace across heterogeneous KV cache
+    groups. A source and destination pair therefore identifies bytes only when
+    combined with its group ID; broadcasting that pair can overwrite a live
+    block belonging to another group. Untagged copies and callers without a
+    group view retain the all-cache behavior for compatibility.
+    """
+    if not kv_cache_block_copies:
+        return
+
+    copies_by_group: dict[int, list[KVCacheBlockCopy]] = defaultdict(list)
+    broadcast_copies: list[KVCacheBlockCopy] = []
+    if kv_cache_groups is None:
+        broadcast_copies.extend(kv_cache_block_copies)
+    else:
+        for copy in kv_cache_block_copies:
+            group_id = copy.kv_cache_group_id
+            if group_id is None:
+                broadcast_copies.append(copy)
+                continue
+            if group_id < 0 or group_id >= len(kv_cache_groups):
+                raise ValueError(
+                    f"KV cache CoW group {group_id} is outside the configured "
+                    f"range [0, {len(kv_cache_groups)})"
+                )
+            copies_by_group[group_id].append(copy)
+
+    logical_copy_views = 0
+    raw_fallback_storages = 0
+    if copies_by_group:
+        assert kv_cache_groups is not None
+    for group_id, group_copies in copies_by_group.items():
+        logical_views, fallback_storages = _copy_kv_cache_block_pairs(
+            kv_cache_groups[group_id],
+            num_blocks,
+            group_copies,
+        )
+        logical_copy_views += logical_views
+        raw_fallback_storages += fallback_storages
+
+    if broadcast_copies:
+        logical_views, fallback_storages = _copy_kv_cache_block_pairs(
+            kv_caches,
+            num_blocks,
+            broadcast_copies,
+        )
+        logical_copy_views += logical_views
+        raw_fallback_storages += fallback_storages
+
     logger.info_once(
-        "KV cache CoW copied %d pair(s) through %d logical view(s); "
-        "%d storage(s) used the compatibility fallback",
-        len(kv_cache_block_copies),
+        "KV cache CoW copied %d group-scoped pair(s) for group(s) %s and "
+        "%d compatibility-broadcast pair(s) through %d logical view(s); "
+        "%d storage(s) used the raw fallback",
+        sum(len(copies) for copies in copies_by_group.values()),
+        tuple(sorted(copies_by_group)),
+        len(broadcast_copies),
         logical_copy_views,
         raw_fallback_storages,
     )

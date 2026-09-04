@@ -155,7 +155,11 @@ from vllm.v1.worker.gpu.spec_decode.utils import (
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
+from vllm.v1.worker.utils import (
+    KVBlockZeroer,
+    copy_kv_cache_blocks_inplace,
+    group_kv_caches_for_copy,
+)
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
@@ -731,6 +735,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
             kv_cache_raw_tensors=kv_cache_raw_tensors,
         )
+        self.kv_caches_by_group = group_kv_caches_for_copy(
+            kv_caches_dict, self.kv_cache_config
+        )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
@@ -1016,6 +1023,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
+        if hasattr(self, "kv_caches_by_group"):
+            self.kv_caches_by_group.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
@@ -1363,6 +1372,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
+                kv_cache_groups=self.kv_caches_by_group,
             )
 
     def prepare_inputs(
@@ -2367,6 +2377,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._release_cudagraph_pool_anchor()
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
+        if hasattr(self, "kv_caches_by_group"):
+            self.kv_caches_by_group.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):

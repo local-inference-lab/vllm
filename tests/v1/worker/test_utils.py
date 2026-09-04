@@ -121,3 +121,24 @@ def test_copy_kv_cache_blocks_detects_nonzero_block_axis() -> None:
     copy_kv_cache_blocks_inplace([cache], 4, [KVCacheBlockCopy(1, 3)])
 
     assert torch.equal(cache[:, 3], cache[:, 1])
+
+
+def test_copy_kv_cache_blocks_scopes_tagged_copy_to_group() -> None:
+    """A group's CoW must not overwrite a live block in another group."""
+    num_blocks = 8
+    attention_cache = torch.zeros((num_blocks, 2), dtype=torch.int32)
+    recurrent_cache = torch.zeros((num_blocks, 2), dtype=torch.int32)
+    attention_cache[1].fill_(11)
+    attention_cache[5].fill_(-1)
+    recurrent_cache[1].fill_(22)
+    recurrent_cache[5].fill_(55)
+
+    copy_kv_cache_blocks_inplace(
+        [attention_cache, recurrent_cache],
+        num_blocks,
+        [KVCacheBlockCopy(1, 5, kv_cache_group_id=0)],
+        kv_cache_groups=[[attention_cache], [recurrent_cache]],
+    )
+
+    assert torch.equal(attention_cache[5], attention_cache[1])
+    assert torch.equal(recurrent_cache[5], torch.full_like(recurrent_cache[5], 55))
