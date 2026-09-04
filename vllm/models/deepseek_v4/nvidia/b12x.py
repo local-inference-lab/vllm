@@ -67,6 +67,16 @@ def _require_compressed_mla_api() -> ModuleType:
             "DeepSeek-V4 B12X sparse MLA requires the B12X package with its "
             "public compressed_sparse_mla API installed."
         ) from exc
+    required_symbols = ("Caps", "plan", "run", "split_chunks_for_contract")
+    missing_symbols = [
+        symbol for symbol in required_symbols if not hasattr(compressed_sparse_mla, symbol)
+    ]
+    if missing_symbols:
+        raise RuntimeError(
+            "DeepSeek-V4 B12X sparse MLA requires a compatible public "
+            "compressed_sparse_mla API; missing "
+            f"{', '.join(missing_symbols)}."
+        )
     return compressed_sparse_mla
 
 
