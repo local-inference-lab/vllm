@@ -130,12 +130,18 @@ lmcache_mode=${LMCACHE_MODE:-off}
 lmcache_mode=${lmcache_mode,,}
 lmcache_transfer_mode=${LMCACHE_TRANSFER_MODE:-auto}
 lmcache_transfer_mode=${lmcache_transfer_mode,,}
-vision_direct_lmcache=0
-if [[ "${model_variant}" == "vision" \
-  && "${lmcache_mode}" != "off" \
+direct_lmcache=0
+if [[ "${lmcache_mode}" != "off" \
   && "${lmcache_mode}" != "0" \
   && "${lmcache_transfer_mode}" != "engine_driven" ]]; then
+  direct_lmcache=1
+fi
+vision_direct_lmcache=0
+text_direct_lmcache=0
+if [[ "${direct_lmcache}" == "1" && "${model_variant}" == "vision" ]]; then
   vision_direct_lmcache=1
+elif [[ "${direct_lmcache}" == "1" ]]; then
+  text_direct_lmcache=1
 fi
 if [[ "${mode}" == "dspark" || "${mode}" == "dspark-mtp0" ]]; then
   max_num_seqs=${MAX_NUM_SEQS:-16}
@@ -389,6 +395,11 @@ if [[ -z "${gpu_memory_utilization}" ]]; then
     # vLLM memory estimate. The TP2 profile reserves enough physical memory for
     # those late allocations and an uncached 810k-token plus ten-image overlap.
     gpu_memory_utilization=0.951
+  elif [[ "${text_direct_lmcache}" == "1" ]]; then
+    # Direct LMCache allocates transfer buffers after vLLM sizes the GPU KV
+    # pool. A 0.965 budget preserves a one-million-token TP2 DSpark KV pool on
+    # 96 GiB GPUs while retaining memory for the runtime transfer allocation.
+    gpu_memory_utilization=0.965
   elif [[ "${model_variant}" == "vision" ]]; then
     gpu_memory_utilization=0.975
   elif [[ "${mode}" == "dspark" ]]; then
@@ -419,6 +430,25 @@ if [[ -z "${gpu_memory_utilization}" ]]; then
     gpu_memory_utilization=0.912
   else
     gpu_memory_utilization=0.91
+  fi
+fi
+
+allow_unqualified_lmcache_memory=$(bool_value \
+  LMCACHE_ALLOW_UNQUALIFIED_MEMORY_PROFILE \
+  "${LMCACHE_ALLOW_UNQUALIFIED_MEMORY_PROFILE:-0}")
+lmcache_memory_profile=standard
+if [[ "${text_direct_lmcache}" == "1" \
+  && "${mode}" == "dspark" \
+  && "${tp_size}" == "2" \
+  && "${max_model_len}" -ge 1048576 ]]; then
+  lmcache_memory_profile=qualified
+  if awk -v value="${gpu_memory_utilization}" \
+    'BEGIN { exit !((value + 0) > 0.965) }'; then
+    if [[ "${allow_unqualified_lmcache_memory}" == "0" ]]; then
+      echo "Text DS4 TP2 DSpark with direct LMCache and MAX_MODEL_LEN at or above 1048576 requires GPU_MEMORY_UTILIZATION at or below 0.965 on 96 GiB GPUs; set LMCACHE_ALLOW_UNQUALIFIED_MEMORY_PROFILE=1 only after qualifying a different memory profile" >&2
+      exit 2
+    fi
+    lmcache_memory_profile=unqualified
   fi
 fi
 
@@ -567,11 +597,12 @@ if [[ -n "${EXTRA_VLLM_ARGS:-}" ]]; then
 fi
 command+=("$@")
 
-printf 'DS4 launch: variant=%s mode=%s depth=%s backend=%s allreduce=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s native_l2=%s allocator=%s model=%s\n' \
+printf 'DS4 launch: variant=%s mode=%s depth=%s backend=%s allreduce=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s direct_lmcache=%s lmcache_memory_profile=%s native_l2=%s allocator=%s model=%s\n' \
   "${model_variant}" "${mode}" "${dspark_depth_mode}" \
   "${backend}" "${allreduce_mode}" \
   "${tp_size}" "${dcp_size}" "${max_num_seqs}" \
   "${graph_cap}" "${load_format}" \
+  "${direct_lmcache}" "${lmcache_memory_profile}" \
   "${native_l2_enabled}" \
   "${PYTORCH_CUDA_ALLOC_CONF:-<unset>}" "${model}" >&2
 printf 'Command:' >&2

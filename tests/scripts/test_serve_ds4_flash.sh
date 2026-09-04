@@ -39,6 +39,43 @@ text_output="$(capture \
 assert_contains "${text_output}" 'variant=text mode=dspark'
 assert_contains "${text_output}" '--max-model-len 131072'
 
+text_lmcache_output="$(capture \
+  MODEL=deepseek-ai/DeepSeek-V4-Flash-0731 DS4_MODEL_VARIANT=text \
+  LMCACHE_MODE=disk)"
+assert_contains "${text_lmcache_output}" '--gpu-memory-utilization 0.965'
+assert_contains "${text_lmcache_output}" 'direct_lmcache=1'
+
+text_engine_driven_output="$(capture \
+  MODEL=deepseek-ai/DeepSeek-V4-Flash-0731 DS4_MODEL_VARIANT=text \
+  LMCACHE_MODE=disk LMCACHE_TRANSFER_MODE=engine_driven)"
+assert_contains "${text_engine_driven_output}" '--gpu-memory-utilization 0.975'
+assert_contains "${text_engine_driven_output}" 'direct_lmcache=0'
+
+text_qualified_output="$(capture \
+  MODEL=deepseek-ai/DeepSeek-V4-Flash-0731 DS4_MODEL_VARIANT=text \
+  LMCACHE_MODE=disk TP_SIZE=2 DSPARK_TOKENS=5 MAX_MODEL_LEN=1048576)"
+assert_contains "${text_qualified_output}" '--gpu-memory-utilization 0.965'
+assert_contains "${text_qualified_output}" 'lmcache_memory_profile=qualified'
+
+if text_unsafe_output="$(capture \
+    MODEL=deepseek-ai/DeepSeek-V4-Flash-0731 DS4_MODEL_VARIANT=text \
+    LMCACHE_MODE=disk TP_SIZE=2 DSPARK_TOKENS=5 MAX_MODEL_LEN=1048576 \
+    GPU_MEMORY_UTILIZATION=0.975)"; then
+  printf 'Text direct LMCache accepted an unqualified memory profile:\n%s\n' \
+    "${text_unsafe_output}" >&2
+  exit 1
+fi
+assert_contains "${text_unsafe_output}" \
+  'requires GPU_MEMORY_UTILIZATION at or below 0.965'
+
+text_override_output="$(capture \
+  MODEL=deepseek-ai/DeepSeek-V4-Flash-0731 DS4_MODEL_VARIANT=text \
+  LMCACHE_MODE=disk TP_SIZE=2 DSPARK_TOKENS=5 MAX_MODEL_LEN=1048576 \
+  GPU_MEMORY_UTILIZATION=0.975 \
+  LMCACHE_ALLOW_UNQUALIFIED_MEMORY_PROFILE=1)"
+assert_contains "${text_override_output}" '--gpu-memory-utilization 0.975'
+assert_contains "${text_override_output}" 'lmcache_memory_profile=unqualified'
+
 lmcache_output="$(capture LMCACHE_MODE=ram)"
 assert_contains "${lmcache_output}" '--gpu-memory-utilization 0.951'
 assert_contains "${lmcache_output}" '--max-model-len 900000'
