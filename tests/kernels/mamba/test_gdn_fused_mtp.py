@@ -236,6 +236,71 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
     torch.testing.assert_close(output, torch.ones_like(output))
 
 
+@torch.inference_mode()
+def test_fused_forward_overlaps_b12x_mxfp8_input_projections() -> None:
+    """B12X-packed QKVZ and BA weights use the paired projection API."""
+    device = torch.device("cuda")
+    num_tokens = 4
+    hidden_states = torch.empty(num_tokens, 256, dtype=torch.bfloat16, device=device)
+    mixed_qkvz = torch.randn(
+        num_tokens, CONV_DIM + HV * V, dtype=torch.bfloat16, device=device
+    )
+    ba = torch.randn(num_tokens, 2 * HV, dtype=torch.bfloat16, device=device)
+    qkvz_weight = object()
+    ba_weight = object()
+    layer = types.SimpleNamespace(
+        prefix=PREFIX,
+        enable_fused_gdn_decode=True,
+        norm=types.SimpleNamespace(
+            weight=torch.empty(V, dtype=torch.bfloat16, device=device)
+        ),
+        num_v_heads=HV,
+        tp_size=1,
+        head_v_dim=V,
+        in_proj_qkvz=types.SimpleNamespace(b12x_mxfp8_packed_weight=qkvz_weight),
+        in_proj_ba=types.SimpleNamespace(b12x_mxfp8_packed_weight=ba_weight),
+        out_proj=lambda x: (x, None),
+    )
+    layer.forward_cuda = types.MethodType(
+        QwenGatedDeltaNetAttention.forward_cuda, layer
+    )
+
+    def packed_op(
+        actual_qkvz: torch.Tensor,
+        actual_ba: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        layer_name: str,
+    ) -> None:
+        assert actual_qkvz is mixed_qkvz
+        assert actual_ba is ba
+        assert layer_name == _encode_layer_name(PREFIX)
+        output.fill_(1)
+
+    with (
+        patch.object(
+            qwen_gdn_linear_attn,
+            "_b12x_mxfp8_pair",
+            return_value=(mixed_qkvz, ba),
+        ) as pair_mock,
+        patch.object(
+            torch.ops.vllm,
+            "qwen_gdn_attention_core_fused_norm_packed",
+            side_effect=packed_op,
+        ),
+    ):
+        output = layer.forward_cuda(hidden_states)
+
+    pair_mock.assert_called_once_with(
+        hidden_states,
+        qkvz_weight,
+        ba_weight,
+        expected_m=num_tokens,
+        parallel_max_tokens=1023,
+    )
+    torch.testing.assert_close(output, torch.ones_like(output))
+
+
 @pytest.mark.parametrize(
     "seq_lens,query_lens,draft_tokens,expected_fused_calls",
     [
