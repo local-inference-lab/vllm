@@ -277,7 +277,12 @@ def test_dense_dflash_tp3_drops_target_expert_parallel(monkeypatch) -> None:
         lambda *args: applied.append(args),
     )
     placement = {
-        "prefill_context_parallel_size": 1,
+        "prefill_context_parallel_size": 2,
+        "decode_context_parallel_size": 2,
+        "dcp_kv_cache_interleave_size": 4,
+        "dcp_comm_backend": "a2a",
+        "dcp_q_replicate": True,
+        "cp_kv_cache_interleave_size": 4,
         "data_parallel_size": 2,
         "data_parallel_size_local": 2,
         "data_parallel_rank": 1,
@@ -302,14 +307,23 @@ def test_dense_dflash_tp3_drops_target_expert_parallel(monkeypatch) -> None:
     )
     spec = object.__new__(SpeculativeConfig)
     object.__setattr__(spec, "method", "dflash")
-    object.__setattr__(spec, "target_model_config", object())
     object.__setattr__(spec, "target_parallel_config", target_parallel)
+    target_hf_config = SimpleNamespace(architectures=["Glm5NextForCausalLM"])
+    object.__setattr__(
+        spec,
+        "target_model_config",
+        SimpleNamespace(
+            hf_config=target_hf_config,
+            hf_text_config=target_hf_config,
+        ),
+    )
     object.__setattr__(spec, "draft_model_config", object())
     object.__setattr__(spec, "draft_parallel_config", draft_parallel)
 
     spec._apply_glm53_tp3_draft_geometry()
 
     assert draft_parallel.enable_expert_parallel is False
+    assert draft_parallel.world_size == 6
     for name, value in placement.items():
         assert getattr(draft_parallel, name) == value
     assert len(applied) == 1
@@ -346,6 +360,10 @@ def test_dense_dflash_tp3_drops_target_expert_parallel(monkeypatch) -> None:
     assert draft_parallel.rank == 0
     assert target_parallel.tensor_parallel_size == 3
     assert target_parallel.enable_expert_parallel
+
+    target_parallel.tensor_parallel_size = 4
+    tp4_vllm_config = proposer._create_draft_vllm_config()
+    assert tp4_vllm_config.parallel_config is target_parallel
 
 
 def test_engine_dp_identity_reaches_speculative_draft() -> None:

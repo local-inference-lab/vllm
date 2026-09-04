@@ -98,6 +98,21 @@ def _snapshot(model_config: object) -> dict[str, Any]:
     return deepcopy(vars(model_config))
 
 
+def test_glm53_tp3_target_geometry_requires_expert_parallel(
+    glm53_model_config: FakeGlm53ModelConfig,
+) -> None:
+    parallel_config = ParallelConfig(
+        tensor_parallel_size=3,
+        enable_expert_parallel=False,
+    )
+
+    with pytest.raises(ValueError, match="requires expert parallelism"):
+        apply_glm53_tp3_target_geometry(
+            cast(Any, glm53_model_config),
+            parallel_config,
+        )
+
+
 def test_glm53_tp3_target_geometry_uses_parallel_config_and_preserves_logical_axes(
     glm53_model_config: FakeGlm53ModelConfig,
     tp3_ep_parallel_config: ParallelConfig,
@@ -330,6 +345,36 @@ def test_glm53_tp3_mtp_draft_preserves_expert_parallel_topology() -> None:
     assert draft_text_config.glm53_tp3_shared_expert_intermediate_size == 2112
 
 
+def test_glm53_tp3_draft_tp1_is_an_exact_noop() -> None:
+    target_model_config = FakeGlm53ModelConfig()
+    draft_model_config = FakeDFlashModelConfig()
+    target_parallel_config = ParallelConfig(
+        tensor_parallel_size=3,
+        data_parallel_size=2,
+        data_parallel_size_local=2,
+        enable_expert_parallel=True,
+    )
+    draft_parallel_config = ParallelConfig(tensor_parallel_size=1)
+    before = _snapshot(draft_model_config)
+    speculative_config = SimpleNamespace(
+        method="dflash",
+        target_model_config=target_model_config,
+        target_parallel_config=target_parallel_config,
+        draft_model_config=draft_model_config,
+        draft_parallel_config=draft_parallel_config,
+    )
+
+    SpeculativeConfig._apply_glm53_tp3_draft_geometry(
+        cast(Any, speculative_config)
+    )
+
+    assert draft_parallel_config.tensor_parallel_size == 1
+    assert draft_parallel_config.data_parallel_size == 1
+    assert draft_parallel_config.data_parallel_size_local == 1
+    assert not draft_parallel_config.enable_expert_parallel
+    assert _snapshot(draft_model_config) == before
+
+
 def test_glm53_tp3_dflash_drops_ep_and_couples_heads_with_vocab_storage() -> None:
     target_model_config = FakeGlm53ModelConfig()
     draft_model_config = FakeDFlashModelConfig()
@@ -375,6 +420,58 @@ def test_glm53_tp3_dflash_drops_ep_and_couples_heads_with_vocab_storage() -> Non
     assert draft_model_config.model_arch_config.total_num_attention_heads == 36
     assert draft_model_config.model_arch_config.total_num_kv_heads == 9
     assert draft_model_config.model_arch_config.vocab_size == 154880
+
+
+def test_glm53_tp3_dflash_preserves_reduced_draft_vocabulary() -> None:
+    target_model_config = FakeGlm53ModelConfig()
+    draft_model_config = FakeDFlashModelConfig()
+    draft_model_config.hf_text_config.draft_vocab_size = 32000
+
+    assert apply_glm53_tp3_draft_geometry(
+        cast(Any, target_model_config),
+        ParallelConfig(tensor_parallel_size=3),
+        cast(Any, draft_model_config),
+        ParallelConfig(tensor_parallel_size=3),
+    )
+
+    assert draft_model_config.hf_text_config.draft_vocab_size == 32000
+
+
+@pytest.mark.parametrize(
+    ("attribute", "invalid_value"),
+    [
+        ("num_attention_heads", 31),
+        ("num_key_value_heads", 7),
+        ("vocab_size", 154879),
+    ],
+)
+def test_glm53_tp3_invalid_nested_dflash_geometry_is_transactional(
+    attribute: str,
+    invalid_value: int,
+) -> None:
+    target_model_config = FakeGlm53ModelConfig()
+    draft_model_config = FakeDFlashModelConfig()
+    text_config = draft_model_config.hf_text_config
+    draft_model_config.hf_config = SimpleNamespace(
+        model_type="qwen3",
+        architectures=["DFlash2DraftModel"],
+        text_config=text_config,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        vocab_size=154880,
+    )
+    setattr(draft_model_config.hf_config, attribute, invalid_value)
+    before = _snapshot(draft_model_config)
+
+    with pytest.raises(ValueError, match=rf"expected {attribute}="):
+        apply_glm53_tp3_draft_geometry(
+            cast(Any, target_model_config),
+            ParallelConfig(tensor_parallel_size=3),
+            cast(Any, draft_model_config),
+            ParallelConfig(tensor_parallel_size=3),
+        )
+
+    assert _snapshot(draft_model_config) == before
 
 
 @pytest.mark.parametrize(
