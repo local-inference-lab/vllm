@@ -177,7 +177,7 @@ if [[ "${vision_direct_lmcache}" == "1" \
   && -n "${MAX_MODEL_LEN:-}" \
   && "${max_model_len}" -gt 900000 \
   && -z "${GPU_MEMORY_UTILIZATION:-}" ]]; then
-  echo "Vision direct LMCache with MAX_MODEL_LEN above 900000 requires an explicit GPU_MEMORY_UTILIZATION override; the qualified 96 GiB default is MAX_MODEL_LEN=900000 with GPU_MEMORY_UTILIZATION=0.95" >&2
+  echo "Vision direct LMCache with MAX_MODEL_LEN above 900000 requires an explicit GPU_MEMORY_UTILIZATION override; the qualified 96 GiB default is MAX_MODEL_LEN=900000 with GPU_MEMORY_UTILIZATION=0.951" >&2
   exit 2
 fi
 if [[ -n "${kv_offloading_size}" \
@@ -388,7 +388,7 @@ if [[ -z "${gpu_memory_utilization}" ]]; then
     # Direct LMCache transfer opens one CUDA IPC client per TP rank after the
     # vLLM memory estimate. The TP2 profile reserves enough physical memory for
     # those late allocations and an uncached 810k-token plus ten-image overlap.
-    gpu_memory_utilization=0.95
+    gpu_memory_utilization=0.951
   elif [[ "${model_variant}" == "vision" ]]; then
     gpu_memory_utilization=0.975
   elif [[ "${mode}" == "dspark" ]]; then

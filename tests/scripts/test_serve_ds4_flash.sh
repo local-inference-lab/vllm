@@ -40,7 +40,7 @@ assert_contains "${text_output}" 'variant=text mode=dspark'
 assert_contains "${text_output}" '--max-model-len 131072'
 
 lmcache_output="$(capture LMCACHE_MODE=ram)"
-assert_contains "${lmcache_output}" '--gpu-memory-utilization 0.95'
+assert_contains "${lmcache_output}" '--gpu-memory-utilization 0.951'
 assert_contains "${lmcache_output}" '--max-model-len 900000'
 
 engine_driven_output="$(capture \
