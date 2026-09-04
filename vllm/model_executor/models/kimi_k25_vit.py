@@ -282,27 +282,28 @@ class Rope2DPosEmbRepeated(nn.Module):
             f"max_width={self.max_width}, theta_base={self.theta_base}"
         )
 
-    def _precompute_freqs_cis(self, device: torch.device) -> torch.Tensor:
-        """Calculate the cis(freqs) for each position in the 2D grid."""
-        N = self.max_height * self.max_width
-        flat_pos = torch.arange(0, N).float().to(device)
-        x_pos = flat_pos % self.max_width
-        y_pos = flat_pos // self.max_width
-        dim_range = (
-            torch.arange(0, self.dim, 4)[: (self.dim // 4)].float().to(device)
-        )  # C/4
+    def _compute_grid_freqs_cis(
+        self, height: int, width: int, device: torch.device
+    ) -> torch.Tensor:
+        """Calculate rotary frequencies for one requested image grid."""
+        x_pos = torch.arange(width, dtype=torch.float32, device=device)
+        y_pos = torch.arange(height, dtype=torch.float32, device=device)
+        dim_range = torch.arange(0, self.dim, 4, dtype=torch.float32, device=device)[
+            : (self.dim // 4)
+        ]
         freqs = 1.0 / (self.theta_base ** (dim_range / self.dim))
-        x_freqs = torch.outer(x_pos, freqs).float()  # N, C/4
-        y_freqs = torch.outer(y_pos, freqs).float()  # N, C/4
-        x_cis = torch.polar(torch.ones_like(x_freqs), x_freqs)  # N, C/4
-        y_cis = torch.polar(torch.ones_like(y_freqs), y_freqs)  # N, C/4
-        # N, C/4, 2
-        freqs_cis = torch.cat(
-            [x_cis.unsqueeze(dim=-1), y_cis.unsqueeze(dim=-1)], dim=-1
+        x_freqs = torch.outer(x_pos, freqs).float()
+        y_freqs = torch.outer(y_pos, freqs).float()
+        x_cis = torch.polar(torch.ones_like(x_freqs), x_freqs)
+        y_cis = torch.polar(torch.ones_like(y_freqs), y_freqs)
+        freqs_cis = torch.stack(
+            (
+                x_cis.unsqueeze(0).expand(height, -1, -1),
+                y_cis.unsqueeze(1).expand(-1, width, -1),
+            ),
+            dim=-1,
         )
-        # max_height, max_width, C/2
-        freqs_cis = freqs_cis.reshape(self.max_height, self.max_width, -1)
-        return freqs_cis
+        return freqs_cis.reshape(height * width, self.dim // 2)
 
     def get_freqs_cis(
         self, grid_thws: torch.Tensor | list[list[int]], device: torch.device
@@ -314,11 +315,6 @@ class Rope2DPosEmbRepeated(nn.Module):
         Returns:
             freqs_cis: tensor of shape (sum(t * height * width), dim//2)
         """
-        if not hasattr(self, "freqs_cis"):
-            self.register_buffer(
-                "freqs_cis", self._precompute_freqs_cis(device), persistent=False
-            )
-
         shapes = grid_thws if isinstance(grid_thws, list) else grid_thws.tolist()
         assert all(
             1 <= h <= self.max_height and 1 <= w <= self.max_width for t, h, w in shapes
@@ -327,14 +323,15 @@ class Rope2DPosEmbRepeated(nn.Module):
             self.max_height,
             self.max_width,
         )
-        freqs_cis = torch.cat(
-            [
-                self.freqs_cis[:h, :w].reshape(-1, self.dim // 2).repeat(t, 1)
-                for t, h, w in shapes
-            ],
-            dim=0,
-        )
-        return freqs_cis
+        grids: dict[tuple[int, int], torch.Tensor] = {}
+        result = []
+        for t, h, w in shapes:
+            grid = grids.get((h, w))
+            if grid is None:
+                grid = self._compute_grid_freqs_cis(h, w, device)
+                grids[(h, w)] = grid
+            result.append(grid.repeat(t, 1))
+        return torch.cat(result, dim=0)
 
 
 class MLP2(nn.Module):
@@ -843,21 +840,24 @@ class MoonViT3dPretrainedModel(nn.Module):
 
 @torch.inference_mode()
 def mm_projector_forward(mm_projector: torch.nn.Module, vt_output: list[torch.Tensor]):
-    """Apply MM projector to vision tower outputs."""
-    num_embedding_list = [x.shape[0] for x in vt_output]
-    batched = torch.cat(vt_output, dim=0)
+    """Apply the projector without concatenating independent image features."""
+    if not vt_output:
+        raise ValueError("Kimi vision projection requires at least one image feature")
+
     projector_norm = getattr(mm_projector, "pre_norm", None)
     if projector_norm is None:
         projector_norm = getattr(mm_projector, "post_norm", None)
     projector_dtype = (
-        projector_norm.weight.dtype if projector_norm is not None else batched.dtype
+        projector_norm.weight.dtype if projector_norm is not None else None
     )
-    if batched.dtype != projector_dtype:
-        batched = batched.to(projector_dtype)
-    proj_out = mm_projector(batched)
-    proj_out = proj_out.reshape(-1, proj_out.shape[-1])
-    proj_out = torch.split(proj_out, num_embedding_list)
-    return proj_out
+
+    projected = []
+    for image_features in vt_output:
+        if projector_dtype is not None and image_features.dtype != projector_dtype:
+            image_features = image_features.to(projector_dtype)
+        output = mm_projector(image_features)
+        projected.append(output.reshape(-1, output.shape[-1]))
+    return tuple(projected)
 
 
 @torch.inference_mode()
