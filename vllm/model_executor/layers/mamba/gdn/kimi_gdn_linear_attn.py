@@ -608,6 +608,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._initialize_b12x_kda_decode(vllm_config)
         self._b12x_prefill_api: Any | None = None
         self._b12x_prefill_plan = None
+        self._b12x_prefill_scratch = None
         self._initialize_b12x_kda_prefill(vllm_config)
         self.o_proj = RowParallelLinear(
             self.projection_size,
@@ -698,9 +699,12 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         super().bind_kv_cache(kv_cache)
         if self._b12x_prefill_api is not None:
-            self._b12x_prefill_plan = self._make_b12x_kda_prefill_plan(
+            prefill_plan = self._make_b12x_kda_prefill_plan(
                 max_state_slots=int(self.kv_cache[1].shape[0])
             )
+            self._b12x_prefill_plan = prefill_plan
+            prefill_scratch, _ = self._get_b12x_prefill_workspace()
+            self._b12x_prefill_scratch = prefill_scratch
         api = self._b12x_kda_api
         if api is None:
             return
@@ -714,6 +718,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_kda_plan = None
         self._b12x_kda_scratch = None
         self._b12x_prefill_plan = None
+        self._b12x_prefill_scratch = None
         super().unbind_kv_cache()
 
     def _initialize_b12x_kda_prefill(self, vllm_config: VllmConfig) -> None:
@@ -779,9 +784,31 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         )
 
+    def _get_b12x_prefill_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
+        plan = self._b12x_prefill_plan
+        if plan is None:
+            raise RuntimeError("b12x KDA prefill KV cache is not bound")
+        scratch_specs = tuple(plan.scratch_specs())
+        if len(scratch_specs) != 1:
+            raise RuntimeError("b12x KDA prefill requires exactly one scratch buffer")
+        scratch_spec = scratch_specs[0]
+        scratch, output = current_workspace_manager().get_simultaneous(
+            (scratch_spec.shape, scratch_spec.dtype),
+            (
+                (
+                    self._b12x_prefill_max_tokens,
+                    self.local_num_heads,
+                    self.head_dim,
+                ),
+                self.model_config.dtype,
+            ),
+        )
+        return scratch, output
+
     def _run_b12x_kda_prefill(
         self,
         *,
+        scratch: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -792,7 +819,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         has_initial_state: torch.Tensor,
         checkpoint: Any | None,
         recurrent_state: torch.Tensor,
-        scratch: torch.Tensor | list[torch.Tensor],
         output: torch.Tensor,
     ) -> None:
         """Run packed KDA prefill straight against the recurrent-state pool.
@@ -803,6 +829,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         an initial state name the null slot and start from zero.
 
         Args:
+            scratch: Workspace that is simultaneously live with ``output``.
             q: Live packed query rows, ``[tokens, heads, head_dim]``.
             k: Live packed key rows.
             v: Live packed value rows.
@@ -813,7 +840,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             has_initial_state: Whether each request continues a cached state.
             checkpoint: Mid-sequence checkpoint metadata, or ``None``.
             recurrent_state: The caller-owned recurrent-state pool.
-            scratch: Caller-owned scratch that is disjoint from ``output``.
             output: Destination rows, ``[tokens, heads, head_dim]``.
 
         Raises:
@@ -1396,30 +1422,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     assert self.gate_lower_bound is not None
                     assert prefill_query_start_loc is not None
                     num_prefill_tokens = int(q_ns.shape[1])
-                    plan = self._b12x_prefill_plan
-                    if plan is None:
-                        raise RuntimeError(
-                            "b12x KDA prefill KV cache was not bound before inference"
-                        )
-                    workspaces = current_workspace_manager().get_simultaneous(
-                        *((spec.shape, spec.dtype) for spec in plan.scratch_specs()),
-                        (
-                            (
-                                self._b12x_prefill_max_tokens,
-                                self.local_num_heads,
-                                self.head_dim,
-                            ),
-                            self.model_config.dtype,
-                        ),
-                    )
-                    *scratch_buffers, b12x_out = workspaces
-                    b12x_scratch = (
-                        scratch_buffers[0]
-                        if len(scratch_buffers) == 1
-                        else scratch_buffers
-                    )
+                    b12x_scratch, b12x_out = self._get_b12x_prefill_workspace()
                     b12x_out = b12x_out[:num_prefill_tokens]
                     self._run_b12x_kda_prefill(
+                        scratch=b12x_scratch,
                         q=q_ns[0],
                         k=k_ns[0],
                         v=v_ns[0],
@@ -1430,7 +1436,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                         has_initial_state=prefill_has_initial_state,
                         checkpoint=prefill_checkpoint,
                         recurrent_state=recurrent_state,
-                        scratch=b12x_scratch,
                         output=b12x_out,
                     )
                     core_attn_out_non_spec = b12x_out.unsqueeze(0)

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -533,6 +534,13 @@ class _FakeKdaPrefillApi:
             self._calls[name] = kwargs[name].clone()
         self._calls["num_seqs"] = int(kwargs["num_seqs"].item())
         self._calls["num_tokens"] = int(kwargs["num_tokens"].item())
+        scratch_start = kwargs["scratch"].data_ptr()
+        scratch_end = scratch_start + kwargs["scratch"].nbytes
+        output_start = kwargs["output"].data_ptr()
+        output_end = output_start + kwargs["output"].nbytes
+        self._calls["scratch_output_overlap"] = (
+            scratch_start < output_end and output_start < scratch_end
+        )
         return SimpleNamespace(
             output=kwargs["output"], recurrent_state=kwargs["recurrent_state"]
         )
@@ -601,7 +609,7 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(
         calls_sink: dict[str, object] = {}
         layer._b12x_prefill_api = _FakeKdaPrefillApi(calls_sink)
         layer._b12x_prefill_plan = SimpleNamespace(
-            scratch_specs=lambda: (SimpleNamespace(shape=(1,), dtype=torch.uint8),)
+            scratch_specs=lambda: (SimpleNamespace(shape=(16,), dtype=torch.uint8),)
         )
         layer._b12x_prefill_num_seqs = torch.zeros(1, dtype=torch.int32)
         layer._b12x_prefill_num_tokens = torch.zeros(1, dtype=torch.int32)
@@ -655,9 +663,25 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(
         return out, final_state
 
     class FakeWorkspaceManager:
-        @staticmethod
-        def get_simultaneous(*specs):
-            return [torch.empty(shape, dtype=dtype) for shape, dtype in specs]
+        def __init__(self) -> None:
+            self.storage = torch.empty(1024, dtype=torch.uint8)
+
+        def get_simultaneous(self, *specs):
+            outputs = []
+            offset = 0
+            for shape, dtype in specs:
+                nbytes = math.prod(shape) * dtype.itemsize
+                outputs.append(
+                    self.storage[offset : offset + nbytes].view(dtype).view(shape)
+                )
+                offset += nbytes
+            return outputs
+
+    workspace_manager = FakeWorkspaceManager()
+    if prefill_backend == "b12x":
+        (layer._b12x_prefill_scratch,) = workspace_manager.get_simultaneous(
+            ((16,), torch.uint8)
+        )
 
     def fake_gather(state, indices, has_initial_state):
         calls["prefill_state_indices"] = indices.clone()
@@ -676,7 +700,7 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(
     monkeypatch.setattr(
         kimi_gdn_linear_attn,
         "current_workspace_manager",
-        lambda: FakeWorkspaceManager(),
+        lambda: workspace_manager,
     )
     monkeypatch.setattr(kda_ops, "fused_recurrent_kda", fake_recurrent)
     monkeypatch.setattr(kda_ops, "chunk_kda_with_fused_gate", fake_chunk)
@@ -717,6 +741,7 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(
         assert calls["max_live_tokens"] == 2
         assert calls["max_live_seqs"] == 1
         assert calls["lower_bound"] == -5.0
+        assert not calls["scratch_output_overlap"]
         assert torch.equal(core_attn_out[:, :2], torch.full((1, 2, 1, 1), 11.0))
         assert torch.equal(core_attn_out[:, 2:], torch.full((1, 2, 1, 1), 22.0))
         assert torch.equal(layer.kv_cache[1][3], torch.full((1, 1, 1), 33.0))
@@ -905,7 +930,7 @@ def test_glm5next_b12x_kda_prefill_matches_the_triton_chunk_path() -> None:
         )
     )
     layer._b12x_prefill_plan = plan
-    scratch = torch.empty(
+    layer._b12x_prefill_scratch = torch.empty(
         plan.scratch_specs()[0].shape, dtype=torch.uint8, device=device
     )
     layer._b12x_prefill_num_seqs = torch.zeros(1, dtype=torch.int32, device=device)
@@ -921,6 +946,7 @@ def test_glm5next_b12x_kda_prefill_matches_the_triton_chunk_path() -> None:
     got_pool = pool.clone()
     out = torch.zeros(tokens, heads, head_dim, dtype=torch.bfloat16, device=device)
     layer._run_b12x_kda_prefill(
+        scratch=layer._b12x_prefill_scratch,
         q=q,
         k=k,
         v=v,
@@ -931,7 +957,6 @@ def test_glm5next_b12x_kda_prefill_matches_the_triton_chunk_path() -> None:
         has_initial_state=initial_mask,
         checkpoint=None,
         recurrent_state=got_pool,
-        scratch=scratch,
         output=out,
     )
     torch.accelerator.synchronize(device)

@@ -34,6 +34,10 @@ KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-10G}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
 MTP_MOE_BACKEND="${MTP_MOE_BACKEND:-humming}"
 MTP_ATTENTION_BACKEND="${MTP_ATTENTION_BACKEND:-B12X}"
+KDA_PREFILL_BACKEND="${KDA_PREFILL_BACKEND:-b12x}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-B12X}"
+MOE_BACKEND="${MOE_BACKEND:-b12x}"
+LINEAR_BACKEND="${LINEAR_BACKEND:-b12x}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 B12X_POLICY_MODE="${B12X_POLICY_MODE:-auto}"
 NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
@@ -95,6 +99,7 @@ Launcher options:
   -h, --help    Show this help.
 
 Environment overrides include MODEL_PATH, MAX_MODEL_LEN, MTP_MOE_BACKEND,
+KDA_PREFILL_BACKEND, ATTENTION_BACKEND, MOE_BACKEND, LINEAR_BACKEND,
 KV_CACHE_MEMORY_BYTES, HEAD_IP, WORKER_IP, ETH_IF, IB_IF, IMAGE_NAME,
 CONTAINER_MEMORY_GB, and NUM_SPECULATIVE_TOKENS.
 EOF
@@ -195,6 +200,14 @@ case "${B12X_POLICY_MODE}" in
     ;;
 esac
 
+case "${KDA_PREFILL_BACKEND}" in
+  auto|triton|flashkda|b12x) ;;
+  *)
+    echo "Invalid KDA prefill backend: ${KDA_PREFILL_BACKEND}" >&2
+    exit 2
+    ;;
+esac
+
 case "${NCCL_DEBUG}" in
   VERSION|WARN|INFO|TRACE) ;;
   *)
@@ -203,8 +216,8 @@ case "${NCCL_DEBUG}" in
     ;;
 esac
 
-if [[ ! "${NUM_SPECULATIVE_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "NUM_SPECULATIVE_TOKENS must be a positive integer." >&2
+if [[ ! "${NUM_SPECULATIVE_TOKENS}" =~ ^[0-9]+$ ]]; then
+  echo "NUM_SPECULATIVE_TOKENS must be a non-negative integer." >&2
   exit 2
 fi
 
@@ -455,9 +468,13 @@ if ((detach)); then
   cluster_args+=(-d)
 fi
 
-speculative_config=$(printf \
-  '{"method":"mtp","num_speculative_tokens":%s,"moe_backend":"%s","attention_backend":"%s"}' \
-  "${NUM_SPECULATIVE_TOKENS}" "${MTP_MOE_BACKEND}" "${MTP_ATTENTION_BACKEND}")
+speculative_args=()
+if ((NUM_SPECULATIVE_TOKENS > 0)); then
+  speculative_config=$(printf \
+    '{"method":"mtp","num_speculative_tokens":%s,"moe_backend":"%s","attention_backend":"%s"}' \
+    "${NUM_SPECULATIVE_TOKENS}" "${MTP_MOE_BACKEND}" "${MTP_ATTENTION_BACKEND}")
+  speculative_args=(--speculative-config "${speculative_config}")
+fi
 
 vllm_command=(
   "${VLLM_BIN}" serve "${MODEL_PATH}"
@@ -474,19 +491,21 @@ vllm_command=(
   --dtype bfloat16
   --kv-cache-dtype fp8
   --quantization modelopt_mixed
-  --attention-backend B12X
+  --attention-backend "${ATTENTION_BACKEND}"
   --block-size 256
-  --moe-backend b12x
-  --linear-backend b12x
+  --moe-backend "${MOE_BACKEND}"
+  --linear-backend "${LINEAR_BACKEND}"
   --no-enable-flashinfer-autotune
   --load-format instanttensor
-  --model-loader-extra-config '{"instanttensor_copy":false}'
+  --model-loader-extra-config \
+    '{"instanttensor_copy":false,"instanttensor_distributed":false}'
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
   --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}"
   --max-model-len "${MAX_MODEL_LEN}"
   --max-num-seqs "${MAX_NUM_SEQS}"
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
-  --speculative-config "${speculative_config}"
+  "${speculative_args[@]}"
+  --kda-prefill-backend "${KDA_PREFILL_BACKEND}"
   --reasoning-parser glm45
   --tool-call-parser glm47
   --enable-auto-tool-choice
