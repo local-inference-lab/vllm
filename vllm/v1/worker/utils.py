@@ -573,6 +573,26 @@ def group_kv_caches_for_copy(
     ]
 
 
+def should_defer_draft_after_partial_dcp_resume(
+    *,
+    cache_dtype: str,
+    dcp_size: int,
+    block_size: int,
+    is_prefilling: np.ndarray,
+    num_cached_tokens: np.ndarray,
+) -> bool:
+    """Return whether a packed partial-DCP resume needs one target-only token."""
+    if cache_dtype != "fp8_ds_mla" or dcp_size <= 1:
+        return False
+    if is_prefilling.shape != num_cached_tokens.shape:
+        raise ValueError("prefill and cached-token arrays must have the same shape")
+    dcp_page_tokens = block_size * dcp_size
+    partial_resume = (num_cached_tokens > 0) & (
+        num_cached_tokens % dcp_page_tokens != 0
+    )
+    return bool(np.any(is_prefilling & partial_resume))
+
+
 def _copy_kv_cache_block_pairs(
     kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
     num_blocks: int,
