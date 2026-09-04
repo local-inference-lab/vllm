@@ -126,9 +126,31 @@ host=${HOST:-0.0.0.0}
 port=${PORT:-8000}
 tp_size=${TP_SIZE:-${TP:-4}}
 dcp_size=${DCP_SIZE:-${DCP:-1}}
+lmcache_mode=${LMCACHE_MODE:-off}
+lmcache_mode=${lmcache_mode,,}
+lmcache_transfer_mode=${LMCACHE_TRANSFER_MODE:-auto}
+lmcache_transfer_mode=${lmcache_transfer_mode,,}
+vision_direct_lmcache=0
+if [[ "${model_variant}" == "vision" \
+  && "${lmcache_mode}" != "off" \
+  && "${lmcache_mode}" != "0" \
+  && "${lmcache_transfer_mode}" != "engine_driven" ]]; then
+  vision_direct_lmcache=1
+fi
 if [[ "${mode}" == "dspark" || "${mode}" == "dspark-mtp0" ]]; then
   max_num_seqs=${MAX_NUM_SEQS:-16}
-  max_model_len=${MAX_MODEL_LEN:-131072}
+  if [[ "${model_variant}" == "vision" ]]; then
+    if [[ "${vision_direct_lmcache}" == "1" ]]; then
+      # Direct LMCache creates CUDA transfer buffers after vLLM profiles the
+      # model. A 900k-token KV pool leaves enough physical memory for those
+      # buffers and the maximum profiled vision batch on a 96 GiB GPU.
+      max_model_len=${MAX_MODEL_LEN:-900000}
+    else
+      max_model_len=${MAX_MODEL_LEN:-1048576}
+    fi
+  else
+    max_model_len=${MAX_MODEL_LEN:-131072}
+  fi
 else
   max_num_seqs=${MAX_NUM_SEQS:-64}
   max_model_len=${MAX_MODEL_LEN:-262144}
@@ -148,8 +170,16 @@ rejection_sample_method=${REJECTION_SAMPLE_METHOD:-standard}
 require_positive_int TP_SIZE "${tp_size}"
 require_positive_int DCP_SIZE "${dcp_size}"
 require_positive_int MAX_NUM_SEQS "${max_num_seqs}"
+require_positive_int MAX_MODEL_LEN "${max_model_len}"
 require_positive_int MAX_NUM_BATCHED_TOKENS "${max_num_batched_tokens}"
 require_positive_int BLOCK_SIZE "${block_size}"
+if [[ "${vision_direct_lmcache}" == "1" \
+  && -n "${MAX_MODEL_LEN:-}" \
+  && "${max_model_len}" -gt 900000 \
+  && -z "${GPU_MEMORY_UTILIZATION:-}" ]]; then
+  echo "Vision direct LMCache with MAX_MODEL_LEN above 900000 requires an explicit GPU_MEMORY_UTILIZATION override; the qualified 96 GiB default is MAX_MODEL_LEN=900000 with GPU_MEMORY_UTILIZATION=0.95" >&2
+  exit 2
+fi
 if [[ -n "${kv_offloading_size}" \
   && ! "${kv_offloading_size}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
   echo "KV_OFFLOADING_SIZE must be a non-negative GiB value; got '${kv_offloading_size}'" >&2
@@ -354,18 +384,11 @@ if [[ "${sp_async_tp}" == "1" ]]; then
 fi
 
 if [[ -z "${gpu_memory_utilization}" ]]; then
-  lmcache_mode=${LMCACHE_MODE:-off}
-  lmcache_mode=${lmcache_mode,,}
-  lmcache_transfer_mode=${LMCACHE_TRANSFER_MODE:-auto}
-  lmcache_transfer_mode=${lmcache_transfer_mode,,}
-  if [[ "${model_variant}" == "vision" \
-    && "${lmcache_mode}" != "off" \
-    && "${lmcache_mode}" != "0" \
-    && "${lmcache_transfer_mode}" != "engine_driven" ]]; then
+  if [[ "${vision_direct_lmcache}" == "1" ]]; then
     # Direct LMCache transfer opens one CUDA IPC client per TP rank after the
-    # vLLM memory estimate. The qualified TP2 profile reserves 1.5 GiB/rank
-    # beyond the normal 0.975 allocation envelope for those late contexts.
-    gpu_memory_utilization=0.96
+    # vLLM memory estimate. The TP2 profile reserves enough physical memory for
+    # those late allocations and an uncached 810k-token plus ten-image overlap.
+    gpu_memory_utilization=0.95
   elif [[ "${model_variant}" == "vision" ]]; then
     gpu_memory_utilization=0.975
   elif [[ "${mode}" == "dspark" ]]; then
