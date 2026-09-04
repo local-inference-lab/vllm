@@ -88,6 +88,17 @@ def test_each_semantic_channel_gets_an_independent_workspace() -> None:
     assert eager.destroyed
 
 
+def test_all_peer_capability_requires_a_prepared_workspace() -> None:
+    pool = make_pool()
+    assert not pool.supports_all_peer_auxiliary
+
+    pool.prepare_channels(("vllm:target:production",))
+    assert pool.supports_all_peer_auxiliary
+
+    pool.close()
+    assert not pool.supports_all_peer_auxiliary
+
+
 def test_capture_routes_graph_calls_without_reusing_eager_state() -> None:
     pool = make_pool()
     inp = torch.arange(4, dtype=torch.float32)
@@ -173,6 +184,8 @@ def test_custom_allreduce_constructs_flashinfer_pool(
 ) -> None:
     captured: dict[str, Any] = {}
     runtime = MagicMock()
+    runtime.supports_all_peer_auxiliary = True
+    dma_min_bytes = MagicMock(return_value=None)
 
     class FakePool:
         @classmethod
@@ -216,6 +229,7 @@ def test_custom_allreduce_constructs_flashinfer_pool(
     monkeypatch.setattr(
         custom_all_reduce, "_load_flashinfer_pcie_oneshot_pool", lambda: FakePool
     )
+    monkeypatch.setattr(custom_all_reduce, "_b12x_pcie_dma_min_bytes", dma_min_bytes)
     monkeypatch.setattr(
         custom_all_reduce.current_platform, "get_device_capability", lambda: None
     )
@@ -260,3 +274,4 @@ def test_custom_allreduce_constructs_flashinfer_pool(
     assert captured["max_size"] > 0
     runtime.prepare_channels.assert_called_once()
     runtime.for_stream.assert_called_once()
+    dma_min_bytes.assert_called_once_with()
