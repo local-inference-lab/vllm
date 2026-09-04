@@ -15,6 +15,9 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
 )
+from vllm.v1.core.single_type_kv_cache_manager import (
+    resolve_sparse_retention_inputs,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
@@ -133,6 +136,10 @@ class MooncakeStoreCoordinator:
         self.eagle_group_ids = {
             gid for g in attention_groups if g.use_eagle for gid in g.group_ids
         }
+        self.lookup_drops_eagle_block = any(
+            group.use_eagle and group.manager_cls.drops_eagle_block
+            for group in attention_groups
+        )
 
     def find_longest_cache_hit(
         self,
@@ -248,13 +255,20 @@ class MooncakeStoreCoordinator:
             manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
             assert manager_cls is not None
             use_eagle = g_idx in self.eagle_group_ids
-            reachable_boundaries = (
+            reachable_boundaries: Sequence[int] = (
                 () if num_prompt_tokens is None else (num_prompt_tokens - 1,)
+            )
+            use_eagle, reachable_boundaries = resolve_sparse_retention_inputs(
+                spec,
+                use_eagle,
+                self.lookup_drops_eagle_block,
+                mask_alignment,
+                reachable_boundaries,
             )
             mask = manager_cls.reachable_block_mask(
                 start_block=start_chunk,
                 end_block=end_chunk,
-                alignment_tokens=self.lcm_block_size,
+                alignment_tokens=mask_alignment,
                 kv_cache_spec=spec,
                 use_eagle=use_eagle,
                 retention_interval=retention_interval,

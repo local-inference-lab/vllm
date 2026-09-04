@@ -149,14 +149,9 @@ class KVCacheCoordinator(ABC):
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
 
-        # Sparse retention must account for a full-attention EAGLE drop because
-        # the coordinator reconciles every group to one hit length. A sparse
-        # group that kept only its own boundary would then sit above the shared
-        # candidate.
         lookup_drops_eagle_block = any(
-            i in self.eagle_group_ids
-            and isinstance(group.kv_cache_spec, FullAttentionSpec)
-            for i, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            i in self.eagle_group_ids and manager.drops_eagle_block
+            for i, manager in enumerate(self.single_type_managers)
         )
         for manager in self.single_type_managers:
             manager.lookup_drops_eagle_block = lookup_drops_eagle_block

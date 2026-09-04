@@ -731,7 +731,10 @@ def _test_partial_request_hit(
 
 
 def _make_hybrid_kv_cache_config(
-    block_size: int, num_blocks: int, spec_types: list[str]
+    block_size: int,
+    num_blocks: int,
+    spec_types: list[str],
+    eagle_group_ids: set[int] | None = None,
 ) -> KVCacheConfig:
     """
     Create a KVCacheConfig with the specified spec types.
@@ -744,6 +747,7 @@ def _make_hybrid_kv_cache_config(
             - "sliding_window": SlidingWindowSpec with window=2*block_size
             - "sliding_window_large": SlidingWindowSpec with window=4*block_size
             - "mamba": MambaSpec
+        eagle_group_ids: Group indices explicitly marked for EAGLE/MTP.
     """
     spec_map = {
         "full": lambda: FullAttentionSpec(
@@ -779,8 +783,13 @@ def _make_hybrid_kv_cache_config(
         ),
     }
 
+    eagle_group_ids = eagle_group_ids or set()
     kv_cache_groups = [
-        KVCacheGroupSpec([f"layer{i}"], spec_map[spec_type]())
+        KVCacheGroupSpec(
+            [f"layer{i}"],
+            spec_map[spec_type](),
+            is_eagle_group=i in eagle_group_ids,
+        )
         for i, spec_type in enumerate(spec_types)
     ]
 
@@ -3461,8 +3470,8 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
     )
 
     # 127 tokens: latest replay boundary is floor((127 - 1) / 32) * 32 = 96.
-    # The EAGLE/MTP SWA lookup group must cache the local tail ending at
-    # 104 tokens, and that tail is two 8-token blocks wide: hashes 11 and 12.
+    # The EAGLE/MTP SWA lookup group must cache two-block proof tails ending
+    # at 104 tokens and at the reachable predecessor after 64 tokens.
     token_ids = [i for i in range(15) for _ in range(block_size)] + [15] * 7
     req0 = make_request("0", token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
@@ -3476,7 +3485,7 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
     assert blocks is not None
 
     pool = manager.block_pool
-    expected_swa_cached = {11, 12}
+    expected_swa_cached = {7, 8, 11, 12}
     for i in range(15):
         cached = pool.get_cached_block(req0.block_hashes[i], kv_cache_group_ids=[1])
         if i in expected_swa_cached:
@@ -3693,12 +3702,23 @@ def _cache_in_chunks(manager, request, chunk_ends, num_lookahead_tokens=0):
         request.num_computed_tokens = chunk_end
 
 
-def test_hybrid_swa_retention_keeps_eagle_reachable_predecessor():
+@pytest.mark.parametrize(
+    "eagle_group_ids",
+    [
+        pytest.param(None, id="fallback"),
+        pytest.param({0}, id="full_only"),
+        pytest.param({0, 1, 2}, id="all_groups"),
+    ],
+)
+def test_hybrid_swa_retention_keeps_eagle_reachable_predecessor(eagle_group_ids):
     """SWA and Mamba must retain the same post-drop replay boundary."""
     block_size = 32
     manager = make_kv_cache_manager(
         kv_cache_config=_make_hybrid_kv_cache_config(
-            block_size, 300, ["full", "mamba_align", "sliding_window"]
+            block_size,
+            300,
+            ["full", "mamba_align", "sliding_window"],
+            eagle_group_ids=eagle_group_ids,
         ),
         max_model_len=8192,
         enable_caching=True,
@@ -3716,6 +3736,39 @@ def test_hybrid_swa_retention_keeps_eagle_reachable_predecessor():
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
     assert num_computed_tokens == 2 * block_size
     assert [len(blocks) for blocks in computed_blocks.blocks] == [2, 2, 2]
+
+
+def test_hybrid_mamba_retention_follows_swa_eagle_drop():
+    """Mamba must retain a boundary lowered by another sparse group."""
+    block_size = 32
+    manager = make_kv_cache_manager(
+        kv_cache_config=_make_hybrid_kv_cache_config(
+            block_size,
+            300,
+            ["sliding_window", "mamba_align"],
+            eagle_group_ids={0},
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=0,
+        use_eagle=True,
+    )
+
+    token_ids = [i for i in range(8) for _ in range(block_size)] + [8] * 31
+    req0 = make_request("0", token_ids, block_size, sha256)
+    _cache_in_chunks(
+        manager,
+        req0,
+        (32, 64, 96, 128, 160, 192, 224, 256, 287),
+        num_lookahead_tokens=3,
+    )
+    manager.free(req0)
+
+    req1 = make_request("1", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+    assert num_computed_tokens == 7 * block_size
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [7, 7]
 
 
 def test_hybrid_sparse_retention_uses_fine_hit_alignment(monkeypatch):
@@ -4299,6 +4352,30 @@ def test_pure_swa_retention_latest_only():
     replay = make_request("1", token_ids, block_size, sha256)
     _, num_computed, _ = manager.get_computed_blocks(replay)
     assert num_computed == 240
+
+
+def test_pure_swa_eagle_retention_keeps_reachable_predecessor():
+    block_size = 32
+    manager = _make_pure_swa_manager(
+        block_size,
+        sliding_window=2 * block_size,
+        retention_interval=0,
+        use_eagle=True,
+    )
+
+    token_ids = [i for i in range(8) for _ in range(block_size)] + [8] * 31
+    request = make_request("0", token_ids, block_size, sha256)
+    _cache_in_chunks(
+        manager,
+        request,
+        (32, 64, 96, 128, 160, 192, 224, 256, 287),
+        num_lookahead_tokens=3,
+    )
+    manager.free(request)
+
+    replay = make_request("1", token_ids, block_size, sha256)
+    _, num_computed, _ = manager.get_computed_blocks(replay)
+    assert num_computed == 7 * block_size
 
 
 def test_pure_swa_dense_retention_caches_all():

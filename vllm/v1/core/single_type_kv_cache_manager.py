@@ -40,14 +40,11 @@ def reachable_hit_positions(
 ) -> tuple[int, ...]:
     """Token positions a cache hit can land on for one reachable boundary.
 
-    A lookup floors the boundary to ``alignment_tokens``. Under EAGLE the
-    full-attention finder additionally subtracts ``min(alignment_tokens,
-    its own block_size)`` and re-floors to the alignment, which lands on
-    exactly one alignment unit below the boundary either way. That lower
-    position is the ONLY one this group can be asked for until the request
-    decodes past the next boundary, so sparse-retention masks must treat both
-    as reachable: retaining only the boundary leaves every kept state above
-    every candidate a lookup can produce, and the reconciled hit is always 0.
+    A lookup floors the boundary to ``alignment_tokens``. Under EAGLE an
+    attention finder removes its lookahead block and re-floors to the
+    alignment. The result is either the aligned boundary or one alignment unit
+    below it, depending on the finder's block size. Sparse-retention masks must
+    treat both as reachable.
 
     Expressing the back-off in tokens rather than blocks is what makes this
     correct when a group's block size differs from the alignment: one block is
@@ -59,6 +56,29 @@ def reachable_hit_positions(
     return (aligned, max(aligned - alignment_tokens, 0))
 
 
+def resolve_sparse_retention_inputs(
+    kv_cache_spec: KVCacheSpec,
+    use_eagle: bool,
+    lookup_drops_eagle_block: bool,
+    alignment_tokens: int,
+    reachable_boundaries: Sequence[int],
+) -> tuple[bool, tuple[int, ...]]:
+    """Account for an EAGLE-reduced shared hit boundary."""
+    boundaries = tuple(reachable_boundaries)
+    if not lookup_drops_eagle_block:
+        return use_eagle, boundaries
+    if isinstance(kv_cache_spec, MambaSpec):
+        return True, boundaries
+    if isinstance(kv_cache_spec, SlidingWindowSpec):
+        boundaries = tuple(
+            position
+            for boundary in boundaries
+            for position in reachable_hit_positions(boundary, alignment_tokens, True)
+            if position > 0
+        )
+    return use_eagle, boundaries
+
+
 class SingleTypeKVCacheManager(ABC):
     """
     An abstract base class for a manager that handle the kv cache management
@@ -66,6 +86,7 @@ class SingleTypeKVCacheManager(ABC):
     """
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
+    drops_eagle_block: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -133,10 +154,9 @@ class SingleTypeKVCacheManager(ABC):
         # determining the attention groups.
         self.use_eagle = False
 
-        # Whether a full-attention lookup applies that drop. Sparse retention
+        # Whether an attention-group lookup applies that drop. Sparse retention
         # must account for it because the coordinator reconciles every group to
-        # one hit length. See ``reachable_hit_positions``. Set by the
-        # coordinator.
+        # one hit length. Set by the coordinator.
         self.lookup_drops_eagle_block = False
 
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
@@ -486,23 +506,20 @@ class SingleTypeKVCacheManager(ABC):
         # Token boundaries whose reachable tail must be retained under sparse
         # retention: the replay boundary (``num_prompt - 1``, capped by
         # ``get_computed_blocks``) and any detected shared-prefix junction.
-        reachable_boundaries = [request.num_prompt_tokens - 1]
+        reachable_boundaries: Sequence[int] = (request.num_prompt_tokens - 1,)
         if request.shared_prefix_boundary:
-            reachable_boundaries.append(request.shared_prefix_boundary)
+            reachable_boundaries = (
+                *reachable_boundaries,
+                request.shared_prefix_boundary,
+            )
 
-        retention_use_eagle = self.use_eagle
-        if self.lookup_drops_eagle_block:
-            if isinstance(self.kv_cache_spec, MambaSpec):
-                retention_use_eagle = True
-            elif isinstance(self.kv_cache_spec, SlidingWindowSpec):
-                reachable_boundaries = [
-                    position
-                    for boundary in reachable_boundaries
-                    for position in reachable_hit_positions(
-                        boundary, mask_alignment_tokens, True
-                    )
-                    if position > 0
-                ]
+        retention_use_eagle, reachable_boundaries = resolve_sparse_retention_inputs(
+            self.kv_cache_spec,
+            self.use_eagle,
+            self.lookup_drops_eagle_block,
+            mask_alignment_tokens,
+            reachable_boundaries,
+        )
 
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
@@ -731,6 +748,7 @@ class SingleTypeKVCacheManager(ABC):
 
 class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
+    drops_eagle_block: ClassVar[bool] = True
 
     @classmethod
     def find_longest_cache_hit(
@@ -936,6 +954,8 @@ class RSWAManager(FullAttentionManager):
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):
+    drops_eagle_block: ClassVar[bool] = True
+
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
         self.sliding_window = kv_cache_spec.sliding_window

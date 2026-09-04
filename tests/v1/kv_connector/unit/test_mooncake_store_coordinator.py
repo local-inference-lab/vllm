@@ -451,6 +451,38 @@ def test_store_mask_retention_prefix_stable_as_aligned_length_grows():
     assert longer[: len(shorter)] == shorter
 
 
+def test_store_mask_retains_shared_eagle_predecessor():
+    groups = [
+        KVCacheGroupSpec(["full"], _full(32), is_eagle_group=True),
+        KVCacheGroupSpec(["mamba"], _mamba_align(32)),
+        KVCacheGroupSpec(["swa"], _swa(32, 64)),
+    ]
+    coord = _make_coord(
+        groups,
+        hash_block_size=32,
+        use_eagle=True,
+        retention_interval=0,
+    )
+
+    masks = coord.store_mask(288, num_prompt_tokens=287)
+    assert masks[0] is None
+    assert masks[1] == [i in (6, 7) for i in range(9)]
+    assert masks[2] == [i in (5, 6, 7) for i in range(9)]
+
+
+def test_store_mask_uses_fine_hit_alignment():
+    groups = [
+        KVCacheGroupSpec(["full"], _full(128)),
+        KVCacheGroupSpec(["mamba"], _mamba_align(64)),
+    ]
+    coord = _make_coord(groups, hash_block_size=32, retention_interval=0)
+    assert coord.enable_partial_hash_hits
+
+    masks = coord.store_mask(512, num_prompt_tokens=501)
+    assert masks[0] is None
+    assert masks[1] == [i == 6 for i in range(8)]
+
+
 # ----- Eagle / MTP interaction with load_mask -----
 
 
