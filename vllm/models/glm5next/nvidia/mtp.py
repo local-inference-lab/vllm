@@ -13,6 +13,7 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import (
@@ -25,6 +26,10 @@ from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from vllm.transformers_utils.configs.glm53_tp_pad import (
+    pad_head_weights,
+    vocab_padding_size,
+)
 from .model import (
     GLM5NEXT_PACKED_MODULES_MAPPING,
     Glm5NextDecoderLayer,
@@ -34,6 +39,21 @@ from .model import (
     get_spec_layer_idx_from_weight_name,
 )
 from .pooled_indexer import Glm5NextPooledIndexer
+
+
+class _TpPaddedSharedHead(SharedHead):
+    """SharedHead whose lm_head pads the vocab to lcm(64, TP) (TP3: 154,880 -> 155,136)."""
+
+    def __init__(self, config, prefix: str, quant_config=None) -> None:
+        nn.Module.__init__(self)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            padding_size=vocab_padding_size(),
+            prefix=maybe_prefix(prefix, "head"),
+        )
 
 
 class Glm5NextMultiTokenPredictorLayer(nn.Module):
@@ -63,7 +83,7 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             dtype=torch.int32,
             device=current_platform.device_type,
         )
-        self.shared_head = SharedHead(
+        self.shared_head = _TpPaddedSharedHead(
             config=config, prefix=prefix, quant_config=quant_config
         )
         # MTP layers sit past the base model's hidden layers; parse the index
@@ -128,6 +148,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            padding_size=vocab_padding_size(),
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
         # Plain list for the per-propose lookup: ModuleDict[str(...)] builds a
@@ -341,6 +362,8 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         return name
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # TP head padding (VLLM_GLM53_TP_HEAD_PAD), see model.py.
+        weights = pad_head_weights(weights, self.config)
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),

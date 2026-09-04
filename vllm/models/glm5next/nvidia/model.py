@@ -95,6 +95,12 @@ from .multimodal import (
     Glm5NextVisionTransformer,
 )
 from .pooled_indexer import Glm5NextPooledIndexer
+from vllm.transformers_utils.configs.glm53_tp_pad import (
+    pad_head_weights,
+    routed_expert_intermediate,
+    shared_expert_intermediate,
+    vocab_padding_size,
+)
 
 logger = init_logger(__name__)
 
@@ -202,6 +208,7 @@ class Glm5NextMoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         apply_routed_scale_to_output: bool = False,
+        is_mtp_layer: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -255,7 +262,8 @@ class Glm5NextMoE(nn.Module):
         if config.n_shared_experts is None:
             self.shared_experts = None
         else:
-            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            # TP3: 2048 does not split three ways; pad to a multiple of 64 x TP (see glm53_tp_pad).
+            intermediate_size = shared_expert_intermediate(config, self.tp_size)
 
             self.shared_experts = Glm5NextMLP(
                 hidden_size=config.hidden_size,
@@ -273,7 +281,8 @@ class Glm5NextMoE(nn.Module):
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_token,
             hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
+            # TP3: pad 2048 -> 2064 (688 per rank, the b12x corpus/profile case) for target layers, 2304 (768) for the MTP layer.
+            intermediate_size=routed_expert_intermediate(config, self.tp_size, mtp=is_mtp_layer),
             renormalize=config.moe_renormalize,
             quant_config=quant_config,
             use_grouped_topk=True,
@@ -402,6 +411,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                is_mtp_layer=is_mtp_layer,
             )
         else:
             self.mlp = Glm5NextMLP(
@@ -723,6 +733,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
+                padding_size=vocab_padding_size(),
                 prefix=f"{prefix}.embed_tokens",
             )
         else:
@@ -867,6 +878,9 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # TP head padding (VLLM_GLM53_TP_HEAD_PAD): zero-pad head-sharded
+        # attention tensors to the padded head counts before sharding.
+        weights = pad_head_weights(weights, self.config)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".gate_up_proj", ".gate_proj", 0),
@@ -1064,6 +1078,7 @@ class Glm5NextForCausalLM(
                 self.config.vocab_size,
                 self.config.hidden_size,
                 quant_config=quant_config,
+                padding_size=vocab_padding_size(),
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
         else:

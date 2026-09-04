@@ -205,6 +205,12 @@ class Glm5NextTextConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        # TP head padding (VLLM_GLM53_TP_HEAD_PAD): pad the MLA/KDA head counts
+        # so tensor-parallel sizes that do not divide 64 (TP3) shard evenly.
+        # The checkpoint counts are kept as *_ckpt for the weight loader.
+        from vllm.transformers_utils.configs.glm53_tp_pad import apply_config_padding
+
+        apply_config_padding(self)
 
     @property
     def is_mla(self):
