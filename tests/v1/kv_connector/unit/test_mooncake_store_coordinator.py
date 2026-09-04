@@ -483,6 +483,26 @@ def test_store_mask_uses_fine_hit_alignment():
     assert masks[1] == [i == 6 for i in range(8)]
 
 
+def test_store_mask_disables_fine_hits_for_incompatible_swa():
+    groups = [
+        KVCacheGroupSpec(["full"], _full(32), is_eagle_group=True),
+        KVCacheGroupSpec(["mamba"], _mamba_align(64)),
+        KVCacheGroupSpec(["swa"], _swa(64, 128)),
+    ]
+    coord = _make_coord(
+        groups,
+        hash_block_size=32,
+        use_eagle=True,
+        retention_interval=0,
+    )
+
+    assert not coord.enable_partial_hash_hits
+    masks = coord.store_mask(384, num_prompt_tokens=383)
+    assert masks[0] is None
+    assert masks[1] is not None
+    assert masks[2] is not None
+
+
 # ----- Eagle / MTP interaction with load_mask -----
 
 

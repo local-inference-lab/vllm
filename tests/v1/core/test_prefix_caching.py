@@ -3501,6 +3501,61 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
     assert [len(blocks) for blocks in computed_blocks.blocks] == [3, 12]
 
 
+def test_hybrid_local_kv_retention_mtp_reuses_exact_boundary():
+    """An unavailable SWA proof block must fall back one aligned boundary."""
+    block_size = 8
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=4 * block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["swa_mtp"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=block_size,
+                ),
+                is_eagle_group=True,
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=0,
+        use_eagle=True,
+    )
+
+    token_ids = [i // block_size for i in range(129)]
+    request = make_request("0", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(request)
+    blocks = manager.allocate_slots(
+        request,
+        len(token_ids),
+        num_computed_tokens,
+        computed_blocks,
+    )
+    assert blocks is not None
+    manager.free(request)
+
+    replay = make_request("1", token_ids, block_size, sha256)
+    _, num_computed_tokens, _ = manager.get_computed_blocks(replay)
+    assert num_computed_tokens == 12 * block_size
+
+
 @pytest.mark.parametrize("annotate_eagle_groups", [None, "full_only", "both"])
 def test_hybrid_mamba_retention_mtp_boundary_reachable_after_eagle_drop(
     annotate_eagle_groups,

@@ -351,10 +351,10 @@ class MooncakeStoreCoordinator:
                     apply_eagle and group_eagle and idx not in eagle_verified
                 )
                 _max_length = curr_hit_length
-                # No eagle peek margin for a recurrent (Mamba) group: its finder
-                # never drops a block, so a widened bound would match past the
-                # attention-verified hit and resume from speculative state (#43559).
-                if drop_eagle_block and not isinstance(spec, MambaSpec):
+                # Only managers whose finder drops a block receive a peek
+                # margin. Otherwise a widened bound can resume past the
+                # attention-verified hit (#43559).
+                if drop_eagle_block and manager_cls.drops_eagle_block:
                     eagle_margin = (
                         self.hash_block_size
                         if self.enable_partial_hash_hits
@@ -418,9 +418,23 @@ def partial_hash_hits_enabled(
     (its dcp == 1 clause holds: the connector rejects hybrid + DCP/PCP > 1).
     Single copy on purpose — scheduler and coordinator must not disagree.
     """
-    return any(
+    has_partial_mamba_group = any(
         isinstance(spec := _unwrap_spec(g.kv_cache_spec), MambaSpec)
         and spec.mamba_cache_mode == "align"
         and spec.block_size > hash_block_size
         for g in kv_cache_groups
     )
+    if not has_partial_mamba_group:
+        return False
+
+    for group in kv_cache_groups:
+        spec = _unwrap_spec(group.kv_cache_spec)
+        manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+        if manager_cls is None:
+            return False
+        if (
+            not manager_cls.supports_fine_grained_hash_lookup
+            and spec.block_size != hash_block_size
+        ):
+            return False
+    return True
