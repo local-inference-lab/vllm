@@ -41,20 +41,15 @@ def get_deepseek_v4_nvfp4_staging(
 ) -> DeepseekV4NVFP4Staging:
     """Return one persistent workspace per CUDA device and producer.
 
-    Allocation occurs during model construction, before CUDA graph capture. A
-    later request cannot silently grow the workspace because its address must
-    stay stable throughout graph replay.
+    Allocation occurs during model construction, before CUDA graph capture. If
+    a later layer needs a larger construction-time capacity, replace the cached
+    entry with a larger workspace. Layers that already hold the smaller object
+    retain its graph-stable address and only use their own declared capacity.
     """
     resolved = torch.device(device)
     key = (resolved.type, resolved.index, producer)
     existing = _STAGING.get(key)
-    if existing is not None:
-        if existing.cache.shape[1] < max_num_tokens:
-            raise RuntimeError(
-                "DeepSeek-V4 NVFP4 staging workspace is smaller than the "
-                f"scheduler batch limit ({existing.cache.shape[1]} < "
-                f"{max_num_tokens})."
-            )
+    if existing is not None and existing.cache.shape[1] >= max_num_tokens:
         return existing
 
     if producer not in {"swa", "compressor"}:

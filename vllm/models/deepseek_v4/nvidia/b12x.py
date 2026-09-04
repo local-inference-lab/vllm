@@ -16,6 +16,8 @@ DSV4 compressed-MLA contract (== upstream/DeepGEMM): q_head_dim = 448 NoPE +
 """
 
 import os
+from functools import lru_cache
+from types import ModuleType
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 import torch
@@ -53,6 +55,19 @@ _DSV4_V_HEAD_DIM = 512
 _DSV4_FP8_CACHE_BYTES_PER_TOKEN = 584
 _DSV4_NVFP4_CACHE_BYTES_PER_TOKEN = 432
 _VALIDATE_DCP_INDICES_ENV = "VLLM_DSV4_DCP_VALIDATE_INDICES"
+
+
+@lru_cache
+def _require_compressed_mla_api() -> ModuleType:
+    """Load B12X's public compressed-MLA API for the selected backend."""
+    try:
+        from b12x.attention import compressed_sparse_mla
+    except ImportError as exc:
+        raise RuntimeError(
+            "DeepSeek-V4 B12X sparse MLA requires the B12X package with its "
+            "public compressed_sparse_mla API installed."
+        ) from exc
+    return compressed_sparse_mla
 
 
 def _get_dspark_decode_row_capacity(vllm_config: VllmConfig) -> int | None:
@@ -360,17 +375,12 @@ def _run_compressed_mla(
     {16,32,64,128} by the outer wrapper). Indices are global slot ids, so no
     indexed page table is needed.
     """
-    from b12x.attention.compressed_sparse_mla import (
-        Caps as B12XCompressedMLAScratchCaps,
-    )
-    from b12x.attention.compressed_sparse_mla import (
-        plan as plan_compressed_mla_scratch,
-    )
-    from b12x.attention.compressed_sparse_mla import (
-        run as compressed_mla_decode_forward,
-    )
-    from b12x.attention.compressed_sparse_mla import (
-        split_chunks_for_contract as compressed_mla_split_chunks_for_contract,
+    compressed_mla = _require_compressed_mla_api()
+    B12XCompressedMLAScratchCaps = compressed_mla.Caps
+    plan_compressed_mla_scratch = compressed_mla.plan
+    compressed_mla_decode_forward = compressed_mla.run
+    compressed_mla_split_chunks_for_contract = (
+        compressed_mla.split_chunks_for_contract
     )
 
     rows, heads = int(q.shape[0]), int(q.shape[1])
@@ -605,14 +615,11 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         return view
 
     def _reserve_dummy_compressed_mla_scratch(self, q: torch.Tensor) -> None:
-        from b12x.attention.compressed_sparse_mla import (
-            Caps as B12XCompressedMLAScratchCaps,
-        )
-        from b12x.attention.compressed_sparse_mla import (
-            plan as plan_compressed_mla_scratch,
-        )
-        from b12x.attention.compressed_sparse_mla import (
-            split_chunks_for_contract as compressed_mla_split_chunks_for_contract,
+        compressed_mla = _require_compressed_mla_api()
+        B12XCompressedMLAScratchCaps = compressed_mla.Caps
+        plan_compressed_mla_scratch = compressed_mla.plan
+        compressed_mla_split_chunks_for_contract = (
+            compressed_mla.split_chunks_for_contract
         )
 
         indexed_width = 0

@@ -732,16 +732,19 @@ void fused_deepseek_v4_qnorm_rope_nvfp4_mla(
   STD_TORCH_CHECK(kv_cache.stride(1) == 432,
                   "kv_cache token stride must be 432");
   STD_TORCH_CHECK(slot_mapping.device().is_cuda() &&
-                      slot_mapping.scalar_type() == ScalarType::Long,
-                  "slot_mapping must be int64 CUDA");
+                      slot_mapping.scalar_type() == ScalarType::Long &&
+                      slot_mapping.is_contiguous(),
+                  "slot_mapping must be contiguous int64 CUDA");
   STD_TORCH_CHECK(position_ids.device().is_cuda() &&
                       position_ids.scalar_type() == ScalarType::Long &&
+                      position_ids.is_contiguous() &&
                       position_ids.size(0) == q.size(0),
-                  "position_ids must be int64 CUDA with N entries");
+                  "position_ids must be contiguous int64 CUDA with N entries");
   STD_TORCH_CHECK(cos_sin_cache.device().is_cuda() &&
                       cos_sin_cache.scalar_type() == ScalarType::Float &&
+                      cos_sin_cache.is_contiguous() &&
                       cos_sin_cache.dim() == 2 && cos_sin_cache.size(1) == 64,
-                  "cos_sin_cache must have shape [max_pos, 64] float32");
+                  "cos_sin_cache must be contiguous [max_pos, 64] float32");
   STD_TORCH_CHECK(slot_mapping.size(0) <= q.size(0),
                   "slot_mapping cannot have more rows than q");
   STD_TORCH_CHECK(
