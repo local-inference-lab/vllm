@@ -155,7 +155,7 @@ def test_b12x_mla_plans_packed_reader_as_exact_dense(monkeypatch) -> None:
 
     class FakeSparseMLA:
         class Caps(SimpleNamespace):
-            pass
+            __dataclass_fields__ = {"partial_dtype": None}
 
         @staticmethod
         def plan(caps):
@@ -185,6 +185,53 @@ def test_b12x_mla_plans_packed_reader_as_exact_dense(monkeypatch) -> None:
     assert captured.caps.max_page_table_width == 86
     assert captured.caps.page_size == 1536
     assert not captured.caps.head_major_output
+    assert captured.caps.partial_dtype is torch.float32
+
+
+def test_b12x_mla_packed_reader_partial_dtype_follows_env(monkeypatch) -> None:
+    class Caps(SimpleNamespace):
+        __dataclass_fields__ = {"partial_dtype": None}
+
+    class LegacyCaps(SimpleNamespace):
+        __dataclass_fields__ = {}
+
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE", "fp32")
+    assert b12x_mla._packed_dense_plan_caps_kwargs(SimpleNamespace(Caps=Caps)) == {
+        "partial_dtype": torch.float32
+    }
+    with pytest.raises(RuntimeError, match="partial_dtype"):
+        b12x_mla._packed_dense_plan_caps_kwargs(SimpleNamespace(Caps=LegacyCaps))
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE", "bf16")
+    assert b12x_mla._packed_dense_plan_caps_kwargs(SimpleNamespace(Caps=Caps)) == {
+        "partial_dtype": torch.bfloat16
+    }
+    assert b12x_mla._packed_dense_plan_caps_kwargs(SimpleNamespace(Caps=LegacyCaps)) == {}
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE", "fp16")
+    with pytest.raises(ValueError, match="VLLM_K3_PACKED_MLA_PARTIAL_DTYPE"):
+        b12x_mla._packed_dense_partial_dtype()
+
+
+def test_b12x_mla_packed_reader_split_policy_follows_env(monkeypatch) -> None:
+    def run_decode_with_policy(*, binding, kv_cache, split_policy="static", **kwargs):
+        del binding, kv_cache, kwargs, split_policy
+
+    def run_decode_legacy(*, binding, kv_cache, **kwargs):
+        del binding, kv_cache, kwargs
+
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_SPLIT_POLICY", "balanced")
+    assert b12x_mla._packed_dense_run_kwargs(run_decode_with_policy) == {
+        "split_policy": "balanced"
+    }
+    with pytest.raises(RuntimeError, match="split_policy"):
+        b12x_mla._packed_dense_run_kwargs(run_decode_legacy)
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_SPLIT_POLICY", "static")
+    assert b12x_mla._packed_dense_run_kwargs(run_decode_with_policy) == {
+        "split_policy": "static"
+    }
+    assert b12x_mla._packed_dense_run_kwargs(run_decode_legacy) == {}
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_SPLIT_POLICY", "dynamic")
+    with pytest.raises(ValueError, match="VLLM_K3_PACKED_MLA_SPLIT_POLICY"):
+        b12x_mla._packed_dense_split_policy()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -207,7 +254,15 @@ def test_b12x_mla_materializes_every_paged_dense_slot() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_b12x_mla_packed_reader_matches_reference_with_1536_token_pages() -> None:
+@pytest.mark.parametrize(
+    "split_policy,partial_dtype",
+    [("static", "bf16"), ("balanced", "fp32")],
+)
+def test_b12x_mla_packed_reader_matches_reference_with_1536_token_pages(
+    monkeypatch, split_policy: str, partial_dtype: str
+) -> None:
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_SPLIT_POLICY", split_policy)
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE", partial_dtype)
     if torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("requires SM120 or SM121")
     sparse_mla = pytest.importorskip("b12x.attention.sparse_mla")
@@ -262,6 +317,7 @@ def test_b12x_mla_packed_reader_matches_reference_with_1536_token_pages() -> Non
             max_chunks_per_row=25,
             page_size=page_size,
             head_major_output=False,
+            **b12x_mla._packed_dense_plan_caps_kwargs(sparse_mla),
         )
     )
     scratch_spec = plan.scratch_specs()[0]
@@ -278,6 +334,9 @@ def test_b12x_mla_packed_reader_matches_reference_with_1536_token_pages() -> Non
     )
     impl, _ = _fake_packed_impl(num_heads=num_heads)
     impl._packed_dense_run = sparse_mla.run_decode
+    impl._packed_dense_run_kwargs = b12x_mla._packed_dense_run_kwargs(
+        sparse_mla.run_decode
+    )
 
     output, lse = impl.forward_mqa(q, cache, metadata, layer=SimpleNamespace())
     expected, expected_lse = reference.sparse_mla_reference(
@@ -495,6 +554,7 @@ def _fake_packed_impl(*, num_heads: int = 8) -> tuple[B12xMLAImpl, _FakePackedRu
     impl._uses_packed_ds_mla = True
     packed_run = _FakePackedRun()
     impl._packed_dense_run = packed_run
+    impl._packed_dense_run_kwargs = {"split_policy": "balanced"}
     impl._dense_mla = None
     return impl, packed_run
 
@@ -538,6 +598,7 @@ def test_b12x_mla_adapter_runs_packed_cache_as_exact_dense() -> None:
     assert call["forced_num_splits"] == 4
     assert call["return_lse"] is True
     assert call["lse_scale"] == "natural"
+    assert call["split_policy"] == "balanced"
 
 
 def test_b12x_mla_adapter_binds_common_decode_metadata(monkeypatch) -> None:

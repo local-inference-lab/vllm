@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import inspect
 from bisect import bisect_left
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
@@ -381,6 +382,62 @@ def _packed_dense_split_capacity(max_cache_tokens: int) -> int:
     return min(live_chunks, _PACKED_DENSE_MAX_SPLITS)
 
 
+def _packed_dense_split_policy() -> str:
+    """Return the packed reader's split partitioning policy from the environment."""
+    policy = str(envs.VLLM_K3_PACKED_MLA_SPLIT_POLICY)
+    if policy not in ("static", "balanced"):
+        raise ValueError(
+            "VLLM_K3_PACKED_MLA_SPLIT_POLICY must be 'static' or 'balanced', "
+            f"got {policy!r}."
+        )
+    return policy
+
+
+def _packed_dense_partial_dtype() -> torch.dtype:
+    """Return the packed reader's split-partial element type from the environment."""
+    dtype_name = str(envs.VLLM_K3_PACKED_MLA_PARTIAL_DTYPE)
+    partial_dtypes = {"bf16": torch.bfloat16, "fp32": torch.float32}
+    if dtype_name not in partial_dtypes:
+        raise ValueError(
+            "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE must be 'bf16' or 'fp32', got "
+            f"{dtype_name!r}."
+        )
+    return partial_dtypes[dtype_name]
+
+
+def _packed_dense_plan_caps_kwargs(sparse_mla: Any) -> dict[str, Any]:
+    """Return the partial-dtype capability for the packed plan.
+
+    B12X versions without a ``partial_dtype`` capability keep bf16 partials;
+    requesting fp32 on such a version is an error rather than a silent
+    downgrade.
+    """
+    partial_dtype = _packed_dense_partial_dtype()
+    caps_fields = getattr(sparse_mla.Caps, "__dataclass_fields__", {})
+    if "partial_dtype" in caps_fields:
+        return {"partial_dtype": partial_dtype}
+    if partial_dtype != torch.bfloat16:
+        raise RuntimeError(
+            "B12X sparse_mla.Caps has no partial_dtype capability; set "
+            "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE=bf16 or update B12X."
+        )
+    return {}
+
+
+def _packed_dense_run_kwargs(run_decode: Any) -> dict[str, Any]:
+    """Return the split-policy argument for ``sparse_mla.run_decode``."""
+    policy = _packed_dense_split_policy()
+    parameters = inspect.signature(run_decode).parameters
+    if "split_policy" in parameters:
+        return {"split_policy": policy}
+    if policy != "static":
+        raise RuntimeError(
+            "B12X sparse_mla.run_decode has no split_policy argument; set "
+            "VLLM_K3_PACKED_MLA_SPLIT_POLICY=static or update B12X."
+        )
+    return {}
+
+
 def _create_packed_dense_mla_plan(
     vllm_config: VllmConfig,
     device: torch.device,
@@ -444,6 +501,7 @@ def _create_packed_dense_mla_plan(
         max_chunks_per_row=_packed_dense_split_capacity(max_cache_tokens),
         page_size=int(page_size),
         head_major_output=False,
+        **_packed_dense_plan_caps_kwargs(sparse_mla),
     )
     return sparse_mla.plan(caps)
 
@@ -1087,9 +1145,13 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 "B12xMLAImpl does not support prefill context parallelism."
             )
         self._uses_packed_ds_mla = kv_cache_dtype == "fp8_ds_mla"
+        self._packed_dense_run_kwargs: dict[str, Any] = {}
         if self._uses_packed_ds_mla:
             sparse_mla = _load_sparse_mla()
             self._packed_dense_run = sparse_mla.run_decode
+            self._packed_dense_run_kwargs = _packed_dense_run_kwargs(
+                sparse_mla.run_decode
+            )
             self._dense_mla = None
         else:
             self._packed_dense_run = None
@@ -1293,6 +1355,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                     forced_num_splits=int(plan.caps.max_chunks_per_row),
                     return_lse=True,
                     lse_scale="natural",
+                    **self._packed_dense_run_kwargs,
                 ),
             )
         else:

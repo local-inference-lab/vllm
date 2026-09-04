@@ -244,6 +244,8 @@ if TYPE_CHECKING:
     VLLM_K3_DYNAMIC_SPARSE_REFRESH_INTERVAL: int = 128
     VLLM_K3_DENSE_MLA_PARTIAL_DTYPE: str = "bf16"
     VLLM_K3_DENSE_MLA_SINGLE_SPLIT_CHUNKS: int = -1
+    VLLM_K3_PACKED_MLA_SPLIT_POLICY: str = "balanced"
+    VLLM_K3_PACKED_MLA_PARTIAL_DTYPE: str = "fp32"
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
@@ -1848,6 +1850,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_K3_DENSE_MLA_SINGLE_SPLIT_CHUNKS": lambda: int(
         os.getenv("VLLM_K3_DENSE_MLA_SINGLE_SPLIT_CHUNKS", "-1")
     ),
+    # Split partitioning of the Kimi-K3 packed (fp8_ds_mla) decode reader.
+    # "balanced": every CTA derives its 64-token chunk range from the row's
+    # live chunk count so at most one CTA wave of near-equal ranges is active;
+    # "static": fixed capacity-based ranges (short rows scan up to the plan's
+    # chunks-per-split serially in one CTA).
+    "VLLM_K3_PACKED_MLA_SPLIT_POLICY": lambda: os.getenv(
+        "VLLM_K3_PACKED_MLA_SPLIT_POLICY", "balanced"
+    ).lower(),
+    # Element type of the packed decode reader's split partials ("bf16" or
+    # "fp32"). fp32 keeps every split partial exact so the merged result is
+    # rounded once, at the output.
+    "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE": lambda: os.getenv(
+        "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE", "fp32"
+    ).lower(),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
     # JIT'ing in the hot-path. However, this warmup increases the engine
