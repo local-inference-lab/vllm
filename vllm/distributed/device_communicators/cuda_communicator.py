@@ -122,7 +122,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device_group=self.device_group,
                 device=self.device,
             )
-        elif self.use_roce_allreduce and self.world_size > 1:
+        if (
+            self.use_roce_allreduce
+            and self.world_size > 1
+            and (self.b12x_ar_comm is None or self.b12x_ar_comm.disabled)
+        ):
             # RoCEnante: multi-node DGX Spark one-shot RDMA collectives
             # from b12x.comm.roce.
             from .b12x_roce_all_reduce import B12xRoceAllReduce

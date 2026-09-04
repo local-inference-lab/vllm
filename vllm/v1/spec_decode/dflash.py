@@ -10,6 +10,7 @@ from typing_extensions import override
 
 from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
+from vllm.transformers_utils.configs.glm53_tp3 import is_glm53_config
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
@@ -99,12 +100,17 @@ class DFlashProposer(SpecDecodeBaseProposer):
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
-        draft_parallel_config = copy(
-            self.speculative_config.draft_parallel_config
-        )
-        assert draft_parallel_config is not None
-        draft_parallel_config.rank = self.vllm_config.parallel_config.rank
-        base = replace(base, parallel_config=draft_parallel_config)
+        target_parallel_config = self.vllm_config.parallel_config
+        if (
+            target_parallel_config.tensor_parallel_size == 3
+            and is_glm53_config(self.speculative_config.target_model_config)
+        ):
+            draft_parallel_config = copy(
+                self.speculative_config.draft_parallel_config
+            )
+            assert draft_parallel_config is not None
+            draft_parallel_config.rank = target_parallel_config.rank
+            base = replace(base, parallel_config=draft_parallel_config)
         # The draft model is text-only — clear the target's multimodal
         # flag so flash_attn is not rejected for mm_prefix support.
         arch = base.model_config.model_arch_config

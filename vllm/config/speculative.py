@@ -1731,6 +1731,7 @@ class SpeculativeConfig:
             or self.draft_model_config is None
             or self.draft_parallel_config is None
             or self.target_parallel_config.tensor_parallel_size != 3
+            or self.draft_parallel_config.tensor_parallel_size != 3
             or not is_glm53_config(self.target_model_config)
         ):
             return
@@ -1741,6 +1742,11 @@ class SpeculativeConfig:
         draft = self.draft_parallel_config
         for name in (
             "prefill_context_parallel_size",
+            "decode_context_parallel_size",
+            "dcp_kv_cache_interleave_size",
+            "dcp_comm_backend",
+            "dcp_q_replicate",
+            "cp_kv_cache_interleave_size",
             "data_parallel_size",
             "data_parallel_size_local",
             "data_parallel_rank",
@@ -1757,6 +1763,13 @@ class SpeculativeConfig:
         draft.enable_expert_parallel = (
             target.enable_expert_parallel if self.method == "mtp" else False
         )
+        draft.world_size = (
+            draft.pipeline_parallel_size
+            * draft.tensor_parallel_size
+            * draft.prefill_context_parallel_size
+        )
+        if draft.distributed_executor_backend == "external_launcher":
+            draft.world_size *= draft.data_parallel_size
 
         apply_glm53_tp3_draft_geometry(
             self.target_model_config,

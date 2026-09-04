@@ -86,6 +86,12 @@ def apply_glm53_tp3_target_geometry(
     ):
         return False
 
+    if not parallel_config.enable_expert_parallel:
+        raise ValueError(
+            "GLM-5.3 physical TP3 requires expert parallelism because the "
+            "released routed-expert width is not divisible by 3."
+        )
+
     text_config = model_config.hf_text_config
     target_shapes = (
         ("num_attention_heads", 64),
@@ -179,9 +185,19 @@ def apply_glm53_tp3_draft_geometry(
         return False
 
     text_config = draft_model_config.hf_text_config
-    _require_shape(text_config, "num_attention_heads", 32)
-    _require_shape(text_config, "num_key_value_heads", 8)
-    _require_shape(text_config, "vocab_size", 154880)
+    draft_shapes = (
+        ("num_attention_heads", 32),
+        ("num_key_value_heads", 8),
+        ("vocab_size", 154880),
+    )
+    for name, expected in draft_shapes:
+        _require_shape(text_config, name, expected)
+    for config in _iter_hf_configs(draft_model_config):
+        if config is text_config:
+            continue
+        for name, expected in draft_shapes:
+            if hasattr(config, name):
+                _require_shape(config, name, expected)
     for config in _iter_hf_configs(draft_model_config):
         if hasattr(config, "num_attention_heads"):
             config.original_num_attention_heads = 32
@@ -191,7 +207,8 @@ def apply_glm53_tp3_draft_geometry(
             config.num_key_value_heads = 9
         if hasattr(config, "vocab_size"):
             config.original_vocab_size = 154880
-            config.draft_vocab_size = 154880
+            if getattr(config, "draft_vocab_size", None) is None:
+                config.draft_vocab_size = 154880
         config.glm53_tp3_padding = True
         config.glm53_tp3_vocab_padding_size = 192
         config.glm53_tp3_vocab_storage_size = 154944
