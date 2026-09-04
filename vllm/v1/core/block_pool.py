@@ -300,7 +300,11 @@ class BlockPool:
         # Publish after all insertions and promotion removals, as for dense stores.
         if stored_indices:
             self._emit_stored_block_runs(
-                request, stored_indices, block_size, kv_cache_group_id
+                request,
+                stored_indices,
+                block_size,
+                kv_cache_group_id,
+                context_start_block_idx=num_cached_blocks,
             )
 
     def _emit_stored_block_runs(
@@ -309,23 +313,37 @@ class BlockPool:
         block_indices: list[int],
         block_size: int,
         kv_cache_group_id: int,
+        context_start_block_idx: int = 0,
     ) -> None:
         """Publish maximal contiguous runs of sorted retained block indices."""
         block_hashes = resolve_block_hashes(
             request.block_hashes, self.hash_block_size, block_size
         )
-        curr_mm_idx = 0
+        previous_end = context_start_block_idx
         for _, run in groupby(
             enumerate(block_indices), key=lambda pair: pair[1] - pair[0]
         ):
             indices = [index for _, index in run]
             start, end = indices[0], indices[-1] + 1
-            extra_keys_list: list[tuple[Any, ...] | None] = []
-            for i in indices:
-                extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
-                    request, i * block_size, (i + 1) * block_size, curr_mm_idx
+            extra_keys_list = self._generate_block_extra_keys(
+                request, start, end, block_size
+            )
+            if start > previous_end:
+                skipped_parent_block_hash = (
+                    maybe_convert_block_hash(block_hashes[previous_end - 1])
+                    if previous_end
+                    else None
                 )
-                extra_keys_list.append(extra_keys)
+                skipped_start_token_idx = previous_end * block_size
+                skipped_end_token_idx = start * block_size
+                skipped_extra_keys = self._generate_block_extra_keys(
+                    request, previous_end, start, block_size
+                )
+            else:
+                skipped_parent_block_hash = None
+                skipped_start_token_idx = None
+                skipped_end_token_idx = None
+                skipped_extra_keys = None
             self.kv_event_queue.append(
                 self._build_block_stored_event(
                     request,
@@ -342,8 +360,29 @@ class BlockPool:
                     block_size=block_size,
                     kv_cache_group_id=kv_cache_group_id,
                     extra_keys_list=extra_keys_list,
+                    skipped_parent_block_hash=skipped_parent_block_hash,
+                    skipped_start_token_idx=skipped_start_token_idx,
+                    skipped_end_token_idx=skipped_end_token_idx,
+                    skipped_extra_keys=skipped_extra_keys,
                 )
             )
+            previous_end = end
+
+    @staticmethod
+    def _generate_block_extra_keys(
+        request: Request,
+        start_block_idx: int,
+        end_block_idx: int,
+        block_size: int,
+    ) -> list[tuple[Any, ...] | None]:
+        extra_keys_list: list[tuple[Any, ...] | None] = []
+        curr_mm_idx = 0
+        for i in range(start_block_idx, end_block_idx):
+            extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
+                request, i * block_size, (i + 1) * block_size, curr_mm_idx
+            )
+            extra_keys_list.append(extra_keys)
+        return extra_keys_list
 
     def _build_block_stored_event(
         self,
@@ -355,6 +394,10 @@ class BlockPool:
         block_size: int,
         kv_cache_group_id: int,
         extra_keys_list: list[tuple[Any, ...] | None],
+        skipped_parent_block_hash: ExternalBlockHash | None = None,
+        skipped_start_token_idx: int | None = None,
+        skipped_end_token_idx: int | None = None,
+        skipped_extra_keys: list[tuple[Any, ...] | None] | None = None,
     ) -> BlockStored:
         """Build a ``BlockStored`` KV event for ``request``.
 
@@ -371,6 +414,14 @@ class BlockPool:
             medium=MEDIUM_GPU,
             lora_name=request.lora_request.name if request.lora_request else None,
             extra_keys=extra_keys_list if extra_keys_list else None,
+            skipped_parent_block_hash=skipped_parent_block_hash,
+            skipped_token_ids=(
+                request.all_token_ids[skipped_start_token_idx:skipped_end_token_idx]
+                if skipped_start_token_idx is not None
+                and skipped_end_token_idx is not None
+                else None
+            ),
+            skipped_extra_keys=skipped_extra_keys,
             group_idx=kv_cache_group_id,
         )
 

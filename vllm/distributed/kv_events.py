@@ -76,6 +76,15 @@ class BlockStored(KVCacheEvent):
     locality: str | None = None
     """LOCAL or REMOTE relative to the publisher; None means unspecified."""
 
+    skipped_parent_block_hash: ExternalBlockHash | None = None
+    """Parent hash for skipped token context preceding this store event."""
+
+    skipped_token_ids: list[int] | None = None
+    """Logical token span for skipped blocks preceding this store event."""
+
+    skipped_extra_keys: list[tuple[Any, ...] | None] | None = None
+    """Extra keys for skipped_token_ids, one entry per skipped block."""
+
     def __hash__(self) -> int:
         return hash(
             (
@@ -90,6 +99,9 @@ class BlockStored(KVCacheEvent):
                 self.kv_cache_spec_kind,
                 self.kv_cache_spec_sliding_window,
                 self.locality,
+                self.skipped_parent_block_hash,
+                tuple(self.skipped_token_ids) if self.skipped_token_ids else None,
+                tuple(self.skipped_extra_keys) if self.skipped_extra_keys else None,
             )
         )
 
