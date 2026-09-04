@@ -1346,10 +1346,7 @@ def _get_kv_cache_bytes_per_block(
         for group in kv_cache_groups
         for layer_name in group.layer_names
     )
-    if (
-        os.getenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE") is not None
-        and contains_glm5_next_mla
-    ):
+    if contains_glm5_next_mla:
         # GLM-5.3 stores two 64-row by 132-byte FP8 C4 index pages in the
         # target MLA page tail when the target block contains 512 tokens.
         # The block-outermost pool stride must preserve the index-page unit

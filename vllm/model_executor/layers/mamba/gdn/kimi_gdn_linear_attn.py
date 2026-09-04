@@ -16,10 +16,6 @@ from vllm.distributed import divide, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    sharded_weight_loader,
-)
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -35,7 +31,10 @@ from vllm.utils.b12x import (
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.worker.workspace import current_workspace_manager
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    retain_cuda_graph_capture_resource,
+)
 
 from ...linear import (
     ColumnParallelLinear,
@@ -234,16 +233,61 @@ def resolve_kda_prefill_backend(
     return "triton"
 
 
+def _load_rank_local_tail(
+    destination: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    dim: int,
+    start_idx: int,
+    shard_size: int,
+    logical_size: int | None,
+) -> None:
+    """Load one shard, zero-filling only a proven logical checkpoint tail."""
+    if logical_size is None or loaded_weight.shape[dim] != logical_size:
+        destination.copy_(loaded_weight.narrow(dim, start_idx, shard_size))
+        return
+
+    available = max(0, min(shard_size, logical_size - start_idx))
+    if available == shard_size:
+        destination.copy_(loaded_weight.narrow(dim, start_idx, shard_size))
+        return
+
+    if destination.shape[dim] != shard_size:
+        raise ValueError(
+            "KDA TP3 tail destination has the wrong shard size: "
+            f"expected {shard_size}, got {destination.shape[dim]}."
+        )
+    destination.zero_()
+    if available:
+        destination.narrow(dim, 0, available).copy_(
+            loaded_weight.narrow(dim, start_idx, available)
+        )
+
+
+def _rank_local_tail_weight_loader(
+    shard_axis: int,
+    logical_size: int | None = None,
+) -> Callable[[torch.Tensor, torch.Tensor], None]:
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        shard_size = param.data.shape[shard_axis]
+        _load_rank_local_tail(
+            param.data,
+            loaded_weight,
+            shard_axis,
+            get_tensor_model_parallel_rank() * shard_size,
+            shard_size,
+            logical_size,
+        )
+
+    return loader
+
+
 def a_log_weight_loader(
     shard_axis: int,
+    logical_size: int | None = None,
 ) -> Callable[[torch.Tensor, torch.Tensor], None]:
-    """Load KDA A_log stored as either old 4D or current 1D weights."""
+    rank_local_loader = _rank_local_tail_weight_loader(shard_axis, logical_size)
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_tensor_model_parallel_rank()
-        shard_size = param.data.shape[shard_axis]
-        start_idx = tp_rank * shard_size
-
         if loaded_weight.dim() == 4:
             assert loaded_weight.shape[:2] == (1, 1), (
                 f"Expected old A_log shape (1, 1, H, 1), got {loaded_weight.shape}"
@@ -253,8 +297,7 @@ def a_log_weight_loader(
             )
             loaded_weight = loaded_weight.view(loaded_weight.shape[2])
 
-        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
-        return default_weight_loader(param, loaded_weight)
+        rank_local_loader(param, loaded_weight)
 
     return loader
 
@@ -263,8 +306,12 @@ def _make_fused_conv1d_weight_loader(
     dims: list[int],
     tp_size: int,
     tp_rank: int,
+    loaded_dims: list[int] | None = None,
 ) -> Callable[..., None]:
     sharded_dims = [dim // tp_size for dim in dims]
+    loaded_dims = dims if loaded_dims is None else loaded_dims
+    if len(loaded_dims) != len(dims):
+        raise ValueError("loaded_dims must match the fused convolution shard count")
 
     def weight_loader(
         param: torch.Tensor,
@@ -276,8 +323,15 @@ def _make_fused_conv1d_weight_loader(
         shard_size = sharded_dims[loaded_shard_id]
         source_start = tp_rank * shard_size
         target_start = sum(sharded_dims[:loaded_shard_id])
-        loaded_shard = loaded_weight[source_start : source_start + shard_size]
-        param.data[target_start : target_start + shard_size].copy_(loaded_shard)
+        destination = param.data.narrow(0, target_start, shard_size)
+        _load_rank_local_tail(
+            destination,
+            loaded_weight,
+            0,
+            source_start,
+            shard_size,
+            loaded_dims[loaded_shard_id],
+        )
 
     return weight_loader
 
@@ -459,10 +513,27 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert kda_config is not None, "linear_attn_config must be set"
         self.head_dim = kda_config["head_dim"]
         self.num_heads = kda_config["num_heads"]
+        self._glm53_tp3_padding = bool(getattr(config, "glm53_tp3_padding", False))
+        self.logical_num_heads = int(
+            getattr(config, "original_linear_num_heads", self.num_heads)
+        )
+        if self._glm53_tp3_padding and (
+            self.tp_size != 3
+            or self.logical_num_heads != 64
+            or self.num_heads != 66
+        ):
+            raise ValueError(
+                "GLM-5.3 KDA TP3 padding requires logical64, physical66, "
+                f"and TP3; got logical{self.logical_num_heads}, "
+                f"physical{self.num_heads}, TP{self.tp_size}."
+            )
+        if not self._glm53_tp3_padding:
+            self.logical_num_heads = self.num_heads
         assert self.num_heads % self.tp_size == 0
         self.local_num_heads = divide(self.num_heads, self.tp_size)
 
         self.projection_size = self.head_dim * self.num_heads
+        self.logical_projection_size = self.head_dim * self.logical_num_heads
         self.local_projection_size = divide(self.projection_size, self.tp_size)
         self.conv_size = kda_config["short_conv_kernel_size"]
         self.use_full_rank_gate = kda_config.get("use_full_rank_gate", False)
@@ -476,15 +547,25 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.head_dim,
                 self.num_heads,
             ]
+            loaded_in_proj_output_sizes = [self.logical_projection_size] * 4 + [
+                self.head_dim,
+                self.logical_num_heads,
+            ]
             local_output_size = (
                 4 * self.local_projection_size + self.head_dim + self.local_num_heads
             )
             self.in_proj_padding = -local_output_size % 16
             if self.in_proj_padding:
-                in_proj_output_sizes.append(self.in_proj_padding * self.tp_size)
+                padding_size = self.in_proj_padding * self.tp_size
+                in_proj_output_sizes.append(padding_size)
+                loaded_in_proj_output_sizes.append(padding_size)
         else:
             in_proj_output_sizes = [self.projection_size] * 3 + [
                 self.num_heads,
+                self.head_dim,
+            ]
+            loaded_in_proj_output_sizes = [self.logical_projection_size] * 3 + [
+                self.logical_num_heads,
                 self.head_dim,
             ]
             self.in_proj_padding = 0
@@ -496,6 +577,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             bias=False,
             quant_config=self.quant_config,
             prefix=f"{prefix}.in_proj_qkvgfab",
+            **(
+                {"loaded_output_sizes": loaded_in_proj_output_sizes}
+                if self._glm53_tp3_padding
+                else {}
+            ),
         )
         if self.in_proj_padding:
             self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
@@ -506,12 +592,29 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             bias=False,
             quant_config=self.quant_config,
             prefix=f"{prefix}.f_b_proj",
+            **(
+                {"loaded_output_size": self.logical_projection_size}
+                if self._glm53_tp3_padding
+                else {}
+            ),
         )
         self.dt_bias = nn.Parameter(
             torch.empty(self.local_projection_size, dtype=torch.float32)
         )
 
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.dt_bias,
+            {
+                "weight_loader": _rank_local_tail_weight_loader(
+                    0,
+                    (
+                        self.logical_projection_size
+                        if self._glm53_tp3_padding
+                        else None
+                    ),
+                )
+            },
+        )
 
         # One packed parameter and cache let decode run a single conv update.
         # Prefill slices them back into Q/K/V to obtain dense outputs cheaply.
@@ -531,6 +634,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     [self.projection_size] * 3,
                     self.tp_size,
                     self.tp_rank,
+                    (
+                        [self.logical_projection_size] * 3
+                        if self._glm53_tp3_padding
+                        else None
+                    ),
                 )
             },
         )
@@ -538,7 +646,15 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.A_log = nn.Parameter(
             torch.empty(self.local_num_heads, dtype=torch.float32)
         )
-        set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader(0)})
+        set_weight_attrs(
+            self.A_log,
+            {
+                "weight_loader": a_log_weight_loader(
+                    0,
+                    self.logical_num_heads if self._glm53_tp3_padding else None,
+                )
+            },
+        )
 
         self.gate_lower_bound: float | None = kda_config.get("gate_lower_bound", None)
         if self.gate_lower_bound is not None:
@@ -601,6 +717,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 bias=False,
                 quant_config=self.quant_config,
                 prefix=f"{prefix}.g_b_proj",
+                **(
+                    {"loaded_output_size": self.logical_projection_size}
+                    if self._glm53_tp3_padding
+                    else {}
+                ),
             )
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
         self._b12x_kda_api: Any | None = None
@@ -615,6 +736,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             bias=False,
             quant_config=self.quant_config,
             prefix=f"{prefix}.o_proj",
+            **(
+                {"loaded_input_size": self.logical_projection_size}
+                if self._glm53_tp3_padding
+                else {}
+            ),
         )
 
         compilation_config = vllm_config.compilation_config
@@ -1063,6 +1189,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_tokens=num_tokens_tensor,
             output=output,
         )
+        retain_cuda_graph_capture_resource(binding)
         api.run_kda(
             binding,
             lower_bound=self.gate_lower_bound,

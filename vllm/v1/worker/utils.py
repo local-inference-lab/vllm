@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import math
+import os
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -11,11 +13,16 @@ import numpy as np
 import torch
 
 from vllm.config import CacheConfig, VllmConfig
+from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
+    B12xPcieAllReduce,
+)
+from vllm.distributed.parallel_state import get_ep_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
+from vllm.transformers_utils.configs.glm53_tp3 import is_glm53_config
 from vllm.triton_utils import tl, triton
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -39,6 +46,76 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.block_table import get_block_table_width
 
 logger = init_logger(__name__)
+
+
+def log_glm53_r17_tp3_runtime_proof(vllm_config: VllmConfig, model: Any) -> None:
+    """Emit the required resolved runtime receipt for GLM-5.3 R17 TP3."""
+    parallel_config = vllm_config.parallel_config
+    model_config = vllm_config.model_config
+    if (
+        os.environ.get("GLM53_R17_REQUIRE_RUNTIME_PROOF") != "1"
+        or parallel_config.tensor_parallel_size != 3
+        or not is_glm53_config(model_config)
+    ):
+        return
+
+    kda_layers = [
+        module
+        for module in model.modules()
+        if type(module).__name__ == "Glm5NextLinearAttention"
+    ]
+    kda_prefill_backends = {
+        getattr(layer, "kda_prefill_backend", None) for layer in kda_layers
+    }
+    device_communicator = get_tp_group().device_communicator
+    b12x_ar = getattr(device_communicator, "b12x_ar_comm", None)
+    collective_backend = (
+        "b12x_pcie_oneshot"
+        if isinstance(b12x_ar, B12xPcieAllReduce)
+        and not b12x_ar.disabled
+        and b12x_ar.world_size == 3
+        and b12x_ar._runtime is not None
+        and b12x_ar.allreduce_max_bytes > 0
+        else "fallback"
+    )
+    mm_config = model_config.multimodal_config
+    proof = {
+        "collective_backend": collective_backend,
+        "expert_parallel_size": (
+            get_ep_group().world_size if parallel_config.enable_expert_parallel else 1
+        ),
+        "kda_decode_backend": (
+            "b12x"
+            if kda_layers
+            and all(
+                getattr(layer, "_b12x_kda_api", None) is not None
+                for layer in kda_layers
+            )
+            else "fallback"
+        ),
+        "kda_prefill_backend": (
+            next(iter(kda_prefill_backends))
+            if len(kda_prefill_backends) == 1
+            and kda_prefill_backends <= {"flashkda", "triton"}
+            else "fallback"
+        ),
+        "mm_encoder_tp_mode": (
+            getattr(mm_config, "mm_encoder_tp_mode", None)
+            if mm_config is not None
+            else None
+        ),
+    }
+    expected = {
+        "collective_backend": "b12x_pcie_oneshot",
+        "expert_parallel_size": 3,
+        "kda_decode_backend": "b12x",
+        "kda_prefill_backend": "flashkda",
+        "mm_encoder_tp_mode": "weights",
+    }
+    payload = json.dumps(proof, sort_keys=True, separators=(",", ":"))
+    if proof != expected:
+        raise RuntimeError(f"GLM-5.3 R17 TP3 runtime proof failed: {payload}")
+    logger.info_once("GLM53_R17_TP3_RUNTIME_PROOF %s", payload, scope="global")
 
 
 def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:

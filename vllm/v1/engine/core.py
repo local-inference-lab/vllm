@@ -1420,6 +1420,23 @@ class EngineCoreProc(EngineCore):
         return init_message.addresses
 
     @staticmethod
+    def _sync_speculative_draft_dp_identity(vllm_config: VllmConfig) -> None:
+        speculative_config = vllm_config.speculative_config
+        if (
+            speculative_config is None
+            or speculative_config.draft_parallel_config is None
+        ):
+            return
+        target = vllm_config.parallel_config
+        draft = speculative_config.draft_parallel_config
+        for name in (
+            "data_parallel_index",
+            "data_parallel_rank",
+            "data_parallel_rank_local",
+        ):
+            setattr(draft, name, getattr(target, name))
+
+    @staticmethod
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
 
@@ -1459,12 +1476,15 @@ class EngineCoreProc(EngineCore):
             if data_parallel and vllm_config.model_config.is_moe:
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
-                engine_core = DPEngineCoreProc(*args, **kwargs)
             else:
                 # Non-MoE DP ranks are completely independent, so treat like DP=1.
                 # Note that parallel_config.data_parallel_index will still reflect
                 # the original DP rank.
                 parallel_config.reconfigure_for_independent_dp_rank()
+            EngineCoreProc._sync_speculative_draft_dp_identity(vllm_config)
+            if data_parallel and vllm_config.model_config.is_moe:
+                engine_core = DPEngineCoreProc(*args, **kwargs)
+            else:
                 engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
 
             assert engine_core is not None
@@ -2558,6 +2578,7 @@ class EngineCoreActorMixin:
         self.addresses = addresses
         vllm_config.parallel_config.data_parallel_index = dp_rank
         vllm_config.parallel_config.data_parallel_rank_local = local_dp_rank
+        EngineCoreProc._sync_speculative_draft_dp_identity(vllm_config)
 
         self._set_nixl_side_channel_host()
 

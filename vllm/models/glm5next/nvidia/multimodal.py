@@ -80,6 +80,7 @@ class Glm5NextVisionMLP(nn.Module):
         in_features: int,
         hidden_features: int,
         swiglu_limit: float,
+        loaded_hidden_features: int | None = None,
         bias: bool = True,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -93,6 +94,11 @@ class Glm5NextVisionMLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
             disable_tp=use_data_parallel,
+            **(
+                {"loaded_output_sizes": [loaded_hidden_features] * 2}
+                if loaded_hidden_features is not None
+                else {}
+            ),
         )
         self.down_proj = RowParallelLinear(
             hidden_features,
@@ -101,6 +107,11 @@ class Glm5NextVisionMLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
             disable_tp=use_data_parallel,
+            **(
+                {"loaded_input_size": loaded_hidden_features}
+                if loaded_hidden_features is not None
+                else {}
+            ),
         )
         # GLM-5.3-Flash clamps the vision SwiGLU gate/up unlike GLM-OCR/GLM-4V.
         self.act_fn = SiluAndMulWithClamp(swiglu_limit=swiglu_limit)
@@ -118,6 +129,8 @@ class Glm5NextVisionAttention(nn.Module):
         embed_dim: int,
         num_heads: int,
         projection_size: int,
+        loaded_num_heads: int | None = None,
+        loaded_projection_size: int | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -132,11 +145,21 @@ class Glm5NextVisionAttention(nn.Module):
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
+        if loaded_projection_size is not None:
+            checkpoint_head_dim = dist_utils.divide(
+                loaded_projection_size,
+                loaded_num_heads if loaded_num_heads is not None else num_heads,
+            )
+            if checkpoint_head_dim != self.hidden_size_per_attention_head:
+                raise ValueError(
+                    "Runtime and checkpoint vision attention head dimensions differ: "
+                    f"{self.hidden_size_per_attention_head} != {checkpoint_head_dim}"
+                )
         self.num_attention_heads_per_partition = dist_utils.divide(
             num_heads, self.tp_size
         )
 
-        self.head_dim = embed_dim // num_heads
+        self.head_dim = self.hidden_size_per_attention_head
 
         # q/k norm eps hard-coded 1e-5 — distinct from block/post norm eps.
         self.q_norm = RMSNorm(self.head_dim, eps=1e-5)
@@ -147,6 +170,14 @@ class Glm5NextVisionAttention(nn.Module):
             head_size=self.hidden_size_per_attention_head,
             total_num_heads=num_heads,
             total_num_kv_heads=num_heads,
+            **(
+                {
+                    "loaded_total_num_heads": loaded_num_heads,
+                    "loaded_total_num_kv_heads": loaded_num_heads,
+                }
+                if loaded_num_heads is not None
+                else {}
+            ),
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj" if quant_config else f"{prefix}.qkv",
@@ -159,6 +190,11 @@ class Glm5NextVisionAttention(nn.Module):
             prefix=f"{prefix}.proj",
             bias=True,
             disable_tp=use_data_parallel,
+            **(
+                {"loaded_input_size": loaded_projection_size}
+                if loaded_projection_size is not None
+                else {}
+            ),
         )
 
         self.attn = MMEncoderAttention(
@@ -235,6 +271,10 @@ class Glm5NextVisionBlock(nn.Module):
         dim: int,
         num_heads: int,
         mlp_hidden_dim: int,
+        projection_size: int,
+        loaded_num_heads: int | None,
+        loaded_mlp_hidden_dim: int | None,
+        loaded_projection_size: int | None,
         swiglu_limit: float,
         norm_layer: partial[nn.Module] | None = None,
         quant_config: QuantizationConfig | None = None,
@@ -248,13 +288,16 @@ class Glm5NextVisionBlock(nn.Module):
         self.attn = Glm5NextVisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
-            projection_size=dim,
+            projection_size=projection_size,
+            loaded_num_heads=loaded_num_heads,
+            loaded_projection_size=loaded_projection_size,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
         self.mlp = Glm5NextVisionMLP(
             dim,
             mlp_hidden_dim,
+            loaded_hidden_features=loaded_mlp_hidden_dim,
             swiglu_limit=swiglu_limit,
             bias=True,
             quant_config=quant_config,
@@ -287,13 +330,17 @@ class Glm5NextPatchMerger(nn.Module):
         d_model: int,
         context_dim: int,
         swiglu_limit: float,
+        loaded_context_dim: int | None = None,
         quant_config: QuantizationConfig | None = None,
         bias: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
         use_data_parallel = is_vit_use_data_parallel()
+        tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
         self.hidden_size = d_model
+        # The 4096-wide projection cannot be divided across TP3. Keep only this
+        # comparatively small projection replicated; the padded merger MLP is sharded.
         self.proj = ColumnParallelLinear(
             self.hidden_size,
             self.hidden_size,
@@ -301,7 +348,7 @@ class Glm5NextPatchMerger(nn.Module):
             gather_output=True,
             quant_config=quant_config,
             prefix=f"{prefix}.proj",
-            disable_tp=use_data_parallel,
+            disable_tp=use_data_parallel or self.hidden_size % tp_size != 0,
         )
         self.post_projection_norm = nn.LayerNorm(self.hidden_size)
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -311,6 +358,11 @@ class Glm5NextPatchMerger(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
             disable_tp=use_data_parallel,
+            **(
+                {"loaded_output_sizes": [loaded_context_dim] * 2}
+                if loaded_context_dim is not None
+                else {}
+            ),
         )
         self.down_proj = RowParallelLinear(
             context_dim,
@@ -319,6 +371,11 @@ class Glm5NextPatchMerger(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
             disable_tp=use_data_parallel,
+            **(
+                {"loaded_input_size": loaded_context_dim}
+                if loaded_context_dim is not None
+                else {}
+            ),
         )
         # GLM-5.3-Flash also clamps the merger SwiGLU.
         self.act_fn = SiluAndMulWithClamp(swiglu_limit=swiglu_limit)
@@ -366,6 +423,25 @@ class Glm5NextVisionTransformer(nn.Module):
         self.hidden_size = vision_config.hidden_size
         self.num_heads = vision_config.num_heads
 
+        # The config pass writes these fields only for weights-mode TP3.
+        # Without its marker, keep the original TP/data-parallel construction.
+        padded_tp3 = bool(getattr(vision_config, "glm53_tp3_padding", False))
+        if padded_tp3:
+            projection_size = vision_config.glm53_tp3_attention_projection_size
+            loaded_num_heads = vision_config.original_num_heads
+            loaded_projection_size = self.hidden_size
+            loaded_intermediate_size = vision_config.original_intermediate_size
+            loaded_projection_intermediate_size = (
+                vision_config.original_projection_intermediate_size
+            )
+        else:
+            projection_size = self.hidden_size
+            loaded_num_heads = None
+            loaded_projection_size = None
+            loaded_intermediate_size = None
+            loaded_projection_intermediate_size = None
+        self.attention_projection_size = projection_size
+
         self.patch_size = vision_config.patch_size
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.out_hidden_size = vision_config.out_hidden_size
@@ -387,7 +463,7 @@ class Glm5NextVisionTransformer(nn.Module):
         )
 
         norm_layer = partial(RMSNorm, eps=norm_eps)
-        head_dim = self.hidden_size // self.num_heads
+        head_dim = projection_size // self.num_heads
         self.rotary_pos_emb = get_rope(
             head_size=head_dim,
             max_position=8192,
@@ -399,7 +475,11 @@ class Glm5NextVisionTransformer(nn.Module):
                 Glm5NextVisionBlock(
                     dim=self.hidden_size,
                     num_heads=self.num_heads,
+                    projection_size=projection_size,
+                    loaded_num_heads=loaded_num_heads,
+                    loaded_projection_size=loaded_projection_size,
                     mlp_hidden_dim=vision_config.intermediate_size,
+                    loaded_mlp_hidden_dim=loaded_intermediate_size,
                     swiglu_limit=swiglu_limit,
                     norm_layer=norm_layer,
                     quant_config=quant_config,
@@ -412,6 +492,7 @@ class Glm5NextVisionTransformer(nn.Module):
         self.merger = Glm5NextPatchMerger(
             d_model=vision_config.out_hidden_size,
             context_dim=vision_config.projection_intermediate_size,
+            loaded_context_dim=loaded_projection_intermediate_size,
             swiglu_limit=swiglu_limit,
             quant_config=quant_config,
             bias=False,
@@ -550,7 +631,7 @@ class Glm5NextVisionTransformer(nn.Module):
         metadata["cu_seqlens"] = MMEncoderAttention.maybe_recompute_cu_seqlens(
             self.attn_backend,
             cu_seqlens,
-            self.hidden_size,
+            self.attention_projection_size,
             self.tp_size,
             device,
         )

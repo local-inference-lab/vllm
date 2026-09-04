@@ -1138,6 +1138,14 @@ class VllmConfig:
         if self.performance_mode != "balanced":
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
+        # GLM-5.3's TP3 storage geometry must be materialized before generic
+        # parallel-shape validation. Derive it from ParallelConfig, never from
+        # process environment or checkpoint paths.
+        from vllm.transformers_utils.configs.glm53_tp3 import (
+            apply_glm53_tp3_target_geometry,
+        )
+
+        apply_glm53_tp3_target_geometry(self.model_config, self.parallel_config)
         self.try_verify_and_update_config()
 
         # Models may have supplied their own DCP defaults above; anything still

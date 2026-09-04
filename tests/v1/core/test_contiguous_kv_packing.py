@@ -113,6 +113,37 @@ class TestDensePacking:
 
         assert _get_kv_cache_bytes_per_block(groups) == expected
 
+    def test_glm5_next_stride_is_c4_page_aligned_without_split_env(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", raising=False)
+        block_size = 3328
+        target = MLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=528,
+            dtype=torch.uint8,
+            model_version="glm5_next",
+            page_tail_bytes_per_token=33,
+        )
+        larger_unaligned = MLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=562,
+            dtype=torch.uint8,
+        )
+        groups = [
+            KVCacheGroupSpec(["target"], target),
+            KVCacheGroupSpec(["draft"], larger_unaligned),
+        ]
+        raw_bytes = larger_unaligned.page_size_bytes
+        c4_page_bytes = 64 * 132
+
+        assert raw_bytes % c4_page_bytes
+        assert _get_kv_cache_bytes_per_block(groups) == (
+            (raw_bytes + c4_page_bytes - 1) // c4_page_bytes * c4_page_bytes
+        )
+
     def test_layers_within_a_group_are_dense(self):
         groups, _, _ = _mixed_page_groups()
         pages = _pages(groups)

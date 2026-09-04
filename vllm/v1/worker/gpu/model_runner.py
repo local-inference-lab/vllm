@@ -160,6 +160,7 @@ from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
     KVBlockZeroer,
+    log_glm53_r17_tp3_runtime_proof,
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
 )
@@ -411,6 +412,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             format_gib(m.consumed_memory),
             time_after_load - time_before_load,
         )
+        log_glm53_r17_tp3_runtime_proof(self.vllm_config, self.model)
+
 
         # Initialize the components that require the model.
         self.model_state = init_model_state(
