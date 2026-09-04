@@ -105,6 +105,12 @@ class FlashInferPcieIpcAllReducePool:
             return self._EAGER_CHANNEL_ID
         return channel_id
 
+    @property
+    def supports_all_peer_auxiliary(self) -> bool:
+        """Whether a workspace mapped every rank's CUDA IPC allocation."""
+
+        return bool(self._workspaces)
+
     def _verify_channel_id(self, channel_id: str) -> None:
         gathered: list[str | None] = [None] * self.world_size
         dist.all_gather_object(gathered, channel_id, group=self.group)
