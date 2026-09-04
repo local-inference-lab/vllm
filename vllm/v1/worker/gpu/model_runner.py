@@ -76,6 +76,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.outputs import (
     DraftTokenIds,
+    KVConnectorOutput,
     ModelRunnerOutput,
     RoutedExpertsTensors,
     make_empty_encoder_model_runner_output,
@@ -1236,6 +1237,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_block_zeroer.zero_block_ids([0])
         torch.accelerator.synchronize()
 
+    def _restore_null_block_after_kv_load(
+        self, kv_connector_output: KVConnectorOutput | None
+    ) -> None:
+        """Re-zero the null placeholder block once external KV loads land.
+
+        Block 0 pads every block table and its pages are shared by all KV
+        cache groups, so readers treat it as all zeros. A KV connector that
+        maps a request's placeholder slots onto it can overwrite those pages;
+        one zeroing pass per completed load restores the invariant before the
+        loaded request is scheduled.
+        """
+        if kv_connector_output is None or not kv_connector_output.finished_recving:
+            return
+        if self.kv_block_zeroer is None:
+            return
+        self.kv_block_zeroer.zero_block_ids([0])
+
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
@@ -1745,6 +1763,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
+                self._restore_null_block_after_kv_load(
+                    empty_output.kv_connector_output
+                )
                 return empty_output
 
         # Get batch descriptor and sync across DP ranks.
@@ -1833,6 +1854,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
+            self._restore_null_block_after_kv_load(empty_output.kv_connector_output)
             return empty_output
 
         if not dummy_run:
@@ -2121,6 +2143,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            self._restore_null_block_after_kv_load(kv_connector_output)
             _maybe_save_b12x_moe_activation_amax()
             _maybe_flush_kquant_capture()
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
@@ -2311,6 +2334,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Post-step KV connector related operations.
         with record_function_or_nullcontext(f"vllm:v2/target/{phase}/kv_post_forward"):
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            self._restore_null_block_after_kv_load(kv_connector_output)
         model_runner_output.kv_connector_output = kv_connector_output
 
         _maybe_save_b12x_moe_activation_amax()
@@ -2335,6 +2359,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+        self._restore_null_block_after_kv_load(kv_connector_output)
 
         if not self.is_last_pp_rank:
             self.postprocess_num_computed_tokens(input_batch)
