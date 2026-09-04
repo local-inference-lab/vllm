@@ -27,7 +27,13 @@ from vllm.v1.attention.backends.utils import (
     compute_causal_conv1d_metadata,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import (
+    MambaSpec,
+    get_mamba_prefill_checkpoint_position,
+    is_mamba_prefill_checkpoint_enabled,
+)
+
+FLASHKDA_CHUNK_SIZE = 16
 
 
 @cache
@@ -230,10 +236,18 @@ def stage_spec_decode_metadata(
 
 @dataclass
 class KimiK3KDAMetadata(GDNAttentionMetadata):
-    pass
+    checkpoint: "KDACheckpointMetadata | None" = None
+
+
+@dataclass
+class KDACheckpointMetadata:
+    checkpoint_offsets: torch.Tensor
+    state_indices: torch.Tensor
 
 
 class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
+    mamba_aligned_state_indices: torch.Tensor | None = None
+
     def build(  # type: ignore[override]
         self,
         common_prefix_len: int,
@@ -251,12 +265,20 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         #   offsets = torch.arange(1 + num_speculative_blocks, dtype=torch.int32)
         #   indices = (start[:, None] + offsets).to(torch.int64)
         #   block_table_tensor = torch.gather(block_table, 1, indices)
-        block_table_tensor = _mamba_get_block_table_tensor(
-            m.block_table_tensor,
-            m.seq_lens,
-            self.kv_cache_spec,
-            self.vllm_config.cache_config.mamba_cache_mode,
-        )
+        if self.vllm_config.cache_config.mamba_cache_mode == "align":
+            if self.mamba_aligned_state_indices is not None:
+                block_table_tensor = self.mamba_aligned_state_indices[: m.num_reqs]
+            else:
+                # The current production runner is MRV1; retain its per-group
+                # fallback while MRV2 supplies the one-launch precomputed view.
+                block_table_tensor = _mamba_get_block_table_tensor(
+                    m.block_table_tensor,
+                    m.seq_lens,
+                    self.kv_cache_spec,
+                    self.vllm_config.cache_config.mamba_cache_mode,
+                )
+        else:
+            block_table_tensor = m.block_table_tensor
 
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks_cpu = None
@@ -417,6 +439,80 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         else:
             has_initial_state = None
 
+        checkpoint = None
+        checkpoint_enabled = is_mamba_prefill_checkpoint_enabled(
+            self.vllm_config.cache_config.mamba_cache_mode,
+            self.kv_cache_spec.num_prefill_checkpoint_blocks,
+        )
+        if num_prefills > 0 and checkpoint_enabled:
+            assert m.seq_lens_cpu_upper_bound is not None
+            request_rows = list(range(m.num_reqs))
+            if spec_sequence_masks_cpu is not None:
+                request_rows = active_non_spec_mask_cpu.nonzero().flatten().tolist()
+            all_query_lens = query_start_loc_cpu.diff().tolist()
+            query_lens = [all_query_lens[row] for row in request_rows]
+            seq_lens = m.seq_lens_cpu_upper_bound.tolist()
+            block_size = self.kv_cache_spec.block_size
+            hash_block_size = (
+                self.vllm_config.cache_config.prefix_match_unit or block_size
+            )
+            checkpoint_alignment = min(hash_block_size, block_size)
+            speculative_config = self.vllm_config.speculative_config
+            drop_eagle_block = (
+                speculative_config is not None
+                and speculative_config.use_eagle_preserves_target_kv_cache()
+            )
+            checkpoint_splits: list[tuple[int, int]] = []
+            checkpoint_cols: list[int] = []
+            for row, query_len in zip(request_rows, query_lens, strict=True):
+                seq_len = seq_lens[row]
+                query_start = seq_len - query_len
+                checkpoint_position = get_mamba_prefill_checkpoint_position(
+                    seq_len,
+                    hash_block_size,
+                    drop_eagle_block=drop_eagle_block,
+                )
+                offset = checkpoint_position - query_start
+                valid = (
+                    seq_len % block_size != 0
+                    and query_start % checkpoint_alignment == 0
+                    and query_start + checkpoint_alignment <= checkpoint_position
+                    and 0 < offset < query_len
+                    and offset % FLASHKDA_CHUNK_SIZE == 0
+                )
+                offset = offset if valid else 0
+                first_len = offset or query_len
+                checkpoint_splits.append((first_len, query_len - first_len))
+                checkpoint_cols.append(seq_len // block_size - 1 if valid else -1)
+            if any(tail for _, tail in checkpoint_splits):
+                checkpoint_offsets = async_tensor_h2d(
+                    [first if tail else 0 for first, tail in checkpoint_splits],
+                    dtype=torch.int32,
+                    device=query_start_loc.device,
+                )
+                request_rows_tensor = async_tensor_h2d(
+                    request_rows,
+                    dtype=torch.int64,
+                    device=query_start_loc.device,
+                )
+                checkpoint_cols_tensor = async_tensor_h2d(
+                    checkpoint_cols,
+                    dtype=torch.int64,
+                    device=query_start_loc.device,
+                )
+                checkpoint_state_indices = m.block_table_tensor[
+                    request_rows_tensor, checkpoint_cols_tensor
+                ]
+                checkpoint_state_indices = torch.where(
+                    checkpoint_cols_tensor >= 0,
+                    checkpoint_state_indices,
+                    NULL_BLOCK_ID,
+                )
+                checkpoint = KDACheckpointMetadata(
+                    checkpoint_offsets=checkpoint_offsets,
+                    state_indices=checkpoint_state_indices,
+                )
+
         # Prepare per-request tensors for cudagraph replay. num_actual_tokens
         # may be token-padded, while state/query/acceptance metadata is indexed
         # by request.
@@ -483,6 +579,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            checkpoint=checkpoint,
         )
 
 

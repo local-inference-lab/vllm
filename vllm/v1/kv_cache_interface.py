@@ -901,6 +901,7 @@ class MambaSpec(KVCacheSpec):
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+    num_prefill_checkpoint_blocks: int = 0
 
     @property
     def page_size_bytes(self) -> int:
@@ -920,7 +921,9 @@ class MambaSpec(KVCacheSpec):
                 cdiv(max_model_len, self.block_size) + self.num_speculative_blocks
             ) * self.page_size_bytes
         elif vllm_config.cache_config.mamba_cache_mode == "align":
-            return self.page_size_bytes * (2 + self.num_speculative_blocks)
+            return self.page_size_bytes * (
+                2 + self.num_speculative_blocks + self.num_prefill_checkpoint_blocks
+            )
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
 
@@ -942,8 +945,29 @@ class MambaSpec(KVCacheSpec):
         return all(
             isinstance(spec, MambaSpec)
             and spec.num_speculative_blocks == self.num_speculative_blocks
+            and spec.num_prefill_checkpoint_blocks == self.num_prefill_checkpoint_blocks
             for spec in kv_cache_specs.values()
         )
+
+
+def get_mamba_prefill_checkpoint_position(
+    num_tokens: int,
+    hash_block_size: int,
+    drop_eagle_block: bool,
+) -> int:
+    """Return the reusable recurrent-state boundary for one prefill."""
+    checkpoint_position = num_tokens // hash_block_size * hash_block_size
+    if drop_eagle_block:
+        checkpoint_position -= hash_block_size
+    return max(checkpoint_position, 0)
+
+
+def is_mamba_prefill_checkpoint_enabled(
+    mamba_cache_mode: str,
+    num_prefill_checkpoint_blocks: int,
+) -> bool:
+    """Whether a Mamba backend may export an internal prefill checkpoint."""
+    return mamba_cache_mode == "align" and num_prefill_checkpoint_blocks > 0
 
 
 @dataclass(frozen=True)

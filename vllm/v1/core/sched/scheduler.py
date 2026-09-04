@@ -824,6 +824,7 @@ class Scheduler(SchedulerInterface):
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
+                resuming_completed_remote_kv = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
 
@@ -936,6 +937,9 @@ class Scheduler(SchedulerInterface):
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
+                    resuming_completed_remote_kv = (
+                        request.status == RequestStatus.WAITING
+                    )
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
@@ -1061,7 +1065,15 @@ class Scheduler(SchedulerInterface):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    # An async KV load passes full-sequence admission before it
+                    # allocates transfer blocks. After completion, the request
+                    # already holds that reservation. Reapplying admission can
+                    # double-count held HMA group blocks; per-step allocation
+                    # still enforces the available-block limit.
+                    full_sequence_must_fit=(
+                        self.scheduler_reserve_full_isl
+                        and not resuming_completed_remote_kv
+                    ),
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
                 )
