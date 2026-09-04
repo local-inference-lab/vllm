@@ -248,7 +248,6 @@ def test_fused_forward_overlaps_b12x_mxfp8_input_projections() -> None:
     ba = torch.randn(num_tokens, 2 * HV, dtype=torch.bfloat16, device=device)
     qkvz_weight = object()
     ba_weight = object()
-    secondary_stream_handle = 1234
     layer = types.SimpleNamespace(
         prefix=PREFIX,
         enable_fused_gdn_decode=True,
@@ -260,7 +259,6 @@ def test_fused_forward_overlaps_b12x_mxfp8_input_projections() -> None:
         head_v_dim=V,
         in_proj_qkvz=types.SimpleNamespace(b12x_mxfp8_packed_weight=qkvz_weight),
         in_proj_ba=types.SimpleNamespace(b12x_mxfp8_packed_weight=ba_weight),
-        _b12x_mxfp8_pair_stream_handle=secondary_stream_handle,
         out_proj=lambda x: (x, None),
     )
     layer.forward_cuda = types.MethodType(
@@ -299,7 +297,6 @@ def test_fused_forward_overlaps_b12x_mxfp8_input_projections() -> None:
         ba_weight,
         expected_m=num_tokens,
         parallel_max_tokens=1023,
-        secondary_stream=secondary_stream_handle,
     )
     torch.testing.assert_close(output, torch.ones_like(output))
 

@@ -68,7 +68,6 @@ from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
     _resolve_layer_name,
-    aux_stream,
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -462,11 +461,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.in_proj_ba",
         )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
-        pair_stream = aux_stream() if _b12x_mxfp8_pair is not None else None
-        self._b12x_mxfp8_pair_stream_handle = (
-            int(pair_stream.cuda_stream) if pair_stream is not None else None
-        )
-
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
 
@@ -1089,7 +1083,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.in_proj_ba.b12x_mxfp8_packed_weight,
                 expected_m=max(1, int(hidden_states.shape[0])),
                 parallel_max_tokens=1023,
-                secondary_stream=self._b12x_mxfp8_pair_stream_handle,
             )
         else:
             mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
