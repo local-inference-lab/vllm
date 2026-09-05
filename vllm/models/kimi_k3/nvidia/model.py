@@ -3094,6 +3094,11 @@ class KimiK3ForConditionalGeneration(
     ) -> QuantizationConfig | None:
         if isinstance(quant_config, compressed_tensors.CompressedTensorsConfig):
             return None
+        # The kquant serialized-MXFP8 dense format covers the language model
+        # only; the checkpoint carries bf16 vision tower and projector weights
+        # without scales, so those modules build as unquantized linears.
+        if getattr(quant_config, "dense_format", None) == "mxfp8":
+            return None
         return quant_config
 
     def _parse_and_validate_media_input(
