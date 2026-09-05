@@ -18,7 +18,14 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
-from vllm.config.scheduler import PrefillComputeHalfLife, PrefillComputeShare
+from vllm.config.scheduler import (
+    DecodeRefillTarget,
+    MaxParallelPrefills,
+    PrefillComputeHalfLife,
+    PrefillComputeShare,
+    PrefillPolicy,
+    SchedulerPolicy,
+)
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -59,6 +66,10 @@ def create_scheduler(
     long_prefill_token_threshold: int = 0,
     prefill_compute_share: PrefillComputeShare | None = None,
     prefill_compute_half_life: PrefillComputeHalfLife | None = None,
+    max_parallel_prefills: MaxParallelPrefills = 1,
+    prefill_policy: PrefillPolicy = "round-robin",
+    decode_refill_target: DecodeRefillTarget = "auto",
+    scheduling_policy: SchedulerPolicy = "fcfs",
     device: str = "auto",
     disable_chunked_mm_input: bool = False,
     use_kv_connector: None | bool | str | MockKVConfig = None,
@@ -113,6 +124,10 @@ def create_scheduler(
         long_prefill_token_threshold=long_prefill_token_threshold,
         prefill_compute_share=prefill_compute_share,
         prefill_compute_half_life=prefill_compute_half_life,
+        max_parallel_prefills=max_parallel_prefills,
+        prefill_policy=prefill_policy,
+        decode_refill_target=decode_refill_target,
+        policy=scheduling_policy,
         disable_chunked_mm_input=disable_chunked_mm_input,
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,

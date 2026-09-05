@@ -13,7 +13,7 @@ router = APIRouter()
 
 
 class PrefillFairnessRequest(BaseModel):
-    """Replacement configuration for prefill compute sharing."""
+    """Replacement configuration for prefill scheduling fairness."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -44,7 +44,7 @@ def engine_client(request: Request) -> EngineClient:
 
 @router.get("/prefill_fairness")
 async def get_prefill_fairness(raw_request: Request):
-    """Return the active prefill compute-share configuration."""
+    """Return the active prefill fairness configuration."""
     config = await engine_client(raw_request).get_prefill_fairness()
     return JSONResponse(content=config)
 

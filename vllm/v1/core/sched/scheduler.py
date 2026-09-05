@@ -52,6 +52,11 @@ from vllm.v1.core.sched.output import (
     ScheduledEncoderInputStats,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.prefill_interleave import (
+    PrefillInterleaveController,
+    resolve_decode_refill_target,
+    resolve_max_parallel_prefills,
+)
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -403,6 +408,17 @@ class Scheduler(SchedulerInterface):
         )
         self._decode_compute_seconds = 0.0
         self._prefill_compute_seconds = 0.0
+        self.prefill_interleave_controller = PrefillInterleaveController()
+        self.max_parallel_prefills = resolve_max_parallel_prefills(
+            self.scheduler_config.max_parallel_prefills,
+            max_num_seqs=self.max_num_running_reqs,
+            max_num_scheduled_tokens=self.max_num_scheduled_tokens,
+            block_size=self.block_size,
+        )
+        self.decode_refill_target = resolve_decode_refill_target(
+            self.scheduler_config.decode_refill_target,
+            max_parallel_prefills=self.max_parallel_prefills,
+        )
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -629,6 +645,27 @@ class Scheduler(SchedulerInterface):
             and request.num_computed_tokens < request.num_tokens - 1
         )
 
+    def _request_is_runnable_decode(
+        self, request: Request, *, scheduling_step: int | None = None
+    ) -> bool:
+        """Whether a running request contributes to the decode reservoir.
+
+        ``is_prefill_chunk`` describes the most recently scheduled step and
+        can remain true while MTP or async output placeholders are in flight.
+        Prompt progress plus the explicit in-flight-prefill set is stable at
+        utility-call boundaries and still excludes partial or resumed
+        prefills. Utility calls occur between async steps, so callers can ask
+        about the next scheduling step instead of the completed one.
+        """
+        scheduling_step = (
+            self.current_step if scheduling_step is None else scheduling_step
+        )
+        return (
+            request.num_computed_tokens >= request.num_prompt_tokens
+            and request not in self._inflight_prefills
+            and scheduling_step >= request.next_decode_eligible_step
+        )
+
     def _has_pending_local_prefill(self) -> bool:
         return any(
             self._request_has_local_prefill(request)
@@ -719,11 +756,24 @@ class Scheduler(SchedulerInterface):
         # decision can schedule decode work. Pipeline-parallel async requests
         # can be temporarily ineligible; admitting prefill in that case avoids
         # an empty model-executor step.
-        has_eligible_decode = any(
-            not request.is_prefill_chunk
-            and self.current_step >= request.next_decode_eligible_step
-            for request in self.running
+        num_runnable_decodes = sum(
+            self._request_is_runnable_decode(request) for request in self.running
         )
+        has_eligible_decode = num_runnable_decodes > 0
+        prefill_interleave_step = self.prefill_interleave_controller.begin_step(
+            running=self.running,
+            waiting=self.waiting,
+            skipped_waiting=self.skipped_waiting,
+            request_lookup=self.requests,
+            is_local_prefill=self._request_has_local_prefill,
+            max_parallel_prefills=self.max_parallel_prefills,
+            policy=self.scheduler_config.prefill_policy,
+            num_runnable_decodes=num_runnable_decodes,
+            decode_refill_target=self.decode_refill_target,
+            current_step=self.current_step,
+            respect_priority=self.policy == SchedulingPolicy.PRIORITY,
+        )
+
         selected_compute_class: ComputeServiceClass | None = None
         compute_contention = False
         compute_contention_started = False
@@ -755,7 +805,10 @@ class Scheduler(SchedulerInterface):
         )
         defer_prefills = legacy_defer_prefills or adaptive_defer_prefills
 
-        needs_multiple_running_passes = self.compute_share_controller is not None
+        needs_multiple_running_passes = (
+            self.compute_share_controller is not None
+            or prefill_interleave_step is not None
+        )
         running_req_ids_at_step_start = (
             {request.request_id for request in self.running}
             if needs_multiple_running_passes
@@ -826,6 +879,14 @@ class Scheduler(SchedulerInterface):
                     req_index += 1
                     continue
 
+                if (
+                    request.is_prefill_chunk
+                    and prefill_interleave_step is not None
+                    and not prefill_interleave_step.is_selected(request.request_id)
+                ):
+                    req_index += 1
+                    continue
+
                 if defer_prefills and request.is_prefill_chunk:
                     # Defer this in-progress chunk to a cadence-aligned step;
                     # decodes still run to fill this step.
@@ -843,6 +904,13 @@ class Scheduler(SchedulerInterface):
                     < num_new_tokens
                 ):
                     num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+                if request.is_prefill_chunk and prefill_interleave_step is not None:
+                    num_new_tokens = min(
+                        num_new_tokens,
+                        prefill_interleave_step.token_budget(
+                            token_budget, scheduled_prefill_req_ids
+                        ),
+                    )
                 num_new_tokens = min(
                     num_new_tokens, token_budget, input_budget - draft_slots
                 )
@@ -902,6 +970,8 @@ class Scheduler(SchedulerInterface):
                     # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                     # we do not strictly follow the FCFS scheduling policy and
                     # allow the lower-priority requests to be scheduled.
+                    if prefill_interleave_step is not None:
+                        prefill_interleave_step.mark_unavailable(request.request_id)
                     req_index += 1
                     continue
 
@@ -948,6 +1018,10 @@ class Scheduler(SchedulerInterface):
                                 input_budget += restored + draft_slots
                                 draft_input_budget += separate_draft_input_tokens
                                 scheduled_prefill_req_ids.discard(preempted_req_id)
+                                if prefill_interleave_step is not None:
+                                    prefill_interleave_step.mark_unavailable(
+                                        preempted_req_id
+                                    )
                                 req_to_new_blocks.pop(preempted_req_id)
                                 scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                                 preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -969,6 +1043,10 @@ class Scheduler(SchedulerInterface):
                             scheduled_timestamp,
                             drop_stale_output=self.requires_kv_delivery,
                         )
+                        if prefill_interleave_step is not None:
+                            prefill_interleave_step.mark_unavailable(
+                                preempted_req.request_id
+                            )
                         preempted_reqs.append(preempted_req)
                         if preempted_req == request:
                             # No more request to preempt. Cannot schedule this request.
@@ -976,6 +1054,8 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # Cannot schedule this request.
+                    if prefill_interleave_step is not None:
+                        prefill_interleave_step.mark_unavailable(request.request_id)
                     break
 
                 # Schedule the request.
@@ -1064,8 +1144,17 @@ class Scheduler(SchedulerInterface):
 
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
-
                 request = request_queue.peek_request()
+                if (
+                    prefill_interleave_step is not None
+                    and self._request_has_local_prefill(request)
+                ):
+                    waiting_selection = prefill_interleave_step.select_waiting_request(
+                        (self.skipped_waiting, self.waiting)
+                    )
+                    if waiting_selection is None:
+                        break
+                    request_queue, request = waiting_selection
                 request_id = request.request_id
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -1077,7 +1166,7 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
-                    request_queue.pop_request()
+                    request_queue.remove_request(request)
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -1088,7 +1177,9 @@ class Scheduler(SchedulerInterface):
                     # Deliverable stale output still in flight: resuming now
                     # could resample a position that output later delivers.
                     # It drains within the pipeline depth.
-                    request_queue.pop_request()
+                    request_queue.remove_request(request)
+                    if prefill_interleave_step is not None:
+                        prefill_interleave_step.mark_unavailable(request_id)
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -1103,7 +1194,9 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    request_queue.pop_request()
+                    request_queue.remove_request(request)
+                    if prefill_interleave_step is not None:
+                        prefill_interleave_step.mark_unavailable(request_id)
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -1148,7 +1241,9 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            request_queue.pop_request()
+                            request_queue.remove_request(request)
+                            if prefill_interleave_step is not None:
+                                prefill_interleave_step.mark_unavailable(request_id)
                             step_skipped_waiting.prepend_request(request)
                             continue
 
@@ -1203,7 +1298,9 @@ class Scheduler(SchedulerInterface):
                             request, num_computed_tokens
                         )
                     ):
-                        request_queue.pop_request()
+                        request_queue.remove_request(request)
+                        if prefill_interleave_step is not None:
+                            prefill_interleave_step.mark_unavailable(request_id)
                         step_skipped_waiting.prepend_request(request)
                         continue
 
@@ -1229,6 +1326,13 @@ class Scheduler(SchedulerInterface):
                 has_local_prefill = (
                     not load_kv_async and num_computed_tokens < request.num_tokens - 1
                 )
+                interleaved_local_prefill = (
+                    prefill_interleave_step is not None
+                    and prefill_interleave_step.is_selected(request_id)
+                    and has_local_prefill
+                )
+                if prefill_interleave_step is not None and not has_local_prefill:
+                    prefill_interleave_step.release(request_id)
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
@@ -1245,6 +1349,14 @@ class Scheduler(SchedulerInterface):
                             # prefill compute to a cadence-aligned step.
                             break
                     request_token_budget = min(token_budget, input_budget - draft_slots)
+                    if interleaved_local_prefill:
+                        assert prefill_interleave_step is not None
+                        request_token_budget = min(
+                            request_token_budget,
+                            prefill_interleave_step.token_budget(
+                                token_budget, scheduled_prefill_req_ids
+                            ),
+                        )
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
@@ -1301,7 +1413,13 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
-                            break
+                            if not interleaved_local_prefill:
+                                break
+                            request_queue.remove_request(request)
+                            assert prefill_interleave_step is not None
+                            prefill_interleave_step.mark_unavailable(request_id)
+                            step_skipped_waiting.prepend_request(request)
+                            continue
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
@@ -1326,7 +1444,13 @@ class Scheduler(SchedulerInterface):
 
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
-                        break
+                        if not interleaved_local_prefill:
+                            break
+                        request_queue.remove_request(request)
+                        assert prefill_interleave_step is not None
+                        prefill_interleave_step.mark_unavailable(request_id)
+                        step_skipped_waiting.prepend_request(request)
+                        continue
 
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
@@ -1377,7 +1501,13 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
-                    break
+                    if not interleaved_local_prefill:
+                        break
+                    request_queue.remove_request(request)
+                    assert prefill_interleave_step is not None
+                    prefill_interleave_step.mark_unavailable(request_id)
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1405,7 +1535,7 @@ class Scheduler(SchedulerInterface):
                         request, num_new_local_computed_tokens
                     )
 
-                request = request_queue.pop_request()
+                request_queue.remove_request(request)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -1456,7 +1586,7 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
-                if num_computed_tokens < request.num_tokens - 1:
+                if has_local_prefill:
                     scheduled_prefill_req_ids.add(request_id)
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
@@ -1501,6 +1631,13 @@ class Scheduler(SchedulerInterface):
             if not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
 
+        if (
+            prefill_interleave_step is not None
+            and not defer_prefills
+            and token_budget > 0
+        ):
+            schedule_running_requests("prefill", allow_preemption=False)
+
         # The coarse runnable check can race async-completion guards. If a
         # selected decode turn produced no work, give an already-running
         # prefill an immediate chance before returning an empty step.
@@ -1523,6 +1660,11 @@ class Scheduler(SchedulerInterface):
                 "decode",
                 allow_preemption=False,
                 enforce_lora_limit=True,
+            )
+
+        if scheduled_prefill_req_ids:
+            self.prefill_interleave_controller.record_scheduled(
+                scheduled_prefill_req_ids, self.current_step
             )
 
         # Check if the scheduling constraints are satisfied.
@@ -1780,8 +1922,14 @@ class Scheduler(SchedulerInterface):
         )
 
     def get_prefill_fairness(self) -> dict[str, Any]:
-        """Return the active prefill compute-share state."""
+        """Return the active prefill fairness state."""
         controller = self.compute_share_controller
+        num_runnable_decodes = sum(
+            self._request_is_runnable_decode(
+                request, scheduling_step=self.current_step + 1
+            )
+            for request in self.running
+        )
         return {
             "prefill_compute_share": self.scheduler_config.prefill_compute_share,
             "prefill_compute_half_life": (
@@ -1806,17 +1954,23 @@ class Scheduler(SchedulerInterface):
             "local_prefill_backlog_tokens": (
                 controller.local_prefill_backlog_tokens if controller is not None else 0
             ),
+            "max_parallel_prefills": self.scheduler_config.max_parallel_prefills,
+            "effective_max_parallel_prefills": self.max_parallel_prefills,
+            "prefill_policy": self.scheduler_config.prefill_policy,
+            "decode_refill_target": self.scheduler_config.decode_refill_target,
+            "effective_decode_refill_target": self.decode_refill_target,
+            "runnable_decodes": num_runnable_decodes,
         }
 
     def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
-        """Replace prefill compute sharing at a scheduler-step boundary."""
+        """Replace prefill fairness at a scheduler-step boundary."""
         unknown_fields = set(config) - {
             "prefill_compute_share",
             "prefill_compute_half_life",
         }
         if unknown_fields:
             names = ", ".join(sorted(unknown_fields))
-            raise ValueError(f"unknown prefill compute-share fields: {names}")
+            raise ValueError(f"unknown prefill fairness fields: {names}")
         prefill_compute_share = config.get("prefill_compute_share")
         valid_compute_share = prefill_compute_share in (None, "auto")
         if isinstance(prefill_compute_share, (int, float)) and not isinstance(
@@ -3036,6 +3190,7 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        self.prefill_interleave_controller.forget(request.request_id)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing
