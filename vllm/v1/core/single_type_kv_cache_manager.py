@@ -746,17 +746,22 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             alignment_tokens=alignment_tokens,
         )
 
-        # Fine-grained mode (alignment_tokens == hash_block_size <
-        # block_size): resolve_block_hashes kept the raw hash-granularity
-        # list so interior boundaries can be probed.
+        # Fine-grained mode (hash_block_size <= alignment_tokens < block_size):
+        # resolve_block_hashes kept the raw hash-granularity list so interior
+        # boundaries can be probed. Hits are reported at boundaries that are
+        # multiples of alignment_tokens (the hash unit, or a coarser Mamba
+        # state cadence in hybrid models).
+        hash_unit = block_pool.hash_block_size
         fine_grained = (
-            alignment_tokens < block_size and block_size % alignment_tokens == 0
+            alignment_tokens < block_size
+            and block_size % alignment_tokens == 0
+            and alignment_tokens % hash_unit == 0
         )
         if fine_grained:
             # list or lazy BlobBlockHashes view
             assert isinstance(block_hashes, Sequence)
             full_block_hashes: BlockHashList = BlockHashListWithBlockSize(
-                block_hashes, alignment_tokens, block_size
+                block_hashes, hash_unit, block_size
             )
         else:
             full_block_hashes = block_hashes
@@ -779,14 +784,17 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if fine_grained:
             # list or lazy BlobBlockHashes view
             assert isinstance(block_hashes, Sequence)
-            scale_factor = block_size // alignment_tokens
+            scale_factor = block_size // hash_unit
             first_partial_idx = len(computed_blocks[0]) * scale_factor
             max_partial_idx = min(
                 first_partial_idx + scale_factor - 1,
-                max_length // alignment_tokens,
+                max_length // hash_unit,
                 len(block_hashes),
             )
             for fine_idx in range(max_partial_idx - 1, first_partial_idx - 1, -1):
+                candidate_length = (fine_idx + 1) * hash_unit
+                if candidate_length % alignment_tokens:
+                    continue
                 cached_tail = block_pool.get_cached_block(
                     block_hashes[fine_idx], kv_cache_group_ids
                 )
@@ -794,7 +802,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                     continue
                 for computed, cached in zip(computed_blocks, cached_tail):
                     computed.append(cached)
-                hit_length = (fine_idx + 1) * alignment_tokens
+                hit_length = candidate_length
                 break
 
         # Eagle needs the tokens right before the generation point recomputed:
@@ -802,7 +810,9 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         # append-only, so it still covers the reduced length), else one cache
         # block.
         if drop_eagle_block and hit_length > 0:
-            hit_length -= min(alignment_tokens, block_size)
+            hit_length -= min(
+                hash_unit if fine_grained else alignment_tokens, block_size
+            )
         # Round down to the alignment; a no-op when fine-grained (hits land on
         # hash boundaries by construction) and when alignment_tokens ==
         # block_size. Then trim blocks past the new tail.
