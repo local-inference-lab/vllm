@@ -129,6 +129,7 @@ def test_mamba_align_split_partial_tail_schedule(dcp_world_size: int):
     scheduler_block_size = block_size * dcp_world_size
     hash_block_size = 32
     mock = SimpleNamespace(
+        drop_last_prefix_cache_block=False,
         cache_config=SimpleNamespace(block_size=block_size),
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
@@ -177,6 +178,7 @@ def test_mamba_align_split_when_block_exceeds_scheduling_budget():
     token_budget = 8192
     prompt_length = 30000
     mock = SimpleNamespace(
+        drop_last_prefix_cache_block=False,
         cache_config=SimpleNamespace(block_size=block_size),
         max_num_scheduled_tokens=token_budget,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
@@ -214,6 +216,7 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
     long_prefill_threshold = 384
     prompt_length = 1300
     mock = SimpleNamespace(
+        drop_last_prefix_cache_block=False,
         cache_config=SimpleNamespace(block_size=block_size),
         max_num_scheduled_tokens=token_budget,
         scheduler_config=SimpleNamespace(

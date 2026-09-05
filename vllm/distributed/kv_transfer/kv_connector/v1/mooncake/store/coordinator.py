@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -404,9 +405,38 @@ def partial_hash_hits_enabled(
     (its dcp == 1 clause holds: the connector rejects hybrid + DCP/PCP > 1).
     Single copy on purpose — scheduler and coordinator must not disagree.
     """
-    return any(
+    has_partial_mamba_group = any(
         isinstance(spec := _unwrap_spec(g.kv_cache_spec), MambaSpec)
         and spec.mamba_cache_mode == "align"
         and spec.block_size > hash_block_size
         for g in kv_cache_groups
     )
+    has_mamba_align_group = any(
+        isinstance(spec := _unwrap_spec(g.kv_cache_spec), MambaSpec)
+        and spec.mamba_cache_mode == "align"
+        for g in kv_cache_groups
+    )
+    has_partial_attention_group = has_mamba_align_group and any(
+        isinstance(
+            spec := _unwrap_spec(g.kv_cache_spec),
+            FullAttentionSpec | SlidingWindowSpec,
+        )
+        and spec.block_size > hash_block_size
+        and (manager := KVCacheSpecRegistry.get_manager_class(spec)) is not None
+        and manager.supports_fine_grained_hash_lookup
+        for g in kv_cache_groups
+    )
+    if not (has_partial_mamba_group or has_partial_attention_group):
+        return False
+
+    for group in kv_cache_groups:
+        spec = _unwrap_spec(group.kv_cache_spec)
+        manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+        if manager_cls is None:
+            return False
+        if (
+            not manager_cls.supports_fine_grained_hash_lookup
+            and spec.block_size != hash_block_size
+        ):
+            return False
+    return True

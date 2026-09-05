@@ -990,7 +990,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             # Fine-grained mode (alignment_tokens == hash_block_size <
             # block_size): resolve_block_hashes kept the raw hash-granularity
             # list so hits can land on boundaries inside a cache block.
-            assert isinstance(block_hashes, list)
+            assert isinstance(block_hashes, Sequence)
             return cls._find_longest_fine_grained_cache_hit(
                 block_hashes=block_hashes,
                 max_length=max_length,
@@ -1085,7 +1085,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
     @classmethod
     def _find_longest_fine_grained_cache_hit(
         cls,
-        block_hashes: list[BlockHash],
+        block_hashes: Sequence[BlockHash],
         max_length: int,
         kv_cache_group_ids: list[int],
         block_pool: BlockPool,
