@@ -1331,16 +1331,8 @@ class Scheduler(SchedulerInterface):
 
         kv_connector_block_state = None
         if self.connector is not None:
-            snapshot_req_ids = {req.req_id for req in new_reqs_data}
-            snapshot_req_ids.update(
-                req_id
-                for req_id, block_ids in zip(
-                    cached_reqs_data.req_ids,
-                    cached_reqs_data.new_block_ids,
-                    strict=True,
-                )
-                if block_ids
-            )
+            # Completing an existing block can create a store without allocation.
+            snapshot_req_ids = set(num_scheduled_tokens)
             snapshot_req_ids.update(
                 req_id for req_id in boundary_state_offloads if req_id in self.requests
             )
