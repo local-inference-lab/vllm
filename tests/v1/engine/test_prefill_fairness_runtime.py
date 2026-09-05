@@ -71,7 +71,7 @@ def test_engine_core_returns_invalid_policy_without_mutating_engine():
 def test_scheduler_rejects_removed_selector_fields():
     scheduler = SimpleNamespace()
 
-    with pytest.raises(ValueError, match="unknown prefill compute-share fields"):
+    with pytest.raises(ValueError, match="unknown prefill fairness fields"):
         Scheduler.set_prefill_fairness(
             scheduler,
             {"fairness_engine": "micro_slicing"},

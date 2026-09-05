@@ -7,6 +7,7 @@ from vllm.config import SchedulerConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.request import RequestStatus
 
 from .utils import create_requests, create_scheduler, mock_kv
 
@@ -95,6 +96,35 @@ def test_prefill_compute_share_cli_accepts_auto():
     engine_args = EngineArgs.from_cli_args(namespace)
 
     assert engine_args.prefill_compute_share == "auto"
+
+
+def test_prefill_interleave_cli_contract():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    namespace = parser.parse_args(
+        [
+            "--max-parallel-prefills",
+            "auto",
+            "--prefill-policy",
+            "decode-aware",
+            "--decode-refill-target",
+            "8",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(namespace)
+
+    assert engine_args.max_parallel_prefills == "auto"
+    assert engine_args.prefill_policy == "decode-aware"
+    assert engine_args.decode_refill_target == 8
+
+
+def test_prefill_interleave_cli_accepts_numeric_parallel_prefills():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    namespace = parser.parse_args(["--max-parallel-prefills", "4"])
+    engine_args = EngineArgs.from_cli_args(namespace)
+
+    assert engine_args.max_parallel_prefills == 4
 
 
 @pytest.mark.parametrize(
@@ -213,6 +243,30 @@ def test_prefill_compute_share_rejects_fixed_cadence():
             is_encoder_decoder=False,
             prefill_compute_share=0.5,
             prefill_schedule_interval=2,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_parallel_prefills": 5, "max_num_seqs": 4},
+        {"max_parallel_prefills": "auto", "enable_chunked_prefill": False},
+        {"max_parallel_prefills": 1, "prefill_policy": "decode-aware"},
+        {"decode_refill_target": 2},
+        {
+            "max_parallel_prefills": 2,
+            "prefill_policy": "decode-aware",
+            "decode_refill_target": 5,
+            "max_num_seqs": 4,
+        },
+    ],
+)
+def test_prefill_interleave_rejects_invalid_config(kwargs):
+    with pytest.raises(ValueError):
+        SchedulerConfig(
+            max_model_len=128,
+            is_encoder_decoder=False,
+            **kwargs,
         )
 
 
@@ -718,3 +772,329 @@ def test_async_scheduler_preserves_compute_class_selection(opt_model_path):
 
     assert prefill_output.compute_service_class == "prefill"
     assert prefill_output.num_scheduled_tokens[prefill.request_id] == 16
+
+
+def _create_interleaving_scheduler(opt_model_path, **kwargs):
+    max_parallel_prefills = kwargs.pop("max_parallel_prefills", "auto")
+    block_size = kwargs.pop("block_size", 4)
+    max_num_seqs = kwargs.pop("max_num_seqs", 8)
+    max_num_batched_tokens = kwargs.pop("max_num_batched_tokens", 16)
+    max_model_len = kwargs.pop("max_model_len", 128)
+    return create_scheduler(
+        model=opt_model_path,
+        skip_tokenizer_init=True,
+        device="cpu",
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_model_len=max_model_len,
+        max_parallel_prefills=max_parallel_prefills,
+        block_size=block_size,
+        **kwargs,
+    )
+
+
+def test_parallel_prefill_preserves_solo_prefill_budget(opt_model_path):
+    scheduler = _create_interleaving_scheduler(opt_model_path)
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        req_ids=["solo"],
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"solo": 16}
+
+
+def test_parallel_prefill_splits_budget_across_four_requests(opt_model_path):
+    scheduler = _create_interleaving_scheduler(opt_model_path)
+    requests = create_requests(
+        num_requests=4,
+        num_tokens=64,
+        req_ids=["p0", "p1", "p2", "p3"],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {
+        "p0": 4,
+        "p1": 4,
+        "p2": 4,
+        "p3": 4,
+    }
+
+
+def test_parallel_prefill_redistributes_unused_short_share(opt_model_path):
+    scheduler = _create_interleaving_scheduler(opt_model_path)
+    (short,) = create_requests(num_requests=1, num_tokens=2, req_ids=["short"])
+    long_requests = create_requests(
+        num_requests=3,
+        num_tokens=64,
+        req_ids=["long0", "long1", "long2"],
+    )
+    for request in (short, *long_requests):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens["short"] == 2
+    assert sum(output.num_scheduled_tokens.values()) == 16
+    assert sorted(
+        output.num_scheduled_tokens[request.request_id] for request in long_requests
+    ) == [4, 5, 5]
+
+
+def test_round_robin_reaches_prefill_outside_first_batch(opt_model_path):
+    scheduler = _create_interleaving_scheduler(opt_model_path)
+    requests = create_requests(
+        num_requests=5,
+        num_tokens=64,
+        req_ids=["p0", "p1", "p2", "p3", "p4"],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    first_output = scheduler.schedule()
+    assert set(first_output.num_scheduled_tokens) == {"p0", "p1", "p2", "p3"}
+    _update(scheduler, first_output)
+
+    second_output = scheduler.schedule()
+
+    assert "p4" in second_output.num_scheduled_tokens
+    assert len(second_output.num_scheduled_tokens) == 4
+
+
+def test_round_robin_prioritizes_never_scheduled_prefills(opt_model_path):
+    scheduler = _create_interleaving_scheduler(
+        opt_model_path,
+        max_parallel_prefills=2,
+    )
+    (long_request,) = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        req_ids=["long"],
+    )
+    scheduler.add_request(long_request)
+    first_output = scheduler.schedule()
+    _update(scheduler, first_output)
+
+    (short_request,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        req_ids=["short"],
+    )
+    (medium_request,) = create_requests(
+        num_requests=1,
+        num_tokens=24,
+        req_ids=["medium"],
+    )
+    scheduler.add_request(short_request)
+    scheduler.add_request(medium_request)
+
+    output = scheduler.schedule()
+
+    assert "long" not in output.num_scheduled_tokens
+    assert output.num_scheduled_tokens == {"short": 8, "medium": 8}
+
+
+def test_decode_aware_reserves_one_lane_for_nearest_decode(opt_model_path):
+    scheduler = _create_interleaving_scheduler(
+        opt_model_path,
+        max_parallel_prefills=2,
+        prefill_policy="decode-aware",
+    )
+    (long_request,) = create_requests(num_requests=1, num_tokens=64, req_ids=["long"])
+    (medium_request,) = create_requests(
+        num_requests=1, num_tokens=24, req_ids=["medium"]
+    )
+    (short_request,) = create_requests(num_requests=1, num_tokens=8, req_ids=["short"])
+    for request in (long_request, medium_request, short_request):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"short": 8, "long": 8}
+    assert scheduler.get_prefill_fairness()["prefill_policy"] == "decode-aware"
+    assert scheduler.get_prefill_fairness()["effective_decode_refill_target"] == 2
+
+
+def test_decode_aware_uses_round_robin_with_healthy_reservoir(opt_model_path):
+    scheduler = _create_interleaving_scheduler(
+        opt_model_path,
+        max_parallel_prefills=2,
+        prefill_policy="decode-aware",
+    )
+    decodes = create_requests(
+        num_requests=2,
+        num_tokens=2,
+        max_tokens=100,
+        req_ids=["decode0", "decode1"],
+    )
+    for request in decodes:
+        scheduler.add_request(request)
+    initial = scheduler.schedule()
+    _update(scheduler, initial)
+
+    (long_request,) = create_requests(num_requests=1, num_tokens=64, req_ids=["long"])
+    (medium_request,) = create_requests(
+        num_requests=1, num_tokens=24, req_ids=["medium"]
+    )
+    (short_request,) = create_requests(num_requests=1, num_tokens=8, req_ids=["short"])
+    for request in (long_request, medium_request, short_request):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert {"long", "medium"} <= output.num_scheduled_tokens.keys()
+    assert "short" not in output.num_scheduled_tokens
+
+
+def test_decode_aware_continues_when_no_prefill_needs_service(opt_model_path):
+    scheduler = _create_interleaving_scheduler(
+        opt_model_path,
+        max_parallel_prefills=2,
+        prefill_policy="decode-aware",
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=2,
+        max_tokens=100,
+        req_ids=["decode"],
+    )
+    scheduler.add_request(request)
+    initial = scheduler.schedule()
+    _update(scheduler, initial)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"decode": 1}
+
+
+@pytest.mark.parametrize(
+    ("max_num_batched_tokens", "block_size", "max_num_seqs", "expected"),
+    [
+        (4096, 256, 64, 4),
+        (512, 256, 64, 2),
+        (128, 256, 64, 1),
+        (4096, 256, 2, 2),
+    ],
+)
+def test_auto_parallel_prefills_follow_scheduler_geometry(
+    opt_model_path,
+    max_num_batched_tokens,
+    block_size,
+    max_num_seqs,
+    expected,
+):
+    scheduler = _create_interleaving_scheduler(
+        opt_model_path,
+        max_num_batched_tokens=max_num_batched_tokens,
+        block_size=block_size,
+        max_num_seqs=max_num_seqs,
+        max_model_len=max(max_num_batched_tokens, 4096),
+    )
+
+    assert scheduler.max_parallel_prefills == expected
+    assert (
+        scheduler.get_prefill_fairness()["effective_max_parallel_prefills"] == expected
+    )
+
+
+def test_prefill_interleave_preserves_request_priority(opt_model_path):
+    scheduler = _create_interleaving_scheduler(
+        opt_model_path,
+        max_parallel_prefills=2,
+        scheduling_policy="priority",
+    )
+    (high_priority_long,) = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        req_ids=["high-priority-long"],
+    )
+    high_priority_long.priority = 0
+    (normal_priority_long,) = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        req_ids=["normal-priority-long"],
+    )
+    normal_priority_long.priority = 0
+    (low_priority_short,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        req_ids=["low-priority-short"],
+    )
+    low_priority_short.priority = 10
+    scheduler.add_request(low_priority_short)
+    scheduler.add_request(high_priority_long)
+    scheduler.add_request(normal_priority_long)
+
+    output = scheduler.schedule()
+
+    assert set(output.num_scheduled_tokens) == {
+        "high-priority-long",
+        "normal-priority-long",
+    }
+
+
+def test_async_restore_does_not_consume_parallel_prefill_lane(
+    opt_model_path, monkeypatch
+):
+    scheduler = _create_interleaving_scheduler(
+        opt_model_path,
+        max_parallel_prefills=2,
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=32, is_async=True),
+    )
+    assert scheduler.connector is not None
+
+    def matched_tokens(request, _num_computed_tokens):
+        return (32, True) if request.request_id == "restore" else (0, False)
+
+    monkeypatch.setattr(
+        scheduler.connector, "get_num_new_matched_tokens", matched_tokens
+    )
+    (restore,) = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        req_ids=["restore"],
+    )
+    local_requests = create_requests(
+        num_requests=2,
+        num_tokens=64,
+        req_ids=["local0", "local1"],
+    )
+    scheduler.add_request(restore)
+    for local in local_requests:
+        scheduler.add_request(local)
+
+    output = scheduler.schedule()
+
+    assert restore.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert output.num_scheduled_tokens == {"local0": 8, "local1": 8}
+
+
+def test_prefill_fairness_hot_switch_is_atomic(opt_model_path):
+    scheduler = _create_fair_scheduler(opt_model_path)
+
+    updated = scheduler.set_prefill_fairness(
+        {
+            "prefill_compute_share": "auto",
+            "prefill_compute_half_life": "responsive",
+        }
+    )
+
+    assert updated["prefill_compute_share"] == "auto"
+    assert updated["prefill_compute_half_life"] == "responsive"
+    with pytest.raises(ValueError, match="prefill_compute_share"):
+        scheduler.set_prefill_fairness(
+            {
+                "prefill_compute_share": 1.0,
+            }
+        )
+
+    unchanged = scheduler.get_prefill_fairness()
+    assert unchanged["prefill_compute_share"] == "auto"
+    assert unchanged["prefill_compute_half_life"] == "responsive"

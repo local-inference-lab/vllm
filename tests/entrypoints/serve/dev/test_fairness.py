@@ -114,3 +114,26 @@ def test_set_prefill_fairness_applies_live_half_life_update(half_life):
 
     assert response.status_code == 200
     assert client.received == config.model_dump()
+
+
+def test_set_prefill_fairness_sends_complete_replacement_config():
+    result = {
+        "applied": True,
+        "config": {
+            "prefill_compute_share": "auto",
+            "prefill_compute_half_life": "smooth",
+        },
+    }
+    client = _FakeEngineClient(result)
+    config = PrefillFairnessRequest(
+        prefill_compute_share="auto",
+        prefill_compute_half_life="smooth",
+    )
+
+    response = asyncio.run(set_prefill_fairness(_request(client), config))
+
+    assert response.status_code == 200
+    assert client.received == {
+        "prefill_compute_share": "auto",
+        "prefill_compute_half_life": "smooth",
+    }

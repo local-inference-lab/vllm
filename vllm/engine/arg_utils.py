@@ -104,8 +104,11 @@ from vllm.config.parallel import (
     ExpertPlacementStrategy,
 )
 from vllm.config.scheduler import (
+    DecodeRefillTarget,
+    MaxParallelPrefills,
     PrefillComputeHalfLife,
     PrefillComputeShare,
+    PrefillPolicy,
     SchedulerPolicy,
 )
 from vllm.config.utils import get_field
@@ -206,6 +209,21 @@ def prefill_compute_half_life_type(value: str) -> PrefillComputeHalfLife:
             "prefill compute half-life must be a finite number greater than zero"
         )
     return half_life
+
+
+def positive_int_or_auto_type(value: str) -> int | Literal["auto"]:
+    """Parse ``auto`` or a strictly positive integer."""
+    if value == "auto":
+        return "auto"
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "value must be 'auto' or a positive integer"
+        ) from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be 'auto' or a positive integer")
+    return parsed
 
 
 def union_dict_and_str(val: str) -> str | dict[str, str] | None:
@@ -682,6 +700,9 @@ class EngineArgs:
     prefill_compute_half_life: PrefillComputeHalfLife | None = (
         SchedulerConfig.prefill_compute_half_life
     )
+    max_parallel_prefills: MaxParallelPrefills = SchedulerConfig.max_parallel_prefills
+    prefill_policy: PrefillPolicy = SchedulerConfig.prefill_policy
+    decode_refill_target: DecodeRefillTarget = SchedulerConfig.decode_refill_target
 
     watermark: float = SchedulerConfig.watermark
 
@@ -1646,6 +1667,22 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--prefill-compute-half-life", **prefill_compute_half_life_kwargs
         )
+        max_parallel_prefills_kwargs = scheduler_kwargs["max_parallel_prefills"]
+        max_parallel_prefills_kwargs.pop("choices", None)
+        max_parallel_prefills_kwargs["type"] = positive_int_or_auto_type
+        scheduler_group.add_argument(
+            "--max-parallel-prefills", **max_parallel_prefills_kwargs
+        )
+        scheduler_group.add_argument(
+            "--prefill-policy",
+            **scheduler_kwargs["prefill_policy"],
+        )
+        decode_refill_target_kwargs = scheduler_kwargs["decode_refill_target"]
+        decode_refill_target_kwargs.pop("choices", None)
+        decode_refill_target_kwargs["type"] = positive_int_or_auto_type
+        scheduler_group.add_argument(
+            "--decode-refill-target", **decode_refill_target_kwargs
+        )
         scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
@@ -2429,6 +2466,9 @@ class EngineArgs:
             prefill_schedule_interval=self.prefill_schedule_interval,
             prefill_compute_share=self.prefill_compute_share,
             prefill_compute_half_life=self.prefill_compute_half_life,
+            max_parallel_prefills=self.max_parallel_prefills,
+            prefill_policy=self.prefill_policy,
+            decode_refill_target=self.decode_refill_target,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
