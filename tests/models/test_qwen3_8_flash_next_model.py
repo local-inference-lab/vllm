@@ -524,15 +524,18 @@ def test_ple_bind_preserves_exact_aligned_page_stride(monkeypatch) -> None:
         == raw_cache.untyped_storage().data_ptr()
     )
     assert planned_slots == [2]
+    assert plan.bind_kwargs is None
+    assert layer._bind_ple() is plan.binding
     assert plan.bind_kwargs is not None
     assert plan.bind_kwargs["conv_state"] is conv_state
-    assert layer._binding is plan.binding
+    assert not hasattr(layer, "_binding")
 
     layer.unbind_kv_cache()
 
     assert layer.kv_cache == ()
     assert layer._plan is None
-    assert layer._binding is None
+    with pytest.raises(RuntimeError, match="was not bound"):
+        layer._bind_ple()
 
     replacement_cache = _allocate_aligned_mamba_cache(
         layer_name="model.layers.1.ple",
@@ -544,8 +547,8 @@ def test_ple_bind_preserves_exact_aligned_page_stride(monkeypatch) -> None:
 
     assert planned_slots == [2, 2]
     assert layer.kv_cache[0] is not conv_state
+    assert layer._bind_ple() is plan.binding
     assert plan.bind_kwargs["conv_state"] is layer.kv_cache[0]
-    assert layer._binding is plan.binding
 
 
 def test_b12x_gdn_bind_preserves_exact_aligned_page_stride(monkeypatch) -> None:
@@ -558,6 +561,8 @@ def test_b12x_gdn_bind_preserves_exact_aligned_page_stride(monkeypatch) -> None:
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
     )
     plan = _RecordingPlan()
+    bind_mock = Mock(wraps=plan.bind)
+    monkeypatch.setattr(plan, "bind", bind_mock)
     planned_slots: list[int] = []
 
     monkeypatch.setattr(QwenGatedDeltaNetAttention, "get_state_shape", lambda _: shapes)
@@ -571,7 +576,6 @@ def test_b12x_gdn_bind_preserves_exact_aligned_page_stride(monkeypatch) -> None:
     layer = QwenGatedDeltaNetAttention.__new__(QwenGatedDeltaNetAttention)
     nn.Module.__init__(layer)
     layer.gdn_decode_kernel = "b12x"
-    layer._b12x_binding = None
     layer._b12x_plan = None
     _set_tensor_attributes(
         layer,
@@ -592,6 +596,11 @@ def test_b12x_gdn_bind_preserves_exact_aligned_page_stride(monkeypatch) -> None:
     layer.norm = SimpleNamespace(weight=torch.empty(0))
 
     layer.bind_kv_cache(raw_cache)
+    bind_mock.assert_not_called()
+    binding = layer._bind_b12x_gdn_decode()
+    assert binding is plan.binding
+    layer._bind_b12x_gdn_decode()
+    assert bind_mock.call_count == 2
 
     conv_state, recurrent_state = layer.kv_cache
     assert conv_state.stride() == (409_088, 5, 1)
@@ -603,23 +612,34 @@ def test_b12x_gdn_bind_preserves_exact_aligned_page_stride(monkeypatch) -> None:
     assert planned_slots == [2]
     assert plan.bind_kwargs is not None
     assert plan.bind_kwargs["recurrent_state"] is recurrent_state
-    assert layer._b12x_binding is plan.binding
+    assert not hasattr(layer, "_b12x_binding")
 
     layer.unbind_kv_cache()
 
     assert layer.kv_cache == ()
     assert layer._b12x_plan is None
-    assert layer._b12x_binding is None
+    with pytest.raises(RuntimeError, match="KV cache was not bound"):
+        layer._bind_b12x_gdn_decode()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-def test_b12x_gdn_stages_speculative_rollback_metadata() -> None:
+def test_b12x_gdn_binds_live_projections_and_stages_rollback_metadata(
+    monkeypatch,
+) -> None:
     layer = QwenGatedDeltaNetAttention.__new__(QwenGatedDeltaNetAttention)
     nn.Module.__init__(layer)
     layer._b12x_max_tokens = 6
     layer._b12x_max_seqs = 2
     layer._b12x_state_index_columns = 3
-    layer._b12x_binding = object()
+    plan = _RecordingPlan()
+    bind_mock = Mock(wraps=plan.bind)
+    monkeypatch.setattr(plan, "bind", bind_mock)
+    layer._b12x_plan = plan
+    layer._b12x_scratch = torch.empty(1, device="cuda")
+    layer.A_log = torch.empty(2, device="cuda")
+    layer.dt_bias = torch.empty(2, device="cuda")
+    layer.norm = SimpleNamespace(weight=torch.empty(4, device="cuda"))
+    layer.kv_cache = (torch.empty(0), torch.empty(10, 2, 4, 4, device="cuda"))
     layer.layer_norm_epsilon = 1e-6
     layer.head_k_dim = 128
     layer._b12x_mixed_qkv = torch.empty(6, 8, device="cuda")
@@ -638,6 +658,8 @@ def test_b12x_gdn_stages_speculative_rollback_metadata() -> None:
 
     def run(binding, *, eps: float, scale: float) -> None:
         calls.append((binding, eps, scale))
+        assert plan.bind_kwargs is not None
+        plan.bind_kwargs["output"].fill_(17.0)
 
     layer._b12x_gdn_api = SimpleNamespace(run=run)
     mixed_qkv = torch.arange(40, dtype=torch.float32, device="cuda").reshape(5, 8)
@@ -663,10 +685,12 @@ def test_b12x_gdn_stages_speculative_rollback_metadata() -> None:
         num_requests=2,
     )
 
-    torch.testing.assert_close(layer._b12x_mixed_qkv[:5], mixed_qkv)
-    torch.testing.assert_close(layer._b12x_a[:5], a)
-    torch.testing.assert_close(layer._b12x_b[:5], b)
-    torch.testing.assert_close(layer._b12x_z[:5], output_gate)
+    assert plan.bind_kwargs is not None
+    assert plan.bind_kwargs["mixed_qkv"] is mixed_qkv
+    assert plan.bind_kwargs["a"] is a
+    assert plan.bind_kwargs["b"] is b
+    assert plan.bind_kwargs["z"] is output_gate
+    assert plan.bind_kwargs["output"].data_ptr() == core_attn_out.data_ptr()
     torch.testing.assert_close(layer._b12x_query_start_loc, query_start_loc)
     torch.testing.assert_close(layer._b12x_num_accepted_tokens, accepted)
     torch.testing.assert_close(layer._b12x_state_indices, state_indices)
@@ -677,4 +701,70 @@ def test_b12x_gdn_stages_speculative_rollback_metadata() -> None:
         layer._b12x_num_tokens, torch.tensor([5], dtype=torch.int32, device="cuda")
     )
     torch.testing.assert_close(core_attn_out, torch.full_like(core_attn_out, 17.0))
-    assert calls == [(layer._b12x_binding, 1e-6, 128**-0.5)]
+    assert calls == [(plan.binding, 1e-6, 128**-0.5)]
+    bind_mock.assert_called_once()
+    assert plan.bind_kwargs["recurrent_state"] is layer.kv_cache[1]
+    assert plan.bind_kwargs["scratch"] is layer._b12x_scratch
+
+
+@pytest.mark.parametrize("head_dim, expected", [(128, "flashinfer"), (64, "triton")])
+def test_sm120_gdn_prefill_selects_supported_flashinfer_geometry(
+    monkeypatch, head_dim, expected
+):
+    platform = SimpleNamespace(
+        is_cuda=lambda: True,
+        is_device_capability=lambda _cap: False,
+        is_device_capability_family=lambda cap: cap == 120,
+        get_cuda_runtime_major=lambda: 13,
+    )
+    monkeypatch.setattr(gdn_module, "current_platform", platform)
+    config = SimpleNamespace(
+        additional_config={},
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(linear_key_head_dim=head_dim)
+        ),
+    )
+    assert gdn_module._resolve_gdn_prefill_backend(config) == ("auto", expected)
+
+
+def test_sm120_flashinfer_sequence_offsets_preserve_values(monkeypatch):
+    monkeypatch.setattr(
+        gdn_module,
+        "current_platform",
+        SimpleNamespace(is_device_capability_family=lambda cap: cap == 120),
+    )
+    offsets = torch.tensor([0, 1, 129, 6019], dtype=torch.int32)
+    converted = gdn_module._prepare_flashinfer_cu_seqlens(offsets)
+    assert converted.dtype == torch.int64
+    torch.testing.assert_close(converted, offsets.to(torch.int64))
+    assert gdn_module._prepare_flashinfer_cu_seqlens(converted) is converted
+    assert gdn_module._prepare_flashinfer_cu_seqlens(None) is None
+
+
+@pytest.mark.skipif(
+    not gdn_module.current_platform.is_device_capability_family(120),
+    reason="requires SM12x FlashInfer GDN",
+)
+@pytest.mark.parametrize("boundaries", [[0, 129], [0, 1, 130, 259]])
+def test_sm120_flashinfer_gdn_int32_offsets_match_int64(boundaries):
+    """The scheduler's int32 offsets preserve the supported kernel result."""
+    torch.manual_seed(312)
+    rows = boundaries[-1]
+    shape = (1, rows, 4, 128)
+    q, k, v = [
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+    ]
+    gate_shape = (1, rows, 4)
+    g = -torch.rand(gate_shape, device="cuda", dtype=torch.float32)
+    beta = torch.rand(gate_shape, device="cuda", dtype=torch.float32)
+    state = torch.randn(len(boundaries) - 1, 4, 128, 128, device="cuda")
+    offsets = torch.tensor(boundaries, device="cuda", dtype=torch.int64)
+    expected = gdn_module.fi_chunk_gated_delta_rule(
+        q, k, v, g, beta, state.clone(), True, offsets
+    )
+    actual = gdn_module.fi_chunk_gated_delta_rule(
+        q, k, v, g, beta, state.clone(), True, offsets.to(torch.int32)
+    )
+    for result, reference in zip(actual, expected):
+        assert torch.isfinite(result).all() and torch.count_nonzero(result)
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)

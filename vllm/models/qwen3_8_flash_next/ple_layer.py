@@ -319,7 +319,9 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             ),
             persistent=False,
         )
-        self._binding = self._plan.bind(
+
+    def _bind_embedding(self):
+        return self._plan.bind(
             scratch=self._scratch,
             weight=self.ngram_embedding.weight,
             weight_scale=self.ngram_embedding.weight_scale,
@@ -370,7 +372,9 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
     ) -> None:
         self._validate_embedding_loaded()
         token_count = self._prepare_inputs(input_ids, query_start_loc, ngram_context)
-        _b12x_module("ple_embedding").run(self._binding, token_count=token_count)
+        _b12x_module("ple_embedding").run(
+            self._bind_embedding(), token_count=token_count
+        )
 
     def _run_prefetch(
         self,
@@ -825,7 +829,6 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         )
         self.register_buffer("_scratch", None, persistent=False)
         self._plan = None
-        self._binding = None
         self.kv_cache = (torch.tensor([]),)
 
         compilation_config = get_current_vllm_config().compilation_config
@@ -863,8 +866,12 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         (scratch,) = get_b12x_scratch_buffers(plan)
         self._scratch = scratch
         self._plan = plan
-        self._binding = plan.bind(
-            scratch=scratch,
+
+    def _bind_ple(self):
+        if self._plan is None:
+            raise RuntimeError("PLE KV cache was not bound before inference")
+        return self._plan.bind(
+            scratch=self._scratch,
             residual=self._residual,
             key=self._key,
             value=self._value,
@@ -878,13 +885,12 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             num_accepted_tokens=self._num_accepted_tokens,
             num_seqs=self._num_seqs,
             num_tokens=self._num_tokens,
-            conv_state=conv_state,
+            conv_state=self.kv_cache[0],
             out=self._out,
             request_is_prefill=self._request_is_prefill,
         )
 
     def unbind_kv_cache(self) -> None:
-        self._binding = None
         self._plan = None
         self._scratch = None
         super().unbind_kv_cache()
@@ -993,14 +999,14 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
                 f"expected ShortConvAttentionMetadata for {self.prefix}, got "
                 f"{type(metadata).__name__}"
             )
-        if self._binding is None:
+        if self._plan is None:
             raise RuntimeError("PLE KV cache was not bound before inference")
         self._residual[:token_count].copy_(residual)
         self._key[:token_count].copy_(key)
         self._value[:token_count].copy_(value)
         self._prepare_metadata(metadata, query_start_loc, token_count)
         _b12x_module("ple").run_mixed(
-            self._binding, eps=self.eps, token_count=token_count
+            self._bind_ple(), eps=self.eps, token_count=token_count
         )
 
     def forward(

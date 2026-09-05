@@ -181,7 +181,7 @@ def _resolve_gdn_prefill_backend(
 
     In-tree CuteDSL GDN prefill kernel is chosen when:
     * "cutedsl" is requested; (opt-in only)
-    * SM10.x (datacenter Blackwell) with ``head_k_dim == 128``;
+    * Blackwell (SM10.x) with ``head_k_dim == 128``;
     """
     additional_config = vllm_config.additional_config
     backend_cfg = (
@@ -610,7 +610,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.enable_fused_gdn_decode = self.gdn_decode_kernel in ("b12x", "cuda")
         self._b12x_gdn_api: Any | None = None
         self._b12x_plan = None
-        self._b12x_binding = None
         if self.gdn_decode_kernel == "b12x":
             self._initialize_b12x_gdn_decode(vllm_config)
         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
@@ -736,26 +735,39 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         (scratch,) = get_b12x_scratch_buffers(plan)
         self._b12x_scratch = scratch
         self._b12x_plan = plan
-        self._b12x_binding = plan.bind(
+
+    def _bind_b12x_gdn_decode(
+        self,
+        *,
+        mixed_qkv: torch.Tensor | None = None,
+        a: torch.Tensor | None = None,
+        b: torch.Tensor | None = None,
+        z: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
+    ):
+        plan = self._b12x_plan
+        scratch = self._b12x_scratch
+        if plan is None or scratch is None:
+            raise RuntimeError("b12x GDN KV cache was not bound before inference")
+        return plan.bind(
             scratch=scratch,
-            mixed_qkv=self._b12x_mixed_qkv,
-            a=self._b12x_a,
-            b=self._b12x_b,
-            z=self._b12x_z,
+            mixed_qkv=self._b12x_mixed_qkv if mixed_qkv is None else mixed_qkv,
+            a=self._b12x_a if a is None else a,
+            b=self._b12x_b if b is None else b,
+            z=self._b12x_z if z is None else z,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
             norm_weight=self.norm.weight,
-            recurrent_state=recurrent_state,
+            recurrent_state=self.kv_cache[1],
             query_start_loc=self._b12x_query_start_loc,
             num_accepted_tokens=self._b12x_num_accepted_tokens,
             state_indices=self._b12x_state_indices,
             num_seqs=self._b12x_num_seqs,
             num_tokens=self._b12x_num_tokens,
-            output=self._b12x_output,
+            output=self._b12x_output if output is None else output,
         )
 
     def unbind_kv_cache(self) -> None:
-        self._b12x_binding = None
         self._b12x_plan = None
         self._b12x_scratch = None
         super().unbind_kv_cache()
@@ -2039,9 +2051,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_accepted_tokens: torch.Tensor | None,
         num_requests: int,
     ) -> None:
-        binding = self._b12x_binding
         api = self._b12x_gdn_api
-        if binding is None or api is None:
+        if self._b12x_plan is None or api is None:
             raise RuntimeError("b12x GDN KV cache was not bound before inference")
         num_input_tokens = mixed_qkv.shape[0]
         if (
@@ -2057,10 +2068,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 f"{self._b12x_state_index_columns}"
             )
 
-        self._b12x_mixed_qkv[:num_input_tokens].copy_(mixed_qkv)
-        self._b12x_a[:num_input_tokens].copy_(a)
-        self._b12x_b[:num_input_tokens].copy_(b)
-        self._b12x_z[:num_input_tokens].copy_(output_gate)
         _stage_b12x_gdn_metadata_kernel[(1,)](
             query_start_loc,
             state_indices,
@@ -2088,12 +2095,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_warps=4,
         )
 
+        # Graph capture records these live projection/output addresses. A fresh
+        # binding maps caller-owned scratch without copying activation tensors.
         api.run(
-            binding,
+            self._bind_b12x_gdn_decode(
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                z=output_gate,
+                output=core_attn_out[:num_input_tokens],
+            ),
             eps=self.layer_norm_epsilon,
             scale=self.head_k_dim**-0.5,
         )
-        core_attn_out[:num_input_tokens].copy_(self._b12x_output[:num_input_tokens])
 
     def _forward_core_decode_b12x_fused_norm(
         self,
@@ -2223,7 +2237,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _can_use_b12x_gdn_decode(self, attn_metadata: GDNAttentionMetadata) -> bool:
         if (
             self.gdn_decode_kernel != "b12x"
-            or self._b12x_binding is None
+            or self._b12x_plan is None
             or attn_metadata.num_prefills != 0
         ):
             return False
