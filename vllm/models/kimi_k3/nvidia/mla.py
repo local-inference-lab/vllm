@@ -208,10 +208,20 @@ class KimiK3PrefillProjectionWorkspace:
         if buffer is None:
             raise RuntimeError("Kimi-K3 prefill projection workspace is not reserved")
         if num_tokens > buffer.shape[1]:
-            raise ValueError(
-                f"context projection needs {num_tokens} rows, but the retained "
-                f"workspace has {buffer.shape[1]}"
+            # The retained buffer is sized when weights are loaded, with the
+            # cache block size known at that point; the attention backend
+            # aligns its context chunk to the final block and DCP geometry,
+            # which can exceed it (DCP9: 27,648 rows against 24,624). Such a
+            # chunk projects into a fresh allocation instead of failing.
+            logger.warning_once(
+                "Kimi-K3 context projection needs %d rows, but the retained "
+                "workspace has %d; this chunk uses a fresh allocation. Set "
+                "VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE to a multiple of the "
+                "DCP-aligned block size to keep the retained path.",
+                num_tokens,
+                buffer.shape[1],
             )
+            return None
         if output_size != buffer.shape[2]:
             raise ValueError(
                 f"context projection needs {output_size} columns, but the retained "
