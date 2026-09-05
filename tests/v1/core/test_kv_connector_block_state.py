@@ -41,7 +41,7 @@ def _hybrid_config() -> KVCacheConfig:
     )
 
 
-def test_connector_block_state_has_snapshot_and_retained_boundaries() -> None:
+def test_connector_block_state_has_snapshot_and_only_explicit_boundaries() -> None:
     grouped_ids = (
         [201, 202, 203, 204],
         [0, 0, 0, 0, 0, 0, 0, 107, 0, 0, 110, 0, 0, 0, 0, 115],
@@ -57,9 +57,7 @@ def test_connector_block_state_has_snapshot_and_retained_boundaries() -> None:
     )
 
     assert state.block_ids == {"req": grouped_ids}
-    assert state.boundary_state_offloads == {
-        "req": [(1, 999, 7680), (1, 107, 4096), (1, 115, 8192)]
-    }
+    assert state.boundary_state_offloads == {"req": [(1, 999, 7680)]}
     manager.get_block_ids.assert_called_once_with("req")
 
 
@@ -89,3 +87,13 @@ def test_connector_block_state_rejects_misaligned_retention() -> None:
             None,
             retention_interval=4100,
         )
+
+
+def test_connector_block_state_never_infers_uncomputed_boundary():
+    manager = SimpleNamespace(
+        get_block_ids=MagicMock(return_value=([1], [0] * 7 + [9]))
+    )
+    state = _build_kv_connector_block_state(
+        _hybrid_config(), manager, ["req"], None, retention_interval=4096
+    )
+    assert state.boundary_state_offloads == {}

@@ -90,45 +90,24 @@ def _build_kv_connector_block_state(
     partial_tail_offloads: dict[str, list[tuple[int, int, int]]] | None,
     retention_interval: int | None,
 ) -> KVConnectorBlockState:
-    """Snapshot exact source blocks for connector stores in this step."""
-    current_block_ids = {
-        req_id: kv_cache_manager.get_block_ids(req_id) for req_id in request_ids
-    }
-    boundary_state_offloads = {
-        req_id: list(entries)
-        for req_id, entries in (partial_tail_offloads or {}).items()
-    }
+    """Copy explicitly offered states without inferring validity from allocation."""
     if retention_interval is not None and retention_interval > 0:
-        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
-            spec = group.kv_cache_spec
-            if not isinstance(spec, MambaSpec):
-                continue
-            if retention_interval % spec.block_size != 0:
+        for group in kv_cache_config.kv_cache_groups:
+            if (
+                isinstance(group.kv_cache_spec, MambaSpec)
+                and retention_interval % group.kv_cache_spec.block_size
+            ):
                 raise ValueError(
-                    "prefix_cache_retention_interval must be divisible by "
-                    f"Mamba block size: {retention_interval=} {spec.block_size=}"
+                    "prefix_cache_retention_interval must be divisible by the Mamba block size"
                 )
-            blocks_per_boundary = retention_interval // spec.block_size
-            for req_id, grouped_ids in current_block_ids.items():
-                if group_id >= len(grouped_ids):
-                    continue
-                entries = boundary_state_offloads.setdefault(req_id, [])
-                existing = {
-                    (entry_group, boundary_tokens)
-                    for entry_group, _, boundary_tokens in entries
-                }
-                for block_index in range(
-                    blocks_per_boundary - 1,
-                    len(grouped_ids[group_id]),
-                    blocks_per_boundary,
-                ):
-                    block_id = grouped_ids[group_id][block_index]
-                    boundary_tokens = (block_index + 1) * spec.block_size
-                    if block_id > 0 and (group_id, boundary_tokens) not in existing:
-                        entries.append((group_id, block_id, boundary_tokens))
     return KVConnectorBlockState(
-        block_ids=current_block_ids,
-        boundary_state_offloads=boundary_state_offloads,
+        block_ids={
+            req_id: kv_cache_manager.get_block_ids(req_id) for req_id in request_ids
+        },
+        boundary_state_offloads={
+            req_id: list(entries)
+            for req_id, entries in (partial_tail_offloads or {}).items()
+        },
     )
 
 
@@ -423,6 +402,18 @@ class Scheduler(SchedulerInterface):
             for group in kv_cache_config.kv_cache_groups
             if isinstance(group.kv_cache_spec, MambaSpec)
         ]
+        max_prefill_tokens = self.max_num_scheduled_tokens
+        if self.scheduler_config.long_prefill_token_threshold > 0:
+            max_prefill_tokens = min(
+                max_prefill_tokens, self.scheduler_config.long_prefill_token_threshold
+            )
+        if (
+            self.need_mamba_block_aligned_split
+            and self.cache_config.block_size <= max_prefill_tokens
+        ):
+            # Match the grid enforced by _mamba_block_aligned_split. Otherwise
+            # several recurrent-sized slices can all round down to zero.
+            mamba_block_sizes.append(self.cache_config.block_size)
         prefill_quantum = (
             math.lcm(*mamba_block_sizes)
             if self.need_mamba_block_aligned_split and mamba_block_sizes
@@ -593,6 +584,14 @@ class Scheduler(SchedulerInterface):
                 end = aligned_end
 
         next_block_boundary = (start // block_size + 1) * block_size
+        retention_interval = getattr(
+            self.cache_config, "prefix_cache_retention_interval", None
+        )
+        next_retention_boundary = (
+            (start // retention_interval + 1) * retention_interval
+            if retention_interval is not None and retention_interval > 0
+            else 0
+        )
         tail_boundary = (
             request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
             if self.mamba_partial_cache_hit
@@ -602,6 +601,10 @@ class Scheduler(SchedulerInterface):
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary if start % block_size != 0 else 0,
+            # Sparse recurrent-state retention makes these boundaries part of
+            # the external cache contract. A fragmented scheduler budget must
+            # not jump over one without materializing its exact state.
+            next_retention_boundary,
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,
             # Fine-grained hits: the prompt's partial-tail entry can only be
@@ -616,6 +619,36 @@ class Scheduler(SchedulerInterface):
             if start < request.shared_prefix_boundary < end
             else 0,
         )
+        if getattr(self.cache_config, "prefix_cache_retention_interval", None) == 0:
+            # Retention cannot preserve a recurrent state that prefill skipped.
+            # Use the same fine and coarse replay positions as the cache masks.
+            managers = [
+                manager
+                for manager in self.kv_cache_manager.coordinator.single_type_managers
+                if isinstance(manager.kv_cache_spec, MambaSpec)
+            ]
+            boundaries = [request.num_prompt_tokens - 1]
+            if request.shared_prefix_boundary:
+                boundaries.append(request.shared_prefix_boundary)
+            reuse_stops = {
+                position
+                for manager in managers
+                for position in manager._expand_reachable_boundaries(boundaries)
+                if start < position < end
+            }
+            if use_internal_checkpoint:
+                # The worker's checkpoint grid belongs to each recurrent group.
+                internal_positions = {
+                    end // manager.block_size * manager.block_size
+                    if end % manager.block_size
+                    else None
+                    for manager in managers
+                }
+                if len(internal_positions) == 1:
+                    internal = internal_positions.pop()
+                    if internal is not None and internal > start:
+                        reuse_stops.discard(internal)
+            stops = (*stops, *reuse_stops)
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
@@ -1779,27 +1812,23 @@ class Scheduler(SchedulerInterface):
             self.prev_step_scheduled_req_ids.clear()
             self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
-        # Producer partial-tail hand-off for external KV connectors. Drained
-        # before the CoW retentions are released below, so the pin lands while
-        # the cow block still holds a retention ref. Without a producer-side
-        # connector nothing consumes the hand-off, so skip the drain (and its
-        # pin); the manager drops stale entries when the request's blocks are
-        # popped for free.
-        pending_partial_tail_offloads = None
+        # Mamba "align" boundary states must be handed off with exact block ids;
+        # they cannot be reconstructed from a connector's append-only block
+        # table. Drained every step so stale offers cannot accumulate.
+        boundary_state_offloads = self.kv_cache_manager.take_boundary_state_offloads()
+
         kv_connector_block_state = None
-        if (
-            self.connector is not None
-            and self.vllm_config.kv_transfer_config is not None
-            and self.vllm_config.kv_transfer_config.is_kv_producer
-        ):
-            pending_partial_tail_offloads = (
-                self.kv_cache_manager.take_partial_tail_offloads() or None
+        if self.connector is not None:
+            # Filling an existing block can create a store without new allocation.
+            snapshot_req_ids = set(num_scheduled_tokens)
+            snapshot_req_ids.update(
+                req_id for req_id in boundary_state_offloads if req_id in self.requests
             )
             kv_connector_block_state = _build_kv_connector_block_state(
                 self.kv_cache_config,
                 self.kv_cache_manager,
-                num_scheduled_tokens,
-                pending_partial_tail_offloads,
+                snapshot_req_ids,
+                boundary_state_offloads,
                 self.cache_config.prefix_cache_retention_interval,
             )
 
@@ -1860,7 +1889,6 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
-            partial_tail_offloads=pending_partial_tail_offloads,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
@@ -1895,6 +1923,9 @@ class Scheduler(SchedulerInterface):
                 scheduler_output
             )
             scheduler_output.ec_connector_metadata = ec_meta
+
+        # Connector-only block state must not be dispatched to workers.
+        scheduler_output.kv_connector_block_state = None
 
         # Advance the fence only for non-empty steps (those that actually
         # write KV and have their output processed later in update_from_output).

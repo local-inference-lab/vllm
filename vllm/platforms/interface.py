@@ -860,10 +860,14 @@ class Platform:
                     "VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE must be a positive "
                     "multiple of 64 after automatic resolution."
                 )
-            if mamba_block_size <= 0 or mamba_block_size % target_block_size != 0:
+            if mamba_block_size <= 0 or (
+                mamba_block_size % target_block_size != 0
+                and target_block_size % mamba_block_size != 0
+            ):
                 raise ValueError(
-                    "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE must be a positive "
-                    "multiple of VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE."
+                    "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE must be positive and "
+                    "either a multiple or a divisor of "
+                    "VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE."
                 )
             if cache_config.mamba_cache_mode != "align":
                 raise ValueError(
@@ -872,8 +876,12 @@ class Platform:
                 )
 
             # The target MLA cache and recurrent-state cache use independent
-            # physical pages. Their token block sizes remain scheduler-visible,
-            # so the recurrent block must be a multiple of the target block.
+            # physical pages. Their token block sizes remain scheduler-visible
+            # (the scheduler block is their LCM), so one must be a multiple of
+            # the other. A recurrent block finer than the target block keeps
+            # recurrent checkpoints (and so prefix-cache reuse, with
+            # ``prefix_match_unit`` set to the recurrent block) fine-grained
+            # while the target page grows to match the recurrent page.
             cache_config.block_size = target_block_size
             cache_config.mamba_block_size = mamba_block_size
             cache_config.mamba_page_size_padded = None

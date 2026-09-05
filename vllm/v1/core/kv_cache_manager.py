@@ -195,9 +195,6 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
-        # Off-table cow blocks handed to a KV connector for partial-tail
-        # offload; pinned until the request's blocks are freed.
-        self._partial_tail_pins: dict[str, list[KVCacheBlock]] = {}
         self.boundary_checkpoints = (
             BoundaryCheckpointCache(self.block_pool)
             if enable_boundary_checkpoints and enable_caching
@@ -315,16 +312,14 @@ class KVCacheManager:
             and getattr(request, "kv_cache_report_mode", "incremental") == "full"
         ):
             for group_idx, group_blocks in enumerate(computed_blocks):
-                num_blocks = len(group_blocks)
-                if num_blocks > 0:
-                    group = self.kv_cache_config.kv_cache_groups[group_idx]
-                    block_size = group.kv_cache_spec.block_size
-                    self.block_pool.emit_cached_block_events(
-                        request,
-                        num_blocks,
-                        block_size,
-                        group_idx,
-                    )
+                manager = self.coordinator.single_type_managers[group_idx]
+                self.block_pool.emit_cached_block_events(
+                    request,
+                    group_blocks,
+                    num_new_computed_tokens,
+                    manager.block_size,
+                    group_idx,
+                )
 
         # The junction to pin is where the lagging sparse-retention group stops
         # (``num_new_computed_tokens``) plus the uncached shared prefix -- i.e.
@@ -671,9 +666,6 @@ class KVCacheManager:
         """
         boundary_blocks = self._pop_boundary_blocks(request)
         self.block_pool.free_blocks(boundary_blocks)
-        pins = self._partial_tail_pins.pop(request.request_id, None)
-        if pins:
-            self.block_pool.free_blocks(pins)
         self.coordinator.free(request.request_id)
 
     def _pop_boundary_blocks(self, request: Request) -> list[KVCacheBlock]:
@@ -767,12 +759,6 @@ class KVCacheManager:
         """
         blocks = self.coordinator.pop_blocks_for_free(request.request_id)
         blocks.extend(self._pop_boundary_blocks(request))
-        # Pins ride the same (possibly deferred) free as the request blocks.
-        # Preemption may release a pin under a still-queued offload — the same
-        # exposure normal saves of table blocks already have.
-        pins = self._partial_tail_pins.pop(request.request_id, None)
-        if pins:
-            blocks = pins + blocks
         return blocks
 
     def evict_blocks(self, block_ids: set[int]) -> None:
@@ -1010,18 +996,18 @@ class KVCacheManager:
         retained_blocks = [block for pair in pending_copies for block in pair]
         return copies, retained_blocks
 
-    def take_partial_tail_offloads(self) -> dict[str, list[tuple[int, int, int]]]:
-        """Drain producer partial-tail offload hand-offs per request.
+    def take_boundary_state_offloads(
+        self,
+    ) -> dict[str, list[tuple[int, int, int]]]:
+        """Drain this step's boundary-state hand-offs for a KV connector.
 
         Returns ``{request_id: [(group_id, block_id, boundary_tokens), ...]}``
-        for the durable boundary blocks of producers' last-prompt-boundary
-        partial tails. Only mamba "align" groups contribute; empty otherwise.
-        A KV connector reads the referenced blocks and offloads them so a later
-        request can hit the sub-block prefix.
-
-        Each handed-off block lives off the request block table, so it is
-        pinned here and unpinned when the request's blocks are freed — for a
-        producer with saved tokens, after the connector reports sends done.
+        for mamba "align" boundary states: the
+        request's committed boundary-state snapshots and, on a sub-block partial
+        hit, the CoW copy of its last-prompt-boundary state. Only mamba "align"
+        groups contribute; empty otherwise. A connector reads the referenced
+        blocks — never resolving them positionally — and offloads them so a
+        later request can hit that prefix.
         """
         offloads: dict[str, list[tuple[int, int, int]]] = {}
         for mgr in self.coordinator.single_type_managers:
@@ -1030,9 +1016,7 @@ class KVCacheManager:
                 group_id,
                 block,
                 boundary_tokens,
-            ) in mgr.take_pending_partial_tail_offloads():
-                self.block_pool.touch((block,))
-                self._partial_tail_pins.setdefault(req_id, []).append(block)
+            ) in mgr.take_pending_boundary_state_offloads():
                 offloads.setdefault(req_id, []).append(
                     (group_id, block.block_id, boundary_tokens)
                 )
