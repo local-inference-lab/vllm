@@ -1,8 +1,12 @@
-import pytest
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from unittest.mock import MagicMock
 
-from tests.v1.core.utils import create_requests, create_scheduler, mock_kv
+import pytest
+
 from tests.v1.core.test_micro_slicing import _update
+from tests.v1.core.utils import create_requests, create_scheduler, mock_kv
 from tests.v1.kv_connector.unit.test_mooncake_store_scheduler import (
     _make_bare_scheduler,
 )

@@ -98,7 +98,8 @@ def _build_kv_connector_block_state(
                 and retention_interval % group.kv_cache_spec.block_size
             ):
                 raise ValueError(
-                    "prefix_cache_retention_interval must be divisible by the Mamba block size"
+                    "prefix_cache_retention_interval must be divisible by "
+                    "the Mamba block size"
                 )
     return KVConnectorBlockState(
         block_ids={
