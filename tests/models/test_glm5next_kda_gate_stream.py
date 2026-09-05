@@ -141,7 +141,12 @@ def test_gate_side_stream_is_graph_capturable(monkeypatch):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         captured = layer(static, positions=None)
+    graph.replay()
+    torch.accelerator.synchronize(device)
+    assert torch.equal(captured, eager)
     for _ in range(3):
+        static.copy_(torch.randn_like(static))
+        expected = _run(layer, static)
         graph.replay()
         torch.accelerator.synchronize(device)
-        assert torch.equal(captured, eager)
+        assert torch.equal(captured, expected)
