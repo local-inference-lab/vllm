@@ -598,6 +598,14 @@ def try_dcp_b12x_all_gather_pair_kimi_topk(
     batch = int(local_down.shape[0])
     local_down_width = _KIMI_LATENT_WIDTH // world_size
     local_router_width = _KIMI_ROUTER_WIDTH // world_size
+    # The paired transport moves 16-byte packs; a world size that does not
+    # divide the widths into whole packs (nine ranks: 398 bf16 and 99 fp32)
+    # uses the ordinary paired gather and router instead.
+    if (
+        local_down_width * local_down.element_size() % 16
+        or local_router_width * local_router.element_size() % 16
+    ):
+        return None
     if (
         not envs.VLLM_USE_B12X_DCP_A2A
         or batch < 1
