@@ -198,9 +198,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self._decode_state_indices_source: torch.Tensor | None = None
         self._decode_state_indices_view: torch.Tensor | None = None
         self._reuse_spec_decode_inputs = envs.VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH
-        self._uniform_spec_masks = torch.ones(
-            self.decode_cudagraph_max_bs, dtype=torch.bool, device=device
-        )
         self._uniform_spec_masks_cpu = torch.ones(
             self.decode_cudagraph_max_bs, dtype=torch.bool
         )
@@ -247,12 +244,35 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self._spec_state_indices_view = source[:num_reqs, : self.num_spec + 1]
         return self._spec_state_indices_view
 
+    def _graph_accepted_tokens(self) -> torch.Tensor:
+        # Uniform and padded replay must update the tensor captured by the graph.
+        if (
+            self._reuse_spec_decode_inputs
+            and self.mamba_spec_accepted_tokens is not None
+        ):
+            return self.mamba_spec_accepted_tokens
+        return self.num_accepted_tokens
+
+    def _store_uniform_spec_inputs(self, num_reqs: int, num_tokens: int) -> None:
+        # Use the fallback destinations so padding cannot leave captured inputs stale.
+        self.spec_state_indices_tensor[:num_reqs].copy_(
+            self._get_spec_state_indices_view(num_reqs), non_blocking=True
+        )
+        self.spec_query_start_loc[: num_reqs + 1].copy_(
+            self._uniform_spec_query_start[: num_reqs + 1], non_blocking=True
+        )
+        self.spec_sequence_masks[:num_reqs].fill_(True)
+        self.spec_token_indx[:num_tokens].copy_(
+            self._uniform_spec_tokens[:num_tokens], non_blocking=True
+        )
+
     def _build_uniform_spec_decode(
         self, m: CommonAttentionMetadata, num_accepted_tokens: torch.Tensor
     ) -> GDNAttentionMetadata:
         num_reqs = m.num_reqs
         assert self.mamba_spec_accepted_tokens is not None
-        accepted = self.mamba_spec_accepted_tokens[:num_reqs]
+        self._store_uniform_spec_inputs(num_reqs, m.num_actual_tokens)
+        accepted = self._graph_accepted_tokens()[:num_reqs]
         accepted.copy_(num_accepted_tokens[:num_reqs], non_blocking=True)
         return GDNAttentionMetadata(
             num_prefills=0,
@@ -262,12 +282,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_spec_decodes=num_reqs,
             num_spec_decode_tokens=m.num_actual_tokens,
             num_actual_tokens=m.num_actual_tokens,
-            spec_query_start_loc=self._uniform_spec_query_start[: num_reqs + 1],
-            spec_state_indices_tensor=self._get_spec_state_indices_view(num_reqs),
-            spec_sequence_masks=self._uniform_spec_masks[:num_reqs],
+            spec_query_start_loc=self.spec_query_start_loc[: num_reqs + 1],
+            spec_state_indices_tensor=self.spec_state_indices_tensor[:num_reqs],
+            spec_sequence_masks=self.spec_sequence_masks[:num_reqs],
             spec_sequence_masks_cpu=self._uniform_spec_masks_cpu[:num_reqs],
-            spec_token_indx=self._uniform_spec_tokens[: m.num_actual_tokens],
-            non_spec_token_indx=self._uniform_spec_tokens[:0],
+            spec_token_indx=self.spec_token_indx[: m.num_actual_tokens],
+            non_spec_token_indx=self.non_spec_token_indx[:0],
             num_accepted_tokens=accepted,
             num_reqs=num_reqs,
             seq_lens=m.seq_lens,
@@ -683,10 +703,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_query_start_loc = self.spec_query_start_loc[: batch_size + 1]
             spec_query_start_loc[num_spec_decodes + 1 :].fill_(spec_num_query_tokens)
 
-            self.num_accepted_tokens[:num_spec_decodes].copy_(
+            accepted_buffer = self._graph_accepted_tokens()
+            accepted_buffer[:num_spec_decodes].copy_(
                 num_accepted_tokens, non_blocking=True
             )
-            num_accepted_tokens = self.num_accepted_tokens[:batch_size]
+            num_accepted_tokens = accepted_buffer[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
         if (
@@ -760,9 +781,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and self.mamba_spec_accepted_tokens is not None
         ):
             updated = copy(metadata)
-            updated.spec_state_indices_tensor = self._get_spec_state_indices_view(
-                metadata.num_reqs
+            self._store_uniform_spec_inputs(
+                metadata.num_reqs, metadata.num_actual_tokens
             )
+            updated.spec_state_indices_tensor = self.spec_state_indices_tensor[
+                : metadata.num_reqs
+            ]
+            updated.spec_query_start_loc = self.spec_query_start_loc[
+                : metadata.num_reqs + 1
+            ]
+            updated.spec_sequence_masks = self.spec_sequence_masks[: metadata.num_reqs]
+            updated.spec_token_indx = self.spec_token_indx[: metadata.num_actual_tokens]
+            updated.non_spec_token_indx = self.non_spec_token_indx[:0]
             accepted = self.mamba_spec_accepted_tokens[: metadata.num_reqs]
             assert metadata.num_accepted_tokens is not None
             if accepted.data_ptr() != metadata.num_accepted_tokens.data_ptr():
@@ -874,10 +904,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
             spec_query_start_loc = self.spec_query_start_loc[: metadata.num_reqs + 1]
 
-            self.num_accepted_tokens[: metadata.num_reqs].copy_(
+            accepted_buffer = self._graph_accepted_tokens()
+            accepted_buffer[: metadata.num_reqs].copy_(
                 num_accepted_tokens[: metadata.num_reqs], non_blocking=True
             )
-            num_accepted_tokens = self.num_accepted_tokens[: metadata.num_reqs]
+            num_accepted_tokens = accepted_buffer[: metadata.num_reqs]
 
         if (
             self.use_full_cuda_graph
