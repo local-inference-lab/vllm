@@ -48,7 +48,9 @@ _B12X_DCP_MAX_CONCURRENT_CHANNELS = 2
 # its first operation. Each entry is keyed by the process-group identity and
 # owns the graph's semantic channel, stream, and cleanup stack.
 _B12X_DCP_ACTIVE_CAPTURE: dict[int, tuple[str, Any, ExitStack]] = {}
-_B12X_DCP_WORLD_SIZES = (2, 4, 8, 16)
+# Mirrors ``b12x.comm.pcie.pcie_dcp_a2a.SUPPORTED_WORLD_SIZES``. Nine ranks
+# use the same generic per-rank staging kernel as the power-of-two sizes.
+_B12X_DCP_WORLD_SIZES = (2, 4, 8, 9, 16)
 _KIMI_LATENT_WIDTH = 3584
 _KIMI_ROUTER_WIDTH = 896
 _KIMI_ROUTER_TOPK = 16
@@ -827,7 +829,7 @@ def warmup_b12x_dcp_a2a(
         # dispatchers already fall back to NCCL collectives per call, so an
         # unsupported DCP size (e.g. TP6 with DCP3/DCP6) must not fail boot.
         logger.warning_once(
-            "B12X PCIe DCP collectives support world sizes 2/4/8/16; "
+            "B12X PCIe DCP collectives support world sizes 2/4/8/9/16; "
             "DCP world size %d uses NCCL collectives instead.",
             cp_group.world_size,
         )
