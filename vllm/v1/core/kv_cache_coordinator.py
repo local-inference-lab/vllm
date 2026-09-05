@@ -732,6 +732,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             and partial_hit_alignment < self.scheduler_block_size
             and self.scheduler_block_size % partial_hit_alignment == 0
         )
+        for manager in self.single_type_managers:
+            manager.cache_alignment_tokens = self._cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
 
     @property
