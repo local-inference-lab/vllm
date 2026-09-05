@@ -98,12 +98,15 @@ def test_gate_overlap_is_enabled_for_regular_full_capture(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_gate_side_stream_matches_sequential_forward(monkeypatch):
+    from vllm.compilation import monitor
+
     device = torch.device("cuda", 0)
     generator = torch.Generator().manual_seed(11)
     log: list[tuple[str, int]] = []
     layer = _make_layer(device, log, generator)
     x = (torch.randn(8, HIDDEN, generator=generator)).to(device, torch.bfloat16)
 
+    monkeypatch.setattr(monitor, "is_cudagraph_capturing_enabled", lambda: False)
     monkeypatch.setattr(kda_module, "_GATE_SIDE_STREAM", True)
     overlapped = _run(layer, x)
     main = torch.cuda.current_stream(device).cuda_stream

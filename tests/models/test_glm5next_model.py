@@ -411,6 +411,7 @@ def test_glm5next_loads_mxfp8_fused_projection_scales(
 def test_glm5next_kda_adapts_shared_out_buffer_forward(monkeypatch) -> None:
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     torch.nn.Module.__init__(layer)
+    layer.use_full_rank_gate = True
     hidden_states = torch.randn(2, 4)
     positions = torch.arange(2)
 
