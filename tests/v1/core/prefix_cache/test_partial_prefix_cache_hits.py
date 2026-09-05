@@ -4,6 +4,8 @@
 "align") models: scheduler chunk splitting, partial tail registration, CoW
 on partial hits, and same-step deferral."""
 
+import unittest
+from dataclasses import replace
 from math import lcm
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -133,6 +135,7 @@ def test_mamba_align_split_partial_tail_schedule(dcp_world_size: int):
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle=False,
+        drop_last_prefix_cache_block=False,
         hash_block_size=hash_block_size,
         dcp_world_size=dcp_world_size,
         scheduler_block_size=scheduler_block_size,
@@ -181,6 +184,7 @@ def test_mamba_align_split_when_block_exceeds_scheduling_budget():
         max_num_scheduled_tokens=token_budget,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle=False,
+        drop_last_prefix_cache_block=False,
         hash_block_size=32,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
@@ -220,6 +224,7 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
             long_prefill_token_threshold=long_prefill_threshold
         ),
         use_eagle=False,
+        drop_last_prefix_cache_block=False,
         hash_block_size=32,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
@@ -2195,3 +2200,133 @@ def test_dcp_partial_hit_with_eagle_rewinds_one_hash_unit():
     assert num_computed == 4
     assert [len(group) for group in computed_blocks.blocks] == [1, 1]
     assert manager.allocate_slots(req1, 4, num_computed, computed_blocks) is not None
+
+
+class TestSemanticReplayCheckpoints(unittest.TestCase):
+    def manager(self, block, draft):
+        config = _make_hybrid_swa_eagle_config(
+            block, 2048, block, 2048, num_blocks=4096
+        )
+        config.kv_cache_groups[1].kv_cache_spec = replace(
+            config.kv_cache_groups[1].kv_cache_spec, num_prefill_checkpoint_blocks=1
+        )
+        if draft == "mtp":
+            config.kv_cache_groups[2].kv_cache_spec = FullAttentionSpec(
+                block_size=2048, num_kv_heads=1, head_size=1, dtype=torch.float32
+            )
+        return make_kv_cache_manager(
+            config,
+            max_model_len=524288,
+            enable_caching=True,
+            hash_block_size=block,
+            use_eagle=True,
+            retention_interval=0,
+        )
+
+    def test_large_chunk_materializes_a_reusable_replay_state(self):
+        manager = self.manager(256, "mtp")
+        scheduler = SimpleNamespace(
+            cache_config=SimpleNamespace(
+                block_size=2048,
+                prefix_cache_retention_interval=0,
+                mamba_cache_mode="align",
+            ),
+            kv_cache_manager=manager,
+            block_size=2048,
+            scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+            drop_last_prefix_cache_block=True,
+            mamba_has_prefill_checkpoint_blocks=True,
+            use_eagle=True,
+            max_num_scheduled_tokens=8192,
+            hash_block_size=256,
+            mamba_partial_cache_hit=True,
+        )
+        request = make_request("cold", list(range(65536)), 256, sha256)
+        steps = 0
+        while request.num_computed_tokens < request.num_prompt_tokens:
+            budget = min(8192, request.num_prompt_tokens - request.num_computed_tokens)
+            step = Scheduler._mamba_block_aligned_split(scheduler, request, budget)
+            self.assertGreater(step, 0)
+            self.assertLessEqual(step, budget)
+            self.assertIsNotNone(manager.allocate_slots(request, step))
+            request.num_computed_tokens += step
+            manager.new_step_starts()
+            steps += 1
+            self.assertLessEqual(steps, 16)
+        self.assertIsNotNone(manager.allocate_slots(request, 1))
+        request.num_computed_tokens += 1
+        manager.new_step_starts()
+        manager.free(request)
+        manager.new_step_starts()
+        _, hit, _ = manager.get_computed_blocks(
+            make_request("repeat", list(range(65536)), 256, sha256)
+        )
+        self.assertGreaterEqual(hit, 65024)
+
+    def test_swa_preserves_the_materialized_recurrent_fallback(self):
+        manager = self.manager(256, "dflash")
+        _prefill_and_free(
+            manager, make_request("cold", list(range(65536)), 256, sha256), 4096
+        )
+        retained = {
+            b.block_hash_num_tokens
+            for b in manager.block_pool.blocks
+            if b.block_hash and get_group_id(b.block_hash) == 1
+        }
+        self.assertIn(61440, retained)
+        _, hit, _ = manager.get_computed_blocks(
+            make_request("repeat", list(range(65536)), 256, sha256)
+        )
+        self.assertGreaterEqual(hit, 61440)
+
+    def test_fine_checkpoint_keeps_the_rewind_stop(self):
+        manager = self.manager(256, "mtp")
+        scheduler = SimpleNamespace(
+            cache_config=SimpleNamespace(
+                block_size=2048, prefix_cache_retention_interval=0
+            ),
+            kv_cache_manager=manager,
+            block_size=2048,
+            scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+            drop_last_prefix_cache_block=True,
+            mamba_has_prefill_checkpoint_blocks=True,
+            use_eagle=True,
+            max_num_scheduled_tokens=4096,
+            hash_block_size=256,
+            mamba_partial_cache_hit=True,
+        )
+        request = make_request("tail", list(range(8449)), 256, sha256)
+        request.num_computed_tokens = 6144
+        # The worker captures 8448 internally. Lookup also needs 8192.
+        step = Scheduler._mamba_block_aligned_split(scheduler, request, 2305)
+        self.assertEqual(step, 2048)
+
+
+def test_semantic_checkpoints_support_unitary_recurrent_coordinator():
+    config = _make_hybrid_swa_eagle_config(2048, 2048, 2048, 2048, num_blocks=128)
+    config.kv_cache_groups = [config.kv_cache_groups[1]]
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=524288,
+        enable_caching=True,
+        hash_block_size=2048,
+        retention_interval=0,
+    )
+    assert not hasattr(manager.coordinator, "_cache_hit_alignment_tokens")
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=2048, prefix_cache_retention_interval=0
+        ),
+        kv_cache_manager=manager,
+        block_size=2048,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        drop_last_prefix_cache_block=False,
+        mamba_has_prefill_checkpoint_blocks=True,
+        use_eagle=False,
+        max_num_scheduled_tokens=8192,
+        hash_block_size=2048,
+        mamba_partial_cache_hit=False,
+    )
+    request = make_request("unitary-tail", list(range(65536)), 2048, sha256)
+    request.num_computed_tokens = 61440
+    assert Scheduler._mamba_block_aligned_split(scheduler, request, 4096) == 2048

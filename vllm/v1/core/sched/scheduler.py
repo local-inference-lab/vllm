@@ -611,6 +611,36 @@ class Scheduler(SchedulerInterface):
             if start < request.shared_prefix_boundary < end
             else 0,
         )
+        if getattr(self.cache_config, "prefix_cache_retention_interval", None) == 0:
+            # Retention cannot preserve a recurrent state that prefill skipped.
+            # Use the same fine and coarse replay positions as the cache masks.
+            managers = [
+                manager
+                for manager in self.kv_cache_manager.coordinator.single_type_managers
+                if isinstance(manager.kv_cache_spec, MambaSpec)
+            ]
+            boundaries = [request.num_prompt_tokens - 1]
+            if request.shared_prefix_boundary:
+                boundaries.append(request.shared_prefix_boundary)
+            reuse_stops = {
+                position
+                for manager in managers
+                for position in manager._expand_reachable_boundaries(boundaries)
+                if start < position < end
+            }
+            if use_internal_checkpoint:
+                # The worker's checkpoint grid belongs to each recurrent group.
+                internal_positions = {
+                    end // manager.block_size * manager.block_size
+                    if end % manager.block_size
+                    else None
+                    for manager in managers
+                }
+                if len(internal_positions) == 1:
+                    internal = internal_positions.pop()
+                    if internal is not None and internal > start:
+                        reuse_stops.discard(internal)
+            stops = (*stops, *reuse_stops)
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
