@@ -55,6 +55,20 @@ _KIMI_LATENT_WIDTH = 3584
 _KIMI_ROUTER_WIDTH = 896
 _KIMI_ROUTER_TOPK = 16
 _KIMI_PAIRED_MAX_BATCH_SIZE = 8
+_KIMI_PROJECTION_SHARD_ALIGNMENT = 8
+
+
+def _kimi_projection_shard_width(width: int, world_size: int) -> int:
+    """Per-rank projection width padded to whole 16-byte packs.
+
+    Mirrors ``vllm.models.kimi_k3.nvidia.model.kimi_projection_shard_width``
+    without importing the model module.
+    """
+    per_rank = -(-width // world_size)
+    alignment = _KIMI_PROJECTION_SHARD_ALIGNMENT
+    return -(-per_rank // alignment) * alignment
+
+
 _DCP_A2A_GRAPH_BUFFERS: dict[
     tuple[tuple[int, ...], torch.device, torch.dtype],
     tuple[torch.Tensor, torch.Tensor],
@@ -778,8 +792,11 @@ def warmup_b12x_kimi_projection_gathers(
         if token_cap <= 0
         else min(token_cap, _KIMI_PAIRED_MAX_BATCH_SIZE)
     )
-    local_down_width = _KIMI_LATENT_WIDTH // world_size
-    local_router_width = _KIMI_ROUTER_WIDTH // world_size
+    # The model pads each rank's projection shard to whole 16-byte packs
+    # (`kimi_projection_shard_width`); the paired gather pool is keyed by the
+    # combined row bytes, so the warmup must use the same widths.
+    local_down_width = _kimi_projection_shard_width(_KIMI_LATENT_WIDTH, world_size)
+    local_router_width = _kimi_projection_shard_width(_KIMI_ROUTER_WIDTH, world_size)
     local_down = torch.zeros(
         (pair_batch, local_down_width),
         device=device,
@@ -799,9 +816,19 @@ def warmup_b12x_kimi_projection_gathers(
     if paired is not None:
         warmed += 1
 
+    fused_down = torch.zeros(
+        (pair_batch, _KIMI_LATENT_WIDTH // world_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    fused_router = torch.zeros(
+        (pair_batch, _KIMI_ROUTER_WIDTH // world_size),
+        device=device,
+        dtype=torch.float32,
+    )
     fused = try_dcp_b12x_all_gather_pair_kimi_topk(
-        local_down[:1],
-        local_router[:1],
+        fused_down[:1],
+        fused_router[:1],
         correction_bias,
         projection_group,
     )
@@ -809,8 +836,8 @@ def warmup_b12x_kimi_projection_gathers(
         warmed += 1
     if pair_batch > 1:
         batched = try_dcp_b12x_all_gather_pair_kimi_topk(
-            local_down,
-            local_router,
+            fused_down,
+            fused_router,
             correction_bias,
             projection_group,
         )

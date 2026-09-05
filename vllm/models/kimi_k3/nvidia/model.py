@@ -604,6 +604,24 @@ def _load_padded_tp_shard(
     param_data.copy_(loaded_shard)
 
 
+_KIMI_PROJECTION_SHARD_ALIGNMENT = 8
+
+
+def kimi_projection_shard_width(output_size: int, tp_size: int) -> int:
+    """Per-rank width of a padded Kimi column-parallel projection.
+
+    The width is the ceiling division of the logical size rounded up to a
+    multiple of eight elements, so every rank's bf16 or fp32 row of the
+    projection occupies whole 16-byte packs for the B12X PCIe gathers. Sizes
+    that divide evenly into aligned shards (Kimi-K3 at TP8: 448 latent and
+    112 router columns) keep their exact widths.
+    """
+    width = cdiv(output_size, tp_size)
+    return (
+        cdiv(width, _KIMI_PROJECTION_SHARD_ALIGNMENT) * _KIMI_PROJECTION_SHARD_ALIGNMENT
+    )
+
+
 class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
     """Column-parallel linear that zero-fills an indivisible output tail."""
 
@@ -625,7 +643,7 @@ class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
         tp_size = get_tensor_model_parallel_world_size()
         self.logical_output_size = output_size
         self.kimi_gather_output = gather_output
-        padded_output_size = cdiv(output_size, tp_size) * tp_size
+        padded_output_size = kimi_projection_shard_width(output_size, tp_size) * tp_size
         super().__init__(
             input_size,
             padded_output_size,
