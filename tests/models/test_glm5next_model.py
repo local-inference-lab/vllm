@@ -195,6 +195,26 @@ def test_glm5next_mtp_selects_only_draft_checkpoint_weights() -> None:
     )
 
 
+def test_glm5next_mtp_reuses_runtime_quantized_draft_head(monkeypatch) -> None:
+    source_head = SimpleNamespace(runtime_lm_head_quantization="nvfp4")
+    predictor = Glm5NextMultiTokenPredictor.__new__(Glm5NextMultiTokenPredictor)
+    torch.nn.Module.__init__(predictor)
+    predictor.quantized_draft_head = torch.nn.Linear(4, 8, bias=False)
+
+    def reject_duplicate_quantization(_source_head):
+        raise AssertionError("runtime-quantized draft head was quantized twice")
+
+    monkeypatch.setattr(
+        glm5next_mtp,
+        "make_quantized_draft_head",
+        reject_duplicate_quantization,
+    )
+
+    predictor.prepare_draft_lm_head(source_head)
+
+    assert predictor.quantized_draft_head is None
+
+
 @pytest.fixture
 def glm_mtp_head_loader(monkeypatch):
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader

@@ -143,7 +143,16 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
     def prepare_draft_lm_head(self, source_head: nn.Module) -> None:
-        """Create the configured draft-only head after target weights are loaded."""
+        """Resolve the draft-only head after its weights have loaded.
+
+        A runtime-quantized MTP head already owns its packed vocabulary
+        projection and must not be quantized again from that packed tensor.
+        Otherwise, create the GLM-specific copy selected by
+        ``VLLM_GLM53_MTP_DRAFT_HEAD`` from an unquantized target head.
+        """
+        if getattr(source_head, "runtime_lm_head_quantization", None) == "nvfp4":
+            self.quantized_draft_head = None
+            return
         self.quantized_draft_head = make_quantized_draft_head(source_head)
 
     def update_max_model_len(self, max_model_len: int) -> None:
