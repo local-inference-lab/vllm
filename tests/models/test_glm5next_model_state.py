@@ -124,7 +124,6 @@ def test_glm5next_kda_reuses_captured_metadata_after_reordering(monkeypatch) -> 
     state._align_mode = True
     state._aligned_metadata_groups = state._aligned_metadata_ctx = None
     state._aligned_metadata_builders = []
-    state._gdn_spec_accepted_tokens = torch.ones(8, dtype=torch.int32)
     state.recoverssm = None
     state._get_mamba_group_info = lambda _: ([0, 1], None)
     indices = torch.arange(64, dtype=torch.int32).reshape(2, 8, 4)
@@ -172,6 +171,10 @@ def test_glm5next_kda_reuses_captured_metadata_after_reordering(monkeypatch) -> 
         )
 
     captured = prepare(for_capture=True)
+    accepted_pointers = [
+        captured[str(i)].num_accepted_tokens.data_ptr() for i in range(2)
+    ]
+    assert accepted_pointers[0] != accepted_pointers[1]
     for slot, accepted in ((5, 4), (1, 2), (5, 1)):
         batch.idx_mapping.fill_(slot)
         state.num_accepted_tokens_gpu[slot] = accepted
@@ -183,10 +186,10 @@ def test_glm5next_kda_reuses_captured_metadata_after_reordering(monkeypatch) -> 
                 captured[str(i)].spec_state_indices_tensor, indices[i, :1]
             )
             assert captured[str(i)].num_accepted_tokens.item() == accepted
-        assert (
-            current["0"].num_accepted_tokens.data_ptr()
-            == current["1"].num_accepted_tokens.data_ptr()
-        )
+            assert (
+                current[str(i)].num_accepted_tokens.data_ptr() == accepted_pointers[i]
+            )
+            assert accepted_pointers[i] == builders[i].num_accepted_tokens.data_ptr()
 
 
 def test_glm5next_draft_metadata_preserves_first_step_acceptance() -> None:
@@ -327,7 +330,9 @@ def test_glm5next_rejects_unaligned_fresh_prefix(
     ):
         state.add_request(
             3,
-            SimpleNamespace(num_computed_tokens=prefix_length),
+            SimpleNamespace(
+                num_computed_tokens=prefix_length, boundary_checkpoint=None
+            ),
         )
 
     assert calls == []
