@@ -73,7 +73,11 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
         return False
     batch, heads, head_dim = (int(value) for value in tensor.shape)
     stride_batch, stride_head, _ = (int(value) for value in tensor.stride())
-    packed_token_major = stride_batch == heads * head_dim and stride_head == head_dim
+    packed_token_major = (
+        stride_batch >= heads * head_dim
+        and stride_batch % 8 == 0
+        and stride_head == head_dim
+    )
     capacity_strided_head_major = (
         stride_batch == head_dim and stride_head >= batch * head_dim
     )

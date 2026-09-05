@@ -1083,11 +1083,18 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                     "QSRT atoms-v2 profile disagrees with the model descriptor"
                 )
             pure_k2 = metadata_v2.profile == _QSRT_ATOMS_V2_PROFILE_COUPLED_K2
-            state.trellis_use_w4a8_prefill = (
-                _qsrt_atoms_v2_w4a8_prefill_enabled(pure_k2=pure_k2)
+            state.trellis_use_w4a8_prefill = _qsrt_atoms_v2_w4a8_prefill_enabled(
+                pure_k2=pure_k2
             )
             tp_size = get_tensor_model_parallel_world_size()
             tp_rank = get_tensor_model_parallel_rank()
+            if pure_k2 and tp_size == 9:
+                from b12x.moe._shared.qsrt_sharding import plan_qsrt_tp9_rank
+
+                extent = plan_qsrt_tp9_rank(layer_index, tp_rank)
+                # The virtual model axis reserves capacity. Packed weights and
+                # execution use only this layer's actual source extent.
+                state.intermediate_size = extent.intermediate_channels
             weight_plan_kwargs: dict[str, Any] = dict(
                 source_format="qsrt_sqg_e4m3",
                 activation=self.moe.activation.value,
@@ -1798,10 +1805,8 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 routing_shape = (runtime.max_m, runtime.topk)
                 if (
                     runtime.trellis_prefill_topk_ids is None
-                    or tuple(runtime.trellis_prefill_topk_ids.shape)
-                    != routing_shape
-                    or runtime.trellis_prefill_topk_ids.device
-                    != prefill_spec.device
+                    or tuple(runtime.trellis_prefill_topk_ids.shape) != routing_shape
+                    or runtime.trellis_prefill_topk_ids.device != prefill_spec.device
                 ):
                     runtime.trellis_prefill_topk_ids = torch.empty(
                         routing_shape,
@@ -2054,9 +2059,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 tids = tids.contiguous()
             if runtime.trellis_output is None:
                 raise RuntimeError("QSRT trellis output was not allocated eagerly")
-            use_w4a8_prefill = (
-                state.trellis_prefill_weights is not None and not decode
-            )
+            use_w4a8_prefill = state.trellis_prefill_weights is not None and not decode
             use_w4a16_prefill = (
                 not use_w4a8_prefill
                 and state.trellis_w4a16_prefill_plan is not None

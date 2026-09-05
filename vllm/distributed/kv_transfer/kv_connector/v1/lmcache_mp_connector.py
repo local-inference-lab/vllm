@@ -3,7 +3,7 @@
 import enum
 import os
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -1235,4 +1235,56 @@ def _resolve_lmcache_mp_connector() -> type[KVConnectorBase_V1]:
         return LMCacheMPConnectorUpstream
 
 
-LMCacheMPConnector = _resolve_lmcache_mp_connector()
+def _tp9_target_cache_view(vllm_config, kv_cache_config):
+    """Keep draft speculation state out of LMCache's target-cache protocol."""
+    spec = vllm_config.speculative_config
+    parallel = vllm_config.parallel_config
+    if (
+        kv_cache_config is None
+        or spec is None
+        or spec.method != "dflash"
+        or parallel.tensor_parallel_size != 9
+        or parallel.decode_context_parallel_size != 9
+    ):
+        return kv_cache_config, frozenset()
+    kept = []
+    excluded = set()
+    for group in kv_cache_config.kv_cache_groups:
+        draft_names = {
+            name for name in group.layer_names if name.startswith("dflash_model.")
+        }
+        if draft_names:
+            if draft_names != set(group.layer_names):
+                raise ValueError("LMCache cannot split mixed target/draft cache groups")
+            excluded.update(draft_names)
+        else:
+            if excluded:
+                raise ValueError(
+                    "DFlash cache groups must follow all target cache groups"
+                )
+            kept.append(group)
+    if not excluded:
+        return kv_cache_config, frozenset()
+    return replace(kv_cache_config, kv_cache_groups=kept), frozenset(excluded)
+
+
+_ResolvedLMCacheMPConnector = _resolve_lmcache_mp_connector()
+
+
+class LMCacheMPConnector(_ResolvedLMCacheMPConnector):  # type: ignore[misc, valid-type]
+    """LMCache connector with target-only registration for colocated TP9 DFlash."""
+
+    def __init__(self, vllm_config, role, kv_cache_config=None):
+        target_cache, self._tp9_draft_cache_names = _tp9_target_cache_view(
+            vllm_config, kv_cache_config
+        )
+        super().__init__(vllm_config, role, target_cache)
+
+    def register_kv_caches(self, kv_caches):
+        if self._tp9_draft_cache_names:
+            kv_caches = {
+                name: tensor
+                for name, tensor in kv_caches.items()
+                if name not in self._tp9_draft_cache_names
+            }
+        return super().register_kv_caches(kv_caches)

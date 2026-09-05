@@ -46,6 +46,13 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
 
+from .dflash_tp9 import (
+    DFlashHeadExtent,
+    DFlashTP9QKVParallelLinear,
+    DFlashTP9RowParallelLinear,
+    aligned_tp9_extent,
+    dflash_tp9_head_extent,
+)
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
 from .utils import (
@@ -60,6 +67,18 @@ logger = init_logger(__name__)
 
 
 _SLIDING_ATTENTION = "sliding_attention"
+
+
+def _uses_kimi_dflash_tp9(config: Qwen3Config) -> bool:
+    return (
+        get_tensor_model_parallel_world_size() == 9
+        and getattr(config, "original_num_attention_heads", config.num_attention_heads)
+        == 32
+        and getattr(config, "original_num_key_value_heads", config.num_key_value_heads)
+        == 8
+        and config.hidden_size == 7168
+        and config.num_hidden_layers == 6
+    )
 
 
 def _retain_dflash_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -248,6 +267,7 @@ class DFlashQwen3Attention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
+        tp9_extent: DFlashHeadExtent | None = None,
     ) -> None:
         super().__init__()
         self.layer_name = prefix
@@ -262,27 +282,51 @@ class DFlashQwen3Attention(nn.Module):
         else:
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        if tp9_extent is not None:
+            if tp_size != 9 or attention_bias or add_swa_attention_sink_bias:
+                raise ValueError(
+                    "Kimi DFlash TP9 requires bias-free 32/8-head attention"
+                )
+            self.num_heads = tp9_extent.query_count
+            self.num_kv_heads = 1
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=attention_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=attention_bias,  # DFlash has o_proj bias when using attention bias
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
-        )
+        if tp9_extent is None:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=attention_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.o_proj = RowParallelLinear(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                bias=attention_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.o_proj",
+            )
+        else:
+            self.qkv_proj = DFlashTP9QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                tp9_extent,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.o_proj = DFlashTP9RowParallelLinear(
+                32 * self.head_dim,
+                hidden_size,
+                tp9_extent.first_query * self.head_dim,
+                tp9_extent.query_count * self.head_dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.o_proj",
+            )
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -394,6 +438,11 @@ class DFlashQwen3DecoderLayer(nn.Module):
             rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
+            tp9_extent=(
+                dflash_tp9_head_extent(layer_idx, get_tensor_model_parallel_rank())
+                if _uses_kimi_dflash_tp9(config)
+                else None
+            ),
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -508,17 +557,34 @@ class DFlashQwen3Model(nn.Module):
             if layer.layer_type == "sliding_attention"
         }
         if self.use_aux_hidden_state:
-            self.fc = ReplicatedLinear(
-                input_size=_get_dflash_fc_input_size(
-                    vllm_config,
-                ),
-                output_size=self.config.hidden_size,
-                bias=False,
-                params_dtype=vllm_config.model_config.dtype,
-                quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, "fc"),
-                return_bias=False,
-            )
+            if _uses_kimi_dflash_tp9(self.config):
+                input_size = _get_dflash_fc_input_size(vllm_config)
+                first, count = aligned_tp9_extent(
+                    input_size, get_tensor_model_parallel_rank(), 64
+                )
+                self.fc = DFlashTP9RowParallelLinear(
+                    input_size,
+                    self.config.hidden_size,
+                    first,
+                    count,
+                    input_is_full=True,
+                    params_dtype=vllm_config.model_config.dtype,
+                    quant_config=self.quant_config,
+                    prefix=maybe_prefix(prefix, "fc"),
+                    return_bias=False,
+                )
+            else:
+                self.fc = ReplicatedLinear(
+                    input_size=_get_dflash_fc_input_size(
+                        vllm_config,
+                    ),
+                    output_size=self.config.hidden_size,
+                    bias=False,
+                    params_dtype=vllm_config.model_config.dtype,
+                    quant_config=self.quant_config,
+                    prefix=maybe_prefix(prefix, "fc"),
+                    return_bias=False,
+                )
         self.hidden_norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,

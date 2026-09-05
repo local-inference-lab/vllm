@@ -398,7 +398,7 @@ class CustomAllreduce:
         self.mnnvl_only = False
         self._pcie_runtime = None
         self._pcie_dma = None
-        self._pcie_twoshot = None
+        self._pcie_twoshot: Any | None = None
         self._pcie_twoshot_max_bytes = 0
         self._pcie_capture_stream: torch.cuda.Stream | None = None
         self._pcie_capture_channel_id: str | None = None
@@ -1084,7 +1084,7 @@ class CustomAllreduce:
         """Lossless bf16 two-shot for payloads above the one-shot ceiling and
         below the DMA ring: the window the PyNCCL ring served before."""
         max_bytes = _b12x_pcie_twoshot_max_bytes()
-        if max_bytes <= 0 or self.world_size not in (2, 4, 8):
+        if max_bytes <= 0 or self.world_size not in (2, 4, 8, 9):
             return
         twoshot_cls = _load_b12x_pcie_twoshot_bf16()
         if twoshot_cls is None:
@@ -1232,6 +1232,7 @@ class CustomAllreduce:
                 and inp_size <= self._pcie_allreduce_max_size
             )
             if not oneshot_eligible and self._pcie_twoshot_accepts(inp):
+                assert self._pcie_twoshot is not None
                 stream = self._pcie_runtime_stream()
                 if stream is not None:
                     with torch.cuda.stream(stream):

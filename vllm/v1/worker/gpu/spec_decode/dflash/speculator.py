@@ -219,7 +219,11 @@ class DFlashSpeculator(DraftModelSpeculator):
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
         )
-        if wants_full and supports_full and self._speculator_name == "DSpark":
+        capture_context = (
+            self._speculator_name == "DSpark"
+            or self.vllm_config.parallel_config.tensor_parallel_size == 9
+        )
+        if wants_full and supports_full and capture_context:
             self.context_cudagraph_manager = DFlashContextCudaGraphManager(
                 self.vllm_config,
                 self.device,

@@ -208,12 +208,11 @@ def _kernel_query_heads(local_heads: int, dcp_size: int = 1) -> int:
             f"heads={local_heads}, DCP={dcp_size}."
         )
     effective_heads = local_heads * dcp_size
-    if dcp_size > 1 and effective_heads % _B12X_QUERY_HEAD_TILE:
-        raise ValueError(
-            "B12X_MLA requires a multiple of eight query heads after DCP "
-            f"gather, got local={local_heads}, DCP={dcp_size}, "
-            f"effective={effective_heads}."
-        )
+    # kimi-k3-dcp-head-tile-tail: a DCP-gathered head count that does not
+    # close an eight-head tile is padded up to the tile, exactly like the
+    # DCP=1 path. The decode path zero-fills the pad rows per batch and
+    # slices output and LSE back to effective_heads before the DCP LSE
+    # reduction, so pad rows never reach the combine.
     return (
         (effective_heads + _B12X_QUERY_HEAD_TILE - 1)
         // _B12X_QUERY_HEAD_TILE
@@ -1236,7 +1235,11 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                         "B12X_MLA padded query dtype does not match the live query: "
                         f"buffer={padded_q.dtype}, query={q.dtype}."
                     )
-                padded_q[:, :effective_heads].copy_(q)
+                # kimi-k3-dcp-padded-self-copy-guard: after a DCP gather the
+                # query is already a leading view of padded_q; an overlapping
+                # self-copy is rejected by torch, and the data is in place.
+                if q.data_ptr() != padded_q.data_ptr():
+                    padded_q[:, :effective_heads].copy_(q)
                 padded_q[:, effective_heads:].zero_()
                 q = padded_q
         scratch = getattr(attn_metadata, "dense_mla_scratch", None)

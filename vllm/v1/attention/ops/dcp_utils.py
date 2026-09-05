@@ -731,27 +731,36 @@ def _dma_kv_gather_op():
 
 
 def dcp_gather_relay_layout(world_size: int, rank: int) -> tuple[int, int] | None:
-    """(partner rank, mates mask) of the two-switch relay schedule for
-    ``VLLM_K3_DCP_GATHER_CLUSTERS`` (``"0,1,2,3;4,5,6,7"`` in DCP ranks: two
-    equal groups sharing a PCIe switch each; the partner is the other
-    group's member at the same position), or None when unset."""
+    """Return a switch-local relay partner and destination mask.
+
+    Equal groups pair ranks by position. A TP9 five/four split pairs eight
+    ranks and broadcasts the unpaired rank directly. Paired ranks on the
+    five-rank switch also deliver local and relayed rows to the extra rank.
+    """
     spec = envs.VLLM_K3_DCP_GATHER_CLUSTERS
     if not spec:
         return None
     groups = [
         [int(r) for r in group.split(",") if r.strip()] for group in spec.split(";")
     ]
-    if len(groups) != 2 or len(groups[0]) != len(groups[1]):
+    if len(groups) != 2 or not all(groups):
         raise ValueError(
-            "VLLM_K3_DCP_GATHER_CLUSTERS must name two equal groups of DCP ranks"
+            "VLLM_K3_DCP_GATHER_CLUSTERS must name two nonempty DCP rank groups"
         )
+    if len(groups[0]) != len(groups[1]) and not (
+        world_size == 9 and sorted(map(len, groups)) == [4, 5]
+    ):
+        raise ValueError("DCP relay requires equal groups or a TP9 five/four split")
     if sorted(groups[0] + groups[1]) != list(range(world_size)):
         raise ValueError(
             f"VLLM_K3_DCP_GATHER_CLUSTERS must cover ranks 0..{world_size - 1} once"
         )
     for mine, other in ((groups[0], groups[1]), (groups[1], groups[0])):
         if rank in mine:
-            partner = other[mine.index(rank)]
+            position = mine.index(rank)
+            if position >= len(other):
+                return None
+            partner = other[position]
             mates_mask = sum(1 << r for r in mine if r != rank)
             return partner, mates_mask
     raise AssertionError("unreachable")
