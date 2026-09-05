@@ -7,7 +7,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
@@ -84,11 +83,6 @@ class MambaHybridModelState(DefaultModelState):
         self.cache_config = vllm_config.cache_config
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
-        )
-        self._gdn_spec_accepted_tokens = (
-            torch.ones_like(self.num_accepted_tokens_gpu)
-            if envs.VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH
-            else None
         )
         # Pre-copy "align" prefix-cache state (V2). The migration of each
         # request's mamba state across block boundaries runs as a fused GPU
@@ -199,10 +193,6 @@ class MambaHybridModelState(DefaultModelState):
                     builder = group.get_metadata_builder(0)
                     if hasattr(builder, "mamba_aligned_state_indices"):
                         self._aligned_metadata_builders.append((group_idx, builder))
-                    if hasattr(builder, "mamba_spec_accepted_tokens"):
-                        builder.mamba_spec_accepted_tokens = (
-                            self._gdn_spec_accepted_tokens
-                        )
             self._aligned_metadata_groups = attn_groups
             self._aligned_metadata_ctx = None
         if not self._aligned_metadata_builders:
