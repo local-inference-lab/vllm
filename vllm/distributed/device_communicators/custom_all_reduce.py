@@ -213,10 +213,9 @@ def _b12x_pcie_twoshot_max_bytes() -> int:
 def _b12x_pcie_twoshot_row_elems() -> int:
     """Row width (bf16 elements) of the two-shot payload view.
 
-    The two-shot serves a tensor only when its element count is a multiple of
-    ``row_elems * world_size``; ``VLLM_PCIE_TWOSHOT_ROW_ELEMS`` (default 896 =
-    7168 / 8, Kimi-K3's hidden size over the TP8 world) keeps every
-    token count of the K3 decode payload eligible.
+    Equal-width worlds require divisibility by ``row_elems * world_size``.
+    TP9 pads the wire payload in fixed buffers; a row width of eight minimizes
+    the unused tail. The TP8 default 896 matches Kimi-K3's hidden width / 8.
     """
     return int(os.getenv("VLLM_PCIE_TWOSHOT_ROW_ELEMS", "896"))
 
