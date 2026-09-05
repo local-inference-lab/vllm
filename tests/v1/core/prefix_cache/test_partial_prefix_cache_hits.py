@@ -1937,6 +1937,63 @@ def test_sliding_window_eagle_margin_is_one_hash_unit_under_partial_hits():
     assert 42 in seen_max_lengths
 
 
+def _cached_mamba_boundaries(manager, group_id: int = 1) -> list[int]:
+    return sorted(
+        {
+            block.block_hash_num_tokens
+            for block in manager.block_pool.blocks
+            if block.block_hash is not None
+            and block.block_hash_num_tokens
+            and get_group_id(block.block_hash) == group_id
+        }
+    )
+
+
+@pytest.mark.parametrize("prefill_chunk", [2, 16])
+def test_fine_grained_retention_keeps_scheduler_aligned_fallback(prefill_chunk: int):
+    """Sparse retention (interval 0) under fine-grained hits must keep the
+    scheduler-aligned recurrent state and its EAGLE predecessor next to the
+    fine replay boundary. With prefill in scheduler-sized steps the recurrent
+    state is only materialized at step ends, so the fine boundary alone would
+    retain nothing and a repeat request would resume from zero."""
+    hash_block_size = 2
+    attn_block_size = 16  # also the scheduler block (LCM with the mamba block)
+    manager = make_kv_cache_manager(
+        kv_cache_config=_make_hybrid_swa_eagle_config(
+            hash_block_size=hash_block_size,
+            attn_block_size=attn_block_size,
+            mamba_block_size=hash_block_size,
+            sliding_window=attn_block_size,
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+        retention_interval=0,
+    )
+    assert manager.coordinator.enable_partial_hash_hits
+    base = list(range(1000, 1045))  # replay boundary 44; scheduler-aligned 32
+    _prefill_and_free(
+        manager, make_request("0", base, hash_block_size, sha256), prefill_chunk
+    )
+
+    retained = _cached_mamba_boundaries(manager)
+    # Scheduler-aligned fallback (32) and its predecessor (16) are always kept.
+    assert {16, 32} <= set(retained)
+    if prefill_chunk == hash_block_size:
+        # Fine states exist: the replay boundary (44) and its EAGLE predecessor (42).
+        assert {42, 44} <= set(retained)
+        expected_repeat_hit = 42
+    else:
+        # Only step-end states exist; the fine boundary retains nothing extra.
+        assert retained == [16, 32]
+        expected_repeat_hit = 32
+    repeat = _prefill_and_free(
+        manager, make_request("1", base, hash_block_size, sha256), prefill_chunk
+    )
+    assert repeat == expected_repeat_hit
+
+
 @pytest.mark.parametrize("num_prompt_tokens", [13, 45, 48])
 def test_hybrid_decoupled_blocks_keep_fine_grained_reuse(num_prompt_tokens: int):
     """Large attention/draft blocks (page parity with the recurrent state)

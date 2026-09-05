@@ -77,6 +77,10 @@ class SingleTypeKVCacheManager(ABC):
         # fine-grained partial hash hits are enabled, so retention masks keep
         # the tails those finer hits need.
         self.hit_alignment_tokens = scheduler_block_size
+        # Whether any EAGLE/MTP group rewinds the reconciled hit by one hit
+        # alignment unit, so sparse retention must also keep the state one
+        # unit below each reachable boundary. Set by the coordinator.
+        self.retention_eagle_rewind = False
         # The block size for this manager; used for actual block allocation.
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
@@ -488,6 +492,17 @@ class SingleTypeKVCacheManager(ABC):
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
 
+        if self.hit_alignment_tokens < self.scheduler_block_size:
+            # Fine-grained hits floor boundaries to the hash unit, but a
+            # recurrent state may only be materialized at scheduler-step ends
+            # (no per-block prefill checkpoints). Keep the scheduler-aligned
+            # fallback next to the fine boundary, and the position one unit
+            # below each when an EAGLE group rewinds the reconciled hit, so a
+            # mathematically valid fine boundary never displaces the only
+            # state that exists.
+            reachable_boundaries = self._expand_reachable_boundaries(
+                reachable_boundaries
+            )
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
             end_block=num_full_blocks,
@@ -508,6 +523,20 @@ class SingleTypeKVCacheManager(ABC):
         )
 
         self.num_cached_block[request.request_id] = num_full_blocks
+
+    def _expand_reachable_boundaries(self, boundaries: Sequence[int]) -> list[int]:
+        """Token boundaries to retain for ``boundaries`` when hits align to
+        a hash unit finer than the scheduler block: each boundary floored to
+        the hit alignment and to the scheduler block, plus the position one
+        alignment unit below each when an EAGLE group rewinds the hit."""
+        retained: set[int] = set()
+        for boundary in boundaries:
+            for alignment in (self.hit_alignment_tokens, self.scheduler_block_size):
+                aligned = boundary // alignment * alignment
+                retained.add(aligned)
+                if self.retention_eagle_rewind:
+                    retained.add(max(aligned - alignment, 0))
+        return sorted(retained)
 
     @classmethod
     def reachable_block_mask(

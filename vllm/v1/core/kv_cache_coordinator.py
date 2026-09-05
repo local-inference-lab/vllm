@@ -678,6 +678,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 )
         for manager in self.single_type_managers:
             manager.hit_alignment_tokens = self._cache_hit_alignment_tokens
+            manager.retention_eagle_rewind = bool(self.eagle_group_ids)
         self.verify_and_split_kv_cache_groups()
 
     @property
