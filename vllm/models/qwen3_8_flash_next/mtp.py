@@ -332,6 +332,22 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             if restore is not None:
                 restore()
 
+    def set_skip_topk(self, skip: bool) -> None:
+        """Reuse each draft attention layer's anchor selection within a round."""
+        for layer in self.layers:
+            attention = getattr(layer, "self_attn", None)
+            setter = getattr(attention, "set_skip_topk", None)
+            if setter is not None:
+                setter(skip)
+
+    def compact_topk_indices(self, source_rows: torch.Tensor) -> None:
+        """Capture accepted-token-aligned draft selections in request order."""
+        for layer in self.layers:
+            attention = getattr(layer, "self_attn", None)
+            compact = getattr(attention, "compact_topk_indices", None)
+            if compact is not None:
+                compact(source_rows)
+
     def _run_feedback(
         self,
         token_embedding: torch.Tensor,

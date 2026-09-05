@@ -302,7 +302,12 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     )
     owner.bind_kv_cache(kv_cache)
 
-    assert len(planned_caps) == 1
+    assert len(planned_caps) == 2
+    assert not bind_kwargs
+    context = owner._qsa_decode_context
+    assert context.plan.caps.max_q_rows == owner.max_decode_rows
+    assert context.plan.caps.max_seq_len == max_seq_len
+    assert owner._bind_qsa_context(context) is binding
     caps = planned_caps[0]
     assert caps.max_seq_len == max_seq_len
     assert caps.max_q_rows == owner.max_tokens
@@ -316,8 +321,16 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     assert bind_kwargs["compressed_k_cache"] is compressed_cache
     assert main_k_cache.shape[0] < caps.num_main_cache_pages
     assert compressed_cache.shape[0] < caps.num_compressed_cache_pages
-    assert owner._qsa_binding is binding
-    assert bind_kwargs["scratch"] is shared_scratch
+    assert not hasattr(owner, "_qsa_binding")
+    assert bind_kwargs["scratch"].data_ptr() == shared_scratch.data_ptr()
+    assert bind_kwargs["output"].shape[0] == owner.max_decode_rows
+    assert bind_kwargs["selected_positions"].shape[0] == owner.max_decode_rows
+    bind_kwargs.clear()
+    assert owner._bind_qsa_context(context) is binding
+    assert bind_kwargs["main_k_cache"] is main_k_cache
+    caller_output = torch.empty(1, 6, 256, dtype=torch.bfloat16)
+    assert owner._bind_qsa_context(context, output=caller_output) is binding
+    assert bind_kwargs["output"] is caller_output
 
     owner.unbind_kv_cache()
 
@@ -325,7 +338,7 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     assert owner._main_block_table is None
     assert owner._compressed_cache is None
     assert owner._qsa_plan is None
-    assert owner._qsa_binding is None
+    assert owner._qsa_decode_context is None
     assert owner._qsa_prefill_bindings == ()
     assert owner._qsa_scratch is None
 
@@ -333,9 +346,10 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     owner.bind_kv_cache(replacement_cache)
 
     assert owner.kv_cache is replacement_cache
-    assert len(planned_caps) == 2
+    assert len(planned_caps) == 4
     assert owner._qsa_plan is not None
-    assert owner._qsa_binding is binding
+    assert owner._qsa_decode_context is not context
+    assert owner._bind_qsa_context(owner._qsa_decode_context) is binding
     assert owner._qsa_scratch is not None
 
 
@@ -356,11 +370,55 @@ def test_qsa_registers_piecewise_splitting_op_once() -> None:
         object(),
     )
 
-    assert compilation_config.splitting_ops == [qsa_module._QSA_SPLITTING_OP]
+    assert compilation_config.splitting_ops == [
+        qsa_module._QSA_SPLITTING_OP,
+        qsa_module._QSA_PROJECTED_READ_OP,
+    ]
     assert set(compilation_config.static_forward_context) == {
         "model.layers.3.attn",
         "model.layers.7.attn",
     }
+
+
+@pytest.mark.parametrize(
+    "rows,query_len,mode,capturing,eligible",
+    [
+        (4, 4, "FULL", True, True),
+        (4, 4, "NONE", True, True),
+        (4, 4, "PIECEWISE", True, False),
+        (4, 4, "FULL", False, False),
+        (32, 4, "FULL", True, False),
+        (4, 5, "FULL", True, False),
+    ],
+)
+def test_qsa_selector_fork_requires_one_full_graph(
+    monkeypatch,
+    rows,
+    query_len,
+    mode,
+    capturing,
+    eligible,
+) -> None:
+    """A selector fork must not escape a piecewise graph before its join."""
+    layer = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.overlap_input_projections = True
+    layer.max_decode_rows = 16
+    layer.max_speculative_tokens = 3
+    layer.layer_name = "qsa"
+    metadata = Qwen3_8FlashNextQSAMetadata.__new__(Qwen3_8FlashNextQSAMetadata)
+    metadata.num_actual_tokens = 4
+    metadata.max_query_len = query_len
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(
+        qsa_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            cudagraph_runtime_mode=getattr(qsa_module.CUDAGraphMode, mode),
+            attn_metadata={"qsa": metadata},
+        ),
+    )
+    assert (layer._parallel_selector_metadata(rows) is metadata) == eligible
 
 
 def test_qsa_prefill_context_capacities_cover_the_configured_limit() -> None:
@@ -387,7 +445,10 @@ def test_qsa_prefill_context_capacities_cover_the_configured_limit() -> None:
     )
 
 
-def test_qsa_warmup_runs_every_context_with_only_padded_requests(monkeypatch) -> None:
+@pytest.mark.parametrize("max_tokens", [4, 10])
+def test_qsa_warmup_runs_every_context_with_only_padded_requests(
+    monkeypatch, max_tokens
+) -> None:
     caps = SimpleNamespace(
         device=torch.device("cpu"),
         q_heads=2,
@@ -404,21 +465,29 @@ def test_qsa_warmup_runs_every_context_with_only_padded_requests(monkeypatch) ->
     contexts = tuple(
         SimpleNamespace(
             max_seq_len=capacity,
-            binding=SimpleNamespace(plan=SimpleNamespace(caps=caps)),
+            plan=SimpleNamespace(caps=caps),
         )
         for capacity in (32, 64)
     )
     layer = SimpleNamespace(
-        _qsa_prefill_bindings=contexts, max_tokens=10, max_speculative_tokens=2
+        _qsa_prefill_bindings=contexts,
+        _qsa_decode_context=SimpleNamespace(
+            plan=SimpleNamespace(caps=SimpleNamespace(max_q_rows=6))
+        ),
+        _bind_qsa_context=lambda context: context,
+        max_tokens=max_tokens,
+        max_speculative_tokens=2,
+        max_decode_rows=6,
     )
     calls = []
 
     def run(binding, **inputs):
-        calls.append(binding)
-        assert inputs["query"].shape == (8, 2, 16)
-        assert inputs["index_query"].shape == (8, 2, 8)
-        assert inputs["raw_index_key"].shape == (8, 8)
-        assert inputs["rope_positions"].shape == (8, 3)
+        rows = inputs["query"].shape[0]
+        calls.append((binding, rows))
+        assert inputs["query"].shape == (rows, 2, 16)
+        assert inputs["index_query"].shape == (rows, 2, 8)
+        assert inputs["raw_index_key"].shape == (rows, 8)
+        assert inputs["rope_positions"].shape == (rows, 3)
         assert (inputs["request_ids"] == -1).all()
         assert (inputs["query_positions"] == -1).all()
         assert not inputs["sequence_lengths"].any()
@@ -426,10 +495,73 @@ def test_qsa_warmup_runs_every_context_with_only_padded_requests(monkeypatch) ->
 
     monkeypatch.setattr(qsa_module, "get_b12x_qsa", lambda: SimpleNamespace(run=run))
     unit = qsa_module._B12xQSAWarmup().get_b12x_warmup_unit(
-        layer, (1, 8), torch.bfloat16
+        layer, (1, 4, 8), torch.bfloat16
     )
     unit.compile()
-    assert calls == [context.binding for context in contexts]
+    assert calls == [
+        *((context, max_tokens - 2) for context in contexts),
+        (layer._qsa_decode_context, 1),
+        (layer._qsa_decode_context, 4),
+    ]
+
+
+def test_qsa_run_consumes_projection_views_and_writes_live_output(monkeypatch) -> None:
+    rows = 2
+    query = torch.randn(rows, 6, 256, dtype=torch.bfloat16)
+    projection = torch.randn(rows, 640, dtype=torch.bfloat16)
+    index_query = projection[:, :512].view(rows, 4, 128)
+    raw_index_key = projection[:, 512:]
+    output = torch.full((4, 6, 256), 23, dtype=torch.bfloat16)
+    positions = torch.arange(rows, dtype=torch.int64)
+    staged = SimpleNamespace(
+        request_ids=torch.zeros(rows, dtype=torch.int32),
+        logical_positions=positions,
+        sequence_lengths=torch.tensor([rows]),
+        query_start_loc=torch.tensor([0, rows]),
+        num_accepted_tokens=torch.ones(1, dtype=torch.int32),
+        is_prefilling=torch.ones(1, dtype=torch.bool),
+    )
+    context = SimpleNamespace(main_block_table=None, compressed_block_table=None)
+    calls = []
+
+    def run(binding, **inputs):
+        calls.append(inputs)
+        for name, original in (
+            ("query", query),
+            ("index_query", index_query),
+            ("raw_index_key", raw_index_key),
+        ):
+            assert inputs[name].data_ptr() == original.data_ptr()
+            assert inputs[name].stride() == original.stride()
+        assert binding.output.data_ptr() == output.data_ptr()
+        assert binding.output.shape[0] == rows
+        binding.output.fill_(7)
+
+    owner = SimpleNamespace(
+        _qsa_binding_for_workload=lambda **_: context,
+        _prepare_qsa_metadata=lambda *_: staged,
+        _shared_qsa_rope_positions=lambda *_: positions,
+        _bind_qsa_context=lambda _context, _staged, out: SimpleNamespace(output=out),
+        _record_mtp_selection_metadata=lambda *_: None,
+        impl=SimpleNamespace(do_kv_cache_update=lambda *_: None),
+        kv_cache=None,
+    )
+    monkeypatch.setattr(qsa_module, "get_b12x_qsa", lambda: SimpleNamespace(run=run))
+    Qwen3_8FlashNextQSAAttention._run_b12x_qsa(
+        owner,
+        metadata=SimpleNamespace(max_seq_len=rows, slot_mapping=positions),
+        positions=positions,
+        query=query,
+        key=query,
+        value=query,
+        index_query=index_query,
+        raw_index_key=raw_index_key,
+        output=output,
+        rows=rows,
+    )
+    assert len(calls) == 1
+    assert torch.all(output[:rows] == 7)
+    assert torch.count_nonzero(output[rows:]) == 0
 
 
 def test_qsa_selects_the_smallest_sufficient_prefill_context_plan() -> None:
@@ -438,18 +570,25 @@ def test_qsa_selects_the_smallest_sufficient_prefill_context_plan() -> None:
     owner.max_seq_len = 63
     binding_32 = object()
     binding_64 = object()
+    decode_plan = object()
+    scratch = torch.empty(0)
     table_32 = torch.empty(2, 4, dtype=torch.int32)
     table_64 = torch.empty(2, 8, dtype=torch.int32)
     owner._qsa_prefill_bindings = (
-        qsa_module._QSAContextBinding(32, binding_32, table_32, table_32),
-        qsa_module._QSAContextBinding(64, binding_64, table_64, table_64),
+        qsa_module._QSAContextPlan(32, binding_32, scratch, table_32, table_32),
+        qsa_module._QSAContextPlan(64, binding_64, scratch, table_64, table_64),
+    )
+    owner._qsa_decode_context = qsa_module._QSAContextPlan(
+        64, decode_plan, scratch, table_64, table_64
     )
 
-    assert owner._qsa_binding_for_workload(rows=1, max_seq_len=20).binding is binding_64
-    assert owner._qsa_binding_for_workload(rows=7, max_seq_len=20).binding is binding_32
-    assert owner._qsa_binding_for_workload(rows=7, max_seq_len=40).binding is binding_64
+    assert owner._qsa_binding_for_workload(rows=1, max_seq_len=20).plan is decode_plan
+    assert owner._qsa_binding_for_workload(rows=7, max_seq_len=20).plan is binding_32
+    assert owner._qsa_binding_for_workload(rows=7, max_seq_len=40).plan is binding_64
     with pytest.raises(ValueError, match="exceeds the configured limit"):
         owner._qsa_binding_for_workload(rows=7, max_seq_len=64)
+    with pytest.raises(ValueError, match="exceeds the configured limit"):
+        owner._qsa_binding_for_workload(rows=1, max_seq_len=64)
 
 
 def test_qsa_prefill_dispatches_through_the_b12x_transaction(monkeypatch) -> None:
@@ -951,7 +1090,7 @@ def test_qsa_builder_stages_runtime_state_in_capture_buffers() -> None:
     )
 
 
-def test_qsa_builder_updates_cached_metadata_into_its_own_buffers() -> None:
+def test_qsa_cache_group_rebinding_preserves_live_metadata_owner() -> None:
     def make_builder() -> Qwen3_8FlashNextQSAMetadataBuilder:
         builder = Qwen3_8FlashNextQSAMetadataBuilder.__new__(
             Qwen3_8FlashNextQSAMetadataBuilder
@@ -996,22 +1135,22 @@ def test_qsa_builder_updates_cached_metadata_into_its_own_buffers() -> None:
 
     assert metadata_b.block_table is block_table_b
     assert metadata_b.slot_mapping is slot_mapping_b
-    assert metadata_b.request_ids.data_ptr() == builder_b._request_ids.data_ptr()
+    assert metadata_b.request_ids.data_ptr() == builder_a._request_ids.data_ptr()
     assert (
         metadata_b.qsa_state_slot_ids.data_ptr()
-        == builder_b._capture_state_slot_ids.data_ptr()
+        == builder_a._capture_state_slot_ids.data_ptr()
     )
     assert (
         metadata_b.qsa_state_is_fresh.data_ptr()
-        == builder_b._capture_state_is_fresh.data_ptr()
+        == builder_a._capture_state_is_fresh.data_ptr()
     )
     assert (
         metadata_b.qsa_num_accepted_tokens.data_ptr()
-        == builder_b._capture_num_accepted_tokens.data_ptr()
+        == builder_a._capture_num_accepted_tokens.data_ptr()
     )
     assert (
         metadata_b.is_prefilling.data_ptr()
-        == builder_b._capture_is_prefilling.data_ptr()
+        == builder_a._capture_is_prefilling.data_ptr()
     )
     torch.testing.assert_close(
         metadata_b.qsa_state_slot_ids,
@@ -1024,6 +1163,19 @@ def test_qsa_builder_updates_cached_metadata_into_its_own_buffers() -> None:
     torch.testing.assert_close(
         metadata_b.qsa_num_accepted_tokens,
         metadata_a.qsa_num_accepted_tokens,
+    )
+    updated = builder_a.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        qsa_state_slot_ids=torch.tensor([3, 7, 2, 1], dtype=torch.int32),
+        qsa_state_is_fresh=torch.tensor([False, False, True, True]),
+        qsa_num_accepted_tokens=torch.tensor([1, 3, 1, 1], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        metadata_b.qsa_state_slot_ids, updated.qsa_state_slot_ids
+    )
+    torch.testing.assert_close(
+        metadata_b.qsa_num_accepted_tokens, updated.qsa_num_accepted_tokens
     )
 
 
@@ -1085,6 +1237,71 @@ def _require_qsa_gpu() -> torch.device:
     return device
 
 
+@pytest.mark.parametrize("source_dtype", [torch.int32, torch.int64])
+def test_mtp_selection_capture_reorders_errors_and_replaces_causal_tail_on_replay(
+    source_dtype: torch.dtype,
+) -> None:
+    """A draft round owns its anchor selection; padding cannot inherit errors."""
+    device = _require_qsa_gpu()
+    layer = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
+    torch.nn.Module.__init__(layer)
+    layer._share_mtp_indices = True
+    layer.max_tokens, layer.max_seqs, layer.max_speculative_tokens = 16, 4, 3
+    layer._native_selection_width = 2051
+    layer._selected_positions = torch.arange(
+        16 * 2051, device=device, dtype=torch.int32
+    ).view(16, 2051)
+    layer._mtp_source_positions = (
+        torch.arange(16, device=device, dtype=torch.int64) + 63
+    )
+    layer._mtp_source_errors = torch.zeros(16, device=device, dtype=torch.int32)
+    layer._mtp_source_errors[7] = 512
+    layer._mtp_shared_selected_positions = torch.full(
+        (4, 2054), -1, device=device, dtype=torch.int32
+    )
+    layer._mtp_captured_lengths = torch.empty(4, device=device, dtype=torch.int64)
+    layer._mtp_captured_errors = torch.empty(4, device=device, dtype=torch.int32)
+    layer._mtp_read_errors = torch.empty(4, device=device, dtype=torch.int32)
+    source_rows = torch.tensor([7, 3, 0, -1], device=device, dtype=source_dtype)
+    request_ids = torch.tensor([0, 1, -1, -1], device=device, dtype=torch.int32)
+    positions = torch.tensor([72, 67, -1, -1], device=device, dtype=torch.int64)
+
+    def capture_and_read():
+        layer.compact_topk_indices(source_rows)
+        layer._append_mtp_selection_tail(positions, request_ids)
+
+    capture_and_read()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        capture_and_read()
+    for shift in (0, 100):
+        layer._selected_positions.add_(shift)
+        graph.replay()
+        torch.testing.assert_close(
+            layer._mtp_shared_selected_positions[:3, :2051],
+            layer._selected_positions[source_rows[:3].long()],
+            rtol=0,
+            atol=0,
+        )
+        assert layer._mtp_shared_selected_positions[:, 2051:].tolist() == [
+            [71, 72, -1],
+            [67, -1, -1],
+            [-1, -1, -1],
+            [-1, -1, -1],
+        ]
+        assert layer._mtp_read_errors.tolist() == [512, 0, 0, 0]
+        # Rejection can shorten a speculative tail; no future column may survive.
+        immutable = layer._mtp_shared_selected_positions[:, :2051].clone()
+        positions[0] = 71
+        layer._append_mtp_selection_tail(positions, request_ids)
+        assert layer._mtp_shared_selected_positions[0, 2051:].tolist() == [71, -1, -1]
+        assert torch.equal(layer._mtp_shared_selected_positions[:, :2051], immutable)
+        positions[0] = 75
+        layer._append_mtp_selection_tail(positions, request_ids)
+        assert layer._mtp_read_errors[0].item() != 0
+        positions[0] = 72
+
+
 def test_qsa_rope_staging_masks_graph_padding() -> None:
     device = _require_qsa_gpu()
     rows = 12
@@ -1113,3 +1330,107 @@ def test_qsa_rope_staging_masks_graph_padding() -> None:
     assert output.data_ptr() == output_ptr
     assert torch.equal(output[:8], source[:8])
     assert torch.equal(output[8:], torch.full_like(output[8:], -1))
+
+
+def test_qsa_staging_shares_live_request_state_but_not_group_page_tables(
+    monkeypatch,
+) -> None:
+    """Shared staging must refresh under replay and preserve group-specific pages."""
+    device = _require_qsa_gpu()
+    context = SimpleNamespace(additional_kwargs={})
+    monkeypatch.setattr(qsa_module, "get_forward_context", lambda: context)
+
+    def owner():
+        layer = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
+        torch.nn.Module.__init__(layer)
+        layer.max_seqs, layer.max_speculative_tokens, layer.position_axes = 2, 3, 1
+        for name, shape, dtype in (
+            ("_sequence_lengths", (2,), torch.int32),
+            ("_query_start_loc", (3,), torch.int32),
+            ("_raw_state_slot_ids", (2,), torch.int32),
+            ("_state_is_fresh", (2,), torch.bool),
+            ("_num_accepted_tokens", (2,), torch.int32),
+            ("_is_prefilling", (2,), torch.bool),
+            ("_rope_position_input", (4, 1), torch.int64),
+        ):
+            setattr(layer, name, torch.full(shape, 1, dtype=dtype, device=device))
+        return layer
+
+    a, b = owner(), owner()
+    metadata = Qwen3_8FlashNextQSAMetadata(
+        num_actual_tokens=4,
+        max_query_len=2,
+        max_seq_len=8,
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32, device=device),
+        seq_lens=torch.tensor([8, 8], dtype=torch.int32, device=device),
+        block_table=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device=device),
+        slot_mapping=torch.arange(4, dtype=torch.int64, device=device),
+        request_ids=torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device),
+        is_prefilling=torch.zeros(2, dtype=torch.bool, device=device),
+        qsa_state_slot_ids=torch.tensor([1, 0], dtype=torch.int32, device=device),
+        qsa_state_is_fresh=torch.zeros(2, dtype=torch.bool, device=device),
+        qsa_num_accepted_tokens=torch.tensor([2, 3], dtype=torch.int32, device=device),
+    )
+    metadata_b = qsa_module.replace(metadata, block_table=metadata.block_table + 4)
+    table_a, table_b = (
+        torch.empty_like(metadata.block_table),
+        torch.empty_like(metadata.block_table),
+    )
+    positions = torch.arange(4, dtype=torch.int64, device=device)
+
+    def stage():
+        context.additional_kwargs.clear()
+        first = a._stage_runtime_metadata(
+            metadata,
+            4,
+            row_capacity=4,
+            main_block_table=table_a,
+            compressed_block_table=table_a,
+        )
+        second = b._stage_runtime_metadata(
+            metadata_b,
+            4,
+            row_capacity=4,
+            main_block_table=table_b,
+            compressed_block_table=table_b,
+        )
+        assert first is second
+        rope_a = a._shared_qsa_rope_positions(positions, first.request_ids, 4)
+        rope_b = b._shared_qsa_rope_positions(positions, second.request_ids, 4)
+        assert rope_a is rope_b
+        return first, rope_a
+
+    stage()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        staged, rope = stage()
+    metadata.seq_lens.add_(3)
+    metadata.qsa_num_accepted_tokens.copy_(
+        torch.tensor([3, 1], dtype=torch.int32, device=device)
+    )
+    metadata.qsa_state_slot_ids.copy_(
+        torch.tensor([0, 1], dtype=torch.int32, device=device)
+    )
+    positions.add_(7)
+    graph.replay()
+    torch.accelerator.synchronize(device)
+    torch.testing.assert_close(staged.sequence_lengths, metadata.seq_lens)
+    torch.testing.assert_close(
+        staged.num_accepted_tokens, metadata.qsa_num_accepted_tokens
+    )
+    torch.testing.assert_close(staged.state_slot_ids, metadata.qsa_state_slot_ids)
+    torch.testing.assert_close(rope[:, 0], positions)
+    torch.testing.assert_close(table_a, metadata.block_table)
+    torch.testing.assert_close(table_b, metadata_b.block_table)
+    assert torch.all(b._num_accepted_tokens == 1)
+    distinct = qsa_module.replace(
+        metadata_b, qsa_num_accepted_tokens=metadata.qsa_num_accepted_tokens.clone()
+    )
+    separate = b._stage_runtime_metadata(
+        distinct,
+        4,
+        row_capacity=4,
+        main_block_table=table_b,
+        compressed_block_table=table_b,
+    )
+    assert separate is not staged

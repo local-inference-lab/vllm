@@ -305,9 +305,10 @@ def build_attn_metadata(
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
             cache_key = (kv_cache_spec, type(attn_metadata_builder))
+            # Graph replay retains captured tensor addresses. Capture must use
+            # the same metadata owner as runtime cache-group reuse.
             if (
-                not for_cudagraph_capture
-                and cache_key in cached_attn_metadata
+                cache_key in cached_attn_metadata
                 and attn_metadata_builder.supports_update_block_table
             ):
                 metadata = attn_metadata_builder.update_block_table(
@@ -371,8 +372,8 @@ def build_attn_metadata(
                         common_attn_metadata=common_attn_metadata,
                         **attn_metadata_extra_kwargs,
                     )
-                    if attn_metadata_builder.supports_update_block_table:
-                        cached_attn_metadata[cache_key] = metadata
+                if attn_metadata_builder.supports_update_block_table:
+                    cached_attn_metadata[cache_key] = metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata

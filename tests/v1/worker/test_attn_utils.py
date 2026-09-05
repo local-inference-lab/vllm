@@ -64,13 +64,16 @@ class _CachingMetadataBuilder:
     def __init__(self):
         self.num_builds = 0
         self.num_updates = 0
+        self.state = torch.zeros(1, dtype=torch.int32)
 
     def build(self, common_prefix_len, common_attn_metadata, **_kwargs):
         self.num_builds += 1
+        self.state.fill_(self.num_builds)
         return SimpleNamespace(
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
             is_prefilling=common_attn_metadata.is_prefilling,
+            state=self.state,
         )
 
     def build_for_cudagraph_capture(self, common_attn_metadata):
@@ -83,6 +86,7 @@ class _CachingMetadataBuilder:
             slot_mapping=slot_mapping,
             reused=metadata,
             is_prefilling=metadata.is_prefilling,
+            state=metadata.state,
         )
 
 
@@ -211,7 +215,7 @@ def test_build_attn_metadata_reuses_equivalent_cache_group_builds(for_capture):
         get_extra_attn_kwargs=Mock(return_value={}),
     )
 
-    metadata = build_attn_metadata(
+    build_kwargs = dict(
         attn_groups=groups,
         num_reqs=2,
         num_tokens=2,
@@ -224,23 +228,24 @@ def test_build_attn_metadata_reuses_equivalent_cache_group_builds(for_capture):
         slot_mappings=slot_mappings,
         kv_cache_config=kv_cache_config,
         model_specific_attn_metadata=model_metadata,
-        for_cudagraph_capture=for_capture,
     )
+    metadata = build_attn_metadata(**build_kwargs, for_cudagraph_capture=for_capture)
 
-    assert [builder.num_builds for builder in builders] == [1, int(for_capture)]
-    assert [builder.num_updates for builder in builders] == [0, int(not for_capture)]
-    assert model_metadata.get_extra_common_attn_kwargs.call_count == 1 + int(
-        for_capture
-    )
+    assert [builder.num_builds for builder in builders] == [1, 0]
+    assert [builder.num_updates for builder in builders] == [0, 1]
+    assert model_metadata.get_extra_common_attn_kwargs.call_count == 1
     assert metadata["layer.0"].block_table is block_tables[0]
     assert metadata["layer.1"].block_table is block_tables[1]
     for group_id in range(2):
         torch.testing.assert_close(
             metadata[f"layer.{group_id}"].slot_mapping, slot_mappings[group_id]
         )
-    if not for_capture:
-        assert metadata["layer.1"].reused is metadata["layer.0"]
+    assert metadata["layer.1"].reused is metadata["layer.0"]
     assert all(item.is_prefilling is is_prefilling for item in metadata.values())
+    captured_state = metadata["layer.1"].state
+    runtime = build_attn_metadata(**build_kwargs)
+    assert captured_state.data_ptr() == runtime["layer.1"].state.data_ptr()
+    assert captured_state.item() == 2
 
 
 def test_reshape_padded_kv_cache_strides_by_padded_page():

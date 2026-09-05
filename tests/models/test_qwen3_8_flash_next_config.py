@@ -74,6 +74,19 @@ def test_ple_embedding_storage_dtype_is_preserved(
     assert config.ple_embedding_dtype == expected_dtype
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_mtp_selection_sharing_uses_serialized_text_configuration(enabled) -> None:
+    config = Qwen3_8FlashNextConfig(
+        text_config={
+            **_TEXT_CONFIG,
+            "index_share_for_mtp_iteration": enabled,
+        }
+    )
+    restored = Qwen3_8FlashNextConfig.from_dict(config.to_dict())
+    assert restored.text_config.index_share_for_mtp_iteration is enabled
+    assert Qwen3_8FlashNextTextConfig(**_TEXT_CONFIG).index_share_for_mtp_iteration
+
+
 def test_model_registry_aliases() -> None:
     assert _TEXT_GENERATION_MODELS["Qwen4ExpForCausalLM"] == (
         "vllm.models.qwen3_8_flash_next",

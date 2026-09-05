@@ -106,6 +106,25 @@ class _QSAIntervalLifecycle:
         self.calls.append("compact_topk")
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_mtp_selection_reuse_reads_nested_text_config(monkeypatch, enabled) -> None:
+    from vllm.v1.worker.gpu.spec_decode.mtp import speculator as mtp_module
+
+    draft = SimpleNamespace(model=_QSAIntervalLifecycle())
+    monkeypatch.setattr(mtp_module, "load_eagle_model", lambda *_: draft)
+    speculator = object.__new__(MTPSpeculator)
+    speculator.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(index_share_for_mtp_iteration=not enabled),
+                hf_text_config=SimpleNamespace(index_share_for_mtp_iteration=enabled),
+            ),
+        )
+    )
+    assert speculator.load_draft_model(None, set()) is draft
+    assert speculator.share_mtp_topk_indices is enabled
+
+
 def test_autoregressive_speculator_uses_sparse_full_draft_prefill_graphs(
     monkeypatch,
 ) -> None:
@@ -258,6 +277,7 @@ def test_propose_restores_mtp_state_when_draft_decode_raises(monkeypatch) -> Non
     speculator.model = SimpleNamespace(model=lifecycle)
     speculator.rollback_qsa_interval_starts = True
     speculator.share_mtp_topk_indices = True
+    speculator.prefill_outputs_are_compact = False
     speculator.num_speculative_steps = 2
     speculator.max_model_len = 32
     speculator.max_num_reqs = 1
