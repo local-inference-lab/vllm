@@ -34,6 +34,14 @@ require_positive_int() {
   fi
 }
 
+require_max_model_len() {
+  local value=$1
+  if [[ "${value}" != "-1" && ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MAX_MODEL_LEN must be -1 or a positive integer; got '${value}'" >&2
+    exit 2
+  fi
+}
+
 require_nonnegative_int() {
   local name=$1 value=$2
   if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
@@ -182,12 +190,19 @@ rejection_sample_method=${REJECTION_SAMPLE_METHOD:-standard}
 require_positive_int TP_SIZE "${tp_size}"
 require_positive_int DCP_SIZE "${dcp_size}"
 require_positive_int MAX_NUM_SEQS "${max_num_seqs}"
-require_positive_int MAX_MODEL_LEN "${max_model_len}"
+require_max_model_len "${max_model_len}"
 require_positive_int MAX_NUM_BATCHED_TOKENS "${max_num_batched_tokens}"
 require_positive_int BLOCK_SIZE "${block_size}"
+# vLLM interprets -1 as the model-derived maximum length. DS4 checkpoints
+# declare a 1,048,576-token limit, so launcher memory guards must evaluate the
+# sentinel against that capacity while preserving -1 on the vLLM command line.
+policy_max_model_len=${max_model_len}
+if [[ "${max_model_len}" == "-1" ]]; then
+  policy_max_model_len=1048576
+fi
 if [[ "${vision_direct_lmcache}" == "1" \
   && -n "${MAX_MODEL_LEN:-}" \
-  && "${max_model_len}" -gt 900000 \
+  && "${policy_max_model_len}" -gt 900000 \
   && -z "${GPU_MEMORY_UTILIZATION:-}" ]]; then
   echo "Vision direct LMCache with MAX_MODEL_LEN above 900000 requires an explicit GPU_MEMORY_UTILIZATION override; the qualified 96 GiB default is MAX_MODEL_LEN=900000 with GPU_MEMORY_UTILIZATION=0.951" >&2
   exit 2
@@ -399,7 +414,7 @@ if [[ -z "${gpu_memory_utilization}" ]]; then
   if [[ "${engine_driven_lmcache}" == "1" \
     && "${mode}" == "dspark" \
     && "${tp_size}" == "2" \
-    && "${max_model_len}" -ge 1048576 ]]; then
+    && "${policy_max_model_len}" -ge 1048576 ]]; then
     # Engine-driven transfer performs GPU gathers in the existing vLLM
     # workers and keeps the standalone cache server CPU-only. A 0.970 budget
     # provides more than one million GPU KV tokens on 96 GiB TP2 GPUs while
@@ -455,7 +470,7 @@ lmcache_memory_profile=standard
 if [[ "${engine_driven_lmcache}" == "1" \
   && "${mode}" == "dspark" \
   && "${tp_size}" == "2" \
-  && "${max_model_len}" -ge 1048576 ]]; then
+  && "${policy_max_model_len}" -ge 1048576 ]]; then
   if awk -v value="${gpu_memory_utilization}" \
     'BEGIN { exit !((value + 0) <= 0.970) }'; then
     lmcache_memory_profile=qualified
@@ -465,7 +480,7 @@ if [[ "${engine_driven_lmcache}" == "1" \
 elif [[ "${text_direct_lmcache}" == "1" \
   && "${mode}" == "dspark" \
   && "${tp_size}" == "2" \
-  && "${max_model_len}" -ge 1048576 ]]; then
+  && "${policy_max_model_len}" -ge 1048576 ]]; then
   lmcache_memory_profile=qualified
   if awk -v value="${gpu_memory_utilization}" \
     'BEGIN { exit !((value + 0) > 0.965) }'; then

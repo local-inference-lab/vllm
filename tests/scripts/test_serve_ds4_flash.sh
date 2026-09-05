@@ -39,6 +39,29 @@ text_output="$(capture \
 assert_contains "${text_output}" 'variant=text mode=dspark'
 assert_contains "${text_output}" '--max-model-len 131072'
 
+text_auto_length_output="$(capture \
+  MODEL=deepseek-ai/DeepSeek-V4-Flash-0731 DS4_MODEL_VARIANT=text \
+  MAX_MODEL_LEN=-1)"
+assert_contains "${text_auto_length_output}" '--max-model-len -1'
+
+text_engine_auto_length_output="$(capture \
+  MODEL=deepseek-ai/DeepSeek-V4-Flash-0731 DS4_MODEL_VARIANT=text \
+  LMCACHE_MODE=disk LMCACHE_TRANSFER_MODE=engine_driven \
+  MAX_MODEL_LEN=-1 TP_SIZE=2)"
+assert_contains "${text_engine_auto_length_output}" '--max-model-len -1'
+assert_contains "${text_engine_auto_length_output}" '--gpu-memory-utilization 0.970'
+assert_contains "${text_engine_auto_length_output}" 'lmcache_memory_profile=qualified'
+
+if invalid_auto_length_output="$(capture \
+    MODEL=deepseek-ai/DeepSeek-V4-Flash-0731 DS4_MODEL_VARIANT=text \
+    MAX_MODEL_LEN=0)"; then
+  printf 'Launcher accepted an invalid zero MAX_MODEL_LEN:\n%s\n' \
+    "${invalid_auto_length_output}" >&2
+  exit 1
+fi
+assert_contains "${invalid_auto_length_output}" \
+  "MAX_MODEL_LEN must be -1 or a positive integer"
+
 text_lmcache_output="$(capture \
   MODEL=deepseek-ai/DeepSeek-V4-Flash-0731 DS4_MODEL_VARIANT=text \
   LMCACHE_MODE=disk)"
