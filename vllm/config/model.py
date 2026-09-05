@@ -1264,6 +1264,10 @@ class ModelConfig:
                 "awq_marlin",
                 "inc",
                 "moe_wna16",
+                # Rank-sliced EXL3 checkpoints retain a ModelOpt dispatch tag
+                # for backward compatibility, so EXL3 must inspect metadata
+                # before the ModelOpt overrides claim them.
+                "exl3",
                 "modelopt",
                 "modelopt_fp4",
                 "modelopt_mxfp8",

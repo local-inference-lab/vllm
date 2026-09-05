@@ -360,7 +360,16 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         _pending_wk_fp8: dict = {}
+        rank_sliced_name = getattr(
+            self.quant_config,
+            "normalize_rank_sliced_weight_name",
+            None,
+        )
         for name, loaded_weight in weights:
+            if rank_sliced_name is not None:
+                name = rank_sliced_name(name)
+                if name is None:
+                    continue
             if "rotary_emb.inv_freq" in name:
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
