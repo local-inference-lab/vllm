@@ -210,6 +210,23 @@ def _b12x_pcie_twoshot_max_bytes() -> int:
     return _parse_byte_size(raw)
 
 
+def _b12x_pcie_twoshot_mode() -> str:
+    """Remote-transfer mode of the bf16 two-shot all-reduce kernel.
+
+    ``VLLM_PCIE_TWOSHOT_ALLREDUCE_MODE`` selects ``pull`` (remote reads, the
+    default) or ``push`` (posted remote writes). Both kernels use the same
+    shard partition and fp32 reduction order, so outputs are bit-identical;
+    on nine PCIe-connected RTX PRO 6000 the push kernel replayed a 57 KB
+    all-reduce in 20 us against 38 us for pull and 67 us for the one-shot.
+    """
+    mode = os.getenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MODE", "pull").strip().lower()
+    if mode not in ("pull", "push"):
+        raise ValueError(
+            f"VLLM_PCIE_TWOSHOT_ALLREDUCE_MODE must be 'pull' or 'push', got {mode!r}"
+        )
+    return mode
+
+
 def _b12x_pcie_twoshot_row_elems() -> int:
     """Row width (bf16 elements) of the two-shot payload view.
 
@@ -1094,6 +1111,7 @@ class CustomAllreduce:
             )
             return
         row_elems = _b12x_pcie_twoshot_row_elems()
+        mode = _b12x_pcie_twoshot_mode()
         max_rows = max_bytes // (row_elems * 2)
         max_rows -= max_rows % self.world_size
         if max_rows < self.world_size:
@@ -1107,6 +1125,13 @@ class CustomAllreduce:
                 max_rows=max_rows,
                 row_elems=row_elems,
             )
+            if mode != "pull":
+                if not hasattr(twoshot, "all_reduce_mode"):
+                    raise RuntimeError(
+                        "the installed b12x two-shot runtime has no "
+                        f"all_reduce_mode; cannot select {mode!r}"
+                    )
+                twoshot.all_reduce_mode = mode
             twoshot.prepare_graph()
         except Exception as exc:
             init_error = exc
@@ -1129,11 +1154,12 @@ class CustomAllreduce:
         self._pcie_twoshot_max_bytes = max_rows * row_elems * 2
         logger.info(
             "b12x PCIe two-shot bf16 all-reduce serves %d < bytes <= %d "
-            "(row_elems=%d, max_rows=%d).",
+            "(row_elems=%d, max_rows=%d, mode=%s).",
             self._pcie_allreduce_max_size or 0,
             self._pcie_twoshot_max_bytes,
             row_elems,
             max_rows,
+            mode,
         )
 
     def _pcie_twoshot_accepts(self, inp: torch.Tensor) -> bool:
