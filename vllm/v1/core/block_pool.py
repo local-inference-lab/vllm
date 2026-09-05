@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import weakref
 from collections.abc import Iterable, Sequence
 from itertools import groupby
 from typing import Any
@@ -194,6 +195,16 @@ class BlockPool:
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
 
+        # Last published full-block endpoint per request and cache group, so a
+        # later publication reports only the unannounced span as skipped
+        # context instead of re-announcing blocks consumers already hold.
+        # Entries map the cache group id to (endpoint, last published block
+        # hash), where the endpoint counts full blocks in the group's block
+        # size. Weak keys let completed requests release their bookkeeping.
+        self.published_full_block_anchors: weakref.WeakKeyDictionary[
+            Request, dict[int, tuple[int, BlockHash]]
+        ] = weakref.WeakKeyDictionary()
+
         self.metrics_collector = metrics_collector
 
     def get_cached_block(
@@ -297,14 +308,19 @@ class BlockPool:
             if stored_indices is not None:
                 stored_indices.append(num_cached_blocks + i)
 
-        # Publish after all insertions and promotion removals, as for dense stores.
+        # Publish after all insertions and promotion removals, as for dense
+        # stores. Skipped context chains from the last published full-block
+        # endpoint, not from ``num_cached_blocks``: the caller's counter
+        # advances over masked and null blocks that were never announced.
         if stored_indices:
             self._emit_stored_block_runs(
                 request,
                 stored_indices,
                 block_size,
                 kv_cache_group_id,
-                context_start_block_idx=num_cached_blocks,
+                context_start_block_idx=self._published_full_block_context_start(
+                    request, block_size, kv_cache_group_id
+                ),
             )
 
     def _emit_stored_block_runs(
@@ -328,22 +344,17 @@ class BlockPool:
             extra_keys_list = self._generate_block_extra_keys(
                 request, start, end, block_size
             )
-            if start > previous_end:
-                skipped_parent_block_hash = (
-                    maybe_convert_block_hash(block_hashes[previous_end - 1])
-                    if previous_end
-                    else None
-                )
-                skipped_start_token_idx = previous_end * block_size
-                skipped_end_token_idx = start * block_size
-                skipped_extra_keys = self._generate_block_extra_keys(
-                    request, previous_end, start, block_size
-                )
-            else:
-                skipped_parent_block_hash = None
-                skipped_start_token_idx = None
-                skipped_end_token_idx = None
-                skipped_extra_keys = None
+            (
+                skipped_parent_block_hash,
+                skipped_start_token_idx,
+                skipped_end_token_idx,
+                skipped_extra_keys,
+            ) = self._get_skipped_context(
+                request,
+                previous_end * block_size,
+                start * block_size,
+                block_size,
+            )
             self.kv_event_queue.append(
                 self._build_block_stored_event(
                     request,
@@ -366,6 +377,10 @@ class BlockPool:
                     skipped_extra_keys=skipped_extra_keys,
                 )
             )
+            # Stores and full replays both advance publication context.
+            self._advance_full_block_anchor(
+                request, end, block_hashes[end - 1], kv_cache_group_id
+            )
             previous_end = end
 
     @staticmethod
@@ -383,6 +398,105 @@ class BlockPool:
             )
             extra_keys_list.append(extra_keys)
         return extra_keys_list
+
+    def _get_skipped_context(
+        self,
+        request: Request,
+        context_start_token_idx: int,
+        end_token_idx: int,
+        extra_keys_block_size: int,
+    ) -> tuple[
+        ExternalBlockHash | None,
+        int | None,
+        int | None,
+        list[tuple[Any, ...] | None] | None,
+    ]:
+        """Build the skipped-context fields for an unannounced token span.
+
+        The span ``[context_start_token_idx, end_token_idx)`` covers tokens
+        that no published event announced for this request yet.
+        ``context_start_token_idx`` is the boundary up to which consumers
+        already hold context (0 at the root). Returns
+        ``(skipped_parent_block_hash, skipped_start_token_idx,
+        skipped_end_token_idx, skipped_extra_keys)``, all ``None`` when the
+        span is empty. The parent hash is the prefix-chain hash at the span's
+        start boundary; extra keys are generated per ``extra_keys_block_size``,
+        which is the group's block size for full-block events and
+        ``self.hash_block_size`` for partial events.
+        """
+        if context_start_token_idx >= end_token_idx:
+            return None, None, None, None
+        assert context_start_token_idx % self.hash_block_size == 0
+        num_hash_blocks = context_start_token_idx // self.hash_block_size
+        skipped_parent_block_hash = (
+            maybe_convert_block_hash(request.block_hashes[num_hash_blocks - 1])
+            if num_hash_blocks
+            else None
+        )
+        skipped_extra_keys = self._generate_block_extra_keys(
+            request,
+            context_start_token_idx // extra_keys_block_size,
+            end_token_idx // extra_keys_block_size,
+            extra_keys_block_size,
+        )
+        return (
+            skipped_parent_block_hash,
+            context_start_token_idx,
+            end_token_idx,
+            skipped_extra_keys,
+        )
+
+    def _published_full_block_context_start(
+        self,
+        request: Request,
+        block_size: int,
+        kv_cache_group_id: int,
+    ) -> int:
+        """Return the validated published endpoint for this request and group.
+
+        The endpoint counts the full blocks whose publication already reached
+        the event queue for this request in this cache group, so the next
+        publication can report only tokens beyond it as skipped context.
+        Streaming updates truncate and re-extend a request in place and
+        recompute its block hashes, so the saved hash is validated before the
+        anchor is reused; an invalid or missing anchor starts at the root.
+        """
+        anchors = self.published_full_block_anchors.get(request)
+        if anchors is None:
+            return 0
+        anchor = anchors.get(kv_cache_group_id)
+        if anchor is None:
+            return 0
+        endpoint, published_hash = anchor
+        block_hashes = resolve_block_hashes(
+            request.block_hashes, self.hash_block_size, block_size
+        )
+        if (
+            endpoint <= 0
+            or endpoint > len(block_hashes)
+            or block_hashes[endpoint - 1] != published_hash
+        ):
+            # The request's prefix changed under the anchor: restart from the
+            # root and drop the stale entry.
+            del anchors[kv_cache_group_id]
+            if not anchors:
+                del self.published_full_block_anchors[request]
+            return 0
+        return endpoint
+
+    def _advance_full_block_anchor(
+        self,
+        request: Request,
+        endpoint: int,
+        last_block_hash: BlockHash,
+        kv_cache_group_id: int,
+    ) -> None:
+        """Record the last published full-block endpoint for request and group."""
+        anchors = self.published_full_block_anchors.get(request)
+        if anchors is None:
+            anchors = {}
+            self.published_full_block_anchors[request] = anchors
+        anchors[kv_cache_group_id] = (endpoint, last_block_hash)
 
     def _build_block_stored_event(
         self,
@@ -459,6 +573,12 @@ class BlockPool:
             self._emit_stored_block_runs(
                 request, stored_indices, block_size, kv_cache_group_id
             )
+            # A full replay re-announces from the root, so a partial event in
+            # the same replay chains from the run just published.
+            partial_context_start = (stored_indices[-1] + 1) * block_size
+        else:
+            # A full replay without a full run still starts at the root.
+            partial_context_start = 0
 
         if num_cached_tokens % block_size == 0 or num_full_blocks >= len(blocks):
             return
@@ -479,6 +599,14 @@ class BlockPool:
         extra_keys, _ = generate_block_hash_extra_keys(
             request, start, num_cached_tokens, 0
         )
+        (
+            skipped_parent_block_hash,
+            skipped_start_token_idx,
+            skipped_end_token_idx,
+            skipped_extra_keys,
+        ) = self._get_skipped_context(
+            request, partial_context_start, start, self.hash_block_size
+        )
         self.kv_event_queue.append(
             self._build_block_stored_event(
                 request,
@@ -493,6 +621,10 @@ class BlockPool:
                 block_size=num_cached_tokens - start,
                 kv_cache_group_id=kv_cache_group_id,
                 extra_keys_list=[extra_keys],
+                skipped_parent_block_hash=skipped_parent_block_hash,
+                skipped_start_token_idx=skipped_start_token_idx,
+                skipped_end_token_idx=skipped_end_token_idx,
+                skipped_extra_keys=skipped_extra_keys,
             )
         )
 
@@ -578,21 +710,34 @@ class BlockPool:
             extra_keys, _ = generate_block_hash_extra_keys(
                 request, block_start, block_end, curr_mm_idx
             )
+            (
+                skipped_parent_block_hash,
+                skipped_start_token_idx,
+                skipped_end_token_idx,
+                skipped_extra_keys,
+            ) = self._get_skipped_context(
+                request,
+                self._published_full_block_context_start(
+                    request, block_size, kv_cache_group_id
+                )
+                * block_size,
+                block_start,
+                self.hash_block_size,
+            )
             self.kv_event_queue.append(
-                BlockStored(
+                self._build_block_stored_event(
+                    request,
                     block_hashes=[maybe_convert_block_hash(block_hash)],
                     parent_block_hash=parent_block_hash,
-                    token_ids=request.all_token_ids[block_start:block_end],
+                    start_token_idx=block_start,
+                    end_token_idx=block_end,
                     block_size=block_end - block_start,
-                    lora_id=request.lora_request.adapter_id
-                    if request.lora_request
-                    else None,
-                    medium=MEDIUM_GPU,
-                    lora_name=request.lora_request.name
-                    if request.lora_request
-                    else None,
-                    extra_keys=[extra_keys],
-                    group_idx=kv_cache_group_id,
+                    kv_cache_group_id=kv_cache_group_id,
+                    extra_keys_list=[extra_keys],
+                    skipped_parent_block_hash=skipped_parent_block_hash,
+                    skipped_start_token_idx=skipped_start_token_idx,
+                    skipped_end_token_idx=skipped_end_token_idx,
+                    skipped_extra_keys=skipped_extra_keys,
                 )
             )
         return block_hash_with_group_id
@@ -847,6 +992,9 @@ class BlockPool:
         logger.info("Successfully reset prefix cache")
 
         if self.enable_kv_cache_events:
+            # Cached blocks are no longer reachable, so a kept anchor would
+            # wrongly suppress skipped context after the reset.
+            self.published_full_block_anchors.clear()
             self.kv_event_queue.append(AllBlocksCleared())
 
         return True

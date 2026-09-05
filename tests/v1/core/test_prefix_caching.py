@@ -4864,7 +4864,9 @@ def test_sparse_block_stored_runs(start, mask, null_indices, runs, events_enable
         (("second-image", 0),),
         None,
     ]
-    previous_end = start
+    # Nothing was published before this call, so the first run's skipped
+    # context starts at the root even when the caller's offset is nonzero.
+    previous_end = 0
     for event, (lo, hi) in zip(events, runs):
         assert isinstance(event, BlockStored)
         assert event.block_hashes == [
