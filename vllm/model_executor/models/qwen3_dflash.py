@@ -943,7 +943,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         needs_squeeze = hidden_states.dim() == 1
         if needs_squeeze:
             hidden_states = hidden_states.unsqueeze(0)
-        expected = self.model.fc.input_size
+        expected = (
+            self.model.fc.source_input_size
+            if isinstance(self.model.fc, DFlashTP9RowParallelLinear)
+            else self.model.fc.input_size
+        )
         if hidden_states.shape[-1] != expected:
             raise ValueError(
                 f"DFlash drafter expects {expected} concatenated aux hidden "

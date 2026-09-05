@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Source-weight identity for uneven DFlash QKV, O, and aux projections."""
 
+from types import SimpleNamespace
+from typing import cast
+
 import pytest
 import torch
 
@@ -72,7 +75,13 @@ def test_tp9_qkv_loader_keeps_source_queries_and_replicates_actual_kv():
             assert gathered_queries == {head: head // 4 for head in range(32)}
 
 
-def test_tp9_aux_row_projection_preserves_full_matrix_product():
+def test_tp9_aux_row_projection_preserves_full_matrix_product(monkeypatch):
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
+
+    monkeypatch.setattr(
+        "vllm.model_executor.models.dflash_tp9.tensor_model_parallel_all_reduce",
+        lambda partial: partial,
+    )
     source_width, hidden = 192, 8
     weight = (torch.arange(source_width * hidden) % 7 - 3).reshape(hidden, -1).float()
     x = (torch.arange(source_width * 2) % 5 - 2).reshape(2, -1).float()
@@ -91,11 +100,19 @@ def test_tp9_aux_row_projection_preserves_full_matrix_product():
                 return_bias=False,
             )
             projection.weight.weight_loader(projection.weight, weight)
-            partials.append(
-                torch.nn.functional.linear(
-                    x[:, first : first + count], projection.weight
-                )
+            draft = cast(
+                DFlashQwen3ForCausalLM,
+                SimpleNamespace(
+                    model=SimpleNamespace(use_aux_hidden_state=True, fc=projection)
+                ),
             )
+            partials.append(DFlashQwen3ForCausalLM.combine_hidden_states(draft, x))
+            torch.testing.assert_close(
+                DFlashQwen3ForCausalLM.combine_hidden_states(draft, x[0]),
+                partials[-1][0],
+            )
+            with pytest.raises(ValueError, match="concatenated aux hidden"):
+                DFlashQwen3ForCausalLM.combine_hidden_states(draft, x[:, :-4])
     torch.testing.assert_close(
         sum(partials), torch.nn.functional.linear(x, weight), atol=0, rtol=0
     )
