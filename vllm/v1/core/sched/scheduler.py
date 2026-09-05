@@ -1617,9 +1617,11 @@ class Scheduler(SchedulerInterface):
                             self.ec_connector.update_state_after_alloc(request, i)
 
                 if boundary_logits_only:
+                    # The boundary-logits step must be the only scheduled work.
+                    # The global token budget is shared by every prefill
+                    # interleaving policy, including policies that do not
+                    # maintain a separate micro-prefill budget.
                     token_budget = 0
-                    if micro_prefill_budget_remaining is not None:
-                        micro_prefill_budget_remaining = 0
                     break
 
             # re-queue requests skipped in this pass ahead of older skipped items.
