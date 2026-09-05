@@ -1311,8 +1311,9 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
 @pytest.mark.parametrize(
     "speculative,uniform", [(False, False), (True, False), (True, True)]
 )
+@pytest.mark.parametrize("separate_acceptance", [False, True])
 def test_b12x_kda_shares_counts_but_preserves_each_layers_state_indices(
-    monkeypatch, speculative: bool, uniform: bool
+    monkeypatch, speculative: bool, uniform: bool, separate_acceptance: bool
 ) -> None:
     calls: dict[str, list] = {"bind": [], "run": []}
 
@@ -1381,7 +1382,11 @@ def test_b12x_kda_shares_counts_but_preserves_each_layers_state_indices(
             output=output,
             state_indices=indices,
             query_start_loc=query_start_loc.clone() if uniform else query_start_loc[:],
-            num_accepted_tokens=accepted[:] if accepted is not None else None,
+            num_accepted_tokens=(
+                accepted.clone() if separate_acceptance else accepted[:]
+            )
+            if accepted is not None
+            else None,
             num_requests=2,
         )
 
@@ -1402,7 +1407,13 @@ def test_b12x_kda_shares_counts_but_preserves_each_layers_state_indices(
         "num_seqs",
         "num_tokens",
     ):
-        assert getattr(calls["bind"][0], name) is getattr(calls["bind"][1], name)
+        first = getattr(calls["bind"][0], name)
+        second = getattr(calls["bind"][1], name)
+        if speculative and separate_acceptance:
+            assert first is not second
+            torch.testing.assert_close(first, second)
+        else:
+            assert first is second
     assert torch.equal(
         layers[0]._b12x_kda_num_accepted_tokens,
         torch.zeros(2, dtype=torch.int32)
@@ -1411,8 +1422,9 @@ def test_b12x_kda_shares_counts_but_preserves_each_layers_state_indices(
     )
     assert layers[0]._b12x_kda_num_seqs.item() == 2
     assert layers[0]._b12x_kda_num_tokens.item() == 2
-    assert layers[1]._b12x_kda_num_seqs.item() == 0
-    assert layers[1]._b12x_kda_num_tokens.item() == 0
+    expected_second_count = 2 if speculative and separate_acceptance else 0
+    assert layers[1]._b12x_kda_num_seqs.item() == expected_second_count
+    assert layers[1]._b12x_kda_num_tokens.item() == expected_second_count
 
 
 @pytest.mark.parametrize("is_mtp_layer", [False, True])
