@@ -172,10 +172,11 @@ class SchedulerConfig:
     """Maximum local prefills that may share one model step.
 
     ``auto`` enables fair round-robin service for at most four prefills and
-    caps that count by the number of cache blocks that fit in the configured
-    scheduling budget, with a minimum of one lane. A lone prefill retains the
-    full token budget and unused shares are redistributed within the step.
-    ``1`` preserves legacy behavior.
+    caps that count by ``max_num_seqs``. The scheduler's normal token budget
+    limits actual work, so this remains independent of cache block size and
+    ``max_num_batched_tokens``. A lone prefill retains the full token budget
+    and unused shares are redistributed within the step. ``1`` preserves
+    legacy behavior.
     """
 
     prefill_policy: PrefillPolicy = "round-robin"

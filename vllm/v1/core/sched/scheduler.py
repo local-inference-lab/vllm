@@ -411,8 +411,6 @@ class Scheduler(SchedulerInterface):
         self.max_parallel_prefills = resolve_max_parallel_prefills(
             self.scheduler_config.max_parallel_prefills,
             max_num_seqs=self.max_num_running_reqs,
-            max_num_scheduled_tokens=self.max_num_scheduled_tokens,
-            block_size=self.block_size,
         )
         self.decode_refill_target = resolve_decode_refill_target(
             self.scheduler_config.decode_refill_target,
@@ -751,22 +749,41 @@ class Scheduler(SchedulerInterface):
         # decision can schedule decode work. Pipeline-parallel async requests
         # can be temporarily ineligible; admitting prefill in that case avoids
         # an empty model-executor step.
-        num_runnable_decodes = sum(
-            self._request_is_runnable_decode(request) for request in self.running
+        has_possible_prefill = bool(
+            self._inflight_prefills or self.waiting or self.skipped_waiting
+        )
+        needs_decode_count = throttle_prefills or (
+            has_possible_prefill
+            and (
+                self.compute_share_controller is not None
+                or (
+                    self.max_parallel_prefills > 1
+                    and self.scheduler_config.prefill_policy == "decode-aware"
+                )
+            )
+        )
+        num_runnable_decodes = (
+            sum(self._request_is_runnable_decode(request) for request in self.running)
+            if needs_decode_count
+            else 0
         )
         has_eligible_decode = num_runnable_decodes > 0
-        prefill_interleave_step = self.prefill_interleave_controller.begin_step(
-            running=self.running,
-            waiting=self.waiting,
-            skipped_waiting=self.skipped_waiting,
-            request_lookup=self.requests,
-            is_local_prefill=self._request_has_local_prefill,
-            max_parallel_prefills=self.max_parallel_prefills,
-            policy=self.scheduler_config.prefill_policy,
-            num_runnable_decodes=num_runnable_decodes,
-            decode_refill_target=self.decode_refill_target,
-            current_step=self.current_step,
-            respect_priority=self.policy == SchedulingPolicy.PRIORITY,
+        prefill_interleave_step = (
+            self.prefill_interleave_controller.begin_step(
+                running=self.running,
+                waiting=self.waiting,
+                skipped_waiting=self.skipped_waiting,
+                request_lookup=self.requests,
+                is_local_prefill=self._request_has_local_prefill,
+                max_parallel_prefills=self.max_parallel_prefills,
+                policy=self.scheduler_config.prefill_policy,
+                num_runnable_decodes=num_runnable_decodes,
+                decode_refill_target=self.decode_refill_target,
+                current_step=self.current_step,
+                respect_priority=self.policy == SchedulingPolicy.PRIORITY,
+            )
+            if self.max_parallel_prefills > 1 and has_possible_prefill
+            else None
         )
 
         selected_compute_class: ComputeServiceClass | None = None
@@ -774,15 +791,19 @@ class Scheduler(SchedulerInterface):
         compute_contention_started = False
         if self.compute_share_controller is not None:
             prior_contention = self.compute_share_controller.contention_active
-            has_prefill_candidate = self._pause_state != PauseState.PAUSED_ALL and (
-                any(
-                    request.is_prefill_chunk
-                    and self.current_step >= request.next_decode_eligible_step
-                    for request in self.running
-                )
-                or (
-                    self._pause_state == PauseState.UNPAUSED
-                    and bool(self.waiting or self.skipped_waiting)
+            has_prefill_candidate = (
+                has_possible_prefill
+                and self._pause_state != PauseState.PAUSED_ALL
+                and (
+                    any(
+                        request.is_prefill_chunk
+                        and self.current_step >= request.next_decode_eligible_step
+                        for request in self.running
+                    )
+                    or (
+                        self._pause_state == PauseState.UNPAUSED
+                        and bool(self.waiting or self.skipped_waiting)
+                    )
                 )
             )
             selected_compute_class = self.compute_share_controller.select(
@@ -1810,13 +1831,8 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
             compute_service_class=compute_service_class,
-            compute_timing_enabled=(
-                compute_service_class is not None
-                or (
-                    self.compute_share_controller is not None
-                    and self.compute_share_controller.auto_enabled
-                )
-            ),
+            # Execution feedback is only useful while both classes can run.
+            compute_timing_enabled=compute_service_class is not None,
             compute_contention=compute_contention,
             compute_service_tokens=compute_service_tokens,
         )

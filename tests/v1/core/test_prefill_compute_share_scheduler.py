@@ -292,6 +292,35 @@ def test_disabled_scheduler_emits_no_compute_policy(opt_model_path):
     assert not output.compute_contention
 
 
+def test_auto_compute_share_does_not_scan_or_time_uncontended_decode(
+    opt_model_path, monkeypatch
+):
+    scheduler = _create_fair_scheduler(
+        opt_model_path,
+        prefill_compute_share="auto",
+        max_parallel_prefills="auto",
+    )
+    decode = _establish_decode(scheduler)
+    decode.num_output_placeholders = 1
+    monkeypatch.setattr(
+        scheduler,
+        "_request_is_runnable_decode",
+        lambda _request: pytest.fail("decode-only path scanned runnable decodes"),
+    )
+    monkeypatch.setattr(
+        scheduler.prefill_interleave_controller,
+        "begin_step",
+        lambda **_kwargs: pytest.fail("decode-only path entered prefill policy"),
+    )
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {decode.request_id: 2}
+    assert output.compute_service_class is None
+    assert not output.compute_timing_enabled
+    assert not output.compute_contention
+
+
 def test_runtime_switch_is_live_and_preserves_inflight_accounting(opt_model_path):
     scheduler = create_scheduler(
         model=opt_model_path,
@@ -580,7 +609,7 @@ def test_async_external_load_does_not_consume_service_credit(opt_model_path):
     output = scheduler.schedule()
     assert output.total_num_scheduled_tokens == 0
     assert output.compute_service_class is None
-    assert output.compute_timing_enabled
+    assert not output.compute_timing_enabled
     assert not output.compute_contention
     controller = scheduler.compute_share_controller
     assert controller is not None
@@ -977,12 +1006,12 @@ def test_decode_aware_continues_when_no_prefill_needs_service(opt_model_path):
     ("max_num_batched_tokens", "block_size", "max_num_seqs", "expected"),
     [
         (4096, 256, 64, 4),
-        (512, 256, 64, 2),
-        (128, 256, 64, 1),
+        (512, 256, 64, 4),
+        (128, 256, 64, 4),
         (4096, 256, 2, 2),
     ],
 )
-def test_auto_parallel_prefills_follow_scheduler_geometry(
+def test_auto_parallel_prefills_ignore_token_geometry(
     opt_model_path,
     max_num_batched_tokens,
     block_size,
@@ -1001,6 +1030,31 @@ def test_auto_parallel_prefills_follow_scheduler_geometry(
     assert (
         scheduler.get_prefill_fairness()["effective_max_parallel_prefills"] == expected
     )
+
+
+def test_default_path_skips_prefill_policy_scans(opt_model_path, monkeypatch):
+    scheduler = _create_interleaving_scheduler(
+        opt_model_path,
+        max_parallel_prefills=1,
+        prefill_compute_share=None,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=64)
+    scheduler.add_request(request)
+
+    monkeypatch.setattr(
+        scheduler,
+        "_request_is_runnable_decode",
+        lambda _request: pytest.fail("default path scanned runnable decodes"),
+    )
+    monkeypatch.setattr(
+        scheduler.prefill_interleave_controller,
+        "begin_step",
+        lambda **_kwargs: pytest.fail("default path entered prefill policy"),
+    )
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 16
 
 
 def test_prefill_interleave_preserves_request_priority(opt_model_path):

@@ -8,7 +8,7 @@ import pytest
 
 from vllm.v1.core.sched.compute_fairness import ComputeServiceClass
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.engine.core import EngineCore, _ModelExecutionTiming
+from vllm.v1.engine.core import EngineCore
 
 pytestmark = pytest.mark.cpu_test
 
@@ -28,17 +28,6 @@ def _scheduler_output(
     return output
 
 
-def test_completion_callback_excludes_later_batch_queue_residency():
-    future: Future[None] = Future()
-    with patch("vllm.v1.engine.core.time.perf_counter", side_effect=[10.0, 10.25]):
-        timing = _ModelExecutionTiming()
-        timing.bind(future)
-        future.set_result(None)
-
-    # Reading much later must use the completion callback's timestamp.
-    assert timing.elapsed_seconds == pytest.approx(0.25)
-
-
 def test_disabled_output_does_not_install_execution_timing():
     completed_future: Future[None] = Future()
     completed_future.set_result(None)
@@ -52,22 +41,19 @@ def test_disabled_output_does_not_install_execution_timing():
     assert timing is None
 
 
-def test_enabled_execution_timer_waits_for_final_batch_future():
+def test_enabled_execution_timer_returns_primitive_start_timestamp():
     execute_future: Future[None] = Future()
     execute_future.set_result(None)
-    final_future: Future[None] = Future()
     engine = object.__new__(EngineCore)
     engine.model_executor = Mock()
     engine.model_executor.execute_model.return_value = execute_future
 
-    _, timing = engine._execute_model(_scheduler_output("prefill", contended=True))
-    assert timing is not None
-    assert timing.completed_at is None
+    with patch("vllm.v1.engine.core.time.perf_counter", return_value=10.0):
+        _, started_at = engine._execute_model(
+            _scheduler_output("prefill", contended=True)
+        )
 
-    timing.bind(final_future)
-    assert timing.completed_at is None
-    final_future.set_result(None)
-    assert timing.completed_at is not None
+    assert started_at == pytest.approx(10.0)
 
 
 def test_queued_feedback_stays_paired_with_exact_batch():
@@ -76,18 +62,12 @@ def test_queued_feedback_stays_paired_with_exact_batch():
     engine._last_model_completion_time = None
     decode_output = _scheduler_output("decode", contended=True)
     prefill_output = _scheduler_output("prefill", contended=True)
-    decode_timing = _ModelExecutionTiming()
-    decode_timing.started_at = 10.0
-    decode_timing.completed_at = 10.1
-    prefill_timing = _ModelExecutionTiming()
-    prefill_timing.started_at = 10.01
-    prefill_timing.completed_at = 10.3
-
     # Queued batches are consumed oldest-first; each carries its own timing and
     # class tag even when a later batch has already completed. The second
     # charge excludes its 90 ms queued behind the first batch.
-    engine._record_compute_time(decode_output, decode_timing)
-    engine._record_compute_time(prefill_output, prefill_timing)
+    with patch("vllm.v1.engine.core.time.perf_counter", side_effect=[10.1, 10.3]):
+        engine._record_compute_time(decode_output, 10.0)
+        engine._record_compute_time(prefill_output, 10.01)
 
     assert engine.scheduler.record_compute_time.call_args_list == [
         call("decode", pytest.approx(0.1), contended=True, scheduled_tokens=0),
@@ -110,19 +90,15 @@ def test_transfer_step_advances_completion_boundary_without_compute_charge():
     engine._last_model_completion_time = None
 
     transfer_output = _scheduler_output(None, timing_enabled=True)
-    transfer_timing = _ModelExecutionTiming()
-    transfer_timing.started_at = 10.0
-    transfer_timing.completed_at = 10.2
-    engine._record_compute_time(transfer_output, transfer_timing)
+    with patch("vllm.v1.engine.core.time.perf_counter", return_value=10.2):
+        engine._record_compute_time(transfer_output, 10.0)
 
     engine.scheduler.record_compute_time.assert_not_called()
     assert engine._last_model_completion_time == pytest.approx(10.2)
 
     prefill_output = _scheduler_output("prefill", contended=True)
-    prefill_timing = _ModelExecutionTiming()
-    prefill_timing.started_at = 10.1
-    prefill_timing.completed_at = 10.5
-    engine._record_compute_time(prefill_output, prefill_timing)
+    with patch("vllm.v1.engine.core.time.perf_counter", return_value=10.5):
+        engine._record_compute_time(prefill_output, 10.1)
 
     engine.scheduler.record_compute_time.assert_called_once_with(
         "prefill",

@@ -102,29 +102,6 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
-class _ModelExecutionTiming:
-    """Capture model completion time without charging queue residency."""
-
-    def __init__(self) -> None:
-        self.started_at = time.perf_counter()
-        self.completed_at: float | None = None
-
-    def bind(self, future: Future[Any]) -> None:
-        future.add_done_callback(self._record_completion)
-
-    def complete(self) -> None:
-        self.completed_at = time.perf_counter()
-
-    def _record_completion(self, _future: Future[Any]) -> None:
-        self.complete()
-
-    @property
-    def elapsed_seconds(self) -> float:
-        if self.completed_at is None:
-            raise RuntimeError("model execution timing read before completion")
-        return max(self.completed_at - self.started_at, 0.0)
-
-
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -237,7 +214,7 @@ class EngineCore:
                     Future[ModelRunnerOutput],
                     SchedulerOutput,
                     Future[Any],
-                    _ModelExecutionTiming | None,
+                    float | None,
                 ]
             ]
             | None
@@ -648,30 +625,28 @@ class EngineCore:
 
     def _execute_model(
         self, scheduler_output: SchedulerOutput
-    ) -> tuple[Future[Any], _ModelExecutionTiming | None]:
-        timing = (
-            _ModelExecutionTiming() if scheduler_output.compute_timing_enabled else None
+    ) -> tuple[Future[Any], float | None]:
+        started_at = (
+            time.perf_counter() if scheduler_output.compute_timing_enabled else None
         )
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        return future, timing
+        return future, started_at
 
     def _record_compute_time(
         self,
         scheduler_output: SchedulerOutput,
-        timing: _ModelExecutionTiming | None,
+        started_at: float | None,
     ) -> None:
-        if timing is None:
+        if started_at is None:
             return
-        completed_at = timing.completed_at
-        if completed_at is None:
-            raise RuntimeError("model execution timing read before completion")
+        completed_at = time.perf_counter()
 
         # Multiple batches can already be queued on the executor when this
         # batch is dispatched. Attribute only the wall-clock interval this
         # completion adds after the previous batch, rather than charging the
         # same executor queue residency to every in-flight batch.
         previous_completion = self._last_model_completion_time
-        service_started_at = timing.started_at
+        service_started_at = started_at
         if previous_completion is not None:
             service_started_at = max(service_started_at, previous_completion)
         elapsed_seconds = max(completed_at - service_started_at, 0.0)
@@ -711,8 +686,6 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
-            if execution_timing is not None:
-                execution_timing.complete()
             self._record_compute_time(scheduler_output, execution_timing)
 
         # Before processing the model output, process any aborts that happened
@@ -789,8 +762,6 @@ class EngineCore:
                     deferred_execution_timing = execution_timing
 
             if not deferred_scheduler_output:
-                if execution_timing is not None:
-                    execution_timing.bind(future)
                 # Add this step's future to the queue.
                 batch_queue.appendleft(
                     (future, scheduler_output, exec_future, execution_timing)
@@ -851,8 +822,6 @@ class EngineCore:
                 deferred_scheduler_output
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            if deferred_execution_timing is not None:
-                deferred_execution_timing.bind(future)
             batch_queue.appendleft(
                 (
                     future,
