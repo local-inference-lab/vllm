@@ -214,15 +214,20 @@ def _b12x_pcie_twoshot_mode() -> str:
     """Remote-transfer mode of the bf16 two-shot all-reduce kernel.
 
     ``VLLM_PCIE_TWOSHOT_ALLREDUCE_MODE`` selects ``pull`` (remote reads, the
-    default) or ``push`` (posted remote writes). Both kernels use the same
-    shard partition and fp32 reduction order, so outputs are bit-identical;
-    on nine PCIe-connected RTX PRO 6000 the push kernel replayed a 57 KB
+    default), ``push`` (posted remote writes) or, at nine ranks, ``island9``
+    (the two-island push kernel of ``b12x.comm.pcie.pcie_island9``: ranks 0-3
+    and 4-7 reduce quarters inside their PCIe switch clusters, rank 8 on the
+    CPU root contributes through island 0, fp32 island partials, one bf16
+    rounding). Pull and push use the same shard partition and fp32 reduction
+    order, so their outputs are bit-identical; island9 sums in island order.
+    On nine PCIe-connected RTX PRO 6000 the push kernel replayed a 57 KB
     all-reduce in 20 us against 38 us for pull and 67 us for the one-shot.
     """
     mode = os.getenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MODE", "pull").strip().lower()
-    if mode not in ("pull", "push"):
+    if mode not in ("pull", "push", "island9"):
         raise ValueError(
-            f"VLLM_PCIE_TWOSHOT_ALLREDUCE_MODE must be 'pull' or 'push', got {mode!r}"
+            "VLLM_PCIE_TWOSHOT_ALLREDUCE_MODE must be 'pull', 'push' or "
+            f"'island9', got {mode!r}"
         )
     return mode
 
@@ -244,6 +249,15 @@ def _load_b12x_pcie_twoshot_bf16() -> Any | None:
     except Exception:  # pragma: no cover - optional dependency
         return None
     return PCIeTwoShotBF16
+
+
+@lru_cache(maxsize=1)
+def _load_b12x_pcie_island9() -> Any | None:
+    try:
+        from b12x.comm.pcie.pcie_island9 import PCIeIsland9AllReduce
+    except Exception:  # pragma: no cover - optional dependency
+        return None
+    return PCIeIsland9AllReduce
 
 
 def _get_physical_device_numa_node(physical_device_id: int) -> int | None:
@@ -1102,16 +1116,25 @@ class CustomAllreduce:
         max_bytes = _b12x_pcie_twoshot_max_bytes()
         if max_bytes <= 0 or self.world_size not in (2, 4, 8, 9):
             return
-        twoshot_cls = _load_b12x_pcie_twoshot_bf16()
+        mode = _b12x_pcie_twoshot_mode()
+        if mode == "island9":
+            if self.world_size != 9:
+                raise ValueError(
+                    "VLLM_PCIE_TWOSHOT_ALLREDUCE_MODE=island9 requires nine ranks, "
+                    f"got {self.world_size}"
+                )
+            twoshot_cls = _load_b12x_pcie_island9()
+        else:
+            twoshot_cls = _load_b12x_pcie_twoshot_bf16()
         if twoshot_cls is None:
             logger.warning(
-                "b12x PCIe two-shot bf16 all-reduce requested but unavailable "
-                "(b12x.comm.pcie.pcie_twoshot_bf16 not importable); mid-size "
-                "allreduces stay on PyNCCL."
+                "b12x PCIe mid-size bf16 all-reduce (%s) requested but "
+                "unavailable (b12x runtime not importable); mid-size "
+                "allreduces stay on PyNCCL.",
+                mode,
             )
             return
         row_elems = _b12x_pcie_twoshot_row_elems()
-        mode = _b12x_pcie_twoshot_mode()
         max_rows = max_bytes // (row_elems * 2)
         max_rows -= max_rows % self.world_size
         if max_rows < self.world_size:
@@ -1125,7 +1148,7 @@ class CustomAllreduce:
                 max_rows=max_rows,
                 row_elems=row_elems,
             )
-            if mode != "pull":
+            if mode not in ("pull", "island9"):
                 if not hasattr(twoshot, "all_reduce_mode"):
                     raise RuntimeError(
                         "the installed b12x two-shot runtime has no "
@@ -1153,7 +1176,7 @@ class CustomAllreduce:
         self._pcie_twoshot = twoshot
         self._pcie_twoshot_max_bytes = max_rows * row_elems * 2
         logger.info(
-            "b12x PCIe two-shot bf16 all-reduce serves %d < bytes <= %d "
+            "b12x PCIe mid-size bf16 all-reduce serves %d < bytes <= %d "
             "(row_elems=%d, max_rows=%d, mode=%s).",
             self._pcie_allreduce_max_size or 0,
             self._pcie_twoshot_max_bytes,
