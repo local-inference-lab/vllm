@@ -67,6 +67,8 @@ if TYPE_CHECKING:
     VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE: int = 0
     VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE: int = 0
     VLLM_MLA_SM120_FA4_PREFILL: bool = False
+    VLLM_VIT_QUERY_SHARD: bool = True
+    VLLM_VIT_QUERY_SHARD_MIN_PATCHES: int = 8192
     VLLM_K3_KV_GROUP_SIZE: int = 0
     VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
     VLLM_DSPARK_COMPACT_ROPE: bool = False
@@ -1180,6 +1182,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # non-MLA attention retain their configured FlashAttention version.
     "VLLM_MLA_SM120_FA4_PREFILL": lambda: bool(
         int(os.getenv("VLLM_MLA_SM120_FA4_PREFILL", "0"))
+    ),
+    # Split the self-attention of a tensor-parallel-replicated vision encoder
+    # by query rows across the TP ranks (exact; see
+    # vllm/model_executor/models/vit_query_shard.py). Batches with fewer
+    # patches than VLLM_VIT_QUERY_SHARD_MIN_PATCHES keep the per-image
+    # data-parallel path, where the split's gather cost exceeds its gain.
+    "VLLM_VIT_QUERY_SHARD": lambda: bool(int(os.getenv("VLLM_VIT_QUERY_SHARD", "1"))),
+    "VLLM_VIT_QUERY_SHARD_MIN_PATCHES": lambda: int(
+        os.getenv("VLLM_VIT_QUERY_SHARD_MIN_PATCHES", "8192")
     ),
     # Bound the number of physical Kimi-K3 layers sharing each hybrid-cache
     # block table. Zero preserves the general grouping heuristic.

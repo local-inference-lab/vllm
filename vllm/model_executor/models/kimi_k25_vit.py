@@ -8,6 +8,7 @@ including 3D patch embedding, RoPE position embedding, and
 temporal pooling for video chunks.
 """
 
+import math
 from collections.abc import Sequence
 from copy import deepcopy
 from typing import Any
@@ -33,9 +34,16 @@ from vllm.model_executor.models.vision import (
     is_vit_use_data_parallel,
     run_dp_sharded_mrope_vision_model,
 )
+from vllm.model_executor.models.vit_query_shard import (
+    activate_query_shard_plan,
+    active_query_shard_plan,
+    maybe_build_query_shard_plan,
+    sharded_varlen_attention,
+)
 from vllm.model_executor.virtual_tp import get_virtual_tp_axis_padded_size
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_k25 import KimiK25VisionConfig
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = init_logger(__name__)
 
@@ -479,16 +487,33 @@ class MoonViTEncoderLayer(nn.Module):
 
         xq, xk = apply_rope(xq, xk, rope_freqs_cis)
 
-        if max_seqlen is None:
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-        attn_out = self.attn(
-            xq.unsqueeze(0),
-            xk.unsqueeze(0),
-            xv.unsqueeze(0),
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            sequence_lengths=sequence_lengths,
-        )
+        shard_plan = active_query_shard_plan()
+        if (
+            shard_plan is not None
+            and self.attn.attn_backend == AttentionBackendEnum.FLASH_ATTN
+        ):
+            # Replicated encoder: every rank holds the full keys and values
+            # and attends for its share of the query rows (exact split).
+            attn_out = sharded_varlen_attention(
+                shard_plan,
+                xq,
+                xk,
+                xv,
+                cu_seqlens,
+                scale=self.attn.scale,
+                fa_version=self.attn.fa_version,
+            )
+        else:
+            if max_seqlen is None:
+                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            attn_out = self.attn(
+                xq.unsqueeze(0),
+                xk.unsqueeze(0),
+                xv.unsqueeze(0),
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                sequence_lengths=sequence_lengths,
+            )
         attn_out = attn_out.reshape(
             seq_length,
             self.num_attention_heads_per_partition
@@ -875,12 +900,28 @@ def vision_tower_forward(
     """
     if use_data_parallel:
         grid_thw_list = grid_thw.tolist()
-        vt_outputs = run_dp_sharded_mrope_vision_model(
-            vision_model=vision_tower,
-            pixel_values=pixel_values,
-            grid_thw_list=grid_thw_list,
-            rope_type="rope_2d",
+        shard_plan = maybe_build_query_shard_plan(
+            [math.prod(thw) for thw in grid_thw_list], pixel_values.device
         )
+        if shard_plan is not None:
+            # Every rank runs the replicated tower on the whole batch; the
+            # plan splits only the self-attention by query rows.
+            encoder_metadata = vision_tower.encoder.prepare_encoder_metadata(
+                grid_thw_list, device=pixel_values.device
+            )
+            with activate_query_shard_plan(shard_plan):
+                vt_outputs = vision_tower(
+                    pixel_values,
+                    grid_thw_list,
+                    encoder_metadata=encoder_metadata,
+                )
+        else:
+            vt_outputs = run_dp_sharded_mrope_vision_model(
+                vision_model=vision_tower,
+                pixel_values=pixel_values,
+                grid_thw_list=grid_thw_list,
+                rope_type="rope_2d",
+            )
     else:
         grid_thw_list = grid_thw.tolist()
         encoder_metadata = vision_tower.encoder.prepare_encoder_metadata(
