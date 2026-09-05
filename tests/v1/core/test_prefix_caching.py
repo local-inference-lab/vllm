@@ -4552,3 +4552,70 @@ def test_swa_shared_prefix_reuse_under_zero_retention(monkeypatch):
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction window -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
+
+
+def test_hybrid_partial_hits_align_to_mamba_block_under_dcp():
+    """Partial hits land on the Mamba block cadence when it is coarser than the
+    hash unit (Kimi-K3 TP9/DCP9 geometry scaled down: 16-token hash unit,
+    48-token aligned Mamba block, full-attention block 64 x 3 DCP shards =
+    192, replicated 16-token sliding-window draft group)."""
+    hash_block_size = 16
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["attn"],
+                FullAttentionSpec(
+                    block_size=64, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=48,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft"],
+                SlidingWindowSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=32,
+                    dcp_replicated=True,
+                ),
+            ),
+        ],
+    )
+    manager = KVCacheManager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=4 * 192,
+        scheduler_block_size=192,
+        hash_block_size=hash_block_size,
+        enable_caching=True,
+        dcp_world_size=3,
+    )
+    coordinator = manager.coordinator
+    assert coordinator.enable_partial_hash_hits
+    assert coordinator._cache_hit_alignment_tokens == 48
+
+    # A 96-token prompt: two Mamba state blocks, half of a full-attention
+    # block, six draft blocks. Every group must cache its tail at the
+    # 48-token cadence for the replay to hit locally.
+    owner = make_request("owner", list(range(96)), hash_block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(owner)
+    assert num_computed_tokens == 0
+    assert manager.allocate_slots(owner, 96, 0, computed_blocks) is not None
+    manager.cache_blocks(owner, 96)
+    manager.free(owner)
+    manager.new_step_starts()
+
+    replay = make_request("replay", list(range(96)) + [7] * 24, hash_block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(replay)
+    assert num_computed_tokens == 96
+    assert len(computed_blocks.get_block_ids()) == 3

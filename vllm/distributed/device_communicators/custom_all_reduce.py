@@ -193,6 +193,73 @@ def _load_flashinfer_pcie_oneshot_pool() -> Any | None:
     return FlashInferPcieIpcAllReducePool
 
 
+def _b12x_pcie_twoshot_max_bytes() -> int:
+    """Largest all-reduce routed to the lossless bf16 PCIe two-shot.
+
+    ``VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE`` (default 768 KB; ``0``/``off``
+    disables the route). The window starts above the one-shot ceiling and
+    replaces the PyNCCL ring there: the two-shot accumulates each shard in
+    FP32 in a fixed rank order and rounds once, where the bf16 ring rounds
+    after every hop, and on four RTX PRO 6000 (TP4) it measured 15.0 vs
+    16.7 us at 128 KB, 32.8 vs 41.7 us at 512 KB and 44.5 vs 54.5 us at
+    768 KB (b12x #290).
+    """
+    raw = os.getenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", "768KB").strip().lower()
+    if raw in ("", "0", "off", "none", "disabled"):
+        return 0
+    return _parse_byte_size(raw)
+
+
+def _b12x_pcie_twoshot_mode() -> str:
+    """Remote-transfer mode of the bf16 two-shot all-reduce kernel.
+
+    ``VLLM_PCIE_TWOSHOT_ALLREDUCE_MODE`` selects ``pull`` (remote reads, the
+    default), ``push`` (posted remote writes) or, at nine ranks, ``island9``
+    (the two-island push kernel of ``b12x.comm.pcie.pcie_island9``: ranks 0-3
+    and 4-7 reduce quarters inside their PCIe switch clusters, rank 8 on the
+    CPU root contributes through island 0, fp32 island partials, one bf16
+    rounding). Pull and push use the same shard partition and fp32 reduction
+    order, so their outputs are bit-identical; island9 sums in island order.
+    On nine PCIe-connected RTX PRO 6000 the push kernel replayed a 57 KB
+    all-reduce in 20 us against 38 us for pull and 67 us for the one-shot.
+    """
+    mode = os.getenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MODE", "pull").strip().lower()
+    if mode not in ("pull", "push", "island9"):
+        raise ValueError(
+            "VLLM_PCIE_TWOSHOT_ALLREDUCE_MODE must be 'pull', 'push' or "
+            f"'island9', got {mode!r}"
+        )
+    return mode
+
+
+def _b12x_pcie_twoshot_row_elems() -> int:
+    """Row width (bf16 elements) of the two-shot payload view.
+
+    Equal-width worlds require divisibility by ``row_elems * world_size``.
+    TP9 pads the wire payload in fixed buffers; a row width of eight minimizes
+    the unused tail. The TP8 default 896 matches Kimi-K3's hidden width / 8.
+    """
+    return int(os.getenv("VLLM_PCIE_TWOSHOT_ROW_ELEMS", "896"))
+
+
+@lru_cache(maxsize=1)
+def _load_b12x_pcie_twoshot_bf16() -> Any | None:
+    try:
+        from b12x.comm.pcie.pcie_twoshot_bf16 import PCIeTwoShotBF16
+    except Exception:  # pragma: no cover - optional dependency
+        return None
+    return PCIeTwoShotBF16
+
+
+@lru_cache(maxsize=1)
+def _load_b12x_pcie_island9() -> Any | None:
+    try:
+        from b12x.comm.pcie.pcie_island9 import PCIeIsland9AllReduce
+    except Exception:  # pragma: no cover - optional dependency
+        return None
+    return PCIeIsland9AllReduce
+
+
 def _get_physical_device_numa_node(physical_device_id: int) -> int | None:
     try:
         import pynvml
@@ -361,6 +428,8 @@ class CustomAllreduce:
         self.mnnvl_only = False
         self._pcie_runtime = None
         self._pcie_dma = None
+        self._pcie_twoshot: Any | None = None
+        self._pcie_twoshot_max_bytes = 0
         self._pcie_capture_stream: torch.cuda.Stream | None = None
         self._pcie_capture_channel_id: str | None = None
         self._pcie_allreduce_max_size: int | None = None
@@ -668,20 +737,19 @@ class CustomAllreduce:
             # preflight can tune its crossover or disable it when lossless DMA
             # never beats NCCL on the selected PCIe topology.
             supports_all_peer_auxiliary = bool(
-                getattr(pcie_runtime, "supports_all_peer_auxiliary", True)
+                getattr(pcie_runtime, "supports_all_peer_auxiliary", False)
             )
             dma_min_bytes = (
-                _b12x_pcie_dma_min_bytes()
-                if pcie_backend == "b12x" and supports_all_peer_auxiliary
-                else None
+                _b12x_pcie_dma_min_bytes() if supports_all_peer_auxiliary else None
             )
             dma_cls = None if dma_min_bytes is None else _load_b12x_pcie_dma()
-            if pcie_backend != "b12x":
+            if pcie_backend == "flashinfer-ipc" and dma_min_bytes is not None:
                 logger.info(
-                    "FlashInfer PCIe IPC handles only tuned one-shot shapes; "
-                    "larger allreduces stay on PyNCCL."
+                    "FlashInfer PCIe IPC handles tuned one-shot shapes; "
+                    "B12X DMA is enabled for larger allreduces at %d bytes.",
+                    dma_min_bytes,
                 )
-            elif not supports_all_peer_auxiliary:
+            if not supports_all_peer_auxiliary:
                 logger.info(
                     "B12X PCIe %s all-reduce does not expose the all-peer "
                     "topology required by DMA; larger tensors use PyNCCL.",
@@ -739,14 +807,20 @@ class CustomAllreduce:
                     self._pcie_dma = dma
                     logger.debug("b12x PCIe DMA allreduce wire mode: %s", dma.wire_mode)
 
+            self._initialize_pcie_twoshot(rank)
+
             if rank == 0:
                 logger.info(
                     "Configured %s PCIe crossovers: "
-                    "algorithm=%s, allreduce max=%d, fused max=%d, DMA min=%s.",
+                    "algorithm=%s, allreduce max=%d, fused max=%d, "
+                    "two-shot bf16 max=%s, DMA min=%s.",
                     pcie_backend,
                     getattr(pcie_runtime, "algorithm", "oneshot"),
                     self._pcie_allreduce_max_size,
                     self._pcie_fused_add_rms_norm_max_size,
+                    self._pcie_twoshot_max_bytes
+                    if self._pcie_twoshot is not None
+                    else "off",
                     dma_min_bytes if dma_min_bytes is not None else "off",
                 )
             self.disabled = False
@@ -949,7 +1023,11 @@ class CustomAllreduce:
                     stream=stream,
                     channel_id=channel_id,
                 ):
-                    yield
+                    if self._pcie_twoshot is not None:
+                        with self._pcie_twoshot.capture():
+                            yield
+                    else:
+                        yield
         finally:
             self._pcie_capture_stream = old_pcie_capture_stream
             self._pcie_capture_channel_id = old_pcie_capture_channel_id
@@ -1032,6 +1110,95 @@ class CustomAllreduce:
         offsets = cast(list[list[int]], [d[1] for d in all_data])
         ops.register_graph_buffers(self._ptr, handles, offsets)
 
+    def _initialize_pcie_twoshot(self, rank: int) -> None:
+        """Lossless bf16 two-shot for payloads above the one-shot ceiling and
+        below the DMA ring: the window the PyNCCL ring served before."""
+        max_bytes = _b12x_pcie_twoshot_max_bytes()
+        if max_bytes <= 0 or self.world_size not in (2, 4, 8, 9):
+            return
+        mode = _b12x_pcie_twoshot_mode()
+        if mode == "island9":
+            if self.world_size != 9:
+                raise ValueError(
+                    "VLLM_PCIE_TWOSHOT_ALLREDUCE_MODE=island9 requires nine ranks, "
+                    f"got {self.world_size}"
+                )
+            twoshot_cls = _load_b12x_pcie_island9()
+        else:
+            twoshot_cls = _load_b12x_pcie_twoshot_bf16()
+        if twoshot_cls is None:
+            logger.warning(
+                "b12x PCIe mid-size bf16 all-reduce (%s) requested but "
+                "unavailable (b12x runtime not importable); mid-size "
+                "allreduces stay on PyNCCL.",
+                mode,
+            )
+            return
+        row_elems = _b12x_pcie_twoshot_row_elems()
+        max_rows = max_bytes // (row_elems * 2)
+        max_rows -= max_rows % self.world_size
+        if max_rows < self.world_size:
+            return
+        twoshot = None
+        init_error: Exception | None = None
+        try:
+            twoshot = twoshot_cls.from_exchange_group(
+                exchange_group=self.nccl_group,
+                device=self.device,
+                max_rows=max_rows,
+                row_elems=row_elems,
+            )
+            if mode not in ("pull", "island9"):
+                if not hasattr(twoshot, "all_reduce_mode"):
+                    raise RuntimeError(
+                        "the installed b12x two-shot runtime has no "
+                        f"all_reduce_mode; cannot select {mode!r}"
+                    )
+                twoshot.all_reduce_mode = mode
+            twoshot.prepare_graph()
+        except Exception as exc:
+            init_error = exc
+        failed = torch.tensor(
+            [int(init_error is not None)], dtype=torch.int, device="cpu"
+        )
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=self.group)
+        if int(failed.item()) != 0:
+            if twoshot is not None:
+                twoshot.close()
+            logger.warning(
+                "b12x PCIe two-shot bf16 all-reduce initialization failed "
+                "(rank %d error: %s); mid-size allreduces stay on PyNCCL.",
+                rank,
+                init_error,
+            )
+            return
+        assert twoshot is not None
+        self._pcie_twoshot = twoshot
+        self._pcie_twoshot_max_bytes = max_rows * row_elems * 2
+        logger.info(
+            "b12x PCIe mid-size bf16 all-reduce serves %d < bytes <= %d "
+            "(row_elems=%d, max_rows=%d, mode=%s).",
+            self._pcie_allreduce_max_size or 0,
+            self._pcie_twoshot_max_bytes,
+            row_elems,
+            max_rows,
+            mode,
+        )
+
+    def _pcie_twoshot_accepts(self, inp: torch.Tensor) -> bool:
+        twoshot = self._pcie_twoshot
+        if twoshot is None:
+            return False
+        inp_size = inp.numel() * inp.element_size()
+        return bool(
+            (
+                self._pcie_allreduce_max_size is None
+                or inp_size > self._pcie_allreduce_max_size
+            )
+            and inp_size <= self._pcie_twoshot_max_bytes
+            and twoshot.accepts(inp)
+        )
+
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
             return False
@@ -1045,6 +1212,8 @@ class CustomAllreduce:
                     channel_id=self._pcie_runtime_channel_id(),
                 ).should_allreduce(inp)
             )
+            if not use_custom and self._pcie_twoshot_accepts(inp):
+                return True
             if (
                 not use_custom
                 and self._pcie_dma is not None
@@ -1081,7 +1250,11 @@ class CustomAllreduce:
     def backend_name(self) -> str:
         if self._pcie_runtime is not None:
             if self._pcie_backend_name == "flashinfer-ipc":
-                return "FLASHINFER_PCIE_IPC"
+                return (
+                    "FLASHINFER_PCIE_IPC_B12X_DMA"
+                    if self._pcie_dma is not None
+                    else "FLASHINFER_PCIE_IPC"
+                )
             if getattr(self._pcie_runtime, "algorithm", "oneshot") != "oneshot":
                 return "B12X_PCIE_HIERARCHICAL"
             if self._pcie_dma is not None:
@@ -1106,6 +1279,13 @@ class CustomAllreduce:
                 self._pcie_allreduce_max_size is not None
                 and inp_size <= self._pcie_allreduce_max_size
             )
+            if not oneshot_eligible and self._pcie_twoshot_accepts(inp):
+                assert self._pcie_twoshot is not None
+                stream = self._pcie_runtime_stream()
+                if stream is not None:
+                    with torch.cuda.stream(stream):
+                        return self._pcie_twoshot.all_reduce(inp, out=out)
+                return self._pcie_twoshot.all_reduce(inp, out=out)
             if (
                 not oneshot_eligible
                 and self._pcie_dma is not None
@@ -1359,6 +1539,9 @@ class CustomAllreduce:
         if self._pcie_runtime is not None:
             self._pcie_runtime.close()
             self._pcie_runtime = None
+        if self._pcie_twoshot is not None:
+            self._pcie_twoshot.close()
+            self._pcie_twoshot = None
         if self._pcie_dma is not None:
             self._pcie_dma.close()
             self._pcie_dma = None

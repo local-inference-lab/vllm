@@ -399,3 +399,25 @@ def test_projection_pair_topk_returns_none_without_b12x_binding(monkeypatch):
     )
 
     assert actual is None
+
+
+@pytest.mark.parametrize(
+    ("logical", "tp_size", "expected"),
+    [
+        # Kimi-K3 latent (3584) and router (896) widths: exact aligned shards
+        # at TP8, pack-padded shards at TP9.
+        (3584, 8, 448),
+        (896, 8, 112),
+        (3584, 9, 400),
+        (896, 9, 104),
+        (7168, 9, 800),
+    ],
+)
+def test_projection_shard_width_keeps_whole_packs(logical, tp_size, expected):
+    from vllm.models.kimi_k3.nvidia.model import kimi_projection_shard_width
+    from vllm.v1.attention.ops.dcp_alltoall import _kimi_projection_shard_width
+
+    assert kimi_projection_shard_width(logical, tp_size) == expected
+    assert _kimi_projection_shard_width(logical, tp_size) == expected
+    assert expected * tp_size >= logical
+    assert expected % 8 == 0
