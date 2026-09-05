@@ -422,6 +422,18 @@ class Scheduler(SchedulerInterface):
             for group in kv_cache_config.kv_cache_groups
             if isinstance(group.kv_cache_spec, MambaSpec)
         ]
+        max_prefill_tokens = self.max_num_scheduled_tokens
+        if self.scheduler_config.long_prefill_token_threshold > 0:
+            max_prefill_tokens = min(
+                max_prefill_tokens, self.scheduler_config.long_prefill_token_threshold
+            )
+        if (
+            self.need_mamba_block_aligned_split
+            and self.cache_config.block_size <= max_prefill_tokens
+        ):
+            # Match the grid enforced by _mamba_block_aligned_split. Otherwise
+            # several recurrent-sized slices can all round down to zero.
+            mamba_block_sizes.append(self.cache_config.block_size)
         prefill_quantum = (
             math.lcm(*mamba_block_sizes)
             if self.need_mamba_block_aligned_split and mamba_block_sizes
