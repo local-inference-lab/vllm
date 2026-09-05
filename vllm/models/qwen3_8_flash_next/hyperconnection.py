@@ -87,11 +87,6 @@ class HyperConnectionWorkspace(nn.Module):
             "normalized", torch.empty(max_tokens, width, **factory), persistent=False
         )
         self.register_buffer(
-            "projected_down",
-            torch.empty(max_tokens, config.hc_lowrank, **factory),
-            persistent=False,
-        )
-        self.register_buffer(
             "bottleneck",
             torch.empty(max_tokens, config.hc_lowrank, **factory),
             persistent=False,
@@ -99,11 +94,6 @@ class HyperConnectionWorkspace(nn.Module):
         self.register_buffer(
             "block_input",
             torch.empty(max_tokens, config.hidden_size, **factory),
-            persistent=False,
-        )
-        self.register_buffer(
-            "injection",
-            torch.empty(max_tokens, config.hc_count, **factory),
             persistent=False,
         )
 
@@ -200,18 +190,15 @@ class GatedResidual(nn.Module):
 
     def _mix_normalized(self, normalized: torch.Tensor, binding):
         api = _hyperconnection_api()
-        token_count = normalized.shape[0]
         if self.use_combine:
             down_and_injection = self.input_mix_weight_down_block_inject(normalized)
-            self.workspace.projected_down[:token_count].copy_(
-                down_and_injection[:, : self.lora_rank]
-            )
+            projected_down = down_and_injection[:, : self.lora_rank]
             injection_start = self.lora_rank
-            self.workspace.injection[:token_count].copy_(
-                down_and_injection[:, injection_start : injection_start + self.hc_count]
-            )
-            projected_down = self.workspace.projected_down[:token_count]
-            injection = self.workspace.injection[:token_count]
+            # The projection owner stays live through the downstream residual
+            # combine; readers consume row-strided slices without staging.
+            injection = down_and_injection[
+                :, injection_start : injection_start + self.hc_count
+            ]
         else:
             projected_down = self.input_mix_weight_down(normalized)
             injection = None
