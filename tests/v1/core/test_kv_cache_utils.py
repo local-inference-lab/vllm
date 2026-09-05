@@ -2337,7 +2337,7 @@ def test_glm5next_split_cache_preserves_physical_pages(
 
     monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "512")
     groups = get_kv_cache_groups(
-        _grouping_config(),
+        _glm5next_split_config(),
         {"model.target": target, "model.recurrent": recurrent},
     )
 
@@ -2360,6 +2360,157 @@ def test_glm5next_split_cache_preserves_physical_pages(
     assert kv_cache_utils._get_kv_cache_bytes_per_block(groups) == (
         expected_pool_stride
     )
+
+
+def _glm5next_split_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        speculative_config=None,
+        model_config=SimpleNamespace(max_model_len=202_752),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+    )
+
+
+def _glm5next_split_specs(cache_dtype: str) -> dict[str, KVCacheSpec]:
+    target = MLAAttentionSpec(
+        block_size=2048,
+        num_kv_heads=1,
+        head_size=512 if cache_dtype == "nvfp4_ds_mla" else 528,
+        dtype=torch.uint8,
+        cache_dtype_str=cache_dtype,
+        state_content_bytes=304 if cache_dtype == "nvfp4_ds_mla" else None,
+        model_version="glm5_next",
+        page_tail_bytes_per_token=33,
+        alignment=64 * 132,
+    )
+    recurrent = MambaSpec(
+        block_size=2048,
+        shapes=((1_122_304,),),
+        dtypes=(torch.uint8,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=3,
+        num_prefill_checkpoint_blocks=1,
+    )
+    return {
+        **{f"model.recurrent.{i}": recurrent for i in range(34)},
+        **{f"model.target.{i}": target for i in range(12)},
+    }
+
+
+def test_glm5next_nvfp4_weights_split_cache_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "2048")
+    specs = _glm5next_split_specs("nvfp4_ds_mla")
+    groups = get_kv_cache_groups(_glm5next_split_config(), specs)
+
+    recurrent_groups = [
+        group for group in groups if isinstance(group.kv_cache_spec, MambaSpec)
+    ]
+    target_groups = [
+        group for group in groups if isinstance(group.kv_cache_spec, MLAAttentionSpec)
+    ]
+    assert [len(group.layer_names) for group in recurrent_groups] == [7, 7, 7, 7, 6]
+    assert [len(group.layer_names) for group in target_groups] == [12]
+    assert {name for group in groups for name in group.layer_names} == set(specs)
+    assert kv_cache_utils._get_kv_cache_bytes_per_block(groups) == 8_312_832
+    assert (
+        kv_cache_utils._get_kv_cache_group_allocation_cost(
+            _glm5next_split_config(), groups
+        )
+        == 457_205_760
+    )
+
+
+def test_glm5next_fp8_keeps_lower_group_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "2048")
+    specs = _glm5next_split_specs("fp8_ds_mla")
+    groups = get_kv_cache_groups(_glm5next_split_config(), specs)
+
+    assert len(groups) == 4
+    assert [len(group.layer_names) for group in groups] == [12, 11, 11, 12]
+
+
+def test_glm5next_weighted_groups_replace_over_limit_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "2048")
+    all_specs = _glm5next_split_specs("nvfp4_ds_mla")
+    specs = {
+        name: spec
+        for name, spec in all_specs.items()
+        if name == "model.target.0"
+        or name in {f"model.recurrent.{index}" for index in range(8)}
+    }
+
+    groups = kv_cache_utils._get_weighted_shared_pool_kv_cache_groups(
+        _glm5next_split_config(), specs
+    )
+
+    assert len(groups) <= kv_cache_utils._MAX_WEIGHTED_SHARED_POOL_GROUPS
+    assert {name for group in groups for name in group.layer_names} == set(specs)
+
+
+def test_glm5next_weighted_groups_reject_more_than_eight_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "_get_kv_cache_layer_buckets",
+        lambda _: [[f"layer.{index}"] for index in range(9)],
+    )
+
+    with pytest.raises(ValueError, match="9 incompatible layer buckets"):
+        kv_cache_utils._get_weighted_shared_pool_kv_cache_groups(
+            _glm5next_split_config(), {}
+        )
+
+
+def test_glm5next_nvfp4_auto_geometry_capacity() -> None:
+    """DCP4 4K retention geometry recovers the expected 12.67M capacity."""
+    target = MLAAttentionSpec(
+        block_size=1024,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+        state_content_bytes=304,
+        model_version="glm5_next",
+        page_tail_bytes_per_token=33,
+        alignment=64 * 132,
+    )
+    recurrent = MambaSpec(
+        block_size=1024,
+        shapes=((1_085_440,),),
+        dtypes=(torch.uint8,),
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=1,
+    )
+    groups = [
+        KVCacheGroupSpec([f"recurrent.{i}.{j}" for j in range(width)], recurrent)
+        for i, width in enumerate((9, 9, 8, 8))
+    ]
+    groups.append(KVCacheGroupSpec([f"target.{i}" for i in range(11)], target))
+    config = KVCacheConfig(
+        num_blocks=3873,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        prefix_cache_retention_interval=4096,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=202_752),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+    )
+
+    capacity, concurrency = get_kv_cache_capacity(vllm_config, config)
+
+    assert target.page_size_bytes == 346_368
+    assert capacity == 12_665_459
+    assert concurrency == pytest.approx(62.46774193548387)
 
 
 def new_indexer_mla_spec(block_size=16):
@@ -2552,8 +2703,9 @@ def test_dflash_draft_cache_partition_is_pp1_only():
                 attention_backend="FLASH_ATTN",
             ),
             model_config=SimpleNamespace(
-                get_num_layers=lambda parallel_config,
-                target_layers=target_layers: target_layers
+                get_num_layers=lambda parallel_config, target_layers=target_layers: (
+                    target_layers
+                )
             ),
             parallel_config=SimpleNamespace(
                 pipeline_parallel_size=pipeline_parallel_size

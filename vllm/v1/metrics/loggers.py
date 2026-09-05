@@ -510,6 +510,73 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_scheduler_waiting, per_engine_labelvalues
         )
 
+        gauge_prefill_compute_share = self._gauge_cls(
+            name="vllm:scheduler_prefill_compute_share",
+            documentation=(
+                "Configured target fraction of contended model execution "
+                "assigned to prefill; zero means disabled."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_prefill_compute_share = create_metric_per_engine(
+            gauge_prefill_compute_share, per_engine_labelvalues
+        )
+
+        counter_scheduler_compute_seconds = self._counter_cls(
+            name="vllm:scheduler_compute_seconds",
+            documentation="Model-execution time charged to each service class.",
+            labelnames=labelnames + ["class"],
+        )
+        self.counter_scheduler_compute_seconds = {
+            service_class: {
+                idx: counter_scheduler_compute_seconds.labels(
+                    model_name, str(idx), service_class
+                )
+                for idx in engine_indexes
+            }
+            for service_class in ("decode", "prefill")
+        }
+
+        counter_decode_prefill_scheduled_tokens = self._counter_cls(
+            name="vllm:decode_prefill_scheduled_tokens",
+            documentation=(
+                "Local prefill tokens governed by mixed-step micro-slicing."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_decode_prefill_scheduled_tokens = create_metric_per_engine(
+            counter_decode_prefill_scheduled_tokens, per_engine_labelvalues
+        )
+        gauge_decode_prefill_active_partial_prefills = self._gauge_cls(
+            name="vllm:decode_prefill_active_partial_prefills",
+            documentation="Active requests performing local partial prefill.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_decode_prefill_active_partial_prefills = create_metric_per_engine(
+            gauge_decode_prefill_active_partial_prefills,
+            per_engine_labelvalues,
+        )
+        counter_decode_prefill_decode_only_steps = self._counter_cls(
+            name="vllm:decode_prefill_decode_only_steps",
+            documentation=(
+                "Decode-only steps taken while local prefill work was pending."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_decode_prefill_decode_only_steps = create_metric_per_engine(
+            counter_decode_prefill_decode_only_steps, per_engine_labelvalues
+        )
+        counter_decode_prefill_fairness_bypasses = self._counter_cls(
+            name="vllm:decode_prefill_fairness_bypasses",
+            documentation="Prefill releases caused by the oldest-waiter deadline.",
+            labelnames=labelnames,
+        )
+        self.counter_decode_prefill_fairness_bypasses = create_metric_per_engine(
+            counter_decode_prefill_fairness_bypasses, per_engine_labelvalues
+        )
+
         gauge_waiting_by_reason = self._gauge_cls(
             name="vllm:num_requests_waiting_by_reason",
             documentation=(
@@ -1121,6 +1188,27 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            self.gauge_prefill_compute_share[engine_idx].set(
+                scheduler_stats.prefill_compute_share
+            )
+            self.counter_scheduler_compute_seconds["decode"][engine_idx].inc(
+                scheduler_stats.decode_compute_seconds
+            )
+            self.counter_scheduler_compute_seconds["prefill"][engine_idx].inc(
+                scheduler_stats.prefill_compute_seconds
+            )
+            self.counter_decode_prefill_scheduled_tokens[engine_idx].inc(
+                scheduler_stats.scheduled_prefill_tokens
+            )
+            self.gauge_decode_prefill_active_partial_prefills[engine_idx].set(
+                scheduler_stats.active_partial_prefills
+            )
+            self.counter_decode_prefill_decode_only_steps[engine_idx].inc(
+                scheduler_stats.decode_only_steps
+            )
+            self.counter_decode_prefill_fairness_bypasses[engine_idx].inc(
+                scheduler_stats.fairness_bypasses
+            )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

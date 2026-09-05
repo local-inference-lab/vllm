@@ -109,6 +109,8 @@ def test_b12x_warmup_token_counts_cover_serving_regimes() -> None:
                 weight_scale=torch.empty((128, 8), dtype=torch.float8_e4m3fn),
                 input_global_scale_inv=torch.tensor(2.0),
                 alpha=torch.tensor(0.25),
+                b12x_activation_mode="auto",
+                b12x_bf16_input_supported=True,
             ),
             "NVFP4",
         ),
@@ -144,7 +146,8 @@ def test_b12x_warmup_units_cover_token_counts(
     unit.compile()
 
     assert unit.name == name
-    assert [args[0].shape[0] for args in calls] == [1, 8]
+    source_index = 1 if kernel_cls is B12xNvFp4LinearKernel else 0
+    assert [args[source_index].shape[0] for args in calls] == [1, 8]
     assert unit.key[-1] == torch.bfloat16
 
 
@@ -152,17 +155,15 @@ def test_b12x_mxfp8_warmup_unit(monkeypatch) -> None:
     import vllm.model_executor.kernels.linear.mxfp8.b12x as b12x_mod
 
     calls = []
+
+    def mm(source, weight, **kwargs):
+        calls.append(((source, weight), kwargs))
+        return source.new_empty((source.shape[0], weight.out_features))
+
     monkeypatch.setattr(
         b12x_mod,
-        "_import_b12x_mxfp8",
-        lambda: SimpleNamespace(
-            mm=lambda *args, **kwargs: calls.append((args, kwargs))
-        ),
-    )
-    monkeypatch.setattr(
-        b12x_mod,
-        "current_stream",
-        lambda: SimpleNamespace(cuda_stream=object()),
+        "_import_b12x_blockscaled",
+        lambda: SimpleNamespace(mm=mm),
     )
     packed_weight = SimpleNamespace(
         in_features=128,
@@ -170,7 +171,11 @@ def test_b12x_mxfp8_warmup_unit(monkeypatch) -> None:
         out_features=256,
         weight=SimpleNamespace(values=torch.empty(1)),
     )
-    layer = SimpleNamespace(b12x_mxfp8_packed_weight=packed_weight)
+    layer = SimpleNamespace(
+        b12x_mxfp8_packed_weight=packed_weight,
+        b12x_activation_mode="auto",
+        b12x_bf16_input_supported=True,
+    )
     kernel = object.__new__(B12xMxfp8LinearKernel)
 
     unit = kernel.get_b12x_warmup_unit(layer, (1, 8), torch.float16)
@@ -249,7 +254,8 @@ def test_b12x_warmup_deduplicates_registered_signatures(monkeypatch) -> None:
         ),
         model_config=SimpleNamespace(dtype=torch.float32),
         vllm_config=SimpleNamespace(
-            compilation_config=SimpleNamespace(compile_sizes=[4, 16])
+            compilation_config=SimpleNamespace(compile_sizes=[4, 16]),
+            num_speculative_tokens=3,
         ),
     )
     platform = SimpleNamespace(
@@ -268,7 +274,58 @@ def test_b12x_warmup_deduplicates_registered_signatures(monkeypatch) -> None:
 
     assert scans == 1
     assert calls == [
-        ("first", (1, 2, 4, 8, 16, 32), torch.bfloat16),
-        ("second", (1, 2, 4, 8, 16, 32), torch.bfloat16),
+        ("first", (1, 2, 4, 8, 16, 29, 32), torch.bfloat16),
+        ("second", (1, 2, 4, 8, 16, 29, 32), torch.bfloat16),
     ]
     assert synchronized == [True]
+
+
+def test_b12x_dsa_indexer_warmup_unit_compiles_before_the_index_cache(
+    monkeypatch,
+) -> None:
+    import vllm.v1.attention.backends.mla.b12x_indexer as indexer_mod
+
+    calls = []
+    monkeypatch.setattr(
+        indexer_mod, "_run_paged_topk", lambda **kwargs: calls.append(kwargs)
+    )
+    device = torch.device("cpu")
+    plan = SimpleNamespace(
+        caps=SimpleNamespace(
+            max_q_rows=4,
+            mode="decode",
+            num_q_heads=8,
+            device=device,
+            max_page_table_width=16,
+        ),
+        layout=SimpleNamespace(route="paged_fused"),
+    )
+    indexer = SimpleNamespace(
+        k_cache=SimpleNamespace(kv_cache=torch.empty(0, dtype=torch.uint8)),
+        _decode_plans={4: plan},
+        _prefill_plans={},
+        max_model_len=4096,
+        topk_tokens=512,
+        dcp_world_size=1,
+        _module=object(),
+        active_width_cap=torch.zeros(1, dtype=torch.int32),
+        topk_indices_buffer=torch.zeros((4, 512), dtype=torch.int32),
+        output_physical_slots=False,
+    )
+    unit = indexer_mod.B12xSparseIndexer.get_b12x_warmup_unit(
+        indexer, None, (1,), torch.bfloat16
+    )
+
+    # Memory profiling runs warmup before the index cache exists: the unit
+    # compiles against a placeholder cache with the production page layout.
+    unit.compile()
+    assert len(calls) == 1
+    assert calls[0]["plan"] is plan
+    assert tuple(calls[0]["kv_cache"].shape) == (2, 64, 132)
+    assert calls[0]["kv_cache"].dtype == torch.uint8
+    assert tuple(calls[0]["q"].shape) == (4, 8, 128)
+
+    indexer.k_cache.kv_cache = torch.zeros((3, 64, 132), dtype=torch.uint8)
+    unit.compile()
+    assert len(calls) == 2
+    assert calls[1]["kv_cache"] is indexer.k_cache.kv_cache

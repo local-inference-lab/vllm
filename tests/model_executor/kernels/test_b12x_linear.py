@@ -379,7 +379,7 @@ def test_b12x_mxfp8_support_check_reports_missing_import(monkeypatch) -> None:
         "is_device_capability_family",
         lambda family: family == 120,
     )
-    monkeypatch.setattr(b12x_mod, "_import_b12x_mxfp8", lambda: None)
+    monkeypatch.setattr(b12x_mod, "_import_b12x_blockscaled", lambda: None)
 
     is_supported, reason = B12xMxfp8LinearKernel.is_supported()
 
@@ -398,14 +398,14 @@ def test_b12x_mxfp8_support_respects_runtime_probe(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         b12x_mod,
-        "_import_b12x_mxfp8",
+        "_import_b12x_blockscaled",
         lambda: types.SimpleNamespace(is_supported=lambda: False),
     )
 
     is_supported, reason = B12xMxfp8LinearKernel.is_supported()
 
     assert not is_supported
-    assert reason == "b12x.gemm.mxfp8_linear is not supported"
+    assert reason == "b12x.gemm.blockscaled is not supported"
 
 
 def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
@@ -420,7 +420,7 @@ def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
 
     monkeypatch.setattr(
         b12x_mod,
-        "_import_b12x_mxfp8",
+        "_import_b12x_blockscaled",
         lambda: types.SimpleNamespace(pack_weight=pack),
     )
 
@@ -474,7 +474,7 @@ def test_b12x_mxfp8_reload_reuses_packed_tensor_addresses(monkeypatch) -> None:
 
     monkeypatch.setattr(
         b12x_mod,
-        "_import_b12x_mxfp8",
+        "_import_b12x_blockscaled",
         lambda: types.SimpleNamespace(pack_weight=pack),
     )
     layer = torch.nn.Module()
@@ -590,7 +590,8 @@ def test_b12x_block_fp8_upcasts_e8m0_weight_scales(scale_dtype) -> None:
     )
 
 
-def test_b12x_mxfp8_apply_uses_packed_weight(monkeypatch) -> None:
+@pytest.mark.parametrize("mode", ["auto", "a16", "quantized"])
+def test_b12x_mxfp8_apply_delegates_activation_precision(monkeypatch, mode) -> None:
     import vllm.model_executor.kernels.linear.mxfp8.b12x as b12x_mod
 
     calls = []
@@ -602,20 +603,23 @@ def test_b12x_mxfp8_apply_uses_packed_weight(monkeypatch) -> None:
         bias: torch.Tensor | None = None,
         expected_m: int | None = None,
         stream: object = None,
+        mode: str = "auto",
     ) -> torch.Tensor:
         del stream
-        calls.append((source, packed_weight, bias, expected_m))
+        calls.append((source, packed_weight, bias, expected_m, mode))
         return source.new_full((source.shape[0], packed_weight.out_features), 3.0)
 
     monkeypatch.setattr(
         b12x_mod,
-        "_import_b12x_mxfp8",
+        "_import_b12x_blockscaled",
         lambda: types.SimpleNamespace(mm=mxfp8_linear),
     )
 
     layer = torch.nn.Module()
     packed = types.SimpleNamespace(out_features=48)
     layer.b12x_mxfp8_packed_weight = packed
+    layer.b12x_activation_mode = mode
+    layer.b12x_bf16_input_supported = True
     x = torch.empty((2, 3, 128), dtype=torch.bfloat16)
     bias = torch.empty((48,), dtype=torch.bfloat16)
     kernel = object.__new__(B12xMxfp8LinearKernel)
@@ -625,11 +629,13 @@ def test_b12x_mxfp8_apply_uses_packed_weight(monkeypatch) -> None:
     assert output.shape == (2, 3, 48)
     assert output.dtype == x.dtype
     assert len(calls) == 1
-    source, called_packed, called_bias, expected_m = calls[0]
+    source, called_packed, called_bias, expected_m, called_mode = calls[0]
     assert source.shape == (6, 128)
     assert called_packed is packed
     assert called_bias is bias
     assert expected_m == 6
+    assert called_mode == mode
+    assert source.data_ptr() == x.data_ptr()
 
 
 def test_b12x_block_fp8_apply_uses_b12x_recipe_api(monkeypatch) -> None:
@@ -718,6 +724,23 @@ def test_b12x_fp4_processes_scale_and_preserves_loader(
     layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
     weight_loader = object()
     layer.weight_scale.weight_loader = weight_loader
+    if kernel_cls is B12xNvFp4LinearKernel:
+        layer.weight = torch.empty((48, 64), dtype=torch.uint8)
+        layer.weight_global_scale = torch.tensor(0.5)
+        packed = object()
+
+        def pack_weight(weight, scale, *, recipe, global_scale):
+            assert weight.data_ptr() == layer.weight.data_ptr()
+            assert scale.data_ptr() == swizzled_scale.data_ptr()
+            assert global_scale is layer.weight_global_scale
+            assert recipe == "nvfp4"
+            return packed
+
+        monkeypatch.setattr(
+            importlib.import_module(module_name),
+            "_import_b12x_blockscaled",
+            lambda: types.SimpleNamespace(pack_weight=pack_weight),
+        )
     kernel = object.__new__(kernel_cls)
 
     kernel.process_weights_after_loading(layer)
@@ -725,6 +748,8 @@ def test_b12x_fp4_processes_scale_and_preserves_loader(
     assert layer.weight_scale.data_ptr() == swizzled_scale.data_ptr()
     assert layer.weight_scale.weight_loader is weight_loader
     assert layer.b12x_warmup_provider is kernel
+    if kernel_cls is B12xNvFp4LinearKernel:
+        assert layer.b12x_nvfp4_packed_weight is packed
 
 
 def test_b12x_mxfp4_apply_calls_native_blockscaled_gemm(monkeypatch) -> None:
@@ -796,7 +821,7 @@ def test_b12x_backend_preserves_w4a16_fallback(monkeypatch) -> None:
     assert isinstance(kernel, MarlinNvFp4LinearKernel)
 
 
-def test_b12x_nvfp4_apply_calls_native_blockscaled_gemm(monkeypatch) -> None:
+def test_b12x_nvfp4_fp16_preserves_quantized_path(monkeypatch) -> None:
     import vllm.model_executor.kernels.linear.nvfp4.b12x as b12x_mod
 
     calls: list[tuple] = []
@@ -810,7 +835,7 @@ def test_b12x_nvfp4_apply_calls_native_blockscaled_gemm(monkeypatch) -> None:
 
     def mm_nvfp4(*args, **kwargs):
         calls.append((args, kwargs))
-        return torch.full((6, 48), 3.0, dtype=torch.bfloat16)
+        return torch.full((6, 48), 3.0, dtype=torch.float16)
 
     monkeypatch.setattr(b12x_mod, "scaled_fp4_quant", quant)
     monkeypatch.setattr(
@@ -825,8 +850,10 @@ def test_b12x_nvfp4_apply_calls_native_blockscaled_gemm(monkeypatch) -> None:
     layer.weight_scale = torch.empty((128, 8), dtype=torch.float8_e4m3fn)
     layer.input_global_scale_inv = torch.tensor(2.0)
     layer.alpha = torch.tensor(0.25)
-    x = torch.empty((2, 3, 256), dtype=torch.bfloat16)[..., ::2]
-    bias = torch.ones(48, dtype=torch.bfloat16)
+    layer.b12x_activation_mode = "auto"
+    layer.b12x_bf16_input_supported = True
+    x = torch.empty((2, 3, 256), dtype=torch.float16)[..., ::2]
+    bias = torch.ones(48, dtype=torch.float16)
     kernel = object.__new__(B12xNvFp4LinearKernel)
 
     output = kernel.apply_weights(layer, x, bias)
@@ -849,4 +876,197 @@ def test_b12x_nvfp4_apply_calls_native_blockscaled_gemm(monkeypatch) -> None:
         layer.weight_scale,
         layer.alpha,
     )
-    assert kwargs == {"out_dtype": torch.bfloat16}
+    assert kwargs == {"out_dtype": torch.float16}
+
+
+@pytest.mark.parametrize("mode", ["auto", "a16", "quantized"])
+def test_b12x_nvfp4_bf16_delegates_quantization(monkeypatch, mode) -> None:
+    import vllm.model_executor.kernels.linear.nvfp4.b12x as b12x_mod
+
+    calls = []
+    packed = object()
+    layer = types.SimpleNamespace(
+        weight=torch.empty(48, 64, dtype=torch.uint8),
+        b12x_nvfp4_packed_weight=packed,
+        b12x_activation_mode=mode,
+        b12x_bf16_input_supported=True,
+        input_global_scale_inv=torch.tensor(2.0),
+    )
+    x = torch.randn(2, 3, 128, dtype=torch.bfloat16)
+    bias = torch.ones(48, dtype=torch.bfloat16)
+
+    def mm(source, weight, **kwargs):
+        calls.append((source, weight, kwargs))
+        return source.new_full((6, 48), 4.0)
+
+    def reject_quant(*args, **kwargs):
+        pytest.fail("BF16 activation quantization must be owned by b12x")
+
+    monkeypatch.setattr(b12x_mod, "scaled_fp4_quant", reject_quant)
+    monkeypatch.setattr(
+        b12x_mod, "_import_b12x_blockscaled", lambda: types.SimpleNamespace(mm=mm)
+    )
+    kernel = object.__new__(B12xNvFp4LinearKernel)
+    output = kernel.apply_weights(layer, x, bias)
+    assert output.shape == (2, 3, 48)
+    assert len(calls) == 1
+    source, weight, kwargs = calls[0]
+    assert source.data_ptr() == x.data_ptr()
+    assert weight is packed
+    assert kwargs == dict(
+        mode=mode,
+        activation_global_scale=layer.input_global_scale_inv,
+        bias=bias,
+        expected_m=6,
+    )
+
+
+@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize(
+    "common,override,expected",
+    [
+        (None, None, "auto"),
+        ("a16", None, "a16"),
+        ("a16", "auto", "auto"),
+        ("quantized", "a16", "a16"),
+        ("a16", "quantized", "quantized"),
+    ],
+)
+def test_b12x_dense_precision_override_precedence(
+    monkeypatch, recipe, common, override, expected
+):
+    from vllm.utils.b12x import get_b12x_dense_activation_mode
+
+    for name, value in (
+        ("VLLM_B12X_DENSE_ACTIVATION_MODE", common),
+        (f"VLLM_B12X_{recipe.upper()}_ACTIVATION_MODE", override),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert get_b12x_dense_activation_mode(recipe) == expected
+
+
+@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
+def test_b12x_dense_precision_rejects_invalid_override(monkeypatch, recipe):
+    from vllm.utils.b12x import get_b12x_dense_activation_mode
+
+    monkeypatch.setenv(f"VLLM_B12X_{recipe.upper()}_ACTIVATION_MODE", "guess")
+    with pytest.raises(ValueError, match="Invalid value"):
+        get_b12x_dense_activation_mode(recipe)
+
+
+@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("mode", ["auto", "a16", "quantized"])
+def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
+    """Exercise loader storage, warmup, both precision oracles, and replay."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (12, 0),
+        (12, 1),
+    ):
+        pytest.skip("SM120/SM121 required")
+    blockscaled = pytest.importorskip("b12x.gemm.blockscaled")
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
+    from b12x.gemm.blockscaled._policy import resolve_precision
+
+    from vllm._custom_ops import scaled_fp4_quant
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        _mxfp8_e4m3_quantize_torch,
+    )
+
+    monkeypatch.setenv(f"VLLM_B12X_{recipe.upper()}_ACTIVATION_MODE", mode)
+    torch.manual_seed(1234)
+    n, k = 4096, 5376
+    layer = torch.nn.Module()
+    if recipe == "nvfp4":
+        codes = torch.randint(0, 16, (n, k), device="cuda", dtype=torch.uint8)
+        values = codes[:, ::2] | (codes[:, 1::2] << 4)
+        scales = (torch.rand(n, k // 16, device="cuda") + 0.125).to(torch.float8_e4m3fn)
+        lut = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            device="cuda",
+        )
+        decoded = lut[codes.long()] * scales.float().repeat_interleave(16, 1) * 0.25
+        layer.weight_global_scale = torch.tensor([0.25], device="cuda")
+        layer.input_global_scale_inv = torch.tensor([128.0], device="cuda")
+        layer.alpha = layer.weight_global_scale / layer.input_global_scale_inv
+        kernel = object.__new__(B12xNvFp4LinearKernel)
+        counts = (1, 8, 32)
+    else:
+        values = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+        exponents = torch.randint(
+            124, 130, (n, k // 32), device="cuda", dtype=torch.uint8
+        )
+        scales = exponents
+        decoded = values.float() * torch.exp2(
+            exponents.float() - 127
+        ).repeat_interleave(32, 1)
+        kernel = object.__new__(B12xMxfp8LinearKernel)
+        counts = (1, 14, 32)
+    layer.weight = torch.nn.Parameter(values, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
+    kernel.process_weights_after_loading(layer)
+    packed = getattr(layer, f"b12x_{recipe}_packed_weight")
+    if recipe == "nvfp4":
+        assert packed.values.data_ptr() == layer.weight.data_ptr()
+        assert packed.scale_mma.data_ptr() == layer.weight_scale.data_ptr()
+        assert packed.global_scale is layer.weight_global_scale
+    kernel.get_b12x_warmup_unit(layer, counts, torch.bfloat16).compile()
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+
+    def reference(source, a16):
+        if a16:
+            return (source.float() @ decoded.T).bfloat16() + bias
+        if recipe == "nvfp4":
+            aq, sf = scaled_fp4_quant(
+                source, layer.input_global_scale_inv, is_sf_swizzled_layout=True
+            )
+            return (
+                blockscaled.mm_nvfp4(
+                    aq,
+                    sf,
+                    layer.weight,
+                    layer.weight_scale,
+                    layer.alpha,
+                    out_dtype=source.dtype,
+                )
+                + bias
+            )
+        aq, sf = _mxfp8_e4m3_quantize_torch(source)
+        return blockscaled.mm((aq, sf), packed, bias=bias, out_dtype=source.dtype)
+
+    for m in counts:
+        source = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        a16 = mode == "a16" or (
+            mode == "auto"
+            and resolve_precision(source.device, recipe, k, n).config.select(m)
+            is not None
+        )
+        expected = reference(source, a16)
+        for _ in range(3):
+            actual = kernel.apply_weights(layer, source, bias)
+        torch.testing.assert_close(actual, expected, atol=0.5, rtol=0.02)
+        freeze_kernel_resolution("vLLM dense precision replay")
+        try:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = kernel.apply_weights(layer, source, bias)
+            pointer = output.data_ptr()
+            for _ in range(2):
+                source.normal_()
+                output.fill_(float("nan"))
+                allocated = torch.accelerator.memory_allocated()
+                graph.replay()
+                torch.accelerator.synchronize()
+                assert torch.accelerator.memory_allocated() == allocated
+                assert output.data_ptr() == pointer
+                assert torch.isfinite(output).all() and torch.count_nonzero(output)
+        finally:
+            unfreeze_kernel_resolution()
+        expected = reference(source, a16)
+        relative = (output.float() - expected.float()).norm() / expected.float().norm()
+        assert relative < 0.005

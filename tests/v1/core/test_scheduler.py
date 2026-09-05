@@ -25,6 +25,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
+from vllm.v1.core.boundary_checkpoint import BoundaryCheckpointCache
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
@@ -51,6 +52,39 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_full_boundary_hit_preserves_async_speculative_decode_token_count():
+    """Sampling saved logits must not advance the processed-token frontier."""
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_v2_model_runner=True,
+        async_scheduling=True,
+        num_speculative_tokens=3,
+        speculative_method="ngram_gpu",
+    )
+    manager = scheduler.kv_cache_manager
+    manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
+    producer, repeat = create_requests(
+        num_requests=2,
+        num_tokens=32,
+        same_prompt=True,
+        req_ids=["producer", "repeat"],
+    )
+    manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(producer, 32) is not None
+    manager.publish_boundary_checkpoint(producer, 32, is_response=False)
+    manager.free(producer)
+    scheduler.add_request(repeat)
+
+    logits_step = scheduler.schedule()
+    assert logits_step.boundary_logits_only
+    assert logits_step.num_scheduled_tokens == {"repeat": 1}
+    assert repeat.num_computed_tokens == 32
+    assert repeat.num_output_placeholders == 1
+    decode_step = scheduler.schedule()
+    assert not decode_step.boundary_logits_only
+    assert decode_step.num_scheduled_tokens == {"repeat": 4}
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
@@ -1332,6 +1366,70 @@ def test_draft_slots_budgeted_per_scheduled_request(tmp_path, monkeypatch):
         scheduler.add_request(request)
 
     assert scheduler.schedule().num_scheduled_tokens == {"0": 10, "1": 4}
+
+
+@pytest.mark.parametrize(
+    ("num_requests", "num_tokens", "expected"),
+    [
+        (2, 8, {"0": 8, "1": 8}),
+        (5, 1, {"0": 1, "1": 1, "2": 1, "3": 1}),
+    ],
+)
+def test_dspark_uses_separate_draft_input_budget(
+    tmp_path, monkeypatch, num_requests, num_tokens, expected
+):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_seqs=16,
+        max_num_batched_tokens=16,
+        num_speculative_tokens=4,
+        parallel_drafting=True,
+        skip_tokenizer_init=True,
+    )
+    speculative_config = scheduler.vllm_config.speculative_config
+    assert speculative_config is not None
+    speculative_config.method = "dspark"
+
+    for request in create_requests(num_requests=num_requests, num_tokens=num_tokens):
+        scheduler.add_request(request)
+
+    assert scheduler.schedule().num_scheduled_tokens == expected
+
+
+@pytest.mark.parametrize(
+    ("num_requests", "num_tokens", "expected"),
+    [
+        (2, 10, {"0": 10, "1": 10}),
+        (3, 1, {"0": 1, "1": 1}),
+    ],
+)
+def test_dflash_uses_separate_query_input_budget(
+    tmp_path, monkeypatch, num_requests, num_tokens, expected
+):
+    """DFlash target and query forwards share their input buffer sequentially."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_seqs=16,
+        max_num_batched_tokens=20,
+        num_speculative_tokens=7,
+        skip_tokenizer_init=True,
+    )
+    speculative_config = scheduler.vllm_config.speculative_config
+    assert speculative_config is not None
+    speculative_config.method = "dflash"
+
+    for request in create_requests(num_requests=num_requests, num_tokens=num_tokens):
+        scheduler.add_request(request)
+
+    assert scheduler.schedule().num_scheduled_tokens == expected
 
 
 # Note - these test cases mirror some of those in test_rejection_sampler.py
@@ -3416,8 +3514,10 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.vllm_config.model_config.enable_return_routed_experts = False
     scheduler.enable_return_routed_experts = False
     scheduler.return_sampling_mask = False
+    scheduler.acceptance_length_controller = None
     scheduler.recompute_kv_load_failures = False
     scheduler.defer_block_free = False
+    scheduler.acceptance_length_controller = None
     scheduler.make_stats = Mock(return_value=None)
     scheduler.max_model_len = 128
 
@@ -3835,6 +3935,7 @@ def test_mamba_align_eagle_schedules_encoder_at_boundary():
     )
     scheduler.need_mamba_block_aligned_split = True
     scheduler.use_eagle = True
+    scheduler.drop_last_prefix_cache_block = True
     scheduler.num_prefill_lookahead = 1
     scheduler.max_num_encoder_input_tokens = 2048
     scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=2048)

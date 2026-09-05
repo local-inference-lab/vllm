@@ -190,6 +190,15 @@ if TYPE_CHECKING:
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
+    VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
+    VLLM_B12X_NVFP4_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
+    VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
+    VLLM_MXFP8_LM_HEAD: bool = True
+    VLLM_LM_HEAD_A16: bool = True
+    VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
+    VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
+    VLLM_MTP_NVFP4_LM_HEAD: bool = True
+    VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
@@ -1632,6 +1641,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force b12x FP4 MoE to use BF16 activations.
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FP4_FORCE_A16", "0"))
+    ),
+    # Dense activation precision; recipe overrides take precedence.
+    "VLLM_B12X_DENSE_ACTIVATION_MODE": env_with_choices(
+        "VLLM_B12X_DENSE_ACTIVATION_MODE", "auto", ["auto", "a16", "quantized"]
+    ),
+    "VLLM_B12X_NVFP4_ACTIVATION_MODE": env_with_choices(
+        "VLLM_B12X_NVFP4_ACTIVATION_MODE", None, ["auto", "a16", "quantized"]
+    ),
+    "VLLM_B12X_MXFP8_ACTIVATION_MODE": env_with_choices(
+        "VLLM_B12X_MXFP8_ACTIVATION_MODE", None, ["auto", "a16", "quantized"]
+    ),
+    # Quantize eligible unquantized LM heads on b12x by default; =0 opts out.
+    "VLLM_MXFP8_LM_HEAD": lambda: bool(int(os.getenv("VLLM_MXFP8_LM_HEAD", "1"))),
+    # Preserve BF16 activations in runtime-quantized NVFP4/MXFP8 LM heads.
+    "VLLM_LM_HEAD_A16": lambda: bool(int(os.getenv("VLLM_LM_HEAD_A16", "1"))),
+    "VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT": lambda: bool(
+        int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT", "1"))
+    ),
+    # Reuse uniform speculative metadata in the shared GDN/KDA backend.
+    "VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH": lambda: bool(
+        int(os.getenv("VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH", "1"))
+    ),
+    "VLLM_MTP_NVFP4_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_MTP_NVFP4_LM_HEAD", "1"))
+    ),
+    # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
+    "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "1"))
     ),
     # Gather DCP-sharded C4 records before B12X sparse-MLA prefill. This avoids
     # query replication plus the per-rank LSE combine and is opt-in while the

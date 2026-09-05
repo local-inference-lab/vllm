@@ -293,43 +293,11 @@ def build_attn_metadata(
     attn_metadata: dict[str, Any] = {}
     cached_attn_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+    group_slot_mappings = slot_mappings[:num_kv_cache_groups].unbind(0)
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
-        slot_mapping = slot_mappings[i]
-        # Per-group causal for hybrid drafters (mixed SWA/full attention).
-        group_causal = (
-            causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
-        )
-
-        common_attn_metadata_extra_kwargs = (
-            model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
-            if model_specific_attn_metadata is not None
-            else {}
-        )
-        # Model-specific metadata (e.g. Mamba hybrid) may supply its own
-        # padding-aware is_prefilling, which takes precedence over the default.
-        group_is_prefilling = common_attn_metadata_extra_kwargs.pop(
-            "is_prefilling", is_prefilling
-        )
-        common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=query_start_loc_gpu,
-            query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            max_seq_len=max_seq_len,
-            num_reqs=num_reqs,
-            num_actual_tokens=num_tokens,
-            max_query_len=max_query_len,
-            block_table_tensor=block_table,
-            slot_mapping=slot_mapping,
-            causal=group_causal,
-            dcp_local_seq_lens=dcp_local_seq_lens,
-            positions=positions,
-            is_prefilling=group_is_prefilling,
-            mm_req_doc_ranges=mm_req_doc_ranges,
-            rswa_prefix_lens=rswa_prefix_lens,
-            **common_attn_metadata_extra_kwargs,
-        )
+        slot_mapping = group_slot_mappings[i]
+        common_attn_metadata = None
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
@@ -337,35 +305,74 @@ def build_attn_metadata(
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
             cache_key = (kv_cache_spec, type(attn_metadata_builder))
-            if for_cudagraph_capture:
-                metadata = attn_metadata_builder.build_for_cudagraph_capture(
-                    common_attn_metadata
-                )
-            elif (
-                cache_key in cached_attn_metadata
+            if (
+                not for_cudagraph_capture
+                and cache_key in cached_attn_metadata
                 and attn_metadata_builder.supports_update_block_table
             ):
                 metadata = attn_metadata_builder.update_block_table(
-                    cached_attn_metadata[cache_key],
-                    common_attn_metadata.block_table_tensor,
-                    common_attn_metadata.slot_mapping,
+                    cached_attn_metadata[cache_key], block_table, slot_mapping
                 )
             else:
-                attn_metadata_extra_kwargs = (
-                    model_specific_attn_metadata.get_extra_attn_kwargs(
-                        attn_metadata_builder,
-                        num_reqs,
+                if common_attn_metadata is None:
+                    # Per-group causal for hybrid drafters (mixed SWA/full attention).
+                    group_causal = (
+                        causal
+                        if isinstance(causal, (bool, torch.Tensor))
+                        else causal.get(i, True)
                     )
-                    if model_specific_attn_metadata is not None
-                    else {}
-                )
-                metadata = attn_metadata_builder.build(
-                    common_prefix_len=0,
-                    common_attn_metadata=common_attn_metadata,
-                    **attn_metadata_extra_kwargs,
-                )
-                if attn_metadata_builder.supports_update_block_table:
-                    cached_attn_metadata[cache_key] = metadata
+
+                    common_attn_metadata_extra_kwargs = (
+                        model_specific_attn_metadata.get_extra_common_attn_kwargs(
+                            i, num_reqs
+                        )
+                        if model_specific_attn_metadata is not None
+                        else {}
+                    )
+                    # Model-specific padding takes precedence over the default.
+                    group_is_prefilling = common_attn_metadata_extra_kwargs.pop(
+                        "is_prefilling", is_prefilling
+                    )
+                    common_attn_metadata = CommonAttentionMetadata(
+                        query_start_loc=query_start_loc_gpu,
+                        query_start_loc_cpu=query_start_loc_cpu,
+                        seq_lens=seq_lens,
+                        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                        max_seq_len=max_seq_len,
+                        num_reqs=num_reqs,
+                        num_actual_tokens=num_tokens,
+                        max_query_len=max_query_len,
+                        block_table_tensor=block_table,
+                        slot_mapping=slot_mapping,
+                        causal=group_causal,
+                        dcp_local_seq_lens=dcp_local_seq_lens,
+                        positions=positions,
+                        is_prefilling=group_is_prefilling,
+                        mm_req_doc_ranges=mm_req_doc_ranges,
+                        rswa_prefix_lens=rswa_prefix_lens,
+                        **common_attn_metadata_extra_kwargs,
+                    )
+
+                if for_cudagraph_capture:
+                    metadata = attn_metadata_builder.build_for_cudagraph_capture(
+                        common_attn_metadata
+                    )
+                else:
+                    attn_metadata_extra_kwargs = (
+                        model_specific_attn_metadata.get_extra_attn_kwargs(
+                            attn_metadata_builder,
+                            num_reqs,
+                        )
+                        if model_specific_attn_metadata is not None
+                        else {}
+                    )
+                    metadata = attn_metadata_builder.build(
+                        common_prefix_len=0,
+                        common_attn_metadata=common_attn_metadata,
+                        **attn_metadata_extra_kwargs,
+                    )
+                    if attn_metadata_builder.supports_update_block_table:
+                        cached_attn_metadata[cache_key] = metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata

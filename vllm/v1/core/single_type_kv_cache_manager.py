@@ -138,6 +138,16 @@ class SingleTypeKVCacheManager(ABC):
             and num_local_computed_tokens % self.block_size != 0
         )
 
+    def prepare_boundary_replay(self, request_id: str, num_tokens: int) -> None:
+        """Protect a full tail page whose last row will be replayed by MTP."""
+        assert num_tokens > 0 and num_tokens % self.block_size == 0
+        block_idx = num_tokens // self.block_size - 1
+        self._partial_hit_reqs[request_id] = (
+            block_idx,
+            self.req_to_blocks[request_id][block_idx],
+        )
+        self.num_cached_block[request_id] = block_idx
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -921,10 +931,12 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         assert pcp_world_size == 1 or kv_cache_spec.dcp_replicated, (
             "PCP only supports sliding-window KV when it is replicated."
         )
-        # Fine-grained partial hits are not supported for sliding window now
-        assert alignment_tokens % kv_cache_spec.block_size == 0, (
-            "SlidingWindowManager does not support fine-grained (partial) cache hits"
-        )
+        # Fine-grained partial hits are not supported for sliding window now.
+        # Fall back to block-aligned hits instead of crashing the engine when
+        # the coordinator alignment is finer than this group's block size
+        # (e.g. a hybrid mamba target with a finer `prefix_match_unit`).
+        if alignment_tokens % kv_cache_spec.block_size != 0:
+            alignment_tokens = kv_cache_spec.block_size
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
@@ -1718,6 +1730,11 @@ class MambaManager(SingleTypeKVCacheManager):
         retention_interval: int | None = None,
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
+        if request.use_boundary_checkpoints:
+            # Keep transient running/rollback blocks private. Boundary bundles
+            # publish their own immutable state copies after GPU completion.
+            self.num_cached_block[request.request_id] = num_tokens // self.block_size
+            return
         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":

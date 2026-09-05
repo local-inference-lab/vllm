@@ -3,6 +3,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +16,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.determinism.batch_invariant import (
     linear_batch_invariant,
@@ -30,6 +32,47 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
+logger = init_logger(__name__)
+
+
+def _supports_default_lm_head_quantization(
+    recipe: Literal["mxfp8", "nvfp4"],
+    params_dtype: torch.dtype,
+    input_size: int,
+    output_size: int,
+) -> bool:
+    from vllm.config import get_current_vllm_config
+
+    config = get_current_vllm_config()
+    if (
+        config.model_config is None
+        or config.model_config.dtype != torch.bfloat16
+        or params_dtype != torch.bfloat16
+        or input_size % 128
+        or output_size % 8
+        or config.kernel_config.linear_backend not in ("auto", "b12x")
+        or not current_platform.is_cuda()
+        or not current_platform.is_device_capability_family(120)
+    ):
+        return False
+
+    if recipe == "nvfp4":
+        from vllm.model_executor.kernels.linear.nvfp4.b12x import (
+            B12xNvFp4LinearKernel,
+        )
+
+        return (
+            B12xNvFp4LinearKernel.__name__ not in envs.VLLM_DISABLED_KERNELS
+            and B12xNvFp4LinearKernel.is_supported()[0]
+        )
+
+    from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
+    from vllm.model_executor.kernels.linear.mxfp8.b12x import B12xMxfp8LinearKernel
+
+    try:
+        return isinstance(init_mxfp8_linear_kernel(), B12xMxfp8LinearKernel)
+    except ValueError:
+        return False
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -248,6 +291,7 @@ class VocabParallelEmbedding(PluggableLayer):
         prefix: str = "",
         *,
         disable_tp: bool = False,
+        lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None,
     ):
         super().__init__()
 
@@ -287,10 +331,65 @@ class VocabParallelEmbedding(PluggableLayer):
         if quant_method is None:
             quant_method = UnquantizedEmbeddingMethod()
 
-        # If we are making an embedding layer, then our quantization linear
-        # method must implement the embedding operation. If we are another
-        # layer type like ParallelLMHead, this is not important.
         is_embedding_layer = not isinstance(self, ParallelLMHead)
+        head_quantization = lm_head_quantization
+        if head_quantization is None and envs.VLLM_MXFP8_LM_HEAD:
+            head_quantization = "mxfp8"
+        self.runtime_lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None
+        if not is_embedding_layer and head_quantization is not None:
+            from vllm.config import get_current_vllm_config
+            from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+            from vllm.model_executor.layers.quantization.online.mxfp8 import (
+                Mxfp8OnlineLinearMethod,
+            )
+
+            unquantized = isinstance(
+                quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
+            )
+            flag = (
+                "VLLM_MTP_NVFP4_LM_HEAD"
+                if head_quantization == "nvfp4"
+                else "VLLM_MXFP8_LM_HEAD"
+            )
+            model_config = get_current_vllm_config().model_config
+            tied = getattr(
+                getattr(model_config, "hf_text_config", None),
+                "tie_word_embeddings",
+                False,
+            )
+            default_supported = _supports_default_lm_head_quantization(
+                head_quantization,
+                params_dtype or torch.get_default_dtype(),
+                embedding_dim,
+                self.num_embeddings_padded // self.tp_size,
+            )
+            if not envs.is_set(flag) and (
+                not unquantized or tied or not default_supported
+            ):
+                head_quantization = None
+            elif not unquantized:
+                raise ValueError(
+                    "Runtime LM head quantization requires an unquantized LM head "
+                    "checkpoint"
+                )
+            use_a16 = envs.VLLM_LM_HEAD_A16 and (
+                envs.is_set("VLLM_LM_HEAD_A16") or default_supported
+            )
+            if head_quantization == "nvfp4":
+                from vllm.model_executor.layers.quantization.online.nvfp4 import (
+                    Nvfp4OnlineLinearMethod,
+                )
+
+                quant_method = Nvfp4OnlineLinearMethod(use_a16=use_a16)
+            elif head_quantization == "mxfp8":
+                quant_method = Mxfp8OnlineLinearMethod(use_a16=use_a16)
+            self.runtime_lm_head_quantization = head_quantization
+            if head_quantization is not None:
+                logger.info_once(
+                    "Quantizing LM head shards to %s with %s activations.",
+                    head_quantization.upper(),
+                    "BF16" if use_a16 else "quantized",
+                )
         quant_method_implements_embedding = method_has_implemented_embedding(
             type(quant_method)
         )
@@ -549,6 +648,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         prefix: str = "",
         *,
         disable_tp: bool = False,
+        lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None,
     ):
         super().__init__(
             num_embeddings,
@@ -559,6 +659,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             quant_config,
             prefix,
             disable_tp=disable_tp,
+            lm_head_quantization=lm_head_quantization,
         )
         self.quant_config = quant_config
         if bias:

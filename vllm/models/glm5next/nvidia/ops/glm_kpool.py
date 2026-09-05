@@ -157,6 +157,7 @@ def _decode_update_kernel(
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     POOL_SIZE: tl.constexpr,
+    TAIL_CAPACITY: tl.constexpr,
     FP8_MAX: tl.constexpr,
     BLOCK_D: tl.constexpr,
     PACKED_MAIN_SLOTS: tl.constexpr,
@@ -169,7 +170,7 @@ def _decode_update_kernel(
     dim_mask = (dim < HEAD_DIM) & (state_slot >= 0)
     for row in tl.range(start, end):
         position = tl.load(positions + row).to(tl.int64)
-        physical_slot = position % POOL_SIZE
+        physical_slot = position % TAIL_CAPACITY
         current_key = tl.load(
             key + row * key_stride_0 + dim, mask=dim_mask, other=0.0
         ).to(tl.float32)
@@ -201,7 +202,8 @@ def _decode_update_kernel(
                 tail_offset = (
                     state_slot * tail_stride_0
                     + tail_stride_1
-                    + slot * tail_stride_2
+                    + ((position - POOL_SIZE + 1 + slot) % TAIL_CAPACITY)
+                    * tail_stride_2
                     + dim
                 )
                 score = tl.load(tail + tail_offset, mask=pool_mask, other=0.0).to(
@@ -219,7 +221,12 @@ def _decode_update_kernel(
             value = current_key
             score = current_gate
             if slot != POOL_SIZE - 1:
-                base = state_slot * tail_stride_0 + slot * tail_stride_2 + dim
+                base = (
+                    state_slot * tail_stride_0
+                    + ((position - POOL_SIZE + 1 + slot) % TAIL_CAPACITY)
+                    * tail_stride_2
+                    + dim
+                )
                 value = tl.load(tail + base, mask=pool_mask, other=0.0).to(tl.float32)
                 score = tl.load(
                     tail + base + tail_stride_1, mask=pool_mask, other=0.0
@@ -276,6 +283,7 @@ def _prefill_pool_kernel(
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     POOL_SIZE: tl.constexpr,
+    TAIL_CAPACITY: tl.constexpr,
     FP8_MAX: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -313,8 +321,9 @@ def _prefill_pool_kernel(
     for slot in tl.static_range(0, POOL_SIZE):
         source_row = completion_row - (POOL_SIZE - 1 - slot)
         from_current_chunk = source_row >= start
+        tail_slot = (completion_position - POOL_SIZE + 1 + slot) % TAIL_CAPACITY
         tail_offset = (
-            state_slot * tail_stride_0 + tail_stride_1 + slot * tail_stride_2 + dim
+            state_slot * tail_stride_0 + tail_stride_1 + tail_slot * tail_stride_2 + dim
         )
         current_score = tl.load(
             gate + source_row * gate_stride_0 + dim,
@@ -339,7 +348,8 @@ def _prefill_pool_kernel(
     for slot in tl.static_range(0, POOL_SIZE):
         source_row = completion_row - (POOL_SIZE - 1 - slot)
         from_current_chunk = source_row >= start
-        tail_offset = state_slot * tail_stride_0 + slot * tail_stride_2 + dim
+        tail_slot = (completion_position - POOL_SIZE + 1 + slot) % TAIL_CAPACITY
+        tail_offset = state_slot * tail_stride_0 + tail_slot * tail_stride_2 + dim
         current_value = tl.load(
             key + source_row * key_stride_0 + dim,
             mask=dim_mask & write_pool & from_current_chunk,
@@ -402,7 +412,7 @@ def _prefill_tail_kernel(
     key_stride_0,
     gate_stride_0,
     HEAD_DIM: tl.constexpr,
-    POOL_SIZE: tl.constexpr,
+    TAIL_CAPACITY: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     request = request_offset + tl.program_id(0)
@@ -412,11 +422,11 @@ def _prefill_tail_kernel(
     last_row = end - 1
     has_rows = end > start
     last_position = tl.load(positions + last_row, mask=has_rows, other=0).to(tl.int64)
-    last_physical_slot = last_position % POOL_SIZE
+    last_physical_slot = last_position % TAIL_CAPACITY
     dim = tl.arange(0, BLOCK_D)
     dim_mask = (dim < HEAD_DIM) & has_rows & (state_slot >= 0)
-    for slot in tl.static_range(0, POOL_SIZE):
-        distance = (last_physical_slot - slot + POOL_SIZE) % POOL_SIZE
+    for slot in tl.static_range(0, TAIL_CAPACITY):
+        distance = (last_physical_slot - slot + TAIL_CAPACITY) % TAIL_CAPACITY
         source_row = last_row - distance
         source_in_chunk = source_row >= start
         source_position = tl.load(
@@ -424,7 +434,9 @@ def _prefill_tail_kernel(
             mask=has_rows & source_in_chunk,
             other=-1,
         ).to(tl.int64)
-        write_slot = dim_mask & source_in_chunk & (source_position % POOL_SIZE == slot)
+        write_slot = (
+            dim_mask & source_in_chunk & (source_position % TAIL_CAPACITY == slot)
+        )
         value = tl.load(
             key + source_row * key_stride_0 + dim,
             mask=write_slot,
@@ -519,6 +531,7 @@ def update_decode_pools(
         PAGE_SIZE=page_size,
         HEAD_DIM=_HEAD_DIM,
         POOL_SIZE=_POOL_SIZE,
+        TAIL_CAPACITY=tail.shape[2],
         FP8_MAX=_FP8_MAX,
         BLOCK_D=128,
         num_warps=4,
@@ -553,7 +566,7 @@ def update_decode_pools(
             int(key.stride(0)),
             int(gate.stride(0)),
             HEAD_DIM=_HEAD_DIM,
-            POOL_SIZE=_POOL_SIZE,
+            TAIL_CAPACITY=tail.shape[2],
             BLOCK_D=128,
             num_warps=4,
         )

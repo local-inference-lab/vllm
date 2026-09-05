@@ -65,6 +65,11 @@ class QSAIndexer(nn.Module):
         """Return raw ``[T, Hi, Di]`` index queries and ``[T, Di]`` keys."""
 
         projected, _ = self.index_qk_proj(hidden_states)
+        return self.split_projection(projected)
+
+    def split_projection(
+        self, projected: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         query_width = self.index_q_heads * self.index_head_dim
         index_query, raw_index_key = projected.split(
             (query_width, self.index_head_dim), dim=-1

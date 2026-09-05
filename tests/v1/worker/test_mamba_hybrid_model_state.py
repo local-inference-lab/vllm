@@ -70,6 +70,8 @@ def test_reset_kv_cache_state_recreates_align_context(monkeypatch) -> None:
 
     assert state._mamba_ctx is None
     assert state._mamba_copy_funcs_by_type is None
+    assert state._aligned_metadata_ctx is None
+    assert state._aligned_metadata_groups is None
     assert state._mamba_group_ids is previous_group_ids
     assert state._mamba_spec is previous_spec
     assert state.recoverssm._step is None
@@ -82,6 +84,60 @@ def test_reset_kv_cache_state_recreates_align_context(monkeypatch) -> None:
 
     assert result is created_context
     assert initialized_with == [(kv_cache_config, forward_context, new_block_table)]
+
+
+def test_aligned_metadata_reuses_views_and_rebinds_with_the_cache() -> None:
+    state = object.__new__(MambaHybridModelState)
+    state._aligned_metadata_groups = None
+    state._aligned_metadata_ctx = None
+    state._aligned_metadata_builders = []
+    state._gdn_spec_accepted_tokens = torch.ones(3, dtype=torch.int32)
+    state._get_mamba_group_info = lambda _: ([1, 2], None)
+    builders = [
+        SimpleNamespace(
+            mamba_aligned_state_indices=None, mamba_spec_accepted_tokens=None
+        )
+        for _ in range(2)
+    ]
+    groups = [
+        [SimpleNamespace(get_metadata_builder=Mock(return_value=builder))]
+        for builder in builders
+    ]
+    attn_groups = [[], *groups]
+    indices = torch.arange(6, dtype=torch.int32).reshape(2, 3, 1)
+    ctx = SimpleNamespace(
+        aligned_state_indices=indices,
+        compute_aligned_state_indices=Mock(),
+    )
+    state._ensure_align_ctx = lambda *_: ctx
+    seq_lens = torch.tensor([10, 20, 0], dtype=torch.int32)
+    for num_reqs in (3, 2):
+        state._prepare_aligned_state_indices(seq_lens, num_reqs, attn_groups, None, ())
+        if num_reqs == 3:
+            views = [builder.mamba_aligned_state_indices for builder in builders]
+        indices.add_(10)
+        for index, builder in enumerate(builders):
+            assert builder.mamba_spec_accepted_tokens is state._gdn_spec_accepted_tokens
+            assert builder.mamba_aligned_state_indices is views[index]
+            torch.testing.assert_close(
+                builder.mamba_aligned_state_indices, indices[index]
+            )
+    for group in groups:
+        group[0].get_metadata_builder.assert_called_once_with(0)
+    assert ctx.compute_aligned_state_indices.call_count == 2
+
+    replacement = torch.full_like(indices, 42)
+    ctx = SimpleNamespace(
+        aligned_state_indices=replacement,
+        compute_aligned_state_indices=Mock(),
+    )
+    state._prepare_aligned_state_indices(seq_lens, 3, attn_groups, None, ())
+    for index, builder in enumerate(builders):
+        assert builder.mamba_aligned_state_indices is not views[index]
+        torch.testing.assert_close(
+            builder.mamba_aligned_state_indices, replacement[index]
+        )
+        torch.testing.assert_close(views[index], indices[index])
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")

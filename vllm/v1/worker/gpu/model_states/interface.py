@@ -151,6 +151,14 @@ class ModelState(ABC):
         across block boundaries. No-op by default."""
         return None
 
+    def get_recurrent_checkpoint_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return persistent per-request auxiliary state for boundary caching."""
+        return ()
+
+    def get_recurrent_checkpoint_acceptance(self) -> torch.Tensor:
+        """Return per-request selector acceptance for boundary MTP replay."""
+        raise NotImplementedError
+
     def postprocess_state(
         self,
         idx_mapping: torch.Tensor,

@@ -64,6 +64,8 @@ from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
     _resolve_layer_name,
+    aux_stream,
+    current_stream,
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -89,6 +91,54 @@ logger = init_logger(__name__)
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
+
+
+@triton.jit(do_not_specialize=["num_requests"])
+def _stage_b12x_gdn_metadata_kernel(
+    query_start_loc,
+    state_indices,
+    num_accepted_tokens,
+    out_query_start_loc,
+    out_state_indices,
+    out_num_accepted_tokens,
+    out_num_seqs,
+    out_num_tokens,
+    num_requests,
+    query_stride: tl.constexpr,
+    accepted_stride: tl.constexpr,
+    state_stride_0: tl.constexpr,
+    state_stride_1: tl.constexpr,
+    INPUT_COLUMNS: tl.constexpr,
+    STATE_COLUMNS: tl.constexpr,
+    MAX_SEQS: tl.constexpr,
+    HAS_ACCEPTED: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK)
+    boundaries = tl.load(
+        query_start_loc + offsets * query_stride, offsets <= num_requests, other=0
+    )
+    tl.store(out_query_start_loc + offsets, boundaries, offsets <= MAX_SEQS)
+    accepted = tl.full((BLOCK,), 1, tl.int32)
+    if HAS_ACCEPTED:
+        accepted = tl.load(
+            num_accepted_tokens + offsets * accepted_stride,
+            offsets < num_requests,
+            other=1,
+        )
+    tl.store(out_num_accepted_tokens + offsets, accepted, offsets < MAX_SEQS)
+
+    rows = offsets // STATE_COLUMNS
+    columns = offsets % STATE_COLUMNS
+    source_offsets = rows.to(tl.int64) * state_stride_0 + columns * state_stride_1
+    states = tl.load(
+        state_indices + source_offsets,
+        (rows < num_requests) & (columns < INPUT_COLUMNS),
+        other=0,
+    )
+    tl.store(out_state_indices + offsets, states, offsets < MAX_SEQS * STATE_COLUMNS)
+    tl.store(out_num_seqs, num_requests)
+    tl.store(out_num_tokens, tl.load(query_start_loc + num_requests * query_stride))
 
 
 def _resolve_gdn_decode_kernel(
@@ -412,6 +462,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         gqa_interleaved_layout=False,
         reduce_results: bool = True,
         prefer_b12x_gdn_decode: bool = False,
+        overlap_input_projections: bool = False,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
 
@@ -470,6 +521,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.in_proj_ba",
         )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
+        self.overlap_input_projections = (
+            overlap_input_projections and current_platform.is_cuda()
+        )
+        if self.overlap_input_projections:
+            aux_stream()
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -1082,8 +1138,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+        if self.overlap_input_projections:
+            mixed_qkvz, ba = torch.ops.vllm.qwen_gdn_input_projections(
+                hidden_states,
+                self.in_proj_qkvz.output_size_per_partition,
+                self.in_proj_ba.output_size_per_partition,
+                _encode_layer_name(self.prefix),
+            )
+        else:
+            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            ba, _ = self.in_proj_ba(hidden_states)
 
         use_fused_gdn_decode = (
             self.enable_fused_gdn_decode
@@ -1997,21 +2061,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_a[:num_input_tokens].copy_(a)
         self._b12x_b[:num_input_tokens].copy_(b)
         self._b12x_z[:num_input_tokens].copy_(output_gate)
-        self._b12x_query_start_loc.zero_()
-        self._b12x_query_start_loc[: num_requests + 1].copy_(
-            query_start_loc[: num_requests + 1]
+        _stage_b12x_gdn_metadata_kernel[(1,)](
+            query_start_loc,
+            state_indices,
+            num_accepted_tokens,
+            self._b12x_query_start_loc,
+            self._b12x_state_indices,
+            self._b12x_num_accepted_tokens,
+            self._b12x_num_seqs,
+            self._b12x_num_tokens,
+            num_requests,
+            query_start_loc.stride(0),
+            num_accepted_tokens.stride(0) if num_accepted_tokens is not None else 0,
+            state_indices.stride(0),
+            state_indices.stride(1),
+            INPUT_COLUMNS=state_indices.shape[1],
+            STATE_COLUMNS=self._b12x_state_index_columns,
+            MAX_SEQS=self._b12x_max_seqs,
+            HAS_ACCEPTED=num_accepted_tokens is not None,
+            BLOCK=triton.next_power_of_2(
+                max(
+                    self._b12x_max_seqs + 1,
+                    self._b12x_max_seqs * self._b12x_state_index_columns,
+                )
+            ),
+            num_warps=4,
         )
-        self._b12x_num_accepted_tokens.fill_(1)
-        if num_accepted_tokens is not None:
-            self._b12x_num_accepted_tokens[:num_requests].copy_(
-                num_accepted_tokens[:num_requests]
-            )
-        self._b12x_state_indices.zero_()
-        self._b12x_state_indices[:num_requests, : state_indices.shape[1]].copy_(
-            state_indices[:num_requests]
-        )
-        self._b12x_num_seqs.fill_(num_requests)
-        self._b12x_num_tokens.copy_(query_start_loc[num_requests : num_requests + 1])
 
         api.run(
             binding,
@@ -2253,6 +2328,50 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             output_gate[:num_actual_tokens],
             core_attn_out[:num_actual_tokens],
         )
+
+
+def qwen_gdn_input_projections(
+    hidden_states: torch.Tensor,
+    qkvz_size: int,
+    ba_size: int,
+    layer_name: LayerNameType,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    layer = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
+    if hidden_states.shape[0] > 16 or not torch.cuda.is_current_stream_capturing():
+        qkvz, _ = layer.in_proj_qkvz(hidden_states)
+        ba, _ = layer.in_proj_ba(hidden_states)
+        return qkvz, ba
+
+    stream = aux_stream()
+    assert stream is not None
+    main_stream = current_stream()
+    stream.wait_stream(main_stream)
+    hidden_states.record_stream(stream)
+    with torch.cuda.stream(stream):
+        ba, _ = layer.in_proj_ba(hidden_states)
+    qkvz, _ = layer.in_proj_qkvz(hidden_states)
+    main_stream.wait_stream(stream)
+    ba.record_stream(main_stream)
+    return qkvz, ba
+
+
+def _qwen_gdn_input_projections_fake(
+    hidden_states: torch.Tensor,
+    qkvz_size: int,
+    ba_size: int,
+    layer_name: LayerNameType,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        hidden_states.new_empty((*hidden_states.shape[:-1], qkvz_size)),
+        hidden_states.new_empty((*hidden_states.shape[:-1], ba_size)),
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen_gdn_input_projections",
+    op_func=qwen_gdn_input_projections,
+    fake_impl=_qwen_gdn_input_projections_fake,
+)
 
 
 def qwen_gdn_attention_core(

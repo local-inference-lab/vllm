@@ -74,6 +74,11 @@ usage() {
     "                                Initial adaptive depth (default: 3)." \
     "  ADAPTIVE_SPECULATIVE_TOKENS_WINDOW=N" \
     "                                Verification steps per update (default: 32)." \
+    "  VLLM_MXFP8_LM_HEAD=1          Runtime MXFP8 verifier head (default: 1)." \
+    "  VLLM_LM_HEAD_A16=1           BF16 head activations (default: 1)." \
+    "  VLLM_MTP_NVFP4_LM_HEAD=1     Separate NVFP4 MTP head (default: 1)." \
+    "  VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH=1" \
+    "                                Reuse KDA decode metadata (default: 1)." \
     "" \
     "All other arguments are forwarded to vLLM. Equivalent environment" \
     "variables use the TORCH_PROFILE_* names declared at the top of the script."
@@ -257,6 +262,10 @@ if [[ "${TP_SIZE}" == 2 ]]; then
 fi
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_B12X_MOE_FP4_FORCE_A16="${VLLM_B12X_MOE_FP4_FORCE_A16:-1}"
+export VLLM_MXFP8_LM_HEAD="${VLLM_MXFP8_LM_HEAD:-1}"
+export VLLM_LM_HEAD_A16="${VLLM_LM_HEAD_A16:-1}"
+export VLLM_MTP_NVFP4_LM_HEAD="${VLLM_MTP_NVFP4_LM_HEAD:-1}"
+export VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH="${VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH:-1}"
 
 speculative_args=()
 if ((NUM_SPECULATIVE_TOKENS > 0)); then

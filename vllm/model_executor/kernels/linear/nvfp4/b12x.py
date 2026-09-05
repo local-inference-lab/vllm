@@ -8,7 +8,7 @@ import torch
 from vllm._custom_ops import scaled_fp4_quant
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
-from vllm.utils.b12x import B12xWarmupUnit
+from vllm.utils.b12x import B12xWarmupUnit, get_b12x_dense_activation_mode
 from vllm.utils.b12x import (
     get_b12x_blockscaled as _import_b12x_blockscaled,
 )
@@ -18,30 +18,40 @@ from .base import NvFp4LinearKernel, NvFp4LinearLayerConfig
 
 
 def _apply_b12x_nvfp4_linear(
+    layer: torch.nn.Module,
     x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale_storage: torch.Tensor,
-    input_global_scale_inv: torch.Tensor,
-    alpha: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
     blockscaled = _import_b12x_blockscaled()
     assert blockscaled is not None
 
-    output_size = int(weight.shape[0])
+    output_size = int(layer.weight.shape[0])
     output_shape = [*x.shape[:-1], output_size]
     x_2d = x.reshape(-1, x.shape[-1])
+    mode = layer.b12x_activation_mode
+    if x.dtype == torch.bfloat16 and layer.b12x_bf16_input_supported:
+        output = blockscaled.mm(
+            x_2d.contiguous(),
+            layer.b12x_nvfp4_packed_weight,
+            mode=mode,
+            activation_global_scale=layer.input_global_scale_inv,
+            bias=bias,
+            expected_m=max(1, int(x_2d.shape[0])),
+        )
+        return output.view(*output_shape)
+    if mode == "a16":
+        raise ValueError("b12x NVFP4 A16 requires BF16 on SM120/SM121 with K%128=N%8=0")
     x_packed, x_scale_swizzled = scaled_fp4_quant(
         x_2d,
-        input_global_scale_inv,
+        layer.input_global_scale_inv,
         is_sf_swizzled_layout=True,
     )
     output = blockscaled.mm_nvfp4(
         x_packed,
         x_scale_swizzled,
-        weight,
-        weight_scale_storage,
-        alpha,
+        layer.weight,
+        layer.weight_scale,
+        layer.alpha,
         out_dtype=x.dtype,
     )
     if bias is not None:
@@ -66,6 +76,11 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
             return False, "Install the B12X backend with `pip install vllm[b12x]`"
         if not blockscaled.is_supported():
             return False, "b12x native NVFP4 GEMM is not supported"
+        if not hasattr(blockscaled, "w4a16"):
+            return (
+                False,
+                "b12x NVFP4 requires a source build with dense precision selection",
+            )
         return True, None
 
     @classmethod
@@ -80,6 +95,21 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
             layer,
             "weight_scale",
             intrinsics.swizzle_block_scale(layer.weight_scale.data),
+        )
+        blockscaled = _import_b12x_blockscaled()
+        assert blockscaled is not None
+        layer.b12x_nvfp4_packed_weight = blockscaled.pack_weight(
+            layer.weight.data,
+            layer.weight_scale.data,
+            recipe="nvfp4",
+            global_scale=layer.weight_global_scale,
+        )
+        layer.b12x_activation_mode = get_b12x_dense_activation_mode("nvfp4")
+        n, packed_k = layer.weight.shape
+        layer.b12x_bf16_input_supported = (
+            current_platform.is_device_capability_family(120)
+            and (packed_k * 2) % 128 == 0
+            and n % 8 == 0
         )
         layer.b12x_warmup_provider = self
 
@@ -100,11 +130,8 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
                     (tokens, k), dtype=output_dtype, device=weight.device
                 )
                 _apply_b12x_nvfp4_linear(
+                    layer,
                     source,
-                    weight,
-                    weight_scale,
-                    layer.input_global_scale_inv,
-                    layer.alpha,
                     None,
                 )
 
@@ -117,6 +144,8 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
                 k,
                 weight.dtype,
                 weight_scale.dtype,
+                layer.b12x_activation_mode,
+                layer.b12x_bf16_input_supported,
                 output_dtype,
             ),
             compile=compile,
@@ -129,11 +158,8 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return _apply_b12x_nvfp4_linear(
+            layer,
             x,
-            layer.weight,
-            layer.weight_scale,
-            layer.input_global_scale_inv,
-            layer.alpha,
             bias,
         )
 

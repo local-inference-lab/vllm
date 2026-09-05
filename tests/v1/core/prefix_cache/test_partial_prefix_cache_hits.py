@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.request import RequestStatus
 
 
 @pytest.fixture(autouse=True)
@@ -78,6 +79,7 @@ def make_full_mamba_manager(
     num_blocks: int = 32,
     use_eagle: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
+    enable_boundary_checkpoints: bool = False,
 ):
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
@@ -116,7 +118,92 @@ def make_full_mamba_manager(
         scheduler_block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
         use_eagle=use_eagle,
+        enable_boundary_checkpoints=enable_boundary_checkpoints,
     )
+
+
+@pytest.mark.parametrize("prompt_len", [3, 4, 5, 7, 8, 9])
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_request_boundaries_reuse_exact_prompt_and_response_with_private_state(
+    prompt_len,
+    use_eagle,
+):
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=4,
+        num_blocks=64,
+        enable_boundary_checkpoints=True,
+        use_eagle=use_eagle,
+    )
+    request = make_request("producer", list(range(prompt_len)), 4, sha256)
+    _, hit, _ = manager.get_computed_blocks(request)
+    assert hit == 0
+    assert manager.allocate_slots(request, prompt_len) is not None
+    prompt = manager.publish_boundary_checkpoint(request, prompt_len, is_response=False)
+    assert prompt is not None
+    request.num_computed_tokens = prompt_len
+    request.append_output_token_ids([20])
+    assert manager.allocate_slots(request, 1) is not None
+    request.num_computed_tokens += 1
+    request.append_output_token_ids([21])
+    request.status = RequestStatus.FINISHED_STOPPED
+    response = manager.publish_boundary_checkpoint(
+        request, prompt_len + 1, is_response=True
+    )
+    assert response is not None
+    manager.free(request)
+    assert len(manager.boundary_checkpoints) == 2
+
+    repeat = make_request("repeat", list(range(prompt_len)), 4, sha256)
+    blocks, hit, _ = manager.get_computed_blocks(repeat)
+    assert hit == prompt_len
+    assert manager.allocate_slots(repeat, 1, hit, blocks) is not None
+    if use_eagle or prompt_len % 4:
+        # MTP replays the last row even at a physical page boundary.
+        attention = manager.get_blocks(repeat.request_id).blocks[0]
+        assert attention[(prompt_len - 1) // 4].block_id != prompt.block_ids[0][-1]
+    state_blocks = manager.get_blocks(repeat.request_id).blocks[1]
+    # An unaligned restore has a private working copy; aligned restores
+    # append a fresh running block after the cached state.
+    assert state_blocks[-1].block_id != prompt.block_ids[1][-1]
+    manager.free(repeat)
+
+    continuation = make_request(
+        "continuation", list(range(prompt_len)) + [20, 21, 22], 4, sha256
+    )
+    blocks, hit, _ = manager.get_computed_blocks(continuation)
+    assert hit == prompt_len + 1
+    assert manager.allocate_slots(continuation, 2, hit, blocks) is not None
+    manager.free(continuation)
+    _, retained = manager.take_kv_cache_block_copies()
+    manager.block_pool.free_blocks(retained)
+    assert manager.reset_prefix_cache()
+
+
+def test_request_boundaries_keep_prompt_but_no_intermediate_recurrent_states():
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=4,
+        num_blocks=64,
+        enable_boundary_checkpoints=True,
+    )
+    request = make_request("producer", [1, 2, 3], 4, sha256)
+    manager.get_computed_blocks(request)
+    assert manager.allocate_slots(request, 3) is not None
+    checkpoint = manager.publish_boundary_checkpoint(request, 3, is_response=False)
+    request.num_computed_tokens = 3
+    for token in range(12):
+        request.append_output_token_ids([token + 10])
+        assert manager.allocate_slots(request, 1) is not None
+        request.num_computed_tokens += 1
+        assert len(manager.boundary_checkpoints) == 1
+        states = manager.get_blocks(request.request_id).blocks[1]
+        assert sum(not block.is_null for block in states) <= 2
+        assert all(block.block_hash is None for block in states)
+    repeat = make_request("repeat", [1, 2, 3], 4, sha256)
+    assert manager.boundary_checkpoints.find(repeat, 3) == checkpoint
+    manager.free(request)
+    assert manager.reset_prefix_cache()
 
 
 @pytest.mark.parametrize("dcp_world_size", [1, 4])
@@ -134,6 +221,7 @@ def test_mamba_align_split_partial_tail_schedule(dcp_world_size: int):
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle=False,
         hash_block_size=hash_block_size,
+        drop_last_prefix_cache_block=False,
         dcp_world_size=dcp_world_size,
         scheduler_block_size=scheduler_block_size,
         mamba_partial_cache_hit=True,
@@ -182,6 +270,7 @@ def test_mamba_align_split_when_block_exceeds_scheduling_budget():
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle=False,
         hash_block_size=32,
+        drop_last_prefix_cache_block=False,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
     )
@@ -221,6 +310,7 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
         ),
         use_eagle=False,
         hash_block_size=32,
+        drop_last_prefix_cache_block=False,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
     )

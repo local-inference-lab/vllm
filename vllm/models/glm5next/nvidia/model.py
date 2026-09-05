@@ -87,6 +87,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.utils.b12x import get_b12x_mhc
 
+from . import l2_prefetch as _l2pf
 from .attention import Glm5NextMLAAttention
 from .kda import Glm5NextLinearAttention
 from .multimodal import (
@@ -415,6 +416,12 @@ class Glm5NextDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # Cached for the hot forward path (isinstance per layer per step).
         self._mlp_is_moe = isinstance(self.mlp, Glm5NextMoE)
+        # L2 weight prefetch (see l2_prefetch.py); plans are built lazily on
+        # the first forward, after weights are loaded and post-processed.
+        object.__setattr__(self, "_l2pf_next", None)
+        self._l2pf_ready = False
+        self._l2pf_plan_b: _l2pf.L2PrefetchPlan | None = None
+        self._l2pf_plan_c: _l2pf.L2PrefetchPlan | None = None
         # In SP, the attention output projection leaves a partial sum; the
         # decoder-layer reduce_scatter after attention completes it (DSv4 pattern).
         # MTP layers use the non-mHC path which has no sp_reduce_scatter, so
@@ -525,6 +532,8 @@ class Glm5NextDecoderLayer(nn.Module):
         # hc_post inputs (its ffn-pre outputs); when present, fuse that
         # hc_post with this layer's attn hc_pre into one kernel (inter-layer
         # fusion). Layer 0 has no incoming state -> standalone hc_pre.
+        if _l2pf.ENABLED and not self._l2pf_ready:
+            self._l2pf_build_plans()
         x = hidden_states
         if post is None:
             if self._b12x_mhc is not None:
@@ -575,6 +584,10 @@ class Glm5NextDecoderLayer(nn.Module):
         if self.is_sequence_parallel:
             x = sp_reduce_scatter(x)
 
+        # L2 prefetch window B (fallback issue point when no pre-reduce hook).
+        if _l2pf.ENABLED and not getattr(self, "_l2pf_hooked_b", False):
+            _l2pf.issue(self._l2pf_plan_b, x.shape[0])
+
         # Fuse post-attn hc_post + pre-FFN hc_pre (+ RMSNorm) into one kernel.
         residual, post, comb, x = self.hc_fused_post_pre(
             x,
@@ -597,12 +610,207 @@ class Glm5NextDecoderLayer(nn.Module):
         # mHC end. The last mHC layer materializes its final hc_post (nothing
         # to fuse with) then contracts; every other layer defers its hc_post to
         # the next layer's fused pre, returning the state.
+        # L2 prefetch window C (fallback issue point when no pre-reduce hook).
+        if _l2pf.ENABLED and not getattr(self, "_l2pf_hooked_c", False):
+            _l2pf.issue(self._l2pf_plan_c, x.shape[0])
+
         if self.layer_idx == self.num_hidden_layers - 1:
             x = self.hc_post(x, residual, post, comb)
             x = hc_contract(x, self.n)
             return x, None, None, None
 
         return x, residual, post, comb
+
+    # ---- L2 weight prefetch planning (see l2_prefetch.py) -------------------
+    _ATTN_SKIP = ("o_proj", "kv_b_proj", "indexer.index_kpool", "indexer.weights_proj")
+
+    def _l2pf_build_plans(self) -> None:
+        self._l2pf_ready = True
+        try:
+            device = next(self.parameters()).device
+            router_segments: list[_l2pf.Segment] = []
+            if self._mlp_is_moe:
+                # Router weight is read right after the post-attention mHC.
+                router_segments = _l2pf.segments_of(
+                    self.mlp.gate, "mlp.gate.", min_bytes=0
+                )
+            # Window B starts before the attention-output reduction. These
+            # tensors are consumed by the post-attention mHC immediately after
+            # that reduction, so carrying them ahead avoids latency-bound cold
+            # reads without displacing the following projection materially.
+            segs_b = _l2pf.segments_of(
+                self.post_attention_layernorm,
+                "post_attention_layernorm.",
+                min_bytes=0,
+            )
+            for attr in ("hc_ffn_base", "hc_ffn_scale", "hc_ffn_fn"):
+                segment = _l2pf.tensor_segment(attr, getattr(self, attr, None))
+                if segment is not None:
+                    segs_b.append(segment)
+            segs_b += router_segments
+            # Dense-MLP layers (first 3): their 75 MB MLP weights are consumed
+            # right after attention with no idle window -> never prefetched.
+            nxt = self._l2pf_next
+            nxt_segs: list[_l2pf.Segment] = []
+            if nxt is not None:
+                # The next layer consumes its mHC and normalization state before
+                # its first attention projection. Preserve that consumption
+                # order in the prefetch plan, including sub-64-KiB parameters.
+                for attr in (
+                    "hc_attn_fn_broadcast",
+                    "hc_attn_fn",
+                    "hc_attn_scale",
+                    "hc_attn_base",
+                ):
+                    segment = _l2pf.tensor_segment(
+                        f"L{nxt.layer_idx}.{attr}", getattr(nxt, attr, None)
+                    )
+                    if segment is not None:
+                        nxt_segs.append(segment)
+                nxt_segs += _l2pf.segments_of(
+                    nxt.input_layernorm,
+                    f"L{nxt.layer_idx}.input_layernorm.",
+                    min_bytes=0,
+                )
+                # The next layer's o_proj (and MLA kv_b, unused at decode) are
+                # prefetched inside that layer's own attention window (A).
+                nxt_segs += _l2pf.segments_of(
+                    nxt.self_attn,
+                    f"L{nxt.layer_idx}.self_attn.",
+                    skip=self._ATTN_SKIP,
+                    min_bytes=0,
+                )
+            # Window A of this layer's attention: its o_proj plus a head slice
+            # of the next layer's first projection (it survives the expert
+            # stream and shortens window C so the tail is resident in time).
+            is_mla = hasattr(self.self_attn, "mla_attn")
+            segs_a = _l2pf.segments_of(self.self_attn.o_proj, "o_proj.")
+            if nxt_segs and _l2pf.A_NEXT_BYTES > 0 and not is_mla:
+                head_a, rest_first = _l2pf.take_budget(nxt_segs[:1], _l2pf.A_NEXT_BYTES)
+                segs_a += head_a
+                nxt_segs = rest_first + nxt_segs[1:]
+            budget_a = _l2pf.BUDGET_A_MLA if is_mla else _l2pf.BUDGET_A
+            # MLA materializes its absorbed decode weights while executing the
+            # first query projection. Build that attention plan from the hook
+            # immediately after the projection, rather than permanently
+            # omitting tensors which did not exist at layer-entry time.
+            plan_a = None
+            if not is_mla:
+                plan_a, _ = _l2pf.make_plan(segs_a, budget_a, device)
+            plan_b, rest = _l2pf.make_plan(segs_b + nxt_segs, _l2pf.BUDGET_B, device)
+            plan_c, dropped = _l2pf.make_plan(rest, _l2pf.BUDGET_C, device)
+            self._l2pf_plan_b = plan_b
+            self._l2pf_plan_c = plan_c
+            # Fire windows B/C before the all-reduces (+10 us of idle window
+            # each): hooks on this layer's o_proj and on the MoE runner (or the
+            # dense MLP's down_proj).  The in-forward issue points below stay
+            # as the fallback when a hook target is missing.
+            self._l2pf_hooked_b = False
+            self._l2pf_hooked_c = False
+            o_proj = getattr(self.self_attn, "o_proj", None)
+            if (
+                o_proj is not None
+                and plan_b is not None
+                and getattr(o_proj, "reduce_results", False)
+            ):
+                object.__setattr__(
+                    o_proj,
+                    "_l2_prefetch_pre_reduce_hook",
+                    lambda n, p=plan_b: _l2pf.issue(p, n),
+                )
+                self._l2pf_hooked_b = True
+            target_c = (
+                self.mlp.experts
+                if self._mlp_is_moe
+                else getattr(self.mlp, "down_proj", None)
+            )
+            if target_c is not None and plan_c is not None:
+                object.__setattr__(
+                    target_c,
+                    "_l2_prefetch_pre_reduce_hook",
+                    lambda n, p=plan_c: _l2pf.issue(p, n),
+                )
+                self._l2pf_hooked_c = True
+            # Window A fires inside the attention layer, right after its first
+            # projection (hook in the shared KDA / MLA layers).
+            target = self.self_attn.mla_attn if is_mla else self.self_attn
+            if is_mla:
+                mla_state: dict[str, _l2pf.L2PrefetchPlan | bool | None] = {
+                    "ready": False,
+                    "plan": None,
+                }
+
+                def issue_mla_window_a(
+                    num_tokens: int,
+                    wrapper=target,
+                    state=mla_state,
+                    layer_idx=self.layer_idx,
+                    o_proj_segments=segs_a,
+                ) -> None:
+                    if not state["ready"]:
+                        mla_layer = getattr(wrapper, "mla_attn", None)
+                        attn_impl = getattr(mla_layer, "impl", None)
+                        resolved = list(o_proj_segments)
+                        seen = {segment[1] for segment in resolved}
+                        # The generic MLA layer owns W_UV/W_UK_T. Specialized
+                        # backends may instead own packed W_UV/W_UK variants
+                        # on their implementation object.
+                        for owner_name, owner in (
+                            ("mla_attn", mla_layer),
+                            ("impl", attn_impl),
+                        ):
+                            for attr in (
+                                "W_UV",
+                                "W_UK_T",
+                                "W_UK",
+                                "W_K",
+                                "W_V",
+                            ):
+                                tensor = (
+                                    getattr(owner, attr, None)
+                                    if owner is not None
+                                    else None
+                                )
+                                segment = _l2pf.tensor_segment(
+                                    f"{owner_name}.{attr}", tensor, min_bytes=0
+                                )
+                                if segment is not None and segment[1] not in seen:
+                                    resolved.append(segment)
+                                    seen.add(segment[1])
+                        state["plan"], _ = _l2pf.make_plan(
+                            resolved, _l2pf.BUDGET_A_MLA, device
+                        )
+                        state["ready"] = True
+                        if layer_idx in (0, 3, 4):
+                            dynamic_plan = state["plan"]
+                            logger.info(
+                                "[l2_prefetch] layer %d deferred MLA A: %s",
+                                layer_idx,
+                                dynamic_plan.describe() if dynamic_plan else "-",
+                            )
+                    _l2pf.issue(state["plan"], num_tokens)
+
+                object.__setattr__(target, "_l2_prefetch_hook", issue_mla_window_a)
+            elif plan_a is not None:
+                object.__setattr__(
+                    target, "_l2_prefetch_hook", lambda n, p=plan_a: _l2pf.issue(p, n)
+                )
+            is_logged_layer = self.layer_idx in (0, 2, 3, 4)
+            if is_logged_layer or self.layer_idx == self.num_hidden_layers - 1:
+                logger.info(
+                    "[l2_prefetch] layer %d A: %s | B: %s | C: %s | dropped %.1f MB",
+                    self.layer_idx,
+                    "deferred" if is_mla else (plan_a.describe() if plan_a else "-"),
+                    plan_b.describe() if plan_b else "-",
+                    plan_c.describe() if plan_c else "-",
+                    sum(s[2] for s in dropped) / 1e6,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[l2_prefetch] layer %d plan failed: %s", self.layer_idx, exc
+            )
+            self._l2pf_plan_b = None
+            self._l2pf_plan_c = None
 
     def hc_pre(
         self,
@@ -747,6 +955,18 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         # The active slice is fixed after construction; cache it so forward
         # doesn't rebuild the slice (a fresh list) every step.
         self._active_layers = self.layers[self.start_layer : self.end_layer]
+        # L2 prefetch chain: each layer prefetches its successor's projections;
+        # the last layer prefetches the first layer's for the next step.
+        # (object.__setattr__ keeps the link out of the nn.Module registry.)
+        active = list(self._active_layers)
+        for i, layer in enumerate(active):
+            object.__setattr__(layer, "_l2pf_next", active[(i + 1) % len(active)])
+        if _l2pf.ENABLED and active:
+            prefetch_device = next(active[0].parameters()).device
+            if prefetch_device.type == "cuda":
+                # Create the side stream and apply the optional context-wide L2
+                # reservation before any CUDA graph capture can begin.
+                _l2pf.L2Prefetcher.get(prefetch_device)
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -850,6 +1070,11 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 if self.is_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 aux_hidden_states.append(aux_hidden_state)
+
+        # Rejoin the L2 prefetch side stream once per forward, before any
+        # early return, so a CUDA-graph capture never ends with a forked
+        # side stream (capture safety on every PP rank).
+        _l2pf.join_all()
 
         if not get_pp_group().is_last_rank:
             # Pipeline parallelism is rejected because post/comb are the
@@ -1335,7 +1560,8 @@ def _try_load_fp8_attn_proj(
         return False
 
     entry = buf.setdefault(layer_prefix, {}).setdefault(key, {})
-    entry["weight" if is_weight else "scale"] = tensor
+    # Streaming loaders can recycle the source before the paired tensor arrives.
+    entry["weight" if is_weight else "scale"] = tensor.clone()
     if "weight" not in entry or "scale" not in entry:
         return True
 
@@ -1386,7 +1612,8 @@ def _try_load_mxfp8_bf16_attn_proj(
         return False
 
     entry = buf.setdefault(layer_prefix, {}).setdefault("indexer_weights", {})
-    entry["weight" if is_weight else "scale"] = tensor
+    # Streaming loaders can recycle the source before the paired tensor arrives.
+    entry["weight" if is_weight else "scale"] = tensor.clone()
     if "weight" not in entry or "scale" not in entry:
         return True
 

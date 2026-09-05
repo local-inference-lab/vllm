@@ -405,17 +405,22 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             self.vllm_config.scheduler_config.max_num_batched_tokens
         )
 
-        # Handle MTP: adjust decode_threshold like the indexer does
+        # DSpark's target verifier consumes the bonus token plus K draft
+        # tokens. Its parallel drafter's own query shape does not change this
+        # target-side decode/prefill boundary.
         spec_config = self.vllm_config.speculative_config
         self.num_speculative_tokens = (
             spec_config.num_speculative_tokens if spec_config else 0
         )
-        # Decode can have query_len up to
-        #   1 + (2 if parallel drafting else 1) * num_speculative_tokens.
-        # sparse_swa has no MQA-vs-dense-MHA routing, so multi-token queries take
-        # the prefill path and the decode/prefill split stays at that width.
+        self.is_dspark = spec_config is not None and spec_config.use_dspark()
         spec_mult = (
-            2 if (spec_config is not None and spec_config.parallel_drafting) else 1
+            2
+            if (
+                spec_config is not None
+                and spec_config.parallel_drafting
+                and not self.is_dspark
+            )
+            else 1
         )
         self.decode_threshold = 1 + spec_mult * self.num_speculative_tokens
         self.reorder_batch_threshold = None
@@ -475,7 +480,6 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # so its per-token index list is wider than `window_size`. The kernel pads
         # the q-head count to B_TOPK. Pad to a kernel-supported width; the logical
         # SWA window remains unchanged when the padded matrix is built.
-        self.is_dspark = spec_config is not None and spec_config.use_dspark()
         self.noncausal_index_width = (
             get_dspark_swa_index_width(
                 self.window_size,

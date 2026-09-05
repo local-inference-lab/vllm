@@ -163,6 +163,16 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def get_prefill_fairness(self) -> dict[str, Any]:
+        """Return the active decode/prefill fairness policy."""
+        ...
+
+    @abstractmethod
+    async def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Replace fairness policy settings without reloading the model."""
+        ...
+
+    @abstractmethod
     async def sleep(self, level: int = 1, mode: "PauseMode" = "abort") -> None:
         """Sleep the engine"""
         ...

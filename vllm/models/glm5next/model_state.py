@@ -125,7 +125,11 @@ class Glm5NextModelState(MambaHybridModelState):
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         prefix_length = int(new_req_data.num_computed_tokens)
-        if self.uses_pooled_selector and prefix_length % self.selector_pool_size != 0:
+        if (
+            self.uses_pooled_selector
+            and prefix_length % self.selector_pool_size != 0
+            and new_req_data.boundary_checkpoint is None
+        ):
             raise ValueError(
                 "GLM5Next pooled selector cannot resume a fresh request from "
                 f"num_computed_tokens={prefix_length}; the prefix length must be "
@@ -143,6 +147,15 @@ class Glm5NextModelState(MambaHybridModelState):
         if self.uses_pooled_selector:
             self.selector_state_is_fresh_gpu.fill_(True)
             self.selector_committed_num_accepted_tokens_gpu.fill_(1)
+
+    def get_recurrent_checkpoint_tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self.selector_state_is_fresh_gpu,
+            self.selector_committed_num_accepted_tokens_gpu,
+        )
+
+    def get_recurrent_checkpoint_acceptance(self) -> torch.Tensor:
+        return self.selector_committed_num_accepted_tokens_gpu
 
     def _prepare_selector_state(
         self,
@@ -310,25 +323,13 @@ class Glm5NextModelState(MambaHybridModelState):
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
         if self._align_mode:
-            mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
-            aligned_index_builders = []
-            for group_idx, group_id in enumerate(mamba_group_ids):
-                for group in attn_groups[group_id]:
-                    builder = group.get_metadata_builder(0)
-                    if hasattr(builder, "mamba_aligned_state_indices"):
-                        aligned_index_builders.append((group_idx, builder))
-            if aligned_index_builders:
-                ctx = self._ensure_align_ctx(
-                    kv_cache_config,
-                    mamba_group_ids,
-                    block_tables,
-                )
-                all_group_indices = ctx.compute_aligned_state_indices(
-                    input_batch.seq_lens,
-                    num_reqs,
-                )
-                for group_idx, builder in aligned_index_builders:
-                    builder.mamba_aligned_state_indices = all_group_indices[group_idx]
+            self._prepare_aligned_state_indices(
+                input_batch.seq_lens,
+                num_reqs,
+                attn_groups,
+                kv_cache_config,
+                block_tables,
+            )
 
         model_metadata = Glm5NextAttnMetadata(
             is_prefilling=is_prefilling,

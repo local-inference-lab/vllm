@@ -375,6 +375,8 @@ class ModelRunnerOutput:
 
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
+    # Per request: completed prompt and response checkpoint token counts, or 0.
+    boundary_checkpoint_tokens: list[list[int]] | None = None
 
     @staticmethod
     def with_kv_conn_output_only(

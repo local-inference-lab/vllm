@@ -72,6 +72,11 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
     max_num_scheduled_tokens = worker.scheduler_config.max_num_scheduled_tokens
     if max_num_scheduled_tokens is not None:
         max_tokens = max(max_tokens, max_num_scheduled_tokens)
+    num_speculative_tokens = int(
+        getattr(worker.vllm_config, "num_speculative_tokens", 0) or 0
+    )
+    if 0 < num_speculative_tokens < max_tokens:
+        serving_sizes.append(max_tokens - num_speculative_tokens)
     token_counts = b12x_warmup_token_counts(
         max_tokens=max_tokens,
         cudagraph_capture_sizes=serving_sizes,

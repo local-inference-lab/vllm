@@ -194,6 +194,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         k_pe = k_pe.unsqueeze(1)
 
         q = q_proj_layer(q_proj_input)[0]
+        # Optional model-installed callback (e.g. GLM-5.3 L2 weight prefetch of
+        # o_proj while the indexer, rope and attention core run).
+        _hook = getattr(self, "_l2_prefetch_hook", None)
+        if _hook is not None:
+            _hook(hidden_states.shape[0])
         heads = self.num_heads
         if self.dcp_q_replicate:
             heads *= q_proj_layer.group_size

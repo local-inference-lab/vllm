@@ -20,6 +20,7 @@ logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority"]
+FairnessEngine = Literal["compute_share", "micro_slicing"]
 
 
 @config
@@ -144,6 +145,48 @@ class SchedulerConfig:
     """Schedule prefill work once every N engine steps while decode requests
     are running. Data-parallel engines align the cadence across DP ranks."""
 
+    fairness_engine: FairnessEngine | None = None
+    """Optional decode/prefill fairness policy.
+
+    ``compute_share`` uses measured accelerator time to target a prefill share.
+    ``micro_slicing`` bounds local prefill work in mixed decode/prefill steps.
+    When unset, the legacy scheduler path is unchanged.
+    """
+
+    prefill_compute_share: float | None = Field(default=None, gt=0.0, lt=1.0)
+    """Target fraction of contended model-execution time assigned to prefill.
+
+    When unset, scheduling behavior is unchanged. Values must be strictly
+    between zero and one so both decode and prefill continue to make progress.
+    """
+
+    max_num_prefill_tokens_per_step: int = Field(default=0, ge=0)
+    """Maximum local prefill tokens in a step that also has eligible decode.
+
+    Used only by ``micro_slicing``. Zero disables the separate mixed-step
+    budget; prefill-only steps retain the normal batched-token budget.
+    """
+
+    max_num_partial_prefills: int = Field(default=0, ge=0)
+    """Maximum locally-computing partial prefills under ``micro_slicing``.
+
+    Zero means unlimited. Asynchronous external-cache restores do not consume
+    this limit because they do not use model compute.
+    """
+
+    decode_prefill_min_decode_steps: int = Field(default=0, ge=0)
+    """Minimum decode-only steps between mixed-prefill service opportunities.
+
+    Used only by ``micro_slicing``; zero disables decode-burst spacing.
+    """
+
+    decode_prefill_max_wait_ms: int = Field(default=0, ge=0)
+    """Maximum prefill waiter age before bypassing decode-burst spacing.
+
+    Zero disables the deadline. A positive value requires a positive
+    ``decode_prefill_min_decode_steps``.
+    """
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.
@@ -224,6 +267,64 @@ class SchedulerConfig:
         return None if value is None else handler(value)
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
+        compute_configured = self.prefill_compute_share is not None
+        micro_values = (
+            self.max_num_prefill_tokens_per_step,
+            self.max_num_partial_prefills,
+            self.decode_prefill_min_decode_steps,
+            self.decode_prefill_max_wait_ms,
+        )
+        micro_configured = any(micro_values)
+
+        if self.fairness_engine is None and (compute_configured or micro_configured):
+            raise ValueError(
+                "fairness_engine must be selected when fairness tuning options "
+                "are configured"
+            )
+        if self.fairness_engine == "compute_share":
+            if not compute_configured:
+                raise ValueError(
+                    "prefill_compute_share is required for fairness_engine="
+                    "compute_share"
+                )
+            if micro_configured:
+                raise ValueError(
+                    "micro-slicing options cannot be combined with "
+                    "fairness_engine=compute_share"
+                )
+        elif self.fairness_engine == "micro_slicing":
+            if compute_configured:
+                raise ValueError(
+                    "prefill_compute_share cannot be combined with "
+                    "fairness_engine=micro_slicing"
+                )
+            if self.max_num_prefill_tokens_per_step <= 0:
+                raise ValueError(
+                    "max_num_prefill_tokens_per_step must be positive for "
+                    "fairness_engine=micro_slicing"
+                )
+            if self.max_num_prefill_tokens_per_step > self.max_num_batched_tokens:
+                raise ValueError(
+                    "max_num_prefill_tokens_per_step cannot exceed "
+                    "max_num_batched_tokens"
+                )
+            if self.max_num_partial_prefills > self.max_num_seqs:
+                raise ValueError("max_num_partial_prefills cannot exceed max_num_seqs")
+            if (
+                self.decode_prefill_max_wait_ms > 0
+                and self.decode_prefill_min_decode_steps == 0
+            ):
+                raise ValueError(
+                    "decode_prefill_max_wait_ms requires a positive "
+                    "decode_prefill_min_decode_steps"
+                )
+
+        if self.fairness_engine is not None and self.prefill_schedule_interval > 1:
+            raise ValueError(
+                "fairness_engine cannot be combined with "
+                "prefill_schedule_interval greater than one"
+            )
+
         if is_encoder_decoder:
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True

@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -64,7 +65,10 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             device=current_platform.device_type,
         )
         self.shared_head = SharedHead(
-            config=config, prefix=prefix, quant_config=quant_config
+            config=config,
+            prefix=prefix,
+            quant_config=quant_config,
+            lm_head_quantization="nvfp4" if envs.VLLM_MTP_NVFP4_LM_HEAD else None,
         )
         # MTP layers sit past the base model's hidden layers; parse the index
         # from the prefix (e.g. "...layers.32") so the decoder builds an MLA
@@ -245,14 +249,25 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
-        self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()
+        self.has_own_lm_head = envs.VLLM_MTP_NVFP4_LM_HEAD
+        if (
+            self.has_own_lm_head
+            and envs.is_set("VLLM_MTP_NVFP4_LM_HEAD")
+            and self.config.tie_word_embeddings
+        ):
+            raise ValueError("NVFP4 draft head requires untied word embeddings")
         self.model = Glm5NextMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        head = self.model._mtp_layers[0].shared_head.head
+        self.has_own_lm_head = head.runtime_lm_head_quantization == "nvfp4"
+        self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()
+        if self.has_own_lm_head:
+            self.lm_head = head
         self.set_moe_parameters()
 
     def _checkpoint_weight_name_prefixes(self) -> tuple[str, ...]:
-        return tuple(
+        prefixes = tuple(
             prefix
             for layer_idx in range(
                 self.config.num_hidden_layers,
@@ -265,6 +280,14 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 f"layers.{layer_idx}.",
             )
         )
+        if self.has_own_lm_head:
+            prefixes += (
+                "lm_head.",
+                "model.lm_head.",
+                "model.language_model.lm_head.",
+                "language_model.lm_head.",
+            )
+        return prefixes
 
     def set_moe_parameters(self):
         self.num_moe_layers = self.config.num_nextn_predict_layers
@@ -372,6 +395,19 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            if name in (
+                "lm_head.weight",
+                "model.lm_head.weight",
+                "language_model.lm_head.weight",
+            ):
+                if self.has_own_lm_head:
+                    for layer_idx in self.model.layers:
+                        head_name = f"model.layers.{layer_idx}.shared_head.head.weight"
+                        if head_name not in loaded_params:
+                            param = params_dict[head_name]
+                            param.weight_loader(param, loaded_weight)
+                            loaded_params.add(head_name)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
@@ -460,6 +496,8 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
         loaded_layers: set[int] = set()
         for param_name in loaded_params:
+            if param_name.endswith(".shared_head.head.weight"):
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, param_name)
             if spec_layer is not None:
                 loaded_layers.add(spec_layer)
@@ -467,6 +505,13 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             self.model.mtp_start_layer_idx,
             self.model.mtp_start_layer_idx + self.model.num_mtp_layers,
         ):
+            if self.has_own_lm_head:
+                head_name = f"model.layers.{layer_idx}.shared_head.head.weight"
+                if head_name not in loaded_params:
+                    raise ValueError(
+                        f"NVFP4 MTP head {layer_idx} requires an unquantized "
+                        "draft head or target lm_head.weight in the checkpoint."
+                    )
             if layer_idx not in loaded_layers:
                 raise ValueError(
                     f"MTP speculative decoding layer {layer_idx} weights "

@@ -966,6 +966,12 @@ class AsyncLLM(EngineClient):
             reset_running_requests, reset_connector
         )
 
+    async def get_prefill_fairness(self) -> dict[str, Any]:
+        return await self.engine_core.get_prefill_fairness_async()
+
+    async def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+        return await self.engine_core.set_prefill_fairness_async(config)
+
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -26,6 +26,9 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_block_hashes,
 )
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.core.boundary_checkpoint import BoundaryCheckpointCache
 
 logger = init_logger(__name__)
 
@@ -183,6 +186,7 @@ class BlockPool:
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
         self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
+        self.boundary_checkpoints: BoundaryCheckpointCache | None = None
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
@@ -687,6 +691,9 @@ class BlockPool:
         Returns:
             True if the block is evicted, False otherwise.
         """
+        if self.boundary_checkpoints is not None:
+            self.boundary_checkpoints.invalidate_block(block.block_id)
+
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
@@ -730,7 +737,12 @@ class BlockPool:
         for block in ordered_blocks:
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
-                if block.block_hash is None or not self.enable_caching:
+                has_boundary = self.boundary_checkpoints is not None and (
+                    self.boundary_checkpoints.contains_block(block.block_id)
+                )
+                if not self.enable_caching or (
+                    block.block_hash is None and not has_boundary
+                ):
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
                 else:
@@ -780,6 +792,8 @@ class BlockPool:
             return False
 
         # Remove all hashes so that no new blocks will hit.
+        if self.boundary_checkpoints is not None:
+            self.boundary_checkpoints.clear()
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
 

@@ -6,6 +6,7 @@ import functools
 import os
 import platform
 import sys
+from dataclasses import replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -814,22 +815,52 @@ class Platform:
                     "VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE is supported only for "
                     "Glm5NextForConditionalGeneration."
                 )
-            target_block_size = int(split_target_block_size)
-            split_mamba_block_size = int(
-                os.getenv(
-                    "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE",
-                    split_target_block_size,
-                )
+            if split_target_block_size.lower() == "auto":
+                geometry_interval = cache_config.prefix_cache_retention_interval
+                # ``0`` is a valid semantic-only retention policy, but it does
+                # not provide a periodic geometry interval. In that mode (and
+                # when retention is unset), derive the block from the worker's
+                # scheduler budget instead.
+                if geometry_interval is None or geometry_interval == 0:
+                    scheduler_config = vllm_config.scheduler_config
+                    geometry_interval = scheduler_config.max_num_scheduled_tokens
+                    if geometry_interval is None:
+                        geometry_interval = scheduler_config.max_num_batched_tokens
+                dcp_world_size = parallel_config.decode_context_parallel_size
+                if (
+                    geometry_interval is None
+                    or geometry_interval <= 0
+                    or geometry_interval % dcp_world_size != 0
+                ):
+                    raise ValueError(
+                        "Automatic GLM-5.3 split-cache geometry requires a "
+                        "positive prefix_cache_retention_interval or scheduler "
+                        "token budget divisible by decode_context_parallel_size."
+                    )
+                # A DCP-sharded target block covers block_size * DCP global
+                # tokens. Fill one retention interval, or one scheduler token
+                # budget when no external-cache retention policy is active,
+                # with exactly one target block per rank. This makes packed
+                # NVFP4 pages use the shared pool efficiently while connector
+                # stores still land on whole pages when retention is enabled.
+                target_block_size = geometry_interval // dcp_world_size
+            else:
+                target_block_size = int(split_target_block_size)
+
+            split_mamba_block_size = os.getenv(
+                "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE", "auto"
+            )
+            mamba_block_size = (
+                target_block_size
+                if split_mamba_block_size.lower() == "auto"
+                else int(split_mamba_block_size)
             )
             if target_block_size <= 0 or target_block_size % 64 != 0:
                 raise ValueError(
                     "VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE must be a positive "
-                    "multiple of 64."
+                    "multiple of 64 after automatic resolution."
                 )
-            if (
-                split_mamba_block_size <= 0
-                or split_mamba_block_size % target_block_size != 0
-            ):
+            if mamba_block_size <= 0 or mamba_block_size % target_block_size != 0:
                 raise ValueError(
                     "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE must be a positive "
                     "multiple of VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE."
@@ -844,13 +875,13 @@ class Platform:
             # physical pages. Their token block sizes remain scheduler-visible,
             # so the recurrent block must be a multiple of the target block.
             cache_config.block_size = target_block_size
-            cache_config.mamba_block_size = split_mamba_block_size
+            cache_config.mamba_block_size = mamba_block_size
             cache_config.mamba_page_size_padded = None
             logger.warning(
                 "Using split GLM-5.3 cache pages: target block size %d tokens, "
                 "recurrent-state block size %d tokens.",
                 target_block_size,
-                split_mamba_block_size,
+                mamba_block_size,
             )
             return
 
@@ -863,13 +894,29 @@ class Platform:
 
         # Compute attention page size for 1 token
         if model_config.use_mla:
-            attn_page_size_1_token = MLAAttentionSpec(
+            mla_spec = MLAAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                 head_size=model_config.get_head_size(),
                 dtype=kv_cache_dtype,
+                cache_dtype_str=cache_config.cache_dtype,
                 kv_quant_mode=kv_quant_mode,
-            ).page_size_bytes
+            )
+            # Most MLA cache formats are at least as large as the dense
+            # latent proxy above, so the materialized specs can safely pad
+            # Mamba up later. GLM5Next's packed NVFP4 record is smaller. Use
+            # the backend-published record width here so the manager chooses
+            # a large enough attention block before it fixes the Mamba page.
+            if cache_config.cache_dtype == "nvfp4_ds_mla":
+                with set_current_vllm_config(vllm_config):
+                    customized_mla_spec = backend_cls.customize_spec(mla_spec)
+                assert isinstance(customized_mla_spec, MLAAttentionSpec)
+                mla_spec = customized_mla_spec
+            # Hybrid sizing needs the unaligned per-token row. Page alignment
+            # is applied after the manager block size is known.
+            attn_page_size_1_token = (
+                mla_spec.state_content_size_bytes + mla_spec.page_tail_bytes_per_token
+            )
         elif cache_config.cache_dtype.startswith("turboquant_"):
             # TQ has a packed K|V layout; the standard FullAttentionSpec
             # formula over-sizes it and trips unify_kv_cache_spec_page_size
@@ -981,7 +1028,16 @@ class Platform:
             cache_config.mamba_block_size = cache_config.block_size
 
         # Pad mamba page size to exactly match attention page size
-        attn_page_size = cache_config.block_size * attn_page_size_1_token
+        if model_config.use_mla and cache_config.cache_dtype == "nvfp4_ds_mla":
+            materialized_mla_spec = replace(
+                mla_spec, block_size=cache_config.block_size
+            )
+            with set_current_vllm_config(vllm_config):
+                attn_page_size = backend_cls.customize_spec(
+                    materialized_mla_spec
+                ).page_size_bytes
+        else:
+            attn_page_size = cache_config.block_size * attn_page_size_1_token
         assert attn_page_size >= mamba_page_size
 
         if attn_page_size == mamba_page_size:

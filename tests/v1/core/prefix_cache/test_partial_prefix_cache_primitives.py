@@ -10,6 +10,10 @@ from vllm.distributed.kv_events import BlockRemoved, BlockStored
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.boundary_checkpoint import (
+    BoundaryCheckpoint,
+    BoundaryCheckpointCache,
+)
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashListWithBlockSize,
@@ -49,6 +53,107 @@ def boundary_hash(req: Request, hash_block_size: int, num_tokens: int) -> BlockH
     # Every boundary at a hash_block_size multiple is just the fine-grained
     # chain hash ending there.
     return req.block_hashes[num_tokens // hash_block_size - 1]
+
+
+@pytest.mark.parametrize("boundary", [1, 7, 8, 9, 15, 16])
+def test_request_boundary_lookup_matches_exact_tokens_and_cache_salt(boundary):
+    """Endpoints need neither hash alignment nor per-token prefix hashes."""
+    pool = BlockPool(8, True, 8)
+    cache = BoundaryCheckpointCache(pool)
+    tokens = list(range(17))
+    request = make_request("producer", tokens, 8, sha256)
+    blocks = pool.get_new_blocks(2)
+    checkpoint = BoundaryCheckpoint(
+        cache.next_id(), boundary, ((blocks[0].block_id,),), (blocks[1].block_id,)
+    )
+    cache.stage(request, checkpoint, num_ranks=1)
+    assert cache.acknowledge(checkpoint.checkpoint_id, 0)
+    pool.free_blocks(blocks)
+    assert cache.find(request, 17) == checkpoint
+    assert cache.find(request, boundary - 1) is None
+    divergent = tokens.copy()
+    divergent[boundary - 1] += 100
+    assert cache.find(make_request("branch", divergent, 8, sha256), 17) is None
+    isolated = Request(
+        "isolated",
+        tokens,
+        SamplingParams(max_tokens=1),
+        None,
+        cache_salt="other tenant",
+        block_hasher=get_request_block_hasher(8, sha256),
+    )
+    assert cache.find(isolated, 17) is None
+    assert len(request.block_hashes) == 2
+
+
+def test_request_boundary_publication_waits_for_every_rank_and_pins_readers():
+    pool = BlockPool(5, True, 8)
+    cache = BoundaryCheckpointCache(pool)
+    request = make_request("producer", [1, 2, 3], 8, sha256)
+    blocks = pool.get_new_blocks(2)
+    checkpoint = BoundaryCheckpoint(cache.next_id(), 3, ((1,),), (2,))
+    cache.stage(request, checkpoint, num_ranks=2)
+    pool.free_blocks(blocks)
+    assert not cache.acknowledge(checkpoint.checkpoint_id, 0)
+    assert not cache.acknowledge(checkpoint.checkpoint_id, 0)
+    assert cache.find(request, 3) is None
+    assert all(block.ref_cnt == 1 for block in blocks)
+    assert cache.acknowledge(checkpoint.checkpoint_id, 1)
+    assert cache.acquire(checkpoint.checkpoint_id) == checkpoint
+    other = pool.get_new_blocks(2)
+    assert {b.block_id for b in other}.isdisjoint({1, 2})
+    cache.release(checkpoint)
+    pool.get_new_blocks(1)
+    assert cache.find(request, 3) is None
+    assert len(cache) == 0
+
+
+def test_request_boundary_invalidation_during_copy_prevents_publication():
+    pool = BlockPool(4, True, 8)
+    cache = BoundaryCheckpointCache(pool)
+    request = make_request("producer", [1, 2, 3], 8, sha256)
+    blocks = pool.get_new_blocks(2)
+    checkpoint = BoundaryCheckpoint(cache.next_id(), 3, ((1,),), (2,))
+    cache.stage(request, checkpoint, num_ranks=2)
+    pool.free_blocks(blocks)
+    pool.evict_blocks({2})
+    assert all(block.ref_cnt == 1 for block in blocks)
+    assert not cache.acknowledge(checkpoint.checkpoint_id, 0)
+    assert not cache.acknowledge(checkpoint.checkpoint_id, 1)
+    assert cache.find(request, 3) is None
+    assert pool.reset_prefix_cache()
+
+
+def test_request_boundaries_fall_back_for_oversized_stop_sets():
+    request = make_request("many stops", [1, 2, 3], 8, sha256)
+    assert BoundaryCheckpointCache.supports_request(request)
+    request.sampling_params.stop_token_ids = list(range(256))
+    assert not BoundaryCheckpointCache.supports_request(request)
+
+
+def test_request_boundary_branches_deduplicate_and_survive_sibling_eviction():
+    pool = BlockPool(12, True, 8)
+    cache = BoundaryCheckpointCache(pool)
+    checkpoints = []
+    for tokens in ([1, 2, 3], [1, 2, 4, 5], [1, 2], [1, 2, 3]):
+        request = make_request("producer", list(tokens), 8, sha256)
+        block = pool.get_new_blocks(1)[0]
+        checkpoint = BoundaryCheckpoint(
+            cache.next_id(), len(tokens), ((block.block_id,),)
+        )
+        cache.stage(request, checkpoint, num_ranks=1)
+        cache.acknowledge(checkpoint.checkpoint_id, 0)
+        pool.free_blocks([block])
+        checkpoints.append(checkpoint)
+    assert len(cache) == 3
+    request = make_request("continuation", [1, 2, 3, 9], 8, sha256)
+    assert cache.find(request, 4) == checkpoints[3]
+    pool.evict_blocks({checkpoints[3].block_ids[0][0]})
+    assert cache.find(request, 4) == checkpoints[2]
+    sibling = make_request("sibling", [1, 2, 4, 5, 6], 8, sha256)
+    assert cache.find(sibling, 5) == checkpoints[1]
+    assert pool.reset_prefix_cache()
+    assert cache.find(sibling, 5) is None
 
 
 def cache_full_block_and_partial_tail(

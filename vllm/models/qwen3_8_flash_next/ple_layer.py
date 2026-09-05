@@ -33,7 +33,7 @@ from vllm.utils.b12x import (
     get_b12x_ple_embedding,
     get_b12x_scratch_buffers,
 )
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.utils.torch_utils import current_stream, direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -44,8 +44,19 @@ logger = init_logger(__name__)
 
 _PLE_SPLITTING_OPS = (
     "vllm::qwen3_8_flash_next_ple_embedding",
+    "vllm::qwen3_8_flash_next_ple_prefetch",
+    "vllm::qwen3_8_flash_next_ple_prefetch_wait",
     "vllm::qwen3_8_flash_next_ple",
 )
+
+_prefetch_stream: torch.cuda.Stream | None = None
+
+
+def _get_prefetch_stream() -> torch.cuda.Stream:
+    global _prefetch_stream
+    if _prefetch_stream is None:
+        _prefetch_stream = torch.cuda.Stream()
+    return _prefetch_stream
 
 
 def _register_ple_compilation_context(
@@ -57,7 +68,7 @@ def _register_ple_compilation_context(
 
     Piecewise graph dispatch is keyed by padded token count, while PLE hashing
     and recurrent-state routing also depend on the live request count and query
-    boundaries.  Both custom operators must therefore execute as partition
+    boundaries. These custom operators must therefore execute as partition
     boundaries so a graph compiled for one request layout cannot replay stale
     PLE metadata for another layout.
     """
@@ -206,6 +217,8 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         self.eos_token_id = int(config.eos_token_id)
         self.split_ngram_parts = int(getattr(config, "split_ngram_parts", 512))
         self.owner_prefix = owner_prefix
+        if envs.VLLM_QWEN3_8_FLASH_NEXT_OVERLAP and current_platform.is_cuda():
+            _get_prefetch_stream()
         self.embedding_storage_dtype = str(
             getattr(config, "ple_embedding_dtype", "bfloat16")
         )
@@ -356,8 +369,41 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         ngram_context: torch.Tensor,
     ) -> None:
         self._validate_embedding_loaded()
-        self._prepare_inputs(input_ids, query_start_loc, ngram_context)
-        _b12x_module("ple_embedding").run(self._binding)
+        token_count = self._prepare_inputs(input_ids, query_start_loc, ngram_context)
+        _b12x_module("ple_embedding").run(self._binding, token_count=token_count)
+
+    def _run_prefetch(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        if input_ids.numel() > 16 or not torch.cuda.is_current_stream_capturing():
+            self._run_embedding(input_ids, query_start_loc, ngram_context)
+            return
+        stream = _get_prefetch_stream()
+        stream.wait_stream(current_stream())
+        for tensor in (input_ids, query_start_loc, ngram_context):
+            tensor.record_stream(stream)
+        with torch.cuda.stream(stream):
+            self._run_embedding(input_ids, query_start_loc, ngram_context)
+
+    def prefetch(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        if torch.compiler.is_compiling():
+            torch.ops.vllm.qwen3_8_flash_next_ple_prefetch(
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                self._embedding_out,
+                self.owner_prefix,
+            )
+        else:
+            self._run_prefetch(input_ids, query_start_loc, ngram_context)
 
     def _validate_embedding_loaded(self) -> None:
         if self._embedding_validated:
@@ -410,9 +456,15 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        *,
+        wait_for: torch.Tensor | None = None,
     ) -> torch.Tensor:
         input_ids = input_ids.reshape(-1)
-        if torch.compiler.is_compiling():
+        if wait_for is not None:
+            torch.ops.vllm.qwen3_8_flash_next_ple_prefetch_wait(
+                self._embedding_out, wait_for
+            )
+        elif torch.compiler.is_compiling():
             torch.ops.vllm.qwen3_8_flash_next_ple_embedding(
                 input_ids,
                 query_start_loc,
@@ -947,7 +999,9 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         self._key[:token_count].copy_(key)
         self._value[:token_count].copy_(value)
         self._prepare_metadata(metadata, query_start_loc, token_count)
-        _b12x_module("ple").run_mixed(self._binding, eps=self.eps)
+        _b12x_module("ple").run_mixed(
+            self._binding, eps=self.eps, token_count=token_count
+        )
 
     def forward(
         self,
@@ -955,13 +1009,20 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        *,
+        prefetched: bool = False,
     ) -> torch.Tensor:
         token_count = hidden_states.shape[0]
         if input_ids.numel() != token_count:
             raise ValueError(
                 "PLE input_ids and hidden states must have the same token count"
             )
-        embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
+        embeddings = self.ple_embedding(
+            input_ids,
+            query_start_loc,
+            ngram_context,
+            wait_for=hidden_states if prefetched else None,
+        )
         key = self.key_proj(embeddings).reshape(
             token_count, self.hc_count, self.hidden_size
         )
@@ -1002,6 +1063,27 @@ def _ple_embedding_fake(
     return
 
 
+def _ple_prefetch_op(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    layer.ple_embedding._run_prefetch(input_ids, query_start_loc, ngram_context)
+
+
+def _ple_prefetch_wait_op(out: torch.Tensor, dependency: torch.Tensor) -> None:
+    # The dependency places this join after the preceding layer's computation.
+    if dependency.shape[0] <= 16 and torch.cuda.is_current_stream_capturing():
+        current_stream().wait_stream(_get_prefetch_stream())
+
+
+def _ple_prefetch_wait_fake(out: torch.Tensor, dependency: torch.Tensor) -> None:
+    return
+
+
 def _ple_op(
     residual: torch.Tensor,
     key: torch.Tensor,
@@ -1030,6 +1112,18 @@ direct_register_custom_op(
     op_func=_ple_embedding_op,
     mutates_args=["out"],
     fake_impl=_ple_embedding_fake,
+)
+direct_register_custom_op(
+    op_name="qwen3_8_flash_next_ple_prefetch",
+    op_func=_ple_prefetch_op,
+    mutates_args=["out"],
+    fake_impl=_ple_embedding_fake,
+)
+direct_register_custom_op(
+    op_name="qwen3_8_flash_next_ple_prefetch_wait",
+    op_func=_ple_prefetch_wait_op,
+    mutates_args=["out"],
+    fake_impl=_ple_prefetch_wait_fake,
 )
 direct_register_custom_op(
     op_name="qwen3_8_flash_next_ple",

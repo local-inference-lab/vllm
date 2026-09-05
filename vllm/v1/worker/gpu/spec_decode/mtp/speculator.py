@@ -12,6 +12,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 class MTPSpeculator(AutoRegressiveSpeculator):
     share_mtp_topk_indices: bool = False
     rollback_qsa_interval_starts: bool = False
+    boundary_checkpoint_capture = None
 
     def load_draft_model(
         self,
@@ -38,7 +39,7 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         ) and hasattr(draft_model.model, "restore_qsa_interval_starts")
         self.prefill_outputs_are_compact = hasattr(
             draft_model.model, "set_prefill_output_indices"
-        )
+        ) and getattr(draft_model.model, "supports_mtp_prefill_compaction", True)
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:
@@ -52,6 +53,9 @@ class MTPSpeculator(AutoRegressiveSpeculator):
             )
 
     def on_prefill_end(self, num_reqs: int) -> None:
+        if self.boundary_checkpoint_capture is not None:
+            state, idx_mapping, capture = self.boundary_checkpoint_capture
+            state.capture_draft(idx_mapping, capture)
         # Step 0 (prefill) wrote topk indices for every query token in the
         # multi-token batch. Compact them down to each request's last token so
         # steps 1+ can reuse them from the shared buffer.

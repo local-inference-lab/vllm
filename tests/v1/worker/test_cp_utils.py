@@ -10,6 +10,27 @@ from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.worker.cp_utils import should_skip_dcp_context_attention
 
 
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [
+        ({}, 0),
+        ({"single_request_prefill": True}, 16),
+        ({"create_mixed_batch": True}, 16),
+    ],
+)
+def test_dcp_dummy_context_covers_single_request_prefill(kwargs, expected):
+    arguments = {
+        "dcp_world_size": 4,
+        "cp_kv_cache_interleave_size": 4,
+        "has_kv_cache_config": True,
+        "create_mixed_batch": False,
+        "is_graph_capturing": False,
+        "uniform_decode": False,
+    }
+    arguments.update(kwargs)
+    assert cp_utils.get_dcp_dummy_context_len(**arguments) == expected
+
+
 def test_skip_gate_only_for_zero_context():
     assert should_skip_dcp_context_attention(torch.zeros(3, dtype=torch.int32))
     assert not should_skip_dcp_context_attention(

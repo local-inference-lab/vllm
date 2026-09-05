@@ -580,6 +580,50 @@ class VllmConfig:
         return bool(mm_config and mm_config.mm_encoder_only)
 
     @property
+    def use_request_boundary_checkpoints(self) -> bool:
+        """Whether this runner has a complete recurrent boundary-state adapter."""
+        from vllm.platforms import current_platform
+
+        cache = self.cache_config
+        model = self.model_config
+        parallel = self.parallel_config
+        return (
+            cache.recurrent_checkpoint_policy in ("auto", "request_boundaries")
+            and cache.enable_prefix_caching
+            and cache.mamba_cache_mode == "align"
+            and (
+                cache.kv_cache_layout is None
+                or cache.get_resolved_kv_cache_layout().is_block_outermost
+            )
+            and self.use_v2_model_runner
+            and current_platform.is_cuda()
+            and model is not None
+            and not model.enable_sleep_mode
+            and not model.enable_return_routed_experts
+            and self.lora_config is None
+            and model.hf_text_config.model_type
+            in (
+                "qwen3_8_flash_next_text",
+                "qwen3_8_flash_next",
+                "glm5_next_text",
+                "glm5_next",
+            )
+            and (
+                self.speculative_config is None
+                or (
+                    self.speculative_config.method == "mtp"
+                    and not self.speculative_config.uses_dynamic_speculative_decoding()
+                )
+            )
+            and parallel.pipeline_parallel_size == 1
+            and parallel.data_parallel_size == 1
+            and parallel.decode_context_parallel_size == 1
+            and parallel.prefill_context_parallel_size == 1
+            and self.kv_transfer_config is None
+            and cache.kv_offloading_size is None
+        )
+
+    @property
     def max_concurrent_batches(self) -> int:
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.
@@ -1132,6 +1176,15 @@ class VllmConfig:
         # Models may have supplied their own DCP defaults above; anything still
         # unset falls back to the stock ones.
         self.parallel_config.set_dcp_defaults()
+
+        if (
+            self.scheduler_config.fairness_engine is not None
+            and self.parallel_config.data_parallel_size > 1
+        ):
+            raise ValueError(
+                "fairness_engine does not yet support data parallelism; all DP "
+                "ranks must make one synchronized fairness decision"
+            )
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
@@ -2678,6 +2731,7 @@ class VllmConfig:
             return self
         if (
             self.cache_config.cache_dtype.startswith("nvfp4")
+            and self.cache_config.cache_dtype != "nvfp4_ds_mla"
             and self.model_config.use_mla
         ):
             raise ValueError(

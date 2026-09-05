@@ -80,14 +80,27 @@ def test_startup_plan_apply_gate(plan_env):
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
 
 
-def test_b12x_warmup_precedes_cudagraph_memory_profile(monkeypatch):
+@pytest.mark.parametrize(
+    "final_free_memory,expected_available_memory",
+    [(80, 80), (75, 75)],
+)
+def test_b12x_warmup_precedes_cudagraph_memory_profile(
+    monkeypatch,
+    final_free_memory,
+    expected_available_memory,
+):
     """B12X launch modules must be resolved before descriptor capture begins."""
-    events = []
+    events: list[object] = []
+
+    def profile_cudagraph_memory():
+        events.append("profile_cudagraph_memory")
+        return 0
 
     model_runner = SimpleNamespace(
         model_memory_usage=0,
         profile_run=lambda: events.append("profile_run"),
-        profile_cudagraph_memory=lambda: events.append("profile_cudagraph_memory") or 0,
+        profile_glm_dcp_attention=lambda: events.append("profile_glm_dcp_attention"),
+        profile_cudagraph_memory=profile_cudagraph_memory,
     )
     profile_result = SimpleNamespace(
         total_consumed=10,
@@ -108,6 +121,7 @@ def test_b12x_warmup_precedes_cudagraph_memory_profile(monkeypatch):
         model_runner=model_runner,
         init_snapshot=SimpleNamespace(free_memory=100, total_memory=100),
         requested_memory=90,
+        device="cuda:0",
         model_config=SimpleNamespace(multimodal_config=None),
         parallel_config=SimpleNamespace(),
         vllm_config=SimpleNamespace(
@@ -120,6 +134,11 @@ def test_b12x_warmup_precedes_cudagraph_memory_profile(monkeypatch):
 
     monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", lambda worker: None)
     monkeypatch.setattr(gpu_worker, "memory_profiling", fake_memory_profiling)
+    monkeypatch.setattr(
+        gpu_worker,
+        "MemorySnapshot",
+        lambda **_kwargs: SimpleNamespace(free_memory=final_free_memory),
+    )
     monkeypatch.setattr(
         gpu_worker,
         "current_platform",
@@ -140,7 +159,8 @@ def test_b12x_warmup_precedes_cudagraph_memory_profile(monkeypatch):
 
     assert events == [
         "profile_run",
+        "profile_glm_dcp_attention",
         ("b12x_warmup", (8, 4)),
         "profile_cudagraph_memory",
     ]
-    assert available == 80
+    assert available == expected_available_memory

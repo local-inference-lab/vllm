@@ -26,6 +26,7 @@ from vllm.v1.utils import ConstantList
 
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
+    from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 
@@ -201,6 +202,9 @@ class Request:
         # in the (sparse) prefix cache; 0 means none. Set at admission for
         # hybrid/Mamba models when a shared prefix is detected (Marconi-style).
         self.shared_prefix_boundary = 0
+        self.use_boundary_checkpoints = False
+        self.boundary_checkpoint: BoundaryCheckpoint | None = None
+        self.boundary_checkpoint_blocks: tuple[tuple[int, ...], ...] | None = None
 
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted

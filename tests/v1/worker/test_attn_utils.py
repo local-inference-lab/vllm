@@ -8,6 +8,7 @@ never addressed by the logical view.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -69,7 +70,11 @@ class _CachingMetadataBuilder:
         return SimpleNamespace(
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            is_prefilling=common_attn_metadata.is_prefilling,
         )
+
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        return self.build(0, common_attn_metadata)
 
     def update_block_table(self, metadata, block_table, slot_mapping):
         self.num_updates += 1
@@ -77,6 +82,7 @@ class _CachingMetadataBuilder:
             block_table=block_table,
             slot_mapping=slot_mapping,
             reused=metadata,
+            is_prefilling=metadata.is_prefilling,
         )
 
 
@@ -165,7 +171,8 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
     )
 
 
-def test_build_attn_metadata_reuses_equivalent_cache_group_builds():
+@pytest.mark.parametrize("for_capture", [False, True])
+def test_build_attn_metadata_reuses_equivalent_cache_group_builds(for_capture):
     spec = FullAttentionSpec(
         block_size=16,
         num_kv_heads=1,
@@ -196,6 +203,13 @@ def test_build_attn_metadata_reuses_equivalent_cache_group_builds():
         torch.full((2, 1), group_id, dtype=torch.int32) for group_id in range(2)
     ]
     slot_mappings = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
+    is_prefilling = torch.ones(2, dtype=torch.bool)
+    model_metadata = SimpleNamespace(
+        get_extra_common_attn_kwargs=Mock(
+            side_effect=lambda *_: {"is_prefilling": is_prefilling}
+        ),
+        get_extra_attn_kwargs=Mock(return_value={}),
+    )
 
     metadata = build_attn_metadata(
         attn_groups=groups,
@@ -209,13 +223,24 @@ def test_build_attn_metadata_reuses_equivalent_cache_group_builds():
         block_tables=block_tables,
         slot_mappings=slot_mappings,
         kv_cache_config=kv_cache_config,
+        model_specific_attn_metadata=model_metadata,
+        for_cudagraph_capture=for_capture,
     )
 
-    assert [builder.num_builds for builder in builders] == [1, 0]
-    assert [builder.num_updates for builder in builders] == [0, 1]
+    assert [builder.num_builds for builder in builders] == [1, int(for_capture)]
+    assert [builder.num_updates for builder in builders] == [0, int(not for_capture)]
+    assert model_metadata.get_extra_common_attn_kwargs.call_count == 1 + int(
+        for_capture
+    )
     assert metadata["layer.0"].block_table is block_tables[0]
     assert metadata["layer.1"].block_table is block_tables[1]
-    assert metadata["layer.1"].reused is metadata["layer.0"]
+    for group_id in range(2):
+        torch.testing.assert_close(
+            metadata[f"layer.{group_id}"].slot_mapping, slot_mappings[group_id]
+        )
+    if not for_capture:
+        assert metadata["layer.1"].reused is metadata["layer.0"]
+    assert all(item.is_prefilling is is_prefilling for item in metadata.values())
 
 
 def test_reshape_padded_kv_cache_strides_by_padded_page():

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -38,10 +39,19 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.compute_fairness import (
+    ComputeServiceClass,
+    PrefillComputeShareController,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched.micro_slicing import (
+    MicroSlicingController,
+    MicroSlicingSettings,
+)
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
+    KVConnectorBlockState,
     NewRequestData,
     ScheduledEncoderInputStats,
     SchedulerOutput,
@@ -71,6 +81,55 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _build_kv_connector_block_state(
+    kv_cache_config: KVCacheConfig,
+    kv_cache_manager: KVCacheManager,
+    request_ids: Iterable[str],
+    partial_tail_offloads: dict[str, list[tuple[int, int, int]]] | None,
+    retention_interval: int | None,
+) -> KVConnectorBlockState:
+    """Snapshot exact source blocks for connector stores in this step."""
+    current_block_ids = {
+        req_id: kv_cache_manager.get_block_ids(req_id) for req_id in request_ids
+    }
+    boundary_state_offloads = {
+        req_id: list(entries)
+        for req_id, entries in (partial_tail_offloads or {}).items()
+    }
+    if retention_interval is not None and retention_interval > 0:
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            spec = group.kv_cache_spec
+            if not isinstance(spec, MambaSpec):
+                continue
+            if retention_interval % spec.block_size != 0:
+                raise ValueError(
+                    "prefix_cache_retention_interval must be divisible by "
+                    f"Mamba block size: {retention_interval=} {spec.block_size=}"
+                )
+            blocks_per_boundary = retention_interval // spec.block_size
+            for req_id, grouped_ids in current_block_ids.items():
+                if group_id >= len(grouped_ids):
+                    continue
+                entries = boundary_state_offloads.setdefault(req_id, [])
+                existing = {
+                    (entry_group, boundary_tokens)
+                    for entry_group, _, boundary_tokens in entries
+                }
+                for block_index in range(
+                    blocks_per_boundary - 1,
+                    len(grouped_ids[group_id]),
+                    blocks_per_boundary,
+                ):
+                    block_id = grouped_ids[group_id][block_index]
+                    boundary_tokens = (block_index + 1) * spec.block_size
+                    if block_id > 0 and (group_id, boundary_tokens) not in existing:
+                        entries.append((group_id, block_id, boundary_tokens))
+    return KVConnectorBlockState(
+        block_ids=current_block_ids,
+        boundary_state_offloads=boundary_state_offloads,
+    )
 
 
 class Scheduler(SchedulerInterface):
@@ -257,6 +316,7 @@ class Scheduler(SchedulerInterface):
         )
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
+        self.drop_last_prefix_cache_block = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
         # Positions past the computed tokens that the drafter reads mid-prefill.
@@ -291,6 +351,9 @@ class Scheduler(SchedulerInterface):
                     num_spec_tokens_by_batch_size=self.dynamic_sd_lookup,
                 )
             self.use_eagle = speculative_config.use_eagle()
+            self.drop_last_prefix_cache_block = (
+                speculative_config.use_eagle_preserves_target_kv_cache()
+            )
             if self.use_eagle:
                 self.num_prefill_lookahead = (
                     self.num_spec_tokens
@@ -307,7 +370,7 @@ class Scheduler(SchedulerInterface):
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            use_eagle=self.drop_last_prefix_cache_block,
             num_prefill_lookahead=self.num_prefill_lookahead,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
@@ -317,6 +380,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+            enable_boundary_checkpoints=vllm_config.use_request_boundary_checkpoints,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -332,6 +396,16 @@ class Scheduler(SchedulerInterface):
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
         self.prefill_capacity_bound = False
+        fairness_engine = self.scheduler_config.fairness_engine
+        prefill_compute_share = self.scheduler_config.prefill_compute_share
+        self.compute_share_controller = (
+            PrefillComputeShareController(prefill_compute_share)
+            if fairness_engine == "compute_share" and prefill_compute_share is not None
+            else None
+        )
+        self.micro_slicing_controller: MicroSlicingController | None = None
+        self._decode_compute_seconds = 0.0
+        self._prefill_compute_seconds = 0.0
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -344,6 +418,35 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        mamba_block_sizes = [
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        prefill_quantum = (
+            math.lcm(*mamba_block_sizes)
+            if self.need_mamba_block_aligned_split and mamba_block_sizes
+            else 1
+        )
+        self.prefill_fairness_quantum = prefill_quantum
+        if fairness_engine == "micro_slicing":
+            self.micro_slicing_controller = MicroSlicingController(
+                settings=MicroSlicingSettings(
+                    max_num_prefill_tokens_per_step=(
+                        self.scheduler_config.max_num_prefill_tokens_per_step
+                    ),
+                    max_num_partial_prefills=(
+                        self.scheduler_config.max_num_partial_prefills
+                    ),
+                    decode_prefill_min_decode_steps=(
+                        self.scheduler_config.decode_prefill_min_decode_steps
+                    ),
+                    decode_prefill_max_wait_ms=(
+                        self.scheduler_config.decode_prefill_max_wait_ms
+                    ),
+                ),
+                quantum=prefill_quantum,
+            )
         glm5_next_mtp_has_independent_draft_state = (
             speculative_config is not None
             and speculative_config.method == "mtp"
@@ -436,6 +539,10 @@ class Scheduler(SchedulerInterface):
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
+        if request.use_boundary_checkpoints:
+            # Running-state migration still happens in the worker, but these
+            # requests do not publish intermediate block-aligned checkpoints.
+            return num_new_tokens
         # Split only during prefill: `request.num_tokens - 1` extends this to
         # resumed requests replaying their output tokens.
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
@@ -443,11 +550,13 @@ class Scheduler(SchedulerInterface):
             return num_new_tokens
 
         block_size = self.cache_config.block_size
-        # The last block-aligned position whose state can be cached. With
-        # Eagle, FullAttn prunes the last matching block, so back off one
-        # block to avoid a Mamba cache miss.
+        # The last block-aligned position whose state can be cached.
+        # Eagle-family drafters pollute the target's last matching
+        # full-attention block with their lookahead KV write, so back off one
+        # block to avoid a Mamba cache miss. DFlash/DSpark draft from their own
+        # KV cache and never write target blocks.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle:
+        if self.drop_last_prefix_cache_block:
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
@@ -544,6 +653,34 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    @staticmethod
+    def _request_has_local_prefill(request: Request) -> bool:
+        """Whether a request still needs model compute for its input."""
+        return request.is_prefill_chunk or (
+            request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            and request.num_computed_tokens < request.num_tokens - 1
+        )
+
+    def _has_pending_local_prefill(self) -> bool:
+        return any(
+            self._request_has_local_prefill(request)
+            for request in (*self.running, *self.waiting, *self.skipped_waiting)
+        )
+
+    def _oldest_local_prefill_waiter_age_ms(self, now: float) -> float:
+        arrival_times = (
+            request.arrival_time
+            for request in (*self.waiting, *self.skipped_waiting)
+            if self._request_has_local_prefill(request)
+        )
+        oldest_arrival = min(arrival_times, default=now)
+        return max((now - oldest_arrival) * 1000.0, 0.0)
+
+    @property
+    def num_active_local_partial_prefills(self) -> int:
+        """Count model-compute partials, excluding async KV-only restores."""
+        return sum(request.is_prefill_chunk for request in self.running)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -566,8 +703,19 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
-        draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+        separate_draft_input_tokens = 0
+        if spec is not None:
+            if spec.use_dflash():
+                separate_draft_input_tokens = 1 + spec.num_speculative_tokens
+            elif spec.use_dspark():
+                separate_draft_input_tokens = spec.num_speculative_tokens
+        draft_slots = (
+            spec.max_num_new_slots_for_drafting
+            if spec is not None and separate_draft_input_tokens == 0
+            else 0
+        )
         input_budget = self.scheduler_config.max_num_batched_tokens
+        draft_input_budget = input_budget
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -579,6 +727,7 @@ class Scheduler(SchedulerInterface):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
+        scheduled_prefill_req_ids: set[str] = set()
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -594,223 +743,400 @@ class Scheduler(SchedulerInterface):
             and self.current_step >= request.next_decode_eligible_step
             for request in self.running
         )
-        defer_prefills = (
+        selected_compute_class: ComputeServiceClass | None = None
+        compute_contention = False
+        if self.compute_share_controller is not None:
+            has_prefill_candidate = self._pause_state != PauseState.PAUSED_ALL and (
+                any(
+                    request.is_prefill_chunk
+                    and self.current_step >= request.next_decode_eligible_step
+                    for request in self.running
+                )
+                or (
+                    self._pause_state == PauseState.UNPAUSED
+                    and bool(self.waiting or self.skipped_waiting)
+                )
+            )
+            selected_compute_class = self.compute_share_controller.select(
+                decode_runnable=has_eligible_decode,
+                prefill_runnable=has_prefill_candidate,
+            )
+            compute_contention = has_eligible_decode and has_prefill_candidate
+
+        legacy_defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
         ) and has_eligible_decode
-
-        # First, schedule the RUNNING requests.
-        req_index = 0
-        while req_index < len(self.running) and token_budget > 0:
-            request = self.running[req_index]
-            if input_budget <= draft_slots:
-                break
-
+        adaptive_defer_prefills = (
+            selected_compute_class == "decode" and compute_contention
+        )
+        micro_controller = self.micro_slicing_controller
+        micro_has_pending_prefill = False
+        micro_defer_prefills = False
+        micro_deadline_bypass_candidate = False
+        micro_prefill_budget_remaining: int | None = None
+        micro_waiter_prefill_limit = 0
+        micro_running_prefill_limits: dict[str, int] = {}
+        micro_waiter_scheduled = False
+        micro_prefill_tokens_scheduled = 0
+        if micro_controller is not None:
+            micro_has_pending_prefill = self._has_pending_local_prefill()
+            oldest_waiter_age_ms = self._oldest_local_prefill_waiter_age_ms(time.time())
+            (
+                micro_defer_prefills,
+                micro_deadline_bypass_candidate,
+            ) = micro_controller.should_defer_prefill(
+                has_eligible_decode=has_eligible_decode,
+                has_pending_prefill=micro_has_pending_prefill,
+                oldest_waiter_age_ms=oldest_waiter_age_ms,
+            )
             if (
-                request.num_output_placeholders > 0
-                # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
-                # Since output placeholders are also included in the computed tokens
-                # count, we subtract (num_output_placeholders - 1) to remove any draft
-                # tokens, so that we can be sure no further steps are needed even if
-                # they are all rejected.
-                and request.num_computed_tokens + 2 - request.num_output_placeholders
-                >= request.num_prompt_tokens + request.max_tokens
+                has_eligible_decode
+                and micro_has_pending_prefill
+                and not legacy_defer_prefills
+                and not micro_defer_prefills
             ):
-                # Async scheduling: Avoid scheduling an extra step when we are sure that
-                # the previous step has reached request.max_tokens. We don't schedule
-                # partial draft tokens since this prevents uniform decode optimizations.
-                req_index += 1
-                continue
-
-            if self.current_step < request.next_decode_eligible_step:
-                # V2+PP+async: enforce `pp_size` steps between same-req decodes
-                # to match worker-side sampled-tokens broadcast slot ring cadence.
-                req_index += 1
-                continue
-
-            if defer_prefills and request.is_prefill_chunk:
-                # Defer this in-progress chunk to a cadence-aligned step;
-                # decodes still run to fill this step.
-                req_index += 1
-                continue
-
-            num_new_tokens = (
-                request.num_tokens_with_spec
-                + request.num_output_placeholders
-                - request.num_computed_tokens
-            )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(
-                num_new_tokens, token_budget, input_budget - draft_slots
-            )
-
-            # Make sure the input position does not exceed the max model len.
-            # This is necessary when using spec decoding.
-            num_new_tokens = min(
-                num_new_tokens,
-                self.max_model_len
-                - request.num_computed_tokens
-                - self.num_sampled_tokens_per_step,
-            )
-
-            # Apply Mamba alignment before encoder caps.
-            if self.need_mamba_block_aligned_split:
-                num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
+                micro_prefill_budget_remaining = min(
+                    micro_controller.settings.max_num_prefill_tokens_per_step,
+                    token_budget,
+                    input_budget,
                 )
-
-            # Schedule encoder inputs.
-            encoder_inputs_to_schedule = None
-            external_load_encoder_input: list[int] = []
-            new_encoder_compute_budget = encoder_compute_budget
-            if request.has_encoder_inputs:
-                (
-                    encoder_inputs_to_schedule,
-                    num_new_tokens,
-                    new_encoder_compute_budget,
-                    external_load_encoder_input,
-                ) = self._try_schedule_encoder_inputs(
-                    request,
-                    request.num_computed_tokens,
-                    num_new_tokens,
-                    encoder_compute_budget,
-                    shift_computed_tokens=self.num_prefill_lookahead,
+                num_running_prefills = sum(
+                    request.is_prefill_chunk
+                    and self.current_step >= request.next_decode_eligible_step
+                    for request in self.running
                 )
-
-            # Multi-module MTP: avoid ending a prefill chunk within
-            # num_prefill_lookahead of the prefill end.
-            num_new_tokens = self._reserve_prefill_lookahead(
-                request, request.num_computed_tokens, num_new_tokens
-            )
-
-            if num_new_tokens == 0:
-                # The request cannot be scheduled because one of the following
-                # reasons:
-                # 1. No new tokens to schedule. This may happen when
-                #    (1) PP>1 and we have already scheduled all prompt tokens
-                #    but they are not finished yet.
-                #    (2) Async scheduling and the request has reached to either
-                #    its max_total_tokens or max_model_len.
-                # 2. The encoder budget is exhausted.
-                # 3. The encoder cache is exhausted.
-                # 4. Insufficient budget for a block-aligned chunk in hybrid
-                #    models with mamba cache mode \"align\".
-                # 5. Insufficient budget to keep a multi-module MTP prefill
-                #    chunk out of the prefill-lookahead window.
-                # NOTE(woosuk): Here, by doing `continue` instead of `break`,
-                # we do not strictly follow the FCFS scheduling policy and
-                # allow the lower-priority requests to be scheduled.
-                req_index += 1
-                continue
-
-            # Schedule newly needed KV blocks for the request.
-            with record_function_or_nullcontext("schedule: allocate_slots"):
-                while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                available_quanta = (
+                    micro_prefill_budget_remaining // micro_controller.quantum
+                )
+                if available_quanta > 0:
+                    # Give a newly admitted waiter a proportional slice instead
+                    # of a single token on non-Mamba models. Mamba-aligned
+                    # models naturally receive one or more complete pages.
+                    waiter_quanta = max(
+                        available_quanta // (num_running_prefills + 1), 1
                     )
-
-                    if new_blocks is not None:
-                        # The request can be scheduled.
-                        break
-
-                    # The request cannot be scheduled.
-                    # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
-                        )
-                        # Record the index of the preemption victim to
-                        # maintain accurate loop state.
-                        victim_index = self.running.index(preempted_req)
-                        del self.running[victim_index]
-                        # Decrement the loop cursor if the removed request
-                        # preceded the current iteration, preventing the
-                        # silent omission of the subsequent request.
-                        if victim_index < req_index:
-                            req_index -= 1
-
-                        if preempted_req in scheduled_running_reqs:
-                            preempted_req_id = preempted_req.request_id
-                            scheduled_running_reqs.remove(preempted_req)
-                            restored = num_scheduled_tokens.pop(preempted_req_id)
-                            token_budget += restored
-                            input_budget += restored + draft_slots
-                            req_to_new_blocks.pop(preempted_req_id)
-                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-                                preempted_req_id, None
-                            )
-                            if preempted_encoder_inputs:
-                                # Restore encoder compute budget if the preempted
-                                # request had encoder inputs scheduled in this step.
-                                num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i)
-                                    for i in preempted_encoder_inputs
-                                )
-                                encoder_compute_budget += num_embeds_to_restore
-                    else:
-                        preempted_req = self.running.pop()
-
-                    self._preempt_request(
-                        preempted_req,
-                        scheduled_timestamp,
-                        drop_stale_output=self.requires_kv_delivery,
+                    micro_waiter_prefill_limit = (
+                        waiter_quanta * micro_controller.quantum
                     )
-                    preempted_reqs.append(preempted_req)
-                    if preempted_req == request:
-                        # No more request to preempt. Cannot schedule this request.
-                        break
+        defer_prefills = (
+            legacy_defer_prefills or adaptive_defer_prefills or micro_defer_prefills
+        )
 
-            if new_blocks is None:
-                # Cannot schedule this request.
-                break
+        needs_multiple_running_passes = (
+            self.compute_share_controller is not None
+            or micro_prefill_budget_remaining is not None
+        )
+        running_req_ids_at_step_start = (
+            {request.request_id for request in self.running}
+            if needs_multiple_running_passes
+            else None
+        )
 
-            # Schedule the request.
-            scheduled_running_reqs.append(request)
-            prefill_scheduled |= request.is_prefill_chunk
-            request_id = request.request_id
-            req_to_new_blocks[request_id] = new_blocks
-            num_scheduled_tokens[request_id] = num_new_tokens
-            token_budget -= num_new_tokens
-            input_budget -= num_new_tokens + draft_slots
-            req_index += 1
+        def schedule_running_requests(
+            service_class: ComputeServiceClass | None = None,
+            *,
+            allow_preemption: bool = True,
+            enforce_lora_limit: bool = False,
+        ) -> None:
+            nonlocal draft_input_budget
+            nonlocal encoder_compute_budget
+            nonlocal input_budget
+            nonlocal micro_prefill_budget_remaining
+            nonlocal micro_prefill_tokens_scheduled
+            nonlocal prefill_scheduled
+            nonlocal token_budget
+            req_index = 0
+            while req_index < len(self.running) and token_budget > 0:
+                request = self.running[req_index]
+                if request.request_id in num_scheduled_tokens or (
+                    running_req_ids_at_step_start is not None
+                    and request.request_id not in running_req_ids_at_step_start
+                ):
+                    req_index += 1
+                    continue
+                if service_class is not None and (
+                    ("prefill" if request.is_prefill_chunk else "decode")
+                    != service_class
+                ):
+                    req_index += 1
+                    continue
+                if (
+                    enforce_lora_limit
+                    and self.lora_config
+                    and request.lora_request
+                    and len(scheduled_loras) == self.lora_config.max_loras
+                    and request.lora_request.lora_int_id not in scheduled_loras
+                ):
+                    req_index += 1
+                    continue
+                if (
+                    input_budget <= draft_slots
+                    or draft_input_budget < separate_draft_input_tokens
+                ):
+                    break
 
-            # Speculative decode related.
-            if request.spec_token_ids:
-                num_scheduled_spec_tokens = (
-                    num_new_tokens
-                    + request.num_computed_tokens
-                    - request.num_tokens
+                if (
+                    request.num_output_placeholders > 0
+                    # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
+                    # Output placeholders are included in computed tokens, so
+                    # subtract (num_output_placeholders - 1) to remove draft
+                    # tokens and prove no further step is needed if all reject.
+                    and request.num_computed_tokens
+                    + 2
                     - request.num_output_placeholders
+                    >= request.num_prompt_tokens + request.max_tokens
+                ):
+                    # Async scheduling: avoid an extra step when the previous
+                    # one reached max_tokens. Do not schedule partial drafts;
+                    # that prevents uniform decode optimizations.
+                    req_index += 1
+                    continue
+
+                if self.current_step < request.next_decode_eligible_step:
+                    # V2+PP+async: enforce `pp_size` steps between same-req decodes
+                    # to match worker-side sampled-tokens broadcast slot ring cadence.
+                    req_index += 1
+                    continue
+
+                if defer_prefills and request.is_prefill_chunk:
+                    # Defer this in-progress chunk to a cadence-aligned step;
+                    # decodes still run to fill this step.
+                    req_index += 1
+                    continue
+
+                running_prefill_limit = None
+                if (
+                    request.is_prefill_chunk
+                    and micro_prefill_budget_remaining is not None
+                ):
+                    running_prefill_limit = micro_running_prefill_limits.get(
+                        request.request_id, 0
+                    )
+                    if (
+                        running_prefill_limit <= 0
+                        or micro_prefill_budget_remaining <= 0
+                    ):
+                        req_index += 1
+                        continue
+
+                num_new_tokens = (
+                    request.num_tokens_with_spec
+                    + request.num_output_placeholders
+                    - request.num_computed_tokens
                 )
-                if num_scheduled_spec_tokens > 0:
-                    spec_token_ids = request.spec_token_ids
-                    if len(spec_token_ids) > num_scheduled_spec_tokens:
-                        spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
-                    scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+                if (
+                    0
+                    < self.scheduler_config.long_prefill_token_threshold
+                    < num_new_tokens
+                ):
+                    num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+                num_new_tokens = min(
+                    num_new_tokens, token_budget, input_budget - draft_slots
+                )
+                if running_prefill_limit is not None:
+                    assert micro_prefill_budget_remaining is not None
+                    num_new_tokens = min(
+                        num_new_tokens,
+                        running_prefill_limit,
+                        micro_prefill_budget_remaining,
+                    )
 
-                # New spec tokens will be set in `update_draft_token_ids` before the
-                # next step when applicable.
-                request.spec_token_ids = []
+                # Make sure the input position does not exceed the max model len.
+                # This is necessary when using spec decoding.
+                num_new_tokens = min(
+                    num_new_tokens,
+                    self.max_model_len
+                    - request.num_computed_tokens
+                    - self.num_sampled_tokens_per_step,
+                )
 
-            # Encoder-related.
-            if encoder_inputs_to_schedule:
-                scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
-                # Allocate the encoder cache.
-                for i in encoder_inputs_to_schedule:
-                    self.encoder_cache_manager.allocate(request, i)
-                    if self.ec_connector is not None:
-                        self.ec_connector.update_state_after_alloc(request, i)
-                encoder_compute_budget = new_encoder_compute_budget
-            if external_load_encoder_input:
-                for i in external_load_encoder_input:
-                    self.encoder_cache_manager.allocate(request, i)
-                    if self.ec_connector is not None:
-                        self.ec_connector.update_state_after_alloc(request, i)
+                # Apply Mamba alignment before encoder caps.
+                if self.need_mamba_block_aligned_split:
+                    num_new_tokens = self._mamba_block_aligned_split(
+                        request, num_new_tokens
+                    )
+
+                # Schedule encoder inputs.
+                encoder_inputs_to_schedule = None
+                external_load_encoder_input: list[int] = []
+                new_encoder_compute_budget = encoder_compute_budget
+                if request.has_encoder_inputs:
+                    (
+                        encoder_inputs_to_schedule,
+                        num_new_tokens,
+                        new_encoder_compute_budget,
+                        external_load_encoder_input,
+                    ) = self._try_schedule_encoder_inputs(
+                        request,
+                        request.num_computed_tokens,
+                        num_new_tokens,
+                        encoder_compute_budget,
+                        shift_computed_tokens=self.num_prefill_lookahead,
+                    )
+
+                # Multi-module MTP: avoid ending a prefill chunk within
+                # num_prefill_lookahead of the prefill end.
+                num_new_tokens = self._reserve_prefill_lookahead(
+                    request, request.num_computed_tokens, num_new_tokens
+                )
+
+                if num_new_tokens == 0:
+                    # The request cannot be scheduled because one of the following
+                    # reasons:
+                    # 1. No new tokens to schedule. This may happen when
+                    #    (1) PP>1 and we have already scheduled all prompt tokens
+                    #    but they are not finished yet.
+                    #    (2) Async scheduling and the request has reached to either
+                    #    its max_total_tokens or max_model_len.
+                    # 2. The encoder budget is exhausted.
+                    # 3. The encoder cache is exhausted.
+                    # 4. Insufficient budget for a block-aligned chunk in hybrid
+                    #    models with mamba cache mode \"align\".
+                    # 5. Insufficient budget to keep a multi-module MTP prefill
+                    #    chunk out of the prefill-lookahead window.
+                    # NOTE(woosuk): Here, by doing `continue` instead of `break`,
+                    # we do not strictly follow the FCFS scheduling policy and
+                    # allow the lower-priority requests to be scheduled.
+                    req_index += 1
+                    continue
+
+                # Schedule newly needed KV blocks for the request.
+                with record_function_or_nullcontext("schedule: allocate_slots"):
+                    while True:
+                        new_blocks = self.kv_cache_manager.allocate_slots(
+                            request,
+                            num_new_tokens,
+                            num_lookahead_tokens=self.num_lookahead_tokens,
+                        )
+
+                        if new_blocks is not None:
+                            # The request can be scheduled.
+                            break
+
+                        if not allow_preemption:
+                            # Leftover service must not evict work selected and
+                            # admitted earlier in this model step.
+                            break
+
+                        # The request cannot be scheduled.
+                        # Preempt the lowest-priority request.
+                        if self.policy == SchedulingPolicy.PRIORITY:
+                            preempted_req = max(
+                                self.running,
+                                key=lambda r: (r.priority, r.arrival_time),
+                            )
+                            # Record the index of the preemption victim to
+                            # maintain accurate loop state.
+                            victim_index = self.running.index(preempted_req)
+                            del self.running[victim_index]
+                            # Decrement the loop cursor if the removed request
+                            # preceded the current iteration, preventing the
+                            # silent omission of the subsequent request.
+                            if victim_index < req_index:
+                                req_index -= 1
+
+                            if preempted_req in scheduled_running_reqs:
+                                preempted_req_id = preempted_req.request_id
+                                scheduled_running_reqs.remove(preempted_req)
+                                restored = num_scheduled_tokens.pop(preempted_req_id)
+                                token_budget += restored
+                                input_budget += restored + draft_slots
+                                draft_input_budget += separate_draft_input_tokens
+                                scheduled_prefill_req_ids.discard(preempted_req_id)
+                                req_to_new_blocks.pop(preempted_req_id)
+                                scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                                preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                                    preempted_req_id, None
+                                )
+                                if preempted_encoder_inputs:
+                                    # Restore encoder compute budget if the preempted
+                                    # request had encoder inputs scheduled in this step.
+                                    num_embeds_to_restore = sum(
+                                        preempted_req.get_num_encoder_embeds(i)
+                                        for i in preempted_encoder_inputs
+                                    )
+                                    encoder_compute_budget += num_embeds_to_restore
+                        else:
+                            preempted_req = self.running.pop()
+
+                        self._preempt_request(
+                            preempted_req,
+                            scheduled_timestamp,
+                            drop_stale_output=self.requires_kv_delivery,
+                        )
+                        preempted_reqs.append(preempted_req)
+                        if preempted_req == request:
+                            # No more request to preempt. Cannot schedule this request.
+                            break
+
+                if new_blocks is None:
+                    # Cannot schedule this request.
+                    break
+
+                # Schedule the request.
+                scheduled_running_reqs.append(request)
+                prefill_scheduled |= request.is_prefill_chunk
+                if request.is_prefill_chunk:
+                    scheduled_prefill_req_ids.add(request.request_id)
+                request_id = request.request_id
+                req_to_new_blocks[request_id] = new_blocks
+                num_scheduled_tokens[request_id] = num_new_tokens
+                token_budget -= num_new_tokens
+                input_budget -= num_new_tokens + draft_slots
+                draft_input_budget -= separate_draft_input_tokens
+                if running_prefill_limit is not None:
+                    assert micro_prefill_budget_remaining is not None
+                    micro_prefill_budget_remaining -= num_new_tokens
+                    micro_prefill_tokens_scheduled += num_new_tokens
+                if enforce_lora_limit and request.lora_request:
+                    scheduled_loras.add(request.lora_request.lora_int_id)
+                req_index += 1
+
+                # Speculative decode related.
+                if request.spec_token_ids:
+                    num_scheduled_spec_tokens = (
+                        num_new_tokens
+                        + request.num_computed_tokens
+                        - request.num_tokens
+                        - request.num_output_placeholders
+                    )
+                    if num_scheduled_spec_tokens > 0:
+                        spec_token_ids = request.spec_token_ids
+                        if len(spec_token_ids) > num_scheduled_spec_tokens:
+                            spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
+                        scheduled_spec_decode_tokens[request.request_id] = (
+                            spec_token_ids
+                        )
+
+                    # New spec tokens will be set in `update_draft_token_ids` before the
+                    # next step when applicable.
+                    request.spec_token_ids = []
+
+                # Encoder-related.
+                if encoder_inputs_to_schedule:
+                    scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
+                    # Allocate the encoder cache.
+                    for i in encoder_inputs_to_schedule:
+                        self.encoder_cache_manager.allocate(request, i)
+                        if self.ec_connector is not None:
+                            self.ec_connector.update_state_after_alloc(request, i)
+                    encoder_compute_budget = new_encoder_compute_budget
+                if external_load_encoder_input:
+                    for i in external_load_encoder_input:
+                        self.encoder_cache_manager.allocate(request, i)
+                        if self.ec_connector is not None:
+                            self.ec_connector.update_state_after_alloc(request, i)
+
+        adaptive_prefill_turn = (
+            selected_compute_class == "prefill" and compute_contention
+        )
+        micro_mixed_step = micro_prefill_budget_remaining is not None
+        initial_service_class: ComputeServiceClass | None = (
+            "decode"
+            if micro_mixed_step
+            else ("prefill" if adaptive_prefill_turn else None)
+        )
+        schedule_running_requests(initial_service_class)
 
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
@@ -827,7 +1153,10 @@ class Scheduler(SchedulerInterface):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                if input_budget <= draft_slots:
+                if (
+                    input_budget <= draft_slots
+                    or draft_input_budget < separate_draft_input_tokens
+                ):
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
@@ -884,6 +1213,7 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
+                boundary_logits_only = False
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -894,6 +1224,12 @@ class Scheduler(SchedulerInterface):
                         request.shared_prefix_boundary,
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
+                    boundary_logits_only = (
+                        request.boundary_checkpoint is not None
+                        and num_new_local_computed_tokens == request.num_tokens
+                    )
+                    if boundary_logits_only and num_scheduled_tokens:
+                        break
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -989,25 +1325,52 @@ class Scheduler(SchedulerInterface):
                     num_computed_tokens = request.num_computed_tokens
 
                 encoder_inputs_to_schedule = None
-                external_load_encoder_input = []
+                external_load_encoder_input: list[int] = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
+                has_local_prefill = (
+                    not load_kv_async and num_computed_tokens < request.num_tokens - 1
+                )
+                waiting_micro_limit = None
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
-                elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
-                    # DP prefill balancing: defer this step's local prefill
-                    # compute to a cadence-aligned step.
-                    break
                 else:
+                    if defer_prefills and has_local_prefill:
+                        if adaptive_defer_prefills and not num_scheduled_tokens:
+                            # The selected decode class proved unrunnable after
+                            # its resource checks. Fall back immediately.
+                            adaptive_defer_prefills = False
+                            defer_prefills = legacy_defer_prefills
+                        else:
+                            # DP prefill balancing: defer this step's local
+                            # prefill compute to a cadence-aligned step.
+                            break
                     request_token_budget = min(token_budget, input_budget - draft_slots)
+                    if has_local_prefill and micro_prefill_budget_remaining is not None:
+                        if (
+                            micro_waiter_scheduled
+                            or micro_prefill_budget_remaining <= 0
+                        ):
+                            break
+                        waiting_micro_limit = min(
+                            micro_waiter_prefill_limit,
+                            micro_prefill_budget_remaining,
+                        )
+                        if waiting_micro_limit <= 0:
+                            break
+                        request_token_budget = min(
+                            request_token_budget, waiting_micro_limit
+                        )
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    if boundary_logits_only:
+                        num_new_tokens = 1
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -1083,6 +1446,21 @@ class Scheduler(SchedulerInterface):
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
                         break
+
+                will_remain_partial = (
+                    has_local_prefill
+                    and num_computed_tokens + num_new_tokens < request.num_tokens
+                )
+                if (
+                    will_remain_partial
+                    and micro_controller is not None
+                    and micro_controller.settings.max_num_partial_prefills > 0
+                    and self.num_active_local_partial_prefills
+                    >= micro_controller.settings.max_num_partial_prefills
+                ):
+                    # A request that finishes its prefill inside this quantum is
+                    # still admitted when all partial slots are occupied.
+                    break
 
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
@@ -1212,8 +1590,16 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if num_computed_tokens < request.num_tokens - 1:
+                    scheduled_prefill_req_ids.add(request_id)
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                draft_input_budget -= separate_draft_input_tokens
+                if waiting_micro_limit is not None:
+                    assert micro_prefill_budget_remaining is not None
+                    micro_prefill_budget_remaining -= num_new_tokens
+                    micro_prefill_tokens_scheduled += num_new_tokens
+                    micro_waiter_scheduled = True
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
@@ -1239,6 +1625,12 @@ class Scheduler(SchedulerInterface):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
+                if boundary_logits_only:
+                    token_budget = 0
+                    if micro_prefill_budget_remaining is not None:
+                        micro_prefill_budget_remaining = 0
+                    break
+
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
@@ -1248,12 +1640,88 @@ class Scheduler(SchedulerInterface):
             if not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
 
+        # In a micro-sliced mixed step, waiting admission gets the first
+        # prefill quantum after decodes. Any unused portion is immediately
+        # redistributed across already-running prefills, so a blocked waiter
+        # can never strand model capacity.
+        if (
+            micro_mixed_step
+            and micro_prefill_budget_remaining is not None
+            and micro_prefill_budget_remaining > 0
+        ):
+            assert micro_controller is not None
+            assert running_req_ids_at_step_start is not None
+            running_prefill_ids = [
+                request.request_id
+                for request in self.running
+                if request.request_id in running_req_ids_at_step_start
+                and request.request_id not in num_scheduled_tokens
+                and request.is_prefill_chunk
+                and self.current_step >= request.next_decode_eligible_step
+            ]
+            micro_running_prefill_limits = micro_controller.select_running_limits(
+                running_prefill_ids, micro_prefill_budget_remaining
+            )
+            schedule_running_requests(
+                "prefill",
+                allow_preemption=False,
+                enforce_lora_limit=True,
+            )
+
+        # The coarse runnable check can race async-completion guards. If a
+        # selected decode turn produced no work, give an already-running
+        # prefill an immediate chance before returning an empty step.
+        if (
+            selected_compute_class == "decode"
+            and compute_contention
+            and not num_scheduled_tokens
+            and not legacy_defer_prefills
+        ):
+            adaptive_defer_prefills = False
+            defer_prefills = False
+            schedule_running_requests("prefill")
+
+        # A prefill turn gives prefills first use of the model-step capacity.
+        # Existing decodes then consume only capacity genuinely left over. New
+        # requests admitted above are excluded by running_req_ids_at_step_start,
+        # so no request can be scheduled twice in one step.
+        if adaptive_prefill_turn and token_budget > 0:
+            schedule_running_requests(
+                "decode",
+                allow_preemption=False,
+                enforce_lora_limit=True,
+            )
+
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        if micro_mixed_step:
+            assert micro_controller is not None
+            assert (
+                micro_prefill_tokens_scheduled
+                <= micro_controller.settings.max_num_prefill_tokens_per_step
+            )
+
+        if micro_controller is not None:
+            scheduled_prefill_tokens = sum(
+                num_scheduled_tokens[request_id]
+                for request_id in scheduled_prefill_req_ids
+            )
+            micro_controller.observe_step(
+                has_eligible_decode=has_eligible_decode,
+                had_pending_prefill=micro_has_pending_prefill,
+                scheduled_decode_tokens=(
+                    total_num_scheduled_tokens - scheduled_prefill_tokens
+                ),
+                scheduled_prefill_tokens=(
+                    micro_prefill_tokens_scheduled if micro_mixed_step else 0
+                ),
+                deadline_bypass_candidate=micro_deadline_bypass_candidate,
+            )
 
         assert token_budget >= 0
         assert input_budget >= 0
+        assert draft_input_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
@@ -1318,6 +1786,7 @@ class Scheduler(SchedulerInterface):
         # pin); the manager drops stale entries when the request's blocks are
         # popped for free.
         pending_partial_tail_offloads = None
+        kv_connector_block_state = None
         if (
             self.connector is not None
             and self.vllm_config.kv_transfer_config is not None
@@ -1325,6 +1794,13 @@ class Scheduler(SchedulerInterface):
         ):
             pending_partial_tail_offloads = (
                 self.kv_cache_manager.take_partial_tail_offloads() or None
+            )
+            kv_connector_block_state = _build_kv_connector_block_state(
+                self.kv_cache_config,
+                self.kv_cache_manager,
+                num_scheduled_tokens,
+                pending_partial_tail_offloads,
+                self.cache_config.prefix_cache_retention_interval,
             )
 
         kv_cache_block_copies, cow_retained_blocks = (
@@ -1361,6 +1837,13 @@ class Scheduler(SchedulerInterface):
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
+            boundary_logits_only=bool(
+                new_reqs_data
+                and new_reqs_data[0].boundary_checkpoint is not None
+                and new_reqs_data[0].prefill_token_ids is not None
+                and new_reqs_data[0].num_computed_tokens
+                == len(new_reqs_data[0].prefill_token_ids)
+            ),
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
@@ -1378,8 +1861,24 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
             partial_tail_offloads=pending_partial_tail_offloads,
+            kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+            compute_service_class=(
+                (
+                    "prefill"
+                    if any(
+                        req_id in num_scheduled_tokens
+                        for req_id in scheduled_prefill_req_ids
+                    )
+                    else "decode"
+                )
+                if self.compute_share_controller is not None
+                and compute_contention
+                and total_num_scheduled_tokens > 0
+                else None
+            ),
+            compute_contention=compute_contention,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1404,7 +1903,141 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if (
+            self.compute_share_controller is not None
+            and scheduler_output.compute_service_class is not None
+        ):
+            self.compute_share_controller.dispatch(
+                scheduler_output.compute_service_class,
+                contended=scheduler_output.compute_contention,
+            )
         return scheduler_output
+
+    def record_compute_time(
+        self,
+        service_class: ComputeServiceClass,
+        elapsed_seconds: float,
+        *,
+        contended: bool,
+    ) -> None:
+        """Apply execution feedback and accumulate metric deltas."""
+        if self.compute_share_controller is None:
+            return
+        if not contended:
+            return
+        if self.log_stats and elapsed_seconds > 0.0:
+            if service_class == "prefill":
+                self._prefill_compute_seconds += elapsed_seconds
+            else:
+                self._decode_compute_seconds += elapsed_seconds
+        self.compute_share_controller.record(
+            service_class, elapsed_seconds, contended=True
+        )
+
+    def get_prefill_fairness(self) -> dict[str, Any]:
+        """Return the active fairness policy and its complete tuning state."""
+        return {
+            "fairness_engine": self.scheduler_config.fairness_engine,
+            "prefill_compute_share": self.scheduler_config.prefill_compute_share,
+            "max_num_prefill_tokens_per_step": (
+                self.scheduler_config.max_num_prefill_tokens_per_step
+            ),
+            "max_num_partial_prefills": (
+                self.scheduler_config.max_num_partial_prefills
+            ),
+            "decode_prefill_min_decode_steps": (
+                self.scheduler_config.decode_prefill_min_decode_steps
+            ),
+            "decode_prefill_max_wait_ms": (
+                self.scheduler_config.decode_prefill_max_wait_ms
+            ),
+            "prefill_quantum": self.prefill_fairness_quantum,
+        }
+
+    def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Replace the fairness policy at an engine-enforced idle boundary."""
+        fairness_engine = config.get("fairness_engine")
+        prefill_compute_share = config.get("prefill_compute_share")
+        max_prefill_tokens = int(config.get("max_num_prefill_tokens_per_step", 0))
+        max_partial_prefills = int(config.get("max_num_partial_prefills", 0))
+        min_decode_steps = int(config.get("decode_prefill_min_decode_steps", 0))
+        max_wait_ms = int(config.get("decode_prefill_max_wait_ms", 0))
+
+        if fairness_engine not in (None, "compute_share", "micro_slicing"):
+            raise ValueError(f"unknown fairness_engine: {fairness_engine!r}")
+
+        micro_configured = any(
+            (
+                max_prefill_tokens,
+                max_partial_prefills,
+                min_decode_steps,
+                max_wait_ms,
+            )
+        )
+        if fairness_engine is None:
+            if prefill_compute_share is not None or micro_configured:
+                raise ValueError(
+                    "fairness tuning options must be cleared when fairness_engine "
+                    "is disabled"
+                )
+        elif fairness_engine == "compute_share":
+            if prefill_compute_share is None or not 0.0 < prefill_compute_share < 1.0:
+                raise ValueError(
+                    "prefill_compute_share must be strictly between zero and one"
+                )
+            if micro_configured:
+                raise ValueError(
+                    "micro-slicing options cannot be set for compute_share"
+                )
+        else:
+            if prefill_compute_share is not None:
+                raise ValueError(
+                    "prefill_compute_share cannot be set for micro_slicing"
+                )
+            if max_prefill_tokens > self.scheduler_config.max_num_batched_tokens:
+                raise ValueError(
+                    "max_num_prefill_tokens_per_step cannot exceed "
+                    "max_num_batched_tokens"
+                )
+            if max_partial_prefills > self.max_num_running_reqs:
+                raise ValueError("max_num_partial_prefills cannot exceed max_num_seqs")
+
+        if fairness_engine is not None:
+            if self.scheduler_config.prefill_schedule_interval > 1:
+                raise ValueError(
+                    "fairness_engine cannot be combined with "
+                    "prefill_schedule_interval greater than one"
+                )
+            if self.parallel_config.data_parallel_size > 1:
+                raise ValueError("fairness_engine does not support data parallelism")
+
+        micro_controller = None
+        compute_controller = None
+        if fairness_engine == "compute_share":
+            assert prefill_compute_share is not None
+            compute_controller = PrefillComputeShareController(prefill_compute_share)
+        elif fairness_engine == "micro_slicing":
+            micro_controller = MicroSlicingController(
+                MicroSlicingSettings(
+                    max_num_prefill_tokens_per_step=max_prefill_tokens,
+                    max_num_partial_prefills=max_partial_prefills,
+                    decode_prefill_min_decode_steps=min_decode_steps,
+                    decode_prefill_max_wait_ms=max_wait_ms,
+                ),
+                quantum=self.prefill_fairness_quantum,
+            )
+
+        self.compute_share_controller = compute_controller
+        self.micro_slicing_controller = micro_controller
+        self._decode_compute_seconds = 0.0
+        self._prefill_compute_seconds = 0.0
+        self.scheduler_config.fairness_engine = fairness_engine
+        self.scheduler_config.prefill_compute_share = prefill_compute_share
+        self.scheduler_config.max_num_prefill_tokens_per_step = max_prefill_tokens
+        self.scheduler_config.max_num_partial_prefills = max_partial_prefills
+        self.scheduler_config.decode_prefill_min_decode_steps = min_decode_steps
+        self.scheduler_config.decode_prefill_max_wait_ms = max_wait_ms
+        return self.get_prefill_fairness()
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
@@ -1481,7 +2114,8 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
-            request.num_computed_tokens += num_scheduled_token
+            if not scheduler_output.boundary_logits_only:
+                request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.
@@ -2082,6 +2716,17 @@ class Scheduler(SchedulerInterface):
                     )
 
             finish_reason = None
+            captures = model_runner_output.boundary_checkpoint_tokens
+            if captures is not None and not output_is_stale:
+                prompt_boundary, response_boundary = captures[req_index]
+                if prompt_boundary:
+                    self.kv_cache_manager.publish_boundary_checkpoint(
+                        request, prompt_boundary, is_response=False
+                    )
+                if stopped and response_boundary:
+                    self.kv_cache_manager.publish_boundary_checkpoint(
+                        request, response_boundary, is_response=True
+                    )
             if stopped:
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
@@ -2762,6 +3407,25 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        decode_compute_seconds = 0.0
+        prefill_compute_seconds = 0.0
+        prefill_compute_share = 0.0
+        if self.compute_share_controller is not None:
+            decode_compute_seconds = self._decode_compute_seconds
+            prefill_compute_seconds = self._prefill_compute_seconds
+            prefill_compute_share = self.compute_share_controller.prefill_compute_share
+            self._decode_compute_seconds = 0.0
+            self._prefill_compute_seconds = 0.0
+        micro_stats = {
+            "scheduled_prefill_tokens": 0,
+            "active_partial_prefills": 0,
+            "decode_only_steps": 0,
+            "fairness_bypasses": 0,
+        }
+        if self.micro_slicing_controller is not None:
+            micro_stats = self.micro_slicing_controller.drain_stats(
+                active_partial_prefills=self.num_active_local_partial_prefills
+            )
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
@@ -2774,6 +3438,13 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            decode_compute_seconds=decode_compute_seconds,
+            prefill_compute_seconds=prefill_compute_seconds,
+            prefill_compute_share=prefill_compute_share,
+            scheduled_prefill_tokens=micro_stats["scheduled_prefill_tokens"],
+            active_partial_prefills=micro_stats["active_partial_prefills"],
+            decode_only_steps=micro_stats["decode_only_steps"],
+            fairness_bypasses=micro_stats["fairness_bypasses"],
         )
 
     def make_spec_decoding_stats(

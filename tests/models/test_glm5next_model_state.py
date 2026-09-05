@@ -2,15 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.models.glm5next.model_state import (
     Glm5NextAttnMetadata,
     Glm5NextModelState,
 )
 from vllm.platforms import current_platform
+from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
 
@@ -99,6 +103,90 @@ def test_glm5next_selector_and_mamba_use_independent_acceptance_after_alignment(
     assert selector_accepted.data_ptr() != mamba_accepted.data_ptr()
     assert torch.equal(selector_accepted, torch.tensor([4], dtype=torch.int32))
     assert torch.equal(mamba_accepted, torch.tensor([1], dtype=torch.int32))
+
+
+def test_glm5next_kda_reuses_captured_metadata_after_reordering(monkeypatch) -> None:
+    from tests.v1.attention.test_gdn_metadata_builder import _create_gdn_builder
+
+    monkeypatch.setenv("VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH", "1")
+    builders = [
+        _create_gdn_builder(3, full_cuda_graph=True, num_prefill_checkpoint_blocks=1)
+        for _ in range(2)
+    ]
+    for builder in builders:
+        builder.vllm_config.cache_config.mamba_cache_mode = "align"
+    state = _bare_model_state()
+    state.vllm_config = builders[0].vllm_config
+    state.max_model_len = 4096
+    state.selector_is_prefilling = CpuGpuBuffer(
+        8, dtype=torch.bool, device=torch.device("cpu"), pin_memory=False
+    )
+    state._align_mode = True
+    state._aligned_metadata_groups = state._aligned_metadata_ctx = None
+    state._aligned_metadata_builders = []
+    state._gdn_spec_accepted_tokens = torch.ones(8, dtype=torch.int32)
+    state.recoverssm = None
+    state._get_mamba_group_info = lambda _: ([0, 1], None)
+    indices = torch.arange(64, dtype=torch.int32).reshape(2, 8, 4)
+    ctx = SimpleNamespace(
+        aligned_state_indices=indices, compute_aligned_state_indices=Mock()
+    )
+    state._ensure_align_ctx = lambda *_: ctx
+    groups = [
+        [SimpleNamespace(get_metadata_builder=lambda _, b=b: b, layer_names=[str(i)])]
+        for i, b in enumerate(builders)
+    ]
+    kv_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=b.kv_cache_spec) for b in builders
+        ]
+    )
+    batch = SimpleNamespace(
+        num_reqs=1,
+        num_reqs_after_padding=1,
+        num_tokens=4,
+        num_tokens_after_padding=4,
+        query_start_loc_np=np.array([0, 4], dtype=np.int32),
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        num_scheduled_tokens=np.array([4], dtype=np.int32),
+        num_draft_tokens_per_req=np.array([3], dtype=np.int32),
+        is_prefilling_np=np.array([False]),
+        seq_lens_cpu_upper_bound=torch.tensor([64], dtype=torch.int32),
+        seq_lens=torch.tensor([64], dtype=torch.int32),
+        idx_mapping=torch.tensor([5], dtype=torch.int32),
+        prompt_lens=torch.tensor([32]),
+        dcp_local_seq_lens=None,
+    )
+    block_tables = (torch.zeros(1, 8, dtype=torch.int32),) * 2
+    slot_mappings = torch.zeros(2, 4, dtype=torch.int64)
+
+    def prepare(for_capture=False):
+        return state.prepare_attn(
+            batch,
+            CUDAGraphMode.FULL,
+            block_tables,
+            slot_mappings,
+            groups,
+            kv_config,
+            for_capture=for_capture,
+        )
+
+    captured = prepare(for_capture=True)
+    for slot, accepted in ((5, 4), (1, 2), (5, 1)):
+        batch.idx_mapping.fill_(slot)
+        state.num_accepted_tokens_gpu[slot] = accepted
+        indices.add_(8)
+        current = prepare()
+        for i in range(2):
+            assert current[str(i)].is_uniform_spec_decode
+            torch.testing.assert_close(
+                captured[str(i)].spec_state_indices_tensor, indices[i, :1]
+            )
+            assert captured[str(i)].num_accepted_tokens.item() == accepted
+        assert (
+            current["0"].num_accepted_tokens.data_ptr()
+            == current["1"].num_accepted_tokens.data_ptr()
+        )
 
 
 def test_glm5next_draft_metadata_preserves_first_step_acceptance() -> None:

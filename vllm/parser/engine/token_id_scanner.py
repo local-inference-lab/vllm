@@ -291,11 +291,40 @@ class TokenIDScanner:
         if not reconstructed:
             return [TextChunk(delta_text)] + results
 
-        pos = delta_text.find(reconstructed)
-        if pos > 0:
-            return [TextChunk(delta_text[:pos])] + results
-        if pos == 0:
+        if delta_text.endswith(reconstructed):
+            holdback = delta_text[: -len(reconstructed)]
+            if holdback:
+                recovered: list[LexerInput] = [TextChunk(holdback)]
+                recovered.extend(results)
+                return recovered
             return results
+
+        # Serving strips a trailing stop token's text from delta_text but
+        # keeps its ID. Match without the trailing DROP terminals before
+        # falling back to anchor rebuilding, which would rebind an anchor
+        # to a literal lookalike earlier in the text.
+        retained: list[LexerInput] = list(results)
+        trailing_drops: list[PreLexedTerminal] = []
+        while (
+            retained
+            and isinstance(retained[-1], PreLexedTerminal)
+            and retained[-1].terminal == DROP_TERMINAL
+        ):
+            drop = retained.pop()
+            assert isinstance(drop, PreLexedTerminal)
+            trailing_drops.insert(0, drop)
+        if trailing_drops:
+            retained_text = self._join_decoded_text(retained)
+            if retained_text and delta_text.endswith(retained_text):
+                for drop in trailing_drops:
+                    self._deferred_terminals.append(drop)
+                    self._deferred_prefix_token_counts.append(0)
+                holdback = delta_text[: -len(retained_text)]
+                if holdback:
+                    recovered = [TextChunk(holdback)]
+                    recovered.extend(retained)
+                    return recovered
+                return retained
 
         # Fallback: SentencePiece context-dependent decoding mismatch.
         # Rebuild from delta_text using PreLexedTerminals as split anchors.

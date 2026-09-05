@@ -45,6 +45,7 @@ CacheDType = Literal[
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
+    "nvfp4_ds_mla",
     "turboquant_k8v4",
     "turboquant_4bit_nc",
     "turboquant_k3v4_nc",
@@ -68,6 +69,7 @@ def _get_prefix_cache_retention_interval() -> int | None:
 
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
+RecurrentCheckpointPolicy = Literal["auto", "aligned", "request_boundaries"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
@@ -125,6 +127,7 @@ class CacheConfig:
     to fp8.
     "nvfp4_4over6" uses the NVFP4 layout and selects between max/6 and max/4
     scales per 16 values by minimizing squared reconstruction error.
+    "nvfp4_ds_mla" uses the model-specific packed sparse-MLA record.
     """
     is_attention_free: bool = False
     """Whether the model is attention-free. This is primarily set in
@@ -162,6 +165,13 @@ class CacheConfig:
     retain periodic checkpoints at the specified interval, which must be a
     multiple of the scheduler block size. ``None`` retains checkpoints densely.
     Applies only to sliding-window and Mamba cache groups."""
+    recurrent_checkpoint_policy: RecurrentCheckpointPolicy = "auto"
+    """Retention policy for reusable recurrent state. ``request_boundaries``
+    retains the completed prompt and committed response endpoint, disabling
+    intermediate reusable checkpoints. ``aligned`` preserves block-aligned
+    retention. ``auto`` selects request boundaries for supported configurations
+    and aligned retention otherwise. Temporary speculative rollback state is
+    independent of this policy."""
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
@@ -270,6 +280,7 @@ class CacheConfig:
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
             "prefix_cache_retention_interval",
+            "recurrent_checkpoint_policy",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
             "mamba_page_size_padded",

@@ -48,7 +48,6 @@ _SELECTION_WIDTH = 2051
 _INDEX_CACHE_WIDTH = 132
 _INDEX_PAGE_SIZE = 64
 _INDEX_PAGE_BYTES = _INDEX_PAGE_SIZE * _INDEX_CACHE_WIDTH
-_MLA_RECORD_BYTES = 528
 
 
 class Glm5NextPooledIndexer(nn.Module):
@@ -193,10 +192,17 @@ class Glm5NextPooledIndexer(nn.Module):
             compress_ratio=_POOL_SIZE,
         )
 
+        speculative_config = vllm_config.speculative_config
+        num_speculative_tokens = (
+            speculative_config.num_speculative_tokens if speculative_config else 0
+        ) or 0
+        tail_capacity = (
+            math.ceil((_POOL_SIZE + num_speculative_tokens) / _POOL_SIZE) * _POOL_SIZE
+        )
         self.register_buffer(
             "_tail",
             torch.empty(
-                (self.max_seqs, 2, _POOL_SIZE, _INDEX_HEAD_DIM),
+                (self.max_seqs, 2, tail_capacity, _INDEX_HEAD_DIM),
                 dtype=torch.bfloat16,
                 device=device,
             ),
@@ -283,7 +289,14 @@ class Glm5NextPooledIndexer(nn.Module):
 
     @staticmethod
     def _active_index_page_count(seq_len: int) -> int:
-        """Return FP8 C4 pages that can contain completed visible pools."""
+        """Return FP8 C4 pages that can contain completed visible pools.
+
+        Args:
+            seq_len: Visible sequence length in tokens.
+
+        Returns:
+            Number of index pages that may contain completed pools.
+        """
         completed_pools = seq_len // _POOL_SIZE
         return max(1, math.ceil(completed_pools / _INDEX_PAGE_SIZE))
 
@@ -294,22 +307,25 @@ class Glm5NextPooledIndexer(nn.Module):
         if (
             main_cache.ndim != 3
             or main_cache.dtype != torch.uint8
-            or int(main_cache.shape[-1]) != _MLA_RECORD_BYTES
+            or int(main_cache.shape[-1]) <= 0
         ):
-            raise ValueError("GLM MLA cache must be uint8 [pages, block, 528]")
-        pages, block_size, _ = map(int, main_cache.shape)
+            raise ValueError("GLM MLA cache must be uint8 [pages, block, record_bytes]")
+        pages, block_size, record_bytes = map(int, main_cache.shape)
         if pages <= 0 or block_size % (_POOL_SIZE * _INDEX_PAGE_SIZE):
             raise ValueError(
                 "GLM MLA pages must contain a whole number of 64-pool C4 pages"
             )
-        if tuple(map(int, main_cache.stride()[1:])) != (_MLA_RECORD_BYTES, 1):
+        if tuple(map(int, main_cache.stride()[1:])) != (record_bytes, 1):
             raise ValueError("GLM MLA cache records must be contiguous within a page")
 
         subpages_per_parent = block_size // (_POOL_SIZE * _INDEX_PAGE_SIZE)
         parent_stride_bytes = int(main_cache.stride(0))
-        semantic_page_bytes = block_size * _MLA_RECORD_BYTES
+        semantic_page_bytes = block_size * record_bytes
+        index_tail_offset_bytes = (
+            (semantic_page_bytes + _INDEX_PAGE_BYTES - 1) // _INDEX_PAGE_BYTES
+        ) * _INDEX_PAGE_BYTES
         index_tail_bytes = subpages_per_parent * _INDEX_PAGE_BYTES
-        if parent_stride_bytes < semantic_page_bytes + index_tail_bytes:
+        if parent_stride_bytes < index_tail_offset_bytes + index_tail_bytes:
             raise ValueError("GLM MLA cache page does not contain its FP8 index tail")
         if parent_stride_bytes % _INDEX_PAGE_BYTES:
             raise ValueError(
@@ -322,7 +338,7 @@ class Glm5NextPooledIndexer(nn.Module):
                 "GLM virtual C4 page IDs exceed the int32 page-table range"
             )
 
-        tail_offset = int(main_cache.storage_offset()) + semantic_page_bytes
+        tail_offset = int(main_cache.storage_offset()) + index_tail_offset_bytes
         tail_end = (
             tail_offset + max_virtual_page * _INDEX_PAGE_BYTES + _INDEX_PAGE_BYTES
         )
@@ -374,7 +390,17 @@ class Glm5NextPooledIndexer(nn.Module):
         num_prefills: int,
         num_decode_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Return the direct physical selection produced for pure decode."""
+        """Return the direct physical selection produced for pure decode.
+
+        Args:
+            num_tokens: Number of active token rows.
+            num_prefills: Number of prefill requests.
+            num_decode_tokens: Number of decode token rows.
+
+        Returns:
+            Physical selected slots and active counts, or ``None`` when direct
+            selection is unavailable for the current batch geometry.
+        """
         if (
             not self._emit_physical_selection
             or self.dcp_world_size != 1
@@ -630,6 +656,9 @@ class Glm5NextPooledIndexer(nn.Module):
 
     def snapshot_speculative_interval_starts(self) -> None:
         self._tail_snapshot.copy_(self._tail)
+
+    def get_recurrent_checkpoint_tensors(self) -> tuple[torch.Tensor, ...]:
+        return (self._tail,)
 
     def restore_speculative_interval_starts(self) -> None:
         self._tail.copy_(self._tail_snapshot)

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -244,6 +245,42 @@ def test_reinterpret_u64_as_i64_preserves_pointer_bits():
         ptr_tensor[idx] = _reinterpret_u64_as_i64(ptr)
 
     assert ptr_tensor.numpy().view(np.uint64).tolist() == ptrs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_aligned_state_indices_graph_replay_masks_padding_and_refreshes_blocks():
+    tables = [
+        torch.arange(16, dtype=torch.int32, device="cuda").view(4, 4) + group * 100
+        for group in range(2)
+    ]
+    indices = torch.empty((2, 4, 1), dtype=torch.int32, device="cuda")
+    ctx = SimpleNamespace(
+        is_initialized=True,
+        aligned_state_indices=indices,
+        block_table_ptrs=torch.tensor(
+            [_reinterpret_u64_as_i64(table.data_ptr()) for table in tables],
+            dtype=torch.int64,
+            device="cuda",
+        ),
+        block_table_stride_req=4,
+        block_size=16,
+        num_groups=2,
+    )
+    seq_lens = torch.tensor([16, 17, 0, 0], dtype=torch.int32, device="cuda")
+
+    def compute():
+        MambaSpecDecodeGPUContext.compute_aligned_state_indices(ctx, seq_lens, 4)
+
+    compute()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compute()
+    graph.replay()
+    assert indices[:, :, 0].tolist() == [[0, 5, -1, -1], [100, 105, -1, -1]]
+
+    seq_lens.copy_(torch.tensor([17, 0, 33, 0], dtype=torch.int32, device="cuda"))
+    graph.replay()
+    assert indices[:, :, 0].tolist() == [[1, -1, 10, -1], [101, -1, 110, -1]]
 
 
 def test_gpu_context_reinterprets_high_data_ptrs_for_int64_metadata():
@@ -862,6 +899,60 @@ def _run_gpu_postprocess(
         num_draft_tokens_gpu=t([num_draft_tokens.get(r, 0) for r in req_ids]),
     )
     torch.accelerator.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_boundary_checkpoint_copies_only_selected_committed_states(monkeypatch):
+    """Prompt/response copies respect request slots and speculative rollback."""
+    monkeypatch.setattr(
+        "vllm.v1.worker.mamba_utils.is_conv_state_dim_first", lambda: False
+    )
+    cfg = _TestConfig()
+    device = torch.device("cuda")
+    names = ["layer_0", "layer_1"]
+    config = _make_kv_cache_config(cfg, names)
+    conv_ref, temporal_ref, conv, temporal, _, context = _make_dual_states(
+        cfg, names, device
+    )
+    ctx = _make_gpu_ctx(cfg, config, device)
+
+    def t(values):
+        return torch.tensor(values, device=device, dtype=torch.int32)
+
+    tables = t([[1, 2, 3, 4, 5, 6], [14, 15, 16, 17, 18, 19]])
+    ctx.initialize_from_forward_context(config, context, _COPY_FUNCS, [tables])
+    destinations = torch.zeros((8, 2, 1), device=device, dtype=torch.int32)
+    destinations[3, :, 0] = t([20, 21])
+    destinations[1, :, 0] = t([22, 23])
+    idx = t([3, 1])
+    states = t([0, 1, 0, 0, 0, 0, 0, 0])
+    capture = t([[7, 9], [0, 23]])
+    bias = t([[0, 2], [0, 1]])
+
+    def copy():
+        ctx.checkpoint_request_boundaries(idx, states, capture, bias, destinations)
+
+    copy()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        copy()
+    graph.replay()
+    for layer in range(len(names)):
+        for dst, src, shift in ((20, 1, 0), (21, 1, 2), (23, 15, 1)):
+            torch.testing.assert_close(
+                conv[layer][dst, : cfg.conv_width - shift],
+                conv_ref[layer][src, shift:],
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                temporal[layer][dst],
+                temporal_ref[layer][src + shift],
+                rtol=0,
+                atol=0,
+            )
+        torch.testing.assert_close(conv[layer][22], conv_ref[layer][22])
+        torch.testing.assert_close(temporal[layer][22], temporal_ref[layer][22])
 
 
 @pytest.mark.skipif(not torch.accelerator.is_available(), reason="accelerator required")

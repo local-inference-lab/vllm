@@ -11,6 +11,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
@@ -174,6 +175,7 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
                 prefer_b12x_gdn_decode=True,
+                overlap_input_projections=envs.VLLM_QWEN3_8_FLASH_NEXT_OVERLAP,
             )
         elif layer_type == "full_attention":
             if getattr(config, "indexer_n_heads", None) is None:
@@ -242,6 +244,8 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
         input_ids: torch.Tensor | None,
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
+        ple_prefetched: bool = False,
+        output_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_hc = self.attn_hyper_connection
         if self.ple is not None:
@@ -253,7 +257,11 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
             hidden_states = hidden_states + self.ple(
-                hidden_states, input_ids, query_start_loc, ngram_context
+                hidden_states,
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                prefetched=ple_prefetched,
             )
         if prev_block_output is not None and prev_injection is not None:
             hidden_states, block_input, injection = attn_hc.combine_and_mix(
@@ -266,6 +274,11 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
             attn_out = self.linear_attn(hidden_states=block_input)
         else:
             attn_out = self.self_attn(hidden_states=block_input, positions=positions)
+        if output_indices is not None:
+            hidden_states = hidden_states[output_indices]
+            attn_out = attn_out[output_indices]
+            assert injection is not None
+            injection = injection[output_indices]
         hidden_states, block_input, injection = (
             self.mlp_hyper_connection.combine_and_mix(
                 hidden_states, attn_out, injection
@@ -436,10 +449,26 @@ class Qwen3_8FlashNextModel(nn.Module):
         block_output = None
         injection = None
         last_layer = None
+        ple_prefetched = False
         for layer_idx, layer in islice(
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
             last_layer = layer
+            next_ple_prefetched = False
+            if (
+                envs.VLLM_QWEN3_8_FLASH_NEXT_OVERLAP
+                and current_platform.is_cuda()
+                and layer_idx + 1 < self.end_layer
+                and input_ids is not None
+                and query_start_loc is not None
+                and ngram_context is not None
+            ):
+                next_ple = self.layers[layer_idx + 1].ple
+                if next_ple is not None:
+                    next_ple.ple_embedding.prefetch(
+                        input_ids, query_start_loc, ngram_context
+                    )
+                    next_ple_prefetched = True
             hidden_states, block_output, injection = layer(
                 hidden_states,
                 block_output,
@@ -448,7 +477,9 @@ class Qwen3_8FlashNextModel(nn.Module):
                 input_ids=input_ids,
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
+                ple_prefetched=ple_prefetched,
             )
+            ple_prefetched = next_ple_prefetched
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds
             ):

@@ -9,12 +9,16 @@ B12X_ROOT="${B12X_ROOT:-/home/luke/projects/b12x}"
 SPARK_ROOT="${SPARK_ROOT:-/home/luke/projects/spark-vllm-docker}"
 CLUSTER_LAUNCHER="${CLUSTER_LAUNCHER:-${SPARK_ROOT}/launch-cluster.sh}"
 
-HEAD_IP="${HEAD_IP:-192.168.177.11}"
-WORKER_IP="${WORKER_IP:-192.168.177.12}"
-ETH_IF="${ETH_IF:-enp1s0f1np1}"
-IB_IF="${IB_IF:-rocep1s0f1,roceP2p1s0f1}"
+HEAD_IP="${HEAD_IP:-192.168.42.223}"
+WORKER_IP="${WORKER_IP:-192.168.42.110}"
+ETH_IF="${ETH_IF:-enP7s7}"
+IB_IF="${IB_IF:-rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1}"
+HEAD_IB_IF="${HEAD_IB_IF:-rocep1s0f1,roceP2p1s0f1}"
+WORKER_IB_IF="${WORKER_IB_IF:-rocep1s0f0,roceP2p1s0f0}"
+NCCL_IB_MERGE_NICS="${NCCL_IB_MERGE_NICS:-1}"
 MASTER_PORT="${MASTER_PORT:-29638}"
-CONTAINER_NAME="${CONTAINER_NAME:-vllm_qwen38_flash_next_tp2}"
+TP_SIZE="${TP_SIZE:-2}"
+CONTAINER_NAME="${CONTAINER_NAME:-vllm_qwen38_flash_next_tp${TP_SIZE}}"
 IMAGE_NAME="${IMAGE_NAME:-vllm-node-eugr-20260712:latest}"
 CONTAINER_MEMORY_GB="${CONTAINER_MEMORY_GB:-108}"
 CONTAINER_MEMORY_SWAP_GB="${CONTAINER_MEMORY_SWAP_GB:-112}"
@@ -30,8 +34,12 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-1610612736}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-3}"
 B12X_POLICY_MODE="${B12X_POLICY_MODE:-auto}"
+ALLREDUCE="${ALLREDUCE:-rocenante}"
+ROCE_ALLREDUCE_MAX_SIZE="${ROCE_ALLREDUCE_MAX_SIZE:-2MB}"
+ROCE_ALLGATHER_MAX_SIZE="${ROCE_ALLGATHER_MAX_SIZE:-16MB}"
 NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 COMPILATION_CONFIG="${VLLM_QWEN38_COMPILATION_CONFIG:-}"
 if [[ -z "${COMPILATION_CONFIG}" ]]; then
@@ -48,20 +56,25 @@ usage() {
   cat <<EOF
 Usage: $0 [launcher options] [-- vLLM options]
 
-Launch Qwen 3.8 Flash Next with TP=2 across tachyon and luxon. The Spark
-cluster launcher starts one native vLLM rank per node and configures NCCL RDMA
-over both ConnectX-7 RoCE interfaces. Ray and TrafficControl are not used.
+Launch Qwen 3.8 Flash Next with TP_SIZE=1 on the local Spark or TP_SIZE=2
+(default) across tachyon and luxon. TP=2 uses the management LAN for bootstrap
+and both RoCE interfaces on the direct ConnectX-7 link. ALLREDUCE=rocenante
+(default) routes supported TP=2 collectives through b12x one-shot RoCE;
+ALLREDUCE=nccl keeps the existing NCCL path. TP=1 uses neither transport.
 
 Launcher options:
-  --sync-code   Mirror local vllm/ and b12x/ to the worker, removing stale files
-                inside those two worker package directories.
-  --sync-model  Rsync the roughly 99 GiB MODEL_PATH to the worker first.
-  --check       Validate both nodes and Spark networking without launching.
+  --sync-code   For TP=2, mirror local vllm/ and b12x/ to the worker.
+  --sync-model  For TP=2, rsync the roughly 99 GiB MODEL_PATH to the worker.
+  --check       Validate the selected topology without launching.
   --detach      Run the head rank in the background; use docker logs to follow it.
   -h, --help    Show this help.
 
-Environment overrides include MODEL_PATH, MAX_MODEL_LEN, KV_CACHE_MEMORY_BYTES,
-HEAD_IP, WORKER_IP, ETH_IF, IB_IF, IMAGE_NAME, and CONTAINER_MEMORY_GB.
+Environment overrides include TP_SIZE (1 or 2), ALLREDUCE, MODEL_PATH,
+MAX_MODEL_LEN, KV_CACHE_MEMORY_BYTES, GPU_MEMORY_UTILIZATION, HEAD_IP,
+WORKER_IP, ETH_IF,
+IB_IF, HEAD_IB_IF, WORKER_IB_IF, NCCL_IB_MERGE_NICS,
+ROCE_ALLREDUCE_MAX_SIZE, ROCE_ALLGATHER_MAX_SIZE, IMAGE_NAME, and
+CONTAINER_MEMORY_GB.
 EOF
 }
 
@@ -99,6 +112,22 @@ while (($#)); do
       ;;
   esac
 done
+
+case "${TP_SIZE}" in
+  1|2) ;;
+  *)
+    echo "TP_SIZE must be 1 or 2; got '${TP_SIZE}'" >&2
+    exit 2
+    ;;
+esac
+
+case "${ALLREDUCE}" in
+  rocenante|nccl) ;;
+  *)
+    echo "ALLREDUCE must be rocenante or nccl; got '${ALLREDUCE}'" >&2
+    exit 2
+    ;;
+esac
 
 case "${B12X_POLICY_MODE}" in
   auto|heuristic-only|preplanned-only) ;;
@@ -158,99 +187,105 @@ ssh_opts=(
   -o StrictHostKeyChecking=no
 )
 
-if ! ssh "${ssh_opts[@]}" "${WORKER_IP}" true; then
-  echo "Passwordless SSH to worker ${WORKER_IP} failed." >&2
-  exit 1
-fi
-
-if ((sync_code)); then
-  echo "Mirroring vLLM runtime source to ${WORKER_IP}..."
-  rsync -a --delete \
-    --exclude='__pycache__/' \
-    --exclude='*.py[co]' \
-    "${VLLM_ROOT}/vllm/" \
-    "${WORKER_IP}:${VLLM_ROOT}/vllm/"
-  echo "Mirroring b12x runtime source to ${WORKER_IP}..."
-  rsync -a --delete \
-    --exclude='__pycache__/' \
-    --exclude='*.py[co]' \
-    "${B12X_ROOT}/b12x/" \
-    "${WORKER_IP}:${B12X_ROOT}/b12x/"
-fi
-
-if ((sync_model)); then
-  printf -v remote_model_parent '%q' "$(dirname -- "${MODEL_PATH}")"
-  remote_prepare_model="mkdir -p -- ${remote_model_parent} 2>/dev/null"
-  remote_prepare_model+=" || sudo -n install -d"
-  remote_prepare_model+=" -o \$(id -un) -g \$(id -gn)"
-  remote_prepare_model+=" -- ${remote_model_parent}"
-  ssh "${ssh_opts[@]}" "${WORKER_IP}" \
-    "${remote_prepare_model}"
-  echo "Rsyncing the model to ${WORKER_IP}:${MODEL_PATH}..."
-  rsync -a --partial --info=progress2 \
-    "${MODEL_PATH}/" \
-    "${WORKER_IP}:${MODEL_PATH}/"
-fi
-
-remote_files=(
-  "${PYTHON_BIN}"
-  "${VLLM_BIN}"
-  "${VLLM_ROOT}/vllm/__init__.py"
-  "${B12X_ROOT}/b12x/__init__.py"
-  "${MODEL_PATH}/config.json"
-)
-for path in "${remote_files[@]}"; do
-  printf -v remote_path '%q' "${path}"
-  if ! ssh "${ssh_opts[@]}" "${WORKER_IP}" "test -e ${remote_path}"; then
-    echo "Required worker path is missing: ${WORKER_IP}:${path}" >&2
-    if [[ "${path}" == "${MODEL_PATH}/config.json" ]]; then
-      echo "Rerun with --sync-model to transfer the model first." >&2
-    else
-      echo "Rerun with --sync-code after preparing the worker venv." >&2
-    fi
+if ((TP_SIZE == 2)); then
+  if ! ssh "${ssh_opts[@]}" "${WORKER_IP}" true; then
+    echo "Passwordless SSH to worker ${WORKER_IP} failed." >&2
     exit 1
   fi
-done
 
-runtime_digest() {
-  LC_ALL=C find \
-    "${VLLM_ROOT}/vllm" \
-    "${B12X_ROOT}/b12x" \
-    \( -type f -o -type l \) \
-    ! -path '*/__pycache__/*' \
-    ! -name '*.py[co]' \
-    -print0 \
-    | sort -z \
-    | xargs -0 -r sha256sum \
-    | sha256sum \
-    | cut -d' ' -f1
-}
+  if ((sync_code)); then
+    echo "Mirroring vLLM runtime source to ${WORKER_IP}..."
+    rsync -a --delete \
+      --exclude='__pycache__/' \
+      --exclude='*.py[co]' \
+      "${VLLM_ROOT}/vllm/" \
+      "${WORKER_IP}:${VLLM_ROOT}/vllm/"
+    echo "Mirroring b12x runtime source to ${WORKER_IP}..."
+    rsync -a --delete \
+      --exclude='__pycache__/' \
+      --exclude='*.py[co]' \
+      "${B12X_ROOT}/b12x/" \
+      "${WORKER_IP}:${B12X_ROOT}/b12x/"
+  fi
 
-printf -v remote_vllm '%q' "${VLLM_ROOT}/vllm"
-printf -v remote_b12x '%q' "${B12X_ROOT}/b12x"
-remote_digest_command="LC_ALL=C find ${remote_vllm} ${remote_b12x} \
-  \\( -type f -o -type l \\) \
-  ! -path '*/__pycache__/*' ! -name '*.py[co]' -print0 \
-  | sort -z | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1"
+  if ((sync_model)); then
+    printf -v remote_model_parent '%q' "$(dirname -- "${MODEL_PATH}")"
+    remote_prepare_model="mkdir -p -- ${remote_model_parent} 2>/dev/null"
+    remote_prepare_model+=" || sudo -n install -d"
+    remote_prepare_model+=" -o \$(id -un) -g \$(id -gn)"
+    remote_prepare_model+=" -- ${remote_model_parent}"
+    ssh "${ssh_opts[@]}" "${WORKER_IP}" \
+      "${remote_prepare_model}"
+    echo "Rsyncing the model to ${WORKER_IP}:${MODEL_PATH}..."
+    rsync -a --partial --info=progress2 \
+      "${MODEL_PATH}/" \
+      "${WORKER_IP}:${MODEL_PATH}/"
+  fi
 
-local_digest="$(runtime_digest)"
-worker_digest="$(
-  ssh "${ssh_opts[@]}" "${WORKER_IP}" "${remote_digest_command}"
-)"
-if [[ "${local_digest}" != "${worker_digest}" ]]; then
-  echo "vLLM/b12x runtime source differs on ${WORKER_IP}." >&2
-  echo "Rerun with --sync-code so both TP ranks execute identical code." >&2
-  exit 1
+  remote_files=(
+    "${PYTHON_BIN}"
+    "${VLLM_BIN}"
+    "${VLLM_ROOT}/vllm/__init__.py"
+    "${B12X_ROOT}/b12x/__init__.py"
+    "${MODEL_PATH}/config.json"
+  )
+  for path in "${remote_files[@]}"; do
+    printf -v remote_path '%q' "${path}"
+    if ! ssh "${ssh_opts[@]}" "${WORKER_IP}" "test -e ${remote_path}"; then
+      echo "Required worker path is missing: ${WORKER_IP}:${path}" >&2
+      if [[ "${path}" == "${MODEL_PATH}/config.json" ]]; then
+        echo "Rerun with --sync-model to transfer the model first." >&2
+      else
+        echo "Rerun with --sync-code after preparing the worker venv." >&2
+      fi
+      exit 1
+    fi
+  done
+
+  runtime_digest() {
+    LC_ALL=C find \
+      "${VLLM_ROOT}/vllm" \
+      "${B12X_ROOT}/b12x" \
+      \( -type f -o -type l \) \
+      ! -path '*/__pycache__/*' \
+      ! -name '*.py[co]' \
+      -print0 \
+      | sort -z \
+      | xargs -0 -r sha256sum \
+      | sha256sum \
+      | cut -d' ' -f1
+  }
+
+  printf -v remote_vllm '%q' "${VLLM_ROOT}/vllm"
+  printf -v remote_b12x '%q' "${B12X_ROOT}/b12x"
+  remote_digest_command="LC_ALL=C find ${remote_vllm} ${remote_b12x} \
+    \\( -type f -o -type l \\) \
+    ! -path '*/__pycache__/*' ! -name '*.py[co]' -print0 \
+    | sort -z | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1"
+
+  local_digest="$(runtime_digest)"
+  worker_digest="$(
+    ssh "${ssh_opts[@]}" "${WORKER_IP}" "${remote_digest_command}"
+  )"
+  if [[ "${local_digest}" != "${worker_digest}" ]]; then
+    echo "vLLM/b12x runtime source differs on ${WORKER_IP}." >&2
+    echo "Rerun with --sync-code so both TP ranks execute identical code." >&2
+    exit 1
+  fi
+elif ((sync_code || sync_model)); then
+  echo "TP_SIZE=1 uses local code and model; ignoring sync options."
 fi
 
 if ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
   echo "Docker image is missing locally: ${IMAGE_NAME}" >&2
   exit 1
 fi
-if ! ssh "${ssh_opts[@]}" "${WORKER_IP}" \
-  "docker image inspect ${IMAGE_NAME} >/dev/null 2>&1"; then
-  echo "Docker image is missing on ${WORKER_IP}: ${IMAGE_NAME}" >&2
-  exit 1
+if ((TP_SIZE == 2)); then
+  if ! ssh "${ssh_opts[@]}" "${WORKER_IP}" \
+    "docker image inspect ${IMAGE_NAME} >/dev/null 2>&1"; then
+    echo "Docker image is missing on ${WORKER_IP}: ${IMAGE_NAME}" >&2
+    exit 1
+  fi
 fi
 
 mount_args="-v ${VLLM_ROOT}:${VLLM_ROOT}"
@@ -262,14 +297,9 @@ fi
 export VLLM_SPARK_EXTRA_DOCKER_ARGS="${mount_args}"
 
 cluster_args=(
-  --nodes "${HEAD_IP},${WORKER_IP}"
   -t "${IMAGE_NAME}"
   --name "${CONTAINER_NAME}"
-  --eth-if "${ETH_IF}"
-  --ib-if "${IB_IF}"
-  --master-port "${MASTER_PORT}"
   --nccl-debug "${NCCL_DEBUG}"
-  --no-ray
   --non-privileged
   --mem-limit-gb "${CONTAINER_MEMORY_GB}"
   --mem-swap-limit-gb "${CONTAINER_MEMORY_SWAP_GB}"
@@ -296,9 +326,37 @@ cluster_args=(
   --env "INSTANTTENSOR_CONCURRENCY=1"
   --env "INSTANTTENSOR_IO_DEPTH=3"
   --env "NCCL_NET_PLUGIN=none"
-  --env "NCCL_IB_MERGE_NICS=0"
+  --env "NCCL_IB_GID_INDEX=3"
+  --env "NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS}"
   --env "NCCL_IB_SUBNET_AWARE_ROUTING=1"
 )
+if ((TP_SIZE == 1)); then
+  cluster_args=(--solo "${cluster_args[@]}")
+else
+  cluster_args=(
+    --nodes "${HEAD_IP},${WORKER_IP}"
+    --eth-if "${ETH_IF}"
+    --ib-if "${IB_IF}"
+    --node-ib-if "${HEAD_IP}=${HEAD_IB_IF}"
+    --node-ib-if "${WORKER_IP}=${WORKER_IB_IF}"
+    --master-port "${MASTER_PORT}"
+    --no-ray
+    "${cluster_args[@]}"
+  )
+fi
+
+allreduce_args=()
+if ((TP_SIZE == 2)) && [[ "${ALLREDUCE}" == rocenante ]]; then
+  cluster_args+=(
+    --env "VLLM_ENABLE_ROCE_ALLREDUCE=1"
+    --env "VLLM_ROCE_ALLREDUCE_MAX_SIZE=${ROCE_ALLREDUCE_MAX_SIZE}"
+    --env "VLLM_ROCE_ALLGATHER_MAX_SIZE=${ROCE_ALLGATHER_MAX_SIZE}"
+    --env "B12X_ROCE_CACHE_DIR=/root/.cache/vllm/b12x-roce"
+  )
+else
+  cluster_args+=(--env "VLLM_ENABLE_ROCE_ALLREDUCE=0")
+  allreduce_args+=(--disable-custom-all-reduce)
+fi
 
 if ((check_only)); then
   exec "${CLUSTER_LAUNCHER}" "${cluster_args[@]}" --check-config
@@ -317,9 +375,9 @@ vllm_command=(
   --host 0.0.0.0
   --port "${PORT}"
   --trust-remote-code
-  --tensor-parallel-size 2
+  --tensor-parallel-size "${TP_SIZE}"
   --pipeline-parallel-size 1
-  --disable-custom-all-reduce
+  "${allreduce_args[@]}"
   --mamba-cache-mode align
   --enable-prefix-caching
   --enable-chunked-prefill
@@ -329,6 +387,7 @@ vllm_command=(
   --block-size 16
   --load-format instanttensor
   --model-loader-extra-config '{"instanttensor_copy":false}'
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
   --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}"
   --max-model-len "${MAX_MODEL_LEN}"
   --max-num-seqs "${MAX_NUM_SEQS}"

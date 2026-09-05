@@ -85,8 +85,10 @@ def get_aligned_state_indices_multi_group_kernel(
         mask=(
             valid_group[:, None, None]
             & valid_row[None, :, None]
+            & (seq_lens[None, :, None] > 0)
             & valid_state_slot[None, None, :]
         ),
+        other=-1,
     )
     tl.store(
         state_indices_ptr
@@ -212,6 +214,7 @@ def _copy_mamba_state_block(
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
+    destination_block_id=None,
 ):
     """Copy one (layer, state-type) mamba state block between block columns.
 
@@ -251,7 +254,10 @@ def _copy_mamba_state_block(
     # Widen block ids to int64 before they reach `block_id * state_block_stride`
     # below: state_block_stride can exceed 2**31 bytes for large mamba caches,
     # and Triton would otherwise do the multiply in int32 and wrap.
-    dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
+    if destination_block_id is None:
+        dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
+    else:
+        dest_block_id = destination_block_id.to(tl.int64)
     dst_addr = state_base_addr + dest_block_id * state_block_stride
 
     is_conv_state = conv_width > 0
@@ -365,6 +371,68 @@ def _copy_mamba_state_block(
         tile_idx,
         COPY_BLOCK_SIZE=COPY_BLOCK_SIZE,
         NUM_TILES=TEMPORAL_TILES,
+    )
+
+
+@triton.jit
+def checkpoint_mamba_states_kernel(
+    idx_mapping_ptr,
+    state_idx_ptr,
+    capture_tokens_ptr,
+    capture_bias_ptr,
+    destination_blocks_ptr,
+    block_table_ptrs_ptr,
+    block_table_stride_req: tl.int64,
+    state_base_addrs_ptr,
+    state_block_strides_ptr,
+    state_elem_sizes_ptr,
+    state_inner_sizes_ptr,
+    state_conv_widths_ptr,
+    state_group_indices_ptr,
+    state_dim_row_count_ptr,
+    state_dim_row_stride_ptr,
+    NUM_GROUPS: tl.constexpr,
+    CONV_STATE_DIM_FIRST: tl.constexpr,
+    TEMPORAL_TILES: tl.constexpr,
+):
+    batch_idx = tl.program_id(0) // 2
+    kind = tl.program_id(0) % 2
+    state_idx = tl.program_id(1)
+    tile_idx = tl.program_id(2)
+    if tl.load(capture_tokens_ptr + batch_idx * 2 + kind) <= 0:
+        return
+    req_idx = tl.load(idx_mapping_ptr + batch_idx)
+    if req_idx < 0:
+        return
+    src_col = tl.load(state_idx_ptr + req_idx)
+    token_bias = tl.load(capture_bias_ptr + batch_idx * 2 + kind)
+    group_idx = tl.load(state_group_indices_ptr + state_idx)
+    destination = tl.load(
+        destination_blocks_ptr + (req_idx * 2 + kind) * NUM_GROUPS + group_idx
+    )
+    if destination <= 0:
+        return
+    _copy_mamba_state_block(
+        state_idx,
+        batch_idx,
+        src_col,
+        0,
+        token_bias,
+        block_table_ptrs_ptr,
+        block_table_stride_req,
+        state_base_addrs_ptr,
+        state_block_strides_ptr,
+        state_elem_sizes_ptr,
+        state_inner_sizes_ptr,
+        state_conv_widths_ptr,
+        state_group_indices_ptr,
+        state_dim_row_count_ptr,
+        state_dim_row_stride_ptr,
+        tile_idx,
+        COPY_BLOCK_SIZE=1024,
+        CONV_STATE_DIM_FIRST=CONV_STATE_DIM_FIRST,
+        TEMPORAL_TILES=TEMPORAL_TILES,
+        destination_block_id=destination,
     )
 
 
@@ -1315,6 +1383,44 @@ class MambaSpecDecodeGPUContext:
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=idx_mapping is not None,
+            TEMPORAL_TILES=_TEMPORAL_TILES,
+        )
+
+    def checkpoint_request_boundaries(
+        self,
+        idx_mapping: torch.Tensor,
+        state_idx: torch.Tensor,
+        capture_tokens: torch.Tensor,
+        capture_bias: torch.Tensor,
+        destination_blocks: torch.Tensor,
+    ) -> None:
+        """Copy only requested endpoints, selecting the committed spec state."""
+        assert self.is_initialized
+        num_reqs = idx_mapping.numel()
+        assert capture_tokens.shape == capture_bias.shape == (num_reqs, 2)
+        assert destination_blocks.shape[1:] == (2, self.num_groups)
+        if not num_reqs:
+            return
+        checkpoint_mamba_states_kernel[
+            (num_reqs * 2, self.total_states, _TEMPORAL_TILES)
+        ](
+            idx_mapping,
+            state_idx,
+            capture_tokens,
+            capture_bias,
+            destination_blocks,
+            self.block_table_ptrs,
+            self.block_table_stride_req,
+            self.state_base_addrs,
+            self.state_block_strides,
+            self.state_elem_sizes,
+            self.state_inner_sizes,
+            self.state_conv_widths,
+            self.state_group_indices,
+            self.state_dim_row_count,
+            self.state_dim_row_stride,
+            NUM_GROUPS=self.num_groups,
+            CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             TEMPORAL_TILES=_TEMPORAL_TILES,
         )
 

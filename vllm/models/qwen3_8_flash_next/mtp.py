@@ -11,6 +11,7 @@ import regex as re
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
@@ -176,6 +177,11 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
         self.hc_count = config.hc_count
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = int(getattr(config, "mtp_num_hidden_layers", 1))
+        self.supports_mtp_prefill_compaction = (
+            envs.VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT
+            and vllm_config.scheduler_config.max_num_seqs == 1
+        )
+        self._prefill_output_indices: torch.Tensor | None = None
         if self.num_mtp_layers != 1:
             raise NotImplementedError(
                 "Qwen3.8-Flash-Next MTP supports exactly one predictor layer"
@@ -257,6 +263,13 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
         )
 
         device = torch.device(current_platform.current_device())
+        self.register_buffer(
+            "_decode_output_indices",
+            torch.zeros(1, dtype=torch.int64, device=device),
+            persistent=False,
+        )
+        if self.supports_mtp_prefill_compaction:
+            self._prefill_output_indices = self._decode_output_indices
         caps = _mtp_api().Caps(
             device=device,
             max_tokens=max_tokens,
@@ -296,6 +309,14 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def set_prefill_output_indices(self, output_indices: torch.Tensor | None) -> None:
+        """Select request-tail outputs after populating the attention cache."""
+        # AOT reuses the same compiled callable for first and subsequent drafts.
+        # Keep the one-row selector's tensor contract stable in both phases.
+        self._prefill_output_indices = (
+            self._decode_output_indices if output_indices is None else output_indices
+        )
 
     def snapshot_qsa_interval_starts(self) -> None:
         for layer in self.layers:
@@ -385,6 +406,7 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             input_ids=None,
             query_start_loc=None,
             ngram_context=None,
+            output_indices=self._prefill_output_indices,
         )
         if not get_pp_group().is_last_rank:
             hidden_states = layer.mlp_hyper_connection.combine(
@@ -478,6 +500,13 @@ class Qwen3_8FlashNextMTP(
             )
         self.quant_config = vllm_config.quant_config
         super().__init__()
+        self.has_own_lm_head = envs.VLLM_MTP_NVFP4_LM_HEAD
+        if (
+            self.has_own_lm_head
+            and envs.is_set("VLLM_MTP_NVFP4_LM_HEAD")
+            and config.tie_word_embeddings
+        ):
+            raise ValueError("NVFP4 draft head requires untied word embeddings")
         self.config = config
         self.model = Qwen3_8FlashNextMultiTokenPredictor(
             vllm_config=vllm_config,
@@ -490,7 +519,9 @@ class Qwen3_8FlashNextMTP(
                 config.hidden_size,
                 quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
+                lm_head_quantization="nvfp4" if self.has_own_lm_head else None,
             )
+            self.has_own_lm_head = self.lm_head.runtime_lm_head_quantization == "nvfp4"
             if config.tie_word_embeddings:
                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         else:

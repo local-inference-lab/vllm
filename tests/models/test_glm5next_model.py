@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -39,6 +40,7 @@ from vllm.models.glm5next.nvidia.mtp import (
     Glm5NextMultiTokenPredictor,
     Glm5NextMultiTokenPredictorLayer,
 )
+from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.glm5_next import (
     Glm5NextConfig,
     Glm5NextTextConfig,
@@ -49,6 +51,7 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xGLM5NextMLASparseBackend,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -178,7 +181,8 @@ def test_glm5next_mtp_resolves_mapped_mxfp8_projection() -> None:
 
 def test_glm5next_mtp_selects_only_draft_checkpoint_weights() -> None:
     mtp = SimpleNamespace(
-        config=SimpleNamespace(num_hidden_layers=45, num_nextn_predict_layers=1)
+        config=SimpleNamespace(num_hidden_layers=45, num_nextn_predict_layers=1),
+        has_own_lm_head=False,
     )
 
     assert Glm5NextMTP._checkpoint_weight_name_prefixes(mtp) == (
@@ -187,6 +191,77 @@ def test_glm5next_mtp_selects_only_draft_checkpoint_weights() -> None:
         "model.layers.45.",
         "layers.45.",
     )
+
+
+@pytest.fixture
+def glm_mtp_head_loader(monkeypatch):
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+    from vllm.models.glm5next.nvidia import mtp as mtp_module
+
+    monkeypatch.setattr(
+        mtp_module, "fused_moe_make_expert_params_mapping", lambda *a, **kw: []
+    )
+    model = Glm5NextMTP.__new__(Glm5NextMTP)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        num_hidden_layers=45,
+        num_nextn_predict_layers=1,
+        n_routed_experts=0,
+        mla_nope=False,
+    )
+    model.has_own_lm_head = True
+    layer = torch.nn.Module()
+    layer.shared_head = torch.nn.Module()
+    layer.shared_head.head = torch.nn.Linear(4, 8, bias=False)
+    layer.shared_head.head.weight.weight_loader = default_weight_loader
+    layer.shared_head.norm = torch.nn.LayerNorm(4, bias=False)
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleDict({"45": layer})
+    model.model.mtp_start_layer_idx = 45
+    model.model.num_mtp_layers = 1
+    return model
+
+
+@pytest.mark.parametrize("draft_order", [None, "before", "after"])
+@pytest.mark.parametrize("target_prefix", ["", "model.language_model."])
+def test_glm5next_mtp_loads_target_head_fallback_and_prefers_draft_weights(
+    glm_mtp_head_loader, draft_order, target_prefix
+) -> None:
+    model = glm_mtp_head_loader
+    target = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    draft = target + 100
+    head_name = "model.layers.45.shared_head.head.weight"
+    weights = [
+        ("model.language_model.layers.45.shared_head.norm.weight", torch.ones(4)),
+        (f"{target_prefix}lm_head.weight", target),
+    ]
+    if draft_order is not None:
+        weights.insert(
+            0 if draft_order == "before" else len(weights), (head_name, draft)
+        )
+
+    loaded = model.load_weights(weights)
+
+    assert head_name in loaded
+    torch.testing.assert_close(
+        model.model.layers["45"].shared_head.head.weight,
+        target if draft_order is None else draft,
+    )
+    assert f"{target_prefix}lm_head." in model._checkpoint_weight_name_prefixes()
+
+
+@pytest.mark.parametrize("missing_head", [False, True])
+def test_glm5next_mtp_requires_both_draft_layer_and_head_weights(
+    glm_mtp_head_loader, missing_head
+) -> None:
+    weights = (
+        [("model.layers.45.shared_head.norm.weight", torch.ones(4))]
+        if missing_head
+        else [("lm_head.weight", torch.ones(8, 4))]
+    )
+    match = "requires an unquantized" if missing_head else "layer 45 weights missing"
+    with pytest.raises(ValueError, match=match):
+        glm_mtp_head_loader.load_weights(weights)
 
 
 def test_glm5next_mtp_preserves_position_zero_embedding() -> None:
@@ -310,19 +385,35 @@ def test_glm5next_fp8_dequantizer_yields_to_mxfp8_projection() -> None:
     assert not pending
 
 
-def test_glm5next_dequantizes_mxfp8_selector_head_projection() -> None:
+@pytest.mark.parametrize("scale_first", [False, True])
+@pytest.mark.parametrize("reuse_buffer", [False, True])
+@pytest.mark.parametrize("quantization", ["mxfp8", "block_fp8"])
+def test_glm5next_dequantizes_buffered_attention_projections(
+    scale_first: bool, reuse_buffer: bool, quantization: str
+) -> None:
+    """Paired tensors must survive a streaming loader reusing its buffers."""
     layer_prefix = "layers.3.self_attn"
-    parameter_name = f"{layer_prefix}.indexer.weights_proj.weight"
+    if quantization == "mxfp8":
+        projection = "indexer.weights_proj"
+        target = projection
+        scale_name = "weight_scale"
+        scale = torch.full((1, 1), 128, dtype=torch.uint8)
+    else:
+        projection = "q_a_proj"
+        target = "fused_qkv_a_proj"
+        scale_name = "weight_scale_inv"
+        scale = torch.full((1, 1), 2.0, dtype=torch.float32)
+    parameter_name = f"{layer_prefix}.{target}.weight"
     param = torch.nn.Parameter(torch.empty((1, 32), dtype=torch.bfloat16))
 
-    def weight_loader(param, loaded_weight) -> None:
+    def weight_loader(param, loaded_weight, shard_id=None) -> None:
         param.data.copy_(loaded_weight)
 
     param.weight_loader = weight_loader
     weight = (
         torch.arange(32, dtype=torch.float32).reshape(1, 32).to(torch.float8_e4m3fn)
     )
-    scale = torch.full((1, 1), 127, dtype=torch.uint8)
+    expected = weight.to(torch.bfloat16) * 2
 
     class FakeModel(torch.nn.Module):
         config = SimpleNamespace(
@@ -338,16 +429,23 @@ def test_glm5next_dequantizes_mxfp8_selector_head_projection() -> None:
         def named_parameters(self):
             return iter([(parameter_name, param)])
 
-    loaded_params = Glm5NextModel.load_weights(
-        FakeModel(),
-        [
-            (f"{layer_prefix}.indexer.weights_proj.weight", weight),
-            (f"{layer_prefix}.indexer.weights_proj.weight_scale", scale),
-        ],
-    )
+    pairs = [
+        (f"{layer_prefix}.{projection}.weight", weight),
+        (f"{layer_prefix}.{projection}.{scale_name}", scale),
+    ]
+    if scale_first:
+        pairs.reverse()
+
+    def weights():
+        for name, tensor in pairs:
+            yield name, tensor
+            if reuse_buffer:
+                tensor.zero_()
+
+    loaded_params = Glm5NextModel.load_weights(FakeModel(), weights())
 
     assert loaded_params == {parameter_name}
-    torch.testing.assert_close(param, weight.to(torch.bfloat16))
+    torch.testing.assert_close(param, expected)
 
 
 @pytest.mark.parametrize(
@@ -512,7 +610,46 @@ def test_glm5next_moe_does_not_give_gate_to_runner(monkeypatch) -> None:
     assert "gate" not in factory_kwargs
 
 
-@pytest.mark.parametrize("prefill_backend", ["triton", "flashkda"])
+class _FakeKdaPrefillApi:
+    """Record what the layer binds and runs through the b12x prefill op."""
+
+    def __init__(self, calls: dict[str, object]) -> None:
+        self._calls = calls
+
+    def bind(self, plan, **kwargs):
+        del plan
+        self._calls["prefill_q_len"] = int(kwargs["q"].shape[0])
+        self._calls["prefill_query_start_loc"] = kwargs["cu_seqlens"].clone()
+        for name in (
+            "initial_state_indices",
+            "final_state_indices",
+            "checkpoint_state_indices",
+            "checkpoint_offsets",
+        ):
+            self._calls[name] = kwargs[name].clone()
+        self._calls["num_seqs"] = int(kwargs["num_seqs"].item())
+        self._calls["num_tokens"] = int(kwargs["num_tokens"].item())
+        scratch_start = kwargs["scratch"].data_ptr()
+        scratch_end = scratch_start + kwargs["scratch"].nbytes
+        output_start = kwargs["output"].data_ptr()
+        output_end = output_start + kwargs["output"].nbytes
+        self._calls["scratch_output_overlap"] = (
+            scratch_start < output_end and output_start < scratch_end
+        )
+        return SimpleNamespace(
+            output=kwargs["output"], recurrent_state=kwargs["recurrent_state"]
+        )
+
+    def run(self, binding, *, lower_bound, max_live_tokens, max_live_seqs):
+        self._calls["lower_bound"] = lower_bound
+        self._calls["max_live_tokens"] = max_live_tokens
+        self._calls["max_live_seqs"] = max_live_seqs
+        binding.output.fill_(22)
+        binding.recurrent_state[3] = 33
+        return binding.output
+
+
+@pytest.mark.parametrize("prefill_backend", ["triton", "flashkda", "b12x"])
 def test_glm5next_kda_splits_mixed_decode_prefill_batch(
     monkeypatch, prefill_backend: str
 ) -> None:
@@ -558,6 +695,24 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(
     layer.dt_bias = torch.ones(1)
     layer._b12x_kda_plan = None
     layer._b12x_kda_scratch = None
+    layer.model_config = SimpleNamespace(dtype=torch.float32)
+    layer._b12x_prefill_api = None
+    layer._b12x_prefill_plan = None
+    layer._b12x_prefill_max_tokens = 4
+    layer._b12x_prefill_max_seqs = 2
+    if prefill_backend == "b12x":
+        calls_sink: dict[str, object] = {}
+        layer._b12x_prefill_api = _FakeKdaPrefillApi(calls_sink)
+        layer._b12x_prefill_plan = SimpleNamespace(
+            scratch_specs=lambda: (SimpleNamespace(shape=(16,), dtype=torch.uint8),)
+        )
+        layer._b12x_prefill_num_seqs = torch.zeros(1, dtype=torch.int32)
+        layer._b12x_prefill_num_tokens = torch.zeros(1, dtype=torch.int32)
+        layer._b12x_prefill_initial_indices = torch.zeros(2, dtype=torch.int32)
+        layer._b12x_prefill_null_indices = torch.full(
+            (2,), NULL_BLOCK_ID, dtype=torch.int32
+        )
+        layer._b12x_prefill_zero_offsets = torch.zeros(2, dtype=torch.int32)
     layer.conv1d = SimpleNamespace(
         weight=torch.ones(3, 1, 3),
         bias=torch.zeros(3),
@@ -571,6 +726,8 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(
     layer.o_norm = IdentityGate()
 
     calls: dict[str, object] = {}
+    if prefill_backend == "b12x":
+        calls = calls_sink  # noqa: F821 - bound above for this backend
 
     def fake_conv(x, *args, **kwargs):
         return x
@@ -601,9 +758,21 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(
         return out, final_state
 
     class FakeWorkspaceManager:
-        @staticmethod
-        def get_simultaneous(*specs):
-            return [torch.empty(shape, dtype=dtype) for shape, dtype in specs]
+        def __init__(self) -> None:
+            self.storage = torch.empty(1024, dtype=torch.uint8)
+
+        def get_simultaneous(self, *specs):
+            outputs = []
+            offset = 0
+            for shape, dtype in specs:
+                nbytes = math.prod(shape) * dtype.itemsize
+                outputs.append(
+                    self.storage[offset : offset + nbytes].view(dtype).view(shape)
+                )
+                offset += nbytes
+            return outputs
+
+    workspace_manager = FakeWorkspaceManager()
 
     def fake_gather(state, indices, has_initial_state):
         calls["prefill_state_indices"] = indices.clone()
@@ -622,7 +791,7 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(
     monkeypatch.setattr(
         kimi_gdn_linear_attn,
         "current_workspace_manager",
-        lambda: FakeWorkspaceManager(),
+        lambda: workspace_manager,
     )
     monkeypatch.setattr(kda_ops, "fused_recurrent_kda", fake_recurrent)
     monkeypatch.setattr(kda_ops, "chunk_kda_with_fused_gate", fake_chunk)
@@ -647,6 +816,27 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(
     assert torch.equal(
         calls["prefill_query_start_loc"], torch.tensor([0, 2], dtype=torch.int32)
     )
+    if prefill_backend == "b12x":
+        # The op addresses state slots directly: no dense gather, and the
+        # pool keeps whatever the op wrote rather than a scattered result.
+        assert "prefill_state_indices" not in calls
+        assert torch.equal(
+            calls["initial_state_indices"],
+            torch.tensor([NULL_BLOCK_ID], dtype=torch.int32),
+        )
+        assert torch.equal(
+            calls["final_state_indices"], torch.tensor([3], dtype=torch.int32)
+        )
+        assert calls["num_seqs"] == 1
+        assert calls["num_tokens"] == 2
+        assert calls["max_live_tokens"] == 2
+        assert calls["max_live_seqs"] == 1
+        assert calls["lower_bound"] == -5.0
+        assert not calls["scratch_output_overlap"]
+        assert torch.equal(core_attn_out[:, :2], torch.full((1, 2, 1, 1), 11.0))
+        assert torch.equal(core_attn_out[:, 2:], torch.full((1, 2, 1, 1), 22.0))
+        assert torch.equal(layer.kv_cache[1][3], torch.full((1, 1, 1), 33.0))
+        return
     if prefill_backend == "triton":
         assert calls["chunk_indices"] is chunk_indices
         assert calls["chunk_offsets"] is chunk_offsets
@@ -698,6 +888,214 @@ def test_glm5next_explicit_flashkda_rejects_unsupported_layer(monkeypatch) -> No
 def test_glm5next_kda_prefill_backend_rejects_unknown_name() -> None:
     with pytest.raises(ValueError, match="Unsupported KDA prefill backend"):
         resolve_kda_prefill_backend("unknown", 128, torch.bfloat16, -5.0)
+
+
+def test_glm5next_kda_prefill_backend_selects_b12x_by_name(monkeypatch) -> None:
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn,
+        "is_b12x_kda_prefill_supported",
+        lambda *args: True,
+    )
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn,
+        "is_flashkda_supported",
+        lambda *args: True,
+    )
+
+    assert (
+        resolve_kda_prefill_backend("b12x", 128, torch.bfloat16, -5.0, torch.float32)
+        == "b12x"
+    )
+    # auto keeps FlashKDA until the b12x serving qualification lands.
+    assert (
+        resolve_kda_prefill_backend("auto", 128, torch.bfloat16, -5.0, torch.float32)
+        == "flashkda"
+    )
+
+
+def test_glm5next_explicit_b12x_rejects_unsupported_layer(monkeypatch) -> None:
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn,
+        "is_b12x_kda_prefill_supported",
+        lambda *args: False,
+    )
+
+    with pytest.raises(RuntimeError, match="b12x KDA prefill backend requires"):
+        resolve_kda_prefill_backend("b12x", 128, torch.bfloat16, -5.0, torch.float32)
+
+
+def test_kimi_k3_kda_prefill_rejects_b12x() -> None:
+    """Only the GLM linear-attention layer offers the b12x prefill backend."""
+    from vllm.models.kimi_k3.nvidia import kda as kimi_k3_kda
+
+    with pytest.raises(ValueError, match="Unsupported KDA prefill backend"):
+        kimi_k3_kda.resolve_kda_prefill_backend("b12x", 128, torch.bfloat16, -5.0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
+def test_glm5next_b12x_kda_prefill_matches_the_triton_chunk_path() -> None:
+    """The b12x prefill path agrees with the Triton chunk path it replaces.
+
+    Covers the contract the two share: the gate and beta activations, the
+    recurrent-state orientation, and slot addressing in place of the dense
+    gather and scatter.
+    """
+    b12x_api = pytest.importorskip("b12x.sequence.kda_prefill")
+    from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
+        chunk_kda_with_fused_gate,
+    )
+
+    if not b12x_api.is_supported(torch.device("cuda", 0)):
+        pytest.skip("b12x KDA prefill is unsupported on this device")
+
+    torch.manual_seed(7)
+    device = torch.device("cuda", 0)
+    heads, head_dim, lower_bound = 4, 128, -5.0
+    lengths = [37, 128, 1]
+    slots = [3, 5, 7]
+    has_initial = [True, False, True]
+    tokens, requests = sum(lengths), len(lengths)
+
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device=device
+    )
+    q, k, v, raw_g = (
+        torch.randn(tokens, heads, head_dim, dtype=torch.bfloat16, device=device)
+        for _ in range(4)
+    )
+    raw_beta = torch.randn(tokens, heads, dtype=torch.bfloat16, device=device)
+    a_log = torch.randn(heads, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(heads * head_dim, dtype=torch.float32, device=device)
+    pool = torch.randn(
+        16, heads, head_dim, head_dim, dtype=torch.float32, device=device
+    )
+    pool[NULL_BLOCK_ID].zero_()
+    state_indices = torch.tensor(slots, dtype=torch.int32, device=device)
+    initial_mask = torch.tensor(has_initial, dtype=torch.bool, device=device)
+
+    # The Triton path overwrites its value tensor, so it gets copies.
+    reference_pool = pool.clone()
+    initial_state = torch.where(
+        initial_mask[:, None, None, None],
+        reference_pool[state_indices.long()],
+        torch.zeros_like(reference_pool[:requests]),
+    )
+    reference_out, reference_last = chunk_kda_with_fused_gate(
+        q=q.clone().unsqueeze(0),
+        k=k.clone().unsqueeze(0),
+        v=v.clone().unsqueeze(0),
+        raw_g=raw_g.clone().unsqueeze(0),
+        raw_beta=raw_beta.clone().unsqueeze(0),
+        A_log=a_log,
+        g_bias=dt_bias,
+        lower_bound=lower_bound,
+        initial_state=initial_state,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+    )
+    reference_pool[state_indices.long()] = reference_last
+
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.head_dim, layer.local_num_heads = head_dim, heads
+    layer.gate_lower_bound = lower_bound
+    layer.A_log, layer.dt_bias = a_log, dt_bias
+    layer._b12x_prefill_api = b12x_api
+    layer._b12x_prefill_max_tokens = 512
+    layer._b12x_prefill_max_seqs = 8
+    plan = b12x_api.plan(
+        b12x_api.Caps(
+            device=device,
+            max_tokens=512,
+            max_seqs=8,
+            max_state_slots=int(pool.shape[0]),
+            heads=heads,
+            head_dim=head_dim,
+            model_dtype=torch.bfloat16,
+            state_dtype=torch.float32,
+            qk_l2norm=True,
+            checkpoint_export=True,
+            null_state_index=NULL_BLOCK_ID,
+            metadata_validation="trusted",
+        )
+    )
+    layer._b12x_prefill_plan = plan
+    scratch = torch.empty(
+        plan.scratch_specs()[0].shape, dtype=torch.uint8, device=device
+    )
+    layer._b12x_prefill_num_seqs = torch.zeros(1, dtype=torch.int32, device=device)
+    layer._b12x_prefill_num_tokens = torch.zeros(1, dtype=torch.int32, device=device)
+    layer._b12x_prefill_initial_indices = torch.zeros(
+        8, dtype=torch.int32, device=device
+    )
+    layer._b12x_prefill_null_indices = torch.full(
+        (8,), NULL_BLOCK_ID, dtype=torch.int32, device=device
+    )
+    layer._b12x_prefill_zero_offsets = torch.zeros(8, dtype=torch.int32, device=device)
+
+    got_pool = pool.clone()
+    out = torch.zeros(tokens, heads, head_dim, dtype=torch.bfloat16, device=device)
+    layer._run_b12x_kda_prefill(
+        q=q,
+        k=k,
+        v=v,
+        raw_g=raw_g,
+        raw_beta=raw_beta,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        has_initial_state=initial_mask,
+        checkpoint=None,
+        recurrent_state=got_pool,
+        scratch=scratch,
+        output=out,
+    )
+    torch.accelerator.synchronize(device)
+
+    def relative_error(got: torch.Tensor, want: torch.Tensor) -> float:
+        got, want = got.float(), want.float()
+        scale = want.pow(2).mean().sqrt().clamp_min(1e-12)
+        return ((got - want).pow(2).mean().sqrt() / scale).item()
+
+    assert relative_error(out, reference_out[0]) < 1e-2
+    for slot in slots:
+        assert relative_error(got_pool[slot], reference_pool[slot]) < 1e-2
+    untouched = [slot for slot in range(pool.shape[0]) if slot not in slots]
+    assert torch.equal(got_pool[untouched], pool[untouched])
+
+
+@pytest.mark.parametrize("request_boundaries", [False, True])
+def test_glm5next_b12x_prefill_requests_a_checkpoint_block(
+    request_boundaries: bool,
+) -> None:
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    spec = SimpleNamespace(num_prefill_checkpoint_blocks=0)
+
+    def fake_super_spec(self, vllm_config):
+        del self, vllm_config
+        return spec
+
+    for backend, expected in (("b12x", 1), ("flashkda", 1), ("triton", 0)):
+        layer.kda_prefill_backend = backend
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                kimi_gdn_linear_attn.GatedDeltaNetAttention,
+                "get_kv_cache_spec",
+                fake_super_spec,
+            )
+            patch.setattr(kimi_gdn_linear_attn, "MambaSpec", SimpleNamespace)
+            patch.setattr(
+                kimi_gdn_linear_attn,
+                "replace",
+                lambda base, **kwargs: SimpleNamespace(**kwargs),
+            )
+            resolved = layer.get_kv_cache_spec(
+                SimpleNamespace(use_request_boundary_checkpoints=request_boundaries)
+            )
+        assert resolved.num_prefill_checkpoint_blocks == (
+            0 if request_boundaries else expected
+        ), backend
 
 
 def test_glm5next_alone_opts_into_b12x_kda_decode() -> None:
@@ -910,7 +1308,12 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
     assert captured_caps["kda_metadata_validation"] == "trusted"
 
 
-def test_b12x_kda_binds_live_invocations_and_shares_metadata(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "speculative,uniform", [(False, False), (True, False), (True, True)]
+)
+def test_b12x_kda_shares_counts_but_preserves_each_layers_state_indices(
+    monkeypatch, speculative: bool, uniform: bool
+) -> None:
     calls: dict[str, list] = {"bind": [], "run": []}
 
     class FakeApi:
@@ -956,53 +1359,60 @@ def test_b12x_kda_binds_live_invocations_and_shares_metadata(monkeypatch) -> Non
         return layer
 
     layers = [make_layer(), make_layer()]
-    metadata = object()
     mixed_qkv = torch.arange(6, dtype=torch.float32).view(2, 3)
     raw_g = torch.ones(2, 1, 1)
     raw_beta = torch.ones(2, 1)
     z = torch.ones(2, 1, 1)
     outputs = [torch.empty(2, 1, 1), torch.empty(2, 1, 1)]
-    state_indices = torch.tensor([[3], [4]], dtype=torch.int32)
+    state_indices = [
+        torch.tensor([[3], [4]], dtype=torch.int32),
+        torch.tensor([[13], [14]], dtype=torch.int32),
+    ]
     query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
+    accepted = torch.tensor([2, 1], dtype=torch.int32) if speculative else None
 
-    for layer, output in zip(layers, outputs):
+    for layer, output, indices in zip(layers, outputs, state_indices):
         layer._run_b12x_kda_decode_post_conv(
-            metadata=metadata,
+            metadata=SimpleNamespace(is_uniform_spec_decode=uniform),
             mixed_qkv=mixed_qkv,
             raw_g=raw_g,
             raw_beta=raw_beta,
             z=z,
             output=output,
-            state_indices=state_indices,
-            query_start_loc=query_start_loc,
-            num_accepted_tokens=None,
+            state_indices=indices,
+            query_start_loc=query_start_loc.clone() if uniform else query_start_loc[:],
+            num_accepted_tokens=accepted[:] if accepted is not None else None,
             num_requests=2,
         )
 
     assert len(calls["bind"]) == 2
     assert len(calls["run"]) == 2
-    for binding, output in zip(calls["bind"], outputs):
+    for binding, output, indices in zip(calls["bind"], outputs, state_indices):
         assert binding.mixed_qkv is mixed_qkv
         assert binding.raw_g is raw_g
         assert binding.raw_beta is raw_beta
         assert binding.z is z
         assert binding.output is output
+        assert binding.state_indices.data_ptr() == indices.data_ptr()
     for (run_binding, _), bind_binding in zip(calls["run"], calls["bind"]):
         assert run_binding is bind_binding
     for name in (
         "query_start_loc",
         "num_accepted_tokens",
-        "state_indices",
         "num_seqs",
         "num_tokens",
     ):
         assert getattr(calls["bind"][0], name) is getattr(calls["bind"][1], name)
     assert torch.equal(
         layers[0]._b12x_kda_num_accepted_tokens,
-        torch.ones(2, dtype=torch.int32),
+        torch.zeros(2, dtype=torch.int32)
+        if speculative
+        else torch.ones(2, dtype=torch.int32),
     )
     assert layers[0]._b12x_kda_num_seqs.item() == 2
     assert layers[0]._b12x_kda_num_tokens.item() == 2
+    assert layers[1]._b12x_kda_num_seqs.item() == 0
+    assert layers[1]._b12x_kda_num_tokens.item() == 0
 
 
 @pytest.mark.parametrize("is_mtp_layer", [False, True])

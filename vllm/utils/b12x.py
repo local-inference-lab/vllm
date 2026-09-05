@@ -7,9 +7,11 @@ import importlib.util
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass, fields, is_dataclass
 from types import ModuleType
-from typing import Any
+from typing import Any, Literal
 
 import torch
+
+import vllm.envs as envs
 
 
 @dataclass(frozen=True)
@@ -17,6 +19,12 @@ class B12xWarmupUnit:
     name: str
     key: Hashable
     compile: Callable[[], None]
+
+
+def get_b12x_dense_activation_mode(recipe: Literal["nvfp4", "mxfp8"]) -> str:
+    """Resolve the dense precision override once when loading a layer."""
+    override = getattr(envs, f"VLLM_B12X_{recipe.upper()}_ACTIVATION_MODE")
+    return override if override is not None else envs.VLLM_B12X_DENSE_ACTIVATION_MODE
 
 
 _HAS_B12X = importlib.util.find_spec("b12x") is not None
@@ -41,6 +49,7 @@ _B12X_SUBMODULES = {
         "b12x.attention.qsa",
         "b12x.gemm.bf16_vocab_projection",
         "b12x.gemm.blockscaled",
+        "b12x.gemm.mla_query_projection",
         "b12x.gemm.wo_projection",
         "b12x.norm.mhc",
         # TODO: Remove once B12X exposes the scale-swizzle API publicly.
@@ -50,6 +59,7 @@ _B12X_SUBMODULES = {
         "b12x.moe.fused_moe",
         "b12x.norm.hyperconnection",
         "b12x.sequence.gdn_decode",
+        "b12x.sequence.kda_prefill",
         "b12x.sequence.mtp_feedback",
         "b12x.sequence.ple",
         "b12x.sequence.ple_embedding",
@@ -73,6 +83,10 @@ def get_b12x_blockscaled() -> ModuleType | None:
 
 def get_b12x_bf16_vocab_projection() -> ModuleType | None:
     return _get_submodule("b12x.gemm.bf16_vocab_projection")
+
+
+def get_b12x_mla_query_projection() -> ModuleType | None:
+    return _get_submodule("b12x.gemm.mla_query_projection")
 
 
 def get_b12x_wo_projection() -> ModuleType | None:
@@ -125,6 +139,10 @@ def get_b12x_hyperconnection() -> ModuleType | None:
 
 def get_b12x_gdn_decode() -> ModuleType | None:
     return _get_submodule("b12x.sequence.gdn_decode")
+
+
+def get_b12x_kda_prefill() -> ModuleType | None:
+    return _get_submodule("b12x.sequence.kda_prefill")
 
 
 def get_b12x_mtp_feedback() -> ModuleType | None:

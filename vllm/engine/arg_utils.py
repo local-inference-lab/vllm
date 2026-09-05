@@ -73,6 +73,7 @@ from vllm.config.cache import (
     MambaCacheMode,
     MambaDType,
     PrefixCachingHashAlgo,
+    RecurrentCheckpointPolicy,
 )
 from vllm.config.device import Device
 from vllm.config.kernel import IrOpPriorityConfig, LinearBackend, MoEBackend
@@ -102,7 +103,7 @@ from vllm.config.parallel import (
     DistributedExecutorBackend,
     ExpertPlacementStrategy,
 )
-from vllm.config.scheduler import SchedulerPolicy
+from vllm.config.scheduler import FairnessEngine, SchedulerPolicy
 from vllm.config.utils import get_field
 from vllm.config.vllm import OptimizationLevel, PerformanceMode
 from vllm.logger import init_logger, suppress_logging
@@ -529,6 +530,9 @@ class EngineArgs:
     prefix_cache_retention_interval: int | None = get_field(
         CacheConfig, "prefix_cache_retention_interval"
     )
+    recurrent_checkpoint_policy: RecurrentCheckpointPolicy = (
+        CacheConfig.recurrent_checkpoint_policy
+    )
     disable_sliding_window: bool = ModelConfig.disable_sliding_window
     disable_cascade_attn: bool = ModelConfig.disable_cascade_attn
     offload_backend: str = OffloadConfig.offload_backend
@@ -634,6 +638,16 @@ class EngineArgs:
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
+    fairness_engine: FairnessEngine | None = SchedulerConfig.fairness_engine
+    prefill_compute_share: float | None = SchedulerConfig.prefill_compute_share
+    max_num_prefill_tokens_per_step: int = (
+        SchedulerConfig.max_num_prefill_tokens_per_step
+    )
+    max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
+    decode_prefill_min_decode_steps: int = (
+        SchedulerConfig.decode_prefill_min_decode_steps
+    )
+    decode_prefill_max_wait_ms: int = SchedulerConfig.decode_prefill_max_wait_ms
 
     watermark: float = SchedulerConfig.watermark
 
@@ -768,7 +782,7 @@ class EngineArgs:
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl"] | None = None
     gdn_decode_kernel: Literal["b12x", "cuda", "triton"] | None = None
-    kda_prefill_backend: Literal["auto", "triton", "flashkda"] | None = None
+    kda_prefill_backend: Literal["auto", "triton", "flashkda", "b12x"] | None = None
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1252,6 +1266,10 @@ class EngineArgs:
             **cache_kwargs["prefix_cache_retention_interval"],
         )
         cache_group.add_argument(
+            "--recurrent-checkpoint-policy",
+            **cache_kwargs["recurrent_checkpoint_policy"],
+        )
+        cache_group.add_argument(
             "--kv-cache-dtype-skip-layers", **cache_kwargs["kv_cache_dtype_skip_layers"]
         )
         cache_group.add_argument(
@@ -1587,6 +1605,30 @@ class EngineArgs:
             **scheduler_kwargs["prefill_schedule_interval"],
         )
         scheduler_group.add_argument(
+            "--fairness-engine",
+            **scheduler_kwargs["fairness_engine"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-compute-share",
+            **scheduler_kwargs["prefill_compute_share"],
+        )
+        scheduler_group.add_argument(
+            "--max-num-prefill-tokens-per-step",
+            **scheduler_kwargs["max_num_prefill_tokens_per_step"],
+        )
+        scheduler_group.add_argument(
+            "--max-num-partial-prefills",
+            **scheduler_kwargs["max_num_partial_prefills"],
+        )
+        scheduler_group.add_argument(
+            "--decode-prefill-min-decode-steps",
+            **scheduler_kwargs["decode_prefill_min_decode_steps"],
+        )
+        scheduler_group.add_argument(
+            "--decode-prefill-max-wait-ms",
+            **scheduler_kwargs["decode_prefill_max_wait_ms"],
+        )
+        scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
         )
@@ -1735,7 +1777,7 @@ class EngineArgs:
         parser.add_argument(
             "--kda-prefill-backend",
             dest="kda_prefill_backend",
-            choices=["auto", "triton", "flashkda"],
+            choices=["auto", "triton", "flashkda", "b12x"],
             default=None,
             help="Select KDA prefill backend.",
         )
@@ -2042,6 +2084,7 @@ class EngineArgs:
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             prefix_cache_retention_interval=self.prefix_cache_retention_interval,
+            recurrent_checkpoint_policy=self.recurrent_checkpoint_policy,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
             mamba_cache_dtype=self.mamba_cache_dtype,
@@ -2367,6 +2410,12 @@ class EngineArgs:
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
+            fairness_engine=self.fairness_engine,
+            prefill_compute_share=self.prefill_compute_share,
+            max_num_prefill_tokens_per_step=(self.max_num_prefill_tokens_per_step),
+            max_num_partial_prefills=self.max_num_partial_prefills,
+            decode_prefill_min_decode_steps=(self.decode_prefill_min_decode_steps),
+            decode_prefill_max_wait_ms=self.decode_prefill_max_wait_ms,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,

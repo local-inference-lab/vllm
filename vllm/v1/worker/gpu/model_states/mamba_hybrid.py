@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
@@ -84,6 +85,11 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+        self._gdn_spec_accepted_tokens = (
+            torch.ones_like(self.num_accepted_tokens_gpu)
+            if envs.VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH
+            else None
+        )
         # Pre-copy "align" prefix-cache state (V2). The migration of each
         # request's mamba state across block boundaries runs as a fused GPU
         # kernel reusing the postprocess copy machinery, so the per-step src
@@ -106,6 +112,9 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
             self._mamba_copy_funcs_by_type: MambaStateCopyFuncsByType | None = None
+            self._aligned_metadata_groups: list[list[AttentionGroup]] | None = None
+            self._aligned_metadata_builders: list[tuple[int, Any]] = []
+            self._aligned_metadata_ctx: MambaSpecDecodeGPUContext | None = None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -122,6 +131,9 @@ class MambaHybridModelState(DefaultModelState):
         if self._align_mode:
             self._mamba_ctx = None
             self._mamba_copy_funcs_by_type = None
+            self._aligned_metadata_ctx = None
+            self._aligned_metadata_groups = None
+            self._aligned_metadata_builders = []
         if self.recoverssm is not None:
             self.recoverssm.reset()
 
@@ -170,6 +182,40 @@ class MambaHybridModelState(DefaultModelState):
                 [block_tables[gid] for gid in mamba_group_ids],
             )
         return ctx
+
+    def _prepare_aligned_state_indices(
+        self,
+        seq_lens: torch.Tensor,
+        num_reqs: int,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        block_tables: tuple[torch.Tensor, ...],
+    ) -> None:
+        mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
+        if self._aligned_metadata_groups is not attn_groups:
+            self._aligned_metadata_builders = []
+            for group_idx, group_id in enumerate(mamba_group_ids):
+                for group in attn_groups[group_id]:
+                    builder = group.get_metadata_builder(0)
+                    if hasattr(builder, "mamba_aligned_state_indices"):
+                        self._aligned_metadata_builders.append((group_idx, builder))
+                    if hasattr(builder, "mamba_spec_accepted_tokens"):
+                        builder.mamba_spec_accepted_tokens = (
+                            self._gdn_spec_accepted_tokens
+                        )
+            self._aligned_metadata_groups = attn_groups
+            self._aligned_metadata_ctx = None
+        if not self._aligned_metadata_builders:
+            return
+
+        ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
+        if self._aligned_metadata_ctx is not ctx:
+            assert ctx.aligned_state_indices is not None
+            group_views = ctx.aligned_state_indices.unbind(0)
+            for group_idx, builder in self._aligned_metadata_builders:
+                builder.mamba_aligned_state_indices = group_views[group_idx]
+            self._aligned_metadata_ctx = ctx
+        ctx.compute_aligned_state_indices(seq_lens, num_reqs)
 
     def preprocess_state(
         self,
@@ -277,22 +323,13 @@ class MambaHybridModelState(DefaultModelState):
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
         if self._align_mode:
-            mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
-            aligned_index_builders = []
-            for group_idx, group_id in enumerate(mamba_group_ids):
-                for group in attn_groups[group_id]:
-                    builder = group.get_metadata_builder(0)
-                    if hasattr(builder, "mamba_aligned_state_indices"):
-                        aligned_index_builders.append((group_idx, builder))
-            if aligned_index_builders:
-                ctx = self._ensure_align_ctx(
-                    kv_cache_config, mamba_group_ids, block_tables
-                )
-                all_group_indices = ctx.compute_aligned_state_indices(
-                    input_batch.seq_lens, num_reqs
-                )
-                for group_idx, builder in aligned_index_builders:
-                    builder.mamba_aligned_state_indices = all_group_indices[group_idx]
+            self._prepare_aligned_state_indices(
+                input_batch.seq_lens,
+                num_reqs,
+                attn_groups,
+                kv_cache_config,
+                block_tables,
+            )
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
