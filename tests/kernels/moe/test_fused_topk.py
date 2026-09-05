@@ -15,6 +15,55 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_
 from vllm.platforms import current_platform
 
 
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120),
+    reason="SM12x small-batch probability-sort router",
+)
+@pytest.mark.parametrize("num_tokens", [1, 4, 16, 128, 129])
+@pytest.mark.parametrize("renormalize", [False, True])
+@pytest.mark.parametrize("indices_type", [torch.int32, torch.int64])
+@pytest.mark.parametrize("topk", [10, 16])
+def test_sorted_softmax_topk_probability_ties_and_graph(
+    num_tokens, renormalize, indices_type, topk
+):
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(113)
+    logits = torch.randn(num_tokens, 512, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.empty(num_tokens, 1, device="cuda", dtype=torch.bfloat16)
+    ref = (
+        torch.empty(num_tokens, topk, device="cuda", dtype=torch.float32),
+        torch.empty(num_tokens, topk, device="cuda", dtype=indices_type),
+        torch.empty(num_tokens, topk, device="cuda", dtype=torch.int32),
+    )
+
+    def invoke():
+        return fused_topk(hidden, logits, topk, renormalize, indices_type)
+
+    invoke()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = invoke()
+    for mode in ("random", "ties", "underflow", "nan", "inf", "partial_nan"):
+        logits.normal_()
+        if mode == "ties":
+            logits.zero_()
+        elif mode == "underflow":
+            logits.mul_(1e-30)
+        elif mode == "nan":
+            logits.fill_(float("nan"))
+        elif mode == "inf":
+            logits.fill_(float("inf"))
+        elif mode == "partial_nan":
+            logits[:, ::3] = float("nan")
+        graph.replay()
+        ops.topk_softmax(*ref, logits, renormalize)
+        torch.testing.assert_close(actual[1], ref[1], atol=0, rtol=0)
+        torch.testing.assert_close(actual[2], ref[2], atol=0, rtol=0)
+        torch.testing.assert_close(actual[0], ref[0], atol=2e-7, rtol=2e-6)
+        assert torch.isfinite(actual[0]).all()
+
+
 def torch_topk(
     gating_output: torch.Tensor,
     topk: int,
