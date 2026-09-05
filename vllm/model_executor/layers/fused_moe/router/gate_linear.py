@@ -127,6 +127,7 @@ class GateLinear(ReplicatedLinear):
         # specialized router kernels above. Preserve FP32 logits when M>16
         # falls through the low-latency BF16 kernel's range.
         self._router_gemm_no_bias = not bias
+        self._sm120_graph_pool_lifetime_guard = is_blackwell_rtx
         self._can_use_cublas_bf16_fp32 = self._can_use_ll_bf16 or (
             current_platform.is_rocm() and self._router_gemm_no_bias
         )
@@ -224,7 +225,26 @@ class GateLinear(ReplicatedLinear):
 
         # Tier 5: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
+            graph_pool_guard = None
+            if self._sm120_graph_pool_lifetime_guard:
+                from vllm.compilation.breakable_cudagraph import (
+                    BreakableCUDAGraphCapture,
+                )
+
+                if (
+                    BreakableCUDAGraphCapture.current() is not None
+                    or torch.cuda.is_current_stream_capturing()
+                ):
+                    # The former linear-plus-cast path reserved a BF16 router
+                    # output before its FP32 result. Preserve that graph-pool
+                    # address layout while using the fused FP32 cuBLAS output;
+                    # auxiliary-stream graph nodes retain addresses across the
+                    # differently sized captures that share this pool.
+                    graph_pool_guard = x.new_empty(
+                        (*x.shape[:-1], self.weight.shape[0])
+                    )
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+            del graph_pool_guard
             return output, None
 
         # Tier 6: F.linear (ReplicatedLinear)
