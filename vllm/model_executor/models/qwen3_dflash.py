@@ -209,15 +209,15 @@ def _resolve_layer_attention(
 class DFlashAttention(Attention):
     """Attention with DFlash-specific KV allocation semantics.
 
-    The draft KV cache is replicated across DCP ranks because DFlash draft
-    attention cannot reduce sharded KV. For SWA drafts we keep the cache
-    window-bounded so replicated DCP does not allocate a full-context draft KV.
+    Each TP-owned KV head retains all positions in its attention window because
+    DFlash cannot combine attention over context shards. SWA keeps that window
+    bounded even when the target uses decode context parallelism.
     """
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        # The draft attends locally over a replicated cache. DCP ranks therefore
-        # need the same draft KV, but sliding-window layers must stay windowed
-        # instead of being widened to full-context storage.
+        # Draft TP ranks need the same token positions for their owned KV heads.
+        # Sliding-window layers retain their window instead of being widened
+        # to full-context storage by the target's DCP configuration.
         dcp_replicated = vllm_config.parallel_config.decode_context_parallel_size > 1
         if self.sliding_window is not None:
             # Build the spec directly instead of converting the parent's

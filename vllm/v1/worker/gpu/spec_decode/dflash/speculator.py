@@ -117,7 +117,8 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         # Context positions for the K/V precompute. Populated by
         # prepare_dflash_inputs, and processed by the model's
-        # precompute_and_store_context_kv method. NOT captured by CUDA graphs.
+        # precompute_and_store_context_kv method. Context graphs retain these
+        # buffers at fixed addresses when supported by the draft configuration.
         self.context_positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=device
         )
