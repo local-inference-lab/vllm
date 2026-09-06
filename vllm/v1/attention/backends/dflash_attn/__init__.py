@@ -155,7 +155,9 @@ def _load(device: torch.device) -> ctypes.CDLL:
 def is_available(device: torch.device) -> bool:
     if not torch.cuda.is_available() or device.type != "cuda":
         return False
-    if torch.cuda.get_device_capability(device) != (12, 0):
+    # The kernel is built for the device's own arch (``_arch_flag``); it is
+    # qualified on the SM120 family, which includes GB10 (SM121).
+    if torch.cuda.get_device_capability(device)[0] != 12:
         return False
     try:
         _load(device)
