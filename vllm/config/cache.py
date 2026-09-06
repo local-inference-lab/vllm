@@ -167,11 +167,12 @@ class CacheConfig:
     Applies only to sliding-window and Mamba cache groups."""
     recurrent_checkpoint_policy: RecurrentCheckpointPolicy = "auto"
     """Retention policy for reusable recurrent state. ``request_boundaries``
-    retains the completed prompt and committed response endpoint, disabling
-    intermediate reusable checkpoints. ``aligned`` preserves block-aligned
-    retention. ``auto`` selects request boundaries for supported configurations
-    and aligned retention otherwise. Temporary speculative rollback state is
-    independent of this policy."""
+    retains a verified leading chat-instruction prefix, the completed prompt,
+    and the committed response endpoint, disabling arbitrary intermediate
+    checkpoints. ``aligned`` preserves block-aligned retention. ``auto`` selects
+    request boundaries for supported configurations and aligned retention
+    otherwise. Temporary speculative rollback state is independent of this
+    policy."""
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""

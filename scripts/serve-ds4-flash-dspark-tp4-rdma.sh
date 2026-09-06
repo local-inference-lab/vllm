@@ -289,7 +289,7 @@ cluster_args=(
   --env "HF_HOME=${HF_CACHE}"
   --env "HF_HUB_OFFLINE=1"
   --env "TRANSFORMERS_OFFLINE=1"
-  --env "VLLM_PLUGINS="
+  --env "VLLM_PLUGINS=${VLLM_PLUGINS:-}"
   --env "DG_JIT_USE_NVRTC=0"
   --env "USE_CUDNN=1"
   --env "VLLM_ALLOW_LONG_MAX_MODEL_LEN=1"
@@ -311,11 +311,6 @@ cluster_args=(
   --env "B12X_POLICY_MODE=${B12X_POLICY_MODE}"
   --env "VLLM_ENABLE_PCIE_ALLREDUCE=0"
   --env "VLLM_ENABLE_ROCE_ALLREDUCE=0"
-  --env "INSTANTTENSOR_BACKEND=BUFFERED"
-  --env "INSTANTTENSOR_BUFFER_SIZE=67108864"
-  --env "INSTANTTENSOR_CHUNK_SIZE=8388608"
-  --env "INSTANTTENSOR_CONCURRENCY=1"
-  --env "INSTANTTENSOR_IO_DEPTH=3"
   --env "NCCL_NET_PLUGIN=none"
   --env "LD_PRELOAD=${NCCL_LIB}"
   --env "VLLM_NCCL_SO_PATH=${NCCL_LIB}"
@@ -386,7 +381,7 @@ vllm_command=(
   --disable-custom-all-reduce
   --kv-cache-dtype fp8
   --block-size 256
-  --load-format instanttensor
+  --load-format fastsafetensors
   --moe-backend b12x
   --linear-backend b12x
   --attention-backend B12X

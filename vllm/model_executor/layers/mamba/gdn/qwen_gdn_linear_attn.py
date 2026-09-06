@@ -46,6 +46,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
@@ -545,10 +546,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # time step projection (discretization)
         # instantiate once and copy inv_dt in init_weights of PretrainedModel
         self.dt_bias = nn.Parameter(
-            torch.ones(self.num_v_heads // self.tp_size),
+            allocate_weights(torch.ones, self.num_v_heads // self.tp_size),
         )
         self.A_log = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 divide(self.num_v_heads, self.tp_size),
                 dtype=torch.float32,
             )

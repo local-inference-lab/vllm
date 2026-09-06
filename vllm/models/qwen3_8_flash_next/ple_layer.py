@@ -27,6 +27,11 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     is_conv_state_dim_first,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.weight_transfer import (
+    allocate_weights,
+    copy_weight,
+    flush_weight_transfers,
+)
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
     get_b12x_ple,
@@ -117,17 +122,18 @@ def _copy_embedding_shard(
     checkpoint_start: int,
     tp_start: int,
     tp_end: int,
-) -> None:
+) -> torch.Tensor | None:
     checkpoint_end = checkpoint_start + loaded_weight.shape[0]
     overlap_start = max(checkpoint_start, tp_start)
     overlap_end = min(checkpoint_end, tp_end)
     if overlap_start >= overlap_end:
-        return
+        return None
     rows = overlap_end - overlap_start
     source = loaded_weight.narrow(0, overlap_start - checkpoint_start, rows)
     target = destination.narrow(0, overlap_start - tp_start, rows)
     with torch.no_grad():
-        target.copy_(source.to(device=target.device, dtype=target.dtype))
+        copy_weight(target, source)
+    return target
 
 
 class Qwen3_8FlashNextPLEGroupedNorm(nn.Module):
@@ -135,13 +141,15 @@ class Qwen3_8FlashNextPLEGroupedNorm(nn.Module):
 
     def __init__(self, hidden_size: int, dtype: torch.dtype) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
+        self.weight = nn.Parameter(
+            allocate_weights(torch.zeros, hidden_size, dtype=dtype)
+        )
 
 
 class _NGramEmbeddingStorage(nn.Module):
     def __init__(self, plan: Any) -> None:
         super().__init__()
-        self._table_storage = plan.allocate_storage()
+        self._table_storage = allocate_weights(plan.allocate_storage)
         self.weight = nn.Parameter(
             self._table_storage.weight,
             requires_grad=False,
@@ -647,8 +655,16 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                         f"PLE shard {shard_index} {suffix} must have dtype "
                         f"{expected_dtype}, got {loaded_weight.dtype}"
                     )
-                if suffix == "weight_scale":
-                    scale = loaded_weight.float()
+                target = _copy_embedding_shard(
+                    destination,
+                    loaded_weight,
+                    checkpoint_start=checkpoint_start,
+                    tp_start=tp_start,
+                    tp_end=tp_end,
+                )
+                if suffix == "weight_scale" and target is not None:
+                    flush_weight_transfers()
+                    scale = target.float()
                     if not bool(torch.isfinite(scale).all()) or not bool(
                         (scale > 0).all()
                     ):
@@ -656,13 +672,6 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                             f"PLE shard {shard_index} weight_scale must be "
                             "finite and positive"
                         )
-                _copy_embedding_shard(
-                    destination,
-                    loaded_weight,
-                    checkpoint_start=checkpoint_start,
-                    tp_start=tp_start,
-                    tp_end=tp_end,
-                )
                 overlap_start = max(checkpoint_start, tp_start)
                 overlap_end = min(checkpoint_start + expected_rows, tp_end)
                 if overlap_start < overlap_end:
@@ -756,7 +765,8 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         self.norm_key = Qwen3_8FlashNextPLEGroupedNorm(self.hc_hidden_size, dtype)
         self.norm_query = Qwen3_8FlashNextPLEGroupedNorm(self.hc_hidden_size, dtype)
         self.norm_conv = Qwen3_8FlashNextPLEGroupedNorm(self.hc_hidden_size, dtype)
-        self.conv1d = nn.Conv1d(
+        self.conv1d = allocate_weights(
+            nn.Conv1d,
             self.hc_hidden_size,
             self.hc_hidden_size,
             self.conv_kernel_size,

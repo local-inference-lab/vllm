@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import is_deferred_attention_layer
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.weight_transfer import flush_weight_transfers
 
 from .meta import (
     SKIP_LOAD_TENSORS,
@@ -357,6 +358,7 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
         args.arguments["param"] = param
         param.weight_loader(*args.args, **args.kwargs)
 
+    flush_weight_transfers()
     # Process weights (quantization, repacking, etc.)
     quant_method = getattr(layer, "quant_method", None)
     if isinstance(quant_method, QuantizeMethodBase):

@@ -258,6 +258,77 @@ def serving_responses(
 
 @pytest.mark.asyncio
 class TestConversationRenderParity:
+    async def test_verified_instruction_token_boundary_is_forwarded(
+        self, online_renderer
+    ):
+        """Only an exact rendering of leading instructions becomes a marker."""
+        online_renderer.enable_recurrent_instruction_checkpoints = True
+        calls: list[tuple[list[Any], ChatParams]] = []
+
+        async def render_chat_async(
+            conversations,
+            chat_params,
+            tok_params=None,
+            *,
+            prompt_extras=None,
+            skip_mm_cache=False,
+        ):
+            messages = list(conversations[0])
+            calls.append((messages, chat_params))
+            token_ids = [11, 12] if len(messages) == 1 else [11, 12, 21, 22]
+            return [messages], [tokens_input(token_ids)]
+
+        online_renderer.renderer.render_chat_async = render_chat_async
+        request = ChatCompletionRequest(
+            model=_MODEL,
+            messages=[
+                {"role": "system", "content": "Shared instructions"},
+                {"role": "user", "content": "Request-specific question"},
+            ],
+        )
+
+        result = await online_renderer.render_chat(request)
+
+        assert not isinstance(result, ErrorResponse)
+        _, engine_inputs = result
+        assert engine_inputs[0]["recurrent_instruction_boundary"] == 2
+        assert len(calls) == 2
+        assert calls[1][1].chat_template_kwargs["add_generation_prompt"] is False
+        assert calls[1][1].chat_template_kwargs["continue_final_message"] is False
+
+    async def test_mismatched_instruction_rendering_does_not_set_boundary(
+        self, online_renderer
+    ):
+        """Conversation-dependent templates fail closed on token mismatch."""
+        online_renderer.enable_recurrent_instruction_checkpoints = True
+
+        async def render_chat_async(
+            conversations,
+            chat_params,
+            tok_params=None,
+            *,
+            prompt_extras=None,
+            skip_mm_cache=False,
+        ):
+            messages = list(conversations[0])
+            token_ids = [11, 99] if len(messages) == 1 else [11, 12, 21, 22]
+            return [messages], [tokens_input(token_ids)]
+
+        online_renderer.renderer.render_chat_async = render_chat_async
+        request = ChatCompletionRequest(
+            model=_MODEL,
+            messages=[
+                {"role": "developer", "content": "Shared instructions"},
+                {"role": "user", "content": "Request-specific question"},
+            ],
+        )
+
+        result = await online_renderer.render_chat(request)
+
+        assert not isinstance(result, ErrorResponse)
+        _, engine_inputs = result
+        assert "recurrent_instruction_boundary" not in engine_inputs[0]
+
     async def test_multiturn_tool_calling(self, online_renderer, serving_responses):
         """System/instructions, tool-call turn, and a follow-up user message."""
         await _assert_parity(

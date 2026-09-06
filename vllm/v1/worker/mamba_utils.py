@@ -20,6 +20,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -392,23 +393,26 @@ def checkpoint_mamba_states_kernel(
     state_dim_row_count_ptr,
     state_dim_row_stride_ptr,
     NUM_GROUPS: tl.constexpr,
+    NUM_CAPTURES: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
 ):
-    batch_idx = tl.program_id(0) // 2
-    kind = tl.program_id(0) % 2
+    batch_idx = tl.program_id(0) // NUM_CAPTURES
+    kind = tl.program_id(0) % NUM_CAPTURES
     state_idx = tl.program_id(1)
     tile_idx = tl.program_id(2)
-    if tl.load(capture_tokens_ptr + batch_idx * 2 + kind) <= 0:
+    if tl.load(capture_tokens_ptr + batch_idx * NUM_CAPTURES + kind) <= 0:
         return
     req_idx = tl.load(idx_mapping_ptr + batch_idx)
     if req_idx < 0:
         return
     src_col = tl.load(state_idx_ptr + req_idx)
-    token_bias = tl.load(capture_bias_ptr + batch_idx * 2 + kind)
+    token_bias = tl.load(capture_bias_ptr + batch_idx * NUM_CAPTURES + kind)
     group_idx = tl.load(state_group_indices_ptr + state_idx)
     destination = tl.load(
-        destination_blocks_ptr + (req_idx * 2 + kind) * NUM_GROUPS + group_idx
+        destination_blocks_ptr
+        + (req_idx * NUM_CAPTURES + kind) * NUM_GROUPS
+        + group_idx
     )
     if destination <= 0:
         return
@@ -1397,12 +1401,26 @@ class MambaSpecDecodeGPUContext:
         """Copy only requested endpoints, selecting the committed spec state."""
         assert self.is_initialized
         num_reqs = idx_mapping.numel()
-        assert capture_tokens.shape == capture_bias.shape == (num_reqs, 2)
-        assert destination_blocks.shape[1:] == (2, self.num_groups)
+        assert (
+            capture_tokens.shape
+            == capture_bias.shape
+            == (
+                num_reqs,
+                NUM_BOUNDARY_CHECKPOINT_SLOTS,
+            )
+        )
+        assert destination_blocks.shape[1:] == (
+            NUM_BOUNDARY_CHECKPOINT_SLOTS,
+            self.num_groups,
+        )
         if not num_reqs:
             return
         checkpoint_mamba_states_kernel[
-            (num_reqs * 2, self.total_states, _TEMPORAL_TILES)
+            (
+                num_reqs * NUM_BOUNDARY_CHECKPOINT_SLOTS,
+                self.total_states,
+                _TEMPORAL_TILES,
+            )
         ](
             idx_mapping,
             state_idx,
@@ -1420,6 +1438,7 @@ class MambaSpecDecodeGPUContext:
             self.state_dim_row_count,
             self.state_dim_row_stride,
             NUM_GROUPS=self.num_groups,
+            NUM_CAPTURES=NUM_BOUNDARY_CHECKPOINT_SLOTS,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             TEMPORAL_TILES=_TEMPORAL_TILES,
         )

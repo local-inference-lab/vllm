@@ -69,6 +69,11 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.weight_transfer import (
+    allocate_weights,
+    copy_weight,
+    flush_weight_transfers,
+)
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -217,7 +222,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         weight_attrs = {"weight_loader": self.weight_loader}
         self.w13_weight = nn.Parameter(
-            torch.zeros(
+            allocate_weights(
+                torch.zeros,
                 num_local_experts,
                 2 * intermediate_size,
                 hidden_size // 2,
@@ -228,7 +234,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         set_weight_attrs(self.w13_weight, weight_attrs)
 
         self.w13_weight_scale = nn.Parameter(
-            torch.zeros(
+            allocate_weights(
+                torch.zeros,
                 num_local_experts,
                 2 * intermediate_size,
                 hidden_size // 32,
@@ -240,7 +247,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.w13_weight_scale.quant_method = "block"
 
         self.w2_weight = nn.Parameter(
-            torch.zeros(
+            allocate_weights(
+                torch.zeros,
                 num_local_experts,
                 hidden_size,
                 intermediate_size // 2,
@@ -251,7 +259,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         set_weight_attrs(self.w2_weight, weight_attrs)
 
         self.w2_weight_scale = nn.Parameter(
-            torch.zeros(
+            allocate_weights(
+                torch.zeros,
                 num_local_experts,
                 hidden_size,
                 intermediate_size // 32,
@@ -323,7 +332,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                     f"{weight_name}: parameter shard {tuple(expert_data.shape)} "
                     f"vs checkpoint {tuple(loaded_weight.shape)}"
                 )
-            expert_data.copy_(loaded_weight)
+            copy_weight(expert_data, loaded_weight)
             loaded_any = True
 
         if return_success:
@@ -810,7 +819,8 @@ class DeepseekV4MoE(nn.Module):
             # Use randint instead of empty to avoid garbage values causing
             # invalid memory access in dummy mode (--load-format="dummy")
             self.gate.tid2eid = nn.Parameter(
-                torch.randint(
+                allocate_weights(
+                    torch.randint,
                     0,
                     config.n_routed_experts,
                     (config.vocab_size, config.num_experts_per_tok),
@@ -820,7 +830,9 @@ class DeepseekV4MoE(nn.Module):
             )
         elif getattr(config, "topk_method", None) == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                allocate_weights(
+                    torch.empty, config.n_routed_experts, dtype=torch.float32
+                ),
                 requires_grad=False,
             )
 
@@ -1115,7 +1127,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * self.hidden_size
         self.hc_attn_fn = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 (mix_hc, hc_dim),
                 dtype=torch.float32,
             ),
@@ -1123,35 +1136,40 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         self.hc_attn_fn_broadcast: torch.Tensor | None = None
         self.hc_ffn_fn = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 (mix_hc, hc_dim),
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_attn_base = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 mix_hc,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_ffn_base = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 mix_hc,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_attn_scale = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 3,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_ffn_scale = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 3,
                 dtype=torch.float32,
             ),
@@ -1406,7 +1424,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.norm = PPMissingLayer()
 
         self.hc_head_fn = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 self.hc_mult,
                 self.hc_dim,
                 dtype=torch.float32,
@@ -1414,14 +1433,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             requires_grad=False,
         )
         self.hc_head_base = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 self.hc_mult,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_head_scale = nn.Parameter(
-            torch.empty(1, dtype=torch.float32),
+            allocate_weights(torch.empty, 1, dtype=torch.float32),
             requires_grad=False,
         )
         spec_config = vllm_config.speculative_config
@@ -1644,7 +1664,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         continue
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
                     n = narrow_weight.shape[0]
-                    params_dict[name][:n].copy_(narrow_weight)
+                    copy_weight(params_dict[name][:n], narrow_weight)
                     loaded_params.add(name)
                     continue
                 else:
@@ -1922,6 +1942,7 @@ class DeepseekV4ForCausalLM(
         return loaded_params
 
     def process_weights_after_loading(self) -> None:
+        flush_weight_transfers()
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
         self.model.process_b12x_weights_after_loading()

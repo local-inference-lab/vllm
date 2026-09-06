@@ -18,6 +18,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import LayerNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.deepseek_v4.nvidia.b12x_indexer import (
     B12xC4SparseIndexer,
 )
@@ -142,14 +143,16 @@ class Glm5NextPooledIndexer(nn.Module):
             b12x_sparse_mla.expand_pooled_topk_to_physical_slots
         )
         self.index_kpool_compress_ape = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 (_POOL_SIZE, _INDEX_HEAD_DIM),
                 dtype=torch.bfloat16,
                 device=device,
             )
         )
         self.index_kpool_compress_gate = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 (_INDEX_HEAD_DIM, hidden_size),
                 dtype=torch.bfloat16,
                 device=device,
