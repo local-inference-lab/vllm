@@ -182,7 +182,7 @@ def _resolve_gdn_prefill_backend(
 
     In-tree CuteDSL GDN prefill kernel is chosen when:
     * "cutedsl" is requested; (opt-in only)
-    * Blackwell (SM10.x) with ``head_k_dim == 128``;
+    * SM10.x (datacenter Blackwell) with ``head_k_dim == 128``;
     """
     additional_config = vllm_config.additional_config
     backend_cfg = (
