@@ -45,6 +45,7 @@ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import (
+    apply_top_k_top_p,
     empty_exponential_noise_like,
     sample_with_exponential_noise,
 )
@@ -467,6 +468,16 @@ class SpecDecodeBaseProposer:
             sampling_metadata = dataclasses.replace(
                 sampling_metadata,
                 temperature=temperature.repeat_interleave(factor, dim=0),
+                top_p=(
+                    None
+                    if sampling_metadata.top_p is None
+                    else sampling_metadata.top_p.repeat_interleave(factor, dim=0)
+                ),
+                top_k=(
+                    None
+                    if sampling_metadata.top_k is None
+                    else sampling_metadata.top_k.repeat_interleave(factor, dim=0)
+                ),
             )
 
         return compute_probs_and_sample_next_token(
@@ -1882,12 +1893,16 @@ def compute_probs_and_sample_next_token(
         is_greedy = temperature < _SAMPLING_EPS
         temperature = torch.where(is_greedy, 1.0, temperature)
     logits.div_(temperature.view(-1, 1))
+    logits = apply_top_k_top_p(
+        logits,
+        sampling_metadata.top_k,
+        sampling_metadata.top_p,
+    )
     probs = logits.softmax(dim=-1, dtype=torch.float32)
 
-    # NOTE(woosuk): Currently, we ignore most of the sampling parameters in
-    # generating the draft tokens. We only use the temperature. While this
-    # could degrade the acceptance rate, it does not affect the distribution
-    # of the generated tokens after rejection sampling.
+    # Logits processors that depend on request history remain target-only.
+    # Temperature, top-k, and top-p are position-local, so the drafter can
+    # match those constraints exactly and keep q closer to the verifier's p.
 
     # TODO(woosuk): Consider seeds.
     q = empty_exponential_noise_like(probs, use_fp64_gumbel)
