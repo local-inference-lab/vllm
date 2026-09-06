@@ -28,6 +28,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
 )
+from vllm.model_executor.weight_transfer import allocate_weights
 
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
 from .utils import (
@@ -62,7 +63,7 @@ class DSparkMarkovHead(nn.Module):
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
-        self.markov_w1 = nn.Embedding(vocab_size, markov_rank)
+        self.markov_w1 = allocate_weights(nn.Embedding, vocab_size, markov_rank)
         self.markov_w2 = ParallelLMHead(
             draft_vocab_size,
             markov_rank,

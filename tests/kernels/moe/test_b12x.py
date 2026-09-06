@@ -596,7 +596,7 @@ def test_b12x_nvfp4_force_a16_updates_quant_config(
     assert quant_config.quant_dtype == expected_quant_dtype
 
 
-def test_b12x_nvfp4_force_a16_updates_weight_preparation(
+def test_b12x_nvfp4_force_a16_leaves_row_order_for_b12x_preparation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -641,7 +641,7 @@ def test_b12x_nvfp4_force_a16_updates_weight_preparation(
         is_act_and_mul=True,
     )
 
-    assert reorder_w13 is True
+    assert reorder_w13 is False
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1144,7 +1144,7 @@ def _make_b12x_moe_case(
             1.0 / w2_global_scale,
             input_scale,
             is_act_and_mul=activation.is_gated,
-            reorder_w13=activation_dtype is None and activation.is_gated,
+            reorder_w13=False,
         )
         w1_q, w1_scale, w1_alpha, a1_scale = prepared[:4]
         w2_q, w2_scale, w2_alpha, a2_scale = prepared[4:]

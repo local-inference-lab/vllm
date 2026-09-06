@@ -157,6 +157,12 @@ class EngineCoreRequest(
 
     session_id: str | None = None
 
+    # Exclusive token offset after the leading system/developer instruction
+    # segment. Appended to preserve positional serialization compatibility.
+    # The renderer supplies it only after exact token-prefix validation;
+    # direct token requests leave it unset.
+    recurrent_instruction_boundary: int | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""
