@@ -721,6 +721,24 @@ class GroupCoordinator:
             return None
         return self.device_communicator.pcie_all_gather_pair(first, second)
 
+    def pcie_prepare_reduce_scatter(self, wire: str) -> bool:
+        """Compile the copy-engine ring's reduce-scatter kernels ahead of
+        any kernel freeze or capture; ``False`` when there is no ring."""
+        if self.world_size == 1 or self.device_communicator is None:
+            return False
+        return self.device_communicator.pcie_prepare_reduce_scatter(wire)
+
+    def pcie_reduce_scatter_columns(
+        self, input_: torch.Tensor, *, wire: str, cols: int
+    ) -> torch.Tensor | None:
+        """Column reduce-scatter on the copy-engine ring; ``None`` when
+        unavailable (the caller falls back to an all-reduce)."""
+        if self.world_size == 1 or self.device_communicator is None:
+            return None
+        return self.device_communicator.pcie_reduce_scatter_columns(
+            input_, wire=wire, cols=cols
+        )
+
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")

@@ -41,6 +41,21 @@ def tensor_model_parallel_pcie_all_gather_pair(
     return get_tp_group().pcie_all_gather_pair(first, second)
 
 
+def tensor_model_parallel_prepare_pcie_reduce_scatter(wire: str) -> bool:
+    """Compile the TP ring's reduce-scatter kernels for ``wire`` ahead of
+    any kernel freeze or graph capture; ``False`` without a ring."""
+    return get_tp_group().pcie_prepare_reduce_scatter(wire)
+
+
+def tensor_model_parallel_pcie_reduce_scatter_columns(
+    input_: torch.Tensor, *, wire: str, cols: int
+) -> torch.Tensor | None:
+    """Reduce ``input_`` across the TP group on the copy-engine ring and
+    return this rank's ``[rows, cols]`` column block; ``None`` when
+    unavailable."""
+    return get_tp_group().pcie_reduce_scatter_columns(input_, wire=wire, cols=cols)
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:

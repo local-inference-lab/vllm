@@ -401,6 +401,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return None
         return ca_comm.pcie_dma_all_gather_pair(first, second)
 
+    def pcie_prepare_reduce_scatter(self, wire: str) -> bool:
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled:
+            return False
+        return ca_comm.pcie_dma_prepare_reduce_scatter(wire)
+
+    def pcie_reduce_scatter_columns(
+        self, input_: torch.Tensor, *, wire: str, cols: int
+    ) -> torch.Tensor | None:
+        """Column reduce-scatter on the B12X DMA ring (see
+        ``CustomAllreduce.pcie_dma_reduce_scatter_columns``)."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled:
+            return None
+        return ca_comm.pcie_dma_reduce_scatter_columns(input_, wire=wire, cols=cols)
+
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor | None:
         ca_comm = self.ca_comm
         if ca_comm is None:

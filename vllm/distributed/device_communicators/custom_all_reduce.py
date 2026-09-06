@@ -1323,6 +1323,37 @@ class CustomAllreduce:
         done.record(side)
         return out_first, out_second, done
 
+    def pcie_dma_prepare_reduce_scatter(self, wire: str) -> bool:
+        """Compile the B12X DMA ring's reduce-scatter kernels for ``wire``
+        before any kernel-resolution freeze or graph capture; ``False`` when
+        there is no ring."""
+        ring = self._pcie_dma
+        if ring is None or self.disabled:
+            return False
+        ring.prepare_reduce_scatter(wire)
+        return True
+
+    def pcie_dma_reduce_scatter_columns(
+        self, inp: torch.Tensor, *, wire: str, cols: int
+    ) -> torch.Tensor | None:
+        """Reduce ``inp`` (``[rows, K]`` bf16) across ranks on the B12X DMA
+        ring and return this rank's ``[rows, cols]`` column block of the sum
+        (see ``PCIeDmaAllReduce.reduce_scatter_columns``); ``None`` when the
+        ring is unavailable, a graph is being captured, or the ring declines
+        the shape. A replayed call returns the ring's static block, valid
+        until the next reduce-scatter of the same shape.
+        """
+        ring = self._pcie_dma
+        if (
+            ring is None
+            or self.disabled
+            or self._IS_CAPTURING
+            or torch.cuda.is_current_stream_capturing()
+            or not ring.should_reduce_scatter_columns(inp, cols=cols)
+        ):
+            return None
+        return ring.reduce_scatter_columns(inp, wire=wire, cols=cols)
+
     def all_reduce(
         self,
         inp: torch.Tensor,
