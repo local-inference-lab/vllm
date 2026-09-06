@@ -141,6 +141,70 @@ class _FakeProcessGroup:
 
 
 class TestDirectDCPGating:
+    def test_a2a_factory_falls_back_without_p2p(self, monkeypatch):
+        monkeypatch.delenv("VLLM_USE_DIRECT_DCP_A2A", raising=False)
+        monkeypatch.setattr(
+            dcp, "direct_cp_peer_access_enabled", lambda *args: False
+        )
+        dcp.get_direct_dcp_a2a_workspace.cache_clear()
+
+        assert (
+            dcp.get_direct_dcp_a2a_workspace(
+                _FakeGroupCoordinator(),
+                torch.device("cpu"),
+                16,
+                2,
+                32,
+                torch.bfloat16,
+                1,
+            )
+            is None
+        )
+
+    def test_auto_a2a_requires_all_pairs_p2p(self, monkeypatch):
+        monkeypatch.delenv("VLLM_USE_DIRECT_DCP_A2A", raising=False)
+        monkeypatch.setattr(cp_common, "direct_cp_enabled", lambda *args: True)
+        monkeypatch.setattr(cp_common, "_cuda_p2p_spans_group", lambda group: False)
+
+        assert not cp_common.direct_cp_peer_access_enabled(
+            _FakeGroupCoordinator(), torch.bfloat16, None
+        )
+
+    def test_forced_a2a_preserves_explicit_override(self, monkeypatch):
+        monkeypatch.setattr(
+            cp_common,
+            "_cuda_p2p_spans_group",
+            lambda group: pytest.fail("forced mode should bypass the automatic probe"),
+        )
+
+        assert cp_common.direct_cp_peer_access_enabled(
+            _FakeGroupCoordinator(), torch.bfloat16, True
+        )
+
+    @pytest.mark.parametrize("p2p_available", [False, True])
+    def test_p2p_probe_checks_both_directions(self, monkeypatch, p2p_available):
+        group = MagicMock(world_size=2, local_rank=2, cpu_group=object())
+        cp_common._cuda_p2p_spans_group.cache_clear()
+        monkeypatch.setattr(cp_common.current_platform, "is_cuda", lambda: True)
+
+        def gather_local_ranks(output, value, *, group):
+            assert value == 2
+            output[:] = [2, 3]
+
+        monkeypatch.setattr(
+            torch.distributed, "all_gather_object", gather_local_ranks
+        )
+        peer_checks = MagicMock(
+            side_effect=lambda src, dst: p2p_available or (src, dst) != (3, 2)
+        )
+        monkeypatch.setattr(cp_common, "gpu_p2p_access_check", peer_checks)
+
+        assert cp_common._cuda_p2p_spans_group(group) is p2p_available
+        if p2p_available:
+            assert peer_checks.call_count == 2
+        else:
+            assert peer_checks.call_args.args == (3, 2)
+
     def test_env_disabled_returns_none(self, monkeypatch):
         monkeypatch.setenv("VLLM_USE_DIRECT_DCP_A2A", "0")
         dcp.get_direct_dcp_a2a_workspace.cache_clear()
