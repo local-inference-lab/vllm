@@ -164,3 +164,66 @@ def test_b12x_warmup_precedes_cudagraph_memory_profile(
         "profile_cudagraph_memory",
     ]
     assert available == expected_available_memory
+
+
+def test_serving_thread_count_is_set_before_warmup(monkeypatch):
+    """Dynamo guards compiled functions on torch.get_num_threads(); dropping to
+    the serving count after warmup makes the first real request recompile
+    every torch.compile'd function."""
+    events: list[str] = []
+
+    def capture_model():
+        events.append("capture_model")
+        return 0
+
+    compilation_config = SimpleNamespace(
+        mode=gpu_worker.CompilationMode.NONE,
+        backend="inductor",
+        compilation_time=0.0,
+        encoder_compilation_time=0.0,
+    )
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(compilation_config=compilation_config),
+        compilation_config=compilation_config,
+        model_runner=SimpleNamespace(
+            lora_config=None,
+            maybe_remove_all_loras=lambda lora_config: None,
+            capture_model=capture_model,
+        ),
+        model_config=SimpleNamespace(enforce_eager=False, seed=0),
+        cache_config=SimpleNamespace(kv_cache_memory_bytes=1),
+        observability_config=SimpleNamespace(
+            jit_monitor_mode="off", jit_monitor_verbose=False
+        ),
+        use_v2_model_runner=True,
+        execute_model=None,
+        sample_tokens=None,
+    )
+
+    monkeypatch.setattr(
+        gpu_worker,
+        "set_torch_threads_for_runtime",
+        lambda: events.append("set_torch_threads_for_runtime"),
+    )
+    monkeypatch.setattr(
+        gpu_worker, "kernel_warmup", lambda worker: events.append("kernel_warmup")
+    )
+    monkeypatch.setattr(
+        gpu_worker,
+        "warmup_kernels",
+        lambda *args: events.append("warmup_kernels"),
+    )
+    monkeypatch.setattr(gpu_worker, "set_random_seed", lambda seed: None)
+    monkeypatch.setattr(gpu_worker, "freeze_gc_heap", lambda: None)
+    monkeypatch.setattr(gpu_worker, "maybe_attach_gc_debug_callback", lambda: None)
+    monkeypatch.setattr(gpu_worker, "enable_gpu_sync_check", lambda: None)
+    monkeypatch.setattr("vllm.utils.jit_monitor.activate", lambda mode, verbose: None)
+
+    gpu_worker.Worker.compile_or_warm_up_model(worker)
+
+    assert events == [
+        "set_torch_threads_for_runtime",
+        "kernel_warmup",
+        "capture_model",
+        "warmup_kernels",
+    ]
