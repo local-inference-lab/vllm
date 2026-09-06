@@ -34,6 +34,7 @@ from .model import (
     _try_load_mxfp8_bf16_attn_proj,
     get_spec_layer_idx_from_weight_name,
 )
+from .mtp_draft_head import QuantizedDraftHead, make_quantized_draft_head
 from .pooled_indexer import Glm5NextPooledIndexer
 
 
@@ -138,7 +139,21 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         # string and hashes it on every draft step.
         self._mtp_layers = list(self.layers.values())
         self._prefill_output_indices: torch.Tensor | None = None
+        self.quantized_draft_head: QuantizedDraftHead | None = None
         self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def prepare_draft_lm_head(self, source_head: nn.Module) -> None:
+        """Resolve the draft-only head after its weights have loaded.
+
+        A runtime-quantized MTP head already owns its packed vocabulary
+        projection and must not be quantized again from that packed tensor.
+        Otherwise, create the GLM-specific copy selected by
+        ``VLLM_GLM53_MTP_DRAFT_HEAD`` from an unquantized target head.
+        """
+        if getattr(source_head, "runtime_lm_head_quantization", None) == "nvfp4":
+            self.quantized_draft_head = None
+            return
+        self.quantized_draft_head = make_quantized_draft_head(source_head)
 
     def update_max_model_len(self, max_model_len: int) -> None:
         for module in self.modules():
@@ -216,7 +231,8 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         # hidden_states is already post-final-norm (produced in the layer
         # forward and recycled as-is); apply the LM head only, without a
         # second RMSNorm.
-        return self.logits_processor(mtp_layer.shared_head.head, hidden_states)
+        head = self.quantized_draft_head or mtp_layer.shared_head.head
+        return self.logits_processor(head, hidden_states)
 
     def get_top_tokens(
         self,
@@ -231,9 +247,8 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         # step. Tie-breaking matches the full argmax (shards are contiguous
         # and rank-ordered, so the lowest-rank winner is the lowest global
         # index), so greedy draft tokens are unchanged.
-        return self.logits_processor.get_top_tokens(
-            mtp_layer.shared_head.head, hidden_states
-        )
+        head = self.quantized_draft_head or mtp_layer.shared_head.head
+        return self.logits_processor.get_top_tokens(head, hidden_states)
 
 
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
@@ -308,6 +323,10 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.model.update_max_model_len(max_model_len)
+
+    def prepare_draft_lm_head(self, source_head: nn.Module) -> None:
+        """Create a draft-only quantized copy of the shared target head."""
+        self.model.prepare_draft_lm_head(source_head)
 
     def forward(
         self,
