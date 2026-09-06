@@ -122,6 +122,9 @@ from vllm.models.kimi_k3.nvidia.ops import attn_res
 from vllm.models.kimi_k3.nvidia.tp_projection import (
     gather_kimi_sharded_projection,
     gather_kimi_sharded_projection_pair,
+    kimi_reduction_is_borrowed,
+    kimi_ring_static_io_enabled,
+    materialize_kimi_reduction,
     try_gather_kimi_sharded_projection_pair_topk,
     try_select_kimi_routed_experts,
 )
@@ -1343,6 +1346,12 @@ class KimiMoE(nn.Module):
                 is_sequence_parallel=use_sequence_parallel,
                 runner_cls=LatentMoERunner if self.use_latent_moe else None,
             )
+            # The runner's in-place prefill reductions may hand back the DMA
+            # ring's static output: the decoder layer consumes it in the next
+            # layer's pre-attention norm, and the model materializes the last
+            # layer's result before returning it.
+            if hasattr(self.experts, "reduction_borrow_output"):
+                self.experts.reduction_borrow_output = kimi_ring_static_io_enabled()
         if self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
             if w13_weight is None:
@@ -1769,7 +1778,9 @@ class KimiDecoderLayer(nn.Module):
                 if self.reuse_attn_res_output and not self.is_final_block_write_layer
                 else None
             )
-            prefix_sum = hidden_states
+            # The new prefix outlives the next same-shape reduction, so a
+            # borrowed attention-output reduction is copied out of the ring.
+            prefix_sum = materialize_kimi_reduction(hidden_states)
             prefix_delta = None
         else:
             prefix_delta = hidden_states
@@ -2405,6 +2416,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         if self.use_attn_res:
             assert prefix_sum is not None
+            # The model output outlives the next forward's reductions: a
+            # borrowed last-layer MoE reduction is read here but never
+            # reused as the output storage.
+            reuse_output = (
+                self.reuse_attn_res_output
+                and not kimi_reduction_is_borrowed(hidden_states)
+            )
             hidden_states = attn_res(
                 prefix_sum,
                 hidden_states,
@@ -2416,7 +2434,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 block_write_idx=-1,
                 eps=self.output_attn_res_norm.variance_epsilon,
                 output_norm_eps=0.0,
-                output=(hidden_states if self.reuse_attn_res_output else None),
+                output=(hidden_states if reuse_output else None),
             )
         else:
             hidden_states = hidden_states + residual

@@ -687,13 +687,30 @@ class GroupCoordinator:
         else:
             return self._all_reduce_out_place(input_)
 
-    def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
-        """All-reduce a tensor whose input storage may hold the result."""
+    def all_reduce_in_place(
+        self, input_: torch.Tensor, *, borrow_output: bool = False
+    ) -> torch.Tensor:
+        """All-reduce a tensor whose input storage may hold the result.
+
+        With ``borrow_output`` the result may alias communicator-owned
+        storage that the next same-shape reduction overwrites; the caller
+        consumes it first and never retains it.
+        """
         if self.world_size == 1:
             return input_
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
+        if borrow_output:
+            return self.device_communicator.all_reduce_in_place(
+                input_, borrow_output=True
+            )
         return self.device_communicator.all_reduce_in_place(input_)
+
+    def is_borrowed_reduction_storage(self, tensor: torch.Tensor) -> bool:
+        """Whether ``tensor`` aliases communicator-owned reduction storage."""
+        if self.world_size == 1 or self.device_communicator is None:
+            return False
+        return self.device_communicator.is_borrowed_reduction_storage(tensor)
 
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:

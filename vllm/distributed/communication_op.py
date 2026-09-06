@@ -14,9 +14,23 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().all_reduce(input_)
 
 
-def tensor_model_parallel_all_reduce_in_place(input_: torch.Tensor) -> torch.Tensor:
-    """All-reduce a dead input tensor without allocating an output tensor."""
+def tensor_model_parallel_all_reduce_in_place(
+    input_: torch.Tensor, *, borrow_output: bool = False
+) -> torch.Tensor:
+    """All-reduce a dead input tensor without allocating an output tensor.
+
+    With ``borrow_output`` the result may be communicator-owned storage that
+    the next same-shape reduction overwrites (see
+    ``GroupCoordinator.all_reduce_in_place``).
+    """
+    if borrow_output:
+        return get_tp_group().all_reduce_in_place(input_, borrow_output=True)
     return get_tp_group().all_reduce_in_place(input_)
+
+
+def tensor_model_parallel_is_borrowed_storage(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` aliases storage a borrowed reduction returned."""
+    return get_tp_group().is_borrowed_reduction_storage(tensor)
 
 
 def tensor_model_parallel_all_gather(

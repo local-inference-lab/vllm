@@ -220,10 +220,20 @@ class DeviceCommunicatorBase:
         dist.all_reduce(input_, group=self.device_group)
         return input_
 
-    def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
-        """All-reduce while allowing the input storage to hold the result."""
+    def all_reduce_in_place(
+        self, input_: torch.Tensor, *, borrow_output: bool = False
+    ) -> torch.Tensor:
+        """All-reduce while allowing the input storage to hold the result.
+
+        ``borrow_output`` lets a communicator return storage it owns instead
+        of the input; communicators without such storage ignore it.
+        """
         dist.all_reduce(input_, group=self.device_group)
         return input_
+
+    def is_borrowed_reduction_storage(self, tensor: torch.Tensor) -> bool:
+        """Whether ``tensor`` aliases communicator-owned reduction storage."""
+        return False
 
     def checkpoint_prepare(self) -> None:
         """Prepare reclaimable communicator state for checkpoint (default: no-op)."""
