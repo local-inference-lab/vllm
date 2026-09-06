@@ -731,7 +731,10 @@ def _test_partial_request_hit(
 
 
 def _make_hybrid_kv_cache_config(
-    block_size: int, num_blocks: int, spec_types: list[str]
+    block_size: int,
+    num_blocks: int,
+    spec_types: list[str],
+    eagle_group_ids: set[int] | None = None,
 ) -> KVCacheConfig:
     """
     Create a KVCacheConfig with the specified spec types.
@@ -744,6 +747,7 @@ def _make_hybrid_kv_cache_config(
             - "sliding_window": SlidingWindowSpec with window=2*block_size
             - "sliding_window_large": SlidingWindowSpec with window=4*block_size
             - "mamba": MambaSpec
+        eagle_group_ids: Group indices explicitly marked for EAGLE/MTP.
     """
     spec_map = {
         "full": lambda: FullAttentionSpec(
@@ -779,8 +783,13 @@ def _make_hybrid_kv_cache_config(
         ),
     }
 
+    eagle_group_ids = eagle_group_ids or set()
     kv_cache_groups = [
-        KVCacheGroupSpec([f"layer{i}"], spec_map[spec_type]())
+        KVCacheGroupSpec(
+            [f"layer{i}"],
+            spec_map[spec_type](),
+            is_eagle_group=i in eagle_group_ids,
+        )
         for i, spec_type in enumerate(spec_types)
     ]
 
@@ -1087,6 +1096,7 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
         max_num_scheduled_tokens=3 * block_size,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle=False,
+        drop_last_prefix_cache_block=False,
         hash_block_size=block_size,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
@@ -2500,21 +2510,28 @@ def test_emit_cached_block_events():
     )
     assert len(req.block_hashes) >= num_cached_blocks
 
+    blocks = pool.get_new_blocks(num_cached_blocks)
+    pool.cache_full_blocks(
+        req, blocks, 0, num_cached_blocks, block_size, kv_cache_group_id
+    )
+    pool.take_events()
+    before = [(block.block_hash, block.ref_cnt) for block in blocks]
     # Snapshot block state to prove emit_cached_block_events does not mutate it.
     free_before = pool.get_num_free_blocks()
-    assert len(pool.cached_block_hash_to_block) == 0
+    assert len(pool.cached_block_hash_to_block) == num_cached_blocks
 
     pool.emit_cached_block_events(
         request=req,
-        num_cached_blocks=num_cached_blocks,
+        blocks=blocks,
+        num_cached_tokens=num_cached_blocks * block_size,
         block_size=block_size,
         kv_cache_group_id=kv_cache_group_id,
     )
 
-    # No block-state mutation: nothing allocated, nothing inserted into the
-    # prefix-cache map.
+    assert [(block.block_hash, block.ref_cnt) for block in blocks] == before
+    # Replay does not allocate blocks or change cache membership.
     assert pool.get_num_free_blocks() == free_before
-    assert len(pool.cached_block_hash_to_block) == 0
+    assert len(pool.cached_block_hash_to_block) == num_cached_blocks
 
     events = pool.take_events()
     assert len(events) == 1
@@ -2554,7 +2571,8 @@ def test_emit_cached_block_events_disabled():
 
     pool.emit_cached_block_events(
         request=req,
-        num_cached_blocks=3,
+        blocks=pool.get_new_blocks(3),
+        num_cached_tokens=3 * block_size,
         block_size=block_size,
         kv_cache_group_id=0,
     )
@@ -2563,7 +2581,7 @@ def test_emit_cached_block_events_disabled():
 
 
 def test_emit_cached_block_events_zero_cached():
-    """No events are emitted when num_cached_blocks == 0."""
+    """No events are emitted when no blocks were reused."""
     block_size = 4
     pool = BlockPool(
         num_gpu_blocks=8,
@@ -2580,7 +2598,8 @@ def test_emit_cached_block_events_zero_cached():
 
     pool.emit_cached_block_events(
         request=req,
-        num_cached_blocks=0,
+        blocks=[],
+        num_cached_tokens=0,
         block_size=block_size,
         kv_cache_group_id=0,
     )
@@ -3461,8 +3480,8 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
     )
 
     # 127 tokens: latest replay boundary is floor((127 - 1) / 32) * 32 = 96.
-    # The EAGLE/MTP SWA lookup group must cache the local tail ending at
-    # 104 tokens, and that tail is two 8-token blocks wide: hashes 11 and 12.
+    # The EAGLE/MTP SWA lookup group must cache two-block proof tails ending
+    # at 104 tokens and at the reachable predecessor after 64 tokens.
     token_ids = [i for i in range(15) for _ in range(block_size)] + [15] * 7
     req0 = make_request("0", token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
@@ -3476,7 +3495,7 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
     assert blocks is not None
 
     pool = manager.block_pool
-    expected_swa_cached = {11, 12}
+    expected_swa_cached = {7, 8, 11, 12}
     for i in range(15):
         cached = pool.get_cached_block(req0.block_hashes[i], kv_cache_group_ids=[1])
         if i in expected_swa_cached:
@@ -3490,6 +3509,440 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
     assert num_computed_tokens == 12 * block_size
     assert [len(blocks) for blocks in computed_blocks.blocks] == [3, 12]
+
+
+def test_hybrid_local_kv_retention_mtp_reuses_exact_boundary():
+    """An unavailable SWA proof block must fall back one aligned boundary."""
+    block_size = 8
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=4 * block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["swa_mtp"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=block_size,
+                ),
+                is_eagle_group=True,
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=0,
+        use_eagle=True,
+    )
+
+    token_ids = [i // block_size for i in range(129)]
+    request = make_request("0", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(request)
+    blocks = manager.allocate_slots(
+        request,
+        len(token_ids),
+        num_computed_tokens,
+        computed_blocks,
+    )
+    assert blocks is not None
+    manager.free(request)
+
+    replay = make_request("1", token_ids, block_size, sha256)
+    _, num_computed_tokens, _ = manager.get_computed_blocks(replay)
+    assert num_computed_tokens == 12 * block_size
+
+
+@pytest.mark.parametrize("annotate_eagle_groups", [None, "full_only", "both"])
+def test_hybrid_mamba_retention_mtp_boundary_reachable_after_eagle_drop(
+    annotate_eagle_groups,
+):
+    """Verify Mamba latest-only retention serves an MTP/EAGLE lookup.
+
+    The full-attention EAGLE lookup drops one block below what it matched, so
+    until a request decodes past the block boundary after its prompt, the only
+    candidate the coordinator can offer the Mamba group is one block below the
+    replay boundary. Mamba retention must keep that state too; keeping only the
+    boundary state leaves every retained state one block above every reachable
+    candidate, and the reconciled hit is always zero (found live on
+    GLM-5.3-Flash MTP: 0 hits across 16,897 queries).
+
+    Parametrized over how the groups are annotated, because the three cases
+    reach the manager's ``use_eagle`` bit by different routes and only one of
+    them is what production hits today: ``None`` is the coordinator's flag-all
+    fallback (no model annotator exists for glm5_next, so this is the live
+    path), ``full_only`` is a single annotated group (what a future annotator
+    would produce), and ``both`` is the hand-flagged case.
+    """
+    block_size = 32
+    num_spec = 3
+    full_is_eagle = annotate_eagle_groups in ("full_only", "both")
+    mamba_is_eagle = annotate_eagle_groups == "both"
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+                is_eagle_group=full_is_eagle,
+            ),
+            KVCacheGroupSpec(
+                ["mamba_mtp"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                    num_speculative_blocks=num_spec,
+                ),
+                is_eagle_group=mamba_is_eagle,
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=0,
+        use_eagle=True,
+    )
+
+    # 127 tokens: replay boundary floor(126 / 32) * 32 = 96, i.e. block 2's end.
+    # Prefill in block-aligned chunks the way the align-mode scheduler does:
+    # the state one block below the boundary only materializes as a chunk's
+    # running-state block, so a single-shot prefill could not retain it.
+    token_ids = [i for i in range(3) for _ in range(block_size)] + [3] * 31
+    req0 = make_request("0", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
+    assert num_computed_tokens == 0
+    for chunk_end in (32, 64, 96, 127):
+        blocks = manager.allocate_slots(
+            req0,
+            chunk_end - req0.num_computed_tokens,
+            num_computed_tokens,
+            computed_blocks,
+            num_lookahead_tokens=num_spec,
+        )
+        assert blocks is not None
+        req0.num_computed_tokens = chunk_end
+
+    # Mamba keeps the boundary state (block 2) plus the state one block below
+    # (block 1) -- the only position an EAGLE-dropped lookup can reach while
+    # the request has not decoded past the next block boundary.
+    pool = manager.block_pool
+    expected_mamba_cached = {1, 2}
+    for i in range(3):
+        cached = pool.get_cached_block(req0.block_hashes[i], kv_cache_group_ids=[1])
+        if i in expected_mamba_cached:
+            assert cached is not None, f"mamba hash {i} should be cached"
+        else:
+            assert cached is None, f"mamba hash {i} should not be cached"
+    manager.free(req0)
+
+    # Identical resend: full attention matches blocks 0-2 (96 tokens) and the
+    # EAGLE drop caps the candidate at 64; the retained state at 64 serves it.
+    req1 = make_request("1", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+    assert num_computed_tokens == 2 * block_size
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [2, 2]
+
+
+@pytest.mark.parametrize("fine_hits", [False, True])
+def test_hybrid_mamba_retention_eagle_backoff_is_one_alignment_unit(fine_hits):
+    """The EAGLE back-off is one ALIGNMENT unit, which is not one Mamba block.
+
+    When the groups' block sizes differ, the scheduler alignment is their LCM,
+    and the full-attention finder subtracts ``min(alignment, its block_size)``
+    and re-floors -- landing one alignment unit below the boundary regardless.
+    Backing off one Mamba block instead retains a state at the wrong offset:
+    Mamba's own finder then rejects it (its hit must be alignment-aligned) and
+    the reconciled hit stays 0, so the extra block is dead weight.
+
+    Here alignment is 64 and the Mamba block is 32, so the reachable position
+    is two Mamba blocks below the boundary, not one.
+    """
+    mamba_block = 32
+    full_block = 64  # scheduler alignment = lcm(64, 32) = 64 = 2 mamba blocks
+    kv_cache_config = KVCacheConfig(
+        num_blocks=200,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=full_block,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+                is_eagle_group=True,
+            ),
+            KVCacheGroupSpec(
+                ["mamba_mtp"],
+                MambaSpec(
+                    block_size=mamba_block,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+                is_eagle_group=True,
+            ),
+        ],
+    )
+    # hash_block_size must divide every group's block size, so it is the
+    # smaller (Mamba) block; the scheduler alignment is still the LCM, 64.
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=mamba_block,
+        retention_interval=0,
+        use_eagle=True,
+    )
+
+    # Preserve both the coarse fallback contract and the newly enabled fine path.
+    manager.coordinator.enable_partial_hash_hits = fine_hits
+    for group in manager.coordinator.single_type_managers:
+        group.hit_alignment_tokens = manager.coordinator._cache_hit_alignment_tokens
+
+    # 255 tokens: replay boundary floor(254 / 64) * 64 = 192. In Mamba blocks
+    # that is index 5; the EAGLE-reachable position 192 - 64 = 128 is index 3.
+    token_ids = [i for i in range(7) for _ in range(mamba_block)] + [7] * 31
+    req0 = make_request("0", token_ids, mamba_block, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
+    assert num_computed_tokens == 0
+    for chunk_end in (64, 128, 192, 255):
+        blocks = manager.allocate_slots(
+            req0,
+            chunk_end - req0.num_computed_tokens,
+            num_computed_tokens,
+            computed_blocks,
+        )
+        assert blocks is not None
+        req0.num_computed_tokens = chunk_end
+
+    pool = manager.block_pool
+    cached_mamba = {
+        i
+        for i in range(len(req0.block_hashes))
+        if pool.get_cached_block(req0.block_hashes[i], kv_cache_group_ids=[1])
+        is not None
+    }
+    # Index 3 is the one a post-drop lookup can ask for; index 4 (one block
+    # below the boundary) is what a block-sized back-off would have kept.
+    assert 3 in cached_mamba, f"reachable state missing; cached={sorted(cached_mamba)}"
+    assert 4 not in cached_mamba, "one-block back-off retained an unreachable state"
+
+    manager.free(req0)
+    req1 = make_request("1", token_ids, mamba_block, sha256)
+    _, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+    assert num_computed_tokens == (192 if fine_hits else 128)
+
+
+def _cache_in_chunks(manager, request, chunk_ends, num_lookahead_tokens=0):
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(request)
+    for chunk_end in chunk_ends:
+        blocks = manager.allocate_slots(
+            request,
+            chunk_end - request.num_computed_tokens,
+            num_computed_tokens,
+            computed_blocks,
+            num_lookahead_tokens=num_lookahead_tokens,
+        )
+        assert blocks is not None
+        request.num_computed_tokens = chunk_end
+
+
+@pytest.mark.parametrize(
+    "eagle_group_ids",
+    [
+        pytest.param(None, id="fallback"),
+        pytest.param({0}, id="full_only"),
+        pytest.param({0, 1, 2}, id="all_groups"),
+    ],
+)
+def test_hybrid_swa_retention_keeps_eagle_reachable_predecessor(eagle_group_ids):
+    """SWA and Mamba must retain the same post-drop replay boundary."""
+    block_size = 32
+    manager = make_kv_cache_manager(
+        kv_cache_config=_make_hybrid_kv_cache_config(
+            block_size,
+            300,
+            ["full", "mamba_align", "sliding_window"],
+            eagle_group_ids=eagle_group_ids,
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=0,
+        use_eagle=True,
+    )
+
+    token_ids = [i for i in range(3) for _ in range(block_size)] + [3] * 31
+    req0 = make_request("0", token_ids, block_size, sha256)
+    _cache_in_chunks(manager, req0, (32, 64, 96, 127), num_lookahead_tokens=3)
+    manager.free(req0)
+
+    req1 = make_request("1", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+    assert num_computed_tokens == 2 * block_size
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [2, 2, 2]
+
+
+def test_hybrid_mamba_retention_follows_swa_eagle_drop():
+    """Mamba must retain a boundary lowered by another sparse group."""
+    block_size = 32
+    manager = make_kv_cache_manager(
+        kv_cache_config=_make_hybrid_kv_cache_config(
+            block_size,
+            300,
+            ["sliding_window", "mamba_align"],
+            eagle_group_ids={0},
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=0,
+        use_eagle=True,
+    )
+
+    token_ids = [i for i in range(8) for _ in range(block_size)] + [8] * 31
+    req0 = make_request("0", token_ids, block_size, sha256)
+    _cache_in_chunks(
+        manager,
+        req0,
+        (32, 64, 96, 128, 160, 192, 224, 256, 287),
+        num_lookahead_tokens=3,
+    )
+    manager.free(req0)
+
+    req1 = make_request("1", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+    assert num_computed_tokens == 7 * block_size
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [7, 7]
+
+
+def test_hybrid_sparse_retention_uses_fine_hit_alignment(monkeypatch):
+    """Sparse retention must use the same fine alignment as cache lookup."""
+    hash_block_size = 32
+    cache_block_size = 64
+    manager = make_kv_cache_manager(
+        kv_cache_config=_make_hybrid_kv_cache_config(
+            cache_block_size, 300, ["full", "mamba_align"]
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        retention_interval=0,
+        use_eagle=True,
+    )
+    assert manager.coordinator._cache_hit_alignment_tokens == hash_block_size
+
+    mamba_manager = manager.coordinator.single_type_managers[1]
+    original_mask = type(mamba_manager).reachable_block_mask
+    observed_alignments = []
+
+    def record_alignment(cls, **kwargs):
+        observed_alignments.append(kwargs["alignment_tokens"])
+        return original_mask(**kwargs)
+
+    monkeypatch.setattr(
+        type(mamba_manager),
+        "reachable_block_mask",
+        classmethod(record_alignment),
+    )
+
+    token_ids = [i for i in range(3) for _ in range(hash_block_size)] + [3] * 31
+    req0 = make_request("0", token_ids, hash_block_size, sha256)
+    _cache_in_chunks(manager, req0, (64, 127), num_lookahead_tokens=3)
+    assert observed_alignments
+    assert set(observed_alignments) == {hash_block_size}
+
+
+def test_hybrid_fine_hit_retention_preserves_materialized_fallback():
+    """A fine boundary without a state must not displace a usable snapshot."""
+    full = lambda size: FullAttentionSpec(
+        block_size=size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full128"], full(128)),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=64,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+            KVCacheGroupSpec(["full32"], full(32)),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=32,
+        retention_interval=0,
+    )
+    assert manager.coordinator._cache_hit_alignment_tokens == 32
+    request = make_request("producer", list(range(480)), 32, sha256)
+    scheduler = SimpleNamespace(
+        # EngineCore uses the smallest group block size here, not the LCM.
+        cache_config=SimpleNamespace(
+            block_size=min(g.kv_cache_spec.block_size for g in config.kv_cache_groups)
+        ),
+        use_eagle=False,
+        drop_last_prefix_cache_block=False,
+        max_num_scheduled_tokens=384,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        mamba_partial_cache_hit=True,
+        hash_block_size=32,
+        mamba_has_prefill_checkpoint_blocks=False,
+    )
+    chunk_ends = []
+    while request.num_computed_tokens < request.num_tokens:
+        num_new_tokens = Scheduler._mamba_block_aligned_split(
+            scheduler,
+            request,
+            min(384, request.num_tokens - request.num_computed_tokens),
+        )
+        assert num_new_tokens > 0
+        assert manager.allocate_slots(request, num_new_tokens) is not None
+        request.num_computed_tokens += num_new_tokens
+        chunk_ends.append(request.num_computed_tokens)
+    assert chunk_ends == [384, 480]
+    # No chunk materialized state@448. State@480 exceeds replay's 479-token cap.
+    mamba = manager.coordinator.single_type_managers[1]
+    assert mamba.req_to_blocks[request.request_id][6].is_null
+    manager.free(request)
+
+    replay = make_request("replay", list(range(480)), 32, sha256)
+    _, hit_tokens, _ = manager.get_computed_blocks(replay)
+    assert hit_tokens == 384
 
 
 def test_block_lookup_cache_single_block_per_key():
@@ -4038,6 +4491,30 @@ def test_pure_swa_retention_latest_only():
     assert num_computed == 240
 
 
+def test_pure_swa_eagle_retention_keeps_reachable_predecessor():
+    block_size = 32
+    manager = _make_pure_swa_manager(
+        block_size,
+        sliding_window=2 * block_size,
+        retention_interval=0,
+        use_eagle=True,
+    )
+
+    token_ids = [i for i in range(8) for _ in range(block_size)] + [8] * 31
+    request = make_request("0", token_ids, block_size, sha256)
+    _cache_in_chunks(
+        manager,
+        request,
+        (32, 64, 96, 128, 160, 192, 224, 256, 287),
+        num_lookahead_tokens=3,
+    )
+    manager.free(request)
+
+    replay = make_request("1", token_ids, block_size, sha256)
+    _, num_computed, _ = manager.get_computed_blocks(replay)
+    assert num_computed == 7 * block_size
+
+
 def test_pure_swa_dense_retention_caches_all():
     """With retention set to ``None``, a pure-SWA model keeps dense behavior:
     every block boundary is a potential hit, so all blocks are cached."""
@@ -4334,3 +4811,232 @@ def test_swa_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction window -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
+
+
+@pytest.mark.parametrize(
+    "start,mask,null_indices,runs",
+    [
+        pytest.param(
+            0,
+            [False, True, True, False, True, True],
+            (),
+            [(1, 3), (4, 6)],
+            id="leading-and-interior-mask",
+        ),
+        pytest.param(0, None, (2,), [(0, 2), (3, 6)], id="interior-null"),
+        pytest.param(0, None, (0,), [(1, 6)], id="leading-null"),
+        pytest.param(0, [False] * 6, (), [], id="all-masked"),
+        pytest.param(0, None, tuple(range(6)), [], id="all-null"),
+        pytest.param(
+            2, [False, True, False, True], (), [(3, 4), (5, 6)], id="cached-offset"
+        ),
+        pytest.param(5, [False], (), [], id="masked-decode"),
+        pytest.param(0, None, (), [(0, 6)], id="dense"),
+    ],
+)
+@pytest.mark.parametrize("events_enabled", [True, False])
+def test_sparse_block_stored_runs(start, mask, null_indices, runs, events_enabled):
+    import msgspec
+
+    from vllm.distributed.kv_events import KVEventBatch
+
+    block_size = 4
+    pool = BlockPool(16, True, block_size, events_enabled)
+    req = make_request(
+        "sparse-events",
+        list(range(24)),
+        block_size,
+        sha256,
+        mm_positions=[
+            PlaceholderRange(offset=4, length=4),
+            PlaceholderRange(offset=16, length=4),
+        ],
+        mm_hashes=["first-image", "second-image"],
+        cache_salt="tenant",
+    )
+    blocks = pool.get_new_blocks(6)
+    for i in null_indices:
+        blocks[i] = pool.null_block
+    pool.cache_full_blocks(req, blocks, start, 6, block_size, 2, mask)
+    retained = {i for lo, hi in runs for i in range(lo, hi)}
+    for i, block_hash in enumerate(req.block_hashes):
+        cached = pool.get_cached_block(block_hash, [2])
+        assert cached == ([blocks[i]] if i in retained else None)
+    events = pool.take_events()
+    assert len(events) == (len(runs) if events_enabled else 0)
+    expected_keys = [
+        ("tenant",),
+        (("first-image", 0),),
+        None,
+        None,
+        (("second-image", 0),),
+        None,
+    ]
+    # Nothing was published before this call, so the first run's skipped
+    # context starts at the root even when the caller's offset is nonzero.
+    previous_end = 0
+    for event, (lo, hi) in zip(events, runs):
+        assert isinstance(event, BlockStored)
+        assert event.block_hashes == [
+            kv_cache_utils.maybe_convert_block_hash(h) for h in req.block_hashes[lo:hi]
+        ]
+        assert event.token_ids == list(range(lo * block_size, hi * block_size))
+        assert event.parent_block_hash == (
+            kv_cache_utils.maybe_convert_block_hash(req.block_hashes[lo - 1])
+            if lo
+            else None
+        )
+        assert event.extra_keys == expected_keys[lo:hi]
+        if lo > previous_end:
+            assert event.skipped_parent_block_hash == (
+                kv_cache_utils.maybe_convert_block_hash(
+                    req.block_hashes[previous_end - 1]
+                )
+                if previous_end
+                else None
+            )
+            assert event.skipped_token_ids == list(
+                range(previous_end * block_size, lo * block_size)
+            )
+            assert event.skipped_extra_keys == expected_keys[previous_end:lo]
+        else:
+            assert event.skipped_parent_block_hash is None
+            assert event.skipped_token_ids is None
+            assert event.skipped_extra_keys is None
+        assert event.block_size == block_size
+        assert event.group_idx == 2
+        assert event.medium == MEDIUM_GPU
+        assert len(event.token_ids) == block_size * len(event.block_hashes)
+        previous_end = hi
+    batch = KVEventBatch(ts=0.0, events=events)
+    encoded = msgspec.msgpack.encode(batch)
+    assert (
+        msgspec.msgpack.encode(msgspec.msgpack.decode(encoded, type=KVEventBatch))
+        == encoded
+    )
+
+
+@pytest.mark.parametrize("kind", ["swa", "mamba"])
+def test_sparse_block_stored_manager_masks(kind):
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        MambaManager,
+        SlidingWindowManager,
+    )
+
+    if kind == "swa":
+        spec = SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=32,
+        )
+        mask = SlidingWindowManager.reachable_block_mask(0, 64, 512, spec, False)
+        runs = [(30, 32), (62, 64)]
+        count = 64
+    else:
+        spec = MambaSpec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        )
+        mask = MambaManager.reachable_block_mask(0, 8, 32, spec, True, 0, (127,))
+        runs = [(3, 4), (5, 6)]
+        count = 8
+    assert mask is not None
+    assert [i for i, keep in enumerate(mask) if keep] == [
+        i for lo, hi in runs for i in range(lo, hi)
+    ]
+    pool = BlockPool(count + 1, True, 16, True)
+    req = make_request("mask-events", list(range(count * 16)), 16, sha256)
+    pool.cache_full_blocks(req, pool.get_new_blocks(count), 0, count, 16, 0, mask)
+    events = pool.take_events()
+    assert len(events) == len(runs)
+    for event, (lo, hi) in zip(events, runs):
+        assert event.token_ids == list(range(lo * 16, hi * 16))
+        assert event.block_hashes == [
+            kv_cache_utils.maybe_convert_block_hash(h) for h in req.block_hashes[lo:hi]
+        ]
+        assert event.parent_block_hash == kv_cache_utils.maybe_convert_block_hash(
+            req.block_hashes[lo - 1]
+        )
+
+
+@pytest.mark.parametrize("kind", ["swa", "mamba", "full"])
+@pytest.mark.parametrize("events_enabled", [True, False])
+def test_full_replay_reports_retained_blocks(kind, events_enabled):
+    block_size = 16
+    full_spec = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    if kind == "mamba":
+        spec = MambaSpec(
+            block_size=block_size,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        )
+        retained = [5]
+    elif kind == "swa":
+        spec = SlidingWindowSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=32,
+        )
+        retained = [4, 5]
+    else:
+        spec = full_spec
+        retained = list(range(6))
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=32,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(["layer"], spec)],
+        ),
+        max_model_len=256,
+        enable_caching=True,
+        enable_kv_cache_events=events_enabled,
+        hash_block_size=block_size,
+    )
+    req = make_request(
+        "replay", list(range(97)), block_size, sha256, cache_salt="tenant"
+    )
+    req.kv_cache_report_mode = "full"
+    pool = manager.block_pool
+    blocks = pool.get_new_blocks(6)
+    pool.cache_full_blocks(
+        req, blocks, 0, 6, block_size, 0, [i in retained for i in range(6)]
+    )
+    pool.take_events()
+    before = [(b.block_hash, b.ref_cnt) for b in blocks]
+    cache_size = len(pool.cached_block_hash_to_block)
+    computed, hit, _ = manager.get_computed_blocks(req)
+    assert hit == 96
+    assert [i for i, b in enumerate(computed.blocks[0]) if not b.is_null] == retained
+    events = manager.take_events()
+    assert [(b.block_hash, b.ref_cnt) for b in blocks] == before
+    assert len(pool.cached_block_hash_to_block) == cache_size
+    if not events_enabled:
+        assert events == []
+        return
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, BlockStored)
+    assert event.block_hashes == [
+        kv_cache_utils.maybe_convert_block_hash(req.block_hashes[i]) for i in retained
+    ]
+    assert event.token_ids == list(range(retained[0] * block_size, 96))
+    assert event.parent_block_hash == (
+        kv_cache_utils.maybe_convert_block_hash(req.block_hashes[retained[0] - 1])
+        if retained[0]
+        else None
+    )
+    assert event.extra_keys == (
+        [None] * len(retained) if retained[0] else [("tenant",)] + [None] * 5
+    )
+    assert event.kv_cache_spec_kind == kind.replace("full", "full_attention").replace(
+        "swa", "sliding_window"
+    )

@@ -60,6 +60,9 @@ async def init_render_app_state(
         reasoning_parser=args.reasoning_parser,
         default_chat_template_kwargs=args.default_chat_template_kwargs,
         log_error_stack=args.log_error_stack,
+        enable_recurrent_instruction_checkpoints=(
+            vllm_config.use_request_boundary_checkpoints
+        ),
     )
     state.online_renderer.warmup()
 

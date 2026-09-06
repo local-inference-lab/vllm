@@ -568,7 +568,7 @@ cluster_args=(
   --env "VLLM_WORKER_MULTIPROC_METHOD=spawn"
   --env "HF_HUB_OFFLINE=1"
   --env "TRANSFORMERS_OFFLINE=1"
-  --env "VLLM_PLUGINS="
+  --env "VLLM_PLUGINS=${VLLM_PLUGINS:-}"
   --env "VLLM_SSM_CONV_STATE_LAYOUT=DS"
   --env "VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE=${VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE}"
   --env "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE=${VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE}"
@@ -581,11 +581,6 @@ cluster_args=(
   --env "VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH=${VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH}"
   --env "VLLM_ENABLE_PCIE_ALLREDUCE=0"
   --env "B12X_POLICY_MODE=${B12X_POLICY_MODE}"
-  --env "INSTANTTENSOR_BACKEND=BUFFERED"
-  --env "INSTANTTENSOR_BUFFER_SIZE=67108864"
-  --env "INSTANTTENSOR_CHUNK_SIZE=8388608"
-  --env "INSTANTTENSOR_CONCURRENCY=1"
-  --env "INSTANTTENSOR_IO_DEPTH=3"
   --env "NCCL_NET_PLUGIN=none"
   --env "NCCL_IB_GID_INDEX=3"
   --env "NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS}"
@@ -624,7 +619,7 @@ if ((NUM_SPECULATIVE_TOKENS > 0)); then
       ;;
     dflash2)
       speculative_config=$(printf \
-        '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard","draft_load_config":{"load_format":"instanttensor","model_loader_extra_config":{"instanttensor_copy":true,"instanttensor_distributed":false}}}' \
+        '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard","draft_load_config":{"load_format":"fastsafetensors"}}' \
         "${DFLASH2_MODEL_PATH}" \
         "${NUM_SPECULATIVE_TOKENS}")
       ;;
@@ -652,9 +647,7 @@ vllm_command=(
   --moe-backend "${MOE_BACKEND}"
   --linear-backend "${LINEAR_BACKEND}"
   --no-enable-flashinfer-autotune
-  --load-format instanttensor
-  --model-loader-extra-config \
-    '{"instanttensor_copy":false,"instanttensor_distributed":false}'
+  --load-format fastsafetensors
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
   --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}"
   --max-model-len "${MAX_MODEL_LEN}"

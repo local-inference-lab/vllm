@@ -70,11 +70,21 @@ def test_boundary_auxiliary_restore_survives_slot_reuse_and_virtual_attention_pa
         model_state, config, {"attn": SimpleNamespace(kv_cache=cache)}, draft
     )
     state.blocks.copy_(
-        torch.tensor([[[4, 8], [5, 9]], [[6, 10], [7, 11]]], device=device)
+        torch.tensor(
+            [
+                [[4, 8], [5, 9], [12, 13]],
+                [[6, 10], [7, 11], [14, 15]],
+            ],
+            device=device,
+        )
     )
     idx = torch.tensor([1, 0], dtype=torch.int32, device=device)
     capture = torch.tensor(
-        [[[7, 0], [0, 11]], [[0, 0], [0, 0]], [[0, -1], [-1, 1]]],
+        [
+            [[7, 0, 0], [0, 11, 0]],
+            [[0, 0, 0], [0, 0, 0]],
+            [[0, -1, 0], [-1, 1, 0]],
+        ],
         dtype=torch.int32,
         device=device,
     )
@@ -133,46 +143,68 @@ def test_boundary_capture_uses_stop_trimmed_endpoint_and_leaves_middle_steps_pri
     state = SimpleNamespace(
         metadata=t(
             [
-                [1, 7, 7, 8, 1],
-                [1, 7, 7, 30, 1],
-                [0, 7, 7, 30, 1],
-                [1, 7, 12, 30, 1],
+                [1, 7, 0, 7, 8, 1],
+                [1, 7, 0, 7, 30, 1],
+                [0, 7, 0, 7, 30, 1],
+                [1, 7, 0, 12, 30, 1],
+                [1, 9, 4, 9, 30, 1],
             ]
         ),
-        stop_tokens=torch.full((4, 128), 99, dtype=torch.int32, device="cuda"),
-        seen=t([[0, 0], [1, 0], [1, 0], [1, 0]]),
+        stop_tokens=torch.full((5, 128), 99, dtype=torch.int32, device="cuda"),
+        seen=t([[0, 0, 0], [1, 0, 0], [1, 0, 0], [1, 0, 0], [0, 0, 0]]),
     )
-    sampled = t([[10, 0, 0, 0], [10, 99, 12, 13], [10, 99, 12, 13], [99, 10, 99, 11]])
-    computed = t([0, 8, 8, 8])
-    total = t([7, 9, 9, 9])
-    num_sampled = t([1, 4, 4, 4])
-    rejected = t([0, 0, 0, 0])
-    last_sampled = t([0, 0, 0, 0])
-    all_tokens = torch.zeros((4, 32), dtype=torch.int32, device="cuda")
-    capture = torch.empty((3, 4, 2), dtype=torch.int32, device="cuda")
+    sampled = t(
+        [
+            [10, 0, 0, 0],
+            [10, 99, 12, 13],
+            [10, 99, 12, 13],
+            [99, 10, 99, 11],
+            [0, 0, 0, 0],
+        ]
+    )
+    computed = t([0, 8, 8, 8, 0])
+    total = t([7, 9, 9, 9, 9])
+    num_sampled = t([1, 4, 4, 4, 0])
+    rejected = t([0, 0, 0, 0, 0])
+    last_sampled = t([0, 0, 0, 0, 0])
+    all_tokens = torch.zeros((5, 32), dtype=torch.int32, device="cuda")
+    capture = torch.empty((3, 5, 3), dtype=torch.int32, device="cuda")
     post_update(
-        t([0, 1, 2, 3]),
+        t([0, 1, 2, 3, 4]),
         computed,
         last_sampled,
         None,
         sampled,
         num_sampled,
         rejected,
-        t([0, 7, 11, 15, 19]),
+        t([0, 7, 11, 15, 19, 23]),
         all_tokens,
         total,
         state,
         capture,
     )
-    assert capture[0].tolist() == [[7, 7], [0, 10], [0, 0], [0, 11]]
-    assert capture[1].tolist() == [[0, 0], [0, 1], [0, 3], [0, 2]]
-    assert num_sampled.tolist() == [1, 2, 4, 3]
-    assert computed.tolist() == [7, 10, 12, 11]
-    assert total.tolist() == [8, 11, 13, 12]
-    assert last_sampled.tolist() == [10, 99, 13, 99]
-    assert capture[2][0].tolist() == [6, 6]
+    assert capture[0].tolist() == [
+        [7, 7, 0],
+        [0, 10, 0],
+        [0, 0, 0],
+        [0, 11, 0],
+        [0, 0, 4],
+    ]
+    assert capture[1].tolist() == [
+        [0, 0, 0],
+        [0, 1, 0],
+        [0, 3, 0],
+        [0, 2, 0],
+        [0, 0, 0],
+    ]
+    assert num_sampled.tolist() == [1, 2, 4, 3, 0]
+    assert computed.tolist() == [7, 10, 12, 11, 4]
+    assert total.tolist() == [8, 11, 13, 12, 9]
+    assert last_sampled.tolist() == [10, 99, 13, 99, 0]
+    assert capture[2][0].tolist() == [6, 6, -1]
     assert capture[2][1, 1].item() == 8
     assert capture[2][3, 1].item() == 17
+    assert capture[2][4, 2].item() == 22
 
 
 @pytest.mark.parametrize(

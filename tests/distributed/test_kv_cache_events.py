@@ -50,6 +50,9 @@ def _make_block_stored(
     group_idx: int | None = None,
     kv_cache_spec_sliding_window: int | None = None,
     locality: str | None = None,
+    skipped_parent_block_hash: bytes | None = None,
+    skipped_token_ids: list[int] | None = None,
+    skipped_extra_keys: list[tuple[Any, ...] | None] | None = None,
 ) -> BlockStored:
     return BlockStored(
         block_hashes=[_FAKE_HASH],
@@ -59,6 +62,9 @@ def _make_block_stored(
         lora_id=None,
         medium="GPU",
         lora_name=None,
+        skipped_parent_block_hash=skipped_parent_block_hash,
+        skipped_token_ids=skipped_token_ids,
+        skipped_extra_keys=skipped_extra_keys,
         group_idx=group_idx,
         kv_cache_spec_sliding_window=kv_cache_spec_sliding_window,
         locality=locality,
@@ -103,6 +109,12 @@ def test_block_stored_hash_same_for_equal_group_idx():
     event_a = _make_block_stored(group_idx=1)
     event_b = _make_block_stored(group_idx=1)
     assert hash(event_a) == hash(event_b)
+
+
+def test_block_stored_hash_differs_by_skipped_context():
+    event_a = _make_block_stored(skipped_token_ids=[1, 2, 3, 4])
+    event_b = _make_block_stored(skipped_token_ids=[5, 6, 7, 8])
+    assert hash(event_a) != hash(event_b)
 
 
 @pytest.mark.parametrize("group_idx", [1, 2, 3])
@@ -160,19 +172,31 @@ def test_block_stored_locality_is_wire_compatible():
         kv_cache_spec_sliding_window=128,
     )
     legacy_payload = msgspec.msgpack.encode(legacy)
-    assert (
-        msgspec.msgpack.encode(
-            _make_block_stored(
-                group_idx=2,
-                kv_cache_spec_sliding_window=128,
-            )
-        )
-        == legacy_payload
-    )
-    assert msgspec.msgpack.decode(legacy_payload, type=BlockStored).locality is None
+    decoded_legacy = msgspec.msgpack.decode(legacy_payload, type=BlockStored)
+    assert decoded_legacy.locality is None
+    assert decoded_legacy.skipped_parent_block_hash is None
+    assert decoded_legacy.skipped_token_ids is None
+    assert decoded_legacy.skipped_extra_keys is None
+
     new_payload = msgspec.msgpack.encode(_make_block_stored(locality="LOCAL"))
     assert msgspec.msgpack.decode(new_payload)["locality"] == "LOCAL"
-    assert msgspec.msgpack.decode(new_payload, type=_LegacyBlockStored).medium == "GPU"
+    decoded_new = msgspec.msgpack.decode(new_payload, type=_LegacyBlockStored)
+    assert decoded_new.medium == "GPU"
+    assert decoded_new.group_idx is None
+
+
+def test_block_stored_skipped_context_is_wire_compatible():
+    event = _make_block_stored(
+        skipped_parent_block_hash=_FAKE_HASH,
+        skipped_token_ids=[5, 6, 7, 8],
+        skipped_extra_keys=[("salt",)],
+    )
+    payload = msgspec.msgpack.encode(event)
+    decoded = msgspec.msgpack.decode(payload)
+    assert decoded["skipped_parent_block_hash"] == _FAKE_HASH
+    assert decoded["skipped_token_ids"] == [5, 6, 7, 8]
+    assert decoded["skipped_extra_keys"] == [["salt"]]
+    assert msgspec.msgpack.decode(payload, type=_LegacyBlockStored).medium == "GPU"
 
 
 def test_block_removed_locality_is_wire_compatible():
