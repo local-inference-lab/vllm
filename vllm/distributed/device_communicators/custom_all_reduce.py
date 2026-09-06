@@ -1264,14 +1264,29 @@ class CustomAllreduce:
             return "CUSTOM_CPP_PCIE"
         return "CUSTOM"
 
+    def is_pcie_ring_storage(self, tensor: torch.Tensor) -> bool:
+        """Whether ``tensor`` aliases the B12X DMA ring's replay arena (a
+        borrowed static output)."""
+        ring = self._pcie_dma
+        return ring is not None and bool(ring.is_ring_storage(tensor))
+
     def all_reduce(
-        self, inp: torch.Tensor, *, out: torch.Tensor = None, registered: bool = False
+        self,
+        inp: torch.Tensor,
+        *,
+        out: torch.Tensor = None,
+        registered: bool = False,
+        borrow_output: bool = False,
     ):
         """Performs an out-of-place all reduce.
 
         If registered is True, this assumes inp's pointer is already
         IPC-registered. Otherwise, inp is first copied into a pre-registered
         buffer.
+
+        ``borrow_output`` applies only to the B12X DMA ring: a replayed ring
+        all-reduce then returns the ring's static output, which the caller
+        must consume before the next all-reduce of the same numel/dtype.
         """
         if self._pcie_runtime is not None:
             inp_size = inp.numel() * inp.element_size()
@@ -1292,10 +1307,11 @@ class CustomAllreduce:
                 and self._pcie_dma.should_allreduce(inp)
             ):
                 stream = self._pcie_runtime_stream()
+                kwargs = {"borrow_output": True} if borrow_output else {}
                 if stream is not None:
                     with torch.cuda.stream(stream):
-                        return self._pcie_dma.all_reduce(inp, out=out)
-                return self._pcie_dma.all_reduce(inp, out=out)
+                        return self._pcie_dma.all_reduce(inp, out=out, **kwargs)
+                return self._pcie_dma.all_reduce(inp, out=out, **kwargs)
             if not self._pcie_logged_first_allreduce:
                 self._pcie_logged_first_allreduce = True
                 logger.debug(
@@ -1385,8 +1401,14 @@ class CustomAllreduce:
         )
         return True
 
-    def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor | None:
-        """The main allreduce API that provides support for cuda graph."""
+    def custom_all_reduce(
+        self, input: torch.Tensor, *, borrow_output: bool = False
+    ) -> torch.Tensor | None:
+        """The main allreduce API that provides support for cuda graph.
+
+        ``borrow_output`` is forwarded to the eager B12X DMA ring path (see
+        ``all_reduce``); graph captures never borrow.
+        """
         # When custom allreduce is disabled, this will be None.
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -1398,6 +1420,10 @@ class CustomAllreduce:
                 # graph capture bookkeeping is active. Those ops need a real
                 # all-reduce; returning a placeholder is only valid for warmup.
                 if _is_piecewise_cudagraph_runtime():
+                    if borrow_output:
+                        return self.all_reduce(
+                            input, registered=False, borrow_output=True
+                        )
                     return self.all_reduce(input, registered=False)
                 # The warmup intentionally skips communication, but CuTe-based
                 # PCIe launchers still need their graph specialization loaded
@@ -1424,6 +1450,8 @@ class CustomAllreduce:
             # Note: outside of cuda graph context, custom allreduce incurs a
             # cost of cudaMemcpy, which should be small (<=1% of overall
             # latency) compared to the performance gain of using custom kernels
+            if borrow_output:
+                return self.all_reduce(input, registered=False, borrow_output=True)
             return self.all_reduce(input, registered=False)
 
     def should_custom_all_gather(self, inp: torch.Tensor) -> bool:

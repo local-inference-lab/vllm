@@ -362,6 +362,12 @@ class MoERunner(MoERunnerInterface):
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
 
+        # When set by the model, the in-place prefill reductions may return
+        # communicator-owned storage (the B12X DMA ring's static output) that
+        # the next same-shape reduction overwrites. The model then consumes
+        # each result before that reduction and never retains it.
+        self.reduction_borrow_output = False
+
         self._forward_entry = self._select_forward()
         self._shared_input_reuse_entry = (
             self._select_shared_input_reuse_forward()
@@ -594,6 +600,13 @@ class MoERunner(MoERunnerInterface):
             shared_output = tensor_model_parallel_all_reduce(shared_output)
         return shared_output
 
+    def _all_reduce_in_place(self, states: torch.Tensor) -> torch.Tensor:
+        """In-place all-reduce of dead storage, borrowing communicator-owned
+        output when the model enabled ``reduction_borrow_output``."""
+        if self.reduction_borrow_output:
+            return tensor_model_parallel_all_reduce_in_place(states, borrow_output=True)
+        return tensor_model_parallel_all_reduce_in_place(states)
+
     def _maybe_reduce_routed_output_before_transform(
         self,
         fused_output: torch.Tensor,
@@ -606,7 +619,10 @@ class MoERunner(MoERunnerInterface):
         Latent MoE output transforms may contain non-linear ops, e.g. RMSNorm.
         TP partial routed outputs must be summed in latent space before such
         transforms are applied. ``in_place`` is valid only when the local
-        partial tensor has no consumer after the collective.
+        partial tensor has no consumer after the collective; the in-place
+        result may be borrowed communicator storage
+        (``reduction_borrow_output``), which the output transform consumes
+        within this forward.
         """
         if (
             self.routed_output_transform is not None
@@ -615,7 +631,7 @@ class MoERunner(MoERunnerInterface):
             and not fused_output_is_reduced
         ):
             if in_place:
-                fused_output = tensor_model_parallel_all_reduce_in_place(fused_output)
+                fused_output = self._all_reduce_in_place(fused_output)
             else:
                 fused_output = tensor_model_parallel_all_reduce(fused_output)
             fused_output_is_reduced = True
@@ -656,7 +672,7 @@ class MoERunner(MoERunnerInterface):
             and not output_is_reduced
         ):
             if in_place:
-                states = tensor_model_parallel_all_reduce_in_place(states)
+                states = self._all_reduce_in_place(states)
             else:
                 states = tensor_model_parallel_all_reduce(states)
 

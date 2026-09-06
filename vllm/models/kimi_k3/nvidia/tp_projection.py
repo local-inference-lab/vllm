@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tensor-parallel collectives for Kimi-K3 projection outputs."""
 
+import os
+from functools import lru_cache
+
 import torch
 
 import vllm.envs as envs
@@ -12,6 +15,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce_in_place,
+    tensor_model_parallel_is_borrowed_storage,
 )
 from vllm.v1.attention.ops import dcp_alltoall
 from vllm.v1.attention.ops.dcp_alltoall import (
@@ -21,6 +25,21 @@ from vllm.v1.attention.ops.dcp_alltoall import (
 
 _KIMI_B12X_PAIRED_PROJECTION_MAX_TOKENS = 8
 _KIMI_INPLACE_REDUCTION_MIN_TOKENS = 1024
+
+
+@lru_cache(maxsize=1)
+def kimi_ring_static_io_enabled() -> bool:
+    """``VLLM_K3_RING_STATIC_IO=1``: prefill in-place reductions borrow the
+    B12X DMA ring's static output instead of copying it out.
+
+    The reduced tensor then aliases ring memory that the next reduction of
+    the same shape overwrites. Kimi-K3 consumes each such tensor before that
+    point (attention output -> post-attention norm and MoE input; MoE output
+    -> next layer's pre-attention norm) and materializes the two tensors it
+    retains longer (``materialize_kimi_reduction``: the AttnRes block-write
+    prefix and the model output). Off by default.
+    """
+    return os.getenv("VLLM_K3_RING_STATIC_IO", "0") == "1"
 
 
 def reduce_kimi_full_width_projection(
@@ -33,7 +52,8 @@ def reduce_kimi_full_width_projection(
     rank-local value is dead after reduction. NCCL may therefore overwrite
     that storage and avoid an equally sized output allocation. Smaller
     projections retain the ordinary functional collective used by decode and
-    CUDA Graph capture.
+    CUDA Graph capture. With ``kimi_ring_static_io_enabled()`` the result may
+    be the DMA ring's static output (see there).
     """
     if tp_size <= 1:
         return output_parallel
@@ -42,8 +62,33 @@ def reduce_kimi_full_width_projection(
         and output_parallel.shape[0] >= _KIMI_INPLACE_REDUCTION_MIN_TOKENS
         and output_parallel.is_contiguous()
     ):
+        if kimi_ring_static_io_enabled():
+            return tensor_model_parallel_all_reduce_in_place(
+                output_parallel, borrow_output=True
+            )
         return tensor_model_parallel_all_reduce_in_place(output_parallel)
     return tensor_model_parallel_all_reduce(output_parallel)
+
+
+def materialize_kimi_reduction(tensor: torch.Tensor) -> torch.Tensor:
+    """Return ``tensor`` in caller-owned storage.
+
+    A tensor a borrowed reduction returned is copied out; any other tensor
+    is returned as is. Call this before retaining a reduction result across
+    the next same-shape reduction.
+    """
+    if kimi_ring_static_io_enabled() and tensor_model_parallel_is_borrowed_storage(
+        tensor
+    ):
+        return tensor.clone()
+    return tensor
+
+
+def kimi_reduction_is_borrowed(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` is a borrowed reduction result (ring-owned)."""
+    return kimi_ring_static_io_enabled() and tensor_model_parallel_is_borrowed_storage(
+        tensor
+    )
 
 
 def _get_kimi_projection_group():
