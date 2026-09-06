@@ -916,7 +916,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return
 
         try:
-            _init_minimal_kv_cache_for_profiling(self)
+            _init_minimal_kv_cache_for_profiling(self, num_blocks=1)
             self._dummy_run(
                 self.max_num_tokens,
                 skip_eplb=True,

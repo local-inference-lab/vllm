@@ -1844,8 +1844,8 @@ def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
     runner.max_num_tokens = 4096
     events: list[object] = []
 
-    def init_kv():
-        events.append("init-kv")
+    def init_kv(*, num_blocks=None):
+        events.append(("init-kv", num_blocks))
         if init_fails:
             raise RuntimeError("expected DeepSeek V4 KV initialization failure")
 
@@ -1878,9 +1878,9 @@ def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
     else:
         runner._profile_deepseek_v4_attention()
 
-    assert events[0] == "init-kv"
+    assert events[0] == ("init-kv", 1)
     if init_fails:
-        assert events == ["init-kv", "cleanup"]
+        assert events == [("init-kv", 1), "cleanup"]
     else:
         assert events[1] == (
             "dummy-run",
