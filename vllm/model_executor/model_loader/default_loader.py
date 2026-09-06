@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import glob
-import json
 import os
 import time
 from collections.abc import Generator, Iterable
@@ -88,8 +87,6 @@ class DefaultModelLoader(BaseModelLoader):
             )
         allowed_keys = {
             "enable_multithread_load",
-            "instanttensor_copy",
-            "instanttensor_distributed",
             "num_threads",
             "enable_weights_track",
         }
@@ -119,29 +116,6 @@ class DefaultModelLoader(BaseModelLoader):
         self.enable_weights_track: bool | None = extra_config.get(
             "enable_weights_track", None
         )
-        self.instanttensor_copy = extra_config.get("instanttensor_copy", True)
-        if not isinstance(self.instanttensor_copy, bool):
-            raise ValueError(
-                "instanttensor_copy must be a bool, got "
-                f"{type(self.instanttensor_copy).__name__}"
-            )
-        self.instanttensor_distributed = extra_config.get(
-            "instanttensor_distributed", True
-        )
-        if not isinstance(self.instanttensor_distributed, bool):
-            raise ValueError(
-                "instanttensor_distributed must be a bool, got "
-                f"{type(self.instanttensor_distributed).__name__}"
-            )
-        if (
-            {"instanttensor_copy", "instanttensor_distributed"} & extra_config.keys()
-            and load_config.load_format != "instanttensor"
-        ):
-            raise ValueError(
-                "InstantTensor options are only supported with "
-                "load_format='instanttensor'"
-            )
-
         # The multi-thread loader ignores safetensors_load_strategy, so reject
         # the combination instead of silently dropping the requested strategy.
         if extra_config.get("enable_multithread_load") and (
@@ -291,16 +265,6 @@ class DefaultModelLoader(BaseModelLoader):
             source.allow_patterns_overrides,
             source.weight_name_prefixes,
         )
-        indexed_tensor_files: dict[str, str] | None = None
-        if use_safetensors:
-            index_path = os.path.join(hf_folder, SAFE_WEIGHTS_INDEX_NAME)
-            if os.path.isfile(index_path):
-                with open(index_path, encoding="utf-8") as index_handle:
-                    weight_map = json.load(index_handle)["weight_map"]
-                indexed_tensor_files = {
-                    name: os.path.abspath(os.path.join(hf_folder, filename))
-                    for name, filename in weight_map.items()
-                }
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -323,9 +287,6 @@ class DefaultModelLoader(BaseModelLoader):
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
                     weight_name_prefixes=source.weight_name_prefixes,
-                    copy=self.instanttensor_copy,
-                    distributed=self.instanttensor_distributed,
-                    indexed_tensor_files=indexed_tensor_files,
                 )
             else:
                 if extra_config.get("enable_multithread_load"):

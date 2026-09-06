@@ -14,6 +14,15 @@ if TYPE_CHECKING:
 
 MAX_BOUNDARY_STOP_TOKENS = 128
 
+# Prompt and response retain their original slots so cached request state and
+# worker metadata remain compatible when an instruction checkpoint is absent.
+PROMPT_CHECKPOINT_SLOT = 0
+RESPONSE_CHECKPOINT_SLOT = 1
+INSTRUCTION_CHECKPOINT_SLOT = 2
+NUM_BOUNDARY_CHECKPOINT_SLOTS = 3
+
+BoundaryCheckpointKind = Literal["instruction", "prompt", "response"]
+
 
 @dataclass(frozen=True)
 class BoundaryCheckpoint:
@@ -22,7 +31,7 @@ class BoundaryCheckpoint:
     block_ids: tuple[tuple[int, ...], ...]
     auxiliary_block_ids: tuple[int, ...] = ()
     draft_prefix_len: int = 0
-    kind: Literal["prompt", "response"] = "prompt"
+    kind: BoundaryCheckpointKind = "prompt"
 
     @property
     def dependencies(self) -> frozenset[int]:

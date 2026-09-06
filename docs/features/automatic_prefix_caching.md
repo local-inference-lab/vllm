@@ -37,7 +37,7 @@ The settings control different parts of caching:
 | Setting | Purpose |
 | --- | --- |
 | `--mamba-cache-mode align` | Maintains the running recurrent state and temporary speculative rollback states. |
-| `--recurrent-checkpoint-policy request_boundaries` | Publishes reusable state after the full prompt and at the processed response endpoint. Intermediate recurrent prefix checkpoints are disabled. |
+| `--recurrent-checkpoint-policy request_boundaries` | Publishes reusable state after a verified leading system/developer segment, the full prompt, and the processed response endpoint. Arbitrary intermediate recurrent checkpoints are disabled. |
 | `--recurrent-checkpoint-policy aligned` | Uses the previous block-aligned checkpoint policy. |
 | `--recurrent-checkpoint-policy auto` | Selects request boundaries for supported configurations and the aligned policy otherwise. |
 | `--prefix-cache-retention-interval` | Controls intermediate retention under the aligned policy; it does not add recurrent checkpoints under the request-boundary policy. |
@@ -47,6 +47,14 @@ processed. The final emitted token usually has not been processed, so the next
 chat turn replays it before processing new user input. EOS, token-stop, and
 length-limited responses can publish this endpoint. Cancellation and stops
 detected by the frontend do not publish a response checkpoint.
+
+For OpenAI chat requests, the renderer separately tokenizes consecutive leading
+`system` and `developer` messages without an assistant generation marker. The
+instruction checkpoint is enabled only when that token sequence exactly matches
+the beginning of the complete rendered prompt. This validation accommodates
+conversation-dependent chat templates without deriving message boundaries from
+model-specific token IDs. Templates that cannot represent the instruction-only
+segment continue to use full-prompt and response checkpoints.
 
 Each checkpoint includes the recurrent state, attention tails, private selector
 state, and final hidden state. MTP additionally saves its selector state and

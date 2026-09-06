@@ -431,6 +431,9 @@ class InputProcessor:
             trace_headers=trace_headers,
             resumable=resumable,
             session_id=session_id,
+            recurrent_instruction_boundary=decoder_input.get(
+                "recurrent_instruction_boundary"
+            ),
         )
 
     def _validate_prompt_len(

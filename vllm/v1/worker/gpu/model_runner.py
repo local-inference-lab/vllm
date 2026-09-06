@@ -61,6 +61,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import (
@@ -2003,7 +2004,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         else:
             boundary_capture = torch.empty(
-                (3, input_batch.num_reqs, 2), dtype=torch.int32, device=self.device
+                (3, input_batch.num_reqs, NUM_BOUNDARY_CHECKPOINT_SLOTS),
+                dtype=torch.int32,
+                device=self.device,
             )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None

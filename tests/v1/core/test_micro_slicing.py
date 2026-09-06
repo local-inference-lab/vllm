@@ -361,3 +361,120 @@ def test_async_external_restore_does_not_consume_local_partial_slot(opt_model_pa
     assert output.total_num_scheduled_tokens == 0
     assert scheduler.num_active_local_partial_prefills == 0
     assert request in scheduler._inflight_prefills
+
+
+@pytest.mark.parametrize("prefill_budget", [2048, 4096])
+def test_split_cache_geometry_allocates_usable_prefill_slices(
+    opt_model_path, monkeypatch, prefill_budget
+):
+    """Three prefills must not divide a usable budget into sub-block slices."""
+    from functools import partial
+
+    import torch
+
+    from vllm.config import CacheConfig
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from . import utils
+
+    monkeypatch.setattr(
+        utils, "CacheConfig", partial(CacheConfig, mamba_cache_mode="align")
+    )
+    scheduler = _create_micro_scheduler(
+        opt_model_path,
+        block_size=2048,
+        kv_cache_spec=MambaSpec(
+            block_size=256,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        ),
+        max_num_prefill_tokens_per_step=prefill_budget,
+    )
+    requests = create_requests(3, num_tokens=16384, block_size=256)
+    controller = scheduler.micro_slicing_controller
+    assert controller is not None
+    limits = controller.select_running_limits(
+        [request.request_id for request in requests], prefill_budget
+    )
+    actual = [
+        Scheduler._mamba_block_aligned_split(
+            scheduler, request, limits[request.request_id]
+        )
+        for request in requests
+        if request.request_id in limits
+    ]
+    assert actual and all(tokens > 0 for tokens in actual)
+    assert sum(actual) == prefill_budget
+
+
+def test_split_cache_geometry_rejects_unusable_micro_budget(
+    opt_model_path, monkeypatch
+):
+    from functools import partial
+
+    import torch
+
+    from vllm.config import CacheConfig
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from . import utils
+
+    monkeypatch.setattr(
+        utils, "CacheConfig", partial(CacheConfig, mamba_cache_mode="align")
+    )
+    with pytest.raises(ValueError, match="scheduler prefill quantum"):
+        _create_micro_scheduler(
+            opt_model_path,
+            block_size=2048,
+            kv_cache_spec=MambaSpec(
+                block_size=256,
+                shapes=((1, 1),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+            max_num_prefill_tokens_per_step=2304,
+        )
+
+
+@pytest.mark.parametrize("global_budget,long_threshold", [(1024, 0), (8192, 1024)])
+def test_split_cache_geometry_preserves_global_sub_block_progress(
+    opt_model_path, monkeypatch, global_budget, long_threshold
+):
+    from functools import partial
+
+    import torch
+
+    from vllm.config import CacheConfig
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from . import utils
+
+    monkeypatch.setattr(
+        utils, "CacheConfig", partial(CacheConfig, mamba_cache_mode="align")
+    )
+    scheduler = _create_micro_scheduler(
+        opt_model_path,
+        block_size=2048,
+        kv_cache_spec=MambaSpec(
+            block_size=256,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        ),
+        max_num_batched_tokens=global_budget,
+        long_prefill_token_threshold=long_threshold,
+        max_num_prefill_tokens_per_step=1024,
+    )
+    (request,) = create_requests(1, num_tokens=16384, block_size=256)
+    controller = scheduler.micro_slicing_controller
+    assert controller is not None
+    limits = controller.select_running_limits([request.request_id], 1024)
+    assert (
+        Scheduler._mamba_block_aligned_split(
+            scheduler, request, limits[request.request_id]
+        )
+        == 1024
+    )

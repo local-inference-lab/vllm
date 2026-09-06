@@ -15,6 +15,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.platforms import current_platform
 from vllm.utils.b12x import get_b12x_hyperconnection
 
@@ -57,7 +58,9 @@ class GroupedGemmaRMSNorm(nn.Module):
             )
         self.eps = float(eps)
         self.group_size = group_size
-        self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
+        self.weight = nn.Parameter(
+            allocate_weights(torch.zeros, hidden_size, dtype=dtype)
+        )
 
 
 class HyperConnectionWorkspace(nn.Module):

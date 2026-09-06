@@ -41,6 +41,7 @@ from vllm.model_executor.parameter import (
     RowvLLMParameter,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.weight_transfer import allocate_weights, copy_weight
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -348,7 +349,8 @@ class ReplicatedLinear(LinearBase):
             disable_tp=disable_tp,
         )
 
-        self.quant_method.create_weights(
+        allocate_weights(
+            self.quant_method.create_weights,
             self,
             self.input_size,
             self.output_partition_sizes,
@@ -360,7 +362,7 @@ class ReplicatedLinear(LinearBase):
 
         if bias:
             self.bias = Parameter(
-                torch.empty(self.output_size, dtype=self.params_dtype)
+                allocate_weights(torch.empty, self.output_size, dtype=self.params_dtype)
             )
             set_weight_attrs(
                 self.bias,
@@ -380,7 +382,7 @@ class ReplicatedLinear(LinearBase):
             f"Tried to load weights of size {loaded_weight.size()}"
             f"to a parameter of size {param.size()}"
         )
-        param.data.copy_(loaded_weight)
+        copy_weight(param.data, loaded_weight)
 
     def forward(
         self,
@@ -489,7 +491,8 @@ class ColumnParallelLinear(LinearBase):
         self._maybe_allow_fp8_block_shape_mismatch()
         self.gather_output = gather_output
 
-        self.quant_method.create_weights(
+        allocate_weights(
+            self.quant_method.create_weights,
             layer=self,
             input_size_per_partition=self.input_size_per_partition,
             output_partition_sizes=self.output_partition_sizes,
@@ -505,7 +508,9 @@ class ColumnParallelLinear(LinearBase):
 
         if bias:
             self.bias = Parameter(
-                torch.empty(self.output_size_per_partition, dtype=params_dtype)
+                allocate_weights(
+                    torch.empty, self.output_size_per_partition, dtype=params_dtype
+                )
             )
             set_weight_attrs(
                 self.bias,
@@ -562,7 +567,7 @@ class ColumnParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        copy_weight(param_data, loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
         # Special case for loading scales off disk, which often do not
@@ -750,7 +755,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     )
 
                 assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
+                copy_weight(param_data, loaded_weight)
                 return
 
             output_sizes = (
@@ -835,7 +840,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 )
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        copy_weight(param_data, loaded_weight)
 
     def _load_fused_module_from_checkpoint(
         self,
@@ -1192,7 +1197,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                     )
 
                 assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
+                copy_weight(param_data, loaded_weight)
                 return
             shard_offsets = [
                 # (shard_id, shard_offset, shard_size)
@@ -1294,7 +1299,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 )
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        copy_weight(param_data, loaded_weight)
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
@@ -1502,7 +1507,7 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
             output_dim, shard_rank * shard_size, shard_size
         )
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        copy_weight(param_data, loaded_weight)
 
 
 # --8<-- [start:row_parallel_linear]
@@ -1579,7 +1584,8 @@ class RowParallelLinear(LinearBase):
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
 
-        self.quant_method.create_weights(
+        allocate_weights(
+            self.quant_method.create_weights,
             layer=self,
             input_size_per_partition=self.input_size_per_partition,
             output_partition_sizes=self.output_partition_sizes,
@@ -1599,7 +1605,9 @@ class RowParallelLinear(LinearBase):
             )
 
         if bias:
-            self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))
+            self.bias = Parameter(
+                allocate_weights(torch.empty, self.output_size, dtype=params_dtype)
+            )
             set_weight_attrs(
                 self.bias,
                 {
@@ -1627,7 +1635,7 @@ class RowParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        copy_weight(param_data, loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
         # Special case for loading scales off disk, which often do not

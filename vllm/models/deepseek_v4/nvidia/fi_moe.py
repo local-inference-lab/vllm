@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
 from vllm.utils.flashinfer_moe_ep import (
     build_fi_mega_layer,
@@ -166,7 +167,9 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         attrs = {"weight_loader": self.weight_loader}
 
         def _param(shape: tuple, dtype: torch.dtype) -> nn.Parameter:
-            p = nn.Parameter(torch.zeros(*shape, dtype=dtype), requires_grad=False)
+            p = nn.Parameter(
+                allocate_weights(torch.zeros, *shape, dtype=dtype), requires_grad=False
+            )
             set_weight_attrs(p, attrs)
             return p
 

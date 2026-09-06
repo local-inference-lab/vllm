@@ -29,6 +29,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.weight_transfer import allocate_weights, copy_weight
 from vllm.platforms import current_platform
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
@@ -421,7 +422,8 @@ class VocabParallelEmbedding(PluggableLayer):
             - self.shard_indices.added_vocab_start_index
         )
 
-        self.quant_method.create_weights(
+        allocate_weights(
+            self.quant_method.create_weights,
             self,
             self.embedding_dim,
             [self.num_embeddings_per_partition],
@@ -555,7 +557,7 @@ class VocabParallelEmbedding(PluggableLayer):
             ):
                 loaded_weight = loaded_weight.reshape(1)
             assert param.data.shape == loaded_weight.shape
-            param.data.copy_(loaded_weight)
+            copy_weight(param.data, loaded_weight)
             return
 
         # Shard indexes for loading the weight
@@ -580,7 +582,7 @@ class VocabParallelEmbedding(PluggableLayer):
 
         # Copy the data. Select chunk corresponding to current shard.
         loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-        param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
+        copy_weight(param[: loaded_weight.shape[0]].data, loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 
     def forward(self, input_):
@@ -668,7 +670,9 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.register_parameter("bias", None)
 
     def _register_bias(self):
-        data = torch.empty(self.num_embeddings_per_partition, dtype=self.params_dtype)
+        data = allocate_weights(
+            torch.empty, self.num_embeddings_per_partition, dtype=self.params_dtype
+        )
         self.bias = Parameter(data, requires_grad=False)
         weight_attrs = dict(output_dim=0, weight_loader=self.weight_loader)
         set_weight_attrs(weight=self.bias, weight_attrs=weight_attrs)

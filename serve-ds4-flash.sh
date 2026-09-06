@@ -107,7 +107,7 @@ fi
 max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-8192}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-}
 block_size=${BLOCK_SIZE:-256}
-load_format=${LOAD_FORMAT:-instanttensor}
+load_format=${LOAD_FORMAT:-fastsafetensors}
 kv_offloading_size=${KV_OFFLOADING_SIZE:-}
 native_l2_path=${NATIVE_L2_PATH:-}
 native_l2_size=${NATIVE_L2_GB:-}
@@ -176,7 +176,6 @@ export NCCL_PROTO=${NCCL_PROTO:-LL,LL128,Simple}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
 export LLM_WORKER_MULTIPROC_METHOD=${LLM_WORKER_MULTIPROC_METHOD:-spawn}
 export SAFETENSORS_FAST_GPU=${SAFETENSORS_FAST_GPU:-1}
-export INSTANTTENSOR_BACKEND=${INSTANTTENSOR_BACKEND:-BUFFERED}
 
 export VLLM_USE_AOT_COMPILE=${VLLM_USE_AOT_COMPILE:-1}
 export VLLM_USE_BREAKABLE_CUDAGRAPH=${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}
@@ -499,11 +498,11 @@ if [[ -n "${EXTRA_VLLM_ARGS:-}" ]]; then
 fi
 command+=("$@")
 
-printf 'DS4 launch: mode=%s depth=%s backend=%s allreduce=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s instanttensor_backend=%s native_l2=%s allocator=%s model=%s\n' \
+printf 'DS4 launch: mode=%s depth=%s backend=%s allreduce=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s native_l2=%s allocator=%s model=%s\n' \
   "${mode}" "${dspark_depth_mode}" \
   "${backend}" "${allreduce_mode}" \
   "${tp_size}" "${dcp_size}" "${max_num_seqs}" \
-  "${graph_cap}" "${load_format}" "${INSTANTTENSOR_BACKEND}" \
+  "${graph_cap}" "${load_format}" \
   "${native_l2_enabled}" \
   "${PYTORCH_CUDA_ALLOC_CONF:-<unset>}" "${model}" >&2
 printf 'Command:' >&2

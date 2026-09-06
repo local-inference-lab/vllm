@@ -18,7 +18,6 @@ exec docker run --rm \
   --env VLLM_PCIE_ALLREDUCE_BACKEND=b12x \
   --env VLLM_WORKER_MULTIPROC_METHOD=spawn \
   --env SAFETENSORS_FAST_GPU=1 \
-  --env INSTANTTENSOR_BACKEND=BUFFERED \
   --entrypoint /opt/venv/bin/python \
   "${IMAGE}" \
   -m vllm.entrypoints.cli.main serve /model \
@@ -32,7 +31,7 @@ exec docker run --rm \
   --enable-chunked-prefill \
   --quantization modelopt_mixed \
   --block-size 16 \
-  --load-format instanttensor \
+  --load-format fastsafetensors \
   --gpu-memory-utilization 0.94 \
   --max-num-seqs 4 \
   --max-num-batched-tokens 4096 \
