@@ -6640,10 +6640,46 @@ class GPUModelRunner(
                 output = self._dummy_sampler_run(last_hidden_states)
         else:
             output = None
+        self._profile_deepseek_v4_attention()
         self._sync_device()
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
+
+    @torch.inference_mode()
+    def _profile_deepseek_v4_attention(self) -> None:
+        """Include the maximum DeepSeek V4 prefill peak in KV admission.
+
+        The generic profile does not create attention metadata and distributes
+        its token budget across requests. DeepSeek V4 can execute the complete
+        scheduler token budget as one prefill, where query projection and
+        auxiliary-stream indexer work overlap. Run that reachable shape while
+        multimodal encoder outputs from ``profile_run`` remain resident. A
+        minimal temporary cache makes attention executable without reserving
+        the production KV pool.
+        """
+        if self.model_config.architecture not in {
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+        }:
+            return
+
+        with set_current_vllm_config(self.vllm_config):
+            self._init_minimal_kv_cache_for_profiling()
+
+        model_output: tuple[torch.Tensor, torch.Tensor] | None = None
+        try:
+            model_output = self._dummy_run(
+                self.max_num_tokens,
+                force_attention=True,
+                skip_eplb=True,
+                is_profile=True,
+                single_request_prefill=True,
+            )
+            self._sync_device()
+        finally:
+            del model_output
+            self._cleanup_profiling_kv_cache()
 
     @torch.inference_mode()
     def profile_glm_dcp_attention(self) -> None:

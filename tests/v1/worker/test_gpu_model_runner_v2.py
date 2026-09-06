@@ -203,3 +203,108 @@ def test_glm_dcp_attention_profile_skips_irrelevant_configurations(
     runner.profile_glm_dcp_attention()
 
     assert not initialized
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["DeepseekV4ForCausalLM", "DeepseekV4ForConditionalGeneration"],
+)
+@pytest.mark.parametrize("dummy_run_fails", [False, True])
+def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+    dummy_run_fails: bool,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(architecture=architecture)
+    runner.max_num_tokens = 4096
+    events: list[object] = []
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "_init_minimal_kv_cache_for_profiling",
+        lambda _: events.append("init-kv"),
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "_teardown_profiling_state",
+        lambda _: events.append("cleanup"),
+    )
+
+    def dummy_run(*args, **kwargs):
+        events.append(("dummy-run", args, kwargs))
+        if dummy_run_fails:
+            raise RuntimeError("expected DeepSeek V4 profile failure")
+        return torch.empty(1), torch.empty(1)
+
+    runner._dummy_run = dummy_run
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+
+    if dummy_run_fails:
+        with pytest.raises(RuntimeError, match="expected DeepSeek V4 profile failure"):
+            runner._profile_deepseek_v4_attention()
+    else:
+        runner._profile_deepseek_v4_attention()
+
+    assert events[0] == "init-kv"
+    assert events[1] == (
+        "dummy-run",
+        (4096,),
+        {
+            "skip_eplb": True,
+            "is_profile": True,
+            "single_request_prefill": True,
+            "profile_all_kv_cache_groups": True,
+        },
+    )
+    assert events[-1] == "cleanup"
+    if not dummy_run_fails:
+        assert events[-2] == "sync"
+
+
+def test_deepseek_v4_attention_profile_skips_other_architectures(monkeypatch):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(architecture="OtherArchitecture")
+    initialized = False
+
+    def record_initialization(_):
+        nonlocal initialized
+        initialized = True
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "_init_minimal_kv_cache_for_profiling",
+        record_initialization,
+    )
+
+    runner._profile_deepseek_v4_attention()
+
+    assert not initialized
+
+
+def test_profile_run_profiles_attention_before_releasing_encoder_cache(monkeypatch):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.supports_mm_inputs = False
+    runner.max_num_tokens = 4096
+    runner.is_last_pp_rank = False
+    events: list[object] = []
+
+    runner._dummy_run = lambda *args, **kwargs: (
+        events.append(("dummy-run", args, kwargs)) or (None, None)
+    )
+    runner._profile_deepseek_v4_attention = lambda: events.append("profile-attention")
+    runner.reset_encoder_cache = lambda: events.append("reset-encoder-cache")
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+
+    runner.profile_run()
+
+    assert events == [
+        (
+            "dummy-run",
+            (4096,),
+            {"skip_attn": True, "is_profile": True},
+        ),
+        "profile-attention",
+        "sync",
+        "reset-encoder-cache",
+    ]

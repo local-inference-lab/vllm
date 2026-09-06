@@ -889,10 +889,41 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 self._dummy_pooler_run(hidden_states)
 
+        self._profile_deepseek_v4_attention()
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
         self.reset_encoder_cache()
         gc.collect()
+
+    @torch.inference_mode()
+    def _profile_deepseek_v4_attention(self) -> None:
+        """Include the maximum DeepSeek V4 prefill peak in KV admission.
+
+        The generic profile omits attention and distributes its token budget
+        across requests. DeepSeek V4 can execute the complete scheduler token
+        budget as one prefill, where query projection and auxiliary-stream
+        indexer work overlap. Run that reachable shape while multimodal encoder
+        outputs from ``profile_run`` remain resident. A minimal temporary cache
+        makes attention executable without reserving the production KV pool.
+        """
+        if self.model_config.architecture not in {
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+        }:
+            return
+
+        _init_minimal_kv_cache_for_profiling(self)
+        try:
+            self._dummy_run(
+                self.max_num_tokens,
+                skip_eplb=True,
+                is_profile=True,
+                single_request_prefill=True,
+                profile_all_kv_cache_groups=True,
+            )
+            torch.accelerator.synchronize()
+        finally:
+            _teardown_profiling_state(self)
 
     @torch.inference_mode()
     def profile_glm_dcp_attention(self) -> None:
