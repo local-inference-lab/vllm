@@ -603,7 +603,7 @@ class Scheduler(SchedulerInterface):
             if self.mamba_partial_cache_hit
             else 0
         )
-        stops = (
+        stops: tuple[int, ...] = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary if start % block_size != 0 else 0,
@@ -719,6 +719,28 @@ class Scheduler(SchedulerInterface):
     def num_active_local_partial_prefills(self) -> int:
         """Count model-compute partials, excluding async KV-only restores."""
         return sum(request.is_prefill_chunk for request in self.running)
+
+    def _has_waiting_boundary_logits(self) -> bool:
+        """Whether the queue head needs an isolated saved-logits step."""
+        if (
+            not (self.waiting or self.skipped_waiting)
+            or self._pause_state != PauseState.UNPAUSED
+            or len(self.running) + self.num_waiting_for_streaming_input
+            >= self.max_num_running_reqs
+        ):
+            return False
+        queue = self._select_waiting_queue_for_scheduling()
+        if queue is None:
+            return False
+        request = queue.peek_request()
+        checkpoint = request.boundary_checkpoint
+        return (
+            request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            and request.num_computed_tokens == 0
+            and checkpoint is not None
+            and checkpoint.num_tokens == request.num_tokens
+            and (request.num_stale_output_tokens == 0 or request.drop_stale_output)
+        )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -1175,7 +1197,12 @@ class Scheduler(SchedulerInterface):
             if micro_mixed_step
             else ("prefill" if adaptive_prefill_turn else None)
         )
-        schedule_running_requests(initial_service_class)
+        # A full recurrent-cache hit cannot share a model step with forwards.
+        # Its cache lookup in the waiting pass records that requirement. Give
+        # it an isolated admission step instead of waiting for decodes to end.
+        reserve_boundary_logits_step = self._has_waiting_boundary_logits()
+        if not reserve_boundary_logits_step:
+            schedule_running_requests(initial_service_class)
 
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
@@ -1678,6 +1705,11 @@ class Scheduler(SchedulerInterface):
             # record whether it was capacity-bound.
             if not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
+
+        if reserve_boundary_logits_step and not num_scheduled_tokens:
+            # Cache eviction, admission limits, or deferred input can prevent
+            # the isolated step. Running requests must still make progress.
+            schedule_running_requests(initial_service_class)
 
         # In a micro-sliced mixed step, waiting admission gets the first
         # prefill quantum after decodes. Any unused portion is immediately

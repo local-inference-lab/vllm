@@ -29,6 +29,7 @@ from vllm.v1.core.boundary_checkpoint import BoundaryCheckpointCache
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
@@ -85,6 +86,68 @@ def test_full_boundary_hit_preserves_async_speculative_decode_token_count():
     decode_step = scheduler.schedule()
     assert not decode_step.boundary_logits_only
     assert decode_step.num_scheduled_tokens == {"repeat": 4}
+
+
+@pytest.mark.parametrize("admission_blocker", [None, "capacity", "allocation", "pause"])
+def test_full_boundary_hit_is_admitted_while_another_request_decodes(
+    admission_blocker, monkeypatch
+):
+    """A saved-logits hit needs one isolated step, not an empty running queue."""
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_v2_model_runner=True,
+        async_scheduling=True,
+        num_speculative_tokens=3,
+        speculative_method="ngram_gpu",
+    )
+    manager = scheduler.kv_cache_manager
+    manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
+    producer, first, second = create_requests(
+        num_requests=3,
+        num_tokens=32,
+        same_prompt=True,
+        req_ids=["producer", "first", "second"],
+    )
+    manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(producer, 32) is not None
+    manager.publish_boundary_checkpoint(producer, 32, kind="prompt")
+    manager.free(producer)
+    scheduler.add_request(first)
+    assert scheduler.schedule().boundary_logits_only
+    scheduler.add_request(second)
+
+    discovery_step = scheduler.schedule()
+    assert discovery_step.num_scheduled_tokens == {"first": 4}
+    assert second.boundary_checkpoint is not None
+    if admission_blocker is not None:
+        with monkeypatch.context() as patch:
+            if admission_blocker == "capacity":
+                patch.setattr(scheduler, "max_num_running_reqs", 1)
+            elif admission_blocker == "allocation":
+                allocate = manager.allocate_slots
+
+                def allocate_without_waiter(request, *args, **kwargs):
+                    if request is second:
+                        return None
+                    return allocate(request, *args, **kwargs)
+
+                patch.setattr(manager, "allocate_slots", allocate_without_waiter)
+            else:
+                scheduler.set_pause_state(PauseState.PAUSED_NEW)
+            blocked_step = scheduler.schedule()
+            assert not blocked_step.boundary_logits_only
+            assert blocked_step.num_scheduled_tokens == {"first": 4}
+            assert second.status == RequestStatus.WAITING
+        scheduler.set_pause_state(PauseState.UNPAUSED)
+    admission_step = scheduler.schedule()
+    assert admission_step.boundary_logits_only
+    assert admission_step.num_scheduled_tokens == {"second": 1}
+    assert first in scheduler.running and second in scheduler.running
+    assert second.num_computed_tokens == 32
+    assert second.num_output_placeholders == 1
+    decode_step = scheduler.schedule()
+    assert not decode_step.boundary_logits_only
+    assert decode_step.num_scheduled_tokens == {"first": 4, "second": 4}
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
