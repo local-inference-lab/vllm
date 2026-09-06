@@ -156,8 +156,11 @@ def _restore_auxiliary_state_kernel(
     stride = tl.load(metadata_ptr + state * 4 + 1)
     size = tl.load(metadata_ptr + state * 4 + 2)
     offset = tl.load(metadata_ptr + state * 4 + 3)
-    source = pool_ptr + block.to(tl.int64) * pool_stride + offset
-    destination = (base + slot.to(tl.int64) * stride).to(tl.pointer_type(tl.uint8))
+    # Scalar one can be specialized to a Python constant by Triton.
+    source = pool_ptr + tl.cast(block, tl.int64) * pool_stride + offset
+    destination = (base + tl.cast(slot, tl.int64) * stride).to(
+        tl.pointer_type(tl.uint8)
+    )
     x = tl.arange(0, BLOCK)
     for start in range(0, size, BLOCK):
         data = tl.load(source + start + x, start + x < size, other=0)
