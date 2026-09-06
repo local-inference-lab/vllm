@@ -235,20 +235,25 @@ def _create_decode_vllm_config(
     vllm_config.scheduler_config = SchedulerConfig.default_factory(max_num_seqs=8)
     vllm_config.parallel_config = ParallelConfig()
     vllm_config.num_speculative_tokens = num_speculative_tokens
-    if dynamic_spec_num_tokens is None:
+    if dynamic_spec_num_tokens is None and num_speculative_tokens == 0:
         vllm_config.speculative_config = None
     else:
         speculative_config = MagicMock()
-        speculative_config.uses_dynamic_speculative_decoding.return_value = True
+        speculative_config.uses_dynamic_speculative_decoding.return_value = (
+            dynamic_spec_num_tokens is not None
+        )
         speculative_config.uses_batch_size_dynamic_speculative_decoding.return_value = (
-            True
+            dynamic_spec_num_tokens is not None
         )
         speculative_config.uses_acceptance_length_adaptation.return_value = False
-        # Each entry is (range_start, range_end, num_speculative_tokens); only
-        # the third element is read by the manager.
-        speculative_config.num_speculative_tokens_per_batch_size = [
-            (0, 0, n) for n in dynamic_spec_num_tokens
-        ]
+        if dynamic_spec_num_tokens is None:
+            speculative_config.num_speculative_tokens_per_batch_size = None
+        else:
+            # Each entry is (range_start, range_end, num_speculative_tokens);
+            # only the third element is read by the manager.
+            speculative_config.num_speculative_tokens_per_batch_size = [
+                (0, 0, n) for n in dynamic_spec_num_tokens
+            ]
         vllm_config.speculative_config = speculative_config
     return vllm_config
 
@@ -319,6 +324,24 @@ def test_uniform_decode_exact_match_is_not_over_padded(monkeypatch):
     assert desc.cg_mode == CUDAGraphMode.FULL
     assert desc.num_tokens == 9
     assert desc.num_reqs == 3
+
+
+def test_planned_token_counts_include_speculative_decode_rows(monkeypatch):
+    capture_sizes = [1, 2, 4, 8, 16, 24]
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=6,
+        capture_sizes=capture_sizes,
+        num_speculative_tokens=5,
+    )
+    target_only = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=1,
+        capture_sizes=capture_sizes,
+    )
+
+    assert manager.planned_token_counts() == [1, 2, 4, 6, 8, 12, 16, 18, 24]
+    assert 12 not in target_only.planned_token_counts()
 
 
 def test_mixed_batch_never_selects_a_uniform_decode_graph(monkeypatch):
