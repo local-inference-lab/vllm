@@ -1576,7 +1576,9 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             return cached
         self._sequence_lengths.zero_()
         self._sequence_lengths[:num_reqs].copy_(metadata.seq_lens[:num_reqs])
-        self._query_start_loc.fill_(rows)
+        # Unused request slots end at the live packed prefix, not the padded
+        # graph row count. Copy the device boundary so replay sees batch changes.
+        self._query_start_loc.copy_(metadata.query_start_loc[num_reqs : num_reqs + 1])
         self._query_start_loc[: num_reqs + 1].copy_(
             metadata.query_start_loc[: num_reqs + 1]
         )

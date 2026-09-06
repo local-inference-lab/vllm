@@ -1332,8 +1332,10 @@ def test_qsa_rope_staging_masks_graph_padding() -> None:
     assert torch.equal(output[8:], torch.full_like(output[8:], -1))
 
 
+@pytest.mark.parametrize("max_seqs", [2, 16])
 def test_qsa_staging_shares_live_request_state_but_not_group_page_tables(
     monkeypatch,
+    max_seqs: int,
 ) -> None:
     """Shared staging must refresh under replay and preserve group-specific pages."""
     device = _require_qsa_gpu()
@@ -1343,14 +1345,15 @@ def test_qsa_staging_shares_live_request_state_but_not_group_page_tables(
     def owner():
         layer = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
         torch.nn.Module.__init__(layer)
-        layer.max_seqs, layer.max_speculative_tokens, layer.position_axes = 2, 3, 1
+        layer.max_seqs = max_seqs
+        layer.max_speculative_tokens, layer.position_axes = 3, 1
         for name, shape, dtype in (
-            ("_sequence_lengths", (2,), torch.int32),
-            ("_query_start_loc", (3,), torch.int32),
-            ("_raw_state_slot_ids", (2,), torch.int32),
-            ("_state_is_fresh", (2,), torch.bool),
-            ("_num_accepted_tokens", (2,), torch.int32),
-            ("_is_prefilling", (2,), torch.bool),
+            ("_sequence_lengths", (max_seqs,), torch.int32),
+            ("_query_start_loc", (max_seqs + 1,), torch.int32),
+            ("_raw_state_slot_ids", (max_seqs,), torch.int32),
+            ("_state_is_fresh", (max_seqs,), torch.bool),
+            ("_num_accepted_tokens", (max_seqs,), torch.int32),
+            ("_is_prefilling", (max_seqs,), torch.bool),
             ("_rope_position_input", (4, 1), torch.int64),
         ):
             setattr(layer, name, torch.full(shape, 1, dtype=dtype, device=device))
@@ -1373,8 +1376,8 @@ def test_qsa_staging_shares_live_request_state_but_not_group_page_tables(
     )
     metadata_b = qsa_module.replace(metadata, block_table=metadata.block_table + 4)
     table_a, table_b = (
-        torch.empty_like(metadata.block_table),
-        torch.empty_like(metadata.block_table),
+        torch.empty((max_seqs, 2), dtype=torch.int32, device=device),
+        torch.empty((max_seqs, 2), dtype=torch.int32, device=device),
     )
     positions = torch.arange(4, dtype=torch.int64, device=device)
 
@@ -1414,15 +1417,35 @@ def test_qsa_staging_shares_live_request_state_but_not_group_page_tables(
     positions.add_(7)
     graph.replay()
     torch.accelerator.synchronize(device)
-    torch.testing.assert_close(staged.sequence_lengths, metadata.seq_lens)
+    torch.testing.assert_close(staged.sequence_lengths[:2], metadata.seq_lens)
     torch.testing.assert_close(
-        staged.num_accepted_tokens, metadata.qsa_num_accepted_tokens
+        staged.num_accepted_tokens[:2], metadata.qsa_num_accepted_tokens
     )
-    torch.testing.assert_close(staged.state_slot_ids, metadata.qsa_state_slot_ids)
+    torch.testing.assert_close(staged.state_slot_ids[:2], metadata.qsa_state_slot_ids)
     torch.testing.assert_close(rope[:, 0], positions)
-    torch.testing.assert_close(table_a, metadata.block_table)
-    torch.testing.assert_close(table_b, metadata_b.block_table)
+    torch.testing.assert_close(table_a[:2], metadata.block_table)
+    torch.testing.assert_close(table_b[:2], metadata_b.block_table)
+    assert torch.all(table_a[2:] == -1)
+    assert torch.all(table_b[2:] == -1)
     assert torch.all(b._num_accepted_tokens == 1)
+    query_ptr = staged.query_start_loc.data_ptr()
+    for terminal in (3, 2, 4):
+        # Replay keeps four token rows but shrinks the packed live prefix.
+        # Unused request capacity must not turn padded token rows into a request.
+        metadata.query_start_loc[-1:].fill_(terminal)
+        metadata.request_ids.copy_(
+            torch.tensor(
+                [0, 0] + [1] * (terminal - 2) + [-1] * (4 - terminal),
+                dtype=torch.int32,
+                device=device,
+            )
+        )
+        graph.replay()
+        expected = torch.full_like(staged.query_start_loc, terminal)
+        expected[:2].copy_(metadata.query_start_loc[:2])
+        torch.testing.assert_close(staged.query_start_loc, expected)
+        assert staged.query_start_loc.data_ptr() == query_ptr
+        assert torch.all(staged.logical_positions[terminal:] == -1)
     distinct = qsa_module.replace(
         metadata_b, qsa_num_accepted_tokens=metadata.qsa_num_accepted_tokens.clone()
     )
