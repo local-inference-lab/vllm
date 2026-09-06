@@ -3,13 +3,22 @@
 sub-steps (Kimi-K3, eager chunked prefill).
 
 Stage 1 of the TP all-reduce / compute overlap design
-(research/prefill-w4a16-20260902/DESIGN-intra-request-ubatch-prefill-20260902.md):
-the halves run sequentially on the current stream, so every cross-half
-dependency (K/V written by the first half, the recurrent KDA state carried
-in the request's mamba slot) is satisfied by stream order and the outputs
-are the same values the unsplit forward produces. This stage only proves
-the split; the overlap (two streams, yield points at the collectives)
-comes on top of it.
+(research/prefill-w4a16-20260902/DESIGN-intra-request-ubatch-prefill-20260902.md,
+research/prefill-campaign-20260906/r1-split-prefill.md): the halves run
+sequentially on the current stream, so every cross-half dependency is
+satisfied by stream order. Cross-half state and its exactness:
+
+- KDA recurrent/conv state: carried in the request's mamba slot; exact when
+  the boundary is a FlashKDA tile boundary (``SPLIT_ALIGNMENT``).
+- MLA keys of the first half: bf16 stash consumed by the second half
+  (``mla.py``, ``k3_split_exact``); the fp8 cache path is not exact.
+- TP all-reduces: the B12X DMA ring orders its reduction by the row block
+  ``row // (rows / world)``, which depends on the row count, so the halves
+  are not bit-identical to the unsplit chunk until the ring uses a
+  row-count-invariant block mapping (see the R1 report).
+
+The overlap (two threads, yield points at the collectives) comes on top of
+the split (``_run_overlapped``).
 
 Eligibility: a single request, no draft tokens, eager (non-graph) dispatch,
 at least ``VLLM_K3_UBATCH_PREFILL_MIN_TOKENS`` scheduled tokens, enabled
@@ -130,12 +139,34 @@ def prime_workspaces() -> None:
         )
 
 
+# FlashKDA advances its recurrent state in 16-token tiles and the state at a
+# tile boundary is a bf16 value that the fp32 mamba slot carries losslessly,
+# so a half boundary on a tile boundary hands the second half exactly the
+# state the unsplit chunk holds there. An unaligned boundary would make the
+# kernel re-tile the second half (different intra-tile terms).
+SPLIT_ALIGNMENT = 16
+
+
+def split_point(rows: int) -> int:
+    """Row index where the second half starts.
+
+    The first half is the larger one so the second half fits the upper half
+    of the retained AttnRes workspace (see KimiLinearModel), and the boundary
+    is rounded up to ``SPLIT_ALIGNMENT`` (4,608 rows -> 2,304).
+    """
+    split = rows - rows // 2
+    split = -(-split // SPLIT_ALIGNMENT) * SPLIT_ALIGNMENT
+    return min(split, rows)
+
+
 def eligible(input_batch: InputBatch) -> bool:
+    rows = input_batch.num_tokens
     return (
         input_batch.num_reqs == 1
         and input_batch.num_draft_tokens == 0
-        and input_batch.num_tokens == input_batch.num_tokens_after_padding
-        and input_batch.num_tokens >= ubatch_prefill_min_tokens()
+        and rows == input_batch.num_tokens_after_padding
+        and rows >= ubatch_prefill_min_tokens()
+        and 0 < split_point(rows) < rows
         and bool(input_batch.is_prefilling_np[0])
     )
 
@@ -214,9 +245,7 @@ def run_split_prefill(
     """Run the chunk as two consecutive half forwards; returns the
     concatenated model output in the same form as one forward."""
     rows = input_batch.num_tokens
-    # First half is the larger one so the second half fits the upper half
-    # of the retained AttnRes workspace (see KimiLinearModel).
-    split = rows - rows // 2
+    split = split_point(rows)
     halves = ((0, split), (split, rows))
     outputs = []
     prepared = []
@@ -252,12 +281,16 @@ def run_split_prefill(
             hb, cudagraph_runtime_mode, block_tables, slot_mappings,
             runner.attn_groups, runner.kv_cache_config, for_capture=False,
         )
+        half_index = 0 if start == 0 else 1
         if exact_mla:
             # Both halves' MLA layers take the exact path: the first half
-            # stashes its bf16 keys, the second consumes them.
+            # stashes its bf16 keys, the second consumes them. The half
+            # index travels in the metadata because the sequential
+            # (single-thread) mode has no ubatch context to read it from.
             for md in attn_metadata.values():
                 if hasattr(md, "prefill") and hasattr(md, "num_decode_tokens"):
                     md.k3_split_exact = True
+                    md.k3_split_half = half_index
         if start > 0 and exact_mla:
             # MLA layers of the second half: context = earlier chunks only;
             # the first half's keys come from the layer's bf16 stash.
@@ -270,6 +303,7 @@ def run_split_prefill(
             for name, md in mla_metadata.items():
                 if hasattr(md, "prefill") and hasattr(md, "num_decode_tokens"):
                     md.k3_split_exact = True
+                    md.k3_split_half = half_index
                     if os.getenv("VLLM_K3_UBATCH_STASH_CHECK", "0") == "1":
                         # Diagnostics (mla.py _split_cache_reference): the
                         # half's cache-path metadata, context through the

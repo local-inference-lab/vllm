@@ -30,6 +30,7 @@ Out of scope (extension points, not wired here): prefill context parallelism
 """
 
 import math
+import os
 import re
 import time
 from typing import TYPE_CHECKING, cast
@@ -160,6 +161,16 @@ def _dma_min_rows() -> int:
     return _dma_min_rows_cache[1]
 
 
+def _split_prefill_shares_compute_stream() -> bool:
+    """True when the Kimi-K3 split prefill may run as ubatch 1.
+
+    ``k3_ubatch_prefill`` issues both halves on the step's compute stream
+    (see ``_run_overlapped``), so per-ubatch buffers that are produced and
+    consumed on that stream can be shared between the halves.
+    """
+    return os.getenv("VLLM_K3_UBATCH_PREFILL", "0") == "1"
+
+
 class KimiK3PrefillProjectionWorkspace:
     """Retained output storage for large dense context projections."""
 
@@ -234,10 +245,17 @@ class KimiK3PrefillProjectionWorkspace:
             )
         ubatch_id = dbo_current_ubatch_id()
         if ubatch_id >= self.num_ubatches:
-            raise RuntimeError(
-                f"ubatch {ubatch_id} has no Kimi-K3 prefill projection workspace; "
-                f"configured slots: {self.num_ubatches}"
-            )
+            if _split_prefill_shares_compute_stream():
+                # The Kimi-K3 split prefill (k3_ubatch_prefill) runs both
+                # halves on one compute stream; the context projection is
+                # written and consumed in stream order, so the halves can
+                # share slot 0 without a second 195 MiB buffer.
+                ubatch_id = 0
+            else:
+                raise RuntimeError(
+                    f"ubatch {ubatch_id} has no Kimi-K3 prefill projection "
+                    f"workspace; configured slots: {self.num_ubatches}"
+                )
         return buffer[ubatch_id, :num_tokens]
 
 
@@ -1586,6 +1604,55 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             gathered[..., self.kv_lora_rank :],
         )
 
+    # First half's bf16 keys/values of the split prefill (ubatch 0 writes,
+    # ubatch 1 consumes; both on the compute stream, so one slot suffices).
+    _split_kv_stash: tuple[torch.Tensor, torch.Tensor] | None = None
+    _split_cu_k_cache: dict[tuple[int, int | None], torch.Tensor] = {}
+
+    @classmethod
+    def _split_cu_seqlens_k(cls, k_len: int, device: torch.device) -> torch.Tensor:
+        key = (k_len, device.index)
+        cu = cls._split_cu_k_cache.get(key)
+        if cu is None:
+            cu = torch.tensor([0, k_len], dtype=torch.int32, device=device)
+            cls._split_cu_k_cache[key] = cu
+        return cu
+
+    def _split_naive_check(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_len: int,
+        output_prefill,
+    ) -> None:
+        """Diagnostic (``VLLM_K3_UBATCH_STASH_CHECK=1``): compare the second
+        half's FA4 result over ``[first half | own rows]`` with an fp32
+        softmax attention under the bottom-right causal mask (query row t
+        attends keys ``<= k_len - Q + t``)."""
+        served = (
+            output_prefill[0] if isinstance(output_prefill, tuple) else output_prefill
+        )
+        served = served[..., : self.v_head_dim].float()
+        rows = q.shape[0]
+        scale = float(self.scale)
+        scores = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * scale
+        t = torch.arange(rows, device=q.device)[:, None]
+        j = torch.arange(k_len, device=q.device)[None, :]
+        scores = scores.masked_fill((j > (k_len - rows) + t)[None], float("-inf"))
+        ref = torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v.float())
+        diff = (served - ref).abs()
+        logger.info(
+            "split naive check %s ub1: FA4 vs fp32 bottom-right max|d| %.3e "
+            "mean|d| %.3e ref mean|x| %.3e rows %d keys %d",
+            getattr(self, "layer_name", "?"),
+            diff.max().item(),
+            diff.mean().item(),
+            ref.abs().mean().item(),
+            rows,
+            k_len,
+        )
+
     def _forward_prefill_fused(
         self,
         q: torch.Tensor,
@@ -1694,20 +1761,76 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache,
             )
 
+        # Split prefill (k3_ubatch_prefill): the chunk's first row half runs
+        # as ubatch 0 and the second as ubatch 1. The second half must see
+        # the first half's keys exactly as the unsplit chunk would (bf16, not
+        # through the fp8 cache), so ubatch 0 stashes its bf16 keys/values
+        # and ubatch 1 attends over [first half | own rows] with the
+        # bottom-right causal mask; its chunked context covers earlier
+        # chunks only (the driver builds that half's MLA metadata with the
+        # chunk start as the computed length).
+        split_k_len = None
+        if getattr(attn_metadata, "k3_split_exact", False):
+            if fp8_prefill:
+                raise RuntimeError(
+                    "Kimi-K3 exact split prefill needs a bf16 prefill query"
+                )
+            # The driver labels each half; the ubatch id is only a fallback
+            # (the sequential mode runs both halves as ubatch 0).
+            ubatch = getattr(attn_metadata, "k3_split_half", None)
+            if ubatch is None:
+                ubatch = dbo_current_ubatch_id()
+            if ubatch == 0:
+                # Own copies: `k` and `v` are per-call allocations, but the
+                # stash outlives this call and must not alias storage the
+                # second half's projections reuse.
+                self._split_kv_stash = (k.clone(), v.clone())
+            elif ubatch == 1:
+                stash = self._split_kv_stash
+                if stash is None:
+                    raise RuntimeError(
+                        "Kimi-K3 exact split prefill: second half has no "
+                        "first-half key/value stash"
+                    )
+                self._split_kv_stash = None
+                stash_k, stash_v = stash
+                k = torch.cat((stash_k, k), dim=0)
+                v = torch.cat((stash_v, v), dim=0)
+                split_k_len = int(k.shape[0])
+
         # When there is no chunked context, backends that honor `out` write the
         # attention result straight into it, avoiding a slice+flatten+copy.
         writes_out = not has_context and prefill.prefill_backend.supports_out()
-        output_prefill = prefill.prefill_backend.run_prefill_new_tokens(
-            q=q,
-            k=k,
-            v=v,
-            return_softmax_lse=has_context,
-            out=(
-                out.view(-1, self.num_local_heads, self.v_head_dim)
-                if writes_out
-                else None
-            ),
+        prefill_out = (
+            out.view(-1, self.num_local_heads, self.v_head_dim)
+            if writes_out
+            else None
         )
+        if split_k_len is not None:
+            backend = prefill.prefill_backend
+            output_prefill = backend._flash_attn_varlen_diff_headdims(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=prefill.query_start_loc,
+                cu_seqlens_k=self._split_cu_seqlens_k(split_k_len, q.device),
+                max_seqlen_q=prefill.max_query_len,
+                max_seqlen_k=split_k_len,
+                softmax_scale=backend.scale,
+                causal=True,
+                return_softmax_lse=has_context,
+                out=prefill_out,
+            )
+            if os.getenv("VLLM_K3_UBATCH_STASH_CHECK", "0") == "1":
+                self._split_naive_check(q, k, v, split_k_len, output_prefill)
+        else:
+            output_prefill = prefill.prefill_backend.run_prefill_new_tokens(
+                q=q,
+                k=k,
+                v=v,
+                return_softmax_lse=has_context,
+                out=prefill_out,
+            )
 
         if has_context:
             suffix_output, suffix_lse = output_prefill
