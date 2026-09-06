@@ -1270,6 +1270,59 @@ class CustomAllreduce:
         ring = self._pcie_dma
         return ring is not None and bool(ring.is_ring_storage(tensor))
 
+    def _pcie_ring_side_stream(self) -> torch.cuda.Stream:
+        stream = getattr(self, "_pcie_ring_stream", None)
+        if stream is None:
+            stream = torch.cuda.Stream(device=self.device)
+            self._pcie_ring_stream = stream
+            # Two event pairs alternate between consecutive gathers; a
+            # caller waits on the previous gather before issuing the next.
+            self._pcie_ring_events = [
+                (torch.cuda.Event(), torch.cuda.Event()) for _ in range(2)
+            ]
+            self._pcie_ring_event_index = 0
+        return stream
+
+    def pcie_dma_all_gather_pair(
+        self, first: torch.Tensor, second: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.cuda.Event] | None:
+        """Gather two rank-local ``[rows, c]`` blocks on the B12X DMA ring.
+
+        The gather runs on the ring's side stream, so work the caller keeps
+        issuing on the current stream overlaps it. Returns rank-major
+        ``[world, rows, c]`` tensors (block ``r`` is rank ``r``'s input) and
+        the event the consumer must wait on before reading them; ``None``
+        when the ring is unavailable, a graph is being captured, or the
+        blocks do not fit one ring step. Replayed gathers return the ring's
+        static outputs, valid until the next gather of the same shapes.
+        """
+        ring = self._pcie_dma
+        if (
+            ring is None
+            or self.disabled
+            or self._IS_CAPTURING
+            or torch.cuda.is_current_stream_capturing()
+            or not ring.should_all_gather_pair(first, second)
+        ):
+            return None
+        main = torch.cuda.current_stream()
+        side = self._pcie_ring_side_stream()
+        ready, done = self._pcie_ring_events[self._pcie_ring_event_index]
+        self._pcie_ring_event_index ^= 1
+        ready.record(main)
+        side.wait_event(ready)
+        # The inputs were allocated on the caller's stream; keep their
+        # storage from being recycled while the side stream reads it.
+        first.record_stream(side)
+        second.record_stream(side)
+        with torch.cuda.stream(side):
+            out_first, out_second = ring.all_gather_pair(first, second)
+        for out in (out_first, out_second):
+            if not ring.is_ring_storage(out):
+                out.record_stream(main)
+        done.record(side)
+        return out_first, out_second, done
+
     def all_reduce(
         self,
         inp: torch.Tensor,

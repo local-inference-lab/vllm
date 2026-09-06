@@ -33,6 +33,14 @@ def tensor_model_parallel_is_borrowed_storage(tensor: torch.Tensor) -> bool:
     return get_tp_group().is_borrowed_reduction_storage(tensor)
 
 
+def tensor_model_parallel_pcie_all_gather_pair(
+    first: torch.Tensor, second: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, Any] | None:
+    """Gather two rank-local ``[rows, c]`` blocks on the TP group's
+    copy-engine ring side stream; ``None`` when unavailable."""
+    return get_tp_group().pcie_all_gather_pair(first, second)
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:
