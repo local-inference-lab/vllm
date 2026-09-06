@@ -1468,6 +1468,53 @@ def test_glm_selector_metadata_builder_updates_draft_acceptance() -> None:
     assert torch.equal(accepted, torch.ones(4, dtype=torch.int32))
 
 
+def test_dsa_builder_refreshes_fused_dcp_lengths(monkeypatch) -> None:
+    builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
+    builder.requires_glm_next_selector_metadata = False
+    builder.supports_draft_decode_metadata_update = True
+    builder.dcp_world_size = 4
+    builder.dcp_rank = 2
+    builder.cp_kv_cache_interleave_size = 1
+    global_seq_lens = torch.tensor([17, 9], dtype=torch.int32)
+    local_seq_lens = torch.zeros(2, dtype=torch.int32)
+    calls = []
+
+    def refresh(*args) -> None:
+        calls.append(args)
+
+    monkeypatch.setattr(b12x_mla_sparse, "refresh_dcp_local_seq_lens_", refresh)
+    metadata = SimpleNamespace(
+        dcp_global_seq_lens=global_seq_lens,
+        seq_lens=local_seq_lens,
+        num_reqs=2,
+        selector_num_accepted_tokens=None,
+    )
+
+    builder.update_draft_decode_metadata(metadata)
+
+    assert calls == [
+        (local_seq_lens, global_seq_lens, 2, 4, 2, 1),
+    ]
+
+
+def test_dsa_builder_rejects_missing_fused_dcp_lengths() -> None:
+    builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
+    builder.requires_glm_next_selector_metadata = False
+    builder.supports_draft_decode_metadata_update = True
+    builder.dcp_world_size = 4
+    builder.dcp_rank = 0
+    builder.cp_kv_cache_interleave_size = 1
+    metadata = SimpleNamespace(
+        dcp_global_seq_lens=None,
+        seq_lens=torch.zeros(1, dtype=torch.int32),
+        num_reqs=1,
+        selector_num_accepted_tokens=None,
+    )
+
+    with pytest.raises(RuntimeError, match="global sequence lengths"):
+        builder.update_draft_decode_metadata(metadata)
+
+
 def test_dsv4_metadata_builder_does_not_claim_glm_selector_state() -> None:
     builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
     builder.requires_glm_next_selector_metadata = False

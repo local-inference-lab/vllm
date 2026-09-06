@@ -37,7 +37,10 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
 )
-from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+from vllm.v1.attention.backends.utils import (
+    get_dcp_local_seq_lens,
+    refresh_dcp_local_seq_lens_,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.workspace import (
@@ -656,6 +659,7 @@ class B12xMLASparseMetadata(AttentionMetadata):
     num_decodes: int
     num_prefills: int
     num_decode_tokens: int
+    dcp_global_seq_lens: torch.Tensor | None = None
     prefill_max_seq_len: int = 0
     prefill: MLACommonPrefillMetadata | None = None
     prefill_query_lens_cpu: torch.Tensor | None = None
@@ -701,9 +705,9 @@ class B12xMLASparseMetadataBuilder(
         ):
             raise ValueError(dcp_error)
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self.supports_draft_decode_metadata_update = (
-            self.requires_glm_next_selector_metadata
-        )
+        # All step-dependent state is persistent. Generic DSA DCP additionally
+        # refreshes its rank-local sequence lengths in place between steps.
+        self.supports_draft_decode_metadata_update = True
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         scheduler_config = vllm_config.scheduler_config
         max_tokens = scheduler_config.max_num_batched_tokens
@@ -881,6 +885,9 @@ class B12xMLASparseMetadataBuilder(
             else common.seq_lens
         )
         metadata.seq_lens = seq_lens
+        metadata.dcp_global_seq_lens = (
+            common.seq_lens[: common.num_reqs] if use_dcp else None
+        )
 
         if common.max_query_len <= 1 and num_tokens == common.num_reqs:
             per_token_lens = seq_lens[:num_tokens]
@@ -1061,12 +1068,28 @@ class B12xMLASparseMetadataBuilder(
         self,
         metadata: B12xMLASparseMetadata,
     ) -> None:
-        accepted = metadata.selector_num_accepted_tokens
-        if not self.requires_glm_next_selector_metadata or accepted is None:
-            raise RuntimeError(
-                "GLM5Next draft decode metadata requires accepted-token counts"
+        if self.dcp_world_size > 1:
+            global_seq_lens = metadata.dcp_global_seq_lens
+            if global_seq_lens is None:
+                raise RuntimeError(
+                    "B12X fused DCP draft decode requires global sequence lengths"
+                )
+            refresh_dcp_local_seq_lens_(
+                metadata.seq_lens,
+                global_seq_lens,
+                metadata.num_reqs,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
             )
-        accepted.fill_(1)
+
+        if self.requires_glm_next_selector_metadata:
+            accepted = metadata.selector_num_accepted_tokens
+            if accepted is None:
+                raise RuntimeError(
+                    "GLM5Next draft decode metadata requires accepted-token counts"
+                )
+            accepted.fill_(1)
 
 
 class B12xGLM5NextMLASparseMetadataBuilder(B12xMLASparseMetadataBuilder):
