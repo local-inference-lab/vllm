@@ -933,7 +933,15 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                     computed.append(cached)
                 hit_length = max_partial_idx * alignment_tokens
             else:
-                for fine_idx in range(max_partial_idx - 1, first_partial_idx - 1, -1):
+                # A published partial tail also covers earlier boundaries in
+                # this page. Its chained hash must match the request before we
+                # can rewind it, just as for a cached full page above.
+                lookup_end = (
+                    min(first_partial_idx + scale_factor - 1, len(block_hashes))
+                    if max_partial_idx > first_partial_idx
+                    else first_partial_idx
+                )
+                for fine_idx in range(lookup_end - 1, first_partial_idx - 1, -1):
                     cached_tail = block_pool.get_cached_block(
                         block_hashes[fine_idx], kv_cache_group_ids
                     )
@@ -941,7 +949,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                         continue
                     for computed, cached in zip(computed_blocks, cached_tail):
                         computed.append(cached)
-                    hit_length = (fine_idx + 1) * alignment_tokens
+                    hit_length = min(fine_idx + 1, max_partial_idx) * alignment_tokens
                     break
 
         # Eagle needs the tokens right before the generation point recomputed:
