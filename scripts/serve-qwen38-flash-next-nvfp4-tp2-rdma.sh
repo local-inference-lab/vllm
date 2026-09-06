@@ -321,10 +321,6 @@ cluster_args=(
   --env "VLLM_USE_V2_MODEL_RUNNER=1"
   --env "VLLM_ENABLE_PCIE_ALLREDUCE=0"
   --env "B12X_POLICY_MODE=${B12X_POLICY_MODE}"
-  --env "INSTANTTENSOR_BACKEND=BUFFERED"
-  --env "INSTANTTENSOR_BUFFER_SIZE=1342177280"
-  --env "INSTANTTENSOR_CONCURRENCY=1"
-  --env "INSTANTTENSOR_IO_DEPTH=3"
   --env "NCCL_NET_PLUGIN=none"
   --env "NCCL_IB_GID_INDEX=3"
   --env "NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS}"
@@ -385,8 +381,7 @@ vllm_command=(
   --kv-cache-dtype fp8
   --quantization modelopt_mixed
   --block-size 16
-  --load-format instanttensor
-  --model-loader-extra-config '{"instanttensor_copy":false}'
+  --load-format fastsafetensors
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
   --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}"
   --max-model-len "${MAX_MODEL_LEN}"

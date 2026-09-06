@@ -418,6 +418,52 @@ class TestLoadWeightsExpertBias:
         loaded = list(RoutedExperts.load_weights(experts, self._checkpoint_weights()))
         assert set(loaded) == {"w13_weight", "w2_weight", "w13_bias", "w2_bias"}
 
+    @pytest.mark.parametrize("packed", [False, True])
+    @pytest.mark.parametrize("lora_prefix", ["", "base_layer."])
+    def test_per_expert_loading_preserves_all_replicas(self, packed, lora_prefix):
+        """Indexed routing must retain EPLB replicas and packed gate/up halves."""
+        experts = self._make_experts(has_bias=False)
+        mapping = RoutedExperts.build_expert_params_mapping(
+            "gate_proj",
+            "down_proj",
+            "up_proj",
+            self.NUM_EXPERTS,
+            num_redundant_experts=1,
+            routed_experts_prefix="",
+            lora_base_layer_prefix=lora_prefix,
+            include_fused=True,
+        )
+        experts.get_expert_mapping = lambda **_: mapping
+        loaded_values = {}
+
+        def weight_loader(*, loaded_weight, expert_id, shard_id, **_):
+            loaded_values[expert_id, shard_id] = loaded_weight.item()
+            return True
+
+        for param in experts.parameters():
+            param.weight_loader = weight_loader
+        projections = (
+            [("gate_up_proj", [[1.0], [3.0]])]
+            if packed
+            else [("gate_proj", [[1.0]]), ("up_proj", [[3.0]])]
+        )
+        projections.append(("down_proj", [[2.0]]))
+        loaded = list(
+            RoutedExperts.load_weights(
+                experts,
+                [
+                    (f"0.{proj}.{lora_prefix}weight", torch.tensor(values))
+                    for proj, values in projections
+                ],
+            )
+        )
+        assert set(loaded) == {"w13_weight", "w2_weight"}
+        assert loaded_values == {
+            (expert, shard): value
+            for expert in (0, 2)
+            for shard, value in (("w1", 1.0), ("w2", 2.0), ("w3", 3.0))
+        }
+
     def test_missing_non_bias_param_names_the_weight(self):
         experts = self._make_experts(has_bias=False)
         weights = [("0.down_proj.new_scale", torch.zeros(1, 1))]

@@ -468,11 +468,6 @@ cluster_args=(
   --env "VLLM_USE_V2_MODEL_RUNNER=1"
   --env "VLLM_ENABLE_PCIE_ALLREDUCE=0"
   --env "B12X_POLICY_MODE=${B12X_POLICY_MODE}"
-  --env "INSTANTTENSOR_BACKEND=BUFFERED"
-  --env "INSTANTTENSOR_BUFFER_SIZE=67108864"
-  --env "INSTANTTENSOR_CHUNK_SIZE=8388608"
-  --env "INSTANTTENSOR_CONCURRENCY=1"
-  --env "INSTANTTENSOR_IO_DEPTH=3"
   --env "NCCL_NET_PLUGIN=none"
   --env "LD_PRELOAD=${NCCL_LIB}"
   --env "VLLM_NCCL_SO_PATH=${NCCL_LIB}"
@@ -533,9 +528,7 @@ vllm_command=(
   --moe-backend b12x
   --linear-backend b12x
   --no-enable-flashinfer-autotune
-  --load-format instanttensor
-  --model-loader-extra-config \
-    '{"instanttensor_copy":false,"instanttensor_distributed":false}'
+  --load-format fastsafetensors
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
   --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}"
   --max-model-len "${MAX_MODEL_LEN}"

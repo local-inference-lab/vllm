@@ -52,6 +52,7 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
     boundary_checkpoint: BoundaryCheckpoint | None = None
     boundary_checkpoint_blocks: tuple[tuple[int, ...], ...] | None = None
+    recurrent_instruction_boundary: int | None = None
 
     @classmethod
     def from_request(
@@ -81,6 +82,7 @@ class NewRequestData:
             prefill_token_ids=prefill_token_ids,
             boundary_checkpoint=request.boundary_checkpoint,
             boundary_checkpoint_blocks=request.boundary_checkpoint_blocks,
+            recurrent_instruction_boundary=request.recurrent_instruction_boundary,
         )
 
     @property
@@ -214,14 +216,7 @@ class ScheduledEncoderInputStats:
 
 @dataclass
 class KVConnectorBlockState:
-    """Authoritative scheduler-side KV source state for external stores.
-
-    ``block_ids`` is a full per-group snapshot for every request scheduled in
-    this step. ``boundary_state_offloads`` identifies the exact recurrent
-    state block at each durable token boundary; connectors must not reconstruct
-    these sources from allocation deltas because align-mode Mamba tables are
-    sparse and mutable.
-    """
+    """Scheduler-local current tables and exact retained-state offers."""
 
     block_ids: dict[str, tuple[list[int], ...]]
     boundary_state_offloads: dict[str, list[tuple[int, int, int]]]
@@ -298,15 +293,7 @@ class SchedulerOutput:
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
-    # Producer partial-tail offload hand-off for external KV connectors:
-    # {request_id: [(group_id, block_id, boundary_tokens), ...]} pointing at
-    # the durable boundary block of a producer's last-prompt-boundary partial
-    # tail (mamba "align" CoW target). None unless partial hash hits are active.
-    partial_tail_offloads: dict[str, list[tuple[int, int, int]]] | None = None
-
-    # Authoritative source tables and recurrent boundary blocks for external
-    # KV stores. This is scheduler-only metadata consumed while connector
-    # metadata is built; workers use the resulting opaque connector metadata.
+    # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None
 
     # Dynamic speculative decoding: optimal K chosen by scheduler.

@@ -9,6 +9,7 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils import random_uuid
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
 from vllm.v1.worker.gpu.boundary_checkpoint import (
     BoundaryCheckpointState,
     prepare_boundary_capture,
@@ -565,14 +566,15 @@ def _post_update_kernel(
     boundary_capture_tokens_ptr=None,
     boundary_capture_bias_ptr=None,
     boundary_capture_rows_ptr=None,
+    NUM_CAPTURES: tl.constexpr = 0,
 ):
     req_id = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
     if req_state_idx < 0:
         # Filter rows with negative index entries.
         if boundary_capture_tokens_ptr is not None:
-            tl.store(boundary_capture_tokens_ptr + req_id * 2, 0)
-            tl.store(boundary_capture_tokens_ptr + req_id * 2 + 1, 0)
+            for kind in range(NUM_CAPTURES):
+                tl.store(boundary_capture_tokens_ptr + req_id * NUM_CAPTURES + kind, 0)
         return
 
     total_len = tl.load(total_len_ptr + req_state_idx)
@@ -605,6 +607,8 @@ def _post_update_kernel(
             boundary_capture_bias_ptr,
             boundary_capture_rows_ptr,
             STOP_CAPACITY=128,
+            NUM_CAPTURES=NUM_CAPTURES,
+            METADATA_WIDTH=6,
         )
         tl.store(num_sampled_ptr + req_id, num_sampled)
         tl.store(num_rejected_ptr + req_id, num_rejected)
@@ -681,6 +685,9 @@ def post_update(
         boundary_capture[0] if boundary_capture is not None else None,
         boundary_capture[1] if boundary_capture is not None else None,
         boundary_capture[2] if boundary_capture is not None else None,
+        NUM_CAPTURES=(
+            NUM_BOUNDARY_CHECKPOINT_SLOTS if boundary_capture is not None else 0
+        ),
         num_warps=1,
     )
 

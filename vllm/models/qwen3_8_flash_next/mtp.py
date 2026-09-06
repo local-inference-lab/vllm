@@ -479,6 +479,21 @@ class Qwen3_8FlashNextMTP(
     SupportsPP,
     Qwen3_8FlashNextMixtureOfExperts,
 ):
+    checkpoint_weight_name_prefixes = tuple(
+        checkpoint_prefix + weight_prefix
+        for checkpoint_prefix in ("", "model.language_model.", "language_model.")
+        for weight_prefix in (
+            "mtp.",
+            "model.mtp.",
+            "embed_tokens.",
+            "model.embed_tokens.",
+            "lm_head.",
+            "model.lm_head.",
+            "shared_head.head.",
+            "model.shared_head.head.",
+        )
+    )
+
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],

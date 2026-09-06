@@ -14,7 +14,9 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    FullAttentionManager,
     SingleTypeKVCacheManager,
+    SlidingWindowManager,
     get_manager_for_kv_cache_spec,
 )
 from vllm.v1.kv_cache_interface import (
@@ -148,6 +150,13 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+
+        lookup_drops_eagle_block = any(
+            i in self.eagle_group_ids and manager.drops_eagle_block
+            for i, manager in enumerate(self.single_type_managers)
+        )
+        for manager in self.single_type_managers:
+            manager.lookup_drops_eagle_block = lookup_drops_eagle_block
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -641,7 +650,25 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             )
             for g in kv_cache_config.kv_cache_groups
         )
-        self.enable_partial_hash_hits = has_partial_mamba_group
+        # Recurrent hybrids may instead hash finer than their attention
+        # blocks (``prefix_match_unit`` at the recurrent block, attention
+        # pages grown to match the recurrent page): partial hits then keep
+        # prefix reuse at the recurrent checkpoint granularity. Attention-only
+        # hybrids keep block-aligned hits, as before.
+        has_mamba_align_group = any(
+            isinstance(g.kv_cache_spec, MambaSpec)
+            and g.kv_cache_spec.mamba_cache_mode == "align"
+            for g in kv_cache_config.kv_cache_groups
+        )
+        has_partial_attention_group = has_mamba_align_group and any(
+            isinstance(manager, (FullAttentionManager, SlidingWindowManager))
+            and manager.block_size > hash_block_size
+            and manager.supports_fine_grained_hash_lookup
+            for manager in self.single_type_managers
+        )
+        self.enable_partial_hash_hits = (
+            has_partial_mamba_group or has_partial_attention_group
+        )
         if self.enable_partial_hash_hits:
             unsupported_partial_hit_managers = {
                 type(manager).__name__
@@ -656,6 +683,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     "cache managers require block-aligned lookups: %s.",
                     ", ".join(sorted(unsupported_partial_hit_managers)),
                 )
+        for manager in self.single_type_managers:
+            manager.hit_alignment_tokens = self._cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
 
     @property
@@ -771,6 +800,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 request,
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
+                alignment_tokens=self._cache_hit_alignment_tokens,
             )
 
     def find_longest_cache_hit(
@@ -838,12 +868,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 drop_eagle_block = use_eagle and idx not in eagle_verified
 
                 _max_length = curr_hit_length
-                # Eagle matches one extra drop unit (one hash unit for
+                # EAGLE matches one extra drop unit (one hash unit for
                 # fine-grained managers, else one cache block) and then drops
-                # it, landing back at the candidate length. No margin for
-                # mamba: its finder never drops (draft models have no mamba
-                # layers), so the hit would grow past the candidate.
-                if drop_eagle_block and not isinstance(spec, MambaSpec):
+                # it, landing back at the candidate length. Managers whose
+                # finder does not drop receive no margin.
+                if drop_eagle_block and manager_cls.drops_eagle_block:
                     eagle_margin = (
                         self.hash_block_size
                         if self.enable_partial_hash_hits

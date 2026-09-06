@@ -10,8 +10,12 @@ from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.boundary_checkpoint import (
+    INSTRUCTION_CHECKPOINT_SLOT,
+    PROMPT_CHECKPOINT_SLOT,
+    RESPONSE_CHECKPOINT_SLOT,
     BoundaryCheckpoint,
     BoundaryCheckpointCache,
+    BoundaryCheckpointKind,
 )
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
@@ -195,9 +199,6 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
-        # Off-table cow blocks handed to a KV connector for partial-tail
-        # offload; pinned until the request's blocks are freed.
-        self._partial_tail_pins: dict[str, list[KVCacheBlock]] = {}
         self.boundary_checkpoints = (
             BoundaryCheckpointCache(self.block_pool)
             if enable_boundary_checkpoints and enable_caching
@@ -208,7 +209,8 @@ class KVCacheManager:
         if self.boundary_checkpoints is not None:
             logger.info(
                 "Request-boundary recurrent checkpoint caching is enabled. "
-                "Supported requests retain prompt and response endpoints."
+                "Supported chat requests retain leading instructions, the "
+                "complete prompt, and the response endpoint."
             )
 
     @property
@@ -315,16 +317,14 @@ class KVCacheManager:
             and getattr(request, "kv_cache_report_mode", "incremental") == "full"
         ):
             for group_idx, group_blocks in enumerate(computed_blocks):
-                num_blocks = len(group_blocks)
-                if num_blocks > 0:
-                    group = self.kv_cache_config.kv_cache_groups[group_idx]
-                    block_size = group.kv_cache_spec.block_size
-                    self.block_pool.emit_cached_block_events(
-                        request,
-                        num_blocks,
-                        block_size,
-                        group_idx,
-                    )
+                manager = self.coordinator.single_type_managers[group_idx]
+                self.block_pool.emit_cached_block_events(
+                    request,
+                    group_blocks,
+                    num_new_computed_tokens,
+                    manager.block_size,
+                    group_idx,
+                )
 
         # The junction to pin is where the lagging sparse-retention group stops
         # (``num_new_computed_tokens``) plus the uncached shared prefix -- i.e.
@@ -508,7 +508,10 @@ class KVCacheManager:
         boundary_replay_managers = []
         if request.use_boundary_checkpoints:
             if request.request_id not in self._boundary_allocations:
-                boundary_blocks = 2 * (self.num_kv_cache_groups + 1)
+                checkpoint_slots = 2 + int(
+                    request.recurrent_instruction_boundary is not None
+                )
+                boundary_blocks = checkpoint_slots * (self.num_kv_cache_groups + 1)
             if request.boundary_checkpoint is not None:
                 boundary_blocks += sum(
                     self.block_pool.blocks[i].ref_cnt == 0
@@ -636,11 +639,14 @@ class KVCacheManager:
             request.request_id not in self._boundary_allocations
         ):
             width = self.num_kv_cache_groups + 1
-            allocation = self.block_pool.get_new_blocks(2 * width)
+            checkpoint_slots = 2 + int(
+                request.recurrent_instruction_boundary is not None
+            )
+            allocation = self.block_pool.get_new_blocks(checkpoint_slots * width)
             self._boundary_allocations[request.request_id] = allocation
             request.boundary_checkpoint_blocks = tuple(
                 tuple(block.block_id for block in allocation[start : start + width])
-                for start in (0, width)
+                for start in range(0, checkpoint_slots * width, width)
             )
 
         # P/D: delay caching blocks if we have to recv from
@@ -671,9 +677,6 @@ class KVCacheManager:
         """
         boundary_blocks = self._pop_boundary_blocks(request)
         self.block_pool.free_blocks(boundary_blocks)
-        pins = self._partial_tail_pins.pop(request.request_id, None)
-        if pins:
-            self.block_pool.free_blocks(pins)
         self.coordinator.free(request.request_id)
 
     def _pop_boundary_blocks(self, request: Request) -> list[KVCacheBlock]:
@@ -686,14 +689,14 @@ class KVCacheManager:
         return blocks
 
     def publish_boundary_checkpoint(
-        self, request: Request, num_tokens: int, *, is_response: bool
+        self, request: Request, num_tokens: int, *, kind: BoundaryCheckpointKind
     ) -> BoundaryCheckpoint | None:
         """Publish a validated endpoint after all workers completed their copies."""
         cache = self.boundary_checkpoints
         allocation = request.boundary_checkpoint_blocks
         if cache is None or allocation is None or num_tokens <= 0:
             return None
-        if is_response:
+        if kind == "response":
             if (
                 request.status
                 not in (
@@ -703,9 +706,17 @@ class KVCacheManager:
                 or num_tokens != request.num_tokens - 1
             ):
                 return None
-        elif num_tokens != request.num_prompt_tokens:
+            slot = RESPONSE_CHECKPOINT_SLOT
+        elif kind == "prompt":
+            if num_tokens != request.num_prompt_tokens:
+                return None
+            slot = PROMPT_CHECKPOINT_SLOT
+        else:
+            if num_tokens != request.recurrent_instruction_boundary:
+                return None
+            slot = INSTRUCTION_CHECKPOINT_SLOT
+        if slot >= len(allocation):
             return None
-        kind = int(is_response)
         grouped_blocks = []
         for group_id, manager in enumerate(self.coordinator.single_type_managers):
             count = cdiv(num_tokens, manager.block_size)
@@ -721,15 +732,15 @@ class KVCacheManager:
                 ]
                 if len(blocks) != count - 1 or 0 in blocks:
                     return None
-            blocks.append(allocation[kind][group_id])
+            blocks.append(allocation[slot][group_id])
             grouped_blocks.append(tuple(blocks))
         checkpoint = BoundaryCheckpoint(
             cache.next_id(),
             num_tokens,
             tuple(grouped_blocks),
-            (allocation[kind][-1],),
+            (allocation[slot][-1],),
             draft_prefix_len=max(num_tokens - 1, 0) if self.use_eagle else num_tokens,
-            kind="response" if is_response else "prompt",
+            kind=kind,
         )
         cache.stage(request, checkpoint, num_ranks=1)
         cache.acknowledge(checkpoint.checkpoint_id, 0)
@@ -767,12 +778,6 @@ class KVCacheManager:
         """
         blocks = self.coordinator.pop_blocks_for_free(request.request_id)
         blocks.extend(self._pop_boundary_blocks(request))
-        # Pins ride the same (possibly deferred) free as the request blocks.
-        # Preemption may release a pin under a still-queued offload — the same
-        # exposure normal saves of table blocks already have.
-        pins = self._partial_tail_pins.pop(request.request_id, None)
-        if pins:
-            blocks = pins + blocks
         return blocks
 
     def evict_blocks(self, block_ids: set[int]) -> None:
@@ -1010,18 +1015,18 @@ class KVCacheManager:
         retained_blocks = [block for pair in pending_copies for block in pair]
         return copies, retained_blocks
 
-    def take_partial_tail_offloads(self) -> dict[str, list[tuple[int, int, int]]]:
-        """Drain producer partial-tail offload hand-offs per request.
+    def take_boundary_state_offloads(
+        self,
+    ) -> dict[str, list[tuple[int, int, int]]]:
+        """Drain this step's boundary-state hand-offs for a KV connector.
 
         Returns ``{request_id: [(group_id, block_id, boundary_tokens), ...]}``
-        for the durable boundary blocks of producers' last-prompt-boundary
-        partial tails. Only mamba "align" groups contribute; empty otherwise.
-        A KV connector reads the referenced blocks and offloads them so a later
-        request can hit the sub-block prefix.
-
-        Each handed-off block lives off the request block table, so it is
-        pinned here and unpinned when the request's blocks are freed — for a
-        producer with saved tokens, after the connector reports sends done.
+        for mamba "align" boundary states: the
+        request's committed boundary-state snapshots and, on a sub-block partial
+        hit, the CoW copy of its last-prompt-boundary state. Only mamba "align"
+        groups contribute; empty otherwise. A connector reads the referenced
+        blocks — never resolving them positionally — and offloads them so a
+        later request can hit that prefix.
         """
         offloads: dict[str, list[tuple[int, int, int]]] = {}
         for mgr in self.coordinator.single_type_managers:
@@ -1030,9 +1035,7 @@ class KVCacheManager:
                 group_id,
                 block,
                 boundary_tokens,
-            ) in mgr.take_pending_partial_tail_offloads():
-                self.block_pool.touch((block,))
-                self._partial_tail_pins.setdefault(req_id, []).append(block)
+            ) in mgr.take_pending_boundary_state_offloads():
                 offloads.setdefault(req_id, []).append(
                     (group_id, block.block_id, boundary_tokens)
                 )

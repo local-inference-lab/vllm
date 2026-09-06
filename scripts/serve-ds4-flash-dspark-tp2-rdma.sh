@@ -296,11 +296,6 @@ cluster_args=(
   --env "B12X_MOE_FORCE_A8=1"
   --env "B12X_POLICY_MODE=${B12X_POLICY_MODE}"
   --env "VLLM_ENABLE_PCIE_ALLREDUCE=0"
-  --env "INSTANTTENSOR_BACKEND=BUFFERED"
-  --env "INSTANTTENSOR_BUFFER_SIZE=67108864"
-  --env "INSTANTTENSOR_CHUNK_SIZE=8388608"
-  --env "INSTANTTENSOR_CONCURRENCY=1"
-  --env "INSTANTTENSOR_IO_DEPTH=3"
   --env "NCCL_NET_PLUGIN=none"
   --env "NCCL_IB_GID_INDEX=3"
   --env "NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS}"
@@ -364,7 +359,7 @@ vllm_command=(
   --decode-context-parallel-size 1
   --kv-cache-dtype fp8
   --block-size 256
-  --load-format instanttensor
+  --load-format fastsafetensors
   --moe-backend b12x
   --linear-backend b12x
   --attention-backend B12X
