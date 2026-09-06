@@ -209,10 +209,14 @@ def test_glm_dcp_attention_profile_skips_irrelevant_configurations(
     "architecture",
     ["DeepseekV4ForCausalLM", "DeepseekV4ForConditionalGeneration"],
 )
-@pytest.mark.parametrize("dummy_run_fails", [False, True])
+@pytest.mark.parametrize(
+    ("init_fails", "dummy_run_fails"),
+    [(False, False), (False, True), (True, False)],
+)
 def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
     monkeypatch: pytest.MonkeyPatch,
     architecture: str,
+    init_fails: bool,
     dummy_run_fails: bool,
 ):
     runner = GPUModelRunner.__new__(GPUModelRunner)
@@ -220,10 +224,13 @@ def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
     runner.max_num_tokens = 4096
     events: list[object] = []
 
+    def init_kv(_):
+        events.append("init-kv")
+        if init_fails:
+            raise RuntimeError("expected DeepSeek V4 KV initialization failure")
+
     monkeypatch.setattr(
-        model_runner_module,
-        "_init_minimal_kv_cache_for_profiling",
-        lambda _: events.append("init-kv"),
+        model_runner_module, "_init_minimal_kv_cache_for_profiling", init_kv
     )
     monkeypatch.setattr(
         model_runner_module,
@@ -240,25 +247,33 @@ def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
     runner._dummy_run = dummy_run
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
 
-    if dummy_run_fails:
+    if init_fails:
+        with pytest.raises(
+            RuntimeError, match="expected DeepSeek V4 KV initialization failure"
+        ):
+            runner._profile_deepseek_v4_attention()
+    elif dummy_run_fails:
         with pytest.raises(RuntimeError, match="expected DeepSeek V4 profile failure"):
             runner._profile_deepseek_v4_attention()
     else:
         runner._profile_deepseek_v4_attention()
 
     assert events[0] == "init-kv"
-    assert events[1] == (
-        "dummy-run",
-        (4096,),
-        {
-            "skip_eplb": True,
-            "is_profile": True,
-            "single_request_prefill": True,
-            "profile_all_kv_cache_groups": True,
-        },
-    )
+    if init_fails:
+        assert events == ["init-kv", "cleanup"]
+    else:
+        assert events[1] == (
+            "dummy-run",
+            (4096,),
+            {
+                "skip_eplb": True,
+                "is_profile": True,
+                "single_request_prefill": True,
+                "profile_all_kv_cache_groups": True,
+            },
+        )
     assert events[-1] == "cleanup"
-    if not dummy_run_fails:
+    if not init_fails and not dummy_run_fails:
         assert events[-2] == "sync"
 
 

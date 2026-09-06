@@ -6664,11 +6664,10 @@ class GPUModelRunner(
         }:
             return
 
-        with set_current_vllm_config(self.vllm_config):
-            self._init_minimal_kv_cache_for_profiling()
-
         model_output: tuple[torch.Tensor, torch.Tensor] | None = None
         try:
+            with set_current_vllm_config(self.vllm_config):
+                self._init_minimal_kv_cache_for_profiling()
             model_output = self._dummy_run(
                 self.max_num_tokens,
                 force_attention=True,
