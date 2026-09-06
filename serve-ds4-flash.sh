@@ -34,6 +34,14 @@ require_positive_int() {
   fi
 }
 
+require_max_model_len() {
+  local value=$1
+  if [[ "${value}" != "-1" && ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MAX_MODEL_LEN must be -1 or a positive integer; got '${value}'" >&2
+    exit 2
+  fi
+}
+
 require_nonnegative_int() {
   local name=$1 value=$2
   if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
@@ -68,8 +76,10 @@ esac
 
 standard_model=${STANDARD_MODEL:-deepseek-ai/DeepSeek-V4-Flash}
 dspark_model=${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}
+vision_model=${VISION_MODEL:-deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
 standard_model_revision=${STANDARD_MODEL_REVISION:-60d8d70770c6776ff598c94bb586a859a38244f1}
 dspark_model_revision=${DSPARK_MODEL_REVISION:-9e165c30e2704aec5d9d593cce3eebd58bbef1cb}
+vision_model_revision=${VISION_MODEL_REVISION:-6821d6ad3681a4b137b066b76094fa82ebd0a380}
 if [[ "${mode}" == "dspark" || "${mode}" == "dspark-mtp0" ]]; then
   model=${MODEL_PATH:-${MODEL:-${dspark_model}}}
   spec_model=${SPEC_MODEL_PATH:-${model}}
@@ -82,9 +92,36 @@ else
   default_model_revision=${standard_model_revision}
 fi
 
+model_variant=${DS4_MODEL_VARIANT:-auto}
+case "${model_variant}" in
+  auto)
+    if [[ "${model}" == "${vision_model}" \
+      || "${model}" == *DeepSeek-V4-Flash-Vision-Exp* ]]; then
+      model_variant=vision
+    else
+      model_variant=text
+    fi
+    ;;
+  text|vision) ;;
+  *)
+    echo "DS4_MODEL_VARIANT must be auto, text, or vision; got '${model_variant}'" >&2
+    exit 2
+    ;;
+esac
+if [[ "${model_variant}" == "vision" ]]; then
+  served_model_name=${SERVED_MODEL_NAME:-DeepSeek-V4-Flash-Vision-Exp}
+  if [[ "${model}" == "${vision_model}" ]]; then
+    default_model_revision=${vision_model_revision}
+  else
+    default_model_revision=
+  fi
+fi
+
 model_revision=${MODEL_REVISION:-}
 if [[ -z "${model_revision}" ]]; then
-  if [[ "${model}" == "${standard_model}" || "${model}" == "${dspark_model}" ]]; then
+  if [[ "${model}" == "${standard_model}" \
+    || "${model}" == "${dspark_model}" \
+    || "${model}" == "${vision_model}" ]]; then
     model_revision=${default_model_revision}
   fi
 fi
@@ -97,9 +134,43 @@ host=${HOST:-0.0.0.0}
 port=${PORT:-8000}
 tp_size=${TP_SIZE:-${TP:-4}}
 dcp_size=${DCP_SIZE:-${DCP:-1}}
+lmcache_mode=${LMCACHE_MODE:-off}
+lmcache_mode=${lmcache_mode,,}
+lmcache_transfer_mode=${LMCACHE_TRANSFER_MODE:-auto}
+lmcache_transfer_mode=${lmcache_transfer_mode,,}
+direct_lmcache=0
+if [[ "${lmcache_mode}" != "off" \
+  && "${lmcache_mode}" != "0" \
+  && "${lmcache_transfer_mode}" != "engine_driven" ]]; then
+  direct_lmcache=1
+fi
+engine_driven_lmcache=0
+if [[ "${lmcache_mode}" != "off" \
+  && "${lmcache_mode}" != "0" \
+  && "${lmcache_transfer_mode}" == "engine_driven" ]]; then
+  engine_driven_lmcache=1
+fi
+vision_direct_lmcache=0
+text_direct_lmcache=0
+if [[ "${direct_lmcache}" == "1" && "${model_variant}" == "vision" ]]; then
+  vision_direct_lmcache=1
+elif [[ "${direct_lmcache}" == "1" ]]; then
+  text_direct_lmcache=1
+fi
 if [[ "${mode}" == "dspark" || "${mode}" == "dspark-mtp0" ]]; then
   max_num_seqs=${MAX_NUM_SEQS:-16}
-  max_model_len=${MAX_MODEL_LEN:-131072}
+  if [[ "${model_variant}" == "vision" ]]; then
+    if [[ "${vision_direct_lmcache}" == "1" ]]; then
+      # Direct LMCache creates CUDA transfer buffers after vLLM profiles the
+      # model. A 900k-token KV pool leaves enough physical memory for those
+      # buffers and the maximum profiled vision batch on a 96 GiB GPU.
+      max_model_len=${MAX_MODEL_LEN:-900000}
+    else
+      max_model_len=${MAX_MODEL_LEN:-1048576}
+    fi
+  else
+    max_model_len=${MAX_MODEL_LEN:-131072}
+  fi
 else
   max_num_seqs=${MAX_NUM_SEQS:-64}
   max_model_len=${MAX_MODEL_LEN:-262144}
@@ -107,7 +178,7 @@ fi
 max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-8192}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-}
 block_size=${BLOCK_SIZE:-256}
-load_format=${LOAD_FORMAT:-fastsafetensors}
+load_format=${LOAD_FORMAT:-instanttensor}
 kv_offloading_size=${KV_OFFLOADING_SIZE:-}
 native_l2_path=${NATIVE_L2_PATH:-}
 native_l2_size=${NATIVE_L2_GB:-}
@@ -119,8 +190,23 @@ rejection_sample_method=${REJECTION_SAMPLE_METHOD:-standard}
 require_positive_int TP_SIZE "${tp_size}"
 require_positive_int DCP_SIZE "${dcp_size}"
 require_positive_int MAX_NUM_SEQS "${max_num_seqs}"
+require_max_model_len "${max_model_len}"
 require_positive_int MAX_NUM_BATCHED_TOKENS "${max_num_batched_tokens}"
 require_positive_int BLOCK_SIZE "${block_size}"
+# vLLM interprets -1 as the model-derived maximum length. DS4 checkpoints
+# declare a 1,048,576-token limit, so launcher memory guards must evaluate the
+# sentinel against that capacity while preserving -1 on the vLLM command line.
+policy_max_model_len=${max_model_len}
+if [[ "${max_model_len}" == "-1" ]]; then
+  policy_max_model_len=1048576
+fi
+if [[ "${vision_direct_lmcache}" == "1" \
+  && -n "${MAX_MODEL_LEN:-}" \
+  && "${policy_max_model_len}" -gt 900000 \
+  && -z "${GPU_MEMORY_UTILIZATION:-}" ]]; then
+  echo "Vision direct LMCache with MAX_MODEL_LEN above 900000 requires an explicit GPU_MEMORY_UTILIZATION override; the qualified 96 GiB default is MAX_MODEL_LEN=900000 with GPU_MEMORY_UTILIZATION=0.951" >&2
+  exit 2
+fi
 if [[ -n "${kv_offloading_size}" \
   && ! "${kv_offloading_size}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
   echo "KV_OFFLOADING_SIZE must be a non-negative GiB value; got '${kv_offloading_size}'" >&2
@@ -176,6 +262,7 @@ export NCCL_PROTO=${NCCL_PROTO:-LL,LL128,Simple}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
 export LLM_WORKER_MULTIPROC_METHOD=${LLM_WORKER_MULTIPROC_METHOD:-spawn}
 export SAFETENSORS_FAST_GPU=${SAFETENSORS_FAST_GPU:-1}
+export INSTANTTENSOR_BACKEND=${INSTANTTENSOR_BACKEND:-BUFFERED}
 
 export VLLM_USE_AOT_COMPILE=${VLLM_USE_AOT_COMPILE:-1}
 export VLLM_USE_BREAKABLE_CUDAGRAPH=${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}
@@ -250,7 +337,12 @@ if [[ "${mode}" == "mtp2" || "${mode}" == "mtp3" ]]; then
   spec_args=(--speculative-config "${spec_json}")
   graph_multiplier=8
 elif [[ "${mode}" == "dspark" ]]; then
-  spec_tokens=${DSPARK_TOKENS:-${NUM_SPECULATIVE_TOKENS:-7}}
+  if [[ "${model_variant}" == "vision" ]]; then
+    default_dspark_tokens=3
+  else
+    default_dspark_tokens=7
+  fi
+  spec_tokens=${DSPARK_TOKENS:-${NUM_SPECULATIVE_TOKENS:-${default_dspark_tokens}}}
   require_positive_int DSPARK_TOKENS "${spec_tokens}"
   # Target verification schedules at most one sampled token plus K drafts per
   # request. Capturing beyond that physical row count only consumes graph
@@ -320,11 +412,30 @@ if [[ "${sp_async_tp}" == "1" ]]; then
 fi
 
 if [[ -z "${gpu_memory_utilization}" ]]; then
-  # The 0731 DSpark draft head is larger than the historical MTP head. Its
-  # B12X TP2 profile needs 0.975 to retain the default 131k serving limit after
-  # attention and FULL-graph allocations are accounted for. At 0.97 the r15
-  # stack exposed 7.11 GiB of KV storage while this profile needs 7.37 GiB.
-  if [[ "${mode}" == "dspark" ]]; then
+  if [[ "${engine_driven_lmcache}" == "1" \
+    && "${mode}" == "dspark" \
+    && "${tp_size}" == "2" \
+    && "${policy_max_model_len}" -ge 1048576 ]]; then
+    # Engine-driven transfer performs GPU gathers in the existing vLLM
+    # workers and keeps the standalone cache server CPU-only. A 0.970 budget
+    # provides more than one million GPU KV tokens on 96 GiB TP2 GPUs while
+    # retaining measured runtime headroom during a one-million-token store.
+    gpu_memory_utilization=0.970
+  elif [[ "${vision_direct_lmcache}" == "1" ]]; then
+    # Direct LMCache transfer opens one CUDA IPC client per TP rank after the
+    # vLLM memory estimate. The TP2 profile reserves enough physical memory for
+    # those late allocations and an uncached 810k-token plus ten-image overlap.
+    gpu_memory_utilization=0.951
+  elif [[ "${text_direct_lmcache}" == "1" ]]; then
+    # Direct LMCache allocates transfer buffers after vLLM sizes the GPU KV
+    # pool. A 0.965 budget preserves a one-million-token TP2 DSpark KV pool on
+    # 96 GiB GPUs while retaining memory for the runtime transfer allocation.
+    gpu_memory_utilization=0.965
+  elif [[ "${model_variant}" == "vision" ]]; then
+    gpu_memory_utilization=0.975
+  elif [[ "${mode}" == "dspark" ]]; then
+    # The 0731 DSpark draft head needs 0.975 to retain its serving limit after
+    # attention and FULL-graph allocations are accounted for.
     if [[ "${backend}" == "lucifer-default" ]]; then
       # The default DeepGEMM MoE path retains more model/runtime memory than
       # FlashInfer CUTLASS. At 0.9465 only 7.35 GiB remained for the 7.89 GiB
@@ -350,6 +461,35 @@ if [[ -z "${gpu_memory_utilization}" ]]; then
     gpu_memory_utilization=0.912
   else
     gpu_memory_utilization=0.91
+  fi
+fi
+
+allow_unqualified_lmcache_memory=$(bool_value \
+  LMCACHE_ALLOW_UNQUALIFIED_MEMORY_PROFILE \
+  "${LMCACHE_ALLOW_UNQUALIFIED_MEMORY_PROFILE:-0}")
+lmcache_memory_profile=standard
+if [[ "${engine_driven_lmcache}" == "1" \
+  && "${mode}" == "dspark" \
+  && "${tp_size}" == "2" \
+  && "${policy_max_model_len}" -ge 1048576 ]]; then
+  if awk -v value="${gpu_memory_utilization}" \
+    'BEGIN { exit !((value + 0) <= 0.970) }'; then
+    lmcache_memory_profile=qualified
+  else
+    lmcache_memory_profile=unqualified
+  fi
+elif [[ "${text_direct_lmcache}" == "1" \
+  && "${mode}" == "dspark" \
+  && "${tp_size}" == "2" \
+  && "${policy_max_model_len}" -ge 1048576 ]]; then
+  lmcache_memory_profile=qualified
+  if awk -v value="${gpu_memory_utilization}" \
+    'BEGIN { exit !((value + 0) > 0.965) }'; then
+    if [[ "${allow_unqualified_lmcache_memory}" == "0" ]]; then
+      echo "Text DS4 TP2 DSpark with direct LMCache and MAX_MODEL_LEN at or above 1048576 requires GPU_MEMORY_UTILIZATION at or below 0.965 on 96 GiB GPUs; set LMCACHE_ALLOW_UNQUALIFIED_MEMORY_PROFILE=1 only after qualifying a different memory profile" >&2
+      exit 2
+    fi
+    lmcache_memory_profile=unqualified
   fi
 fi
 
@@ -498,11 +638,13 @@ if [[ -n "${EXTRA_VLLM_ARGS:-}" ]]; then
 fi
 command+=("$@")
 
-printf 'DS4 launch: mode=%s depth=%s backend=%s allreduce=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s native_l2=%s allocator=%s model=%s\n' \
-  "${mode}" "${dspark_depth_mode}" \
+printf 'DS4 launch: variant=%s mode=%s depth=%s backend=%s allreduce=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s instanttensor_backend=%s lmcache_transfer=%s direct_lmcache=%s lmcache_memory_profile=%s native_l2=%s allocator=%s model=%s\n' \
+  "${model_variant}" "${mode}" "${dspark_depth_mode}" \
   "${backend}" "${allreduce_mode}" \
   "${tp_size}" "${dcp_size}" "${max_num_seqs}" \
-  "${graph_cap}" "${load_format}" \
+  "${graph_cap}" "${load_format}" "${INSTANTTENSOR_BACKEND}" \
+  "${lmcache_transfer_mode}" \
+  "${direct_lmcache}" "${lmcache_memory_profile}" \
   "${native_l2_enabled}" \
   "${PYTORCH_CUDA_ALLOC_CONF:-<unset>}" "${model}" >&2
 printf 'Command:' >&2

@@ -180,11 +180,12 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
                 )
             inputs_embeds = sp_shard(inputs_embeds)
             previous_hidden_states = sp_shard(previous_hidden_states)
+            input_ids = sp_shard(input_ids)
         hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(
             inputs_embeds
         ).unsqueeze(-2)
         hidden_states, residual, post_mix, res_mix = self.mtp_block(
-            positions=positions, x=hidden_states, input_ids=None
+            positions=positions, x=hidden_states, input_ids=input_ids
         )
         hidden_states = self.mtp_block.mhc_post(
             hidden_states, residual, post_mix, res_mix
