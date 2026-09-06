@@ -12,8 +12,8 @@ H, HKV, D, BLOCK, WINDOW = 8, 2, 128, 256, 2048
 SCALE = D**-0.5
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
-    reason="SM120 split-KV draft attention",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12,
+    reason="SM120-family split-KV draft attention",
 )
 
 
