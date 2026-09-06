@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import functools
 import json
+import math
 import os
 import sys
 from collections.abc import Callable
@@ -103,7 +104,14 @@ from vllm.config.parallel import (
     DistributedExecutorBackend,
     ExpertPlacementStrategy,
 )
-from vllm.config.scheduler import FairnessEngine, SchedulerPolicy
+from vllm.config.scheduler import (
+    DecodeRefillTarget,
+    MaxParallelPrefills,
+    PrefillComputeHalfLife,
+    PrefillComputeShare,
+    PrefillPolicy,
+    SchedulerPolicy,
+)
 from vllm.config.utils import get_field
 from vllm.config.vllm import OptimizationLevel, PerformanceMode
 from vllm.logger import init_logger, suppress_logging
@@ -165,6 +173,58 @@ def optional_type(return_type: Callable[[str], T]) -> Callable[[str], T | None]:
         return parse_type(return_type)(val)
 
     return _optional_type
+
+
+def prefill_compute_share_type(value: str) -> PrefillComputeShare:
+    """Parse a fixed prefill share or automatic compute sharing."""
+    if value == "auto":
+        return "auto"
+    try:
+        share = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "prefill compute share must be 'auto' or a number between zero and one"
+        ) from exc
+    if not 0.0 < share < 1.0:
+        raise argparse.ArgumentTypeError(
+            "prefill compute share must be strictly between zero and one"
+        )
+    return share
+
+
+def prefill_compute_half_life_type(value: str) -> PrefillComputeHalfLife:
+    """Parse an automatic compute-share half-life in seconds or a preset."""
+    if value == "smooth":
+        return "smooth"
+    if value == "responsive":
+        return "responsive"
+    try:
+        half_life = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "prefill compute half-life must be 'smooth', 'responsive', or a "
+            "positive number of seconds"
+        ) from exc
+    if half_life <= 0.0 or not math.isfinite(half_life):
+        raise argparse.ArgumentTypeError(
+            "prefill compute half-life must be a finite number greater than zero"
+        )
+    return half_life
+
+
+def positive_int_or_auto_type(value: str) -> int | Literal["auto"]:
+    """Parse ``auto`` or a strictly positive integer."""
+    if value == "auto":
+        return "auto"
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "value must be 'auto' or a positive integer"
+        ) from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be 'auto' or a positive integer")
+    return parsed
 
 
 def union_dict_and_str(val: str) -> str | dict[str, str] | None:
@@ -638,16 +698,15 @@ class EngineArgs:
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
-    fairness_engine: FairnessEngine | None = SchedulerConfig.fairness_engine
-    prefill_compute_share: float | None = SchedulerConfig.prefill_compute_share
-    max_num_prefill_tokens_per_step: int = (
-        SchedulerConfig.max_num_prefill_tokens_per_step
+    prefill_compute_share: PrefillComputeShare | None = (
+        SchedulerConfig.prefill_compute_share
     )
-    max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
-    decode_prefill_min_decode_steps: int = (
-        SchedulerConfig.decode_prefill_min_decode_steps
+    prefill_compute_half_life: PrefillComputeHalfLife | None = (
+        SchedulerConfig.prefill_compute_half_life
     )
-    decode_prefill_max_wait_ms: int = SchedulerConfig.decode_prefill_max_wait_ms
+    max_parallel_prefills: MaxParallelPrefills = SchedulerConfig.max_parallel_prefills
+    prefill_policy: PrefillPolicy = SchedulerConfig.prefill_policy
+    decode_refill_target: DecodeRefillTarget = SchedulerConfig.decode_refill_target
 
     watermark: float = SchedulerConfig.watermark
 
@@ -1604,29 +1663,33 @@ class EngineArgs:
             "--prefill-schedule-interval",
             **scheduler_kwargs["prefill_schedule_interval"],
         )
+        prefill_compute_share_kwargs = scheduler_kwargs["prefill_compute_share"]
+        prefill_compute_share_kwargs.pop("choices", None)
+        prefill_compute_share_kwargs["type"] = prefill_compute_share_type
         scheduler_group.add_argument(
-            "--fairness-engine",
-            **scheduler_kwargs["fairness_engine"],
+            "--prefill-compute-share", **prefill_compute_share_kwargs
+        )
+        prefill_compute_half_life_kwargs = scheduler_kwargs["prefill_compute_half_life"]
+        prefill_compute_half_life_kwargs.pop("choices", None)
+        prefill_compute_half_life_kwargs["type"] = prefill_compute_half_life_type
+        scheduler_group.add_argument(
+            "--prefill-compute-half-life", **prefill_compute_half_life_kwargs
+        )
+        max_parallel_prefills_kwargs = scheduler_kwargs["max_parallel_prefills"]
+        max_parallel_prefills_kwargs.pop("choices", None)
+        max_parallel_prefills_kwargs["type"] = positive_int_or_auto_type
+        scheduler_group.add_argument(
+            "--max-parallel-prefills", **max_parallel_prefills_kwargs
         )
         scheduler_group.add_argument(
-            "--prefill-compute-share",
-            **scheduler_kwargs["prefill_compute_share"],
+            "--prefill-policy",
+            **scheduler_kwargs["prefill_policy"],
         )
+        decode_refill_target_kwargs = scheduler_kwargs["decode_refill_target"]
+        decode_refill_target_kwargs.pop("choices", None)
+        decode_refill_target_kwargs["type"] = positive_int_or_auto_type
         scheduler_group.add_argument(
-            "--max-num-prefill-tokens-per-step",
-            **scheduler_kwargs["max_num_prefill_tokens_per_step"],
-        )
-        scheduler_group.add_argument(
-            "--max-num-partial-prefills",
-            **scheduler_kwargs["max_num_partial_prefills"],
-        )
-        scheduler_group.add_argument(
-            "--decode-prefill-min-decode-steps",
-            **scheduler_kwargs["decode_prefill_min_decode_steps"],
-        )
-        scheduler_group.add_argument(
-            "--decode-prefill-max-wait-ms",
-            **scheduler_kwargs["decode_prefill_max_wait_ms"],
+            "--decode-refill-target", **decode_refill_target_kwargs
         )
         scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
@@ -2410,12 +2473,11 @@ class EngineArgs:
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
-            fairness_engine=self.fairness_engine,
             prefill_compute_share=self.prefill_compute_share,
-            max_num_prefill_tokens_per_step=(self.max_num_prefill_tokens_per_step),
-            max_num_partial_prefills=self.max_num_partial_prefills,
-            decode_prefill_min_decode_steps=(self.decode_prefill_min_decode_steps),
-            decode_prefill_max_wait_ms=self.decode_prefill_max_wait_ms,
+            prefill_compute_half_life=self.prefill_compute_half_life,
+            max_parallel_prefills=self.max_parallel_prefills,
+            prefill_policy=self.prefill_policy,
+            decode_refill_target=self.decode_refill_target,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
