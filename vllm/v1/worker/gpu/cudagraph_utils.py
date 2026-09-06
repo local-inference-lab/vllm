@@ -1094,8 +1094,15 @@ def _extrapolate_full_graph_memory(
     return estimate
 
 
-def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
-    """Allocate the smallest KV cache that still lets every graph be captured."""
+def _init_minimal_kv_cache_for_profiling(
+    runner: "GPUModelRunner", *, num_blocks: int | None = None
+) -> None:
+    """Allocate the smallest KV cache required by a profiling workload.
+
+    Graph capture needs one block per padded sequence. A caller that executes
+    one eager request can request one block explicitly, avoiding temporary KV
+    storage that would otherwise be included in activation headroom.
+    """
     from vllm.v1.core.kv_cache_utils import (
         get_kv_cache_config_from_groups,
         get_kv_cache_groups,
@@ -1104,12 +1111,18 @@ def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
     kv_cache_spec = runner.get_kv_cache_spec()
     kv_cache_groups = get_kv_cache_groups(runner.vllm_config, kv_cache_spec)
     # At least one block per sequence is required to capture the graphs.
-    min_blocks = (
-        min(runner.max_num_reqs, runner.compilation_config.max_cudagraph_capture_size)
-        or 1
-    )
+    if num_blocks is None:
+        num_blocks = (
+            min(
+                runner.max_num_reqs,
+                runner.compilation_config.max_cudagraph_capture_size,
+            )
+            or 1
+        )
+    if num_blocks < 1:
+        raise ValueError("Profiling KV cache requires at least one block")
     saved_override = runner.cache_config.num_gpu_blocks_override
-    runner.cache_config.num_gpu_blocks_override = min_blocks
+    runner.cache_config.num_gpu_blocks_override = num_blocks
     try:
         minimal_config = get_kv_cache_config_from_groups(
             runner.vllm_config, kv_cache_groups, available_memory=0

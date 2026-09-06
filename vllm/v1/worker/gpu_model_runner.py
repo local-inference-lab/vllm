@@ -6640,10 +6640,48 @@ class GPUModelRunner(
                 output = self._dummy_sampler_run(last_hidden_states)
         else:
             output = None
+        # The generic and DeepSeek-specific passes represent separate scheduler
+        # steps. Release the generic outputs so KV admission uses the larger
+        # transient peak instead of an unreachable sum of both passes.
         self._sync_device()
-        del hidden_states, output
+        del hidden_states, last_hidden_states, output
+        self._profile_deepseek_v4_attention()
         self.encoder_cache.clear()
         gc.collect()
+
+    @torch.inference_mode()
+    def _profile_deepseek_v4_attention(self) -> None:
+        """Include the maximum DeepSeek V4 prefill peak in KV admission.
+
+        The generic profile does not create attention metadata and distributes
+        its token budget across requests. DeepSeek V4 can execute the complete
+        scheduler token budget as one prefill, where query projection and
+        auxiliary-stream indexer work overlap. Run that reachable shape while
+        multimodal encoder outputs from ``profile_run`` remain resident. A
+        minimal temporary cache makes attention executable without reserving
+        the production KV pool.
+        """
+        if self.model_config.architecture not in {
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+        }:
+            return
+
+        model_output: tuple[torch.Tensor, torch.Tensor] | None = None
+        try:
+            with set_current_vllm_config(self.vllm_config):
+                self._init_minimal_kv_cache_for_profiling(num_blocks=1)
+            model_output = self._dummy_run(
+                self.max_num_tokens,
+                force_attention=True,
+                skip_eplb=True,
+                is_profile=True,
+                single_request_prefill=True,
+            )
+            self._sync_device()
+        finally:
+            del model_output
+            self._cleanup_profiling_kv_cache()
 
     @torch.inference_mode()
     def profile_glm_dcp_attention(self) -> None:
@@ -6678,7 +6716,9 @@ class GPUModelRunner(
             del model_output
             self._cleanup_profiling_kv_cache()
 
-    def _init_minimal_kv_cache_for_profiling(self) -> None:
+    def _init_minimal_kv_cache_for_profiling(
+        self, *, num_blocks: int | None = None
+    ) -> None:
         from vllm.v1.core.kv_cache_utils import (
             get_kv_cache_config_from_groups,
             get_kv_cache_groups,
@@ -6688,14 +6728,20 @@ class GPUModelRunner(
         KVCacheSpecRegistry.check_kv_cache_spec_registry(kv_cache_spec)
         kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
         # the minimum number of blocks required is 1 block *per sequence*
-        min_blocks = (
-            min(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
-            or 1
-        )
+        if num_blocks is None:
+            num_blocks = (
+                min(
+                    self.max_num_reqs,
+                    self.compilation_config.max_cudagraph_capture_size,
+                )
+                or 1
+            )
+        if num_blocks < 1:
+            raise ValueError("Profiling KV cache requires at least one block")
 
         # Temporarily change num_gpu_blocks_override to allocate a minimal KV cache
         saved_override = self.cache_config.num_gpu_blocks_override
-        self.cache_config.num_gpu_blocks_override = min_blocks
+        self.cache_config.num_gpu_blocks_override = num_blocks
         try:
             minimal_config = get_kv_cache_config_from_groups(
                 self.vllm_config, kv_cache_groups, available_memory=0
