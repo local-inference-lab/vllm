@@ -168,11 +168,45 @@ def _ubatch_no_yield() -> bool:
     return os.getenv("VLLM_K3_UBATCH_NO_YIELD", "0") == "1"
 
 
+_PIECEWISE_MODULE: Any = None
+_PIECEWISE_ON: bool | None = None
+
+
+def _piecewise():
+    """The Kimi-K3 piecewise prefill graph driver, or None when it is off.
+
+    A collective is a boundary between two captured pieces (a graph cannot
+    launch the ring's replay graph, and a captured collective would hold the
+    compute stream for the whole transfer), so every collective the model
+    reaches passes through the driver while a half is being recorded.
+
+    Every forward reaches this five times per layer, decode included, so the
+    disabled path is one global read: the driver's flag is set at boot and is
+    read once.
+    """
+    global _PIECEWISE_MODULE, _PIECEWISE_ON
+    if _PIECEWISE_ON is None:
+        from vllm.v1.worker.gpu import k3_piecewise_graph
+
+        _PIECEWISE_MODULE = k3_piecewise_graph
+        _PIECEWISE_ON = k3_piecewise_graph.enabled()
+    if not _PIECEWISE_ON:
+        return None
+    return _PIECEWISE_MODULE if _PIECEWISE_MODULE.active_session() else None
+
+
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
-    if _ubatch_active() and not _ubatch_no_yield():
-        return _ubatch_all_reduce(input_)
-    return get_tp_group().all_reduce(input_)
+
+    def _run() -> torch.Tensor:
+        if _ubatch_active() and not _ubatch_no_yield():
+            return _ubatch_all_reduce(input_)
+        return get_tp_group().all_reduce(input_)
+
+    driver = _piecewise()
+    if driver is None:
+        return _run()
+    return driver.run_collective("ar", input_, _run)
 
 
 def tensor_model_parallel_all_reduce_in_place(
@@ -184,16 +218,26 @@ def tensor_model_parallel_all_reduce_in_place(
     the next same-shape reduction overwrites (see
     ``GroupCoordinator.all_reduce_in_place``). Inside a split-prefill
     communication region the reduction runs on the comm stream and the result
-    is delivered into the caller's buffer, so borrowing does not apply.
+    is delivered into the caller's buffer, so borrowing does not apply. While
+    a piecewise prefill graph is being recorded the driver copies the result
+    into the half's static storage right away, so a borrowed result is
+    consumed before any later reduction can overwrite it.
     """
-    if _ubatch_active() and not _ubatch_no_yield():
-        # The caller's buffer is its own projection output; deliver the
-        # result there on the compute stream once the collective is done.
-        input_.copy_(_ubatch_all_reduce(input_))
-        return input_
-    if borrow_output:
-        return get_tp_group().all_reduce_in_place(input_, borrow_output=True)
-    return get_tp_group().all_reduce_in_place(input_)
+
+    def _run() -> torch.Tensor:
+        if _ubatch_active() and not _ubatch_no_yield():
+            # The caller's buffer is its own projection output; deliver the
+            # result there on the compute stream once the collective is done.
+            input_.copy_(_ubatch_all_reduce(input_))
+            return input_
+        if borrow_output:
+            return get_tp_group().all_reduce_in_place(input_, borrow_output=True)
+        return get_tp_group().all_reduce_in_place(input_)
+
+    driver = _piecewise()
+    if driver is None:
+        return _run()
+    return driver.run_collective("ar_in_place", input_, _run)
 
 
 def tensor_model_parallel_is_borrowed_storage(tensor: torch.Tensor) -> bool:
@@ -228,7 +272,14 @@ def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:
     """All-gather the input tensor across model parallel group."""
-    return get_tp_group().all_gather(input_, dim)
+
+    def _run() -> torch.Tensor:
+        return get_tp_group().all_gather(input_, dim)
+
+    driver = _piecewise()
+    if driver is None:
+        return _run()
+    return driver.run_collective("ag", input_, _run)
 
 
 def tensor_model_parallel_all_gatherv(

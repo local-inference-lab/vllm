@@ -42,6 +42,7 @@ from vllm.forward_context import (
     override_forward_context,
     set_forward_context,
 )
+from vllm.v1.worker.gpu import k3_piecewise_graph
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -402,7 +403,8 @@ def run_split_prefill(
         prepared.append((hb, attn_metadata, slot_mappings_by_layer, half_inputs))
 
     if not ubatch_prefill_overlap():
-        for hb, attn_metadata, slot_mappings_by_layer, half_inputs in prepared:
+        for half_index, item in enumerate(prepared):
+            hb, attn_metadata, slot_mappings_by_layer, half_inputs = item
             with set_forward_context(
                 attn_metadata,
                 runner.vllm_config,
@@ -416,7 +418,9 @@ def run_split_prefill(
                 skip_compiled=skip_compiled,
                 is_padding=hb.is_padding,
             ):
-                outputs.append(runner.model(**half_inputs))
+                outputs.append(
+                    _run_half(runner, half_index, hb, half_inputs, slot_mappings_by_layer)
+                )
     else:
         outputs = _run_overlapped(runner, prepared, cudagraph_runtime_mode,
                                   batch_descriptor, skip_compiled)
@@ -427,6 +431,42 @@ def run_split_prefill(
         aux = [torch.cat(parts, dim=0) for parts in zip(*aux_lists)]
         return hidden, aux
     return torch.cat(outputs, dim=0)
+
+
+def _run_half(runner, half_index, hb, half_inputs, slot_mappings_by_layer):
+    """Run one half, through its recorded piece graphs when they exist.
+
+    Without ``VLLM_K3_PREFILL_PIECEWISE_GRAPH`` this is the plain forward.
+    With it, the first eligible chunk captures the half's device work between
+    its collectives and every later chunk of the same row count replays the
+    capture; the per-chunk tensors the capture baked in are watched, so a
+    chunk whose metadata moved falls back to the eager forward instead of
+    reading the previous chunk's addresses.
+    """
+    session = k3_piecewise_graph.session_for(
+        half_index, hb.num_tokens, hb.query_start_loc.device
+    )
+    if session is None:
+        return runner.model(**half_inputs)
+    inputs = {
+        name: half_inputs[name]
+        for name in ("input_ids", "positions", "inputs_embeds")
+        if half_inputs.get(name) is not None
+    }
+    watch = {"query_start_loc": hb.query_start_loc, "seq_lens": hb.seq_lens}
+    for layer_name, mapping in (slot_mappings_by_layer or {}).items():
+        watch[f"slot_mapping:{layer_name}"] = mapping
+    try:
+        with k3_piecewise_graph.half_region(session, inputs, watch) as bound:
+            if bound is None:
+                return session.output
+            session.output = runner.model(**{**half_inputs, **bound})
+            return session.output
+    except k3_piecewise_graph.PlanMismatch:
+        # The driver has disabled itself and said why; this chunk still owes
+        # an answer, and the eager path is unaffected by the abandoned
+        # capture (it executed nothing).
+        return runner.model(**half_inputs)
 
 
 def _run_overlapped(runner, prepared, cudagraph_runtime_mode, batch_descriptor,
