@@ -6640,9 +6640,12 @@ class GPUModelRunner(
                 output = self._dummy_sampler_run(last_hidden_states)
         else:
             output = None
-        self._profile_deepseek_v4_attention()
+        # The generic and DeepSeek-specific passes represent separate scheduler
+        # steps. Release the generic outputs so KV admission uses the larger
+        # transient peak instead of an unreachable sum of both passes.
         self._sync_device()
         del hidden_states, output
+        self._profile_deepseek_v4_attention()
         self.encoder_cache.clear()
         gc.collect()
 

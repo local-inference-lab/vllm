@@ -889,9 +889,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 self._dummy_pooler_run(hidden_states)
 
-        self._profile_deepseek_v4_attention()
+        # The generic and DeepSeek-specific passes represent separate scheduler
+        # steps. Release the generic outputs so KV admission uses the larger
+        # transient peak instead of an unreachable sum of both passes.
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
+        self._profile_deepseek_v4_attention()
         self.reset_encoder_cache()
         gc.collect()
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from weakref import ref
 
 import pytest
 import torch
@@ -297,17 +298,29 @@ def test_deepseek_v4_attention_profile_skips_other_architectures(monkeypatch):
     assert not initialized
 
 
-def test_profile_run_profiles_attention_before_releasing_encoder_cache(monkeypatch):
+def test_profile_run_releases_generic_outputs_before_deepseek_profile(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.supports_mm_inputs = False
     runner.max_num_tokens = 4096
     runner.is_last_pp_rank = False
     events: list[object] = []
+    output_refs: list[ref] = []
 
-    runner._dummy_run = lambda *args, **kwargs: (
-        events.append(("dummy-run", args, kwargs)) or (None, None)
-    )
-    runner._profile_deepseek_v4_attention = lambda: events.append("profile-attention")
+    class ProfileOutput:
+        pass
+
+    def dummy_run(*args, **kwargs):
+        events.append(("dummy-run", args, kwargs))
+        outputs = (ProfileOutput(), ProfileOutput())
+        output_refs.extend(ref(output) for output in outputs)
+        return outputs
+
+    def profile_attention():
+        assert all(output_ref() is None for output_ref in output_refs)
+        events.append("profile-attention")
+
+    runner._dummy_run = dummy_run
+    runner._profile_deepseek_v4_attention = profile_attention
     runner.reset_encoder_cache = lambda: events.append("reset-encoder-cache")
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
 
@@ -319,7 +332,7 @@ def test_profile_run_profiles_attention_before_releasing_encoder_cache(monkeypat
             (4096,),
             {"skip_attn": True, "is_profile": True},
         ),
-        "profile-attention",
         "sync",
+        "profile-attention",
         "reset-encoder-cache",
     ]

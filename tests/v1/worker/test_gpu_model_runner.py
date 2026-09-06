@@ -5,6 +5,7 @@ import gc
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
+from weakref import ref
 
 import numpy as np
 import pytest
@@ -1906,17 +1907,29 @@ def test_deepseek_v4_attention_profile_skips_other_architectures():
     runner._init_minimal_kv_cache_for_profiling.assert_not_called()
 
 
-def test_profile_run_profiles_attention_before_releasing_encoder_cache(monkeypatch):
+def test_profile_run_releases_generic_outputs_before_deepseek_profile(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.supports_mm_inputs = False
     runner.max_num_tokens = 4096
     runner.is_pooling_model = False
     events: list[object] = []
+    output_refs: list[ref] = []
 
-    runner._dummy_run = lambda *args, **kwargs: (
-        events.append(("dummy-run", args, kwargs)) or (torch.empty(1), torch.empty(1))
-    )
-    runner._profile_deepseek_v4_attention = lambda: events.append("profile-attention")
+    class ProfileOutput:
+        pass
+
+    def dummy_run(*args, **kwargs):
+        events.append(("dummy-run", args, kwargs))
+        outputs = (ProfileOutput(), ProfileOutput())
+        output_refs.extend(ref(output) for output in outputs)
+        return outputs
+
+    def profile_attention():
+        assert all(output_ref() is None for output_ref in output_refs)
+        events.append("profile-attention")
+
+    runner._dummy_run = dummy_run
+    runner._profile_deepseek_v4_attention = profile_attention
     runner._sync_device = lambda: events.append("sync")
     runner.encoder_cache = SimpleNamespace(
         clear=lambda: events.append("clear-encoder-cache")
@@ -1931,8 +1944,8 @@ def test_profile_run_profiles_attention_before_releasing_encoder_cache(monkeypat
 
     assert events == [
         ("dummy-run", (4096,), {"is_profile": True}),
-        "profile-attention",
         "sync",
+        "profile-attention",
         "clear-encoder-cache",
     ]
 
