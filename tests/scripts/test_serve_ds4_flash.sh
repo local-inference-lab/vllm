@@ -33,6 +33,13 @@ assert_contains "${default_output}" '--revision 6821d6ad3681a4b137b066b76094fa82
 assert_contains "${default_output}" 'num_speculative_tokens\":3'
 assert_contains "${default_output}" '--gpu-memory-utilization 0.975'
 assert_contains "${default_output}" '--max-model-len 1048576'
+assert_contains "${default_output}" '--load-format instanttensor'
+assert_contains "${default_output}" 'load_format=instanttensor'
+assert_contains "${default_output}" 'instanttensor_backend=BUFFERED'
+
+fastsafetensors_output="$(capture LOAD_FORMAT=fastsafetensors)"
+assert_contains "${fastsafetensors_output}" '--load-format fastsafetensors'
+assert_contains "${fastsafetensors_output}" 'load_format=fastsafetensors'
 
 text_output="$(capture \
   MODEL=deepseek-ai/DeepSeek-V4-Flash-0731 DS4_MODEL_VARIANT=text)"
