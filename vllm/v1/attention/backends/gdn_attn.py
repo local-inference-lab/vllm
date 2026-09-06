@@ -10,6 +10,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -24,6 +25,39 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+
+
+@triton.jit(do_not_specialize=["num_reqs", "source_stride", "accepted_stride"])
+def _fill_uniform_spec_metadata(
+    source,
+    accepted_source,
+    state_indices,
+    accepted,
+    sequence_masks,
+    token_indices,
+    query_start_loc,
+    num_reqs,
+    source_stride,
+    accepted_stride,
+    WINDOW: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = token // WINDOW
+    column = token % WINDOW
+    live = row < num_reqs
+    state = tl.load(source + row.to(tl.int64) * source_stride + column, live, other=0)
+    tl.store(state_indices + token, state, live)
+    tl.store(token_indices + token, token, live)
+    first = live & (column == 0)
+    count = tl.load(
+        accepted_source + row.to(tl.int64) * accepted_stride, first, other=0
+    )
+    tl.store(accepted + row, count, first)
+    tl.store(sequence_masks + row, True, first)
+    tl.store(query_start_loc + row, token, first)
+    if tl.program_id(0) == 0:
+        tl.store(query_start_loc + num_reqs, num_reqs * WINDOW)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -236,7 +270,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     def _build_uniform_spec_decode(
         self, m: CommonAttentionMetadata, num_accepted_tokens: torch.Tensor
     ) -> GDNAttentionMetadata:
-        """Build an all-spec, uniform-window batch without any host-side work.
+        """Populate uniform speculative metadata in builder-owned graph storage.
 
         Everything the layers read is written into the builder-owned graph
         buffers, exactly where the generic path writes it, so a full cudagraph
@@ -247,19 +281,31 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         source = self.mamba_aligned_state_indices
         assert source is not None
         spec_state_indices = self.spec_state_indices_tensor[:num_reqs]
-        spec_state_indices.copy_(
-            source[:num_reqs, : self.num_spec + 1], non_blocking=True
-        )
         spec_sequence_masks = self.spec_sequence_masks[:num_reqs]
-        spec_sequence_masks.fill_(True)
         spec_token_indx = self.spec_token_indx[:num_tokens]
-        spec_token_indx.copy_(self._uniform_spec_tokens[:num_tokens], non_blocking=True)
         spec_query_start_loc = self.spec_query_start_loc[: num_reqs + 1]
-        spec_query_start_loc.copy_(
-            self._uniform_spec_query_start[: num_reqs + 1], non_blocking=True
-        )
         accepted = self.num_accepted_tokens[:num_reqs]
-        accepted.copy_(num_accepted_tokens[:num_reqs], non_blocking=True)
+        if source.is_cuda:
+            _fill_uniform_spec_metadata[(triton.cdiv(num_tokens, 128),)](
+                source,
+                num_accepted_tokens,
+                spec_state_indices,
+                accepted,
+                spec_sequence_masks,
+                spec_token_indx,
+                spec_query_start_loc,
+                num_reqs,
+                source.stride(0),
+                num_accepted_tokens.stride(0),
+                WINDOW=self.num_spec + 1,
+                BLOCK=128,
+            )
+        else:
+            spec_state_indices.copy_(source[:num_reqs, : self.num_spec + 1])
+            spec_sequence_masks.fill_(True)
+            spec_token_indx.copy_(self._uniform_spec_tokens[:num_tokens])
+            spec_query_start_loc.copy_(self._uniform_spec_query_start[: num_reqs + 1])
+            accepted.copy_(num_accepted_tokens[:num_reqs])
         return GDNAttentionMetadata(
             num_prefills=0,
             num_prefill_tokens=0,

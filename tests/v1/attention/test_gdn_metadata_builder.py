@@ -3,6 +3,7 @@
 """Tests for mixed speculative and non-speculative GDN metadata."""
 
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -23,6 +24,86 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("window", [2, 4, 8])
+@pytest.mark.parametrize("num_reqs", [1, 3, 16])
+def test_uniform_spec_metadata_gpu_preserves_live_values_and_graph_storage(
+    window: int,
+    num_reqs: int,
+) -> None:
+    """Metadata fusion must retain the buffers shared with padded-batch replay."""
+    device = torch.device("cuda")
+    capacity = 32
+    builder = GDNAttentionMetadataBuilder.__new__(GDNAttentionMetadataBuilder)
+    builder.num_spec = window - 1
+    source = torch.arange(
+        capacity * (window + 3), dtype=torch.int32, device=device
+    ).reshape(capacity, window + 3)
+    source[0, 0] = -1
+    counts = torch.ones(capacity * 2, dtype=torch.int32, device=device)[::2]
+    builder.mamba_aligned_state_indices = source
+    builder.spec_state_indices_tensor = torch.full(
+        (capacity, window), -71, dtype=torch.int32, device=device
+    )
+    builder.num_accepted_tokens = torch.full_like(counts, -71)
+    builder.spec_sequence_masks = torch.zeros(capacity, dtype=torch.bool, device=device)
+    builder.spec_token_indx = torch.full(
+        (capacity * window,), -71, dtype=torch.int32, device=device
+    )
+    builder.non_spec_token_indx = torch.empty_like(builder.spec_token_indx)
+    builder.spec_query_start_loc = torch.full(
+        (capacity + 1,), -71, dtype=torch.int32, device=device
+    )
+    builder._uniform_spec_masks_cpu = torch.ones(capacity, dtype=torch.bool)
+    common = SimpleNamespace(
+        num_reqs=num_reqs,
+        num_actual_tokens=num_reqs * window,
+        seq_lens=None,
+    )
+    fields = (
+        "spec_state_indices_tensor",
+        "num_accepted_tokens",
+        "spec_sequence_masks",
+        "spec_token_indx",
+        "spec_query_start_loc",
+    )
+    addresses = tuple(getattr(builder, field).data_ptr() for field in fields)
+    builder._build_uniform_spec_decode(common, counts)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        metadata = builder._build_uniform_spec_decode(common, counts)
+    for accepted in (window, 2, 1):
+        source.add_(13)
+        counts.fill_(accepted)
+        allocations = torch.accelerator.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert (
+            torch.accelerator.memory_stats()["allocation.all.allocated"] == allocations
+        )
+        assert (
+            tuple(getattr(metadata, field).data_ptr() for field in fields) == addresses
+        )
+        torch.testing.assert_close(
+            metadata.spec_state_indices_tensor, source[:num_reqs, :window]
+        )
+        torch.testing.assert_close(metadata.num_accepted_tokens, counts[:num_reqs])
+        torch.testing.assert_close(
+            metadata.spec_token_indx,
+            torch.arange(num_reqs * window, dtype=torch.int32, device=device),
+        )
+        torch.testing.assert_close(
+            metadata.spec_query_start_loc,
+            torch.arange(num_reqs + 1, dtype=torch.int32, device=device) * window,
+        )
+        assert metadata.spec_sequence_masks.all()
+        assert (builder.spec_state_indices_tensor[num_reqs:] == -71).all()
+        assert (builder.num_accepted_tokens[num_reqs:] == -71).all()
+        assert (builder.spec_token_indx[num_reqs * window :] == -71).all()
+        assert (builder.spec_query_start_loc[num_reqs + 1 :] == -71).all()
+        assert not builder.spec_sequence_masks[num_reqs:].any()
 
 
 @dataclass
