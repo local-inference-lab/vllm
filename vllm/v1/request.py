@@ -79,6 +79,7 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        recurrent_instruction_boundary: int | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -142,6 +143,13 @@ class Request:
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
         )
+        if recurrent_instruction_boundary is not None and not (
+            0 < recurrent_instruction_boundary < self.num_prompt_tokens
+        ):
+            raise ValueError(
+                "The recurrent instruction boundary must be inside the prompt"
+            )
+        self.recurrent_instruction_boundary = recurrent_instruction_boundary
         self._output_token_ids: list[int] = []
         if self.prompt_token_ids is None:
             self._all_token_ids: list[int] = [0] * self.num_prompt_tokens
@@ -264,6 +272,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            recurrent_instruction_boundary=request.recurrent_instruction_boundary,
         )
 
     def append_output_token_ids(

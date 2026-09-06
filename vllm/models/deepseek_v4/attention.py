@@ -45,6 +45,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.triton_utils import tl, triton
@@ -224,7 +225,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Sink padded to the same head count, initialized to -inf (no sink
         # effect). Weight loading fills the first n_local_heads slots.
         self.attn_sink = nn.Parameter(
-            torch.full((self.padded_heads,), -float("inf"), dtype=torch.float32),
+            allocate_weights(
+                torch.full, (self.padded_heads,), -float("inf"), dtype=torch.float32
+            ),
             requires_grad=False,
         )
 

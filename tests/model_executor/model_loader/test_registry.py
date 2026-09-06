@@ -61,54 +61,14 @@ def test_default_loader_rejects_multithread_with_non_lazy_strategy():
         )
 
 
-def test_default_loader_accepts_instanttensor_zero_copy():
-    loader = DefaultModelLoader(
-        LoadConfig(
-            load_format="instanttensor",
-            model_loader_extra_config={"instanttensor_copy": False},
-        )
-    )
-    assert loader.instanttensor_copy is False
-
-
-def test_default_loader_accepts_local_instanttensor_loading():
-    loader = DefaultModelLoader(
-        LoadConfig(
-            load_format="instanttensor",
-            model_loader_extra_config={"instanttensor_distributed": False},
-        )
-    )
-    assert loader.instanttensor_distributed is False
-
-
-@pytest.mark.parametrize("value", [0, "false", None])
-def test_default_loader_rejects_non_bool_instanttensor_copy(value):
-    with pytest.raises(ValueError, match="instanttensor_copy must be a bool"):
+@pytest.mark.parametrize("option", ["instanttensor_copy", "instanttensor_distributed"])
+@pytest.mark.parametrize("load_format", ["instanttensor", "fastsafetensors"])
+def test_default_loader_rejects_removed_instanttensor_options(option, load_format):
+    with pytest.raises(ValueError, match="Unexpected extra config keys"):
         DefaultModelLoader(
             LoadConfig(
-                load_format="instanttensor",
-                model_loader_extra_config={"instanttensor_copy": value},
-            )
-        )
-
-
-@pytest.mark.parametrize("value", [0, "false", None])
-def test_default_loader_rejects_non_bool_instanttensor_distributed(value):
-    with pytest.raises(ValueError, match="instanttensor_distributed must be a bool"):
-        DefaultModelLoader(
-            LoadConfig(
-                load_format="instanttensor",
-                model_loader_extra_config={"instanttensor_distributed": value},
-            )
-        )
-
-
-def test_default_loader_rejects_instanttensor_copy_for_other_formats():
-    with pytest.raises(ValueError, match="only supported"):
-        DefaultModelLoader(
-            LoadConfig(
-                load_format="safetensors",
-                model_loader_extra_config={"instanttensor_copy": False},
+                load_format=load_format,
+                model_loader_extra_config={option: False},
             )
         )
 
@@ -142,7 +102,12 @@ def test_default_loader_hf_still_falls_back_to_pt(tmp_path):
     assert any(f.endswith("model.pt") for f in files)
 
 
-def test_default_loader_restricts_safetensors_shards_by_weight_prefix(tmp_path):
+@pytest.mark.parametrize(
+    "load_format", ["safetensors", "fastsafetensors", "instanttensor"]
+)
+def test_default_loader_restricts_safetensors_shards_by_weight_prefix(
+    tmp_path, load_format
+):
     base_shard = tmp_path / "model-00001-of-00002.safetensors"
     mtp_shard = tmp_path / "model-00002-of-00002.safetensors"
     base_shard.write_bytes(b"")
@@ -153,7 +118,7 @@ def test_default_loader_restricts_safetensors_shards_by_weight_prefix(tmp_path):
         f'"model.layers.45.weight": "{mtp_shard.name}"'
         "}}"
     )
-    loader = DefaultModelLoader(LoadConfig(load_format="instanttensor"))
+    loader = DefaultModelLoader(LoadConfig(load_format=load_format))
 
     _, files, use_safetensors = loader._prepare_weights(
         str(tmp_path),

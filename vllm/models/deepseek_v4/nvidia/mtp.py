@@ -45,6 +45,11 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.weight_transfer import (
+    allocate_weights,
+    copy_weight,
+    flush_weight_transfers,
+)
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -118,15 +123,17 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * config.hidden_size
         self.hc_head_fn = nn.Parameter(
-            torch.empty(self.hc_mult, self.hc_dim, dtype=torch.float32),
+            allocate_weights(
+                torch.empty, self.hc_mult, self.hc_dim, dtype=torch.float32
+            ),
             requires_grad=False,
         )
         self.hc_head_base = nn.Parameter(
-            torch.empty(self.hc_mult, dtype=torch.float32),
+            allocate_weights(torch.empty, self.hc_mult, dtype=torch.float32),
             requires_grad=False,
         )
         self.hc_head_scale = nn.Parameter(
-            torch.empty(1, dtype=torch.float32),
+            allocate_weights(torch.empty, 1, dtype=torch.float32),
             requires_grad=False,
         )
 
@@ -467,7 +474,7 @@ class DeepSeekV4MTP(nn.Module):
                 elif "attn_sink" in name:
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
                     n = narrow_weight.shape[0]
-                    params_dict[name][:n].copy_(narrow_weight)
+                    copy_weight(params_dict[name][:n], narrow_weight)
                     loaded_params.add(name)
                     continue
                 else:
@@ -512,6 +519,7 @@ class DeepSeekV4MTP(nn.Module):
             layer.mtp_block.ffn.finalize_mega_moe_weights()
 
     def process_weights_after_loading(self) -> None:
+        flush_weight_transfers()
         self.finalize_mega_moe_weights()
         for layer in self.model.layers.values():
             layer.mtp_block.process_b12x_weights_after_loading()

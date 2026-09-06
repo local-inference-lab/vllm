@@ -2,12 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU-only package and weight-routing tests for Qwen3.8-Flash-Next."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 from torch import nn
 
+from vllm.config.load import LoadConfig
+from vllm.model_executor.model_loader import weight_utils
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.models.qwen3_8_flash_next.model import (
     _remap_qsa_cache_scale_name,
@@ -49,6 +54,70 @@ def test_mtp_checkpoint_prefix_mapping(
     model_name: str | None,
 ) -> None:
     assert _remap_mtp_weight_name(checkpoint_name) == model_name
+    assert checkpoint_name.startswith(
+        Qwen3_8FlashNextMTP.checkpoint_weight_name_prefixes
+    ) == (model_name is not None)
+
+
+@pytest.mark.parametrize(
+    "checkpoint_prefix", ["", "model.language_model.", "language_model."]
+)
+def test_mtp_loading_skips_target_shards_and_weights(
+    tmp_path, monkeypatch, checkpoint_prefix
+):
+    """MTP opens only draft/shared shards, retaining every supported weight alias."""
+    target_path = tmp_path / "target.safetensors"
+    draft_path = tmp_path / "draft.safetensors"
+    target_name = checkpoint_prefix + "layers.0.mlp.down_proj.weight"
+    weights = {
+        checkpoint_prefix + name: torch.tensor([float(index)])
+        for index, name in enumerate(
+            (
+                "mtp.fc_embedding.weight",
+                "model.mtp.fc_hidden.weight",
+                "embed_tokens.weight",
+                "model.embed_tokens.weight",
+                "lm_head.weight",
+                "model.lm_head.weight",
+                "shared_head.head.weight",
+                "model.shared_head.head.weight",
+                "mtp.shared_head.head.weight",
+            )
+        )
+    }
+    save_file({target_name: torch.zeros(1)}, target_path)
+    save_file(
+        {**weights, checkpoint_prefix + "layers.1.weight": torch.zeros(1)}, draft_path
+    )
+    weight_map = {name: draft_path.name for name in weights}
+    weight_map[target_name] = target_path.name
+    weight_map[checkpoint_prefix + "layers.1.weight"] = draft_path.name
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+
+    opened = []
+    safe_open = weight_utils.safe_open
+
+    def record_open(filename, **kwargs):
+        opened.append(filename)
+        return safe_open(filename, **kwargs)
+
+    monkeypatch.setattr(weight_utils, "safe_open", record_open)
+    loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
+    prefixes = Qwen3_8FlashNextMTP.checkpoint_weight_name_prefixes
+    loaded = dict(
+        loader.get_all_weights(
+            SimpleNamespace(model=str(tmp_path), revision=None),
+            SimpleNamespace(checkpoint_weight_name_prefixes=prefixes),
+        )
+    )
+
+    assert opened == [str(draft_path)]
+    assert loaded.keys() == weights.keys()
+    for name, weight in loaded.items():
+        assert _remap_mtp_weight_name(name) is not None
+        torch.testing.assert_close(weight, weights[name])
 
 
 def test_mtp_qsa_scale_uses_runtime_module_index() -> None:

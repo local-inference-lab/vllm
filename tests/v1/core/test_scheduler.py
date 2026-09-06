@@ -73,7 +73,7 @@ def test_full_boundary_hit_preserves_async_speculative_decode_token_count():
     )
     manager.get_computed_blocks(producer)
     assert manager.allocate_slots(producer, 32) is not None
-    manager.publish_boundary_checkpoint(producer, 32, is_response=False)
+    manager.publish_boundary_checkpoint(producer, 32, kind="prompt")
     manager.free(producer)
     scheduler.add_request(repeat)
 

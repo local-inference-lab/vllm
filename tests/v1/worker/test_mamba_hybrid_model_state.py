@@ -91,14 +91,8 @@ def test_aligned_metadata_reuses_views_and_rebinds_with_the_cache() -> None:
     state._aligned_metadata_groups = None
     state._aligned_metadata_ctx = None
     state._aligned_metadata_builders = []
-    state._gdn_spec_accepted_tokens = torch.ones(3, dtype=torch.int32)
     state._get_mamba_group_info = lambda _: ([1, 2], None)
-    builders = [
-        SimpleNamespace(
-            mamba_aligned_state_indices=None, mamba_spec_accepted_tokens=None
-        )
-        for _ in range(2)
-    ]
+    builders = [SimpleNamespace(mamba_aligned_state_indices=None) for _ in range(2)]
     groups = [
         [SimpleNamespace(get_metadata_builder=Mock(return_value=builder))]
         for builder in builders
@@ -117,7 +111,6 @@ def test_aligned_metadata_reuses_views_and_rebinds_with_the_cache() -> None:
             views = [builder.mamba_aligned_state_indices for builder in builders]
         indices.add_(10)
         for index, builder in enumerate(builders):
-            assert builder.mamba_spec_accepted_tokens is state._gdn_spec_accepted_tokens
             assert builder.mamba_aligned_state_indices is views[index]
             torch.testing.assert_close(
                 builder.mamba_aligned_state_indices, indices[index]

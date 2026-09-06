@@ -7,7 +7,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
@@ -85,11 +84,6 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
-        self._gdn_spec_accepted_tokens = (
-            torch.ones_like(self.num_accepted_tokens_gpu)
-            if envs.VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH
-            else None
-        )
         # Pre-copy "align" prefix-cache state (V2). The migration of each
         # request's mamba state across block boundaries runs as a fused GPU
         # kernel reusing the postprocess copy machinery, so the per-step src
@@ -121,9 +115,11 @@ class MambaHybridModelState(DefaultModelState):
         # Must reset the speculative acceptance count in this idx which could be stale.
         self.num_accepted_tokens_gpu[req_index].fill_(1)
         if self._align_mode:
-            # Seed the running state block from the resumed/prefilled position.
+            # The saved column indexes recurrent blocks, not target attention pages.
+            block_size = self.cache_config.mamba_block_size
+            assert block_size is not None
             self._mamba_state_idx_gpu[req_index].fill_(
-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
+                (new_req_data.num_computed_tokens - 1) // block_size
             )
 
     def reset_kv_cache_state(self) -> None:
@@ -199,10 +195,6 @@ class MambaHybridModelState(DefaultModelState):
                     builder = group.get_metadata_builder(0)
                     if hasattr(builder, "mamba_aligned_state_indices"):
                         self._aligned_metadata_builders.append((group_idx, builder))
-                    if hasattr(builder, "mamba_spec_accepted_tokens"):
-                        builder.mamba_spec_accepted_tokens = (
-                            self._gdn_spec_accepted_tokens
-                        )
             self._aligned_metadata_groups = attn_groups
             self._aligned_metadata_ctx = None
         if not self._aligned_metadata_builders:

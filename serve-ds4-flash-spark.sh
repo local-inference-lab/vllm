@@ -160,7 +160,7 @@ elif [[ "${enable_dspark}" == 1 ]]; then
 else
   max_cudagraph_capture_size=256
 fi
-load_format=${LOAD_FORMAT:-instanttensor}
+load_format=${LOAD_FORMAT:-fastsafetensors}
 enable_flashinfer_autotune=${ENABLE_FLASHINFER_AUTOTUNE:-1}
 enable_prefix_caching=${ENABLE_PREFIX_CACHING:-1}
 dspark_draft_attention_backend=${DSPARK_DRAFT_ATTENTION_BACKEND:-B12X_MLA_SPARSE}

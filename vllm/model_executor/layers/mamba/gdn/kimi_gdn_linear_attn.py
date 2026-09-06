@@ -22,6 +22,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.weight_transfer import allocate_weights, copy_weight
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -277,7 +278,7 @@ def _make_fused_conv1d_weight_loader(
         source_start = tp_rank * shard_size
         target_start = sum(sharded_dims[:loaded_shard_id])
         loaded_shard = loaded_weight[source_start : source_start + shard_size]
-        param.data[target_start : target_start + shard_size].copy_(loaded_shard)
+        copy_weight(param.data[target_start : target_start + shard_size], loaded_shard)
 
     return weight_loader
 
@@ -509,7 +510,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.f_b_proj",
         )
         self.dt_bias = nn.Parameter(
-            torch.empty(self.local_projection_size, dtype=torch.float32)
+            allocate_weights(
+                torch.empty, self.local_projection_size, dtype=torch.float32
+            )
         )
 
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
@@ -537,7 +540,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
         self.A_log = nn.Parameter(
-            torch.empty(self.local_num_heads, dtype=torch.float32)
+            allocate_weights(torch.empty, self.local_num_heads, dtype=torch.float32)
         )
         set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader(0)})
 
@@ -603,7 +606,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 quant_config=self.quant_config,
                 prefix=f"{prefix}.g_b_proj",
             )
-        self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
+        self.o_norm = allocate_weights(
+            FusedRMSNormGated, self.head_dim, activation="sigmoid"
+        )
         self._b12x_kda_api: Any | None = None
         self._b12x_kda_plan = None
         self._initialize_b12x_kda_decode(vllm_config)
