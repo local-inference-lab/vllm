@@ -118,6 +118,56 @@ def _w4a16_prefill_route_min_m() -> int:
     return int(os.getenv("VLLM_KQUANT_W4A16_PREFILL_MIN_M", "256"))
 
 
+def _w4a16_preplanned_launch_enabled() -> bool:
+    """Whether W4A16 prefill bindings carry the plan's preplanned launches.
+
+    ``VLLM_KQUANT_W4A16_PREPLANNED_LAUNCH=0`` restores the lazy path in which
+    ``run_w4a16_moe`` re-derives the launch objects on every call. Both paths
+    launch the same compiled kernel with the same arguments.
+    """
+    raw = os.getenv("VLLM_KQUANT_W4A16_PREPLANNED_LAUNCH", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _preplanned_w4a16_launches(
+    plan: Any,
+    *,
+    route_ids_dtype: torch.dtype,
+    mapped: bool,
+) -> tuple[Any, Any] | None:
+    """Return the (fused, top-k sum) launches a W4A16 scratch plan prewarmed.
+
+    ``fused_moe.plan`` compiles one fused launch for the plan's token capacity
+    and one top-k sum launch per (route id dtype, expert map) variant. The
+    fused kernel binary does not depend on the row count (only ``M == 1`` and
+    the small-M split-K band are specialized) and takes the live row count at
+    launch, so the capacity launch serves every ``M`` up to the capacity.
+    ``fused_moe.bind`` leaves the binding's launch slots empty, and
+    ``run_w4a16_moe`` then re-derives the same objects on every call through
+    ``compile_w4a16_fused_moe`` (tile selection, kernel object construction,
+    cache lookup). Handing the prewarmed objects to the binding skips that
+    per-call host work; the kernel launch is unchanged.
+
+    Returns ``None`` when the plan carries no prewarmed launches or no top-k
+    sum variant matches, in which case the lazy path stays in effect.
+    """
+    fused_launches = tuple(getattr(plan, "_prewarmed_fused_launches", ()) or ())
+    sum_launches = tuple(getattr(plan, "_prewarmed_topk_sum_launches", ()) or ())
+    fused = None
+    fused_tokens = -1
+    for token_count, launch in fused_launches:
+        if int(token_count) > fused_tokens:
+            fused_tokens, fused = int(token_count), launch
+    topk_sum = None
+    for ids_dtype, use_map, launch in sum_launches:
+        if ids_dtype == route_ids_dtype and bool(use_map) == bool(mapped):
+            topk_sum = launch
+            break
+    if fused is None or topk_sum is None:
+        return None
+    return fused, topk_sum
+
+
 def _stack_exl3_intermediate_rotations(
     w13_svh: torch.Tensor,
     w2_suh: torch.Tensor,
@@ -311,6 +361,10 @@ class _HybridLayerState:
         # _w4a16_prefill_route_min_m(); None when disabled or when the
         # W4A8-MX prefill tier owns prefill.
         self.trellis_w4a16_prefill_plan: Any = None
+        # (fused, top-k sum) launches the prefill plan compiled for its
+        # capacity; bound into every prefill binding. None keeps the lazy
+        # per-call launch resolution.
+        self.trellis_w4a16_prefill_launches: tuple[Any, Any] | None = None
         self.trellis_prefill_weights: Any = None
         self.trellis_prefill_plan: Any = None
         self.trellis_use_w4a8_prefill = False
@@ -1719,6 +1773,32 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                             "than 8 rows compiled; prefill keeps the decode plan"
                         )
                 state.trellis_w4a16_prefill_plan = prefill16_plan
+            state.trellis_w4a16_prefill_launches = None
+            if (
+                state.trellis_w4a16_prefill_plan is not None
+                and _w4a16_preplanned_launch_enabled()
+            ):
+                # Route ids are cast to int32 and the secondary expert map is
+                # always bound (see _apply_once), which selects the top-k
+                # sum variant.
+                state.trellis_w4a16_prefill_launches = _preplanned_w4a16_launches(
+                    state.trellis_w4a16_prefill_plan,
+                    route_ids_dtype=torch.int32,
+                    mapped=state.emap_secondary is not None,
+                )
+                if state.trellis_w4a16_prefill_launches is None:
+                    logger.warning_once(
+                        "kquant_hybrid: the W4A16 prefill plan carries no "
+                        "prewarmed launches; prefill launches resolve per call"
+                    )
+                else:
+                    fused_launch = state.trellis_w4a16_prefill_launches[0]
+                    logger.info_once(
+                        "kquant_hybrid: W4A16 prefill bindings carry the "
+                        "prewarmed capacity launch (size_m=%d, block_size_m=%d)",
+                        int(getattr(fused_launch, "size_m", -1)),
+                        int(getattr(fused_launch, "moe_block_size", -1)),
+                    )
             if state.trellis_w4a16_prefill_plan is not None:
                 # Both W4A16 plans bind the same scratch buffer, sized to the
                 # larger arena: launches are stream-ordered and every bind
@@ -2134,6 +2214,15 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             if not use_w4a8_prefill:
                 bind_kwargs["route_expert_map"] = state.emap_secondary
             binding = fused_moe.bind(trellis_plan, **bind_kwargs)
+            if use_w4a16_prefill and state.trellis_w4a16_prefill_launches is not None:
+                # bind() leaves the launch slots empty; without them
+                # run_w4a16_moe re-derives the launch objects on every call.
+                fused_launch, topk_sum_launch = state.trellis_w4a16_prefill_launches
+                binding = dataclasses.replace(
+                    binding,
+                    fused_launch=fused_launch,
+                    topk_sum_launch=topk_sum_launch,
+                )
             # W4A16 decode emits fp32 while W4A8 prefill emits model dtype;
             # normalize both contracts for downstream layers.
             out_trellis = fused_moe.run(binding=binding)[:m]
