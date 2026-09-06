@@ -747,6 +747,14 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        # Drop to the serving thread count *before* any warmup: Dynamo guards
+        # every compiled function on torch.get_num_threads(), so compiles done
+        # under the startup count are all invalidated (and redone, ~1s of
+        # TTFT on GLM-5.3-Flash TP4) by the first real request otherwise.
+        # Weight loading, the only startup work that benefits from intra-op
+        # parallelism, has already finished.
+        set_torch_threads_for_runtime()
+
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
@@ -916,10 +924,6 @@ class Worker(WorkerBase):
         # Warmup / first-compile is done — activate the `VLLM_GPU_SYNC_CHECK`
         # gate so subsequent `execute_model` / `sample_tokens` calls enforce it.
         enable_gpu_sync_check()
-
-        # Startup is done; steady-state serving gets no benefit from torch
-        # intra-op parallelism.
-        set_torch_threads_for_runtime()
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
