@@ -171,6 +171,48 @@ def test_delegating_parser_preserves_tool_calls_after_reasoning():
     assert json.loads(tool_calls[0].arguments) == {"x": 1}
 
 
+def test_fresh_tool_stream_does_not_inherit_closed_reasoning():
+    parser = KimiK3DelegatingParser(
+        DummyTokenizer(),
+        chat_template_kwargs={
+            "thinking": True,
+            "add_generation_prompt": True,
+        },
+    )
+    request = _request()
+    messages: list[DeltaMessage] = []
+    chunks = [
+        (".", [9]),
+        (f"{CLOSE}think", [4, 2]),
+        (
+            f"{SEP}{_response('')}{_tools(_call('calc', 1))}",
+            [3, 10],
+        ),
+    ]
+
+    for index, (text, token_ids) in enumerate(chunks):
+        delta = parser.parse_delta(
+            delta_text=text,
+            delta_token_ids=token_ids,
+            request=request,
+            prompt_token_ids=[4, 2, 3],
+            finished=index == len(chunks) - 1,
+        )
+        if delta is not None:
+            messages.append(delta)
+
+    reasoning = "".join(message.reasoning or "" for message in messages)
+    content = "".join(message.content or "" for message in messages)
+    tool_calls = [call for message in messages for call in (message.tool_calls or [])]
+    assert reasoning == "."
+    assert content == ""
+    assert len(tool_calls) == 1
+    assert tool_calls[0].function.name == "calc"
+    assert OPEN not in reasoning + content
+    assert CLOSE not in reasoning + content
+    assert SEP not in reasoning + content
+
+
 def test_delegating_parser_required_tool_choice_uses_xtml_parser():
     parser = KimiK3DelegatingParser(DummyTokenizer())
     request = _request().model_copy(update={"tool_choice": "required"})
@@ -361,9 +403,141 @@ def test_streaming_split_markers_do_not_leak():
     assert content == "Hi"
     assert OPEN not in content
     assert SEP not in content
-    assert len(tool_deltas) == 1
-    assert tool_deltas[0].function.name == "calc"
-    assert json.loads(tool_deltas[0].function.arguments) == {"x": 1}
+    assert [tool_call.function.name for tool_call in tool_deltas if tool_call.id] == [
+        "calc"
+    ]
+    arguments = "".join(tool_call.function.arguments or "" for tool_call in tool_deltas)
+    assert json.loads(arguments) == {"x": 1}
+
+
+def test_streaming_emits_argument_text_as_it_arrives():
+    """A long string argument must stream, not land in one delta at the close."""
+    parser = KimiK3ToolParser(DummyTokenizer())
+    request = _request()
+    value = "word " * 200
+    body_chunks = [value[i : i + 5] for i in range(0, len(value), 5)]
+    chunks = [
+        f"{OPEN}tools{SEP}",
+        f'{OPEN}call tool="write_file" index="1"{SEP}',
+        f'{OPEN}argument key="content" type="string"{SEP}',
+        *body_chunks,
+        f"{CLOSE}argument{SEP}",
+        f"{CLOSE}call{SEP}",
+    ]
+    previous_text = ""
+    previous_ids: list[int] = []
+    messages: list[DeltaMessage] = []
+    arguments_before_close = ""
+
+    for i, chunk in enumerate(chunks, start=1):
+        if chunk == f"{CLOSE}argument{SEP}":
+            arguments_before_close = "".join(
+                tool_call.function.arguments or ""
+                for message in messages
+                for tool_call in (message.tool_calls or [])
+            )
+        current_text = previous_text + chunk
+        current_ids = previous_ids + [i]
+        delta = parser.extract_tool_calls_streaming(
+            previous_text=previous_text,
+            current_text=current_text,
+            delta_text=chunk,
+            previous_token_ids=previous_ids,
+            current_token_ids=current_ids,
+            delta_token_ids=[i],
+            request=request,
+        )
+        if delta is not None:
+            messages.append(delta)
+        previous_text = current_text
+        previous_ids = current_ids
+
+    tool_deltas = [
+        tool_call for message in messages for tool_call in (message.tool_calls or [])
+    ]
+
+    # the name is announced once, up front, and every body chunk moves the stream
+    assert [tool_call.function.name for tool_call in tool_deltas if tool_call.id] == [
+        "write_file"
+    ]
+    assert len(tool_deltas) >= len(body_chunks)
+    assert all(tool_call.index == 0 for tool_call in tool_deltas)
+    assert (
+        arguments_before_close
+        == json.dumps({"content": value}, ensure_ascii=False)[:-2]
+    )
+
+    arguments = "".join(tool_call.function.arguments or "" for tool_call in tool_deltas)
+    assert json.loads(arguments) == {"content": value}
+    non_streamed = parser.extract_tool_calls(previous_text, request)
+    assert arguments == non_streamed.tool_calls[0].function.arguments
+
+
+def test_streaming_holds_whitespace_tolerant_argument_close_fragments():
+    parser = KimiK3ToolParser(DummyTokenizer())
+    request = _request()
+    chunks = [
+        f"{OPEN}tools{SEP}",
+        f'{OPEN}call tool="write_file" index="1"{SEP}',
+        f'{OPEN}argument key="content" type="string"{SEP}',
+        "payload",
+        f"{CLOSE} arg",
+        "ument ",
+        "<|sep",
+        "|>",
+        f"{CLOSE}call{SEP}",
+    ]
+    previous_text = ""
+    previous_ids: list[int] = []
+    streamed_arguments = ""
+    partial_close_snapshots: list[str] = []
+
+    for i, chunk in enumerate(chunks, start=1):
+        current_text = previous_text + chunk
+        current_ids = previous_ids + [i]
+        delta = parser.extract_tool_calls_streaming(
+            previous_text=previous_text,
+            current_text=current_text,
+            delta_text=chunk,
+            previous_token_ids=previous_ids,
+            current_token_ids=current_ids,
+            delta_token_ids=[i],
+            request=request,
+        )
+        if delta is not None:
+            streamed_arguments += "".join(
+                tool_call.function.arguments or ""
+                for tool_call in (delta.tool_calls or [])
+            )
+        if 5 <= i <= 7:
+            partial_close_snapshots.append(streamed_arguments)
+        previous_text = current_text
+        previous_ids = current_ids
+
+    expected_prefix = json.dumps({"content": "payload"}, ensure_ascii=False)[:-2]
+    assert partial_close_snapshots == [expected_prefix] * 3
+    assert json.loads(streamed_arguments) == {"content": "payload"}
+    non_streamed = parser.extract_tool_calls(previous_text, request)
+    assert streamed_arguments == non_streamed.tool_calls[0].function.arguments
+
+
+def test_streaming_ignores_call_shaped_text_after_tools_close():
+    parser = KimiK3ToolParser(DummyTokenizer())
+    request = _request()
+    output = _tools() + _call("calc", 1, _arg("x", "number", "1"))
+
+    delta = parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=output,
+        delta_text=output,
+        previous_token_ids=[],
+        current_token_ids=[1],
+        delta_token_ids=[1],
+        request=request,
+    )
+
+    assert delta is None
+    assert parser.extract_tool_calls(output, request).tools_called is False
 
 
 def test_tool_call_ids_are_unique_across_messages():

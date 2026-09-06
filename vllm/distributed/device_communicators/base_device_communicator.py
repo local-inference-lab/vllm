@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
+from typing import Any
 from weakref import WeakValueDictionary
 
 import torch
@@ -220,10 +221,42 @@ class DeviceCommunicatorBase:
         dist.all_reduce(input_, group=self.device_group)
         return input_
 
-    def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
-        """All-reduce while allowing the input storage to hold the result."""
+    def all_reduce_in_place(
+        self, input_: torch.Tensor, *, borrow_output: bool = False
+    ) -> torch.Tensor:
+        """All-reduce while allowing the input storage to hold the result.
+
+        ``borrow_output`` lets a communicator return storage it owns instead
+        of the input; communicators without such storage ignore it.
+        """
         dist.all_reduce(input_, group=self.device_group)
         return input_
+
+    def is_borrowed_reduction_storage(self, tensor: torch.Tensor) -> bool:
+        """Whether ``tensor`` aliases communicator-owned reduction storage."""
+        return False
+
+    def pcie_all_gather_pair(
+        self, first: torch.Tensor, second: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, Any] | None:
+        """Gather two rank-local ``[rows, c]`` blocks on a copy-engine ring.
+
+        Returns rank-major ``[world, rows, c]`` outputs and the event the
+        consumer waits on, or ``None`` when no such ring is available.
+        """
+        return None
+
+    def pcie_prepare_reduce_scatter(self, wire: str) -> bool:
+        """Compile a copy-engine ring's reduce-scatter kernels; ``False``
+        when there is no such ring."""
+        return False
+
+    def pcie_reduce_scatter_columns(
+        self, input_: torch.Tensor, *, wire: str, cols: int
+    ) -> torch.Tensor | None:
+        """Column reduce-scatter on a copy-engine ring: this rank's
+        ``[rows, cols]`` block of the sum, or ``None`` when unavailable."""
+        return None
 
     def checkpoint_prepare(self) -> None:
         """Prepare reclaimable communicator state for checkpoint (default: no-op)."""

@@ -362,6 +362,12 @@ class MoERunner(MoERunnerInterface):
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
 
+        # When set by the model, the in-place prefill reductions may return
+        # communicator-owned storage (the B12X DMA ring's static output) that
+        # the next same-shape reduction overwrites. The model then consumes
+        # each result before that reduction and never retains it.
+        self.reduction_borrow_output = False
+
         self._forward_entry = self._select_forward()
         self._shared_input_reuse_entry = (
             self._select_shared_input_reuse_forward()
@@ -484,23 +490,29 @@ class MoERunner(MoERunnerInterface):
         fused_output: torch.Tensor,
         residual: torch.Tensor | None = None,
         output: torch.Tensor | None = None,
+        column_block: bool = False,
     ) -> torch.Tensor:
         """Apply transform to routed expert output (e.g., latent to full dim).
 
         Used by latent MoE models (e.g., NemotronH) where routed experts
         operate in a compressed latent space and need projection back to
         the full hidden dimension before combining with shared expert output.
+        ``column_block`` says ``fused_output`` is this rank's column block of
+        the reduced latent (see ``_maybe_reduce_routed_output_before_transform``);
+        it is passed on only when set.
         """
         if self.routed_output_transform is not None:
+            kwargs = {"column_block": True} if column_block else {}
             if residual is not None:
                 r = self.routed_output_transform(
                     fused_output,
                     residual=residual,
+                    **kwargs,
                 )
             elif output is not None:
-                r = self.routed_output_transform(fused_output, output=output)
+                r = self.routed_output_transform(fused_output, output=output, **kwargs)
             else:
-                r = self.routed_output_transform(fused_output)
+                r = self.routed_output_transform(fused_output, **kwargs)
             fused_output = r[0] if isinstance(r, tuple) else r
         return fused_output
 
@@ -594,32 +606,53 @@ class MoERunner(MoERunnerInterface):
             shared_output = tensor_model_parallel_all_reduce(shared_output)
         return shared_output
 
+    def _all_reduce_in_place(self, states: torch.Tensor) -> torch.Tensor:
+        """In-place all-reduce of dead storage, borrowing communicator-owned
+        output when the model enabled ``reduction_borrow_output``."""
+        if self.reduction_borrow_output:
+            return tensor_model_parallel_all_reduce_in_place(states, borrow_output=True)
+        return tensor_model_parallel_all_reduce_in_place(states)
+
     def _maybe_reduce_routed_output_before_transform(
         self,
         fused_output: torch.Tensor,
         fused_output_is_reduced: bool,
         *,
         in_place: bool = False,
-    ) -> tuple[torch.Tensor, bool]:
-        """All-reduce latent routed output before its output transform.
+    ) -> tuple[torch.Tensor, bool, bool]:
+        """Reduce the latent routed output before its output transform.
 
         Latent MoE output transforms may contain non-linear ops, e.g. RMSNorm.
         TP partial routed outputs must be summed in latent space before such
-        transforms are applied. ``in_place`` is valid only when the local
-        partial tensor has no consumer after the collective.
+        transforms are applied. A transform whose up-projection is TP-sharded
+        may offer ``reduce_scatter_tp_partial``, which returns this rank's
+        column block of the sum (its up-projection input shard) instead of
+        the full width; the third result then says the returned tensor is
+        such a block and the transform normalizes it as one. ``in_place`` is
+        valid only when the local partial tensor has no consumer after the
+        collective; the in-place result may be borrowed communicator storage
+        (``reduction_borrow_output``), which the output transform consumes
+        within this forward.
         """
+        column_block = False
         if (
             self.routed_output_transform is not None
             and not self.moe_config.is_sequence_parallel
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not fused_output_is_reduced
         ):
+            reduce_scatter = getattr(
+                self.routed_output_transform, "reduce_scatter_tp_partial", None
+            )
+            block = reduce_scatter(fused_output) if reduce_scatter is not None else None
+            if block is not None:
+                return block, True, True
             if in_place:
-                fused_output = tensor_model_parallel_all_reduce_in_place(fused_output)
+                fused_output = self._all_reduce_in_place(fused_output)
             else:
                 fused_output = tensor_model_parallel_all_reduce(fused_output)
             fused_output_is_reduced = True
-        return fused_output, fused_output_is_reduced
+        return fused_output, fused_output_is_reduced, column_block
 
     def _maybe_reduce_final_output(
         self,
@@ -656,7 +689,7 @@ class MoERunner(MoERunnerInterface):
             and not output_is_reduced
         ):
             if in_place:
-                states = tensor_model_parallel_all_reduce_in_place(states)
+                states = self._all_reduce_in_place(states)
             else:
                 states = tensor_model_parallel_all_reduce(states)
 
@@ -861,12 +894,16 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        shared_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Invoke the fused moe layer.
 
         Input:
         - hidden_states
         - router_logits
+        - shared_output: the shared experts' result when the caller computed
+          it already (with the layer call the runner would make); the runner
+          then adopts it instead of running the shared experts.
 
         Output:
         - The new hidden_states.
@@ -911,6 +948,10 @@ class MoERunner(MoERunnerInterface):
             and shared_experts is not None
             and shared_experts.can_reuse_input(shared_experts_input)
         )
+        if shared_output is not None:
+            if shared_experts is None:
+                raise ValueError("shared_output given to a MoE without shared experts")
+            shared_experts.install_precomputed_output(shared_output)
         forward_entry = (
             self._shared_input_reuse_entry
             if reuse_shared_experts_input
@@ -951,7 +992,7 @@ class MoERunner(MoERunnerInterface):
 
         # Latent routed output has to be reduced before output transform,
         # because the transform may include non-linear normalization.
-        fused_output, fused_output_is_reduced = (
+        fused_output, fused_output_is_reduced, latent_is_column_block = (
             self._maybe_reduce_routed_output_before_transform(
                 fused_output,
                 fused_output_is_reduced,
@@ -998,6 +1039,7 @@ class MoERunner(MoERunnerInterface):
             fused_output,
             residual=routed_output_residual,
             output=routed_output_buffer,
+            column_block=latent_is_column_block,
         )
         if routed_output_residual is not None:
             shared_output = None

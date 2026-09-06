@@ -1840,22 +1840,15 @@ class VllmConfig:
 
     def _set_max_num_scheduled_tokens(self):
         """
-        In most cases, the scheduler may schedule a batch with as many tokens as the
-        worker is configured to handle. However for some speculative decoding methods,
-        the drafter model may insert additional slots into the batch when drafting.
-        To account for this, we need to decrease the max_num_scheduled_tokens by an
-        upper bound on the number of slots that can be added.
+        Keep the target-token scheduling limit independent from the draft-model
+        input-row limit. The scheduler accounts for both budgets per request, so
+        prefill can consume otherwise-idle target capacity without overflowing the
+        worker's max_num_batched_tokens limit during speculative decoding.
         """
         if self.speculative_config is not None:
-            scheduled_token_delta = (
-                self.speculative_config.max_num_new_slots_for_drafting
-                * self.scheduler_config.max_num_seqs
-            )
             max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
             if self.scheduler_config.max_num_scheduled_tokens is None:
-                self.scheduler_config.max_num_scheduled_tokens = (
-                    max_num_batched_tokens - scheduled_token_delta
-                )
+                self.scheduler_config.max_num_scheduled_tokens = max_num_batched_tokens
 
             if self.scheduler_config.max_num_scheduled_tokens <= 0:
                 raise ValueError(
@@ -1876,16 +1869,15 @@ class VllmConfig:
                     " num_speculative_tokens or max_num_seqs.",
                 )
 
-            max_num_scheduled_tokens = self.scheduler_config.max_num_scheduled_tokens
-            if max_num_batched_tokens < max_num_scheduled_tokens + (
-                self.speculative_config.max_num_new_slots_for_drafting
-                * self.scheduler_config.max_num_seqs
-            ):
+            min_num_draft_input_tokens = (
+                self.speculative_config.draft_input_layout.minimum_cost
+            )
+            if max_num_batched_tokens < min_num_draft_input_tokens:
                 raise ValueError(
-                    f"VllmConfig received max_num_scheduled_tokens but it does not have"
-                    " enough slots to support the speculative decoding settings."
-                    f" It should be greater by at least {scheduled_token_delta}, but"
-                    f" got {max_num_batched_tokens=} and {max_num_scheduled_tokens=}."
+                    "VllmConfig does not have enough slots for the smallest "
+                    "draft input batch. "
+                    f"Got {max_num_batched_tokens=} and "
+                    f"{min_num_draft_input_tokens=}."
                 )
 
     def _set_cudagraph_sizes(self):

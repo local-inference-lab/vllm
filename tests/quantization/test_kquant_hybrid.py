@@ -11,9 +11,11 @@ from vllm.model_executor.layers.quantization.kquant_hybrid import (
     KQuantHybridConfig,
     _b12x_tiles_for_geometry,
     _is_dense_layer_ignored,
+    _preplanned_w4a16_launches,
     _read_hybrid_keys,
     _require_rank_local_kept_kernel,
     _stack_exl3_intermediate_rotations,
+    _w4a16_preplanned_launch_enabled,
 )
 from vllm.model_executor.layers.quantization.kquant_qsrt_atoms_v2 import (
     COUPLED_H308_ATOM_SLAB_BYTES,
@@ -278,3 +280,182 @@ def test_dense_kda_precision_groups_resolve_fused_children() -> None:
     assert _is_dense_layer_ignored(
         "model.layers.1.linear_attn.in_proj_gfab", ignored, mapping
     )
+
+
+def test_preplanned_w4a16_launches_pick_capacity_and_matching_sum() -> None:
+    """The prefill binding must carry the plan's capacity fused launch and
+    the top-k sum variant for int32 mapped routes; other variants are for
+    other route contracts."""
+    fused_4608 = SimpleNamespace(size_m=4608, moe_block_size=48)
+    sums = {
+        (torch.int32, False): object(),
+        (torch.int32, True): object(),
+        (torch.int64, False): object(),
+        (torch.int64, True): object(),
+    }
+    plan = SimpleNamespace(
+        _prewarmed_fused_launches=((4608, fused_4608),),
+        _prewarmed_topk_sum_launches=tuple(
+            (dtype, mapped, launch) for (dtype, mapped), launch in sums.items()
+        ),
+    )
+
+    resolved = _preplanned_w4a16_launches(
+        plan, route_ids_dtype=torch.int32, mapped=True
+    )
+
+    assert resolved is not None
+    assert resolved[0] is fused_4608
+    assert resolved[1] is sums[(torch.int32, True)]
+    unmapped = _preplanned_w4a16_launches(
+        plan, route_ids_dtype=torch.int64, mapped=False
+    )
+    assert unmapped is not None and unmapped[1] is sums[(torch.int64, False)]
+
+
+def test_preplanned_w4a16_launches_fall_back_without_prewarm() -> None:
+    """A plan without prewarmed launches (or without the needed top-k sum
+    variant) keeps the lazy per-call resolution."""
+    empty = SimpleNamespace(
+        _prewarmed_fused_launches=(), _prewarmed_topk_sum_launches=()
+    )
+    assert (
+        _preplanned_w4a16_launches(empty, route_ids_dtype=torch.int32, mapped=True)
+        is None
+    )
+
+    no_variant = SimpleNamespace(
+        _prewarmed_fused_launches=((4608, object()),),
+        _prewarmed_topk_sum_launches=((torch.int64, False, object()),),
+    )
+    assert (
+        _preplanned_w4a16_launches(no_variant, route_ids_dtype=torch.int32, mapped=True)
+        is None
+    )
+    assert (
+        _preplanned_w4a16_launches(object(), route_ids_dtype=torch.int32, mapped=True)
+        is None
+    )
+
+
+def test_preplanned_w4a16_launch_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_KQUANT_W4A16_PREPLANNED_LAUNCH", raising=False)
+    assert _w4a16_preplanned_launch_enabled()
+    monkeypatch.setenv("VLLM_KQUANT_W4A16_PREPLANNED_LAUNCH", "0")
+    assert not _w4a16_preplanned_launch_enabled()
+
+
+def test_b12x_w4a16_fused_moe_compile_key_is_row_count_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compiled W4A16 fused MoE kernel is keyed without the row count
+    (except the single-token specialization), so the launch compiled for the
+    scheduler capacity at boot is the one every prefill tail resolves to.
+
+    Runs against the b12x planner on CPU with the kernel cache stubbed to
+    always hit; only the derived cache keys are inspected.
+    """
+    kmod = pytest.importorskip("b12x.moe._shared.kernels.w4a16.kernel")
+
+    class _AlwaysHit(dict):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list[tuple] = []
+
+        def get(self, key, default=None):
+            self.seen.append(key)
+            return placeholder
+
+    placeholder = kmod.W4A16FusedMoeCompileResult(
+        compiled=None,
+        size_m=1,
+        hidden_size=3584,
+        intermediate_size=384,
+        num_experts=896,
+        top_k=16,
+        activation="situ",
+        apply_router_weight_on_input=False,
+        zero_fc2_output=False,
+        element_dtype="fp16",
+        fast_math=True,
+        swiglu_limit=None,
+        swiglu_alpha=1.0,
+        swiglu_beta=0.0,
+        fc1_tile_n=128,
+        fc1_tile_k=128,
+        fc2_tile_n=128,
+        fc2_tile_k=128,
+        moe_block_size=48,
+        max_m_blocks=1,
+        blocks_per_sm=1,
+    )
+    cache = _AlwaysHit()
+    monkeypatch.setattr(kmod, "_FUSED_CACHE", cache)
+    monkeypatch.delenv("B12X_W4A16_SMALL_M_SPLITK", raising=False)
+
+    def compile_for(size_m: int) -> None:
+        # Kimi-K3 TP9 rank-0 layer with the 384-wide expert extent, the
+        # served route block (48) and pinned 128x128 tiles.
+        kmod.compile_w4a16_fused_moe(
+            size_m=size_m,
+            hidden_size=3584,
+            intermediate_size=384,
+            num_experts=896,
+            top_k=16,
+            activation="situ",
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            moe_block_size=48,
+            max_m_blocks=(size_m * 16 + 896 * 47 + 47) // 48,
+            element_dtype="fp16",
+            fast_math=True,
+            sms=188,
+            max_shared_mem=101_376,
+            weight_layout="trellis3_t256",
+            scale_format="e4m3_k32",
+            w13_layout="trellis3_t256_proj",
+            trellis_bits=2,
+            force_tile_config=(128, 128, 128, 128),
+            intermediate_rotation=True,
+            full_rotation=True,
+            coupled_hadamard=True,
+            rotation_input_dtype="bf16",
+        )
+
+    keys: dict[int, tuple] = {}
+    for size_m in (2, 257, 830, 1536, 4608):
+        cache.seen.clear()
+        compile_for(size_m)
+        (keys[size_m],) = cache.seen
+    assert len(set(keys.values())) == 1
+    cache.seen.clear()
+    compile_for(1)
+    (single,) = cache.seen
+    assert single != keys[4608]
+
+
+def test_topk_id_dump_writes_prefill_chunks_on_rank_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    import vllm.model_executor.layers.quantization.kquant_hybrid as kq
+
+    monkeypatch.setattr(kq, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(kq, "_topk_dump_counts", {})
+    monkeypatch.setenv("VLLM_K3_DUMP_TOPK_IDS", str(tmp_path))
+    monkeypatch.setenv("VLLM_K3_DUMP_TOPK_IDS_CHUNKS", "2")
+    layer = SimpleNamespace(layer_name="model.layers.5.mlp.experts")
+    ids = torch.randint(0, 896, (830, 16), dtype=torch.int64)
+
+    for _ in range(3):
+        kq._maybe_dump_topk_ids(layer, ids)
+
+    files = sorted(p.name for p in tmp_path.iterdir())
+    assert files == ["layer005_chunk000_m830.pt", "layer005_chunk001_m830.pt"]
+    saved = torch.load(tmp_path / files[0])
+    assert saved["layer"] == 5 and saved["num_tokens"] == 830
+    assert saved["topk_ids"].dtype == torch.int32
+    assert torch.equal(saved["topk_ids"], ids.to(torch.int32))
+
+    monkeypatch.setattr(kq, "get_tensor_model_parallel_rank", lambda: 1)
+    kq._maybe_dump_topk_ids(SimpleNamespace(layer_name="model.layers.6.x"), ids)
+    assert len(list(tmp_path.iterdir())) == 2
