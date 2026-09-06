@@ -391,6 +391,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ca_comm = self.ca_comm
         return ca_comm is not None and ca_comm.is_pcie_ring_storage(tensor)
 
+    def pcie_all_gather_pair(
+        self, first: torch.Tensor, second: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.cuda.Event] | None:
+        """Gather two blocks on the B12X DMA ring's side stream (see
+        ``CustomAllreduce.pcie_dma_all_gather_pair``)."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled:
+            return None
+        return ca_comm.pcie_dma_all_gather_pair(first, second)
+
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor | None:
         ca_comm = self.ca_comm
         if ca_comm is None:

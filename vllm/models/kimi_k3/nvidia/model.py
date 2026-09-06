@@ -120,8 +120,11 @@ from vllm.models.kimi_k3.nvidia.mla import (
 )
 from vllm.models.kimi_k3.nvidia.ops import attn_res
 from vllm.models.kimi_k3.nvidia.tp_projection import (
+    KIMI_DMA_PAIR_GATHER_MIN_TOKENS,
+    gather_kimi_projection_pair_prefill,
     gather_kimi_sharded_projection,
     gather_kimi_sharded_projection_pair,
+    kimi_projection_gather_mode,
     kimi_reduction_is_borrowed,
     kimi_ring_static_io_enabled,
     materialize_kimi_reduction,
@@ -1463,9 +1466,72 @@ class KimiMoE(nn.Module):
         )
         return routed_hidden_states, router_output, topk_ids
 
+    def _prefill_projection_gather_eligible(self, hidden_states: torch.Tensor) -> bool:
+        """Whether this layer gathers its router logits and routed latent as
+        one DMA ring pass (``VLLM_K3_PROJECTION_GATHER=dma_pair``)."""
+        if (
+            self.use_mega_moe
+            or not self.use_latent_moe
+            or not isinstance(self.gate, KimiColumnParallelGate)
+            or not isinstance(
+                self.routed_expert_down_proj, KimiPaddedColumnParallelLinear
+            )
+            or hidden_states.shape[0] < KIMI_DMA_PAIR_GATHER_MIN_TOKENS
+            or kimi_projection_gather_mode() != "dma_pair"
+        ):
+            return False
+        use_fused_path = getattr(self.experts, "_use_fused_path", None)
+        return use_fused_path is None or not use_fused_path()
+
+    def _forward_with_prefill_projection_gather(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """Prefill layer with the router-logit and latent gathers issued as
+        one ring pass on the ring's side stream.
+
+        The shared experts run on the main stream while the ring transfers,
+        with the same layer call the runner would make (writing into the
+        consumed input when the runner would), and the runner adopts their
+        result; the gathered blocks are assembled after the ring completes.
+        Numerics are those of the NCCL path: an all-gather only copies, and
+        the GEMMs see identical operands.
+        """
+        down_proj = self.routed_expert_down_proj
+        assert isinstance(self.gate, KimiColumnParallelGate)
+        assert isinstance(down_proj, KimiPaddedColumnParallelLinear)
+        router_local, _ = self.gate.forward_local(hidden_states)
+        down_local, _ = down_proj.forward_local(hidden_states)
+        gather = gather_kimi_projection_pair_prefill(
+            router_local,
+            self.gate.logical_output_size,
+            down_local,
+            down_proj.logical_output_size,
+        )
+        shared_output = None
+        if self.shared_experts is not None:
+            shared_experts = getattr(self.experts, "shared_experts", None)
+            if shared_experts is not None and shared_experts.can_reuse_input(
+                hidden_states
+            ):
+                shared_output = self.shared_experts(hidden_states, output=hidden_states)
+            else:
+                shared_output = self.shared_experts(hidden_states)
+        router_logits, routed_hidden_states = gather.wait()
+        return self.experts(
+            hidden_states=routed_hidden_states,
+            router_logits=router_logits,
+            shared_experts_input=hidden_states,
+            shared_output=shared_output,
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        if self._prefill_projection_gather_eligible(hidden_states):
+            final_hidden_states = self._forward_with_prefill_projection_gather(
+                hidden_states
+            )
+            return final_hidden_states.view(num_tokens, hidden_size)
         # Overlap the gate with the routed down projection; the returned hidden
         # states are already down-projected. Keep the original ``hidden_states``
         # for the shared experts.

@@ -712,6 +712,15 @@ class GroupCoordinator:
             return False
         return self.device_communicator.is_borrowed_reduction_storage(tensor)
 
+    def pcie_all_gather_pair(
+        self, first: torch.Tensor, second: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, Any] | None:
+        """Gather two rank-local blocks on the communicator's copy-engine ring
+        side stream; ``None`` when unavailable (the caller falls back)."""
+        if self.world_size == 1 or self.device_communicator is None:
+            return None
+        return self.device_communicator.pcie_all_gather_pair(first, second)
+
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")

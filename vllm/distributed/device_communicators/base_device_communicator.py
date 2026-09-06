@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
+from typing import Any
 from weakref import WeakValueDictionary
 
 import torch
@@ -234,6 +235,16 @@ class DeviceCommunicatorBase:
     def is_borrowed_reduction_storage(self, tensor: torch.Tensor) -> bool:
         """Whether ``tensor`` aliases communicator-owned reduction storage."""
         return False
+
+    def pcie_all_gather_pair(
+        self, first: torch.Tensor, second: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, Any] | None:
+        """Gather two rank-local ``[rows, c]`` blocks on a copy-engine ring.
+
+        Returns rank-major ``[world, rows, c]`` outputs and the event the
+        consumer waits on, or ``None`` when no such ring is available.
+        """
+        return None
 
     def checkpoint_prepare(self) -> None:
         """Prepare reclaimable communicator state for checkpoint (default: no-op)."""

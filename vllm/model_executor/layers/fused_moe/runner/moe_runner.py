@@ -877,12 +877,16 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        shared_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Invoke the fused moe layer.
 
         Input:
         - hidden_states
         - router_logits
+        - shared_output: the shared experts' result when the caller computed
+          it already (with the layer call the runner would make); the runner
+          then adopts it instead of running the shared experts.
 
         Output:
         - The new hidden_states.
@@ -927,6 +931,10 @@ class MoERunner(MoERunnerInterface):
             and shared_experts is not None
             and shared_experts.can_reuse_input(shared_experts_input)
         )
+        if shared_output is not None:
+            if shared_experts is None:
+                raise ValueError("shared_output given to a MoE without shared experts")
+            shared_experts.install_precomputed_output(shared_output)
         forward_entry = (
             self._shared_input_reuse_entry
             if reuse_shared_experts_input
