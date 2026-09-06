@@ -137,6 +137,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import aux_stream
+from vllm.v1.worker.gpu import k3_piecewise_graph
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from ..common.mm_preprocess import (
@@ -2356,10 +2357,20 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 first_position=int(positions[0].item()),
                 rank=get_tensor_model_parallel_rank(),
             )
+        # A split prefill may capture a layer's device work as CUDA graphs cut
+        # at its collectives (k3_piecewise_graph). A latent-attention layer's
+        # chunked context pass issues a number of key gathers that follows the
+        # context length, so it is not captured and suspends the recording
+        # around itself. Resolved once per forward: every other forward,
+        # decode included, pays one identity test per layer.
+        piecewise = k3_piecewise_graph.active_session()
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
             start=self.start_layer,
         ):
+            if piecewise is not None:
+                capturable = not isinstance(layer.self_attn, MultiHeadLatentAttention)
+                piecewise.enter_layer(layer_idx, capturable)
             hidden_states, prefix_sum, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -2367,6 +2378,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 residual=residual,
                 attn_res_scratch=attn_res_scratch,
             )
+            if piecewise is not None:
+                piecewise.leave_layer(layer_idx, capturable)
             if digest is not None:
                 digest.add(hidden_states)
             if (layer_idx + 1) in self.aux_hidden_state_layers:
