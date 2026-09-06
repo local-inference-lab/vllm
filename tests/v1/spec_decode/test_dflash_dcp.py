@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
@@ -62,7 +63,11 @@ def test_dflash_sliding_window_cache_is_replicated_under_dcp():
     assert spec.dcp_replicated is True
 
 
-def test_dflash_uses_draft_group_dcp_slot_parameters(monkeypatch):
+@pytest.mark.parametrize("context_kv_is_restored", [False, True])
+@pytest.mark.parametrize("use_full_graph", [False, True])
+def test_dflash_uses_draft_group_dcp_slot_parameters(
+    monkeypatch, context_kv_is_restored, use_full_graph
+):
     """A sharded DSpark-style draft group must retain the real DCP mapping."""
     cp_args = []
 
@@ -79,7 +84,7 @@ def test_dflash_uses_draft_group_dcp_slot_parameters(monkeypatch):
             SimpleNamespace(
                 num_reqs=1,
                 num_tokens=1,
-                cg_mode=CUDAGraphMode.NONE,
+                cg_mode=(CUDAGraphMode.FULL if use_full_graph else CUDAGraphMode.NONE),
             ),
             None,
         ),
@@ -96,14 +101,18 @@ def test_dflash_uses_draft_group_dcp_slot_parameters(monkeypatch):
         kernel_block_sizes=[16],
         get_group_cp_parameters=lambda _gid: (2, 4, 8),
     )
-    model = SimpleNamespace(precompute_and_store_context_kv=lambda *_args: None)
+    context_writes = []
+    query_runs = []
+    model = SimpleNamespace(
+        precompute_and_store_context_kv=lambda *args: context_writes.append(args)
+    )
     speculator = SimpleNamespace(
         num_query_per_req=1,
         num_speculative_steps=1,
         max_model_len=128,
         max_num_reqs=1,
         max_num_tokens=1,
-        hidden_states=torch.zeros((1, 1)),
+        hidden_states=torch.full((1, 1), -99.0),
         context_positions=torch.zeros(1, dtype=torch.int64),
         sample_indices=torch.zeros(1, dtype=torch.int64),
         sample_pos=torch.zeros(1, dtype=torch.int64),
@@ -119,7 +128,9 @@ def test_dflash_uses_draft_group_dcp_slot_parameters(monkeypatch):
         parallel_drafting_token_id=0,
         sample_from_anchor=False,
         model=model,
-        query_cudagraph_manager=None,
+        query_cudagraph_manager=SimpleNamespace(
+            run_fullgraph=lambda *_args: query_runs.append("graph")
+        ),
         dp_size=1,
         dp_rank=0,
         _group_causal=False,
@@ -127,7 +138,7 @@ def test_dflash_uses_draft_group_dcp_slot_parameters(monkeypatch):
         draft_tokens=torch.zeros((1, 1), dtype=torch.int64),
         _build_draft_attn_metadata=lambda **_kwargs: {},
         _prepare_eplb_forward=lambda *_args: None,
-        _generate_draft=lambda *_args, **_kwargs: None,
+        _generate_draft=lambda *_args, **_kwargs: query_runs.append("eager"),
     )
     input_batch = SimpleNamespace(
         num_reqs=1,
@@ -143,7 +154,7 @@ def test_dflash_uses_draft_group_dcp_slot_parameters(monkeypatch):
         input_batch=input_batch,
         attn_metadata={},
         slot_mappings={},
-        last_hidden_states=torch.zeros((1, 1)),
+        last_hidden_states=torch.full((1, 1), 5.0),
         aux_hidden_states=None,
         num_sampled=one_i32,
         num_rejected=one_i32,
@@ -151,9 +162,13 @@ def test_dflash_uses_draft_group_dcp_slot_parameters(monkeypatch):
         next_prefill_tokens=one_i64,
         temperature=one_f32,
         seeds=one_i64,
+        context_kv_is_restored=context_kv_is_restored,
     )
 
     assert cp_args == [(2, 4, 8)]
+    assert len(context_writes) == (0 if context_kv_is_restored else 1)
+    assert speculator.hidden_states.item() == (-99.0 if context_kv_is_restored else 5.0)
+    assert query_runs == ["graph" if use_full_graph else "eager"]
 
 
 def test_replicated_draft_metadata_uses_full_sequence_lengths(monkeypatch):
