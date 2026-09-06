@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for mixed speculative and non-speculative GDN metadata."""
 
+from copy import copy
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
@@ -29,15 +30,18 @@ DEVICE = torch.device("cpu")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("window", [2, 4, 8])
 @pytest.mark.parametrize("num_reqs", [1, 3, 16])
+@pytest.mark.parametrize("rebind_group", [False, True])
 def test_uniform_spec_metadata_gpu_preserves_live_values_and_graph_storage(
     window: int,
     num_reqs: int,
+    rebind_group: bool,
 ) -> None:
     """Metadata fusion must retain the buffers shared with padded-batch replay."""
     device = torch.device("cuda")
     capacity = 32
     builder = GDNAttentionMetadataBuilder.__new__(GDNAttentionMetadataBuilder)
     builder.num_spec = window - 1
+    builder._reuse_spec_decode_inputs = True
     source = torch.arange(
         capacity * (window + 3), dtype=torch.int32, device=device
     ).reshape(capacity, window + 3)
@@ -60,7 +64,7 @@ def test_uniform_spec_metadata_gpu_preserves_live_values_and_graph_storage(
     common = SimpleNamespace(
         num_reqs=num_reqs,
         num_actual_tokens=num_reqs * window,
-        seq_lens=None,
+        seq_lens=torch.full((num_reqs,), 128, dtype=torch.int32, device=device),
     )
     fields = (
         "spec_state_indices_tensor",
@@ -69,13 +73,28 @@ def test_uniform_spec_metadata_gpu_preserves_live_values_and_graph_storage(
         "spec_token_indx",
         "spec_query_start_loc",
     )
-    addresses = tuple(getattr(builder, field).data_ptr() for field in fields)
-    builder._build_uniform_spec_decode(common, counts)
+    owner = builder
+    if rebind_group:
+        owner = copy(builder)
+        owner.mamba_aligned_state_indices = source + 1000
+        for field in fields:
+            setattr(owner, field, getattr(builder, field).clone())
+
+    def build_metadata():
+        metadata = builder._build_uniform_spec_decode(common, counts)
+        if rebind_group:
+            return owner.update_block_table(metadata, source, source)
+        return metadata
+
+    addresses = tuple(getattr(owner, field).data_ptr() for field in fields)
+    build_metadata()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        metadata = builder._build_uniform_spec_decode(common, counts)
+        metadata = build_metadata()
     for accepted in (window, 2, 1):
         source.add_(13)
+        if rebind_group:
+            owner.mamba_aligned_state_indices.add_(29)
         counts.fill_(accepted)
         allocations = torch.accelerator.memory_stats()["allocation.all.allocated"]
         graph.replay()
@@ -87,7 +106,8 @@ def test_uniform_spec_metadata_gpu_preserves_live_values_and_graph_storage(
             tuple(getattr(metadata, field).data_ptr() for field in fields) == addresses
         )
         torch.testing.assert_close(
-            metadata.spec_state_indices_tensor, source[:num_reqs, :window]
+            metadata.spec_state_indices_tensor,
+            owner.mamba_aligned_state_indices[:num_reqs, :window],
         )
         torch.testing.assert_close(metadata.num_accepted_tokens, counts[:num_reqs])
         torch.testing.assert_close(
@@ -99,11 +119,11 @@ def test_uniform_spec_metadata_gpu_preserves_live_values_and_graph_storage(
             torch.arange(num_reqs + 1, dtype=torch.int32, device=device) * window,
         )
         assert metadata.spec_sequence_masks.all()
-        assert (builder.spec_state_indices_tensor[num_reqs:] == -71).all()
-        assert (builder.num_accepted_tokens[num_reqs:] == -71).all()
-        assert (builder.spec_token_indx[num_reqs * window :] == -71).all()
-        assert (builder.spec_query_start_loc[num_reqs + 1 :] == -71).all()
-        assert not builder.spec_sequence_masks[num_reqs:].any()
+        assert (owner.spec_state_indices_tensor[num_reqs:] == -71).all()
+        assert (owner.num_accepted_tokens[num_reqs:] == -71).all()
+        assert (owner.spec_token_indx[num_reqs * window :] == -71).all()
+        assert (owner.spec_query_start_loc[num_reqs + 1 :] == -71).all()
+        assert not owner.spec_sequence_masks[num_reqs:].any()
 
 
 @dataclass

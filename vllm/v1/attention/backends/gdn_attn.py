@@ -268,7 +268,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
     def _build_uniform_spec_decode(
-        self, m: CommonAttentionMetadata, num_accepted_tokens: torch.Tensor
+        self,
+        m: CommonAttentionMetadata | GDNAttentionMetadata,
+        num_accepted_tokens: torch.Tensor,
     ) -> GDNAttentionMetadata:
         """Populate uniform speculative metadata in builder-owned graph storage.
 
@@ -804,6 +806,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         del slot_mapping
         assert metadata.num_reqs > 0
         assert metadata.seq_lens is not None
+
+        if (
+            metadata.is_uniform_spec_decode
+            and self._reuse_spec_decode_inputs
+            and self.mamba_aligned_state_indices is not None
+        ):
+            assert metadata.num_accepted_tokens is not None
+            return self._build_uniform_spec_decode(
+                metadata, metadata.num_accepted_tokens
+            )
 
         if (
             metadata.num_prefills == 0
