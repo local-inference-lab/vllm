@@ -9,7 +9,13 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.v1.core.boundary_checkpoint import MAX_BOUNDARY_STOP_TOKENS
+from vllm.v1.core.boundary_checkpoint import (
+    INSTRUCTION_CHECKPOINT_SLOT,
+    MAX_BOUNDARY_STOP_TOKENS,
+    NUM_BOUNDARY_CHECKPOINT_SLOTS,
+    PROMPT_CHECKPOINT_SLOT,
+    RESPONSE_CHECKPOINT_SLOT,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, iter_layer_specs
 from vllm.v1.worker.mamba_utils import _reinterpret_u64_as_i64
 
@@ -19,6 +25,10 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
     from vllm.v1.worker.gpu.model_states.interface import ModelState
     from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+_PROMPT_CHECKPOINT_SLOT = tl.constexpr(PROMPT_CHECKPOINT_SLOT)
+_RESPONSE_CHECKPOINT_SLOT = tl.constexpr(RESPONSE_CHECKPOINT_SLOT)
+_INSTRUCTION_CHECKPOINT_SLOT = tl.constexpr(INSTRUCTION_CHECKPOINT_SLOT)
 
 
 @triton.jit
@@ -40,15 +50,20 @@ def prepare_boundary_capture(
     capture_bias_ptr,
     capture_rows_ptr,
     STOP_CAPACITY: tl.constexpr,
+    NUM_CAPTURES: tl.constexpr,
+    METADATA_WIDTH: tl.constexpr,
 ):
-    enabled = tl.load(metadata_ptr + req_idx * 5)
+    metadata_offset = req_idx * METADATA_WIDTH
+    enabled = tl.load(metadata_ptr + metadata_offset)
     prompt_capture = 0
     response_capture = 0
+    instruction_capture = 0
     if enabled:
-        prompt_len = tl.load(metadata_ptr + req_idx * 5 + 1)
-        min_len = tl.load(metadata_ptr + req_idx * 5 + 2)
-        max_len = tl.load(metadata_ptr + req_idx * 5 + 3)
-        num_stops = tl.load(metadata_ptr + req_idx * 5 + 4)
+        prompt_len = tl.load(metadata_ptr + metadata_offset + 1)
+        instruction_len = tl.load(metadata_ptr + metadata_offset + 2)
+        min_len = tl.load(metadata_ptr + metadata_offset + 3)
+        max_len = tl.load(metadata_ptr + metadata_offset + 4)
+        num_stops = tl.load(metadata_ptr + metadata_offset + 5)
         offsets = tl.arange(0, STOP_CAPACITY)
         stops = tl.load(
             stop_tokens_ptr + req_idx * STOP_CAPACITY + offsets,
@@ -72,25 +87,61 @@ def prepare_boundary_capture(
         if (
             num_computed < prompt_len
             and computed_after == prompt_len
-            and tl.load(seen_ptr + req_idx * 2) == 0
+            and tl.load(seen_ptr + req_idx * NUM_CAPTURES + _PROMPT_CHECKPOINT_SLOT)
+            == 0
         ):
             prompt_capture = prompt_len
-            tl.store(seen_ptr + req_idx * 2, 1)
-        if stopped and tl.load(seen_ptr + req_idx * 2 + 1) == 0:
+            tl.store(seen_ptr + req_idx * NUM_CAPTURES + _PROMPT_CHECKPOINT_SLOT, 1)
+        if (
+            instruction_len > 0
+            and num_computed < instruction_len
+            and computed_after == instruction_len
+            and tl.load(
+                seen_ptr + req_idx * NUM_CAPTURES + _INSTRUCTION_CHECKPOINT_SLOT
+            )
+            == 0
+        ):
+            instruction_capture = instruction_len
+            tl.store(
+                seen_ptr + req_idx * NUM_CAPTURES + _INSTRUCTION_CHECKPOINT_SLOT, 1
+            )
+        if (
+            stopped
+            and tl.load(seen_ptr + req_idx * NUM_CAPTURES + _RESPONSE_CHECKPOINT_SLOT)
+            == 0
+        ):
             response_capture = computed_after
-            tl.store(seen_ptr + req_idx * 2 + 1, 1)
+            tl.store(seen_ptr + req_idx * NUM_CAPTURES + _RESPONSE_CHECKPOINT_SLOT, 1)
 
-    tl.store(capture_tokens_ptr + batch_idx * 2, prompt_capture)
-    tl.store(capture_tokens_ptr + batch_idx * 2 + 1, response_capture)
-    tl.store(capture_bias_ptr + batch_idx * 2, 0)
-    tl.store(capture_bias_ptr + batch_idx * 2 + 1, tl.maximum(num_sampled - 1, 0))
+    output_offset = batch_idx * NUM_CAPTURES
     tl.store(
-        capture_rows_ptr + batch_idx * 2,
+        capture_tokens_ptr + output_offset + _PROMPT_CHECKPOINT_SLOT, prompt_capture
+    )
+    tl.store(
+        capture_tokens_ptr + output_offset + _RESPONSE_CHECKPOINT_SLOT,
+        response_capture,
+    )
+    tl.store(
+        capture_tokens_ptr + output_offset + _INSTRUCTION_CHECKPOINT_SLOT,
+        instruction_capture,
+    )
+    tl.store(capture_bias_ptr + output_offset + _PROMPT_CHECKPOINT_SLOT, 0)
+    tl.store(
+        capture_bias_ptr + output_offset + _RESPONSE_CHECKPOINT_SLOT,
+        tl.maximum(num_sampled - 1, 0),
+    )
+    tl.store(capture_bias_ptr + output_offset + _INSTRUCTION_CHECKPOINT_SLOT, 0)
+    tl.store(
+        capture_rows_ptr + output_offset + _PROMPT_CHECKPOINT_SLOT,
         query_start + prompt_capture - num_computed - 1,
     )
     tl.store(
-        capture_rows_ptr + batch_idx * 2 + 1,
+        capture_rows_ptr + output_offset + _RESPONSE_CHECKPOINT_SLOT,
         query_start + response_capture - num_computed - 1,
+    )
+    tl.store(
+        capture_rows_ptr + output_offset + _INSTRUCTION_CHECKPOINT_SLOT,
+        query_start + instruction_capture - num_computed - 1,
     )
     return num_sampled, num_rejected
 
@@ -111,15 +162,18 @@ def _copy_auxiliary_state_kernel(
     HIDDEN_OFFSET: tl.constexpr,
     HIDDEN_BYTES: tl.constexpr,
     BLOCK: tl.constexpr,
+    NUM_CAPTURES: tl.constexpr,
 ):
-    row = tl.program_id(0) // 2
-    kind = tl.program_id(0) % 2
+    row = tl.program_id(0) // NUM_CAPTURES
+    kind = tl.program_id(0) % NUM_CAPTURES
     state = tl.program_id(1)
-    if tl.load(capture_tokens_ptr + row * 2 + kind) <= 0:
+    if tl.load(capture_tokens_ptr + row * NUM_CAPTURES + kind) <= 0:
         return
     slot = tl.load(idx_mapping_ptr + row)
     block = tl.load(
-        destination_blocks_ptr + (slot * 2 + kind) * (NUM_GROUPS + 1) + NUM_GROUPS
+        destination_blocks_ptr
+        + (slot * NUM_CAPTURES + kind) * (NUM_GROUPS + 1)
+        + NUM_GROUPS
     )
     if state < NUM_STATES:
         base = tl.load(metadata_ptr + state * 4)
@@ -128,7 +182,7 @@ def _copy_auxiliary_state_kernel(
         offset = tl.load(metadata_ptr + state * 4 + 3)
         source = (base + slot.to(tl.int64) * stride).to(tl.pointer_type(tl.uint8))
     else:
-        hidden_row = tl.load(capture_rows_ptr + row * 2 + kind)
+        hidden_row = tl.load(capture_rows_ptr + row * NUM_CAPTURES + kind)
         source = (
             hidden_ptr.to(tl.pointer_type(tl.uint8))
             + hidden_row.to(tl.int64) * hidden_stride
@@ -176,12 +230,13 @@ def _copy_attention_tails_kernel(
     NUM_GROUPS: tl.constexpr,
     BLOCK: tl.constexpr,
     TILES: tl.constexpr,
+    NUM_CAPTURES: tl.constexpr,
 ):
-    row = tl.program_id(0) // 2
-    kind = tl.program_id(0) % 2
+    row = tl.program_id(0) // NUM_CAPTURES
+    kind = tl.program_id(0) % NUM_CAPTURES
     storage = tl.program_id(1)
     tile = tl.program_id(2)
-    count = tl.load(capture_tokens_ptr + row * 2 + kind)
+    count = tl.load(capture_tokens_ptr + row * NUM_CAPTURES + kind)
     if count <= 0:
         return
     slot = tl.load(idx_mapping_ptr + row)
@@ -197,7 +252,7 @@ def _copy_attention_tails_kernel(
     )
     source_block //= block_size // kernel_block_size
     destination_block = tl.load(
-        destination_blocks_ptr + (slot * 2 + kind) * (NUM_GROUPS + 1) + group
+        destination_blocks_ptr + (slot * NUM_CAPTURES + kind) * (NUM_GROUPS + 1) + group
     )
     source = (base + source_block.to(tl.int64) * stride).to(tl.pointer_type(tl.uint8))
     destination = (base + destination_block.to(tl.int64) * stride).to(
@@ -222,7 +277,7 @@ class BoundaryCheckpointState:
         self.max_reqs = model_state.max_num_reqs
         self.num_groups = len(kv_cache_config.kv_cache_groups)
         self.metadata = torch.zeros(
-            (self.max_reqs, 5), dtype=torch.int32, device=self.device
+            (self.max_reqs, 6), dtype=torch.int32, device=self.device
         )
         self.stop_tokens = torch.full(
             (self.max_reqs, MAX_BOUNDARY_STOP_TOKENS),
@@ -231,10 +286,12 @@ class BoundaryCheckpointState:
             device=self.device,
         )
         self.seen = torch.zeros(
-            (self.max_reqs, 2), dtype=torch.int32, device=self.device
+            (self.max_reqs, NUM_BOUNDARY_CHECKPOINT_SLOTS),
+            dtype=torch.int32,
+            device=self.device,
         )
         self.blocks = torch.zeros(
-            (self.max_reqs, 2, self.num_groups + 1),
+            (self.max_reqs, NUM_BOUNDARY_CHECKPOINT_SLOTS, self.num_groups + 1),
             dtype=torch.int32,
             device=self.device,
         )
@@ -283,7 +340,9 @@ class BoundaryCheckpointState:
         self.pool = self._storages[0]
         self.mamba_group_ids = mamba_groups
         self.mamba_blocks = torch.zeros(
-            (self.max_reqs, 2, len(mamba_groups)), dtype=torch.int32, device=self.device
+            (self.max_reqs, NUM_BOUNDARY_CHECKPOINT_SLOTS, len(mamba_groups)),
+            dtype=torch.int32,
+            device=self.device,
         )
         self.storage_metadata = torch.tensor(
             storage_metadata, dtype=torch.int64, device=self.device
@@ -345,6 +404,8 @@ class BoundaryCheckpointState:
     def add_request(self, slot: int, request: "NewRequestData") -> None:
         self.seen[slot].zero_()
         self.metadata[slot].zero_()
+        self.blocks[slot].zero_()
+        self.mamba_blocks[slot].zero_()
         allocation = request.boundary_checkpoint_blocks
         if allocation is None:
             return
@@ -361,6 +422,7 @@ class BoundaryCheckpointState:
                 [
                     1,
                     prompt_len,
+                    request.recurrent_instruction_boundary or 0,
                     prompt_len + params.min_tokens,
                     min(
                         prompt_len + params.max_tokens,
@@ -376,10 +438,10 @@ class BoundaryCheckpointState:
             self.stop_tokens[slot, : len(stops)].copy_(
                 torch.tensor(sorted(stops), dtype=torch.int32, device=self.device)
             )
-        self.blocks[slot].copy_(
+        self.blocks[slot, : len(allocation)].copy_(
             torch.tensor(allocation, dtype=torch.int32, device=self.device)
         )
-        self.mamba_blocks[slot].copy_(
+        self.mamba_blocks[slot, : len(allocation)].copy_(
             torch.tensor(
                 [
                     [kind[group_id] for group_id in self.mamba_group_ids]
@@ -392,7 +454,12 @@ class BoundaryCheckpointState:
         checkpoint = request.boundary_checkpoint
         if checkpoint is not None:
             if checkpoint.num_tokens >= prompt_len:
-                self.seen[slot, 0] = 1
+                self.seen[slot, PROMPT_CHECKPOINT_SLOT] = 1
+            if (
+                request.recurrent_instruction_boundary is not None
+                and checkpoint.num_tokens >= request.recurrent_instruction_boundary
+            ):
+                self.seen[slot, INSTRUCTION_CHECKPOINT_SLOT] = 1
             _restore_auxiliary_state_kernel[(self.auxiliary_metadata.shape[0],)](
                 self.auxiliary_metadata,
                 self.pool,
@@ -435,7 +502,10 @@ class BoundaryCheckpointState:
         self.hidden_dtype = hidden.dtype
         self.spec_hidden_offset = self.hidden_offset + hidden_bytes
         _copy_auxiliary_state_kernel[
-            (idx_mapping.numel() * 2, self.target_metadata.shape[0] + 1)
+            (
+                idx_mapping.numel() * NUM_BOUNDARY_CHECKPOINT_SLOTS,
+                self.target_metadata.shape[0] + 1,
+            )
         ](
             idx_mapping,
             capture[0],
@@ -451,6 +521,7 @@ class BoundaryCheckpointState:
             HIDDEN_OFFSET=self.hidden_offset,
             HIDDEN_BYTES=hidden_bytes,
             BLOCK=1024,
+            NUM_CAPTURES=NUM_BOUNDARY_CHECKPOINT_SLOTS,
         )
         if spec_hidden is not None:
             size = spec_hidden[0].numel() * spec_hidden.element_size()
@@ -458,7 +529,9 @@ class BoundaryCheckpointState:
                 raise RuntimeError("Boundary MTP state exceeds its reserved KV page")
             self.spec_hidden_shape = tuple(spec_hidden.shape[1:])
             self.spec_hidden_dtype = spec_hidden.dtype
-            _copy_auxiliary_state_kernel[(idx_mapping.numel() * 2, 1)](
+            _copy_auxiliary_state_kernel[
+                (idx_mapping.numel() * NUM_BOUNDARY_CHECKPOINT_SLOTS, 1)
+            ](
                 idx_mapping,
                 capture[0],
                 capture[2],
@@ -473,11 +546,15 @@ class BoundaryCheckpointState:
                 HIDDEN_OFFSET=self.spec_hidden_offset,
                 HIDDEN_BYTES=size,
                 BLOCK=1024,
+                NUM_CAPTURES=NUM_BOUNDARY_CHECKPOINT_SLOTS,
             )
 
     def capture_draft(self, idx_mapping: torch.Tensor, capture: torch.Tensor) -> None:
         _copy_auxiliary_state_kernel[
-            (idx_mapping.numel() * 2, self.draft_metadata.shape[0])
+            (
+                idx_mapping.numel() * NUM_BOUNDARY_CHECKPOINT_SLOTS,
+                self.draft_metadata.shape[0],
+            )
         ](
             idx_mapping,
             capture[0],
@@ -493,6 +570,7 @@ class BoundaryCheckpointState:
             HIDDEN_OFFSET=0,
             HIDDEN_BYTES=0,
             BLOCK=1024,
+            NUM_CAPTURES=NUM_BOUNDARY_CHECKPOINT_SLOTS,
         )
 
     def set_draft_replay_anchor(
@@ -575,7 +653,11 @@ class BoundaryCheckpointState:
         block_tables: "BlockTables",
     ) -> None:
         _copy_attention_tails_kernel[
-            (idx_mapping.numel() * 2, self.storage_metadata.shape[0], 16)
+            (
+                idx_mapping.numel() * NUM_BOUNDARY_CHECKPOINT_SLOTS,
+                self.storage_metadata.shape[0],
+                16,
+            )
         ](
             idx_mapping,
             capture[0],
@@ -587,6 +669,7 @@ class BoundaryCheckpointState:
             NUM_GROUPS=self.num_groups,
             BLOCK=4096,
             TILES=16,
+            NUM_CAPTURES=NUM_BOUNDARY_CHECKPOINT_SLOTS,
         )
         self._completion.record()
 

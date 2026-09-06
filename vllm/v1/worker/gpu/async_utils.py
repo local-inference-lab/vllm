@@ -185,7 +185,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.model_runner_output.sampled_token_ids = sampled_token_ids
         if self.boundary_checkpoint_tokens_np is not None:
             tokens = self.boundary_checkpoint_tokens_np.tolist()
-            if any(prompt or response for prompt, response in tokens):
+            if any(any(boundary for boundary in row) for row in tokens):
                 self.model_runner_output.boundary_checkpoint_tokens = tokens
 
         if self.sampling_mask_tensors is not None:

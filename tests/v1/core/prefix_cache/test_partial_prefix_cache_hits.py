@@ -156,7 +156,7 @@ def test_request_boundaries_reuse_exact_prompt_and_response_with_private_state(
     _, hit, _ = manager.get_computed_blocks(request)
     assert hit == 0
     assert manager.allocate_slots(request, prompt_len) is not None
-    prompt = manager.publish_boundary_checkpoint(request, prompt_len, is_response=False)
+    prompt = manager.publish_boundary_checkpoint(request, prompt_len, kind="prompt")
     assert prompt is not None
     request.num_computed_tokens = prompt_len
     request.append_output_token_ids([20])
@@ -165,7 +165,7 @@ def test_request_boundaries_reuse_exact_prompt_and_response_with_private_state(
     request.append_output_token_ids([21])
     request.status = RequestStatus.FINISHED_STOPPED
     response = manager.publish_boundary_checkpoint(
-        request, prompt_len + 1, is_response=True
+        request, prompt_len + 1, kind="response"
     )
     assert response is not None
     manager.free(request)
@@ -207,7 +207,7 @@ def test_request_boundaries_keep_prompt_but_no_intermediate_recurrent_states():
     request = make_request("producer", [1, 2, 3], 4, sha256)
     manager.get_computed_blocks(request)
     assert manager.allocate_slots(request, 3) is not None
-    checkpoint = manager.publish_boundary_checkpoint(request, 3, is_response=False)
+    checkpoint = manager.publish_boundary_checkpoint(request, 3, kind="prompt")
     request.num_computed_tokens = 3
     for token in range(12):
         request.append_output_token_ids([token + 10])
@@ -221,6 +221,56 @@ def test_request_boundaries_keep_prompt_but_no_intermediate_recurrent_states():
     assert manager.boundary_checkpoints.find(repeat, 3) == checkpoint
     manager.free(request)
     assert manager.reset_prefix_cache()
+
+
+def test_request_boundaries_reuse_leading_instructions_across_user_prompts():
+    """A verified chat instruction endpoint can seed divergent user turns."""
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=4,
+        num_blocks=64,
+        enable_boundary_checkpoints=True,
+        use_eagle=True,
+    )
+    instruction_len = 5
+    producer = make_request("producer", [1, 2, 3, 4, 5, 10, 11], 4, sha256)
+    producer.recurrent_instruction_boundary = instruction_len
+    manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(producer, instruction_len) is not None
+    checkpoint = manager.publish_boundary_checkpoint(
+        producer, instruction_len, kind="instruction"
+    )
+    assert checkpoint is not None
+    assert checkpoint.kind == "instruction"
+    manager.free(producer)
+
+    sibling = make_request("sibling", [1, 2, 3, 4, 5, 20, 21], 4, sha256)
+    sibling.recurrent_instruction_boundary = instruction_len
+    blocks, hit, _ = manager.get_computed_blocks(sibling)
+    assert hit == instruction_len
+    assert manager.allocate_slots(sibling, 2, hit, blocks) is not None
+    manager.free(sibling)
+    _, retained = manager.take_kv_cache_block_copies()
+    manager.block_pool.free_blocks(retained)
+
+    divergent = make_request("divergent", [1, 2, 3, 9, 5, 20, 21], 4, sha256)
+    divergent.recurrent_instruction_boundary = instruction_len
+    _, hit, _ = manager.get_computed_blocks(divergent)
+    assert hit == 0
+    manager.free(divergent)
+    assert manager.reset_prefix_cache()
+
+
+def test_request_boundaries_split_prefill_at_instruction_endpoint():
+    request = make_request("chat", [0] * 9000, 32, sha256)
+    request.use_boundary_checkpoints = True
+    request.recurrent_instruction_boundary = 3000
+    scheduler = SimpleNamespace()
+
+    request.num_computed_tokens = 0
+    assert Scheduler._mamba_block_aligned_split(scheduler, request, 4096) == 3000
+    request.num_computed_tokens = 3000
+    assert Scheduler._mamba_block_aligned_split(scheduler, request, 4096) == 4096
 
 
 @pytest.mark.parametrize("dcp_world_size", [1, 4])

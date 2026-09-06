@@ -921,13 +921,13 @@ def test_boundary_checkpoint_copies_only_selected_committed_states(monkeypatch):
 
     tables = t([[1, 2, 3, 4, 5, 6], [14, 15, 16, 17, 18, 19]])
     ctx.initialize_from_forward_context(config, context, _COPY_FUNCS, [tables])
-    destinations = torch.zeros((8, 2, 1), device=device, dtype=torch.int32)
-    destinations[3, :, 0] = t([20, 21])
-    destinations[1, :, 0] = t([22, 23])
+    destinations = torch.zeros((8, 3, 1), device=device, dtype=torch.int32)
+    destinations[3, :, 0] = t([20, 21, 0])
+    destinations[1, :, 0] = t([22, 23, 0])
     idx = t([3, 1])
     states = t([0, 1, 0, 0, 0, 0, 0, 0])
-    capture = t([[7, 9], [0, 23]])
-    bias = t([[0, 2], [0, 1]])
+    capture = t([[7, 9, 0], [0, 23, 0]])
+    bias = t([[0, 2, 0], [0, 1, 0]])
 
     def copy():
         ctx.checkpoint_request_boundaries(idx, states, capture, bias, destinations)

@@ -533,7 +533,12 @@ class Scheduler(SchedulerInterface):
         )
         if request.use_boundary_checkpoints:
             # Running-state migration still happens in the worker, but these
-            # requests do not publish intermediate block-aligned checkpoints.
+            # requests publish only semantic endpoints. Stop exactly at the
+            # leading instruction boundary so the worker can snapshot the
+            # recurrent state associated with that token prefix.
+            instruction_boundary = request.recurrent_instruction_boundary
+            if instruction_boundary is not None and start < instruction_boundary:
+                return min(num_new_tokens, instruction_boundary - start)
             return num_new_tokens
         # Split only during prefill: `request.num_tokens - 1` extends this to
         # resumed requests replaying their output tokens.
@@ -2750,14 +2755,20 @@ class Scheduler(SchedulerInterface):
             finish_reason = None
             captures = model_runner_output.boundary_checkpoint_tokens
             if captures is not None and not output_is_stale:
-                prompt_boundary, response_boundary = captures[req_index]
+                prompt_boundary, response_boundary, instruction_boundary = captures[
+                    req_index
+                ]
+                if instruction_boundary:
+                    self.kv_cache_manager.publish_boundary_checkpoint(
+                        request, instruction_boundary, kind="instruction"
+                    )
                 if prompt_boundary:
                     self.kv_cache_manager.publish_boundary_checkpoint(
-                        request, prompt_boundary, is_response=False
+                        request, prompt_boundary, kind="prompt"
                     )
                 if stopped and response_boundary:
                     self.kv_cache_manager.publish_boundary_checkpoint(
-                        request, response_boundary, is_response=True
+                        request, response_boundary, kind="response"
                     )
             if stopped:
                 # Capture finish_reason BEFORE _handle_stopped_request, which may

@@ -52,6 +52,7 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
     boundary_checkpoint: BoundaryCheckpoint | None = None
     boundary_checkpoint_blocks: tuple[tuple[int, ...], ...] | None = None
+    recurrent_instruction_boundary: int | None = None
 
     @classmethod
     def from_request(
@@ -81,6 +82,7 @@ class NewRequestData:
             prefill_token_ids=prefill_token_ids,
             boundary_checkpoint=request.boundary_checkpoint,
             boundary_checkpoint_blocks=request.boundary_checkpoint_blocks,
+            recurrent_instruction_boundary=request.recurrent_instruction_boundary,
         )
 
     @property
