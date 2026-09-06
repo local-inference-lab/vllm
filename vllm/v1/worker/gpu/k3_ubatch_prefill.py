@@ -14,8 +14,11 @@ satisfied by stream order. Cross-half state and its exactness:
   (``mla.py``, ``k3_split_exact``); the fp8 cache path is not exact.
 - TP all-reduces: the B12X DMA ring orders its reduction by the row block
   ``row // (rows / world)``, which depends on the row count, so the halves
-  are not bit-identical to the unsplit chunk until the ring uses a
-  row-count-invariant block mapping (see the R1 report).
+  are not bit-identical to the unsplit chunk unless the ring uses its
+  row-count-invariant granule mapping (``B12X_PCIE_RING_GRANULE_ROWS=g``).
+  With that mapping the boundary must fall on a ``world * g`` row period
+  and the chunk must be a whole number of periods (``split_point``);
+  chunks that are not run whole.
 
 The overlap (two threads, yield points at the collectives) comes on top of
 the split (``_run_overlapped``).
@@ -146,17 +149,84 @@ def prime_workspaces() -> None:
 # kernel re-tile the second half (different intra-tile terms).
 SPLIT_ALIGNMENT = 16
 
+# Granules per ring chunk that the B12X ring accepts before it falls back to
+# the served contiguous mapping (b12x.comm.pcie.pcie_dma.MAX_PIECES): one
+# granule is one copy piece of a reduce-scatter step.
+_RING_MAX_GRANULES_PER_CHUNK = 8
 
-def split_point(rows: int) -> int:
-    """Row index where the second half starts.
+
+def ring_granule_rows() -> int:
+    """Rows per granule of the B12X ring's row-count-invariant chunk mapping.
+
+    ``B12X_PCIE_RING_GRANULE_ROWS=g`` (``g > 0``) makes the ring assign row
+    granules of ``g`` rows round-robin to its ``world`` reduction chunks, so
+    an element's summation order depends only on its position inside a
+    ``world * g`` row period instead of on the tensor's row count. 0 (the
+    default) selects the served contiguous mapping, whose order is
+    row-count-relative.
+    """
+    try:
+        return max(0, int(os.getenv("B12X_PCIE_RING_GRANULE_ROWS", "0") or 0))
+    except ValueError:
+        return 0
+
+
+def _tp_world_size() -> int:
+    from vllm.distributed.parallel_state import (
+        get_tensor_model_parallel_world_size,
+    )
+
+    return int(get_tensor_model_parallel_world_size())
+
+
+def split_point(rows: int, block_rows: int = 0) -> int:
+    """Row index where the second half starts, or 0 to run the chunk whole.
+
+    ``block_rows`` is the row period over which the TP all-reduce's element
+    ordering repeats (``world * granule`` for the ring's row-count-invariant
+    mapping, 0 when the ring orders its reduction relative to the row count).
+
+    With a period, both the chunk and the boundary must be whole multiples of
+    it, because the halves reduce to the same bits as the unsplit chunk only
+    when each half's rows start and end on a period boundary; a chunk that is
+    not a multiple of the period runs whole. Without a period the boundary is
+    rounded up to ``SPLIT_ALIGNMENT`` and the halves' all-reduces differ from
+    the unsplit chunk's whatever the boundary is.
 
     The first half is the larger one so the second half fits the upper half
-    of the retained AttnRes workspace (see KimiLinearModel), and the boundary
-    is rounded up to ``SPLIT_ALIGNMENT`` (4,608 rows -> 2,304).
+    of the retained AttnRes workspace (see KimiLinearModel).
     """
-    split = rows - rows // 2
-    split = -(-split // SPLIT_ALIGNMENT) * SPLIT_ALIGNMENT
-    return min(split, rows)
+    if rows <= 0:
+        return 0
+    if block_rows <= 0:
+        split = rows - rows // 2
+        split = -(-split // SPLIT_ALIGNMENT) * SPLIT_ALIGNMENT
+        return split if split < rows else 0
+    blocks, tail = divmod(rows, block_rows)
+    if tail or blocks < 2 or blocks > _RING_MAX_GRANULES_PER_CHUNK:
+        return 0
+    return (blocks - blocks // 2) * block_rows
+
+
+def current_split_point(rows: int) -> int:
+    """``split_point`` for the ring this process runs; 0 to run the chunk
+    whole.
+
+    A configured granule whose period cannot be determined (no
+    tensor-parallel group) refuses the split rather than falling back to the
+    row-count-relative boundary: the granule is configured precisely to make
+    the halves reduce like the unsplit chunk.
+    """
+    granule = ring_granule_rows()
+    if granule <= 0:
+        return split_point(rows)
+    try:
+        world = _tp_world_size()
+    except Exception:
+        return 0
+    if world <= 1:
+        return split_point(rows)
+    return split_point(rows, world * granule)
 
 
 def eligible(input_batch: InputBatch) -> bool:
@@ -166,7 +236,7 @@ def eligible(input_batch: InputBatch) -> bool:
         and input_batch.num_draft_tokens == 0
         and rows == input_batch.num_tokens_after_padding
         and rows >= ubatch_prefill_min_tokens()
-        and 0 < split_point(rows) < rows
+        and 0 < current_split_point(rows) < rows
         and bool(input_batch.is_prefilling_np[0])
     )
 
@@ -245,7 +315,9 @@ def run_split_prefill(
     """Run the chunk as two consecutive half forwards; returns the
     concatenated model output in the same form as one forward."""
     rows = input_batch.num_tokens
-    split = split_point(rows)
+    split = current_split_point(rows)
+    if not 0 < split < rows:
+        raise ValueError(f"{rows} rows do not split (boundary {split})")
     halves = ((0, split), (split, rows))
     outputs = []
     prepared = []
