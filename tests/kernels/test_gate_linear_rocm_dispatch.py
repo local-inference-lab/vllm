@@ -7,7 +7,7 @@ run device-free by mocking the platform predicates. The flag decides whether
 the bf16xbf16->fp32 router GEMM uses ``torch.mm``'s fused out_dtype epilogue
 (one kernel) or falls back to a bf16 matmul plus a standalone bf16->fp32 copy.
 
-ROCm's fused ``torch.mm`` branch and SM120's CuTe branch are both guarded on
+ROCm's fused ``torch.mm`` branch and SM120's router branches are both guarded on
 ``not bias`` so a biased gate cannot silently drop its bias term.
 """
 
@@ -108,7 +108,7 @@ def test_rocm_set_out_dtype_respects_bias_guard(monkeypatch):
     assert not gate.allow_cublas_router_gemm
 
 
-def test_sm120_enables_only_ll_bf16_router(monkeypatch):
+def test_sm120_enables_bf16_fp32_paths_without_datacenter_kernels(monkeypatch):
     gate = _make_gate(
         monkeypatch,
         is_rocm=False,
@@ -119,7 +119,7 @@ def test_sm120_enables_only_ll_bf16_router(monkeypatch):
     assert gate.allow_ll_bf16_gemm
     assert not gate.allow_specialized_router_gemm
     assert not gate.allow_dsv3_router_gemm
-    assert not gate.allow_cublas_router_gemm
+    assert gate.allow_cublas_router_gemm
 
 
 def test_sm120_ll_bf16_respects_bias(monkeypatch):
@@ -132,6 +132,7 @@ def test_sm120_ll_bf16_respects_bias(monkeypatch):
     )
 
     assert not gate.allow_ll_bf16_gemm
+    assert not gate.allow_cublas_router_gemm
 
 
 def test_sm120_force_fp32_compute_preserves_fp32_weight_contract(monkeypatch):
@@ -145,6 +146,7 @@ def test_sm120_force_fp32_compute_preserves_fp32_weight_contract(monkeypatch):
 
     assert gate.weight.dtype == torch.float32
     assert not gate.allow_ll_bf16_gemm
+    assert not gate.allow_cublas_router_gemm
 
 
 def test_sm120_set_out_dtype_enables_ll_bf16(monkeypatch):
@@ -157,5 +159,52 @@ def test_sm120_set_out_dtype_enables_ll_bf16(monkeypatch):
     )
 
     assert not gate.allow_ll_bf16_gemm
+    assert not gate.allow_cublas_router_gemm
     gate.set_out_dtype(torch.float32)
     assert gate.allow_ll_bf16_gemm
+    assert gate.allow_cublas_router_gemm
+
+
+def test_sm120_bf16_output_does_not_enable_fp32_gemm(monkeypatch):
+    gate = _make_gate(
+        monkeypatch,
+        is_rocm=False,
+        is_cuda=True,
+        device_capability=(12, 0),
+        out_dtype=torch.bfloat16,
+    )
+    assert not gate.allow_ll_bf16_gemm
+    assert not gate.allow_cublas_router_gemm
+
+
+def test_sm120_capture_preserves_router_graph_pool_layout(monkeypatch):
+    gate = _make_gate(
+        monkeypatch,
+        is_rocm=False,
+        is_cuda=True,
+        device_capability=(12, 0),
+    )
+
+    class FakeInput:
+        dtype = torch.bfloat16
+        shape = (32, 2048)
+
+        def new_empty(self, shape):
+            captured_allocations.append(shape)
+            return self
+
+    x = FakeInput()
+    expected = torch.empty((32, 64), dtype=torch.float32)
+    captured_allocations: list[tuple[int, ...]] = []
+
+    monkeypatch.setattr(
+        "vllm.compilation.breakable_cudagraph.BreakableCUDAGraphCapture.current",
+        lambda: object(),
+    )
+    monkeypatch.setattr(torch, "mm", lambda *args, **kwargs: expected)
+
+    output, output_bias = gate(x)
+
+    assert output is expected
+    assert output_bias is None
+    assert captured_allocations == [(32, 64)]
