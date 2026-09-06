@@ -141,12 +141,14 @@ def make_full_mamba_manager(
 
 @pytest.mark.parametrize("prompt_len", [3, 4, 5, 7, 8, 9])
 @pytest.mark.parametrize("use_eagle", [False, True])
+@pytest.mark.parametrize("dcp", [1, 4])
 def test_request_boundaries_reuse_exact_prompt_and_response_with_private_state(
     prompt_len,
     use_eagle,
+    dcp,
 ):
     manager = make_full_mamba_manager(
-        dcp_world_size=1,
+        dcp_world_size=dcp,
         hash_block_size=4,
         num_blocks=64,
         enable_boundary_checkpoints=True,
@@ -175,10 +177,12 @@ def test_request_boundaries_reuse_exact_prompt_and_response_with_private_state(
     blocks, hit, _ = manager.get_computed_blocks(repeat)
     assert hit == prompt_len
     assert manager.allocate_slots(repeat, 1, hit, blocks) is not None
-    if use_eagle or prompt_len % 4:
+    if use_eagle or prompt_len % (4 * dcp):
         # MTP replays the last row even at a physical page boundary.
         attention = manager.get_blocks(repeat.request_id).blocks[0]
-        assert attention[(prompt_len - 1) // 4].block_id != prompt.block_ids[0][-1]
+        assert (
+            attention[(prompt_len - 1) // (4 * dcp)].block_id != prompt.block_ids[0][-1]
+        )
     state_blocks = manager.get_blocks(repeat.request_id).blocks[1]
     # An unaligned restore has a private working copy; aligned restores
     # append a fresh running block after the cached state.
@@ -192,6 +196,99 @@ def test_request_boundaries_reuse_exact_prompt_and_response_with_private_state(
     assert hit == prompt_len + 1
     assert manager.allocate_slots(continuation, 2, hit, blocks) is not None
     manager.free(continuation)
+    _, retained = manager.take_kv_cache_block_copies()
+    manager.block_pool.free_blocks(retained)
+    assert manager.reset_prefix_cache()
+
+
+@pytest.mark.parametrize("dcp", [1, 4])
+@pytest.mark.parametrize("missing_group", [None, 2, 3])
+def test_request_boundary_retains_complete_dflash_windows(dcp, missing_group):
+    """Evicted draft prefixes are valid only before every required window."""
+    config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target"],
+                FullAttentionSpec(4, num_kv_heads=1, head_size=1, dtype=torch.float32),
+            ),
+            KVCacheGroupSpec(
+                ["recurrent"],
+                MambaSpec(
+                    4,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft_window"],
+                SlidingWindowSpec(
+                    4,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=8,
+                    dcp_replicated=True,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft_full"],
+                FullAttentionSpec(
+                    4,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    dcp_replicated=True,
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=128,
+        enable_caching=True,
+        dcp_world_size=dcp,
+        scheduler_block_size=4 * dcp,
+        hash_block_size=4,
+        enable_boundary_checkpoints=True,
+    )
+    tokens = list(range(29))
+    producer = make_request("producer", tokens, 4, sha256)
+    manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(producer, len(tokens)) is not None
+    manager.remove_skipped_blocks(producer.request_id, len(tokens) - 1)
+    groups = manager.get_blocks(producer.request_id).blocks
+    assert groups[2][0].is_null
+    if missing_group is not None:
+        block = groups[missing_group][-2]
+        manager.block_pool.free_blocks([block])
+        groups[missing_group][-2] = manager.block_pool.null_block
+
+    checkpoint = manager.publish_boundary_checkpoint(
+        producer, len(tokens), kind="prompt"
+    )
+    if missing_group is not None:
+        assert checkpoint is None
+        manager.free(producer)
+        assert len(manager.boundary_checkpoints) == 0
+        return
+    assert checkpoint is not None
+    assert checkpoint.draft_prefix_len == len(tokens)
+    assert checkpoint.block_ids[2][:5] == (0,) * 5
+    assert all(checkpoint.block_ids[2][5:])
+    assert all(checkpoint.block_ids[3])
+    manager.free(producer)
+
+    consumer = make_request("consumer", tokens + [100], 4, sha256)
+    blocks, hit, _ = manager.get_computed_blocks(consumer)
+    assert hit == len(tokens)
+    assert manager.allocate_slots(consumer, 1, hit, blocks) is not None
+    working = manager.get_blocks(consumer.request_id).blocks
+    for group in (0, 2, 3):
+        assert working[group][-1].block_id != checkpoint.block_ids[group][-1]
+    manager.free(consumer)
     _, retained = manager.take_kv_cache_block_copies()
     manager.block_pool.free_blocks(retained)
     assert manager.reset_prefix_cache()

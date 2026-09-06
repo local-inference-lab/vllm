@@ -227,6 +227,7 @@ def _copy_attention_tails_kernel(
     block_table_ptrs,
     table_strides_ptr,
     kernel_block_sizes_ptr,
+    group_cp_sizes_ptr,
     NUM_GROUPS: tl.constexpr,
     BLOCK: tl.constexpr,
     TILES: tl.constexpr,
@@ -245,12 +246,15 @@ def _copy_attention_tails_kernel(
     group = tl.load(storage_metadata_ptr + storage * 4 + 2)
     block_size = tl.load(storage_metadata_ptr + storage * 4 + 3)
     kernel_block_size = tl.load(kernel_block_sizes_ptr + group)
+    cp_size = tl.load(group_cp_sizes_ptr + group)
     table_stride = tl.load(table_strides_ptr + group)
     table = tl.load(block_table_ptrs + group).to(tl.pointer_type(tl.int32))
-    source_block = tl.load(
-        table + slot * table_stride + (count - 1) // kernel_block_size
-    )
-    source_block //= block_size // kernel_block_size
+    # A DCP page covers cp_size times as many global tokens as local tokens.
+    # Every rank snapshots its own allocation of that same virtual page.
+    blocks_per_page = block_size // kernel_block_size
+    page_index = (count - 1) // (block_size * cp_size)
+    source_block = tl.load(table + slot * table_stride + page_index * blocks_per_page)
+    source_block //= blocks_per_page
     destination_block = tl.load(
         destination_blocks_ptr + (slot * NUM_CAPTURES + kind) * (NUM_GROUPS + 1) + group
     )
@@ -590,14 +594,16 @@ class BoundaryCheckpointState:
         token: int | None = None,
         num_speculative_tokens: int = 1,
     ) -> torch.Tensor:
-        """Rebuild the lookahead-dependent draft row using its saved target hidden."""
+        """Prepare the first proposal after restoring a committed target prefix."""
         from vllm.config.compilation import CUDAGraphMode
         from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
         from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
         from vllm.v1.worker.workspace import use_workspace_lane
 
         speculator = runner.speculator
         assert speculator is not None and runner.sampler is not None
+        is_dflash = isinstance(speculator, DFlashSpeculator)
         slot = runner.req_states.req_id_to_index[req_id]
         batch = InputBatch.make_dummy(1, 1, InputBuffers(1, 1, self.device))
         batch.req_ids = [req_id]
@@ -619,20 +625,28 @@ class BoundaryCheckpointState:
         zeros = torch.zeros_like(ones)
         try:
             tables, slots = runner.prepare_attn(batch)
-            metadata = runner.model_state.prepare_attn(
-                batch,
-                CUDAGraphMode.NONE,
-                tables,
-                slots,
-                speculator.attn_groups,
-                runner.kv_cache_config,
+            metadata = (
+                None
+                if is_dflash
+                else runner.model_state.prepare_attn(
+                    batch,
+                    CUDAGraphMode.NONE,
+                    tables,
+                    slots,
+                    speculator.attn_groups,
+                    runner.kv_cache_config,
+                )
             )
+            # DFlash's restored prefix already contains context KV through
+            # count. Re-inserting row count-1 would mutate a shared full page;
+            # only the bonus-and-mask query block is needed for the proposal.
+            replay_kwargs = {"context_kv_is_restored": True} if is_dflash else {}
             with use_workspace_lane(runner._draft_workspace_lane):
                 return speculator.propose(
                     batch,
                     metadata,
                     build_slot_mappings_by_layer(slots, runner.kv_cache_config),
-                    self.get_hidden_states(block_id, draft=True),
+                    self.get_hidden_states(block_id, draft=not is_dflash),
                     None,
                     ones,
                     zeros,
@@ -641,7 +655,10 @@ class BoundaryCheckpointState:
                     runner.sampler.sampling_states.temperature.gpu,
                     runner.sampler.sampling_states.seeds.gpu,
                     num_speculative_tokens=num_speculative_tokens,
-                    is_profile=True,
+                    # DFlash uses its ordinary fixed-size query block; its
+                    # graph reads the persistent buffers prepared by propose.
+                    is_profile=not is_dflash,
+                    **replay_kwargs,
                 )
         finally:
             self.set_draft_replay_anchor(slot, count, 1)
@@ -666,6 +683,7 @@ class BoundaryCheckpointState:
             block_tables.block_table_ptrs,
             block_tables.block_table_strides,
             block_tables.kernel_block_sizes_tensor,
+            block_tables.group_cp_sizes,
             NUM_GROUPS=self.num_groups,
             BLOCK=4096,
             TILES=16,
