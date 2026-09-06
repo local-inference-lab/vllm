@@ -2742,3 +2742,31 @@ def test_postprocess_messages_null_arguments_string():
     tool_calls = messages[0]["tool_calls"]
     assert tool_calls is not None
     assert tool_calls[0]["function"]["arguments"] == {}
+
+
+def test_postprocess_messages_recovers_malformed_tool_arguments():
+    raw_arguments = '{"value": '
+    messages: list[ConversationMessage] = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_incomplete",
+                    "type": "function",
+                    "function": {
+                        "name": "diagnostic_noop",
+                        "arguments": raw_arguments,
+                    },
+                }
+            ],
+        }
+    ]
+
+    _postprocess_messages(messages)
+
+    tool_calls = messages[0]["tool_calls"]
+    assert tool_calls is not None
+    assert tool_calls[0]["function"]["arguments"] == {
+        "__vllm_malformed_json__": raw_arguments
+    }

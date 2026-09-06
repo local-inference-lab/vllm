@@ -1851,11 +1851,17 @@ def _postprocess_messages(messages: list[ConversationMessage]) -> None:
                         parameter="tool_calls",
                     )
 
-                # if arguments is None or empty string, set to {}
+                # Keep the existing zero-argument compatibility for None, empty,
+                # and JSON null. Preserve malformed non-empty history in a valid
+                # object so chat templates can render a failed call for recovery.
                 if content := function.get("arguments"):
                     if not isinstance(content, (dict, list)):
-                        parsed = json.loads(content)
-                        function["arguments"] = parsed if parsed is not None else {}
+                        try:
+                            parsed = json.loads(content)
+                        except json.JSONDecodeError:
+                            function["arguments"] = {"__vllm_malformed_json__": content}
+                        else:
+                            function["arguments"] = parsed if parsed is not None else {}
                 else:
                     function["arguments"] = {}
 
