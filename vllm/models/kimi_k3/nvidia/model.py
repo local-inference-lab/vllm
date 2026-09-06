@@ -21,7 +21,6 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce_in_place,
 )
-from vllm.distributed.utils import split_tensor_along_last_dim
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
@@ -693,7 +692,26 @@ class KimiColumnParallelGate(KimiPaddedColumnParallelLinear):
 
 
 class KimiPaddedRowParallelLinear(RowParallelLinear):
-    """Row-parallel linear with a zero-padded input axis."""
+    """Row-parallel linear whose per-rank input shard is 16-byte aligned.
+
+    The logical input width is split into ``kimi_projection_shard_width``
+    columns per rank, a multiple of eight elements: 400 for the 3,584-wide
+    Kimi-K3 routed latent at TP9 instead of the ceiling division 399. With
+    bf16 operands every rank's window of the full-width input then starts on
+    a 16-byte boundary with a 16-byte-aligned row pitch, and the weight shard
+    has a 16-byte-aligned row pitch, so cuBLAS can pick a tensor-core kernel
+    with vectorized operand loads instead of the align-1 fallback (the served
+    TP9 stack ran the 4,608-token prefill up-projection, K=399 per rank and
+    N=7,168, on that fallback at 202 us and 130 TFLOP/s per layer). The last
+    rank owns the remaining logical columns (384 at TP9); the loader
+    zero-fills its weight tail.
+
+    The prefill entry points (``forward_into``, ``accumulate_into``) read the
+    rank's window as a strided view of the full-width input and skip the
+    zero-filled weight tail, so they launch neither the pad nor the
+    shard-copy kernels. ``forward`` keeps the zero-padded split of
+    :class:`RowParallelLinear`, which computes the same partial sums.
+    """
 
     _ACCUMULATION_TILE_ROWS = 1024
 
@@ -706,7 +724,8 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
 
     def __init__(self, input_size: int, output_size: int, prefix: str) -> None:
         tp_size = get_tensor_model_parallel_world_size()
-        padded_input_size = cdiv(input_size, tp_size) * tp_size
+        self.logical_input_size = input_size
+        padded_input_size = kimi_projection_shard_width(input_size, tp_size) * tp_size
         self.input_pad = padded_input_size - input_size
         super().__init__(
             padded_input_size,
@@ -723,6 +742,23 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
             x = torch.nn.functional.pad(x, (0, self.input_pad))
         return super().forward(x)
 
+    def input_shard(self, x: torch.Tensor) -> torch.Tensor:
+        """This rank's window of the full-width input as a strided view.
+
+        The window starts at ``tp_rank * shard_width``; it is narrower than the
+        weight shard only where the shard's zero-filled columns extend past
+        the logical input (the last rank), and those weight columns are then
+        skipped instead of padding the input.
+        """
+        if self.input_is_parallel:
+            return x
+        shard_width = int(self.weight.shape[1])
+        start = self.tp_rank * shard_width
+        width = min(shard_width, int(x.shape[-1]) - start)
+        if width <= 0:
+            return x.narrow(-1, 0, 0)
+        return x.narrow(-1, start, width)
+
     def forward_into(
         self, x: torch.Tensor, output: torch.Tensor
     ) -> tuple[torch.Tensor, None]:
@@ -735,21 +771,15 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
             )
         if x.ndim != 2 or output.ndim != 2:
             raise ValueError("Caller-owned output requires 2D tensors")
-        if self.input_pad:
-            x = torch.nn.functional.pad(x, (0, self.input_pad))
-        if self.input_is_parallel:
-            input_parallel = x
-        else:
-            input_parallel = split_tensor_along_last_dim(
-                x, num_partitions=self.tp_size
-            )[self.tp_rank].contiguous()
+        input_parallel = self.input_shard(x)
         expected_shape = (input_parallel.shape[0], self.output_size)
         if output.shape != expected_shape:
             raise ValueError(
                 f"Caller-owned output has shape {tuple(output.shape)}; "
                 f"expected {expected_shape}"
             )
-        torch.mm(input_parallel, self.weight.t(), out=output)
+        width = input_parallel.shape[1]
+        torch.mm(input_parallel, self.weight[:, :width].t(), out=output)
         return output, None
 
     def accumulate_into(self, x: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
@@ -768,14 +798,7 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
             )
         if x.ndim != 2 or output.ndim != 2:
             raise ValueError("Residual accumulation requires 2D tensors")
-        if self.input_pad:
-            x = torch.nn.functional.pad(x, (0, self.input_pad))
-        if self.input_is_parallel:
-            input_parallel = x
-        else:
-            input_parallel = split_tensor_along_last_dim(
-                x, num_partitions=self.tp_size
-            )[self.tp_rank].contiguous()
+        input_parallel = self.input_shard(x)
         expected_shape = (input_parallel.shape[0], self.output_size)
         if output.shape != expected_shape:
             raise ValueError(
@@ -806,11 +829,12 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
             dtype=output.dtype,
             device=output.device,
         )
+        width = input_parallel.shape[1]
         for row_start in range(0, self.output_size, tile_rows):
             row_end = row_start + tile_rows
             torch.mm(
                 input_parallel,
-                self.weight[row_start:row_end].t(),
+                self.weight[row_start:row_end, :width].t(),
                 out=scratch,
             )
             output[:, row_start:row_end].add_(scratch)

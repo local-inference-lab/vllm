@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import weakref
 
@@ -270,3 +271,67 @@ def test_routed_output_transform_accumulates_prefill_in_bounded_tiles() -> None:
 
     assert actual.data_ptr() == residual_ptr
     torch.testing.assert_close(actual, expected)
+
+
+def _padded_row_parallel(
+    tp_size: int, tp_rank: int, weight: torch.Tensor
+) -> KimiPaddedRowParallelLinear:
+    projection = object.__new__(KimiPaddedRowParallelLinear)
+    nn.Module.__init__(projection)
+    projection.input_is_parallel = False
+    projection.tp_size = tp_size
+    projection.tp_rank = tp_rank
+    projection.output_size = int(weight.shape[0])
+    projection.reduce_results = False
+    projection.quant_method = UnquantizedLinearMethod()
+    projection.register_parameter("bias", None)
+    projection.weight = nn.Parameter(weight, requires_grad=False)
+    return projection
+
+
+def test_padded_row_parallel_input_shard_is_an_aligned_view_at_tp9() -> None:
+    """At TP9 the 3,584-wide latent splits into 400-column shards: every
+    rank's window starts on a 16-byte boundary with a 16-byte row pitch, has
+    a K that is a multiple of eight, and is a view (no copy); the last rank
+    reads the 384 remaining columns."""
+    latent = torch.zeros(3, 3584, dtype=torch.bfloat16)
+    shard_width = 400
+    for rank in range(9):
+        projection = _padded_row_parallel(
+            9, rank, torch.zeros(16, shard_width, dtype=torch.bfloat16)
+        )
+        window = projection.input_shard(latent)
+        start = rank * shard_width
+        assert window.shape == (3, min(shard_width, 3584 - start))
+        assert window.shape[1] % 8 == 0
+        assert window.data_ptr() == latent.data_ptr() + start * 2
+        assert (window.data_ptr() - latent.data_ptr()) % 16 == 0
+        assert window.stride() == (3584, 1)
+        assert window.stride(0) * 2 % 16 == 0
+
+
+def test_padded_row_parallel_shards_sum_to_the_full_projection_at_tp9() -> None:
+    """The nine rank-local partials of forward_into (aligned 400-wide K
+    windows, zero-filled tail on the last rank) sum to the full projection,
+    and accumulate_into adds the same partial into a residual."""
+    torch.manual_seed(0)
+    logical, tp_size, shard_width, out = 3584, 9, 400, 2048
+    latent = torch.randint(-2, 3, (1024, logical)).float()
+    full_weight = torch.randint(-2, 3, (out, logical)).float()
+    expected = torch.mm(latent, full_weight.t())
+
+    total = torch.zeros_like(expected)
+    for rank in range(tp_size):
+        param = nn.Parameter(torch.empty(out, shard_width), requires_grad=False)
+        param.input_dim = 1
+        projection = _padded_row_parallel(tp_size, rank, param)
+        projection.weight_loader(param, full_weight)
+        if rank == tp_size - 1:
+            assert torch.equal(param[:, 384:], torch.zeros(out, 16))
+        output = torch.empty(1024, out)
+        projection.forward_into(latent, output)
+        residual = torch.ones(1024, out)
+        assert projection.accumulate_into(latent, residual) is residual
+        torch.testing.assert_close(residual, output + 1.0)
+        total += output
+    torch.testing.assert_close(total, expected)
