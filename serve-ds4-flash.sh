@@ -198,6 +198,11 @@ case "${allreduce_mode}" in
     ;;
   nccl)
     export VLLM_ENABLE_PCIE_ALLREDUCE=0
+    # Base images may export a backend value for an earlier vLLM release.
+    # NCCL mode must not expose an inactive custom-backend selector because
+    # every registered vLLM environment variable is validated at worker init.
+    unset VLLM_PCIE_ALLREDUCE_BACKEND
+    unset VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE
     export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
     allreduce_args=(--disable-custom-all-reduce)
     ;;
