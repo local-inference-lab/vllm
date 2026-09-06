@@ -246,6 +246,18 @@ class DeviceCommunicatorBase:
         """
         return None
 
+    def pcie_prepare_reduce_scatter(self, wire: str) -> bool:
+        """Compile a copy-engine ring's reduce-scatter kernels; ``False``
+        when there is no such ring."""
+        return False
+
+    def pcie_reduce_scatter_columns(
+        self, input_: torch.Tensor, *, wire: str, cols: int
+    ) -> torch.Tensor | None:
+        """Column reduce-scatter on a copy-engine ring: this rank's
+        ``[rows, cols]`` block of the sum, or ``None`` when unavailable."""
+        return None
+
     def checkpoint_prepare(self) -> None:
         """Prepare reclaimable communicator state for checkpoint (default: no-op)."""
 

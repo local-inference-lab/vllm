@@ -128,7 +128,9 @@ from vllm.models.kimi_k3.nvidia.tp_projection import (
     kimi_reduction_is_borrowed,
     kimi_ring_static_io_enabled,
     materialize_kimi_reduction,
+    prepare_kimi_latent_reduce_scatter,
     try_gather_kimi_sharded_projection_pair_topk,
+    try_reduce_scatter_kimi_latent,
     try_select_kimi_routed_experts,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -451,6 +453,8 @@ class KimiRoutedOutputTransform(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
         output: torch.Tensor | None = None,
+        *,
+        column_block: bool = False,
     ) -> torch.Tensor:
         """Project the routed latent back to the hidden dim.
 
@@ -463,14 +467,26 @@ class KimiRoutedOutputTransform(nn.Module):
                 rank-local partials before their shared all-reduce.
             output: Dead caller-owned storage for the routed projection. This
                 preserves the separate projection and shared-output addition.
+            column_block: ``hidden_states`` is this rank's ``[rows,
+                shard_width]`` column block of the reduced latent (from
+                ``reduce_scatter_tp_partial``) rather than the full width; it
+                is normalized with the column-block RMSNorm and fed to the
+                TP-sharded up-projection as its input shard.
         """
         if residual is not None and output is not None:
             raise ValueError(
                 "Kimi routed output transform accepts either residual or output"
             )
-        self.capture_routed_latent(hidden_states)
-        if self.norm is not None:
-            hidden_states = self.normalize_routed_latent(hidden_states)
+        if column_block:
+            if not isinstance(self.up_proj, KimiPaddedRowParallelLinear):
+                raise ValueError(
+                    "A column-block latent needs a TP-sharded up-projection"
+                )
+            hidden_states = self.normalize_column_block(hidden_states)
+        else:
+            self.capture_routed_latent(hidden_states)
+            if self.norm is not None:
+                hidden_states = self.normalize_routed_latent(hidden_states)
         if residual is not None and isinstance(self.up_proj, ReplicatedLinear):
             return residual.addmm_(hidden_states, self.up_proj.weight.t())
         if residual is not None and isinstance(
@@ -481,18 +497,74 @@ class KimiRoutedOutputTransform(nn.Module):
                     "Kimi routed output transform cannot accumulate into the "
                     "supplied residual"
                 )
-            return self.up_proj.accumulate_into(hidden_states, residual)
+            return self.up_proj.accumulate_into(
+                hidden_states, residual, x_is_local_block=column_block
+            )
         if output is not None:
             if not self.can_write_output(hidden_states, output):
                 raise ValueError(
                     "Kimi routed output transform cannot write the supplied buffer"
                 )
-            hidden_states, _ = self.up_proj.forward_into(hidden_states, output)
+            hidden_states, _ = self.up_proj.forward_into(
+                hidden_states, output, x_is_local_block=column_block
+            )
+        elif column_block:
+            assert isinstance(self.up_proj, KimiPaddedRowParallelLinear)
+            hidden_states, _ = self.up_proj.forward_local_block(hidden_states)
         else:
             hidden_states, _ = self.up_proj(hidden_states)
         if residual is not None:
             hidden_states.add_(residual)
         return hidden_states
+
+    def reduce_scatter_tp_partial(self, partial: torch.Tensor) -> torch.Tensor | None:
+        """Reduce a prefill TP-partial latent to this rank's input shard.
+
+        Returns the ``[rows, shard_width]`` column block of the sum for the
+        ``column_block`` path of ``forward`` (``VLLM_K3_LATENT_REDUCE``
+        ``rs_fp32`` / ``rs_bf16``), or ``None`` when the layer keeps the
+        full-width all-reduce: the mode is off, the up-projection is not
+        TP-sharded, the latent capture is active (it records the full
+        latent), or the ring declines the call.
+        """
+        up_proj = self.up_proj
+        if (
+            not isinstance(up_proj, KimiPaddedRowParallelLinear)
+            or up_proj.reduce_results
+            or up_proj.input_is_parallel
+            or os.getenv("VLLM_KQUANT_CAPTURE_DIR")
+            or (self.norm is not None and self.norm.variance_size_override is not None)
+        ):
+            return None
+        return try_reduce_scatter_kimi_latent(partial, cols=up_proj.shard_width)
+
+    def normalize_column_block(self, block: torch.Tensor) -> torch.Tensor:
+        """RMSNorm of the reduced latent restricted to this rank's column block.
+
+        The variance is the mean of squares over the full latent width: each
+        rank sums the squares of its block in fp64 (the block's padding
+        columns are zero) and the per-row sums are combined with an fp64
+        all-reduce, so the variance is at least as precise as the fp32
+        block reduction of the full-width kernel. The block is then scaled
+        by ``rsqrt(variance + eps)`` and its slice of the norm weight in fp32
+        and rounded to bf16 once.
+        """
+        norm = self.norm
+        if norm is None:
+            return block
+        up_proj = self.up_proj
+        assert isinstance(up_proj, KimiPaddedRowParallelLinear)
+        width = norm.hidden_size
+        rows, shard = block.shape
+        start = up_proj.tp_rank * shard
+        valid = max(0, min(shard, width - start))
+        sumsq = block.double().square().sum(dim=-1, keepdim=True)
+        sumsq = tensor_model_parallel_all_reduce(sumsq)
+        inv_rms = torch.rsqrt(sumsq / width + norm.variance_epsilon).float()
+        weight = block.new_zeros((shard,), dtype=torch.float32)
+        if valid:
+            weight[:valid] = norm.weight.data[start : start + valid].float()
+        return (block.float() * inv_rms * weight).to(block.dtype)
 
     def can_normalize_routed_latent_in_place(self, hidden_states: torch.Tensor) -> bool:
         """Check whether the consumed prefill latent can hold its RMSNorm."""
@@ -748,6 +820,30 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
             x = torch.nn.functional.pad(x, (0, self.input_pad))
         return super().forward(x)
 
+    @property
+    def shard_width(self) -> int:
+        """Columns of this rank's input shard (the weight shard's K)."""
+        return int(self.weight.shape[1])
+
+    def local_block_shard(self, block: torch.Tensor) -> torch.Tensor:
+        """This rank's K window of a ``[rows, shard_width]`` column block.
+
+        The block came from a column reduce-scatter whose blocks are
+        ``shard_width`` wide; the last rank's block extends past the logical
+        input with zero columns, which are skipped like the matching
+        zero-filled weight columns of ``input_shard``.
+        """
+        shard_width = self.shard_width
+        if block.shape[-1] != shard_width:
+            raise ValueError(
+                f"Column block has {block.shape[-1]} columns; expected {shard_width}"
+            )
+        start = self.tp_rank * shard_width
+        width = min(shard_width, self.logical_input_size - start)
+        if width <= 0:
+            return block.narrow(-1, 0, 0)
+        return block.narrow(-1, 0, width)
+
     def input_shard(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's window of the full-width input as a strided view.
 
@@ -758,17 +854,27 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
         """
         if self.input_is_parallel:
             return x
-        shard_width = int(self.weight.shape[1])
+        shard_width = self.shard_width
         start = self.tp_rank * shard_width
         width = min(shard_width, int(x.shape[-1]) - start)
         if width <= 0:
             return x.narrow(-1, 0, 0)
         return x.narrow(-1, start, width)
 
+    def forward_local_block(self, block: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Rank-local projection of a column block (allocating output)."""
+        input_parallel = self.local_block_shard(block)
+        width = input_parallel.shape[1]
+        return torch.mm(input_parallel, self.weight[:, :width].t()), None
+
     def forward_into(
-        self, x: torch.Tensor, output: torch.Tensor
+        self, x: torch.Tensor, output: torch.Tensor, *, x_is_local_block: bool = False
     ) -> tuple[torch.Tensor, None]:
-        """Write an unquantized rank-local projection into caller storage."""
+        """Write an unquantized rank-local projection into caller storage.
+
+        ``x`` is the full-width input, or with ``x_is_local_block`` this
+        rank's ``[rows, shard_width]`` column block.
+        """
         if not isinstance(self.quant_method, UnquantizedLinearMethod):
             raise ValueError("Caller-owned output requires an unquantized projection")
         if self.bias is not None or self.reduce_results:
@@ -777,7 +883,9 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
             )
         if x.ndim != 2 or output.ndim != 2:
             raise ValueError("Caller-owned output requires 2D tensors")
-        input_parallel = self.input_shard(x)
+        input_parallel = (
+            self.local_block_shard(x) if x_is_local_block else self.input_shard(x)
+        )
         expected_shape = (input_parallel.shape[0], self.output_size)
         if output.shape != expected_shape:
             raise ValueError(
@@ -788,13 +896,16 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
         torch.mm(input_parallel, self.weight[:, :width].t(), out=output)
         return output, None
 
-    def accumulate_into(self, x: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+    def accumulate_into(
+        self, x: torch.Tensor, output: torch.Tensor, *, x_is_local_block: bool = False
+    ) -> torch.Tensor:
         """Add an unquantized rank-local projection using bounded scratch.
 
         The output dimension is processed in fixed row tiles. Each tile is
         rounded to BF16 by ``torch.mm`` before it is added to the BF16
         residual, matching the allocating projection-then-add operation while
-        avoiding a full-width projection allocation.
+        avoiding a full-width projection allocation. ``x`` is the full-width
+        input, or with ``x_is_local_block`` this rank's column block.
         """
         if not isinstance(self.quant_method, UnquantizedLinearMethod):
             raise ValueError("Residual accumulation requires an unquantized projection")
@@ -804,7 +915,9 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
             )
         if x.ndim != 2 or output.ndim != 2:
             raise ValueError("Residual accumulation requires 2D tensors")
-        input_parallel = self.input_shard(x)
+        input_parallel = (
+            self.local_block_shard(x) if x_is_local_block else self.input_shard(x)
+        )
         expected_shape = (input_parallel.shape[0], self.output_size)
         if output.shape != expected_shape:
             raise ValueError(
@@ -1355,6 +1468,10 @@ class KimiMoE(nn.Module):
             # layer's result before returning it.
             if hasattr(self.experts, "reduction_borrow_output"):
                 self.experts.reduction_borrow_output = kimi_ring_static_io_enabled()
+            # The latent reduce-scatter's add kernels must exist before the
+            # kernel-resolution freeze and graph capture that follow loading.
+            if self.routed_output_transform is not None:
+                prepare_kimi_latent_reduce_scatter()
         if self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
             if w13_weight is None:

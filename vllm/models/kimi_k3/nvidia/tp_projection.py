@@ -17,6 +17,8 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce_in_place,
     tensor_model_parallel_is_borrowed_storage,
     tensor_model_parallel_pcie_all_gather_pair,
+    tensor_model_parallel_pcie_reduce_scatter_columns,
+    tensor_model_parallel_prepare_pcie_reduce_scatter,
 )
 from vllm.v1.attention.ops import dcp_alltoall
 from vllm.v1.attention.ops.dcp_alltoall import (
@@ -94,6 +96,68 @@ def kimi_reduction_is_borrowed(tensor: torch.Tensor) -> bool:
 
 _KIMI_PROJECTION_GATHER_MODES = ("nccl", "dma_pair")
 KIMI_DMA_PAIR_GATHER_MIN_TOKENS = 1024
+_KIMI_LATENT_REDUCE_MODES = ("allreduce", "rs_fp32", "rs_bf16")
+KIMI_LATENT_REDUCE_SCATTER_MIN_TOKENS = 1024
+
+
+@lru_cache(maxsize=1)
+def kimi_latent_reduce_mode() -> str:
+    """``VLLM_K3_LATENT_REDUCE``: how a prefill layer reduces the TP-partial
+    routed latent before its RMSNorm and row-parallel up-projection.
+
+    ``allreduce`` (default): the full-width all-reduce (DMA ring, eight
+    bf16 roundings at TP9), then each rank normalizes the full latent and
+    reads its input shard. ``rs_fp32`` / ``rs_bf16``: a column reduce-scatter
+    on the DMA ring returning only this rank's input shard, with an fp32
+    running sum on the wire (one bf16 rounding) or bf16 hops (eight); the
+    RMSNorm variance then comes from fp64 per-shard sums of squares combined
+    across ranks. Falls back to ``allreduce`` per call when the ring
+    declines or the call is decode-sized.
+    """
+    mode = os.getenv("VLLM_K3_LATENT_REDUCE", "allreduce").strip().lower()
+    if mode not in _KIMI_LATENT_REDUCE_MODES:
+        raise ValueError(
+            "VLLM_K3_LATENT_REDUCE must be one of "
+            f"{_KIMI_LATENT_REDUCE_MODES}, got {mode!r}"
+        )
+    return mode
+
+
+def kimi_latent_reduce_scatter_wire() -> str | None:
+    """The reduce-scatter wire of ``kimi_latent_reduce_mode()``, or ``None``
+    for the all-reduce."""
+    mode = kimi_latent_reduce_mode()
+    return None if mode == "allreduce" else mode.removeprefix("rs_")
+
+
+def prepare_kimi_latent_reduce_scatter() -> bool:
+    """Compile the ring's reduce-scatter kernels for the configured wire at
+    model build time, before any kernel freeze or graph capture."""
+    wire = kimi_latent_reduce_scatter_wire()
+    if wire is None:
+        return False
+    return tensor_model_parallel_prepare_pcie_reduce_scatter(wire)
+
+
+def try_reduce_scatter_kimi_latent(
+    partial: torch.Tensor, *, cols: int
+) -> torch.Tensor | None:
+    """Reduce a prefill TP-partial latent to this rank's ``[rows, cols]``
+    column block on the DMA ring; ``None`` keeps the all-reduce path."""
+    wire = kimi_latent_reduce_scatter_wire()
+    if wire is None:
+        return None
+    if (
+        partial.ndim != 2
+        or partial.shape[0] < KIMI_LATENT_REDUCE_SCATTER_MIN_TOKENS
+        or partial.dtype != torch.bfloat16
+        or not partial.is_contiguous()
+        or get_tensor_model_parallel_world_size() <= 1
+    ):
+        return None
+    return tensor_model_parallel_pcie_reduce_scatter_columns(
+        partial, wire=wire, cols=cols
+    )
 
 
 @lru_cache(maxsize=1)
