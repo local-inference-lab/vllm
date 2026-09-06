@@ -6644,7 +6644,7 @@ class GPUModelRunner(
         # steps. Release the generic outputs so KV admission uses the larger
         # transient peak instead of an unreachable sum of both passes.
         self._sync_device()
-        del hidden_states, output
+        del hidden_states, last_hidden_states, output
         self._profile_deepseek_v4_attention()
         self.encoder_cache.clear()
         gc.collect()

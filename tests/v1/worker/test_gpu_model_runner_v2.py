@@ -303,6 +303,7 @@ def test_profile_run_releases_generic_outputs_before_deepseek_profile(monkeypatc
     runner.supports_mm_inputs = False
     runner.max_num_tokens = 4096
     runner.is_last_pp_rank = False
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
     events: list[object] = []
     output_refs: list[ref] = []
 
