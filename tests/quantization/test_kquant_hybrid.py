@@ -432,3 +432,30 @@ def test_b12x_w4a16_fused_moe_compile_key_is_row_count_independent(
     compile_for(1)
     (single,) = cache.seen
     assert single != keys[4608]
+
+
+def test_topk_id_dump_writes_prefill_chunks_on_rank_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    import vllm.model_executor.layers.quantization.kquant_hybrid as kq
+
+    monkeypatch.setattr(kq, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(kq, "_topk_dump_counts", {})
+    monkeypatch.setenv("VLLM_K3_DUMP_TOPK_IDS", str(tmp_path))
+    monkeypatch.setenv("VLLM_K3_DUMP_TOPK_IDS_CHUNKS", "2")
+    layer = SimpleNamespace(layer_name="model.layers.5.mlp.experts")
+    ids = torch.randint(0, 896, (830, 16), dtype=torch.int64)
+
+    for _ in range(3):
+        kq._maybe_dump_topk_ids(layer, ids)
+
+    files = sorted(p.name for p in tmp_path.iterdir())
+    assert files == ["layer005_chunk000_m830.pt", "layer005_chunk001_m830.pt"]
+    saved = torch.load(tmp_path / files[0])
+    assert saved["layer"] == 5 and saved["num_tokens"] == 830
+    assert saved["topk_ids"].dtype == torch.int32
+    assert torch.equal(saved["topk_ids"], ids.to(torch.int32))
+
+    monkeypatch.setattr(kq, "get_tensor_model_parallel_rank", lambda: 1)
+    kq._maybe_dump_topk_ids(SimpleNamespace(layer_name="model.layers.6.x"), ids)
+    assert len(list(tmp_path.iterdir())) == 2

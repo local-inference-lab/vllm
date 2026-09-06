@@ -168,6 +168,40 @@ def _preplanned_w4a16_launches(
     return fused, topk_sum
 
 
+_topk_dump_counts: dict[str, int] = {}
+
+
+def _maybe_dump_topk_ids(layer: "RoutedExperts", topk_ids: torch.Tensor) -> None:
+    """Save a prefill chunk's routed expert ids for offline replay.
+
+    Active only when ``VLLM_K3_DUMP_TOPK_IDS`` names a directory: TP rank 0
+    writes ``layer{L}_chunk{c}_m{tokens}.pt`` holding ``{"topk_ids": int32
+    [tokens, top_k], "layer": int, "num_tokens": int}`` for the first
+    ``VLLM_K3_DUMP_TOPK_IDS_CHUNKS`` (default 16) prefill launches of every
+    layer. The device-to-host copy synchronizes the stream; diagnostic only.
+    """
+    directory = os.getenv("VLLM_K3_DUMP_TOPK_IDS")
+    if not directory or get_tensor_model_parallel_rank() != 0:
+        return
+    name = str(layer.layer_name)
+    count = _topk_dump_counts.get(name, 0)
+    if count >= int(os.getenv("VLLM_K3_DUMP_TOPK_IDS_CHUNKS", "16")):
+        return
+    _topk_dump_counts[name] = count + 1
+    match = re.search(r"layers\.(\d+)\b", name)
+    layer_idx = int(match.group(1)) if match else -1
+    os.makedirs(directory, exist_ok=True)
+    tokens = int(topk_ids.shape[0])
+    torch.save(
+        {
+            "topk_ids": topk_ids.to(torch.int32).cpu(),
+            "layer": layer_idx,
+            "num_tokens": tokens,
+        },
+        os.path.join(directory, f"layer{layer_idx:03d}_chunk{count:03d}_m{tokens}.pt"),
+    )
+
+
 def _stack_exl3_intermediate_rotations(
     w13_svh: torch.Tensor,
     w2_suh: torch.Tensor,
@@ -2118,6 +2152,8 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 f"capacity {runtime.max_m} (max_num_batched_tokens)."
             )
         decode = m <= _B12X_DECODE_M
+        if not decode:
+            _maybe_dump_topk_ids(layer, topk_ids)
         weights = (
             topk_weights
             if topk_weights.dtype == torch.float32
