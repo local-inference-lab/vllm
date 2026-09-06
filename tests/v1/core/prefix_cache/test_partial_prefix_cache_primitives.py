@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
+from vllm.config import VllmConfig
 from vllm.distributed.kv_events import BlockRemoved, BlockStored
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
@@ -129,6 +131,52 @@ def test_request_boundaries_fall_back_for_oversized_stop_sets():
     assert BoundaryCheckpointCache.supports_request(request)
     request.sampling_params.stop_token_ids = list(range(256))
     assert not BoundaryCheckpointCache.supports_request(request)
+
+
+@pytest.mark.parametrize("method", [None, "mtp", "dflash"])
+@pytest.mark.parametrize("dcp", [1, 2, 4])
+@pytest.mark.parametrize("external_cache", [False, True])
+def test_glm_boundary_adapter_requires_gpu_resident_atomic_state(
+    monkeypatch, method, dcp, external_cache
+):
+    """DCP and DFlash are supported; external checkpoint persistence is not."""
+    monkeypatch.setattr(
+        "vllm.platforms.current_platform",
+        SimpleNamespace(is_cuda=lambda: True),
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            recurrent_checkpoint_policy="auto",
+            enable_prefix_caching=True,
+            mamba_cache_mode="align",
+            kv_cache_layout=None,
+            kv_offloading_size=None,
+        ),
+        model_config=SimpleNamespace(
+            enable_sleep_mode=False,
+            enable_return_routed_experts=False,
+            hf_text_config=SimpleNamespace(model_type="glm5_next_text"),
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            decode_context_parallel_size=dcp,
+            prefill_context_parallel_size=1,
+        ),
+        speculative_config=(
+            None
+            if method is None
+            else SimpleNamespace(
+                method=method,
+                uses_dynamic_speculative_decoding=lambda: False,
+            )
+        ),
+        use_v2_model_runner=True,
+        lora_config=None,
+        kv_transfer_config=object() if external_cache else None,
+    )
+    adapter_enabled = VllmConfig.use_request_boundary_checkpoints.fget(config)
+    assert adapter_enabled is not external_cache
 
 
 def test_request_boundary_branches_deduplicate_and_survive_sibling_eviction():
