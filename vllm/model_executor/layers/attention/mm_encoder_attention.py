@@ -376,6 +376,11 @@ class MMEncoderAttention(CustomOp):
 
         self._init_fp8_state()
 
+    @property
+    def fa_version(self) -> int | None:
+        """FlashAttention version used by the flash backends (``None`` otherwise)."""
+        return self._fa_version
+
     def _init_fp8_state(self) -> None:
         """Initialize FP8 attention state from multimodal config.
 

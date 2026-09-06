@@ -46,6 +46,13 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
 
+from .dflash_tp9 import (
+    DFlashHeadExtent,
+    DFlashTP9QKVParallelLinear,
+    DFlashTP9RowParallelLinear,
+    aligned_tp9_extent,
+    dflash_tp9_head_extent,
+)
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
 from .utils import (
@@ -60,6 +67,18 @@ logger = init_logger(__name__)
 
 
 _SLIDING_ATTENTION = "sliding_attention"
+
+
+def _uses_kimi_dflash_tp9(config: Qwen3Config) -> bool:
+    return (
+        get_tensor_model_parallel_world_size() == 9
+        and getattr(config, "original_num_attention_heads", config.num_attention_heads)
+        == 32
+        and getattr(config, "original_num_key_value_heads", config.num_key_value_heads)
+        == 8
+        and config.hidden_size == 7168
+        and config.num_hidden_layers == 6
+    )
 
 
 def _retain_dflash_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -84,6 +103,33 @@ def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
     return not all(
         _dflash_layer_causal(config, i) for i in range(config.num_hidden_layers)
     )
+
+
+def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
+    """Return the target model's rotary-embedding layout when it is exposed.
+
+    A DFlash-family draft must rotate query and key tensors with the same
+    dimension layout as the target model used during hidden-state extraction.
+    Draft checkpoints do not encode this property. A mismatch changes every
+    drafted attention result without raising an error and collapses token
+    acceptance.
+
+    Args:
+        target_model: Target model that can expose rotary layout modules.
+
+    Returns:
+        The exposed NeoX rotary-layout setting, or ``None`` when unavailable.
+    """
+    language_model = (
+        target_model.get_language_model()
+        if hasattr(target_model, "get_language_model")
+        else target_model
+    )
+    for module in language_model.modules():
+        style = getattr(module, "is_neox_style", None)
+        if isinstance(style, bool):
+            return style
+    return None
 
 
 def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
@@ -163,15 +209,15 @@ def _resolve_layer_attention(
 class DFlashAttention(Attention):
     """Attention with DFlash-specific KV allocation semantics.
 
-    The draft KV cache is replicated across DCP ranks because DFlash draft
-    attention cannot reduce sharded KV. For SWA drafts we keep the cache
-    window-bounded so replicated DCP does not allocate a full-context draft KV.
+    Each TP-owned KV head retains all positions in its attention window because
+    DFlash cannot combine attention over context shards. SWA keeps that window
+    bounded even when the target uses decode context parallelism.
     """
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        # The draft attends locally over a replicated cache. DCP ranks therefore
-        # need the same draft KV, but sliding-window layers must stay windowed
-        # instead of being widened to full-context storage.
+        # Draft TP ranks need the same token positions for their owned KV heads.
+        # Sliding-window layers retain their window instead of being widened
+        # to full-context storage by the target's DCP configuration.
         dcp_replicated = vllm_config.parallel_config.decode_context_parallel_size > 1
         if self.sliding_window is not None:
             # Build the spec directly instead of converting the parent's
@@ -216,10 +262,12 @@ class DFlashQwen3Attention(nn.Module):
         add_swa_attention_sink_bias: bool = False,
         sliding_window: int | None = None,
         causal: bool = False,
+        is_neox_style: bool = True,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
+        tp9_extent: DFlashHeadExtent | None = None,
     ) -> None:
         super().__init__()
         self.layer_name = prefix
@@ -234,31 +282,56 @@ class DFlashQwen3Attention(nn.Module):
         else:
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        if tp9_extent is not None:
+            if tp_size != 9 or attention_bias or add_swa_attention_sink_bias:
+                raise ValueError(
+                    "Kimi DFlash TP9 requires bias-free 32/8-head attention"
+                )
+            self.num_heads = tp9_extent.query_count
+            self.num_kv_heads = 1
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=attention_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=attention_bias,  # DFlash has o_proj bias when using attention bias
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
-        )
+        if tp9_extent is None:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=attention_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.o_proj = RowParallelLinear(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                bias=attention_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.o_proj",
+            )
+        else:
+            self.qkv_proj = DFlashTP9QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                tp9_extent,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.o_proj = DFlashTP9RowParallelLinear(
+                32 * self.head_dim,
+                hidden_size,
+                tp9_extent.first_query * self.head_dim,
+                tp9_extent.query_count * self.head_dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.o_proj",
+            )
 
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=max_position,
+            is_neox_style=is_neox_style,
             rope_parameters=rope_parameters,
         )
 
@@ -342,6 +415,12 @@ class DFlashQwen3DecoderLayer(nn.Module):
         # non-causal) from the draft config.
         sliding_window, causal = _resolve_layer_attention(config, layer_idx)
 
+        # The loader copies this value from the built target model. Kimi-K3
+        # uses interleaved rotary dimensions while Qwen3 defaults to NeoX
+        # rotary dimensions, so relying on the Qwen3 default is not valid for
+        # a Kimi-trained DFlash-family checkpoint.
+        is_neox_style = getattr(config, "is_neox_style", True)
+
         self.self_attn = DFlashQwen3Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -352,12 +431,18 @@ class DFlashQwen3DecoderLayer(nn.Module):
             add_swa_attention_sink_bias=add_swa_attention_sink_bias,
             sliding_window=sliding_window,
             causal=causal,
+            is_neox_style=is_neox_style,
             head_dim=getattr(config, "head_dim", None),
             cache_config=cache_config,
             quant_config=quant_config,
             rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
+            tp9_extent=(
+                dflash_tp9_head_extent(layer_idx, get_tensor_model_parallel_rank())
+                if _uses_kimi_dflash_tp9(config)
+                else None
+            ),
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -472,17 +557,34 @@ class DFlashQwen3Model(nn.Module):
             if layer.layer_type == "sliding_attention"
         }
         if self.use_aux_hidden_state:
-            self.fc = ReplicatedLinear(
-                input_size=_get_dflash_fc_input_size(
-                    vllm_config,
-                ),
-                output_size=self.config.hidden_size,
-                bias=False,
-                params_dtype=vllm_config.model_config.dtype,
-                quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, "fc"),
-                return_bias=False,
-            )
+            if _uses_kimi_dflash_tp9(self.config):
+                input_size = _get_dflash_fc_input_size(vllm_config)
+                first, count = aligned_tp9_extent(
+                    input_size, get_tensor_model_parallel_rank(), 64
+                )
+                self.fc = DFlashTP9RowParallelLinear(
+                    input_size,
+                    self.config.hidden_size,
+                    first,
+                    count,
+                    input_is_full=True,
+                    params_dtype=vllm_config.model_config.dtype,
+                    quant_config=self.quant_config,
+                    prefix=maybe_prefix(prefix, "fc"),
+                    return_bias=False,
+                )
+            else:
+                self.fc = ReplicatedLinear(
+                    input_size=_get_dflash_fc_input_size(
+                        vllm_config,
+                    ),
+                    output_size=self.config.hidden_size,
+                    bias=False,
+                    params_dtype=vllm_config.model_config.dtype,
+                    quant_config=self.quant_config,
+                    prefix=maybe_prefix(prefix, "fc"),
+                    return_bias=False,
+                )
         self.hidden_norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -841,7 +943,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         needs_squeeze = hidden_states.dim() == 1
         if needs_squeeze:
             hidden_states = hidden_states.unsqueeze(0)
-        expected = self.model.fc.input_size
+        expected = (
+            self.model.fc.source_input_size
+            if isinstance(self.model.fc, DFlashTP9RowParallelLinear)
+            else self.model.fc.input_size
+        )
         if hidden_states.shape[-1] != expected:
             raise ValueError(
                 f"DFlash drafter expects {expected} concatenated aux hidden "
