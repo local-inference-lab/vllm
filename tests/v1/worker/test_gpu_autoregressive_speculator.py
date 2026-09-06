@@ -258,11 +258,13 @@ def test_propose_restores_mtp_state_when_draft_decode_raises(monkeypatch) -> Non
     speculator.model = SimpleNamespace(model=lifecycle)
     speculator.rollback_qsa_interval_starts = True
     speculator.share_mtp_topk_indices = True
+    speculator.prefill_outputs_are_compact = False
     speculator.num_speculative_steps = 2
     speculator.max_model_len = 32
     speculator.max_num_reqs = 1
     speculator.hidden_states = torch.zeros(3, 2)
     speculator.last_token_indices = torch.zeros(1, dtype=torch.int64)
+    speculator.sample_src_positions = torch.zeros(1, dtype=torch.int64)
     speculator.current_draft_step = torch.tensor(0, dtype=torch.int64)
     speculator.input_buffers = SimpleNamespace()
     speculator.draft_tokens = torch.zeros((1, 2), dtype=torch.int64)
@@ -591,7 +593,11 @@ def test_mrope_profile_uses_scalar_positions_before_target_state_is_bound(monkey
 
 
 @pytest.mark.skipif(not torch.accelerator.is_available(), reason="accelerator required")
-def test_mrope_prefill_compaction_and_continuation_kernels():
+@pytest.mark.parametrize("max_model_len", [108, 4096])
+@pytest.mark.parametrize("advance_draft_positions", [False, True])
+def test_mrope_prefill_compaction_and_continuation_kernels(
+    max_model_len: int, advance_draft_positions: bool
+):
     device = torch.device("cuda")
     sentinel = -777
     input_buffers = SimpleNamespace(
@@ -660,19 +666,27 @@ def test_mrope_prefill_compaction_and_continuation_kernels():
         num_reqs=2,
     )
     input_buffers.positions[:2] = torch.tensor([102, 106], device=device)
+    sample_src_positions = torch.tensor([103, 107], device=device)
     prepare_decode_inputs(
         draft_tokens=torch.tensor([70, 71], dtype=torch.int64, device=device),
         target_seq_lens=input_batch.seq_lens,
         num_rejected=num_rejected,
         input_buffers=input_buffers,
-        max_model_len=4096,
+        sample_src_positions=sample_src_positions,
+        max_model_len=max_model_len,
         max_num_reqs=3,
+        advance_draft_positions=advance_draft_positions,
         mrope_positions=mrope_positions,
     )
     torch.accelerator.synchronize()
 
-    assert input_buffers.positions[:2].tolist() == [103, 107]
-    assert mrope_positions[:, :2].tolist() == [[13, 17], [13, 17], [13, 17]]
+    shift = int(advance_draft_positions)
+    assert input_buffers.positions[:2].tolist() == [102 + shift, 106 + shift]
+    expected_mrope = (
+        [[13, 17]] * 3 if advance_draft_positions else [[12, 16], [22, 26], [32, 36]]
+    )
+    assert mrope_positions[:, :2].tolist() == expected_mrope
+    assert sample_src_positions.tolist() == [104, 108]
     assert mrope_positions.data_ptr() == backing_ptr
 
     overlapping_positions = torch.tensor(
@@ -722,15 +736,25 @@ def test_mrope_prefill_compaction_and_continuation_kernels():
         output_draft_tokens=torch.zeros((2, 3), dtype=torch.int64, device=device),
         next_input_hidden_states=torch.zeros((2, 4), device=device),
         input_buffers=input_buffers,
+        sample_src_positions=sample_src_positions,
         num_reqs=2,
-        max_model_len=4096,
+        max_model_len=max_model_len,
         num_speculative_steps=3,
+        advance_draft_positions=advance_draft_positions,
         mrope_positions=mrope_positions,
     )
     torch.accelerator.synchronize()
 
-    assert input_buffers.positions[:2].tolist() == [104, 108]
-    assert mrope_positions[:, :2].tolist() == [[14, 18], [14, 18], [14, 18]]
+    assert input_buffers.positions[:2].tolist() == [
+        102 + 2 * shift,
+        min(106 + 2 * shift, max_model_len - 1),
+    ]
+    expected_mrope = (
+        [[14, 18]] * 3 if advance_draft_positions else [[12, 16], [22, 26], [32, 36]]
+    )
+    assert mrope_positions[:, :2].tolist() == expected_mrope
+    # Sampling positions must advance even for clamped or Q-only forward positions.
+    assert sample_src_positions.tolist() == [105, 109]
     assert mrope_positions.data_ptr() == backing_ptr
 
 
