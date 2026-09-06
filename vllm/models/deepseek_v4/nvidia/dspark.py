@@ -280,14 +280,15 @@ def _insert_context_kv(
     if cache_dtype == torch.uint8:
         # fp8_ds_mla UE8M0 paged layout
         swa_2d = swa_cache.view(swa_cache.shape[0], -1)
+        q_out = attn._get_q_padded_scratch(dummy_q)
         torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
             dummy_q,
             kv,
+            q_out,
             swa_2d,
             slot_mapping,
             positions,
             cos_sin_cache,
-            attn.padded_heads,
             attn.eps,
             block_size,
         )
