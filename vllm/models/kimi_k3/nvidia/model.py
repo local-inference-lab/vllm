@@ -17,6 +17,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce_in_place,
@@ -108,6 +109,7 @@ from vllm.models.common.ops.sequence_parallel import (
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.models.kimi_k3.nvidia import l2_prefetch as _l2pf
+from vllm.models.kimi_k3.nvidia import residual_digest
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.nvidia.latent_moe_runner import (
     LatentMoERunner,
@@ -2172,6 +2174,20 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 shape[2],
             ).permute(1, 0, 2)
             self._attn_res_workspace = workspace
+        # A split prefill runs its second half on another thread with the
+        # same row count; give it the upper half of the reserved rows so the
+        # two halves' block residuals never alias (the reserved workspace
+        # covers the full chunk and the second half is the smaller one).
+        from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+        ubatch = dbo_current_ubatch_id()
+        if ubatch > 0:
+            offset = ubatch * (workspace.size(0) // 2)
+            if offset + shape[0] > workspace.size(0):
+                raise RuntimeError(
+                    "AttnRes workspace too small for the split prefill half"
+                )
+            return workspace[offset : offset + shape[0]]
         return workspace[: shape[0]]
 
     def reserve_attn_res_workspace(self) -> None:
@@ -2333,6 +2349,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         else:
             attn_res_scratch = None
 
+        digest = None
+        if residual_digest.enabled():
+            digest = residual_digest.ForwardDigest(
+                self.end_layer - self.start_layer,
+                first_position=int(positions[0].item()),
+                rank=get_tensor_model_parallel_rank(),
+            )
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
             start=self.start_layer,
@@ -2344,6 +2367,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 residual=residual,
                 attn_res_scratch=attn_res_scratch,
             )
+            if digest is not None:
+                digest.add(hidden_states)
             if (layer_idx + 1) in self.aux_hidden_state_layers:
                 if stream_aux_hidden_states and self.use_attn_res:
                     assert prefix_sum is not None
@@ -2363,6 +2388,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                     aux_hidden_state = hidden_states + residual
                     aux_hidden_states.append(aux_hidden_state)
 
+        if digest is not None:
+            digest.flush()
         # Rejoin the L2 prefetch side stream (no-op when nothing was issued).
         if _l2pf.ENABLED:
             _l2pf.join_all()
