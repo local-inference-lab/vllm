@@ -14,6 +14,46 @@ from vllm.model_executor.layers.fused_moe.config import (
     get_routing_method_type,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
+
+
+@triton.jit
+def _sorted_softmax_topk_kernel(
+    logits,
+    weights,
+    ids,
+    source_rows,
+    padding,
+    rows,
+    stride,
+    EXPERTS: tl.constexpr,
+    TOP_K: tl.constexpr,
+    RENORMALIZE: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    expert = tl.arange(0, EXPERTS)
+    values = tl.load(logits + row * stride + expert).to(tl.float32)
+    exps = tl.exp(values - tl.max(values, 0))
+    probs = exps / tl.sum(exps, 0)
+    probs = tl.where((probs == probs) & (probs != float("inf")), probs, 0.0)
+    # Rank probabilities, not logits: rounding can merge distinct logits into
+    # probability ties. Lower expert IDs win those ties, including poisoned rows.
+    key = probs.to(tl.uint32, bitcast=True).to(tl.uint64) << 32
+    key = key | (0xFFFFFFFF - expert.to(tl.uint32)).to(tl.uint64)
+    ordered = tl.sort(key, descending=True)
+    selected_probs = (ordered >> 32).to(tl.uint32).to(tl.float32, bitcast=True)
+    selected_ids = (0xFFFFFFFF - ordered.to(tl.uint32)).to(tl.int32)
+    if RENORMALIZE:
+        denom = tl.sum(tl.where(expert < TOP_K, selected_probs, 0.0), 0)
+        selected_probs = selected_probs / tl.where(denom > 0.0, denom, 1.0)
+    if HAS_PADDING:
+        selected_ids = tl.where(tl.load(padding + row), -1, selected_ids)
+    out = row * TOP_K + expert
+    tl.store(weights + out, selected_probs, mask=expert < TOP_K)
+    tl.store(ids + out, selected_ids, mask=expert < TOP_K)
+    tl.store(source_rows + out, expert * rows + row, mask=expert < TOP_K)
 
 
 def _get_padding_mask(num_tokens: int) -> torch.Tensor | None:
@@ -30,6 +70,30 @@ def vllm_topk_softmax(
     gating_output: torch.Tensor,
     renormalize: bool = False,
 ) -> tuple[torch.Tensor, ...]:
+    if (
+        current_platform.is_device_capability_family(120)
+        and gating_output.dtype == torch.bfloat16
+        and gating_output.shape[1] == 512
+        and gating_output.stride(1) == 1
+        and topk_indices.shape[1] in (10, 16)
+        and 0 < gating_output.shape[0] <= 128
+    ):
+        padding = _get_padding_mask(topk_indices.shape[0])
+        _sorted_softmax_topk_kernel[(gating_output.shape[0],)](
+            gating_output,
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            padding,
+            gating_output.shape[0],
+            gating_output.stride(0),
+            512,
+            topk_indices.shape[1],
+            renormalize,
+            padding is not None,
+            num_warps=4,
+        )
+        return topk_weights, topk_indices
     ops.topk_softmax(
         topk_weights,
         topk_indices,
