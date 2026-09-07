@@ -200,6 +200,23 @@ def _max_dcp_local_cache_tokens(
     return ((max_model_len + partitions - 1) // partitions) * interleave
 
 
+def _planned_cache_tokens(
+    local_shard_tokens: int, sliding_window: int | None, block_size: int
+) -> int:
+    """Return the cache tokens one request can expose to the kernel.
+
+    The kernel attends to every token of the block table it is given, so the
+    plan's page table (and the flattened copy ``build`` makes of the worker's
+    block table) covers the largest local shard. A sliding-window MLA group is
+    the Kimi-K3 draft tail: the speculator shifts each request's block table
+    to its last ``sliding_window`` tokens, so at most the window plus one
+    partial block is exposed and the plan covers that many tokens instead.
+    """
+    if sliding_window is None:
+        return local_shard_tokens
+    return min(local_shard_tokens, int(sliding_window) + block_size - 1)
+
+
 def _kernel_query_heads(local_heads: int, dcp_size: int = 1) -> int:
     """Return the tiled head count after an optional DCP query gather."""
     if local_heads <= 0 or dcp_size <= 0:
@@ -521,19 +538,11 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         local_shard_tokens = _max_dcp_local_cache_tokens(
             vllm_config, dcp_size=self.dcp_world_size
         )
-        max_cache_tokens = local_shard_tokens
-        sliding_window = getattr(kv_cache_spec, "sliding_window", None)
-        if sliding_window is not None:
-            max_cache_tokens = min(max_cache_tokens, int(sliding_window))
-        if max_cache_tokens < local_shard_tokens:
-            # The kernel attends to every local token of a request; the plan's
-            # page table (and the flattened copy `build` makes of the worker's
-            # block table) must therefore cover the largest local shard.
-            raise ValueError(
-                "B12X_MLA plans must cover the largest local KV shard: "
-                f"planned={max_cache_tokens} tokens, shard={local_shard_tokens} "
-                f"(sliding_window={sliding_window})."
-            )
+        max_cache_tokens = _planned_cache_tokens(
+            local_shard_tokens,
+            getattr(kv_cache_spec, "sliding_window", None),
+            int(kv_cache_spec.block_size),
+        )
         create_plan = (
             _create_packed_dense_mla_plan
             if self._uses_packed_ds_mla

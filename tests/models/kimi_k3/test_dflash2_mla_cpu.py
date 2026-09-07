@@ -409,3 +409,14 @@ def test_boot_description_is_one_hashable_string() -> None:
     assert "5 MLA layers (sliding/sliding/sliding/sliding/full, window 4096)" in text
     assert "target taps [19,37,66,78,90]" in text
     assert "4 speculative tokens per step, sampled proposals" in text
+
+
+def test_b12x_mla_plans_cover_the_bounded_draft_tail() -> None:
+    """A windowed draft group plans for window + one partial block."""
+    from vllm.v1.attention.backends.mla.b12x_mla import _planned_cache_tokens
+
+    assert _planned_cache_tokens(116_509, None, 64) == 116_509
+    assert _planned_cache_tokens(1_048_576, 4096, 64) == 4096 + 63
+    # The speculator's own attention view is already bounded to the tail.
+    assert _planned_cache_tokens(4096 + 63, 4096, 64) == 4096 + 63
+    assert _planned_cache_tokens(2048, 4096, 64) == 2048
