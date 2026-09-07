@@ -499,13 +499,13 @@ class OnlineRenderer:
         *,
         skip_mm_cache: bool,
     ) -> None:
-        """Attach a verified token boundary after leading chat instructions.
+        """Attach a verified token boundary before the first user content.
 
         Chat templates can depend on the complete conversation, so message
-        counts cannot be translated into token offsets directly. Rendering the
-        leading system/developer segment without a generation prompt produces a
-        candidate offset. The marker is emitted only when those token IDs are
-        an exact prefix of the complete rendered prompt.
+        counts cannot be translated into token offsets directly. Continuing an
+        empty user turn after the leading instructions renders a valid shared
+        prefix even when the template requires a user message. The marker is
+        emitted only when those token IDs exactly prefix the complete prompt.
         """
         if (
             not self.enable_recurrent_instruction_checkpoints
@@ -526,20 +526,24 @@ class OnlineRenderer:
         if instruction_count == 0:
             return
 
+        instruction_messages = [
+            *messages[:instruction_count],
+            {"role": "user", "content": ""},
+        ]
         instruction_params = replace(
             chat_params,
             chat_template_kwargs=merge_kwargs(
                 chat_params.chat_template_kwargs,
                 {
                     "add_generation_prompt": False,
-                    "continue_final_message": False,
+                    "continue_final_message": True,
                 },
                 unset_values=(),
             ),
         )
         try:
             (_,), (instruction_input,) = await self.renderer.render_chat_async(
-                [messages[:instruction_count]],
+                [instruction_messages],
                 instruction_params,
                 tok_params,
                 skip_mm_cache=skip_mm_cache,
