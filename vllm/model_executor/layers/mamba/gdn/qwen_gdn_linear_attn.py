@@ -177,11 +177,12 @@ def _resolve_gdn_prefill_backend(
     * ``platform == cuda``;
     * one of the following:
       - Hopper (SM90) — no further constraints;
-      - Blackwell (SM10.x) with ``head_k_dim == 128``, ``cuda_runtime >= 13``.
+      - Blackwell (SM10.x or SM12.x) with ``head_k_dim == 128``,
+        ``cuda_runtime >= 13``.
 
     In-tree CuteDSL GDN prefill kernel is chosen when:
     * "cutedsl" is requested; (opt-in only)
-    * Blackwell (SM10.x) with ``head_k_dim == 128``;
+    * SM10.x (datacenter Blackwell) with ``head_k_dim == 128``;
     """
     additional_config = vllm_config.additional_config
     backend_cfg = (
@@ -204,12 +205,15 @@ def _resolve_gdn_prefill_backend(
     if current_platform.is_device_capability(90):
         supports_flashinfer = True
     elif (
-        current_platform.is_device_capability_family(100)
+        (
+            current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(120)
+        )
         and head_k_dim == 128
         and current_platform.get_cuda_runtime_major() >= 13
     ):
         supports_flashinfer = True
-        supports_cutedsl = True
+        supports_cutedsl = current_platform.is_device_capability_family(100)
 
     if backend in ["flashinfer", "auto"] and supports_flashinfer:
         return backend, "flashinfer"
@@ -245,6 +249,18 @@ def _log_gdn_backend_decision(
         )
 
 
+def _prepare_flashinfer_cu_seqlens(
+    cu_seqlens: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if (
+        cu_seqlens is not None
+        and cu_seqlens.dtype != torch.int64
+        and current_platform.is_device_capability_family(120)
+    ):
+        return cu_seqlens.to(torch.int64)
+    return cu_seqlens
+
+
 def fi_chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -274,6 +290,7 @@ def fi_chunk_gated_delta_rule(
     fi_state = initial_state.to(torch.float32)
     fi_g = g.to(torch.float32)
     fi_beta = beta.to(torch.float32)
+    cu_seqlens = _prepare_flashinfer_cu_seqlens(cu_seqlens)
     result = chunk_gated_delta_rule_fi(
         q=q,
         k=k,
