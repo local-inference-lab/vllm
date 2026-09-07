@@ -5301,6 +5301,8 @@ def test_ec_connector_update_connector_output_called():
     scheduler.ec_connector.update_connector_output.assert_called_once_with(
         ec_connector_output
     )
+
+
 # ==============================================================================
 # Variable-length encoder cross-attention block allocation tests
 # ==============================================================================
