@@ -955,9 +955,13 @@ class B12xMLABackend(MLACommonBackend):
         if model_config is None:
             return None
         hf_text_config = model_config.hf_text_config
-        if getattr(hf_text_config, "model_type", None) not in (
-            "kimi_linear",
-            "k3_dspark",
+        # The DFlash2 draft (model type of its EAGLEConfig wrapper) runs the
+        # K3 DSpark MLA layers.
+        draft_architectures = getattr(hf_text_config, "architectures", None) or ()
+        if (
+            getattr(hf_text_config, "model_type", None)
+            not in ("kimi_linear", "k3_dspark")
+            and "DFlash2DraftModel" not in draft_architectures
         ):
             return "B12X_MLA currently supports only Kimi K3 and K3 DSpark"
 
