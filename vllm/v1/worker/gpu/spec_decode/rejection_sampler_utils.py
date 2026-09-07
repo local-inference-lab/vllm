@@ -379,7 +379,10 @@ def _compute_cumulative_log_p_kernel(
                     HAS_DRAFT_LOGITS,
                 )
             )
-            log_p = tl.minimum(log_p + (target_logprob - draft_logprob), 0.0)
+            log_p += target_logprob - draft_logprob
+            # An undefined ratio cannot verify a proposal. In particular,
+            # all-masked or non-finite logits produce NaN log probabilities.
+            log_p = tl.where(log_p == log_p, tl.minimum(log_p, 0.0), float("-inf"))
         tl.store(cumulative_log_p_ptr + logit_idx, log_p)
 
 
@@ -620,7 +623,13 @@ def _rejection_kernel(
                         HAS_DRAFT_LOGITS,
                     )
                     denom = residual_mass + 1.0 - prefix_joint_ratio
-                    h = tl.where(denom > 0.0, residual_mass / denom, 1.0)
+                    # Zero residual with a unit prefix ratio accepts; NaN
+                    # residuals must not take that same acceptance fallback.
+                    h = tl.where(
+                        denom > 0.0,
+                        residual_mass / denom,
+                        tl.where(denom == 0.0, 1.0, 0.0),
+                    )
                 else:
                     h = prefix_joint_ratio
                 accepted_length = tl.where(u <= h, i + 1, accepted_length)
@@ -808,6 +817,10 @@ def _resample_kernel(
             target_log_probs + tldevice.log1p(-ratio),
             float("-inf"),
         ).to(tl.float32)
+        # No draft distribution exists when its normalizer is non-finite.
+        # Discard its proposals and recover directly from the target.
+        valid_draft = (draft_lse > float("-inf")) & (draft_lse < float("inf"))
+        residual_logits = tl.where(valid_draft, residual_logits, target_logits)
     else:
         # One-hot draft. The residual is just the target distribution with
         # the rejected draft token probability zeroed out.

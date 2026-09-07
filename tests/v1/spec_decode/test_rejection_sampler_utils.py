@@ -338,6 +338,47 @@ def test_all_nan_target_logits_in_range(temperature: float):
     assert (sampled[valid] < vocab_size).all()
 
 
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_block_verification_rejects_invalid_target_distribution(invalid: float):
+    """An undefined target distribution cannot verify any draft proposal."""
+    inputs = _build_rejection_sample_inputs(
+        torch.full((256,), invalid, device="cuda"),
+        torch.zeros(256, device="cuda"),
+        num_speculative_steps=3,
+        temperature=1.0,
+        num_trials=4,
+    )
+    _, num_sampled = rejection_sample(
+        **inputs, num_speculative_steps=3, use_block_verification=True
+    )
+    assert (num_sampled == 1).all()
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("use_block_verification", [False, True])
+def test_invalid_draft_distribution_samples_from_target(
+    invalid: float, use_block_verification: bool
+):
+    """Invalid draft logits discard proposals and retain the target's support."""
+    target = torch.full((256,), float("-inf"), device="cuda")
+    target[7] = 0.0
+    inputs = _build_rejection_sample_inputs(
+        target,
+        torch.zeros(256, device="cuda"),
+        num_speculative_steps=3,
+        temperature=1.0,
+        num_trials=4,
+    )
+    inputs["draft_logits"].fill_(invalid)
+    sampled, num_sampled = rejection_sample(
+        **inputs,
+        num_speculative_steps=3,
+        use_block_verification=use_block_verification,
+    )
+    assert (num_sampled == 1).all()
+    assert (sampled[:, 0] == 7).all()
+
+
 def test_placeholder_draft_token_rejected():
     """A placeholder draft id (-1) must be rejected without reading the logit
     tensors out of bounds, for any sampling method.
