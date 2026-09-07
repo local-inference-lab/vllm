@@ -65,7 +65,6 @@ from vllm.multimodal.encoder_budget import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
-from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -77,6 +76,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.outputs import (
     DraftTokenIds,
+    KVConnectorOutput,
     ModelRunnerOutput,
     RoutedExpertsTensors,
     make_empty_encoder_model_runner_output,
@@ -156,7 +156,11 @@ from vllm.v1.worker.gpu.spec_decode.utils import (
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
+from vllm.v1.worker.utils import (
+    KVBlockZeroer,
+    copy_kv_cache_blocks_inplace,
+    group_kv_caches_for_copy,
+)
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
@@ -511,6 +515,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_logits=self.max_num_reqs * self.decode_query_len,
                 vocab_size=self.vocab_size,
                 device=self.device,
+                num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
             )
 
         if self.is_pooling_model and self.is_last_pp_rank:
@@ -619,19 +624,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
-            # One local block covers `block_size * dcp_shard_count` tokens in
-            # the global sequence. Replicated groups keep the full cache on
-            # every rank instead.
             group_cp_size = get_kv_cache_dcp_shard_count(spec, self.dcp_size)
             group_cp_sizes.append(group_cp_size)
-            max_num_blocks = cdiv(
-                block_table_max_model_len, spec.block_size * group_cp_size
+            # Cache specifications own their block-table geometry. Attention
+            # caches account for their token-position DCP shards, while
+            # recurrent state and replicated attention caches remain unscaled.
+            max_num_blocks = spec.max_num_blocks_per_req(
+                self.vllm_config, block_table_max_model_len
             )
-            # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
             if isinstance(spec, MambaSpec):
-                max_num_blocks = (
-                    max_num_blocks if self.cache_config.enable_prefix_caching else 1
-                ) + spec.num_speculative_blocks
                 max_num_blocks = get_block_table_width(
                     max_num_blocks, spec.block_size, token_alignment=None
                 )
@@ -734,6 +735,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kernel_block_sizes,
             self.vllm_config,
             kv_cache_raw_tensors=kv_cache_raw_tensors,
+        )
+        self.kv_caches_by_group = group_kv_caches_for_copy(
+            kv_caches_dict, self.kv_cache_config
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
@@ -1020,6 +1024,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
+        if hasattr(self, "kv_caches_by_group"):
+            self.kv_caches_by_group.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
@@ -1231,6 +1237,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_block_zeroer.zero_block_ids([0])
         torch.accelerator.synchronize()
 
+    def _restore_null_block_after_kv_load(
+        self, kv_connector_output: KVConnectorOutput | None
+    ) -> None:
+        """Re-zero the null placeholder block once external KV loads land.
+
+        Block 0 pads every block table and its pages are shared by all KV
+        cache groups, so readers treat it as all zeros. A KV connector that
+        maps a request's placeholder slots onto it can overwrite those pages;
+        one zeroing pass per completed load restores the invariant before the
+        loaded request is scheduled.
+        """
+        if kv_connector_output is None or not kv_connector_output.finished_recving:
+            return
+        if self.kv_block_zeroer is None:
+            return
+        self.kv_block_zeroer.zero_block_ids([0])
+
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
@@ -1367,6 +1390,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
+                kv_cache_groups=self.kv_caches_by_group,
             )
 
     def prepare_inputs(
@@ -1562,6 +1586,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_lens=prompt_lens,
             max_req_tokens=max_req_tokens,
             valid_num_draft_tokens_per_req=valid_num_draft_tokens_per_req,
+            all_token_ids_cpu=self.req_states.all_token_ids.cpu,
         )
         # InputBuffers are reused across real, dummy, and captured batches.
         # Clear stale padding before a capacity manager optionally marks a
@@ -1646,6 +1671,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch,
                     grammar_output.structured_output_request_ids,
                     grammar_output.grammar_bitmask,
+                    grammar_output.num_spec_tokens,
                 )
 
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
@@ -1737,6 +1763,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
+                self._restore_null_block_after_kv_load(
+                    empty_output.kv_connector_output
+                )
                 return empty_output
 
         # Get batch descriptor and sync across DP ranks.
@@ -1825,6 +1854,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
+            self._restore_null_block_after_kv_load(empty_output.kv_connector_output)
             return empty_output
 
         if not dummy_run:
@@ -2113,6 +2143,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            self._restore_null_block_after_kv_load(kv_connector_output)
             _maybe_save_b12x_moe_activation_amax()
             _maybe_flush_kquant_capture()
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
@@ -2303,6 +2334,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Post-step KV connector related operations.
         with record_function_or_nullcontext(f"vllm:v2/target/{phase}/kv_post_forward"):
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            self._restore_null_block_after_kv_load(kv_connector_output)
         model_runner_output.kv_connector_output = kv_connector_output
 
         _maybe_save_b12x_moe_activation_amax()
@@ -2327,6 +2359,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+        self._restore_null_block_after_kv_load(kv_connector_output)
 
         if not self.is_last_pp_rank:
             self.postprocess_num_computed_tokens(input_batch)
@@ -2369,6 +2402,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._release_cudagraph_pool_anchor()
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
+        if hasattr(self, "kv_caches_by_group"):
+            self.kv_caches_by_group.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
