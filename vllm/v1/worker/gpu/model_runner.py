@@ -84,6 +84,7 @@ from vllm.v1.outputs import (
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+from vllm.v1.worker.gpu import k3_ubatch_prefill
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
@@ -107,7 +108,6 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
-from vllm.v1.worker.gpu import k3_ubatch_prefill
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
@@ -1840,9 +1840,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
-                self._restore_null_block_after_kv_load(
-                    empty_output.kv_connector_output
-                )
+                self._restore_null_block_after_kv_load(empty_output.kv_connector_output)
                 return empty_output
 
         # Get batch descriptor and sync across DP ranks.
@@ -1850,6 +1848,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        # A prompt tail can match the verifier's query length exactly. Its
+        # attention metadata still needs prefill, not the captured decode path.
+        has_prefill = False
+        if not dummy_run:
+            for req_id in scheduler_output.num_scheduled_tokens:
+                req_index = self.req_states.req_id_to_index[req_id]
+                if (
+                    self.req_states.num_computed_prefill_tokens[req_index]
+                    < self.req_states.prefill_len.np[req_index]
+                ):
+                    has_prefill = True
+                    break
         # Per-request token bound for graph dispatch: varlen spec-decode graphs
         # are captured for at most `max_req_tokens` tokens per request, so a
         # batch may only replay one if its longest request fits.
@@ -1923,6 +1933,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.dp_rank,
                 need_eager=is_profile or skip_compiled,
                 num_active_loras=num_active_loras,
+                has_prefill=has_prefill,
             )
         if use_varlen_capacity:
             assert verification_capacity_manager is not None
@@ -2369,12 +2380,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # would read it before the reply; neither can use a deferred
                 # reply. The async output's draft copy is recorded once the
                 # reply has been consumed instead.
-                self.speculator.deferred_resolve_allowed = (
-                    self._late_input_ids
-                    and (
-                        copy_draft_with_output
-                        or not self.draft_tokens_handler.needs_host_copy(input_batch)
-                    )
+                self.speculator.deferred_resolve_allowed = self._late_input_ids and (
+                    copy_draft_with_output
+                    or not self.draft_tokens_handler.needs_host_copy(input_batch)
                 )
             with (
                 use_workspace_lane(1),
