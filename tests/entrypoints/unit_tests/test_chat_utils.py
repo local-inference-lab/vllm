@@ -2835,6 +2835,7 @@ def _assistant_tool_calls(calls):
 
 
 def test_tool_call_arguments_dict_passthrough(caplog):
+    """Dictionary arguments pass through without warnings."""
     messages = _assistant_tool_call({"a": 1})
     _postprocess_messages(messages)
     args = messages[0]["tool_calls"][0]["function"]["arguments"]
@@ -2843,6 +2844,7 @@ def test_tool_call_arguments_dict_passthrough(caplog):
 
 
 def test_tool_call_arguments_valid_object_string(caplog):
+    """A valid object string becomes the mapping templates require."""
     messages = _assistant_tool_call('{"a": 1}')
     _postprocess_messages(messages)
     args = messages[0]["tool_calls"][0]["function"]["arguments"]
@@ -2851,6 +2853,7 @@ def test_tool_call_arguments_valid_object_string(caplog):
 
 
 def test_tool_call_arguments_malformed_json_small(caplog):
+    """A short malformed call is redacted and reported once."""
     bad = '{"cmd": "mkdir -p /tmp/mmadtest && cat > /tmp/mmadtest'
     messages = _assistant_tool_call(bad, name="exec")
     _postprocess_messages(messages)
@@ -2863,6 +2866,7 @@ def test_tool_call_arguments_malformed_json_small(caplog):
 
 
 def test_tool_call_arguments_malformed_json_large(caplog):
+    """A cap-truncated large call is redacted without logging its body."""
     bad = '{"filepath": "src/main.py", "contents": "' + ("x" * 18000)
     messages = _assistant_tool_call(bad, name="write")
     _postprocess_messages(messages)
@@ -2876,6 +2880,7 @@ def test_tool_call_arguments_malformed_json_large(caplog):
 
 @pytest.mark.parametrize("non_obj", ["[]", "42", "true", '"hello"', "null"])
 def test_tool_call_arguments_valid_json_non_object(caplog, non_obj):
+    """Valid JSON values that are not objects are not sent to templates."""
     messages = _assistant_tool_call(non_obj, name="bad_tool")
     _postprocess_messages(messages)
     args = messages[0]["tool_calls"][0]["function"]["arguments"]
@@ -2892,6 +2897,7 @@ def test_tool_call_arguments_valid_json_non_object(caplog, non_obj):
 
 @pytest.mark.parametrize("missing", [None, ""])
 def test_tool_call_arguments_missing_or_empty(caplog, missing):
+    """Missing and empty arguments retain zero-argument compatibility."""
     messages = _assistant_tool_call(missing)
     if missing is None:
         del messages[0]["tool_calls"][0]["function"]["arguments"]
@@ -2902,6 +2908,7 @@ def test_tool_call_arguments_missing_or_empty(caplog, missing):
 
 
 def test_tool_call_arguments_multiple_independent(caplog):
+    """One malformed call does not alter a valid sibling call."""
     calls = [
         {
             "id": "call_0",
