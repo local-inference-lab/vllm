@@ -158,9 +158,7 @@ def test_lmcache_mp_non_engine_driven_rejects_expandable_segments(
 ):
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     extra_config = (
-        {}
-        if transfer_mode is None
-        else {"lmcache.mp.mp_transfer_mode": transfer_mode}
+        {} if transfer_mode is None else {"lmcache.mp.mp_transfer_mode": transfer_mode}
     )
     with pytest.raises(ValueError, match="expandable_segments"):
         _build_config(

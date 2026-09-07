@@ -1674,6 +1674,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 hidden_states = self.boundary_checkpoint_state.get_hidden_states(
                     checkpoint.auxiliary_block_ids[0]
                 )
+                # Connector metadata can carry stores for other requests even
+                # when this request resumes without an attention forward.
+                self.kv_connector.pre_forward(scheduler_output)
                 self.execute_model_state = ExecuteModelState(
                     input_batch=input_batch,
                     attn_metadata=None,
