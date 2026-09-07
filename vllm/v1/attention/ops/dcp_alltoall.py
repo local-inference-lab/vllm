@@ -48,11 +48,27 @@ _B12X_DCP_MAX_CONCURRENT_CHANNELS = 2
 # its first operation. Each entry is keyed by the process-group identity and
 # owns the graph's semantic channel, stream, and cleanup stack.
 _B12X_DCP_ACTIVE_CAPTURE: dict[int, tuple[str, Any, ExitStack]] = {}
-_B12X_DCP_WORLD_SIZES = (2, 4, 8, 16)
+# Mirrors ``b12x.comm.pcie.pcie_dcp_a2a.SUPPORTED_WORLD_SIZES``. Nine ranks
+# use the same generic per-rank staging kernel as the power-of-two sizes.
+_B12X_DCP_WORLD_SIZES = (2, 4, 8, 9, 16)
 _KIMI_LATENT_WIDTH = 3584
 _KIMI_ROUTER_WIDTH = 896
 _KIMI_ROUTER_TOPK = 16
 _KIMI_PAIRED_MAX_BATCH_SIZE = 8
+_KIMI_PROJECTION_SHARD_ALIGNMENT = 8
+
+
+def _kimi_projection_shard_width(width: int, world_size: int) -> int:
+    """Per-rank projection width padded to whole 16-byte packs.
+
+    Mirrors ``vllm.models.kimi_k3.nvidia.model.kimi_projection_shard_width``
+    without importing the model module.
+    """
+    per_rank = -(-width // world_size)
+    alignment = _KIMI_PROJECTION_SHARD_ALIGNMENT
+    return -(-per_rank // alignment) * alignment
+
+
 _DCP_A2A_GRAPH_BUFFERS: dict[
     tuple[tuple[int, ...], torch.device, torch.dtype],
     tuple[torch.Tensor, torch.Tensor],
@@ -73,7 +89,11 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
         return False
     batch, heads, head_dim = (int(value) for value in tensor.shape)
     stride_batch, stride_head, _ = (int(value) for value in tensor.stride())
-    packed_token_major = stride_batch == heads * head_dim and stride_head == head_dim
+    packed_token_major = (
+        stride_batch >= heads * head_dim
+        and stride_batch % 8 == 0
+        and stride_head == head_dim
+    )
     capacity_strided_head_major = (
         stride_batch == head_dim and stride_head >= batch * head_dim
     )
@@ -431,11 +451,22 @@ def _try_b12x_dcp_all_gather_heads(
     if pool is None:
         return None
     if out is not None:
-        return pool.all_gather_heads(
+        if out.is_contiguous():
+            return pool.all_gather_heads(
+                local_input,
+                out=out,
+                channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+            )
+        # The B12X kernel writes a packed [batch, heads, head_dim] result. A
+        # caller-owned view whose head count is padded past the gathered
+        # heads (Kimi-K3 TP9: 99 heads inside a 104-head tile) is filled
+        # through a packed intermediate.
+        gathered = pool.all_gather_heads(
             local_input,
-            out=out,
             channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
         )
+        out.copy_(gathered)
+        return out
     return pool.all_gather_heads(
         local_input,
         channel_id=_b12x_dcp_channel_id(cp_group),
@@ -592,6 +623,14 @@ def try_dcp_b12x_all_gather_pair_kimi_topk(
     batch = int(local_down.shape[0])
     local_down_width = _KIMI_LATENT_WIDTH // world_size
     local_router_width = _KIMI_ROUTER_WIDTH // world_size
+    # The paired transport moves 16-byte packs; a world size that does not
+    # divide the widths into whole packs (nine ranks: 398 bf16 and 99 fp32)
+    # uses the ordinary paired gather and router instead.
+    if (
+        local_down_width * local_down.element_size() % 16
+        or local_router_width * local_router.element_size() % 16
+    ):
+        return None
     if (
         not envs.VLLM_USE_B12X_DCP_A2A
         or batch < 1
@@ -764,8 +803,11 @@ def warmup_b12x_kimi_projection_gathers(
         if token_cap <= 0
         else min(token_cap, _KIMI_PAIRED_MAX_BATCH_SIZE)
     )
-    local_down_width = _KIMI_LATENT_WIDTH // world_size
-    local_router_width = _KIMI_ROUTER_WIDTH // world_size
+    # The model pads each rank's projection shard to whole 16-byte packs
+    # (`kimi_projection_shard_width`); the paired gather pool is keyed by the
+    # combined row bytes, so the warmup must use the same widths.
+    local_down_width = _kimi_projection_shard_width(_KIMI_LATENT_WIDTH, world_size)
+    local_router_width = _kimi_projection_shard_width(_KIMI_ROUTER_WIDTH, world_size)
     local_down = torch.zeros(
         (pair_batch, local_down_width),
         device=device,
@@ -785,9 +827,19 @@ def warmup_b12x_kimi_projection_gathers(
     if paired is not None:
         warmed += 1
 
+    fused_down = torch.zeros(
+        (pair_batch, _KIMI_LATENT_WIDTH // world_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    fused_router = torch.zeros(
+        (pair_batch, _KIMI_ROUTER_WIDTH // world_size),
+        device=device,
+        dtype=torch.float32,
+    )
     fused = try_dcp_b12x_all_gather_pair_kimi_topk(
-        local_down[:1],
-        local_router[:1],
+        fused_down[:1],
+        fused_router[:1],
         correction_bias,
         projection_group,
     )
@@ -795,8 +847,8 @@ def warmup_b12x_kimi_projection_gathers(
         warmed += 1
     if pair_batch > 1:
         batched = try_dcp_b12x_all_gather_pair_kimi_topk(
-            local_down,
-            local_router,
+            fused_down,
+            fused_router,
             correction_bias,
             projection_group,
         )
@@ -823,7 +875,7 @@ def warmup_b12x_dcp_a2a(
         # dispatchers already fall back to NCCL collectives per call, so an
         # unsupported DCP size (e.g. TP6 with DCP3/DCP6) must not fail boot.
         logger.warning_once(
-            "B12X PCIe DCP collectives support world sizes 2/4/8/16; "
+            "B12X PCIe DCP collectives support world sizes 2/4/8/9/16; "
             "DCP world size %d uses NCCL collectives instead.",
             cp_group.world_size,
         )

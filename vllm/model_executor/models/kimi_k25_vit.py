@@ -8,6 +8,7 @@ including 3D patch embedding, RoPE position embedding, and
 temporal pooling for video chunks.
 """
 
+import math
 from collections.abc import Sequence
 from copy import deepcopy
 from typing import Any
@@ -33,9 +34,16 @@ from vllm.model_executor.models.vision import (
     is_vit_use_data_parallel,
     run_dp_sharded_mrope_vision_model,
 )
+from vllm.model_executor.models.vit_query_shard import (
+    activate_query_shard_plan,
+    active_query_shard_plan,
+    maybe_build_query_shard_plan,
+    sharded_varlen_attention,
+)
 from vllm.model_executor.virtual_tp import get_virtual_tp_axis_padded_size
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_k25 import KimiK25VisionConfig
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = init_logger(__name__)
 
@@ -282,27 +290,28 @@ class Rope2DPosEmbRepeated(nn.Module):
             f"max_width={self.max_width}, theta_base={self.theta_base}"
         )
 
-    def _precompute_freqs_cis(self, device: torch.device) -> torch.Tensor:
-        """Calculate the cis(freqs) for each position in the 2D grid."""
-        N = self.max_height * self.max_width
-        flat_pos = torch.arange(0, N).float().to(device)
-        x_pos = flat_pos % self.max_width
-        y_pos = flat_pos // self.max_width
-        dim_range = (
-            torch.arange(0, self.dim, 4)[: (self.dim // 4)].float().to(device)
-        )  # C/4
+    def _compute_grid_freqs_cis(
+        self, height: int, width: int, device: torch.device
+    ) -> torch.Tensor:
+        """Calculate rotary frequencies for one requested image grid."""
+        x_pos = torch.arange(width, dtype=torch.float32, device=device)
+        y_pos = torch.arange(height, dtype=torch.float32, device=device)
+        dim_range = torch.arange(0, self.dim, 4, dtype=torch.float32, device=device)[
+            : (self.dim // 4)
+        ]
         freqs = 1.0 / (self.theta_base ** (dim_range / self.dim))
-        x_freqs = torch.outer(x_pos, freqs).float()  # N, C/4
-        y_freqs = torch.outer(y_pos, freqs).float()  # N, C/4
-        x_cis = torch.polar(torch.ones_like(x_freqs), x_freqs)  # N, C/4
-        y_cis = torch.polar(torch.ones_like(y_freqs), y_freqs)  # N, C/4
-        # N, C/4, 2
-        freqs_cis = torch.cat(
-            [x_cis.unsqueeze(dim=-1), y_cis.unsqueeze(dim=-1)], dim=-1
+        x_freqs = torch.outer(x_pos, freqs).float()
+        y_freqs = torch.outer(y_pos, freqs).float()
+        x_cis = torch.polar(torch.ones_like(x_freqs), x_freqs)
+        y_cis = torch.polar(torch.ones_like(y_freqs), y_freqs)
+        freqs_cis = torch.stack(
+            (
+                x_cis.unsqueeze(0).expand(height, -1, -1),
+                y_cis.unsqueeze(1).expand(-1, width, -1),
+            ),
+            dim=-1,
         )
-        # max_height, max_width, C/2
-        freqs_cis = freqs_cis.reshape(self.max_height, self.max_width, -1)
-        return freqs_cis
+        return freqs_cis.reshape(height * width, self.dim // 2)
 
     def get_freqs_cis(
         self, grid_thws: torch.Tensor | list[list[int]], device: torch.device
@@ -314,11 +323,6 @@ class Rope2DPosEmbRepeated(nn.Module):
         Returns:
             freqs_cis: tensor of shape (sum(t * height * width), dim//2)
         """
-        if not hasattr(self, "freqs_cis"):
-            self.register_buffer(
-                "freqs_cis", self._precompute_freqs_cis(device), persistent=False
-            )
-
         shapes = grid_thws if isinstance(grid_thws, list) else grid_thws.tolist()
         assert all(
             1 <= h <= self.max_height and 1 <= w <= self.max_width for t, h, w in shapes
@@ -327,14 +331,15 @@ class Rope2DPosEmbRepeated(nn.Module):
             self.max_height,
             self.max_width,
         )
-        freqs_cis = torch.cat(
-            [
-                self.freqs_cis[:h, :w].reshape(-1, self.dim // 2).repeat(t, 1)
-                for t, h, w in shapes
-            ],
-            dim=0,
-        )
-        return freqs_cis
+        grids: dict[tuple[int, int], torch.Tensor] = {}
+        result = []
+        for t, h, w in shapes:
+            grid = grids.get((h, w))
+            if grid is None:
+                grid = self._compute_grid_freqs_cis(h, w, device)
+                grids[(h, w)] = grid
+            result.append(grid.repeat(t, 1))
+        return torch.cat(result, dim=0)
 
 
 class MLP2(nn.Module):
@@ -482,16 +487,33 @@ class MoonViTEncoderLayer(nn.Module):
 
         xq, xk = apply_rope(xq, xk, rope_freqs_cis)
 
-        if max_seqlen is None:
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-        attn_out = self.attn(
-            xq.unsqueeze(0),
-            xk.unsqueeze(0),
-            xv.unsqueeze(0),
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            sequence_lengths=sequence_lengths,
-        )
+        shard_plan = active_query_shard_plan()
+        if (
+            shard_plan is not None
+            and self.attn.attn_backend == AttentionBackendEnum.FLASH_ATTN
+        ):
+            # Replicated encoder: every rank holds the full keys and values
+            # and attends for its share of the query rows (exact split).
+            attn_out = sharded_varlen_attention(
+                shard_plan,
+                xq,
+                xk,
+                xv,
+                cu_seqlens,
+                scale=self.attn.scale,
+                fa_version=self.attn.fa_version,
+            )
+        else:
+            if max_seqlen is None:
+                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            attn_out = self.attn(
+                xq.unsqueeze(0),
+                xk.unsqueeze(0),
+                xv.unsqueeze(0),
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                sequence_lengths=sequence_lengths,
+            )
         attn_out = attn_out.reshape(
             seq_length,
             self.num_attention_heads_per_partition
@@ -843,21 +865,24 @@ class MoonViT3dPretrainedModel(nn.Module):
 
 @torch.inference_mode()
 def mm_projector_forward(mm_projector: torch.nn.Module, vt_output: list[torch.Tensor]):
-    """Apply MM projector to vision tower outputs."""
-    num_embedding_list = [x.shape[0] for x in vt_output]
-    batched = torch.cat(vt_output, dim=0)
+    """Apply the projector without concatenating independent image features."""
+    if not vt_output:
+        raise ValueError("Kimi vision projection requires at least one image feature")
+
     projector_norm = getattr(mm_projector, "pre_norm", None)
     if projector_norm is None:
         projector_norm = getattr(mm_projector, "post_norm", None)
     projector_dtype = (
-        projector_norm.weight.dtype if projector_norm is not None else batched.dtype
+        projector_norm.weight.dtype if projector_norm is not None else None
     )
-    if batched.dtype != projector_dtype:
-        batched = batched.to(projector_dtype)
-    proj_out = mm_projector(batched)
-    proj_out = proj_out.reshape(-1, proj_out.shape[-1])
-    proj_out = torch.split(proj_out, num_embedding_list)
-    return proj_out
+
+    projected = []
+    for image_features in vt_output:
+        if projector_dtype is not None and image_features.dtype != projector_dtype:
+            image_features = image_features.to(projector_dtype)
+        output = mm_projector(image_features)
+        projected.append(output.reshape(-1, output.shape[-1]))
+    return tuple(projected)
 
 
 @torch.inference_mode()
@@ -875,12 +900,28 @@ def vision_tower_forward(
     """
     if use_data_parallel:
         grid_thw_list = grid_thw.tolist()
-        vt_outputs = run_dp_sharded_mrope_vision_model(
-            vision_model=vision_tower,
-            pixel_values=pixel_values,
-            grid_thw_list=grid_thw_list,
-            rope_type="rope_2d",
+        shard_plan = maybe_build_query_shard_plan(
+            [math.prod(thw) for thw in grid_thw_list], pixel_values.device
         )
+        if shard_plan is not None:
+            # Every rank runs the replicated tower on the whole batch; the
+            # plan splits only the self-attention by query rows.
+            encoder_metadata = vision_tower.encoder.prepare_encoder_metadata(
+                grid_thw_list, device=pixel_values.device
+            )
+            with activate_query_shard_plan(shard_plan):
+                vt_outputs = vision_tower(
+                    pixel_values,
+                    grid_thw_list,
+                    encoder_metadata=encoder_metadata,
+                )
+        else:
+            vt_outputs = run_dp_sharded_mrope_vision_model(
+                vision_model=vision_tower,
+                pixel_values=pixel_values,
+                grid_thw_list=grid_thw_list,
+                rope_type="rope_2d",
+            )
     else:
         grid_thw_list = grid_thw.tolist()
         encoder_metadata = vision_tower.encoder.prepare_encoder_metadata(

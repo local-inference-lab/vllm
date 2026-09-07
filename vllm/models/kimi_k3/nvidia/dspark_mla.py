@@ -558,7 +558,7 @@ class K3DSparkModel(nn.Module):
             keepdim=True,
             dtype=torch.float32,
         ).square_()
-        tensor_model_parallel_all_reduce_in_place(squared_norm)
+        squared_norm = tensor_model_parallel_all_reduce_in_place(squared_norm)
         squared_norm.div_(self.config.hidden_size).add_(
             self.context_norm.variance_epsilon
         )
@@ -778,7 +778,7 @@ class K3DSparkModel(nn.Module):
                 + self._context_local_width,
             ]
             layer_kv = F.linear(context_states, weight)
-            tensor_model_parallel_all_reduce_in_place(layer_kv)
+            layer_kv = tensor_model_parallel_all_reduce_in_place(layer_kv)
 
             kv_c = layer_kv[:, : self._context_kv_lora_rank]
             normalized_kv_c = torch.empty(
