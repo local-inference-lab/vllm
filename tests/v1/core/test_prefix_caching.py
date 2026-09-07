@@ -137,6 +137,128 @@ def make_kv_cache_config(block_size: int, num_blocks: int) -> KVCacheConfig:
     )
 
 
+@pytest.mark.parametrize("dcp", [1, 4])
+def test_external_boundary_import_is_private_until_all_ranks_complete(dcp):
+    config = make_kv_cache_config_hybrid_model(4, 64, 2, "mamba")
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=128,
+        hash_block_size=4,
+        enable_boundary_checkpoints=True,
+        dcp_world_size=dcp,
+    )
+    request = make_request("external-consumer", list(range(11)), 4, sha256)
+    positions = manager.boundary_checkpoint_page_positions(11)
+    assert positions[0] == tuple(range((11 + 4 * dcp - 1) // (4 * dcp)))
+    assert positions[1:] == ((2,), (2,))
+    free = manager.block_pool.get_num_free_blocks()
+    checkpoint = manager.reserve_external_boundary_checkpoint(
+        request,
+        11,
+        positions,
+        draft_prefix_len=10,
+        kind="prompt",
+        num_ranks=4,
+    )
+    assert checkpoint is not None
+    assert len(checkpoint.dependencies) == sum(map(len, positions)) + 1
+    assert manager.block_pool.get_num_free_blocks() == free - len(
+        checkpoint.dependencies
+    )
+    assert manager.get_computed_blocks(request)[1] == 0
+    assert not manager.reset_prefix_cache()
+    for rank in (0, 1, 1, 2):
+        assert not manager.acknowledge_external_boundary_checkpoint(
+            checkpoint.checkpoint_id, rank
+        )
+        assert manager.get_computed_blocks(request)[1] == 0
+    assert manager.acknowledge_external_boundary_checkpoint(checkpoint.checkpoint_id, 3)
+    blocks, hits, _ = manager.get_computed_blocks(request)
+    assert hits == 11
+    assert request.boundary_checkpoint == checkpoint
+    assert (
+        tuple(tuple(block.block_id for block in group) for group in blocks.blocks)
+        == checkpoint.block_ids
+    )
+    assert manager.block_pool.get_num_free_blocks() == free
+    assert not manager.acknowledge_external_boundary_checkpoint(
+        checkpoint.checkpoint_id, 3
+    )
+
+
+def test_external_boundary_import_rejects_missing_pages_and_releases_cancellation():
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(4, 16),
+        max_model_len=128,
+        hash_block_size=4,
+        enable_boundary_checkpoints=True,
+    )
+    request = make_request("external-consumer", list(range(11)), 4, sha256)
+    free = manager.block_pool.get_num_free_blocks()
+    with pytest.raises(ValueError, match="every live cache page"):
+        manager.reserve_external_boundary_checkpoint(
+            request, 11, ((0, 2),), draft_prefix_len=11, kind="prompt", num_ranks=4
+        )
+    assert manager.block_pool.get_num_free_blocks() == free
+    checkpoint = manager.reserve_external_boundary_checkpoint(
+        request, 11, ((0, 1, 2),), draft_prefix_len=11, kind="prompt", num_ranks=4
+    )
+    assert checkpoint is not None
+    manager.acknowledge_external_boundary_checkpoint(checkpoint.checkpoint_id, 0)
+    manager.discard_external_boundary_checkpoint(checkpoint.checkpoint_id)
+    assert manager.block_pool.get_num_free_blocks() == free
+    assert manager.get_computed_blocks(request)[1] == 0
+    assert not manager.acknowledge_external_boundary_checkpoint(
+        checkpoint.checkpoint_id, 1
+    )
+
+
+def test_invalidated_external_import_keeps_pins_until_all_rank_copies_drain():
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(4, 16),
+        max_model_len=128,
+        hash_block_size=4,
+        enable_boundary_checkpoints=True,
+    )
+    request = make_request("external-consumer", list(range(11)), 4, sha256)
+    free = manager.block_pool.get_num_free_blocks()
+    checkpoint = manager.reserve_external_boundary_checkpoint(
+        request, 11, ((0, 1, 2),), draft_prefix_len=11, kind="prompt", num_ranks=4
+    )
+    assert checkpoint is not None
+    cache = manager.boundary_checkpoints
+    assert cache is not None
+    cache.invalidate_block(checkpoint.auxiliary_block_ids[0])
+    for rank in range(4):
+        assert not manager.acknowledge_external_boundary_checkpoint(
+            checkpoint.checkpoint_id, rank
+        )
+        assert cache.is_pending(checkpoint.checkpoint_id) == (rank < 3)
+        assert manager.get_computed_blocks(request)[1] == 0
+        if rank < 3:
+            assert manager.block_pool.get_num_free_blocks() < free
+    assert manager.block_pool.get_num_free_blocks() == free
+    assert manager.reset_prefix_cache()
+
+
+def test_external_boundary_import_does_not_partially_allocate_when_pool_is_full():
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(4, 4),
+        max_model_len=128,
+        hash_block_size=4,
+        enable_boundary_checkpoints=True,
+    )
+    request = make_request("external-consumer", list(range(11)), 4, sha256)
+    free = manager.block_pool.get_num_free_blocks()
+    assert (
+        manager.reserve_external_boundary_checkpoint(
+            request, 11, ((0, 1, 2),), draft_prefix_len=11, kind="prompt", num_ranks=4
+        )
+        is None
+    )
+    assert manager.block_pool.get_num_free_blocks() == free
+
+
 def make_kv_cache_config_hybrid_model(
     block_size: int,
     num_blocks: int,

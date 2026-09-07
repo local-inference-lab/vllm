@@ -691,6 +691,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+        if self.boundary_checkpoint_state is not None:
+            self.kv_connector.bind_boundary_checkpoint_state(
+                self.boundary_checkpoint_state
+            )
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""

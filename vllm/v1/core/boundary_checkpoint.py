@@ -240,6 +240,10 @@ class BoundaryCheckpointCache:
         self._release(pending.checkpoint)
         return True
 
+    def is_pending(self, checkpoint_id: int) -> bool:
+        """Return whether a bundle still owns pins for unfinished worker copies."""
+        return checkpoint_id in self._pending
+
     def discard(self, checkpoint_id: int) -> None:
         """Release an unpublished bundle after its GPU writers have completed."""
         pending = self._pending.pop(checkpoint_id, None)

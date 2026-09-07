@@ -206,6 +206,7 @@ class KVCacheManager:
         )
         self._boundary_allocations: dict[str, list[KVCacheBlock]] = {}
         self._boundary_readers: dict[str, BoundaryCheckpoint] = {}
+        self._boundary_imports: set[int] = set()
         if self.boundary_checkpoints is not None:
             logger.info(
                 "Request-boundary recurrent checkpoint caching is enabled. "
@@ -756,6 +757,120 @@ class KVCacheManager:
         cache.stage(request, checkpoint, num_ranks=1)
         cache.acknowledge(checkpoint.checkpoint_id, 0)
         return checkpoint
+
+    def boundary_checkpoint_page_positions(
+        self, num_tokens: int
+    ) -> tuple[tuple[int, ...], ...]:
+        """Describe the live logical pages required by a committed prefix.
+
+        Attention spans include each group's DCP geometry. Recurrent groups
+        retain one endpoint state, and sliding-window groups retain only their
+        visible suffix. Returned indices are logical positions, not GPU IDs.
+        """
+        if not 0 < num_tokens <= self.max_model_len:
+            raise ValueError("Boundary token count is outside the model context")
+        groups = []
+        for manager in self.coordinator.single_type_managers:
+            count = cdiv(num_tokens, manager.block_size)
+            if all(
+                isinstance(spec, MambaSpec)
+                for spec in iter_layer_specs(manager.kv_cache_spec)
+            ):
+                first = count - 1
+            else:
+                first = min(
+                    manager.get_num_skipped_tokens(num_tokens - 1)
+                    // manager.block_size,
+                    count - 1,
+                )
+            groups.append(tuple(range(first, count)))
+        return tuple(groups)
+
+    def reserve_external_boundary_checkpoint(
+        self,
+        request: Request,
+        num_tokens: int,
+        page_positions: tuple[tuple[int, ...], ...],
+        *,
+        draft_prefix_len: int,
+        kind: BoundaryCheckpointKind,
+        num_ranks: int,
+    ) -> BoundaryCheckpoint | None:
+        """Reserve private destinations for an externally stored checkpoint.
+
+        The imported state is invisible to prefix lookup until every worker
+        acknowledges its completed H2D copies. Destinations are pinned in the
+        ordinary KV pool, including one page for target/draft auxiliary state.
+
+        Returns None if request-boundary caching is unavailable or the pool
+        cannot admit every live page. Raises ValueError for incompatible cache
+        geometry; callers must treat that as an external cache miss.
+        """
+        cache = self.boundary_checkpoints
+        if (
+            cache is None
+            or not cache.supports_request(request)
+            or not self.prefix_cache_lookup_enabled(request)
+        ):
+            return None
+        if not 0 < num_tokens <= request.num_tokens:
+            raise ValueError("Imported boundary must cover an existing request prefix")
+        if not 0 <= draft_prefix_len <= num_tokens:
+            raise ValueError("Imported draft prefix exceeds the target prefix")
+        if kind not in ("instruction", "prompt", "response") or num_ranks < 1:
+            raise ValueError("Invalid external checkpoint kind or rank count")
+        if page_positions != self.boundary_checkpoint_page_positions(num_tokens):
+            raise ValueError("External checkpoint does not cover every live cache page")
+        count = sum(len(group) for group in page_positions) + 1
+        if count > self.block_pool.get_num_free_blocks():
+            return None
+        allocation = self.block_pool.get_new_blocks(count)
+        try:
+            sources = iter(allocation)
+            groups = []
+            for positions in page_positions:
+                blocks = [0] * (positions[-1] + 1)
+                for position in positions:
+                    blocks[position] = next(sources).block_id
+                groups.append(tuple(blocks))
+            checkpoint = BoundaryCheckpoint(
+                cache.next_id(),
+                num_tokens,
+                tuple(groups),
+                (next(sources).block_id,),
+                draft_prefix_len=draft_prefix_len,
+                kind=kind,
+            )
+            cache.stage(request, checkpoint, num_ranks=num_ranks)
+            self._boundary_imports.add(checkpoint.checkpoint_id)
+            return checkpoint
+        finally:
+            # stage() owns a separate pin on every dependency until publication
+            # or discard. Failed staging releases the original allocation here.
+            self.block_pool.free_blocks(allocation)
+
+    def acknowledge_external_boundary_checkpoint(
+        self, checkpoint_id: int, rank: int
+    ) -> bool:
+        """Publish imported state only after all ranks finish their GPU copies."""
+        cache = self.boundary_checkpoints
+        if cache is None or checkpoint_id not in self._boundary_imports:
+            return False
+        published = cache.acknowledge(checkpoint_id, rank)
+        if not cache.is_pending(checkpoint_id):
+            self._boundary_imports.remove(checkpoint_id)
+        return published
+
+    def discard_external_boundary_checkpoint(self, checkpoint_id: int) -> None:
+        """Release an unsuccessful import after every submitted GPU copy drains.
+
+        Calling this while any worker may still write its destinations would
+        make those pages reusable too early. The connector owns that barrier.
+        """
+        if checkpoint_id in self._boundary_imports:
+            assert self.boundary_checkpoints is not None
+            self.boundary_checkpoints.discard(checkpoint_id)
+            self._boundary_imports.remove(checkpoint_id)
 
     def remove_skipped_blocks(
         self,
