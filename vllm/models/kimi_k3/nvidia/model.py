@@ -1588,16 +1588,15 @@ class KimiMoE(nn.Module):
             if precomputed_pair_topk is not None:
                 routed_hidden_states, routing_payload = precomputed_pair_topk
                 return routed_hidden_states, routing_payload, None
+            # The paired gather returns the logical widths (the B12X kernel
+            # writes them directly; the collective path slices), so no copy
+            # sits between the gather and the router.
             routed_hidden_states, router_logits = gather_kimi_sharded_projection_pair(
                 down_local,
                 router_local,
+                down_proj.logical_output_size,
+                self.gate.logical_output_size,
             )
-            routed_hidden_states = routed_hidden_states[
-                ..., : down_proj.logical_output_size
-            ].contiguous()
-            router_logits = router_logits[
-                ..., : self.gate.logical_output_size
-            ].contiguous()
             router_output, topk_ids = _finish_router(router_logits)
             return routed_hidden_states, router_output, topk_ids
         (router_output, topk_ids), (routed_hidden_states, _) = (

@@ -514,8 +514,16 @@ def _try_b12x_dcp_all_gather_pair(
     cp_group: GroupCoordinator,
     *,
     max_batch_size: int | None,
+    first_columns: int | None = None,
+    second_columns: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Gather two projection rows behind one B12X IPC barrier."""
+    """Gather two projection rows behind one B12X IPC barrier.
+
+    ``first_columns`` / ``second_columns`` request outputs of that logical
+    width (the gathered width without the last rank's trailing padding
+    columns) written row-major by the kernel, so callers need no slice
+    copy; the width must keep every row a multiple of 16 bytes.
+    """
     supported_dtypes = (
         torch.float16,
         torch.bfloat16,
@@ -564,9 +572,25 @@ def _try_b12x_dcp_all_gather_pair(
     )
     if pool is None or not hasattr(pool, "all_gather_pair"):
         return None
+    outputs: list[torch.Tensor | None] = []
+    for source, columns in (
+        (local_first, first_columns),
+        (local_second, second_columns),
+    ):
+        full = int(source.shape[1]) * cp_group.world_size
+        if columns is None or columns >= full:
+            outputs.append(None)
+            continue
+        if columns <= 0 or (columns * source.element_size()) % 16:
+            return None
+        outputs.append(
+            torch.empty((batch, columns), device=source.device, dtype=source.dtype)
+        )
     return pool.all_gather_pair(
         local_first,
         local_second,
+        outputs[0],
+        outputs[1],
         channel_id=_b12x_dcp_channel_id(cp_group),
     )
 
@@ -577,21 +601,33 @@ def dcp_b12x_all_gather_pair(
     cp_group: GroupCoordinator,
     *,
     max_batch_size: int | None = None,
+    first_columns: int | None = None,
+    second_columns: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather two rank-local rows together, with exact separate fallbacks."""
+    """Gather two rank-local rows together, with exact separate fallbacks.
+
+    With ``first_columns`` / ``second_columns`` the outputs hold the logical
+    widths (see ``_try_b12x_dcp_all_gather_pair``); the collective fallback
+    slices its full-width gathers to them.
+    """
     if envs.VLLM_USE_B12X_DCP_A2A:
         result = _try_b12x_dcp_all_gather_pair(
             local_first,
             local_second,
             cp_group,
             max_batch_size=max_batch_size,
+            first_columns=first_columns,
+            second_columns=second_columns,
         )
         if result is not None:
             return result
-    return (
-        cp_group.all_gather(local_first, dim=-1),
-        cp_group.all_gather(local_second, dim=-1),
-    )
+    first = cp_group.all_gather(local_first, dim=-1)
+    second = cp_group.all_gather(local_second, dim=-1)
+    if first_columns is not None and first_columns < first.shape[-1]:
+        first = first[..., :first_columns].contiguous()
+    if second_columns is not None and second_columns < second.shape[-1]:
+        second = second[..., :second_columns].contiguous()
+    return first, second
 
 
 def try_dcp_b12x_all_gather_pair_kimi_topk(

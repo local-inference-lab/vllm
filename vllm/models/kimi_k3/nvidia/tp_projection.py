@@ -404,8 +404,15 @@ def gather_kimi_sharded_projection(output_parallel: torch.Tensor) -> torch.Tenso
 def gather_kimi_sharded_projection_pair(
     local_first: torch.Tensor,
     local_second: torch.Tensor,
+    first_columns: int | None = None,
+    second_columns: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather two decode projections behind one lossless B12X barrier."""
+    """Gather two decode projections behind one lossless B12X barrier.
+
+    ``first_columns`` / ``second_columns`` are the logical widths the callers
+    consume (the padded gathered width without the last rank's tail); the
+    B12X kernel writes them directly, the collective path slices to them.
+    """
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size <= 1:
         return local_first, local_second
@@ -425,11 +432,16 @@ def gather_kimi_sharded_projection_pair(
                 local_second,
                 projection_group,
                 max_batch_size=_KIMI_B12X_PAIRED_PROJECTION_MAX_TOKENS,
+                first_columns=first_columns,
+                second_columns=second_columns,
             )
-    return (
-        gather_kimi_sharded_projection(local_first),
-        gather_kimi_sharded_projection(local_second),
-    )
+    first = gather_kimi_sharded_projection(local_first)
+    second = gather_kimi_sharded_projection(local_second)
+    if first_columns is not None and first_columns < first.shape[-1]:
+        first = first[..., :first_columns].contiguous()
+    if second_columns is not None and second_columns < second.shape[-1]:
+        second = second[..., :second_columns].contiguous()
+    return first, second
 
 
 def try_gather_kimi_sharded_projection_pair_topk(
