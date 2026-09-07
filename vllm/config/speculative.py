@@ -1208,15 +1208,22 @@ class SpeculativeConfig:
                     self.parallel_drafting = True
 
                 if (
-                    self.method == "dspark"
-                    and "K3DSparkModel" in self.draft_model_config.architectures
-                    and self.target_parallel_config.decode_context_parallel_size > 1
+                    (
+                        self.method == "dspark"
+                        and "K3DSparkModel" in self.draft_model_config.architectures
+                    )
+                    or (
+                        self.method == "dflash"
+                        and "DFlash2DraftModel" in self.draft_model_config.architectures
+                    )
+                ) and (
+                    self.target_parallel_config.decode_context_parallel_size > 1
                     and self.attention_backend != AttentionBackendEnum.B12X_MLA
                 ):
                     raise ValueError(
-                        "K3 DSpark decode context parallelism requires "
-                        "attention_backend=B12X_MLA; otherwise set "
-                        "decode_context_parallel_size=1."
+                        "Kimi-K3 MLA drafts (K3 DSpark, DFlash2) under decode "
+                        "context parallelism require attention_backend=B12X_MLA; "
+                        "otherwise set decode_context_parallel_size=1."
                     )
 
                 if self.num_speculative_tokens is not None and hasattr(

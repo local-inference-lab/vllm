@@ -49,7 +49,12 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         else target_model
     )
     rope_ownership: AbstractContextManager[None]
-    if getattr(draft_model_config.hf_config, "model_type", None) == "k3_dspark":
+    draft_hf_config = draft_model_config.hf_config
+    if getattr(draft_hf_config, "model_type", None) == "k3_dspark" or (
+        "DFlash2DraftModel" in (getattr(draft_hf_config, "architectures", None) or ())
+    ):
+        # Both drafts build Kimi-K3 MLA layers with their own rotary tables;
+        # the target's compact-rope sources must survive that construction.
         from vllm.models.kimi_k3.nvidia.dspark_mla import (
             protect_k3_compact_rope_sources,
         )

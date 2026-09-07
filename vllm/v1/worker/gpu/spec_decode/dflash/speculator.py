@@ -470,9 +470,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         """Discover one uniform rolling window for Kimi-K3 draft MLA layers."""
         self.draft_kv_window = None
         self.draft_kv_window_block_size = None
-        if (
-            getattr(self.draft_model_config.hf_config, "model_type", None)
-            != "k3_dspark"
+        hf_config = self.draft_model_config.hf_config
+        if getattr(hf_config, "model_type", None) != "k3_dspark" and (
+            "DFlash2DraftModel" not in (getattr(hf_config, "architectures", None) or ())
         ):
             return
 

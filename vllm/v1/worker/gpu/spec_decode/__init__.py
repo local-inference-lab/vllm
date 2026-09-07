@@ -11,6 +11,17 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     if speculative_config.method == "dflash":
+        draft_architectures = (
+            getattr(speculative_config.draft_model_config, "architectures", None) or ()
+        )
+        if "DFlash2DraftModel" in draft_architectures:
+            # The DFlash2 MLA draft runs on the DSpark backbone with DFlash's
+            # parallel block proposal.
+            from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
+                DFlash2Speculator,
+            )
+
+            return DFlash2Speculator(vllm_config, device)
         remote_address = os.environ.get("VLLM_K3_DRAFT_REMOTE_ADDRESS")
         if remote_address:
             from vllm.v1.worker.gpu.spec_decode.dspark.remote_speculator import (
