@@ -929,7 +929,95 @@ def test_b12x_selected_indices_use_physical_slots(record_bytes: int) -> None:
 
 def test_sparse_index_remap_tiling_covers_glm5_next_width() -> None:
     assert _remap_tiling(2048, 128, True) == (True, 2048, 1, 8)
-    assert _remap_tiling(2051, 128, True) == (False, 128, 17, 4)
+    assert _remap_tiling(2051, 128, True) == (True, 4096, 1, 8)
+    assert _remap_tiling(384, 128, True) == (False, 128, 3, 4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA metadata kernel")
+@pytest.mark.parametrize("gathered", [False, True])
+@pytest.mark.parametrize("dcp_rank", range(4))
+def test_glm_dcp_compaction_preserves_tail_order_on_graph_replay(
+    gathered: bool, dcp_rank: int
+) -> None:
+    """A C4 tail cannot race the history into a different attention order."""
+    from vllm.v1.attention.backends.mla.sparse_utils import (
+        triton_filter_and_convert_dcp_index,
+    )
+
+    rows, width, page_size = 4, 2051, 2048
+    # Remapping only reads metadata. This physical page would lie above 2 GiB
+    # in a 528-byte packed-record pool; no KV payload is allocated here.
+    page_id = 4097
+    req_ids = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    block_table = torch.full((1, 1), page_id, dtype=torch.int32, device="cuda")
+    starts = torch.zeros((4, 1), dtype=torch.int32, device="cuda")
+    lengths = torch.full_like(starts, page_size)
+    indices = torch.full((rows, width), -1, dtype=torch.int32, device="cuda")
+    out, counts = torch.empty_like(indices), torch.empty_like(req_ids)
+
+    def run():
+        if gathered:
+            b12x_mla_sparse._map_global_topk_to_gathered_ckv(
+                req_ids,
+                indices,
+                starts,
+                lengths,
+                out,
+                counts,
+                dcp_size=4,
+                cp_kv_cache_interleave_size=4,
+                padded_rank_tokens=page_size,
+            )
+            return out, counts
+        return triton_filter_and_convert_dcp_index(
+            req_ids,
+            block_table,
+            indices,
+            dcp_size=4,
+            dcp_rank=dcp_rank,
+            cp_kv_cache_interleave_size=4,
+            BLOCK_SIZE=page_size,
+            NUM_TOPK_TOKENS=width,
+            return_valid_counts=True,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result, valid_counts = run()
+
+    for tail_count in (3, 0, 1):
+        source = torch.full((rows, width), -1, dtype=torch.int32)
+        source[1, 2048 : 2048 + tail_count] = torch.arange(tail_count)
+        source[2, :24] = torch.arange(24)
+        source[2, 2048 : 2048 + tail_count] = torch.arange(24, 24 + tail_count)
+        source[3] = torch.arange(width)
+        expected = torch.full_like(source, -1)
+        expected_counts = torch.zeros(rows, dtype=torch.int32)
+        for row in range(rows):
+            token = source[row].to(torch.int64)
+            owner = token // 4 % 4
+            local = token // 16 * 4 + token % 4
+            valid = (token >= 0) & (local < page_size)
+            if gathered:
+                slots = owner * page_size + local
+            else:
+                valid &= owner == dcp_rank
+                slots = page_id * page_size + local
+            selected = slots[valid].to(torch.int32)
+            expected_counts[row] = selected.numel()
+            expected[row, : selected.numel()] = selected
+        indices.copy_(source)
+        for _ in range(4):
+            result.fill_(123456)
+            valid_counts.fill_(-123456)
+            graph.replay()
+            assert torch.equal(result.cpu(), expected)
+            assert torch.equal(valid_counts.cpu(), expected_counts)
 
 
 def test_b12x_glm5_next_cache_writer_ignores_empty_rope() -> None:

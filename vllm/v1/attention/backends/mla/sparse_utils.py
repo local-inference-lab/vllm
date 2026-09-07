@@ -47,7 +47,7 @@ def _convert_req_index_to_global_index_kernel(
     BLOCK_N: tl.constexpr,  # tile width along columns
     HAS_PREFILL: tl.constexpr,
     COUNT_VALID: tl.constexpr,  # whether to count valid indices
-    # BLOCK_N == NUM_TOPK_TOKENS: one program owns the row, so the valid count
+    # BLOCK_N >= NUM_TOPK_TOKENS: one program owns the row, so the valid count
     # is an in-register reduction and needs no atomic.
     SINGLE_TILE: tl.constexpr,
     # When set, scatter valid slots to a contiguous prefix [0, valid_count) using
@@ -134,6 +134,13 @@ def _convert_req_index_to_global_index_kernel(
         if SINGLE_TILE:
             base = 0
             tl.store(valid_count_ptr + token_id, tile_valid_count)
+            # The row owner initializes only the tail. These stores cannot
+            # overlap the compacted prefix written by valid lanes below.
+            tl.store(
+                out_ptr + token_id * out_stride0 + indice_id * out_stride1,
+                -1,
+                mask=in_bounds & (indice_id >= tile_valid_count),
+            )
         else:
             base = tl.atomic_add(valid_count_ptr + token_id, tile_valid_count)
         dest = base + local_offset
@@ -162,8 +169,10 @@ def _remap_tiling(
     Counting the valid slots per row is the only reason the column tiles have to
     talk to each other, so when counting give one program the whole row: the
     count becomes an in-register reduction plus a plain store, needing neither
-    atomics nor a zero-initialized counter. The row is one ``tl.arange``, so this
-    needs a power-of-two width; other top-k sizes stay tiled and atomic.
+    atomics nor a zero-initialized counter. GLM's 2051-column layout includes
+    three incomplete-pool tokens after 2048 history columns. A padded row tile
+    keeps that tail in input-relative order instead of racing a history tile.
+    Other non-power-of-two widths retain tiled counting.
 
     Returns:
         (single_tile, block_n, tiles_per_row, num_warps)
@@ -172,9 +181,11 @@ def _remap_tiling(
     assert BLOCK_N > 0 and BLOCK_N & (BLOCK_N - 1) == 0, (
         f"BLOCK_N ({BLOCK_N}) must be a positive power of two"
     )
-    single_tile = count_valid and NUM_TOPK_TOKENS & (NUM_TOPK_TOKENS - 1) == 0
+    single_tile = count_valid and (
+        NUM_TOPK_TOKENS & (NUM_TOPK_TOKENS - 1) == 0 or NUM_TOPK_TOKENS == 2051
+    )
     if single_tile:
-        return True, NUM_TOPK_TOKENS, 1, 8
+        return True, triton.next_power_of_2(NUM_TOPK_TOKENS), 1, 8
     return False, BLOCK_N, (NUM_TOPK_TOKENS + BLOCK_N - 1) // BLOCK_N, 4
 
 
@@ -322,8 +333,10 @@ def triton_filter_and_convert_dcp_index(
     leaves the rest ``-1``. DCP filtering marks non-owned slots ``-1`` and so
     creates interior gaps; the trtllm-gen sparse kernel reads the first
     ``valid_count`` entries of each row, so they must be a contiguous prefix.
-    Compaction is fused into the kernel (atomic slot allocator) rather than a
-    separate sort/gather pass. Prefix order is unspecified (only the set matters).
+    Compaction is fused into the kernel rather than a separate sort/gather
+    pass. Counted power-of-two widths and GLM's 2051 columns preserve input
+    order with one row owner. Other widths use an atomic tile allocator and
+    provide the same selected set without an ordering guarantee.
     """
     assert dcp_size >= 1
     assert 0 <= dcp_rank < dcp_size
@@ -358,8 +371,8 @@ def triton_filter_and_convert_dcp_index(
     block_table_c = block_table.contiguous()
     token_indices_c = token_indices.contiguous()
 
-    # The compaction uses the valid-count buffer as a slot allocator, so it
-    # requires counting. Pre-fill out with -1 so the unwritten tail stays -1.
+    # Compaction requires counting. A single row owner writes its own -1 tail;
+    # racing tiles require the output to be initialized before reservation.
     count_valid = return_valid_counts or compact_valid_to_front
 
     # The compaction builds on the counting, so it shares the tiling.
@@ -367,7 +380,7 @@ def triton_filter_and_convert_dcp_index(
         NUM_TOPK_TOKENS, BLOCK_N, count_valid
     )
 
-    if compact_valid_to_front:
+    if compact_valid_to_front and not single_tile:
         out = torch.full_like(token_indices_c, -1)
     else:
         out = torch.empty_like(token_indices_c)
