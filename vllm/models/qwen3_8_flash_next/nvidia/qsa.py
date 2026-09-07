@@ -265,7 +265,9 @@ class _B12xQSAWarmup:
                         query=inputs["query"][:rows],
                         request_ids=inputs["request_ids"][:rows],
                         query_positions=inputs["query_positions"][:rows],
-                        reuse_draft_selection=True,
+                        reuse=qsa.DraftSelectionReuse(
+                            source_rows=layer._mtp_source_rows
+                        ),
                     )
 
         return B12xWarmupUnit(
@@ -974,29 +976,14 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             and self.max_speculative_tokens > 1
         )
         self.skip_topk = False
+        self._mtp_anchor_state: Any | None = None
+        self.register_buffer("_mtp_anchor_storage", None, persistent=False)
         if self._share_mtp_indices:
-            for name, shape, dtype in (
-                ("_mtp_source_positions", (self.max_tokens,), torch.int64),
-                ("_mtp_source_errors", (self.max_tokens,), torch.int32),
-                ("_mtp_source_rows", (self.max_seqs,), torch.int64),
-                ("_mtp_num_source_rows", (1,), torch.int32),
-                ("_mtp_read_errors", (self.max_seqs,), torch.int32),
-                (
-                    "_mtp_shared_selected_positions",
-                    (
-                        self.max_seqs,
-                        self._native_selection_width + self.max_speculative_tokens,
-                    ),
-                    torch.int32,
-                ),
-            ):
-                self.register_buffer(
-                    name,
-                    torch.zeros(shape, dtype=dtype, device=device),
-                    persistent=False,
-                )
-            self._mtp_shared_selected_positions.fill_(-1)
-            self._mtp_source_rows.fill_(-1)
+            self.register_buffer(
+                "_mtp_source_rows",
+                torch.full((self.max_seqs,), -1, dtype=torch.int64, device=device),
+                persistent=False,
+            )
 
         self.register_buffer(
             "_raw_k_ring",
@@ -1266,6 +1253,17 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             )
         )
         full_plan = prefill_plans[-1][1]
+        if self._share_mtp_indices:
+            anchor_plan = full_plan.draft_selection_plan()
+            (anchor_spec,) = anchor_plan.storage_specs()
+            self._mtp_anchor_storage = torch.empty(
+                anchor_spec.shape,
+                dtype=anchor_spec.dtype,
+                device=anchor_spec.device,
+            )
+            self._mtp_anchor_state = anchor_plan.bind(storage=self._mtp_anchor_storage)
+            self._mtp_anchor_state.reset()
+            self._mtp_source_rows.fill_(-1)
         # A decode plan reserves rows for the verifier batch, not the prefill
         # budget. This keeps the score workspace wide enough to avoid unnecessary
         # top-k carry passes while covering the complete configured context.
@@ -1349,18 +1347,11 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         rows = context.plan.caps.max_q_rows
         draft_selection = None
         if self._share_mtp_indices:
-            qsa = get_b12x_qsa()
-            if qsa is None:
-                raise RuntimeError("b12x QSA is unavailable for draft state binding")
-            draft_selection = qsa.DraftSelectionState(
-                selected_positions=self._selected_positions,
-                logical_positions=self._mtp_source_positions,
-                errors=self._mtp_source_errors,
-                source_rows=self._mtp_source_rows,
-                num_source_rows=self._mtp_num_source_rows,
-                work_positions=self._mtp_shared_selected_positions,
-                work_errors=self._mtp_read_errors,
-            )
+            draft_selection = self._mtp_anchor_state
+            if draft_selection is None:
+                raise RuntimeError(
+                    "QSA draft anchor storage was not bound to its cache"
+                )
         return context.plan.bind(
             scratch=context.scratch,
             main_block_table=context.main_block_table,
@@ -1389,6 +1380,8 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         )
 
     def unbind_kv_cache(self) -> None:
+        self._mtp_anchor_state = None
+        self._mtp_anchor_storage = None
         self._qsa_decode_context = None
         self._qsa_plan = None
         self._qsa_prefill_bindings = ()
@@ -1631,8 +1624,12 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         return staged
 
     def set_skip_topk(self, skip: bool) -> None:
-        """Reuse a draft-owned selection only inside its speculative round."""
+        """Start a recording round or reuse its accepted draft anchors."""
         self.skip_topk = bool(skip and self._share_mtp_indices)
+        if self._share_mtp_indices and not self.skip_topk:
+            if self._mtp_anchor_state is not None:
+                self._mtp_anchor_state.reset()
+            self._mtp_source_rows.fill_(-1)
 
     def compact_topk_indices(self, source_rows: torch.Tensor) -> None:
         """Map compacted requests to their accepted draft-selection anchors."""
@@ -1706,7 +1703,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             query=query[:rows],
             request_ids=staged.request_ids,
             query_positions=staged.logical_positions,
-            reuse_draft_selection=True,
+            reuse=qsa.DraftSelectionReuse(source_rows=self._mtp_source_rows),
         )
         if rows < output.shape[0]:
             output[rows:].zero_()

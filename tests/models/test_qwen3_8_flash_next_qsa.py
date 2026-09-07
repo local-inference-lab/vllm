@@ -190,8 +190,10 @@ def test_qsa_main_cache_views_reinterpret_fp8_storage() -> None:
     )
 
 
+@pytest.mark.parametrize("draft", [False, True])
 def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     monkeypatch,
+    draft,
 ) -> None:
     actual_pages = 2
     page_size = 8
@@ -215,6 +217,7 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     planned_caps: list[SimpleNamespace] = []
     shared_scratch = torch.empty(32, dtype=torch.uint8)
     binding = object()
+    anchor_capacities = []
 
     class FakePlan:
         def __init__(self, caps):
@@ -232,6 +235,22 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
         def bind(self, **kwargs):
             bind_kwargs.update(kwargs)
             return binding
+
+        def draft_selection_plan(self):
+            anchor_capacities.append(self.caps.max_q_rows)
+            return SimpleNamespace(
+                storage_specs=lambda: (
+                    SimpleNamespace(
+                        shape=(53,),
+                        dtype=torch.uint8,
+                        device=torch.device("cpu"),
+                    ),
+                ),
+                bind=lambda *, storage: SimpleNamespace(
+                    storage=storage,
+                    reset=lambda: storage.zero_(),
+                ),
+            )
 
     def plan(caps):
         planned_caps.append(caps)
@@ -264,7 +283,8 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     owner.max_seq_len = max_seq_len
     owner.max_speculative_tokens = 2
     owner.max_decode_rows = 6
-    owner._share_mtp_indices = False
+    owner._share_mtp_indices = draft
+    owner._mtp_source_rows = torch.full((2,), -1, dtype=torch.int64)
     owner.compress_ratio = 4
     owner.raw_ring_capacity = 8
     owner.budget = 2048
@@ -309,6 +329,11 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     assert context.plan.caps.max_q_rows == owner.max_decode_rows
     assert context.plan.caps.max_seq_len == max_seq_len
     assert owner._bind_qsa_context(context) is binding
+    if draft:
+        assert anchor_capacities == [owner.max_tokens]
+        assert owner._mtp_anchor_storage.shape == (53,)
+        assert owner._mtp_anchor_state.storage is owner._mtp_anchor_storage
+        assert bind_kwargs["draft_selection"] is owner._mtp_anchor_state
     caps = planned_caps[0]
     assert caps.max_seq_len == max_seq_len
     assert caps.max_q_rows == owner.max_tokens
@@ -342,6 +367,8 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     assert owner._qsa_decode_context is None
     assert owner._qsa_prefill_bindings == ()
     assert owner._qsa_scratch is None
+    assert owner._mtp_anchor_state is None
+    assert owner._mtp_anchor_storage is None
 
     replacement_cache = torch.empty_like(kv_cache)
     owner.bind_kv_cache(replacement_cache)
@@ -447,8 +474,9 @@ def test_qsa_prefill_context_capacities_cover_the_configured_limit() -> None:
 
 
 @pytest.mark.parametrize("max_tokens", [4, 10])
+@pytest.mark.parametrize("draft", [False, True])
 def test_qsa_warmup_runs_every_context_with_only_padded_requests(
-    monkeypatch, max_tokens
+    monkeypatch, max_tokens, draft
 ) -> None:
     caps = SimpleNamespace(
         device=torch.device("cpu"),
@@ -477,6 +505,9 @@ def test_qsa_warmup_runs_every_context_with_only_padded_requests(
         ),
         _bind_qsa_context=lambda context: context,
         max_tokens=max_tokens,
+        max_seqs=2,
+        _share_mtp_indices=draft,
+        _mtp_source_rows=torch.full((2,), -1, dtype=torch.int64),
         max_speculative_tokens=2,
         max_decode_rows=6,
         overlap_input_projections=False,
@@ -487,6 +518,10 @@ def test_qsa_warmup_runs_every_context_with_only_padded_requests(
         rows = inputs["query"].shape[0]
         calls.append((binding, rows))
         assert inputs["query"].shape == (rows, 2, 16)
+        if "reuse" in inputs:
+            assert inputs["reuse"].source_rows is layer._mtp_source_rows
+            assert set(inputs) == {"query", "request_ids", "query_positions", "reuse"}
+            return
         assert inputs["index_query"].shape == (rows, 2, 8)
         assert inputs["raw_index_key"].shape == (rows, 8)
         assert inputs["rope_positions"].shape == (rows, 3)
@@ -495,7 +530,11 @@ def test_qsa_warmup_runs_every_context_with_only_padded_requests(
         assert not inputs["sequence_lengths"].any()
         assert not inputs["query_start_loc"].any()
 
-    monkeypatch.setattr(qsa_module, "get_b12x_qsa", lambda: SimpleNamespace(run=run))
+    monkeypatch.setattr(
+        qsa_module,
+        "get_b12x_qsa",
+        lambda: SimpleNamespace(run=run, DraftSelectionReuse=SimpleNamespace),
+    )
     unit = qsa_module._B12xQSAWarmup().get_b12x_warmup_unit(
         layer, (1, 4, 8), torch.bfloat16
     )
@@ -504,6 +543,7 @@ def test_qsa_warmup_runs_every_context_with_only_padded_requests(
         *((context, max_tokens - 2) for context in contexts),
         (layer._qsa_decode_context, 1),
         (layer._qsa_decode_context, 4),
+        *(([(layer._qsa_decode_context, 2)]) if draft else []),
     ]
 
 
@@ -1245,6 +1285,8 @@ def test_mtp_anchor_row_map_follows_compaction_during_graph_replay(
 ) -> None:
     """Only row ownership is supplied by vLLM; B12X owns anchor/tail evaluation."""
     device = _require_qsa_gpu()
+    from b12x.attention import qsa as b12x_qsa
+
     layer = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
     torch.nn.Module.__init__(layer)
     layer._share_mtp_indices = True
@@ -1253,16 +1295,31 @@ def test_mtp_anchor_row_map_follows_compaction_during_graph_replay(
         (16, 2051), device=device, dtype=torch.int32
     )
     layer._mtp_source_rows = torch.full((4,), -1, device=device, dtype=torch.int64)
+    anchor_plan = b12x_qsa.DraftSelectionPlan(device, 16, 2051)
+    (spec,) = anchor_plan.storage_specs()
+    layer._mtp_anchor_storage = torch.empty(
+        spec.shape, dtype=spec.dtype, device=spec.device
+    )
+    layer._mtp_anchor_state = anchor_plan.bind(storage=layer._mtp_anchor_storage)
+    layer._mtp_anchor_state.num_source_rows.fill_(16)
+    layer.set_skip_topk(True)
+    assert layer._mtp_anchor_state.num_source_rows.item() == 16
     source_rows = torch.tensor([7, 3, 0], device=device, dtype=source_dtype)
     pointer = layer._mtp_source_rows.data_ptr()
     layer.compact_topk_indices(source_rows)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
+        layer.set_skip_topk(False)
         layer.compact_topk_indices(source_rows)
     for mapping in ([7, 3, 0], [1, -1, 15]):
         source_rows.copy_(torch.tensor(mapping, device=device, dtype=source_dtype))
         layer._mtp_source_rows.fill_(99)
+        layer._mtp_anchor_state.num_source_rows.fill_(16)
+        allocated = torch.accelerator.memory_stats()["allocation.all.allocated"]
         graph.replay()
+        torch.accelerator.synchronize()
+        assert torch.accelerator.memory_stats()["allocation.all.allocated"] == allocated
+        assert layer._mtp_anchor_state.num_source_rows.item() == 0
         assert layer._mtp_source_rows.tolist() == [*mapping, -1]
         assert layer._mtp_source_rows.data_ptr() == pointer
 
@@ -1489,3 +1546,63 @@ def test_qsa_staging_shares_live_request_state_but_not_group_page_tables(
         compressed_block_table=table_b,
     )
     assert separate is not staged
+
+
+def test_reused_qsa_passes_live_anchor_map_after_kv_update(monkeypatch) -> None:
+    """A reuse transaction writes KV first and passes only typed reuse inputs."""
+    rows = 2
+    metadata = Qwen3_8FlashNextQSAMetadata.__new__(Qwen3_8FlashNextQSAMetadata)
+    metadata.num_actual_tokens = rows
+    metadata.max_query_len, metadata.max_seq_len, metadata.causal = 1, 8, True
+    metadata.slot_mapping = torch.arange(rows)
+    staged = SimpleNamespace(
+        request_ids=torch.arange(rows, dtype=torch.int32),
+        logical_positions=torch.full((rows,), 4, dtype=torch.int64),
+    )
+    source_rows = torch.tensor([3, 7], dtype=torch.int64)
+    output = torch.full((4, 2, 4), 23.0)
+    events: list[str] = []
+
+    def run(binding, *, query, request_ids, query_positions, reuse):
+        assert events == ["kv"]
+        assert reuse.source_rows is source_rows
+        assert request_ids is staged.request_ids
+        assert query_positions is staged.logical_positions
+        assert query.shape[0] == rows
+        binding.output.fill_(7)
+
+    context = SimpleNamespace(main_block_table=None, compressed_block_table=None)
+    layer = SimpleNamespace(
+        layer_name="qsa",
+        max_seqs=2,
+        _mtp_source_rows=source_rows,
+        _qsa_binding_for_workload=lambda **_: context,
+        _stage_runtime_metadata=lambda *_args, **_kwargs: staged,
+        _bind_qsa_context=lambda _context, _staged, out: SimpleNamespace(output=out),
+        impl=SimpleNamespace(do_kv_cache_update=lambda *_: events.append("kv")),
+        kv_cache=None,
+    )
+    monkeypatch.setattr(
+        qsa_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={"qsa": metadata},
+        ),
+    )
+    monkeypatch.setattr(
+        qsa_module,
+        "get_b12x_qsa",
+        lambda: SimpleNamespace(
+            run=run,
+            DraftSelectionReuse=SimpleNamespace,
+        ),
+    )
+    Qwen3_8FlashNextQSAAttention._run_reused_qsa(
+        layer,
+        torch.empty_like(output),
+        torch.empty_like(output),
+        torch.empty_like(output),
+        output,
+    )
+    assert torch.all(output[:rows] == 7)
+    assert torch.all(output[rows:] == 0)
