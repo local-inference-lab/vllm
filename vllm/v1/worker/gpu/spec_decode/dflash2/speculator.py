@@ -151,7 +151,9 @@ class DFlash2Speculator(DSparkSpeculator):
     def propose(self, input_batch, *args, **kwargs):  # type: ignore[override]
         draft_tokens = super().propose(input_batch, *args, **kwargs)
         if self._dump_dir is not None:
-            bound = inspect.signature(DSparkSpeculator.propose).bind(
+            # The DSpark override forwards *args/**kwargs; the DFlash base
+            # names every parameter, so bind against it.
+            bound = inspect.signature(DFlashSpeculator.propose).bind(
                 self, input_batch, *args, **kwargs
             )
             self._dump_state(
@@ -164,7 +166,8 @@ class DFlash2Speculator(DSparkSpeculator):
         comparison: the target auxiliary states of the tokens the target ran
         this step, the draft block's token ids and positions, the draft's
         sampled hidden states and unary logits, and the proposals."""
-        if get_tensor_model_parallel_rank() != 0 or self._dump_step >= 64:
+        max_steps = int(os.environ.get("VLLM_DFLASH2_DUMP_MAX_STEPS", "512"))
+        if get_tensor_model_parallel_rank() != 0 or self._dump_step >= max_steps:
             return
         rows = self.num_query_per_req
         # Long prefills are not dumped (their auxiliary states are hundreds of
