@@ -183,3 +183,54 @@ def test_prefill_guard_reaches_single_rank_dispatch():
     desc, across = dispatch_cg_and_sync_dp(manager, 1, 4, 4, 4, 1, 0, has_prefill=True)
     assert desc is piecewise
     assert across is None
+
+
+@pytest.mark.parametrize(
+    "computed,prefill,scheduled,dummy,expected",
+    [
+        ([4608], [4612], {"r0": 4}, False, True),
+        ([115200], [115204], {"r0": 4}, False, True),
+        ([4612], [4612], {"r0": 4}, False, False),
+        ([4612, 4608], [4612, 4612], {"r1": 4, "r0": 4}, False, True),
+        ([4608, 4612], [4612, 4612], {"r1": 4}, False, False),
+        ([0], [4612], {"r0": 4}, True, False),
+    ],
+)
+def test_v2_runner_passes_scheduled_prefill_state_to_dispatch(
+    monkeypatch, computed, prefill, scheduled, dummy, expected
+):
+    """The real runner must use request state, not shape or inactive slots."""
+    from vllm.v1.worker.gpu import model_runner
+
+    class DispatchObserved(Exception):
+        pass
+
+    runner = model_runner.GPUModelRunner.__new__(model_runner.GPUModelRunner)
+    runner._resolve_pending_draft = lambda: None
+    runner.update_pp_decode_requests = lambda: None
+    for method in ("finish_requests", "free_states", "add_requests", "update_requests"):
+        setattr(runner, method, lambda _output: None)
+    runner.block_tables = SimpleNamespace(apply_staged_writes=lambda: None)
+    runner.req_states = SimpleNamespace(
+        req_id_to_index={f"r{i}": i for i in range(len(computed))},
+        num_computed_prefill_tokens=computed,
+        prefill_len=SimpleNamespace(np=prefill),
+    )
+    runner.verification_capacity_manager = None
+    runner.lora_config = None
+    runner.is_encoder_decoder = False
+    runner.cudagraph_manager = object()
+    runner.dp_size, runner.dp_rank = 1, 0
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens=scheduled,
+        total_num_scheduled_tokens=sum(scheduled.values()),
+        scheduled_spec_decode_tokens={},
+    )
+
+    def observe_dispatch(*args, **kwargs):
+        assert kwargs["has_prefill"] is expected
+        raise DispatchObserved
+
+    monkeypatch.setattr(model_runner, "dispatch_cg_and_sync_dp", observe_dispatch)
+    with pytest.raises(DispatchObserved):
+        runner.execute_model(scheduler_output, dummy_run=dummy)
