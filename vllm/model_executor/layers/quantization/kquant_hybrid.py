@@ -77,6 +77,23 @@ def _qsrt_atoms_v2_w4a8_prefill_enabled(*, pure_k2: bool) -> bool:
     return enabled
 
 
+def _w4a16_rotation_output_dtype() -> torch.dtype:
+    """Dtype of the full-rotation trellis route-sum output buffer.
+
+    b12x stores the fp32 route sum by default and this layer casts it to the
+    model dtype; with ``B12X_W4A16_TOPK_SUM_OUTPUT=bf16`` (or ``fp16``) the
+    kernel rounds once in its store and the cast is a no-op. The buffer dtype
+    follows the b12x setting so the launch contract holds.
+    """
+    try:
+        from b12x.moe._shared.kernels.w4a16.host import (
+            w4a16_topk_sum_rotation_output_torch_dtype,
+        )
+    except ImportError:
+        return torch.float32
+    return w4a16_topk_sum_rotation_output_torch_dtype()
+
+
 def _w4a16_prefill_route_block_m() -> int | None:
     """Route-block rows for W4A16 trellis launches above the prefill threshold.
 
@@ -1729,7 +1746,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             ):
                 runtime.trellis_output = torch.empty(
                     output_shape,
-                    dtype=torch.float32,
+                    dtype=_w4a16_rotation_output_dtype(),
                     device=spec.device,
                 )
             prefill_block_m = _w4a16_prefill_route_block_m()
