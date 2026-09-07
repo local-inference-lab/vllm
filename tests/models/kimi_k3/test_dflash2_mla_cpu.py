@@ -23,6 +23,7 @@ from vllm.models.kimi_k3.nvidia.dflash2_mla import (
     DFlash2ForCausalLM,
     DFlash2Model,
     _grouped_conv,
+    describe_dflash2_draft,
     is_dflash2_draft,
     normalize_dflash2_config,
     rename_dflash2_checkpoint_name,
@@ -398,3 +399,13 @@ def test_dflash2_draft_uses_the_k3_dspark_virtual_tp_plan() -> None:
     model_config = SimpleNamespace(hf_config=hf_config, hf_text_config=hf_config)
     assert _is_kimi_k3_dspark_config(model_config)
     assert not _is_dflash_draft_config(model_config)
+
+
+def test_boot_description_is_one_hashable_string() -> None:
+    """The once-only boot log takes a single string (its args are hashed)."""
+    text = describe_dflash2_draft(normalize_dflash2_config(_config()), 4, sampled=True)
+    assert isinstance(text, str)
+    hash(text)
+    assert "5 MLA layers (sliding/sliding/sliding/sliding/full, window 4096)" in text
+    assert "target taps [19,37,66,78,90]" in text
+    assert "4 speculative tokens per step, sampled proposals" in text

@@ -461,6 +461,23 @@ class DFlash2ForCausalLM(K3DSparkForCausalLM):
         return super().load_weights(renamed())
 
 
+def describe_dflash2_draft(
+    hf_config: Any, num_speculative_steps: int, sampled: bool
+) -> str:
+    """One-line description of the served DFlash2 geometry for the boot log."""
+    geometry = dflash2_config_summary(hf_config)
+    layer_types = "/".join(t.replace("_attention", "") for t in geometry.layer_types)
+    taps = ",".join(str(layer_id) for layer_id in geometry.target_layer_ids)
+    return (
+        f"DFlash2 draft: {geometry.layers} MLA layers ({layer_types}, window "
+        f"{geometry.sliding_window}), block {geometry.block_size}, conv taps "
+        f"{geometry.taps} x groups of {geometry.group_size}, selector rank "
+        f"{geometry.selector_rank} top-{geometry.selector_top_k}, target taps "
+        f"[{taps}], {num_speculative_steps} speculative tokens per step, "
+        f"{'sampled' if sampled else 'greedy'} proposals."
+    )
+
+
 def dflash2_config_summary(hf_config: Any) -> SimpleNamespace:
     """Small read-only view of the DFlash2 geometry for logs and tests."""
     nested = getattr(hf_config, "dflash_config", None) or {}

@@ -30,7 +30,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.models.kimi_k3.nvidia.dflash2_mla import (
-    dflash2_config_summary,
+    describe_dflash2_draft,
     is_dflash2_draft,
     normalize_dflash2_config,
 )
@@ -69,22 +69,13 @@ class DFlash2Speculator(DSparkSpeculator):
                 "DFlash2 drafts have no confidence head; disable the DSpark "
                 "draft-token capacity settings."
             )
-        geometry = dflash2_config_summary(hf_config)
         logger.info_once(
-            "DFlash2 draft: %d MLA layers (%s, window %s), block %d, conv taps %d "
-            "x groups of %d, selector rank %d top-%d, target taps %s, "
-            "%d speculative tokens per step, %s proposals.",
-            geometry.layers,
-            "/".join(t.replace("_attention", "") for t in geometry.layer_types),
-            geometry.sliding_window,
-            geometry.block_size,
-            geometry.taps,
-            geometry.group_size,
-            geometry.selector_rank,
-            geometry.selector_top_k,
-            geometry.target_layer_ids,
-            self.num_speculative_steps,
-            "sampled" if self.draft_logits is not None else "greedy",
+            "%s",
+            describe_dflash2_draft(
+                hf_config,
+                self.num_speculative_steps,
+                sampled=self.draft_logits is not None,
+            ),
         )
 
     # DFlash's parallel proposal: backbone forward, then one sampling pass over
