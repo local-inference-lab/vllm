@@ -1778,6 +1778,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         )
         stream = aux_stream()
         assert stream is not None and self._selector_done is not None
+        assert self._index_ready is not None
         main_stream = current_stream()
         stream.wait_stream(main_stream)
         hidden_states.record_stream(stream)

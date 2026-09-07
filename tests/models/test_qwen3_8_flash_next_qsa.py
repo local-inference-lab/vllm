@@ -1291,8 +1291,8 @@ def test_projected_qsa_uses_complete_run_with_ready_event(monkeypatch) -> None:
         torch.empty(rows, 1),
     )
     ready = object()
-    events = []
-    bindings = []
+    events: list[str] = []
+    bindings: list[SimpleNamespace] = []
 
     def bind(context, live, out, *, overlap):
         assert live is staged and overlap
