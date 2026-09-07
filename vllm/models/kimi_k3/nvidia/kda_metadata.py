@@ -272,9 +272,23 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                 num_spec_decodes = spec_sequence_masks_cpu.sum().item()
 
         if num_spec_decodes == 0:
-            # The runner orders ordinary decodes before prefills.
+            # A one-token first chunk has no valid KDA state, while a one-token
+            # continuation does. Only the prefill path masks an unowned state slot.
+            assert m.seq_lens_cpu_upper_bound is not None
+            query_lens_cpu = query_start_loc_cpu.diff()
+            no_prior_state = (query_lens_cpu > 0) & (
+                m.seq_lens_cpu_upper_bound <= query_lens_cpu
+            )
+            if m.is_prefilling is not None:
+                no_prior_state &= m.is_prefilling
+            else:
+                no_prior_state = torch.zeros_like(no_prior_state)
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-                split_decodes_and_prefills(m, decode_threshold=1)
+                split_decodes_and_prefills(
+                    m.replace(is_prefilling=no_prior_state),
+                    decode_threshold=1,
+                    treat_short_extends_as_decodes=False,
+                )
             )
             num_spec_decode_tokens = 0
             spec_token_indx = None
