@@ -932,7 +932,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         checkpoint: Any,
     ) -> None:
         """Store the convolution history at each request's checkpoint offset."""
-        state_len = conv_state.shape[-1]
+        # Prefill reads history at the start of the row. Any additional
+        # speculative slots are scratch, not older convolution inputs.
+        state_len = self.conv_size - 1
         width = mixed_qkv.shape[-1]
         store_block_size = 256
         _store_cache_checkpoints_kernel[
@@ -1509,7 +1511,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                         core_attn_out_non_spec = flashkda_out
                         last_recurrent_state = final_state
 
-                        state_len = conv_state.shape[-1]
+                        # Match causal_conv1d_fn's history layout even when
+                        # the row also reserves speculative scratch slots.
+                        state_len = self.conv_size - 1
                         width = prefill_mixed_qkv.shape[-1]
                         recurrent_row_size = checkpoint_state[0].numel()
                         store_block_size = 256
