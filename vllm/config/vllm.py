@@ -655,8 +655,10 @@ class VllmConfig:
         if speculative_config.use_dflash():
             # DFlash requires an extra lookahead slot since it uses in-fill-style
             # decoding instead of standard next-token sampling, so it has a query
-            # for the last sampled token plus queries for each draft token.
-            return self.num_speculative_tokens + 1
+            # for the last sampled token plus queries for each draft token. A
+            # drafter run at a wider trained block writes KV for every row of it.
+            draft_query_rows = getattr(speculative_config, "draft_query_rows", None)
+            return max(self.num_speculative_tokens + 1, int(draft_query_rows or 0))
         if speculative_config.use_eagle() or speculative_config.uses_draft_model():
             # DSpark (covered by use_eagle) drafts a block of num_speculative_tokens
             # query tokens in which the anchor itself is the first prediction

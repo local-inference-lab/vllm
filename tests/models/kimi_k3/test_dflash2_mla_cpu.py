@@ -25,6 +25,7 @@ from vllm.models.kimi_k3.nvidia.dflash2_mla import (
     _grouped_conv,
     add_selector_transitions,
     describe_dflash2_draft,
+    dflash2_draft_query_rows,
     is_dflash2_draft,
     normalize_dflash2_config,
     rename_dflash2_checkpoint_name,
@@ -505,3 +506,15 @@ def test_selector_conditioning_matches_the_reference_edge_scores() -> None:
     torch.testing.assert_close(
         conditioned.gather(1, candidates[:, 1]), expected, rtol=1e-5, atol=1e-5
     )
+
+
+def test_draft_runs_its_trained_block_and_proposes_fewer_rows() -> None:
+    """The draft step holds the trained block (8 rows) for 3 or 7 proposals."""
+    config = _config()
+    assert dflash2_draft_query_rows(config, 3, full_block=True) == 8
+    assert dflash2_draft_query_rows(config, 7, full_block=True) == 8
+    assert dflash2_draft_query_rows(config, 3, full_block=False) == 4
+    with pytest.raises(ValueError, match="trained block holds 7"):
+        dflash2_draft_query_rows(config, 8, full_block=True)
+    config.dflash_config.pop("block_size")
+    assert dflash2_draft_query_rows(config, 3, full_block=True) == 4

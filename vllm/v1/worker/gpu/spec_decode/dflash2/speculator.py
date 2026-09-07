@@ -35,6 +35,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.models.kimi_k3.nvidia.dflash2_mla import (
     describe_dflash2_draft,
+    dflash2_draft_query_rows,
     is_dflash2_draft,
     normalize_dflash2_config,
 )
@@ -76,6 +77,30 @@ class DFlash2Speculator(DSparkSpeculator):
         if self._draft_topk is not None:
             raise ValueError("DFlash2 drafts do not support dspark_draft_topk.")
         self.use_selector = bool(envs.VLLM_DFLASH2_SELECTOR)
+        # Query rows per request and step: the checkpoint's trained block
+        # (anchor + block_size - 1 masks) by default, of which the first
+        # num_speculative_steps mask rows are proposed; the speculative
+        # config derived the same number for the scheduler's KV lookahead.
+        self.draft_query_rows = int(
+            getattr(self.speculative_config, "draft_query_rows", None)
+            or dflash2_draft_query_rows(
+                hf_config,
+                self.num_speculative_steps,
+                bool(envs.VLLM_DFLASH2_FULL_BLOCK),
+            )
+        )
+        if self.draft_query_rows < 1 + self.num_speculative_steps:
+            raise ValueError(
+                f"DFlash2 draft rows ({self.draft_query_rows}) cannot be fewer "
+                f"than one anchor plus {self.num_speculative_steps} proposals."
+            )
+        self.num_query_per_req = self.draft_query_rows
+        if self.max_num_reqs * self.num_query_per_req > self.max_num_tokens:
+            raise ValueError(
+                "max_num_batched_tokens is too small for the DFlash2 draft block "
+                f"({self.max_num_reqs * self.num_query_per_req} > "
+                f"{self.max_num_tokens})."
+            )
         logger.info_once(
             "%s",
             describe_dflash2_draft(
@@ -87,8 +112,16 @@ class DFlash2Speculator(DSparkSpeculator):
                 " Positions sampled in order with the candidate selector."
                 if self.use_selector
                 else " Positions sampled in one parallel pass (selector off)."
-            ),
+            )
+            + f" Draft block {self.draft_query_rows} rows per request.",
         )
+
+    def _query_len_for_speculative_steps(self, num_speculative_steps: int) -> int:
+        # Every step drafts the full block; fewer proposals do not shrink it.
+        return max(1 + num_speculative_steps, self.draft_query_rows)
+
+    def _speculative_steps_for_query_len(self, query_len: int) -> int:
+        return min(query_len - 1, self.num_speculative_steps)
 
     # Nothing of the proposal runs outside the draft graph.
     _finish_captured_draft = DFlashSpeculator._finish_captured_draft
