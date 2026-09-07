@@ -38,6 +38,38 @@ _ALIGNED_PAGE_SIZE_BYTES = 818_176
 _ALIGNED_BLOCK_SIZE = 752
 
 
+def test_hyperconnection_consumes_projection_views_without_staging(monkeypatch):
+    """Low-rank and injection readers share the immutable projection owner."""
+    layer = hyperconnection_module.GatedResidual.__new__(
+        hyperconnection_module.GatedResidual
+    )
+    nn.Module.__init__(layer)
+    layer.use_combine = True
+    layer.lora_rank, layer.hc_count = 8, 4
+    merged = torch.arange(64, dtype=torch.bfloat16).reshape(4, 16)
+    layer.input_mix_weight_down_block_inject = lambda x: merged
+    layer.input_mix_weight_up = lambda x: x
+    normalized = torch.ones(4, 8)
+    binding = object()
+    seen = {}
+
+    def silu(projected, *, binding):
+        seen["down"] = projected
+        return projected + 1
+
+    api = SimpleNamespace(
+        run_scaled_silu=silu,
+        run_gate_mean=lambda normalized, logits, **kwargs: normalized + logits,
+    )
+    monkeypatch.setattr(hyperconnection_module, "_hyperconnection_api", lambda: api)
+    block, injection = layer._mix_normalized(normalized, binding)
+    torch.testing.assert_close(block, normalized + merged[:, :8] + 1)
+    torch.testing.assert_close(injection, merged[:, 8:12], rtol=0, atol=0)
+    for view in (seen["down"], injection):
+        assert view.untyped_storage().data_ptr() == merged.untyped_storage().data_ptr()
+        assert view.stride(0) == merged.stride(0)
+
+
 def test_mtp_compaction_selector_reuses_aot_callable_across_draft_phases():
     from vllm.models.qwen3_8_flash_next.mtp import (
         Qwen3_8FlashNextMultiTokenPredictor,
