@@ -288,13 +288,22 @@ class LatentMoERunner(MoERunner):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        shared_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self._use_fused_path():
+            if shared_output is not None:
+                raise ValueError(
+                    "The fused latent tail computes its own shared experts"
+                )
             return self._fused_forward(
                 hidden_states, router_logits, input_ids, shared_experts_input
             )
         return super().forward(
-            hidden_states, router_logits, input_ids, shared_experts_input
+            hidden_states,
+            router_logits,
+            input_ids,
+            shared_experts_input,
+            shared_output=shared_output,
         )
 
     def _fused_forward(

@@ -348,13 +348,35 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
-    def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
+    def all_reduce_in_place(
+        self, input_: torch.Tensor, *, borrow_output: bool = False
+    ) -> torch.Tensor:
         """Run NCCL with the same tensor as its input and output.
 
         Functional custom operators cannot return aliased mutable storage, so
         callers must use this method only when the source tensor is dead after
         the collective.
+
+        With ``borrow_output`` a replayed B12X DMA ring all-reduce returns the
+        ring's static output instead of a fresh tensor; the caller must
+        consume it before its next all-reduce of the same numel/dtype and
+        must not retain it (see ``is_borrowed_reduction_storage``).
         """
+        # kimi-k3-inplace-ar-dma: eligible prefill-size tensors take the same PCIe
+        # custom/DMA all-reduce as the functional entry; the caller consumes
+        # the returned tensor and treats the source as dead.
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_custom_ar(input_)
+        ):
+            if borrow_output:
+                out = ca_comm.custom_all_reduce(input_, borrow_output=True)
+            else:
+                out = ca_comm.custom_all_reduce(input_)
+            if out is not None:
+                return out
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
             torch.distributed.all_reduce(input_, group=self.device_group)
@@ -363,6 +385,37 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if out is None:
             torch.distributed.all_reduce(input_, group=self.device_group)
         return input_
+
+    def is_borrowed_reduction_storage(self, tensor: torch.Tensor) -> bool:
+        """Whether ``tensor`` aliases storage a borrowed reduction returned."""
+        ca_comm = self.ca_comm
+        return ca_comm is not None and ca_comm.is_pcie_ring_storage(tensor)
+
+    def pcie_all_gather_pair(
+        self, first: torch.Tensor, second: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.cuda.Event] | None:
+        """Gather two blocks on the B12X DMA ring's side stream (see
+        ``CustomAllreduce.pcie_dma_all_gather_pair``)."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled:
+            return None
+        return ca_comm.pcie_dma_all_gather_pair(first, second)
+
+    def pcie_prepare_reduce_scatter(self, wire: str) -> bool:
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled:
+            return False
+        return ca_comm.pcie_dma_prepare_reduce_scatter(wire)
+
+    def pcie_reduce_scatter_columns(
+        self, input_: torch.Tensor, *, wire: str, cols: int
+    ) -> torch.Tensor | None:
+        """Column reduce-scatter on the B12X DMA ring (see
+        ``CustomAllreduce.pcie_dma_reduce_scatter_columns``)."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled:
+            return None
+        return ca_comm.pcie_dma_reduce_scatter_columns(input_, wire=wire, cols=cols)
 
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor | None:
         ca_comm = self.ca_comm

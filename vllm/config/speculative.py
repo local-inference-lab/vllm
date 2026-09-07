@@ -6,6 +6,7 @@ import functools
 import math
 import os
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
@@ -83,6 +84,44 @@ SpeculativeMethod = Literal[
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
 DSparkCapacityVerificationMode = Literal["varlen", "mask"]
+
+
+@dataclass(frozen=True)
+class DraftInputLayout:
+    """Per-request input geometry consumed by the draft-model forward."""
+
+    target_segment: Literal["all", "all_except_first", "last_valid", "none"]
+    includes_bonus_as_anchor: bool
+    num_parallel_drafting_tokens: int
+
+    @classmethod
+    def make_empty(cls) -> "DraftInputLayout":
+        return cls("none", False, 0)
+
+    def get_cost(self, num_target_tokens: int) -> int:
+        if num_target_tokens == 0:
+            return 0
+        if self.target_segment == "all":
+            target_tokens = num_target_tokens
+        elif self.target_segment == "all_except_first":
+            target_tokens = num_target_tokens - 1
+        elif self.target_segment == "last_valid":
+            target_tokens = 1
+        else:
+            target_tokens = 0
+        return (
+            target_tokens
+            + int(self.includes_bonus_as_anchor)
+            + self.num_parallel_drafting_tokens
+        )
+
+    @property
+    def minimum_cost(self) -> int:
+        return self.get_cost(1)
+
+    @property
+    def grows_with_target_input(self) -> bool:
+        return self.target_segment in ("all", "all_except_first")
 
 
 @config
@@ -1486,7 +1525,7 @@ class SpeculativeConfig:
 
     def _maybe_apply_virtual_tp_to_draft(self) -> None:
         if (
-            self.method not in ("mtp", "dspark")
+            self.method not in ("mtp", "dspark", "dflash")
             or self.draft_model_config is None
             or self.draft_parallel_config is None
             or self.draft_model_config is self.target_model_config
@@ -1671,6 +1710,40 @@ class SpeculativeConfig:
                 )
 
     @property
+    def draft_input_layout(self) -> DraftInputLayout:
+        """Describe how many draft-model input rows one target request creates."""
+        k = self.num_speculative_tokens
+        target_segment: Literal["all", "all_except_first", "last_valid", "none"] = (
+            "none"
+        )
+        includes_bonus_as_anchor = False
+        parallel_tokens = 0
+
+        if self.use_dflash():
+            includes_bonus_as_anchor = True
+            parallel_tokens = k
+        elif self.use_dspark():
+            hf_config = getattr(self.draft_model_config, "hf_config", None)
+            sample_from_anchor = getattr(hf_config, "sample_from_anchor", True)
+            includes_bonus_as_anchor = True
+            parallel_tokens = k - 1 if sample_from_anchor else k
+        elif self.method == "medusa":
+            target_segment = "last_valid"
+        elif self.uses_extract_hidden_states():
+            target_segment = "all"
+        elif self.uses_draft_model() or self.use_eagle():
+            target_segment = "all" if self.uses_draft_model() else "all_except_first"
+            includes_bonus_as_anchor = True
+            if self.parallel_drafting:
+                parallel_tokens = k - 1
+
+        return DraftInputLayout(
+            target_segment=target_segment,
+            includes_bonus_as_anchor=includes_bonus_as_anchor,
+            num_parallel_drafting_tokens=parallel_tokens,
+        )
+
+    @property
     def max_num_new_slots_for_drafting(self) -> int:
         """
         Calculate the maximum number of new slots that might be added to the batch
@@ -1707,6 +1780,10 @@ class SpeculativeConfig:
         # target model hidden states"
         # TODO(ben): Refactor this so the naming is clearer
         return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+
+    def use_eagle_preserves_target_kv_cache(self) -> bool:
+        """Whether the drafter writes lookahead state into target KV groups."""
+        return self.method in ("eagle", "eagle3", "mtp")
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"

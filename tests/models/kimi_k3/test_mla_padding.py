@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -120,6 +121,33 @@ def test_kimi_mla_defines_graph_padding_before_output_projection(monkeypatch):
 
     torch.testing.assert_close(output[:2], torch.full_like(output[:2], 3))
     torch.testing.assert_close(output[2:], torch.zeros_like(output[2:]))
+
+
+@pytest.mark.parametrize("query_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_kimi_mla_context_output_reuses_consumed_query_bytes(query_dtype):
+    from vllm.models.kimi_k3.nvidia import mla
+
+    query = torch.empty((4, 2, 256), dtype=query_dtype)
+    output = torch.randn((4, 2, 128), dtype=torch.bfloat16)
+
+    compact = mla._reuse_consumed_query_for_context_output(query, output)
+    compact.copy_(output)
+
+    assert compact.data_ptr() == query.data_ptr()
+    assert compact.shape == output.shape
+    assert compact.dtype == output.dtype
+    assert compact.is_contiguous()
+    torch.testing.assert_close(compact, output)
+
+
+def test_kimi_mla_context_output_rejects_insufficient_query_storage():
+    from vllm.models.kimi_k3.nvidia import mla
+
+    query = torch.empty((4, 2, 64), dtype=torch.bfloat16)
+    output = torch.empty((4, 2, 128), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="too small"):
+        mla._reuse_consumed_query_for_context_output(query, output)
 
 
 def test_kimi_mla_caller_output_selection_preserves_decode_and_sp_paths():

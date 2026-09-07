@@ -1285,6 +1285,77 @@ def test_b12x_lse_reduce_honors_token_cap(
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
+@pytest.mark.parametrize(
+    ("world_size", "expect_b12x"),
+    [(8, True), (9, True), (6, False)],
+)
+def test_b12x_dcp_world_size_gate(
+    monkeypatch: pytest.MonkeyPatch, world_size: int, expect_b12x: bool
+):
+    """Nine DCP ranks reach the B12X pool; unsupported sizes decline it.
+
+    The Kimi-K3 TP9/DCP9 profile pads the MLA query heads to 99 so that every
+    rank owns eleven heads; the gate must admit that geometry alongside the
+    power-of-two sizes and keep refusing sizes the B12X kernel does not build.
+    """
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_DCP_A2A_MAX_TOKENS", "8")
+    sentinel = torch.zeros(1)
+    pool_requests: list[dict[str, int]] = []
+
+    class _FakePool:
+        def lse_reduce_scatter(
+            self, partial, lse, out=None, *, is_lse_base_on_e, channel_id
+        ):
+            return sentinel
+
+        def all_gather_heads(self, local_input, *, channel_id, out=None):
+            return sentinel
+
+    def fake_get_pool(
+        cp_group, *, device, total_heads, head_dim, query_head_dim, max_batch_size
+    ):
+        pool_requests.append(
+            {"total_heads": total_heads, "max_batch_size": max_batch_size}
+        )
+        return _FakePool()
+
+    monkeypatch.setattr(dcp_alltoall, "_get_b12x_dcp_a2a_pool", fake_get_pool)
+    group = _FakeCPGroup(world_size, None)  # type: ignore[arg-type]
+    heads = 11 * world_size
+
+    out = torch.zeros(4, heads, 512, dtype=torch.bfloat16, device="cuda")
+    lse = torch.zeros(4, heads, dtype=torch.float32, device="cuda")
+    reduced = dcp_alltoall._try_b12x_dcp_lse_reduce(
+        out,
+        lse,
+        group,  # type: ignore[arg-type]
+        return_lse=False,
+        is_lse_base_on_e=True,
+        max_batch_size=28,
+        query_head_dim=576,
+    )
+    local_q = torch.zeros(4, 11, 576, dtype=torch.bfloat16, device="cuda")
+    gathered = dcp_alltoall._try_b12x_dcp_all_gather_heads(
+        local_q,
+        group,  # type: ignore[arg-type]
+        max_batch_size=28,
+        output_head_dim=512,
+    )
+    if expect_b12x:
+        assert reduced is sentinel
+        assert gathered is sentinel
+        assert [request["total_heads"] for request in pool_requests] == [heads, heads]
+        assert all(request["max_batch_size"] == 8 for request in pool_requests)
+    else:
+        assert reduced is None
+        assert gathered is None
+        assert pool_requests == []
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
 @pytest.mark.parametrize("world_size", [4, 16])
 def test_b12x_query_gather_honors_token_cap(
     monkeypatch: pytest.MonkeyPatch, world_size: int
