@@ -21,6 +21,14 @@ from vllm.v1.attention.ops.dcp_alltoall import (
 
 _KIMI_B12X_PAIRED_PROJECTION_MAX_TOKENS = 8
 _KIMI_INPLACE_REDUCTION_MIN_TOKENS = 1024
+# Prefill-size projection gathers (more rows than any captured decode batch)
+# take the B12X PCIe copy channel with a pool planned for this many rows.
+# 0 keeps NCCL for every multi-row gather. Decode-size gathers (rows <= the
+# largest CUDA-graph capture size) keep their existing path.
+_KIMI_B12X_PREFILL_GATHER_MAX_TOKENS = int(
+    __import__("os").getenv("VLLM_K3_B12X_PREFILL_GATHER_MAX_TOKENS", "0")
+)
+_KIMI_B12X_PREFILL_GATHER_MIN_TOKENS = 32
 
 
 def reduce_kimi_full_width_projection(
@@ -75,10 +83,26 @@ def _try_b12x_kimi_projection_gather(
     if (
         not envs.VLLM_USE_B12X_DCP_A2A
         or output_parallel.ndim != 2
-        or output_parallel.shape[0] != 1
         or not output_parallel.is_cuda
         or not output_parallel.is_contiguous()
     ):
+        return None
+    rows = output_parallel.shape[0]
+    if rows == 1:
+        max_batch_size = 1
+    elif (
+        _KIMI_B12X_PREFILL_GATHER_MIN_TOKENS
+        <= rows
+        <= _KIMI_B12X_PREFILL_GATHER_MAX_TOKENS
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        # Prefill rows: one pool planned for the configured row capacity
+        # serves every projection width through the head-gather channel
+        # (rows -> batch, local width -> one head), so the gathered tensor
+        # is exactly the dim=-1 all_gather layout after flattening. The
+        # channel is IPC-backed and initialized outside graph capture only.
+        max_batch_size = _KIMI_B12X_PREFILL_GATHER_MAX_TOKENS
+    else:
         return None
 
     tp_size = get_tensor_model_parallel_world_size()
@@ -91,12 +115,12 @@ def _try_b12x_kimi_projection_gather(
     strip_local_width: int | None = None
     if output_parallel.dtype in (torch.float16, torch.bfloat16):
         if local_width % 8 == 0:
-            transport = output_parallel.view(1, 1, local_width)
+            transport = output_parallel.view(rows, 1, local_width)
         else:
             padded_width = (local_width + 7) // 8 * 8
             transport = torch.nn.functional.pad(
                 output_parallel, (0, padded_width - local_width)
-            ).view(1, 1, padded_width)
+            ).view(rows, 1, padded_width)
             strip_local_width = local_width
     elif output_parallel.dtype == torch.float32:
         raw_width = local_width * output_parallel.element_size()
@@ -104,19 +128,27 @@ def _try_b12x_kimi_projection_gather(
             return None
         # The FP8 view exposes one-byte transport lanes without converting the
         # FP32 payload. The gathered result is restored to the original dtype.
-        transport = output_parallel.view(torch.float8_e4m3fn).view(1, 1, raw_width)
+        transport = output_parallel.view(torch.float8_e4m3fn).view(rows, 1, raw_width)
         restore_dtype = torch.float32
     elif output_parallel.dtype == torch.float8_e4m3fn:
         if local_width % 16 != 0:
             return None
-        transport = output_parallel.view(1, 1, local_width)
+        transport = output_parallel.view(rows, 1, local_width)
     else:
         return None
 
+    # The channel launches one warp per gathered row, capped at 16 blocks by
+    # default (a decode-size default). Prefill batches gather thousands of
+    # rows, so let the launch scale to the row count.
+    block_limit = None if max_batch_size == 1 else int(
+        __import__("os").getenv("VLLM_K3_B12X_PREFILL_GATHER_BLOCKS", "64")
+    )
     gathered = dcp_b12x_all_gather_heads(
         transport,
         projection_group,
-        max_batch_size=1,
+        max_batch_size=max_batch_size,
+        enforce_token_cap=max_batch_size == 1,
+        block_limit=block_limit,
     )
     if strip_local_width is not None:
         gathered = gathered.narrow(-1, 0, strip_local_width).contiguous()

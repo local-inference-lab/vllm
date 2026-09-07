@@ -73,6 +73,12 @@ class MambaHybridModelState(DefaultModelState):
         # columns and the running state_idx are kept GPU-resident.
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
         if self._align_mode:
+            # The physical attention page and the logical recurrent-state
+            # checkpoint can have different token widths. Prefix-hit requests
+            # must resume from the recurrent-state grid used by MambaSpec.
+            self._mamba_block_size = (
+                self.cache_config.mamba_block_size or self.cache_config.block_size
+            )
             self._mamba_state_idx_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
             )
@@ -93,7 +99,7 @@ class MambaHybridModelState(DefaultModelState):
         if self._align_mode:
             # Seed the running state block from the resumed/prefilled position.
             self._mamba_state_idx_gpu[req_index].fill_(
-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
+                (new_req_data.num_computed_tokens - 1) // self._mamba_block_size
             )
 
     def _get_mamba_group_info(
@@ -109,6 +115,10 @@ class MambaHybridModelState(DefaultModelState):
                     specs.append(spec)
             assert specs, "no mamba layers in the model"
             assert all(specs[0] == s for s in specs)
+            assert specs[0].block_size == self._mamba_block_size, (
+                "Mamba state migration and cache allocation must use the same "
+                "checkpoint cadence"
+            )
             self._mamba_group_ids = group_ids
             self._mamba_spec = specs[0]
         return self._mamba_group_ids, self._mamba_spec

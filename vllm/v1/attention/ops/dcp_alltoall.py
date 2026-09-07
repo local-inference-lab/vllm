@@ -388,8 +388,15 @@ def _try_b12x_dcp_all_gather_heads(
     max_batch_size: int | None,
     output_head_dim: int | None,
     out: torch.Tensor | None = None,
+    enforce_token_cap: bool = True,
+    block_limit: int | None = None,
 ) -> torch.Tensor | None:
-    """Gather rank-local query heads with the B12X PCIe channel."""
+    """Gather rank-local query heads with the B12X PCIe channel.
+
+    ``enforce_token_cap=False`` lets a caller that plans its own pool
+    capacity (the Kimi projection gathers) bypass VLLM_DCP_A2A_MAX_TOKENS,
+    which bounds the attention DCP staging pools only.
+    """
     world_size = cp_group.world_size
     if (
         not local_input.is_cuda
@@ -407,7 +414,7 @@ def _try_b12x_dcp_all_gather_heads(
     if max_batch_size is None:
         max_batch_size = batch
     max_batch_size = int(max_batch_size)
-    token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
+    token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS if enforce_token_cap else 0
     if token_cap > 0:
         if batch > token_cap:
             return None
@@ -430,15 +437,18 @@ def _try_b12x_dcp_all_gather_heads(
     )
     if pool is None:
         return None
+    launch_kwargs = {} if block_limit is None else {"block_limit": int(block_limit)}
     if out is not None:
         return pool.all_gather_heads(
             local_input,
             out=out,
             channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+            **launch_kwargs,
         )
     return pool.all_gather_heads(
         local_input,
         channel_id=_b12x_dcp_channel_id(cp_group),
+        **launch_kwargs,
     )
 
 
@@ -449,6 +459,8 @@ def dcp_b12x_all_gather_heads(
     max_batch_size: int | None = None,
     output_head_dim: int | None = None,
     out: torch.Tensor | None = None,
+    enforce_token_cap: bool = True,
+    block_limit: int | None = None,
 ) -> torch.Tensor:
     """Gather query heads into optional caller-owned output storage."""
     local_input = local_input.contiguous()
@@ -459,6 +471,8 @@ def dcp_b12x_all_gather_heads(
                 cp_group,
                 max_batch_size=max_batch_size,
                 output_head_dim=output_head_dim,
+                enforce_token_cap=enforce_token_cap,
+                block_limit=block_limit,
             )
         else:
             result = _try_b12x_dcp_all_gather_heads(
@@ -467,6 +481,8 @@ def dcp_b12x_all_gather_heads(
                 max_batch_size=max_batch_size,
                 output_head_dim=output_head_dim,
                 out=out,
+                enforce_token_cap=enforce_token_cap,
+                block_limit=block_limit,
             )
         if result is not None:
             return result
