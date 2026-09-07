@@ -146,6 +146,10 @@ class DFlash2Speculator(DSparkSpeculator):
         return config
 
     def propose(self, input_batch, *args, **kwargs):  # type: ignore[override]
+        # A step that skips sampling (a prefill chunk, a cache-restored
+        # prefix) must not report the previous step's tensors.
+        self._dump_sample_hidden = None
+        self._dump_base_logits = None
         draft_tokens = super().propose(input_batch, *args, **kwargs)
         if self._dump_dir is not None:
             self._dump_state(input_batch, kwargs.get("aux_hidden_states"), draft_tokens)
@@ -159,6 +163,11 @@ class DFlash2Speculator(DSparkSpeculator):
         if get_tensor_model_parallel_rank() != 0 or self._dump_step >= 64:
             return
         rows = self.num_query_per_req
+        # Long prefills are not dumped (their auxiliary states are hundreds of
+        # megabytes); the comparison uses short, uncached requests.
+        max_tokens = int(os.environ.get("VLLM_DFLASH2_DUMP_MAX_TOKENS", "1024"))
+        if input_batch.num_tokens > max_tokens:
+            aux_hidden_states = None
         record = {
             "step": self._dump_step,
             "num_reqs": int(input_batch.num_reqs),
