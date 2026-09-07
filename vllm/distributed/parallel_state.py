@@ -1408,6 +1408,26 @@ def get_dcp_group() -> GroupCoordinator:
     return _DCP
 
 
+_QUERY_SPLIT: GroupCoordinator | None = None
+
+
+def get_query_split_group() -> GroupCoordinator:
+    assert _QUERY_SPLIT is not None, "query split group is not initialized"
+    return _QUERY_SPLIT
+
+
+def _query_split_rank_groups(
+    tp_groups: list[list[int]], dcp_size: int
+) -> list[list[int]]:
+    """Group replicas of each indexer shard within their TP cohort."""
+    groups: list[list[int]] = []
+    for ranks in tp_groups:
+        if dcp_size < 1 or len(ranks) % dcp_size:
+            raise ValueError("Query splitting requires DCP size to divide TP size")
+        groups.extend(ranks[shard::dcp_size] for shard in range(dcp_size))
+    return groups
+
+
 _PP: GroupCoordinator | None = None
 
 
@@ -1849,6 +1869,7 @@ def initialize_model_parallel(
         group_ranks = local_all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
         group_ranks = [x.tolist() for x in group_ranks]
     # message queue broadcaster is only used in tensor model parallel group
+    tp_group_ranks = group_ranks
     _TP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
@@ -1874,6 +1895,18 @@ def initialize_model_parallel(
         use_message_queue_broadcaster=True,
         group_name="dcp",
     )
+
+    global _QUERY_SPLIT
+    assert _QUERY_SPLIT is None, "query split group is already initialized"
+    if envs.VLLM_DCP_QUERY_SPLIT:
+        if prefill_context_model_parallel_size != 1:
+            raise ValueError("Indexer query splitting requires PCP size 1")
+        _QUERY_SPLIT = init_model_parallel_group(
+            _query_split_rank_groups(tp_group_ranks, dcp_size),
+            get_world_group().local_rank,
+            backend,
+            group_name="query_split",
+        )
 
     global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
@@ -2102,6 +2135,11 @@ def destroy_model_parallel():
     if _DCP:
         _DCP.destroy()
     _DCP = None
+
+    global _QUERY_SPLIT
+    if _QUERY_SPLIT:
+        _QUERY_SPLIT.destroy()
+    _QUERY_SPLIT = None
 
     global _PCP
     if _PCP:

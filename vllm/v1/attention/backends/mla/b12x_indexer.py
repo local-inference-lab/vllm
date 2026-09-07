@@ -249,9 +249,12 @@ def _merge_dcp_topk(
     dcp_rank: int,
     dcp_world_size: int,
     interleave: int,
-) -> None:
+    *,
+    use_owner_merge: bool = False,
+) -> bool:
+    """Merge global candidate IDs; return whether row ownership is used."""
     if dcp_world_size <= 1 or indices.numel() == 0:
-        return
+        return False
     topk = int(indices.shape[1])
     if topk not in (512, 1024, 2048):
         raise RuntimeError(
@@ -276,12 +279,85 @@ def _merge_dcp_topk(
         512,
         num_warps=8,
     )
+    if (
+        use_owner_merge
+        and indices.shape[0] % dcp_world_size == 0
+        and not _is_current_stream_capturing(indices)
+    ):
+        _merge_dcp_topk_by_owner(packed, indices, dcp_rank, dcp_world_size)
+        return True
     gathered = get_dcp_group().all_gather(packed, dim=1)
     from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
         stable_topk_from_gathered_candidates_cutedsl,
     )
 
     stable_topk_from_gathered_candidates_cutedsl(gathered, topk, out=indices)
+    return False
+
+
+def _merge_dcp_topk_by_owner(
+    packed: torch.Tensor,
+    indices: torch.Tensor,
+    dcp_rank: int,
+    dcp_world_size: int,
+) -> None:
+    """Route candidates to row owners and restore the stable global top-k IDs.
+
+    This adapts Gilded Gnosis owner merge to Jovian's packed score/ID layout
+    and stable tie-breaking kernel. Every DCP shard processes all query rows;
+    row ownership applies only to the candidate merge, not indexer queries.
+    """
+    import torch.distributed as dist
+
+    from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
+        stable_topk_from_gathered_candidates_cutedsl,
+    )
+
+    group = get_dcp_group()
+    if group.world_size != dcp_world_size or group.rank_in_group != dcp_rank:
+        raise RuntimeError("DCP owner merge group does not match the indexer shards")
+    rows, topk, _ = packed.shape
+    owner_rows = rows // dcp_world_size
+    received = torch.empty_like(packed)
+    dist.all_to_all_single(received.view(-1), packed.view(-1), group=group.device_group)
+    # All-to-all receives source-rank-major row slices. Preserve that candidate
+    # order while grouping each owner's row for the existing stable kernel.
+    candidates = (
+        received.view(dcp_world_size, owner_rows, topk, 2)
+        .permute(1, 0, 2, 3)
+        .contiguous()
+        .view(owner_rows, dcp_world_size * topk, 2)
+    )
+    owner_indices = stable_topk_from_gathered_candidates_cutedsl(candidates, topk)
+    _gather_indexer_row_ids(group, owner_indices, indices)
+
+
+def _gather_indexer_row_ids(group, local_ids, all_ids) -> None:
+    """Gather row partitions, preserving caller storage and aliased send slices."""
+    import torch.distributed as dist
+
+    output = (
+        all_ids
+        if all_ids.is_contiguous()
+        else torch.empty_like(all_ids, memory_format=torch.contiguous_format)
+    )
+    local_ids = local_ids.contiguous()
+    communicator = group.device_communicator
+    pynccl = getattr(communicator, "pynccl_comm", None)
+    if pynccl is not None and not pynccl.disabled:
+        pynccl.all_gather(output, local_ids)
+    else:
+        # PyTorch does not expose NCCL's in-place alias contract. Query-split
+        # sends may be views into the caller's final output buffer.
+        begin = local_ids.data_ptr()
+        end = begin + local_ids.numel() * local_ids.element_size()
+        output_begin = output.data_ptr()
+        output_end = output_begin + output.numel() * output.element_size()
+        if begin < output_end and output_begin < end:
+            local_ids = local_ids.clone()
+        dist.all_gather_into_tensor(output, local_ids, group=group.device_group)
+    if output is not all_ids:
+        all_ids.copy_(output)
 
 
 class B12xSparseIndexer(nn.Module):

@@ -38,6 +38,192 @@ def _require_glm_gpu() -> torch.device:
     return device
 
 
+@pytest.fixture(scope="module")
+def owner_merge_group():
+    """Use one GPU per process for the opt-in distributed merge comparison."""
+    if os.environ.get("GLM53_OWNER_MERGE_DISTRIBUTED_TEST") != "1":
+        pytest.skip("set GLM53_OWNER_MERGE_DISTRIBUTED_TEST=1 under torchrun")
+    from vllm.distributed.parallel_state import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        get_dcp_group,
+        init_distributed_environment,
+        initialize_model_parallel,
+        set_custom_all_reduce,
+    )
+
+    torch.accelerator.set_device_index(int(os.environ["LOCAL_RANK"]))
+    # These tests exercise NCCL indexer collectives; custom all-reduce is unused.
+    set_custom_all_reduce(False)
+    world_size = int(os.environ["WORLD_SIZE"])
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(
+            world_size=world_size,
+            rank=int(os.environ["RANK"]),
+            distributed_init_method="env://",
+            local_rank=int(os.environ["LOCAL_RANK"]),
+        )
+        initialize_model_parallel(
+            tensor_model_parallel_size=world_size,
+            decode_context_model_parallel_size=int(
+                os.environ.get("GLM53_TEST_DCP_SIZE", world_size)
+            ),
+        )
+    yield get_dcp_group()
+    destroy_model_parallel()
+    destroy_distributed_environment()
+
+
+@pytest.mark.parametrize("transport", ["pynccl", "torch"])
+@pytest.mark.parametrize(
+    ("rows", "padding", "interleave"),
+    [(0, 0, 1), (1, 7, 1), (7, 7, 4), (8, 0, 1), (256, 7, 4), (8192, 0, 1)],
+)
+def test_glm53_owner_merge_preserves_ties_masks_and_row_order(
+    owner_merge_group, monkeypatch, transport, rows, padding, interleave
+) -> None:
+    from vllm.v1.attention.backends.mla.b12x_indexer import _merge_dcp_topk
+
+    group = owner_merge_group
+    device = _require_glm_gpu()
+    topk = 512
+    generator = torch.Generator(device=device).manual_seed(73 + group.rank_in_group)
+    storage = torch.full((rows, topk + padding), -77, dtype=torch.int32, device=device)
+    original = storage[:, :topk]
+    original.copy_(torch.arange(topk, device=device).expand(rows, -1))
+    original[:, ::11] = -1
+    scores = torch.randint(
+        -4, 5, (rows, topk + padding), generator=generator, device=device
+    ).float()[:, :topk]
+    if rows:
+        original[0].fill_(-1)
+        scores[0].fill_(-float("inf"))
+    saved_scores = scores.clone()
+    expected = original.clone()
+    assert not _merge_dcp_topk(
+        expected, scores, group.rank_in_group, group.world_size, interleave
+    )
+    if transport == "torch" and group.world_size > 1:
+        monkeypatch.setattr(group.device_communicator, "pynccl_comm", None)
+    elif group.world_size > 1:
+        assert not group.device_communicator.pynccl_comm.disabled
+    used = _merge_dcp_topk(
+        original,
+        scores,
+        group.rank_in_group,
+        group.world_size,
+        interleave,
+        use_owner_merge=True,
+    )
+    assert used == (group.world_size > 1 and rows > 0 and rows % group.world_size == 0)
+    # The stable selection kernel emits IDs via atomic appends. Ordering within
+    # a row is unspecified; the selected multiset and row identity must match.
+    torch.testing.assert_close(
+        original.sort(dim=-1).values, expected.sort(dim=-1).values, rtol=0, atol=0
+    )
+    torch.testing.assert_close(scores, saved_scores, rtol=0, atol=0)
+    assert bool(torch.all(storage[:, topk:] == -77))
+
+
+def test_glm53_owner_merge_keeps_captured_merge_on_existing_path(
+    owner_merge_group,
+) -> None:
+    from vllm.v1.attention.backends.mla.b12x_indexer import _merge_dcp_topk
+
+    group = owner_merge_group
+    device = _require_glm_gpu()
+    source = torch.arange(512, dtype=torch.int32, device=device).expand(8, -1)
+    indices = source.clone()
+    scores = torch.ones((8, 512), device=device)
+    _merge_dcp_topk(indices, scores, group.rank_in_group, group.world_size, 1)
+    expected = indices.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        indices.copy_(source)
+        used = _merge_dcp_topk(
+            indices,
+            scores,
+            group.rank_in_group,
+            group.world_size,
+            1,
+            use_owner_merge=True,
+        )
+    assert not used
+    graph.replay()
+    torch.testing.assert_close(
+        indices.sort(dim=-1).values, expected.sort(dim=-1).values, rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("rows", [7, 16, 64])
+@pytest.mark.parametrize("owner_merge", [False, True])
+@pytest.mark.parametrize("transport", ["pynccl", "torch"])
+def test_glm53_query_split_restores_pool_rows_with_owner_merge(
+    owner_merge_group, monkeypatch, rows, owner_merge, transport
+) -> None:
+    from vllm.distributed.parallel_state import get_query_split_group
+
+    group = owner_merge_group
+    query_group = get_query_split_group()
+    device = _require_glm_gpu()
+    indexer = Glm5NextPooledIndexer.__new__(Glm5NextPooledIndexer)
+    nn.Module.__init__(indexer)
+    indexer.dcp_rank = group.rank_in_group
+    indexer.dcp_world_size = group.world_size
+    indexer.pool_interleave = 1
+    seen_rows = []
+
+    def select_rows(**args):
+        query = args["q"][:, 0]
+        torch.testing.assert_close(args["weights"][:, 0], query + 100)
+        torch.testing.assert_close(args["seq_lens"], query.int() + 7)
+        assert args["block_table"].shape[0] == query.shape[0]
+        seen_rows.append(query.shape[0])
+        ids = query.int()[:, None] * 512 + torch.arange(512, device=device)
+        args["output"].copy_(ids)
+        if args["scores"] is not None:
+            args["scores"].copy_((ids % 31).float())
+
+    indexer.indexer_op = SimpleNamespace(run_paged_topk=select_rows)
+    query = torch.arange(rows, device=device, dtype=torch.float32)[:, None]
+    output = torch.empty((rows, 512), device=device, dtype=torch.int32)
+    scores = (
+        torch.empty_like(output, dtype=torch.float32) if group.world_size > 1 else None
+    )
+    args = dict(
+        q=query,
+        weights=query + 100,
+        index_cache=None,
+        seq_lens=query[:, 0].int() + 7,
+        request_table=torch.ones((1, 2), device=device, dtype=torch.int32),
+        pool_ids=output,
+        pool_scores=scores,
+    )
+    monkeypatch.setenv("VLLM_DCP_QUERY_SPLIT", "0")
+    monkeypatch.setenv("VLLM_DCP_TOPK_OWNER_MERGE", "0")
+    assert indexer._run_prefill_topk(**args) == (1, False)
+    expected = output.clone()
+    output.fill_(-91)
+    monkeypatch.setenv("VLLM_DCP_QUERY_SPLIT", "1")
+    monkeypatch.setenv("VLLM_DCP_TOPK_OWNER_MERGE", str(int(owner_merge)))
+    if transport == "torch" and query_group.world_size > 1:
+        monkeypatch.setattr(query_group.device_communicator, "pynccl_comm", None)
+    split_size, used = indexer._run_prefill_topk(**args)
+    expected_split = query_group.world_size if rows % query_group.world_size == 0 else 1
+    assert split_size == expected_split
+    assert seen_rows == [rows, rows // expected_split]
+    assert used == (
+        owner_merge
+        and group.world_size > 1
+        and (rows // expected_split) % group.world_size == 0
+    )
+    torch.testing.assert_close(
+        output.sort(dim=-1).values, expected.sort(dim=-1).values, rtol=0, atol=0
+    )
+
+
 def _hadamard128(x: torch.Tensor) -> torch.Tensor:
     for stride in (1, 2, 4, 8, 16, 32, 64):
         x = x.reshape(-1, 2, stride)
