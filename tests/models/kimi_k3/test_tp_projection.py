@@ -290,12 +290,22 @@ def test_projection_pair_uses_one_b12x_barrier(monkeypatch):
     )
     monkeypatch.setattr(tp_projection, "_get_kimi_projection_group", lambda: group)
 
-    def gather_pair(local_first, local_second, projection_group, *, max_batch_size):
+    def gather_pair(
+        local_first,
+        local_second,
+        projection_group,
+        *,
+        max_batch_size,
+        first_columns=None,
+        second_columns=None,
+    ):
         received.update(
             local_first=local_first,
             local_second=local_second,
             projection_group=projection_group,
             max_batch_size=max_batch_size,
+            first_columns=first_columns,
+            second_columns=second_columns,
         )
         return expected
 
@@ -308,6 +318,13 @@ def test_projection_pair_uses_one_b12x_barrier(monkeypatch):
     assert received["local_second"] is second
     assert received["projection_group"] is group
     assert received["max_batch_size"] == 8
+    assert received["first_columns"] is None
+    assert received["second_columns"] is None
+
+    # Logical widths reach the B12X binding, which writes them directly.
+    tp_projection.gather_kimi_sharded_projection_pair(first, second, 14, 7)
+    assert received["first_columns"] == 14
+    assert received["second_columns"] == 7
 
 
 def test_projection_pair_uses_exact_separate_fallback(monkeypatch):
@@ -332,6 +349,30 @@ def test_projection_pair_uses_exact_separate_fallback(monkeypatch):
     assert actual[1] is gathered_second
     assert calls[0] is first
     assert calls[1] is second
+
+
+def test_projection_pair_fallback_slices_to_logical_widths(monkeypatch):
+    first = torch.empty(3, 8)
+    second = torch.empty(3, 4)
+    gathered_first = torch.arange(3 * 16, dtype=torch.float32).view(3, 16)
+    gathered_second = torch.arange(3 * 8, dtype=torch.float32).view(3, 8)
+    monkeypatch.setattr(
+        tp_projection, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(
+        tp_projection,
+        "gather_kimi_sharded_projection",
+        lambda local: gathered_first if local is first else gathered_second,
+    )
+
+    actual = tp_projection.gather_kimi_sharded_projection_pair(first, second, 14, 7)
+
+    assert torch.equal(actual[0], gathered_first[:, :14])
+    assert torch.equal(actual[1], gathered_second[:, :7])
+    assert actual[0].is_contiguous() and actual[1].is_contiguous()
+    # A width equal to the gathered width returns the gathered tensor itself.
+    same = tp_projection.gather_kimi_sharded_projection_pair(first, second, 16, 8)
+    assert same[0] is gathered_first and same[1] is gathered_second
 
 
 def test_projection_pair_topk_uses_available_b12x_binding(monkeypatch):
@@ -399,3 +440,25 @@ def test_projection_pair_topk_returns_none_without_b12x_binding(monkeypatch):
     )
 
     assert actual is None
+
+
+@pytest.mark.parametrize(
+    ("logical", "tp_size", "expected"),
+    [
+        # Kimi-K3 latent (3584) and router (896) widths: exact aligned shards
+        # at TP8, pack-padded shards at TP9.
+        (3584, 8, 448),
+        (896, 8, 112),
+        (3584, 9, 400),
+        (896, 9, 104),
+        (7168, 9, 800),
+    ],
+)
+def test_projection_shard_width_keeps_whole_packs(logical, tp_size, expected):
+    from vllm.models.kimi_k3.nvidia.model import kimi_projection_shard_width
+    from vllm.v1.attention.ops.dcp_alltoall import _kimi_projection_shard_width
+
+    assert kimi_projection_shard_width(logical, tp_size) == expected
+    assert _kimi_projection_shard_width(logical, tp_size) == expected
+    assert expected * tp_size >= logical
+    assert expected % 8 == 0

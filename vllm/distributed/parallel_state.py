@@ -687,13 +687,57 @@ class GroupCoordinator:
         else:
             return self._all_reduce_out_place(input_)
 
-    def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
-        """All-reduce a tensor whose input storage may hold the result."""
+    def all_reduce_in_place(
+        self, input_: torch.Tensor, *, borrow_output: bool = False
+    ) -> torch.Tensor:
+        """All-reduce a tensor whose input storage may hold the result.
+
+        With ``borrow_output`` the result may alias communicator-owned
+        storage that the next same-shape reduction overwrites; the caller
+        consumes it first and never retains it.
+        """
         if self.world_size == 1:
             return input_
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
+        if borrow_output:
+            return self.device_communicator.all_reduce_in_place(
+                input_, borrow_output=True
+            )
         return self.device_communicator.all_reduce_in_place(input_)
+
+    def is_borrowed_reduction_storage(self, tensor: torch.Tensor) -> bool:
+        """Whether ``tensor`` aliases communicator-owned reduction storage."""
+        if self.world_size == 1 or self.device_communicator is None:
+            return False
+        return self.device_communicator.is_borrowed_reduction_storage(tensor)
+
+    def pcie_all_gather_pair(
+        self, first: torch.Tensor, second: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, Any] | None:
+        """Gather two rank-local blocks on the communicator's copy-engine ring
+        side stream; ``None`` when unavailable (the caller falls back)."""
+        if self.world_size == 1 or self.device_communicator is None:
+            return None
+        return self.device_communicator.pcie_all_gather_pair(first, second)
+
+    def pcie_prepare_reduce_scatter(self, wire: str) -> bool:
+        """Compile the copy-engine ring's reduce-scatter kernels ahead of
+        any kernel freeze or capture; ``False`` when there is no ring."""
+        if self.world_size == 1 or self.device_communicator is None:
+            return False
+        return self.device_communicator.pcie_prepare_reduce_scatter(wire)
+
+    def pcie_reduce_scatter_columns(
+        self, input_: torch.Tensor, *, wire: str, cols: int
+    ) -> torch.Tensor | None:
+        """Column reduce-scatter on the copy-engine ring; ``None`` when
+        unavailable (the caller falls back to an all-reduce)."""
+        if self.world_size == 1 or self.device_communicator is None:
+            return None
+        return self.device_communicator.pcie_reduce_scatter_columns(
+            input_, wire=wire, cols=cols
+        )
 
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:

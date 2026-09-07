@@ -93,6 +93,8 @@ def _build_b12x_virtual_tp_plan(
 ) -> dict[str, dict[str, int] | str]:
     if _is_kimi_k3_dspark_config(model_config):
         return _build_kimi_k3_dspark_virtual_tp_plan(model_config, parallel_config)
+    if _is_dflash_draft_config(model_config):
+        return _build_dflash_draft_virtual_tp_plan(model_config, parallel_config)
     if _is_minimax_m3_config(model_config):
         return _build_minimax_m3_virtual_tp_plan(model_config, parallel_config)
     if _get_virtual_tp_profile(model_config) == _GQA_GDN_MOE_PROFILE:
@@ -214,6 +216,83 @@ def _build_kimi_k3_dspark_virtual_tp_plan(
             _require_int_attr(text_config, "vocab_size"), tp_size
         ),
     }
+
+
+_KIMI_K3_DFLASH_PROFILE = "kimi-k3-dflash"
+
+
+def _is_dflash_draft_config(model_config: ModelConfig) -> bool:
+    # kimi-k3-dflash-draft-virtual-tp
+    for config in _iter_virtual_tp_configs(model_config):
+        architectures = getattr(config, "architectures", None) or ()
+        if "DFlashDraftModel" in architectures:
+            return True
+    return False
+
+
+def _build_dflash_draft_virtual_tp_plan(
+    model_config: ModelConfig,
+    parallel_config: ParallelConfig,
+) -> dict[str, dict[str, int] | str]:
+    """Coupled-GQA zero-tail padding for the Qwen3-shaped DFlash draft."""
+    text_config = model_config.hf_text_config
+    tp_size = parallel_config.tensor_parallel_size
+    dense_alignment = _get_dense_linear_local_alignment(model_config)
+    if tp_size == 9:
+        dense_alignment = max(32, dense_alignment)
+    attention_axis, kv_axis = _make_coupled_virtual_axes(
+        _require_int_attr(text_config, "num_attention_heads"),
+        _require_int_attr(text_config, "num_key_value_heads"),
+        tp_size,
+        ratio_key="q_heads_per_kv",
+        allow_secondary_replication=True,
+    )
+    return {
+        "sharding": _VIRTUAL_TP_PLAN_KIND_B12X_PADDED,
+        "model_type": _KIMI_K3_DFLASH_PROFILE,
+        "attention_heads": attention_axis,
+        "kv_heads": kv_axis,
+        "dense_intermediate_size": _make_virtual_axis(
+            _require_int_attr(text_config, "intermediate_size"),
+            tp_size,
+            dense_alignment,
+        ),
+        "vocab_size": _make_virtual_vocab_axis(
+            _require_int_attr(text_config, "vocab_size"), tp_size
+        ),
+    }
+
+
+def _apply_dflash_draft_virtual_tp_plan(
+    model_config: ModelConfig,
+    plan: dict[str, dict[str, int] | str],
+) -> None:
+    configs = tuple(_iter_virtual_tp_configs(model_config))
+    for axis_name, attr in (
+        ("attention_heads", "num_attention_heads"),
+        ("kv_heads", "num_key_value_heads"),
+        ("dense_intermediate_size", "intermediate_size"),
+    ):
+        _apply_virtual_axis_to_config_attr(configs, plan, axis_name, attr)
+    for config in configs:
+        setattr(config, VIRTUAL_TP_PLAN_ATTR, plan)
+
+    model_config.model_arch_config = model_config.get_model_arch_config()
+
+    changes = []
+    for axis_name, label in (
+        ("attention_heads", "attention heads"),
+        ("kv_heads", "KV heads"),
+        ("dense_intermediate_size", "dense intermediate size"),
+        ("vocab_size", "vocab storage size"),
+    ):
+        axis = _require_axis(plan, axis_name)
+        if axis["original_size"] != axis["padded_size"]:
+            changes.append(f"{label} {axis['original_size']} -> {axis['padded_size']}")
+    logger.warning(
+        "Automatically enabled B12X virtual TP padding for the DFlash draft: %s.",
+        ", ".join(changes),
+    )
 
 
 def _build_gqa_gdn_moe_virtual_tp_plan(
@@ -452,6 +531,9 @@ def _apply_b12x_virtual_tp_plan(
     if plan.get("model_type") == _KIMI_K3_DSPARK_PROFILE:
         _apply_kimi_k3_dspark_virtual_tp_plan(model_config, plan)
         return
+    if plan.get("model_type") == _KIMI_K3_DFLASH_PROFILE:
+        _apply_dflash_draft_virtual_tp_plan(model_config, plan)
+        return
     if plan.get("model_type") == "minimax_m3":
         _apply_minimax_m3_virtual_tp_plan(model_config, plan)
         return
@@ -477,8 +559,17 @@ def _apply_b12x_virtual_tp_plan(
             model_config.hf_text_config, "linear_attn_config", None
         )
         if isinstance(linear_attn_config, dict) and "num_heads" in linear_attn_config:
+            # kimi-k3-kda-separate-padding: KDA has no DCP head gather, so it
+            # does not inherit the MLA eight-head alignment. Pad KDA heads to
+            # the smallest multiple of TP with local alignment 4, keeping the
+            # recurrent state (and therefore the mamba page size) minimal.
+            kda_axis = _make_virtual_axis(
+                int(linear_attn_config["num_heads"]),
+                int(attention_axis["tp_size"]),
+                4 if int(attention_axis["tp_size"]) == 9 else 1,
+            )
             linear_attn_config["original_num_heads"] = linear_attn_config["num_heads"]
-            linear_attn_config["num_heads"] = attention_axis["padded_size"]
+            linear_attn_config["num_heads"] = kda_axis["padded_size"]
 
     dense_intermediate_axis = _optional_axis(plan, "dense_intermediate_size")
     if dense_intermediate_axis is not None:
@@ -864,6 +955,7 @@ def _is_supported_b12x_virtual_tp_config(model_config: ModelConfig) -> bool:
     return (
         _get_virtual_tp_profile(model_config) == _GQA_GDN_MOE_PROFILE
         or _is_kimi_k3_dspark_config(model_config)
+        or _is_dflash_draft_config(model_config)
         or _is_deepseek_v4_config(model_config)
         or _is_sparse_mla_config(model_config)
         or _is_minimax_m3_config(model_config)

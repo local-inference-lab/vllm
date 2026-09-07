@@ -21,6 +21,19 @@ from vllm.utils.torch_utils import aux_stream
 logger = init_logger(__name__)
 
 
+def _tail_trace_tokens() -> int:
+    """Batch size whose first eager MoE tail call is profiled with stacks.
+
+    ``VLLM_K3_TAIL_TRACE_TOKENS`` (default 0: off) names the token count; the
+    report lands in ``VLLM_K3_TAIL_TRACE_DIR`` (default /tmp). A diagnostic
+    only: it runs once per runner instance and never inside graph capture.
+    """
+    try:
+        return int(os.getenv("VLLM_K3_TAIL_TRACE_TOKENS", "0"))
+    except ValueError:
+        return 0
+
+
 class LatentTailTier(IntEnum):
     """Which tail implementation the fused path runs, by token count.
 
@@ -288,16 +301,101 @@ class LatentMoERunner(MoERunner):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        shared_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self._use_fused_path():
+            if shared_output is not None:
+                raise ValueError(
+                    "The fused latent tail computes its own shared experts"
+                )
             return self._fused_forward(
                 hidden_states, router_logits, input_ids, shared_experts_input
             )
         return super().forward(
-            hidden_states, router_logits, input_ids, shared_experts_input
+            hidden_states,
+            router_logits,
+            input_ids,
+            shared_experts_input,
+            shared_output=shared_output,
         )
 
     def _fused_forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        shared_experts_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        trace_tokens = _tail_trace_tokens()
+        if (
+            trace_tokens > 0
+            and int(hidden_states.shape[0]) == trace_tokens
+            and not getattr(self, "_k3_tail_traced", False)
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # One eager call (the pre-capture warm-up of this batch size) is
+            # profiled with Python stacks, so every kernel of the MoE tail can
+            # be attributed to the line that launched it.
+            self._k3_tail_traced = True
+            return self._traced_fused_forward(
+                hidden_states, router_logits, input_ids, shared_experts_input
+            )
+        return self._fused_forward_impl(
+            hidden_states, router_logits, input_ids, shared_experts_input
+        )
+
+    def _traced_fused_forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        from torch.profiler import ProfilerActivity, profile
+
+        rank = get_tensor_model_parallel_rank()
+        out_dir = os.getenv("VLLM_K3_TAIL_TRACE_DIR", "/tmp")
+        os.makedirs(out_dir, exist_ok=True)
+        stem = f"{out_dir}/k3-tail-trace-rank{rank}-tokens{int(hidden_states.shape[0])}"
+        torch.accelerator.synchronize()
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            with_stack=True,
+            record_shapes=True,
+        ) as prof:
+            result = self._fused_forward_impl(
+                hidden_states, router_logits, input_ids, shared_experts_input
+            )
+            torch.accelerator.synchronize()
+        prof.export_chrome_trace(f"{stem}.json")
+        lines = [
+            "# MoE tail kernels of one eager call, in launch order: "
+            "duration us, kernel, launching Python frames (innermost first)"
+        ]
+        kernels = [event for event in prof.events() if event.device_type.name == "CUDA"]
+        kernels.sort(key=lambda event: event.time_range.start)
+        for event in kernels:
+            frames = [
+                frame
+                for frame in (event.stack or [])
+                if "/vllm/" in frame or "/b12x/" in frame
+            ][:6]
+            lines.append(
+                f"{event.time_range.elapsed_us():8.1f} {event.name[:90]}\n    "
+                + "\n    ".join(frames)
+            )
+        lines.append("")
+        lines.append(
+            prof.key_averages(group_by_input_shape=True).table(
+                sort_by="cuda_time_total", row_limit=60
+            )
+        )
+        with open(f"{stem}.txt", "w") as handle:
+            handle.write("\n".join(lines) + "\n")
+        logger.warning("[k3 tail trace] wrote %s.{txt,json}", stem)
+        return result
+
+    def _fused_forward_impl(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,

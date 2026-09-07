@@ -542,13 +542,20 @@ class CudaGraphManager:
         uniform_token_count: int | None,
         num_active_loras: int,
         max_req_tokens: int = 0,
+        *,
+        has_prefill: bool = False,
     ) -> BatchExecutionDescriptor:
-        """Find matching cudagraph descriptor from priority-ordered candidates."""
+        """Find a shape-compatible graph with matching attention semantics.
+
+        Uniform and bounded-verifier FULL graphs capture decode attention.
+        A prompt tail of the same shape must instead use a mixed-mode graph
+        or eager. Generic FULL graphs captured for mixed batches remain valid.
+        """
 
         effective_loras = self._resolve_effective_loras(num_active_loras)
         key = (num_tokens, effective_loras)
         if self._graphs_captured and num_tokens > 0:
-            if uniform_token_count is not None:
+            if uniform_token_count is not None and not has_prefill:
                 for desc in getattr(self, "_exact_uniform_candidates", {}).get(key, ()):
                     if _is_compatible(
                         desc,
@@ -560,6 +567,15 @@ class CudaGraphManager:
                     ):
                         return desc
             for desc in self._candidates.get(key, ()):
+                if (
+                    has_prefill
+                    and desc.cg_mode == CUDAGraphMode.FULL
+                    and (
+                        desc.uniform_token_count is not None
+                        or desc.max_req_tokens is not None
+                    )
+                ):
+                    continue
                 if _is_compatible(
                     desc,
                     num_reqs,
