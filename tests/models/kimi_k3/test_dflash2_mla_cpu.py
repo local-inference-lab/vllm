@@ -384,3 +384,17 @@ def test_checkpoint_names_resolve_to_model_parameters(
         assert shard_id is None
         assert mapped.startswith("model.")
         assert mapped.removeprefix("model.") in params, (name, mapped)
+
+
+def test_dflash2_draft_uses_the_k3_dspark_virtual_tp_plan() -> None:
+    """Nine-rank serving pads the draft's 64 heads like the K3 DSpark draft."""
+    from vllm.config.virtual_tp import (
+        _is_dflash_draft_config,
+        _is_kimi_k3_dspark_config,
+    )
+
+    hf_config = _config()
+    hf_config.model_type = "eagle"  # the EAGLEConfig wrapper of method dflash
+    model_config = SimpleNamespace(hf_config=hf_config, hf_text_config=hf_config)
+    assert _is_kimi_k3_dspark_config(model_config)
+    assert not _is_dflash_draft_config(model_config)

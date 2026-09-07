@@ -964,11 +964,12 @@ def _is_supported_b12x_virtual_tp_config(model_config: ModelConfig) -> bool:
 
 
 def _is_kimi_k3_dspark_config(model_config: ModelConfig) -> bool:
+    # The DFlash2 draft shares the K3 DSpark MLA backbone and its padding.
     for config in _iter_virtual_tp_configs(model_config):
         if getattr(config, "model_type", None) == "k3_dspark":
             return True
         architectures = getattr(config, "architectures", None) or ()
-        if "K3DSparkModel" in architectures:
+        if "K3DSparkModel" in architectures or "DFlash2DraftModel" in architectures:
             return True
     return False
 
