@@ -41,8 +41,13 @@ Serving contract: the embedding and LM head are the target's (the checkpoint
 ships copies of the target embedding only). Proposals are sampled per block
 position from the LM-head distribution of the draft hidden states (the
 speculator's probabilistic path, draft probabilities handed to the rejection
-sampler); the selector is loaded for the greedy lattice walk and the
-conditioned sampling variants and is not used by the parallel proposal.
+sampler). With the selector enabled (``VLLM_DFLASH2_SELECTOR``, the default)
+the positions are sampled in order and each position's logits carry the
+selector's transition scores from the token sampled before it to the
+position's unary top-k candidates (``DFlash2CandidateSelector.condition``),
+so the proposal distribution is the reference lattice's chain and the
+rejection sampler sees exactly that distribution. With the selector disabled
+the block is sampled in one parallel pass.
 
 Weight names of the checkpoint and their module paths here:
 ``fc.weight`` -> ``model.context_proj.weight``; ``hidden_norm.weight`` ->
@@ -350,6 +355,26 @@ def score_selector_edges(
     )
 
 
+def add_selector_transitions(
+    logits: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    successor_rows: torch.Tensor,
+    predecessor_rows: torch.Tensor,
+    hidden: torch.Tensor,
+) -> torch.Tensor:
+    """Add the transition score of each candidate to its logit, in place.
+
+    ``logits`` is ``[rows, vocab]``, ``candidate_ids`` ``[rows, k]`` (the
+    unary top-k of each row), ``successor_rows`` ``[rows, k, rank]`` (their
+    successor codebook rows), ``predecessor_rows`` ``[rows, rank]`` (the
+    predecessor codebook row of the token preceding each row) and ``hidden``
+    ``[rows, rank]`` (the projected draft hidden state of the row). Candidates
+    outside the top-k keep their unary logit, as in the reference lattice.
+    """
+    transition = torch.einsum("br,bcr->bc", predecessor_rows * hidden, successor_rows)
+    return logits.scatter_add_(1, candidate_ids, transition.to(logits.dtype))
+
+
 class DFlash2CandidateSelector(nn.Module):
     """DFlash2's low-rank transition model over top-k candidate lattices."""
 
@@ -401,6 +426,35 @@ class DFlash2CandidateSelector(nn.Module):
             unary_logits,
             hidden,
             anchor_token_ids,
+        )
+
+    def prepare_rows(
+        self, hidden_states: torch.Tensor, logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-row inputs of the sequential conditioning.
+
+        Returns the projected hidden states ``[rows, rank]``, the unary top-k
+        candidate ids ``[rows, k]`` and their successor rows ``[rows, k, rank]``.
+        """
+        hidden = self.hidden_projection(hidden_states)
+        candidate_ids = logits.topk(self.top_k, dim=-1).indices
+        return hidden, candidate_ids, self.successor_codebook[candidate_ids]
+
+    def condition(
+        self,
+        logits: torch.Tensor,
+        previous_token_ids: torch.Tensor,
+        hidden: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        successor_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """Condition one block position's logits on the tokens before it."""
+        return add_selector_transitions(
+            logits,
+            candidate_ids,
+            successor_rows,
+            self.predecessor_codebook[previous_token_ids],
+            hidden,
         )
 
 

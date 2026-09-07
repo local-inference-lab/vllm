@@ -23,10 +23,12 @@ from vllm.models.kimi_k3.nvidia.dflash2_mla import (
     DFlash2ForCausalLM,
     DFlash2Model,
     _grouped_conv,
+    add_selector_transitions,
     describe_dflash2_draft,
     is_dflash2_draft,
     normalize_dflash2_config,
     rename_dflash2_checkpoint_name,
+    score_selector_edges,
 )
 
 CHECKPOINT_CONFIG = {
@@ -451,3 +453,55 @@ def test_wrapped_dflash2_config_is_mla_with_latent_head_size() -> None:
         num_attention_heads=32,
     )
     assert not ModelArchConfigConvertorBase(plain, plain).is_deepseek_mla()
+
+
+def test_selector_conditioning_matches_the_reference_edge_scores() -> None:
+    """Conditioning on the sampled predecessor equals the lattice edge score.
+
+    ``score_selector_edges`` scores every (predecessor candidate, successor
+    candidate) pair as the reference does; the sequential sampler adds, to
+    each successor candidate's unary logit, the score of the edge from the
+    one predecessor that was actually sampled. Candidates outside the top-k
+    keep their unary logit.
+    """
+    torch.manual_seed(20260908)
+    vocab, rank, top_k, batch, steps = 40, 8, 4, 3, 2
+    predecessor = torch.randn(vocab, rank)
+    successor = torch.randn(vocab, rank)
+    logits = torch.randn(batch, steps, vocab)
+    hidden = torch.randn(batch, steps, rank)
+    anchors = torch.randint(0, vocab, (batch,))
+    unary, candidates = logits.topk(top_k, dim=-1)
+    edges = score_selector_edges(
+        predecessor, successor, candidates, unary, hidden, anchors
+    )  # [batch, steps, top_k predecessors, top_k successors]
+
+    # Step 0: every predecessor slot is the anchor.
+    conditioned = add_selector_transitions(
+        logits[:, 0].clone(),
+        candidates[:, 0],
+        successor[candidates[:, 0]],
+        predecessor[anchors],
+        hidden[:, 0],
+    )
+    torch.testing.assert_close(
+        conditioned.gather(1, candidates[:, 0]), edges[:, 0, 0], rtol=1e-5, atol=1e-5
+    )
+    untouched = torch.ones(batch, vocab, dtype=torch.bool)
+    untouched.scatter_(1, candidates[:, 0], False)
+    torch.testing.assert_close(conditioned[untouched], logits[:, 0][untouched])
+
+    # Step 1: the sampled predecessor is candidate slot p of step 0.
+    slot = torch.tensor([1, 3, 0])
+    sampled_prev = candidates[:, 0].gather(1, slot[:, None]).squeeze(1)
+    conditioned = add_selector_transitions(
+        logits[:, 1].clone(),
+        candidates[:, 1],
+        successor[candidates[:, 1]],
+        predecessor[sampled_prev],
+        hidden[:, 1],
+    )
+    expected = edges[torch.arange(batch), 1, slot]
+    torch.testing.assert_close(
+        conditioned.gather(1, candidates[:, 1]), expected, rtol=1e-5, atol=1e-5
+    )
