@@ -23,6 +23,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
 from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -47,7 +48,9 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.eh_proj = allocate_weights(
+            nn.Linear, config.hidden_size * 2, config.hidden_size, bias=False
+        )
 
         topk_tokens = config.index_topk
         kpool = getattr(config, "index_kpool", 1) or 1
