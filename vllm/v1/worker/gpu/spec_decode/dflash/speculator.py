@@ -1078,7 +1078,14 @@ def _prepare_dflash_inputs_kernel(
     # Otherwise (DFlash default) the anchor is the bonus token and only the mask tokens
     # at offsets > 0 are sampled from, each AT its own position.
     sample_off = 0 if SAMPLE_FROM_ANCHOR else 1
-    is_sample = is_query & (query_off >= sample_off)
+    # A draft block may hold more query rows than proposals (a drafter run at
+    # its trained block width); only the first num_speculative_steps rows
+    # after the anchor are sampled.
+    is_sample = (
+        is_query
+        & (query_off >= sample_off)
+        & (query_off - sample_off < num_speculative_steps)
+    )
     sample_idx = req_idx * num_speculative_steps + (query_off - sample_off)
     sample_pos = query_pos + 1 if SAMPLE_FROM_ANCHOR else query_pos
     tl.store(out_sample_indices_ptr + sample_idx, query_idx, mask=is_sample)

@@ -136,6 +136,31 @@ def normalize_dflash2_config(hf_config: Any) -> Any:
     return hf_config
 
 
+def dflash2_draft_query_rows(
+    hf_config: Any, num_speculative_tokens: int, full_block: bool
+) -> int:
+    """Query rows of one draft step: anchor plus mask rows.
+
+    With ``full_block`` the draft runs at the checkpoint's trained block width
+    (``dflash_config.block_size``: anchor + block_size - 1 masks) and the
+    first ``num_speculative_tokens`` mask rows are proposed; otherwise it runs
+    exactly one anchor plus one mask row per proposal.
+    """
+    proposal_rows = 1 + int(num_speculative_tokens)
+    if not full_block:
+        return proposal_rows
+    nested = getattr(hf_config, "dflash_config", None) or {}
+    block_rows = int(nested.get("block_size") or 0)
+    if block_rows < 2:
+        return proposal_rows
+    if proposal_rows > block_rows:
+        raise ValueError(
+            f"DFlash2 proposes {num_speculative_tokens} tokens per step but its "
+            f"trained block holds {block_rows - 1} mask rows."
+        )
+    return block_rows
+
+
 def rename_dflash2_checkpoint_name(name: str) -> str | None:
     """Map one checkpoint tensor name to the backbone's parameter name.
 
@@ -278,14 +303,20 @@ class DFlash2DecoderLayer(K3DSparkDecoderLayer):
         assert speculative_config is not None
         layer_prefix = f"layers.{start_layer_id + layer_idx}"
 
+        # The drafted block: the query rows of one request in the speculator's
+        # batch (`draft_query_rows` of the speculative config; anchor plus one
+        # mask row per proposal when unset).
+        block_rows = int(
+            getattr(speculative_config, "draft_query_rows", None)
+            or 1 + int(speculative_config.num_speculative_tokens)
+        )
+
         def grouped_conv(name: str) -> DFlash2GroupedConv:
             return DFlash2GroupedConv(
                 hidden_size=int(config.hidden_size),
                 taps=int(nested["conv_kernel_size"]),
                 group_size=int(nested["conv_group_size"]),
-                # The drafted block: the anchor plus the mask tokens of one
-                # request, the row layout of the speculator's query batch.
-                block_size=1 + int(speculative_config.num_speculative_tokens),
+                block_size=block_rows,
                 params_dtype=vllm_config.model_config.dtype,
                 prefix=maybe_prefix(prefix, f"{layer_prefix}.{name}"),
             )

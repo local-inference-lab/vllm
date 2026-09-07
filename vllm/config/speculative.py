@@ -209,6 +209,12 @@ class SpeculativeConfig:
     """Minimum size of ngram token window when using Ngram proposer, if
     provided. Defaults to 1."""
 
+    draft_query_rows: int | None = None
+    """Query rows one draft step holds per request when the drafter runs a
+    trained block wider than one anchor plus `num_speculative_tokens`
+    proposals (the DFlash2 draft: its `dflash_config.block_size`). Derived
+    from the draft config; the KV lookahead reserves these rows."""
+
     # Alternative drafting strategies
     parallel_drafting: bool = False
     """Enable parallel drafting, where all speculative tokens are generated
@@ -1262,6 +1268,20 @@ class SpeculativeConfig:
                 ):
                     raise ValueError(
                         "Inkling MTP currently supports exactly one speculative token"
+                    )
+
+                if self.method == "dflash" and (
+                    "DFlash2DraftModel" in self.draft_model_config.architectures
+                ):
+                    from vllm import envs
+                    from vllm.models.kimi_k3.nvidia.dflash2_mla import (
+                        dflash2_draft_query_rows,
+                    )
+
+                    self.draft_query_rows = dflash2_draft_query_rows(
+                        self.draft_model_config.hf_config,
+                        self.num_speculative_tokens,
+                        bool(envs.VLLM_DFLASH2_FULL_BLOCK),
                     )
 
                 if self.dspark_draft_topk is not None and self.method != "dspark":
