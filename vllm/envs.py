@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     VLLM_K3_KV_GROUP_SIZE: int = 0
     VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
     VLLM_DSPARK_COMPACT_ROPE: bool = False
+    VLLM_DFLASH2_SELECTOR: bool = True
     VLLM_DSPARK_SHARD_MARKOV_HEAD: bool = False
     VLLM_DSPARK_REPLICATE_MARKOV_W1: bool = False
     VLLM_KIMI_K3_B12X_DSPARK_ARGMAX: bool = False
@@ -1212,6 +1213,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_COMPACT_ROPE": lambda: bool(
         int(os.getenv("VLLM_DSPARK_COMPACT_ROPE", "0"))
     ),
+    # DFlash2 draft: sample the block positions in order with the candidate
+    # selector's transition scores (1, default) or in one parallel pass (0).
+    "VLLM_DFLASH2_SELECTOR": lambda: bool(int(os.getenv("VLLM_DFLASH2_SELECTOR", "1"))),
     "VLLM_DSPARK_SHARD_MARKOV_HEAD": lambda: bool(
         int(os.getenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "0"))
     ),
