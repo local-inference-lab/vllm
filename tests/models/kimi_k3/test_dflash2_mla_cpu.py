@@ -420,3 +420,34 @@ def test_b12x_mla_plans_cover_the_bounded_draft_tail() -> None:
     # The speculator's own attention view is already bounded to the tail.
     assert _planned_cache_tokens(4096 + 63, 4096, 64) == 4096 + 63
     assert _planned_cache_tokens(2048, 4096, 64) == 2048
+
+
+def test_wrapped_dflash2_config_is_mla_with_latent_head_size() -> None:
+    """Under the EAGLEConfig wrapper the draft keeps the 576-wide MLA head."""
+    from vllm.transformers_utils.model_arch_config_convertor import (
+        ModelArchConfigConvertorBase,
+    )
+
+    wrapped = SimpleNamespace(
+        model_type="eagle",
+        architectures=["DFlash2DraftModel"],
+        model=SimpleNamespace(model_type="qwen3"),
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        qk_nope_head_dim=128,
+        head_dim=128,
+        hidden_size=7168,
+        num_attention_heads=64,
+    )
+    convertor = ModelArchConfigConvertorBase(wrapped, wrapped)
+    assert convertor.is_deepseek_mla()
+    assert convertor.get_head_size() == 512 + 64
+    plain = SimpleNamespace(
+        model_type="eagle",
+        architectures=["DFlashQwen3ForCausalLM"],
+        model=SimpleNamespace(model_type="qwen3"),
+        head_dim=128,
+        hidden_size=4096,
+        num_attention_heads=32,
+    )
+    assert not ModelArchConfigConvertorBase(plain, plain).is_deepseek_mla()
