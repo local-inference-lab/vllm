@@ -16,6 +16,7 @@ from openai.types.responses.response_reasoning_item import (
     Summary,
 )
 
+from vllm.entrypoints.chat_utils import _postprocess_messages
 from vllm.entrypoints.openai.responses.utils import (
     _construct_message_from_response_item,
     construct_chat_messages_with_tool_call,
@@ -152,6 +153,32 @@ class TestResponsesUtils:
         assert (
             message["tool_calls"][0]["function"]["arguments"] == '{"code": "123+456"}'
         )
+
+    def test_malformed_function_call_history_remains_replayable(self):
+        """Malformed Responses history must not poison later turns."""
+        malformed = (
+            '{"cmd": "sed -n 155,180p test.py", "workdir": "'
+            "/workspace/L</think><tool_call>exec_command<arg_key>cmd"
+        )
+        items = [
+            make_function_call(
+                call_id="call_incomplete",
+                name="exec_command",
+                arguments=malformed,
+            ),
+            make_function_call_output(
+                call_id="call_incomplete",
+                output="The tool call was not executed.",
+            ),
+            {"role": "user", "content": "Continue."},
+        ]
+
+        messages = construct_chat_messages_with_tool_call(items)
+        _postprocess_messages(messages)
+
+        assert messages[0]["tool_calls"][0]["function"]["arguments"] == {}
+        assert messages[1]["tool_call_id"] == "call_incomplete"
+        assert messages[2] == {"role": "user", "content": "Continue."}
 
     def test_construct_chat_messages_preserves_single_item_conversions(self):
         item = ResponseReasoningItem(
