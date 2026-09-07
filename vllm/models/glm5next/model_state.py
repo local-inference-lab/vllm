@@ -12,6 +12,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
+from vllm.v1.core.recurrent_prefill_checkpoint import checkpoint_plan_rows
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.utils import CpuGpuBuffer
@@ -267,6 +268,7 @@ class Glm5NextModelState(MambaHybridModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        recurrent_prefill_checkpoint_plans: dict | None = None,
     ) -> dict[str, Any]:
         # This is the MambaHybridModelState construction with only the metadata
         # object specialized. Keeping it package-local avoids a GLM hook in the
@@ -331,7 +333,14 @@ class Glm5NextModelState(MambaHybridModelState):
                 block_tables,
             )
 
+        checkpoint_rows = checkpoint_plan_rows(
+            input_batch,
+            recurrent_prefill_checkpoint_plans,
+            num_reqs,
+            for_capture=for_capture,
+        )
         model_metadata = Glm5NextAttnMetadata(
+            recurrent_prefill_checkpoint_plans_cpu=checkpoint_rows,
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
@@ -358,6 +367,21 @@ class Glm5NextModelState(MambaHybridModelState):
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
         )
+        if checkpoint_rows is not None:
+            gdn_metadata = [
+                item
+                for item in attn_metadata.values()
+                if hasattr(item, "prefill_checkpoint")
+            ]
+            if not gdn_metadata or any(
+                item.prefill_checkpoint is None
+                or item.prefill_checkpoint.required_mask is None
+                for item in gdn_metadata
+            ):
+                raise RuntimeError(
+                    "GLM checkpoint plans require GDN export metadata "
+                    "on every recurrent layer"
+                )
         if self.recoverssm is not None:
             self.recoverssm.record_step(
                 attn_metadata,

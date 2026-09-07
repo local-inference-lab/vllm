@@ -13,6 +13,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadataBuilder
+from vllm.v1.core.recurrent_prefill_checkpoint import checkpoint_plan_rows
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
@@ -37,13 +38,21 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    recurrent_prefill_checkpoint_plans_cpu: list | None = None
 
     def get_extra_common_attn_kwargs(
         self,
         kv_cache_group_id: int,
         num_reqs: int,
     ) -> dict[str, Any]:
-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
+        return {
+            "is_prefilling": self.is_prefilling[:num_reqs],
+            "recurrent_prefill_checkpoint_plans_cpu": (
+                None
+                if self.recurrent_prefill_checkpoint_plans_cpu is None
+                else self.recurrent_prefill_checkpoint_plans_cpu[:num_reqs]
+            ),
+        }
 
     def get_extra_attn_kwargs(
         self,
@@ -267,6 +276,7 @@ class MambaHybridModelState(DefaultModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        recurrent_prefill_checkpoint_plans: dict | None = None,
     ) -> dict[str, Any]:
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
@@ -323,7 +333,14 @@ class MambaHybridModelState(DefaultModelState):
                 block_tables,
             )
 
+        checkpoint_rows = checkpoint_plan_rows(
+            input_batch,
+            recurrent_prefill_checkpoint_plans,
+            num_reqs,
+            for_capture=for_capture,
+        )
         mamba_attn_metadata = MambaHybridAttnMetadata(
+            recurrent_prefill_checkpoint_plans_cpu=checkpoint_rows,
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,

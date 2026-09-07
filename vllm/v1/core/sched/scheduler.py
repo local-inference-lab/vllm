@@ -39,6 +39,13 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.recurrent_prefill_checkpoint import (
+    COALESCED_CHECKPOINT_CAPACITY,
+    CheckpointPlan,
+    continuation_layout,
+    prefill_checkpoint_plan,
+    validate_coalescing_config,
+)
 from vllm.v1.core.sched.compute_fairness import (
     ComputeServiceClass,
     PrefillComputeShareController,
@@ -62,6 +69,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -113,6 +121,9 @@ def _build_kv_connector_block_state(
 
 
 class Scheduler(SchedulerInterface):
+    _kda_coalescing_enabled = False
+    _kda_coalescing_exclusive = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -510,6 +521,133 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+        self._kda_coalescing_enabled = validate_coalescing_config(vllm_config)
+        self._kda_coalescing_origins: dict[str, Request] = {}
+        self._kda_coalescing_exclusive = False
+        if self._kda_coalescing_enabled:
+            recurrent_groups = [
+                group.kv_cache_spec
+                for group in kv_cache_config.kv_cache_groups
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            ]
+            if not recurrent_groups or any(
+                spec.num_prefill_checkpoint_blocks != COALESCED_CHECKPOINT_CAPACITY
+                or spec.block_size != self.cache_config.block_size
+                for spec in recurrent_groups
+            ):
+                raise ValueError(
+                    "KDA coalescing requires four-checkpoint recurrent groups "
+                    "on one block grid"
+                )
+            managers = self.kv_cache_manager.coordinator.single_type_managers
+            logger.info(
+                "KDA_PREFILL_COALESCING configured capacity=%d grids=%s "
+                "(physical, lookup, scheduler)",
+                COALESCED_CHECKPOINT_CAPACITY,
+                sorted(
+                    {
+                        (
+                            manager.block_size,
+                            manager.hit_alignment_tokens,
+                            manager.scheduler_block_size,
+                        )
+                        for manager in managers
+                        if isinstance(manager, MambaManager)
+                    }
+                ),
+            )
+
+    def _recurrent_checkpoint_plan(
+        self, request: Request, start: int, end: int
+    ) -> CheckpointPlan | None:
+        """Plan exact retained states for one cold, unmixed prompt chunk."""
+        if (
+            not self._kda_coalescing_enabled
+            or not self._kda_coalescing_exclusive
+            or request.use_boundary_checkpoints
+            or request.num_preemptions
+            or request.has_encoder_inputs
+            or request.resumable
+            or request.num_tokens != request.num_prompt_tokens
+            or request.spec_token_ids
+            or request.num_computed_tokens != start
+        ):
+            return None
+        if (
+            start
+            and self._kda_coalescing_origins.get(request.request_id) is not request
+        ):
+            return None
+        managers = [
+            manager
+            for manager in self.kv_cache_manager.coordinator.single_type_managers
+            if isinstance(manager, MambaManager)
+        ]
+        boundaries = [request.num_prompt_tokens - 1]
+        if request.shared_prefix_boundary:
+            boundaries.append(request.shared_prefix_boundary)
+        publications = tuple(
+            sorted(
+                {
+                    position
+                    for manager in managers
+                    for position in manager._expand_reachable_boundaries(boundaries)
+                }
+            )
+        )
+        plan = prefill_checkpoint_plan(
+            start=start,
+            end=end,
+            prompt=request.num_prompt_tokens,
+            num_tokens=request.num_tokens,
+            block_size=self.cache_config.block_size,
+            publications=publications,
+            shared_prefix_boundary=request.shared_prefix_boundary,
+        )
+        if plan is None:
+            return None
+        for manager in managers:
+            assert isinstance(manager.kv_cache_spec, MambaSpec)
+            if (
+                request.request_id in manager._partial_hit_reqs
+                or manager.kv_cache_spec.num_prefill_checkpoint_blocks < len(plan[2])
+            ):
+                return None
+            if start:
+                if request.request_id not in manager._allocated_block_reqs:
+                    return None
+                try:
+                    continuation_layout(
+                        manager.req_to_blocks[request.request_id],
+                        plan,
+                        manager.block_size,
+                        manager.num_speculative_blocks,
+                    )
+                except ValueError:
+                    return None
+            elif manager.req_to_blocks.get(request.request_id):
+                return None
+        return plan
+
+    def _record_coalescing_origin(
+        self, request: Request, computed: int, local: int, external: int, loading: bool
+    ) -> None:
+        if not self._kda_coalescing_enabled:
+            return
+        self._kda_coalescing_origins.pop(request.request_id, None)
+        if (
+            self._kda_coalescing_enabled
+            and not loading
+            and computed == 0
+            and local == 0
+            and external == 0
+            and not request.num_preemptions
+            and request.status == RequestStatus.WAITING
+            and not request.resumable
+            and not request.has_encoder_inputs
+            and request.num_tokens == request.num_prompt_tokens
+        ):
+            self._kda_coalescing_origins[request.request_id] = request
 
     def _mamba_block_aligned_split(
         self,
@@ -531,6 +669,14 @@ class Scheduler(SchedulerInterface):
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
+        if (
+            getattr(self, "_kda_coalescing_enabled", False)
+            and not num_new_local_computed_tokens
+            and not num_external_computed_tokens
+            and self._recurrent_checkpoint_plan(request, start, start + num_new_tokens)
+            is not None
+        ):
+            return num_new_tokens
         if request.use_boundary_checkpoints:
             # Running-state migration still happens in the worker, but these
             # requests publish only semantic endpoints. Stop exactly at the
@@ -744,6 +890,10 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        self._kda_coalescing_exclusive = (
+            self._kda_coalescing_enabled
+            and len(self.running) + len(self.waiting) + len(self.skipped_waiting) == 1
+        )
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -762,6 +912,7 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        recurrent_checkpoint_plans: dict[str, CheckpointPlan] = {}
         token_budget = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
         separate_draft_input_tokens = 0
@@ -1064,10 +1215,16 @@ class Scheduler(SchedulerInterface):
                 # Schedule newly needed KV blocks for the request.
                 with record_function_or_nullcontext("schedule: allocate_slots"):
                     while True:
+                        checkpoint_plan = self._recurrent_checkpoint_plan(
+                            request,
+                            request.num_computed_tokens,
+                            request.num_computed_tokens + num_new_tokens,
+                        )
                         new_blocks = self.kv_cache_manager.allocate_slots(
                             request,
                             num_new_tokens,
                             num_lookahead_tokens=self.num_lookahead_tokens,
+                            recurrent_checkpoint_plan=checkpoint_plan,
                         )
 
                         if new_blocks is not None:
@@ -1142,6 +1299,8 @@ class Scheduler(SchedulerInterface):
                 request_id = request.request_id
                 req_to_new_blocks[request_id] = new_blocks
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if checkpoint_plan is not None:
+                    recurrent_checkpoint_plans[request_id] = checkpoint_plan
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 draft_input_budget -= separate_draft_input_tokens
@@ -1556,6 +1715,17 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
+                checkpoint_plan = (
+                    None
+                    if load_kv_async
+                    or num_new_local_computed_tokens
+                    or num_external_computed_tokens
+                    else self._recurrent_checkpoint_plan(
+                        request,
+                        num_computed_tokens,
+                        num_computed_tokens + num_new_tokens,
+                    )
+                )
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -1568,6 +1738,7 @@ class Scheduler(SchedulerInterface):
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
+                    recurrent_checkpoint_plan=checkpoint_plan,
                 )
 
                 if new_blocks is None:
@@ -1579,6 +1750,15 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     break
 
+                if checkpoint_plan is not None:
+                    recurrent_checkpoint_plans[request_id] = checkpoint_plan
+                self._record_coalescing_origin(
+                    request,
+                    num_computed_tokens,
+                    num_new_local_computed_tokens,
+                    num_external_computed_tokens,
+                    load_kv_async,
+                )
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
                 # This information is used to determine if a load is
@@ -1903,6 +2083,11 @@ class Scheduler(SchedulerInterface):
             )
 
         scheduler_output = SchedulerOutput(
+            recurrent_prefill_checkpoint_plans={
+                request_id: plan
+                for request_id, plan in recurrent_checkpoint_plans.items()
+                if request_id in num_scheduled_tokens
+            },
             scheduled_new_reqs=new_reqs_data,
             boundary_logits_only=bool(
                 new_reqs_data
@@ -1980,6 +2165,13 @@ class Scheduler(SchedulerInterface):
                 scheduler_output.compute_service_class,
                 contended=scheduler_output.compute_contention,
             )
+        if scheduler_output.recurrent_prefill_checkpoint_plans:
+            for plan in scheduler_output.recurrent_prefill_checkpoint_plans.values():
+                logger.info_once(
+                    "KDA_PREFILL_COALESCING scheduled span=%d checkpoints=%d",
+                    plan[1] - plan[0],
+                    len(plan[2]),
+                )
         return scheduler_output
 
     def record_compute_time(
@@ -3308,6 +3500,8 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        if self._kda_coalescing_enabled:
+            self._kda_coalescing_origins.pop(request.request_id, None)
         if not self.defer_block_free or (
             # Last scheduled step already processed: no in-flight write remains
             # (always the case for a normal finish), so free now.

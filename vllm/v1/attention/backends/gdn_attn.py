@@ -23,6 +23,10 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
+from vllm.v1.core.recurrent_prefill_checkpoint import (
+    COALESCED_CHECKPOINT_CAPACITY,
+    checkpoint_metadata,
+)
 from vllm.v1.kv_cache_interface import MambaSpec
 
 
@@ -42,7 +46,7 @@ class GDNAttentionBackend(AttentionBackend):
 
 @dataclass
 class GDNPrefillCheckpointMetadata:
-    """One recurrent-state checkpoint inside each packed prefill sequence.
+    """Bounded recurrent-state checkpoints inside each packed prefill sequence.
 
     ``checkpoint_offsets`` are relative to the corresponding packed query.
     ``request_rows`` and ``block_table_columns`` identify the cache slots that
@@ -54,6 +58,7 @@ class GDNPrefillCheckpointMetadata:
     state_indices: torch.Tensor
     request_rows: torch.Tensor
     block_table_columns: torch.Tensor
+    required_mask: torch.Tensor | None = None
 
 
 @dataclass
@@ -574,9 +579,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and self.kv_cache_spec.num_prefill_checkpoint_blocks > 0
             and self.vllm_config.cache_config.mamba_cache_mode == "align"
         ):
-            # FlashKDA can materialize one state at a cache-block boundary
-            # without splitting the target-model forward. Only prefill rows
-            # participate, in the same order as prefill_query_start_loc.
+            # Checkpoint rows use the packed prefill query order.
             assert m.seq_lens_cpu_upper_bound is not None
             all_query_lens = query_start_loc_cpu.diff().tolist()
             if spec_sequence_masks_cpu is None:
@@ -591,23 +594,36 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
             seq_lens = m.seq_lens_cpu_upper_bound.tolist()
             block_size = self.kv_cache_spec.block_size
-            checkpoint_offsets: list[int] = []
-            checkpoint_columns: list[int] = []
+            capacity = min(
+                self.kv_cache_spec.num_prefill_checkpoint_blocks,
+                COALESCED_CHECKPOINT_CAPACITY,
+            )
+            plans = getattr(m, "recurrent_prefill_checkpoint_plans_cpu", None)
+            if plans is not None and len(plans) < len(all_query_lens):
+                raise ValueError("checkpoint plan rows do not cover the packed batch")
+            checkpoint_offsets: list[list[int]] = []
+            checkpoint_columns: list[list[int]] = []
+            checkpoint_required: list[list[bool]] = []
             for row in request_rows:
                 query_len = all_query_lens[row]
                 seq_len = seq_lens[row]
-                offset = seq_len // block_size * block_size - (seq_len - query_len)
-                valid = (
-                    seq_len % block_size != 0
-                    and 0 < offset < query_len
-                    # FlashKDA checkpoint outputs are produced on its
-                    # 16-token recurrence boundary.
-                    and offset % 16 == 0
+                offsets, columns = checkpoint_metadata(
+                    None if plans is None else plans[row],
+                    seq_len - query_len,
+                    seq_len,
+                    block_size,
+                    capacity,
                 )
-                checkpoint_offsets.append(offset if valid else 0)
-                checkpoint_columns.append(seq_len // block_size - 1 if valid else -1)
+                checkpoint_offsets.append(offsets)
+                checkpoint_columns.append(columns)
+                required = [
+                    plans is not None and plans[row] is not None and column >= 0
+                    for column in columns
+                ]
+                checkpoint_required.append(required)
 
-            if any(checkpoint_offsets):
+            any_checkpoint = any(any(row) for row in checkpoint_offsets)
+            if any_checkpoint:
                 checkpoint_offsets_tensor = async_tensor_h2d(
                     checkpoint_offsets,
                     dtype=torch.int32,
@@ -623,19 +639,42 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     dtype=torch.int64,
                     device=query_start_loc.device,
                 )
+                if capacity == 1:
+                    checkpoint_offsets_tensor = checkpoint_offsets_tensor[:, 0]
+                    checkpoint_columns_tensor = checkpoint_columns_tensor[:, 0]
                 checkpoint_state_indices = m.block_table_tensor[
-                    request_rows_tensor, checkpoint_columns_tensor
+                    request_rows_tensor[:, None]
+                    if capacity > 1
+                    else request_rows_tensor,
+                    checkpoint_columns_tensor,
                 ]
                 checkpoint_state_indices = torch.where(
                     checkpoint_columns_tensor >= 0,
                     checkpoint_state_indices,
                     NULL_BLOCK_ID,
                 )
+                has_required = any(any(row) for row in checkpoint_required)
+                required_mask = None
+                if has_required:
+                    required_mask = async_tensor_h2d(
+                        checkpoint_required,
+                        dtype=torch.bool,
+                        device=query_start_loc.device,
+                    )
+                    if capacity == 1:
+                        required_mask = required_mask[:, 0]
+                    torch._assert_async(
+                        torch.all(
+                            ~required_mask | (checkpoint_state_indices != NULL_BLOCK_ID)
+                        ),
+                        "planned recurrent checkpoint refers to a NULL state block",
+                    )
                 prefill_checkpoint = GDNPrefillCheckpointMetadata(
                     checkpoint_offsets=checkpoint_offsets_tensor,
                     state_indices=checkpoint_state_indices,
                     request_rows=request_rows_tensor,
                     block_table_columns=checkpoint_columns_tensor,
+                    required_mask=required_mask,
                 )
 
         # Function code counted on either presency non-spec decode or spec decode,
@@ -802,7 +841,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_checkpoint = metadata.prefill_checkpoint
         if prefill_checkpoint is not None:
             checkpoint_state_indices = blk_table[
-                prefill_checkpoint.request_rows,
+                prefill_checkpoint.request_rows[:, None]
+                if prefill_checkpoint.block_table_columns.ndim == 2
+                else prefill_checkpoint.request_rows,
                 prefill_checkpoint.block_table_columns,
             ]
             checkpoint_state_indices = torch.where(
@@ -810,6 +851,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 checkpoint_state_indices,
                 NULL_BLOCK_ID,
             )
+            if prefill_checkpoint.required_mask is not None:
+                torch._assert_async(
+                    torch.all(
+                        ~prefill_checkpoint.required_mask
+                        | (checkpoint_state_indices != NULL_BLOCK_ID)
+                    ),
+                    "planned recurrent checkpoint refers to a NULL state block",
+                )
             prefill_checkpoint = replace(
                 prefill_checkpoint,
                 state_indices=checkpoint_state_indices,

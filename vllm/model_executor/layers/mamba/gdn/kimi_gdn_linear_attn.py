@@ -157,18 +157,26 @@ def _store_cache_checkpoints_kernel(
     NULL_STATE_IDX: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     STORE_RECURRENT: tl.constexpr,
+    CHECKPOINTS: tl.constexpr = 1,
+    error_code_ptr=None,
+    CHECK_ERROR: tl.constexpr = False,
 ):
     """Store FlashKDA recurrent and convolution state at an internal boundary."""
-    seq_idx = tl.program_id(0)
+    checkpoint_idx = tl.program_id(0)
+    seq_idx = checkpoint_idx // CHECKPOINTS
     cols = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     seq_idx_i64 = seq_idx.to(tl.int64)
     cols_i64 = cols.to(tl.int64)
-    state_idx = tl.load(checkpoint_state_indices_ptr + seq_idx_i64)
+    state_idx = tl.load(checkpoint_state_indices_ptr + checkpoint_idx.to(tl.int64))
     state_idx_i64 = state_idx.to(tl.int64)
     checkpoint_offset = tl.load(
-        checkpoint_offsets_ptr + seq_idx_i64 * checkpoint_offset_stride
+        checkpoint_offsets_ptr
+        + seq_idx_i64 * checkpoint_offset_stride
+        + (checkpoint_idx % CHECKPOINTS).to(tl.int64)
     )
     valid_checkpoint = (state_idx != NULL_STATE_IDX) & (checkpoint_offset > 0)
+    if CHECK_ERROR:
+        valid_checkpoint = valid_checkpoint & (tl.load(error_code_ptr) == 0)
     valid_conv = (
         (cols < WIDTH * STATE_LEN) & valid_checkpoint & (checkpoint_offset >= STATE_LEN)
     )
@@ -389,8 +397,8 @@ class _B12xKdaPrefillWarmup:
                 cu_seqlens=torch.tensor([0, tokens], dtype=torch.int32, device=device),
                 initial_state_indices=indices,
                 final_state_indices=indices,
-                checkpoint_state_indices=indices,
-                checkpoint_offsets=torch.zeros(1, dtype=torch.int32, device=device),
+                checkpoint_state_indices=layer._b12x_prefill_null_indices[:1],
+                checkpoint_offsets=layer._b12x_prefill_zero_offsets[:1],
                 num_seqs=layer._b12x_prefill_num_seqs,
                 num_tokens=layer._b12x_prefill_num_tokens,
                 output=torch.zeros_like(rows),
@@ -407,6 +415,7 @@ class _B12xKdaPrefillWarmup:
                 layer.head_dim,
                 layer._b12x_prefill_max_tokens,
                 layer._b12x_prefill_max_seqs,
+                layer._b12x_prefill_checkpoint_capacity,
                 None if caps is None else caps.max_state_slots,
             ),
             compile=compile,
@@ -443,7 +452,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert isinstance(spec, MambaSpec)
         return replace(
             spec,
-            num_prefill_checkpoint_blocks=int(
+            num_prefill_checkpoint_blocks=self._b12x_prefill_checkpoint_capacity
+            * int(
                 self.kda_prefill_backend in ("flashkda", "b12x")
                 and not vllm_config.use_request_boundary_checkpoints
             ),
@@ -724,6 +734,15 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def _initialize_b12x_kda_prefill(self, vllm_config: VllmConfig) -> None:
         """Hold the b12x prefill op and its per-request metadata buffers."""
+        from vllm.v1.core.recurrent_prefill_checkpoint import (
+            COALESCED_CHECKPOINT_CAPACITY,
+            validate_coalescing_config,
+        )
+
+        coalescing = validate_coalescing_config(vllm_config)
+        self._b12x_prefill_checkpoint_capacity = (
+            COALESCED_CHECKPOINT_CAPACITY if coalescing else 1
+        )
         if self.kda_prefill_backend != "b12x":
             return
         api = get_b12x_kda_prefill()
@@ -732,11 +751,28 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "The b12x KDA prefill backend requires the b12x package."
             )
         device = torch.device(current_platform.current_device())
+        if coalescing:
+            if "max_checkpoints" not in getattr(api.Caps, "__dataclass_fields__", {}):
+                raise RuntimeError(
+                    "KDA coalescing requires B12X four-checkpoint support"
+                )
+            properties = torch.cuda.get_device_properties(device)
+            if (
+                properties.name.strip().lower() != "nvidia gb10"
+                or (properties.major, properties.minor) != (12, 1)
+                or properties.multi_processor_count != 48
+            ):
+                raise ValueError("KDA coalescing requires NVIDIA GB10 / SM121 / 48 SMs")
         scheduler_config = vllm_config.scheduler_config
         self._b12x_prefill_api = api
         self._b12x_prefill_max_tokens = int(scheduler_config.max_num_batched_tokens)
         self._b12x_prefill_max_seqs = int(scheduler_config.max_num_seqs)
         max_seqs = self._b12x_prefill_max_seqs
+        checkpoint_shape = (
+            (max_seqs, self._b12x_prefill_checkpoint_capacity)
+            if coalescing
+            else (max_seqs,)
+        )
         self.register_buffer(
             "_b12x_prefill_num_seqs",
             torch.zeros(1, dtype=torch.int32, device=device),
@@ -754,12 +790,14 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         self.register_buffer(
             "_b12x_prefill_null_indices",
-            torch.full((max_seqs,), NULL_BLOCK_ID, dtype=torch.int32, device=device),
+            torch.full(
+                checkpoint_shape, NULL_BLOCK_ID, dtype=torch.int32, device=device
+            ),
             persistent=False,
         )
         self.register_buffer(
             "_b12x_prefill_zero_offsets",
-            torch.zeros(max_seqs, dtype=torch.int32, device=device),
+            torch.zeros(checkpoint_shape, dtype=torch.int32, device=device),
             persistent=False,
         )
         self.b12x_warmup_provider = _B12xKdaPrefillWarmup()
@@ -781,7 +819,16 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 qk_l2norm=True,
                 checkpoint_export=True,
                 null_state_index=NULL_BLOCK_ID,
-                metadata_validation="trusted",
+                metadata_validation=(
+                    "transactional"
+                    if self._b12x_prefill_checkpoint_capacity > 1
+                    else "trusted"
+                ),
+                **(
+                    {"max_checkpoints": self._b12x_prefill_checkpoint_capacity}
+                    if self._b12x_prefill_checkpoint_capacity > 1
+                    else {}
+                ),
             )
         )
 
@@ -821,7 +868,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         checkpoint: Any | None,
         recurrent_state: torch.Tensor,
         output: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor | None:
         """Run packed KDA prefill straight against the recurrent-state pool.
 
         The op reads each request's initial state and writes its final state,
@@ -903,6 +950,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             max_live_tokens=num_tokens,
             max_live_seqs=num_requests,
         )
+        if self._b12x_prefill_checkpoint_capacity > 1:
+            # Consumers share this stream and must not publish invalid states.
+            torch._assert_async(
+                binding.error_code == 0, "invalid recurrent checkpoint metadata"
+            )
+            return binding.error_code
+        return None
 
     def _store_kda_conv_checkpoint(
         self,
@@ -912,11 +966,30 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         recurrent_state: torch.Tensor,
         query_start_loc: torch.Tensor,
         checkpoint: Any,
+        error_code: torch.Tensor | None = None,
     ) -> None:
         """Store the convolution history at each request's checkpoint offset."""
-        state_len = conv_state.shape[-1]
+        # Speculative storage includes future-token cells. A reusable prefill
+        # checkpoint stores only the causal kernel's history in the first cells.
+        state_len = self.conv1d.weight.shape[-1] - 1
+        if not 1 <= state_len <= conv_state.shape[-1]:
+            raise ValueError("Convolution checkpoint history exceeds state storage")
         width = mixed_qkv.shape[-1]
         store_block_size = 256
+        offsets = checkpoint.checkpoint_offsets
+        indices = checkpoint.state_indices
+        checkpoint_count = offsets.shape[1] if offsets.ndim == 2 else 1
+        if (
+            checkpoint_count not in (1, 2, 4)
+            or not offsets.is_contiguous()
+            or not indices.is_contiguous()
+        ):
+            raise ValueError(
+                "Checkpoint convolution metadata must be contiguous "
+                "with capacity one, two or four"
+            )
+        if tuple(offsets.shape) != tuple(indices.shape):
+            raise ValueError("Checkpoint offset and destination shapes differ")
         _store_cache_checkpoints_kernel[
             (
                 checkpoint.checkpoint_offsets.numel(),
@@ -944,6 +1017,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             NULL_BLOCK_ID,
             store_block_size,
             False,
+            checkpoint_count,
+            error_code,
+            error_code is not None,
         )
 
     def rearrange_mixed_qkv(
@@ -1421,7 +1497,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     num_prefill_tokens = int(q_ns.shape[1])
                     b12x_scratch, b12x_out = self._get_b12x_prefill_workspace()
                     b12x_out = b12x_out[:num_prefill_tokens]
-                    self._run_b12x_kda_prefill(
+                    checkpoint_error = self._run_b12x_kda_prefill(
                         scratch=b12x_scratch,
                         q=q_ns[0],
                         k=k_ns[0],
@@ -1445,6 +1521,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                             recurrent_state=recurrent_state,
                             query_start_loc=prefill_query_start_loc,
                             checkpoint=prefill_checkpoint,
+                            error_code=checkpoint_error,
                         )
                 elif self.kda_prefill_backend == "flashkda":
                     assert initial_state is not None

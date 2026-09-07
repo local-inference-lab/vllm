@@ -516,3 +516,66 @@ def test_causal_conv1d_update_hoisted_spec_decode_is_bitwise(
     assert torch.equal(out_h, out_g)
     assert torch.equal(state_h, state_g)
     assert torch.isfinite(out_h.float()).all()
+
+
+@pytest.mark.parametrize("checkpoint_count", [1, 2, 4])
+@pytest.mark.parametrize("metadata_error", [0, 1])
+def test_kda_checkpoint_history_excludes_speculative_cells(
+    checkpoint_count, metadata_error
+):
+    """Convolution exports match the raw three-token history at each offset."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+        KimiGatedDeltaNetAttention,
+    )
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for checkpoint-store kernel execution")
+    device = torch.device("cuda")
+    width = 12
+    raw = torch.arange(64 * width, device=device, dtype=torch.float32).reshape(
+        64, width
+    )
+    state = torch.full((8, width, 6), -7.0, device=device)
+    offsets = torch.tensor(
+        [[16, 32, 48, 64]] if checkpoint_count == 4 else [[16, 48]],
+        dtype=torch.int32,
+        device=device,
+    )
+    destinations = torch.tensor(
+        [[2, 3, 4, 5]] if checkpoint_count == 4 else [[2, 5]],
+        dtype=torch.int32,
+        device=device,
+    )
+    if checkpoint_count == 1:
+        offsets = offsets[:, 0].contiguous()
+        destinations = destinations[:, 0].contiguous()
+    layer = KimiGatedDeltaNetAttention.__new__(KimiGatedDeltaNetAttention)
+    torch.nn.Module.__init__(layer)
+    layer.conv1d = torch.nn.Conv1d(
+        width, width, 4, groups=width, bias=False, device=device
+    )
+    checkpoint = SimpleNamespace(checkpoint_offsets=offsets, state_indices=destinations)
+    KimiGatedDeltaNetAttention._store_kda_conv_checkpoint(
+        layer,
+        mixed_qkv=raw,
+        conv_state=state,
+        recurrent_state=torch.empty(8, 1, 128, 128, device=device),
+        query_start_loc=torch.tensor([0, 64], dtype=torch.int32, device=device),
+        checkpoint=checkpoint,
+        error_code=torch.tensor([metadata_error], dtype=torch.int32, device=device),
+    )
+    torch.accelerator.synchronize()
+    if metadata_error:
+        assert torch.all(state == -7.0)
+        return
+    for slot, offset in zip(
+        destinations.flatten().tolist(), offsets.flatten().tolist()
+    ):
+        torch.testing.assert_close(
+            state[slot, :, :3], raw[offset - 3 : offset].T, rtol=0, atol=0
+        )
+        assert torch.all(state[slot, :, 3:] == -7.0)
+    untouched = sorted(set(range(8)) - set(destinations.flatten().tolist()))
+    assert torch.all(state[untouched] == -7.0)

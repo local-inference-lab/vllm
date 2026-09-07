@@ -262,6 +262,9 @@ class SchedulerOutput:
     scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None
     # This batch samples saved final hidden states without a target forward.
     boundary_logits_only: bool = False
+    recurrent_prefill_checkpoint_plans: (
+        dict[str, tuple[int, int, tuple[int, ...]]] | None
+    ) = None
 
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.

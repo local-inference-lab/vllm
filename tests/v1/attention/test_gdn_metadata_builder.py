@@ -3,6 +3,7 @@
 """Tests for mixed speculative and non-speculative GDN metadata."""
 
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,9 +11,7 @@ import torch
 from tests.v1.attention.utils import (
     BatchSpec,
     create_common_attn_metadata,
-    create_vllm_config,
 )
-from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
@@ -23,6 +22,13 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
+
+
+@pytest.fixture(autouse=True)
+def _metadata_uses_unpinned_host_storage(monkeypatch):
+    """CPU metadata tests do not require accelerator-pinned allocations."""
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
+    monkeypatch.setattr("vllm.v1.attention.backends.utils.PIN_MEMORY", False)
 
 
 @dataclass
@@ -126,18 +132,32 @@ def _create_gdn_builder(
     num_prefill_checkpoint_blocks: int = 0,
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
-    vllm_config = create_vllm_config(
-        model_name="Qwen/Qwen3.5-0.8B",
-        block_size=BLOCK_SIZE,
-        max_num_batched_tokens=4096,
+    # Metadata construction needs capacity and layout, not model weights or a
+    # platform-specific serving configuration.
+    vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=(
+                CUDAGraphMode.FULL_AND_PIECEWISE
+                if full_cuda_graph
+                else CUDAGraphMode.NONE
+            ),
+            max_cudagraph_capture_size=None,
+        ),
+        speculative_config=(
+            SimpleNamespace(
+                num_speculative_tokens=num_speculative_tokens, parallel_drafting=False
+            )
+            if num_speculative_tokens
+            else None
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=256),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(linear_key_head_dim=128)
+        ),
+        additional_config={"gdn_prefill_backend": "triton"},
     )
-    if full_cuda_graph:
-        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
-    if num_speculative_tokens > 0:
-        vllm_config.speculative_config = SpeculativeConfig(
-            method="ngram",
-            num_speculative_tokens=num_speculative_tokens,
-        )
     mamba_spec = MambaSpec(
         block_size=BLOCK_SIZE,
         shapes=((16, 64),),
@@ -715,3 +735,140 @@ def test_gdn_mixed_spec_update_selects_group_specific_state_indices() -> None:
         metadata_b.prefill_state_indices,
         builder_b.mamba_aligned_state_indices[0:1, 0],
     )
+
+
+def test_gdn_two_checkpoint_plan_uses_explicit_columns_and_refreshes_destinations():
+    builder = _create_gdn_builder(num_prefill_checkpoint_blocks=2)
+    builder.vllm_config.cache_config.mamba_cache_mode = "align"
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[128], query_lens=[64]),
+        BLOCK_SIZE,
+        DEVICE,
+        arange_block_indices=True,
+    ).replace(
+        is_prefilling=torch.tensor([True]),
+        recurrent_prefill_checkpoint_plans_cpu=[(64, 128, (80, 112))],
+    )
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    checkpoint = metadata.prefill_checkpoint
+    assert checkpoint is not None
+    torch.testing.assert_close(
+        checkpoint.checkpoint_offsets, torch.tensor([[16, 48]], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        checkpoint.block_table_columns, torch.tensor([[4, 6]], dtype=torch.int64)
+    )
+    assert checkpoint.required_mask is not None and checkpoint.required_mask.all()
+    updated = builder.update_block_table(
+        metadata, common.block_table_tensor + 100, torch.zeros(64, dtype=torch.int64)
+    )
+    assert updated.prefill_checkpoint is not None
+    torch.testing.assert_close(
+        updated.prefill_checkpoint.state_indices, checkpoint.state_indices + 100
+    )
+
+
+def test_gdn_planned_checkpoint_rejects_missing_required_state_storage():
+    builder = _create_gdn_builder(num_prefill_checkpoint_blocks=2)
+    builder.vllm_config.cache_config.mamba_cache_mode = "align"
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[128], query_lens=[64]),
+        BLOCK_SIZE,
+        DEVICE,
+        arange_block_indices=True,
+    ).replace(
+        is_prefilling=torch.tensor([True]),
+        recurrent_prefill_checkpoint_plans_cpu=[(64, 128, (80, 112))],
+    )
+    common.block_table_tensor[0, 6] = 0
+    with pytest.raises(RuntimeError, match="NULL state block"):
+        builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+
+def test_unpadded_common_metadata_preserves_live_checkpoint_plan_rows():
+    plan = (0, 64, (16, 48))
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[64, 64], query_lens=[64, 64]), BLOCK_SIZE, DEVICE
+    ).replace(recurrent_prefill_checkpoint_plans_cpu=[plan, None])
+    assert common.unpadded(64, 1).recurrent_prefill_checkpoint_plans_cpu == [plan]
+
+
+@pytest.mark.parametrize("missing_column", [None, 6])
+def test_gdn_four_checkpoint_plan_refreshes_all_fine_and_coarse_destinations(
+    missing_column,
+):
+    builder = _create_gdn_builder(num_prefill_checkpoint_blocks=4)
+    builder.vllm_config.cache_config.mamba_cache_mode = "align"
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[160], query_lens=[96]),
+        BLOCK_SIZE,
+        DEVICE,
+        arange_block_indices=True,
+    ).replace(
+        is_prefilling=torch.tensor([True]),
+        recurrent_prefill_checkpoint_plans_cpu=[(64, 160, (80, 96, 112, 144))],
+    )
+    if missing_column is not None:
+        common.block_table_tensor[0, missing_column] = 0
+        with pytest.raises(RuntimeError, match="NULL state block"):
+            builder.build(common_prefix_len=0, common_attn_metadata=common)
+        return
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    checkpoint = metadata.prefill_checkpoint
+    assert checkpoint is not None
+    assert checkpoint.checkpoint_offsets.tolist() == [[16, 32, 48, 80]]
+    assert checkpoint.block_table_columns.tolist() == [[4, 5, 6, 8]]
+    assert checkpoint.required_mask is not None and checkpoint.required_mask.all()
+    updated = builder.update_block_table(
+        metadata, common.block_table_tensor + 100, torch.zeros(64, dtype=torch.int64)
+    )
+    assert updated.prefill_checkpoint is not None
+    torch.testing.assert_close(
+        updated.prefill_checkpoint.state_indices, checkpoint.state_indices + 100
+    )
+
+
+@pytest.mark.parametrize("prompt", [8192, 16384])
+def test_dcp4_allocator_plan_reaches_all_gdn_checkpoint_destinations(prompt):
+    from tests.v1.core.test_recurrent_prefill_checkpoint import cache_fixture
+
+    cache, manager, scheduler, request = cache_fixture(prompt, speculative=3)
+    start = prompt - 8192
+    if start:
+        assert cache.allocate_slots(request, 8192, num_lookahead_tokens=3) is not None
+        scheduler._record_coalescing_origin(request, 0, 0, 0, False)
+        request.num_computed_tokens = start
+    plan = scheduler._recurrent_checkpoint_plan(request, start, prompt)
+    assert plan is not None and len(plan[2]) == 4
+    assert (
+        cache.allocate_slots(
+            request, 8192, num_lookahead_tokens=3, recurrent_checkpoint_plan=plan
+        )
+        is not None
+    )
+    blocks = manager.req_to_blocks[request.request_id]
+    builder = _create_gdn_builder(
+        num_speculative_tokens=3, num_prefill_checkpoint_blocks=4
+    )
+    builder.kv_cache_spec = manager.kv_cache_spec
+    builder.vllm_config.parallel_config.decode_context_parallel_size = 4
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[prompt], query_lens=[8192]), 512, DEVICE
+    ).replace(
+        is_prefilling=torch.tensor([True]),
+        block_table_tensor=torch.tensor(
+            [[b.block_id for b in blocks]], dtype=torch.int32
+        ),
+        recurrent_prefill_checkpoint_plans_cpu=[plan],
+    )
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    checkpoint = metadata.prefill_checkpoint
+    assert checkpoint is not None
+    assert checkpoint.checkpoint_offsets.tolist() == [[4096, 6144, 7168, 7680]]
+    columns = [position // 512 - 1 for position in plan[2]]
+    expected_ids = [blocks[column].block_id for column in columns]
+    assert checkpoint.state_indices.tolist() == [expected_ids]
+    assert checkpoint.required_mask is not None and checkpoint.required_mask.all()
+    final_and_reserve = [block.block_id for block in blocks[prompt // 512 - 1 :]]
+    assert len(final_and_reserve) == 4
+    assert len(set(expected_ids + final_and_reserve)) == 8

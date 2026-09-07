@@ -4,7 +4,7 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Any, Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
@@ -23,6 +23,12 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.recurrent_prefill_checkpoint import (
+    CheckpointPlan,
+    continuation_layout,
+    validate_plan,
+)
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -384,6 +390,68 @@ class KVCacheManager:
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
 
+    def _allocate_checkpoint_slots(
+        self, request: Request, plan: CheckpointPlan, **kwargs: Any
+    ) -> KVCacheBlocks | None:
+        """Keep checkpoint allocation plans scoped to one admission attempt."""
+        start, end, targets = plan
+        cached = kwargs["new_computed_blocks"]
+        if (
+            request.num_computed_tokens != start
+            or start + kwargs["num_new_tokens"] != end
+            or end > request.num_prompt_tokens
+            or request.num_tokens != request.num_prompt_tokens
+            or kwargs["num_new_computed_tokens"]
+            or kwargs["num_external_computed_tokens"]
+            or kwargs["delay_cache_blocks"]
+            or kwargs["num_encoder_tokens"]
+            or (cached is not None and any(cached.blocks))
+            or request.num_preemptions
+            or request.spec_token_ids
+            or request.has_encoder_inputs
+            or request.resumable
+            or request.use_boundary_checkpoints
+        ):
+            raise ValueError("checkpoint allocation requires a cold pure prompt chunk")
+        managers = [
+            manager
+            for manager in self.coordinator.single_type_managers
+            if isinstance(manager, MambaManager)
+        ]
+        if not managers:
+            raise ValueError("checkpoint allocation requires recurrent cache groups")
+        for manager in managers:
+            assert isinstance(manager.kv_cache_spec, MambaSpec)
+            validate_plan(plan, start, end, manager.block_size)
+            if (
+                manager.mamba_cache_mode != "align"
+                or manager.kv_cache_spec.num_prefill_checkpoint_blocks < len(targets)
+                or request.request_id in manager._partial_hit_reqs
+            ):
+                raise ValueError(
+                    "recurrent cache group cannot produce the checkpoint plan"
+                )
+            if start:
+                if request.request_id not in manager._allocated_block_reqs:
+                    raise ValueError("continuation has no retained running state")
+                continuation_layout(
+                    manager.req_to_blocks[request.request_id],
+                    plan,
+                    manager.block_size,
+                    manager.num_speculative_blocks,
+                )
+            elif manager.req_to_blocks.get(request.request_id):
+                raise ValueError(
+                    "cold checkpoint request already owns recurrent blocks"
+                )
+        try:
+            for manager in managers:
+                manager._planned_recurrent_checkpoints[request.request_id] = plan
+            return self.allocate_slots(request, **kwargs)
+        finally:
+            for manager in managers:
+                manager._planned_recurrent_checkpoints.pop(request.request_id, None)
+
     def allocate_slots(
         self,
         request: Request,
@@ -397,6 +465,7 @@ class KVCacheManager:
         full_sequence_must_fit: bool = False,
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
+        recurrent_checkpoint_plan: CheckpointPlan | None = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -480,6 +549,21 @@ class KVCacheManager:
         Returns:
             A list of new allocated blocks.
         """
+        if recurrent_checkpoint_plan is not None:
+            return self._allocate_checkpoint_slots(
+                request,
+                recurrent_checkpoint_plan,
+                num_new_tokens=num_new_tokens,
+                num_new_computed_tokens=num_new_computed_tokens,
+                new_computed_blocks=new_computed_blocks,
+                num_lookahead_tokens=num_lookahead_tokens,
+                num_external_computed_tokens=num_external_computed_tokens,
+                delay_cache_blocks=delay_cache_blocks,
+                num_encoder_tokens=num_encoder_tokens,
+                full_sequence_must_fit=full_sequence_must_fit,
+                reserved_blocks=reserved_blocks,
+                has_scheduled_reqs=has_scheduled_reqs,
+            )
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
         if num_new_tokens == 0 and num_external_computed_tokens == 0:

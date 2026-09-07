@@ -16,6 +16,11 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
     resolve_block_hashes,
 )
+from vllm.v1.core.recurrent_prefill_checkpoint import (
+    CheckpointPlan,
+    continuation_layout,
+    validate_plan,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
@@ -1633,6 +1638,7 @@ class MambaManager(SingleTypeKVCacheManager):
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+        self._planned_recurrent_checkpoints: dict[str, CheckpointPlan] = {}
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1854,6 +1860,43 @@ class MambaManager(SingleTypeKVCacheManager):
         apply_admission_cap: bool = False,
     ) -> int:
         assert isinstance(self.kv_cache_spec, MambaSpec)
+        plan = self._planned_recurrent_checkpoints.get(request_id)
+        if plan is not None:
+            start, end, targets = plan
+            validate_plan(plan, start, end, self.block_size)
+            if apply_admission_cap:
+                # Full-prompt admission bounds the recurrent resident peak;
+                # actual allocation below is restricted to this chunk's span.
+                resident = (
+                    2
+                    + self.num_speculative_blocks
+                    + self.kv_cache_spec.num_prefill_checkpoint_blocks
+                )
+                owned = sum(
+                    not block.is_null for block in self.req_to_blocks[request_id]
+                )
+                return max(resident - owned, 0)
+            if (
+                new_computed_blocks
+                or total_computed_tokens != start
+                or num_tokens_main_model != end
+            ):
+                raise ValueError(
+                    "checkpoint admission differs from the planned query span"
+                )
+            if start:
+                _, layout = continuation_layout(
+                    self.req_to_blocks[request_id],
+                    plan,
+                    self.block_size,
+                    self.num_speculative_blocks,
+                )
+                return layout.count(-2)
+            if self.req_to_blocks.get(request_id):
+                raise ValueError(
+                    "cold checkpoint allocation requires an empty block table"
+                )
+            return len(targets) + 1 + self.num_speculative_blocks
         if (
             len(new_computed_blocks) > 0
             and new_computed_blocks[-1].block_hash in self.cached_blocks_this_step
@@ -1926,6 +1969,47 @@ class MambaManager(SingleTypeKVCacheManager):
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
         assert isinstance(self.kv_cache_spec, MambaSpec)
+        plan = self._planned_recurrent_checkpoints.get(request_id)
+        if plan is not None:
+            start, end, targets = plan
+            if num_tokens_main_model != end:
+                raise ValueError("checkpoint allocation differs from the planned end")
+            blocks = self.req_to_blocks[request_id]
+            if start:
+                source, layout = continuation_layout(
+                    blocks, plan, self.block_size, self.num_speculative_blocks
+                )
+                retained = tuple(blocks)
+                allocated = iter(self.block_pool.get_new_blocks(layout.count(-2)))
+                replacement = [
+                    retained[index]
+                    if index >= 0
+                    else self._null_block
+                    if index == -1
+                    else next(allocated)
+                    for index in layout
+                ]
+                self.last_state_block_idx[request_id] = source
+                blocks[:] = replacement
+                self._allocated_block_reqs.add(request_id)
+                return replacement[len(retained) :]
+            if blocks:
+                raise ValueError(
+                    "cold checkpoint allocation requires an empty block table"
+                )
+            final_column = cdiv(end, self.block_size) - 1
+            columns = [target // self.block_size - 1 for target in targets]
+            columns.extend(
+                range(final_column, final_column + 1 + self.num_speculative_blocks)
+            )
+            physical = self.block_pool.get_new_blocks(len(columns))
+            blocks.extend(
+                [self._null_block] * (final_column + 1 + self.num_speculative_blocks)
+            )
+            for column, block in zip(columns, physical):
+                blocks[column] = block
+            self._allocated_block_reqs.add(request_id)
+            return blocks[:]
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
             # speculative decoding (MTP/EAGLE) with linear attention.
@@ -2058,6 +2142,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
             self._num_checkpoint_blocks.pop(request_id, None)
+            self._planned_recurrent_checkpoints.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
