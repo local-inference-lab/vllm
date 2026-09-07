@@ -81,7 +81,7 @@ _QSA_INDEX_HEAD_DIM = 128
 _QSA_MANAGER_BLOCK_ALIGNMENT = 8
 _QSA_MAX_SPECULATIVE_TOKENS = 4
 _QSA_SPLITTING_OP = "vllm::qwen3_8_flash_next_qsa_with_output"
-_QSA_PROJECTED_READ_OP = "vllm::qwen3_8_flash_next_qsa_read_projected"
+_QSA_PROJECTED_READ_OP = "vllm::qwen3_8_flash_next_qsa_run_projected"
 
 
 def _qsa_prefill_context_capacities(
@@ -238,13 +238,18 @@ class _B12xQSAWarmup:
             }
 
             def compile_rows(context: _QSAContextPlan, rows: int) -> None:
-                qsa.run(
-                    layer._bind_qsa_context(context),
-                    **{
-                        key: value[:rows] if key in row_inputs else value
-                        for key, value in inputs.items()
-                    },
-                )
+                dynamic = {
+                    key: value[:rows] if key in row_inputs else value
+                    for key, value in inputs.items()
+                }
+                qsa.run(layer._bind_qsa_context(context), **dynamic)
+                if layer.overlap_input_projections and rows <= 16:
+                    layer._index_ready.record(current_stream())
+                    qsa.run(
+                        layer._bind_qsa_context(context, overlap=True),
+                        **dynamic,
+                        index_ready=layer._index_ready,
+                    )
 
             for context in live_contexts:
                 compile_rows(context, prefill_rows)
@@ -255,13 +260,12 @@ class _B12xQSAWarmup:
                         compile_rows(decode_context, rows)
                 if getattr(layer, "_share_mtp_indices", False):
                     rows = int(layer.max_seqs)
-                    qsa.run_selected(
+                    qsa.run(
                         layer._bind_qsa_context(decode_context),
                         query=inputs["query"][:rows],
                         request_ids=inputs["request_ids"][:rows],
                         query_positions=inputs["query_positions"][:rows],
-                        selected_positions=layer._mtp_shared_selected_positions,
-                        selection_errors=layer._mtp_read_errors,
+                        reuse_draft_selection=True,
                     )
 
         return B12xWarmupUnit(
@@ -790,88 +794,6 @@ def _stage_qsa_rope_positions_kernel(
     )
 
 
-@triton.jit
-def _record_mtp_selection_metadata_kernel(
-    positions,
-    errors,
-    saved_positions,
-    saved_errors,
-    rows,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = row < rows
-    tl.store(saved_positions + row, tl.load(positions + row, mask, other=-1), mask)
-    tl.store(saved_errors + row, tl.load(errors + row, mask, other=0), mask)
-
-
-@triton.jit
-def _compact_mtp_selection_kernel(
-    source_rows,
-    source_positions,
-    source_errors,
-    source_selection,
-    captured_lengths,
-    captured_errors,
-    captured_selection,
-    source_capacity,
-    source_stride,
-    destination_stride,
-    WIDTH: tl.constexpr,
-    TAIL: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    source = tl.load(source_rows + row).to(tl.int64)
-    valid = (source >= 0) & (source < source_capacity)
-    column = tl.arange(0, BLOCK)
-    position = tl.load(source_positions + source, valid, other=-1)
-    error = tl.load(source_errors + source, valid, other=1)
-    selected = tl.load(
-        source_selection + source * source_stride + column,
-        valid & (column < WIDTH),
-        other=-1,
-    )
-    tl.store(
-        captured_selection + row * destination_stride + column,
-        selected,
-        column < WIDTH + TAIL,
-    )
-    tl.store(captured_lengths + row, position + 1)
-    tl.store(captured_errors + row, error)
-
-
-@triton.jit
-def _append_mtp_selection_tail_kernel(
-    captured_lengths,
-    captured_errors,
-    positions,
-    request_ids,
-    selection,
-    errors,
-    selection_stride,
-    max_requests,
-    WIDTH: tl.constexpr,
-    TAIL: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    column = tl.arange(0, BLOCK)
-    start = tl.load(captured_lengths + row)
-    end = tl.load(positions + row)
-    request = tl.load(request_ids + row)
-    active = (request >= 0) & (request < max_requests)
-    valid = active & (start > 0) & (end >= start) & (end < start + TAIL)
-    tail = start + column
-    tl.store(
-        selection + row * selection_stride + WIDTH + column,
-        tl.where(valid & (tail <= end), tail, -1),
-        column < TAIL,
-    )
-    error = tl.load(captured_errors + row)
-    tl.store(errors + row, tl.where(active, error | tl.where(valid, 0, 1), 0))
-
-
 class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
     """Merged main attention, selector state, and b12x QSA transaction."""
 
@@ -1038,6 +960,12 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         self._selector_done = (
             torch.cuda.Event() if self.overlap_input_projections else None
         )
+        self._index_ready = (
+            torch.cuda.Event() if self.overlap_input_projections else None
+        )
+        if self._selector_done is not None:
+            self._selector_done.record(aux_stream())
+        self._selector_index_inputs: tuple[torch.Tensor, ...] | None = None
         self._selector_metadata_views: _StagedQSAMetadata | None = None
         self._native_selection_width = self.budget + self.compress_ratio - 1
         self._share_mtp_indices = bool(
@@ -1050,8 +978,8 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             for name, shape, dtype in (
                 ("_mtp_source_positions", (self.max_tokens,), torch.int64),
                 ("_mtp_source_errors", (self.max_tokens,), torch.int32),
-                ("_mtp_captured_lengths", (self.max_seqs,), torch.int64),
-                ("_mtp_captured_errors", (self.max_seqs,), torch.int32),
+                ("_mtp_source_rows", (self.max_seqs,), torch.int64),
+                ("_mtp_num_source_rows", (1,), torch.int32),
                 ("_mtp_read_errors", (self.max_seqs,), torch.int32),
                 (
                     "_mtp_shared_selected_positions",
@@ -1068,6 +996,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
                     persistent=False,
                 )
             self._mtp_shared_selected_positions.fill_(-1)
+            self._mtp_source_rows.fill_(-1)
 
         self.register_buffer(
             "_raw_k_ring",
@@ -1411,11 +1340,27 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         context: _QSAContextPlan,
         staged: _StagedQSAMetadata | None = None,
         output: torch.Tensor | None = None,
+        *,
+        overlap: bool = False,
     ):
         impl = cast(Qwen3_8FlashNextQSAImpl, self.impl)
         main_k_cache, main_v_cache = impl._kv_cache_views(self.kv_cache)
         rope_cos, rope_sin = self.rotary_emb.cos_sin_cache.chunk(2, dim=-1)
         rows = context.plan.caps.max_q_rows
+        draft_selection = None
+        if self._share_mtp_indices:
+            qsa = get_b12x_qsa()
+            if qsa is None:
+                raise RuntimeError("b12x QSA is unavailable for draft state binding")
+            draft_selection = qsa.DraftSelectionState(
+                selected_positions=self._selected_positions,
+                logical_positions=self._mtp_source_positions,
+                errors=self._mtp_source_errors,
+                source_rows=self._mtp_source_rows,
+                num_source_rows=self._mtp_num_source_rows,
+                work_positions=self._mtp_shared_selected_positions,
+                work_errors=self._mtp_read_errors,
+            )
         return context.plan.bind(
             scratch=context.scratch,
             main_block_table=context.main_block_table,
@@ -1438,6 +1383,9 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             rope_sin=rope_sin,
             output=self._qsa_output[:rows] if output is None else output,
             selected_positions=self._selected_positions[:rows],
+            selection_stream=aux_stream() if overlap else None,
+            selection_done=self._selector_done if overlap else None,
+            draft_selection=draft_selection,
         )
 
     def unbind_kv_cache(self) -> None:
@@ -1687,7 +1635,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         self.skip_topk = bool(skip and self._share_mtp_indices)
 
     def compact_topk_indices(self, source_rows: torch.Tensor) -> None:
-        """Capture accepted-token-aligned draft rows and their selector errors."""
+        """Map compacted requests to their accepted draft-selection anchors."""
         if not self._share_mtp_indices:
             return
         rows = int(source_rows.numel())
@@ -1701,50 +1649,9 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             or not source_rows.is_contiguous()
         ):
             raise TypeError("QSA MTP source rows must be contiguous CUDA int32/int64")
-        _compact_mtp_selection_kernel[(rows,)](
-            source_rows,
-            self._mtp_source_positions,
-            self._mtp_source_errors,
-            self._selected_positions,
-            self._mtp_captured_lengths,
-            self._mtp_captured_errors,
-            self._mtp_shared_selected_positions,
-            self.max_tokens,
-            self._selected_positions.stride(0),
-            self._mtp_shared_selected_positions.stride(0),
-            WIDTH=self._native_selection_width,
-            TAIL=self.max_speculative_tokens,
-            BLOCK=triton.next_power_of_2(
-                self._native_selection_width + self.max_speculative_tokens
-            ),
-        )
-
-    def _record_mtp_selection_metadata(self, binding, staged, rows: int) -> None:
-        if self._share_mtp_indices:
-            _record_mtp_selection_metadata_kernel[(triton.cdiv(rows, 128),)](
-                staged.logical_positions,
-                binding.state_errors,
-                self._mtp_source_positions,
-                self._mtp_source_errors,
-                rows,
-                BLOCK=128,
-            )
-
-    def _append_mtp_selection_tail(self, positions, request_ids) -> None:
-        _append_mtp_selection_tail_kernel[(int(positions.shape[0]),)](
-            self._mtp_captured_lengths,
-            self._mtp_captured_errors,
-            positions,
-            request_ids,
-            self._mtp_shared_selected_positions,
-            self._mtp_read_errors,
-            self._mtp_shared_selected_positions.stride(0),
-            self.max_seqs,
-            WIDTH=self._native_selection_width,
-            TAIL=self.max_speculative_tokens,
-            BLOCK=triton.next_power_of_2(self.max_speculative_tokens),
-            num_warps=1,
-        )
+        self._mtp_source_rows[:rows].copy_(source_rows)
+        if rows < self.max_seqs:
+            self._mtp_source_rows[rows:].fill_(-1)
 
     def _run_reused_qsa(self, query, key, value, output) -> None:
         raw = get_forward_context().attn_metadata
@@ -1791,17 +1698,15 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         impl.do_kv_cache_update(
             self, key[:rows], value[:rows], self.kv_cache, metadata.slot_mapping[:rows]
         )
-        self._append_mtp_selection_tail(staged.logical_positions, staged.request_ids)
         qsa = get_b12x_qsa()
         if qsa is None:
             raise RuntimeError("b12x QSA is unavailable for MTP selection reuse")
-        qsa.run_selected(
+        qsa.run(
             self._bind_qsa_context(context, staged, output[:rows]),
             query=query[:rows],
             request_ids=staged.request_ids,
             query_positions=staged.logical_positions,
-            selected_positions=self._mtp_shared_selected_positions[:rows],
-            selection_errors=self._mtp_read_errors[:rows],
+            reuse_draft_selection=True,
         )
         if rows < output.shape[0]:
             output[rows:].zero_()
@@ -1856,7 +1761,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             return None
         return metadata
 
-    def _project_and_select(
+    def _project_qsa_inputs(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -1890,29 +1795,17 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
                 positions, staged.request_ids, rows
             )
             index_query, raw_index_key = self.indexer.project(hidden_states)
-            qsa = get_b12x_qsa()
-            if qsa is None:
-                raise RuntimeError("b12x QSA disappeared after cache binding")
-            binding = self._bind_qsa_context(context, staged)
-            qsa.select(
-                binding,
-                index_query=index_query[:rows],
-                raw_index_key=raw_index_key[:rows],
-                request_ids=staged.request_ids,
-                query_positions=staged.logical_positions,
-                rope_positions=rope_positions,
-                sequence_lengths=staged.sequence_lengths,
-                query_start_loc=staged.query_start_loc,
-                num_accepted_tokens=staged.num_accepted_tokens,
-                is_prefilling=staged.is_prefilling,
+            self._selector_index_inputs = (
+                index_query[:rows],
+                raw_index_key[:rows],
+                rope_positions,
             )
-            self._record_mtp_selection_metadata(binding, staged, rows)
-            self._selector_done.record(stream)
-        # Only QKV is exposed as a returned tensor. Selector storage is private
-        # until _read_projected_qsa joins its producer before reading attention.
+            self._index_ready.record(stream)
+        # The complete B12X run consumes these inputs and joins its selection
+        # stream after the independent main Q/K/V producer has been enqueued.
         return self.qkv_proj(hidden_states)[0]
 
-    def _read_projected_qsa(
+    def _run_projected_qsa(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -1944,19 +1837,26 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             self.kv_cache,
             metadata.slot_mapping[:rows],
         )
-        assert self._selector_done is not None
-        current_stream().wait_event(self._selector_done)
         qsa = get_b12x_qsa()
         if qsa is None or metadata.request_ids is None:
             raise RuntimeError("b12x QSA selection metadata is unavailable")
         staged = self._selector_metadata_views
-        if staged is None:
+        if staged is None or self._selector_index_inputs is None:
             raise RuntimeError("QSA attention has no matching selector metadata")
-        qsa.run_selected(
-            self._bind_qsa_context(context, staged, output[:rows]),
+        index_query, raw_index_key, rope_positions = self._selector_index_inputs
+        qsa.run(
+            self._bind_qsa_context(context, staged, output[:rows], overlap=True),
             query=query[:rows],
+            index_query=index_query,
+            raw_index_key=raw_index_key,
             request_ids=staged.request_ids,
             query_positions=staged.logical_positions,
+            rope_positions=rope_positions,
+            sequence_lengths=staged.sequence_lengths,
+            query_start_loc=staged.query_start_loc,
+            num_accepted_tokens=staged.num_accepted_tokens,
+            is_prefilling=staged.is_prefilling,
+            index_ready=self._index_ready,
         )
         if rows < output.shape[0]:
             output[rows:].zero_()
@@ -2015,7 +1915,6 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             num_accepted_tokens=staged.num_accepted_tokens,
             is_prefilling=staged.is_prefilling,
         )
-        self._record_mtp_selection_metadata(binding, staged, rows)
         if rows < output.shape[0]:
             output[rows:].zero_()
 
@@ -2080,7 +1979,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
     ) -> torch.Tensor:
         if self.overlap_input_projections or self._share_mtp_indices:
             layer_name = _encode_layer_name(self.layer_name)
-            qkv = torch.ops.vllm.qwen3_8_flash_next_qsa_project_and_select(
+            qkv = torch.ops.vllm.qwen3_8_flash_next_qsa_project_inputs(
                 positions,
                 hidden_states,
                 self._selected_positions,
@@ -2093,7 +1992,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             key = key.view(rows, self.num_kv_heads, self.head_dim)
             value = value.view(rows, self.num_kv_heads, self.head_dim)
             output = torch.empty_like(query)
-            torch.ops.vllm.qwen3_8_flash_next_qsa_read_projected(
+            torch.ops.vllm.qwen3_8_flash_next_qsa_run_projected(
                 positions,
                 hidden_states,
                 query,
@@ -2141,7 +2040,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         return projected
 
 
-def _qsa_project_and_select(
+def _qsa_project_inputs(
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
     selected_positions: torch.Tensor,
@@ -2151,10 +2050,10 @@ def _qsa_project_and_select(
     layer = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
     if selected_positions.data_ptr() != layer._selected_positions.data_ptr():
         raise ValueError("QSA selection must use its bound caller-owned buffer")
-    return layer._project_and_select(positions, hidden_states)
+    return layer._project_qsa_inputs(positions, hidden_states)
 
 
-def _qsa_project_and_select_fake(
+def _qsa_project_inputs_fake(
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
     selected_positions: torch.Tensor,
@@ -2165,14 +2064,15 @@ def _qsa_project_and_select_fake(
 
 
 direct_register_custom_op(
-    op_name="qwen3_8_flash_next_qsa_project_and_select",
-    op_func=_qsa_project_and_select,
+    op_name="qwen3_8_flash_next_qsa_project_inputs",
+    op_func=_qsa_project_inputs,
+    # This buffer is also the ordering token for the hidden selector inputs.
     mutates_args=["selected_positions"],
-    fake_impl=_qsa_project_and_select_fake,
+    fake_impl=_qsa_project_inputs_fake,
 )
 
 
-def _qsa_read_projected(
+def _qsa_run_projected(
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
     query: torch.Tensor,
@@ -2185,10 +2085,10 @@ def _qsa_read_projected(
     layer = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
     if selected_positions.data_ptr() != layer._selected_positions.data_ptr():
         raise ValueError("QSA attention must consume the matching selector buffer")
-    layer._read_projected_qsa(positions, hidden_states, query, key, value, output)
+    layer._run_projected_qsa(positions, hidden_states, query, key, value, output)
 
 
-def _qsa_read_projected_fake(
+def _qsa_run_projected_fake(
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
     query: torch.Tensor,
@@ -2202,10 +2102,10 @@ def _qsa_read_projected_fake(
 
 
 direct_register_custom_op(
-    op_name="qwen3_8_flash_next_qsa_read_projected",
-    op_func=_qsa_read_projected,
-    mutates_args=["output"],
-    fake_impl=_qsa_read_projected_fake,
+    op_name="qwen3_8_flash_next_qsa_run_projected",
+    op_func=_qsa_run_projected,
+    mutates_args=["output", "selected_positions"],
+    fake_impl=_qsa_run_projected_fake,
 )
 
 

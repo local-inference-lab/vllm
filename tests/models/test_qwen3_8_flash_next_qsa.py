@@ -264,6 +264,7 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     owner.max_seq_len = max_seq_len
     owner.max_speculative_tokens = 2
     owner.max_decode_rows = 6
+    owner._share_mtp_indices = False
     owner.compress_ratio = 4
     owner.raw_ring_capacity = 8
     owner.budget = 2048
@@ -478,6 +479,7 @@ def test_qsa_warmup_runs_every_context_with_only_padded_requests(
         max_tokens=max_tokens,
         max_speculative_tokens=2,
         max_decode_rows=6,
+        overlap_input_projections=False,
     )
     calls = []
 
@@ -1238,68 +1240,98 @@ def _require_qsa_gpu() -> torch.device:
 
 
 @pytest.mark.parametrize("source_dtype", [torch.int32, torch.int64])
-def test_mtp_selection_capture_reorders_errors_and_replaces_causal_tail_on_replay(
+def test_mtp_anchor_row_map_follows_compaction_during_graph_replay(
     source_dtype: torch.dtype,
 ) -> None:
-    """A draft round owns its anchor selection; padding cannot inherit errors."""
+    """Only row ownership is supplied by vLLM; B12X owns anchor/tail evaluation."""
     device = _require_qsa_gpu()
     layer = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
     torch.nn.Module.__init__(layer)
     layer._share_mtp_indices = True
     layer.max_tokens, layer.max_seqs, layer.max_speculative_tokens = 16, 4, 3
-    layer._native_selection_width = 2051
-    layer._selected_positions = torch.arange(
-        16 * 2051, device=device, dtype=torch.int32
-    ).view(16, 2051)
-    layer._mtp_source_positions = (
-        torch.arange(16, device=device, dtype=torch.int64) + 63
+    layer._selected_positions = torch.empty(
+        (16, 2051), device=device, dtype=torch.int32
     )
-    layer._mtp_source_errors = torch.zeros(16, device=device, dtype=torch.int32)
-    layer._mtp_source_errors[7] = 512
-    layer._mtp_shared_selected_positions = torch.full(
-        (4, 2054), -1, device=device, dtype=torch.int32
-    )
-    layer._mtp_captured_lengths = torch.empty(4, device=device, dtype=torch.int64)
-    layer._mtp_captured_errors = torch.empty(4, device=device, dtype=torch.int32)
-    layer._mtp_read_errors = torch.empty(4, device=device, dtype=torch.int32)
-    source_rows = torch.tensor([7, 3, 0, -1], device=device, dtype=source_dtype)
-    request_ids = torch.tensor([0, 1, -1, -1], device=device, dtype=torch.int32)
-    positions = torch.tensor([72, 67, -1, -1], device=device, dtype=torch.int64)
-
-    def capture_and_read():
-        layer.compact_topk_indices(source_rows)
-        layer._append_mtp_selection_tail(positions, request_ids)
-
-    capture_and_read()
+    layer._mtp_source_rows = torch.full((4,), -1, device=device, dtype=torch.int64)
+    source_rows = torch.tensor([7, 3, 0], device=device, dtype=source_dtype)
+    pointer = layer._mtp_source_rows.data_ptr()
+    layer.compact_topk_indices(source_rows)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        capture_and_read()
-    for shift in (0, 100):
-        layer._selected_positions.add_(shift)
+        layer.compact_topk_indices(source_rows)
+    for mapping in ([7, 3, 0], [1, -1, 15]):
+        source_rows.copy_(torch.tensor(mapping, device=device, dtype=source_dtype))
+        layer._mtp_source_rows.fill_(99)
         graph.replay()
-        torch.testing.assert_close(
-            layer._mtp_shared_selected_positions[:3, :2051],
-            layer._selected_positions[source_rows[:3].long()],
-            rtol=0,
-            atol=0,
-        )
-        assert layer._mtp_shared_selected_positions[:, 2051:].tolist() == [
-            [71, 72, -1],
-            [67, -1, -1],
-            [-1, -1, -1],
-            [-1, -1, -1],
-        ]
-        assert layer._mtp_read_errors.tolist() == [512, 0, 0, 0]
-        # Rejection can shorten a speculative tail; no future column may survive.
-        immutable = layer._mtp_shared_selected_positions[:, :2051].clone()
-        positions[0] = 71
-        layer._append_mtp_selection_tail(positions, request_ids)
-        assert layer._mtp_shared_selected_positions[0, 2051:].tolist() == [71, -1, -1]
-        assert torch.equal(layer._mtp_shared_selected_positions[:, :2051], immutable)
-        positions[0] = 75
-        layer._append_mtp_selection_tail(positions, request_ids)
-        assert layer._mtp_read_errors[0].item() != 0
-        positions[0] = 72
+        assert layer._mtp_source_rows.tolist() == [*mapping, -1]
+        assert layer._mtp_source_rows.data_ptr() == pointer
+
+
+def test_projected_qsa_uses_complete_run_with_ready_event(monkeypatch) -> None:
+    """The projection consumer needs only B12X run, never split QSA exports."""
+    rows = 2
+    metadata = SimpleNamespace(
+        num_actual_tokens=rows,
+        max_seq_len=8,
+        slot_mapping=torch.arange(rows),
+        request_ids=torch.arange(rows, dtype=torch.int32),
+    )
+    staged = SimpleNamespace(
+        request_ids=torch.arange(rows, dtype=torch.int32),
+        logical_positions=torch.arange(rows, dtype=torch.int64),
+        sequence_lengths=torch.ones(rows, dtype=torch.int32),
+        query_start_loc=torch.arange(rows + 1, dtype=torch.int32),
+        num_accepted_tokens=torch.ones(rows, dtype=torch.int32),
+        is_prefilling=torch.zeros(rows, dtype=torch.bool),
+    )
+    output = torch.empty(rows, 2, 4)
+    index_query, raw_key, rope = (
+        torch.empty(rows, 2, 4),
+        torch.empty(rows, 4),
+        torch.empty(rows, 1),
+    )
+    ready = object()
+    events = []
+    bindings = []
+
+    def bind(context, live, out, *, overlap):
+        assert live is staged and overlap
+        binding = SimpleNamespace(output=out)
+        bindings.append(binding)
+        return binding
+
+    def run(binding, **inputs):
+        assert events == ["kv"]
+        assert inputs["index_ready"] is ready
+        assert inputs["index_query"] is index_query
+        assert inputs["raw_index_key"] is raw_key
+        assert inputs["rope_positions"] is rope
+        assert inputs["query_positions"] is staged.logical_positions
+        binding.output.fill_(7)
+
+    layer = SimpleNamespace(
+        skip_topk=False,
+        _parallel_selector_metadata=lambda _: metadata,
+        _qsa_binding_for_workload=lambda **_: object(),
+        _selector_metadata_views=staged,
+        _selector_index_inputs=(index_query, raw_key, rope),
+        _index_ready=ready,
+        _bind_qsa_context=bind,
+        kv_cache=None,
+        impl=SimpleNamespace(do_kv_cache_update=lambda *_: events.append("kv")),
+    )
+    monkeypatch.setattr(qsa_module, "get_b12x_qsa", lambda: SimpleNamespace(run=run))
+    Qwen3_8FlashNextQSAAttention._run_projected_qsa(
+        layer,
+        torch.arange(rows),
+        torch.empty(rows, 8),
+        torch.empty_like(output),
+        torch.empty_like(output),
+        torch.empty_like(output),
+        output,
+    )
+    assert len(bindings) == 1
+    assert torch.all(output == 7)
 
 
 def test_qsa_rope_staging_masks_graph_padding() -> None:
