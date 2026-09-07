@@ -335,3 +335,72 @@ def test_padded_row_parallel_shards_sum_to_the_full_projection_at_tp9() -> None:
         torch.testing.assert_close(residual, output + 1.0)
         total += output
     torch.testing.assert_close(total, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("rows", [0, 1, 4, 8])
+def test_decode_shard_pack_preserves_bits_and_replay(dtype, rows) -> None:
+    """Packing preserves payload bits, logical tail zeros and strided rows."""
+    from vllm.models.kimi_k3.nvidia.ops.projection_shard import pack_projection_shard
+
+    x = torch.randn(rows, 3584 * 2, device="cuda", dtype=dtype)[:, :3584]
+    if rows:
+        x[:, 0] = -0.0
+        x[:, -1] = float("nan")
+    before = x.clone()
+    results = []
+    for rank in (0, 4, 8, 9):
+        start, width = rank * 400, 400
+        padded = torch.nn.functional.pad(x, (0, max(0, start + width - 3584)))
+        expected = padded[:, start : start + width].contiguous()
+        actual = pack_projection_shard(x, start, width)
+        assert actual.is_contiguous()
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+        results.append(actual)
+    assert torch.equal(x.view(torch.uint8), before.view(torch.uint8))
+    if not rows:
+        return
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = pack_projection_shard(x, 3200, 400)
+    address = actual.data_ptr()
+    for value in (1.0, -0.0, -2.0):
+        x.fill_(value)
+        graph.replay()
+        expected = torch.nn.functional.pad(x, (0, 16))[:, 3200:].contiguous()
+        assert actual.data_ptr() == address
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rows", [1, 4, 8, 9])
+def test_decode_shard_pack_preserves_projection_bits_and_dispatch(
+    monkeypatch, rows: int
+) -> None:
+    """The opt-in pack changes no GEMM operand, rank partial or output contract."""
+    from vllm.models.kimi_k3.nvidia import model
+
+    x = torch.randn(rows, 3584, device="cuda", dtype=torch.bfloat16)
+    for rank in range(9):
+        weight = torch.randn(7168, 400, device="cuda", dtype=torch.bfloat16)
+        if rank == 8:
+            weight[:, 384:] = 0
+        projection = _padded_row_parallel(9, rank, weight)
+        projection.logical_input_size = 3584
+        projection.input_pad = 16
+        projection.return_bias = True
+        projection.skip_bias_add = False
+        hook_rows: list[int] = []
+        projection._l2_prefetch_pre_reduce_hook = hook_rows.append
+        with torch.inference_mode():
+            monkeypatch.setattr(model, "kimi_decode_shard_pack_enabled", lambda: False)
+            expected, expected_bias = projection(x)
+            monkeypatch.setattr(model, "kimi_decode_shard_pack_enabled", lambda: True)
+            actual, actual_bias = projection(x)
+        assert expected_bias is actual_bias is None
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+        assert hook_rows == [rows, rows]
+        projection.return_bias = False
+        with torch.inference_mode():
+            assert torch.equal(projection(x), actual)

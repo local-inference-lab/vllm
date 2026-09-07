@@ -31,6 +31,12 @@ _KIMI_INPLACE_REDUCTION_MIN_TOKENS = 1024
 
 
 @lru_cache(maxsize=1)
+def kimi_decode_shard_pack_enabled() -> bool:
+    """Select rank-local packing for padded decode up-projection inputs."""
+    return os.getenv("VLLM_K3_DECODE_SHARD_PACK", "0") == "1"
+
+
+@lru_cache(maxsize=1)
 def kimi_ring_static_io_enabled() -> bool:
     """``VLLM_K3_RING_STATIC_IO=1``: prefill in-place reductions borrow the
     B12X DMA ring's static output instead of copying it out.

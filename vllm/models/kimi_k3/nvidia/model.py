@@ -124,6 +124,7 @@ from vllm.models.kimi_k3.nvidia.tp_projection import (
     gather_kimi_projection_pair_prefill,
     gather_kimi_sharded_projection,
     gather_kimi_sharded_projection_pair,
+    kimi_decode_shard_pack_enabled,
     kimi_projection_gather_mode,
     kimi_reduction_is_borrowed,
     kimi_ring_static_io_enabled,
@@ -816,6 +817,36 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
         )
 
     def forward(self, x: torch.Tensor):
+        if (
+            kimi_decode_shard_pack_enabled()
+            and self.input_pad
+            and not self.input_is_parallel
+            and not self.reduce_results
+            and self.bias is None
+            and isinstance(self.quant_method, UnquantizedLinearMethod)
+            and not envs.VLLM_BATCH_INVARIANT
+            and x.is_cuda
+            and x.ndim == 2
+            and 0 < x.shape[0] <= 8
+            and x.shape[1] == self.logical_input_size
+            and x.stride(-1) == 1
+            and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and not torch.is_grad_enabled()
+        ):
+            from vllm.models.kimi_k3.nvidia.ops.projection_shard import (
+                pack_projection_shard,
+            )
+
+            # Keep the full padded K dimension and the normal GEMM dispatcher.
+            # Dropping zero columns changes the GEMM's reduction order.
+            shard = pack_projection_shard(
+                x, self.tp_rank * self.shard_width, self.shard_width
+            )
+            output = self.quant_method.apply(self, shard, None)
+            hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
+            if hook is not None:
+                hook(output.shape[0])
+            return (output, None) if self.return_bias else output
         if self.input_pad:
             x = torch.nn.functional.pad(x, (0, self.input_pad))
         return super().forward(x)
