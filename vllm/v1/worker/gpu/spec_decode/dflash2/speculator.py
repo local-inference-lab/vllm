@@ -25,6 +25,7 @@ mask embedding is loaded.
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import torch
@@ -115,6 +116,25 @@ class DFlash2Speculator(DSparkSpeculator):
             )
             + f" Draft block {self.draft_query_rows} rows per request.",
         )
+
+    @property
+    def attn_vllm_config(self) -> VllmConfig:
+        """The draft attention view sized for the trained block.
+
+        The attention builders derive their decode query-length threshold
+        from the speculative config's proposal count; a block wider than the
+        proposals needs the threshold to cover every row of it.
+        """
+        config = super().attn_vllm_config
+        speculative_config = config.speculative_config
+        if (
+            speculative_config is not None
+            and self.draft_query_rows > 1 + self.num_speculative_steps
+        ):
+            block_view = copy.copy(speculative_config)
+            block_view.num_speculative_tokens = self.draft_query_rows - 1
+            config.speculative_config = block_view
+        return config
 
     def _query_len_for_speculative_steps(self, num_speculative_steps: int) -> int:
         # Every step drafts the full block; fewer proposals do not shrink it.
