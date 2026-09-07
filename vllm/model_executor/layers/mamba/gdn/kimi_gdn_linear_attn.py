@@ -109,6 +109,7 @@ def _flashkda_prefill(
     workspace: torch.Tensor,
     checkpoint_state: torch.Tensor | None = None,
     checkpoint_offsets: torch.Tensor | None = None,
+    checkpoint_indptr: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run packed bounded-gate KDA prefill into caller-owned buffers."""
     import vllm._flashkda_C  # noqa: F401
@@ -130,6 +131,7 @@ def _flashkda_prefill(
         cu_seqlens.contiguous(),
         checkpoint_state,
         checkpoint_offsets.contiguous() if checkpoint_offsets is not None else None,
+        checkpoint_indptr,
     )
     return out, final_state
 
@@ -157,6 +159,7 @@ def _store_cache_checkpoints_kernel(
     NULL_STATE_IDX: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     STORE_RECURRENT: tl.constexpr,
+    checkpoint_query_indices_ptr=None,
 ):
     """Store FlashKDA recurrent and convolution state at an internal boundary."""
     seq_idx = tl.program_id(0)
@@ -174,7 +177,10 @@ def _store_cache_checkpoints_kernel(
     )
     width_idx = cols // STATE_LEN
     history_idx = cols % STATE_LEN
-    checkpoint_end = tl.load(query_start_loc_ptr + seq_idx_i64) + checkpoint_offset
+    query_idx = seq_idx_i64
+    if checkpoint_query_indices_ptr is not None:
+        query_idx = tl.load(checkpoint_query_indices_ptr + seq_idx_i64)
+    checkpoint_end = tl.load(query_start_loc_ptr + query_idx) + checkpoint_offset
     token_idx = checkpoint_end.to(tl.int64) - STATE_LEN + history_idx.to(tl.int64)
     values = tl.load(
         x_ptr + token_idx * x_stride_0 + width_idx.to(tl.int64) * x_stride_1,
@@ -417,6 +423,7 @@ class _B12xKdaPrefillWarmup:
 class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
     enable_b12x_kda_decode = False
     b12x_kda_null_state_index: int | None = None
+    _flashkda_buffer_specs: tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
 
     def get_state_dtype(
         self,
@@ -441,13 +448,26 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
         spec = super().get_kv_cache_spec(vllm_config)
         assert isinstance(spec, MambaSpec)
-        return replace(
-            spec,
-            num_prefill_checkpoint_blocks=int(
-                self.kda_prefill_backend in ("flashkda", "b12x")
-                and not vllm_config.use_request_boundary_checkpoints
-            ),
+        capacity = int(
+            self.kda_prefill_backend in ("flashkda", "b12x")
+            and not vllm_config.use_request_boundary_checkpoints
         )
+        if capacity and self.kda_prefill_backend == "flashkda":
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            capacity = max(1, (max_tokens - 1) // spec.block_size)
+            assert self._flashkda_buffer_specs is not None
+            output, final_state, checkpoint_state, workspace = (
+                self._flashkda_buffer_specs
+            )
+            checkpoint_shape, _ = checkpoint_state
+            checkpoint_rows = max(checkpoint_shape[0], capacity)
+            self._flashkda_buffer_specs = (
+                output,
+                final_state,
+                ((checkpoint_rows, *checkpoint_shape[1:]), torch.float32),
+                workspace,
+            )
+        return replace(spec, num_prefill_checkpoint_blocks=capacity)
 
     def __init__(
         self,
@@ -565,9 +585,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.gate_lower_bound,
             self.get_state_dtype()[1],
         )
-        self._flashkda_buffer_specs: (
-            tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
-        ) = None
+        self._flashkda_buffer_specs = None
         if self.kda_prefill_backend == "flashkda":
             max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             max_sequences = vllm_config.scheduler_config.max_num_seqs
@@ -1460,11 +1478,16 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     if prefill_checkpoint is not None:
                         assert prefill_query_start_loc is not None
                         num_sequences = initial_state.shape[0]
-                        assert prefill_checkpoint.checkpoint_offsets.shape == (
-                            num_sequences,
-                        )
+                        num_checkpoints = prefill_checkpoint.checkpoint_offsets.numel()
+                        if prefill_checkpoint.checkpoint_indptr is None:
+                            assert num_checkpoints == num_sequences
+                        else:
+                            assert (
+                                prefill_checkpoint.checkpoint_indptr.numel()
+                                == num_sequences + 1
+                            )
                         final_state = final_state[:num_sequences]
-                        checkpoint_state = checkpoint_state[:num_sequences]
+                        checkpoint_state = checkpoint_state[:num_checkpoints]
                         _flashkda_prefill(
                             q=q_ns,
                             k=k_ns,
@@ -1481,6 +1504,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                             workspace=workspace,
                             checkpoint_state=checkpoint_state,
                             checkpoint_offsets=(prefill_checkpoint.checkpoint_offsets),
+                            checkpoint_indptr=prefill_checkpoint.checkpoint_indptr,
                         )
                         core_attn_out_non_spec = flashkda_out
                         last_recurrent_state = final_state
@@ -1519,6 +1543,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                             NULL_BLOCK_ID,
                             store_block_size,
                             True,
+                            prefill_checkpoint.checkpoint_query_indices,
                         )
                     else:
                         (

@@ -862,6 +862,34 @@ class MambaSpec(KVCacheSpec):
     num_heads: int = 1
     tokens_per_state: int = -1
 
+    def prefill_checkpoint_indices(
+        self, num_computed_tokens: int, num_tokens: int
+    ) -> tuple[int, ...]:
+        """Return internal state columns produced by packed checkpoint export.
+
+        The input state must be block-aligned. The final running state is not
+        included; the attention backend writes that state through its ordinary
+        output path. Columns are shared by allocator and attention metadata so
+        no uninitialized page can be advertised as a reusable checkpoint.
+
+        Raises:
+            ValueError: If the query exceeds the declared checkpoint capacity.
+        """
+        if (
+            self.num_prefill_checkpoint_blocks <= 1
+            or num_computed_tokens % self.block_size
+            or num_tokens <= num_computed_tokens
+        ):
+            return ()
+        if self.block_size % 16:
+            raise ValueError("Packed KDA checkpoints require 16-token aligned blocks")
+        first = num_computed_tokens // self.block_size
+        stop = (num_tokens - 1) // self.block_size
+        columns = tuple(range(first, stop))
+        if len(columns) > self.num_prefill_checkpoint_blocks:
+            raise ValueError("Prefill checkpoint count exceeds its declared capacity")
+        return columns
+
     @property
     def state_content_size_bytes(self) -> int:
         return sum(

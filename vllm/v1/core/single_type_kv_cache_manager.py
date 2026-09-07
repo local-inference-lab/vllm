@@ -183,6 +183,8 @@ class SingleTypeKVCacheManager(ABC):
         # This is only used to track the RUNNING requests, we do not track the
         # data for preempted ones.
         self.num_cached_block: dict[str, int] = {}
+        self.cache_internal_attention_anchors = False
+        self._attention_anchor_tokens: dict[str, int] = {}
 
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
@@ -505,30 +507,86 @@ class SingleTypeKVCacheManager(ABC):
         request: Request,
         num_tokens: int,
     ) -> BlockHashWithGroupId | None:
-        """Cache the prompt tail when it ends inside a cache block.
+        """Index append-only attention at prompt and retained replay anchors.
 
-        Only the final prompt hash boundary is registered as a partial
-        prefix-cache entry; intermediate hash boundaries inside the same cache
-        block are intentionally skipped.
+        A divergent continuation cannot authenticate a hash beyond its shared
+        prefix. Publish the bounded replay anchors retained by sparse groups,
+        so an interior recurrent checkpoint has a matching attention entry.
         """
         hash_block_size = self.block_pool.hash_block_size
-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
-        if boundary_tokens == 0 or boundary_tokens > num_tokens:
-            return None
-        if boundary_tokens % self.block_size == 0:
-            return None
-
+        prompt_tail = request.num_prompt_tokens // hash_block_size * hash_block_size
+        boundaries = {prompt_tail}
+        if self.hit_alignment_tokens < self.block_size:
+            reachable_boundaries = [request.num_prompt_tokens - 1]
+            if request.shared_prefix_boundary:
+                reachable_boundaries.append(request.shared_prefix_boundary)
+            for boundary in reachable_boundaries:
+                for alignment in {self.hit_alignment_tokens, self.scheduler_block_size}:
+                    boundaries.update(
+                        reachable_hit_positions(
+                            boundary,
+                            alignment,
+                            self.use_eagle or self.lookup_drops_eagle_block,
+                        )
+                    )
         blocks = self.req_to_blocks[request.request_id]
-        block_idx = boundary_tokens // self.block_size
-        if block_idx >= len(blocks):
-            return None
-        return self.block_pool.cache_partial_block(
-            request=request,
-            block=blocks[block_idx],
-            num_tokens=boundary_tokens,
-            kv_cache_group_id=self.kv_cache_group_id,
-            block_size=self.block_size,
+        prompt_hash = None
+        # Publish the longest entry first: partial-tail promotion removes the
+        # shorter primary hash before shorter aliases can be attached to it.
+        for boundary_tokens in sorted(boundaries, reverse=True):
+            if not 0 < boundary_tokens <= num_tokens:
+                continue
+            if boundary_tokens % self.block_size == 0:
+                continue
+            block_idx = boundary_tokens // self.block_size
+            if block_idx >= len(blocks):
+                continue
+            cached_hash = self.block_pool.cache_partial_block(
+                request=request,
+                block=blocks[block_idx],
+                num_tokens=boundary_tokens,
+                kv_cache_group_id=self.kv_cache_group_id,
+                block_size=self.block_size,
+            )
+            if boundary_tokens == prompt_tail:
+                prompt_hash = cached_hash
+        return prompt_hash
+
+    def _cache_internal_attention_anchors(
+        self,
+        request: Request,
+        num_tokens: int,
+        num_cached_blocks_before: int,
+        retention_interval: int | None,
+    ) -> None:
+        """Authenticate internal recurrent checkpoints without copying attention."""
+        if not self.cache_internal_attention_anchors or retention_interval == 0:
+            return
+        interval = max(self.hit_alignment_tokens, retention_interval or 0)
+        if interval >= self.block_size:
+            return
+        end = num_tokens // interval * interval
+        previous = self._attention_anchor_tokens.get(
+            request.request_id, num_cached_blocks_before * self.block_size
         )
+        if end <= previous:
+            return
+        # A partial-to-full promotion removes the block's shorter aliases.
+        # Re-index only the advanced physical block and the appended suffix,
+        # never the full context on each decode iteration.
+        start = previous // self.block_size * self.block_size
+        first = (start // interval + 1) * interval
+        blocks = self.req_to_blocks[request.request_id]
+        for position in reversed(range(first, end + 1, interval)):
+            if position % self.block_size:
+                self.block_pool.cache_partial_block(
+                    request=request,
+                    block=blocks[position // self.block_size],
+                    num_tokens=position,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                    block_size=self.block_size,
+                )
+        self._attention_anchor_tokens[request.request_id] = end
 
     def _apply_cow(
         self,
@@ -672,6 +730,7 @@ class SingleTypeKVCacheManager(ABC):
         # Default to [] in case a request is freed (aborted) before alloc.
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
+        self._attention_anchor_tokens.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
         return req_blocks
 
@@ -974,6 +1033,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         retention_interval: int | None = None,
         alignment_tokens: int | None = None,
     ) -> None:
+        num_cached_before = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(
             request,
             num_tokens,
@@ -984,6 +1044,9 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if self.block_size == hash_block_size:
             return
         self._cache_partial_tail_block(request, num_tokens)
+        self._cache_internal_attention_anchors(
+            request, num_tokens, num_cached_before, retention_interval
+        )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
@@ -1289,6 +1352,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         retention_interval: int | None = None,
         alignment_tokens: int | None = None,
     ) -> None:
+        num_cached_before = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(
             request,
             num_tokens,
@@ -1300,6 +1364,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         )
         if hit_alignment < self.block_size:
             self._cache_partial_tail_block(request, num_tokens)
+            self._cache_internal_attention_anchors(
+                request, num_tokens, num_cached_before, retention_interval
+            )
 
     @classmethod
     def _fine_grained_reachable_block_mask(
@@ -1650,6 +1717,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # Number of internal checkpoint blocks required by each request's
             # current allocation.
             self._num_checkpoint_blocks: dict[str, int] = {}
+            self._packed_prefill_checkpoint_reqs: set[str] = set()
             # Requests that registered their own last-prompt-boundary partial
             # tail (producers). On the next step's CoW the boundary state moves
             # into a private cow_block; we record that block for connector
@@ -1895,6 +1963,19 @@ class MambaManager(SingleTypeKVCacheManager):
             # mamba layers.
             num_tokens = num_tokens_main_model
 
+            if (
+                apply_admission_cap
+                and self.kv_cache_spec.num_prefill_checkpoint_blocks > 1
+            ):
+                # Admission can inspect the whole prompt. Active recurrent
+                # memory is bounded by one scheduled query, not prompt length.
+                num_tokens = min(
+                    num_tokens,
+                    total_computed_tokens
+                    + (self.kv_cache_spec.num_prefill_checkpoint_blocks + 1)
+                    * self.block_size,
+                )
+
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
             num_required_blocks = (
@@ -1911,6 +1992,21 @@ class MambaManager(SingleTypeKVCacheManager):
                 )
                 or request_id in self._partial_hit_reqs
             )
+            packed_checkpoints = self.kv_cache_spec.prefill_checkpoint_indices(
+                total_computed_tokens, num_tokens
+            )
+            if not apply_admission_cap:
+                self._packed_prefill_checkpoint_reqs.discard(request_id)
+            if packed_checkpoints and not has_partial_hit:
+                if not apply_admission_cap:
+                    self._packed_prefill_checkpoint_reqs.add(request_id)
+                    self._num_checkpoint_blocks[request_id] = len(packed_checkpoints)
+                # Existing private speculative slots remain at their logical
+                # positions. Prefill can materialize them as checkpoints while
+                # appending the final running state and future scratch slots.
+                return max(num_new_blocks, 0) + self._get_num_evictable_blocks(
+                    new_computed_blocks
+                )
             if has_partial_hit:
                 num_new_blocks = max(num_new_blocks, 0) + 1
             checkpoint_block = int(
@@ -1977,6 +2073,15 @@ class MambaManager(SingleTypeKVCacheManager):
                     # When a new request hits the prefix cache, the last block
                     # saves the hit state.
                     self.last_state_block_idx[request_id] = prev_block_len - 1
+
+                if request_id in self._packed_prefill_checkpoint_reqs:
+                    assert not has_partial_hit
+                    new_blocks = self.block_pool.get_new_blocks(
+                        num_required_blocks - len(req_blocks)
+                    )
+                    req_blocks.extend(new_blocks)
+                    self._allocated_block_reqs.add(request_id)
+                    return new_blocks
 
                 num_skipped_blocks = (
                     num_required_blocks - self.num_speculative_blocks - 1
@@ -2066,6 +2171,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
             self._num_checkpoint_blocks.pop(request_id, None)
+            self._packed_prefill_checkpoint_reqs.discard(request_id)
             self._producer_partial_tail_reqs.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to

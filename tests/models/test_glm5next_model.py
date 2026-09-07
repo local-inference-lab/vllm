@@ -1065,18 +1065,30 @@ def test_glm5next_b12x_kda_prefill_matches_the_triton_chunk_path() -> None:
 
 
 @pytest.mark.parametrize("request_boundaries", [False, True])
-def test_glm5next_b12x_prefill_requests_a_checkpoint_block(
+@pytest.mark.parametrize("block_size", [256, 2048, 8192])
+def test_glm5next_prefill_checkpoint_capacity_matches_backend(
     request_boundaries: bool,
+    block_size: int,
 ) -> None:
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     torch.nn.Module.__init__(layer)
-    spec = SimpleNamespace(num_prefill_checkpoint_blocks=0)
+    spec = SimpleNamespace(num_prefill_checkpoint_blocks=0, block_size=block_size)
+    layer._flashkda_buffer_specs = (
+        ((1, 4096, 1, 128), torch.bfloat16),
+        ((1, 1, 128, 128), torch.bfloat16),
+        ((1, 1, 128, 128), torch.bfloat16),
+        ((1024,), torch.uint8),
+    )
 
     def fake_super_spec(self, vllm_config):
         del self, vllm_config
         return spec
 
-    for backend, expected in (("b12x", 1), ("flashkda", 1), ("triton", 0)):
+    for backend, expected in (
+        ("b12x", 1),
+        ("flashkda", max(1, 4095 // block_size)),
+        ("triton", 0),
+    ):
         layer.kda_prefill_backend = backend
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(
@@ -1091,11 +1103,18 @@ def test_glm5next_b12x_prefill_requests_a_checkpoint_block(
                 lambda base, **kwargs: SimpleNamespace(**kwargs),
             )
             resolved = layer.get_kv_cache_spec(
-                SimpleNamespace(use_request_boundary_checkpoints=request_boundaries)
+                SimpleNamespace(
+                    use_request_boundary_checkpoints=request_boundaries,
+                    scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
+                )
             )
         assert resolved.num_prefill_checkpoint_blocks == (
             0 if request_boundaries else expected
         ), backend
+        if backend == "flashkda" and not request_boundaries:
+            shape, dtype = layer._flashkda_buffer_specs[2]
+            assert shape == (expected, 1, 128, 128)
+            assert dtype == torch.float32
 
 
 def test_glm5next_alone_opts_into_b12x_kda_decode() -> None:
@@ -1103,6 +1122,67 @@ def test_glm5next_alone_opts_into_b12x_kda_decode() -> None:
     assert Glm5NextLinearAttention.enable_b12x_kda_decode
     assert KimiGatedDeltaNetAttention.b12x_kda_null_state_index is None
     assert Glm5NextLinearAttention.b12x_kda_null_state_index == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dim_first", [False, True])
+def test_glm5next_packed_checkpoint_store_preserves_query_ownership(dim_first):
+    """Each packed checkpoint stores its owner's convolution history and state."""
+    device = torch.device("cuda", 0)
+    width, history = 48, 3
+    mixed = torch.arange(96 * width, device=device).reshape(96, width).float()
+    recurrent = torch.full((6, 2, 128, 128), -1.0, device=device)
+    saved = (
+        torch.arange(3 * 2 * 128 * 128, device=device).reshape(3, 2, 128, 128).float()
+    )
+    conv_shape = (6, width, history) if dim_first else (6, history, width)
+    conv = torch.full(conv_shape, -1.0, device=device)
+    view = conv if dim_first else conv.transpose(1, 2)
+    starts = torch.tensor([0, 64, 96], dtype=torch.int32, device=device)
+    offsets = torch.tensor([16, 48, 16], dtype=torch.int32, device=device)
+    slots = torch.tensor([3, 1, 4], dtype=torch.int32, device=device)
+    owners = torch.tensor([0, 0, 1], dtype=torch.int64, device=device)
+
+    def store():
+        kimi_gdn_linear_attn._store_cache_checkpoints_kernel[(3, 32)](
+            mixed,
+            view,
+            saved,
+            recurrent,
+            starts,
+            offsets,
+            slots,
+            *mixed.stride(),
+            *view.stride(),
+            saved.stride(0),
+            recurrent.stride(0),
+            offsets.stride(0),
+            history,
+            width,
+            saved[0].numel(),
+            NULL_BLOCK_ID,
+            1024,
+            True,
+            owners,
+        )
+
+    store()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        store()
+    for delta in (0, 1):
+        mixed.add_(delta)
+        saved.add_(delta)
+        view.fill_(-1)
+        recurrent.fill_(-1)
+        graph.replay()
+        torch.accelerator.synchronize()
+        for row, (slot, endpoint) in enumerate(((3, 16), (1, 48), (4, 80))):
+            assert torch.equal(view[slot], mixed[endpoint - history : endpoint].T)
+            assert torch.equal(recurrent[slot], saved[row])
+        assert (view[[0, 2, 5]] == -1).all()
+        assert (recurrent[[0, 2, 5]] == -1).all()
 
 
 def test_glm5next_b12x_mhc_builds_first_layer_broadcast_fn() -> None:

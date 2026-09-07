@@ -683,8 +683,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     "cache managers require block-aligned lookups: %s.",
                     ", ".join(sorted(unsupported_partial_hit_managers)),
                 )
+        has_internal_checkpoints = any(
+            isinstance(g.kv_cache_spec, MambaSpec)
+            and g.kv_cache_spec.num_prefill_checkpoint_blocks > 1
+            for g in kv_cache_config.kv_cache_groups
+        )
         for manager in self.single_type_managers:
             manager.hit_alignment_tokens = self._cache_hit_alignment_tokens
+            manager.cache_internal_attention_anchors = has_internal_checkpoints
         self.verify_and_split_kv_cache_groups()
 
     @property

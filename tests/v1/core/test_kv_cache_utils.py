@@ -3564,6 +3564,17 @@ def test_resolve_block_hashes_gate():
     assert swa.scale_factor == 2
 
 
+@pytest.mark.parametrize("container", [list, tuple])
+def test_block_hash_view_reads_sequences_without_materializing(container):
+    hashes = container(BlockHash(bytes([i])) for i in range(8))
+    view = kv_cache_utils.BlockHashListWithBlockSize(hashes, 2, 4)
+    assert view.block_hashes is hashes
+    assert len(view) == 4
+    assert view[1] == hashes[3]
+    assert view[1::2] == [hashes[3], hashes[7]]
+    assert list(view) == [hashes[i] for i in (1, 3, 5, 7)]
+
+
 def test_resolve_block_hashes_rejects_mismatched_view():
     resolve_block_hashes = kv_cache_utils.resolve_block_hashes
     BlockHashListWithBlockSize = kv_cache_utils.BlockHashListWithBlockSize
