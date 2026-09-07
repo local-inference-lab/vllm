@@ -523,6 +523,46 @@ def test_reader_timeout_caps_indefinite_waits(should_warn):
         assert timeout.timeout_ms() == 7
 
 
+@pytest.mark.parametrize("seconds", ["0", "0.001", "0.01", "1"])
+def test_reader_spin_budget_is_configured_per_queue(monkeypatch, seconds):
+    monkeypatch.setenv("VLLM_SHM_BROADCAST_BUSY_LOOP_S", seconds)
+    writer = MessageQueue(
+        n_reader=1, n_local_reader=1, max_chunk_bytes=1024, max_chunks=1
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    try:
+        assert reader._spin_condition.busy_loop_s == float(seconds)
+    finally:
+        reader.shutdown()
+        writer.shutdown()
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf"])
+def test_reader_spin_budget_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("VLLM_SHM_BROADCAST_BUSY_LOOP_S", value)
+    context = mock.Mock()
+    with pytest.raises(ValueError, match="VLLM_SHM_BROADCAST_BUSY_LOOP_S"):
+        shm_broadcast.SpinCondition(True, context, "unused")
+    context.socket.assert_not_called()
+
+
+def test_reader_short_spin_parks_and_consumes_notifications(monkeypatch):
+    """After the budget, wait uses the existing cancel/notify-aware poller."""
+    condition = shm_broadcast.SpinCondition.__new__(shm_broadcast.SpinCondition)
+    condition.is_reader = True
+    condition.busy_loop_s = 0.001
+    condition.last_read = 10.0
+    condition.local_notify_socket = mock.Mock()
+    condition.read_cancel_socket = mock.Mock()
+    condition.poller = mock.Mock()
+    condition.poller.poll.return_value = [(condition.local_notify_socket, 1)]
+    monkeypatch.setattr(shm_broadcast.time, "monotonic", lambda: 10.002)
+    monkeypatch.setattr(shm_broadcast, "sched_yield", lambda: pytest.fail("must park"))
+    condition.wait(timeout_ms=100)
+    condition.poller.poll.assert_called_once_with(timeout=100)
+    condition.local_notify_socket.recv.assert_called_once()
+
+
 def test_reader_rechecks_shm_after_idle_wait_timeout_without_notify():
     writer = MessageQueue(
         n_reader=1,
