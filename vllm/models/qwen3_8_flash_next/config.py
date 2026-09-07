@@ -43,6 +43,7 @@ class Qwen3_8FlashNextTextConfig(Qwen3NextConfig):
         make_ngram_vocab_size_divisible_by: int = 128,
         ple_embedding_dtype: str | None = None,
         output_gate_type: str = "sigmoid",
+        index_share_for_mtp_iteration: bool = True,
         rope_parameters: dict[str, Any] | None = None,
         layer_types: list[str] | None = None,
         **kwargs: Any,
@@ -89,6 +90,7 @@ class Qwen3_8FlashNextTextConfig(Qwen3NextConfig):
         self.make_ngram_vocab_size_divisible_by = make_ngram_vocab_size_divisible_by
         self.ple_embedding_dtype = ple_embedding_dtype or "bfloat16"
         self.output_gate_type = output_gate_type
+        self.index_share_for_mtp_iteration = index_share_for_mtp_iteration
 
         self._validate_ple_config()
         self._validate_ple_layer_ids()

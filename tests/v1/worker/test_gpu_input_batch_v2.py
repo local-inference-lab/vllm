@@ -24,7 +24,10 @@ DEVICE = current_platform.device_type
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_boundary_auxiliary_restore_survives_slot_reuse_and_virtual_attention_pages():
+@pytest.mark.parametrize("restore_slot", [0, 1])
+def test_boundary_auxiliary_restore_survives_slot_reuse_and_virtual_attention_pages(
+    restore_slot: int,
+):
     """Raw selector state, saved hidden states and attention tails form one bundle."""
     device = torch.device("cuda")
     raw_state = torch.arange(6, dtype=torch.float32, device=device).reshape(2, 3)
@@ -124,13 +127,13 @@ def test_boundary_auxiliary_restore_survives_slot_reuse_and_virtual_attention_pa
         boundary_checkpoint=BoundaryCheckpoint(1, 7, ((6,),), (10,)),
         boundary_checkpoint_blocks=((12, 13), (14, 15)),
     )
-    state.add_request(0, request)
-    torch.testing.assert_close(raw_state[0], expected_state)
-    assert anchors[0].item() == 6
-    assert accepted[0].item() == 1
+    state.add_request(restore_slot, request)
+    torch.testing.assert_close(raw_state[restore_slot], expected_state)
+    assert anchors[restore_slot].item() == 6
+    assert accepted[restore_slot].item() == 1
     torch.testing.assert_close(state.get_hidden_states(10), hidden[:1])
     torch.testing.assert_close(state.get_hidden_states(10, draft=True), spec_hidden[:1])
-    torch.testing.assert_close(draft_state[0], expected_draft)
+    torch.testing.assert_close(draft_state[restore_slot], expected_draft)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

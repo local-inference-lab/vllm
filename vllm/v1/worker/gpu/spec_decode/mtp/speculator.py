@@ -22,7 +22,7 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         draft_model = load_eagle_model(target_model, self.vllm_config)
         spec_config = self.vllm_config.speculative_config
         draft_hf_config = (
-            spec_config.draft_model_config.hf_config
+            spec_config.draft_model_config.hf_text_config
             if spec_config is not None
             else None
         )
