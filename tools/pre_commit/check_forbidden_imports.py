@@ -56,6 +56,9 @@ CHECK_IMPORTS = {
             "tests/utils_/test_hashing.py",
             "tests/compile/test_aot_compile.py",
             "benchmarks/kernels/graph_machete_bench.py",
+            # 로컬 allocator snapshot 형식 및 신뢰된 테스트 출력만 처리한다.
+            "tools/profiler/kimi_memory_audit_patch.py",
+            "tests/tools/test_kimi_memory_audit_patch.py",
             "benchmarks/kernels/benchmark_lora.py",
             "benchmarks/kernels/benchmark_machete.py",
             "benchmarks/fused_kernels/layernorm_rms_benchmarks.py",
