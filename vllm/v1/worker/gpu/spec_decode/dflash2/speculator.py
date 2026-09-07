@@ -26,6 +26,7 @@ mask embedding is loaded.
 from __future__ import annotations
 
 import copy
+import os
 from typing import Any
 
 import torch
@@ -33,6 +34,7 @@ import torch
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.models.kimi_k3.nvidia.dflash2_mla import (
     describe_dflash2_draft,
@@ -96,6 +98,13 @@ class DFlash2Speculator(DSparkSpeculator):
                 f"than one anchor plus {self.num_speculative_steps} proposals."
             )
         self.num_query_per_req = self.draft_query_rows
+        # Fidelity dump (VLLM_DFLASH2_DUMP_DIR): the first requests' target
+        # auxiliary states, block token ids, draft hidden states and logits of
+        # every step, for the offline comparison against the reference model.
+        self._dump_dir = os.environ.get("VLLM_DFLASH2_DUMP_DIR") or None
+        self._dump_step = 0
+        self._dump_sample_hidden: torch.Tensor | None = None
+        self._dump_base_logits: torch.Tensor | None = None
         if self.max_num_reqs * self.num_query_per_req > self.max_num_tokens:
             raise ValueError(
                 "max_num_batched_tokens is too small for the DFlash2 draft block "
@@ -135,6 +144,57 @@ class DFlash2Speculator(DSparkSpeculator):
             block_view.num_speculative_tokens = self.draft_query_rows - 1
             config.speculative_config = block_view
         return config
+
+    def propose(self, input_batch, *args, **kwargs):  # type: ignore[override]
+        draft_tokens = super().propose(input_batch, *args, **kwargs)
+        if self._dump_dir is not None:
+            self._dump_state(input_batch, kwargs.get("aux_hidden_states"), draft_tokens)
+        return draft_tokens
+
+    def _dump_state(self, input_batch, aux_hidden_states, draft_tokens) -> None:
+        """Write one step of the first request (TP rank 0) for the offline
+        comparison: the target auxiliary states of the tokens the target ran
+        this step, the draft block's token ids and positions, the draft's
+        sampled hidden states and unary logits, and the proposals."""
+        if get_tensor_model_parallel_rank() != 0 or self._dump_step >= 64:
+            return
+        rows = self.num_query_per_req
+        record = {
+            "step": self._dump_step,
+            "num_reqs": int(input_batch.num_reqs),
+            "num_target_tokens": int(input_batch.num_tokens),
+            "target_positions": input_batch.positions[: input_batch.num_tokens]
+            .detach()
+            .cpu()
+            if hasattr(input_batch, "positions")
+            else None,
+            "aux_hidden_states": [
+                aux[: input_batch.num_tokens].detach().cpu()
+                for aux in aux_hidden_states
+            ]
+            if aux_hidden_states
+            else None,
+            "block_input_ids": self.input_buffers.input_ids[:rows].detach().cpu(),
+            "block_positions": self.input_buffers.positions[:rows].detach().cpu()
+            if hasattr(self.input_buffers, "positions")
+            else None,
+            "sample_hidden": self._dump_sample_hidden[: self.num_speculative_steps]
+            .detach()
+            .cpu()
+            if self._dump_sample_hidden is not None
+            else None,
+            "base_logits": self._dump_base_logits[: self.num_speculative_steps]
+            .detach()
+            .cpu()
+            if self._dump_base_logits is not None
+            else None,
+            "draft_tokens": draft_tokens[0].detach().cpu(),
+        }
+        os.makedirs(self._dump_dir, exist_ok=True)
+        torch.save(
+            record, os.path.join(self._dump_dir, f"step-{self._dump_step:04d}.pt")
+        )
+        self._dump_step += 1
 
     def _query_len_for_speculative_steps(self, num_speculative_steps: int) -> int:
         # Every step drafts the full block; fewer proposals do not shrink it.
@@ -200,6 +260,10 @@ class DFlash2Speculator(DSparkSpeculator):
         num_sample = num_reqs * n_spec
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
         base_logits = self.model.compute_draft_logits(sample_hidden)
+        if self._dump_dir is not None:
+            # Graph-owned intermediates keep their storage while referenced.
+            self._dump_sample_hidden = sample_hidden
+            self._dump_base_logits = base_logits
         selector = self.model.candidate_selector
         hidden, candidate_ids, successor_rows = selector.prepare_rows(
             sample_hidden, base_logits
