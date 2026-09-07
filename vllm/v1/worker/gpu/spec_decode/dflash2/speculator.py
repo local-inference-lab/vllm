@@ -26,6 +26,7 @@ mask embedding is loaded.
 from __future__ import annotations
 
 import copy
+import inspect
 import os
 from typing import Any
 
@@ -103,8 +104,10 @@ class DFlash2Speculator(DSparkSpeculator):
         # every step, for the offline comparison against the reference model.
         self._dump_dir = os.environ.get("VLLM_DFLASH2_DUMP_DIR") or None
         self._dump_step = 0
-        self._dump_sample_hidden: torch.Tensor | None = None
-        self._dump_base_logits: torch.Tensor | None = None
+        # Per padded request count: the graph-owned (sample_hidden, base_logits)
+        # of the last eager run or capture at that size; a replayed graph
+        # rewrites the same storage, so the entry stays current.
+        self._dump_stash: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         if self.max_num_reqs * self.num_query_per_req > self.max_num_tokens:
             raise ValueError(
                 "max_num_batched_tokens is too small for the DFlash2 draft block "
@@ -146,13 +149,14 @@ class DFlash2Speculator(DSparkSpeculator):
         return config
 
     def propose(self, input_batch, *args, **kwargs):  # type: ignore[override]
-        # A step that skips sampling (a prefill chunk, a cache-restored
-        # prefix) must not report the previous step's tensors.
-        self._dump_sample_hidden = None
-        self._dump_base_logits = None
         draft_tokens = super().propose(input_batch, *args, **kwargs)
         if self._dump_dir is not None:
-            self._dump_state(input_batch, kwargs.get("aux_hidden_states"), draft_tokens)
+            bound = inspect.signature(DSparkSpeculator.propose).bind(
+                self, input_batch, *args, **kwargs
+            )
+            self._dump_state(
+                input_batch, bound.arguments.get("aux_hidden_states"), draft_tokens
+            )
         return draft_tokens
 
     def _dump_state(self, input_batch, aux_hidden_states, draft_tokens) -> None:
@@ -168,6 +172,14 @@ class DFlash2Speculator(DSparkSpeculator):
         max_tokens = int(os.environ.get("VLLM_DFLASH2_DUMP_MAX_TOKENS", "1024"))
         if input_batch.num_tokens > max_tokens:
             aux_hidden_states = None
+        # The smallest captured (or eager) size covering this batch holds the
+        # tensors of this step; a step without sampling has no entry.
+        sizes = sorted(
+            size for size in self._dump_stash if size >= input_batch.num_reqs
+        )
+        stash = self._dump_stash.get(sizes[0]) if sizes else None
+        sample_hidden = stash[0] if stash is not None else None
+        base_logits = stash[1] if stash is not None else None
         record = {
             "step": self._dump_step,
             "num_reqs": int(input_batch.num_reqs),
@@ -187,15 +199,11 @@ class DFlash2Speculator(DSparkSpeculator):
             "block_positions": self.input_buffers.positions[:rows].detach().cpu()
             if hasattr(self.input_buffers, "positions")
             else None,
-            "sample_hidden": self._dump_sample_hidden[: self.num_speculative_steps]
-            .detach()
-            .cpu()
-            if self._dump_sample_hidden is not None
+            "sample_hidden": sample_hidden[: self.num_speculative_steps].detach().cpu()
+            if sample_hidden is not None
             else None,
-            "base_logits": self._dump_base_logits[: self.num_speculative_steps]
-            .detach()
-            .cpu()
-            if self._dump_base_logits is not None
+            "base_logits": base_logits[: self.num_speculative_steps].detach().cpu()
+            if base_logits is not None
             else None,
             "draft_tokens": draft_tokens[0].detach().cpu(),
         }
@@ -271,8 +279,7 @@ class DFlash2Speculator(DSparkSpeculator):
         base_logits = self.model.compute_draft_logits(sample_hidden)
         if self._dump_dir is not None:
             # Graph-owned intermediates keep their storage while referenced.
-            self._dump_sample_hidden = sample_hidden
-            self._dump_base_logits = base_logits
+            self._dump_stash[num_reqs] = (sample_hidden, base_logits)
         selector = self.model.candidate_selector
         hidden, candidate_ids, successor_rows = selector.prepare_rows(
             sample_hidden, base_logits
