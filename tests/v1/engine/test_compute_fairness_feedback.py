@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import deque
 from concurrent.futures import Future
+from contextlib import nullcontext
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -112,3 +114,77 @@ def test_transfer_step_advances_completion_boundary_without_compute_charge():
         contended=True,
         scheduled_tokens=0,
     )
+
+
+def _queued_engine(
+    predecessor_tokens: int, *, successor_timed: bool, deferred: bool = False
+):
+    """Construct two executor results while retaining the real engine loop."""
+    engine = object.__new__(EngineCore)
+    engine.scheduler = Mock()
+    engine.model_executor = Mock()
+    engine._last_model_completion_time = None
+    engine.batch_queue_size = 2
+    engine.is_ec_consumer = True
+    engine.is_pooling_model = False
+    engine.check_for_draft_tokens = False
+    engine._should_throttle_prefills = Mock(return_value=False)
+    engine.log_error_detail = lambda _: nullcontext()
+    engine.capture_iteration_details = lambda _: nullcontext()
+    engine._wait_for_boundary_checkpoint_copies = Mock()
+    engine._process_aborts_queue = Mock()
+    engine._attach_iteration_details = Mock()
+
+    predecessor = _scheduler_output(None)
+    predecessor.total_num_scheduled_tokens = predecessor_tokens
+    prior_future: Future[Mock] = Future()
+    prior_future.set_result(Mock())
+    engine.batch_queue = deque(
+        [(prior_future, predecessor, prior_future, None)], maxlen=2
+    )
+    successor = _scheduler_output(
+        "prefill" if successor_timed else None, contended=successor_timed
+    )
+    successor.total_num_scheduled_tokens = 1
+    successor.pending_structured_output_tokens = deferred
+    completed: Future[Mock] = Future()
+    completed.set_result(Mock())
+    engine.scheduler.schedule.return_value = successor
+    engine.model_executor.execute_model.return_value = completed
+    engine.model_executor.sample_tokens.return_value = completed
+    engine.scheduler.has_requests.side_effect = [True, False]
+    return engine
+
+
+@pytest.mark.parametrize("predecessor_tokens", [0, 1])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_queued_contended_model_excludes_untimed_predecessor(
+    predecessor_tokens, deferred
+):
+    engine = _queued_engine(predecessor_tokens, successor_timed=True, deferred=deferred)
+    # The contended successor is dispatched at 10.1, before the transfer-only
+    # or uncontended predecessor is observed complete at 10.2.
+    with patch("vllm.v1.engine.core.time.perf_counter", side_effect=[10.1, 10.2]):
+        engine.step_with_batch_queue()
+    engine.scheduler.record_compute_time.assert_not_called()
+    with patch("vllm.v1.engine.core.time.perf_counter", return_value=10.5):
+        engine.step_with_batch_queue()
+    engine.scheduler.record_compute_time.assert_called_once_with(
+        "prefill", pytest.approx(0.3), contended=True, scheduled_tokens=0
+    )
+
+
+@pytest.mark.parametrize("predecessor_tokens", [0, 1])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_untimed_executor_queue_never_reads_clock(predecessor_tokens, deferred):
+    engine = _queued_engine(
+        predecessor_tokens, successor_timed=False, deferred=deferred
+    )
+    with patch(
+        "vllm.v1.engine.core.time.perf_counter",
+        side_effect=AssertionError("An uncontended queue must not read the clock"),
+    ):
+        engine.step_with_batch_queue()
+        engine.step_with_batch_queue()
+    engine.scheduler.record_compute_time.assert_not_called()
+    assert engine._last_model_completion_time is None

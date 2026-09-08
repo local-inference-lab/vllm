@@ -793,6 +793,15 @@ class EngineCore:
             self.log_error_detail(scheduler_output),
         ):
             model_output = future.result()
+            if execution_timing is None:
+                successor_timing = (
+                    batch_queue[-1][3] if batch_queue else deferred_execution_timing
+                )
+                if successor_timing is not None:
+                    # A timed successor was dispatched before this untimed
+                    # batch completed. Exclude that queue residency without
+                    # timing transfers or uncontended execution on their own.
+                    self._last_model_completion_time = time.perf_counter()
             self._record_compute_time(scheduler_output, execution_timing)
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
