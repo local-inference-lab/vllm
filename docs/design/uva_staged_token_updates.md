@@ -66,6 +66,15 @@ The deployed composition passes seven cache/conversation checks, including
 canaries. All sampled log probabilities are finite. These checks qualify
 serving correctness under their request conditions, not a throughput gain.
 
+A four-iteration rank-zero Torch decode capture at approximately 64 Ki context
+measures target graph replay at 30.840 ms median versus 30.848 ms in the
+reference composition, and draft proposal at 2.281 versus 2.285 ms. Steady
+target execution is preserved in these captures. Input-preparation scope
+medians are 0.033 and 0.018 ms respectively; the traces contain profiler-start
+outliers and use different sampled continuations. They do not establish a
+model-throughput improvement. The qualified UVA-write composition is retained
+in service.
+
 The benchmark is `benchmarks/kernels/benchmark_staged_uva_writes.py`. Supply
 the unmodified `buffer_utils.py` as `--reference`. Run in an environment with
 the matching vLLM native extension. Correctness reads occur outside the timed

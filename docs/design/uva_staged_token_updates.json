@@ -546,5 +546,86 @@
     "The 48 GiB LMCache pool remains allocated in the separate serving processes.",
     "An overlapping interval was excluded from performance evidence.",
     "CPU and GPU view code for managed allocations is the installed frozen runtime, not a general CUDA restriction."
-  ]
+  ],
+  "serving_qualification": {
+    "status": "qualified serving correctness and scoped trace observation",
+    "source_id": "6e5fff3911585dfd",
+    "cache_conversation_checks_passed": 7,
+    "concurrent_canaries_passed": 4,
+    "nonfinite_logprobs": 0,
+    "trace_iterations": 4,
+    "running_requests_at_profile_start": 1.0,
+    "prompt_tokens": 63833,
+    "reference_prompt_tokens": 63833,
+    "stage_comparison": {
+      "vllm:v2/target/verify/full_graph_replay": {
+        "reference": {
+          "count": 4,
+          "durations_ms": [
+            30.859129,
+            30.839481,
+            30.856569,
+            30.827959999999997
+          ],
+          "median_ms": 30.848025
+        },
+        "deployed": {
+          "count": 4,
+          "durations_ms": [
+            30.86788,
+            30.822758999999998,
+            30.838791,
+            30.841767
+          ],
+          "median_ms": 30.840279000000002
+        }
+      },
+      "vllm:v2/speculator/verify/propose": {
+        "reference": {
+          "count": 4,
+          "durations_ms": [
+            2.284643,
+            2.2872660000000002,
+            2.285315,
+            2.285187
+          ],
+          "median_ms": 2.285251
+        },
+        "deployed": {
+          "count": 4,
+          "durations_ms": [
+            2.286213,
+            2.283364,
+            2.279077,
+            2.274693
+          ],
+          "median_ms": 2.2812205000000003
+        }
+      },
+      "vllm:v2/target/prepare_inputs": {
+        "reference": {
+          "count": 4,
+          "durations_ms": [
+            0.670059,
+            0.018242,
+            0.018563,
+            0.01677
+          ],
+          "median_ms": 0.0184025
+        },
+        "deployed": {
+          "count": 4,
+          "durations_ms": [
+            2.2889969999999997,
+            0.035938000000000005,
+            0.027393999999999998,
+            0.029346
+          ],
+          "median_ms": 0.032642000000000004
+        }
+      }
+    },
+    "trace_sha256": "675fcbbed9c666c6ba58a8a47112235e9c420b890b8f5dbfd6d19629cacc29e8",
+    "limits": "Different sampled continuations and profiler-start outliers; no model-throughput gain claim."
+  }
 }
