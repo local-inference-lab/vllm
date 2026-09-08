@@ -672,18 +672,31 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 activation=activation,
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
+            # One buffer set per token count serves both route-id dtypes: the
+            # launches are stream-ordered, so the second reads the same zero
+            # input and overwrites the same output and scratch after the
+            # first completes. The retained set stays one input, one output
+            # and one scratch per regime instead of doubling with the dtypes;
+            # its allocator footprint bounds the KV budget of launches that
+            # retain the warmed allocator high-water.
+            scratch = torch.empty(
+                (_b12x_scratch_nbytes(plan),),
+                dtype=torch.uint8,
+                device=device,
+            )
+            hidden_states = torch.zeros(
+                (tokens, int(prepared.hidden_size)),
+                dtype=dtype,
+                device=device,
+            )
+            output = torch.empty_like(hidden_states)
+            topk_weights = torch.full(
+                (tokens, topk),
+                1.0 / topk,
+                dtype=torch.float32,
+                device=device,
+            )
             for route_ids_dtype in (torch.int32, torch.int64):
-                scratch = torch.empty(
-                    (_b12x_scratch_nbytes(plan),),
-                    dtype=torch.uint8,
-                    device=device,
-                )
-                hidden_states = torch.zeros(
-                    (tokens, int(prepared.hidden_size)),
-                    dtype=dtype,
-                    device=device,
-                )
-                output = torch.empty_like(hidden_states)
                 topk_ids = (
                     torch.arange(topk, device=device, dtype=route_ids_dtype)
                     .unsqueeze(0)
@@ -691,12 +704,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                     .contiguous()
                 )
                 topk_ids.remainder_(int(prepared.num_experts))
-                topk_weights = torch.full(
-                    (tokens, topk),
-                    1.0 / topk,
-                    dtype=torch.float32,
-                    device=device,
-                )
                 # B12X warmup launches may outlive the Python call that
                 # submits them. Retain every caller-owned input, output, and
                 # scratch tensor until device completion so the allocator
