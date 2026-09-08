@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu.async_utils import StepTimingSample
@@ -35,13 +36,26 @@ def make_manager(
     return manager
 
 
-def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(monkeypatch):
+@pytest.mark.parametrize(
+    "target_support,varlen_decode,allowed",
+    [
+        (AttentionCGSupport.ALWAYS, False, True),
+        (AttentionCGSupport.UNIFORM_BATCH, True, True),
+        (AttentionCGSupport.UNIFORM_BATCH, False, False),
+        (AttentionCGSupport.NEVER, True, False),
+    ],
+)
+def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(
+    monkeypatch, target_support, varlen_decode, allowed
+):
     class Backend:
         @classmethod
         def supports_device_cpu_query_lens_mismatch(cls):
             return True
 
     class Builder:
+        supports_varlen_decode_cudagraph = varlen_decode
+
         def __init__(self, support):
             self.support = support
 
@@ -59,7 +73,7 @@ def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(monkeypatc
 
     groups = [
         [
-            group("target", AttentionCGSupport.ALWAYS),
+            group("target", target_support),
             group("draft", AttentionCGSupport.UNIFORM_BATCH),
         ]
     ]
@@ -73,7 +87,7 @@ def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(monkeypatc
         lambda *_args, **_kwargs: created,
     )
 
-    manager = maybe_create_adaptive_verification_manager(
+    kwargs = dict(
         enable_adaptive_verification=True,
         attn_groups=groups,
         attn_cg_support=runner_support,
@@ -85,8 +99,58 @@ def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(monkeypatc
         target_layer_names={"target"},
     )
 
-    assert manager is created
+    if allowed:
+        assert maybe_create_adaptive_verification_manager(**kwargs) is created
+    else:
+        with pytest.raises(ValueError, match="variable-length decode"):
+            maybe_create_adaptive_verification_manager(**kwargs)
     assert runner_support.min_cg_support == AttentionCGSupport.UNIFORM_BATCH
+
+
+def test_glm53_adaptive_manager_accepts_real_target_backends(monkeypatch):
+    from vllm.models.glm5next.nvidia.kda import Glm5NextKDAAttentionBackend
+    from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+        B12xGLM5NextMLASparseBackend,
+        B12xMLASparseBackend,
+    )
+
+    backends = [Glm5NextKDAAttentionBackend, B12xGLM5NextMLASparseBackend]
+    groups = []
+    for index, backend in enumerate(backends):
+        builder = object.__new__(backend.get_builder_cls())
+        groups.append(
+            SimpleNamespace(
+                layer_names=[f"target.{index}"],
+                backend=backend,
+                kv_cache_spec=None,
+                get_metadata_builder=lambda _index, builder=builder: builder,
+            )
+        )
+    created = object()
+    monkeypatch.setattr(
+        adaptive_module, "AdaptiveVerificationManager", lambda *_a, **_kw: created
+    )
+    assert (
+        maybe_create_adaptive_verification_manager(
+            enable_adaptive_verification=True,
+            attn_groups=[groups],
+            attn_cg_support=AttentionCGSupportInfo(
+                AttentionCGSupport.UNIFORM_BATCH, None
+            ),
+            req_states=object(),
+            query_start_loc=object(),
+            num_bonus_tokens=1,
+            max_total_logits=32,
+            vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(model_type="glm5_next_text")
+                )
+            ),
+            target_layer_names={"target.0", "target.1"},
+        )
+        is created
+    )
+    assert not B12xMLASparseBackend.supports_device_cpu_query_lens_mismatch()
 
 
 def test_budget_stops_where_marginal_drafts_stop_paying_for_themselves():

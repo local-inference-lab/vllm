@@ -909,8 +909,13 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         config = vllm_config.model_config.hf_config
         self.config = config
         speculative_config = vllm_config.speculative_config
-        self.dflash_capture = (
-            speculative_config is not None and speculative_config.use_dflash()
+        self.dflash_capture = speculative_config is not None and (
+            speculative_config.use_dflash()
+            or (
+                speculative_config.use_dspark()
+                and speculative_config.draft_model_config.hf_config.model_type
+                == "glm53_dspark"
+            )
         )
 
         self.vocab_size = config.vocab_size

@@ -225,6 +225,8 @@ def _create_gdn_builder(
     num_speculative_tokens: int = 0,
     full_cuda_graph: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
+    builder_cls: type[GDNAttentionMetadataBuilder] = GDNAttentionMetadataBuilder,
+    device: torch.device = DEVICE,
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(
@@ -245,12 +247,89 @@ def _create_gdn_builder(
         dtypes=(torch.float16,),
         num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
     )
-    return GDNAttentionMetadataBuilder(
+    return builder_cls(
         kv_cache_spec=mamba_spec,
         layer_names=["layer.0"],
         vllm_config=vllm_config,
-        device=DEVICE,
+        device=device,
     )
+
+
+@pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda", 0)])
+@pytest.mark.parametrize("with_prefill", [False, True])
+def test_glm_adaptive_metadata_uses_device_verification_boundaries(
+    device, with_prefill
+):
+    from vllm.models.glm5next.nvidia.kda import Glm5NextKDAMetadataBuilder
+
+    if device.type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    builder = _create_gdn_builder(
+        7, full_cuda_graph=True, builder_cls=Glm5NextKDAMetadataBuilder, device=device
+    )
+    builder.vllm_config.cache_config.mamba_cache_mode = "align"
+    builder.mamba_aligned_state_indices = torch.arange(
+        1, 33, dtype=torch.int32, device=device
+    ).view(4, 8)
+    tail = [9] if with_prefill else [0]
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[100, 100, 100, 50], query_lens=[4, 4, 4, *tail]),
+        BLOCK_SIZE,
+        device,
+    ).replace(is_prefilling=torch.tensor([False, False, False, with_prefill]))
+    # CPU boundaries carry the total budget, not its device-selected split.
+    common.query_start_loc_cpu = common.query_start_loc_cpu.clone()
+    accepted = torch.tensor([1, 3, 2, 1], dtype=torch.int32, device=device)
+    drafts = torch.tensor([3, 3, 3, -1], dtype=torch.int32)
+    addresses = None
+    for boundaries in ([0, 1, 8, 12], [0, 7, 10, 12], [0, 4, 5, 12]):
+        common.query_start_loc.copy_(
+            torch.tensor([*boundaries, 12 + tail[0]], dtype=torch.int32, device=device)
+        )
+        metadata = builder.build(0, common, accepted, drafts)
+        assert not metadata.is_uniform_spec_decode
+        assert metadata.num_spec_decodes == 3
+        torch.testing.assert_close(
+            metadata.spec_query_start_loc[:4], common.query_start_loc[:4]
+        )
+        torch.testing.assert_close(metadata.num_accepted_tokens[:3], accepted[:3])
+        torch.testing.assert_close(
+            metadata.spec_state_indices_tensor[:3],
+            builder.mamba_aligned_state_indices[:3],
+        )
+        if not with_prefill:
+            pointers = tuple(
+                getattr(metadata, name).data_ptr()
+                for name in (
+                    "spec_query_start_loc",
+                    "num_accepted_tokens",
+                    "spec_state_indices_tensor",
+                )
+            )
+            assert addresses is None or addresses == pointers
+            addresses = pointers
+        else:
+            assert metadata.num_prefills == 1
+            assert metadata.num_prefill_tokens == 9
+            torch.testing.assert_close(
+                metadata.non_spec_query_start_loc,
+                torch.tensor([0, 9], dtype=torch.int32, device=device),
+            )
+
+
+def test_glm_adaptive_zero_draft_capture_retains_speculative_state_recovery():
+    from vllm.models.glm5next.nvidia.kda import Glm5NextKDAMetadataBuilder
+
+    builder = _create_gdn_builder(
+        7, full_cuda_graph=True, builder_cls=Glm5NextKDAMetadataBuilder
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[100, 100], query_lens=[1, 1]), BLOCK_SIZE, DEVICE
+    ).replace(is_prefilling=torch.zeros(2, dtype=torch.bool))
+    metadata = builder.build_for_cudagraph_capture(common)
+    assert metadata.num_spec_decodes == 2
+    assert metadata.num_decodes == 0
+    assert metadata.spec_state_indices_tensor.shape[1] == 8
 
 
 def _build(

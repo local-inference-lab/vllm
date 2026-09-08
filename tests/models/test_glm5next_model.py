@@ -1267,6 +1267,26 @@ def test_glm5next_conditional_post_load_finalizes_language_model() -> None:
     assert model.language_model.finalize_calls == 1
 
 
+@pytest.mark.parametrize("adaptive", [False, True])
+@pytest.mark.parametrize("cache_mode", ["align", "all"])
+def test_glm_adaptive_kda_backend_is_scoped_to_aligned_state_cache(
+    adaptive, cache_mode, default_vllm_config
+):
+    from vllm.models.glm5next.nvidia.kda import Glm5NextKDAAttentionBackend
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
+
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.speculative_config = SimpleNamespace(enable_adaptive_verification=adaptive)
+    layer.cache_config = SimpleNamespace(mamba_cache_mode=cache_mode)
+    expected = (
+        Glm5NextKDAAttentionBackend
+        if adaptive and cache_mode == "align"
+        else GDNAttentionBackend
+    )
+    assert layer.get_attn_backend() is expected
+
+
 def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
     captured_caps = {}
 
@@ -1306,6 +1326,170 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
     assert plan == captured_caps
     assert captured_caps["null_state_index"] == 0
     assert captured_caps["kda_metadata_validation"] == "trusted"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("tokens", [3, 12])
+def test_glm_adaptive_kda_graph_matches_independent_request_states(monkeypatch, tokens):
+    from dataclasses import replace
+
+    from tests.v1.attention.test_gdn_metadata_builder import _create_gdn_builder
+    from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
+    from vllm.models.glm5next.nvidia.kda import Glm5NextKDAMetadataBuilder
+    from vllm.utils.b12x import get_b12x_gdn_decode, get_b12x_scratch_buffers
+
+    device = torch.device("cuda", 0)
+    api = get_b12x_gdn_decode()
+    if api is None or not api.is_supported(device):
+        pytest.skip("B12X GDN decode is unavailable")
+    torch.manual_seed(37)
+    heads, dim, requests, columns = 4, 128, 4, 8
+    builder = _create_gdn_builder(
+        columns - 1,
+        full_cuda_graph=True,
+        builder_cls=Glm5NextKDAMetadataBuilder,
+        device=device,
+    )
+    builder.vllm_config.cache_config.mamba_cache_mode = "align"
+    builder.mamba_aligned_state_indices = torch.arange(
+        1, requests * columns + 1, dtype=torch.int32, device=device
+    ).view(requests, columns)
+    capture_lengths = [3, 3, 3, 3] if tokens == 12 else [1, 1, 1, 0]
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[100] * requests, query_lens=capture_lengths),
+        16,
+        device,
+    ).replace(is_prefilling=torch.zeros(requests, dtype=torch.bool), max_query_len=8)
+    accepted = torch.ones(requests, dtype=torch.int32, device=device)
+    drafts = torch.tensor([length - 1 for length in capture_lengths], dtype=torch.int32)
+    metadata = builder.build(0, common, accepted, drafts)
+    assert metadata.num_spec_decodes == (4 if tokens == 12 else 3)
+
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.prefix = "model.layers.0.self_attn"
+    layer.head_dim, layer.local_num_heads = dim, heads
+    layer.local_projection_size = heads * dim
+    layer.gate_lower_bound = -5.0
+    layer.A_log = torch.randn(heads, device=device)
+    layer.dt_bias = torch.randn(heads * dim, device=device)
+    layer.o_norm = SimpleNamespace(weight=torch.ones(dim, device=device), eps=1e-6)
+    layer.conv1d = SimpleNamespace(
+        weight=torch.randn(3 * heads * dim, 1, 4, device=device), bias=None
+    )
+    initial_conv = torch.randn(
+        33, 3 * heads * dim, 3 + columns, dtype=torch.bfloat16, device=device
+    )
+    initial_state = torch.randn(33, heads, dim, dim, device=device)
+    layer.kv_cache = (initial_conv.clone(), initial_state.clone())
+    layer._b12x_kda_api = api
+    layer._b12x_kda_max_tokens = tokens
+    layer._b12x_kda_max_seqs = requests
+    layer._b12x_kda_state_index_columns = columns
+    layer._b12x_kda_num_seqs = torch.zeros(1, dtype=torch.int32, device=device)
+    layer._b12x_kda_num_tokens = torch.zeros(1, dtype=torch.int32, device=device)
+    layer._b12x_kda_num_accepted_tokens = torch.ones(
+        requests, dtype=torch.int32, device=device
+    )
+    plan = api.plan(
+        api.Caps(
+            device=device,
+            max_tokens=tokens,
+            max_seqs=requests,
+            max_state_slots=33,
+            key_heads=heads,
+            value_heads=heads,
+            key_head_dim=dim,
+            value_head_dim=dim,
+            state_index_columns=columns,
+            model_dtype=torch.bfloat16,
+            state_dtype=torch.float32,
+            gate_activation="sigmoid",
+            qk_l2norm=True,
+            null_state_index=0,
+            kda_metadata_validation="trusted",
+        )
+    )
+    layer._b12x_kda_plan = plan
+    (layer._b12x_kda_scratch,) = get_b12x_scratch_buffers(plan)
+    context = SimpleNamespace(
+        attn_metadata={layer.prefix: metadata}, additional_kwargs={}
+    )
+    monkeypatch.setattr(kimi_gdn_linear_attn, "get_forward_context", lambda: context)
+    monkeypatch.setattr(kimi_gdn_linear_attn, "is_conv_state_dim_first", lambda: True)
+    inputs = dict(
+        mixed_qkv=torch.randn(
+            tokens, 3 * heads * dim, dtype=torch.bfloat16, device=device
+        ),
+        g1=torch.randn(1, tokens, heads, dim, dtype=torch.bfloat16, device=device),
+        g2=torch.randn(tokens, heads, dim, dtype=torch.bfloat16, device=device),
+        beta=torch.randn(1, tokens, heads, dtype=torch.bfloat16, device=device),
+    )
+    output = torch.empty(1, tokens, heads, dim, dtype=torch.bfloat16, device=device)
+
+    def run():
+        context.additional_kwargs.clear()
+        layer._forward(**inputs, core_attn_out=output)
+
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    length_cases = ([1, 1, 1],) if tokens == 3 else ([1, 7, 4], [7, 3, 2], [4, 1, 7])
+    for lengths in length_cases:
+        boundaries = [0, *torch.tensor(lengths).cumsum(0).tolist()]
+        common.query_start_loc_cpu.copy_(
+            torch.tensor([0, tokens // 3, 2 * tokens // 3, tokens, tokens])
+        )
+        drafts.copy_(torch.tensor([tokens // 3 - 1] * 3 + [-1]))
+        common.query_start_loc.copy_(torch.tensor([*boundaries, tokens], device=device))
+        accepted.copy_(torch.tensor([3, 2, 5, 1], dtype=torch.int32, device=device))
+        metadata = builder.build(0, common, accepted, drafts)
+        context.attn_metadata[layer.prefix] = metadata
+        layer.kv_cache[0].copy_(initial_conv)
+        layer.kv_cache[1].copy_(initial_state)
+        allocations = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert (
+            torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocations
+        )
+        graph_output = output.clone()
+        graph_states = tuple(state.clone() for state in layer.kv_cache)
+        layer.kv_cache[0].copy_(initial_conv)
+        layer.kv_cache[1].copy_(initial_state)
+        expected = torch.empty_like(output)
+        for row, (start, stop) in enumerate(zip(boundaries, boundaries[1:])):
+            single = replace(
+                metadata,
+                num_actual_tokens=stop - start,
+                num_spec_decodes=1,
+                num_spec_decode_tokens=stop - start,
+                spec_query_start_loc=torch.tensor(
+                    [0, stop - start], dtype=torch.int32, device=device
+                ),
+                spec_state_indices_tensor=metadata.spec_state_indices_tensor[
+                    row : row + 1
+                ],
+                num_accepted_tokens=accepted[row : row + 1],
+            )
+            context.attn_metadata[layer.prefix] = single
+            context.additional_kwargs.clear()
+            layer._forward(
+                mixed_qkv=inputs["mixed_qkv"][start:stop],
+                g1=inputs["g1"][:, start:stop],
+                g2=inputs["g2"][start:stop],
+                beta=inputs["beta"][:, start:stop],
+                core_attn_out=expected[:, start:stop],
+            )
+        torch.testing.assert_close(graph_output, expected, atol=0, rtol=0)
+        for actual, reference in zip(graph_states, layer.kv_cache):
+            torch.testing.assert_close(actual, reference, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(

@@ -1998,15 +1998,22 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
     return 1
 
 
-def _partition_dflash_draft_specs(
+def _partition_parallel_draft_specs(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> tuple[dict[str, KVCacheSpec], dict[str, KVCacheSpec]]:
-    """Split appended DFlash layers from the target for PP1 grouping."""
+    """Split appended DFlash or GLM DSpark layers for PP1 cache grouping."""
     speculative_config = vllm_config.speculative_config
     if (
         speculative_config is None
-        or speculative_config.method != "dflash"
+        or not (
+            speculative_config.method == "dflash"
+            or (
+                speculative_config.method == "dspark"
+                and speculative_config.draft_model_config.hf_config.model_type
+                == "glm53_dspark"
+            )
+        )
         or vllm_config.parallel_config.pipeline_parallel_size > 1
         or vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
     ):
@@ -2051,14 +2058,14 @@ def get_kv_cache_groups(
         # attention free models.
         return []
 
-    target_specs, draft_specs = _partition_dflash_draft_specs(
+    target_specs, draft_specs = _partition_parallel_draft_specs(
         vllm_config, kv_cache_spec
     )
     if target_specs and draft_specs:
         target_groups = get_kv_cache_groups(vllm_config, target_specs)
         draft_groups = get_kv_cache_groups(vllm_config, draft_specs)
         logger.info(
-            "Keeping %d DFlash draft KV layers in %d independent cache groups",
+            "Keeping %d parallel draft KV layers in %d independent cache groups",
             len(draft_specs),
             len(draft_groups),
         )
