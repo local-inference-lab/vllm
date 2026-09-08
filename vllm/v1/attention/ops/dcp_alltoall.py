@@ -451,16 +451,15 @@ def _try_b12x_dcp_all_gather_heads(
     if pool is None:
         return None
     if out is not None:
-        if out.is_contiguous():
+        supports_output = getattr(pool, "supports_all_gather_heads_output", None)
+        if out.is_contiguous() or (callable(supports_output) and supports_output(out)):
             return pool.all_gather_heads(
                 local_input,
                 out=out,
                 channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
             )
-        # The B12X kernel writes a packed [batch, heads, head_dim] result. A
-        # caller-owned view whose head count is padded past the gathered
-        # heads (Kimi-K3 TP9: 99 heads inside a 104-head tile) is filled
-        # through a packed intermediate.
+        # Preserve compatibility with kernels that require packed output,
+        # and with layouts outside the backend's supported batch strides.
         gathered = pool.all_gather_heads(
             local_input,
             channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
