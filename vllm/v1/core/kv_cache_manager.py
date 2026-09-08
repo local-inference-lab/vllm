@@ -838,18 +838,19 @@ class KVCacheManager:
     def take_kv_cache_block_copies(
         self,
     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
-        """Drain pending copies and return their retained endpoints."""
-        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
-        for mgr in self.coordinator.single_type_managers:
-            pending_copies.extend(mgr.take_pending_cow_copies())
-        copies = [
-            KVCacheBlockCopy(
-                src_block_id=source_block.block_id,
-                dst_block_id=cow_block.block_id,
-            )
-            for source_block, cow_block in pending_copies
-        ]
-        retained_blocks = [block for pair in pending_copies for block in pair]
+        """Drain group-scoped copies and return their retained endpoints."""
+        copies: list[KVCacheBlockCopy] = []
+        retained_blocks: list[KVCacheBlock] = []
+        for group_id, mgr in enumerate(self.coordinator.single_type_managers):
+            for source_block, cow_block in mgr.take_pending_cow_copies():
+                copies.append(
+                    KVCacheBlockCopy(
+                        src_block_id=source_block.block_id,
+                        dst_block_id=cow_block.block_id,
+                        kv_cache_group_id=group_id,
+                    )
+                )
+                retained_blocks.extend((source_block, cow_block))
         return copies, retained_blocks
 
     def take_partial_tail_offloads(self) -> dict[str, list[tuple[int, int, int]]]:

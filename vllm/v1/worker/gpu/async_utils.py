@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import threading
 
 import numpy as np
 import torch
@@ -17,6 +18,11 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.utils import raise_if_nan_logits
+
+# A deferred draft copy is recorded by the next execute_model call; a worker
+# that never issues one (shutdown, a failed step) must not block its output
+# thread forever.
+_COPY_EVENT_RECORD_TIMEOUT_S = 600.0
 
 
 class AsyncOutput(AsyncModelRunnerOutput):
@@ -46,6 +52,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
         self.copy_event_recorded = False
+        # Set once the final copy event is recorded. A deferred draft copy is
+        # recorded by a later runner step, so the consumer thread waits for
+        # the recording before it waits for the event.
+        self._copy_event_ready = threading.Event()
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
@@ -73,6 +83,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if not defer_copy_event:
                 self.copy_event.record(copy_stream)
                 self.copy_event_recorded = True
+                self._copy_event_ready.set()
 
     def add_draft_token_ids(
         self, req_ids: list[str], draft_token_ids: torch.Tensor
@@ -91,8 +102,14 @@ class AsyncOutput(AsyncModelRunnerOutput):
             draft_token_ids_snapshot.record_stream(self.copy_stream)
             self.copy_event.record(self.copy_stream)
             self.copy_event_recorded = True
+        self._copy_event_ready.set()
 
     def get_output(self) -> ModelRunnerOutput:
+        if not self._copy_event_ready.wait(timeout=_COPY_EVENT_RECORD_TIMEOUT_S):
+            raise RuntimeError(
+                "AsyncOutput: the draft token copy was never recorded "
+                f"within {_COPY_EVENT_RECORD_TIMEOUT_S} s"
+            )
         assert self.copy_event_recorded
         self.copy_event.synchronize()
 

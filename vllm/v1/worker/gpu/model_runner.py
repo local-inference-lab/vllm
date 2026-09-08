@@ -65,7 +65,6 @@ from vllm.multimodal.encoder_budget import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
-from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -77,6 +76,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.outputs import (
     DraftTokenIds,
+    KVConnectorOutput,
     ModelRunnerOutput,
     RoutedExpertsTensors,
     make_empty_encoder_model_runner_output,
@@ -107,6 +107,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
+from vllm.v1.worker.gpu import k3_ubatch_prefill
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
@@ -156,7 +157,11 @@ from vllm.v1.worker.gpu.spec_decode.utils import (
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
+from vllm.v1.worker.utils import (
+    KVBlockZeroer,
+    copy_kv_cache_blocks_inplace,
+    group_kv_caches_for_copy,
+)
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
@@ -402,6 +407,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        self._pending_draft: _PendingDraft | None = None
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -511,6 +517,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_logits=self.max_num_reqs * self.decode_query_len,
                 vocab_size=self.vocab_size,
                 device=self.device,
+                num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
             )
 
         if self.is_pooling_model and self.is_last_pp_rank:
@@ -619,19 +626,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
-            # One local block covers `block_size * dcp_shard_count` tokens in
-            # the global sequence. Replicated groups keep the full cache on
-            # every rank instead.
             group_cp_size = get_kv_cache_dcp_shard_count(spec, self.dcp_size)
             group_cp_sizes.append(group_cp_size)
-            max_num_blocks = cdiv(
-                block_table_max_model_len, spec.block_size * group_cp_size
+            # Cache specifications own their block-table geometry. Attention
+            # caches account for their token-position DCP shards, while
+            # recurrent state and replicated attention caches remain unscaled.
+            max_num_blocks = spec.max_num_blocks_per_req(
+                self.vllm_config, block_table_max_model_len
             )
-            # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
             if isinstance(spec, MambaSpec):
-                max_num_blocks = (
-                    max_num_blocks if self.cache_config.enable_prefix_caching else 1
-                ) + spec.num_speculative_blocks
                 max_num_blocks = get_block_table_width(
                     max_num_blocks, spec.block_size, token_alignment=None
                 )
@@ -734,6 +737,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kernel_block_sizes,
             self.vllm_config,
             kv_cache_raw_tensors=kv_cache_raw_tensors,
+        )
+        self.kv_caches_by_group = group_kv_caches_for_copy(
+            kv_caches_dict, self.kv_cache_config
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
@@ -1020,6 +1026,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
+        if hasattr(self, "kv_caches_by_group"):
+            self.kv_caches_by_group.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
@@ -1215,6 +1223,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
         elapsed_time = end_time - start_time
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        k3_ubatch_prefill.prime_workspaces()
         lock_workspace()
         # This usually takes 5~20 seconds.
         logger.info(
@@ -1230,6 +1239,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert self.kv_block_zeroer is not None
         self.kv_block_zeroer.zero_block_ids([0])
         torch.accelerator.synchronize()
+
+    def _restore_null_block_after_kv_load(
+        self, kv_connector_output: KVConnectorOutput | None
+    ) -> None:
+        """Re-zero the null placeholder block once external KV loads land.
+
+        Block 0 pads every block table and its pages are shared by all KV
+        cache groups, so readers treat it as all zeros. A KV connector that
+        maps a request's placeholder slots onto it can overwrite those pages;
+        one zeroing pass per completed load restores the invariant before the
+        loaded request is scheduled.
+        """
+        if kv_connector_output is None or not kv_connector_output.finished_recving:
+            return
+        if self.kv_block_zeroer is None:
+            return
+        self.kv_block_zeroer.zero_block_ids([0])
 
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
@@ -1367,6 +1393,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
+                kv_cache_groups=self.kv_caches_by_group,
             )
 
     def prepare_inputs(
@@ -1482,18 +1509,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
-        logits_indices = combine_sampled_and_draft_tokens(
-            self.input_buffers.input_ids,
-            idx_mapping,
-            self.req_states.last_sampled_tokens,
-            query_start_loc,
-            seq_lens,
-            self.req_states.prefill_len.gpu,
-            self.req_states.draft_tokens,
-            cu_num_logits,
-            total_num_logits,
-            self.model_state.num_new_sampled_tokens_per_step,
-        )
+        # With late input ids the combine runs after the attention metadata,
+        # once a pending remote draft has been consumed in stream order.
+        if self._late_input_ids:
+            logits_indices = self.input_buffers.query_start_loc[:0]
+        else:
+            logits_indices = combine_sampled_and_draft_tokens(
+                self.input_buffers.input_ids,
+                idx_mapping,
+                self.req_states.last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                self.req_states.prefill_len.gpu,
+                self.req_states.draft_tokens,
+                cu_num_logits,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+            )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
         num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
@@ -1562,6 +1594,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_lens=prompt_lens,
             max_req_tokens=max_req_tokens,
             valid_num_draft_tokens_per_req=valid_num_draft_tokens_per_req,
+            all_token_ids_cpu=self.req_states.all_token_ids.cpu,
         )
         # InputBuffers are reused across real, dummy, and captured batches.
         # Clear stale padding before a capacity manager optionally marks a
@@ -1595,6 +1628,71 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 True
             )
         return pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)
+
+    @property
+    def _late_input_ids(self) -> bool:
+        """Whether input ids are combined after the attention metadata.
+
+        The combine reads the draft tokens; running it last lets a remote
+        speculator's reply be consumed in stream order after every host-side
+        preparation of the step. Context-parallel partitioning and the
+        capacity manager read the combined batch inside prepare_inputs, so
+        they keep the early combine.
+        """
+        return self.pcp_manager is None and self.verification_capacity_manager is None
+
+    def _finalize_input_ids(self, input_batch: InputBatch) -> None:
+        input_batch.logits_indices = combine_sampled_and_draft_tokens(
+            self.input_buffers.input_ids,
+            input_batch.idx_mapping,
+            self.req_states.last_sampled_tokens,
+            input_batch.query_start_loc,
+            input_batch.seq_lens,
+            self.req_states.prefill_len.gpu,
+            self.req_states.draft_tokens,
+            input_batch.cu_num_logits,
+            int(input_batch.cu_num_logits_np[-1]),
+            self.model_state.num_new_sampled_tokens_per_step,
+        )
+
+    def _resolve_pending_draft(self) -> None:
+        """Consume a deferred remote proposal on the current stream.
+
+        The speculator parks the stream until its reply thread has staged the
+        draft, then the draft tokens are stored for the proposed batch and,
+        when the scheduler needs them on the host, appended to that step's
+        output copy. No host wait happens here.
+        """
+        pending = self._pending_draft
+        if pending is None:
+            return
+        self._pending_draft = None
+        assert self.speculator is not None
+        draft_tokens = self.speculator.resolve_pending()
+        num_draft_tokens = pending.num_draft_tokens
+        if draft_tokens is None or num_draft_tokens == 0:
+            stored = self.req_states.draft_tokens[pending.idx_mapping, :0]
+        else:
+            self.req_states.draft_tokens[pending.idx_mapping, :num_draft_tokens] = (
+                draft_tokens[:, :num_draft_tokens]
+            )
+            stored = self.req_states.draft_tokens[
+                pending.idx_mapping, :num_draft_tokens
+            ]
+        if pending.async_output is not None:
+            pending.async_output.add_draft_token_ids(pending.req_ids, stored)
+
+    @torch.inference_mode()
+    def flush_deferred_draft(self) -> None:
+        """Consume a deferred proposal outside a step.
+
+        The output of the step that issued the proposal is not complete until
+        the proposal has been consumed, which the next step normally does. A
+        worker that has to answer another RPC first (profiling, LoRA, sleep,
+        a generic collective_rpc) consumes it here, because the engine waits
+        for that output before it issues the next step.
+        """
+        self._resolve_pending_draft()
 
     def prepare_attn(
         self, input_batch: InputBatch
@@ -1646,6 +1744,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch,
                     grammar_output.structured_output_request_ids,
                     grammar_output.grammar_bitmask,
+                    grammar_output.num_spec_tokens,
                 )
 
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
@@ -1725,6 +1824,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # Enqueue the pending reply while its request-to-slot mapping still
+        # belongs to the batch that produced it. Subsequent slot removal and
+        # initialization remain ordered behind these operations on the stream.
+        self._resolve_pending_draft()
         if not dummy_run:
             with record_function_or_nullcontext("vllm:v2/target/update_batch"):
                 # Update the request states.
@@ -1737,6 +1840,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
+                self._restore_null_block_after_kv_load(
+                    empty_output.kv_connector_output
+                )
                 return empty_output
 
         # Get batch descriptor and sync across DP ranks.
@@ -1825,6 +1931,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
+            self._restore_null_block_after_kv_load(empty_output.kv_connector_output)
             return empty_output
 
         if not dummy_run:
@@ -1910,6 +2017,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL
                     ),
                 )
+
+        if not dummy_run and self._late_input_ids:
+            with record_function_or_nullcontext(
+                f"vllm:v2/target/{phase}/finalize_input_ids"
+            ):
+                self._finalize_input_ids(input_batch)
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -2002,6 +2115,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+                # kimi-k3-graph-sync-diag: make the annotation equal true GPU
+                # time when K3_DIAG_SYNC_AFTER_GRAPH=1 (diagnostic only).
+                import os as _os
+
+                if _os.environ.get("K3_DIAG_SYNC_AFTER_GRAPH") == "1":
+                    torch.cuda.synchronize()
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -2032,6 +2151,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     assert self.cudagraph_manager is not None
                     model_output = self.cudagraph_manager.run_pw_graph(
                         self.model, model_inputs
+                    )
+                elif (
+                    not dummy_run
+                    and k3_ubatch_prefill.ubatch_prefill_enabled()
+                    and k3_ubatch_prefill.eligible(input_batch)
+                    and self.parallel_config.tensor_parallel_size > 1
+                ):
+                    # Kimi-K3 split prefill: the chunk runs as two consecutive
+                    # row halves (see k3_ubatch_prefill).
+                    model_output = k3_ubatch_prefill.run_split_prefill(
+                        self,
+                        scheduler_output,
+                        input_batch,
+                        model_inputs,
+                        cudagraph_runtime_mode=batch_desc.cg_mode,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        batch_descriptor=batch_descriptor,
+                        skip_compiled=skip_compiled,
                     )
                 else:
                     # Eager (NONE): call the raw model directly.
@@ -2113,6 +2250,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            self._restore_null_block_after_kv_load(kv_connector_output)
             _maybe_save_b12x_moe_activation_amax()
             _maybe_flush_kquant_capture()
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
@@ -2124,7 +2262,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     num_spec_tokens_to_schedule
                 )
             )
-
         # Last rank: sample tokens
         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
             self.pcp_manager, hidden_states, input_batch
@@ -2225,6 +2362,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            deferring = hasattr(self.speculator, "resolve_pending")
+            if deferring:
+                # The capacity manager reads the proposal right after
+                # propose(), and a synchronous host copy for the scheduler
+                # would read it before the reply; neither can use a deferred
+                # reply. The async output's draft copy is recorded once the
+                # reply has been consumed instead.
+                self.speculator.deferred_resolve_allowed = (
+                    self._late_input_ids
+                    and (
+                        copy_draft_with_output
+                        or not self.draft_tokens_handler.needs_host_copy(input_batch)
+                    )
+                )
             with (
                 use_workspace_lane(1),
                 record_function_or_nullcontext(f"vllm:v2/speculator/{phase}/propose"),
@@ -2249,11 +2400,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     num_spec_tokens_to_schedule,
                     self.num_speculative_steps,
                 )
+            pending_draft = deferring and self.speculator.has_pending_proposal()
             with record_function_or_nullcontext(
                 f"vllm:v2/speculator/{phase}/store_draft_tokens"
             ):
                 num_draft_tokens = draft_tokens.shape[1]
-                if num_draft_tokens > 0:
+                if pending_draft:
+                    # The tokens arrive in stream order during the next
+                    # execute_model; the store and the host copy follow there.
+                    self._pending_draft = _PendingDraft(
+                        idx_mapping=input_batch.idx_mapping,
+                        req_ids=input_batch.req_ids,
+                        num_draft_tokens=num_draft_tokens,
+                        async_output=async_output if copy_draft_with_output else None,
+                    )
+                    draft_tokens_for_next_step = draft_tokens
+                elif num_draft_tokens > 0:
                     self.req_states.draft_tokens[
                         input_batch.idx_mapping, :num_draft_tokens
                     ] = draft_tokens
@@ -2291,7 +2453,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if draft_tokens_for_next_step is not None
                     else self.req_states.draft_tokens[input_batch.idx_mapping]
                 )
-                if copy_draft_with_output:
+                if self._pending_draft is not None and copy_draft_with_output:
+                    pass  # recorded by _resolve_pending_draft
+                elif copy_draft_with_output:
                     async_output.add_draft_token_ids(
                         input_batch.req_ids, next_draft_tokens
                     )
@@ -2303,6 +2467,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Post-step KV connector related operations.
         with record_function_or_nullcontext(f"vllm:v2/target/{phase}/kv_post_forward"):
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            self._restore_null_block_after_kv_load(kv_connector_output)
         model_runner_output.kv_connector_output = kv_connector_output
 
         _maybe_save_b12x_moe_activation_amax()
@@ -2327,6 +2492,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+        self._restore_null_block_after_kv_load(kv_connector_output)
 
         if not self.is_last_pp_rank:
             self.postprocess_num_computed_tokens(input_batch)
@@ -2369,6 +2535,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._release_cudagraph_pool_anchor()
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
+        if hasattr(self, "kv_caches_by_group"):
+            self.kv_caches_by_group.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
@@ -2420,6 +2588,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @property
     def pcp_manager_cls(self) -> type[pcp.PCPManager]:
         return pcp.PCPManager
+
+
+class _PendingDraft(NamedTuple):
+    """A proposal whose draft tokens arrive in stream order during the next step.
+
+    ``idx_mapping`` and ``req_ids`` describe the batch that was proposed for;
+    ``async_output`` is the step's output whose draft copy is recorded once the
+    tokens exist on the device.
+    """
+
+    idx_mapping: torch.Tensor
+    req_ids: list[str]
+    num_draft_tokens: int
+    async_output: AsyncOutput | None
 
 
 class ExecuteModelState(NamedTuple):

@@ -355,6 +355,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
         callers must use this method only when the source tensor is dead after
         the collective.
         """
+        # kimi-k3-inplace-ar-dma: eligible prefill-size tensors take the same PCIe
+        # custom/DMA all-reduce as the functional entry; the caller consumes
+        # the returned tensor and treats the source as dead.
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_custom_ar(input_)
+        ):
+            out = ca_comm.custom_all_reduce(input_)
+            if out is not None:
+                return out
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
             torch.distributed.all_reduce(input_, group=self.device_group)

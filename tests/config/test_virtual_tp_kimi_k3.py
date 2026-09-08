@@ -16,6 +16,15 @@ from vllm.config.virtual_tp import (
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
+@pytest.fixture(autouse=True)
+def virtual_tp_shape_test_device_count(monkeypatch):
+    # These tests inspect configuration and CPU weight loading, independently
+    # of the number of CUDA devices exposed to the test process.
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_count", lambda: 16)
+
+
 class FakeKimiK3ModelConfig:
     def __init__(self, *, mm_encoder_tp_mode: str = "weights"):
         self.hf_text_config = SimpleNamespace(

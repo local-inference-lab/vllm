@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
@@ -698,11 +699,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     f"{type(g.kv_cache_spec).__name__}."
                 )
         # Fine-grained hash hits are safe when an aligned Mamba group can
-        # materialize recurrent state at every candidate boundary. Under DCP,
-        # full-attention blocks grow by the shard count while Mamba state stays
-        # replicated. Allow interior attention hits only when every aligned
-        # Mamba manager already has one complete state block per hash unit; this
-        # avoids requiring partial recurrent-state hand-off across DCP ranks.
+        # materialize recurrent state at every candidate boundary. Recurrent
+        # state exists at Mamba block boundaries only, so interior attention
+        # hits are aligned to the least common multiple of the hash unit and
+        # every aligned Mamba block size (equal to the hash unit when the
+        # Mamba block matches it, as on TP8; 4,608 tokens for a 1,536-token
+        # hash unit with a 4,608-token Mamba block, as on TP9/DCP9). The
+        # alignment must still be finer than the scheduler block, otherwise
+        # partial hits add nothing.
         aligned_mamba_managers = [
             manager
             for group, manager in zip(
@@ -718,22 +722,27 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             and manager.block_size > hash_block_size
             for manager in self.single_type_managers
         )
-        dcp_mamba_states_are_hash_aligned = all(
-            manager.block_size == hash_block_size for manager in aligned_mamba_managers
-        )
+        partial_hit_alignment = hash_block_size
+        for manager in aligned_mamba_managers:
+            partial_hit_alignment = math.lcm(partial_hit_alignment, manager.block_size)
+        self.partial_hit_alignment_tokens = partial_hit_alignment
         self.enable_partial_hash_hits = (
             bool(aligned_mamba_managers)
             and has_fine_grained_group
-            and (dcp_world_size == 1 or dcp_mamba_states_are_hash_aligned)
+            and partial_hit_alignment < self.scheduler_block_size
+            and self.scheduler_block_size % partial_hit_alignment == 0
         )
+        for manager in self.single_type_managers:
+            manager.cache_alignment_tokens = self._cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:
-        # Fine-grained partial hits may return hash-block-aligned lengths;
-        # otherwise it must stay scheduler-block-aligned.
+        # Fine-grained partial hits return lengths aligned to the hash unit
+        # lifted to every aligned Mamba block; otherwise the hit stays
+        # scheduler-block-aligned.
         return (
-            self.hash_block_size
+            self.partial_hit_alignment_tokens
             if self.enable_partial_hash_hits
             else self.scheduler_block_size
         )
