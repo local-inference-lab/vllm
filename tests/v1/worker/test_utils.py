@@ -3,7 +3,8 @@
 
 import torch
 
-from vllm.v1.worker.utils import bind_kv_cache
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+from vllm.v1.worker.utils import bind_kv_cache, copy_kv_cache_blocks_inplace
 
 
 def test_bind_kv_cache(default_vllm_config):
@@ -90,3 +91,54 @@ def test_bind_kv_cache_draft_model(default_vllm_config):
     assert runner_kv_caches[1] is kv_cache["draft_model.layers.0.attn"]
     assert runner_kv_caches[2] is kv_cache["model.layers.1.attn"]
     assert runner_kv_caches[3] is kv_cache["draft_model.layers.1.attn"]
+
+
+def test_copy_kv_cache_blocks_uses_logical_strided_views() -> None:
+    """CoW copies each logical page without copying backing-store padding."""
+    num_blocks = 4
+    backing = torch.full((num_blocks, 32), 0xEE, dtype=torch.uint8)
+    first = backing.as_strided((num_blocks, 3, 4), (32, 4, 1), 0)
+    second = backing.as_strided((num_blocks, 2, 4), (32, 4, 1), 16)
+    first[1].fill_(0x11)
+    second[1].fill_(0x22)
+    first[3].zero_()
+    second[3].zero_()
+    padding_before = backing[3, 12:16].clone()
+
+    copy_kv_cache_blocks_inplace([first, second], num_blocks, [KVCacheBlockCopy(1, 3)])
+
+    assert torch.equal(first[3], first[1])
+    assert torch.equal(second[3], second[1])
+    assert torch.equal(backing[3, 12:16], padding_before)
+
+
+def test_copy_kv_cache_blocks_detects_nonzero_block_axis() -> None:
+    """K/V-first cache layouts copy along their unique block dimension."""
+    cache = torch.zeros((2, 4, 3, 2), dtype=torch.int32)
+    cache[:, 1].fill_(17)
+    cache[:, 3].fill_(-1)
+
+    copy_kv_cache_blocks_inplace([cache], 4, [KVCacheBlockCopy(1, 3)])
+
+    assert torch.equal(cache[:, 3], cache[:, 1])
+
+
+def test_copy_kv_cache_blocks_scopes_tagged_copy_to_group() -> None:
+    """A group's CoW must not overwrite a live block in another group."""
+    num_blocks = 8
+    attention_cache = torch.zeros((num_blocks, 2), dtype=torch.int32)
+    recurrent_cache = torch.zeros((num_blocks, 2), dtype=torch.int32)
+    attention_cache[1].fill_(11)
+    attention_cache[5].fill_(-1)
+    recurrent_cache[1].fill_(22)
+    recurrent_cache[5].fill_(55)
+
+    copy_kv_cache_blocks_inplace(
+        [attention_cache, recurrent_cache],
+        num_blocks,
+        [KVCacheBlockCopy(1, 5, kv_cache_group_id=0)],
+        kv_cache_groups=[[attention_cache], [recurrent_cache]],
+    )
+
+    assert torch.equal(attention_cache[5], attention_cache[1])
+    assert torch.equal(recurrent_cache[5], torch.full_like(recurrent_cache[5], 55))

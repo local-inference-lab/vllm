@@ -805,19 +805,9 @@ def warmup_b12x_kimi_projection_gathers(
     return warmed
 
 
-def warmup_b12x_dcp_a2a(
-    cp_group: GroupCoordinator,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-    max_batch_size: int,
-    total_heads: int,
-    head_dim: int,
-    query_head_dim: int | None = None,
-) -> None:
-    """Create and exercise the B12X DCP channel before CUDA graph capture."""
+def _b12x_dcp_channel_available(cp_group: GroupCoordinator) -> bool:
     if not envs.VLLM_USE_B12X_DCP_A2A:
-        return
+        return False
     if cp_group.world_size not in _B12X_DCP_WORLD_SIZES:
         # The PCIe channel only exists for these world sizes. The runtime
         # dispatchers already fall back to NCCL collectives per call, so an
@@ -827,9 +817,29 @@ def warmup_b12x_dcp_a2a(
             "DCP world size %d uses NCCL collectives instead.",
             cp_group.world_size,
         )
+        return False
+    return True
+
+
+def warmup_b12x_dcp_query_gather(
+    cp_group: GroupCoordinator,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    max_batch_size: int,
+    total_heads: int,
+    head_dim: int,
+    query_head_dim: int,
+) -> None:
+    """Create and exercise the B12X DCP query all-gather channel for one
+    query element type and record width before CUDA graph capture.
+
+    Only the gather pool of that signature is created; the output reduction
+    is not touched, so this also serves query formats the reduction does
+    not accept (E4M3 query records gathered as bytes).
+    """
+    if not _b12x_dcp_channel_available(cp_group):
         return
-    if query_head_dim is None:
-        query_head_dim = head_dim
     local_query = torch.empty(
         (1, total_heads // cp_group.world_size, query_head_dim),
         device=device,
@@ -846,6 +856,32 @@ def warmup_b12x_dcp_a2a(
             "B12X PCIe DCP query all-gather is unavailable for the configured "
             "attention geometry"
         )
+
+
+def warmup_b12x_dcp_a2a(
+    cp_group: GroupCoordinator,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    max_batch_size: int,
+    total_heads: int,
+    head_dim: int,
+    query_head_dim: int | None = None,
+) -> None:
+    """Create and exercise the B12X DCP channel before CUDA graph capture."""
+    if not _b12x_dcp_channel_available(cp_group):
+        return
+    if query_head_dim is None:
+        query_head_dim = head_dim
+    warmup_b12x_dcp_query_gather(
+        cp_group,
+        device=device,
+        dtype=dtype,
+        max_batch_size=max_batch_size,
+        total_heads=total_heads,
+        head_dim=head_dim,
+        query_head_dim=query_head_dim,
+    )
     partial_output = torch.empty(
         (1, total_heads, head_dim),
         device=device,
