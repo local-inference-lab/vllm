@@ -558,6 +558,28 @@ class BlockPool:
         # entry for any group block size is the hash at that prefix boundary.
         return request.block_hashes[num_hash_blocks - 1]
 
+    def cache_partial_checkpoint_block(
+        self,
+        request: Request,
+        block: KVCacheBlock,
+        num_tokens: int,
+        kv_cache_group_id: int,
+        block_size: int,
+    ) -> BlockHashWithGroupId | None:
+        """Re-key an exported recurrent checkpoint at its true boundary."""
+        if block.is_null:
+            return None
+        assert num_tokens % block_size != 0
+        removed_hashes = self._remove_cached_block_hashes(block)
+        self._emit_block_removed_events(removed_hashes)
+        return self.cache_partial_block(
+            request=request,
+            block=block,
+            num_tokens=num_tokens,
+            kv_cache_group_id=kv_cache_group_id,
+            block_size=block_size,
+        )
+
     def _get_partial_block_parent_hash_and_start(
         self,
         request: Request,

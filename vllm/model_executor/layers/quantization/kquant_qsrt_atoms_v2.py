@@ -398,11 +398,17 @@ def open_qsrt_atom_v2_extent(
 ) -> Iterator[tuple[int, torch.Tensor]]:
     """Yield one shard's contiguous padded atom rows as ``[A, stride]``."""
 
-    first, rows = (
-        _balanced_pure_k2_atom_partition(shard_count, shard_index)
-        if metadata.profile == PURE_K2_PROFILE
-        else balanced_atom_partition(shard_count, shard_index)
-    )
+    if metadata.profile == PURE_K2_PROFILE and shard_count == 9:
+        from b12x.moe._shared.qsrt_sharding import plan_qsrt_tp9_rank
+
+        extent = plan_qsrt_tp9_rank(metadata.layer, shard_index)
+        first, rows = extent.first_atom, extent.atom_count
+    else:
+        first, rows = (
+            _balanced_pure_k2_atom_partition(shard_count, shard_index)
+            if metadata.profile == PURE_K2_PROFILE
+            else balanced_atom_partition(shard_count, shard_index)
+        )
     if metadata.coupled_h308:
         if rows != ATOMS_PER_PAIR or first % ATOMS_PER_PAIR:
             raise ValueError(

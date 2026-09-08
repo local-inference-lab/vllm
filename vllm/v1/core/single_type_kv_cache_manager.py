@@ -29,6 +29,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     TQFullAttentionSpec,
     get_kv_cache_dcp_shard_count,
+    get_mamba_prefill_checkpoint_position,
+    is_mamba_prefill_checkpoint_enabled,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -72,6 +74,10 @@ class SingleTypeKVCacheManager(ABC):
                 block until the request finishes.
         """
         self.scheduler_block_size = scheduler_block_size
+        # Token alignment of cached tails and retained checkpoints. The hybrid
+        # coordinator lowers it to its partial-hit alignment so that every
+        # boundary a lookup can return is also a boundary the groups cache.
+        self.cache_alignment_tokens = scheduler_block_size
         # The block size for this manager; used for actual block allocation.
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
@@ -492,7 +498,7 @@ class SingleTypeKVCacheManager(ABC):
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
             end_block=num_full_blocks,
-            alignment_tokens=self.scheduler_block_size,
+            alignment_tokens=self.cache_alignment_tokens,
             kv_cache_spec=self.kv_cache_spec,
             use_eagle=self.use_eagle,
             retention_interval=retention_interval,
@@ -744,17 +750,22 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             alignment_tokens=alignment_tokens,
         )
 
-        # Fine-grained mode (alignment_tokens == hash_block_size <
-        # block_size): resolve_block_hashes kept the raw hash-granularity
-        # list so interior boundaries can be probed.
+        # Fine-grained mode (hash_block_size <= alignment_tokens < block_size):
+        # resolve_block_hashes kept the raw hash-granularity list so interior
+        # boundaries can be probed. Hits are reported at boundaries that are
+        # multiples of alignment_tokens (the hash unit, or a coarser Mamba
+        # state cadence in hybrid models).
+        hash_unit = block_pool.hash_block_size
         fine_grained = (
-            alignment_tokens < block_size and block_size % alignment_tokens == 0
+            alignment_tokens < block_size
+            and block_size % alignment_tokens == 0
+            and alignment_tokens % hash_unit == 0
         )
         if fine_grained:
             # list or lazy BlobBlockHashes view
             assert isinstance(block_hashes, Sequence)
             full_block_hashes: BlockHashList = BlockHashListWithBlockSize(
-                block_hashes, alignment_tokens, block_size
+                block_hashes, hash_unit, block_size
             )
         else:
             full_block_hashes = block_hashes
@@ -777,14 +788,17 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if fine_grained:
             # list or lazy BlobBlockHashes view
             assert isinstance(block_hashes, Sequence)
-            scale_factor = block_size // alignment_tokens
+            scale_factor = block_size // hash_unit
             first_partial_idx = len(computed_blocks[0]) * scale_factor
             max_partial_idx = min(
                 first_partial_idx + scale_factor - 1,
-                max_length // alignment_tokens,
+                max_length // hash_unit,
                 len(block_hashes),
             )
             for fine_idx in range(max_partial_idx - 1, first_partial_idx - 1, -1):
+                candidate_length = (fine_idx + 1) * hash_unit
+                if candidate_length % alignment_tokens:
+                    continue
                 cached_tail = block_pool.get_cached_block(
                     block_hashes[fine_idx], kv_cache_group_ids
                 )
@@ -792,7 +806,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                     continue
                 for computed, cached in zip(computed_blocks, cached_tail):
                     computed.append(cached)
-                hit_length = (fine_idx + 1) * alignment_tokens
+                hit_length = candidate_length
                 break
 
         # Eagle needs the tokens right before the generation point recomputed:
@@ -800,7 +814,9 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         # append-only, so it still covers the reduced length), else one cache
         # block.
         if drop_eagle_block and hit_length > 0:
-            hit_length -= min(alignment_tokens, block_size)
+            hit_length -= min(
+                hash_unit if fine_grained else alignment_tokens, block_size
+            )
         # Round down to the alignment; a no-op when fine-grained (hits land on
         # hash boundaries by construction) and when alignment_tokens ==
         # block_size. Then trim blocks past the new tail.
@@ -1301,6 +1317,10 @@ class MambaManager(SingleTypeKVCacheManager):
         self.block_size = kv_cache_spec.block_size
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+        self.has_prefill_checkpoint_blocks = is_mamba_prefill_checkpoint_enabled(
+            self.mamba_cache_mode,
+            kv_cache_spec.num_prefill_checkpoint_blocks,
+        )
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
@@ -1308,6 +1328,8 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx: dict[str, int] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
+            # Absolute checkpoint position selected for each live allocation.
+            self._checkpoint_positions: dict[str, int] = {}
             # Requests that registered their own last-prompt-boundary partial
             # tail (producers). On the next step's CoW the boundary state moves
             # into a private cow_block; we record that block for connector
@@ -1487,6 +1509,35 @@ class MambaManager(SingleTypeKVCacheManager):
         """
         return 0
 
+    def _needs_internal_checkpoint(
+        self,
+        request_id: str,
+        query_start: int,
+        query_end: int,
+        checkpoint_position: int,
+    ) -> bool:
+        assert isinstance(self.kv_cache_spec, MambaSpec)
+        hash_block_size = self.block_pool.hash_block_size
+        checkpoint_alignment = min(hash_block_size, self.block_size)
+        checkpoint_idx = cdiv(query_end, self.block_size) - 2
+        blocks = self.req_to_blocks[request_id]
+        return (
+            self.has_prefill_checkpoint_blocks
+            and query_end % self.block_size != 0
+            and query_start % checkpoint_alignment == 0
+            and query_start + checkpoint_alignment <= checkpoint_position
+            and query_start < checkpoint_position < query_end
+            and checkpoint_idx >= 0
+            and (
+                checkpoint_idx >= len(blocks)
+                or blocks[checkpoint_idx].is_null
+                or (
+                    request_id in self._allocated_block_reqs
+                    and checkpoint_idx >= len(blocks) - self.num_speculative_blocks
+                )
+            )
+        )
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -1549,18 +1600,27 @@ class MambaManager(SingleTypeKVCacheManager):
             )
             if has_partial_hit:
                 num_new_blocks = max(num_new_blocks, 0) + 1
+            checkpoint_position = get_mamba_prefill_checkpoint_position(
+                num_tokens,
+                self.block_pool.hash_block_size,
+                self.use_eagle,
+            )
+            if not self._needs_internal_checkpoint(
+                request_id,
+                total_computed_tokens,
+                num_tokens,
+                checkpoint_position,
+            ):
+                checkpoint_position = 0
+            checkpoint_block = int(checkpoint_position > 0)
+            if not apply_admission_cap:
+                self._checkpoint_positions[request_id] = checkpoint_position
             if num_new_blocks > 0:
-                if request_id in self._allocated_block_reqs:
-                    # Old request. Needs at most 1 more blocks as we can reuse the
-                    # speculative blocks in previous step.
-                    num_new_blocks = 1 + int(has_partial_hit)
-                else:
-                    # First prefill. Allocate 1 block for running state, the
-                    # speculative blocks, and one extra block if a partial cache
-                    # hit must be copy-on-written before the new tokens run.
-                    num_new_blocks = (
-                        1 + self.num_speculative_blocks + int(has_partial_hit)
-                    )
+                blocks_allocated = request_id in self._allocated_block_reqs
+                if not (checkpoint_block and blocks_allocated):
+                    num_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
+                    if not blocks_allocated:
+                        num_new_blocks += self.num_speculative_blocks
 
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
@@ -1592,11 +1652,18 @@ class MambaManager(SingleTypeKVCacheManager):
             num_required_blocks = (
                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
             )
+            checkpoint_position = self._checkpoint_positions.get(request_id, 0)
+            checkpoint_block = int(checkpoint_position > 0)
             partial_hit = self._partial_hit_reqs.get(request_id)
             has_partial_hit = partial_hit is not None
             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
             # over-allocated at last round.
-            if num_required_blocks <= len(req_blocks) and not has_partial_hit:
+            if (
+                num_required_blocks <= len(req_blocks)
+                and not has_partial_hit
+                and not checkpoint_block
+            ):
+                self._allocated_block_reqs.add(request_id)
                 return []
             else:
                 prev_block_len = len(req_blocks)
@@ -1618,15 +1685,15 @@ class MambaManager(SingleTypeKVCacheManager):
                 )
                 # null blocks
                 if prev_block_len < num_skipped_blocks:
+                    # minus the internal checkpoint block
+                    # so we don't set null for that block
+                    null_end = num_skipped_blocks - checkpoint_block
                     req_blocks.extend(
-                        [
-                            self._null_block
-                            for _ in range(prev_block_len, num_skipped_blocks)
-                        ]
+                        [self._null_block for _ in range(prev_block_len, null_end)]
                     )
 
-                if blocks_allocated:
-                    # reuse previous speculative blocks in this step
+                if blocks_allocated and not checkpoint_block:
+                    # Relocate exclusively owned speculative scratch blocks.
                     for block_idx in range(
                         prev_block_len - self.num_speculative_blocks, prev_block_len
                     ):
@@ -1635,15 +1702,13 @@ class MambaManager(SingleTypeKVCacheManager):
                             req_blocks[block_idx] = self._null_block
                         else:
                             break
-                num_new_blocks = num_required_blocks - len(req_blocks)
+                num_new_blocks = max(num_required_blocks - len(req_blocks), 0)
                 if has_partial_hit:
                     num_new_blocks = max(num_new_blocks, 0) + 1
-                if blocks_allocated:
-                    assert num_new_blocks <= 1 + int(has_partial_hit)
-                else:
-                    assert num_new_blocks <= self.num_speculative_blocks + 1 + int(
-                        has_partial_hit
-                    )
+                max_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
+                if not blocks_allocated or checkpoint_block:
+                    max_new_blocks += self.num_speculative_blocks
+                assert num_new_blocks <= max_new_blocks
                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
                 returned_blocks = req_blocks[prev_block_len:]
                 if partial_hit is not None:
@@ -1692,6 +1757,7 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
+            self._checkpoint_positions.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
             # A hand-off whose request died in this same scheduling pass must
             # not reach the connector: its unpin hook (free) has already run.
@@ -1744,6 +1810,22 @@ class MambaManager(SingleTypeKVCacheManager):
         num_tokens: int,
     ) -> BlockHashWithGroupId | None:
         hash_block_size = self.block_pool.hash_block_size
+        checkpoint_position = self._checkpoint_positions.get(request.request_id, 0)
+        if checkpoint_position > 0:
+            if checkpoint_position % self.block_size == 0:
+                return None
+            checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
+            blocks = self.req_to_blocks[request.request_id]
+            assert 0 <= checkpoint_idx < len(blocks)
+            checkpoint_block = blocks[checkpoint_idx]
+            assert not checkpoint_block.is_null
+            return self.block_pool.cache_partial_checkpoint_block(
+                request=request,
+                block=checkpoint_block,
+                num_tokens=checkpoint_position,
+                kv_cache_group_id=self.kv_cache_group_id,
+                block_size=self.block_size,
+            )
         if self.block_size == hash_block_size:
             return None
         if num_tokens % self.block_size == 0:

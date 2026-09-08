@@ -105,6 +105,11 @@ class InputBatch:
     max_req_tokens: int | None = None
     valid_num_draft_tokens_per_req: np.ndarray | None = None
 
+    # Optional host view of the request token table. Remote speculators use
+    # this to verify that a target prefix-cache hit belongs to retained draft
+    # state before reconnecting it. The tensor is shared, not copied.
+    all_token_ids_cpu: torch.Tensor | None = None
+
     # When > 0, dummy batches carry seeded-random token ids instead of zeros.
     # All-zero ids embed identically, so every dummy token routes to the SAME
     # MoE experts — grouped expert reads collapse and the profiled cost of a

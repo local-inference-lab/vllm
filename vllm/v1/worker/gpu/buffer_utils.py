@@ -152,6 +152,12 @@ class StagedWriteTensor:
         self.write_starts = new_buffer(self.num_rows, dtype=torch.int32)
         self.write_cu_lens = new_buffer(self.num_rows, dtype=torch.int32)
 
+    @property
+    def cpu(self) -> torch.Tensor | None:
+        """Return the host backing tensor when this tensor uses UVA."""
+        uva_buf = getattr(self, "_uva_buf", None)
+        return None if uva_buf is None else uva_buf.cpu
+
     def stage_write(
         self, index: int, start: int, x: Iterable[int] | Iterable[float]
     ) -> None:
