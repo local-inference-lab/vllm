@@ -41,8 +41,12 @@ the eight-head dense adapter; the packed reader executes six full 16-head tiles
 and an eight-head remainder in two successive launches. The packed-reader adapter
 pads to 112, executes one launch, and removes the padding before DCP reduction.
 Six four-row cases at 2,048/8,192/16,384 local tokens preserve every valid output
-and LSE byte. With vector loads, one call measures approximately 108–213 µs
-versus 296–426 µs in the reference reader. These are isolated kernel timings.
+and LSE byte. Across those cases, replay medians are 295.8–426.0 µs for scalar
+loads with 104 heads, 194.6–286.7 µs for vector loads with 104 heads, and
+108.5–212.8 µs for vector loads with 112 heads. These are isolated kernel
+measurements recorded as `base104`, `fast104`, and `fast112` in B12X #311's
+`docs/evidence/kimi_packed_mla_tp9.json`; the two 104-head arms are distinct
+references for the load-path and head-padding comparisons.
 
 ## QSRT expert execution and communication
 
