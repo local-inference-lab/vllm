@@ -1,0 +1,631 @@
+{
+  "schema_version": 1,
+  "status": "qualified synchronized update measurements; no model-throughput claim",
+  "measurement_date": "2026-09-08",
+  "vllm_composition_revision": "f9ac0209a2edb6d54cd40a27913fde5dd833f944",
+  "baseline_vllm_revision": "fa6ea71c01fdaef3a664d083a536cee00a848b1d",
+  "b12x_revision": "0bf9f177b237d122d8c214c470bfe02be0b41c89",
+  "image": "sha256:bb9843ca63fe61b258077a3231a4136f143f942e259676225446df030afda767",
+  "benchmark": {
+    "status": "qualified fixed-input update cases",
+    "torch": "2.13.0",
+    "cuda_runtime": "13.3",
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "reference_sha256": "3c0e3060793907e33e1f8b68801aa6a7deab9cc27c0dff264a4139394372cf6f",
+    "candidate_sha256": "02b9d5fc55feb6abea06b6ee9c966071ea649959506d5ff6583ae09b686f6bcd",
+    "target_shape": [
+      4,
+      1048576
+    ],
+    "dtype": "int32",
+    "iterations": 30,
+    "order": "alternating reference/candidate each iteration",
+    "boundary": "apply_write through device completion; stage_write excluded",
+    "cases": [
+      {
+        "rows": 1,
+        "elements_per_row": 4,
+        "output_sha256": {
+          "gpu_contents": "baed642339816affb3fe8719792d0e4ce82f12db72b7373d244eaa65445800fe",
+          "uva_contents": "baed642339816affb3fe8719792d0e4ce82f12db72b7373d244eaa65445800fe"
+        },
+        "completion_samples_us": {
+          "gpu_contents": [
+            39.274,
+            37.351,
+            42.801,
+            40.467,
+            36.84,
+            35.868,
+            41.379,
+            35.328,
+            35.688,
+            34.676,
+            35.227,
+            34.365,
+            35.167,
+            45.176,
+            35.858,
+            34.145,
+            39.886,
+            39.856,
+            35.247,
+            33.964,
+            40.798,
+            39.695,
+            38.393,
+            33.564,
+            40.858,
+            34.085,
+            34.866,
+            38.854,
+            34.746,
+            35.498
+          ],
+          "uva_contents": [
+            26.21,
+            28.174,
+            24.467,
+            21.511,
+            29.786,
+            21.21,
+            23.896,
+            28.724,
+            29.496,
+            22.133,
+            23.435,
+            26.25,
+            28.675,
+            20.79,
+            23.315,
+            26.08,
+            23.635,
+            21.21,
+            28.434,
+            20.93,
+            23.816,
+            21.06,
+            28.644,
+            20.839,
+            24.196,
+            26.23,
+            28.374,
+            20.76,
+            23.695,
+            25.469
+          ]
+        },
+        "median_us": {
+          "gpu_contents": 35.863,
+          "uva_contents": 24.046
+        },
+        "reference_over_candidate": 1.4914330865840473
+      },
+      {
+        "rows": 1,
+        "elements_per_row": 4608,
+        "output_sha256": {
+          "gpu_contents": "bfa02a6b26784cd6471fc721cb6410fb07cea7d82ce102ecaf839ac4d26b3d83",
+          "uva_contents": "bfa02a6b26784cd6471fc721cb6410fb07cea7d82ce102ecaf839ac4d26b3d83"
+        },
+        "completion_samples_us": {
+          "gpu_contents": [
+            231.761,
+            240.117,
+            245.998,
+            242.191,
+            233.774,
+            241.239,
+            252.13,
+            244.315,
+            248.613,
+            258.872,
+            241.699,
+            253.532,
+            255.116,
+            236.169,
+            236.53,
+            243.944,
+            238.443,
+            237.692,
+            234.296,
+            244.856,
+            244.626,
+            235.498,
+            234.235,
+            235.818,
+            236.259,
+            251.689,
+            237.572,
+            236.039,
+            239.656,
+            238.754
+          ],
+          "uva_contents": [
+            132.552,
+            121.702,
+            124.847,
+            121.091,
+            137.552,
+            124.457,
+            128.304,
+            130.328,
+            137.03,
+            122.914,
+            128.474,
+            128.826,
+            126.29,
+            121.861,
+            122.493,
+            132.382,
+            122.994,
+            120.51,
+            129.146,
+            121.19,
+            127.252,
+            127.533,
+            129.998,
+            126.301,
+            124.197,
+            127.052,
+            130.619,
+            122.152,
+            124.457,
+            126.18
+          ]
+        },
+        "median_us": {
+          "gpu_contents": 239.8865,
+          "uva_contents": 126.2955
+        },
+        "reference_over_candidate": 1.899406550510509
+      },
+      {
+        "rows": 4,
+        "elements_per_row": 4608,
+        "output_sha256": {
+          "gpu_contents": "25d6ea39ba943144db0535fc68541f94af408b55a4835d33c641db3b98101fc8",
+          "uva_contents": "25d6ea39ba943144db0535fc68541f94af408b55a4835d33c641db3b98101fc8"
+        },
+        "completion_samples_us": {
+          "gpu_contents": [
+            824.358,
+            832.915,
+            832.685,
+            830.951,
+            837.904,
+            822.976,
+            841.161,
+            812.336,
+            831.562,
+            831.302,
+            835.921,
+            835.179,
+            835.25,
+            849.507,
+            860.237,
+            835.029,
+            835.6,
+            846.762,
+            827.314,
+            834.788,
+            834.879,
+            847.142,
+            833.866,
+            838.786,
+            854.125,
+            843.205,
+            837.083,
+            862.03,
+            861.769,
+            854.556
+          ],
+          "uva_contents": [
+            409.81,
+            411.292,
+            405.432,
+            405.071,
+            407.536,
+            411.964,
+            409.539,
+            403.118,
+            405.332,
+            407.826,
+            410.792,
+            403.858,
+            406.854,
+            412.455,
+            410.752,
+            404.189,
+            405.332,
+            410.812,
+            408.307,
+            405.531,
+            409.429,
+            414.619,
+            411.242,
+            407.395,
+            406.934,
+            412.115,
+            404.981,
+            406.834,
+            414.028,
+            409.88
+          ]
+        },
+        "median_us": {
+          "gpu_contents": 835.425,
+          "uva_contents": 408.0665
+        },
+        "reference_over_candidate": 2.0472766081018654
+      },
+      {
+        "rows": 1,
+        "elements_per_row": 65536,
+        "output_sha256": {
+          "gpu_contents": "4a35a59aabf394adb1d83cda6d3c2e799553e35ba7e4ee55537c8add209532a7",
+          "uva_contents": "4a35a59aabf394adb1d83cda6d3c2e799553e35ba7e4ee55537c8add209532a7"
+        },
+        "completion_samples_us": {
+          "gpu_contents": [
+            2942.86,
+            2901.09,
+            2918.243,
+            2910.589,
+            2939.564,
+            2890.129,
+            2916.359,
+            2891.863,
+            2904.077,
+            2879.129,
+            2896.132,
+            2977.086,
+            2908.875,
+            2914.085,
+            2935.426,
+            2902.413,
+            2880.281,
+            2963.078,
+            2899.187,
+            2926.348,
+            2971.465,
+            2953.05,
+            2946.988,
+            2954.592,
+            2930.076,
+            2900.309,
+            2920.918,
+            2896.492,
+            2897.364,
+            2885.24
+          ],
+          "uva_contents": [
+            1471.14,
+            1465.188,
+            1469.355,
+            1461.962,
+            1466.631,
+            1463.265,
+            1471.951,
+            1462.433,
+            1469.627,
+            1464.056,
+            1470.639,
+            1468.975,
+            1470.107,
+            1497.069,
+            1470.048,
+            1472.762,
+            1466.25,
+            1467.592,
+            1466.24,
+            1464.126,
+            1466.441,
+            1466.651,
+            1466.811,
+            1472.282,
+            1467.052,
+            1462.072,
+            1472.051,
+            1464.296,
+            1471.911,
+            1461.982
+          ]
+        },
+        "median_us": {
+          "gpu_contents": 2912.337,
+          "uva_contents": 1466.9315
+        },
+        "reference_over_candidate": 1.9853258315061066
+      },
+      {
+        "rows": 1,
+        "elements_per_row": 131072,
+        "output_sha256": {
+          "gpu_contents": "061e694cd62753aa1a6eb0432029ac8c62b8ad5fb97e0dcb9764a9dc6344af35",
+          "uva_contents": "061e694cd62753aa1a6eb0432029ac8c62b8ad5fb97e0dcb9764a9dc6344af35"
+        },
+        "completion_samples_us": {
+          "gpu_contents": [
+            5747.156,
+            5769.048,
+            5753.96,
+            5620.455,
+            5888.726,
+            5749.05,
+            5758.669,
+            5832.228,
+            5859.109,
+            5681.922,
+            5776.081,
+            5788.946,
+            5792.142,
+            5769.329,
+            5700.648,
+            5797.442,
+            5777.755,
+            5813.843,
+            5817.14,
+            5776.011,
+            5776.442,
+            5792.944,
+            5802.602,
+            5788.415,
+            5837.558,
+            5712.541,
+            5942.488,
+            5778.586,
+            5790.439,
+            5790.729
+          ],
+          "uva_contents": [
+            2903.414,
+            2882.274,
+            2925.507,
+            2895.881,
+            2898.896,
+            2895.77,
+            2900.529,
+            2889.408,
+            2904.086,
+            2887.375,
+            2911.13,
+            2891.663,
+            2895.891,
+            2895.971,
+            2906.551,
+            2893.947,
+            2904.086,
+            2893.647,
+            2903.475,
+            2881.974,
+            2904.396,
+            2888.386,
+            2904.748,
+            2889.699,
+            2900.84,
+            2893.336,
+            2902.653,
+            2887.855,
+            2907.202,
+            2889.438
+          ]
+        },
+        "median_us": {
+          "gpu_contents": 5783.5005,
+          "uva_contents": 2895.931
+        },
+        "reference_over_candidate": 1.9971126729193478
+      },
+      {
+        "rows": 1,
+        "elements_per_row": 1048576,
+        "output_sha256": {
+          "gpu_contents": "1f7a6345e9b0e88fbda1b3deadf54bb6f18ccbf548a244bf2de33179c243c0ff",
+          "uva_contents": "1f7a6345e9b0e88fbda1b3deadf54bb6f18ccbf548a244bf2de33179c243c0ff"
+        },
+        "completion_samples_us": {
+          "gpu_contents": [
+            44222.331,
+            45080.154,
+            45821.665,
+            45606.385,
+            45436.432,
+            45625.622,
+            45969.546,
+            46006.226,
+            45966.501,
+            45945.731,
+            46040.531,
+            46456.953,
+            46962.305,
+            46810.617,
+            47209.426,
+            46525.785,
+            46736.636,
+            46851.314,
+            47170.531,
+            46717.86,
+            46777.153,
+            46693.565,
+            45787.36,
+            46659.549,
+            46852.526,
+            46534.942,
+            46513.14,
+            46843.058,
+            46767.004,
+            46630.334
+          ],
+          "uva_contents": [
+            22961.464,
+            22895.028,
+            22976.062,
+            22920.897,
+            22975.831,
+            22891.11,
+            22961.003,
+            22897.953,
+            22968.527,
+            22890.8,
+            22948.089,
+            22872.985,
+            22946.385,
+            22894.427,
+            22944.602,
+            22879.648,
+            22964.429,
+            22908.934,
+            22905.007,
+            22891.782,
+            22953.869,
+            22912.411,
+            22981.923,
+            22899.225,
+            22967.896,
+            22890.689,
+            22982.945,
+            22857.596,
+            22949.832,
+            22884.748
+          ]
+        },
+        "median_us": {
+          "gpu_contents": 46530.36350000001,
+          "uva_contents": 22916.654000000002
+        },
+        "reference_over_candidate": 2.030416984085024
+      }
+    ]
+  },
+  "service_activity": {
+    "running_before": 0,
+    "running_after": 0,
+    "waiting_before": 0,
+    "waiting_after": 0,
+    "token_or_request_counters_changed": false
+  },
+  "gpu_before": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2580 MHz, 16365 MHz, 59, 82.97 W, 0 %, 95589 MiB",
+  "gpu_after": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2580 MHz, 16365 MHz, 59, 84.18 W, 0 %, 95589 MiB",
+  "allocator_alias_probe": [
+    {
+      "allocation": "host_default",
+      "torch_is_pinned": true,
+      "cpu_update_visible_on_gpu": true,
+      "gpu_update_visible_on_cpu": true,
+      "same_numeric_pointer": true,
+      "free_status": 0
+    },
+    {
+      "allocation": "host_mapped",
+      "torch_is_pinned": true,
+      "cpu_update_visible_on_gpu": true,
+      "gpu_update_visible_on_cpu": true,
+      "same_numeric_pointer": true,
+      "free_status": 0
+    },
+    {
+      "allocation": "host_mapped_write_combined",
+      "torch_is_pinned": true,
+      "cpu_update_visible_on_gpu": true,
+      "gpu_update_visible_on_cpu": true,
+      "same_numeric_pointer": true,
+      "free_status": 0
+    },
+    {
+      "allocation": "managed",
+      "torch_is_pinned": false,
+      "cpu_update_visible_on_gpu": false,
+      "gpu_update_visible_on_cpu": false,
+      "same_numeric_pointer": false,
+      "free_status": 0
+    }
+  ],
+  "limitations": [
+    "Single-GPU update completion, with synchronization; not model throughput.",
+    "The 48 GiB LMCache pool remains allocated in the separate serving processes.",
+    "An overlapping interval was excluded from performance evidence.",
+    "CPU and GPU view code for managed allocations is the installed frozen runtime, not a general CUDA restriction."
+  ],
+  "serving_qualification": {
+    "status": "qualified serving correctness and scoped trace observation",
+    "source_id": "6e5fff3911585dfd",
+    "cache_conversation_checks_passed": 7,
+    "concurrent_canaries_passed": 4,
+    "nonfinite_logprobs": 0,
+    "trace_iterations": 4,
+    "running_requests_at_profile_start": 1.0,
+    "prompt_tokens": 63833,
+    "reference_prompt_tokens": 63833,
+    "stage_comparison": {
+      "vllm:v2/target/verify/full_graph_replay": {
+        "reference": {
+          "count": 4,
+          "durations_ms": [
+            30.859129,
+            30.839481,
+            30.856569,
+            30.827959999999997
+          ],
+          "median_ms": 30.848025
+        },
+        "deployed": {
+          "count": 4,
+          "durations_ms": [
+            30.86788,
+            30.822758999999998,
+            30.838791,
+            30.841767
+          ],
+          "median_ms": 30.840279000000002
+        }
+      },
+      "vllm:v2/speculator/verify/propose": {
+        "reference": {
+          "count": 4,
+          "durations_ms": [
+            2.284643,
+            2.2872660000000002,
+            2.285315,
+            2.285187
+          ],
+          "median_ms": 2.285251
+        },
+        "deployed": {
+          "count": 4,
+          "durations_ms": [
+            2.286213,
+            2.283364,
+            2.279077,
+            2.274693
+          ],
+          "median_ms": 2.2812205000000003
+        }
+      },
+      "vllm:v2/target/prepare_inputs": {
+        "reference": {
+          "count": 4,
+          "durations_ms": [
+            0.670059,
+            0.018242,
+            0.018563,
+            0.01677
+          ],
+          "median_ms": 0.0184025
+        },
+        "deployed": {
+          "count": 4,
+          "durations_ms": [
+            2.2889969999999997,
+            0.035938000000000005,
+            0.027393999999999998,
+            0.029346
+          ],
+          "median_ms": 0.032642000000000004
+        }
+      }
+    },
+    "trace_sha256": "675fcbbed9c666c6ba58a8a47112235e9c420b890b8f5dbfd6d19629cacc29e8",
+    "limits": "Different sampled continuations and profiler-start outliers; no model-throughput gain claim."
+  }
+}
