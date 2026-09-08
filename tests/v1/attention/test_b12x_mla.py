@@ -61,8 +61,13 @@ def test_b12x_mla_uses_gathered_dcp_head_geometry() -> None:
     assert b12x_mla._kernel_query_heads(12, 8) == 96
     assert b12x_mla._kernel_query_heads(8, 12) == 96
     assert b12x_mla._kernel_query_heads(6, 16) == 96
-    with pytest.raises(ValueError, match="multiple of eight"):
-        b12x_mla._kernel_query_heads(6, 2)
+    assert b12x_mla._kernel_query_heads(6, 2) == 16
+
+
+def test_b12x_mla_packed_dcp_heads_close_one_reader_tile() -> None:
+    assert b12x_mla._kernel_query_heads(11, 9, packed_ds_mla=True) == 112
+    assert b12x_mla._kernel_query_heads(11, 9) == 104
+    assert b12x_mla._kernel_query_heads(12, 8, packed_ds_mla=True) == 96
 
 
 @pytest.mark.parametrize(
@@ -292,11 +297,7 @@ def test_b12x_mla_packed_reader_matches_reference_with_1536_token_pages(
     kv_c = torch.randn((num_tokens, 512), dtype=torch.bfloat16, device=device).div_(4)
     k_pe = torch.randn((num_tokens, 64), dtype=torch.bfloat16, device=device).div_(4)
     ops.concat_and_cache_mla(
-        kv_c,
-        k_pe,
-        cache,
-        selected_indices[0].to(torch.int64),
-        "fp8_ds_mla",
+        kv_c, k_pe, cache, selected_indices[0].to(torch.int64), "fp8_ds_mla",
         torch.ones((), dtype=torch.float32, device=device),
     )
     q = torch.randn((1, num_heads, 576), dtype=torch.bfloat16, device=device).div_(4)
@@ -441,8 +442,7 @@ def test_b12x_mla_rejects_unsupported_parallel_geometry(monkeypatch) -> None:
     dcp_reason = _support_reason(monkeypatch, dcp_size=2)
     pcp_reason = _support_reason(monkeypatch, dcp_size=8, pcp_size=2)
 
-    assert dcp_reason is not None
-    assert "multiple of eight" in dcp_reason
+    assert dcp_reason is None
     assert pcp_reason is not None
     assert "prefill context parallelism" in pcp_reason
 
@@ -1212,14 +1212,20 @@ def test_b12x_mla_adapter_gathers_and_combines_dcp(monkeypatch) -> None:
     assert lse is None
 
 
-def test_b12x_mla_packed_adapter_gathers_and_combines_dcp(monkeypatch) -> None:
-    impl, packed_run = _fake_packed_impl(num_heads=8)
-    impl.dcp_world_size = 8
+@pytest.mark.parametrize(
+    ("num_heads", "dcp_size", "kernel_heads"),
+    ((8, 8, 64), (11, 9, 112)),
+)
+def test_b12x_mla_packed_adapter_gathers_and_combines_dcp(
+    monkeypatch, num_heads: int, dcp_size: int, kernel_heads: int
+) -> None:
+    impl, packed_run = _fake_packed_impl(num_heads=num_heads)
+    impl.dcp_world_size = dcp_size
     batch = 2
-    q = torch.randn(batch, 8, 576, dtype=torch.bfloat16)
+    q = torch.randn(batch, num_heads, 576, dtype=torch.bfloat16)
     cache = torch.zeros(4, 16, 656, dtype=torch.uint8)
     selected = torch.arange(32, dtype=torch.int32).expand(batch, -1).clone()
-    group = SimpleNamespace(world_size=8)
+    group = SimpleNamespace(world_size=dcp_size)
     calls: list[str] = []
 
     monkeypatch.setattr(b12x_mla, "get_dcp_group", lambda: group)
@@ -1229,16 +1235,16 @@ def test_b12x_mla_packed_adapter_gathers_and_combines_dcp(monkeypatch) -> None:
         assert max_batch_size == 16
         assert output_head_dim == 512
         calls.append("gather")
-        out.copy_(local_q.repeat(1, 8, 1))
+        out.copy_(local_q.repeat(1, dcp_size, 1))
         return out
 
     def reduce(output, lse, actual_group, **kwargs):
         assert actual_group is group
-        assert output.shape == (batch, 64, 512)
-        assert lse.shape == (batch, 64)
+        assert output.shape == (batch, num_heads * dcp_size, 512)
+        assert lse.shape == (batch, num_heads * dcp_size)
         assert kwargs["is_lse_base_on_e"] is True
         calls.append("reduce")
-        return output[:, :8].add(1)
+        return output[:, :num_heads].add(1)
 
     monkeypatch.setattr(b12x_mla, "dcp_b12x_all_gather_heads", gather)
     monkeypatch.setattr(b12x_mla, "dcp_a2a_lse_reduce", reduce)
@@ -1247,8 +1253,10 @@ def test_b12x_mla_packed_adapter_gathers_and_combines_dcp(monkeypatch) -> None:
         dense_mla_plan=_FakePackedPlan(),
         dense_mla_scratch=torch.empty(256, dtype=torch.uint8),
         dense_mla_selected_indices=selected,
-        dense_mla_padded_q=torch.empty(batch, 64, 576, dtype=torch.bfloat16),
-        dense_mla_padded_output=torch.empty(batch, 64, 512, dtype=torch.bfloat16),
+        dense_mla_padded_q=torch.empty(batch, kernel_heads, 576, dtype=torch.bfloat16),
+        dense_mla_padded_output=torch.empty(
+            batch, kernel_heads, 512, dtype=torch.bfloat16
+        ),
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         decode=SimpleNamespace(
             block_table=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
@@ -1260,7 +1268,11 @@ def test_b12x_mla_packed_adapter_gathers_and_combines_dcp(monkeypatch) -> None:
 
     assert calls == ["gather", "reduce"]
     assert packed_run.calls[0]["lse_scale"] == "natural"
-    assert output.shape == (batch, 8, 512)
+    bound_query = packed_run.calls[0]["binding"].q
+    assert bound_query.shape == (batch, kernel_heads, 576)
+    assert bound_query.data_ptr() == metadata.dense_mla_padded_q.data_ptr()
+    assert torch.count_nonzero(bound_query[:, num_heads * dcp_size :]) == 0
+    assert output.shape == (batch, num_heads, 512)
     torch.testing.assert_close(output, torch.ones_like(output))
     assert lse is None
 
@@ -1407,22 +1419,21 @@ def test_b12x_mla_pack_k3_query_matches_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_b12x_mla_packed_query_matches_bf16_query(monkeypatch) -> None:
+@pytest.mark.parametrize("num_heads", [64, 99])
+def test_b12x_mla_packed_query_matches_bf16_query(monkeypatch, num_heads) -> None:
     """The packed query record gives the bit-identical attention output."""
     if torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("requires SM120 or SM121")
     sparse_mla = pytest.importorskip("b12x.attention.sparse_mla")
     monkeypatch.setenv("B12X_MLA_SM120_GLM_FASTPATH", "1")
-    monkeypatch.setenv("B12X_MLA_SM120_GLM_W_HW_DEQUANT", "1")
-    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_SPLIT_POLICY", "balanced")
-    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE", "fp32")
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_W_HW_DEQUANT", "0")
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_SPLIT_POLICY", "static")
+    monkeypatch.setattr(b12x_mla.envs, "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE", "bf16")
     torch.manual_seed(20260905)
     device = torch.device("cuda")
     page_size = 1536
     num_tokens = 1600
-    # 64 gathered heads: the HPB=16 generic arm that serves Kimi-K3 (8 heads
-    # would select the native H8 arm, which has no packed-query support).
-    num_heads = 64
+    kernel_heads = b12x_mla._kernel_query_heads(num_heads, packed_ds_mla=True)
     block_table = torch.tensor([[1, 0]], dtype=torch.int32, device=device)
     seq_lens = torch.tensor([num_tokens], dtype=torch.int32, device=device)
     selected_indices = torch.empty((1, num_tokens), dtype=torch.int32, device=device)
@@ -1439,10 +1450,21 @@ def test_b12x_mla_packed_query_matches_bf16_query(monkeypatch) -> None:
     q = torch.randn((1, num_heads, 576), dtype=torch.bfloat16, device=device).div_(4)
     plan = sparse_mla.plan(
         sparse_mla.Caps(
-            device=device, num_q_heads=num_heads, max_q_rows=1, max_width=num_tokens,
-            dtype=torch.bfloat16, kv_dtype=torch.uint8, head_dim=576, v_head_dim=512,
-            mode="decode", max_batch=1, max_page_table_width=2, max_chunks_per_row=25,
-            page_size=page_size, head_major_output=False, partial_dtype=torch.float32,
+            device=device,
+            num_q_heads=kernel_heads,
+            max_q_rows=1,
+            max_width=num_tokens,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.uint8,
+            head_dim=576,
+            v_head_dim=512,
+            mode="decode",
+            max_batch=1,
+            max_page_table_width=2,
+            max_chunks_per_row=25,
+            page_size=page_size,
+            head_major_output=False,
+            partial_dtype=torch.float32,
         )
     )
     scratch_spec = plan.scratch_specs()[0]
@@ -1464,6 +1486,14 @@ def test_b12x_mla_packed_query_matches_bf16_query(monkeypatch) -> None:
             dense_mla_selected_indices=selected_indices,
             dense_mla_packed_q_local=torch.empty(
                 (1, num_heads, 656), dtype=torch.uint8, device=device
+            ),
+            dense_mla_padded_q=torch.empty(
+                (1, kernel_heads, 656 if packed else 576),
+                dtype=torch.uint8 if packed else torch.bfloat16,
+                device=device,
+            ),
+            dense_mla_padded_output=torch.empty(
+                (1, kernel_heads, 512), dtype=torch.bfloat16, device=device
             ),
             query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device=device),
             decode=SimpleNamespace(block_table=block_table, seq_lens=seq_lens),

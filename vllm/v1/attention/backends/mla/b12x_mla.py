@@ -51,6 +51,7 @@ _K3_V_HEAD_DIM = 128
 _MAX_B12X_QUERY_ROWS = 1024
 _MAX_B12X_CACHE_TOKENS = 1_048_576
 _B12X_QUERY_HEAD_TILE = 8
+_B12X_PACKED_QUERY_HEAD_TILE = 16
 _FP8_DS_MLA_RECORD_BYTES = 656
 _PACKED_DENSE_MAX_SPLITS = 64
 # Packed query record consumed by the B12X packed reader: 512 E4M3 nope bytes
@@ -306,7 +307,9 @@ def _max_dcp_local_cache_tokens(
     return ((max_model_len + partitions - 1) // partitions) * interleave
 
 
-def _kernel_query_heads(local_heads: int, dcp_size: int = 1) -> int:
+def _kernel_query_heads(
+    local_heads: int, dcp_size: int = 1, *, packed_ds_mla: bool = False
+) -> int:
     """Return the tiled head count after an optional DCP query gather."""
     if local_heads <= 0 or dcp_size <= 0:
         raise ValueError(
@@ -314,17 +317,16 @@ def _kernel_query_heads(local_heads: int, dcp_size: int = 1) -> int:
             f"heads={local_heads}, DCP={dcp_size}."
         )
     effective_heads = local_heads * dcp_size
-    if dcp_size > 1 and effective_heads % _B12X_QUERY_HEAD_TILE:
-        raise ValueError(
-            "B12X_MLA requires a multiple of eight query heads after DCP "
-            f"gather, got local={local_heads}, DCP={dcp_size}, "
-            f"effective={effective_heads}."
-        )
-    return (
-        (effective_heads + _B12X_QUERY_HEAD_TILE - 1)
-        // _B12X_QUERY_HEAD_TILE
-        * _B12X_QUERY_HEAD_TILE
+    # The packed reader launches a separate grid for a partial 16-head tile.
+    # Closing that tile lets every head share one launch. Zero query heads are
+    # removed from output and LSE before DCP reduction, so padding contributes
+    # no model state and does not change any valid head's arithmetic.
+    tile = (
+        _B12X_PACKED_QUERY_HEAD_TILE
+        if packed_ds_mla and effective_heads > _B12X_PACKED_QUERY_HEAD_TILE
+        else _B12X_QUERY_HEAD_TILE
     )
+    return (effective_heads + tile - 1) // tile * tile
 
 
 def _active_dense_mla_splits(plan: Any, max_seq_len: int | None) -> int:
@@ -682,7 +684,11 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             )
         self._max_dense_mla_rows = max_dense_mla_rows
         self._effective_heads = self.num_heads * self.dcp_world_size
-        self._kernel_heads = _kernel_query_heads(self.num_heads, self.dcp_world_size)
+        self._kernel_heads = _kernel_query_heads(
+            self.num_heads,
+            self.dcp_world_size,
+            packed_ds_mla=self._uses_packed_ds_mla,
+        )
         local_shard_tokens = _max_dcp_local_cache_tokens(
             vllm_config, dcp_size=self.dcp_world_size
         )
@@ -1353,7 +1359,11 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 f"metadata={metadata_dcp_world_size}, runtime={self.dcp_world_size}."
             )
         effective_heads = self.num_heads * metadata_dcp_world_size
-        kernel_heads = _kernel_query_heads(self.num_heads, metadata_dcp_world_size)
+        kernel_heads = _kernel_query_heads(
+            self.num_heads,
+            metadata_dcp_world_size,
+            packed_ds_mla=self._uses_packed_ds_mla,
+        )
         qrep_decode = self.dcp_q_replicate and metadata_dcp_world_size > 1
         expected_input_heads = effective_heads if qrep_decode else self.num_heads
         if int(q.shape[1]) != expected_input_heads:
@@ -1454,7 +1464,11 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                         "B12X_MLA padded query dtype does not match the live query: "
                         f"buffer={padded_q.dtype}, query={q.dtype}."
                     )
-                padded_q[:, :effective_heads].copy_(q)
+                # The DCP all-gather writes directly into the leading view of
+                # this buffer. Copying that view onto itself is invalid during
+                # CUDA graph replay; only an independent query needs copying.
+                if q.data_ptr() != padded_q.data_ptr():
+                    padded_q[:, :effective_heads].copy_(q)
                 padded_q[:, effective_heads:].zero_()
                 q = padded_q
         scratch = getattr(attn_metadata, "dense_mla_scratch", None)
