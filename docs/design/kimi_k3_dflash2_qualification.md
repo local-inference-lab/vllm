@@ -4,6 +4,7 @@ Status: **implemented and qualified for the conditions recorded here**.
 The measurement date is 2026-09-08. The source-locked serving composition is
 vLLM `fa6ea71c01fdaef3a664d083a536cee00a848b1d`, B12X
 `0bf9f177b237`, and LMCache `9f8514c680e77f8d5d026e05037bc29b603a5bf4`.
+The eight-row serving configuration has frozen source ID `5ee97cdc6d995067`.
 It combines the DFlash2 port and rejection guards in
 [vLLM #704](https://github.com/local-inference-lab/vllm/pull/704) with the
 packed-reader integration of
@@ -11,6 +12,10 @@ packed-reader integration of
 [B12X #311](https://github.com/local-inference-lab/b12x/pull/311).
 These are composition measurements, not a claim that any one PR independently
 produces the whole serving result.
+The 99-to-112 head padding and DCP self-copy avoidance from the measured
+vLLM candidate are also ported to PR #644 at `2c99648d7185`. Its 63 adapter
+tests pass with those modules overlaid on the frozen serving runtime; that
+check establishes module correctness, not standalone PR serving performance.
 
 ## Configuration and precision contract
 
@@ -136,7 +141,9 @@ The ordinary E4M3 four-query MLA kernel is present in the source but does not
 consume `fp8_ds_mla`. This packed path originally padded 99 effective heads to
 104, producing a separate eight-head tail launch. Padding to 112 reduces
 192 reader launches to 96 across four steps and 24 MLA layers. This launch
-change and vector shared-memory loads explain the measured cost reduction.
+change and vector shared-memory loads are consistent with the reduction in
+the fixed-input kernel measurements. The serving traces combine both changes
+and do not isolate their individual contributions.
 
 ### Invalid server-counter attribution
 
