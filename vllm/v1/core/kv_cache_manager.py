@@ -726,12 +726,23 @@ class KVCacheManager:
             ):
                 blocks = [0] * (count - 1)
             else:
-                blocks = [
+                # A sliding-window group can legitimately evict its leading
+                # pages. Retain the window required to replay the final row,
+                # and reject holes only inside that reachable range.
+                skipped = min(
+                    manager.get_num_skipped_tokens(num_tokens - 1)
+                    // manager.block_size,
+                    count - 1,
+                )
+                tail = [
                     block.block_id
-                    for block in manager.req_to_blocks[request.request_id][: count - 1]
+                    for block in manager.req_to_blocks[request.request_id][
+                        skipped : count - 1
+                    ]
                 ]
-                if len(blocks) != count - 1 or 0 in blocks:
+                if len(tail) != count - 1 - skipped or 0 in tail:
                     return None
+                blocks = [0] * skipped + tail
             blocks.append(allocation[slot][group_id])
             grouped_blocks.append(tuple(blocks))
         checkpoint = BoundaryCheckpoint(

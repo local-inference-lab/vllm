@@ -92,6 +92,7 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "DeepseekV32MTPModel",
         "DeepseekV32ForCausalLM",
         "DeepseekV4ForCausalLM",
+        "DeepseekV4ForConditionalGeneration",
         "DeepSeekV4MTPModel",
         "GlmMoeDsaForCausalLM",
         "Glm5NextForCausalLM",
@@ -611,13 +612,23 @@ class VllmConfig:
             and (
                 self.speculative_config is None
                 or (
-                    self.speculative_config.method == "mtp"
+                    (
+                        self.speculative_config.method == "mtp"
+                        or (
+                            self.speculative_config.method == "dflash"
+                            and model.hf_text_config.model_type
+                            in ("glm5_next_text", "glm5_next")
+                        )
+                    )
                     and not self.speculative_config.uses_dynamic_speculative_decoding()
                 )
             )
             and parallel.pipeline_parallel_size == 1
             and parallel.data_parallel_size == 1
-            and parallel.decode_context_parallel_size == 1
+            and (
+                parallel.decode_context_parallel_size == 1
+                or model.hf_text_config.model_type in ("glm5_next_text", "glm5_next")
+            )
             and parallel.prefill_context_parallel_size == 1
             and self.kv_transfer_config is None
             and cache.kv_offloading_size is None

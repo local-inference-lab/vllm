@@ -38,6 +38,10 @@ from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
+from vllm.v1.attention.backends.mla.sparse_swa import (
+    DeepseekSparseSWABackend,
+    DeepseekSparseSWAMetadataBuilder,
+)
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
     retain_cuda_graph_capture_resource,
@@ -509,6 +513,16 @@ class DeepseekV4B12xSparseMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder)
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
 
+class DeepseekSparseSWAB12xMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+
+
+class DeepseekSparseSWAB12xBackend(DeepseekSparseSWABackend):
+    @staticmethod
+    def get_builder_cls() -> type[DeepseekSparseSWAB12xMetadataBuilder]:
+        return DeepseekSparseSWAB12xMetadataBuilder
+
+
 class DeepseekV4B12xSparseMLABackend(DeepseekV4SparseMLABackend):
     @staticmethod
     def get_name() -> str:
@@ -525,6 +539,7 @@ class DeepseekV4B12xSparseMLABackend(DeepseekV4SparseMLABackend):
 
 class DeepseekV4B12xAttention(DeepseekV4Attention):
     backend_cls = DeepseekV4B12xSparseMLABackend
+    swa_backend_cls = DeepseekSparseSWAB12xBackend
     indexer_backend_cls = DeepseekV4B12xIndexerBackend
     indexer_op_cls = DeepseekV4B12xSparseIndexer
 
@@ -665,13 +680,13 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                 self.compress_ratio,
             )
 
-        swa_width = int(self.window_size)
+        swa_width = int(self.window_size) + self.max_image_tokens
         speculative_config = self.vllm_config.speculative_config
         if speculative_config is not None and speculative_config.use_dspark():
             swa_width = max(
                 swa_width,
                 get_dspark_swa_index_width(
-                    swa_width,
+                    int(self.window_size),
                     speculative_config.num_speculative_tokens or 0,
                 ),
             )

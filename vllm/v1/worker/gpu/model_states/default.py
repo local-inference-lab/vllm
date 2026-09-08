@@ -209,6 +209,19 @@ class DefaultModelState(ModelState):
                 req_ids=input_batch.req_ids,
                 mm_features=self.encoder_cache.mm_features,
                 sliding_window=self.model_config.get_sliding_window(),
+                clamp_sliding_window=(
+                    getattr(self.model, "mm_prefix_clamp_sliding_window", False)
+                    or getattr(
+                        self.model_config.hf_text_config,
+                        "mm_prefix_clamp_sliding_window",
+                        False,
+                    )
+                ),
+                span_leading_pad_modulus=getattr(
+                    self.model_config.hf_text_config,
+                    "mm_prefix_span_leading_pad_modulus",
+                    0,
+                ),
             )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,

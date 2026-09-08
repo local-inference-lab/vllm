@@ -666,53 +666,54 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 
         launch_resources: list[tuple[torch.Tensor, ...]] = []
         for tokens in launch_tokens.values():
-            hidden_states = torch.zeros(
-                (tokens, int(prepared.hidden_size)),
-                dtype=dtype,
-                device=device,
-            )
-            output = torch.empty_like(hidden_states)
-            topk_ids = (
-                torch.arange(topk, device=device, dtype=torch.int32)
-                .unsqueeze(0)
-                .expand(tokens, -1)
-                .contiguous()
-            )
-            topk_ids.remainder_(int(prepared.num_experts))
-            topk_weights = torch.full(
-                (tokens, topk),
-                1.0 / topk,
-                dtype=torch.float32,
-                device=device,
-            )
             plan = self._plan(
                 tokens=tokens,
                 topk=topk,
                 activation=activation,
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
-            scratch = torch.empty(
-                (_b12x_scratch_nbytes(plan),),
-                dtype=torch.uint8,
-                device=device,
-            )
-            # B12X warmup launches may outlive the Python call that submits
-            # them. Retain every caller-owned input, output, and scratch tensor
-            # until device completion so the allocator cannot reuse an address
-            # while a warmup kernel still references it.
-            launch_resources.append(
-                (hidden_states, output, topk_ids, topk_weights, scratch)
-            )
-            _run_b12x_moe_plan(
-                plan=plan,
-                scratch=scratch,
-                hidden_states=hidden_states,
-                prepared=prepared,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                output=output,
-                unit_scale_contract=self._quant_mode == "w4a16",
-            )
+            for route_ids_dtype in (torch.int32, torch.int64):
+                scratch = torch.empty(
+                    (_b12x_scratch_nbytes(plan),),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                hidden_states = torch.zeros(
+                    (tokens, int(prepared.hidden_size)),
+                    dtype=dtype,
+                    device=device,
+                )
+                output = torch.empty_like(hidden_states)
+                topk_ids = (
+                    torch.arange(topk, device=device, dtype=route_ids_dtype)
+                    .unsqueeze(0)
+                    .expand(tokens, -1)
+                    .contiguous()
+                )
+                topk_ids.remainder_(int(prepared.num_experts))
+                topk_weights = torch.full(
+                    (tokens, topk),
+                    1.0 / topk,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                # B12X warmup launches may outlive the Python call that
+                # submits them. Retain every caller-owned input, output, and
+                # scratch tensor until device completion so the allocator
+                # cannot reuse an address while a warmup kernel references it.
+                launch_resources.append(
+                    (hidden_states, output, topk_ids, topk_weights, scratch)
+                )
+                _run_b12x_moe_plan(
+                    plan=plan,
+                    scratch=scratch,
+                    hidden_states=hidden_states,
+                    prepared=prepared,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    output=output,
+                    unit_scale_contract=self._quant_mode == "w4a16",
+                )
         if launch_resources:
             torch.accelerator.synchronize()
         return len(launch_tokens)

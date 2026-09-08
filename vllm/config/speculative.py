@@ -1449,7 +1449,8 @@ class SpeculativeConfig:
                         # Default to max value defined in draft model config.
                         self.num_speculative_tokens = n_predict
                     elif (
-                        self.num_speculative_tokens > n_predict
+                        self.method not in ("dflash", "dspark")
+                        and self.num_speculative_tokens > n_predict
                         and self.num_speculative_tokens % n_predict != 0
                     ):
                         # Ensure divisibility for MTP module reuse.

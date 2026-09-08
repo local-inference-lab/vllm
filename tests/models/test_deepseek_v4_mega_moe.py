@@ -9,6 +9,7 @@ import torch
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     bind_routed_experts_capturer,
 )
+from vllm.model_executor.models.utils import WeightsMapper
 from vllm.models.deepseek_v4.nvidia.dspark import DSparkDeepseekV4ForCausalLM
 from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4ForCausalLM,
@@ -18,6 +19,9 @@ from vllm.models.deepseek_v4.nvidia.model import (
 )
 from vllm.models.deepseek_v4.nvidia.mtp import DeepSeekV4MTP
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.deepseek_v4.nvidia.vl_model import (
+    DeepseekV4ForConditionalGeneration,
+)
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -495,6 +499,48 @@ def test_deepseek_v4_pwal_hook_finalizes_mega_moe_and_mhc_broadcast():
     assert calls == ["mega_moe", "mhc", "b12x"]
 
 
+def test_deepseek_v4_vision_loads_interleaved_weights_before_finalizing():
+    finalized = []
+
+    class LanguageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = torch.nn.Parameter(torch.zeros(1))
+            self.last = torch.nn.Parameter(torch.zeros(1))
+
+        def load_weights(self, weights):
+            raise AssertionError(
+                "Language-model finalization must wait for all weights"
+            )
+
+        def process_weights_after_loading(self):
+            assert self.first.item() == 1 and self.last.item() == 3
+            finalized.append(True)
+
+    model = DeepseekV4ForConditionalGeneration.__new__(
+        DeepseekV4ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.language_model = LanguageModel()
+    model.image_start = torch.nn.Parameter(torch.zeros(1))
+    model.hf_to_vllm_mapper = WeightsMapper()
+
+    def weights():
+        yield "language_model.first", torch.tensor([1.0])
+        assert model.language_model.first.item() == 1
+        yield "image_start", torch.tensor([2.0])
+        assert model.image_start.item() == 2
+        assert not finalized
+        yield "language_model.last", torch.tensor([3.0])
+
+    with torch.no_grad():
+        loaded = model.load_weights(weights())
+        model.process_weights_after_loading()
+
+    assert loaded == {"language_model.first", "image_start", "language_model.last"}
+    assert finalized == [True]
+
+
 def test_deepseek_v4_drafter_pwal_hooks_finalize_mega_moe():
     """MTP and DSpark top-level loaders finalize derived backend weights."""
     calls = []
@@ -510,18 +556,19 @@ def test_deepseek_v4_drafter_pwal_hooks_finalize_mega_moe():
     dspark = SimpleNamespace(
         _finalize_moe=lambda: calls.append("dspark"),
         model=SimpleNamespace(
+            finalize_mhc_broadcast_weights=lambda: calls.append("dspark_mhc"),
             layers=[
                 SimpleNamespace(
                     process_b12x_weights_after_loading=lambda: calls.append(
                         "dspark_b12x"
                     )
                 )
-            ]
+            ],
         ),
     )
     DSparkDeepseekV4ForCausalLM.process_weights_after_loading(dspark)
 
-    assert calls == ["mtp", "mtp_b12x", "dspark", "dspark_b12x"]
+    assert calls == ["mtp", "mtp_b12x", "dspark", "dspark_mhc", "dspark_b12x"]
 
 
 @pytest.mark.skipif(

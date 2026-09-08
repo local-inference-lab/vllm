@@ -145,6 +145,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
     maybe_create_adaptive_verification_manager,
 )
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
@@ -1582,6 +1583,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if (
                 self.boundary_checkpoint_state is not None
                 and self.speculator is not None
+                and not isinstance(self.speculator, DFlashSpeculator)
             ):
                 for new_req in scheduler_output.scheduled_new_reqs:
                     checkpoint = new_req.boundary_checkpoint
@@ -2038,7 +2040,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if boundary_state is not None:
             assert boundary_capture is not None
             spec_hidden = None
-            if self.speculator is not None:
+            if self.speculator is not None and not isinstance(
+                self.speculator, DFlashSpeculator
+            ):
                 spec_hidden = hidden_states
                 if hasattr(self.model, "get_mtp_target_hidden_states"):
                     spec_hidden = self.model.get_mtp_target_hidden_states()

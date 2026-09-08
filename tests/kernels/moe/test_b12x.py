@@ -739,6 +739,7 @@ def test_b12x_moe_warmup_runs_each_planner_regime_once(
     )
     planned_tokens = []
     launched_tokens = []
+    launched_dtypes = []
     launched_resources = []
     synchronized = []
 
@@ -767,6 +768,7 @@ def test_b12x_moe_warmup_runs_each_planner_regime_once(
 
     def fake_run(**kwargs):
         launched_tokens.append(kwargs["hidden_states"].shape[0])
+        launched_dtypes.append(kwargs["topk_ids"].dtype)
         launched_resources.append(
             tuple(
                 weakref.ref(kwargs[name])
@@ -797,7 +799,8 @@ def test_b12x_moe_warmup_runs_each_planner_regime_once(
 
     assert warmed == 3
     assert planned_tokens == [1, 3, 8]
-    assert launched_tokens == planned_tokens
+    assert launched_tokens == [1, 1, 3, 3, 8, 8]
+    assert launched_dtypes == [torch.int32, torch.int64] * 3
     assert synchronized == [True]
 
 

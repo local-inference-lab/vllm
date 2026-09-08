@@ -42,6 +42,11 @@ from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.weight_transfer import (
+    allocate_weights,
+    copy_weight,
+    flush_weight_transfers,
+)
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -118,14 +123,15 @@ class DSparkDeepseekV4Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         hc_dim = self.hc_mult * config.hidden_size
         self.hc_head_fn = nn.Parameter(
-            torch.empty(self.hc_mult, hc_dim, dtype=torch.float32),
+            allocate_weights(torch.empty, self.hc_mult, hc_dim, dtype=torch.float32),
             requires_grad=False,
         )
         self.hc_head_base = nn.Parameter(
-            torch.empty(self.hc_mult, dtype=torch.float32), requires_grad=False
+            allocate_weights(torch.empty, self.hc_mult, dtype=torch.float32),
+            requires_grad=False,
         )
         self.hc_head_scale = nn.Parameter(
-            torch.empty(1, dtype=torch.float32), requires_grad=False
+            allocate_weights(torch.empty, 1, dtype=torch.float32), requires_grad=False
         )
         draft_vocab_size = (
             getattr(config, "draft_vocab_size", None) or config.vocab_size
@@ -509,7 +515,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             else:
                 if "attn_sink" in name:
                     narrow = loaded_weight[head_start:head_end]
-                    params_dict[name][: narrow.shape[0]].copy_(narrow)
+                    copy_weight(params_dict[name][: narrow.shape[0]], narrow)
                     loaded_params.add(name)
                     continue
                 if name.endswith(".ffn.gate.bias"):
@@ -532,6 +538,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             layer.ffn.finalize_mega_moe_weights()
 
     def process_weights_after_loading(self) -> None:
+        flush_weight_transfers()
         self._finalize_moe()
         self.model.finalize_mhc_broadcast_weights()
         for layer in self.model.layers:

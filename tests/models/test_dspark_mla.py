@@ -63,8 +63,9 @@ def test_dspark_mla_shares_frozen_target_weights_and_skips_training_head():
 @pytest.mark.cpu_test
 def test_dspark_markov_head_is_replicated(
     monkeypatch: pytest.MonkeyPatch,
+    default_vllm_config,
 ):
-    from vllm.model_executor.layers import logits_processor, vocab_parallel_embedding
+    from vllm.model_executor.layers import vocab_parallel_embedding
 
     monkeypatch.setattr(
         vocab_parallel_embedding, "get_tensor_model_parallel_rank", lambda: 3
@@ -74,12 +75,6 @@ def test_dspark_markov_head_is_replicated(
         "get_tensor_model_parallel_world_size",
         lambda: 8,
     )
-    monkeypatch.setattr(
-        logits_processor,
-        "get_current_vllm_config",
-        lambda: SimpleNamespace(model_config=None),
-    )
-
     head = DSparkMarkovHead(128, 128, 8, prefix="markov_head")
     assert head.markov_w2.tp_size == 1
     assert head.markov_w1.weight.shape == (128, 8)

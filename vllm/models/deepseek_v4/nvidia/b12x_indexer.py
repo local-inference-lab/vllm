@@ -39,7 +39,7 @@ class DeepseekV4B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
 
     def __init__(self, *args, block_table_width: int, **kwargs) -> None:
         super().__init__(*args, block_table_width=block_table_width, **kwargs)
-        self.use_flattening = False
+        self.use_flattening = True
         self.supports_varlen = False
 
     def _supports_native_decode(self, next_n: int) -> bool:
@@ -71,6 +71,11 @@ class DeepseekV4B12xIndexerBackend(DeepseekV4IndexerBackend):
     @classmethod
     def supports_pcp(cls) -> bool:
         return False
+
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        # Flattened rows use the device query lengths after draft trimming.
+        return True
 
     @staticmethod
     def get_name() -> str:
