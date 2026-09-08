@@ -380,9 +380,9 @@ def _compute_cumulative_log_p_kernel(
                 )
             )
             log_p += target_logprob - draft_logprob
-            # An undefined ratio cannot verify a proposal. In particular,
-            # all-masked or non-finite logits produce NaN log probabilities.
-            log_p = tl.where(log_p == log_p, tl.minimum(log_p, 0.0), float("-inf"))
+            # Preserve an undefined ratio through the rest of the block so
+            # verification can discard every proposal and sample the target.
+            log_p = tl.where(log_p == log_p, tl.minimum(log_p, 0.0), float("nan"))
         tl.store(cumulative_log_p_ptr + logit_idx, log_p)
 
 
@@ -554,6 +554,11 @@ def _rejection_kernel(
     target_lse = 0.0
     draft_lse = 0.0
     verifying = True
+    valid_block = True
+    if USE_BLOCK_VERIFICATION and not is_greedy and num_draft_tokens > 0:
+        final_log_p = tl.load(cumulative_log_p_ptr + end_idx - 2)
+        valid_block = final_log_p == final_log_p
+        verifying = valid_block
     for i in range(num_draft_tokens):
         logit_idx = start_idx + i
         draft_sampled = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
@@ -697,6 +702,10 @@ def _rejection_kernel(
                 vocab_num_blocks,
                 PADDED_VOCAB_NUM_BLOCKS,
             )
+    if not valid_block:
+        # Even a finite first draft row must be discarded if a later row
+        # invalidates block verification. Sampling p-q here would bias output.
+        draft_lse = float("nan")
     tl.store(target_rejected_logsumexp_ptr + req_idx, target_lse)
     tl.store(draft_rejected_logsumexp_ptr + req_idx, draft_lse)
 
