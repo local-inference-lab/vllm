@@ -335,7 +335,9 @@ def _store_cache_checkpoints_kernel(
 ):
     seq_idx = tl.program_id(0)
     cols = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    state_idx = tl.load(checkpoint_state_indices_ptr + seq_idx)
+    # The slot index multiplies a per-slot element stride below; keep the
+    # product in 64 bits so large state pools cannot wrap a 32-bit offset.
+    state_idx = tl.load(checkpoint_state_indices_ptr + seq_idx).to(tl.int64)
     checkpoint_offset = tl.load(
         checkpoint_offsets_ptr + seq_idx * checkpoint_offset_stride
     )
