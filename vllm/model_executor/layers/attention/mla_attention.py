@@ -417,6 +417,13 @@ def _detect_output_quant_key(
 def _bmm_with_disjoint_batches(
     lhs: torch.Tensor, rhs: torch.Tensor, *, out: torch.Tensor
 ) -> None:
+    """Write a batched product using disjoint input matrices on SM120/121.
+
+    Args:
+        lhs: Input with shape (heads, rows, reduction).
+        rhs: Input with shape (heads, reduction, columns).
+        out: Caller-owned result with shape (heads, rows, columns).
+    """
     # cuBLAS issues 6040940/5996751: on SM120/121, interleaved input
     # matrices can read past their allocation. Disjoint matrices avoid that
     # access without changing logical values. Contiguous inputs remain aliases.
