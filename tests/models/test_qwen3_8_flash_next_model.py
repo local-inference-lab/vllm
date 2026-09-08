@@ -140,7 +140,7 @@ def test_mtp_compaction_preserves_attention_rows_and_selected_outputs(indices):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("num_tokens", [1, 4, 16, 32])
+@pytest.mark.parametrize("num_tokens", [1, 4, 16, 32, 64, 65])
 @pytest.mark.parametrize("kind", ["gdn", "qsa"])
 def test_attention_projection_overlap_replays_with_changed_inputs(
     monkeypatch, num_tokens: int, kind: str

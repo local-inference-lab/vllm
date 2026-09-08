@@ -2353,7 +2353,7 @@ def qwen_gdn_input_projections(
     layer_name: LayerNameType,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
-    if hidden_states.shape[0] > 16 or not torch.cuda.is_current_stream_capturing():
+    if hidden_states.shape[0] > 64 or not torch.cuda.is_current_stream_capturing():
         qkvz, _ = layer.in_proj_qkvz(hidden_states)
         ba, _ = layer.in_proj_ba(hidden_states)
         return qkvz, ba
