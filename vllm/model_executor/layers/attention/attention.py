@@ -110,8 +110,21 @@ def _largest_kernel_block_within(
 
     sizes = attn_backend.get_supported_kernel_block_sizes()
     candidates = [s for s in sizes if isinstance(s, int)]
-    if not candidates:
-        candidates = [s.base for s in sizes if isinstance(s, MultipleOf)]
+    for size in sizes:
+        if not isinstance(size, MultipleOf):
+            continue
+        # ``MultipleOf`` describes an unbounded family, not just its base.
+        # Choose the largest member whose natural page fits the shared page.
+        # Treating it as only ``base`` can leave almost the entire shared page
+        # unused for a small sibling attention layer in a hybrid model.
+        largest = (
+            page_budget // per_token_bytes
+            if page_budget and per_token_bytes > 0
+            else size.base
+        )
+        largest -= largest % size.base
+        if largest >= size.base:
+            candidates.append(largest)
     if not candidates:
         return fallback
     smallest = min(candidates)
@@ -618,7 +631,11 @@ class Attention(nn.Module, AttentionLayerBase):
             # block that still fits the shared page so we waste fewer padding
             # bytes per block. Otherwise (page_size_padded is None) the smallest
             # block is fine — ``unify`` scales it up by an integer ratio.
-            shared_page = vllm_config.cache_config.skip_page_size_padded
+            page_budgets = (
+                vllm_config.cache_config.skip_page_size_padded,
+                vllm_config.cache_config.mamba_page_size_padded,
+            )
+            shared_page = max((p for p in page_budgets if p is not None), default=None)
             # The backend owns its packing
             sw_per_token = self.attn_backend.customize_spec(
                 SlidingWindowSpec(
@@ -634,6 +651,14 @@ class Attention(nn.Module, AttentionLayerBase):
             sw_block_size = _largest_kernel_block_within(
                 self.attn_backend, sw_per_token, shared_page, block_size
             )
+            if shared_page is not None:
+                logger.info_once(
+                    "Using sliding-window KV block size %d; its natural page "
+                    "uses %d of %d shared bytes.",
+                    sw_block_size,
+                    sw_block_size * sw_per_token,
+                    shared_page,
+                )
             return SlidingWindowSpec(
                 block_size=sw_block_size,
                 num_kv_heads=self.num_kv_heads,
