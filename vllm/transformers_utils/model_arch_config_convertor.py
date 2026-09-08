@@ -335,16 +335,18 @@ class ModelArchConfigConvertorBase:
         elif self.hf_text_config.model_type == "eagle":
             # if the model is an EAGLE module, check for the
             # underlying architecture
-            return (
-                self.hf_text_config.model.model_type
-                in (
-                    "axk1",
-                    "deepseek_v2",
-                    "deepseek_v3",
-                    "deepseek_v32",
-                    "deepseek_mtp",
-                )
-                and getattr(self.hf_text_config, "kv_lora_rank", None) is not None
+            if getattr(self.hf_text_config, "kv_lora_rank", None) is None:
+                return False
+            architectures = getattr(self.hf_text_config, "architectures", None) or ()
+            # The DFlash2 draft: Kimi-K3 MLA layers under a qwen3-typed config.
+            if "DFlash2DraftModel" in architectures:
+                return True
+            return self.hf_text_config.model.model_type in (
+                "axk1",
+                "deepseek_v2",
+                "deepseek_v3",
+                "deepseek_v32",
+                "deepseek_mtp",
             )
         return False
 

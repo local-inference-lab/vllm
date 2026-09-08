@@ -293,6 +293,35 @@ def _warm_chunk_kda_prefill(
     )
 
 
+def _warm_projection_shard_pack(model: torch.nn.Module) -> None:
+    from vllm.models.kimi_k3.nvidia.model import KimiPaddedRowParallelLinear
+    from vllm.models.kimi_k3.nvidia.ops.projection_shard import pack_projection_shard
+    from vllm.models.kimi_k3.nvidia.tp_projection import kimi_decode_shard_pack_enabled
+
+    if not kimi_decode_shard_pack_enabled():
+        return
+    warmed = set()
+    for module in model.modules():
+        if not isinstance(module, KimiPaddedRowParallelLinear) or not module.input_pad:
+            continue
+        start = module.tp_rank * module.shard_width
+        if start + module.shard_width <= module.logical_input_size:
+            continue
+        key = (
+            module.logical_input_size,
+            module.shard_width,
+            start,
+            module.weight.dtype,
+            module.weight.device,
+        )
+        if key in warmed:
+            continue
+        warmed.add(key)
+        for rows in range(1, 9):
+            x = module.weight.new_zeros((rows, module.logical_input_size))
+            pack_projection_shard(x, start, module.shard_width)
+
+
 @torch.inference_mode()
 def kimi_k3_triton_warmup(worker: Worker) -> None:
     """Warm Kimi-K3 Triton kernels reachable by this server."""
@@ -308,6 +337,7 @@ def kimi_k3_triton_warmup(worker: Worker) -> None:
             warmed_vision_interpolators,
         )
 
+    _warm_projection_shard_pack(worker.get_model())
     layer = _get_kda_layer(worker)
     if layer is None:
         return
