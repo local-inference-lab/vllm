@@ -174,6 +174,11 @@ def _remap_tiling(
     keeps that tail in input-relative order instead of racing a history tile.
     Other non-power-of-two widths retain tiled counting.
 
+    Args:
+        NUM_TOPK_TOKENS: Number of selection columns per token row.
+        BLOCK_N: Power-of-two column width for the tiled implementation.
+        count_valid: Whether the operation must produce a valid-entry count.
+
     Returns:
         (single_tile, block_n, tiles_per_row, num_warps)
     """
@@ -337,6 +342,24 @@ def triton_filter_and_convert_dcp_index(
     pass. Counted power-of-two widths and GLM's 2051 columns preserve input
     order with one row owner. Other widths use an atomic tile allocator and
     provide the same selected set without an ordering guarantee.
+
+    Args:
+        req_id: Request-row index for each token row.
+        block_table: Per-request mapping from logical blocks to physical blocks.
+        token_indices: Global per-request token positions, with negative padding.
+        dcp_size: Number of decode-context-parallel ranks.
+        dcp_rank: Rank whose owned positions are retained.
+        cp_kv_cache_interleave_size: Number of consecutive positions per stripe.
+        BLOCK_SIZE: Number of token positions in a logical KV block.
+        BLOCK_STRIDE_ROWS: Physical row stride between blocks; defaults to BLOCK_SIZE.
+        NUM_TOPK_TOKENS: Number of selection columns per token row.
+        BLOCK_N: Power-of-two column width for tiled remapping.
+        return_valid_counts: Whether to return per-row counts alongside indices.
+        compact_valid_to_front: Whether valid indices must form a contiguous prefix.
+
+    Returns:
+        Physical indices with invalid entries set to -1, optionally paired with
+        the per-row valid counts.
     """
     assert dcp_size >= 1
     assert 0 <= dcp_rank < dcp_size
