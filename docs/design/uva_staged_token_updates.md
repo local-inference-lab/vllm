@@ -53,11 +53,18 @@ prefill updates differ from a steady decode step with no staged host writes.
 
 ## Correctness and source scope
 
-The serving-composition module passes 12 single-GPU tests from
+The serving-composition and public-port modules pass 12 single-GPU tests from
 `tests/kernels/core/test_uva.py`. They cover host/device write visibility,
 growing and shrinking contents, list/NumPy/Tensor inputs, all supported dtypes,
 and in-flight consumers. The public port has identical buffer code except
 that the composition also exposes its inherited CPU token-table accessor.
+The GPU-write test explicitly synchronizes its device before host assertions;
+mapped storage does not make CPU reads wait for asynchronous GPU execution.
+
+The deployed composition passes seven cache/conversation checks, including
+9,216- and 4,608-token external cache reuse, and four concurrent request
+canaries. All sampled log probabilities are finite. These checks qualify
+serving correctness under their request conditions, not a throughput gain.
 
 The benchmark is `benchmarks/kernels/benchmark_staged_uva_writes.py`. Supply
 the unmodified `buffer_utils.py` as `--reference`. Run in an environment with

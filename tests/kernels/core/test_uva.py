@@ -52,6 +52,8 @@ def test_gpu_write(device):
     cuda_view[2, 3] = 2
     cuda_view[4, 5] = -1
     cuda_view.mul_(2)
+    # Host reads do not wait for asynchronous GPU writes to the mapped pages.
+    torch.accelerator.synchronize(torch.device(device).index)
 
     assert cpu_tensor[0, 0] == 2
     assert cpu_tensor[2, 3] == 4
