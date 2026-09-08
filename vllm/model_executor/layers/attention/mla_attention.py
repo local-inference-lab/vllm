@@ -414,6 +414,18 @@ def _detect_output_quant_key(
     return kFp8StaticTensorSym
 
 
+def _bmm_with_disjoint_batches(
+    lhs: torch.Tensor, rhs: torch.Tensor, *, out: torch.Tensor
+) -> None:
+    # cuBLAS issues 6040940/5996751: on SM120/121, interleaved input
+    # matrices can read past their allocation. Disjoint matrices avoid that
+    # access without changing logical values. Contiguous inputs remain aliases.
+    if current_platform.is_cuda() and current_platform.is_device_capability_family(120):
+        lhs = lhs.contiguous()
+        rhs = rhs.contiguous()
+    torch.bmm(lhs, rhs, out=out)
+
+
 def _select_mqa_query(
     q: torch.Tensor,
     q_dcp_replicated: torch.Tensor | None,
@@ -1167,7 +1179,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
 
                 # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-                torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
+                _bmm_with_disjoint_batches(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
 
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
@@ -1538,7 +1550,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
         else:
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
-            torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
+            _bmm_with_disjoint_batches(x, self.W_UV, out=out.transpose(0, 1))
 
 
 def unified_mla_kv_cache_update(
