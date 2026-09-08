@@ -173,6 +173,10 @@ when verification step rate is stable.
 
 ## Research coverage and limitations
 
+The [optimization applicability review](kimi_k3_verification_research.md)
+maps attention, recurrent state, QSRT, collective, and cache-lifetime PRs to
+the measured configuration and their qualification limits.
+
 An all-state snapshot contains PR metadata and bodies for 75,914 pull requests:
 vLLM 37,013, SGLang 30,628, FlashInfer 3,712, lab vLLM 621, B12X 274,
 lab LMCache 62, and upstream LMCache 3,604. Collection completed at
