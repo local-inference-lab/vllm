@@ -21,13 +21,10 @@ def resolve_max_parallel_prefills(
     configured: MaxParallelPrefills,
     *,
     max_num_seqs: int,
-    max_num_scheduled_tokens: int,
-    block_size: int,
 ) -> int:
-    """Resolve a safe lane count from the active scheduler geometry."""
+    """Resolve the automatic lane count without assuming token geometry."""
     requested = AUTO_MAX_PARALLEL_PREFILLS if configured == "auto" else configured
-    budget_lanes = max(1, max_num_scheduled_tokens // block_size)
-    return min(requested, max_num_seqs, budget_lanes)
+    return min(requested, max_num_seqs)
 
 
 def resolve_decode_refill_target(
