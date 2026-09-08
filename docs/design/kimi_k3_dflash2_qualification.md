@@ -103,6 +103,12 @@ their cache entries are not interchangeable.
 | Sampled cache and conversation checks | Seven pass, including 9,216- and 4,608-token external reuse; finite logprobs |
 | Four concurrent request canaries | All return their own code; finite logprobs |
 
+The physical-page regressions and transfer-audit suppression are also published
+against LMCache `dev` in
+[LMCache #63](https://github.com/local-inference-lab/LMCache/pull/63). Its
+103 transfer/layout tests pass with matching native extensions built from that
+checkout. This is a separate API qualification, not a deployment of `dev`.
+
 The high-page and packed-reader tools and numerical records are published
 with B12X #311. The tests establish their stated numerical and state contracts;
 they do not establish equality of every sampled model continuation.
