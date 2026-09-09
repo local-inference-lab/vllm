@@ -24,13 +24,13 @@ from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     fastsafetensors_weights_iterator,
+    file_backed_safetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     filter_safetensors_files_by_weight_name_prefixes,
     get_quant_config,
     instanttensor_weights_iterator,
     maybe_download_from_modelscope,
-    mmap_safetensors_weights_iterator,
     multi_thread_pt_weights_iterator,
     multi_thread_safetensors_weights_iterator,
     np_cache_weights_iterator,
@@ -74,7 +74,7 @@ class DefaultModelLoader(BaseModelLoader):
         weight_name_prefixes: tuple[str, ...] | None = None
         """If defined, load only checkpoint tensor names with these prefixes."""
 
-        mmap_weight_filter: Callable[[str], bool] | None = None
+        file_weight_filter: Callable[[str], bool] | None = None
         """Select raw checkpoint names to route as immutable file ranges."""
 
     counter_before_loading_weights: float = 0.0
@@ -307,8 +307,8 @@ class DefaultModelLoader(BaseModelLoader):
             source.allow_patterns_overrides,
             source.weight_name_prefixes,
         )
-        if source.mmap_weight_filter is not None and not use_safetensors:
-            raise ValueError("Checkpoint mmap weights require safetensors files")
+        if source.file_weight_filter is not None and not use_safetensors:
+            raise ValueError("Checkpoint file-backed weights require safetensors files")
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -320,7 +320,7 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.use_tqdm_on_load,
             )
         elif use_safetensors:
-            if source.mmap_weight_filter is None:
+            if source.file_weight_filter is None:
                 weights_iterator = self._safetensors_weights_iterator(
                     hf_weights_files, source
                 )
@@ -339,10 +339,10 @@ class DefaultModelLoader(BaseModelLoader):
                 else:
                     ordered_files = sorted(hf_weights_files, key=_natural_sort_key)
                     tensor_order = "name"
-                weights_iterator = mmap_safetensors_weights_iterator(
+                weights_iterator = file_backed_safetensors_weights_iterator(
                     ordered_files,
                     lambda files: self._safetensors_weights_iterator(files, source),
-                    source.mmap_weight_filter,
+                    source.file_weight_filter,
                     weight_name_prefixes=source.weight_name_prefixes,
                     local_expert_ids=self.local_expert_ids,
                     tensor_order=tensor_order,
@@ -374,9 +374,9 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        mmap_weight_filter = getattr(model, "checkpoint_mmap_weight_filter", None)
-        if not callable(mmap_weight_filter):
-            mmap_weight_filter = None
+        file_weight_filter = getattr(model, "checkpoint_file_weight_filter", None)
+        if not callable(file_weight_filter):
+            file_weight_filter = None
         primary_weights = DefaultModelLoader.Source(
             model_config.model,
             model_config.revision,
@@ -386,7 +386,7 @@ class DefaultModelLoader(BaseModelLoader):
             weight_name_prefixes=getattr(
                 model, "checkpoint_weight_name_prefixes", None
             ),
-            mmap_weight_filter=mmap_weight_filter,
+            file_weight_filter=file_weight_filter,
         )
         yield from self._get_weights_iterator(primary_weights)
 
@@ -395,9 +395,9 @@ class DefaultModelLoader(BaseModelLoader):
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            if source.mmap_weight_filter is None and mmap_weight_filter is not None:
+            if source.file_weight_filter is None and file_weight_filter is not None:
                 source = dataclasses.replace(
-                    source, mmap_weight_filter=mmap_weight_filter
+                    source, file_weight_filter=file_weight_filter
                 )
             yield from self._get_weights_iterator(source)
 

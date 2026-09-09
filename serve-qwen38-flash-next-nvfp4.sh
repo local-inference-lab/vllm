@@ -51,8 +51,8 @@ usage() {
     "" \
     "Environment modes:" \
     "  TP_SIZE=1                    Default to one GPU and mapped-host tables." \
-    "  VLLM_PLE_TABLE_MEMORY=mmap    Demand-page PLE tables from checkpoint files." \
-    "                               Also accepts device and mapped_host." \
+    "  VLLM_PLE_TABLE_MEMORY=io_uring  Read PLE rows with bounded O_DIRECT I/O." \
+    "                                 Also accepts device and mapped_host." \
     "" \
     "Launcher options:" \
     "  --torch-profile [DIR]         Enable a four-step Torch CPU+CUDA capture." \

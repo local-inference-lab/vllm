@@ -110,10 +110,10 @@ def _resolve_ple_table_memory(additional_config: Any) -> str:
         table_memory = envs.VLLM_PLE_TABLE_MEMORY
         if table_memory is None:
             table_memory = "mapped_host" if envs.VLLM_PLE_CPU_OFFLOAD else "device"
-    if table_memory not in {"device", "mapped_host", "mmap"}:
+    if table_memory not in {"device", "mapped_host", "io_uring"}:
         raise ValueError(
             "additional_config.ple_table_memory must be 'device', "
-            f"'mapped_host', or 'mmap', got {table_memory!r}"
+            f"'mapped_host', or 'io_uring', got {table_memory!r}"
         )
     return table_memory
 
@@ -152,12 +152,11 @@ class Qwen3_8FlashNextPLEGroupedNorm(nn.Module):
 class _NGramEmbeddingStorage(nn.Module):
     def __init__(self, plan: Any, shard_rows: int) -> None:
         super().__init__()
-        self.mapped_table = None
+        self.disk_table = None
         self._table_storage = None
-        if plan.caps.table_memory == "mmap":
-            self.mapped_table = _b12x_module("ple_embedding").MMapTable(
-                plan, shard_rows
-            )
+        if plan.caps.table_memory == "io_uring":
+            api = _b12x_module("ple_embedding")
+            self.disk_table = api.DiskTable(plan, shard_rows)
             tensors: dict[str, torch.Tensor | None] = {"weight": None}
             for name in ("weight_scale", "weight_scale_2"):
                 shape = getattr(plan, f"{name}_shape")
@@ -237,11 +236,18 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         self.ngram_size = int(config.ngram_size)
         self.heads_per_ngram = int(config.heads_per_ngram)
         self.ngram_heads = (self.ngram_size - 1) * self.heads_per_ngram
+        self.requires_disk_preparation = table_memory == "io_uring"
+        self._disk_prepared_tokens = -1
+        self._disk_prepared = False
         self.head_dim = self.embedding_dim // self.ngram_heads
         self.eos_token_id = int(config.eos_token_id)
         self.split_ngram_parts = int(getattr(config, "split_ngram_parts", 512))
         self.owner_prefix = owner_prefix
-        if envs.VLLM_QWEN3_8_FLASH_NEXT_OVERLAP and current_platform.is_cuda():
+        if (
+            not self.requires_disk_preparation
+            and envs.VLLM_QWEN3_8_FLASH_NEXT_OVERLAP
+            and current_platform.is_cuda()
+        ):
             _get_prefetch_stream()
         self.embedding_storage_dtype = str(
             getattr(config, "ple_embedding_dtype", "bfloat16")
@@ -300,11 +306,6 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                 "PLE table",
                 self.ngram_embedding.mapped_host_nbytes / (1 << 30),
             )
-        if self.ngram_embedding.mapped_table is not None:
-            logger.info(
-                "Using read-only, private checkpoint mappings for this TP rank's "
-                "PLE table; pages remain demand-paged"
-            )
 
         (scratch,) = get_b12x_scratch_buffers(self._plan)
         self.register_buffer(
@@ -353,9 +354,6 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         )
 
     def _bind_embedding(self):
-        kwargs = {}
-        if self.ngram_embedding.mapped_table is not None:
-            kwargs["mapped_table"] = self.ngram_embedding.mapped_table
         return self._plan.bind(
             scratch=self._scratch,
             weight=self.ngram_embedding.weight,
@@ -367,7 +365,7 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             num_seqs=self._num_seqs,
             num_tokens=self._num_tokens,
             out=self._embedding_out,
-            **kwargs,
+            disk_table=self.ngram_embedding.disk_table,
         )
 
     def _prepare_inputs(
@@ -412,6 +410,37 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             self._bind_embedding(), token_count=token_count
         )
 
+    def prepare_disk(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        """Produce local embeddings before the model's graph is replayed."""
+        if not self.requires_disk_preparation:
+            raise RuntimeError("prepare_disk requires an io_uring PLE table")
+        if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Disk PLE preparation must run outside CUDA graphs")
+        self._disk_prepared_tokens = -1
+        self._disk_prepared = False
+        self._run_embedding(input_ids, query_start_loc, ngram_context)
+        self._disk_prepared_tokens = input_ids.numel()
+        self._disk_prepared = True
+
+    def prepare_dummy_output(self, num_tokens: int) -> None:
+        """Initialize graph-visible profiling output without reading the table."""
+        if not self.requires_disk_preparation:
+            raise RuntimeError("Dummy disk output requires an io_uring table")
+        if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Dummy disk PLE preparation must run outside CUDA graphs"
+            )
+        if not 0 <= num_tokens <= self.max_total_tokens:
+            raise ValueError("Dummy PLE output exceeds token capacity")
+        self._embedding_out[:num_tokens].zero_()
+        self._disk_prepared_tokens = num_tokens
+        self._disk_prepared = True
+
     def _run_prefetch(
         self,
         input_ids: torch.Tensor,
@@ -434,6 +463,8 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> None:
+        if self.requires_disk_preparation:
+            raise RuntimeError("Disk PLE tables must be prepared before model forward")
         if torch.compiler.is_compiling():
             torch.ops.vllm.qwen3_8_flash_next_ple_prefetch(
                 input_ids,
@@ -500,7 +531,16 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         wait_for: torch.Tensor | None = None,
     ) -> torch.Tensor:
         input_ids = input_ids.reshape(-1)
-        if wait_for is not None:
+        if self.requires_disk_preparation:
+            # Batch counts must not become per-step Dynamo specialization guards.
+            if not self._disk_prepared or (
+                not torch.compiler.is_compiling()
+                and self._disk_prepared_tokens < input_ids.shape[0]
+            ):
+                raise RuntimeError(
+                    "Disk PLE output is not prepared; call prepare_disk before forward"
+                )
+        elif wait_for is not None:
             torch.ops.vllm.qwen3_8_flash_next_ple_prefetch_wait(
                 self._embedding_out, wait_for
             )
@@ -676,19 +716,19 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                     )
                 overlap_start = max(checkpoint_start, tp_start)
                 overlap_end = min(checkpoint_start + expected_rows, tp_end)
-                mapped_table = getattr(embedding, "mapped_table", None)
-                if mapped_table is not None:
+                disk_table = getattr(embedding, "disk_table", None)
+                if disk_table is not None:
                     source = get_file_tensor_source(loaded_weight)
                     if source is None:
                         raise ValueError(
-                            "mmap PLE tables require file-backed safetensors weights "
+                            "File-backed PLE tables require safetensors weights "
                             "from the b12x, instanttensor, fastsafetensors, or "
                             "safetensors loader"
                         )
                     if source.shape != expected_shape or source.dtype != expected_dtype:
                         raise ValueError(f"file source geometry does not match {name}")
                     if overlap_start < overlap_end:
-                        mapped_table.map_shard(
+                        disk_table.add_shard(
                             shard_index,
                             source.path,
                             source.offset,

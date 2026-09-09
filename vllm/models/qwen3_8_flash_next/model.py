@@ -82,7 +82,7 @@ from .hyperconnection import (
 from .ple_layer import Qwen3_8FlashNextPLELayer, _resolve_ple_table_memory
 
 
-def _is_mmap_ple_weight(name: str) -> bool:
+def _is_file_backed_ple_weight(name: str) -> bool:
     _, marker, shard_suffix = name.rpartition(
         ".ple.ple_embedding.ngram_embedding.shard_"
     )
@@ -477,7 +477,10 @@ class Qwen3_8FlashNextModel(nn.Module):
                 and ngram_context is not None
             ):
                 next_ple = self.layers[layer_idx + 1].ple
-                if next_ple is not None:
+                if (
+                    next_ple is not None
+                    and not next_ple.ple_embedding.requires_disk_preparation
+                ):
                     next_ple.ple_embedding.prefetch(
                         input_ids, query_start_loc, ngram_context
                     )
@@ -725,12 +728,13 @@ class Qwen3_8FlashNextForCausalLM(
         return positions.unsqueeze(0).expand(3, -1), 0
 
     @property
-    def checkpoint_mmap_weight_filter(self) -> Callable[[str], bool] | None:
+    def checkpoint_file_weight_filter(self) -> Callable[[str], bool] | None:
         if (
             self.config.ple_layer_ids
-            and _resolve_ple_table_memory(self.vllm_config.additional_config) == "mmap"
+            and _resolve_ple_table_memory(self.vllm_config.additional_config)
+            == "io_uring"
         ):
-            return _is_mmap_ple_weight
+            return _is_file_backed_ple_weight
         return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -836,8 +840,8 @@ class Qwen3_8FlashNextForConditionalGeneration(
         self.set_moe_parameters(self.language_model.model.layers)
 
     @property
-    def checkpoint_mmap_weight_filter(self) -> Callable[[str], bool] | None:
-        return self.language_model.checkpoint_mmap_weight_filter
+    def checkpoint_file_weight_filter(self) -> Callable[[str], bool] | None:
+        return self.language_model.checkpoint_file_weight_filter
 
     def embed_input_ids(
         self,

@@ -4,9 +4,9 @@ Status: C99 O_DIRECT transport and initial b12x vLLM adapter, September 6,
 2026. The adapter registers `--load-format b12x`, uses explicitly locked,
 CPU-addressable CUDA pools for final weights, and routes metadata-only source
 views through `vllm.model_executor.weight_transfer`. Selected payload ranges
-are read with O_DIRECT, except for model-selected, read-only checkpoint mappings
-described below. Existing model name routing, MTP prefix filtering, and
-quantization remain in place.
+are read with O_DIRECT. PLE payloads can remain in checkpoint files and be read
+per batch, as described below. Existing model name routing, MTP prefix filtering,
+and quantization remain in place.
 Arbitrary source arithmetic and unsupported layouts fail explicitly. Native
 descriptor batches execute through eight persistent pthread readers by default
 (`io_threads`, 1–16). C owns range ordering, splitting, dispatch, and completion;
@@ -29,7 +29,7 @@ VLLM_PLUGINS=b12x_loader vllm serve MODEL --load-format b12x
 
 Ordinary weights use the loader's managed shared storage pool. There is no
 serving `allocation` option; PLE tables can independently opt into the
-read-only mmap storage mode below.
+io_uring runtime reads below.
 The adapter uses the standard vLLM checkpoint-shard progress format and honors
 the existing progress setting and rank-zero output. The initial
 adapter requires GPU host page tables and the native Torch CUDA allocator;
@@ -63,45 +63,62 @@ transforms. vLLM supplies model name mappings, TP/EP slices, destination handles
 and numerical requirements. A tensor handed to an ordinary model loader must
 own its storage. Reusable staging views stay inside the controlled executor.
 
-## Demand-paged PLE tables
+## PLE table storage
 
-Select Qwen3.8-Flash-Next PLE storage with
-`VLLM_PLE_TABLE_MEMORY=device|mapped_host|mmap`. vLLM resolves the setting and
-passes `table_memory` to the b12x planner; b12x does not read this environment
-variable. With matching vLLM and b12x packages installed:
+Qwen3.8-Flash-Next supports three storage policies:
+
+- `device`: GPU-resident tables.
+- `mapped_host`: CUDA-mapped, pinned host tables.
+- `io_uring`: bounded, explicit `O_DIRECT` reads from checkpoint files.
+
+Select the policy in vLLM, which passes it to the b12x planner:
 
 ```sh
-VLLM_PLE_TABLE_MEMORY=mmap VLLM_PLUGINS=b12x_loader \
-    vllm serve MODEL --load-format b12x
+VLLM_PLE_TABLE_MEMORY=io_uring vllm serve MODEL --load-format fastsafetensors
 ```
 
-The same environment variable works with `--load-format instanttensor`,
-`fastsafetensors`, or `safetensors`; no `--additional-config` is needed.
-Selection precedence is explicit `additional_config.ple_table_memory`, then
-`VLLM_PLE_TABLE_MEMORY`, then the existing `VLLM_PLE_CPU_OFFLOAD` boolean
-(`1` selects `mapped_host`, otherwise `device`).
+The same environment variable works with `--load-format b12x`, `instanttensor`,
+or `safetensors`; no `--additional-config` is needed. Selection precedence is
+explicit `additional_config.ple_table_memory`, then `VLLM_PLE_TABLE_MEMORY`,
+then the existing `VLLM_PLE_CPU_OFFLOAD` boolean (`1` selects `mapped_host`,
+otherwise `device`). Matching vLLM and b12x packages are required.
 
-PLE row weights and NVFP4 row scales map their original safetensors ranges with
-`MAP_PRIVATE` and `PROT_READ`. There is no repacked sidecar file, table-sized
-allocation, CUDA host registration, or table-wide payload scan. Only the
-TP-overlapping checkpoint shards are mapped. A small CUDA shard-pointer table
-lets the existing hash/gather/dequantization kernels read those mappings.
-Scalar FP8 and NVFP4 global scales remain device-resident.
+The io_uring reader does not map, pin, or prewarm the entire table. It
+deduplicates requested 4 KiB blocks, coalesces adjacent blocks into reads of at
+most 64 KiB, and scatters requested packed rows and scales into a reusable
+GPU-accessible cache. It batches SQE submissions through 64 registered
+read-buffer slots. BF16, FP8 and NVFP4 checkpoint representations are preserved
+until the existing GPU gather/dequantization step.
 
-The GPU must support pageable memory access. DGX Spark is the primary target;
-the mmap kernels also support Linux HMM devices. The ordinary b12x loader's
-host-page-table requirements still apply when selecting `--load-format b12x`.
+Staging and planning memory scale with `max_num_batched_tokens` and the number
+of n-gram heads, not the table size. With 4,096 tokens and the 16-head NVFP4
+geometry, the reader owns about 28 MiB of buffers and planning metadata,
+excluding kernel bookkeeping and existing embedding output/scratch.
 
-Loaders read headers to route PLE ranges without materializing their payloads.
-Ordinary files retain the selected accelerated loader. Mixed files containing
-PLE and other tensors use named lazy reads for the other tensors under
-instanttensor/fastsafetensors, whose bulk-file paths would otherwise allocate
-or read the PLE payload. The b12x loader skips PLE ranges in its direct reader.
+Loaders route PLE byte ranges from safetensors headers without materializing
+their payloads. Ordinary files retain the selected accelerated loader. Mixed
+files use named lazy reads for non-PLE tensors under instanttensor/fastsafetensors,
+whose bulk-file paths would otherwise allocate or read the PLE payload. The
+b12x loader skips these PLE ranges in its separate model-weight reader.
 
-Keep backing checkpoint files immutable and available for the model's entire
-lifetime. Pages are faulted in on demand and may remain in the OS page cache;
-mmap does not force a disk read on every lookup. Cold lookups can therefore be
-storage-latency-bound, without requiring the entire table to stay pinned in RAM.
+Model-state preparation performs hashing, reads and output production before
+model execution. CUDA graphs consume fixed-address prepared outputs; no host
+I/O runs inside graph replay. Accepted n-gram history and padding are refreshed
+on every step, including chunked prefill and speculative decoding.
+
+Keep checkpoint files immutable and available for the model's lifetime.
+Filesystem support for `O_DIRECT`, `liburing` development files and `pkg-config`
+are required for io_uring (`liburing-dev` on Debian/Ubuntu), as is permission to
+use io_uring in the kernel/container. Unsupported configurations fail explicitly;
+there is no fallback disk backend. Ordinary checkpoint loading and the in-memory
+PLE modes do not depend on liburing.
+
+The `benchmarks/benchmark_ple_disk.py` program in b12x measures complete io_uring
+transactions, including host work, across changing queries. It accepts
+`--stream-queries N --query-file PATH` for token-ID lists and `--queue-depth`
+for concurrency experiments. The default full-size NVFP4 fixture uses about
+27 GiB of private temporary disk space. Results are component measurements,
+not end-to-end serving throughput or a Spark performance guarantee.
 
 ## b12x component scope
 

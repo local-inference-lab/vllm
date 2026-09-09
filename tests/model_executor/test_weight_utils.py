@@ -3,6 +3,7 @@
 
 import tempfile
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import huggingface_hub.constants
 import pytest
@@ -22,7 +23,7 @@ from vllm.model_executor.weight_transfer import get_file_tensor_source
 @pytest.mark.parametrize(
     "load_format", ["safetensors", "fastsafetensors", "instanttensor"]
 )
-def test_mmap_ranges_bypass_payload_loading_in_mixed_files(
+def test_file_ranges_bypass_payload_loading_in_mixed_files(
     tmp_path, monkeypatch, load_format
 ):
     """Only ordinary weights may reach a payload reader, even in mixed files."""
@@ -47,7 +48,7 @@ def test_mmap_ranges_bypass_payload_loading_in_mixed_files(
                     return getattr(archive, name)
 
                 def get_tensor(self, name):
-                    assert name != table_name, "mmap payload was materialized"
+                    assert name != table_name, "file-backed payload was materialized"
                     return archive.get_tensor(name)
 
             yield GuardedArchive()
@@ -68,7 +69,7 @@ def test_mmap_ranges_bypass_payload_loading_in_mixed_files(
         None,
         prefix="wrapped.",
         weight_name_prefixes=("keep.",),
-        mmap_weight_filter=lambda name: name == table_name,
+        file_weight_filter=lambda name: name == table_name,
     )
     loaded = dict(loader._get_weights_iterator(source))
     assert set(loaded) == {
@@ -85,6 +86,54 @@ def test_mmap_ranges_bypass_payload_loading_in_mixed_files(
     with open(descriptor.path, "rb", buffering=0) as file:
         file.seek(descriptor.offset)
         assert file.read(table.numel()) == bytes(table.flatten().tolist())
+
+
+def test_file_weight_selector_preserves_explicit_source_precedence(tmp_path):
+    weights = {
+        "model.table": torch.arange(4),
+        "source.table": torch.arange(4) + 10,
+    }
+    save_file(weights, str(tmp_path / "weights.safetensors"))
+    loader = default_loader.DefaultModelLoader(
+        LoadConfig(load_format="safetensors", use_tqdm_on_load=False)
+    )
+    explicit = loader.Source(
+        str(tmp_path),
+        None,
+        prefix="explicit.",
+        file_weight_filter=lambda name: name == "source.table",
+    )
+    inherited = loader.Source(str(tmp_path), None, prefix="inherited.")
+    disabled = loader.Source(
+        str(tmp_path), None, prefix="disabled.", file_weight_filter=lambda name: False
+    )
+    model = SimpleNamespace(
+        checkpoint_file_weight_filter=lambda name: name == "model.table",
+        secondary_weights=(explicit, inherited, disabled),
+    )
+    loaded = dict(
+        loader.get_all_weights(
+            SimpleNamespace(model=str(tmp_path), revision=None), model
+        )
+    )
+    for prefix, file_name in (
+        ("", "model.table"),
+        ("explicit.", "source.table"),
+        ("inherited.", "model.table"),
+        ("disabled.", None),
+    ):
+        for name, expected in weights.items():
+            tensor = loaded[prefix + name]
+            if name == file_name:
+                source = get_file_tensor_source(tensor)
+                assert source is not None
+                with open(source.path, "rb") as file:
+                    file.seek(source.offset)
+                    assert file.read(expected.numel() * expected.element_size()) == (
+                        expected.numpy().tobytes()
+                    )
+            else:
+                torch.testing.assert_close(tensor, expected)
 
 
 def test_download_weights_from_hf():

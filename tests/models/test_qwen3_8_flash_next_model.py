@@ -199,6 +199,7 @@ def test_ple_prefetch_joins_before_embedding_consumers(monkeypatch, num_tokens) 
     )
     nn.Module.__init__(embedding)
     embedding.owner_prefix = "test.ple"
+    embedding.requires_disk_preparation = False
     embedding._embedding_out = torch.empty(32, 32, device="cuda")
     table = torch.randn(512, 32, device="cuda")
 
@@ -245,6 +246,138 @@ def test_ple_prefetch_joins_before_embedding_consumers(monkeypatch, num_tokens) 
             graph.replay()
             expected = table[(ids + history[0, 0]) % 512] + hidden * 2
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_disk_ple_preparation_refreshes_graph_output(tmp_path, monkeypatch) -> None:
+    """Real file reads precede replay, including accepted history and padding."""
+    pytest.importorskip("b12x.sequence.ple_embedding")
+    from safetensors.torch import save_file
+
+    from vllm.model_executor.model_loader.weight_utils import (
+        file_source_tensor,
+        safetensors_file_sources,
+    )
+    from vllm.models.qwen3_8_flash_next.model_state import (
+        Qwen3_8FlashNextModelState,
+    )
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+    monkeypatch.setattr(
+        ple_layer_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(ple_layer_module, "get_tensor_model_parallel_rank", lambda: 0)
+    config = SimpleNamespace(
+        ngram_size=3,
+        heads_per_ngram=1,
+        eos_token_id=0,
+        split_ngram_parts=4,
+        ple_embedding_dtype="bfloat16",
+        vocab_size=128,
+        ngram_vocab_size_base=31,
+        make_ngram_vocab_size_divisible_by=16,
+    )
+
+    def make_embedding(memory):
+        return ple_layer_module.Qwen3_8FlashNextNGramEmbedding(
+            config,
+            64,
+            0,
+            32,
+            2,
+            "test.disk.ple",
+            "test.disk.embedding",
+            torch.bfloat16,
+            memory,
+        )
+
+    embedding = make_embedding("io_uring")
+    resident = make_embedding("device")
+    rows = embedding._plan.padded_vocab_size
+    table = torch.arange(rows * 32).reshape(rows, 32).remainder(251).to(torch.bfloat16)
+    shard_rows = (rows + 3) // 4
+    weights = {
+        f"ngram_embedding.shard_{index}.weight": table[
+            index * shard_rows : min((index + 1) * shard_rows, rows)
+        ].contiguous()
+        for index in range(4)
+    }
+    path = tmp_path / "ple.safetensors"
+    save_file(weights, str(path))
+    embedding.load_weights(
+        (name, file_source_tensor(source))
+        for name, source in safetensors_file_sources(str(path)).items()
+    )
+    resident.load_weights(weights.items())
+    ple_layer_module.flush_weight_transfers()
+
+    state = Qwen3_8FlashNextModelState.__new__(Qwen3_8FlashNextModelState)
+    state.uses_ngram_embedding = True
+    state.disk_embeddings = (embedding,)
+    state.ngram_context = torch.empty(2, 2, dtype=torch.int64, device="cuda")
+    state.ngram_context_offsets = torch.tensor([-2, -1], device="cuda")
+    state.ngram_eos_token_id = 0
+    state.ple_query_start_loc = torch.empty(3, dtype=torch.int32, device="cuda")
+    monkeypatch.setattr(MambaHybridModelState, "prepare_inputs", lambda *args: {})
+    monkeypatch.setattr(MambaHybridModelState, "prepare_dummy_inputs", lambda *args: {})
+    batch = SimpleNamespace(
+        num_reqs=1,
+        num_reqs_after_padding=2,
+        input_ids=torch.zeros(4, dtype=torch.int32, device="cuda"),
+        query_start_loc=torch.tensor([0, 2, 2], dtype=torch.int32, device="cuda"),
+        idx_mapping=torch.tensor([0], dtype=torch.int32, device="cuda"),
+    )
+    req_states = SimpleNamespace(
+        num_computed_tokens=SimpleNamespace(
+            gpu=torch.tensor([2], dtype=torch.int32, device="cuda")
+        ),
+        all_token_ids=SimpleNamespace(
+            gpu=torch.tensor([[5, 9, 13, 17, 19, 23]], device="cuda")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="not prepared"):
+        embedding(batch.input_ids, batch.query_start_loc, state.ngram_context)
+
+    @torch.compile(backend="eager", fullgraph=True)
+    def consume(ids, query_start_loc, ngram_context):
+        return embedding(ids, query_start_loc, ngram_context) + 1
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.inference_mode(), torch.cuda.stream(stream):
+        dummy = state.prepare_dummy_inputs(2, 4)
+        for _ in range(3):
+            consume(batch.input_ids, **dummy)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            actual = consume(batch.input_ids, **dummy)
+        graph.replay()
+        torch.testing.assert_close(actual, torch.ones_like(actual), rtol=0, atol=0)
+        for ids, accepted, live in (
+            ([11, 12, 99, 99], 2, 2),
+            ([21, 22, 23, 99], 3, 3),
+            ([31, 99, 99, 99], 1, 1),
+        ):
+            batch.input_ids.copy_(torch.tensor(ids, dtype=torch.int32, device="cuda"))
+            batch.query_start_loc[1:].fill_(live)
+            req_states.num_computed_tokens.gpu.fill_(accepted)
+            prepared = state.prepare_inputs(batch, req_states)
+            graph.replay()
+            expected = resident(batch.input_ids, **prepared) + 1
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                actual[live:], torch.ones_like(actual[live:]), rtol=0, atol=0
+            )
+        # Changing batch sizes must not specialize on Python preparation counts.
+        for count in (4, 8, 3, 7, 2, 6, 12, 16, 24, 32):
+            batch.input_ids = torch.arange(count, dtype=torch.int32, device="cuda")
+            batch.query_start_loc[1:].fill_(count)
+            prepared = state.prepare_inputs(batch, req_states)
+            expected = resident(batch.input_ids, **prepared) + 1
+            torch.testing.assert_close(
+                consume(batch.input_ids, **prepared), expected, rtol=0, atol=0
+            )
+    torch.cuda.current_stream().wait_stream(stream)
 
 
 class _RecordingPlan:
@@ -312,16 +445,16 @@ def test_ple_cpu_offload_env_alias(monkeypatch) -> None:
     assert ple_layer_module._resolve_ple_table_memory(None) == "mapped_host"
 
 
-def test_ple_table_memory_env_overrides_cpu_offload_flag(monkeypatch) -> None:
+@pytest.mark.parametrize("memory", ["device", "io_uring"])
+def test_ple_table_memory_env_overrides_cpu_offload_flag(monkeypatch, memory) -> None:
     monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
-    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "device")
-    assert ple_layer_module._resolve_ple_table_memory(None) == "device"
-    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "mmap")
-    assert ple_layer_module._resolve_ple_table_memory(None) == "mmap"
+    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", memory)
+    assert ple_layer_module._resolve_ple_table_memory(None) == memory
 
 
-def test_ple_table_memory_env_rejects_unknown_storage(monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "disk")
+@pytest.mark.parametrize("memory", ["mmap", "pread"])
+def test_ple_table_memory_env_rejects_removed_modes(monkeypatch, memory) -> None:
+    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", memory)
     with pytest.raises(ValueError, match="VLLM_PLE_TABLE_MEMORY"):
         ple_layer_module._resolve_ple_table_memory(None)
 
@@ -341,7 +474,7 @@ def test_qwen3_8_prefers_b12x_gdn_unless_explicitly_overridden(monkeypatch) -> N
 
 def test_explicit_ple_table_memory_overrides_env_alias(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
-    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "mmap")
+    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "io_uring")
     assert (
         ple_layer_module._resolve_ple_table_memory({"ple_table_memory": "device"})
         == "device"

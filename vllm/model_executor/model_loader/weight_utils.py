@@ -928,18 +928,18 @@ def file_source_tensor(source: FileTensorSource) -> torch.Tensor:
     return tensor
 
 
-def mmap_safetensors_weights_iterator(
+def file_backed_safetensors_weights_iterator(
     hf_weights_files: list[str],
     ordinary_iterator: Callable[
         [list[str]], Generator[tuple[str, torch.Tensor], None, None]
     ],
-    mmap_weight_filter: Callable[[str], bool],
+    file_weight_filter: Callable[[str], bool],
     *,
     weight_name_prefixes: Sequence[str] | None = None,
     local_expert_ids: set[int] | None = None,
     tensor_order: Literal["name", "offset"] = "name",
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Keep accelerated I/O for ordinary files and demand-page opted-in ranges.
+    """Keep accelerated I/O for ordinary files and descriptors for opted-in ranges.
 
     Files must arrive in the backend's original order. Only contiguous ordinary
     runs are batched, so duplicate names and source ordering are not changed.
@@ -949,8 +949,8 @@ def mmap_safetensors_weights_iterator(
     ordinary_files: list[str] = []
     for path in hf_weights_files:
         sources = safetensors_file_sources(path)
-        mapped_names = {name for name in sources if mmap_weight_filter(name)}
-        if not mapped_names:
+        file_names = {name for name in sources if file_weight_filter(name)}
+        if not file_names:
             ordinary_files.append(path)
             continue
         if ordinary_files:
@@ -969,7 +969,7 @@ def mmap_safetensors_weights_iterator(
                     continue
                 if should_skip_weight(name, local_expert_ids):
                     continue
-                if name in mapped_names:
+                if name in file_names:
                     yield name, file_source_tensor(sources[name])
                 else:
                     yield name, f.get_tensor(name)
