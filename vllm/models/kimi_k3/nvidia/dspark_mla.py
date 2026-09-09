@@ -24,6 +24,7 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -268,7 +269,9 @@ class K3DSparkModel(nn.Module):
         self.fc_norm: nn.ModuleList | None = (
             nn.ModuleList(
                 [
-                    RMSNorm(self.config.target_hidden_size, eps=self.config.rms_norm_eps)
+                    RMSNorm(
+                        self.config.target_hidden_size, eps=self.config.rms_norm_eps
+                    )
                     for _ in range(self.config.num_target_layers)
                 ]
             )
@@ -500,13 +503,75 @@ class K3DSparkModel(nn.Module):
                 f"width {hidden_states.shape[-1]}."
             )
         pieces = [
-            self.fc_norm[i](hidden_states[..., i * width : (i + 1) * width].contiguous())
+            self.fc_norm[i](
+                hidden_states[..., i * width : (i + 1) * width].contiguous()
+            )
             for i in range(taps)
         ]
         return torch.cat(pieces, dim=-1)
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.context_norm(self.context_proj(self.normalize_taps(hidden_states)))
+
+    def _context_proj_weight_is_plain(self) -> bool:
+        """True when ``context_proj.weight`` is an unquantized ``[out, in]``
+        matrix whose input columns can be sliced per target tap."""
+        quant_method = getattr(self.context_proj, "quant_method", None)
+        if quant_method is not None and not isinstance(
+            quant_method, UnquantizedLinearMethod
+        ):
+            return False
+        weight = getattr(self.context_proj, "weight", None)
+        return (
+            isinstance(weight, torch.Tensor)
+            and weight.ndim == 2
+            and weight.is_floating_point()
+            and weight.shape[1]
+            == int(self.config.target_hidden_size) * int(self.config.num_target_layers)
+        )
+
+    def combine_tap_states(self, taps: list[torch.Tensor]) -> torch.Tensor:
+        """Project per-tap target states ``[tokens, width]`` into the draft
+        context without concatenating them.
+
+        Each tap is normalized and accumulated into the projection output
+        through its input-column slice of ``context_proj.weight``, the same
+        arithmetic as the streamed large-prefill path
+        (``accumulate_auxiliary_state``). The transient footprint is one
+        normalized tap plus the projection output instead of the
+        ``[tokens, taps * width]`` concatenation and its normalized copy; at
+        a 4608-token prefill chunk with five 7168-wide taps that is roughly
+        130 MiB instead of 760 MiB. Falls back to the concatenated path when
+        the projection weight is quantized and cannot be sliced.
+        """
+        expected_taps = int(self.config.num_target_layers)
+        width = int(self.config.target_hidden_size)
+        if len(taps) != expected_taps:
+            raise ValueError(
+                f"Kimi-K3 DSpark expects {expected_taps} target taps, got {len(taps)}."
+            )
+        for tap in taps:
+            if tap.ndim != 2 or tap.shape[-1] != width:
+                raise ValueError(
+                    "Kimi-K3 DSpark target taps must have shape [tokens, "
+                    f"{width}], got {tuple(tap.shape)}."
+                )
+        if not self._context_proj_weight_is_plain():
+            return self.combine_hidden_states(torch.cat(taps, dim=-1))
+        weight = self.context_proj.weight
+        output: torch.Tensor | None = None
+        for index, tap in enumerate(taps):
+            normalized = self.normalize_tap(index, tap.contiguous()).to(weight.dtype)
+            columns = weight[:, index * width : (index + 1) * width]
+            if output is None:
+                output = torch.mm(normalized, columns.t())
+            else:
+                output.addmm_(normalized, columns.t())
+        assert output is not None
+        if self.context_proj_sharded and getattr(self.context_proj, "tp_size", 1) > 1:
+            # Same all-gather ColumnParallelLinear performs for gather_output.
+            output = tensor_model_parallel_all_gather(output)
+        return self.context_norm(output)
 
     def bind_auxiliary_stream_scratch(self, scratch: torch.Tensor) -> bool:
         """Bind caller-owned storage used to form one target auxiliary state."""
@@ -649,14 +714,18 @@ class K3DSparkModel(nn.Module):
         if not self.context_proj_sharded or len(states) != 1:
             return False
         candidate = states[0]
+        assert self._streamed_context_states is not None
         expected = self._streamed_context_states[: self._streamed_aux_tokens]
-        matches = (
-            candidate is self._completed_stream_result
-            and self._completed_stream_generation > self._consumed_stream_generation
-            and candidate.shape == expected.shape
+        same_buffer = (
+            candidate.shape == expected.shape
             and candidate.dtype == expected.dtype
             and candidate.device == expected.device
             and candidate.data_ptr() == expected.data_ptr()
+        )
+        matches = (
+            same_buffer
+            and candidate is self._completed_stream_result
+            and self._completed_stream_generation > self._consumed_stream_generation
         )
         if matches:
             self._consumed_stream_generation = self._completed_stream_generation
@@ -1014,6 +1083,9 @@ class K3DSparkForCausalLM(nn.Module):
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.combine_hidden_states(hidden_states)
+
+    def combine_tap_states(self, taps: list[torch.Tensor]) -> torch.Tensor:
+        return self.model.combine_tap_states(taps)
 
     def bind_target_auxiliary_stream(
         self,

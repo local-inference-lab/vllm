@@ -757,9 +757,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             assert aux_hidden_states is not None
             context_states = aux_hidden_states[0]
         elif aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
-            )
+            combine_tap_states = getattr(self.model, "combine_tap_states", None)
+            if callable(combine_tap_states):
+                # Per-tap projection never materializes the concatenated
+                # [tokens, taps * width] target state.
+                hidden_states = combine_tap_states(list(aux_hidden_states))
+            else:
+                hidden_states = self.model.combine_hidden_states(
+                    torch.cat(aux_hidden_states, dim=-1)
+                )
             self.hidden_states[:num_target_tokens].copy_(
                 hidden_states[:num_target_tokens]
             )

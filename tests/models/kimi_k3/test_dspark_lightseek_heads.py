@@ -22,7 +22,9 @@ CHECKPOINT = os.environ.get(
 )
 
 
-def _rms_norm_reference(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _rms_norm_reference(
+    x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
     xf = x.float()
     y = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
     return (y * weight.float()).to(x.dtype)
@@ -43,15 +45,28 @@ class _RMSNorm(nn.Module):
 class _Linear(nn.Module):
     """Plain-torch stand-in for ReplicatedLinear (weight ``[out, in]``)."""
 
-    def __init__(self, input_size, output_size, bias=False, return_bias=True, params_dtype=None, prefix="", **_):
+    def __init__(
+        self,
+        input_size,
+        output_size,
+        bias=False,
+        return_bias=True,
+        params_dtype=None,
+        prefix="",
+        **_,
+    ):
         super().__init__()
         dtype = params_dtype or torch.float32
         self.weight = nn.Parameter(torch.zeros(output_size, input_size, dtype=dtype))
-        self.bias = nn.Parameter(torch.zeros(output_size, dtype=dtype)) if bias else None
+        self.bias = (
+            nn.Parameter(torch.zeros(output_size, dtype=dtype)) if bias else None
+        )
         self.return_bias = return_bias
 
     def forward(self, x: torch.Tensor):
-        out = torch.nn.functional.linear(x.to(self.weight.dtype), self.weight, self.bias)
+        out = torch.nn.functional.linear(
+            x.to(self.weight.dtype), self.weight, self.bias
+        )
         return (out, None) if self.return_bias else out
 
 
@@ -63,7 +78,9 @@ def test_normalize_taps_matches_per_tap_rmsnorm():
     taps, width, tokens, eps = 5, 16, 7, 1e-6
     norms = torch.nn.ModuleList([_RMSNorm(width, eps=eps) for _ in range(taps)])
     for i, norm in enumerate(norms):
-        norm.weight.data = 0.5 + 0.1 * i + 0.01 * torch.arange(width, dtype=torch.float32)
+        norm.weight.data = (
+            0.5 + 0.1 * i + 0.01 * torch.arange(width, dtype=torch.float32)
+        )
     model = SimpleNamespace(
         fc_norm=norms,
         config=SimpleNamespace(target_hidden_size=width, num_target_layers=taps),
@@ -72,11 +89,17 @@ def test_normalize_taps_matches_per_tap_rmsnorm():
     out = K3DSparkModel.normalize_taps(model, x)
     assert out.shape == x.shape
     for i in range(taps):
-        ref = _rms_norm_reference(x[:, i * width : (i + 1) * width], norms[i].weight, eps)
-        torch.testing.assert_close(out[:, i * width : (i + 1) * width], ref, atol=1e-2, rtol=1e-2)
+        ref = _rms_norm_reference(
+            x[:, i * width : (i + 1) * width], norms[i].weight, eps
+        )
+        torch.testing.assert_close(
+            out[:, i * width : (i + 1) * width], ref, atol=1e-2, rtol=1e-2
+        )
     # Streamed path: one tap at a time, same numbers.
     for i in range(taps):
-        tap = K3DSparkModel.normalize_tap(model, i, x[:, i * width : (i + 1) * width].contiguous())
+        tap = K3DSparkModel.normalize_tap(
+            model, i, x[:, i * width : (i + 1) * width].contiguous()
+        )
         torch.testing.assert_close(tap, out[:, i * width : (i + 1) * width])
     # Without fc_norm the state passes through untouched.
     plain = SimpleNamespace(fc_norm=None, config=model.config)
@@ -96,9 +119,9 @@ def _load_tensors(path: str, names: list[str]) -> dict[str, torch.Tensor]:
             start, end = meta["data_offsets"]
             f.seek(8 + header_len + start)
             raw = f.read(end - start)
-            out[name] = torch.frombuffer(bytearray(raw), dtype=dtypes[meta["dtype"]]).reshape(
-                meta["shape"]
-            )
+            out[name] = torch.frombuffer(
+                bytearray(raw), dtype=dtypes[meta["dtype"]]
+            ).reshape(meta["shape"])
     return out
 
 
@@ -109,14 +132,18 @@ def _load_tensors(path: str, names: list[str]) -> dict[str, torch.Tensor]:
 def test_confidence_head_matches_checkpoint_math(monkeypatch):
     """The head with the checkpoint's weights computes w^T [h; e] + b in fp32
     for hidden width 7,168 and Markov rank 256 (input 7,424)."""
-    cfg = json.load(open(os.path.join(CHECKPOINT, "config.json")))
+    with open(os.path.join(CHECKPOINT, "config.json")) as cfg_file:
+        cfg = json.load(cfg_file)
     assert cfg["enable_confidence_head"] and cfg["confidence_head_with_markov"]
     hidden, rank = cfg["hidden_size"], cfg["markov_rank"]
     tensors = _load_tensors(
         os.path.join(CHECKPOINT, "model.safetensors"),
         ["confidence_head.proj.weight", "confidence_head.proj.bias"],
     )
-    weight, bias = tensors["confidence_head.proj.weight"], tensors["confidence_head.proj.bias"]
+    weight, bias = (
+        tensors["confidence_head.proj.weight"],
+        tensors["confidence_head.proj.bias"],
+    )
     assert tuple(weight.shape) == (1, hidden + rank) and tuple(bias.shape) == (1,)
     from vllm.model_executor.models import qwen3_dspark
 
@@ -138,6 +165,74 @@ def test_confidence_head_matches_checkpoint_math(monkeypatch):
     from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM
 
     with_head = SimpleNamespace(model=SimpleNamespace(confidence_head=head))
-    torch.testing.assert_close(K3DSparkForCausalLM.compute_confidence(with_head, h, e), got)
+    torch.testing.assert_close(
+        K3DSparkForCausalLM.compute_confidence(with_head, h, e), got
+    )
     without = SimpleNamespace(model=SimpleNamespace(confidence_head=None))
     assert K3DSparkForCausalLM.compute_confidence(without, h, e) is None
+
+
+def _projection_model(taps: int, width: int, hidden: int, eps: float, plain: bool):
+    """DSpark draft stand-in with per-tap norms, a plain context projection
+    and the context norm; ``plain=False`` marks the projection weight as
+    quantized so the concatenated fallback path must be taken."""
+    torch.manual_seed(0)
+    norms = torch.nn.ModuleList([_RMSNorm(width, eps=eps) for _ in range(taps)])
+    for i, norm in enumerate(norms):
+        norm.weight.data = (
+            0.5 + 0.1 * i + 0.01 * torch.arange(width, dtype=torch.float32)
+        )
+    proj = _Linear(taps * width, hidden, return_bias=False)
+    proj.weight.data = torch.randn(hidden, taps * width) * 0.05
+    if not plain:
+        proj.quant_method = object()
+    context_norm = _RMSNorm(hidden, eps=eps)
+    context_norm.weight.data = 1.0 + 0.01 * torch.arange(hidden, dtype=torch.float32)
+    return _DraftProjection(
+        fc_norm=norms,
+        context_proj=proj,
+        context_norm=context_norm,
+        context_proj_sharded=False,
+        config=SimpleNamespace(target_hidden_size=width, num_target_layers=taps),
+    )
+
+
+class _DraftProjection(SimpleNamespace):
+    """Attribute bag carrying the draft model's projection methods."""
+
+    def __getattr__(self, name):
+        from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkModel
+
+        method = getattr(K3DSparkModel, name, None)
+        if method is None or not callable(method):
+            raise AttributeError(name)
+        return method.__get__(self, type(self))
+
+
+@pytest.mark.parametrize("plain", [True, False])
+def test_combine_tap_states_matches_concatenated_projection(plain):
+    """``combine_tap_states`` (per-tap accumulation, no concatenation) equals
+    ``combine_hidden_states`` on the concatenated taps up to accumulation
+    order, and takes the concatenated path verbatim for quantized weights."""
+    from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkModel
+
+    taps, width, hidden, tokens, eps = 5, 16, 24, 7, 1e-6
+    model = _projection_model(taps, width, hidden, eps, plain)
+    tap_states = [torch.randn(tokens, width) * (1.0 + i) for i in range(taps)]
+    expected = K3DSparkModel.combine_hidden_states(model, torch.cat(tap_states, dim=-1))
+    actual = K3DSparkModel.combine_tap_states(model, tap_states)
+    assert actual.shape == expected.shape == (tokens, hidden)
+    if plain:
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+    else:
+        assert torch.equal(actual, expected)
+
+
+def test_combine_tap_states_rejects_wrong_tap_count():
+    from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkModel
+
+    model = _projection_model(5, 16, 24, 1e-6, True)
+    with pytest.raises(ValueError, match="expects 5 target taps"):
+        K3DSparkModel.combine_tap_states(model, [torch.randn(3, 16)] * 4)
+    with pytest.raises(ValueError, match="shape"):
+        K3DSparkModel.combine_tap_states(model, [torch.randn(3, 8)] * 5)
