@@ -28,20 +28,41 @@ divergent digest can be quantified and located by row.
 from __future__ import annotations
 
 import os
+import threading
+import time
 
 import torch
 
 BLOCK_ROWS = 256
-_state: dict = {"seq": 0, "weights": None, "active": None}
+# ``active`` maps a thread id to the forward digest running on that thread:
+# the two-thread split prefill runs one forward per thread, and each tap must
+# reach the digest of its own forward. ``meta`` is the runner's description of
+# the scheduler step being executed; every digest created during the step
+# records a copy of it.
+_state: dict = {"seq": 0, "weights": None, "active": {}, "meta": {}}
+
+
+def _current() -> "ForwardDigest | None":
+    active = _state["active"]
+    digest = active.get(threading.get_ident())
+    if digest is None and len(active) == 1:
+        digest = next(iter(active.values()))
+    return digest
 
 
 def tap(name: str, x: torch.Tensor) -> None:
     """Digest an intermediate of the active forward under ``name`` (for
     example ``attn`` for a layer's attention output or ``mlp`` for its MLP
     output). No-op without an active digest."""
-    digest = _state["active"]
+    digest = _current()
     if digest is not None:
         digest.add_tap(name, x)
+
+
+def set_step_meta(meta: dict) -> None:
+    """Describe the scheduler step about to run (recorded by every forward
+    digest of the step under ``meta``)."""
+    _state["meta"] = dict(meta)
 
 
 def enabled() -> bool:
@@ -100,7 +121,10 @@ class ForwardDigest:
         self.first_position = first_position
         self.rank = rank
         self.num_layers = num_layers
-        _state["active"] = self
+        self.meta = dict(_state["meta"])
+        self.meta["created"] = time.time()
+        self.meta["thread"] = threading.get_ident()
+        _state["active"][threading.get_ident()] = self
 
     def add(self, residual: torch.Tensor) -> None:
         self.rows.append(block_digests(residual, 0))
@@ -124,8 +148,10 @@ class ForwardDigest:
         return table
 
     def flush(self) -> None:
-        if _state["active"] is self:
-            _state["active"] = None
+        active = _state["active"]
+        for tid, digest in list(active.items()):
+            if digest is self:
+                del active[tid]
         if not self.rows:
             return
         table = self._table(self.rows)
@@ -138,6 +164,7 @@ class ForwardDigest:
                 "digests": table,
                 "taps": {name: self._table(rows) for name, rows in self.taps.items()},
                 "raw": self.raw,
+                "meta": self.meta,
                 "first_position": self.first_position,
                 "block_rows": BLOCK_ROWS,
                 "rank": self.rank,

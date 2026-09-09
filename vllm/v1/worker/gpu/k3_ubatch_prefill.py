@@ -39,6 +39,7 @@ import time
 import numpy as np
 import torch
 
+from vllm.logger import init_logger
 from vllm.forward_context import (
     create_forward_context,
     override_forward_context,
@@ -48,6 +49,8 @@ from vllm.v1.worker.gpu import k3_piecewise_graph
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+logger = init_logger(__name__)
 
 _MODE_CACHE: list = [0.0, None]
 
@@ -124,6 +127,81 @@ def _comm_resources(device: torch.device):
         _COMM_STREAM = torch.cuda.Stream(device=device)
         _READY_BARRIER = threading.Barrier(3)
     return _COMM_STREAM, _READY_BARRIER
+
+
+_STEP_COUNTER = [0]
+
+
+def record_step(runner, scheduler_output, input_batch) -> None:
+    """Describe the scheduler step about to run for the residual digests
+    (``VLLM_K3_RESIDUAL_DIGEST_DIR``): requests with their computed-token
+    counts, resumptions, blocks to zero, block copies, partial-tail offloads,
+    KV-connector operations and whether the chunk splits. Rank 0 also logs
+    the description so the container log places every digest file in time.
+    Diagnostic only; never raises."""
+    from vllm.models.kimi_k3.nvidia import residual_digest
+
+    if not residual_digest.enabled():
+        return
+    try:
+        so = scheduler_output
+        cached = so.scheduled_cached_reqs
+        conn = getattr(so.kv_connector_metadata, "requests", None) or []
+        meta = {
+            "step": _STEP_COUNTER[0],
+            "rows": int(input_batch.num_tokens),
+            "padded": int(input_batch.num_tokens_after_padding),
+            "reqs": int(input_batch.num_reqs),
+            "prefilling": bool(input_batch.is_prefilling_np[0])
+            if input_batch.num_reqs
+            else None,
+            "computed": [int(v) for v in input_batch.num_computed_tokens_np[: input_batch.num_reqs]],
+            "new": [
+                (r.req_id[-12:], int(r.num_computed_tokens), [len(b) for b in r.block_ids])
+                for r in so.scheduled_new_reqs
+            ],
+            "cached": [
+                (
+                    rid[-12:],
+                    int(nct),
+                    rid in cached.resumed_req_ids,
+                    None if nb is None else [len(b) for b in nb],
+                )
+                for rid, nct, nb in zip(
+                    cached.req_ids, cached.num_computed_tokens, cached.new_block_ids
+                )
+            ],
+            "scheduled": {k[-12:]: int(v) for k, v in so.num_scheduled_tokens.items()},
+            "zero_blocks": len(so.new_block_ids_to_zero or []),
+            "block_copies": len(so.kv_cache_block_copies or []),
+            "tail_offloads": {
+                k[-12:]: v for k, v in (so.partial_tail_offloads or {}).items()
+            },
+            "connector": [
+                (
+                    m.request_id[-12:],
+                    m.direction,
+                    int(m.op.start),
+                    int(m.op.end),
+                    int(getattr(m.op, "skip_first_n_tokens", 0) or 0),
+                )
+                for m in conn
+            ],
+            "mode": runtime_mode(),
+            "split": bool(ubatch_prefill_enabled() and eligible(input_batch)),
+        }
+        _STEP_COUNTER[0] += 1
+        residual_digest.set_step_meta(meta)
+        if _tp_rank() == 0:
+            logger.info("[k3 digest step] %s", meta)
+    except Exception as exc:  # diagnostic path only
+        logger.warning("[k3 digest step] description failed: %s", exc)
+
+
+def _tp_rank() -> int:
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    return get_tensor_model_parallel_rank()
 
 
 def prime_workspaces() -> None:
@@ -438,6 +516,11 @@ def run_split_prefill(
             half_inputs["inputs_embeds"] = model_inputs["inputs_embeds"][start:end]
         half_inputs.update(runner.model_state.prepare_inputs(hb, runner.req_states))
         prepared.append((hb, attn_metadata, slot_mappings_by_layer, half_inputs))
+    # Leave the runner's persistent slot-mapping and block-table buffers
+    # holding the whole batch's mappings again: consumers later in the step
+    # (the draft speculator, connector-driven copies) read them as the
+    # mapping of the scheduled tokens, not of the last prepared half.
+    runner.prepare_attn(input_batch)
 
     if not ubatch_prefill_overlap():
         for half_index, item in enumerate(prepared):

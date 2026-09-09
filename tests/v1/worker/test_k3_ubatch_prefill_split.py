@@ -272,6 +272,9 @@ def test_each_half_keeps_its_own_slot_mapping(monkeypatch):
     )
     split = rows // 2
     assert out.shape[0] == rows
-    assert calls == [0, split]
+    # Both halves, then the whole batch again so the runner's persistent
+    # buffer ends the step holding the mapping of every scheduled token.
+    assert calls == [0, split, 0]
     assert torch.equal(seen[0], torch.arange(0, split))
     assert torch.equal(seen[1], torch.arange(split, rows))
+    assert torch.equal(shared[0], torch.arange(0, rows))

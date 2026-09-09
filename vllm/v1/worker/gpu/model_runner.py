@@ -2112,6 +2112,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Update the EPLB meta.
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
+        if not dummy_run:
+            # Residual-digest study: describe the step (no-op unless enabled).
+            k3_ubatch_prefill.record_step(self, scheduler_output, input_batch)
+
         # Run model.
         forward_scope = (
             f"vllm:v2/target/{phase}/forward/{_profile_cg_mode(batch_desc.cg_mode)}"
