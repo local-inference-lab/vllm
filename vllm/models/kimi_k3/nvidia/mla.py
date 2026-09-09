@@ -1311,6 +1311,10 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 # The projection and the concat were the last reads of the
                 # gathered planes; the attention reads the packed key.
                 release()
+            # Context-attention inputs, one table row per context chunk.
+            residual_digest.tap("mla.ctx_q", q[chunk.token_slice])
+            residual_digest.tap("mla.ctx_k", k)
+            residual_digest.tap("mla.ctx_v", v)
             attn_output, attn_lse = prefill_backend.run_prefill_context_chunk(
                 chunk=chunk, q=q[chunk.token_slice], k=k, v=v, out=out
             )

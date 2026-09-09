@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Split one prefill chunk into two row halves and run them as consecutive
 sub-steps (Kimi-K3, eager chunked prefill).
 
@@ -48,7 +49,6 @@ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
-
 _MODE_CACHE: list = [0.0, None]
 
 
@@ -90,6 +90,17 @@ def ubatch_prefill_enabled() -> bool:
     return os.getenv("VLLM_K3_UBATCH_PREFILL", "0") == "1"
 
 
+def ubatch_prefill_configured() -> bool:
+    """Whether a split may be selected at any point in this process's life:
+    the split is enabled by the environment, or a mode file is configured
+    so an operator can turn it on later. Boot-time preparation (workspace
+    slots for the second half) keys on this rather than on the mode that
+    happens to be selected while the model warms up."""
+    if os.getenv("VLLM_K3_UBATCH_PREFILL", "0") == "1":
+        return True
+    return bool(os.getenv("VLLM_K3_UBATCH_MODE_FILE", ""))
+
+
 def ubatch_prefill_min_tokens() -> int:
     return int(os.getenv("VLLM_K3_UBATCH_PREFILL_MIN_TOKENS", "1024"))
 
@@ -125,9 +136,11 @@ def prime_workspaces() -> None:
     indexes past the slot list or hits the growth lock on its first KDA/MLA
     workspace request. Each ubatch-1 lane gets a buffer as large as the
     corresponding ubatch-0 lane after warm-up (sized for the full chunk, so
-    a half fits). No-op when the split is disabled or the slots exist.
+    a half fits). The slots are created whenever a split can be selected
+    later (``ubatch_prefill_configured``), including a boot whose mode file
+    says ``off``; no-op when no split is configured or the slots exist.
     """
-    if not ubatch_prefill_enabled():
+    if not ubatch_prefill_configured():
         return
     from vllm.v1.worker.workspace import current_workspace_manager
 

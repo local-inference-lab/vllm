@@ -163,3 +163,23 @@ def test_mode_file_fails_safe_to_off(monkeypatch, tmp_path):
     assert mod.runtime_mode() is None
     assert mod.ubatch_prefill_enabled()
     fresh()
+
+
+def test_configured_split_is_independent_of_boot_mode(tmp_path, monkeypatch):
+    """Boot-time preparation keys on whether a split can ever be selected: a
+    mode file saying ``off`` at boot still configures the split, while a
+    process with neither the enable flag nor a mode file does not."""
+    from vllm.v1.worker.gpu import k3_ubatch_prefill as mod
+
+    path = tmp_path / "mode"
+    path.write_text("off\n")
+    monkeypatch.delenv("VLLM_K3_UBATCH_PREFILL", raising=False)
+    monkeypatch.setenv("VLLM_K3_UBATCH_MODE_FILE", str(path))
+    mod._MODE_CACHE[0] = 0.0
+    mod._MODE_CACHE[1] = None
+    assert not mod.ubatch_prefill_enabled()
+    assert mod.ubatch_prefill_configured()
+    monkeypatch.delenv("VLLM_K3_UBATCH_MODE_FILE")
+    assert not mod.ubatch_prefill_configured()
+    monkeypatch.setenv("VLLM_K3_UBATCH_PREFILL", "1")
+    assert mod.ubatch_prefill_configured()
