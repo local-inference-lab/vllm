@@ -211,8 +211,14 @@ class Glm5NextMLAAttention(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, positions: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        defer_tp_reduction: bool = False,
     ) -> torch.Tensor:
+        if defer_tp_reduction:
+            return self.mla_attn(positions, hidden_states, defer_tp_reduction=True)
         return self.mla_attn(positions, hidden_states)
 
 

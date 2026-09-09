@@ -65,9 +65,14 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        defer_tp_reduction: bool = False,
     ) -> torch.Tensor:
         output = torch.empty_like(hidden_states)
-        super().forward(hidden_states, positions, output)
+        if defer_tp_reduction:
+            super().forward(hidden_states, positions, output, defer_tp_reduction=True)
+        else:
+            super().forward(hidden_states, positions, output)
         return output
 
 

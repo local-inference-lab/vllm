@@ -37,6 +37,8 @@ class MoERunnerInterface(PluggableLayer, ABC):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        *,
+        defer_tp_reduction: bool = False,
     ) -> torch.Tensor:
         raise NotImplementedError
 

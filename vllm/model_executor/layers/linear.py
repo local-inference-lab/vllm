@@ -1649,7 +1649,11 @@ class RowParallelLinear(LinearBase):
     def forward(
         self,
         input_,
+        *,
+        defer_tp_reduction: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        if defer_tp_reduction and (self.tp_size != 4 or not self.reduce_results):
+            raise RuntimeError("Explicit TP deferral requires an enabled TP4 reduction")
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1669,7 +1673,7 @@ class RowParallelLinear(LinearBase):
         _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
         if _hook is not None:
             _hook(output_parallel.shape[0])
-        if self.reduce_results and self.tp_size > 1:
+        if self.reduce_results and self.tp_size > 1 and not defer_tp_reduction:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel

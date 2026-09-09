@@ -7,6 +7,7 @@ from typing import ClassVar, Literal
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -91,6 +92,15 @@ from vllm.utils.b12x import get_b12x_mhc
 from . import l2_prefetch as _l2pf
 from .attention import Glm5NextMLAAttention
 from .kda import Glm5NextLinearAttention
+from .mhc_prefill_sharding import (
+    PrefillOwnership,
+)
+from .mhc_prefill_sharding import (
+    configure as configure_mhc_prefill,
+)
+from .mhc_prefill_sharding import (
+    maybe_create as maybe_create_mhc_prefill_ownership,
+)
 from .multimodal import (
     Glm5NextMultiModalProcessor,
     Glm5NextProcessingInfo,
@@ -189,10 +199,13 @@ class Glm5NextMLP(nn.Module):
         else:
             self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, *, defer_tp_reduction: bool = False):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        if defer_tp_reduction:
+            x, _ = self.down_proj(x, defer_tp_reduction=True)
+        else:
+            x, _ = self.down_proj(x)
         return x
 
 
@@ -300,6 +313,8 @@ class Glm5NextMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         already_sequence_parallel: bool = False,
+        *,
+        defer_tp_reduction: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
 
@@ -309,10 +324,21 @@ class Glm5NextMoE(nn.Module):
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
+        if defer_tp_reduction:
+            if self.is_sequence_parallel or already_sequence_parallel:
+                raise RuntimeError(
+                    "mHC deferral preserves full-token conventional TP MoE"
+                )
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                defer_tp_reduction=True,
+            )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
 
         if self.is_sequence_parallel and not already_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -501,12 +527,20 @@ class Glm5NextDecoderLayer(nn.Module):
         post: torch.Tensor | None = None,
         comb: torch.Tensor | None = None,
         output_indices: torch.Tensor | None = None,
+        *,
+        mhc_prefill_ownership: PrefillOwnership | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
+        if mhc_prefill_ownership is not None and (
+            not self.mhc or self.is_mtp_layer or output_indices is not None
+        ):
+            raise RuntimeError(
+                "mHC ownership cannot enter MTP/non-mHC/compacted decode"
+            )
         # 70B or MTP layers: KDA + MoE without HC.
         if not self.mhc or self.is_mtp_layer:
             residual = hidden_states
@@ -546,6 +580,7 @@ class Glm5NextDecoderLayer(nn.Module):
         if _l2pf.ENABLED and not self._l2pf_ready:
             self._l2pf_build_plans()
         x = hidden_states
+        first_full_pre = post is None
         if post is None:
             if self._b12x_mhc is not None:
                 assert self.hc_attn_fn_broadcast is not None
@@ -569,6 +604,12 @@ class Glm5NextDecoderLayer(nn.Module):
                     norm_weight=self.input_layernorm.weight,
                     norm_eps=self.input_layernorm.variance_epsilon,
                 )
+            if mhc_prefill_ownership is not None:
+                # First pre stays full-sized, avoiding an extra boundary AG.
+                mhc_prefill_ownership.record_mhc("first_pre", x)
+                residual = mhc_prefill_ownership.local_view(residual)
+                post = mhc_prefill_ownership.local_view(post)
+                comb = mhc_prefill_ownership.local_view(comb)
         else:
             residual, post, comb, x = self.hc_fused_post_pre(
                 x,
@@ -584,15 +625,26 @@ class Glm5NextDecoderLayer(nn.Module):
 
         # Attention needs the full token sequence; mHC above ran on the SP
         # shard. Gather for attention, scatter back afterward (DSv4 pattern).
-        if self.is_sequence_parallel:
+        if mhc_prefill_ownership is not None:
+            if not first_full_pre:
+                mhc_prefill_ownership.record_mhc("attention_post_pre", x)
+                x = mhc_prefill_ownership.all_gather(x)
+        elif self.is_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
-        x = self.self_attn(
-            hidden_states=x,
-            positions=positions,
-        )
+        if mhc_prefill_ownership is not None:
+            x = self.self_attn(
+                hidden_states=x, positions=positions, defer_tp_reduction=True
+            )
+        else:
+            x = self.self_attn(
+                hidden_states=x,
+                positions=positions,
+            )
 
-        if self.is_sequence_parallel:
+        if mhc_prefill_ownership is not None:
+            x = mhc_prefill_ownership.reduce_scatter(x)
+        elif self.is_sequence_parallel:
             x = sp_reduce_scatter(x)
 
         # L2 prefetch window B (fallback issue point when no pre-reduce hook).
@@ -613,7 +665,12 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        if self._mlp_is_moe:
+        if mhc_prefill_ownership is not None:
+            mhc_prefill_ownership.record_mhc("ffn_post_pre", x)
+            x = mhc_prefill_ownership.all_gather(x)
+            x = self.mlp(x, defer_tp_reduction=True)
+            x = mhc_prefill_ownership.reduce_scatter(x)
+        elif self._mlp_is_moe:
             x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
         else:
             x = self.mlp(x)
@@ -627,6 +684,8 @@ class Glm5NextDecoderLayer(nn.Module):
 
         if self.layer_idx == self.num_hidden_layers - 1:
             x = self.hc_post(x, residual, post, comb)
+            if mhc_prefill_ownership is not None:
+                mhc_prefill_ownership.record_mhc("final_post", x)
             x = hc_contract(x, self.n)
             return x, None, None, None
 
@@ -989,6 +1048,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         else:
             self.norm = PPMissingLayer()
 
+        configure_mhc_prefill(self, vllm_config, envs.VLLM_GLM53_MHC_PREFILL_SHARD)
         self.is_sequence_parallel = (
             vllm_config.parallel_config.use_sequence_parallel_moe
         )
@@ -1068,6 +1128,8 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             comb = None
 
         full_num_tokens = positions.shape[0]
+        mhc_owner = maybe_create_mhc_prefill_ownership(self, hidden_states, positions)
+        mhc_aux_gathers = 0
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
@@ -1076,14 +1138,27 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             aux_hidden_states.append(hidden_states)
 
         for layer_idx, layer in enumerate(self._active_layers, start=self.start_layer):
-            hidden_states, residual, post, comb = layer(
-                positions, hidden_states, residual, post, comb
-            )
+            if mhc_owner is not None:
+                hidden_states, residual, post, comb = layer(
+                    positions,
+                    hidden_states,
+                    residual,
+                    post,
+                    comb,
+                    mhc_prefill_ownership=mhc_owner,
+                )
+            else:
+                hidden_states, residual, post, comb = layer(
+                    positions, hidden_states, residual, post, comb
+                )
             if layer_idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_state = self._prepare_aux_hidden_state(
                     layer, hidden_states, residual, post, comb
                 )
-                if self.is_sequence_parallel:
+                if mhc_owner is not None:
+                    aux_hidden_state = mhc_owner.all_gather(aux_hidden_state)
+                    mhc_aux_gathers += 1
+                elif self.is_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 aux_hidden_states.append(aux_hidden_state)
 
@@ -1099,7 +1174,10 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        if self.is_sequence_parallel:
+        if mhc_owner is not None:
+            hidden_states = mhc_owner.all_gather(hidden_states)
+            mhc_owner.finish(len(self._active_layers), mhc_aux_gathers)
+        elif self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         hidden_states = self.norm(hidden_states)

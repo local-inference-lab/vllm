@@ -466,6 +466,8 @@ class MoERunner(MoERunnerInterface):
         states: torch.Tensor,
         trunc_size: int | None,
         output_is_reduced: bool | None = None,
+        *,
+        defer_tp_reduction: bool = False,
     ) -> torch.Tensor:
         """All-reduce the combined output if needed.
 
@@ -492,8 +494,16 @@ class MoERunner(MoERunnerInterface):
         _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
         if _hook is not None:
             _hook(states.shape[0])
+        if defer_tp_reduction and (
+            output_is_reduced or self.moe_config.skip_final_all_reduce
+        ):
+            raise RuntimeError(
+                "Cannot defer an already reduced or disabled MoE reduction"
+            )
+
         if (
-            not self.moe_config.is_sequence_parallel
+            not defer_tp_reduction
+            and not self.moe_config.is_sequence_parallel
             and not self.moe_config.skip_final_all_reduce
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not output_is_reduced
@@ -681,6 +691,8 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        *,
+        defer_tp_reduction: bool = False,
     ) -> torch.Tensor:
         """Invoke the fused moe layer.
 
@@ -701,6 +713,13 @@ class MoERunner(MoERunnerInterface):
         1. pytorch cannot handle union types in custom op signatures so
            _moe_forward and _moe_forward_shared must be split.
         """
+
+        if defer_tp_reduction:
+            from vllm.models.glm5next.nvidia.mhc_prefill_sharding import (
+                validate_moe_deferral,
+            )
+
+            validate_moe_deferral(self)
 
         # Apply transform for routed experts (e.g., latent projection for
         # latent MoE). When the caller pre-applies the routed input transform
@@ -781,9 +800,17 @@ class MoERunner(MoERunnerInterface):
         else:
             result = fused_output
 
-        result = self._maybe_reduce_final_output(
-            result, og_hidden_dim_post_xform, fused_output_is_reduced
-        )
+        if defer_tp_reduction:
+            result = self._maybe_reduce_final_output(
+                result,
+                og_hidden_dim_post_xform,
+                fused_output_is_reduced,
+                defer_tp_reduction=True,
+            )
+        else:
+            result = self._maybe_reduce_final_output(
+                result, og_hidden_dim_post_xform, fused_output_is_reduced
+            )
 
         return self._maybe_add_zero_expert_output(result)
 

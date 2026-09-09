@@ -154,6 +154,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
+        *,
+        defer_tp_reduction: bool = False,
     ) -> torch.Tensor:
         q_c = None
         kv_lora = None
@@ -230,4 +232,6 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         if self.g_proj is not None:
             attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
 
+        if defer_tp_reduction:
+            return self.o_proj(attn_out, defer_tp_reduction=True)[0]
         return self.o_proj(attn_out)[0]

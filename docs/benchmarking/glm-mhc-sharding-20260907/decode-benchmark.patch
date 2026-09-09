@@ -1,0 +1,294 @@
+diff --git a/llm_decode_bench.py b/llm_decode_bench.py
+index d4e5508..d53f270 100644
+--- a/llm_decode_bench.py
++++ b/llm_decode_bench.py
+@@ -33,19 +33,30 @@ import signal
+ import string
+ import subprocess
+ import sys
+-import termios
++try:
++    import termios
++    import tty
++except ImportError:  # Windows has no POSIX terminal modules.
++    termios = None
++    tty = None
+ import threading
+ import time
+-import tty
+ import zipfile
+ import zlib
+-from dataclasses import dataclass, field, asdict, fields as dataclass_fields
++from dataclasses import dataclass, field, asdict, fields as dataclass_fields, replace
+ from datetime import datetime
+ from pathlib import Path
+ from statistics import mean, median, pstdev
+ from typing import Optional
+ from urllib.parse import urlparse
+ 
++if os.name == "nt":
++    for _stream in (sys.stdout, sys.stderr):
++        try:
++            _stream.reconfigure(encoding="utf-8")
++        except (AttributeError, OSError):
++            pass
++
+ import httpx
+ from rich import box
+ from rich.columns import Columns
+@@ -4649,6 +4660,8 @@ class CompletionStatsRun:
+ @dataclass
+ class GpuStats:
+     index: int = 0
++    label: str = ""
++    host: str = ""
+     temp_c: float = 0.0
+     gpu_util_pct: float = 0.0
+     mem_util_pct: float = 0.0
+@@ -4662,6 +4675,33 @@ class GpuStats:
+     pcie_width: float = 0.0
+     pcie_rx_mb_s: float = 0.0
+     pcie_tx_mb_s: float = 0.0
++    stale: bool = False
++
++
++@dataclass(frozen=True)
++class RemoteHardwareTarget:
++    label: str
++    ssh_target: str
++
++
++@dataclass
++class RemoteHardwareSample:
++    target: RemoteHardwareTarget
++    gpu: Optional[GpuStats] = None
++    gpus: list[GpuStats] = field(default_factory=list)
++    cpu_total_ticks: float = 0.0
++    cpu_idle_ticks: float = 0.0
++    cpu_freq_mhz: float = 0.0
++    cpu_temp_c: float = 0.0
++    net_rx_bytes: float = 0.0
++    net_tx_bytes: float = 0.0
++    error: str = ""
++
++    def __post_init__(self) -> None:
++        if self.gpu is not None and not self.gpus:
++            self.gpus = [self.gpu]
++        elif self.gpu is None and len(self.gpus) == 1:
++            self.gpu = self.gpus[0]
+ 
+ 
+ @dataclass
+@@ -4828,6 +4868,108 @@ def _to_float(value: str) -> float:
+         return 0.0
+ 
+ 
++def resolve_prompt_run_id(requested: str) -> str:
++    if requested:
++        if not re.fullmatch(r"[a-z]{12}", requested):
++            raise ValueError("prompt run id must contain exactly 12 lowercase ASCII letters")
++        return requested
++    return "".join(random.choices(string.ascii_lowercase, k=12))
++
++
++REMOTE_HARDWARE_SCRIPT = """
++LC_ALL=C
++nvidia-smi --query-gpu=index,temperature.gpu,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,clocks.sm,clocks.mem --format=csv,noheader,nounits 2>/dev/null | while IFS= read -r line; do printf 'GPU|%s\\n' "$line"; done
++printf 'PROCMB|'; nvidia-smi --query-compute-apps=used_memory --format=csv,noheader,nounits 2>/dev/null | awk 'BEGIN{s=0} $1 ~ /^[0-9.]+$/ {s+=$1} END{printf "%.3f\\n",s}'
++awk '/MemTotal:/ {t=$2} /MemAvailable:/ {a=$2} END {printf "MEM|%.3f|%.3f\\n",t/1024,(t-a)/1024}' /proc/meminfo
++awk '/^cpu / {idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; printf "CPU|%.0f|%.0f\\n",total,idle; exit}' /proc/stat
++awk '/cpu MHz/ {s+=$4;n++} END {printf "FREQ|%.1f\\n",n?s/n:0}' /proc/cpuinfo
++printf 'TEMP|0\\nNET|0|0\\n'
++""".strip()
++
++
++def parse_remote_hardware_targets(value: str) -> list[RemoteHardwareTarget]:
++    targets: list[RemoteHardwareTarget] = []
++    labels: set[str] = set()
++    for index, raw in enumerate((value or "").split(",")):
++        raw = raw.strip()
++        if not raw:
++            continue
++        if "=" in raw:
++            label, ssh_target = (part.strip() for part in raw.split("=", 1))
++        else:
++            label, ssh_target = f"S{index}", raw
++        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,15}", label):
++            raise ValueError(f"invalid remote hardware label {label!r}")
++        if not ssh_target or ssh_target.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.:@%+\-\[\]]+", ssh_target):
++            raise ValueError(f"invalid SSH target {ssh_target!r}")
++        if label in labels:
++            raise ValueError(f"duplicate remote hardware label {label!r}")
++        labels.add(label)
++        targets.append(RemoteHardwareTarget(label, ssh_target))
++    return targets
++
++
++def _parse_remote_hardware_output(target: RemoteHardwareTarget, index: int, output: str) -> RemoteHardwareSample:
++    values: dict[str, list[list[str]]] = {}
++    for raw_line in output.splitlines():
++        if "|" not in raw_line:
++            continue
++        tag, *parts = raw_line.strip().split("|")
++        values.setdefault(tag.upper(), []).append([part.strip() for part in parts])
++    gpu_rows = values.get("GPU", [])
++    if not gpu_rows:
++        return RemoteHardwareSample(target=target, error="remote nvidia-smi returned no GPU sample")
++    proc_used_mb = _to_float((values.get("PROCMB") or [["0"]])[0][0])
++    mem_parts = (values.get("MEM") or [["0", "0"]])[0]
++    physical_total_mb = _to_float(mem_parts[0])
++    is_uma = len(gpu_rows) == 1 and physical_total_mb > 0
++    gpus: list[GpuStats] = []
++    for row in gpu_rows:
++        parts = row[0].split(",")
++        if len(parts) < 9:
++            continue
++        vals = [_to_float(part) for part in parts]
++        vals.extend([0.0] * (10 - len(vals)))
++        gpu_index = int(vals[0])
++        gpus.append(GpuStats(index=index * 100 + gpu_index, label=target.label if is_uma else f"{target.label}-G{gpu_index}", host=target.ssh_target, temp_c=vals[1], gpu_util_pct=vals[2], mem_util_pct=vals[3], mem_used_mb=proc_used_mb if is_uma else vals[4], mem_total_mb=physical_total_mb if is_uma else vals[5], power_w=vals[6], power_limit_w=vals[7], sm_clock_mhz=vals[8], mem_clock_mhz=vals[9]))
++    cpu = (values.get("CPU") or [["0", "0"]])[0]
++    net = (values.get("NET") or [["0", "0"]])[0]
++    return RemoteHardwareSample(target=target, gpus=gpus, cpu_total_ticks=_to_float(cpu[0]), cpu_idle_ticks=_to_float(cpu[1]) if len(cpu) > 1 else 0.0, cpu_freq_mhz=_to_float((values.get("FREQ") or [["0"]])[0][0]), cpu_temp_c=_to_float((values.get("TEMP") or [["0"]])[0][0]), net_rx_bytes=_to_float(net[0]), net_tx_bytes=_to_float(net[1]) if len(net) > 1 else 0.0)
++
++
++def _sample_remote_hardware_target(target: RemoteHardwareTarget, index: int, timeout: float = 10.0) -> RemoteHardwareSample:
++    if shutil.which("ssh") is None:
++        return RemoteHardwareSample(target=target, error="ssh executable not found")
++    try:
++        proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "-o", "ConnectionAttempts=1", "-o", "LogLevel=ERROR", target.ssh_target, REMOTE_HARDWARE_SCRIPT], check=False, capture_output=True, text=True, timeout=timeout)
++    except subprocess.TimeoutExpired:
++        return RemoteHardwareSample(target=target, error=f"SSH sample timed out after {timeout:g}s")
++    except Exception as exc:
++        return RemoteHardwareSample(target=target, error=f"{type(exc).__name__}: {exc}")
++    if proc.returncode != 0:
++        return RemoteHardwareSample(target=target, error=(proc.stderr or proc.stdout or f"ssh exit {proc.returncode}").strip()[:160])
++    return _parse_remote_hardware_output(target, index, proc.stdout)
++
++
++def _sample_remote_hardware(targets, previous, last_good=None):
++    last_good = last_good or {}
++    samples = [_sample_remote_hardware_target(target, index) for index, target in enumerate(targets)]
++    gpus: list[GpuStats] = []
++    errors: list[str] = []
++    for sample in samples:
++        if sample.error or not sample.gpus:
++            errors.append(f"{sample.target.label}: {sample.error or 'no sample'}")
++            for label, cached in last_good.items():
++                if label == sample.target.label or label.startswith(f"{sample.target.label}-G"):
++                    gpus.append(replace(cached, stale=True))
++            continue
++        for gpu in sample.gpus:
++            gpu.stale = False
++            last_good[gpu.label] = replace(gpu)
++            gpus.append(gpu)
++    return gpus, 0.0, 0.0, [], errors
++
++
+ def _sample_gpu_query() -> list[GpuStats]:
+     if shutil.which("nvidia-smi") is None:
+         return []
+@@ -7211,34 +7353,49 @@ def collect_startup_diagnostics(args, base_url: str) -> dict:
+     return diagnostics
+ 
+ 
+-def start_hardware_monitor(state: TUIState, interval: float) -> None:
++def start_hardware_monitor(state: TUIState, interval: float, ssh_hosts: str = "") -> None:
+     if interval <= 0:
+         state.hw_monitor_enabled = False
+         state.hw_last_error = "hardware monitor disabled"
+         return
+-    if shutil.which("nvidia-smi") is None:
++    try:
++        remote_targets = parse_remote_hardware_targets(ssh_hosts)
++    except ValueError as exc:
++        state.hw_monitor_enabled = False
++        state.hw_last_error = str(exc)
++        return
++    if remote_targets and shutil.which("ssh") is None:
++        state.hw_monitor_enabled = False
++        state.hw_last_error = "ssh executable not found"
++        return
++    if not remote_targets and shutil.which("nvidia-smi") is None:
+         state.hw_monitor_enabled = False
+         state.hw_last_error = "nvidia-smi not found"
+         return
+     state.hw_monitor_enabled = True
+ 
+     def loop() -> None:
++        previous = {}
++        last_good = {}
+         while True:
+             try:
+-                gpus = _sample_gpu_query()
+-                pcie = _sample_gpu_pcie()
+-                for gpu in gpus:
+-                    rx, tx = pcie.get(gpu.index, (0.0, 0.0))
+-                    gpu.pcie_rx_mb_s = rx
+-                    gpu.pcie_tx_mb_s = tx
+-                cpu_util, cpu_freq = _sample_cpu_stats()
+-                cpu_temps = _sample_cpu_temperatures()
++                if remote_targets:
++                    gpus, cpu_util, cpu_freq, cpu_temps, errors = _sample_remote_hardware(remote_targets, previous, last_good)
++                else:
++                    gpus = _sample_gpu_query()
++                    pcie = _sample_gpu_pcie()
++                    for gpu in gpus:
++                        rx, tx = pcie.get(gpu.index, (0.0, 0.0))
++                        gpu.pcie_rx_mb_s = rx
++                        gpu.pcie_tx_mb_s = tx
++                    cpu_util, cpu_freq = _sample_cpu_stats()
++                    cpu_temps = _sample_cpu_temperatures()
+                 state.cpu_util_pct = cpu_util
+                 state.cpu_freq_mhz = cpu_freq
+                 state.cpu_temps = cpu_temps
+                 state.gpu_stats = gpus
+                 state.hw_available = bool(gpus)
+-                state.hw_last_error = "" if gpus else "no GPU samples"
++                state.hw_last_error = "; ".join(errors) if remote_targets and errors else ("" if gpus else "no GPU samples")
+                 state.hw_last_update = time.monotonic()
+                 if gpus:
+                     state.hw_history.append(
+@@ -13029,11 +13186,11 @@ async def run_completion_stats_benchmark(args) -> dict:
+         if not hw_monitor_requested:
+             hw_state.hw_monitor_enabled = False
+             hw_state.hw_last_error = "hardware monitor disabled"
+-        elif shutil.which("nvidia-smi") is None:
++        elif not args.hw_ssh_hosts and shutil.which("nvidia-smi") is None:
+             hw_state.hw_monitor_enabled = False
+             hw_state.hw_last_error = "nvidia-smi not found"
+         else:
+-            start_hardware_monitor(hw_state, args.hw_monitor_interval)
++            start_hardware_monitor(hw_state, args.hw_monitor_interval, args.hw_ssh_hosts)
+ 
+         payload = {
+             "model": args.model,
+@@ -14004,7 +14161,7 @@ async def run_benchmark(args):
+         state.hw_monitor_enabled = False
+         state.hw_last_error = "hardware monitor disabled"
+         add_event(state, "startup hardware monitor disabled")
+-    elif shutil.which("nvidia-smi") is None:
++    elif not args.hw_ssh_hosts and shutil.which("nvidia-smi") is None:
+         state.hw_monitor_enabled = False
+         state.hw_last_error = "nvidia-smi not found"
+         console.print(
+@@ -14018,7 +14175,7 @@ async def run_benchmark(args):
+             "(benchmark may be running off the GPU server/container)",
+         )
+     else:
+-        start_hardware_monitor(state, args.hw_monitor_interval)
++        start_hardware_monitor(state, args.hw_monitor_interval, args.hw_ssh_hosts)
+         add_event(state, f"hardware monitor interval={args.hw_monitor_interval:g}s")
+ 
+     # Mark skipped decode cells
+@@ -16412,6 +16569,10 @@ def parse_args():
+         help="Maximum GPUs to show in the live hardware panel. All sampled GPUs "
+              "still contribute to aggregate PCIe rx/tx. (default: 8)"
+     )
++    parser.add_argument(
++        "--hw-ssh-hosts", default="",
++        help="Comma-separated remote hardware targets, optionally labeled as S0=user@host."
++    )
+     parser.add_argument(
+         "--p2pmark", action="store_true",
+         help="Run the bundled CUDA/NCCL P2P diagnostic before the LLM benchmark "
