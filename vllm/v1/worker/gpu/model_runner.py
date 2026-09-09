@@ -1986,6 +1986,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.input_buffers,
                 max_req_tokens=batch_desc.max_req_tokens,
             )
+            if self.use_dcp and not skip_attn_for_dummy_run:
+                # Decode-context-parallel attention builders read the per-rank
+                # local sequence lengths (the MLA decode path substitutes them
+                # for seq_lens); the graph-capture dummy batches fill them the
+                # same way (cudagraph_utils), so any dummy run that builds
+                # attention metadata carries them too.
+                prepare_dcp_local_seq_lens(
+                    self.input_buffers.dcp_local_seq_lens,
+                    input_batch.seq_lens,
+                    input_batch.num_reqs,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    self.cp_interleave,
+                )
+                input_batch.dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[
+                    : input_batch.num_reqs_after_padding
+                ]
             phase = _profile_batch_phase(input_batch, dummy_run=True)
             if not skip_attn_for_dummy_run:
                 with record_function_or_nullcontext(
