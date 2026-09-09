@@ -2605,7 +2605,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             attn_res_scratch = None
 
         digest = None
-        if residual_digest.enabled():
+        # Prefill-size forwards only: a decode forward has nothing to digest
+        # and its CUDA-graph capture cannot host the .item() below.
+        if (
+            residual_digest.enabled()
+            and positions.numel() >= residual_digest.BLOCK_ROWS
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             digest = residual_digest.ForwardDigest(
                 self.end_layer - self.start_layer,
                 first_position=int(positions[0].item()),
