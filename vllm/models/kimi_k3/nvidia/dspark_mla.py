@@ -29,7 +29,10 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
+from vllm.model_executor.models.qwen3_dspark import (
+    DSparkConfidenceHead,
+    DSparkMarkovHead,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -257,6 +260,35 @@ class K3DSparkModel(nn.Module):
         self.context_norm = RMSNorm(
             self.config.hidden_size, eps=self.config.rms_norm_eps
         )
+        # Checkpoints trained with ``fc_norm`` normalize every tapped target
+        # state separately before the taps are concatenated into the context
+        # projection input (lightseekorg/kimi-k3-dspark; tokenspeed PR #1016).
+        # Without the norms such a draft consumes unnormalized taps and its
+        # acceptance collapses silently.
+        self.fc_norm: nn.ModuleList | None = (
+            nn.ModuleList(
+                [
+                    RMSNorm(self.config.target_hidden_size, eps=self.config.rms_norm_eps)
+                    for _ in range(self.config.num_target_layers)
+                ]
+            )
+            if getattr(self.config, "fc_norm", False)
+            else None
+        )
+        # Per-position acceptance estimate w^T [h_k; markov_w1[x_{k-1}]] + b for
+        # the speculator's confidence-scheduled verification capacity.
+        self.confidence_head: DSparkConfidenceHead | None = None
+        if getattr(self.config, "enable_confidence_head", False):
+            include_markov = bool(
+                getattr(self.config, "confidence_head_with_markov", False)
+            )
+            self.confidence_head = DSparkConfidenceHead(
+                self.config.hidden_size
+                + (self.config.markov_rank if include_markov else 0),
+                prefix=maybe_prefix(prefix, "confidence_head"),
+                bias=bool(getattr(self.config, "confidence_head_bias", True)),
+                include_markov=include_markov,
+            )
 
         decoder_layer_cls = self.decoder_layer_cls or K3DSparkDecoderLayer
         self.layers = nn.ModuleList(
@@ -449,8 +481,32 @@ class K3DSparkModel(nn.Module):
         assert self.embed_tokens is not None
         return self.embed_tokens(input_ids)
 
+    def normalize_tap(self, index: int, state: torch.Tensor) -> torch.Tensor:
+        """Apply the checkpoint's per-tap norm to target tap ``index``."""
+        if self.fc_norm is None:
+            return state
+        return self.fc_norm[index](state)
+
+    def normalize_taps(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Per-tap norm over concatenated taps ``[tokens, taps * width]``."""
+        if self.fc_norm is None:
+            return hidden_states
+        width = int(self.config.target_hidden_size)
+        taps = hidden_states.shape[-1] // width
+        if taps != len(self.fc_norm) or hidden_states.shape[-1] != taps * width:
+            raise ValueError(
+                "Kimi-K3 DSpark fc_norm expects "
+                f"{len(self.fc_norm)} taps of width {width}, got a state of "
+                f"width {hidden_states.shape[-1]}."
+            )
+        pieces = [
+            self.fc_norm[i](hidden_states[..., i * width : (i + 1) * width].contiguous())
+            for i in range(taps)
+        ]
+        return torch.cat(pieces, dim=-1)
+
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.context_norm(self.context_proj(hidden_states))
+        return self.context_norm(self.context_proj(self.normalize_taps(hidden_states)))
 
     def bind_auxiliary_stream_scratch(self, scratch: torch.Tensor) -> bool:
         """Bind caller-owned storage used to form one target auxiliary state."""
@@ -535,6 +591,7 @@ class K3DSparkModel(nn.Module):
             scratch.copy_(primary)
         else:
             torch.add(primary, residual, out=scratch)
+        tap = self.normalize_tap(index, scratch)
 
         input_width = int(self.config.target_hidden_size)
         weight = self.context_proj.weight[
@@ -542,11 +599,11 @@ class K3DSparkModel(nn.Module):
         ]
         output = self._streamed_context_states[:num_tokens]
         if index == 0:
-            torch.mm(scratch, weight.t(), out=output)
+            torch.mm(tap, weight.t(), out=output)
         else:
             torch.addmm(
                 output,
-                scratch,
+                tap,
                 weight.t(),
                 beta=1.0,
                 alpha=1.0,
@@ -893,8 +950,10 @@ class K3DSparkForCausalLM(nn.Module):
     has_own_embed_tokens = False
     has_own_lm_head = False
     draft_id_to_target_id = None
+    # The frozen target embedding and LM head are shared after the draft
+    # checkpoint loads; the confidence head is loaded when the checkpoint
+    # enables it (``enable_confidence_head``) and skipped otherwise.
     checkpoint_skip_substrs: tuple[str, ...] = (
-        "confidence_head",
         "embed_tokens",
         "lm_head",
     )
@@ -1145,13 +1204,20 @@ class K3DSparkForCausalLM(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self._require_markov_head().bias(markov_embed, self.logits_processor)
 
+    def compute_confidence(
+        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Pre-sigmoid acceptance score per draft position, or None without
+        a confidence head (the speculator then verifies every draft)."""
+        if self.model.confidence_head is None:
+            return None
+        return self.model.confidence_head(head_hidden, markov_embed)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # confidence_head is training-only. The frozen target embedding and LM
-        # head are shared after this draft-specific checkpoint is loaded.
-        loader = AutoWeightsLoader(
-            self,
-            skip_substrs=list(self.checkpoint_skip_substrs),
-        )
+        skip = list(self.checkpoint_skip_substrs)
+        if self.model.confidence_head is None:
+            skip.append("confidence_head")
+        loader = AutoWeightsLoader(self, skip_substrs=skip)
         # read: 1. all weights. 2. context kv weights
         weights = _duplicate_context_kv_weights(weights, len(self.model.layers))
         loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
