@@ -163,6 +163,17 @@ class DSparkSpeculator(DFlashSpeculator):
             or self.capacity_budget_frac < 1.0
             or self.sps_table is not None
         )
+        # VLLM_DSPARK_CONFIDENCE_STATS=<steps>: every that many drafting steps,
+        # rank 0 logs the raw confidence-head logit statistics per draft
+        # position (mean, std, saturated fractions) and the online-STS
+        # temperatures, so a head's calibration can be judged in service.
+        import os as _os
+
+        self._confidence_stats_every = int(
+            _os.getenv("VLLM_DSPARK_CONFIDENCE_STATS", "0") or 0
+        )
+        self._confidence_stats_acc: torch.Tensor | None = None
+        self._confidence_stats_steps = 0
         self.online_sts: DSparkOnlineSTS | None = None
         if self.use_draft_token_capacity and self.speculative_config.dspark_online_sts:
             self.online_sts = DSparkOnlineSTS(
@@ -435,6 +446,8 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
 
+        if use_confidence_capacity and not is_profile and self._confidence_stats_every:
+            self._record_confidence_stats(confidence_logits)
         if use_confidence_capacity and not is_profile:
             capacity_confidence = self.draft_token_confidence_logits
             capacity_temperature = self.confidence_temperature
@@ -463,6 +476,59 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_token_capacity[:num_reqs],
             valid_lengths,
             out=self.draft_token_capacity[:num_reqs],
+        )
+
+    def _record_confidence_stats(self, logits: torch.Tensor) -> None:
+        """Accumulate raw confidence-logit statistics per draft position and
+        log them every ``VLLM_DSPARK_CONFIDENCE_STATS`` steps on rank 0.
+
+        A sigmoid in fp32 rounds to exactly 1 above about +17 and the
+        survival product's ``1 / (1 + exp(-x))`` becomes exactly 0 below
+        about -88; positions past a zero leave the capacity allocator's
+        candidate set, which is what the confidence temperature guards.
+        """
+        x = logits.detach().float()
+        num_reqs, n_spec = x.shape
+        acc = self._confidence_stats_acc
+        if acc is None or acc.shape[0] != n_spec:
+            acc = torch.zeros(n_spec, 6, dtype=torch.float64, device=x.device)
+            self._confidence_stats_acc = acc
+        acc[:, 0] += num_reqs
+        acc[:, 1] += x.sum(dim=0)
+        acc[:, 2] += (x * x).sum(dim=0)
+        acc[:, 3] += (x > 17.0).sum(dim=0)
+        acc[:, 4] += (x < -17.0).sum(dim=0)
+        acc[:, 5] += (x < -88.0).sum(dim=0)
+        self._confidence_stats_steps += 1
+        if self._confidence_stats_steps % self._confidence_stats_every:
+            return
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        rows = acc.cpu().tolist()
+        acc.zero_()
+        if get_tensor_model_parallel_rank() != 0:
+            return
+        parts = []
+        for i, (n, s1, s2, hi, lo, zero) in enumerate(rows):
+            if n <= 0:
+                continue
+            mean = s1 / n
+            var = max(s2 / n - mean * mean, 0.0)
+            parts.append(
+                f"p{i}: mean {mean:+.2f} std {var ** 0.5:.2f} "
+                f">17 {hi / n:.3f} <-17 {lo / n:.3f} <-88 {zero / n:.4f}"
+            )
+        temps = ""
+        if self.online_sts is not None and hasattr(self.online_sts, "temperatures"):
+            temps = " | online STS temperatures " + " ".join(
+                f"{t:.2f}" for t in self.online_sts.temperatures.tolist()
+            )
+        logger.info(
+            "DSpark confidence logits over %d steps (temperature %.2f): %s%s",
+            self._confidence_stats_every,
+            self.confidence_temperature,
+            "; ".join(parts),
+            temps,
         )
 
     def set_sps_curve(self, sps_curve: list[tuple[int, float]]) -> None:
