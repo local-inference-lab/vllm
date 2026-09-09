@@ -120,7 +120,7 @@ from vllm.models.kimi_k3.nvidia.mla import (
     KimiK3PrefillProjectionWorkspace,
     MultiHeadLatentAttention,
 )
-from vllm.models.kimi_k3.nvidia.ops import attn_res
+from vllm.models.kimi_k3.nvidia.ops import attn_res, invariant_gemm
 from vllm.models.kimi_k3.nvidia.tp_projection import (
     KIMI_DMA_PAIR_GATHER_MIN_TOKENS,
     gather_kimi_projection_pair_prefill,
@@ -379,7 +379,10 @@ class KimiMLP(nn.Module):
                 "KimiMLP caller-owned output must not alias the down-projection input"
             )
 
-        torch.mm(x, self.down_proj.weight.t(), out=output)
+        if invariant_gemm.applies_to(x, self.down_proj.weight):
+            invariant_gemm.mm(x, self.down_proj.weight.t(), out=output)
+        else:
+            torch.mm(x, self.down_proj.weight.t(), out=output)
         if self.down_proj.reduce_results and self.down_proj.tp_size > 1:
             output = tensor_model_parallel_all_reduce_in_place(output)
         return output
@@ -760,7 +763,10 @@ class KimiColumnParallelGate(KimiPaddedColumnParallelLinear):
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if x.is_cuda and x.dtype == self.weight.dtype == torch.bfloat16:
-            output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+            if invariant_gemm.applies_to(x, self.weight):
+                output = invariant_gemm.mm(x, self.weight.T, out_dtype=torch.float32)
+            else:
+                output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
         else:
             output = torch.nn.functional.linear(
                 x.to(self.weight.dtype), self.weight

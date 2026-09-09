@@ -14,6 +14,7 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner, _unpack
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.models.kimi_k3.nvidia.ops import invariant_gemm
 from vllm.platforms import current_platform
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import aux_stream
@@ -289,7 +290,10 @@ class LatentMoERunner(MoERunner):
 
         # hidden_shard += latent @ up_proj_shard.T, accumulated in the GEMM's
         # beta-add epilogue so folding in the shared partial costs no kernel.
-        hidden_shard.addmm_(latent, up_proj_shard.t())
+        if invariant_gemm.applies_to(latent, up_proj_shard, hidden_shard):
+            invariant_gemm.addmm_(hidden_shard, latent, up_proj_shard.t())
+        else:
+            hidden_shard.addmm_(latent, up_proj_shard.t())
 
         return self._maybe_reduce_final_output(
             shared_output, trunc_size, output_is_reduced=False
