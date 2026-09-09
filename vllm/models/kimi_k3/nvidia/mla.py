@@ -1636,19 +1636,35 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         served = served[..., : self.v_head_dim].float()
         rows = q.shape[0]
         scale = float(self.scale)
-        scores = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * scale
-        t = torch.arange(rows, device=q.device)[:, None]
+        # Row chunks keep the fp32 score tensor small (a whole 2,304 x 4,608
+        # x 11-head chunk is 0.5 GiB, which a fully provisioned production
+        # GPU cannot spare); the reference is exact per chunk.
         j = torch.arange(k_len, device=q.device)[None, :]
-        scores = scores.masked_fill((j > (k_len - rows) + t)[None], float("-inf"))
-        ref = torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v.float())
-        diff = (served - ref).abs()
+        kf = k.float()
+        vf = v.float()
+        max_d = torch.zeros((), device=q.device)
+        sum_d = torch.zeros((), device=q.device)
+        sum_x = torch.zeros((), device=q.device)
+        step = 256
+        for start in range(0, rows, step):
+            end = min(start + step, rows)
+            scores = torch.einsum("qhd,khd->hqk", q[start:end].float(), kf) * scale
+            t = torch.arange(start, end, device=q.device)[:, None]
+            scores = scores.masked_fill((j > (k_len - rows) + t)[None], float("-inf"))
+            ref = torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), vf)
+            diff = (served[start:end] - ref).abs()
+            max_d = torch.maximum(max_d, diff.max())
+            sum_d += diff.sum()
+            sum_x += ref.abs().sum()
+            del scores, ref, diff
+        numel = float(served.numel())
         logger.info(
             "split naive check %s ub1: FA4 vs fp32 bottom-right max|d| %.3e "
             "mean|d| %.3e ref mean|x| %.3e rows %d keys %d",
             getattr(self, "layer_name", "?"),
-            diff.max().item(),
-            diff.mean().item(),
-            ref.abs().mean().item(),
+            max_d.item(),
+            (sum_d / numel).item(),
+            (sum_x / numel).item(),
             rows,
             k_len,
         )
@@ -1802,9 +1818,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         # attention result straight into it, avoiding a slice+flatten+copy.
         writes_out = not has_context and prefill.prefill_backend.supports_out()
         prefill_out = (
-            out.view(-1, self.num_local_heads, self.v_head_dim)
-            if writes_out
-            else None
+            out.view(-1, self.num_local_heads, self.v_head_dim) if writes_out else None
         )
         if split_k_len is not None:
             backend = prefill.prefill_backend
