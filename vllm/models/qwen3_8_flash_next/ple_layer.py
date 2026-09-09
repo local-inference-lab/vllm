@@ -31,6 +31,7 @@ from vllm.model_executor.weight_transfer import (
     allocate_weights,
     copy_weight,
     flush_weight_transfers,
+    get_file_tensor_source,
 )
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
@@ -106,11 +107,13 @@ def _resolve_ple_table_memory(additional_config: Any) -> str:
     if isinstance(additional_config, dict) and "ple_table_memory" in additional_config:
         table_memory = additional_config["ple_table_memory"]
     else:
-        table_memory = "mapped_host" if envs.VLLM_PLE_CPU_OFFLOAD else "device"
-    if table_memory not in {"device", "mapped_host"}:
+        table_memory = envs.VLLM_PLE_TABLE_MEMORY
+        if table_memory is None:
+            table_memory = "mapped_host" if envs.VLLM_PLE_CPU_OFFLOAD else "device"
+    if table_memory not in {"device", "mapped_host", "mmap"}:
         raise ValueError(
-            "additional_config.ple_table_memory must be 'device' or "
-            f"'mapped_host', got {table_memory!r}"
+            "additional_config.ple_table_memory must be 'device', "
+            f"'mapped_host', or 'mmap', got {table_memory!r}"
         )
     return table_memory
 
@@ -147,47 +150,60 @@ class Qwen3_8FlashNextPLEGroupedNorm(nn.Module):
 
 
 class _NGramEmbeddingStorage(nn.Module):
-    def __init__(self, plan: Any) -> None:
+    def __init__(self, plan: Any, shard_rows: int) -> None:
         super().__init__()
-        self._table_storage = allocate_weights(plan.allocate_storage)
-        self.weight = nn.Parameter(
-            self._table_storage.weight,
-            requires_grad=False,
-        )
-        if plan.weight_scale_shape is None:
-            self.register_parameter("weight_scale", None)
-        else:
-            weight_scale = self._table_storage.weight_scale
-            assert weight_scale is not None
-            self.weight_scale = nn.Parameter(
-                weight_scale,
-                requires_grad=False,
+        self.mapped_table = None
+        self._table_storage = None
+        if plan.caps.table_memory == "mmap":
+            self.mapped_table = _b12x_module("ple_embedding").MMapTable(
+                plan, shard_rows
             )
-        if plan.weight_scale_2_shape is None:
-            self.register_parameter("weight_scale_2", None)
+            tensors: dict[str, torch.Tensor | None] = {"weight": None}
+            for name in ("weight_scale", "weight_scale_2"):
+                shape = getattr(plan, f"{name}_shape")
+                tensors[name] = (
+                    allocate_weights(
+                        torch.empty,
+                        shape,
+                        dtype=getattr(plan, f"{name}_dtype"),
+                        device=plan.caps.device,
+                    )
+                    if shape == (1,)
+                    else None
+                )
         else:
-            weight_scale_2 = self._table_storage.weight_scale_2
-            assert weight_scale_2 is not None
-            self.weight_scale_2 = nn.Parameter(
-                weight_scale_2,
-                requires_grad=False,
+            self._table_storage = allocate_weights(plan.allocate_storage)
+            tensors = {
+                name: getattr(self._table_storage, name)
+                for name in ("weight", "weight_scale", "weight_scale_2")
+            }
+        for name, tensor in tensors.items():
+            self.register_parameter(
+                name,
+                nn.Parameter(tensor, requires_grad=False)
+                if tensor is not None
+                else None,
             )
 
     @property
-    def weight_load_view(self) -> torch.Tensor:
-        return self._table_storage.weight_load_view
+    def weight_load_view(self) -> torch.Tensor | None:
+        return self._table_storage.weight_load_view if self._table_storage else None
 
     @property
     def weight_scale_load_view(self) -> torch.Tensor | None:
+        if self._table_storage is None:
+            return self.weight_scale
         return self._table_storage.weight_scale_load_view
 
     @property
     def weight_scale_2_load_view(self) -> torch.Tensor | None:
+        if self._table_storage is None:
+            return self.weight_scale_2
         return self._table_storage.weight_scale_2_load_view
 
     @property
     def mapped_host_nbytes(self) -> int:
-        return int(self._table_storage.mapped_host_nbytes)
+        return int(self._table_storage.mapped_host_nbytes) if self._table_storage else 0
 
 
 class Qwen3_8FlashNextNGramEmbedding(nn.Module):
@@ -274,12 +290,20 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         self.register_buffer("ngram_heads_offsets", self._plan.table_offsets)
         self.register_buffer("ngram_heads_vocab_sizes", self._plan.prime_sizes)
 
-        self.ngram_embedding = _NGramEmbeddingStorage(self._plan)
+        shard_rows = (
+            self._plan.padded_vocab_size + self.split_ngram_parts - 1
+        ) // self.split_ngram_parts
+        self.ngram_embedding = _NGramEmbeddingStorage(self._plan, shard_rows)
         if self.ngram_embedding.mapped_host_nbytes:
             logger.info(
                 "Using %.2f GiB of CUDA-mapped host memory for this TP rank's "
                 "PLE table",
                 self.ngram_embedding.mapped_host_nbytes / (1 << 30),
+            )
+        if self.ngram_embedding.mapped_table is not None:
+            logger.info(
+                "Using read-only, private checkpoint mappings for this TP rank's "
+                "PLE table; pages remain demand-paged"
             )
 
         (scratch,) = get_b12x_scratch_buffers(self._plan)
@@ -329,6 +353,9 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         )
 
     def _bind_embedding(self):
+        kwargs = {}
+        if self.ngram_embedding.mapped_table is not None:
+            kwargs["mapped_table"] = self.ngram_embedding.mapped_table
         return self._plan.bind(
             scratch=self._scratch,
             weight=self.ngram_embedding.weight,
@@ -340,6 +367,7 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             num_seqs=self._num_seqs,
             num_tokens=self._num_tokens,
             out=self._embedding_out,
+            **kwargs,
         )
 
     def _prepare_inputs(
@@ -625,9 +653,6 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                 if suffix == "weight":
                     expected_shape = (expected_rows, self._plan.weight_shape[1])
                     expected_dtype = self._plan.weight_dtype
-                    destination = getattr(
-                        embedding, "weight_load_view", embedding.weight.data
-                    )
                 else:
                     if self._quant_mode != "nvfp4_group16":
                         regular_weights.append((name, loaded_weight))
@@ -639,12 +664,6 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                         self._plan.weight_scale_shape[1],
                     )
                     expected_dtype = self._plan.weight_scale_dtype
-                    destination = getattr(
-                        embedding,
-                        "weight_scale_load_view",
-                        embedding.weight_scale.data,
-                    )
-                    assert destination is not None
                 if tuple(loaded_weight.shape) != expected_shape:
                     raise ValueError(
                         f"shape mismatch for PLE shard {shard_index} {suffix}: "
@@ -655,25 +674,49 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                         f"PLE shard {shard_index} {suffix} must have dtype "
                         f"{expected_dtype}, got {loaded_weight.dtype}"
                     )
-                target = _copy_embedding_shard(
-                    destination,
-                    loaded_weight,
-                    checkpoint_start=checkpoint_start,
-                    tp_start=tp_start,
-                    tp_end=tp_end,
-                )
-                if suffix == "weight_scale" and target is not None:
-                    flush_weight_transfers()
-                    scale = target.float()
-                    if not bool(torch.isfinite(scale).all()) or not bool(
-                        (scale > 0).all()
-                    ):
-                        raise ValueError(
-                            f"PLE shard {shard_index} weight_scale must be "
-                            "finite and positive"
-                        )
                 overlap_start = max(checkpoint_start, tp_start)
                 overlap_end = min(checkpoint_start + expected_rows, tp_end)
+                mapped_table = getattr(embedding, "mapped_table", None)
+                if mapped_table is not None:
+                    source = get_file_tensor_source(loaded_weight)
+                    if source is None:
+                        raise ValueError(
+                            "mmap PLE tables require file-backed safetensors weights "
+                            "from the b12x, instanttensor, fastsafetensors, or "
+                            "safetensors loader"
+                        )
+                    if source.shape != expected_shape or source.dtype != expected_dtype:
+                        raise ValueError(f"file source geometry does not match {name}")
+                    if overlap_start < overlap_end:
+                        mapped_table.map_shard(
+                            shard_index,
+                            source.path,
+                            source.offset,
+                            scale=suffix == "weight_scale",
+                        )
+                else:
+                    parameter = getattr(embedding, suffix)
+                    destination = getattr(
+                        embedding, f"{suffix}_load_view", parameter.data
+                    )
+                    assert destination is not None
+                    target = _copy_embedding_shard(
+                        destination,
+                        loaded_weight,
+                        checkpoint_start=checkpoint_start,
+                        tp_start=tp_start,
+                        tp_end=tp_end,
+                    )
+                    if suffix == "weight_scale" and target is not None:
+                        flush_weight_transfers()
+                        scale = target.float()
+                        if not bool(torch.isfinite(scale).all()) or not bool(
+                            (scale > 0).all()
+                        ):
+                            raise ValueError(
+                                f"PLE shard {shard_index} weight_scale must be "
+                                "finite and positive"
+                            )
                 if overlap_start < overlap_end:
                     load_ranges = (
                         self._embedding_load_ranges

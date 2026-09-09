@@ -50,7 +50,9 @@ usage() {
     "Usage: $0 [launcher options] [vLLM options]" \
     "" \
     "Environment modes:" \
-    "  TP_SIZE=1                    Use one GPU and mapped-host n-gram tables." \
+    "  TP_SIZE=1                    Default to one GPU and mapped-host tables." \
+    "  VLLM_PLE_TABLE_MEMORY=mmap    Demand-page PLE tables from checkpoint files." \
+    "                               Also accepts device and mapped_host." \
     "" \
     "Launcher options:" \
     "  --torch-profile [DIR]         Enable a four-step Torch CPU+CUDA capture." \
@@ -181,7 +183,7 @@ export NCCL_PROTO="${NCCL_PROTO:-LL,LL128,Simple}"
 export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
 export VLLM_PCIE_ALLREDUCE_BACKEND="${VLLM_PCIE_ALLREDUCE_BACKEND:-b12x}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
-export VLLM_PLE_CPU_OFFLOAD
+export VLLM_PLE_CPU_OFFLOAD VLLM_PLE_TABLE_MEMORY
 export SAFETENSORS_FAST_GPU="${SAFETENSORS_FAST_GPU:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
@@ -273,7 +275,9 @@ command=(
 cd "${SCRIPT_DIR}"
 printf 'Launching %s as %s on devices %s\n' \
   "${MODEL_PATH}" "${SERVED_MODEL_NAME}" "${DEVICE_IDS}" >&2
-if [[ "${VLLM_PLE_CPU_OFFLOAD}" == 1 ]]; then
+if [[ -n "${VLLM_PLE_TABLE_MEMORY:-}" ]]; then
+  printf 'PLE n-gram table storage default: %s\n' "${VLLM_PLE_TABLE_MEMORY}" >&2
+elif [[ "${VLLM_PLE_CPU_OFFLOAD}" == 1 ]]; then
   printf 'PLE n-gram tables: CUDA-mapped host DRAM\n' >&2
 fi
 if [[ -n "${TORCH_PROFILE_DIR}" ]]; then

@@ -4,8 +4,9 @@ Status: C99 O_DIRECT transport and initial b12x vLLM adapter, September 6,
 2026. The adapter registers `--load-format b12x`, uses explicitly locked,
 CPU-addressable CUDA pools for final weights, and routes metadata-only source
 views through `vllm.model_executor.weight_transfer`. Selected payload ranges
-are read with O_DIRECT; buffered fallback and mmap input are not used. Existing
-model name routing, MTP prefix filtering, and quantization remain in place.
+are read with O_DIRECT, except for model-selected, read-only checkpoint mappings
+described below. Existing model name routing, MTP prefix filtering, and
+quantization remain in place.
 Arbitrary source arithmetic and unsupported layouts fail explicitly. Native
 descriptor batches execute through eight persistent pthread readers by default
 (`io_threads`, 1–16). C owns range ordering, splitting, dispatch, and completion;
@@ -26,9 +27,9 @@ package installed:
 VLLM_PLUGINS=b12x_loader vllm serve MODEL --load-format b12x
 ```
 
-The loader always uses mapped, pinned storage with write-combined CPU caching
-for weights. There is no serving `allocation` option; alternative mappings
-remain confined to b12x's allocation-qualification tools.
+Ordinary weights use the loader's managed shared storage pool. There is no
+serving `allocation` option; PLE tables can independently opt into the
+read-only mmap storage mode below.
 The adapter uses the standard vLLM checkpoint-shard progress format and honors
 the existing progress setting and rank-zero output. The initial
 adapter requires GPU host page tables and the native Torch CUDA allocator;
@@ -61,6 +62,46 @@ b12x owns manifest parsing, scheduling, memory budgets, transport, and generic
 transforms. vLLM supplies model name mappings, TP/EP slices, destination handles,
 and numerical requirements. A tensor handed to an ordinary model loader must
 own its storage. Reusable staging views stay inside the controlled executor.
+
+## Demand-paged PLE tables
+
+Select Qwen3.8-Flash-Next PLE storage with
+`VLLM_PLE_TABLE_MEMORY=device|mapped_host|mmap`. vLLM resolves the setting and
+passes `table_memory` to the b12x planner; b12x does not read this environment
+variable. With matching vLLM and b12x packages installed:
+
+```sh
+VLLM_PLE_TABLE_MEMORY=mmap VLLM_PLUGINS=b12x_loader \
+    vllm serve MODEL --load-format b12x
+```
+
+The same environment variable works with `--load-format instanttensor`,
+`fastsafetensors`, or `safetensors`; no `--additional-config` is needed.
+Selection precedence is explicit `additional_config.ple_table_memory`, then
+`VLLM_PLE_TABLE_MEMORY`, then the existing `VLLM_PLE_CPU_OFFLOAD` boolean
+(`1` selects `mapped_host`, otherwise `device`).
+
+PLE row weights and NVFP4 row scales map their original safetensors ranges with
+`MAP_PRIVATE` and `PROT_READ`. There is no repacked sidecar file, table-sized
+allocation, CUDA host registration, or table-wide payload scan. Only the
+TP-overlapping checkpoint shards are mapped. A small CUDA shard-pointer table
+lets the existing hash/gather/dequantization kernels read those mappings.
+Scalar FP8 and NVFP4 global scales remain device-resident.
+
+The GPU must support pageable memory access. DGX Spark is the primary target;
+the mmap kernels also support Linux HMM devices. The ordinary b12x loader's
+host-page-table requirements still apply when selecting `--load-format b12x`.
+
+Loaders read headers to route PLE ranges without materializing their payloads.
+Ordinary files retain the selected accelerated loader. Mixed files containing
+PLE and other tensors use named lazy reads for the other tensors under
+instanttensor/fastsafetensors, whose bulk-file paths would otherwise allocate
+or read the PLE payload. The b12x loader skips PLE ranges in its direct reader.
+
+Keep backing checkpoint files immutable and available for the model's entire
+lifetime. Pages are faulted in on demand and may remain in the OS page cache;
+mmap does not force a disk read on every lookup. Cold lookups can therefore be
+storage-latency-bound, without requiring the entire table to stay pinned in RAM.
 
 ## b12x component scope
 

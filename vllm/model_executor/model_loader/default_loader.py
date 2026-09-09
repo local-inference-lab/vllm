@@ -4,8 +4,8 @@ import dataclasses
 import glob
 import os
 import time
-from collections.abc import Generator, Iterable
-from typing import cast
+from collections.abc import Callable, Generator, Iterable
+from typing import Literal, cast
 
 import torch
 from torch import nn
@@ -20,6 +20,7 @@ from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
 )
 from vllm.model_executor.model_loader.weight_utils import (
+    _natural_sort_key,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     fastsafetensors_weights_iterator,
@@ -29,6 +30,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     get_quant_config,
     instanttensor_weights_iterator,
     maybe_download_from_modelscope,
+    mmap_safetensors_weights_iterator,
     multi_thread_pt_weights_iterator,
     multi_thread_safetensors_weights_iterator,
     np_cache_weights_iterator,
@@ -71,6 +73,9 @@ class DefaultModelLoader(BaseModelLoader):
 
         weight_name_prefixes: tuple[str, ...] | None = None
         """If defined, load only checkpoint tensor names with these prefixes."""
+
+        mmap_weight_filter: Callable[[str], bool] | None = None
+        """Select raw checkpoint names to route as immutable file ranges."""
 
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
@@ -252,6 +257,43 @@ class DefaultModelLoader(BaseModelLoader):
 
         return hf_folder, hf_weights_files, use_safetensors
 
+    def _safetensors_weights_iterator(
+        self, hf_weights_files: list[str], source: "Source"
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        extra_config = self.load_config.model_loader_extra_config
+        if self.load_config.load_format == "fastsafetensors":
+            return fastsafetensors_weights_iterator(
+                hf_weights_files,
+                self.load_config.use_tqdm_on_load,
+                weight_name_prefixes=source.weight_name_prefixes,
+            )
+        if self.load_config.load_format == "instanttensor":
+            return instanttensor_weights_iterator(
+                hf_weights_files,
+                self.load_config.use_tqdm_on_load,
+                weight_name_prefixes=source.weight_name_prefixes,
+            )
+        if extra_config.get("enable_multithread_load"):
+            return multi_thread_safetensors_weights_iterator(
+                hf_weights_files,
+                self.load_config.use_tqdm_on_load,
+                max_workers=extra_config.get("num_threads", self.DEFAULT_NUM_THREADS),
+                weight_name_prefixes=source.weight_name_prefixes,
+            )
+        return safetensors_weights_iterator(
+            hf_weights_files,
+            self.load_config.use_tqdm_on_load,
+            self.load_config.safetensors_load_strategy,
+            local_expert_ids=self.local_expert_ids,
+            weight_name_prefixes=source.weight_name_prefixes,
+            safetensors_prefetch_num_threads=(
+                self.load_config.safetensors_prefetch_num_threads
+            ),
+            safetensors_prefetch_block_size=(
+                self.load_config.safetensors_prefetch_block_size
+            ),
+        )
+
     def _get_weights_iterator(
         self, source: "Source"
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -265,6 +307,8 @@ class DefaultModelLoader(BaseModelLoader):
             source.allow_patterns_overrides,
             source.weight_name_prefixes,
         )
+        if source.mmap_weight_filter is not None and not use_safetensors:
+            raise ValueError("Checkpoint mmap weights require safetensors files")
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -276,42 +320,33 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.use_tqdm_on_load,
             )
         elif use_safetensors:
-            if self.load_config.load_format == "fastsafetensors":
-                weights_iterator = fastsafetensors_weights_iterator(
-                    hf_weights_files,
-                    self.load_config.use_tqdm_on_load,
-                    weight_name_prefixes=source.weight_name_prefixes,
-                )
-            elif self.load_config.load_format == "instanttensor":
-                weights_iterator = instanttensor_weights_iterator(
-                    hf_weights_files,
-                    self.load_config.use_tqdm_on_load,
-                    weight_name_prefixes=source.weight_name_prefixes,
+            if source.mmap_weight_filter is None:
+                weights_iterator = self._safetensors_weights_iterator(
+                    hf_weights_files, source
                 )
             else:
-                if extra_config.get("enable_multithread_load"):
-                    weights_iterator = multi_thread_safetensors_weights_iterator(
-                        hf_weights_files,
-                        self.load_config.use_tqdm_on_load,
-                        max_workers=extra_config.get(
-                            "num_threads", self.DEFAULT_NUM_THREADS
-                        ),
-                        weight_name_prefixes=source.weight_name_prefixes,
-                    )
+                load_format = self.load_config.load_format
+                tensor_order: Literal["name", "offset"]
+                if load_format == "instanttensor":
+                    ordered_files = sorted(hf_weights_files)
+                    tensor_order = "offset"
+                elif load_format == "fastsafetensors":
+                    ordered_files = sorted(hf_weights_files, key=_natural_sort_key)
+                    tensor_order = "offset"
+                elif extra_config.get("enable_multithread_load"):
+                    ordered_files = hf_weights_files
+                    tensor_order = "name"
                 else:
-                    weights_iterator = safetensors_weights_iterator(
-                        hf_weights_files,
-                        self.load_config.use_tqdm_on_load,
-                        self.load_config.safetensors_load_strategy,
-                        local_expert_ids=self.local_expert_ids,
-                        weight_name_prefixes=source.weight_name_prefixes,
-                        safetensors_prefetch_num_threads=(
-                            self.load_config.safetensors_prefetch_num_threads
-                        ),
-                        safetensors_prefetch_block_size=(
-                            self.load_config.safetensors_prefetch_block_size
-                        ),
-                    )
+                    ordered_files = sorted(hf_weights_files, key=_natural_sort_key)
+                    tensor_order = "name"
+                weights_iterator = mmap_safetensors_weights_iterator(
+                    ordered_files,
+                    lambda files: self._safetensors_weights_iterator(files, source),
+                    source.mmap_weight_filter,
+                    weight_name_prefixes=source.weight_name_prefixes,
+                    local_expert_ids=self.local_expert_ids,
+                    tensor_order=tensor_order,
+                )
         else:
             if extra_config.get("enable_multithread_load"):
                 weights_iterator = multi_thread_pt_weights_iterator(
@@ -339,6 +374,9 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        mmap_weight_filter = getattr(model, "checkpoint_mmap_weight_filter", None)
+        if not callable(mmap_weight_filter):
+            mmap_weight_filter = None
         primary_weights = DefaultModelLoader.Source(
             model_config.model,
             model_config.revision,
@@ -348,6 +386,7 @@ class DefaultModelLoader(BaseModelLoader):
             weight_name_prefixes=getattr(
                 model, "checkpoint_weight_name_prefixes", None
             ),
+            mmap_weight_filter=mmap_weight_filter,
         )
         yield from self._get_weights_iterator(primary_weights)
 
@@ -356,6 +395,10 @@ class DefaultModelLoader(BaseModelLoader):
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
+            if source.mmap_weight_filter is None and mmap_weight_filter is not None:
+                source = dataclasses.replace(
+                    source, mmap_weight_filter=mmap_weight_filter
+                )
             yield from self._get_weights_iterator(source)
 
     def download_model(self, model_config: ModelConfig) -> None:

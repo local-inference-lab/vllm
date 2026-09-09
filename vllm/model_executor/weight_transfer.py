@@ -5,6 +5,7 @@
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 import torch
@@ -15,6 +16,21 @@ _allocator: ContextVar[Callable[[], AbstractContextManager] | None] = ContextVar
     "weight_allocator", default=None
 )
 _T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class FileTensorSource:
+    """Immutable checkpoint tensor range, without materializing its payload."""
+
+    path: str
+    offset: int
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+
+def get_file_tensor_source(tensor: torch.Tensor) -> FileTensorSource | None:
+    """Return the backing range carried by an opted-in checkpoint tensor."""
+    return getattr(tensor, "_vllm_file_tensor_source", None)
 
 
 @contextmanager

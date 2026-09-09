@@ -203,6 +203,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
     VLLM_PLE_CPU_OFFLOAD: bool = False
+    VLLM_PLE_TABLE_MEMORY: Literal["device", "mapped_host", "mmap"] | None = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1682,8 +1683,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
     ),
-    # Qwen3.8-Flash-Next only. Store PLE table payloads in CUDA-mapped host
-    # memory unless additional_config.ple_table_memory is explicitly set.
+    # Qwen3.8-Flash-Next PLE storage policy, passed to the b12x planner.
+    "VLLM_PLE_TABLE_MEMORY": env_with_choices(
+        "VLLM_PLE_TABLE_MEMORY", None, ["device", "mapped_host", "mmap"]
+    ),
+    # Fallback when neither additional_config nor VLLM_PLE_TABLE_MEMORY selects
+    # a policy: store PLE table payloads in CUDA-mapped host memory.
     "VLLM_PLE_CPU_OFFLOAD": lambda: bool(int(os.getenv("VLLM_PLE_CPU_OFFLOAD", "0"))),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(

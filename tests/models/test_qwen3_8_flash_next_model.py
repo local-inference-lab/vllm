@@ -307,8 +307,23 @@ def _set_tensor_attributes(module: nn.Module, *names: str) -> None:
 
 
 def test_ple_cpu_offload_env_alias(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_PLE_TABLE_MEMORY", raising=False)
     monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
     assert ple_layer_module._resolve_ple_table_memory(None) == "mapped_host"
+
+
+def test_ple_table_memory_env_overrides_cpu_offload_flag(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
+    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "device")
+    assert ple_layer_module._resolve_ple_table_memory(None) == "device"
+    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "mmap")
+    assert ple_layer_module._resolve_ple_table_memory(None) == "mmap"
+
+
+def test_ple_table_memory_env_rejects_unknown_storage(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "disk")
+    with pytest.raises(ValueError, match="VLLM_PLE_TABLE_MEMORY"):
+        ple_layer_module._resolve_ple_table_memory(None)
 
 
 def test_qwen3_8_prefers_b12x_gdn_unless_explicitly_overridden(monkeypatch) -> None:
@@ -326,6 +341,7 @@ def test_qwen3_8_prefers_b12x_gdn_unless_explicitly_overridden(monkeypatch) -> N
 
 def test_explicit_ple_table_memory_overrides_env_alias(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
+    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "mmap")
     assert (
         ple_layer_module._resolve_ple_table_memory({"ple_table_memory": "device"})
         == "device"

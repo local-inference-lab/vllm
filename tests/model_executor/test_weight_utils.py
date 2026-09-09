@@ -2,15 +2,89 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import tempfile
+from contextlib import contextmanager
 
 import huggingface_hub.constants
 import pytest
+import torch
 from huggingface_hub.utils import LocalEntryNotFoundError
+from safetensors.torch import save_file
 
+from vllm.config.load import LoadConfig
+from vllm.model_executor.model_loader import default_loader, weight_utils
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     maybe_remap_kv_scale_name,
 )
+from vllm.model_executor.weight_transfer import get_file_tensor_source
+
+
+@pytest.mark.parametrize(
+    "load_format", ["safetensors", "fastsafetensors", "instanttensor"]
+)
+def test_mmap_ranges_bypass_payload_loading_in_mixed_files(
+    tmp_path, monkeypatch, load_format
+):
+    """Only ordinary weights may reach a payload reader, even in mixed files."""
+    table_name = "keep.table.weight"
+    table = torch.arange(48, dtype=torch.uint8).reshape(6, 8)
+    scale = torch.tensor([0.5], dtype=torch.bfloat16)
+    mixed = tmp_path / "part-1.safetensors"
+    ordinary = tmp_path / "part-0.safetensors"
+    save_file(
+        {table_name: table, "keep.scale": scale, "ignore.weight": table + 1}, str(mixed)
+    )
+    save_file({"keep.ordinary": scale + 1}, str(ordinary))
+    real_open = weight_utils.safe_open
+    real_iterator = weight_utils.safetensors_weights_iterator
+
+    @contextmanager
+    def guarded_open(*args, **kwargs):
+        with real_open(*args, **kwargs) as archive:
+
+            class GuardedArchive:
+                def __getattr__(self, name):
+                    return getattr(archive, name)
+
+                def get_tensor(self, name):
+                    assert name != table_name, "mmap payload was materialized"
+                    return archive.get_tensor(name)
+
+            yield GuardedArchive()
+
+    def ordinary_iterator(paths, *args, **kwargs):
+        assert str(mixed) not in paths, "mixed file reached bulk payload loading"
+        yield from real_iterator(paths, False, weight_name_prefixes=("keep.",))
+
+    monkeypatch.setattr(weight_utils, "safe_open", guarded_open)
+    monkeypatch.setattr(
+        default_loader, f"{load_format}_weights_iterator", ordinary_iterator
+    )
+    loader = default_loader.DefaultModelLoader(
+        LoadConfig(load_format=load_format, use_tqdm_on_load=False)
+    )
+    source = loader.Source(
+        str(tmp_path),
+        None,
+        prefix="wrapped.",
+        weight_name_prefixes=("keep.",),
+        mmap_weight_filter=lambda name: name == table_name,
+    )
+    loaded = dict(loader._get_weights_iterator(source))
+    assert set(loaded) == {
+        "wrapped.keep.ordinary",
+        "wrapped.keep.scale",
+        "wrapped.keep.table.weight",
+    }
+    torch.testing.assert_close(loaded["wrapped.keep.ordinary"], scale + 1)
+    torch.testing.assert_close(loaded["wrapped.keep.scale"], scale)
+    mapped = loaded["wrapped.keep.table.weight"]
+    assert mapped.is_meta
+    descriptor = get_file_tensor_source(mapped)
+    assert descriptor is not None
+    with open(descriptor.path, "rb", buffering=0) as file:
+        file.seek(descriptor.offset)
+        assert file.read(table.numel()) == bytes(table.flatten().tolist())
 
 
 def test_download_weights_from_hf():

@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from importlib import import_module
 from itertools import islice
 
@@ -79,7 +79,20 @@ from .hyperconnection import (
     HyperConnectionConfig,
     HyperConnectionWorkspace,
 )
-from .ple_layer import Qwen3_8FlashNextPLELayer
+from .ple_layer import Qwen3_8FlashNextPLELayer, _resolve_ple_table_memory
+
+
+def _is_mmap_ple_weight(name: str) -> bool:
+    _, marker, shard_suffix = name.rpartition(
+        ".ple.ple_embedding.ngram_embedding.shard_"
+    )
+    shard_index, separator, suffix = shard_suffix.partition(".")
+    return bool(
+        marker
+        and separator
+        and shard_index.isdigit()
+        and suffix in {"weight", "weight_scale"}
+    )
 
 
 def _remap_qsa_cache_scale_name(name: str, qsa_layer_ids: frozenset[int]) -> str:
@@ -711,6 +724,15 @@ class Qwen3_8FlashNextForCausalLM(
         positions = torch.arange(len(input_tokens), dtype=torch.long)
         return positions.unsqueeze(0).expand(3, -1), 0
 
+    @property
+    def checkpoint_mmap_weight_filter(self) -> Callable[[str], bool] | None:
+        if (
+            self.config.ple_layer_ids
+            and _resolve_ple_table_memory(self.vllm_config.additional_config) == "mmap"
+        ):
+            return _is_mmap_ple_weight
+        return None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
@@ -812,6 +834,10 @@ class Qwen3_8FlashNextForConditionalGeneration(
             self.language_model.make_empty_intermediate_tensors
         )
         self.set_moe_parameters(self.language_model.model.layers)
+
+    @property
+    def checkpoint_mmap_weight_filter(self) -> Callable[[str], bool] | None:
+        return self.language_model.checkpoint_mmap_weight_filter
 
     def embed_input_ids(
         self,
