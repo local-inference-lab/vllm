@@ -6,10 +6,12 @@ A prefill chunk that runs as two row halves reproduces the bits of the whole
 chunk only if every row-local kernel gives a row the same result whether the
 call carries all rows or a subset. cuBLAS chooses its kernel and its split-K
 factor from the problem shape, so for the three smallest-N GEMMs of a Kimi-K3
-layer (the router gate, K 7168 N 104 with fp32 output; the routed
-down-projection, K 7168 N 400; the tier-2 up-projection tail, K 3584 N 796
-accumulated into a column window) a 4,608-row call and two 2,304-row calls
-accumulate in different orders and differ in some rows.
+MoE layer (the router gate, K 7168 N 104 with fp32 output; the routed latent
+projection ``routed_expert_down_proj``, K 7168 N 400 per rank; the tier-2
+up-projection tail, K 3584 N 796 accumulated into a column window) a
+4,608-row call and two 2,304-row calls accumulate in different orders and
+differ in some rows. The shared experts' down-projection takes the kernel as
+well when its weight is an unquantized bf16 tensor.
 
 This module computes those GEMMs with one Triton kernel whose reduction order
 is fixed by its tile constants alone: every output tile reduces the full K

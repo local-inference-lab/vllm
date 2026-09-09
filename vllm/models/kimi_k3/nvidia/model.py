@@ -723,10 +723,18 @@ class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
         prefix: str,
         *,
         gather_output: bool = True,
+        fixed_order_gemm: bool = False,
     ) -> None:
         tp_size = get_tensor_model_parallel_world_size()
         self.logical_output_size = output_size
         self.kimi_gather_output = gather_output
+        # Prefill-size calls take the row-count-invariant GEMM kernel when
+        # the operator enables it (invariant_gemm): for the routed latent
+        # projection (K 7168, N 400 at TP9) cuBLAS picks a split-K kernel
+        # whose result depends on the row count, which breaks the split
+        # prefill's exactness; the other shapes of this class are invariant
+        # on cuBLAS and keep it.
+        self.fixed_order_gemm = fixed_order_gemm
         padded_output_size = kimi_projection_shard_width(output_size, tp_size) * tp_size
         super().__init__(
             input_size,
@@ -738,6 +746,12 @@ class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
         )
 
     def forward_local(self, x: torch.Tensor):
+        if (
+            self.fixed_order_gemm
+            and self.bias is None
+            and invariant_gemm.applies_to(x, self.weight)
+        ):
+            return invariant_gemm.mm(x, self.weight.T), None
         return super().forward(x)
 
     def forward(self, x: torch.Tensor):
@@ -1386,6 +1400,7 @@ class KimiMoE(nn.Module):
                     hidden_size,
                     self.moe_hidden_size,
                     prefix=f"{prefix}.routed_expert_down_proj",
+                    fixed_order_gemm=True,
                 )
             else:
                 self.routed_expert_down_proj = ReplicatedLinear(
