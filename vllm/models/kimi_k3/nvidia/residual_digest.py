@@ -17,6 +17,12 @@ dumping activations (``evidence/r1/compare_digests.py``).
 
 The digest is computed on the device and copied to the host once per
 forward. It is inactive without the environment variable.
+
+``VLLM_K3_RESIDUAL_DUMP_TAPS=<name>,<name>,...`` additionally stores the
+first occurrence per forward of each named tap as a raw host tensor under
+``raw`` in the same file (the first MLA layer for the ``mla.*`` taps), on the
+ranks listed in ``VLLM_K3_RESIDUAL_DUMP_RANKS`` (default ``0``), so a
+divergent digest can be quantified and located by row.
 """
 
 from __future__ import annotations
@@ -73,12 +79,24 @@ def block_digests(x: torch.Tensor, row_offset: int) -> torch.Tensor:
     return out
 
 
+def _dump_taps(rank: int) -> frozenset[str]:
+    """Tap names whose first occurrence per forward is stored raw on ``rank``."""
+    names = os.getenv("VLLM_K3_RESIDUAL_DUMP_TAPS", "")
+    if not names:
+        return frozenset()
+    ranks = os.getenv("VLLM_K3_RESIDUAL_DUMP_RANKS", "0")
+    if str(rank) not in {r.strip() for r in ranks.split(",") if r.strip()}:
+        return frozenset()
+    return frozenset(n.strip() for n in names.split(",") if n.strip())
+
+
 class ForwardDigest:
     """Collects one forward's per-layer digests and writes them at the end."""
 
     def __init__(self, num_layers: int, first_position: int, rank: int) -> None:
         self.rows: list[torch.Tensor] = []
         self.taps: dict[str, list[torch.Tensor]] = {}
+        self.raw: dict[str, torch.Tensor] = {}
         self.first_position = first_position
         self.rank = rank
         self.num_layers = num_layers
@@ -93,6 +111,8 @@ class ForwardDigest:
             x = x.reshape(x.shape[0], -1)
         if not x.is_contiguous():
             x = x.contiguous()
+        if name not in self.raw and name in _dump_taps(self.rank):
+            self.raw[name] = x.cpu().clone()
         self.taps.setdefault(name, []).append(block_digests(x, 0))
 
     @staticmethod
@@ -117,6 +137,7 @@ class ForwardDigest:
             {
                 "digests": table,
                 "taps": {name: self._table(rows) for name, rows in self.taps.items()},
+                "raw": self.raw,
                 "first_position": self.first_position,
                 "block_rows": BLOCK_ROWS,
                 "rank": self.rank,
