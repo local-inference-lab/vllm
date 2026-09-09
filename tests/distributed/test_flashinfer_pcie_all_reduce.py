@@ -21,6 +21,7 @@ class FakeWorkspace:
         self.kwargs = kwargs
         self.destroyed = False
         self.last_input: torch.Tensor | None = None
+        self.prepared: list[tuple[list[tuple[int, ...]], torch.dtype]] = []
         FakeWorkspace.instances.append(self)
 
     def supports(self, inp: torch.Tensor) -> bool:
@@ -34,6 +35,9 @@ class FakeWorkspace:
             return inp.clone()
         out.copy_(inp)
         return out
+
+    def prepare(self, shapes, *, dtype) -> None:
+        self.prepared.append((list(shapes), dtype))
 
     def destroy(self) -> None:
         self.destroyed = True
@@ -101,6 +105,7 @@ def test_capture_routes_graph_calls_without_reusing_eager_state() -> None:
     assert torch.equal(actual, inp)
     assert len(FakeWorkspace.instances) == 1
     assert FakeWorkspace.instances[0].last_input is inp
+    assert FakeWorkspace.instances[0].prepared == [([(1, 4)], torch.float32)]
     pool.close()
 
 

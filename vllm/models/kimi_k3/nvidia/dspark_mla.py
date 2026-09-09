@@ -199,6 +199,13 @@ class K3DSparkDecoderLayer(nn.Module):
 
 
 class K3DSparkModel(nn.Module):
+    # Subclass hooks: the decoder layer class (None = K3DSparkDecoderLayer,
+    # resolved at construction) and whether the checkpoint owns a Markov head
+    # (DFlash2 drafts use the same MLA backbone with a pairwise candidate
+    # selector instead).
+    decoder_layer_cls: type[nn.Module] | None = None
+    uses_markov_head: bool = True
+
     def __init__(
         self,
         *,
@@ -251,9 +258,10 @@ class K3DSparkModel(nn.Module):
             self.config.hidden_size, eps=self.config.rms_norm_eps
         )
 
+        decoder_layer_cls = self.decoder_layer_cls or K3DSparkDecoderLayer
         self.layers = nn.ModuleList(
             [
-                K3DSparkDecoderLayer(
+                decoder_layer_cls(
                     vllm_config=vllm_config,
                     config=self.config,
                     layer_idx=layer_idx,
@@ -277,11 +285,15 @@ class K3DSparkModel(nn.Module):
             disable_tp=True,
         )
         self.final_norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
-        self.markov_head = DSparkMarkovHead(
-            self.config.vocab_size,
-            self.config.draft_vocab_size,
-            self.config.markov_rank,
-            prefix=maybe_prefix(prefix, "markov_head"),
+        self.markov_head: DSparkMarkovHead | None = (
+            DSparkMarkovHead(
+                self.config.vocab_size,
+                self.config.draft_vocab_size,
+                self.config.markov_rank,
+                prefix=maybe_prefix(prefix, "markov_head"),
+            )
+            if self.uses_markov_head
+            else None
         )
         self._max_num_context_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
@@ -558,7 +570,7 @@ class K3DSparkModel(nn.Module):
             keepdim=True,
             dtype=torch.float32,
         ).square_()
-        tensor_model_parallel_all_reduce_in_place(squared_norm)
+        squared_norm = tensor_model_parallel_all_reduce_in_place(squared_norm)
         squared_norm.div_(self.config.hidden_size).add_(
             self.context_norm.variance_epsilon
         )
@@ -778,7 +790,7 @@ class K3DSparkModel(nn.Module):
                 + self._context_local_width,
             ]
             layer_kv = F.linear(context_states, weight)
-            tensor_model_parallel_all_reduce_in_place(layer_kv)
+            layer_kv = tensor_model_parallel_all_reduce_in_place(layer_kv)
 
             kv_c = layer_kv[:, : self._context_kv_lora_rank]
             normalized_kv_c = torch.empty(
@@ -881,7 +893,14 @@ class K3DSparkForCausalLM(nn.Module):
     has_own_embed_tokens = False
     has_own_lm_head = False
     draft_id_to_target_id = None
-    checkpoint_skip_substrs = ("confidence_head", "embed_tokens", "lm_head")
+    checkpoint_skip_substrs: tuple[str, ...] = (
+        "confidence_head",
+        "embed_tokens",
+        "lm_head",
+    )
+    # Subclass hook for drafts that share this backbone (DFlash2); None
+    # resolves to K3DSparkModel at construction.
+    model_cls: type[K3DSparkModel] | None = None
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={"": "model."},
@@ -901,7 +920,8 @@ class K3DSparkForCausalLM(nn.Module):
         target_layer_num = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
-        self.model = K3DSparkModel(
+        model_cls = self.model_cls or K3DSparkModel
+        self.model = model_cls(
             vllm_config=vllm_config,
             start_layer_id=target_layer_num,
             prefix=maybe_prefix(prefix, "model"),
@@ -993,7 +1013,7 @@ class K3DSparkForCausalLM(nn.Module):
     def supports_local_draft_argmax(self) -> bool:
         """Return whether rank-local target and Markov logits can be combined."""
         markov_head = self.model.markov_head
-        if not markov_head.shard_across_tp:
+        if markov_head is None or not markov_head.shard_across_tp:
             return False
         if not isinstance(self.lm_head, VocabParallelEmbedding):
             return False
@@ -1038,7 +1058,9 @@ class K3DSparkForCausalLM(nn.Module):
 
     def compute_local_markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         """Project a Markov embedding into the matching vocabulary shard."""
-        return self.model.markov_head.local_bias(markov_embed, self.logits_processor)
+        return self._require_markov_head().local_bias(
+            markov_embed, self.logits_processor
+        )
 
     def gather_local_draft_logits(
         self,
@@ -1111,11 +1133,17 @@ class K3DSparkForCausalLM(nn.Module):
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
 
+    def _require_markov_head(self) -> DSparkMarkovHead:
+        markov_head = self.model.markov_head
+        if markov_head is None:
+            raise RuntimeError(f"{type(self).__name__} has no Markov head")
+        return markov_head
+
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.markov_head.embed(token_ids)
+        return self._require_markov_head().embed(token_ids)
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
-        return self.model.markov_head.bias(markov_embed, self.logits_processor)
+        return self._require_markov_head().bias(markov_embed, self.logits_processor)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # confidence_head is training-only. The frozen target embedding and LM

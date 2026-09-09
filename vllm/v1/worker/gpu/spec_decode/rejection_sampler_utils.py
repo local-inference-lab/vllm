@@ -379,7 +379,10 @@ def _compute_cumulative_log_p_kernel(
                     HAS_DRAFT_LOGITS,
                 )
             )
-            log_p = tl.minimum(log_p + (target_logprob - draft_logprob), 0.0)
+            log_p += target_logprob - draft_logprob
+            # Preserve an undefined ratio through the rest of the block so
+            # verification can discard every proposal and sample the target.
+            log_p = tl.where(log_p == log_p, tl.minimum(log_p, 0.0), float("nan"))
         tl.store(cumulative_log_p_ptr + logit_idx, log_p)
 
 
@@ -551,6 +554,11 @@ def _rejection_kernel(
     target_lse = 0.0
     draft_lse = 0.0
     verifying = True
+    valid_block = True
+    if USE_BLOCK_VERIFICATION and not is_greedy and num_draft_tokens > 0:
+        final_log_p = tl.load(cumulative_log_p_ptr + end_idx - 2)
+        valid_block = final_log_p == final_log_p
+        verifying = valid_block
     for i in range(num_draft_tokens):
         logit_idx = start_idx + i
         draft_sampled = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
@@ -620,7 +628,13 @@ def _rejection_kernel(
                         HAS_DRAFT_LOGITS,
                     )
                     denom = residual_mass + 1.0 - prefix_joint_ratio
-                    h = tl.where(denom > 0.0, residual_mass / denom, 1.0)
+                    # Zero residual with a unit prefix ratio accepts; NaN
+                    # residuals must not take that same acceptance fallback.
+                    h = tl.where(
+                        denom > 0.0,
+                        residual_mass / denom,
+                        tl.where(denom == 0.0, 1.0, 0.0),
+                    )
                 else:
                     h = prefix_joint_ratio
                 accepted_length = tl.where(u <= h, i + 1, accepted_length)
@@ -688,6 +702,10 @@ def _rejection_kernel(
                 vocab_num_blocks,
                 PADDED_VOCAB_NUM_BLOCKS,
             )
+    if not valid_block:
+        # Even a finite first draft row must be discarded if a later row
+        # invalidates block verification. Sampling p-q here would bias output.
+        draft_lse = float("nan")
     tl.store(target_rejected_logsumexp_ptr + req_idx, target_lse)
     tl.store(draft_rejected_logsumexp_ptr + req_idx, draft_lse)
 
@@ -808,6 +826,10 @@ def _resample_kernel(
             target_log_probs + tldevice.log1p(-ratio),
             float("-inf"),
         ).to(tl.float32)
+        # No draft distribution exists when its normalizer is non-finite.
+        # Discard its proposals and recover directly from the target.
+        valid_draft = (draft_lse > float("-inf")) & (draft_lse < float("inf"))
+        residual_logits = tl.where(valid_draft, residual_logits, target_logits)
     else:
         # One-hot draft. The residual is just the target distribution with
         # the rejected draft token probability zeroed out.

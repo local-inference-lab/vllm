@@ -1285,6 +1285,77 @@ def test_b12x_lse_reduce_honors_token_cap(
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
+@pytest.mark.parametrize(
+    ("world_size", "expect_b12x"),
+    [(8, True), (9, True), (6, False)],
+)
+def test_b12x_dcp_world_size_gate(
+    monkeypatch: pytest.MonkeyPatch, world_size: int, expect_b12x: bool
+):
+    """Nine DCP ranks reach the B12X pool; unsupported sizes decline it.
+
+    The Kimi-K3 TP9/DCP9 profile pads the MLA query heads to 99 so that every
+    rank owns eleven heads; the gate must admit that geometry alongside the
+    power-of-two sizes and keep refusing sizes the B12X kernel does not build.
+    """
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_DCP_A2A_MAX_TOKENS", "8")
+    sentinel = torch.zeros(1)
+    pool_requests: list[dict[str, int]] = []
+
+    class _FakePool:
+        def lse_reduce_scatter(
+            self, partial, lse, out=None, *, is_lse_base_on_e, channel_id
+        ):
+            return sentinel
+
+        def all_gather_heads(self, local_input, *, channel_id, out=None):
+            return sentinel
+
+    def fake_get_pool(
+        cp_group, *, device, total_heads, head_dim, query_head_dim, max_batch_size
+    ):
+        pool_requests.append(
+            {"total_heads": total_heads, "max_batch_size": max_batch_size}
+        )
+        return _FakePool()
+
+    monkeypatch.setattr(dcp_alltoall, "_get_b12x_dcp_a2a_pool", fake_get_pool)
+    group = _FakeCPGroup(world_size, None)  # type: ignore[arg-type]
+    heads = 11 * world_size
+
+    out = torch.zeros(4, heads, 512, dtype=torch.bfloat16, device="cuda")
+    lse = torch.zeros(4, heads, dtype=torch.float32, device="cuda")
+    reduced = dcp_alltoall._try_b12x_dcp_lse_reduce(
+        out,
+        lse,
+        group,  # type: ignore[arg-type]
+        return_lse=False,
+        is_lse_base_on_e=True,
+        max_batch_size=28,
+        query_head_dim=576,
+    )
+    local_q = torch.zeros(4, 11, 576, dtype=torch.bfloat16, device="cuda")
+    gathered = dcp_alltoall._try_b12x_dcp_all_gather_heads(
+        local_q,
+        group,  # type: ignore[arg-type]
+        max_batch_size=28,
+        output_head_dim=512,
+    )
+    if expect_b12x:
+        assert reduced is sentinel
+        assert gathered is sentinel
+        assert [request["total_heads"] for request in pool_requests] == [heads, heads]
+        assert all(request["max_batch_size"] == 8 for request in pool_requests)
+    else:
+        assert reduced is None
+        assert gathered is None
+        assert pool_requests == []
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
 @pytest.mark.parametrize("world_size", [4, 16])
 def test_b12x_query_gather_honors_token_cap(
     monkeypatch: pytest.MonkeyPatch, world_size: int
@@ -2439,6 +2510,108 @@ def test_distributed_packed_a2a_with_workspace_matches_reference():
             "LSE_BASE_E": "1",
             "USE_WORKSPACE": "1",
         },
+    )
+
+
+def _distributed_b12x_packed_query_gather_worker(env: dict[str, str]) -> None:
+    """Gather-only warmup of the E4M3 656-byte query record signature, then an
+    eager and a graph-captured byte gather through the caller-owned output."""
+    update_environment_variables(env)
+    local_rank = int(env["LOCAL_RANK"])
+    torch.accelerator.set_device_index(local_rank)
+    dist.init_process_group(backend="nccl")
+    try:
+        from vllm.v1.attention.ops import dcp_alltoall
+
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        batch, h_per_rank, head_dim, record_bytes = 3, 8, 512, 656
+        total_heads = world_size * h_per_rank
+        group = _FakeCPGroup(world_size, dist.group.WORLD)
+        device = torch.device(f"cuda:{local_rank}")
+
+        dcp_alltoall.warmup_b12x_dcp_query_gather(
+            group,  # type: ignore[arg-type]
+            device=device,
+            dtype=torch.float8_e4m3fn,
+            max_batch_size=4,
+            total_heads=total_heads,
+            head_dim=head_dim,
+            query_head_dim=record_bytes,
+        )
+        assert dcp_alltoall._B12X_DCP_A2A_POOLS
+
+        def make_records(step: int) -> torch.Tensor:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(20000 * step + rank)
+            return torch.randint(
+                0, 256, (batch, h_per_rank, record_bytes), device=device,
+                dtype=torch.uint8, generator=generator,
+            )
+
+        def expected(records: torch.Tensor) -> torch.Tensor:
+            gathered = [torch.empty_like(records) for _ in range(world_size)]
+            dist.all_gather(gathered, records)
+            return torch.cat(gathered, dim=1)
+
+        out = torch.empty(
+            (batch, total_heads, record_bytes), device=device, dtype=torch.uint8
+        )
+
+        def gather(records: torch.Tensor) -> torch.Tensor:
+            return dcp_alltoall.dcp_b12x_all_gather_heads(
+                records.view(torch.float8_e4m3fn),
+                group,  # type: ignore[arg-type]
+                max_batch_size=4,
+                output_head_dim=head_dim,
+                out=out.view(torch.float8_e4m3fn),
+            ).view(torch.uint8)
+
+        records = make_records(0)
+        gathered = gather(records)
+        torch.accelerator.synchronize()
+        assert gathered.data_ptr() == out.data_ptr()
+        assert torch.equal(gathered, expected(records))
+
+        def fail_query_nccl(*args, **kwargs):
+            raise AssertionError("captured path fell back to NCCL all-gather")
+
+        group.all_gather = fail_query_nccl  # type: ignore[attr-defined]
+        static_records = make_records(1)
+        graph = torch.cuda.CUDAGraph()
+        capture_stream = torch.cuda.Stream(device=device)
+        with (
+            dcp_alltoall.capture_b12x_dcp_a2a(
+                group,  # type: ignore[arg-type]
+                capture_stream,
+                channel_id="test:dcp:graph",
+            ),
+            torch.cuda.graph(graph, stream=capture_stream),
+        ):
+            graph_out = gather(static_records)
+        for step in range(2, 4):
+            static_records.copy_(make_records(step))
+            graph.replay()
+            torch.accelerator.synchronize()
+            assert torch.equal(graph_out, expected(static_records))
+    finally:
+        from vllm.v1.attention.ops import dcp_alltoall
+
+        for pool in dcp_alltoall._B12X_DCP_A2A_POOLS.values():
+            pool.close()
+        dcp_alltoall._B12X_DCP_A2A_POOLS.clear()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 2 or importlib.util.find_spec("b12x") is None,
+    reason="Need two GPUs and b12x.",
+)
+def test_distributed_b12x_packed_query_gather_warmup_eager_and_graph():
+    _distributed_run(
+        _distributed_b12x_packed_query_gather_worker,
+        world_size=2,
+        extra_env={"VLLM_USE_B12X_DCP_A2A": "1"},
     )
 
 

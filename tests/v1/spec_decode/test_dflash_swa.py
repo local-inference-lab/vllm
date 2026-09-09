@@ -10,6 +10,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.models.qwen3_dflash import DFlashAttention
 from vllm.transformers_utils.configs.speculators import SpeculatorsConfig
 from vllm.v1.attention.backend import AttentionType, CommonAttentionMetadata
+from vllm.v1.attention.backends import flash_attn as flash_attn_backend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     SlidingWindowSpec,
@@ -159,6 +160,53 @@ def test_dflash_swa_layers_keep_sliding_window_kv_cache_spec(monkeypatch):
     assert isinstance(spec, FullAttentionSpec)
     assert spec.sliding_window is None
     assert spec.dcp_replicated is True
+
+
+def test_flash_attention_metadata_treats_replicated_kv_as_dcp1(monkeypatch):
+    """Replicated draft cache metadata uses global sequence lengths locally."""
+    spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+        dcp_replicated=True,
+    )
+    model_config = SimpleNamespace(
+        get_num_attention_heads=lambda _parallel_config: 96,
+        get_num_kv_heads=lambda _parallel_config: 16,
+        get_head_size=lambda: 128,
+        rswa_window=None,
+        is_mm_prefix_lm=False,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=1),
+        cache_config=SimpleNamespace(cache_dtype="bfloat16"),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False),
+            max_cudagraph_capture_size=None,
+        ),
+        attention_config=SimpleNamespace(
+            flash_attn_max_num_splits_for_cuda_graph=0,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+    )
+
+    monkeypatch.setattr(
+        flash_attn_backend,
+        "get_dcp_group",
+        lambda: SimpleNamespace(world_size=16, rank_in_group=7),
+    )
+    builder = flash_attn_backend.FlashAttentionMetadataBuilder(
+        spec,
+        ["draft.layer"],
+        vllm_config,
+        torch.device("cpu"),
+    )
+
+    assert builder.dcp_world_size == 1
+    assert builder.dcp_rank == 0
 
 
 def test_dflash_swa_layers_use_causal_metadata():

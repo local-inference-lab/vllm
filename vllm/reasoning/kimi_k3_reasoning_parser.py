@@ -95,6 +95,9 @@ class KimiK3ReasoningParser(ReasoningParser):
         if thinking is None:
             thinking = chat_kwargs.get("enable_thinking", True)
         self._thinking_enabled = bool(thinking)
+        self._starts_new_assistant_message = bool(
+            chat_kwargs.get("add_generation_prompt", True)
+        ) and not bool(chat_kwargs.get("continue_final_message", False))
 
         # XTML markers as literal strings (skip_special_tokens=False at serve time)
         self._think_open = "<|open|>think<|sep|>"
@@ -145,6 +148,11 @@ class KimiK3ReasoningParser(ReasoningParser):
     def reasoning_end_str(self) -> str | None:
         return self._think_close
 
+    @property
+    def thinking_enabled(self) -> bool:
+        """Whether the request opens a Kimi K3 reasoning channel."""
+        return self._thinking_enabled
+
     def adjust_request(
         self,
         request: "ChatCompletionRequest | ResponsesRequest",
@@ -169,6 +177,24 @@ class KimiK3ReasoningParser(ReasoningParser):
         return (
             _newest_marker(input_ids, self._think_close_ids, self._think_open_ids) == 0
         )
+
+    def is_reasoning_end_for_prompt(self, input_ids: Sequence[int]) -> bool:
+        """Return the reasoning phase at the generation boundary.
+
+        A fresh Kimi K3 assistant message starts in the think channel whenever
+        thinking is enabled. That request contract is authoritative even when
+        the token list exposed to the output parser does not contain the
+        generation-prefix marker; closed think channels from historical turns
+        cannot determine the phase of a fresh assistant message.
+
+        ``continue_final_message`` does not open a fresh channel, so its prompt
+        markers remain authoritative.
+        """
+        if not self._thinking_enabled:
+            return True
+        if self._starts_new_assistant_message:
+            return False
+        return self.is_reasoning_end(input_ids)
 
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Iterable[int]
