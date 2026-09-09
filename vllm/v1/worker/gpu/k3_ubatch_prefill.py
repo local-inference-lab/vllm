@@ -27,6 +27,7 @@ Eligibility: a single request, no draft tokens, eager (non-graph) dispatch,
 at least ``VLLM_K3_UBATCH_PREFILL_MIN_TOKENS`` scheduled tokens, enabled
 with ``VLLM_K3_UBATCH_PREFILL=1``. Anything else runs the normal path.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -61,8 +62,9 @@ def runtime_mode() -> str | None:
     ``lockstep`` (hand-offs with the device drained around each),
     ``overlap``, or ``inexact`` (overlap with the second half reading the
     first half through the KV cache instead of the bf16 stash). The file is
-    re-read at most once per second; a missing file leaves the
-    environment-derived behaviour in place.
+    re-read at most once per second. A configured file that is missing,
+    unreadable or empty selects ``off``: the operator switch fails safe to
+    the unsplit chunk rather than to whatever the environment enables.
     """
     path = os.getenv("VLLM_K3_UBATCH_MODE_FILE", "")
     if not path:
@@ -72,9 +74,10 @@ def runtime_mode() -> str | None:
         return _MODE_CACHE[1]
     try:
         with open(path) as fh:
-            mode = fh.read().split()[0].strip().lower()
+            words = fh.read().split()
+        mode = words[0].strip().lower() if words else "off"
     except Exception:
-        mode = None
+        mode = "off"
     _MODE_CACHE[0] = now
     _MODE_CACHE[1] = mode
     return mode
@@ -264,10 +267,12 @@ def _half_batch(
     computed_prefill = input_batch.num_computed_prefill_tokens_np.copy()
     computed_prefill[0] += computed_offset
     seq_len = int(computed[0] + rows)
-    seq_lens = torch.full((input_batch.num_reqs_after_padding,), seq_len,
-                          dtype=torch.int32, device=device)
-    seq_lens_cpu = torch.full((input_batch.num_reqs_after_padding,), seq_len,
-                              dtype=torch.int32)
+    seq_lens = torch.full(
+        (input_batch.num_reqs_after_padding,), seq_len, dtype=torch.int32, device=device
+    )
+    seq_lens_cpu = torch.full(
+        (input_batch.num_reqs_after_padding,), seq_len, dtype=torch.int32
+    )
     qsl_np = np.array([0, rows], dtype=np.int32)
     qsl = torch.from_numpy(qsl_np).to(device, non_blocking=True)
     dcp_local = None
@@ -345,14 +350,22 @@ def run_split_prefill(
             computed_for_half = num_computed_gpu.clone()
             computed_for_half[req_state_idx] += start
         runner.model_state.preprocess_state(
-            hb, block_tables, runner.kv_cache_config, computed_for_half,
+            hb,
+            block_tables,
+            runner.kv_cache_config,
+            computed_for_half,
         )
         slot_mappings_by_layer = build_slot_mappings_by_layer(
             slot_mappings, runner.kv_cache_config
         )
         attn_metadata = runner.model_state.prepare_attn(
-            hb, cudagraph_runtime_mode, block_tables, slot_mappings,
-            runner.attn_groups, runner.kv_cache_config, for_capture=False,
+            hb,
+            cudagraph_runtime_mode,
+            block_tables,
+            slot_mappings,
+            runner.attn_groups,
+            runner.kv_cache_config,
+            for_capture=False,
         )
         half_index = 0 if start == 0 else 1
         if exact_mla:
@@ -369,8 +382,13 @@ def run_split_prefill(
             # the first half's keys come from the layer's bf16 stash.
             hb_mla = _half_batch(runner, input_batch, start, end, computed_offset=0)
             mla_metadata = runner.model_state.prepare_attn(
-                hb_mla, cudagraph_runtime_mode, block_tables, slot_mappings,
-                runner.attn_groups, runner.kv_cache_config, for_capture=False,
+                hb_mla,
+                cudagraph_runtime_mode,
+                block_tables,
+                slot_mappings,
+                runner.attn_groups,
+                runner.kv_cache_config,
+                for_capture=False,
             )
             merged = dict(attn_metadata)
             for name, md in mla_metadata.items():
@@ -393,7 +411,8 @@ def run_split_prefill(
             attn_metadata = merged
         half_inputs = dict(model_inputs)
         half_inputs["input_ids"] = (
-            None if model_inputs.get("input_ids") is None
+            None
+            if model_inputs.get("input_ids") is None
             else model_inputs["input_ids"][start:end]
         )
         half_inputs["positions"] = model_inputs["positions"][start:end]
@@ -419,11 +438,14 @@ def run_split_prefill(
                 is_padding=hb.is_padding,
             ):
                 outputs.append(
-                    _run_half(runner, half_index, hb, half_inputs, slot_mappings_by_layer)
+                    _run_half(
+                        runner, half_index, hb, half_inputs, slot_mappings_by_layer
+                    )
                 )
     else:
-        outputs = _run_overlapped(runner, prepared, cudagraph_runtime_mode,
-                                  batch_descriptor, skip_compiled)
+        outputs = _run_overlapped(
+            runner, prepared, cudagraph_runtime_mode, batch_descriptor, skip_compiled
+        )
     first = outputs[0]
     if isinstance(first, tuple):
         hidden = torch.cat([o[0] for o in outputs], dim=0)
@@ -469,8 +491,9 @@ def _run_half(runner, half_index, hb, half_inputs, slot_mappings_by_layer):
         return runner.model(**half_inputs)
 
 
-def _run_overlapped(runner, prepared, cudagraph_runtime_mode, batch_descriptor,
-                    skip_compiled):
+def _run_overlapped(
+    runner, prepared, cudagraph_runtime_mode, batch_descriptor, skip_compiled
+):
     """Two threads, one per half, alternating at every TP all-reduce.
 
     Both halves compute on the current (compute) stream in CPU-issue order,
@@ -525,7 +548,10 @@ def _run_overlapped(runner, prepared, cudagraph_runtime_mode, batch_descriptor,
             from vllm.logger import init_logger
 
             init_logger(__name__).error(
-                "split-prefill half %d failed: %s\n%s", ctx.id, exc, traceback.format_exc()
+                "split-prefill half %d failed: %s\n%s",
+                ctx.id,
+                exc,
+                traceback.format_exc(),
             )
             errors.append(exc)
             ctx.cpu_signal_event.set()
@@ -587,12 +613,16 @@ def _join_with_watchdog(threads, runner) -> None:
                 fr = frames.get(th.ident)
                 if fr is not None:
                     stacks.append(
-                        f"{th.name}: " + " <- ".join(
-                            f"{f.name}:{f.lineno}" for f in traceback.extract_stack(fr)[-6:]
+                        f"{th.name}: "
+                        + " <- ".join(
+                            f"{f.name}:{f.lineno}"
+                            for f in traceback.extract_stack(fr)[-6:]
                         )
                     )
             logger.error(
                 "split-prefill watchdog (rank %s): %s | %s",
-                getattr(runner, "rank", "?"), _UbatchTrace.report(), " || ".join(stacks),
+                getattr(runner, "rank", "?"),
+                _UbatchTrace.report(),
+                " || ".join(stacks),
             )
     _UbatchTrace.reset()

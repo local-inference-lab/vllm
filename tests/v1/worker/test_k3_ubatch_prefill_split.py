@@ -126,3 +126,40 @@ def test_served_configuration_keeps_the_tile_rule(monkeypatch):
     assert current_split_point(4608) == 2304
     assert current_split_point(3072) == 1536
     assert current_split_point(1297) == 656
+
+
+def test_mode_file_fails_safe_to_off(monkeypatch, tmp_path):
+    """A configured mode file that is missing or empty selects ``off`` even
+    when the environment enables the split; a present file selects its
+    first word."""
+    from vllm.v1.worker.gpu import k3_ubatch_prefill as mod
+
+    path = tmp_path / "mode"
+    monkeypatch.setenv("VLLM_K3_UBATCH_MODE_FILE", str(path))
+    monkeypatch.setenv("VLLM_K3_UBATCH_PREFILL", "1")
+    monkeypatch.setenv("VLLM_K3_UBATCH_PREFILL_OVERLAP", "1")
+
+    def fresh():
+        mod._MODE_CACHE[0] = 0.0
+        mod._MODE_CACHE[1] = None
+
+    fresh()
+    assert mod.runtime_mode() == "off"
+    assert not mod.ubatch_prefill_enabled()
+    assert not mod.ubatch_prefill_overlap()
+    path.write_text("")
+    fresh()
+    assert mod.runtime_mode() == "off"
+    path.write_text("stage1\n")
+    fresh()
+    assert mod.runtime_mode() == "stage1"
+    assert mod.ubatch_prefill_enabled()
+    assert not mod.ubatch_prefill_overlap()
+    path.write_text("overlap extra words\n")
+    fresh()
+    assert mod.ubatch_prefill_overlap()
+    monkeypatch.delenv("VLLM_K3_UBATCH_MODE_FILE")
+    fresh()
+    assert mod.runtime_mode() is None
+    assert mod.ubatch_prefill_enabled()
+    fresh()
