@@ -43,6 +43,7 @@ def test_continuation_guard_bypasses_only_without_local_reader_progress(case, le
         num_external_computed_tokens=1 if case == "external" else 0,
         num_lookahead_tokens=3,
         can_defer_boundary_restore=case != "no_runnable",
+        **base.pending_kwargs(cache, [base.request("queued-b", "b")]),
     )
     if case == "defer":
         assert hit == 140
@@ -107,6 +108,7 @@ def test_nonisolated_continuation_deferral_serves_existing_decoder(
         monkeypatch.setattr(
             scheduler.compute_share_controller, "select", lambda **kwargs: "prefill"
         )
+    base.queue_matching(scheduler, unrelated)
     base.victim_at_head(cache, checkpoint)
     assert not scheduler._has_waiting_boundary_logits()
     output = scheduler.schedule()
@@ -258,6 +260,7 @@ def test_continuation_reserve_includes_cached_source_and_future_growth(
         cached,
         num_lookahead_tokens=3,
         can_defer_boundary_restore=can_defer,
+        **base.pending_kwargs(cache, [base.request("queued-b", "b")]),
     )
     if can_defer:
         assert result is None
@@ -317,6 +320,7 @@ def test_same_pass_continuations_use_already_scheduled_prefill_progress(length):
     first.max_tokens = second.max_tokens = scheduler.max_model_len
     scheduler.add_request(first)
     scheduler.add_request(second)
+    base.queue_matching(scheduler, unrelated)
     assert not scheduler.running
     output = scheduler.schedule()
     assert not output.boundary_logits_only

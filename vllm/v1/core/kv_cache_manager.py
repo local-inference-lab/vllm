@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -401,6 +401,26 @@ class KVCacheManager:
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
 
+    def _pending_boundary_blocks(self, requests: Iterable[Request]) -> set[int]:
+        """Find queued reuse dependencies without acquiring reader pins."""
+        protected: set[int] = set()
+        cache = self.boundary_checkpoints
+        if cache is None:
+            return protected
+        for request in requests:
+            if (
+                request.num_computed_tokens != 0
+                or request.request_id in self._boundary_readers
+                or request.status
+                not in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                or not self.prefix_cache_lookup_enabled(request)
+            ):
+                continue
+            checkpoint = cache.find(request, request.num_tokens)
+            if checkpoint is not None:
+                protected.update(checkpoint.dependencies)
+        return protected
+
     def allocate_slots(
         self,
         request: Request,
@@ -415,6 +435,7 @@ class KVCacheManager:
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
         can_defer_boundary_restore: bool = False,
+        pending_boundary_requests: Iterable[Request] = (),
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -450,6 +471,9 @@ class KVCacheManager:
 
             can_defer_boundary_restore: Whether scheduled work or eligible
                 decode can progress while a local boundary restore waits.
+            pending_boundary_requests: Bounded queued requests whose cached
+                prefixes should survive admission. Unrelated old checkpoints
+                remain eligible for normal eviction.
 
         Blocks layout:
         ```
@@ -641,6 +665,11 @@ class KVCacheManager:
             and num_new_computed_tokens == checkpoint.num_tokens
             and new_computed_blocks is not None
             and num_external_computed_tokens == 0
+            and (
+                protected_blocks := self._pending_boundary_blocks(
+                    pending_boundary_requests
+                )
+            )
         ):
             # Existing warm readers can finish while this restore waits.
             # Predict FIFO after acquiring the incoming reader's dependencies.
@@ -682,7 +711,7 @@ class KVCacheManager:
                     break
                 if block.block_id in dependencies:
                     continue
-                if self.boundary_checkpoints.contains_block(block.block_id):
+                if block.block_id in protected_blocks:
                     return None
                 new_ids -= 1
 

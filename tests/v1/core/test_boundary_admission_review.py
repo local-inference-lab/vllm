@@ -126,6 +126,7 @@ def scheduler_state():
     assert scheduler.schedule().boundary_logits_only
     scheduler.add_request(second)
     assert scheduler.schedule().num_scheduled_tokens == {"first": 4}
+    base.queue_matching(scheduler, unrelated)
     base.victim_at_head(cache, checkpoint)
     return scheduler, first, second
 

@@ -1591,6 +1591,10 @@ class Scheduler(SchedulerInterface):
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
+                    pending_boundary_requests=itertools.islice(
+                        itertools.chain(self.skipped_waiting, self.waiting),
+                        self.max_num_running_reqs,
+                    ),
                     can_defer_boundary_restore=(
                         request.boundary_checkpoint is not None
                         and not load_kv_async

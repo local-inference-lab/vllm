@@ -70,7 +70,7 @@ def seed(cache, salt="0", length=8192, lookahead=4):
     return checkpoint
 
 
-def restore(cache, req, lookahead=4, defer=True):
+def restore(cache, req, lookahead=4, defer=True, pending=()):
     cache.new_step_starts()
     blocks, hit, _ = cache.get_computed_blocks(req)
     assert hit
@@ -81,6 +81,7 @@ def restore(cache, req, lookahead=4, defer=True):
         blocks,
         num_lookahead_tokens=lookahead,
         can_defer_boundary_restore=defer,
+        **base.pending_kwargs(cache, pending),
     )
     if allocated is not None:
         req.num_computed_tokens = req.num_prompt_tokens
@@ -186,7 +187,7 @@ def test_deferred_admission_and_failed_acquire_never_leave_a_horizon(monkeypatch
     base.drain(cache)
     base.victim_at_head(cache, victim)
     waiting = request("waiting")
-    assert restore(cache, waiting) is None
+    assert restore(cache, waiting, pending=[request("queued-other", "other")]) is None
     assert set(cache._boundary_reader_horizons) == {first.request_id}
     cache.free(first)
     monkeypatch.setattr(
@@ -280,3 +281,77 @@ def test_scheduler_abort_and_preemption_clear_reader_horizon(action):
     assert first.request_id not in cache._boundary_reader_horizons
     for _, blocks in scheduler.deferred_frees:
         assert all(b.ref_cnt > 0 for b in blocks if not b.is_null)
+
+
+@pytest.mark.parametrize("defer", [False, True])
+@pytest.mark.parametrize("concurrency", [2, 4, 16])
+@pytest.mark.parametrize("cap", [4096, 65536])
+def test_aged_cache_keeps_explicit_warm_queue_concurrent(concurrency, cap, defer):
+    cache = manager()
+    for index in range(300):
+        seed(cache, str(index), lookahead=3)
+    queued = [
+        request(f"warm-{index}", str(index), cap=cap)
+        for index in range(300 - concurrency, 300)
+    ]
+    active = []
+    try:
+        for index, req in enumerate(queued):
+            # Match the scheduler snapshot, including the incoming queue head.
+            assert (
+                restore(cache, req, lookahead=3, defer=defer, pending=queued[index:])
+                is not None
+            )
+            base.drain(cache)
+            active.append(req)
+        assert len(active) == concurrency
+        assert len(cache._boundary_readers) == concurrency
+    finally:
+        for req in active:
+            cache.free(req)
+    assert cache.block_pool.get_num_free_blocks() == 1933
+    assert not cache._boundary_readers and not cache._boundary_reader_horizons
+
+
+@pytest.mark.parametrize("pressure", [80, 95])
+@pytest.mark.parametrize("defer", [False, True])
+@pytest.mark.parametrize("status", [RequestStatus.WAITING, RequestStatus.PREEMPTED])
+def test_queued_checkpoint_pressure_preserves_admission_control(
+    pressure, defer, status
+):
+    cache = manager()
+    seed(cache)
+    checkpoint = seed(cache, "future")
+    active = request("active")
+    assert restore(cache, active) is not None
+    base.drain(cache)
+    queue = cache.block_pool.free_block_queue
+    expendable = [
+        block
+        for block in queue.get_all_free_blocks()
+        if not cache.boundary_checkpoints.contains_block(block.block_id)
+    ]
+    # Hold actual blocks to model occupancy, then place a queued dependency first.
+    held = expendable[: 1933 * pressure // 100]
+    assert len(held) == 1933 * pressure // 100
+    cache.block_pool.touch(held)
+    base.victim_at_head(cache, checkpoint)
+    future = request("future-reader", "future")
+    future.status = status
+    waiting = request("waiting")
+    before = [(b.block_id, b.ref_cnt) for b in queue.get_all_free_blocks()]
+    result = restore(cache, waiting, defer=defer, pending=[future])
+    if defer:
+        assert result is None
+        assert before == [(b.block_id, b.ref_cnt) for b in queue.get_all_free_blocks()]
+        assert checkpoint.checkpoint_id in cache.boundary_checkpoints._entries
+        assert waiting.request_id not in cache._boundary_readers
+    else:
+        # The same physical pressure permits immediate allocation without the guard.
+        assert result is not None
+        assert checkpoint.checkpoint_id not in cache.boundary_checkpoints._entries
+        base.drain(cache)
+        cache.free(waiting)
+    cache.block_pool.free_blocks(held)
+    cache.free(active)
+    assert cache.block_pool.get_num_free_blocks() == 1933

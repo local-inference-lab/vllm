@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU ownership and scheduler-progress checks for the installed admission guard."""
 
+import inspect
 from dataclasses import replace
 
 import pytest
@@ -84,7 +85,27 @@ def seed(cache, salt):
     return checkpoint
 
 
-def restore(cache, req, can_defer=False):
+def pending_kwargs(cache, requests=()):
+    """Keep baseline execution compatible with the queued-request API."""
+    parameters = inspect.signature(cache.allocate_slots).parameters
+    if "pending_boundary_requests" in parameters:
+        return {"pending_boundary_requests": tuple(requests)}
+    return {}
+
+
+def queue_matching(scheduler, producer):
+    """Queue a future consumer of the checkpoint used by pressure fixtures."""
+    queued = make_request(
+        "queued-" + producer.request_id,
+        list(producer.prompt_token_ids),
+        scheduler.block_size,
+        sha256,
+    )
+    scheduler.add_request(queued)
+    return queued
+
+
+def restore(cache, req, can_defer=False, pending=()):
     cache.new_step_starts()
     blocks, hit, _ = cache.get_computed_blocks(req)
     result = cache.allocate_slots(
@@ -94,6 +115,7 @@ def restore(cache, req, can_defer=False):
         new_computed_blocks=blocks,
         num_lookahead_tokens=3,
         can_defer_boundary_restore=can_defer,
+        **pending_kwargs(cache, pending),
     )
     if result is not None:
         req.num_computed_tokens = hit
@@ -128,7 +150,12 @@ def test_guard_only_defers_exact_restore_with_runnable_reader(case):
     free_before = [
         b.block_id for b in cache.block_pool.free_block_queue.get_all_free_blocks()
     ]
-    result = restore(cache, waiting, can_defer=case != "no_runnable")
+    result = restore(
+        cache,
+        waiting,
+        can_defer=case != "no_runnable",
+        pending=[request("queued-b", "b")],
+    )
     if case == "defer":
         assert result is None
         assert before == [b.ref_cnt for b in cache.block_pool.blocks]
@@ -227,8 +254,9 @@ def make_scheduler(**kwargs):
     return create_scheduler(**kwargs)
 
 
+@pytest.mark.parametrize("release", ["move_victim", "finish_reader"])
 @pytest.mark.parametrize("fairness", [None, 0.4])
-def test_actual_scheduler_runs_decode_after_guard_defers_restore(fairness):
+def test_actual_scheduler_runs_decode_after_guard_defers_restore(fairness, release):
     from tests.v1.core.utils import create_requests
 
     scheduler = make_scheduler(
@@ -260,18 +288,32 @@ def test_actual_scheduler_runs_decode_after_guard_defers_restore(fairness):
     assert scheduler.schedule().boundary_logits_only
     scheduler.add_request(second)
     assert scheduler.schedule().num_scheduled_tokens == {"first": 4}
+    future = queue_matching(scheduler, unrelated)
     victim = victim_at_head(cache, checkpoint)
     blocked = scheduler.schedule()
     assert not blocked.boundary_logits_only
     assert blocked.num_scheduled_tokens == {"first": 4}
     assert second.status == RequestStatus.WAITING
     assert checkpoint.checkpoint_id in cache.boundary_checkpoints._entries
-    queue = cache.block_pool.free_block_queue
-    queue.remove(victim)
-    queue.append(victim)
+    if release == "move_victim":
+        queue = cache.block_pool.free_block_queue
+        queue.remove(victim)
+        queue.append(victim)
+    else:
+        # Reader completion must unblock admission without rearranging the victim.
+        scheduler.finish_requests([first.request_id], RequestStatus.FINISHED_STOPPED)
     admitted = scheduler.schedule()
     assert admitted.boundary_logits_only
     assert admitted.num_scheduled_tokens == {"second": 1}
+    assert future.status == RequestStatus.WAITING
+    scheduler.finish_requests(
+        [second.request_id] + ([first.request_id] if release == "move_victim" else []),
+        RequestStatus.FINISHED_ABORTED,
+    )
+    final = scheduler.schedule()
+    assert final.boundary_logits_only
+    assert final.num_scheduled_tokens == {future.request_id: 1}
+    assert future.status == RequestStatus.RUNNING
     assert scheduler.max_num_running_reqs == 16
 
 
@@ -328,7 +370,9 @@ def test_future_working_reserve_blocks_beyond_immediate_allocation(can_defer):
         queue.remove(block)
     queue.prepend_n(prefix)
     before = [b.block_id for b in queue.get_all_free_blocks()]
-    result = restore(cache, waiting, can_defer=can_defer)
+    result = restore(
+        cache, waiting, can_defer=can_defer, pending=[request("queued-b", "b")]
+    )
     if can_defer:
         assert result is None
         assert before == [b.block_id for b in queue.get_all_free_blocks()]
