@@ -562,43 +562,176 @@ def bind_kv_cache(
         forward_context[layer_name].bind_kv_cache(kv_cache)
 
 
+def group_kv_caches_for_copy(
+    kv_caches: Mapping[str, Any],
+    kv_cache_config: KVCacheConfig,
+) -> list[list[torch.Tensor | list[torch.Tensor]]]:
+    """Index logical KV cache views by scheduler KV cache group."""
+    return [
+        [kv_caches[name] for name in group.layer_names if name in kv_caches]
+        for group in kv_cache_config.kv_cache_groups
+    ]
+
+
+def _copy_kv_cache_block_pairs(
+    kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
+    num_blocks: int,
+    kv_cache_block_copies: Sequence[KVCacheBlockCopy],
+) -> tuple[int, int]:
+    """Copy CoW pages through each cache tensor's logical block axis.
+
+    Hybrid DCP caches can expose several differently shaped or padded views of
+    one allocation. Dividing an entire untyped storage by the scheduler's
+    ``num_blocks`` assumes every view has the same physical page geometry and
+    can copy the wrong byte range for an interior, hash-aligned prefix hit.
+    Logical tensor copies preserve each view's block stride and storage offset.
+    Layouts whose block axis cannot be identified retain the raw-storage
+    fallback for compatibility.
+    """
+    if not kv_cache_block_copies:
+        return 0, 0
+
+    storage_tensors: dict[int, list[torch.Tensor]] = defaultdict(list)
+    for entry in kv_caches:
+        # Mamba layers hold a list of state tensors; attention layers a single
+        # tensor. Group aliases can share one backing allocation while keeping
+        # different logical shapes and offsets.
+        tensors = entry if isinstance(entry, (list, tuple)) else (entry,)
+        for tensor in tensors:
+            ptr = tensor.untyped_storage().data_ptr()
+            storage_tensors[ptr].append(tensor)
+
+    if not storage_tensors:
+        return 0, 0
+    first_tensor = next(iter(storage_tensors.values()))[0]
+    device = first_tensor.device
+    indices_np = np.array(
+        [(copy.src_block_id, copy.dst_block_id) for copy in kv_cache_block_copies],
+        dtype=np.int64,
+    )
+    indices = async_tensor_h2d(indices_np, device=device)
+    src_indices, dst_indices = indices.unbind(dim=1)
+    logical_copy_views = 0
+    raw_fallback_storages = 0
+
+    for aliases in storage_tensors.values():
+        logical_views: list[tuple[torch.Tensor, int]] = []
+        seen_views: set[tuple[object, ...]] = set()
+        for tensor in aliases:
+            assert tensor.device == device
+            matching_dims = [
+                dim for dim, size in enumerate(tensor.shape) if size == num_blocks
+            ]
+            block_dim = (
+                0
+                if 0 in matching_dims
+                else matching_dims[0]
+                if len(matching_dims) == 1
+                else None
+            )
+            if block_dim is None:
+                continue
+            view_key: tuple[object, ...] = (
+                tensor.data_ptr(),
+                tensor.storage_offset(),
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                tensor.dtype,
+            )
+            if view_key in seen_views:
+                continue
+            seen_views.add(view_key)
+            logical_views.append((tensor, block_dim))
+
+        if logical_views:
+            for tensor, block_dim in logical_views:
+                source_pages = tensor.index_select(block_dim, src_indices)
+                tensor.index_copy_(block_dim, dst_indices, source_pages)
+                logical_copy_views += 1
+            continue
+
+        # Compatibility fallback for layouts that do not expose a unique
+        # scheduler-block dimension (for example a flattened custom cache).
+        tensor = aliases[0]
+        blocks = torch.empty(0, dtype=torch.uint8, device=device)
+        blocks.set_(tensor.untyped_storage())
+        assert blocks.numel() % num_blocks == 0
+        blocks = blocks.view(num_blocks, -1)
+        source_pages = blocks.index_select(0, src_indices)
+        blocks.index_copy_(0, dst_indices, source_pages)
+        raw_fallback_storages += 1
+
+    return logical_copy_views, raw_fallback_storages
+
+
 def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
     num_blocks: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
+    *,
+    kv_cache_groups: Sequence[Iterable[torch.Tensor | list[torch.Tensor]]]
+    | None = None,
 ) -> None:
+    """Copy CoW pages only within the scheduler group that created them.
+
+    Block IDs share one allocator namespace across heterogeneous KV cache
+    groups. A source and destination pair therefore identifies bytes only when
+    combined with its group ID; broadcasting that pair can overwrite a live
+    block belonging to another group. Untagged copies and callers without a
+    group view retain the all-cache behavior for compatibility.
+    """
     if not kv_cache_block_copies:
         return
 
-    storage_tensors: list[torch.Tensor] = []
-    seen_storage: set[int] = set()
-    for entry in kv_caches:
-        # Mamba layers hold a list of state tensors; attention layers a single
-        # tensor. Both alias the shared block-major backing storage.
-        tensors = entry if isinstance(entry, (list, tuple)) else (entry,)
-        for tensor in tensors:
-            ptr = tensor.untyped_storage().data_ptr()
-            if ptr in seen_storage:
+    copies_by_group: dict[int, list[KVCacheBlockCopy]] = defaultdict(list)
+    broadcast_copies: list[KVCacheBlockCopy] = []
+    if kv_cache_groups is None:
+        broadcast_copies.extend(kv_cache_block_copies)
+    else:
+        for copy in kv_cache_block_copies:
+            group_id = copy.kv_cache_group_id
+            if group_id is None:
+                broadcast_copies.append(copy)
                 continue
-            seen_storage.add(ptr)
-            storage_tensors.append(tensor)
+            if group_id < 0 or group_id >= len(kv_cache_groups):
+                raise ValueError(
+                    f"KV cache CoW group {group_id} is outside the configured "
+                    f"range [0, {len(kv_cache_groups)})"
+                )
+            copies_by_group[group_id].append(copy)
 
-    if not storage_tensors:
-        return
-    device = storage_tensors[0].device
-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
-    indices = async_tensor_h2d(indices_np, device=device)
-    src_indices, dst_indices = indices.unbind(dim=1)
+    logical_copy_views = 0
+    raw_fallback_storages = 0
+    if copies_by_group:
+        assert kv_cache_groups is not None
+    for group_id, group_copies in copies_by_group.items():
+        logical_views, fallback_storages = _copy_kv_cache_block_pairs(
+            kv_cache_groups[group_id],
+            num_blocks,
+            group_copies,
+        )
+        logical_copy_views += logical_views
+        raw_fallback_storages += fallback_storages
 
-    for tensor in storage_tensors:
-        assert tensor.device == device
-        blocks = torch.empty(0, dtype=torch.uint8, device=device)
-        blocks.set_(tensor.untyped_storage())
-        # Block-major backing storage: block i owns the contiguous byte range
-        # [i * page_size, (i + 1) * page_size).
-        assert blocks.numel() % num_blocks == 0
-        blocks = blocks.view(num_blocks, -1)
-        blocks[dst_indices] = blocks[src_indices]
+    if broadcast_copies:
+        logical_views, fallback_storages = _copy_kv_cache_block_pairs(
+            kv_caches,
+            num_blocks,
+            broadcast_copies,
+        )
+        logical_copy_views += logical_views
+        raw_fallback_storages += fallback_storages
+
+    logger.info_once(
+        "KV cache CoW copied %d group-scoped pair(s) for group(s) %s and "
+        "%d compatibility-broadcast pair(s) through %d logical view(s); "
+        "%d storage(s) used the raw fallback",
+        sum(len(copies) for copies in copies_by_group.values()),
+        tuple(sorted(copies_by_group)),
+        len(broadcast_copies),
+        logical_copy_views,
+        raw_fallback_storages,
+    )
 
 
 def is_residual_scattered_for_sp(

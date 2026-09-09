@@ -117,7 +117,8 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         # Context positions for the K/V precompute. Populated by
         # prepare_dflash_inputs, and processed by the model's
-        # precompute_and_store_context_kv method. NOT captured by CUDA graphs.
+        # precompute_and_store_context_kv method. Context graphs retain these
+        # buffers at fixed addresses when supported by the draft configuration.
         self.context_positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=device
         )
@@ -219,7 +220,11 @@ class DFlashSpeculator(DraftModelSpeculator):
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
         )
-        if wants_full and supports_full and self._speculator_name == "DSpark":
+        capture_context = (
+            self._speculator_name == "DSpark"
+            or self.vllm_config.parallel_config.tensor_parallel_size == 9
+        )
+        if wants_full and supports_full and capture_context:
             self.context_cudagraph_manager = DFlashContextCudaGraphManager(
                 self.vllm_config,
                 self.device,
@@ -465,9 +470,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         """Discover one uniform rolling window for Kimi-K3 draft MLA layers."""
         self.draft_kv_window = None
         self.draft_kv_window_block_size = None
-        if (
-            getattr(self.draft_model_config.hf_config, "model_type", None)
-            != "k3_dspark"
+        hf_config = self.draft_model_config.hf_config
+        if getattr(hf_config, "model_type", None) != "k3_dspark" and (
+            "DFlash2DraftModel" not in (getattr(hf_config, "architectures", None) or ())
         ):
             return
 
@@ -752,9 +757,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             assert aux_hidden_states is not None
             context_states = aux_hidden_states[0]
         elif aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
-            )
+            combine_tap_states = getattr(self.model, "combine_tap_states", None)
+            if callable(combine_tap_states):
+                # Per-tap projection never materializes the concatenated
+                # [tokens, taps * width] target state.
+                hidden_states = combine_tap_states(list(aux_hidden_states))
+            else:
+                hidden_states = self.model.combine_hidden_states(
+                    torch.cat(aux_hidden_states, dim=-1)
+                )
             self.hidden_states[:num_target_tokens].copy_(
                 hidden_states[:num_target_tokens]
             )
@@ -1073,7 +1084,14 @@ def _prepare_dflash_inputs_kernel(
     # Otherwise (DFlash default) the anchor is the bonus token and only the mask tokens
     # at offsets > 0 are sampled from, each AT its own position.
     sample_off = 0 if SAMPLE_FROM_ANCHOR else 1
-    is_sample = is_query & (query_off >= sample_off)
+    # A draft block may hold more query rows than proposals (a drafter run at
+    # its trained block width); only the first num_speculative_steps rows
+    # after the anchor are sampled.
+    is_sample = (
+        is_query
+        & (query_off >= sample_off)
+        & (query_off - sample_off < num_speculative_steps)
+    )
     sample_idx = req_idx * num_speculative_steps + (query_off - sample_off)
     sample_pos = query_pos + 1 if SAMPLE_FROM_ANCHOR else query_pos
     tl.store(out_sample_indices_ptr + sample_idx, query_idx, mask=is_sample)

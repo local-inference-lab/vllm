@@ -73,6 +73,12 @@ class MambaHybridModelState(DefaultModelState):
         # columns and the running state_idx are kept GPU-resident.
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
         if self._align_mode:
+            # The physical attention page and the logical recurrent-state
+            # checkpoint can have different token widths. Prefix-hit requests
+            # must resume from the recurrent-state grid used by MambaSpec.
+            self._mamba_block_size = (
+                self.cache_config.mamba_block_size or self.cache_config.block_size
+            )
             self._mamba_state_idx_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
             )
@@ -93,7 +99,7 @@ class MambaHybridModelState(DefaultModelState):
         if self._align_mode:
             # Seed the running state block from the resumed/prefilled position.
             self._mamba_state_idx_gpu[req_index].fill_(
-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
+                (new_req_data.num_computed_tokens - 1) // self._mamba_block_size
             )
 
     def _get_mamba_group_info(
@@ -109,6 +115,10 @@ class MambaHybridModelState(DefaultModelState):
                     specs.append(spec)
             assert specs, "no mamba layers in the model"
             assert all(specs[0] == s for s in specs)
+            assert specs[0].block_size == self._mamba_block_size, (
+                "Mamba state migration and cache allocation must use the same "
+                "checkpoint cadence"
+            )
             self._mamba_group_ids = group_ids
             self._mamba_spec = specs[0]
         return self._mamba_group_ids, self._mamba_spec
@@ -252,6 +262,24 @@ class MambaHybridModelState(DefaultModelState):
                     spec_decode_mask, num_draft_tokens_per_req, -1
                 )
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
+
+        if self._align_mode:
+            mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
+            aligned_index_builders = []
+            for group_idx, group_id in enumerate(mamba_group_ids):
+                for group in attn_groups[group_id]:
+                    builder = group.get_metadata_builder(0)
+                    if hasattr(builder, "mamba_aligned_state_indices"):
+                        aligned_index_builders.append((group_idx, builder))
+            if aligned_index_builders:
+                ctx = self._ensure_align_ctx(
+                    kv_cache_config, mamba_group_ids, block_tables
+                )
+                all_group_indices = ctx.compute_aligned_state_indices(
+                    input_batch.seq_lens, num_reqs
+                )
+                for group_idx, builder in aligned_index_builders:
+                    builder.mamba_aligned_state_indices = all_group_indices[group_idx]
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
             num_accepted_tokens=num_accepted_tokens,

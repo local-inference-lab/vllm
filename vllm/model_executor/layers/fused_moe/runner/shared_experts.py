@@ -52,6 +52,10 @@ class SharedExperts(torch.nn.Module):
         # index is always 0 and the second output list element is ignored.
         self.enable_dbo = enable_dbo
         self._output: list[torch.Tensor | None] = [None, None]
+        # A result the model computed itself (to overlap the shared experts
+        # with a collective it issued on another stream); ``forward`` adopts
+        # it instead of running the layer.
+        self._precomputed: list[torch.Tensor | None] = [None, None]
         self._layer = layer
         self._moe_config = moe_config
 
@@ -178,6 +182,17 @@ class SharedExperts(torch.nn.Module):
             and should_use_caller_output(shared_experts_input)
         )
 
+    def install_precomputed_output(self, shared_output: torch.Tensor) -> None:
+        """Adopt ``shared_output`` as this forward's shared-expert result.
+
+        The model computed the shared experts itself with the same layer
+        call the runner would make (``layer(x)``, or ``layer(x, output=x)``
+        when ``can_reuse_input``), so the numerics are those of the in-runner
+        computation; only the issue order changes.
+        """
+        assert self._precomputed[self._output_idx] is None
+        self._precomputed[self._output_idx] = shared_output
+
     def forward(
         self,
         shared_experts_input: torch.Tensor,
@@ -190,6 +205,21 @@ class SharedExperts(torch.nn.Module):
             return None
 
         assert self._output[self._output_idx] is None
+
+        precomputed = self._precomputed[self._output_idx]
+        if precomputed is not None:
+            self._precomputed[self._output_idx] = None
+            if reuse_input and (
+                precomputed.shape != shared_experts_input.shape
+                or precomputed.untyped_storage().data_ptr()
+                != shared_experts_input.untyped_storage().data_ptr()
+            ):
+                raise ValueError(
+                    "Precomputed shared-expert output must occupy the shared "
+                    "input storage when input reuse is requested"
+                )
+            self._output[self._output_idx] = precomputed
+            return None
 
         if reuse_input:
             if order != SharedExpertsOrder.NO_OVERLAP or not self.can_reuse_input(

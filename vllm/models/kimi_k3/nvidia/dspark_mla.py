@@ -24,12 +24,16 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
+from vllm.model_executor.models.qwen3_dspark import (
+    DSparkConfidenceHead,
+    DSparkMarkovHead,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -199,6 +203,13 @@ class K3DSparkDecoderLayer(nn.Module):
 
 
 class K3DSparkModel(nn.Module):
+    # Subclass hooks: the decoder layer class (None = K3DSparkDecoderLayer,
+    # resolved at construction) and whether the checkpoint owns a Markov head
+    # (DFlash2 drafts use the same MLA backbone with a pairwise candidate
+    # selector instead).
+    decoder_layer_cls: type[nn.Module] | None = None
+    uses_markov_head: bool = True
+
     def __init__(
         self,
         *,
@@ -250,10 +261,42 @@ class K3DSparkModel(nn.Module):
         self.context_norm = RMSNorm(
             self.config.hidden_size, eps=self.config.rms_norm_eps
         )
+        # Checkpoints trained with ``fc_norm`` normalize every tapped target
+        # state separately before the taps are concatenated into the context
+        # projection input (lightseekorg/kimi-k3-dspark; tokenspeed PR #1016).
+        # Without the norms such a draft consumes unnormalized taps and its
+        # acceptance collapses silently.
+        self.fc_norm: nn.ModuleList | None = (
+            nn.ModuleList(
+                [
+                    RMSNorm(
+                        self.config.target_hidden_size, eps=self.config.rms_norm_eps
+                    )
+                    for _ in range(self.config.num_target_layers)
+                ]
+            )
+            if getattr(self.config, "fc_norm", False)
+            else None
+        )
+        # Per-position acceptance estimate w^T [h_k; markov_w1[x_{k-1}]] + b for
+        # the speculator's confidence-scheduled verification capacity.
+        self.confidence_head: DSparkConfidenceHead | None = None
+        if getattr(self.config, "enable_confidence_head", False):
+            include_markov = bool(
+                getattr(self.config, "confidence_head_with_markov", False)
+            )
+            self.confidence_head = DSparkConfidenceHead(
+                self.config.hidden_size
+                + (self.config.markov_rank if include_markov else 0),
+                prefix=maybe_prefix(prefix, "confidence_head"),
+                bias=bool(getattr(self.config, "confidence_head_bias", True)),
+                include_markov=include_markov,
+            )
 
+        decoder_layer_cls = self.decoder_layer_cls or K3DSparkDecoderLayer
         self.layers = nn.ModuleList(
             [
-                K3DSparkDecoderLayer(
+                decoder_layer_cls(
                     vllm_config=vllm_config,
                     config=self.config,
                     layer_idx=layer_idx,
@@ -277,11 +320,15 @@ class K3DSparkModel(nn.Module):
             disable_tp=True,
         )
         self.final_norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
-        self.markov_head = DSparkMarkovHead(
-            self.config.vocab_size,
-            self.config.draft_vocab_size,
-            self.config.markov_rank,
-            prefix=maybe_prefix(prefix, "markov_head"),
+        self.markov_head: DSparkMarkovHead | None = (
+            DSparkMarkovHead(
+                self.config.vocab_size,
+                self.config.draft_vocab_size,
+                self.config.markov_rank,
+                prefix=maybe_prefix(prefix, "markov_head"),
+            )
+            if self.uses_markov_head
+            else None
         )
         self._max_num_context_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
@@ -437,8 +484,94 @@ class K3DSparkModel(nn.Module):
         assert self.embed_tokens is not None
         return self.embed_tokens(input_ids)
 
+    def normalize_tap(self, index: int, state: torch.Tensor) -> torch.Tensor:
+        """Apply the checkpoint's per-tap norm to target tap ``index``."""
+        if self.fc_norm is None:
+            return state
+        return self.fc_norm[index](state)
+
+    def normalize_taps(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Per-tap norm over concatenated taps ``[tokens, taps * width]``."""
+        if self.fc_norm is None:
+            return hidden_states
+        width = int(self.config.target_hidden_size)
+        taps = hidden_states.shape[-1] // width
+        if taps != len(self.fc_norm) or hidden_states.shape[-1] != taps * width:
+            raise ValueError(
+                "Kimi-K3 DSpark fc_norm expects "
+                f"{len(self.fc_norm)} taps of width {width}, got a state of "
+                f"width {hidden_states.shape[-1]}."
+            )
+        pieces = [
+            self.fc_norm[i](
+                hidden_states[..., i * width : (i + 1) * width].contiguous()
+            )
+            for i in range(taps)
+        ]
+        return torch.cat(pieces, dim=-1)
+
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.context_norm(self.context_proj(hidden_states))
+        return self.context_norm(self.context_proj(self.normalize_taps(hidden_states)))
+
+    def _context_proj_weight_is_plain(self) -> bool:
+        """True when ``context_proj.weight`` is an unquantized ``[out, in]``
+        matrix whose input columns can be sliced per target tap."""
+        quant_method = getattr(self.context_proj, "quant_method", None)
+        if quant_method is not None and not isinstance(
+            quant_method, UnquantizedLinearMethod
+        ):
+            return False
+        weight = getattr(self.context_proj, "weight", None)
+        return (
+            isinstance(weight, torch.Tensor)
+            and weight.ndim == 2
+            and weight.is_floating_point()
+            and weight.shape[1]
+            == int(self.config.target_hidden_size) * int(self.config.num_target_layers)
+        )
+
+    def combine_tap_states(self, taps: list[torch.Tensor]) -> torch.Tensor:
+        """Project per-tap target states ``[tokens, width]`` into the draft
+        context without concatenating them.
+
+        Each tap is normalized and accumulated into the projection output
+        through its input-column slice of ``context_proj.weight``, the same
+        arithmetic as the streamed large-prefill path
+        (``accumulate_auxiliary_state``). The transient footprint is one
+        normalized tap plus the projection output instead of the
+        ``[tokens, taps * width]`` concatenation and its normalized copy; at
+        a 4608-token prefill chunk with five 7168-wide taps that is roughly
+        130 MiB instead of 760 MiB. Falls back to the concatenated path when
+        the projection weight is quantized and cannot be sliced.
+        """
+        expected_taps = int(self.config.num_target_layers)
+        width = int(self.config.target_hidden_size)
+        if len(taps) != expected_taps:
+            raise ValueError(
+                f"Kimi-K3 DSpark expects {expected_taps} target taps, got {len(taps)}."
+            )
+        for tap in taps:
+            if tap.ndim != 2 or tap.shape[-1] != width:
+                raise ValueError(
+                    "Kimi-K3 DSpark target taps must have shape [tokens, "
+                    f"{width}], got {tuple(tap.shape)}."
+                )
+        if not self._context_proj_weight_is_plain():
+            return self.combine_hidden_states(torch.cat(taps, dim=-1))
+        weight = self.context_proj.weight
+        output: torch.Tensor | None = None
+        for index, tap in enumerate(taps):
+            normalized = self.normalize_tap(index, tap.contiguous()).to(weight.dtype)
+            columns = weight[:, index * width : (index + 1) * width]
+            if output is None:
+                output = torch.mm(normalized, columns.t())
+            else:
+                output.addmm_(normalized, columns.t())
+        assert output is not None
+        if self.context_proj_sharded and getattr(self.context_proj, "tp_size", 1) > 1:
+            # Same all-gather ColumnParallelLinear performs for gather_output.
+            output = tensor_model_parallel_all_gather(output)
+        return self.context_norm(output)
 
     def bind_auxiliary_stream_scratch(self, scratch: torch.Tensor) -> bool:
         """Bind caller-owned storage used to form one target auxiliary state."""
@@ -523,6 +656,7 @@ class K3DSparkModel(nn.Module):
             scratch.copy_(primary)
         else:
             torch.add(primary, residual, out=scratch)
+        tap = self.normalize_tap(index, scratch)
 
         input_width = int(self.config.target_hidden_size)
         weight = self.context_proj.weight[
@@ -530,11 +664,11 @@ class K3DSparkModel(nn.Module):
         ]
         output = self._streamed_context_states[:num_tokens]
         if index == 0:
-            torch.mm(scratch, weight.t(), out=output)
+            torch.mm(tap, weight.t(), out=output)
         else:
             torch.addmm(
                 output,
-                scratch,
+                tap,
                 weight.t(),
                 beta=1.0,
                 alpha=1.0,
@@ -558,7 +692,7 @@ class K3DSparkModel(nn.Module):
             keepdim=True,
             dtype=torch.float32,
         ).square_()
-        tensor_model_parallel_all_reduce_in_place(squared_norm)
+        squared_norm = tensor_model_parallel_all_reduce_in_place(squared_norm)
         squared_norm.div_(self.config.hidden_size).add_(
             self.context_norm.variance_epsilon
         )
@@ -580,14 +714,18 @@ class K3DSparkModel(nn.Module):
         if not self.context_proj_sharded or len(states) != 1:
             return False
         candidate = states[0]
+        assert self._streamed_context_states is not None
         expected = self._streamed_context_states[: self._streamed_aux_tokens]
-        matches = (
-            candidate is self._completed_stream_result
-            and self._completed_stream_generation > self._consumed_stream_generation
-            and candidate.shape == expected.shape
+        same_buffer = (
+            candidate.shape == expected.shape
             and candidate.dtype == expected.dtype
             and candidate.device == expected.device
             and candidate.data_ptr() == expected.data_ptr()
+        )
+        matches = (
+            same_buffer
+            and candidate is self._completed_stream_result
+            and self._completed_stream_generation > self._consumed_stream_generation
         )
         if matches:
             self._consumed_stream_generation = self._completed_stream_generation
@@ -778,7 +916,7 @@ class K3DSparkModel(nn.Module):
                 + self._context_local_width,
             ]
             layer_kv = F.linear(context_states, weight)
-            tensor_model_parallel_all_reduce_in_place(layer_kv)
+            layer_kv = tensor_model_parallel_all_reduce_in_place(layer_kv)
 
             kv_c = layer_kv[:, : self._context_kv_lora_rank]
             normalized_kv_c = torch.empty(
@@ -881,7 +1019,16 @@ class K3DSparkForCausalLM(nn.Module):
     has_own_embed_tokens = False
     has_own_lm_head = False
     draft_id_to_target_id = None
-    checkpoint_skip_substrs = ("confidence_head", "embed_tokens", "lm_head")
+    # The frozen target embedding and LM head are shared after the draft
+    # checkpoint loads; the confidence head is loaded when the checkpoint
+    # enables it (``enable_confidence_head``) and skipped otherwise.
+    checkpoint_skip_substrs: tuple[str, ...] = (
+        "embed_tokens",
+        "lm_head",
+    )
+    # Subclass hook for drafts that share this backbone (DFlash2); None
+    # resolves to K3DSparkModel at construction.
+    model_cls: type[K3DSparkModel] | None = None
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={"": "model."},
@@ -901,7 +1048,8 @@ class K3DSparkForCausalLM(nn.Module):
         target_layer_num = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
-        self.model = K3DSparkModel(
+        model_cls = self.model_cls or K3DSparkModel
+        self.model = model_cls(
             vllm_config=vllm_config,
             start_layer_id=target_layer_num,
             prefix=maybe_prefix(prefix, "model"),
@@ -935,6 +1083,9 @@ class K3DSparkForCausalLM(nn.Module):
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.combine_hidden_states(hidden_states)
+
+    def combine_tap_states(self, taps: list[torch.Tensor]) -> torch.Tensor:
+        return self.model.combine_tap_states(taps)
 
     def bind_target_auxiliary_stream(
         self,
@@ -993,7 +1144,7 @@ class K3DSparkForCausalLM(nn.Module):
     def supports_local_draft_argmax(self) -> bool:
         """Return whether rank-local target and Markov logits can be combined."""
         markov_head = self.model.markov_head
-        if not markov_head.shard_across_tp:
+        if markov_head is None or not markov_head.shard_across_tp:
             return False
         if not isinstance(self.lm_head, VocabParallelEmbedding):
             return False
@@ -1038,7 +1189,9 @@ class K3DSparkForCausalLM(nn.Module):
 
     def compute_local_markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         """Project a Markov embedding into the matching vocabulary shard."""
-        return self.model.markov_head.local_bias(markov_embed, self.logits_processor)
+        return self._require_markov_head().local_bias(
+            markov_embed, self.logits_processor
+        )
 
     def gather_local_draft_logits(
         self,
@@ -1111,19 +1264,32 @@ class K3DSparkForCausalLM(nn.Module):
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
 
+    def _require_markov_head(self) -> DSparkMarkovHead:
+        markov_head = self.model.markov_head
+        if markov_head is None:
+            raise RuntimeError(f"{type(self).__name__} has no Markov head")
+        return markov_head
+
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.markov_head.embed(token_ids)
+        return self._require_markov_head().embed(token_ids)
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
-        return self.model.markov_head.bias(markov_embed, self.logits_processor)
+        return self._require_markov_head().bias(markov_embed, self.logits_processor)
+
+    def compute_confidence(
+        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Pre-sigmoid acceptance score per draft position, or None without
+        a confidence head (the speculator then verifies every draft)."""
+        if self.model.confidence_head is None:
+            return None
+        return self.model.confidence_head(head_hidden, markov_embed)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # confidence_head is training-only. The frozen target embedding and LM
-        # head are shared after this draft-specific checkpoint is loaded.
-        loader = AutoWeightsLoader(
-            self,
-            skip_substrs=list(self.checkpoint_skip_substrs),
-        )
+        skip = list(self.checkpoint_skip_substrs)
+        if self.model.confidence_head is None:
+            skip.append("confidence_head")
+        loader = AutoWeightsLoader(self, skip_substrs=skip)
         # read: 1. all weights. 2. context kv weights
         weights = _duplicate_context_kv_weights(weights, len(self.model.layers))
         loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

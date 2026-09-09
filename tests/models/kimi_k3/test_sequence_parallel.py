@@ -705,15 +705,23 @@ def test_kimi_moe_paired_projection_uses_exact_router_fallback(monkeypatch):
         "try_gather_kimi_sharded_projection_pair_topk",
         lambda *_args: None,
     )
-    monkeypatch.setattr(
-        kimi_model,
-        "gather_kimi_sharded_projection_pair",
-        lambda down, router: (gathered_down, gathered_router),
-    )
+    received: dict[str, int | None] = {}
+
+    def gather_pair(down, router, first_columns=None, second_columns=None):
+        # The paired gather returns the logical widths the caller asks for.
+        received.update(first_columns=first_columns, second_columns=second_columns)
+        return (
+            gathered_down[:, :first_columns].contiguous(),
+            gathered_router[:, :second_columns].contiguous(),
+        )
+
+    monkeypatch.setattr(kimi_model, "gather_kimi_sharded_projection_pair", gather_pair)
 
     routed_hidden, router_output, topk_ids = moe._maybe_overlap_router_and_down_proj(
         hidden_states
     )
+
+    assert received == {"first_columns": 3, "second_columns": 5}
 
     torch.testing.assert_close(routed_hidden, gathered_down[:, :3])
     torch.testing.assert_close(router_output, gathered_router[:, :5])
