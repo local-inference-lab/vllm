@@ -82,6 +82,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
 from vllm.model_executor.utils import replace_parameter
 from vllm.models.common.ops import fused_q_kv_rmsnorm
+from vllm.models.kimi_k3.nvidia import residual_digest
 from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_decode_q_concat_kv_cache_insert,
     fused_mla_key_concat_ds_mla_insert,
@@ -1814,6 +1815,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 v = torch.cat((stash_v, v), dim=0)
                 split_k_len = int(k.shape[0])
 
+        residual_digest.tap("mla.q", q)
+        residual_digest.tap("mla.k", k)
+        residual_digest.tap("mla.v", v)
         # When there is no chunked context, backends that honor `out` write the
         # attention result straight into it, avoiding a slice+flatten+copy.
         writes_out = not has_context and prefill.prefill_backend.supports_out()
@@ -1856,6 +1860,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             # output aliasing its suffix input, so both padded results never
             # need to be live at the same time.
             out.copy_(suffix_output[..., : self.v_head_dim])
+            residual_digest.tap("mla.new", out)
+            residual_digest.tap("mla.new_lse", suffix_lse.t())
             del output_prefill, suffix_output
             dcp_kv_gather = prefill.chunked_context.dcp_manager
             if self.dcp_world_size > 1 and not (
@@ -1877,6 +1883,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             compact_context_output = _reuse_consumed_query_for_context_output(q, out)
             compact_context_output.copy_(context_output[..., : self.v_head_dim])
             del context_output
+            residual_digest.tap("mla.ctx", compact_context_output)
+            residual_digest.tap("mla.ctx_lse", context_lse.t())
             merge_attn_states(
                 output=out,
                 prefix_output=compact_context_output,
@@ -1884,5 +1892,6 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 suffix_output=out,
                 suffix_lse=suffix_lse,
             )
+            residual_digest.tap("mla.merged", out)
         elif not writes_out:
             out.copy_(output_prefill[..., : self.v_head_dim].flatten(start_dim=-2))

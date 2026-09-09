@@ -88,8 +88,11 @@ class ForwardDigest:
         self.rows.append(block_digests(residual, 0))
 
     def add_tap(self, name: str, x: torch.Tensor) -> None:
+        x = x.detach()
         if x.ndim != 2:
             x = x.reshape(x.shape[0], -1)
+        if not x.is_contiguous():
+            x = x.contiguous()
         self.taps.setdefault(name, []).append(block_digests(x, 0))
 
     @staticmethod
