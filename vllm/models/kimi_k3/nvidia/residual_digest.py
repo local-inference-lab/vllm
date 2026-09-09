@@ -26,7 +26,16 @@ import os
 import torch
 
 BLOCK_ROWS = 256
-_state: dict = {"seq": 0, "weights": None}
+_state: dict = {"seq": 0, "weights": None, "active": None}
+
+
+def tap(name: str, x: torch.Tensor) -> None:
+    """Digest an intermediate of the active forward under ``name`` (for
+    example ``attn`` for a layer's attention output or ``mlp`` for its MLP
+    output). No-op without an active digest."""
+    digest = _state["active"]
+    if digest is not None:
+        digest.add_tap(name, x)
 
 
 def enabled() -> bool:
@@ -69,20 +78,34 @@ class ForwardDigest:
 
     def __init__(self, num_layers: int, first_position: int, rank: int) -> None:
         self.rows: list[torch.Tensor] = []
+        self.taps: dict[str, list[torch.Tensor]] = {}
         self.first_position = first_position
         self.rank = rank
         self.num_layers = num_layers
+        _state["active"] = self
 
     def add(self, residual: torch.Tensor) -> None:
         self.rows.append(block_digests(residual, 0))
 
+    def add_tap(self, name: str, x: torch.Tensor) -> None:
+        if x.ndim != 2:
+            x = x.reshape(x.shape[0], -1)
+        self.taps.setdefault(name, []).append(block_digests(x, 0))
+
+    @staticmethod
+    def _table(rows: list[torch.Tensor]) -> torch.Tensor:
+        width = max(r.shape[0] for r in rows)
+        table = torch.zeros(len(rows), width, dtype=torch.int64)
+        for i, r in enumerate(rows):
+            table[i, : r.shape[0]] = r.cpu()
+        return table
+
     def flush(self) -> None:
+        if _state["active"] is self:
+            _state["active"] = None
         if not self.rows:
             return
-        width = max(r.shape[0] for r in self.rows)
-        table = torch.zeros(len(self.rows), width, dtype=torch.int64)
-        for i, r in enumerate(self.rows):
-            table[i, : r.shape[0]] = r.cpu()
+        table = self._table(self.rows)
         directory = os.getenv("VLLM_K3_RESIDUAL_DIGEST_DIR", "")
         os.makedirs(directory, exist_ok=True)
         seq = _state["seq"]
@@ -90,6 +113,7 @@ class ForwardDigest:
         torch.save(
             {
                 "digests": table,
+                "taps": {name: self._table(rows) for name, rows in self.taps.items()},
                 "first_position": self.first_position,
                 "block_rows": BLOCK_ROWS,
                 "rank": self.rank,

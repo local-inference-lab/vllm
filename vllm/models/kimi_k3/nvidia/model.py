@@ -2055,6 +2055,7 @@ class KimiDecoderLayer(nn.Module):
                 output=caller_output,
             )
 
+        residual_digest.tap("attn", hidden_states)
         if self.use_sequence_parallel:
             # Add SP padding if needed, and then perform reduce scatter.
             hidden_states = sp_reduce_scatter(hidden_states)
@@ -2068,8 +2069,10 @@ class KimiDecoderLayer(nn.Module):
             hidden_states
         ):
             hidden_states = self.mlp(hidden_states, output=hidden_states)
+            residual_digest.tap("mlp", hidden_states)
         else:
             hidden_states = self.mlp(hidden_states)
+            residual_digest.tap("mlp", hidden_states)
         return hidden_states, prefix_sum, residual
 
     def _l2pf_build_plans(self) -> None:
