@@ -311,7 +311,11 @@ from vllm.v1.attention.ops.dcp_alltoall import (
     dcp_b12x_all_gather_heads,
     sanitize_dcp_attn_empty_rows,
 )
-from vllm.v1.attention.ops.dcp_utils import MLADCPKVGather, MLADCPManager
+from vllm.v1.attention.ops.dcp_utils import (
+    MLADCPKVGather,
+    MLADCPManager,
+    dcp_kv_gather_ubatch_slots,
+)
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
@@ -3318,7 +3322,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 self.dcp_manager = MLADCPKVGather(
                     get_dcp_group(),
                     device,
-                    parallel_config.num_ubatches,
+                    dcp_kv_gather_ubatch_slots(parallel_config),
                 )
             use_direct_kv_gather = False
             if self.dcp_manager is not None:

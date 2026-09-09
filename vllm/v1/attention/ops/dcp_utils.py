@@ -1077,6 +1077,14 @@ class DCPCombine(Protocol):
     ) -> torch.Tensor: ...
 
 
+def dcp_kv_gather_ubatch_slots(parallel_config) -> int:
+    """Ubatch slots of a DCP gather workspace: the DBO ubatch count, or two
+    when the Kimi-K3 split prefill is enabled (its second half runs as ubatch
+    1 without DBO, see ``vllm.v1.worker.gpu.k3_ubatch_prefill``)."""
+    split = os.getenv("VLLM_K3_UBATCH_PREFILL", "0") == "1"
+    return max(parallel_config.num_ubatches, 2 if split else 1)
+
+
 class MLADCPManager(MLADCPKVGather):
     """Select and own layer-level collective implementations for MLA DCP."""
 
@@ -1097,12 +1105,7 @@ class MLADCPManager(MLADCPKVGather):
         super().__init__(
             get_dcp_group(),
             device,
-            # The Kimi-K3 split prefill runs its second half as ubatch 1
-            # without DBO; give the gather workspace a slot for it.
-            max(
-                parallel_config.num_ubatches,
-                2 if os.getenv("VLLM_K3_UBATCH_PREFILL", "0") == "1" else 1,
-            ),
+            dcp_kv_gather_ubatch_slots(parallel_config),
         )
         self.max_num_tokens = get_dcp_workspace_max_num_tokens(vllm_config)
         self.use_a2a = parallel_config.dcp_comm_backend == "a2a"

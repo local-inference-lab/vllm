@@ -183,3 +183,95 @@ def test_configured_split_is_independent_of_boot_mode(tmp_path, monkeypatch):
     assert not mod.ubatch_prefill_configured()
     monkeypatch.setenv("VLLM_K3_UBATCH_PREFILL", "1")
     assert mod.ubatch_prefill_configured()
+
+
+def test_each_half_keeps_its_own_slot_mapping(monkeypatch):
+    """The runner computes slot mappings into one persistent buffer and
+    returns a view of it. Both halves are prepared before either runs, so each
+    half must run with a copy holding the mapping computed for its own rows,
+    not with whatever the buffer holds after the second half was prepared
+    (which sent the first half's keys into the second half's cache slots and
+    left the first half's slots unwritten)."""
+    import dataclasses
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import numpy as np
+    import torch
+
+    from vllm.v1.worker.gpu import k3_ubatch_prefill as mod
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+
+    rows = 2304
+    monkeypatch.delenv("VLLM_K3_UBATCH_MODE_FILE", raising=False)
+    monkeypatch.delenv("VLLM_K3_UBATCH_PREFILL_OVERLAP", raising=False)
+    monkeypatch.delenv("B12X_PCIE_RING_GRANULE_ROWS", raising=False)
+    monkeypatch.setattr(mod, "_tp_world_size", lambda: WORLD)
+    monkeypatch.setattr(mod, "set_forward_context", lambda *a, **k: nullcontext())
+    device = torch.device("cpu")
+    buffers = InputBuffers(max_num_reqs=4, max_num_tokens=rows, device=device)
+    batch = InputBatch.make_dummy(1, rows, buffers)
+    batch = dataclasses.replace(
+        batch,
+        is_prefilling_np=np.array([True]),
+        positions=torch.arange(rows, dtype=torch.int64),
+        dcp_local_seq_lens=None,
+    )
+
+    shared = torch.full((1, rows), -1, dtype=torch.int64)
+    calls: list[int] = []
+
+    def prepare_attn(hb):
+        # Marker per call: the row position, like a real slot for one page.
+        calls.append(int(hb.positions[0]))
+        shared[0, : hb.num_tokens] = hb.positions
+        return (torch.zeros(1, 4, dtype=torch.int32),), shared[:, : hb.num_tokens]
+
+    model_state = SimpleNamespace(
+        preprocess_state=lambda *a, **k: None,
+        prepare_attn=lambda *a, **k: {},
+        prepare_inputs=lambda *a, **k: {},
+    )
+    runner = SimpleNamespace(
+        prepare_attn=prepare_attn,
+        model_state=model_state,
+        req_states=SimpleNamespace(
+            num_computed_tokens=SimpleNamespace(gpu=torch.zeros(4, dtype=torch.int32))
+        ),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(layer_names=["layer"])]
+        ),
+        attn_groups=[],
+        vllm_config=None,
+        dcp_size=1,
+        dcp_rank=0,
+        cp_interleave=1,
+        model=None,
+    )
+    seen: list[torch.Tensor] = []
+
+    def run_half(runner, half_index, hb, half_inputs, slot_mappings_by_layer):
+        seen.append(slot_mappings_by_layer["layer"].clone())
+        return torch.zeros(hb.num_tokens, 1)
+
+    monkeypatch.setattr(mod, "_run_half", run_half)
+
+    @dataclasses.dataclass
+    class Descriptor:
+        num_tokens: int
+
+    out = mod.run_split_prefill(
+        runner,
+        scheduler_output=None,
+        input_batch=batch,
+        model_inputs={"input_ids": batch.input_ids, "positions": batch.positions},
+        cudagraph_runtime_mode=None,
+        num_tokens_across_dp=None,
+        batch_descriptor=Descriptor(num_tokens=rows),
+        skip_compiled=False,
+    )
+    split = rows // 2
+    assert out.shape[0] == rows
+    assert calls == [0, split]
+    assert torch.equal(seen[0], torch.arange(0, split))
+    assert torch.equal(seen[1], torch.arange(split, rows))

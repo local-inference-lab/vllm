@@ -353,6 +353,11 @@ def run_split_prefill(
     for start, end in halves:
         hb = _half_batch(runner, input_batch, start, end)
         block_tables, slot_mappings = runner.prepare_attn(hb)
+        # The runner computes slot mappings into one persistent buffer and
+        # returns a view of it; both halves are prepared before either runs,
+        # so without a copy the first half would write its keys into the
+        # second half's cache slots and leave its own unwritten.
+        slot_mappings = slot_mappings.clone()
         # The recurrent-state pre-copy reads the request's computed-token
         # count from the GPU request table; the second half starts where the
         # first ended, so hand it a shifted copy instead of the step-start
