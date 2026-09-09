@@ -245,12 +245,67 @@ def tensor_model_parallel_is_borrowed_storage(tensor: torch.Tensor) -> bool:
     return get_tp_group().is_borrowed_reduction_storage(tensor)
 
 
+def _ubatch_ring_call(fn, inputs: tuple[torch.Tensor, ...]):
+    """Issue a ring collective of one split half on the comm stream.
+
+    The DMA ring shares its scratch, side streams and replay entries between
+    every op on the channel, and a replayed op returns entry-owned storage
+    that the next same-shape op overwrites. Under the two-thread split the
+    all-reduces already run on the comm stream; an op left on the compute
+    stream would overlap them on the shared scratch and its static result
+    would be clobbered by the other half's same-shape op. So every ring op
+    of a half goes through here: the inputs are snapshotted on the compute
+    stream (they may live in runtime buffers the other half reuses), the op
+    runs on the comm stream, ``fn`` copies entry-owned results into fresh
+    comm-stream tensors, and the compute stream is made to wait for them.
+    The CPU is not yielded: the caller consumes the result at once.
+    """
+    from vllm.v1.worker.ubatching import (
+        dbo_switch_to_comm_sync,
+        dbo_switch_to_compute_sync,
+    )
+
+    lockstep = _ubatch_lockstep()
+    snapshots = tuple(t.clone() for t in inputs)
+    if lockstep:
+        torch.cuda.synchronize()
+    dbo_switch_to_comm_sync()
+    result = fn(*snapshots)
+    if lockstep:
+        torch.cuda.synchronize()
+    dbo_switch_to_compute_sync()
+    if lockstep:
+        torch.cuda.synchronize()
+    del snapshots
+    return result
+
+
+def _ubatch_ring_active() -> bool:
+    return _ubatch_active() and not _ubatch_no_yield()
+
+
 def tensor_model_parallel_pcie_all_gather_pair(
     first: torch.Tensor, second: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, Any] | None:
     """Gather two rank-local ``[rows, c]`` blocks on the TP group's
     copy-engine ring side stream; ``None`` when unavailable."""
-    return get_tp_group().pcie_all_gather_pair(first, second)
+    if not _ubatch_ring_active():
+        return get_tp_group().pcie_all_gather_pair(first, second)
+
+    def _run(a: torch.Tensor, b: torch.Tensor):
+        got = get_tp_group().pcie_all_gather_pair(a, b)
+        if got is None:
+            return None
+        out_first, out_second, done = got
+        stream = torch.cuda.current_stream()
+        if done is not None:
+            stream.wait_event(done)
+        out_first, out_second = out_first.clone(), out_second.clone()
+        ready = torch.cuda.Event()
+        ready.record(stream)
+        return out_first, out_second, ready
+
+    return _ubatch_ring_call(_run, (first, second))
 
 
 def tensor_model_parallel_prepare_pcie_reduce_scatter(wire: str) -> bool:
@@ -265,7 +320,16 @@ def tensor_model_parallel_pcie_reduce_scatter_columns(
     """Reduce ``input_`` across the TP group on the copy-engine ring and
     return this rank's ``[rows, cols]`` column block; ``None`` when
     unavailable."""
-    return get_tp_group().pcie_reduce_scatter_columns(input_, wire=wire, cols=cols)
+    if not _ubatch_ring_active():
+        return get_tp_group().pcie_reduce_scatter_columns(
+            input_, wire=wire, cols=cols
+        )
+
+    def _run(x: torch.Tensor):
+        out = get_tp_group().pcie_reduce_scatter_columns(x, wire=wire, cols=cols)
+        return None if out is None else out.clone()
+
+    return _ubatch_ring_call(_run, (input_,))
 
 
 def tensor_model_parallel_all_gather(
@@ -274,6 +338,10 @@ def tensor_model_parallel_all_gather(
     """All-gather the input tensor across model parallel group."""
 
     def _run() -> torch.Tensor:
+        if _ubatch_ring_active():
+            return _ubatch_ring_call(
+                lambda x: get_tp_group().all_gather(x, dim).clone(), (input_,)
+            )
         return get_tp_group().all_gather(input_, dim)
 
     driver = _piecewise()
