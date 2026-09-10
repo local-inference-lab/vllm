@@ -776,7 +776,10 @@ class GPUModelRunner(
                 # uses output token ids so we set this conservatively. Thinking-budget
                 # tracking is requested dynamically when a budgeted request is in the
                 # batch.
-                logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
+                logitsprocs_need_output_token_ids=(
+                    bool(custom_logitsprocs)
+                    or self.model_config.hf_config.model_type == "deepseek_v41"
+                ),
                 is_pooling_model=self.is_pooling_model,
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                 reasoning_config=self.vllm_config.reasoning_config,
@@ -815,6 +818,7 @@ class GPUModelRunner(
 
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+        self.lookback_token_ids: CpuGpuBuffer | None = None
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
@@ -1132,8 +1136,42 @@ class GPUModelRunner(
             )
         return self._mamba_bufs
 
-    def _init_model_kwargs(self):
+    def _prepare_lookback_token_ids(self, num_reqs: int) -> torch.Tensor:
+        """Gather accepted raw history, chronologically and right-aligned."""
+        buf = self.lookback_token_ids
+        assert buf is not None
+        buf.np.fill(-1)
+        if num_reqs:
+            self.input_batch.update_async_output_token_ids()
+            depth = buf.np.shape[1]
+            starts = (
+                self.num_computed_tokens[:num_reqs].cpu().tolist()
+                if self.use_async_spec_decode
+                else self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            )
+            for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                req = self.requests[req_id]
+                prompt = req.prompt_token_ids or []
+                start = int(starts[row])
+                for column, position in enumerate(range(start - depth, start)):
+                    if 0 <= position < len(prompt):
+                        buf.np[row, column] = prompt[position]
+                    elif (
+                        len(prompt)
+                        <= position
+                        < len(prompt) + len(req.output_token_ids)
+                    ):
+                        buf.np[row, column] = req.output_token_ids[
+                            position - len(prompt)
+                        ]
+        return buf.copy_to_gpu()
+
+    def _init_model_kwargs(self, num_reqs: int | None = None):
         model_kwargs = dict[str, Any]()
+        if self.lookback_token_ids is not None:
+            model_kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
+                self.input_batch.num_reqs if num_reqs is None else num_reqs
+            )
 
         if not self.is_pooling_model:
             return model_kwargs
@@ -5463,6 +5501,11 @@ class GPUModelRunner(
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
+                lookback_depth = getattr(self.model, "token_lookback_depth", 0)
+                if lookback_depth:
+                    self.lookback_token_ids = self._make_buffer(
+                        self.max_num_reqs, lookback_depth, dtype=torch.int32
+                    )
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
@@ -6237,7 +6280,7 @@ class GPUModelRunner(
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
-            model_kwargs = self._init_model_kwargs()
+            model_kwargs = self._init_model_kwargs(num_reqs=0)
             if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
                 input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
 
@@ -6248,7 +6291,7 @@ class GPUModelRunner(
             elif self.enable_prompt_embeds:
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
-                model_kwargs = self._init_model_kwargs()
+                model_kwargs = self._init_model_kwargs(num_reqs=0)
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
@@ -7462,7 +7505,10 @@ class GPUModelRunner(
                 continue
             block_size = kv_cache_spec.block_size
             block_sizes.append(block_size)
-            if kv_cache_spec_kind == KVCacheSpecKind.MAMBA:
+            if kv_cache_spec_kind in (
+                KVCacheSpecKind.MAMBA,
+                KVCacheSpecKind.CIRCULAR_BUFFER,
+            ):
                 slot_mapping_modes.append(SlotMappingMode.NONE)
             else:
                 slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)

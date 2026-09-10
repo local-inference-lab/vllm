@@ -96,9 +96,11 @@ def init_attn_backend(
     vllm_config: VllmConfig,
     device: torch.device,
     active_layer_names: set[str] | None = None,
+    layer_vllm_configs: Mapping[str, VllmConfig] | None = None,
 ) -> tuple[list[list[AttentionGroup]], AttentionCGSupportInfo, list[int]]:
     # Phase 1: discover attention groups for each kv cache group.
     attn_groups: list[list[AttentionGroup]] = []
+    layer_vllm_configs = layer_vllm_configs or {}
 
     # Add KV-sharing layers to their target's kv cache group so they are
     # discovered alongside the target layer in Phase 1 below.
@@ -121,8 +123,10 @@ def init_attn_backend(
             attn_layers, vllm_config.cache_config.kv_cache_layout
         )
 
-        group_map: dict[tuple[tuple[str, str], KVCacheSpec, int], AttentionGroup] = {}
-        group_order: list[tuple[tuple[str, str], KVCacheSpec, int]] = []
+        group_map: dict[
+            tuple[tuple[str, str], KVCacheSpec, int, int], AttentionGroup
+        ] = {}
+        group_order: list[tuple[tuple[str, str], KVCacheSpec, int, int]] = []
 
         for layer_name in layer_names:
             attn_backend = attn_layers[layer_name].get_attn_backend()
@@ -135,7 +139,13 @@ def init_attn_backend(
             # counts (e.g. a spec-decode draft head and its target) get separate
             # metadata builders.
             num_heads_q = getattr(attn_layers[layer_name], "num_heads", 0)
-            key = (attn_backend.full_cls_name(), layer_kv_cache_spec, num_heads_q)
+            layer_config = layer_vllm_configs.get(layer_name, vllm_config)
+            key = (
+                attn_backend.full_cls_name(),
+                layer_kv_cache_spec,
+                num_heads_q,
+                id(layer_config),
+            )
             if key not in group_map:
                 group_map[key] = AttentionGroup(
                     attn_backend, [layer_name], layer_kv_cache_spec, kv_cache_group_id
@@ -158,7 +168,7 @@ def init_attn_backend(
             kernel_block_size = kernel_block_sizes[kv_cache_group_id]
         for group in groups:
             group.create_metadata_builders(
-                vllm_config=vllm_config,
+                vllm_config=layer_vllm_configs.get(group.layer_names[0], vllm_config),
                 device=device,
                 kernel_block_size=kernel_block_size,
                 num_metadata_builders=1,

@@ -3,7 +3,7 @@
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
 import os
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from einops import rearrange
@@ -70,6 +70,10 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.mamba.ops.b12x_gdn_prefill import B12xGdnPrefill
 
 # Optional ROCm AITER Triton kernels for the GDN decode path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -92,6 +96,29 @@ logger = init_logger(__name__)
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
+
+
+@triton.jit
+def _scatter_b12x_gdn_output(
+    source,
+    indices,
+    counts,
+    output,
+    SOURCE_STRIDE: tl.constexpr,
+    OUTPUT_STRIDE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    live = row < tl.load(counts + 1)
+    target = tl.load(indices + row, live, other=0).to(tl.int64)
+    value = tl.load(
+        source + row.to(tl.int64) * SOURCE_STRIDE + offsets,
+        live & (offsets < WIDTH),
+        other=0,
+    )
+    tl.store(output + target * OUTPUT_STRIDE + offsets, value, live & (offsets < WIDTH))
 
 
 @triton.jit(do_not_specialize=["num_requests"])
@@ -142,35 +169,66 @@ def _stage_b12x_gdn_metadata_kernel(
     tl.store(out_num_tokens, tl.load(query_start_loc + num_requests * query_stride))
 
 
-def _resolve_gdn_decode_kernel(
-    vllm_config: VllmConfig, prefer_b12x: bool
-) -> tuple[str, bool]:
+def _resolve_gdn_backend_selection(
+    vllm_config: VllmConfig,
+) -> tuple[str, str, bool]:
+    """Select b12x for both GDN paths or neither, preserving explicit choices."""
     additional_config = vllm_config.additional_config
-    configured = (
-        additional_config.get("gdn_decode_kernel")
-        if isinstance(additional_config, dict)
-        else None
+    if not isinstance(additional_config, dict):
+        additional_config = {}
+    configured_prefill = additional_config.get("gdn_prefill_backend")
+    prefill = (
+        "auto"
+        if configured_prefill is None
+        else str(configured_prefill).strip().lower()
     )
+    configured = additional_config.get("gdn_decode_kernel")
     explicitly_configured = (
         configured is not None or "VLLM_GDN_DECODE_KERNEL" in os.environ
     )
     if configured is not None:
-        requested = str(configured).strip().lower()
+        decode = str(configured).strip().lower()
     elif "VLLM_GDN_DECODE_KERNEL" in os.environ:
-        requested = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
-    elif prefer_b12x:
-        requested = "b12x"
+        decode = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
     else:
-        requested = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
-    if requested not in ("b12x", "cuda", "triton"):
-        raise ValueError(f"Unsupported GDN decode kernel: {requested!r}")
-    return requested, explicitly_configured
+        decode = None
+    if prefill not in ("auto", "b12x", "flashinfer", "triton", "cutedsl"):
+        raise ValueError(f"Unsupported GDN prefill backend: {prefill!r}")
+    if decode not in (None, "b12x", "cuda", "triton"):
+        raise ValueError(f"Unsupported GDN decode kernel: {decode!r}")
+
+    if prefill == "b12x" or decode == "b12x":
+        if prefill not in ("auto", "b12x") or decode not in (None, "b12x"):
+            raise ValueError(
+                "b12x GDN prefill and decode must be selected together; "
+                f"got prefill={prefill!r}, decode={decode!r}. "
+                "Remove the conflicting GDN backend override."
+            )
+        return "b12x", "b12x", explicitly_configured
+
+    text_config = getattr(vllm_config.model_config, "hf_text_config", None)
+    if (
+        prefill == "auto"
+        and decode is None
+        and getattr(text_config, "model_type", None) == "qwen3_8_flash_next_text"
+    ):
+        return "b12x", "b12x", False
+    return prefill, decode or "cuda", explicitly_configured
+
+
+def _resolve_gdn_decode_kernel(vllm_config: VllmConfig) -> tuple[str, bool]:
+    _, decode, explicitly_configured = _resolve_gdn_backend_selection(vllm_config)
+    return decode, explicitly_configured
 
 
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
-) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
+) -> tuple[str, Literal["triton", "flashinfer", "cutedsl", "b12x"]]:
     """Resolve GDN prefill backend.
+
+    Selecting b12x for either GDN path selects it for both. Explicit mixed
+    selections fail. Qwen3.8-Flash-Next defaults to b12x unless a non-b12x GDN
+    backend is explicitly configured.
 
     FlashInfer's GDN prefill kernel is chosen when:
     * ``requested in ["flashinfer", "auto"]``;
@@ -184,13 +242,26 @@ def _resolve_gdn_prefill_backend(
     * "cutedsl" is requested; (opt-in only)
     * SM10.x (datacenter Blackwell) with ``head_k_dim == 128``;
     """
-    additional_config = vllm_config.additional_config
-    backend_cfg = (
-        additional_config.get("gdn_prefill_backend", "auto")
-        if isinstance(additional_config, dict)
-        else "auto"
-    )
-    backend = str(backend_cfg).strip().lower()
+    backend, _, _ = _resolve_gdn_backend_selection(vllm_config)
+
+    if backend == "b12x":
+        config = vllm_config.model_config.hf_text_config
+        key_heads = getattr(config, "linear_num_key_heads", 0)
+        value_heads = getattr(config, "linear_num_value_heads", 0)
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+            and getattr(config, "linear_key_head_dim", None) == 128
+            and getattr(config, "linear_value_head_dim", None) == 128
+            and key_heads > 0
+            and value_heads == 3 * key_heads
+            and vllm_config.model_config.dtype == torch.bfloat16
+        ):
+            raise ValueError(
+                "b12x GDN prefill requires SM12x, BF16, 128-wide heads, "
+                "and V:K heads=3:1"
+            )
+        return backend, "b12x"
 
     if not current_platform.is_cuda():
         return backend, "triton"
@@ -234,6 +305,7 @@ def _log_gdn_backend_decision(
     chosen = {
         "flashinfer": "FlashInfer",
         "cutedsl": "CuteDSL",
+        "b12x": "b12x CuTeDSL",
         "triton": "Triton/FLA",
     }[active_backend]
     logger.info_once(
@@ -331,8 +403,13 @@ class ChunkGatedDeltaRule(CustomOp):
             self._forward_method = self.forward_cuda
         elif active_backend == "cutedsl":
             self._forward_method = self.forward_cutedsl
+        elif active_backend == "b12x":
+            self._forward_method = self.forward_b12x
         else:
             self._forward_method = self.forward_native
+
+    def forward_b12x(self, *args, **kwargs):
+        raise RuntimeError("b12x GDN prefill must use the layer's pooled-state binding")
 
     def forward_cuda(
         self,
@@ -462,7 +539,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         prefix: str = "",
         gqa_interleaved_layout=False,
         reduce_results: bool = True,
-        prefer_b12x_gdn_decode: bool = False,
         overlap_input_projections: bool = False,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
@@ -588,16 +664,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
         self._prefill_kernels_warmed_up = False
+        self._b12x_prefill: B12xGdnPrefill | None = None
+        self._b12x_prefill_max_tokens = int(
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        self._b12x_prefill_max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+        if self.gdn_prefill_backend == "b12x" and self.gqa_interleaved_layout:
+            raise ValueError(
+                "b12x GDN prefill requires non-interleaved Q/K/V projections"
+            )
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
         (
             self.gdn_decode_kernel,
             gdn_decode_kernel_is_explicit,
-        ) = _resolve_gdn_decode_kernel(
-            vllm_config,
-            prefer_b12x_gdn_decode,
-        )
+        ) = _resolve_gdn_decode_kernel(vllm_config)
         if self.gdn_decode_kernel == "cuda":
             reason = self._fused_gdn_decode_unsupported_reason(vllm_config)
             if reason is not None:
@@ -730,6 +812,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         super().bind_kv_cache(kv_cache)
+        if self.gdn_prefill_backend == "b12x":
+            from vllm.model_executor.layers.mamba.ops.b12x_gdn_prefill import (
+                B12xGdnPrefill,
+            )
+
+            self._b12x_prefill = B12xGdnPrefill(
+                recurrent_state=self.kv_cache[1],
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                max_tokens=self._b12x_prefill_max_tokens,
+                max_seqs=self._b12x_prefill_max_seqs,
+                key_heads=self.num_k_heads // self.tp_size,
+                value_heads=self.num_v_heads // self.tp_size,
+                checkpoint_export=True,
+            )
         if self.gdn_decode_kernel != "b12x":
             return
         recurrent_state = self.kv_cache[1]
@@ -770,6 +867,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
     def unbind_kv_cache(self) -> None:
+        self._b12x_prefill = None
         self._b12x_plan = None
         self._b12x_scratch = None
         super().unbind_kv_cache()
@@ -1348,6 +1446,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         which has fixed kernel parameters (no autotuning), so only the
         prefill (chunked) path needs warming up.
         """
+        if self.gdn_prefill_backend == "b12x":
+            # Cache binding compiles the complete planned capacity family.
+            return
         if self._prefill_kernels_warmed_up:
             return
         self._prefill_kernels_warmed_up = True
@@ -1683,29 +1784,30 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_prefill = a_non_spec
                 b_prefill = b_non_spec
 
-            (
-                query_non_spec,
-                key_non_spec,
-                value_non_spec,
-                g_non_spec,
-                beta_non_spec,
-            ) = fused_post_conv_prep(
-                conv_output=conv_output_prefill,
-                a=a_prefill,
-                b=b_prefill,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                num_k_heads=self.num_k_heads // self.tp_size,
-                head_k_dim=self.head_k_dim,
-                head_v_dim=self.head_v_dim,
-                apply_l2norm=True,
-                output_g_exp=False,
-            )
-            query_non_spec = query_non_spec.unsqueeze(0)
-            key_non_spec = key_non_spec.unsqueeze(0)
-            value_non_spec = value_non_spec.unsqueeze(0)
-            g_non_spec = g_non_spec.unsqueeze(0)
-            beta_non_spec = beta_non_spec.unsqueeze(0)
+            if self.gdn_prefill_backend != "b12x":
+                (
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                ) = fused_post_conv_prep(
+                    conv_output=conv_output_prefill,
+                    a=a_prefill,
+                    b=b_prefill,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    num_k_heads=self.num_k_heads // self.tp_size,
+                    head_k_dim=self.head_k_dim,
+                    head_v_dim=self.head_v_dim,
+                    apply_l2norm=True,
+                    output_g_exp=False,
+                )
+                query_non_spec = query_non_spec.unsqueeze(0)
+                key_non_spec = key_non_spec.unsqueeze(0)
+                value_non_spec = value_non_spec.unsqueeze(0)
+                g_non_spec = g_non_spec.unsqueeze(0)
+                beta_non_spec = beta_non_spec.unsqueeze(0)
         else:
             query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
                 mixed_qkv_non_spec
@@ -1774,26 +1876,49 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            initial_state = ssm_state[prefill_state_indices]
-            initial_state[~prefill_has_initial_state, ...] = 0
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=attn_metadata.prefill_query_start_loc,
-                chunk_indices=attn_metadata.chunk_indices,
-                chunk_offsets=attn_metadata.chunk_offsets,
-                use_qk_l2norm_in_kernel=False,
-            )
-            # Init cache
-            ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            if self.gdn_prefill_backend == "b12x":
+                runner = self._b12x_prefill
+                if runner is None or attn_metadata.b12x_prefill_live_counts is None:
+                    raise RuntimeError(
+                        "b12x GDN prefill cache and runtime metadata must be bound"
+                    )
+                runner.run(
+                    mixed_qkv=conv_output_prefill,
+                    a=a_prefill,
+                    b=b_prefill,
+                    query_start_loc=attn_metadata.prefill_query_start_loc,
+                    state_indices=prefill_state_indices,
+                    has_initial_state=prefill_has_initial_state,
+                    live_counts=attn_metadata.b12x_prefill_live_counts,
+                    checkpoint=attn_metadata.prefill_checkpoint,
+                    output=runner.output,
+                    eps=self.layer_norm_epsilon,
+                )
+                core_attn_out_non_spec = runner.output[
+                    : conv_output_prefill.shape[0]
+                ].unsqueeze(0)
+            else:
+                initial_state = ssm_state[prefill_state_indices]
+                initial_state[~prefill_has_initial_state, ...] = 0
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = self.chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=attn_metadata.prefill_query_start_loc,
+                    chunk_indices=attn_metadata.chunk_indices,
+                    chunk_offsets=attn_metadata.chunk_offsets,
+                    use_qk_l2norm_in_kernel=False,
+                )
+                ssm_state[prefill_state_indices] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
@@ -2309,6 +2434,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        descriptor = forward_context.batch_descriptor
+        if attn_metadata.b12x_mixed is not None and (
+            descriptor is not None
+            and not descriptor.uniform
+            or attn_metadata.num_prefills > 0
+        ):
+            self._forward_core_b12x_mixed(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                output_gate=output_gate,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+            )
+            return
         if self._can_use_b12x_gdn_decode(attn_metadata):
             self._forward_core_decode_b12x_fused_norm(
                 mixed_qkv=mixed_qkv,
@@ -2344,6 +2484,112 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             output_gate[:num_actual_tokens],
             core_attn_out[:num_actual_tokens],
         )
+
+    def _forward_core_b12x_mixed(
+        self,
+        *,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        output_gate: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> None:
+        metadata = attn_metadata.b12x_mixed
+        runner = self._b12x_prefill
+        if metadata is None or runner is None:
+            raise RuntimeError("b12x mixed GDN requires bound state and worklists")
+        if self.gdn_decode_kernel != "b12x":
+            raise RuntimeError("b12x mixed GDN requires the b12x decode backend")
+        retain_cuda_graph_capture_resource(self)
+        retain_cuda_graph_capture_resource(metadata)
+        rows = mixed_qkv.shape[0]
+        conv_state = (
+            self.kv_cache[0]
+            if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2)
+        )
+        weights = self.conv1d.weight.view(self.conv1d.weight.size(0), -1)
+        non_spec_indices = metadata.token_indices[:rows]
+        packed = mixed_qkv.index_select(0, non_spec_indices)
+        convolved = causal_conv1d_fn(
+            packed.transpose(0, 1),
+            weights,
+            self.conv1d.bias,
+            activation=self.activation,
+            conv_states=conv_state,
+            has_initial_state=metadata.has_initial_state,
+            cache_indices=metadata.state_indices,
+            query_start_loc=metadata.query_start_loc,
+            metadata=metadata.convolution_metadata(rows),
+        ).transpose(0, 1)
+        runner.run(
+            mixed_qkv=convolved,
+            a=a.index_select(0, non_spec_indices),
+            b=b.index_select(0, non_spec_indices),
+            query_start_loc=metadata.query_start_loc,
+            state_indices=metadata.state_indices,
+            has_initial_state=metadata.has_initial_state,
+            live_counts=metadata.live_counts,
+            checkpoint=metadata.checkpoint,
+            output=runner.output,
+            eps=self.layer_norm_epsilon,
+        )
+        self._rms_norm_gated_cuda(
+            runner.output[:rows],
+            output_gate.index_select(0, non_spec_indices),
+            runner.output[:rows],
+        )
+        core_attn_out.zero_()
+        width = core_attn_out.shape[-2] * core_attn_out.shape[-1]
+        _scatter_b12x_gdn_output[(rows, triton.cdiv(width, 256))](
+            runner.output,
+            non_spec_indices,
+            metadata.live_counts,
+            core_attn_out,
+            SOURCE_STRIDE=runner.output.stride(0),
+            OUTPUT_STRIDE=core_attn_out.stride(0),
+            WIDTH=width,
+            BLOCK=256,
+        )
+
+        if self._b12x_state_index_columns > 1:
+            spec_rows = min(rows, metadata.spec_token_indices.numel())
+            spec_indices = metadata.spec_token_indices[:spec_rows]
+            spec_packed = mixed_qkv.index_select(0, spec_indices)
+            convolved_spec = causal_conv1d_update(
+                spec_packed,
+                conv_state,
+                weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=metadata.spec_state_indices[:, 0],
+                num_accepted_tokens=metadata.spec_accepted,
+                query_start_loc=metadata.spec_query_start_loc,
+                max_query_len=self._b12x_state_index_columns,
+                validate_data=False,
+            )
+            self._run_b12x_gdn_decode_post_conv(
+                mixed_qkv=convolved_spec,
+                a=a.index_select(0, spec_indices),
+                b=b.index_select(0, spec_indices),
+                output_gate=output_gate.index_select(0, spec_indices),
+                core_attn_out=self._b12x_output[:spec_rows],
+                state_indices=metadata.spec_state_indices,
+                query_start_loc=metadata.spec_query_start_loc,
+                num_accepted_tokens=metadata.spec_accepted,
+                num_requests=metadata.max_seqs,
+            )
+            _scatter_b12x_gdn_output[(spec_rows, triton.cdiv(width, 256))](
+                self._b12x_output,
+                spec_indices,
+                metadata.spec_counts,
+                core_attn_out,
+                SOURCE_STRIDE=self._b12x_output.stride(0),
+                OUTPUT_STRIDE=core_attn_out.stride(0),
+                WIDTH=width,
+                BLOCK=256,
+            )
 
 
 def qwen_gdn_input_projections(

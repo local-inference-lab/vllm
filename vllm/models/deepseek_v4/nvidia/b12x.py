@@ -20,6 +20,7 @@ from vllm.models.deepseek_v4.nvidia.b12x_indexer import (
     DeepseekV4B12xSparseIndexer,
     b12x_indexer_is_supported,
 )
+from vllm.models.deepseek_v4.nvidia.ops.o_proj import bf16_o_proj
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
@@ -615,6 +616,8 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         return groups, group_width, rank, hidden
 
     def setup_b12x_wo_projection(self) -> None:
+        if self.wo_a.weight.dtype == self.wo_b.weight.dtype == torch.bfloat16:
+            return
         # These linears hold checkpoint tensors for the fused B12x projection;
         # their ordinary forward methods are not used by this attention class.
         self.wo_a.b12x_warmup_provider = None
@@ -636,6 +639,17 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         )
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if self.wo_a.weight.dtype == self.wo_b.weight.dtype == torch.bfloat16:
+            return bf16_o_proj(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.wo_a,
+                self.wo_b,
+                n_groups=self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                o_lora_rank=self.o_lora_rank,
+            )
         if self._b12x_wo_projection_weights is None:
             raise RuntimeError("B12x WO-A/WO-B weights were not packed after loading.")
         module = _require_b12x_wo_projection()

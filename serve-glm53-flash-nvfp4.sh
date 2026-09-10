@@ -32,6 +32,7 @@ if [[ -z "${KV_CACHE_MEMORY_BYTES+x}" ]]; then
 fi
 SPECULATOR="${SPECULATOR:-mtp}"
 DFLASH2_MODEL="${DFLASH2_MODEL:-incoai/GLM-5.3-Flash-DFlash2}"
+DSPARK_MODEL="${DSPARK_MODEL:-/data/models/GLM-5.3-Flash-DSpark}"
 ADAPTIVE_SPECULATIVE_TOKENS="${ADAPTIVE_SPECULATIVE_TOKENS:-0}"
 TORCH_PROFILE_DIR="${TORCH_PROFILE_DIR:-}"
 TORCH_PROFILE_RECORD_SHAPES="${TORCH_PROFILE_RECORD_SHAPES:-0}"
@@ -69,6 +70,10 @@ usage() {
     "  -h, --help                    Show this help." \
     "" \
     "Launcher environment:" \
+    "  SPECULATOR=mtp|dflash2|dspark Select the draft model (default: mtp)." \
+    "  DSPARK_MODEL=PATH            GLM-5.3 DSpark release directory." \
+    "  DSPARK_DEPTH_MODE=fixed|adaptive" \
+    "                                Confidence-based verification (default: fixed)." \
     "  ADAPTIVE_SPECULATIVE_TOKENS=1 Enable adaptive MTP draft depth." \
     "  ADAPTIVE_SPECULATIVE_TOKENS_INITIAL=N" \
     "                                Initial adaptive depth (default: 3)." \
@@ -160,8 +165,11 @@ case "${SPECULATOR}" in
     # plus seven draft tokens.
     default_num_speculative_tokens=7
     ;;
+  dspark)
+    default_num_speculative_tokens=7
+    ;;
   *)
-    echo "SPECULATOR must be mtp or dflash2; got '${SPECULATOR}'" >&2
+    echo "SPECULATOR must be mtp, dflash2, or dspark; got '${SPECULATOR}'" >&2
     exit 2
     ;;
 esac
@@ -280,6 +288,32 @@ if ((NUM_SPECULATIVE_TOKENS > 0)); then
         '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"kv_cache_dtype":"auto"}' \
         "${DFLASH2_MODEL}" "${NUM_SPECULATIVE_TOKENS}"
       ;;
+    dspark)
+      case "${DSPARK_DEPTH_MODE:-fixed}" in
+        fixed) dspark_adaptive=false ;;
+        adaptive|dynamic) dspark_adaptive=true ;;
+        *)
+          echo "DSPARK_DEPTH_MODE must be fixed, adaptive, or dynamic" >&2
+          exit 2
+          ;;
+      esac
+      speculative_config="$(
+        "${PYTHON_BIN}" - "${DSPARK_MODEL}" "${NUM_SPECULATIVE_TOKENS}" "${dspark_adaptive}" <<'PY'
+import json
+import sys
+
+print(json.dumps({
+    "method": "dspark",
+    "model": sys.argv[1],
+    "num_speculative_tokens": int(sys.argv[2]),
+    "enable_adaptive_verification": sys.argv[3] == "true",
+    "moe_backend": "triton",
+    "attention_backend": "B12X",
+    "kv_cache_dtype": "fp8",
+}))
+PY
+      )"
+      ;;
   esac
   speculative_args=(--speculative-config "${speculative_config}")
 fi
@@ -374,7 +408,8 @@ command=(
 cd "${SCRIPT_DIR}"
 printf 'Launching %s as %s directly on devices %s\n' \
   "${MODEL_PATH}" "${SERVED_MODEL_NAME}" "${DEVICE_IDS}" >&2
-printf 'Serving NVFP4 routed experts through B12X W4A16 (BF16 activations)\n' >&2
+printf 'Serving NVFP4 routed experts through B12X; FORCE_A16=%s\n' \
+  "${VLLM_B12X_MOE_FP4_FORCE_A16}" >&2
 printf 'Linear backend: %s\n' "${LINEAR_BACKEND}" >&2
 printf 'Speculator: %s (%s draft tokens)\n' \
   "${SPECULATOR}" "${NUM_SPECULATIVE_TOKENS}" >&2

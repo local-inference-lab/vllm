@@ -43,6 +43,8 @@ class ModelSpecificAttnMetadata:
 
 
 class ModelState(ABC):
+    specialize_full_decode_graphs: ClassVar[bool] = False
+    """Capture decode-specific graphs alongside general full-model graphs."""
     supports_prompt_embeds: ClassVar[bool] = False
     """Whether this state implements user-provided prompt embeddings."""
 

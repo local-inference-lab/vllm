@@ -31,6 +31,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     compute_mm_prefix_ranges,
     get_attn_cg_support,
     get_query_lens_mismatch_unsupported_backend,
+    init_attn_backend,
     synchronize_attention_impl_kv_cache_layout,
 )
 from vllm.v1.worker.utils import (
@@ -146,6 +147,65 @@ def test_attention_impl_cache_layout_preserves_model_specific_dtype():
     assert draft_cache_config.kv_cache_layout == "BLHNC"
     assert target_cache_config.cache_dtype == "fp8_ds_mla"
     assert draft_cache_config.cache_dtype == "fp8"
+
+
+def test_attention_builders_keep_target_and_draft_model_configs(monkeypatch):
+    import vllm.v1.worker.gpu.attn_utils as attn_utils
+
+    class Builder(_FakeMetadataBuilder):
+        requires_block_table_width = False
+
+        def __init__(self, spec, layer_names, config, device):
+            super().__init__(AttentionCGSupport.ALWAYS)
+            self.config = config
+
+    class Backend:
+        @staticmethod
+        def full_cls_name():
+            return (__name__, "Backend")
+
+        @staticmethod
+        def get_supported_kernel_block_sizes():
+            return [16]
+
+        @staticmethod
+        def get_builder_cls():
+            return Builder
+
+    configs = [
+        SimpleNamespace(cache_config=SimpleNamespace(kv_cache_layout=None))
+        for _ in range(2)
+    ]
+    layers = {
+        name: SimpleNamespace(get_attn_backend=lambda: Backend, num_heads=8)
+        for name in ("target", "draft")
+    }
+    monkeypatch.setattr(attn_utils, "get_shared_kv_cache_layers", lambda _: {})
+    monkeypatch.setattr(
+        attn_utils,
+        "get_layers_from_vllm_config",
+        lambda config, layer_type, names: {name: layers[name] for name in names},
+    )
+    spec = FullAttentionSpec(
+        block_size=32, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    cache = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(list(layers), spec)],
+    )
+
+    groups, _, kernel_sizes = init_attn_backend(
+        cache,
+        configs[0],
+        torch.device("cpu"),
+        layer_vllm_configs={"draft": configs[1]},
+    )
+
+    assert kernel_sizes == [16]
+    assert len(groups[0]) == 2
+    for group, expected_config in zip(groups[0], configs):
+        assert group.get_metadata_builder(0).config is expected_config
 
 
 def test_attention_checks_preserve_global_and_target_scoped_support():

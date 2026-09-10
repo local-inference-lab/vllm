@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from tests.utils import get_open_port, init_test_distributed_environment
 from vllm.model_executor.kernels.linear import (
     _LINEAR_BACKEND_KERNEL_MAP,
     _POSSIBLE_FP8_BLOCK_KERNELS,
@@ -1070,3 +1071,291 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
         expected = reference(source, a16)
         relative = (output.float() - expected.float()).norm() / expected.float().norm()
         assert relative < 0.005
+
+
+@pytest.mark.parametrize("leading_shape", [(17,), (1, 17)])
+def test_v41_block32_adapter_preserves_native_output_view_and_replay(
+    monkeypatch,
+    leading_shape,
+):
+    """Real FP8 execution must adapt vLLM output ranks without copying scratch."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native b12x projection requires SM12x")
+    from types import SimpleNamespace
+
+    from flashinfer.b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+    from vllm.models.deepseek_v4_1 import b12x_layers
+    from vllm.v1.worker import workspace
+
+    device = torch.device("cuda")
+    monkeypatch.setattr(b12x_layers, "_capacity", lambda: 17)
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    monkeypatch.setattr(workspace, "_manager", workspace.WorkspaceManager(device))
+    torch.manual_seed(41107)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.randn(96, 128, device=device).to(torch.float8_e4m3fn),
+        requires_grad=False,
+    )
+    layer.weight_scale_inv = torch.nn.Parameter(
+        torch.full((3, 4), 0.125, device=device).to(torch.float8_e8m0fnu),
+        requires_grad=False,
+    )
+    method = b12x_layers.B12xFP8LinearMethod(
+        SimpleNamespace(weight_block_size=[32, 32])
+    )
+    method.process_weights_after_loading(layer)
+    source = torch.randn((*leading_shape, 128), device=device, dtype=torch.bfloat16)
+
+    def oracle():
+        values = source.float().reshape(-1, 4, 32)
+        scales = torch.exp2(
+            torch.ceil(
+                torch.log2(values.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448.0)
+            )
+        )
+        values = ((values / scales).to(torch.float8_e4m3fn).float() * scales).reshape(
+            -1, 128
+        )
+        weights = layer.weight.float() * 0.125
+        return (values @ weights.T).bfloat16().view(*leading_shape, 96)
+
+    actual = method.apply(layer, source)
+    torch.testing.assert_close(actual, oracle(), rtol=0.01, atol=0.01)
+    freeze_kernel_resolution("V4.1 vLLM block32 output-view replay")
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with workspace.collect_cuda_graph_capture_resources() as retained:
+            with torch.cuda.graph(graph):
+                captured = method.apply(layer, source)
+        source.mul_(0.5)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, oracle(), rtol=0.01, atol=0.01)
+        del retained
+    finally:
+        unfreeze_kernel_resolution()
+
+
+def _check_v41_vocab_embedding_and_tied_head(device):
+    from flashinfer.b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+    from vllm.distributed.parallel_state import graph_capture
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
+    from vllm.models.deepseek_v4_1.b12x_layers import B12xLogitsProcessor
+    from vllm.models.deepseek_v4_1.quant_config import DeepseekV41FP8Config
+    from vllm.v1.worker import workspace
+
+    vocab, hidden = 131, 128
+    quant_config = DeepseekV41FP8Config(
+        is_checkpoint_fp8_serialized=True,
+        weight_block_size=[32, 32],
+    )
+    with torch.device(device):
+        target = VocabParallelEmbedding(
+            vocab,
+            hidden,
+            params_dtype=torch.bfloat16,
+            quant_config=quant_config,
+        )
+        head = ParallelLMHead(
+            vocab,
+            hidden,
+            params_dtype=torch.bfloat16,
+            quant_config=quant_config,
+        ).tie_weights(target)
+    checkpoint = (
+        torch.arange(vocab, device=device)[:, None] / 16
+        + torch.arange(hidden, device=device)[None, :] / 128
+    ).bfloat16()
+    target.weight_loader(target.weight, checkpoint)
+    target.quant_method.process_weights_after_loading(target)
+    ids = torch.tensor([0, 1, 63, 64, 95, 96, 127, 130], device=device)
+    probe = torch.zeros((1, hidden), dtype=torch.bfloat16, device=device)
+    probe[0, 0] = 1
+    processor = B12xLogitsProcessor(vocab)
+
+    def check_head():
+        logits = processor(head, probe)
+        if logits is not None:  # Gather returns logits only on its destination.
+            torch.testing.assert_close(
+                logits,
+                checkpoint[:, 0].unsqueeze(0),
+                rtol=0,
+                atol=0,
+                check_dtype=False,
+            )
+
+    torch.testing.assert_close(target(ids), checkpoint[ids], rtol=0, atol=0)
+    check_head()
+    freeze_kernel_resolution("V4.1 sharded vocabulary embedding replay")
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with workspace.collect_cuda_graph_capture_resources() as retained:
+            with graph_capture(device=device) as capture_context:
+                with torch.cuda.graph(graph, stream=capture_context.stream):
+                    captured = target(ids)
+        for offset in (3, 17):
+            ids.add_(offset).remainder_(vocab)
+            checkpoint.neg_()
+            target.weight_loader(target.weight, checkpoint)
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(captured, checkpoint[ids], rtol=0, atol=0)
+            # Reload the target after tying: the head must see current weights,
+            # not a copied or prepacked snapshot from embedding finalization.
+            check_head()
+        del retained
+    finally:
+        unfreeze_kernel_resolution()
+
+
+def test_v41_vocab_embedding_global_ids_and_target_weight_tie(request, monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native b12x embedding requires SM12x")
+    monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "0")
+    request.getfixturevalue("dist_init")
+    with torch.no_grad():
+        _check_v41_vocab_embedding_and_tied_head(torch.device("cuda", 0))
+
+
+def _run_v41_sharded_embedding(rank, port):
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed.parallel_state import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+    )
+
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    with set_current_vllm_config(VllmConfig()), torch.no_grad():
+        try:
+            init_test_distributed_environment(2, 1, rank, str(port), local_rank=rank)
+            _check_v41_vocab_embedding_and_tied_head(device)
+        finally:
+            destroy_model_parallel()
+            destroy_distributed_environment()
+
+
+@pytest.mark.distributed(num_gpus=2)
+def test_v41_vocab_embedding_sharded_global_ids_and_target_weight_tie(monkeypatch):
+    # This test already spawns fresh workers. Forking an outer test process
+    # after a preceding CUDA test would inherit an unusable CUDA context.
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("native b12x embedding requires two GPUs")
+    if any(torch.cuda.get_device_capability(i)[0] != 12 for i in range(2)):
+        pytest.skip("native b12x embedding requires two SM12x GPUs")
+    monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "0")
+    torch.multiprocessing.spawn(
+        _run_v41_sharded_embedding,
+        args=(get_open_port(),),
+        nprocs=2,
+        join=True,
+    )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("broadcast", [False, True])
+def test_v41_mhc_shares_scratch_and_preserves_live_outputs(monkeypatch, broadcast):
+    from types import SimpleNamespace
+
+    from flashinfer.b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from flashinfer.b12x.norm import mhc
+
+    from vllm.models.deepseek_v4_1 import b12x_layers
+    from vllm.v1.worker import workspace
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native b12x mHC requires SM12x")
+    device = torch.device("cuda", torch.cuda.current_device())
+    capacity, hidden, tokens = 4096, 5120, 3
+    monkeypatch.setattr(b12x_layers, "_capacity", lambda: capacity)
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(device)
+    monkeypatch.setattr(workspace, "_manager", manager)
+    config = SimpleNamespace(
+        hidden_size=hidden,
+        hc_mult=4,
+        rms_norm_eps=1e-20,
+        hc_eps=1e-6,
+        hc_sinkhorn_iters=20,
+    )
+    allocated = torch.cuda.memory_allocated(device)
+    with torch.device(device):
+        first, second = b12x_layers.B12xMHC(config), b12x_layers.B12xMHC(config)
+    # Model construction must not reserve capacity-sized activations per layer.
+    assert torch.cuda.memory_allocated(device) - allocated < 1024**2
+    torch.manual_seed(4124096)
+    shape = (tokens, hidden) if broadcast else (tokens, 4, hidden)
+    residual = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    fn = torch.randn(24, 4 * hidden, device=device) * 0.001
+    first_fn = fn.view(24, 4, hidden).sum(1) if broadcast else fn
+    scale = torch.full((3,), 0.1, device=device)
+    bias = torch.zeros(24, device=device)
+    norm = torch.ones(hidden, device=device, dtype=torch.bfloat16)
+    identity = torch.zeros(tokens, 4, device=device)
+    identity[:, 0] = 1
+
+    def run():
+        a = first.pre(residual, first_fn, scale, bias, norm, None)
+        reconstructed = first.post(a[3] * 0.125, a[0], a[1], a[2])
+        b = second.pre(reconstructed, fn, scale, bias, norm, a[4])
+        return (*a, reconstructed, *b)
+
+    def expected():
+        incoming = identity
+        state = residual
+        outputs = []
+        for index in range(2):
+            predicted = torch.empty_like(incoming)
+            result = mhc.run_pre(
+                state,
+                first_fn if index == 0 else fn,
+                scale,
+                bias,
+                pre_mix=incoming,
+                pre_out=predicted,
+                norm_weight=norm,
+                norm_eps=1e-20,
+                rms_eps=1e-20,
+                hc_eps=1e-6,
+                sinkhorn_iters=20,
+            )
+            outputs.extend((*result, predicted))
+            if index == 0:
+                state = mhc.run_post(result[3] * 0.125, result[0], result[1], result[2])
+                outputs.append(state)
+            incoming = predicted
+        return outputs
+
+    actual = run()
+    reference = expected()
+    for got, want in zip(actual, reference, strict=True):
+        torch.testing.assert_close(got, want, rtol=2e-5, atol=0.008)
+    retained_outputs = [tensor.clone() for tensor in actual]
+    specs = b12x_layers._mhc_plan(device, capacity, hidden).shapes_and_dtypes()
+    (scratch,) = manager.get_simultaneous(*specs)
+    scratch.fill_(173)
+    for got, want in zip(actual, retained_outputs, strict=True):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    manager.lock()
+    freeze_kernel_resolution("V4.1 shared mHC workspace")
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with workspace.collect_cuda_graph_capture_resources() as resources:
+            with torch.cuda.graph(graph):
+                captured = run()
+        for factor in (0.5, -1.0):
+            residual.mul_(factor)
+            graph.replay()
+            torch.cuda.synchronize()
+            for got, want in zip(captured, expected(), strict=True):
+                torch.testing.assert_close(got, want, rtol=2e-5, atol=0.008)
+        del resources
+    finally:
+        unfreeze_kernel_resolution()
