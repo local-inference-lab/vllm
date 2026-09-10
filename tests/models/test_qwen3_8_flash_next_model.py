@@ -467,16 +467,23 @@ def test_ple_table_memory_env_rejects_backend_names(monkeypatch) -> None:
 
 
 def test_qwen3_8_prefers_b12x_gdn_unless_explicitly_overridden(monkeypatch) -> None:
-    config = SimpleNamespace(additional_config={})
+    config = SimpleNamespace(
+        additional_config={},
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="qwen3_8_flash_next_text")
+        ),
+    )
     monkeypatch.delenv("VLLM_GDN_DECODE_KERNEL", raising=False)
-    assert _resolve_gdn_decode_kernel(config, prefer_b12x=True) == ("b12x", False)
-    assert _resolve_gdn_decode_kernel(config, prefer_b12x=False) == ("cuda", False)
+    assert _resolve_gdn_decode_kernel(config) == ("b12x", False)
+    config.model_config.hf_text_config.model_type = "qwen3_next"
+    assert _resolve_gdn_decode_kernel(config) == ("cuda", False)
 
     monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "triton")
-    assert _resolve_gdn_decode_kernel(config, prefer_b12x=True) == ("triton", True)
+    config.model_config.hf_text_config.model_type = "qwen3_8_flash_next_text"
+    assert _resolve_gdn_decode_kernel(config) == ("triton", True)
 
     config.additional_config["gdn_decode_kernel"] = "b12x"
-    assert _resolve_gdn_decode_kernel(config, prefer_b12x=False) == ("b12x", True)
+    assert _resolve_gdn_decode_kernel(config) == ("b12x", True)
 
 
 def test_explicit_ple_table_memory_overrides_env_alias(monkeypatch) -> None:
@@ -764,6 +771,7 @@ def test_b12x_gdn_bind_preserves_exact_aligned_page_stride(monkeypatch) -> None:
     layer = QwenGatedDeltaNetAttention.__new__(QwenGatedDeltaNetAttention)
     nn.Module.__init__(layer)
     layer.gdn_decode_kernel = "b12x"
+    layer.gdn_prefill_backend = "triton"
     layer._b12x_plan = None
     _set_tensor_attributes(
         layer,

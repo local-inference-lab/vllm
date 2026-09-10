@@ -187,7 +187,6 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
-                prefer_b12x_gdn_decode=True,
                 overlap_input_projections=envs.VLLM_QWEN3_8_FLASH_NEXT_OVERLAP,
             )
         elif layer_type == "full_attention":

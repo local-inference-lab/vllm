@@ -61,6 +61,8 @@ class Qwen3_8FlashNextAttnMetadata(MambaHybridAttnMetadata):
 class Qwen3_8FlashNextModelState(MambaHybridModelState):
     """Add rollback-safe n-gram history and persistent QSA request identity."""
 
+    specialize_full_decode_graphs = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,

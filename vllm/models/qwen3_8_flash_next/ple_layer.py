@@ -41,10 +41,10 @@ from vllm.utils.b12x import (
 )
 from vllm.utils.torch_utils import current_stream, direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from .config import Qwen3_8FlashNextTextConfig
+from .ple_attn import PLEAttentionBackend, PLEAttentionMetadata
 
 logger = init_logger(__name__)
 
@@ -997,6 +997,9 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
     def mamba_type(self) -> MambaAttentionBackendEnum:
         return MambaAttentionBackendEnum.SHORT_CONV
 
+    def get_attn_backend(self) -> type[PLEAttentionBackend]:
+        return PLEAttentionBackend
+
     @property
     def is_kv_cache_tp_replicated(self) -> bool:
         return True
@@ -1018,59 +1021,25 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
 
     def _prepare_metadata(
         self,
-        metadata: ShortConvAttentionMetadata,
+        metadata: PLEAttentionMetadata,
         query_start_loc: torch.Tensor,
         token_count: int,
     ) -> None:
-        num_seqs = int(metadata.num_reqs)
-        if num_seqs > self.max_seqs or token_count > self.max_tokens:
+        inputs = metadata.graph_inputs
+        if inputs is None:
+            raise RuntimeError("PLE metadata has no staged graph inputs")
+        if inputs.max_seqs != self.max_seqs or token_count > self.max_tokens:
             raise ValueError(
                 f"PLE capacity exceeded: tokens={token_count}/{self.max_tokens}, "
-                f"requests={num_seqs}/{self.max_seqs}"
+                f"requests={inputs.max_seqs}/{self.max_seqs}"
             )
-        if query_start_loc.numel() < num_seqs + 1:
-            raise ValueError("PLE query_start_loc is shorter than request metadata")
-        self._query_start_loc.zero_()
-        self._query_start_loc[: num_seqs + 1].copy_(
-            query_start_loc[: num_seqs + 1].to(torch.int32)
-        )
-        self._state_slot_ids.fill_(NULL_BLOCK_ID)
-        self._state_is_fresh.fill_(True)
-        self._num_accepted_tokens.fill_(1)
-        self._request_is_prefill.zero_()
-
-        num_decodes = int(metadata.num_decodes)
-        num_prefills = int(metadata.num_prefills)
-        if num_decodes:
-            state_d = metadata.state_indices_tensor_d
-            if state_d is None:
-                raise RuntimeError("decode PLE metadata is missing state indices")
-            if state_d.ndim == 2:
-                state_d = state_d[:, 0]
-            self._state_slot_ids[:num_decodes].copy_(state_d[:num_decodes])
-            self._state_is_fresh[:num_decodes] = False
-            if metadata.num_accepted_tokens is not None:
-                self._num_accepted_tokens[:num_decodes].copy_(
-                    metadata.num_accepted_tokens[:num_decodes].to(torch.int32)
-                )
-        if num_prefills:
-            state_p = metadata.state_indices_tensor_p
-            if state_p is None:
-                raise RuntimeError("prefill PLE metadata is missing state indices")
-            start = num_decodes
-            self._state_slot_ids[start : start + num_prefills].copy_(
-                state_p[:num_prefills]
-            )
-            has_initial = metadata.has_initial_states_p
-            if has_initial is None:
-                raise RuntimeError("prefill PLE metadata is missing fresh-state flags")
-            self._state_is_fresh[start : start + num_prefills].copy_(
-                ~has_initial[:num_prefills]
-            )
-            self._request_is_prefill[start : start + num_prefills] = True
-
-        self._num_seqs.fill_(num_seqs)
-        self._num_tokens.copy_(query_start_loc[num_seqs : num_seqs + 1])
+        self._query_start_loc.copy_(inputs.query_start_loc)
+        self._state_slot_ids.copy_(inputs.state_slot_ids)
+        self._state_is_fresh.copy_(inputs.state_is_fresh)
+        self._num_accepted_tokens.copy_(inputs.num_accepted_tokens)
+        self._request_is_prefill.copy_(inputs.request_is_prefill)
+        self._num_seqs.copy_(inputs.num_seqs)
+        self._num_tokens.copy_(inputs.num_tokens)
 
     def _run_ple(
         self,
@@ -1092,9 +1061,9 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             self._out.zero_()
             self._out[:token_count].copy_(value[:, None, :].expand_as(residual))
             return
-        if not isinstance(metadata, ShortConvAttentionMetadata):
+        if not isinstance(metadata, PLEAttentionMetadata):
             raise TypeError(
-                f"expected ShortConvAttentionMetadata for {self.prefix}, got "
+                f"expected PLEAttentionMetadata for {self.prefix}, got "
                 f"{type(metadata).__name__}"
             )
         if self._plan is None:

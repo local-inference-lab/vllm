@@ -261,7 +261,6 @@ command=(
   --max-num-seqs "${MAX_NUM_SEQS}"
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
   --speculative-config "${speculative_config}"
-  --gdn-decode-kernel b12x
   --linear-backend b12x
   --moe-backend b12x
   --no-enable-flashinfer-autotune
@@ -285,5 +284,10 @@ if [[ -n "${TORCH_PROFILE_DIR}" ]]; then
     "${TORCH_PROFILE_DIR}" >&2
   printf 'Trigger with b12x vllm-take-capture; auto-stop: %s engine steps.\n' \
     "${TORCH_PROFILE_MAX_ITERATIONS}" >&2
+fi
+if [[ "${DRY_RUN:-0}" == 1 ]]; then
+  printf '%q ' "${command[@]}"
+  printf '\n'
+  exit 0
 fi
 exec "${command[@]}"

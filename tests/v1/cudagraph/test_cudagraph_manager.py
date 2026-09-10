@@ -218,6 +218,34 @@ def test_capture_synchronizes_auxiliary_warmup_streams(monkeypatch):
 _DECODE_QUERY_LEN = 3
 
 
+def test_full_mode_prefers_decode_specialization_and_captures_mixed_batches(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform, "get_global_graph_pool", lambda: object()
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=_create_vllm_config(),
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL,
+        decode_query_len=1,
+        specialize_full_decode=True,
+    )
+    manager._graphs_captured = True
+    decode = manager.dispatch(2, 2, 1, 0, max_query_len=1)
+    prefill = manager.dispatch(1, 4, None, 0, max_query_len=4)
+    assert decode.cg_mode == prefill.cg_mode == CUDAGraphMode.FULL
+    assert decode.uniform_token_count == 1
+    assert prefill.uniform_token_count is None
+    assert decode != prefill
+    assert {decode, prefill} <= set(manager._capture_descs[CUDAGraphMode.FULL])
+
+
 def _create_decode_vllm_config(
     capture_sizes: list[int],
     num_speculative_tokens: int = 0,

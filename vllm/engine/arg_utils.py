@@ -782,7 +782,9 @@ class EngineArgs:
     )
 
     fail_on_environ_validation: bool = False
-    gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl"] | None = None
+    gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl", "b12x"] | None = (
+        None
+    )
     gdn_decode_kernel: Literal["b12x", "cuda", "triton"] | None = None
     kda_prefill_backend: Literal["auto", "triton", "flashkda", "b12x"] | None = None
 
@@ -1768,16 +1770,22 @@ class EngineArgs:
         parser.add_argument(
             "--gdn-prefill-backend",
             dest="gdn_prefill_backend",
-            choices=["flashinfer", "triton", "cutedsl"],
+            choices=["flashinfer", "triton", "cutedsl", "b12x"],
             default=None,
-            help="Select GDN prefill backend.",
+            help=(
+                "Select GDN prefill backend. Selecting b12x also selects b12x "
+                "decode; conflicting explicit GDN selections are rejected."
+            ),
         )
         parser.add_argument(
             "--gdn-decode-kernel",
             dest="gdn_decode_kernel",
             choices=["b12x", "cuda", "triton"],
             default=None,
-            help="Select GDN decode kernel.",
+            help=(
+                "Select GDN decode kernel. Selecting b12x also selects b12x "
+                "prefill; conflicting explicit GDN selections are rejected."
+            ),
         )
         parser.add_argument(
             "--kda-prefill-backend",

@@ -1225,10 +1225,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))
     ),
-    # Select the GDN decode implementation. "b12x" uses the planned SM120/SM121
-    # operator, while "cuda" uses the fused decode kernel where supported and
-    # falls back to "triton" otherwise. Setting "cuda" explicitly raises when
-    # unsupported.
+    # Select the GDN decode implementation. "b12x" also selects b12x GDN prefill;
+    # conflicting explicit prefill overrides are rejected. "cuda" uses the fused
+    # decode kernel where supported and falls back to "triton" otherwise.
+    # Setting "cuda" explicitly raises when unsupported.
     "VLLM_GDN_DECODE_KERNEL": env_with_choices(
         "VLLM_GDN_DECODE_KERNEL",
         "cuda",

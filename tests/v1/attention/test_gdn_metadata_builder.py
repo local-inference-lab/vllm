@@ -895,3 +895,99 @@ def test_gdn_mixed_spec_update_selects_group_specific_state_indices() -> None:
         metadata_b.prefill_state_indices,
         builder_b.mamba_aligned_state_indices[0:1, 0],
     )
+
+
+@pytest.mark.parametrize("num_spec", [0, 3])
+@pytest.mark.parametrize("full_cuda_graph", [False, True])
+def test_b12x_mixed_metadata_reuse_preserves_group_owned_buffers(
+    monkeypatch, num_spec: int, full_cuda_graph: bool
+) -> None:
+    """Cache-group refreshes cannot mutate another group's captured worklists."""
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn."
+        "_resolve_gdn_prefill_backend",
+        lambda _: ("b12x", "b12x"),
+    )
+    builders = [_create_gdn_builder(num_spec, full_cuda_graph, 1) for _ in range(3)]
+    for group, builder in enumerate(builders):
+        builder.vllm_config.cache_config.mamba_cache_mode = "align"
+        builder.mamba_aligned_state_indices = (
+            torch.arange(3 * (num_spec + 1), dtype=torch.int32)
+            .reshape(3, num_spec + 1)
+            .add_(100 * (group + 1))
+        )
+    owned = [builder._b12x_mixed for builder in builders]
+    pointers = [
+        {
+            name: value.data_ptr()
+            for name, value in vars(work).items()
+            if isinstance(value, torch.Tensor)
+        }
+        for work in owned
+    ]
+    trials = [
+        ([33, 33, 20], [1, 33, 4], [-1, -1, 3]),
+        ([17, 34, 19], [17, 1, 2], [-1, -1, 1]),
+        ([40, 40, 40], [4, 4, 4], [3, 3, 3]),
+        ([41, 41, 41], [1, 1, 1], [-1, -1, -1]),
+    ]
+    for trial, (seq_lens, query_lens, drafts) in enumerate(trials):
+        common = create_common_attn_metadata(
+            BatchSpec(seq_lens=seq_lens, query_lens=query_lens),
+            BLOCK_SIZE,
+            DEVICE,
+            arange_block_indices=True,
+        ).replace(
+            is_prefilling=torch.tensor(
+                [query == length for query, length in zip(query_lens, seq_lens)]
+            )
+        )
+        if trial == 0:
+            captured = [
+                builder.build_for_cudagraph_capture(common) for builder in builders
+            ]
+        accepted = torch.tensor([1, 2, 1], dtype=torch.int32)
+        draft_tokens = torch.tensor(drafts, dtype=torch.int32) if num_spec else None
+        tables = [common.block_table_tensor + 1000 * (group + 1) for group in range(3)]
+        metadata = [
+            builders[0].build(
+                0, common.replace(block_table_tensor=tables[0]), accepted, draft_tokens
+            )
+        ]
+        source = metadata[0].b12x_mixed
+        before = source.state_indices.clone()
+        for builder, table in zip(builders[1:], tables[1:]):
+            metadata.append(builder.update_block_table(metadata[0], table, None))
+        torch.testing.assert_close(source.state_indices, before)
+        for group, (builder, result, work) in enumerate(zip(builders, metadata, owned)):
+            assert result.b12x_mixed is work
+            assert captured[group].b12x_mixed is work
+            for name, pointer in pointers[group].items():
+                assert getattr(work, name).data_ptr() == pointer
+            non_spec_rows = [
+                row for row, draft in enumerate(drafts) if not num_spec or draft < 0
+            ]
+            spec_rows = [
+                row for row, draft in enumerate(drafts) if num_spec and draft >= 0
+            ]
+            indices = builder.mamba_aligned_state_indices
+            torch.testing.assert_close(
+                work.state_indices[: len(non_spec_rows)], indices[non_spec_rows, 0]
+            )
+            torch.testing.assert_close(
+                work.spec_state_indices[: len(spec_rows)], indices[spec_rows]
+            )
+            assert work._num_non_spec == len(non_spec_rows)
+            assert work._num_spec == len(spec_rows)
+            assert work.live_counts.tolist() == [
+                len(non_spec_rows),
+                sum(query_lens[row] for row in non_spec_rows),
+            ]
+            assert work.spec_counts.tolist() == [
+                len(spec_rows),
+                sum(query_lens[row] for row in spec_rows),
+            ]
+            if trial == 0:
+                assert work.checkpoint.checkpoint_offsets[1] == 32
+                assert work.checkpoint.state_indices[1] == tables[group][1, 1]
+            builder.mamba_aligned_state_indices.add_(20)
