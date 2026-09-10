@@ -72,7 +72,7 @@ def _reference(vision, aligner, patches, height, width):
 def test_native_small_vision_block_aligner_and_image_isolation():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native b12x vision requires SM12x")
-    from flashinfer.b12x._lib.runtime_control import (
+    from b12x._lib.runtime_control import (
         freeze_kernel_resolution,
         unfreeze_kernel_resolution,
     )

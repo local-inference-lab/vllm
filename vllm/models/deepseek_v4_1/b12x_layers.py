@@ -8,9 +8,9 @@ from functools import cache
 from weakref import WeakValueDictionary
 
 import torch
-from flashinfer.b12x.gemm import bf16_gemv, block_fp8_linear
-from flashinfer.b12x.norm import hyperconnection, mhc
-from flashinfer.b12x.sequence import embedding
+from b12x.gemm import bf16_gemv, block_fp8_linear
+from b12x.norm import hyperconnection, mhc
+from b12x.sequence import embedding
 from torch import nn
 
 from vllm.config import get_current_vllm_config

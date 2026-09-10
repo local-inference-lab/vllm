@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from flashinfer.b12x.sequence import engram as native
+from b12x.sequence import engram as native
 from safetensors.torch import save_file
 from torch import nn
 
