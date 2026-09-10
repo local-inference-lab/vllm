@@ -49,6 +49,11 @@ def mask_dcp_empty_shards_(
         or query_start_loc.shape[0] != seq_lens.shape[0] + 1
     ):
         raise ValueError("query_start_loc must contain one boundary per sequence")
+    if seq_lens.numel() == 0:
+        # A DCP rank can receive no local sequences during draft prefill. Its
+        # contribution must be ignored by the cross-rank LSE reduction.
+        lse.fill_(float("-inf"))
+        return
 
     row_indices = torch.arange(
         lse.shape[0], device=lse.device, dtype=query_start_loc.dtype

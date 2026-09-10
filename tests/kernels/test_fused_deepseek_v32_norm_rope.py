@@ -234,6 +234,57 @@ def test_fused_norm_rope(num_tokens: int, index_interleave: bool, mla_dtype: str
     assert (topk == -1).all(), "topk buffer not cleared on indexer layer"
 
 
+def test_fused_norm_rope_computes_q_for_unmapped_dcp_tokens():
+    """DCP cache ownership must not turn replicated query rows into padding."""
+    torch.manual_seed(11)
+    dev = "cuda"
+    num_tokens = 4
+    pos = torch.arange(num_tokens, device=dev, dtype=torch.int64)
+    q_c = torch.randn(num_tokens, Q_LORA, device=dev, dtype=torch.bfloat16)
+    kv_c = torch.randn(num_tokens, KV_LORA, device=dev, dtype=torch.bfloat16)
+    k_pe = torch.randn(num_tokens, ROPE_DIM, device=dev, dtype=torch.bfloat16)
+    qw = torch.randn(Q_LORA, device=dev, dtype=torch.bfloat16)
+    kvw = torch.randn(KV_LORA, device=dev, dtype=torch.bfloat16)
+    cos_sin = make_cos_sin(16, ROPE_DIM, dev)
+    mla_cache = torch.zeros(
+        1,
+        num_tokens,
+        KV_LORA + ROPE_DIM,
+        device=dev,
+        dtype=torch.bfloat16,
+    )
+    slot_mapping = torch.tensor([0, -1, 1, -1], device=dev, dtype=torch.int64)
+    topk = torch.empty((num_tokens, 2048), device=dev, dtype=torch.int32)
+
+    q_out = K.fused_norm_rope(
+        pos,
+        q_c,
+        qw,
+        EPS,
+        kv_c,
+        kvw,
+        EPS,
+        k_pe,
+        cos_sin,
+        None,
+        None,
+        None,
+        EPS,
+        None,
+        topk,
+        slot_mapping=slot_mapping,
+        mla_kv_cache=mla_cache,
+        has_indexer=False,
+    )
+
+    assert_bf16(q_out, rms_norm(q_c, qw), "DCP q_c rmsnorm")
+    kv_ref = rms_norm(kv_c, kvw)
+    kpe_ref = rope(k_pe.float(), pos, cos_sin, interleave=True)
+    expected_cache = torch.cat([kv_ref[[0, 2]], kpe_ref[[0, 2]]], dim=-1)
+    assert_bf16(mla_cache[0, :2], expected_cache, "DCP-owned MLA cache rows")
+    assert torch.count_nonzero(mla_cache[0, 2:]) == 0
+
+
 def test_fused_norm_rope_writes_strided_indexer_cache_pages():
     """BLHNC indexer pages must retain their physical block stride."""
     torch.manual_seed(7)
