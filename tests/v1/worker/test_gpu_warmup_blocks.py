@@ -15,6 +15,7 @@ import torch
 
 from tests.v1.core.test_prefix_caching import make_kv_cache_manager
 from tests.v1.core.utils import create_requests
+from vllm import SamplingParams
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.vllm import VllmConfig
 from vllm.platforms import current_platform
@@ -104,6 +105,8 @@ class _StepRecorder:
         self._held: dict[str, list[int]] = {}
 
     def execute_model(self, scheduler_output) -> None:
+        for req_id in scheduler_output.finished_req_ids:
+            del self._held[req_id]
         for new_req in scheduler_output.scheduled_new_reqs:
             self._held[new_req.req_id] = [len(ids) for ids in new_req.block_ids]
             self._record(new_req.req_id, new_req.num_computed_tokens, scheduler_output)
@@ -158,6 +161,80 @@ def test_warmup_kernels_reserves_lookahead_blocks(num_spec_steps, extra_lookahea
     )
 
     _assert_covers_lookahead(recorder.steps, num_lookahead_tokens)
+
+
+@pytest.mark.parametrize("num_reqs", [1, 4])
+@pytest.mark.parametrize("num_spec_steps", [0, NUM_SPEC_STEPS])
+@pytest.mark.parametrize("is_last_pp_rank", [False, True])
+def test_warmup_covers_both_sampling_paths_without_repeating_model_warmup(
+    num_reqs, num_spec_steps, is_last_pp_rank
+):
+    """A plain-only batch must reach sampling and speculative verification.
+
+    Feature-rich requests promote the whole logits batch to FP32, so merely
+    mixing a greedy request into that batch does not warm native-dtype kernels.
+    Recycling requests must also work with only one available request slot.
+    """
+    runner = _make_runner([_attention_group()], num_spec_steps, num_spec_steps)
+    runner.scheduler_config.max_num_seqs = num_reqs
+    runner.max_num_reqs = num_reqs
+    runner.is_last_pp_rank = is_last_pp_rank
+    recorder = _StepRecorder()
+    live_params = {}
+    sampled_paths = set()
+    pending = None
+    prefill_tokens = 0
+    forward_steps = 0
+    connector_disabled = False
+
+    def set_disabled(disabled):
+        nonlocal connector_disabled
+        connector_disabled = disabled
+
+    runner.kv_connector.set_disabled = set_disabled
+
+    def execute(scheduled):
+        nonlocal pending, prefill_tokens, forward_steps
+        assert connector_disabled
+        assert pending is None, "every forward must sample before the next step"
+        for req_id in scheduled.finished_req_ids:
+            del live_params[req_id]
+        for req in scheduled.scheduled_new_reqs:
+            assert req.req_id not in live_params
+            live_params[req.req_id] = req.sampling_params
+            prefill_tokens += scheduled.num_scheduled_tokens[req.req_id]
+        assert len(live_params) <= num_reqs
+        assert set(scheduled.num_scheduled_tokens) <= live_params.keys()
+        recorder.execute_model(scheduled)
+        if scheduled.total_num_scheduled_tokens:
+            pending = scheduled
+            forward_steps += 1
+
+    def sample(grammar_output):
+        nonlocal pending
+        assert pending is not None
+        if not is_last_pp_rank:
+            assert grammar_output is None
+        params = [live_params[rid] for rid in pending.num_scheduled_tokens]
+        plain = all(p == SamplingParams(temperature=0.0) for p in params)
+        sampled_paths.add((plain, bool(pending.scheduled_spec_decode_tokens)))
+        pending = None
+
+    warmup_kernels(runner, execute, sample)
+
+    expected = {(False, False), (True, False)}
+    if num_spec_steps:
+        expected |= {(False, True), (True, True)}
+    assert sampled_paths == expected
+    # One full prefill plus at most one token to initialize plain sampling;
+    # at most the original shape sweep plus one tiny forward.
+    assert prefill_tokens <= num_reqs * (runner.decode_query_len + 1) + 1
+    assert forward_steps <= (7 if num_spec_steps else 5)
+    assert pending is None
+    assert not live_params
+    assert not recorder._held
+    assert not connector_disabled
+    _assert_covers_lookahead(recorder.steps, num_spec_steps)
 
 
 def test_mixed_warmup_reserves_lookahead_blocks():

@@ -22,7 +22,6 @@ import uvicorn
 import uvloop
 from fastapi import FastAPI, Response
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.system_utils import (
     decorate_logs,
@@ -261,7 +260,9 @@ def _run_vllm_dp_server(child_args: argparse.Namespace) -> None:
     name = f"APIServer_DP{child_args.data_parallel_rank}"
     set_process_title(name)
     decorate_logs(name)
-    if envs.VLLM_USE_RUST_FRONTEND and envs.VLLM_RUST_FRONTEND_PATH:
+    from vllm.entrypoints.cli.serve import resolve_rust_frontend_path
+
+    if resolve_rust_frontend_path(child_args):
         _run_rust_vllm_dp_server(child_args)
     else:
         _run_python_vllm_dp_server(child_args)

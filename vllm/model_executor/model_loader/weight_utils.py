@@ -23,7 +23,7 @@ import huggingface_hub.constants
 import numpy as np
 import regex as re
 import torch
-from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
+from safetensors.torch import _TYPES as _SAFETENSORS_BASE_DTYPES
 from safetensors.torch import load, load_file, safe_open, save_file
 from tqdm.auto import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
@@ -69,6 +69,13 @@ except ImportError:
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 
 logger = init_logger(__name__)
+
+# The Rust reader supports E8M0 even in releases whose Python lookup omits it.
+# Extend a local map; do not mutate safetensors' process-global dtype registry.
+_SAFETENSORS_TO_TORCH_DTYPE = {
+    **_SAFETENSORS_BASE_DTYPES,
+    "F8_E8M0": torch.float8_e8m0fnu,
+}
 
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
