@@ -20,6 +20,7 @@ from vllm.models.deepseek_v4.nvidia.b12x_indexer import (
     DeepseekV4B12xSparseIndexer,
     b12x_indexer_is_supported,
 )
+from vllm.models.deepseek_v4.nvidia.ops.o_proj import bf16_o_proj
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
@@ -37,6 +38,10 @@ from vllm.utils.torch_utils import current_stream
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
+)
+from vllm.v1.attention.backends.mla.sparse_swa import (
+    DeepseekSparseSWABackend,
+    DeepseekSparseSWAMetadataBuilder,
 )
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -330,6 +335,7 @@ class B12xMHCResidual:
 
 
 def _get_dspark_decode_row_capacity(vllm_config: VllmConfig) -> int | None:
+    """Return the largest target-verifier row count the scheduler can emit."""
     speculative_config = vllm_config.speculative_config
     if speculative_config is None or not speculative_config.use_dspark():
         return None
@@ -337,11 +343,9 @@ def _get_dspark_decode_row_capacity(vllm_config: VllmConfig) -> int | None:
     if num_speculative_tokens <= 0:
         return None
     scheduler_config = vllm_config.scheduler_config
-    # Kernel warmup adds one row to the decode query length per request.
-    warmup_rows_per_request = 2 + num_speculative_tokens
     return min(
         int(scheduler_config.max_num_batched_tokens),
-        int(scheduler_config.max_num_seqs) * warmup_rows_per_request,
+        int(scheduler_config.max_num_seqs) * (1 + num_speculative_tokens),
     )
 
 
@@ -510,6 +514,16 @@ class DeepseekV4B12xSparseMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder)
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
 
+class DeepseekSparseSWAB12xMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+
+
+class DeepseekSparseSWAB12xBackend(DeepseekSparseSWABackend):
+    @staticmethod
+    def get_builder_cls() -> type[DeepseekSparseSWAB12xMetadataBuilder]:
+        return DeepseekSparseSWAB12xMetadataBuilder
+
+
 class DeepseekV4B12xSparseMLABackend(DeepseekV4SparseMLABackend):
     @staticmethod
     def get_name() -> str:
@@ -526,6 +540,7 @@ class DeepseekV4B12xSparseMLABackend(DeepseekV4SparseMLABackend):
 
 class DeepseekV4B12xAttention(DeepseekV4Attention):
     backend_cls = DeepseekV4B12xSparseMLABackend
+    swa_backend_cls = DeepseekSparseSWAB12xBackend
     indexer_backend_cls = DeepseekV4B12xIndexerBackend
     indexer_op_cls = DeepseekV4B12xSparseIndexer
 
@@ -601,6 +616,8 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         return groups, group_width, rank, hidden
 
     def setup_b12x_wo_projection(self) -> None:
+        if self.wo_a.weight.dtype == self.wo_b.weight.dtype == torch.bfloat16:
+            return
         # These linears hold checkpoint tensors for the fused B12x projection;
         # their ordinary forward methods are not used by this attention class.
         self.wo_a.b12x_warmup_provider = None
@@ -622,6 +639,17 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         )
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if self.wo_a.weight.dtype == self.wo_b.weight.dtype == torch.bfloat16:
+            return bf16_o_proj(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.wo_a,
+                self.wo_b,
+                n_groups=self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                o_lora_rank=self.o_lora_rank,
+            )
         if self._b12x_wo_projection_weights is None:
             raise RuntimeError("B12x WO-A/WO-B weights were not packed after loading.")
         module = _require_b12x_wo_projection()
@@ -666,13 +694,13 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                 self.compress_ratio,
             )
 
-        swa_width = int(self.window_size)
+        swa_width = int(self.window_size) + self.max_image_tokens
         speculative_config = self.vllm_config.speculative_config
         if speculative_config is not None and speculative_config.use_dspark():
             swa_width = max(
                 swa_width,
                 get_dspark_swa_index_width(
-                    swa_width,
+                    int(self.window_size),
                     speculative_config.num_speculative_tokens or 0,
                 ),
             )

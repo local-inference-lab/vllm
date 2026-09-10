@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
@@ -35,7 +35,6 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
     maybe_gather_mla_latent_cache_inputs,
@@ -50,7 +49,7 @@ class DeepseekV32Indexer(nn.Module):
     indexer_op_cls = SparseAttnIndexer
 
     @staticmethod
-    def get_indexer_op_kwargs(vllm_config: VllmConfig) -> dict[str, bool]:
+    def get_indexer_op_kwargs(vllm_config: VllmConfig) -> dict[str, Any]:
         del vllm_config
         return {}
 
@@ -164,24 +163,6 @@ class DeepseekV32Indexer(nn.Module):
         )
 
 
-def _select_sparse_components(
-    vllm_config: VllmConfig,
-    attn_backend: type | None,
-    indexer_cls: type[DeepseekV32Indexer],
-) -> tuple[type[DeepseekV32Indexer], type | None]:
-    if (
-        attn_backend is None
-        and vllm_config.attention_config.backend == AttentionBackendEnum.B12X
-    ):
-        from vllm.models.deepseek_v32.b12x import B12xDeepseekV32Indexer
-        from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
-            B12xMLASparseBackend,
-        )
-
-        return B12xDeepseekV32Indexer, B12xMLASparseBackend
-    return indexer_cls, attn_backend
-
-
 class DeepseekV32Attention(MLAAttention):
     indexer: "DeepseekV32Indexer | None"
     indexer_cls: "type[DeepseekV32Indexer]" = DeepseekV32Indexer
@@ -199,9 +180,7 @@ class DeepseekV32Attention(MLAAttention):
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
 
-        indexer_cls, attn_backend = _select_sparse_components(
-            vllm_config, attn_backend, type(self).indexer_cls
-        )
+        indexer_cls = type(self).indexer_cls
 
         hidden_size = config.hidden_size
         qk_nope_head_dim = config.qk_nope_head_dim
@@ -304,7 +283,11 @@ class DeepseekV32Attention(MLAAttention):
 
         fp8_attention = is_quantized_kv_cache(self.kv_cache_dtype)
         self._fp8_query = fp8_attention and self.impl.supports_quant_query_input
-        self._fp8_kv_needs_view = fp8_attention and self.kv_cache_dtype != "fp8_ds_mla"
+        self._native_packed_kv_update = self.kv_cache_dtype == "nvfp4_ds_mla"
+        self._fp8_kv_needs_view = fp8_attention and self.kv_cache_dtype not in (
+            "fp8_ds_mla",
+            "nvfp4_ds_mla",
+        )
 
         self._index_rope_interleave = getattr(config, "indexer_rope_interleave", False)
 
@@ -413,12 +396,18 @@ class DeepseekV32Attention(MLAAttention):
             mla_k_scale = None
             indexer_k_cache = None
             mla_slot = None
+        elif self._native_packed_kv_update:
+            # Keep the fused indexer-cache write, but let the sparse backend
+            # own the model-specific packed MLA record update below.
+            mla_kv_cache = None
+            mla_k_scale = None
         else:
             mla_kv_cache = self.kv_cache
             mla_k_scale = self._k_scale
 
-        kv_c_out = torch.empty_like(kv_c) if self.use_pcp else None
-        k_pe_out = torch.empty_like(k_pe) if self.use_pcp else None
+        separate_kv_update = self.use_pcp or self._native_packed_kv_update
+        kv_c_out = torch.empty_like(kv_c) if separate_kv_update else None
+        k_pe_out = torch.empty_like(k_pe) if separate_kv_update else None
         q_c = fused_norm_rope(
             positions,
             q_c,
@@ -532,17 +521,23 @@ class DeepseekV32Attention(MLAAttention):
             return
         attn_metadata = cast("MLACommonMetadata", attn_metadata)
 
-        if self.use_pcp:
+        if self.use_pcp or self._native_packed_kv_update:
             assert kv_c is not None and k_pe is not None
-            kv_for_cache, kpe_for_cache, cache_slot_mapping = (
-                maybe_gather_mla_latent_cache_inputs(
-                    kv_c,
-                    k_pe.unsqueeze(1),
-                    layer_slot_mapping,
-                    attn_metadata.num_decode_tokens,
-                    True,
+            if self.use_pcp:
+                kv_for_cache, kpe_for_cache, cache_slot_mapping = (
+                    maybe_gather_mla_latent_cache_inputs(
+                        kv_c,
+                        k_pe.unsqueeze(1),
+                        layer_slot_mapping,
+                        attn_metadata.num_decode_tokens,
+                        True,
+                    )
                 )
-            )
+            else:
+                kv_for_cache = kv_c
+                kpe_for_cache = k_pe.unsqueeze(1)
+                cache_slot_mapping = layer_slot_mapping
+            assert cache_slot_mapping is not None
             self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
                 kv_for_cache,
                 kpe_for_cache,

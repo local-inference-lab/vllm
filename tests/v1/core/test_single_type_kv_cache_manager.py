@@ -14,16 +14,123 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
+    CircularBufferManager,
+    FullAttentionManager,
+    MambaManager,
     RSWAManager,
     SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
+    FullAttentionSpec,
+    MambaSpec,
     RSWASpec,
     SlidingWindowSpec,
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_circular_state_stays_private_until_request_release():
+    spec = CircularBufferSpec(
+        block_size=1,
+        num_kv_heads=1,
+        head_size=1026,
+        state_content_bytes=4104,
+        dtype=torch.float32,
+    )
+    pool = BlockPool(num_gpu_blocks=3, enable_caching=True, hash_block_size=32)
+    manager = CircularBufferManager(
+        spec,
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=32,
+    )
+    first = manager.allocate_new_blocks("a", 1, 1)[0]
+    second = manager.allocate_new_blocks("b", 1, 1)[0]
+    assert first.block_id != second.block_id
+    manager.remove_skipped_blocks("a", 10000)
+    assert manager.allocate_new_blocks("a", 10001, 10001) == []
+    assert manager.req_to_blocks["a"] == [first]
+    assert first.ref_cnt == 1
+    manager.free("a")
+    assert first.ref_cnt == 0
+    assert second.ref_cnt == 1
+    replacement = manager.allocate_new_blocks("c", 20000, 20000)
+    assert replacement == [first]
+
+
+def test_external_computed_blocks_do_not_corrupt_free_pool():
+    block_size = 4
+    spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=10,
+        enable_caching=False,
+        hash_block_size=block_size,
+    )
+    manager = FullAttentionManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+    )
+    request_id = "request"
+    manager.allocate_new_blocks(
+        request_id,
+        num_tokens=3 * block_size,
+        num_tokens_main_model=3 * block_size,
+    )
+    num_free_blocks = block_pool.get_num_free_blocks()
+
+    # Speculative allocations can exceed the blocks implied by the eventual
+    # external computed-token count. This must not request a negative number
+    # of blocks, which inflates the free-queue counter.
+    manager.allocate_external_computed_blocks(
+        request_id,
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=block_size,
+    )
+
+    assert block_pool.get_num_free_blocks() == num_free_blocks
+    assert len(manager.req_to_blocks[request_id]) == 3
+
+
+def test_mamba_speculative_block_relocation_requires_exclusive_ownership():
+    spec = MambaSpec(
+        block_size=4,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=1,
+    )
+    block_pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=4)
+    manager = MambaManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+    )
+    block = block_pool.get_new_blocks(1)[0]
+    blocks = [block]
+
+    manager._relocate_speculative_block(blocks, 0)
+
+    assert blocks == [block_pool.null_block, block]
+    assert block.ref_cnt == 1
+
+    pinned_block = block_pool.get_new_blocks(1)[0]
+    block_pool.touch((pinned_block,))
+    with pytest.raises(AssertionError, match="exclusively owned and unhashed"):
+        manager._relocate_speculative_block([pinned_block], 0)
 
 
 def get_sliding_window_manager(

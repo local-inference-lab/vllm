@@ -25,6 +25,8 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
+from .ple_layer import Qwen3_8FlashNextNGramEmbedding
+
 
 @dataclass
 class Qwen3_8FlashNextAttnMetadata(MambaHybridAttnMetadata):
@@ -58,6 +60,8 @@ class Qwen3_8FlashNextAttnMetadata(MambaHybridAttnMetadata):
 
 class Qwen3_8FlashNextModelState(MambaHybridModelState):
     """Add rollback-safe n-gram history and persistent QSA request identity."""
+
+    specialize_full_decode_graphs = True
 
     def __init__(
         self,
@@ -116,6 +120,12 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
             device=self.device,
         )
         self.uses_ngram_embedding = bool(config.ple_layer_ids)
+        self.disk_embeddings = tuple(
+            module
+            for module in model.modules()
+            if isinstance(module, Qwen3_8FlashNextNGramEmbedding)
+            and module.requires_disk_preparation
+        )
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -161,6 +171,15 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
             # QSA layer independently resets its slot.
             self.qsa_state_is_fresh_gpu[req_index].fill_(True)
             self.qsa_committed_num_accepted_tokens_gpu[req_index].fill_(1)
+
+    def get_recurrent_checkpoint_tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self.qsa_state_is_fresh_gpu,
+            self.qsa_committed_num_accepted_tokens_gpu,
+        )
+
+    def get_recurrent_checkpoint_acceptance(self) -> torch.Tensor:
+        return self.qsa_committed_num_accepted_tokens_gpu
 
     def _prepare_qsa_state(
         self,
@@ -322,25 +341,13 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
                 )
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
         if self._align_mode:
-            mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
-            aligned_index_builders = []
-            for group_idx, group_id in enumerate(mamba_group_ids):
-                for group in attn_groups[group_id]:
-                    builder = group.get_metadata_builder(0)
-                    if hasattr(builder, "mamba_aligned_state_indices"):
-                        aligned_index_builders.append((group_idx, builder))
-            if aligned_index_builders:
-                ctx = self._ensure_align_ctx(
-                    kv_cache_config,
-                    mamba_group_ids,
-                    block_tables,
-                )
-                all_group_indices = ctx.compute_aligned_state_indices(
-                    input_batch.seq_lens,
-                    num_reqs,
-                )
-                for group_idx, builder in aligned_index_builders:
-                    builder.mamba_aligned_state_indices = all_group_indices[group_idx]
+            self._prepare_aligned_state_indices(
+                input_batch.seq_lens,
+                num_reqs,
+                attn_groups,
+                kv_cache_config,
+                block_tables,
+            )
 
         model_metadata = Qwen3_8FlashNextAttnMetadata(
             is_prefilling=is_prefilling,
@@ -445,9 +452,14 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
         num_reqs_padded = input_batch.num_reqs_after_padding
         query_start_loc = self.ple_query_start_loc[: num_reqs_padded + 1]
         query_start_loc.copy_(input_batch.query_start_loc[: num_reqs_padded + 1])
+        ngram_context = self._prepare_ngram_context(input_batch, req_states)
+        for embedding in self.disk_embeddings:
+            embedding.prepare_disk(
+                input_batch.input_ids, query_start_loc, ngram_context
+            )
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
         return model_inputs
 
@@ -475,6 +487,8 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
 
         ngram_context = self.ngram_context[:num_reqs]
         ngram_context.fill_(self.ngram_eos_token_id)
+        for embedding in self.disk_embeddings:
+            embedding.prepare_dummy_output(num_tokens)
         model_inputs.update(
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,

@@ -2,15 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import glob
-import json
-import struct
 import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import save_file
 
 import vllm.model_executor.model_loader.weight_utils as weight_utils
 from vllm.model_executor.model_loader.weight_utils import (
@@ -21,57 +18,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.platforms import current_platform
 
 
-def _safetensors_tensor_metadata(filename):
-    with open(filename, "rb") as checkpoint:
-        header_size = struct.unpack("<Q", checkpoint.read(8))[0]
-        header = json.loads(checkpoint.read(header_size))
-    return {name: item for name, item in header.items() if name != "__metadata__"}
-
-
-class _FakeInstantOpen:
-    def __init__(self, filename, tensors):
-        self.filename = [str(filename)]
-        self._tensors = tensors
-        with weight_utils.safe_open(filename, framework="pt") as physical_file:
-            names = list(physical_file.offset_keys())
-        metadata = _safetensors_tensor_metadata(filename)
-        self.original_names = names
-        self.ordered_tensor_metadatas = [(name, metadata[name]) for name in names]
-        first_offset = metadata[names[0]]["data_offsets"][0]
-        self.tensor_offsets = [(0, first_offset)]
-        self.tensor_offsets.extend(
-            (0, metadata[name]["data_offsets"][1]) for name in names
-        )
-        self.tensor_sizes = [
-            item["data_offsets"][1] - item["data_offsets"][0]
-            for _, item in self.ordered_tensor_metadatas
-        ]
-        self.total_tensor_size = sum(self.tensor_sizes)
-        self.tensor_name_to_index = {name: index for index, name in enumerate(names)}
-        self.loader_handle = None
-        self.buffer_size_requests = []
-        self.enter_count = 0
-
-    def _determine_buffer_size(self, requested):
-        self.buffer_size_requests.append(requested)
-
-    def __enter__(self):
-        self.enter_count += 1
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        return False
-
-    def tensors(self):
-        for name, _ in self.ordered_tensor_metadatas:
-            yield name, self._tensors[name]
-
-
-@pytest.mark.parametrize(
-    ("copy", "expected_borrowed"),
-    [(False, True), (True, False)],
-)
-def test_instanttensor_copy_contract(copy, expected_borrowed, monkeypatch):
+def test_instanttensor_requests_owned_tensors(monkeypatch):
     tensor = torch.ones(4)
     observed: dict[str, object] = {}
 
@@ -95,7 +42,6 @@ def test_instanttensor_copy_contract(copy, expected_borrowed, monkeypatch):
     def no_world_group():
         raise AssertionError
 
-    monkeypatch.delenv("INSTANTTENSOR_BUFFER_SIZE", raising=False)
     monkeypatch.setattr(
         weight_utils,
         "current_platform",
@@ -106,9 +52,7 @@ def test_instanttensor_copy_contract(copy, expected_borrowed, monkeypatch):
         sys.modules, "instanttensor", SimpleNamespace(safe_open=fake_safe_open)
     )
 
-    loaded = list(
-        instanttensor_weights_iterator(["model.safetensors"], False, copy=copy)
-    )
+    loaded = list(instanttensor_weights_iterator(["model.safetensors"], False))
 
     assert loaded == [("weight", tensor)]
     assert observed == {
@@ -116,117 +60,8 @@ def test_instanttensor_copy_contract(copy, expected_borrowed, monkeypatch):
         "framework": "pt",
         "device": 0,
         "process_group": None,
-        "copy": copy,
+        "copy": True,
     }
-    assert getattr(tensor, "_vllm_instanttensor_borrowed", False) is expected_borrowed
-
-
-def test_instanttensor_restricts_io_to_indexed_shards(tmp_path):
-    base_shard = tmp_path / "model-00001-of-00002.safetensors"
-    overlay_shard = tmp_path / "model-00002-of-00002.safetensors"
-    save_file(
-        {
-            "model.dense.weight": torch.tensor([2.0]),
-            "model.expert.weight": torch.tensor([1.0, 1.0]),
-        },
-        base_shard,
-    )
-    save_file(
-        {"model.expert.weight": torch.tensor([3.0, 3.0, 3.0])},
-        overlay_shard,
-    )
-
-    buffer_sizes = []
-    instant_open = SimpleNamespace(
-        filename=[str(base_shard), str(overlay_shard)],
-        ordered_tensor_metadatas=[
-            ("model.dense.weight", {"data_offsets": [0, 4]}),
-            ("model.expert.weight", {"data_offsets": [4, 12]}),
-            ("model.expert.weight", {"data_offsets": [0, 12]}),
-        ],
-        tensor_offsets=[
-            (0, 0),
-            (0, 4),
-            (0, 12),
-            (1, 0),
-            (1, 12),
-        ],
-        tensor_sizes=[4, 8, 12],
-        total_tensor_size=24,
-        tensor_name_to_index={},
-        loader_handle=None,
-        _determine_buffer_size=lambda requested: buffer_sizes.append(requested),
-    )
-    indexed_tensor_files = {
-        "model.dense.weight": str(base_shard.resolve()),
-        "model.expert.weight": str(overlay_shard.resolve()),
-    }
-
-    selection = weight_utils._restrict_instanttensor_to_selected_ranges(
-        instant_open,
-        indexed_tensor_files=indexed_tensor_files,
-        weight_name_prefixes=None,
-    )
-
-    assert [name for name, _ in instant_open.ordered_tensor_metadatas] == [
-        "model.dense.weight",
-        "model.expert.weight",
-    ]
-    assert instant_open.tensor_offsets == [
-        (0, 0),
-        (0, 4),
-        (1, 0),
-        (1, 12),
-    ]
-    assert instant_open.tensor_sizes == [4, 12]
-    assert instant_open.total_tensor_size == 16
-    assert buffer_sizes == [None]
-    assert selection.gpu_tensor_count == 2
-    assert selection.selected_tensor_count == 2
-    assert selection.cpu_fallbacks == ()
-
-
-@pytest.mark.parametrize(
-    ("buffer_size", "expected_gpu_opens", "expected_buffer_requests"),
-    [(16, 1, [None]), (1, 0, [])],
-)
-def test_instanttensor_emits_cpu_fallbacks_in_checkpoint_order(
-    tmp_path,
-    monkeypatch,
-    buffer_size,
-    expected_gpu_opens,
-    expected_buffer_requests,
-):
-    shard = tmp_path / "model.safetensors"
-    source = {
-        "a_small": torch.arange(2, dtype=torch.float32),
-        "b_large": torch.arange(8, dtype=torch.float32),
-        "c_small": torch.arange(2, dtype=torch.float32),
-    }
-    save_file(source, shard)
-    instant_open = _FakeInstantOpen(shard, source)
-
-    def no_world_group():
-        raise AssertionError
-
-    monkeypatch.setenv("INSTANTTENSOR_BUFFER_SIZE", str(buffer_size))
-    monkeypatch.setattr(
-        weight_utils,
-        "current_platform",
-        SimpleNamespace(is_cuda=lambda: True, current_device=lambda: 0),
-    )
-    monkeypatch.setattr(weight_utils, "get_world_group", no_world_group)
-    monkeypatch.setitem(
-        sys.modules,
-        "instanttensor",
-        SimpleNamespace(safe_open=lambda *args, **kwargs: instant_open),
-    )
-
-    loaded = list(instanttensor_weights_iterator([str(shard)], False))
-
-    assert [name for name, _ in loaded] == instant_open.original_names
-    assert instant_open.enter_count == expected_gpu_opens
-    assert instant_open.buffer_size_requests == expected_buffer_requests
 
 
 @pytest.mark.skipif(

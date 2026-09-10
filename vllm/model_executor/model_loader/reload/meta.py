@@ -7,6 +7,8 @@ import torch
 from torch.nn.parameter import UninitializedParameter
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from vllm.model_executor.weight_transfer import allocate_weights
+
 from .sanitize import restore_layer_refs, sanitize_layer_refs
 from .types import LayerReloadingInfo, LayerTensors
 from .utils import get_layer_params_buffers, get_layer_tensors
@@ -151,7 +153,11 @@ def materialize_layer(layer: torch.nn.Module, info: LayerReloadingInfo):
     with info.restore_device:
         for name, tensor in get_layer_tensors(layer).items():
             if name not in SKIP_TENSORS and tensor.is_meta:
-                setattr(layer, name, materialize_meta_tensor(tensor))
+                if isinstance(tensor, torch.nn.Parameter):
+                    tensor = allocate_weights(materialize_meta_tensor, tensor)
+                else:
+                    tensor = materialize_meta_tensor(tensor)
+                setattr(layer, name, tensor)
 
 
 class CopyCounter(TorchDispatchMode):

@@ -96,9 +96,11 @@ def init_attn_backend(
     vllm_config: VllmConfig,
     device: torch.device,
     active_layer_names: set[str] | None = None,
+    layer_vllm_configs: Mapping[str, VllmConfig] | None = None,
 ) -> tuple[list[list[AttentionGroup]], AttentionCGSupportInfo, list[int]]:
     # Phase 1: discover attention groups for each kv cache group.
     attn_groups: list[list[AttentionGroup]] = []
+    layer_vllm_configs = layer_vllm_configs or {}
 
     # Add KV-sharing layers to their target's kv cache group so they are
     # discovered alongside the target layer in Phase 1 below.
@@ -121,8 +123,10 @@ def init_attn_backend(
             attn_layers, vllm_config.cache_config.kv_cache_layout
         )
 
-        group_map: dict[tuple[tuple[str, str], KVCacheSpec, int], AttentionGroup] = {}
-        group_order: list[tuple[tuple[str, str], KVCacheSpec, int]] = []
+        group_map: dict[
+            tuple[tuple[str, str], KVCacheSpec, int, int], AttentionGroup
+        ] = {}
+        group_order: list[tuple[tuple[str, str], KVCacheSpec, int, int]] = []
 
         for layer_name in layer_names:
             attn_backend = attn_layers[layer_name].get_attn_backend()
@@ -135,7 +139,13 @@ def init_attn_backend(
             # counts (e.g. a spec-decode draft head and its target) get separate
             # metadata builders.
             num_heads_q = getattr(attn_layers[layer_name], "num_heads", 0)
-            key = (attn_backend.full_cls_name(), layer_kv_cache_spec, num_heads_q)
+            layer_config = layer_vllm_configs.get(layer_name, vllm_config)
+            key = (
+                attn_backend.full_cls_name(),
+                layer_kv_cache_spec,
+                num_heads_q,
+                id(layer_config),
+            )
             if key not in group_map:
                 group_map[key] = AttentionGroup(
                     attn_backend, [layer_name], layer_kv_cache_spec, kv_cache_group_id
@@ -158,7 +168,7 @@ def init_attn_backend(
             kernel_block_size = kernel_block_sizes[kv_cache_group_id]
         for group in groups:
             group.create_metadata_builders(
-                vllm_config=vllm_config,
+                vllm_config=layer_vllm_configs.get(group.layer_names[0], vllm_config),
                 device=device,
                 kernel_block_size=kernel_block_size,
                 num_metadata_builders=1,
@@ -293,43 +303,11 @@ def build_attn_metadata(
     attn_metadata: dict[str, Any] = {}
     cached_attn_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+    group_slot_mappings = slot_mappings[:num_kv_cache_groups].unbind(0)
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
-        slot_mapping = slot_mappings[i]
-        # Per-group causal for hybrid drafters (mixed SWA/full attention).
-        group_causal = (
-            causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
-        )
-
-        common_attn_metadata_extra_kwargs = (
-            model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
-            if model_specific_attn_metadata is not None
-            else {}
-        )
-        # Model-specific metadata (e.g. Mamba hybrid) may supply its own
-        # padding-aware is_prefilling, which takes precedence over the default.
-        group_is_prefilling = common_attn_metadata_extra_kwargs.pop(
-            "is_prefilling", is_prefilling
-        )
-        common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=query_start_loc_gpu,
-            query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            max_seq_len=max_seq_len,
-            num_reqs=num_reqs,
-            num_actual_tokens=num_tokens,
-            max_query_len=max_query_len,
-            block_table_tensor=block_table,
-            slot_mapping=slot_mapping,
-            causal=group_causal,
-            dcp_local_seq_lens=dcp_local_seq_lens,
-            positions=positions,
-            is_prefilling=group_is_prefilling,
-            mm_req_doc_ranges=mm_req_doc_ranges,
-            rswa_prefix_lens=rswa_prefix_lens,
-            **common_attn_metadata_extra_kwargs,
-        )
+        slot_mapping = group_slot_mappings[i]
+        common_attn_metadata = None
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
@@ -337,33 +315,73 @@ def build_attn_metadata(
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
             cache_key = (kv_cache_spec, type(attn_metadata_builder))
-            if for_cudagraph_capture:
-                metadata = attn_metadata_builder.build_for_cudagraph_capture(
-                    common_attn_metadata
-                )
-            elif (
+            # Graph replay retains captured tensor addresses. Capture must use
+            # the same metadata owner as runtime cache-group reuse.
+            if (
                 cache_key in cached_attn_metadata
                 and attn_metadata_builder.supports_update_block_table
             ):
                 metadata = attn_metadata_builder.update_block_table(
-                    cached_attn_metadata[cache_key],
-                    common_attn_metadata.block_table_tensor,
-                    common_attn_metadata.slot_mapping,
+                    cached_attn_metadata[cache_key], block_table, slot_mapping
                 )
             else:
-                attn_metadata_extra_kwargs = (
-                    model_specific_attn_metadata.get_extra_attn_kwargs(
-                        attn_metadata_builder,
-                        num_reqs,
+                if common_attn_metadata is None:
+                    # Per-group causal for hybrid drafters (mixed SWA/full attention).
+                    group_causal = (
+                        causal
+                        if isinstance(causal, (bool, torch.Tensor))
+                        else causal.get(i, True)
                     )
-                    if model_specific_attn_metadata is not None
-                    else {}
-                )
-                metadata = attn_metadata_builder.build(
-                    common_prefix_len=0,
-                    common_attn_metadata=common_attn_metadata,
-                    **attn_metadata_extra_kwargs,
-                )
+
+                    common_attn_metadata_extra_kwargs = (
+                        model_specific_attn_metadata.get_extra_common_attn_kwargs(
+                            i, num_reqs
+                        )
+                        if model_specific_attn_metadata is not None
+                        else {}
+                    )
+                    # Model-specific padding takes precedence over the default.
+                    group_is_prefilling = common_attn_metadata_extra_kwargs.pop(
+                        "is_prefilling", is_prefilling
+                    )
+                    common_attn_metadata = CommonAttentionMetadata(
+                        query_start_loc=query_start_loc_gpu,
+                        query_start_loc_cpu=query_start_loc_cpu,
+                        seq_lens=seq_lens,
+                        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                        max_seq_len=max_seq_len,
+                        num_reqs=num_reqs,
+                        num_actual_tokens=num_tokens,
+                        max_query_len=max_query_len,
+                        block_table_tensor=block_table,
+                        slot_mapping=slot_mapping,
+                        causal=group_causal,
+                        dcp_local_seq_lens=dcp_local_seq_lens,
+                        positions=positions,
+                        is_prefilling=group_is_prefilling,
+                        mm_req_doc_ranges=mm_req_doc_ranges,
+                        rswa_prefix_lens=rswa_prefix_lens,
+                        **common_attn_metadata_extra_kwargs,
+                    )
+
+                if for_cudagraph_capture:
+                    metadata = attn_metadata_builder.build_for_cudagraph_capture(
+                        common_attn_metadata
+                    )
+                else:
+                    attn_metadata_extra_kwargs = (
+                        model_specific_attn_metadata.get_extra_attn_kwargs(
+                            attn_metadata_builder,
+                            num_reqs,
+                        )
+                        if model_specific_attn_metadata is not None
+                        else {}
+                    )
+                    metadata = attn_metadata_builder.build(
+                        common_prefix_len=0,
+                        common_attn_metadata=common_attn_metadata,
+                        **attn_metadata_extra_kwargs,
+                    )
                 if attn_metadata_builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = metadata
             for layer_name in attn_group.layer_names:
@@ -375,11 +393,15 @@ def compute_mm_prefix_ranges(
     req_ids: list[str],
     mm_features: dict[str, list[MultiModalFeatureSpec]],
     sliding_window: int | None = None,
+    *,
+    clamp_sliding_window: bool = False,
+    span_leading_pad_modulus: int = 0,
 ) -> dict[int, list[tuple[int, int]]]:
     """Compute PrefixLM bidirectional ranges for multimodal tokens.
 
-    Ranges exceeding sliding_window are skipped to prevent early tokens
-    from attending across the entire image span.
+    Ranges exceeding sliding_window are skipped unless the attention kernel
+    clamps them. Aligned sentinel blocks include the boundary tokens and
+    exclude their leading alignment padding.
     """
     req_doc_ranges: dict[int, list[tuple[int, int]]] = {}
     for req_idx, req_id in enumerate(req_ids):
@@ -387,8 +409,24 @@ def compute_mm_prefix_ranges(
         for mm_feature in mm_features.get(req_id, ()):
             if mm_feature.modality not in ("image", "video"):
                 continue
-            for r in mm_feature.mm_position.extract_embeds_range():
-                if sliding_window is not None and (r[1] - r[0] + 1) > sliding_window:
+            pos_info = mm_feature.mm_position
+            if span_leading_pad_modulus:
+                pad = (
+                    span_leading_pad_modulus
+                    - 1
+                    - pos_info.offset % span_leading_pad_modulus
+                )
+                ranges = [
+                    (pos_info.offset + pad, pos_info.offset + pos_info.length - 1)
+                ]
+            else:
+                ranges = pos_info.extract_embeds_range()
+            for r in ranges:
+                if (
+                    not clamp_sliding_window
+                    and sliding_window is not None
+                    and (r[1] - r[0] + 1) > sliding_window
+                ):
                     continue
                 image_doc_ranges.append(r)
         req_doc_ranges[req_idx] = image_doc_ranges

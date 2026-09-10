@@ -329,7 +329,10 @@ def test_qwen3_dspark_rejects_incomplete_vocab_weights(
 
 
 @pytest.mark.skip_global_cleanup
-def test_dspark_shares_target_embedding_with_smaller_draft_vocabulary():
+@pytest.mark.parametrize("draft_moe_backend", [None, "triton"])
+def test_dspark_shares_target_embedding_with_smaller_draft_vocabulary(
+    draft_moe_backend,
+):
     from vllm.v1.worker.gpu.spec_decode.dspark import utils as dspark_utils
 
     target_embedding = nn.Embedding(100, 8)
@@ -348,7 +351,9 @@ def test_dspark_shares_target_embedding_with_smaller_draft_vocabulary():
             draft_model_config=draft_model_config,
             attention_backend=None,
             kv_cache_dtype=None,
+            moe_backend=draft_moe_backend,
         ),
+        kernel_config=SimpleNamespace(moe_backend="b12x"),
         attention_config=SimpleNamespace(backend=None),
         cache_config=SimpleNamespace(),
         model_config=SimpleNamespace(get_vocab_size=Mock(return_value=100)),
@@ -373,7 +378,7 @@ def test_dspark_shares_target_embedding_with_smaller_draft_vocabulary():
         patch(
             "vllm.model_executor.model_loader.get_model",
             return_value=draft_model,
-        ),
+        ) as get_model,
         patch(
             "vllm.model_executor.models.qwen3_dflash.dflash_has_any_non_causal",
             return_value=False,
@@ -386,6 +391,9 @@ def test_dspark_shares_target_embedding_with_smaller_draft_vocabulary():
         loaded_model = dspark_utils.load_dspark_model(target_model, vllm_config)
 
     assert loaded_model.model.embed_tokens is target_embedding
+    loaded_config = get_model.call_args.kwargs["vllm_config"]
+    assert loaded_config.kernel_config.moe_backend == (draft_moe_backend or "b12x")
+    assert vllm_config.kernel_config.moe_backend == "b12x"
 
 
 if __name__ == "__main__":

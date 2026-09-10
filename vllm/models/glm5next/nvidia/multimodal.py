@@ -40,6 +40,7 @@ from vllm.model_executor.models.vision import (
     get_vit_attn_backend,
     is_vit_use_data_parallel,
 )
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.multimodal.parse import ImageSize, MultiModalDataItems
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -242,7 +243,7 @@ class Glm5NextVisionBlock(nn.Module):
     ) -> None:
         super().__init__()
         if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
+            norm_layer = partial(allocate_weights, nn.LayerNorm, eps=1e-6)
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
         self.attn = Glm5NextVisionAttention(
@@ -303,7 +304,7 @@ class Glm5NextPatchMerger(nn.Module):
             prefix=f"{prefix}.proj",
             disable_tp=use_data_parallel,
         )
-        self.post_projection_norm = nn.LayerNorm(self.hidden_size)
+        self.post_projection_norm = allocate_weights(nn.LayerNorm, self.hidden_size)
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=self.hidden_size,
             output_sizes=[context_dim] * 2,

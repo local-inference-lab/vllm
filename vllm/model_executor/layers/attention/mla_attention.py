@@ -233,6 +233,11 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.kernels.attention.b12x_mla_query import (
+    can_implement_bf16_mla_query,
+    prewarm_bf16_mla_query,
+    run_bf16_mla_query,
+)
 from vllm.model_executor.layers.attention.attention import (
     _init_kv_cache_quant,
     get_attention_context,
@@ -259,6 +264,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
+from vllm.utils.b12x import B12xWarmupUnit
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.math_utils import cdiv, round_down, round_up
 from vllm.utils.torch_utils import (
@@ -310,6 +316,68 @@ logger = init_logger(__name__)
 _FP8_DTYPE = current_platform.fp8_dtype()
 
 
+def _find_linear_weight_device(layer: torch.nn.Module) -> torch.device | None:
+    while hasattr(layer, "base_layer") and hasattr(layer.base_layer, "quant_method"):
+        layer = layer.base_layer
+
+    for name in ("weight", "qweight", "weight_packed"):
+        weight = getattr(layer, name, None)
+        if isinstance(weight, torch.Tensor):
+            return weight.device
+    for parameter in layer.parameters(recurse=False):
+        return parameter.device
+    for buffer in layer.buffers(recurse=False):
+        return buffer.device
+    return None
+
+
+def _preallocate_absorbed_mla_weights(
+    layer: "MLAAttention", act_dtype: torch.dtype
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    num_heads = getattr(layer, "num_local_heads", layer.num_heads)
+    w_uv_shape = (num_heads, layer.kv_lora_rank, layer.v_head_dim)
+    w_uk_t_shape = (
+        num_heads,
+        layer.qk_nope_head_dim,
+        layer.kv_lora_rank,
+    )
+    current_w_uv = getattr(layer, "W_UV", None)
+    current_w_uk_t = getattr(layer, "W_UK_T", None)
+
+    device = _find_linear_weight_device(layer.kv_b_proj)
+    if device is None:
+        current_devices = {
+            weight.device
+            for weight in (current_w_uv, current_w_uk_t)
+            if isinstance(weight, torch.Tensor)
+        }
+        if len(current_devices) != 1:
+            raise RuntimeError(
+                "Cannot determine the device for absorbed MLA projection weights."
+            )
+        device = current_devices.pop()
+
+    def needs_storage(weight: object, shape: tuple[int, ...]) -> bool:
+        return not (
+            isinstance(weight, torch.Tensor)
+            and weight.shape == shape
+            and weight.dtype == act_dtype
+            and weight.device == device
+        )
+
+    pre_w_uv = (
+        torch.empty(w_uv_shape, dtype=act_dtype, device=device)
+        if needs_storage(current_w_uv, w_uv_shape)
+        else None
+    )
+    pre_w_uk_t = (
+        torch.empty(w_uk_t_shape, dtype=act_dtype, device=device)
+        if needs_storage(current_w_uk_t, w_uk_t_shape)
+        else None
+    )
+    return pre_w_uv, pre_w_uk_t
+
+
 def _detect_output_quant_key(
     output: torch.Tensor,
     output_scale: torch.Tensor | None,
@@ -353,7 +421,17 @@ def _select_mqa_query(
     num_mqa_tokens: int,
     full_ckv_dcp: bool,
 ) -> tuple[torch.Tensor, bool]:
-    """Select local or replicated query geometry for MLA decode/prefill."""
+    """Select local or replicated query geometry for MLA decode/prefill.
+
+    Args:
+        q: Query tensor in the local DCP geometry.
+        q_dcp_replicated: Optional query tensor replicated across DCP ranks.
+        num_mqa_tokens: Number of active query tokens.
+        full_ckv_dcp: Whether the backend gathers the complete CKV cache.
+
+    Returns:
+        The selected query rows and whether replicated geometry was selected.
+    """
     if q_dcp_replicated is not None and not full_ckv_dcp:
         return q_dcp_replicated[:num_mqa_tokens], True
     return q[:num_mqa_tokens], False
@@ -379,6 +457,55 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     ):
         return "fp8_ds_mla"
     return kv_cache_dtype
+
+
+_PACKED_SPARSE_MLA_CACHE_DTYPES = frozenset({"fp8_ds_mla", "nvfp4_ds_mla"})
+
+
+def _is_packed_sparse_mla_cache_dtype(kv_cache_dtype: CacheDType) -> bool:
+    """Return whether an MLA cache uses an opaque packed-byte record.
+
+    Args:
+        kv_cache_dtype: Resolved cache dtype name.
+
+    Returns:
+        Whether the dtype represents a packed sparse MLA record.
+    """
+    return kv_cache_dtype in _PACKED_SPARSE_MLA_CACHE_DTYPES
+
+
+def _uses_packed_sparse_mla_workspace(kv_cache_spec: AttentionSpec) -> bool:
+    """Determine workspace layout from the resolved layer cache spec.
+
+    Args:
+        kv_cache_spec: Cache specification for the builder's layer group.
+
+    Returns:
+        Whether the layer group uses packed sparse MLA records.
+    """
+    cache_dtype = getattr(kv_cache_spec, "cache_dtype_str", None)
+    return cache_dtype is not None and _is_packed_sparse_mla_cache_dtype(cache_dtype)
+
+
+def _maybe_view_mla_cache_as_fp8(
+    kv_cache: torch.Tensor,
+    kv_cache_dtype: CacheDType,
+) -> torch.Tensor:
+    """View ordinary FP8 caches as FP8 while preserving packed byte records.
+
+    Args:
+        kv_cache: Cache tensor supplied by the allocator.
+        kv_cache_dtype: Resolved cache dtype name for the layer.
+
+    Returns:
+        An FP8 view for ordinary quantized caches, or the original tensor for
+        packed sparse MLA and unquantized caches.
+    """
+    if is_quantized_kv_cache(kv_cache_dtype) and not (
+        _is_packed_sparse_mla_cache_dtype(kv_cache_dtype)
+    ):
+        return kv_cache.view(current_platform.fp8_dtype())
+    return kv_cache
 
 
 def _get_kv_b_proj_input_dtype(
@@ -628,7 +755,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             query_dtype = (
                 current_platform.fp8_dtype()
                 if is_quantized_kv_cache(self.kv_cache_dtype)
-                and self.kv_cache_dtype != "fp8_ds_mla"
+                and not _is_packed_sparse_mla_cache_dtype(self.kv_cache_dtype)
                 and self.impl.supports_quant_query_input
                 else dtype
             )
@@ -772,6 +899,48 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
             return output
 
+    def _try_fused_mla_query(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if self.is_aiter_triton_fp4_bmm_enabled or self.is_aiter_triton_fp8_bmm_enabled:
+            return None
+        if self.q_pad_num_heads is not None:
+            return None
+
+        weight = getattr(self, "W_UK_T", None)
+        if not isinstance(weight, torch.Tensor) or weight.dtype != torch.bfloat16:
+            return None
+        num_heads, num_tokens, nope_dim = q_nope.shape
+        if not can_implement_bf16_mla_query(
+            num_heads=num_heads,
+            max_m=num_tokens,
+            nope_dim=nope_dim,
+            latent_dim=self.kv_lora_rank,
+            output_dtype=torch.bfloat16,
+            device=q_nope.device,
+        ):
+            return None
+
+        workspace_getter = getattr(self.impl, "get_fused_mla_query_output", None)
+        output = (
+            workspace_getter(num_tokens, num_heads, torch.bfloat16)
+            if callable(workspace_getter)
+            else None
+        )
+        if output is None:
+            output = torch.empty(
+                (
+                    num_tokens,
+                    num_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ),
+                dtype=torch.bfloat16,
+                device=q_nope.device,
+            )
+        return run_bf16_mla_query(q_nope, weight, q_pe, output)
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -845,8 +1014,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
 
-        if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
-            kv_cache = kv_cache.view(current_platform.fp8_dtype())
+        kv_cache = _maybe_view_mla_cache_as_fp8(kv_cache, self.kv_cache_dtype)
 
         assert (
             attn_metadata.num_decodes is not None
@@ -945,7 +1113,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_pe_padded.copy_(mqa_q_pe)
                 mqa_q_pe = mqa_pe_padded
 
-            if self.is_aiter_triton_fp4_bmm_enabled:
+            fused_mqa_q = None
+            if not qrep_decode:
+                fused_mqa_q = self._try_fused_mla_query(mqa_q_nope, mqa_q_pe)
+
+            if fused_mqa_q is not None:
+                mqa_q = fused_mqa_q
+            elif self.is_aiter_triton_fp4_bmm_enabled:
                 from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
                 mqa_ql_nope = batched_gemm_a16wfp4(
@@ -998,14 +1172,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-            if fp8_attention and self.impl.supports_quant_query_input:
-                assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
-                assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
-                mqa_q = self._decode_concat_quant_fp8_op(
-                    mqa_ql_nope, mqa_q_pe, self._q_scale
-                )
-            else:
-                mqa_q = (mqa_ql_nope, mqa_q_pe)
+            if fused_mqa_q is None:
+                if fp8_attention and self.impl.supports_quant_query_input:
+                    assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
+                    assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
+                    mqa_q = self._decode_concat_quant_fp8_op(
+                        mqa_ql_nope, mqa_q_pe, self._q_scale
+                    )
+                else:
+                    mqa_q = (mqa_ql_nope, mqa_q_pe)
             # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)
             if self.impl.dcp_world_size > 1:
                 assert self.dcp_manager is not None
@@ -1114,6 +1289,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
             return
 
+        pre_w_uv = pre_w_uk_t = None
+        if not (
+            self.is_aiter_triton_fp4_bmm_enabled or self.is_aiter_triton_fp8_bmm_enabled
+        ):
+            pre_w_uv, pre_w_uk_t = _preallocate_absorbed_mla_weights(self, act_dtype)
+
         # we currently do not have quantized bmm's which are needed for
         # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
         # the bmm's in 16-bit, the extra memory overhead of this is fairly low
@@ -1213,9 +1394,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
         else:
             # Convert from (L, N, V) to (N, L, V)
-            replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
+            w_uv = W_UV.transpose(0, 1)
+            if pre_w_uv is not None:
+                pre_w_uv.copy_(w_uv)
+                w_uv = pre_w_uv
+            replace_parameter(self, "W_UV", w_uv, prefer_copy=True)
             # Convert from (L, N, P) to (N, P, L)
-            replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
+            w_uk_t = W_UK.permute(1, 2, 0)
+            if pre_w_uk_t is not None:
+                pre_w_uk_t.copy_(w_uk_t)
+                w_uk_t = pre_w_uk_t
+            replace_parameter(self, "W_UK_T", w_uk_t, prefer_copy=True)
             if self.dcp_q_replicate:
                 self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
                     self.W_UK_T.contiguous(), dim=0
@@ -1231,6 +1420,63 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         if not should_load_quant_weights(quant_method):
             set_default_quant_scales(self, register_buffer=False)
+
+        weight = getattr(self, "W_UK_T", None)
+        impl_warmup = getattr(self.impl, "warmup", None)
+        if (
+            isinstance(weight, torch.Tensor)
+            and weight.dtype == torch.bfloat16
+            and can_implement_bf16_mla_query(
+                num_heads=int(weight.shape[0]),
+                max_m=1,
+                nope_dim=int(weight.shape[1]),
+                latent_dim=int(weight.shape[2]),
+                output_dtype=torch.bfloat16,
+                device=weight.device,
+            )
+        ) or callable(impl_warmup):
+            object.__setattr__(self, "b12x_warmup_provider", self)
+
+    def get_b12x_warmup_unit(
+        self,
+        layer: torch.nn.Module,
+        token_counts: tuple[int, ...],
+        output_dtype: torch.dtype,
+    ) -> B12xWarmupUnit:
+        del layer, output_dtype
+        weight = getattr(self, "W_UK_T", None)
+        fused_query_rows = tuple(rows for rows in token_counts if 0 < rows <= 32)
+        impl_warmup = getattr(self.impl, "warmup", None)
+        impl_key_getter = getattr(self.impl, "b12x_warmup_key", None)
+        impl_key = impl_key_getter() if callable(impl_key_getter) else None
+
+        def compile() -> None:
+            if (
+                isinstance(weight, torch.Tensor)
+                and fused_query_rows
+                and can_implement_bf16_mla_query(
+                    num_heads=int(weight.shape[0]),
+                    max_m=max(fused_query_rows),
+                    nope_dim=int(weight.shape[1]),
+                    latent_dim=int(weight.shape[2]),
+                    output_dtype=torch.bfloat16,
+                    device=weight.device,
+                )
+            ):
+                prewarm_bf16_mla_query(weight, fused_query_rows)
+            if callable(impl_warmup):
+                impl_warmup(token_counts)
+
+        weight_key = (
+            (tuple(weight.shape), weight.dtype, weight.device)
+            if isinstance(weight, torch.Tensor)
+            else None
+        )
+        return B12xWarmupUnit(
+            name="MLA",
+            key=(type(self), weight_key, impl_key),
+            compile=compile,
+        )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
@@ -2231,7 +2477,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             self.determine_chunked_prefill_workspace_size(vllm_config)
         )
 
-        use_packed_fp8_cache = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        use_packed_sparse_mla_cache = _uses_packed_sparse_mla_workspace(
+            self.kv_cache_spec
+        )
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:
             # Note(hc): The local kvcache is incomplete when DCP is triggered,
@@ -2245,9 +2493,11 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     + self.chunked_prefill_workspace_size // self.dcp_world_size,
                     self.mla_dims.kv_lora_rank + self.mla_dims.qk_rope_head_dim,
                 ),
-                dtype=torch.bfloat16
-                if use_packed_fp8_cache
-                else self.model_config.dtype,
+                dtype=(
+                    torch.bfloat16
+                    if use_packed_sparse_mla_cache
+                    else self.model_config.dtype
+                ),
                 device=device,
             )
             self.dcp_manager = getattr(attention_layer, "dcp_manager", None)
@@ -2262,7 +2512,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     self.chunked_prefill_workspace_size,
                     self.mla_dims.kv_lora_rank + self.mla_dims.qk_rope_head_dim,
                 ),
-                dtype=torch.bfloat16 if use_packed_fp8_cache else self.q_data_type,
+                dtype=(
+                    torch.bfloat16 if use_packed_sparse_mla_cache else self.q_data_type
+                ),
                 device=device,
             )
 

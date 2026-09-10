@@ -12,7 +12,10 @@ from tests.v1.attention.test_attention_backends import (
     _test_backend_correctness,
 )
 from tests.v1.attention.utils import BatchSpec
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, set_current_vllm_config
+from vllm.model_executor.kernels.attention import b12x_mla_query
+from vllm.model_executor.layers.attention import mla_attention
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.b12x import get_b12x_paged_attention
@@ -23,6 +26,8 @@ from vllm.v1.attention.backends.b12x import (
     _kv_page_size,
     _max_page_table_width,
 )
+from vllm.v1.attention.backends.mla import b12x_indexer, b12x_mla_sparse
+from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseImpl
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheLayout
 
@@ -39,6 +44,242 @@ def _require_b12x_paged_attention() -> None:
     paged_attention = get_b12x_paged_attention()
     if paged_attention is None or not paged_attention.is_supported():
         pytest.skip("b12x paged attention is not available.")
+
+
+class _Workspace:
+    def get_simultaneous(self, *shapes_and_dtypes):
+        return [torch.empty(shape, dtype=dtype) for shape, dtype in shapes_and_dtypes]
+
+
+def test_b12x_bf16_mla_query_uses_public_run_api(monkeypatch) -> None:
+    calls = []
+    module = SimpleNamespace(run=lambda *args: calls.append(args))
+    monkeypatch.setattr(b12x_mla_query, "get_b12x_mla_query_projection", lambda: module)
+    q_nope = torch.empty((8, 2, 192), dtype=torch.bfloat16)
+    weight = torch.empty((8, 192, 512), dtype=torch.bfloat16)
+    q_pe = torch.empty((2, 8, 64), dtype=torch.bfloat16)
+    output = torch.empty((2, 8, 576), dtype=torch.bfloat16)
+
+    b12x_mla_query._b12x_bf16_mla_query_impl(q_nope, weight, q_pe, output)
+
+    assert calls == [(q_nope, weight, q_pe, output)]
+
+
+def test_b12x_bf16_mla_query_uses_backend_workspace(monkeypatch) -> None:
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.is_aiter_triton_fp4_bmm_enabled = False
+    layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.q_pad_num_heads = None
+    layer.kv_lora_rank = 512
+    layer.qk_rope_head_dim = 64
+    layer.W_UK_T = torch.nn.Parameter(
+        torch.empty((8, 192, 512), dtype=torch.bfloat16), requires_grad=False
+    )
+    workspace = torch.empty((2, 8, 576), dtype=torch.bfloat16)
+    layer.impl = SimpleNamespace(get_fused_mla_query_output=lambda *args: workspace)
+    calls = []
+    monkeypatch.setattr(
+        mla_attention, "can_implement_bf16_mla_query", lambda **kwargs: True
+    )
+
+    def run_query(*args):
+        calls.append(args)
+        return args[-1]
+
+    monkeypatch.setattr(mla_attention, "run_bf16_mla_query", run_query)
+    q_nope = torch.empty((8, 2, 192), dtype=torch.bfloat16)
+    q_pe = torch.empty((2, 8, 64), dtype=torch.bfloat16)
+
+    result = layer._try_fused_mla_query(q_nope, q_pe)
+
+    assert result is workspace
+    assert calls == [(q_nope, layer.W_UK_T, q_pe, workspace)]
+
+
+def test_mla_preallocates_absorbed_weights_before_dequantization(
+    monkeypatch,
+) -> None:
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.impl = SimpleNamespace(
+        process_weights_after_loading=lambda dtype: None,
+        warmup=lambda token_counts: None,
+    )
+    layer.is_amx_bmm_enabled = False
+    layer.kv_lora_rank = 2
+    layer.num_heads = 2
+    layer.qk_nope_head_dim = 3
+    layer.v_head_dim = 4
+    layer.kv_b_proj = torch.nn.Module()
+    layer.kv_b_proj.qweight = torch.nn.Parameter(
+        torch.ones((14, 2), dtype=torch.int8), requires_grad=False
+    )
+    layer.kv_b_proj.quant_method = object()
+    layer.is_aiter_triton_fp4_bmm_enabled = False
+    layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.dcp_q_replicate = False
+    layer.quant_config = None
+    layer.layer_name = "test"
+    dequantized = torch.arange(28.0, dtype=torch.float32).reshape(14, 2)
+    events = []
+    preallocated = []
+    preallocate = mla_attention._preallocate_absorbed_mla_weights
+
+    def track_preallocation(*args, **kwargs):
+        events.append("preallocate")
+        weights = preallocate(*args, **kwargs)
+        preallocated.extend(weights)
+        return weights
+
+    def fake_dequant(*args, **kwargs):
+        events.append("dequantize")
+        return dequantized
+
+    monkeypatch.setattr(
+        mla_attention,
+        "_preallocate_absorbed_mla_weights",
+        track_preallocation,
+    )
+    monkeypatch.setattr(mla_attention, "get_and_maybe_dequant_weights", fake_dequant)
+    monkeypatch.setattr(mla_attention, "set_default_quant_scales", lambda *a, **k: None)
+
+    with torch.no_grad():
+        layer.process_weights_after_loading(torch.float32)
+
+    assert events == ["preallocate", "dequantize"]
+    assert layer.W_UV.data_ptr() == preallocated[0].data_ptr()
+    assert layer.W_UK_T.data_ptr() == preallocated[1].data_ptr()
+    assert layer.b12x_warmup_provider is layer
+    assert "b12x_warmup_provider" not in layer._modules
+
+
+@pytest.mark.parametrize(
+    ("max_model_len", "page_table_width"),
+    [
+        (64, 2),
+        (129, 4),
+        (4096, 64),
+        (999936, 15624),
+        (999937, 15626),
+        (1000000, 15626),
+        (1000001, 15626),
+    ],
+)
+def test_b12x_dsa_indexer_owns_prefill_width_cap(
+    monkeypatch, max_model_len: int, page_table_width: int
+) -> None:
+    module = SimpleNamespace(
+        Caps=lambda **kwargs: SimpleNamespace(**kwargs),
+        plan=lambda caps: SimpleNamespace(caps=caps),
+    )
+    monkeypatch.setattr(b12x_indexer, "_require_b12x_indexer", lambda: module)
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8, max_num_seqs=8),
+        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[1, 2, 4, 8]),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+    )
+
+    with set_current_vllm_config(config):
+        indexer = b12x_indexer.B12xSparseIndexer(
+            k_cache=object(),
+            quant_block_size=128,
+            scale_fmt="ue8m0",
+            topk_tokens=4,
+            head_dim=128,
+            max_model_len=max_model_len,
+            max_total_seq_len=max_model_len,
+            topk_indices_buffer=torch.empty((8, 4), dtype=torch.int32),
+            skip_k_cache_insert=True,
+            num_q_heads=16,
+            output_physical_slots=True,
+        )
+
+    torch.testing.assert_close(
+        indexer.active_width_cap,
+        torch.tensor([max_model_len], dtype=torch.int32),
+    )
+    assert all(
+        plan.caps.max_page_table_width == page_table_width
+        for plan in (*indexer._decode_plans.values(), *indexer._prefill_plans.values())
+    )
+    assert all(
+        plan.caps.output_index_space == "physical"
+        for plan in indexer._decode_plans.values()
+    )
+    assert indexer._decode_plans[8].caps.max_q_rows == 8
+    assert max(indexer._prefill_plans) == 8
+    assert indexer.b12x_warmup_provider is indexer
+    assert "b12x_warmup_provider" not in indexer._modules
+
+
+def test_b12x_sparse_mla_prefill_binds_request_sequence_lengths(
+    monkeypatch,
+) -> None:
+    calls = {}
+
+    def bind(plan, **kwargs):
+        calls["plan"] = plan
+        calls["bind"] = kwargs
+        return object()
+
+    plan = SimpleNamespace()
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = False
+    impl._ckv_gather_enabled = False
+    impl._decode_plan = object()
+    impl._extend_plan = plan
+    impl._scratch_nbytes = 64
+    impl._max_tokens = 8
+    impl._input_num_heads = 2
+    impl._q_head_dim = 576
+    impl._topk_tokens = 4
+    impl._ckv_local_capacity = 0
+    impl.topk_indices_buffer = torch.zeros((8, 4), dtype=torch.int32)
+    impl.dcp_world_size = 1
+    impl.kv_lora_rank = 512
+    impl.num_heads = 2
+    impl.need_to_return_lse_for_decode = False
+    impl._physical_selection_provider = None
+    impl._bind = bind
+    impl._run = lambda binding: torch.empty((8, 2, 512))
+
+    monkeypatch.setattr(
+        b12x_mla_sparse, "current_workspace_manager", lambda: _Workspace()
+    )
+    metadata = SimpleNamespace(
+        max_query_len=8,
+        is_spec_decode=False,
+        num_reqs=1,
+        num_prefills=1,
+        num_decode_tokens=0,
+        num_actual_tokens=8,
+        seq_lens=torch.tensor([8], dtype=torch.int32),
+        req_id_per_token=torch.zeros(8, dtype=torch.int32),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        block_size=64,
+        cp_kv_cache_interleave_size=1,
+        cache_seq_lens_per_token=torch.arange(1, 9, dtype=torch.int32),
+    )
+    q = torch.empty((8, 2, 576), dtype=torch.bfloat16)
+    kv_cache = torch.empty((1, 64, 656), dtype=torch.uint8)
+
+    impl.forward_mqa(q, kv_cache, metadata, SimpleNamespace())
+
+    assert calls["plan"] is plan
+    torch.testing.assert_close(calls["bind"]["cache_lengths"], metadata.seq_lens)
+    assert calls["bind"]["cache_lengths"].shape == (1,)
+    assert (
+        calls["bind"]["selected_indices"].data_ptr()
+        == impl.topk_indices_buffer.data_ptr()
+    )
+    assert (
+        calls["bind"]["selected_lengths"].data_ptr()
+        == metadata.cache_seq_lens_per_token.data_ptr()
+    )
 
 
 def _causal_mask(

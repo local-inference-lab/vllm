@@ -204,14 +204,9 @@ def warmup_kernels(
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
 ) -> None:
-    """Run scheduler-realistic prefill and decode steps to JIT compile kernels.
-
-    We must call the provided worker's execute_model for pipeline parallel
-    coordination.
-    """
+    """Warm model and both sampling dtypes through the worker's PP path."""
     if model_runner.vllm_config.is_mm_encoder_only:
         return
-
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
     # Use decode_query_len + 1 tokens so the prefill batch's per-request query
@@ -222,7 +217,7 @@ def warmup_kernels(
     # Upper bound on the decode steps built in `decode_steps` below.
     num_decode_steps = 1
     if not model_runner.is_pooling_model:
-        num_decode_steps = 5 if num_spec_steps > 0 else 3
+        num_decode_steps = 3 if num_spec_steps > 0 else 2
     # Size the block allocation for the worst case: every request advancing
     # decode_query_len tokens on every decode step.
     decode_len = prompt_len + num_decode_steps * decode_query_len
@@ -399,15 +394,46 @@ def warmup_kernels(
                 # Exercise the model paths that split a batch by whether each
                 # request received draft tokens.
                 decode_steps.append(([0, 1], [False, False]))
-        if num_reqs > 1:
-            decode_steps.append(([0], [use_spec_decode]))
-            if use_spec_decode:
-                decode_steps.append(([0], [False]))
-        elif use_spec_decode:
-            decode_steps.append(([0], [False]))
 
         for step_indices, step_spec_flags in decode_steps:
             _run_decode_step(step_indices, step_spec_flags)
+
+        # Replace the singleton tail with a fresh greedy request. Mixing greedy
+        # and feature-rich requests would still promote the whole logits batch
+        # to FP32. A one-token prefill exercises native-dtype sampling without
+        # repeating the full model warmup; its decode warms native rejection.
+        # Retire the old requests before reusing their slots and KV blocks.
+        greedy_prompt = [0]
+        greedy_block_counts = [block_count(1, s) for s in kv_cache_specs]
+        greedy_output = SchedulerOutput.make_empty()
+        greedy_output.finished_req_ids = set(req_ids)
+        req_ids = ["_warmup_greedy_"]
+        next_block_id = 1
+        greedy_output.scheduled_new_reqs = [
+            NewRequestData.from_request(
+                Request(
+                    req_ids[0],
+                    greedy_prompt,
+                    SamplingParams(temperature=0.0),
+                    None,
+                    mm_features=warmup_mm_features,
+                ),
+                block_ids=tuple(_alloc_blocks(n) for n in greedy_block_counts),
+                prefill_token_ids=greedy_prompt,
+            )
+        ]
+        greedy_output.num_scheduled_tokens = {req_ids[0]: 1}
+        greedy_output.total_num_scheduled_tokens = 1
+        greedy_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+        worker_execute_model(greedy_output)
+        worker_sample_tokens(None)
+
+        req_computed = [1]
+        req_blocks = [list(greedy_block_counts)]
+        if use_spec_decode:
+            _run_decode_step([0], [True])
+        # Keep a real singleton decode without drafts, not just a short prefill.
+        _run_decode_step([0], [False])
 
     # Clean up - process finish_req_ids.
     cleanup_output = SchedulerOutput.make_empty()

@@ -487,6 +487,11 @@ class MoERunner(MoERunnerInterface):
         if output_is_reduced is None:
             output_is_reduced = self._fused_output_is_reduced
 
+        # Optional model-installed callback fired before the final all-reduce
+        # (GLM-5.3 L2 weight prefetch: the reduction leaves device memory idle).
+        _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
+        if _hook is not None:
+            _hook(states.shape[0])
         if (
             not self.moe_config.is_sequence_parallel
             and not self.moe_config.skip_final_all_reduce

@@ -349,6 +349,31 @@ class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
                 )
 
 
+class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        for cfg in (
+            model_config.hf_config,
+            model_config.hf_text_config,
+            model_config.model_arch_config,
+        ):
+            quant_config = getattr(cfg, "quantization_config", None)
+            if (
+                isinstance(quant_config, dict)
+                and quant_config.get("quant_method") == "fp8"
+            ):
+                quant_config["quant_method"] = "deepseek_v41_fp8"
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        backend = AttentionBackendEnum.B12X_MLA_SPARSE_DSV41
+        if vllm_config.attention_config.backend not in (None, backend):
+            raise ValueError("DeepSeek V4.1 requires B12X_MLA_SPARSE_DSV41.")
+        vllm_config.attention_config.backend = backend
+
+
 class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     """Route MXFP4-checkpointed Kimi-K3 MoE experts to the MXFP4 interface.
 
@@ -1011,6 +1036,9 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": ColQwen3_5Config,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
+    "DeepseekV4ForConditionalGeneration": DeepseekV4ForCausalLMConfig,
+    "DeepseekV41ForCausalLM": DeepseekV41ForCausalLMConfig,
+    "DSparkV41DraftModel": DeepseekV41ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
     "DiffusionGemmaForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501

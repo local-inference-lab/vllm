@@ -11,6 +11,8 @@ Each model format is described by a :class:`ParserEngineConfig` that specifies:
 * **transitions** – a state machine mapping
   ``(state, terminal) → (new_state, events_to_emit)`` that drives semantic
   event generation during streaming.
+* **non_whitespace_transitions** – optional state changes triggered by plain
+  content that contains a non-whitespace character.
 * **content_events** – what :class:`EventType` to emit for plain content
   (non-terminal text) in each state.
 """
@@ -33,6 +35,7 @@ class ParserState(Enum):
     TOOL_NAME = auto()
     TOOL_ARGS = auto()
     TOOL_BETWEEN = auto()
+    TOOL_ARG_END_PENDING = auto()
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +98,10 @@ class ParserEngineConfig:
 
     # Reject tool calls whose names are absent from the request tools.
     validate_tool_names: bool = False
+
+    non_whitespace_transitions: dict[ParserState, Transition] = field(
+        default_factory=dict,
+    )
 
     @cached_property
     def terminal_defs(self):

@@ -6,7 +6,7 @@ PYTHON_BIN="${PYTHON_BIN:-${SCRIPT_DIR}/.venv/bin/python}"
 
 MODEL_PATH="${MODEL_PATH:-/data/models/GLM-5.3-Flash-4p67}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-zai-org/GLM-5.3-Flash}"
-LOAD_FORMAT="${LOAD_FORMAT:-instanttensor}"
+LOAD_FORMAT="${LOAD_FORMAT:-fastsafetensors}"
 LINEAR_BACKEND="${LINEAR_BACKEND:-b12x}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8001}"
@@ -32,6 +32,7 @@ if [[ -z "${KV_CACHE_MEMORY_BYTES+x}" ]]; then
 fi
 SPECULATOR="${SPECULATOR:-mtp}"
 DFLASH2_MODEL="${DFLASH2_MODEL:-incoai/GLM-5.3-Flash-DFlash2}"
+DSPARK_MODEL="${DSPARK_MODEL:-/data/models/GLM-5.3-Flash-DSpark}"
 ADAPTIVE_SPECULATIVE_TOKENS="${ADAPTIVE_SPECULATIVE_TOKENS:-0}"
 TORCH_PROFILE_DIR="${TORCH_PROFILE_DIR:-}"
 TORCH_PROFILE_RECORD_SHAPES="${TORCH_PROFILE_RECORD_SHAPES:-0}"
@@ -69,11 +70,20 @@ usage() {
     "  -h, --help                    Show this help." \
     "" \
     "Launcher environment:" \
+    "  SPECULATOR=mtp|dflash2|dspark Select the draft model (default: mtp)." \
+    "  DSPARK_MODEL=PATH            GLM-5.3 DSpark release directory." \
+    "  DSPARK_DEPTH_MODE=fixed|adaptive" \
+    "                                Confidence-based verification (default: fixed)." \
     "  ADAPTIVE_SPECULATIVE_TOKENS=1 Enable adaptive MTP draft depth." \
     "  ADAPTIVE_SPECULATIVE_TOKENS_INITIAL=N" \
     "                                Initial adaptive depth (default: 3)." \
     "  ADAPTIVE_SPECULATIVE_TOKENS_WINDOW=N" \
     "                                Verification steps per update (default: 32)." \
+    "  VLLM_MXFP8_LM_HEAD=1          Runtime MXFP8 verifier head (default: 1)." \
+    "  VLLM_LM_HEAD_A16=1           BF16 head activations (default: 1)." \
+    "  VLLM_MTP_NVFP4_LM_HEAD=1     Separate NVFP4 MTP head (default: 1)." \
+    "  VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH=1" \
+    "                                Reuse KDA decode metadata (default: 1)." \
     "" \
     "All other arguments are forwarded to vLLM. Equivalent environment" \
     "variables use the TORCH_PROFILE_* names declared at the top of the script."
@@ -155,8 +165,11 @@ case "${SPECULATOR}" in
     # plus seven draft tokens.
     default_num_speculative_tokens=7
     ;;
+  dspark)
+    default_num_speculative_tokens=7
+    ;;
   *)
-    echo "SPECULATOR must be mtp or dflash2; got '${SPECULATOR}'" >&2
+    echo "SPECULATOR must be mtp, dflash2, or dspark; got '${SPECULATOR}'" >&2
     exit 2
     ;;
 esac
@@ -248,15 +261,12 @@ export VLLM_PCIE_ALLREDUCE_BACKEND="${VLLM_PCIE_ALLREDUCE_BACKEND:-b12x}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export SAFETENSORS_FAST_GPU="${SAFETENSORS_FAST_GPU:-1}"
-export INSTANTTENSOR_BACKEND="${INSTANTTENSOR_BACKEND:-BUFFERED}"
-if [[ "${TP_SIZE}" == 2 ]]; then
-  export INSTANTTENSOR_BUFFER_SIZE="${INSTANTTENSOR_BUFFER_SIZE:-67108864}"
-  export INSTANTTENSOR_IO_DEPTH="${INSTANTTENSOR_IO_DEPTH:-3}"
-  export INSTANTTENSOR_CONCURRENCY="${INSTANTTENSOR_CONCURRENCY:-1}"
-  export INSTANTTENSOR_CHUNK_SIZE="${INSTANTTENSOR_CHUNK_SIZE:-8388608}"
-fi
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_B12X_MOE_FP4_FORCE_A16="${VLLM_B12X_MOE_FP4_FORCE_A16:-1}"
+export VLLM_MXFP8_LM_HEAD="${VLLM_MXFP8_LM_HEAD:-1}"
+export VLLM_LM_HEAD_A16="${VLLM_LM_HEAD_A16:-1}"
+export VLLM_MTP_NVFP4_LM_HEAD="${VLLM_MTP_NVFP4_LM_HEAD:-1}"
+export VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH="${VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH:-1}"
 
 speculative_args=()
 if ((NUM_SPECULATIVE_TOKENS > 0)); then
@@ -277,6 +287,32 @@ if ((NUM_SPECULATIVE_TOKENS > 0)); then
       printf -v speculative_config \
         '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"kv_cache_dtype":"auto"}' \
         "${DFLASH2_MODEL}" "${NUM_SPECULATIVE_TOKENS}"
+      ;;
+    dspark)
+      case "${DSPARK_DEPTH_MODE:-fixed}" in
+        fixed) dspark_adaptive=false ;;
+        adaptive|dynamic) dspark_adaptive=true ;;
+        *)
+          echo "DSPARK_DEPTH_MODE must be fixed, adaptive, or dynamic" >&2
+          exit 2
+          ;;
+      esac
+      speculative_config="$(
+        "${PYTHON_BIN}" - "${DSPARK_MODEL}" "${NUM_SPECULATIVE_TOKENS}" "${dspark_adaptive}" <<'PY'
+import json
+import sys
+
+print(json.dumps({
+    "method": "dspark",
+    "model": sys.argv[1],
+    "num_speculative_tokens": int(sys.argv[2]),
+    "enable_adaptive_verification": sys.argv[3] == "true",
+    "moe_backend": "triton",
+    "attention_backend": "B12X",
+    "kv_cache_dtype": "fp8",
+}))
+PY
+      )"
       ;;
   esac
   speculative_args=(--speculative-config "${speculative_config}")
@@ -372,13 +408,9 @@ command=(
 cd "${SCRIPT_DIR}"
 printf 'Launching %s as %s directly on devices %s\n' \
   "${MODEL_PATH}" "${SERVED_MODEL_NAME}" "${DEVICE_IDS}" >&2
-printf 'Serving NVFP4 routed experts through B12X W4A16 (BF16 activations)\n' >&2
+printf 'Serving NVFP4 routed experts through B12X; FORCE_A16=%s\n' \
+  "${VLLM_B12X_MOE_FP4_FORCE_A16}" >&2
 printf 'Linear backend: %s\n' "${LINEAR_BACKEND}" >&2
-if [[ "${LOAD_FORMAT}" == instanttensor && "${TP_SIZE}" == 2 ]]; then
-  printf 'InstantTensor staging: %s-byte GPU ceiling, depth %s, concurrency %s\n' \
-    "${INSTANTTENSOR_BUFFER_SIZE}" "${INSTANTTENSOR_IO_DEPTH}" \
-    "${INSTANTTENSOR_CONCURRENCY}" >&2
-fi
 printf 'Speculator: %s (%s draft tokens)\n' \
   "${SPECULATOR}" "${NUM_SPECULATIVE_TOKENS}" >&2
 if [[ "${SPECULATOR}" == mtp ]] \

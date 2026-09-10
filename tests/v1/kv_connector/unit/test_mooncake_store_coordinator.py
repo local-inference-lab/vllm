@@ -3,6 +3,7 @@
 
 from math import lcm
 
+import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
@@ -14,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 )
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
+    ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     KVCacheGroupSpec,
     MambaSpec,
@@ -449,6 +451,117 @@ def test_store_mask_retention_prefix_stable_as_aligned_length_grows():
     assert shorter is not None
     assert longer is not None
     assert longer[: len(shorter)] == shorter
+
+
+def test_store_mask_retains_shared_eagle_predecessor():
+    groups = [
+        KVCacheGroupSpec(["full"], _full(32), is_eagle_group=True),
+        KVCacheGroupSpec(["mamba"], _mamba_align(32)),
+        KVCacheGroupSpec(["swa"], _swa(32, 64)),
+    ]
+    coord = _make_coord(
+        groups,
+        hash_block_size=32,
+        use_eagle=True,
+        retention_interval=0,
+    )
+
+    masks = coord.store_mask(288, num_prompt_tokens=287)
+    assert masks[0] is None
+    assert masks[1] == [False] * 9
+    assert masks[2] == [i in (5, 6, 7) for i in range(9)]
+
+
+def test_store_mask_uses_fine_hit_alignment():
+    groups = [
+        KVCacheGroupSpec(["full"], _full(128)),
+        KVCacheGroupSpec(["mamba"], _mamba_align(64)),
+    ]
+    coord = _make_coord(groups, hash_block_size=32, retention_interval=0)
+    assert coord.enable_partial_hash_hits
+
+    masks = coord.store_mask(512, num_prompt_tokens=501)
+    assert masks[0] is None
+    assert masks[1] == [False] * 8
+
+
+@pytest.mark.parametrize("use_eagle, retained", [(False, {5, 6}), (True, {3, 5, 6})])
+def test_store_mask_preserves_fine_and_materialized_boundaries(use_eagle, retained):
+    groups = [
+        KVCacheGroupSpec(["full128"], _full(128)),
+        KVCacheGroupSpec(["mamba"], _mamba_align(64)),
+        KVCacheGroupSpec(["full32"], _full(32)),
+    ]
+    coord = _make_coord(
+        groups, hash_block_size=32, use_eagle=use_eagle, retention_interval=0
+    )
+    assert coord.enable_partial_hash_hits
+    # Fine replay positions: 448 (and 416 under EAGLE).
+    # Materialized fallback positions: 384 (and 256 under EAGLE).
+    assert coord.store_mask(480, num_prompt_tokens=480)[1] == [False for i in range(7)]
+    assert coord.store_mask(384, num_prompt_tokens=480)[1] == [False for i in range(6)]
+    assert coord.store_mask(480, start_token=384, num_prompt_tokens=480)[1] == [False]
+
+
+def test_store_mask_enables_fine_hits_for_swa():
+    groups = [
+        KVCacheGroupSpec(["full"], _full(32), is_eagle_group=True),
+        KVCacheGroupSpec(["mamba"], _mamba_align(64)),
+        KVCacheGroupSpec(["swa"], _swa(64, 128)),
+    ]
+    coord = _make_coord(
+        groups,
+        hash_block_size=32,
+        use_eagle=True,
+        retention_interval=0,
+    )
+
+    assert coord.enable_partial_hash_hits
+    masks = coord.store_mask(384, num_prompt_tokens=383)
+    assert masks[0] is None
+    assert masks[1] is not None
+    assert masks[2] is not None
+
+
+def test_coarse_chunked_group_disables_fine_hits():
+    groups = [
+        KVCacheGroupSpec(["full"], _full(32)),
+        KVCacheGroupSpec(["mamba"], _mamba_align(64)),
+        KVCacheGroupSpec(
+            ["chunked"],
+            ChunkedLocalAttentionSpec(
+                block_size=64,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                attention_chunk_size=128,
+            ),
+        ),
+    ]
+    coord = _make_coord(groups, hash_block_size=32)
+    assert not coord.enable_partial_hash_hits
+    assert coord.align_lookup_length(383) == 320
+
+
+def test_store_mask_excludes_mamba_groups_lookup_unaffected():
+    """Align-mode mamba block tables are not append-only (interior states are
+    nulled/freed; speculative blocks relocate), so the positional normal save
+    must never cover mamba chunks — regardless of retention. Lookups still
+    probe mamba boundaries: their keys come from the pinned snapshot/CoW
+    hand-off path instead."""
+    groups = [
+        KVCacheGroupSpec(["L0"], _full(16)),
+        KVCacheGroupSpec(["L1"], _mamba_align(16)),
+    ]
+    coord = _make_coord(groups, hash_block_size=16)
+    masks = coord.store_mask(64)
+    assert masks[0] is None  # full attn stays dense
+    assert masks[1] == [False] * 4
+
+    coord = _make_coord(groups, hash_block_size=16, retention_interval=32)
+    assert coord.store_mask(64)[1] == [False] * 4
+
+    assert coord.lookup_mask(64)[1] is None
 
 
 # ----- Eagle / MTP interaction with load_mask -----

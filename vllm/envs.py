@@ -190,10 +190,20 @@ if TYPE_CHECKING:
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
+    VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
+    VLLM_B12X_NVFP4_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
+    VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
+    VLLM_MXFP8_LM_HEAD: bool = True
+    VLLM_LM_HEAD_A16: bool = True
+    VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
+    VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
+    VLLM_MTP_NVFP4_LM_HEAD: bool = True
+    VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
     VLLM_PLE_CPU_OFFLOAD: bool = False
+    VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk"] | None = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -225,6 +235,9 @@ if TYPE_CHECKING:
     VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
     VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x"] = "b12x"
     VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
+    VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
+    VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
+    VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
     VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
     VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
     VLLM_PCIE_DMA_FP8: str | None = None
@@ -1212,10 +1225,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))
     ),
-    # Select the GDN decode implementation. "b12x" uses the planned SM120/SM121
-    # operator, while "cuda" uses the fused decode kernel where supported and
-    # falls back to "triton" otherwise. Setting "cuda" explicitly raises when
-    # unsupported.
+    # Select the GDN decode implementation. "b12x" also selects b12x GDN prefill;
+    # conflicting explicit prefill overrides are rejected. "cuda" uses the fused
+    # decode kernel where supported and falls back to "triton" otherwise.
+    # Setting "cuda" explicitly raises when unsupported.
     "VLLM_GDN_DECODE_KERNEL": env_with_choices(
         "VLLM_GDN_DECODE_KERNEL",
         "cuda",
@@ -1630,6 +1643,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FP4_FORCE_A16", "0"))
     ),
+    # Dense activation precision; recipe overrides take precedence.
+    "VLLM_B12X_DENSE_ACTIVATION_MODE": env_with_choices(
+        "VLLM_B12X_DENSE_ACTIVATION_MODE", "auto", ["auto", "a16", "quantized"]
+    ),
+    "VLLM_B12X_NVFP4_ACTIVATION_MODE": env_with_choices(
+        "VLLM_B12X_NVFP4_ACTIVATION_MODE", None, ["auto", "a16", "quantized"]
+    ),
+    "VLLM_B12X_MXFP8_ACTIVATION_MODE": env_with_choices(
+        "VLLM_B12X_MXFP8_ACTIVATION_MODE", None, ["auto", "a16", "quantized"]
+    ),
+    # Quantize eligible unquantized LM heads on b12x by default; =0 opts out.
+    "VLLM_MXFP8_LM_HEAD": lambda: bool(int(os.getenv("VLLM_MXFP8_LM_HEAD", "1"))),
+    # Preserve BF16 activations in runtime-quantized NVFP4/MXFP8 LM heads.
+    "VLLM_LM_HEAD_A16": lambda: bool(int(os.getenv("VLLM_LM_HEAD_A16", "1"))),
+    "VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT": lambda: bool(
+        int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT", "1"))
+    ),
+    # Reuse uniform speculative metadata in the shared GDN/KDA backend.
+    "VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH": lambda: bool(
+        int(os.getenv("VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH", "1"))
+    ),
+    "VLLM_MTP_NVFP4_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_MTP_NVFP4_LM_HEAD", "1"))
+    ),
+    # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
+    "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "1"))
+    ),
     # Gather DCP-sharded C4 records before B12X sparse-MLA prefill. This avoids
     # query replication plus the per-rank LSE combine and is opt-in while the
     # path is being qualified on GLM5Next.
@@ -1642,8 +1683,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
     ),
-    # Qwen3.8-Flash-Next only. Store PLE table payloads in CUDA-mapped host
-    # memory unless additional_config.ple_table_memory is explicitly set.
+    # Qwen3.8-Flash-Next PLE offload policy, resolved by vLLM for b12x.
+    "VLLM_PLE_TABLE_MEMORY": env_with_choices(
+        "VLLM_PLE_TABLE_MEMORY",
+        None,
+        ["ram", "disk"],
+    ),
+    # Fallback when neither additional_config nor VLLM_PLE_TABLE_MEMORY selects
+    # a policy: store PLE table payloads in CUDA-mapped host memory.
     "VLLM_PLE_CPU_OFFLOAD": lambda: bool(int(os.getenv("VLLM_PLE_CPU_OFFLOAD", "0"))),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
@@ -1902,6 +1949,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_PCIE_ALLREDUCE_BACKEND", "b12x", ["b12x"]
     ),
     # Maximum input sizes dispatched to the low-latency one-shot kernels.
+    # Enable the b12x one-shot RoCE all-reduce for multi-node TP (DGX Spark).
+    "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
+    ),
+    "VLLM_ROCE_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLREDUCE_MAX_SIZE", "2MB"
+    ),
+    # Largest per-rank shard routed to the RoCE all-gather
+    # (e.g. logits [rows, vocab/tp]).
+    "VLLM_ROCE_ALLGATHER_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLGATHER_MAX_SIZE", "16MB"
+    ),
     "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
         "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "84KB"
     ),

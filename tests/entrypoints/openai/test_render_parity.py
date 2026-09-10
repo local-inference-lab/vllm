@@ -11,13 +11,19 @@ arguments each passes to ``BaseRenderer.render_chat_async`` (via shared
     (template, content format, template kwargs including tools,
      media_io_kwargs, mm_processor_kwargs)
 
+Instruction checkpoint tests also exercise HF tokenization to verify reusable
+prefixes without changing the complete request prompt.
+
 ``TokenizeParams``, ``prompt_extras``, Harmony / GPT-OSS, prefill / continue,
 prompt cache salt, and truncation are out of scope for this file.
 """
 
 from __future__ import annotations
 
+import logging
+from copy import deepcopy
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -30,8 +36,10 @@ from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
 from vllm.inputs import tokens_input
+from vllm.renderers.hf import HfRenderer
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.renderers.params import ChatParams
+from vllm.tokenizers import get_tokenizer
 
 _MODEL = "test-model"
 _USER = [{"role": "user", "content": "Hello"}]
@@ -258,6 +266,158 @@ def serving_responses(
 
 @pytest.mark.asyncio
 class TestConversationRenderParity:
+    @pytest.mark.parametrize(
+        "roles,with_tools,enable_thinking",
+        [
+            (("system",), False, False),
+            (("system",), True, True),
+            (("developer",), True, False),
+            (("system", "developer"), True, True),
+        ],
+    )
+    async def test_user_required_template_reuses_instruction_prefix(
+        self, online_renderer, model_config, roles, with_tools, enable_thinking, caplog
+    ):
+        """Qwen's user-turn requirement must not disable shared instructions."""
+        model_config.max_model_len = 32768
+        tokenizer = get_tokenizer(
+            "Qwen/Qwen3.5-0.8B",
+            revision="2fc06364715b967f1860aea9cf38778875588b17",
+        )
+        renderer = HfRenderer(
+            SimpleNamespace(
+                model_config=model_config,
+                parallel_config=SimpleNamespace(_api_process_rank=0),
+            ),
+            tokenizer,
+        )
+        online_renderer.renderer = renderer
+        online_renderer.chat_template = tokenizer.chat_template
+        instructions = [
+            {"role": role, "content": f"Shared {role} instructions."} for role in roles
+        ]
+        prefixes = []
+        try:
+            for question in ("Weather in Berlin?", "Temperature in Tokyo?"):
+                request = ChatCompletionRequest(
+                    model=_MODEL,
+                    messages=[*instructions, {"role": "user", "content": question}],
+                    tools=[_CHAT_WEATHER_TOOL] if with_tools else None,
+                    chat_template_kwargs={"enable_thinking": enable_thinking},
+                )
+                original_messages = deepcopy(request.messages)
+                online_renderer.enable_recurrent_instruction_checkpoints = False
+                _, (baseline,) = await online_renderer.render_chat(request)
+                online_renderer.enable_recurrent_instruction_checkpoints = True
+                _, (engine_input,) = await online_renderer.render_chat(request)
+
+                assert request.messages == original_messages
+                assert engine_input["prompt_token_ids"] == baseline["prompt_token_ids"]
+                boundary = engine_input["recurrent_instruction_boundary"]
+                assert 0 < boundary < len(engine_input["prompt_token_ids"])
+                prefix = engine_input["prompt_token_ids"][:boundary]
+                prefix_text = tokenizer.decode(prefix)
+                assert all(
+                    message["content"] in prefix_text for message in instructions
+                )
+                assert question not in prefix_text
+                if with_tools:
+                    assert "get_weather" in prefix_text
+                prefixes.append(prefix)
+
+            assert prefixes[0] == prefixes[1]
+            assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+            with pytest.raises(ValueError, match="No user query found"):
+                await online_renderer.render_chat(
+                    ChatCompletionRequest(model=_MODEL, messages=instructions)
+                )
+        finally:
+            renderer._executor.shutdown(wait=True)
+            renderer._mm_executor.shutdown(wait=True)
+
+    async def test_verified_instruction_token_boundary_is_forwarded(
+        self, online_renderer
+    ):
+        """Only an exact rendering of leading instructions becomes a marker."""
+        online_renderer.enable_recurrent_instruction_checkpoints = True
+        calls: list[tuple[list[Any], ChatParams]] = []
+
+        async def render_chat_async(
+            conversations,
+            chat_params,
+            tok_params=None,
+            *,
+            prompt_extras=None,
+            skip_mm_cache=False,
+        ):
+            messages = list(conversations[0])
+            calls.append((messages, chat_params))
+            token_ids = (
+                [11, 12]
+                if chat_params.chat_template_kwargs.get("continue_final_message")
+                else [11, 12, 21, 22]
+            )
+            return [messages], [tokens_input(token_ids)]
+
+        online_renderer.renderer.render_chat_async = render_chat_async
+        request = ChatCompletionRequest(
+            model=_MODEL,
+            messages=[
+                {"role": "system", "content": "Shared instructions"},
+                {"role": "user", "content": "Request-specific question"},
+            ],
+        )
+
+        result = await online_renderer.render_chat(request)
+
+        assert not isinstance(result, ErrorResponse)
+        _, engine_inputs = result
+        assert engine_inputs[0]["recurrent_instruction_boundary"] == 2
+        assert len(calls) == 2
+        assert calls[1][0] == [
+            request.messages[0],
+            {"role": "user", "content": ""},
+        ]
+        assert calls[1][1].chat_template_kwargs["add_generation_prompt"] is False
+        assert calls[1][1].chat_template_kwargs["continue_final_message"] is True
+
+    async def test_mismatched_instruction_rendering_does_not_set_boundary(
+        self, online_renderer
+    ):
+        """Conversation-dependent templates fail closed on token mismatch."""
+        online_renderer.enable_recurrent_instruction_checkpoints = True
+
+        async def render_chat_async(
+            conversations,
+            chat_params,
+            tok_params=None,
+            *,
+            prompt_extras=None,
+            skip_mm_cache=False,
+        ):
+            messages = list(conversations[0])
+            token_ids = (
+                [11, 99]
+                if chat_params.chat_template_kwargs.get("continue_final_message")
+                else [11, 12, 21, 22]
+            )
+            return [messages], [tokens_input(token_ids)]
+
+        online_renderer.renderer.render_chat_async = render_chat_async
+        request = ChatCompletionRequest(
+            model=_MODEL,
+            messages=[
+                {"role": "developer", "content": "Shared instructions"},
+                {"role": "user", "content": "Request-specific question"},
+            ],
+        )
+
+        result = await online_renderer.render_chat(request)
+
+        assert not isinstance(result, ErrorResponse)
+        _, engine_inputs = result
+        assert "recurrent_instruction_boundary" not in engine_inputs[0]
+
     async def test_multiturn_tool_calling(self, online_renderer, serving_responses):
         """System/instructions, tool-call turn, and a follow-up user message."""
         await _assert_parity(

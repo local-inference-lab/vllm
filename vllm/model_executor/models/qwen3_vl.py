@@ -76,6 +76,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.module_mapping import MultiModelKeys
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -458,7 +459,7 @@ class Qwen3_VisionBlock(nn.Module):
     ) -> None:
         super().__init__()
         if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
+            norm_layer = partial(allocate_weights, nn.LayerNorm, eps=1e-6)
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
         self.attn = Qwen2_5_VisionAttention(
@@ -519,7 +520,7 @@ class Qwen3_VisionPatchMerger(nn.Module):
             context_dim = self.hidden_size
 
         if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
+            norm_layer = partial(allocate_weights, nn.LayerNorm, eps=1e-6)
         self.norm = norm_layer(context_dim)
         self.linear_fc1 = ColumnParallelLinear(
             self.hidden_size,
@@ -602,9 +603,11 @@ class Qwen3_VisionTransformer(nn.Module):
             hidden_size=self.hidden_size,
         )
 
-        self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
+        self.pos_embed = allocate_weights(
+            nn.Embedding, self.num_position_embeddings, self.hidden_size
+        )
 
-        norm_layer = partial(nn.LayerNorm, eps=norm_eps)
+        norm_layer = partial(allocate_weights, nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
 
         # FP8 attention: Q/K/V become independent contiguous tensors

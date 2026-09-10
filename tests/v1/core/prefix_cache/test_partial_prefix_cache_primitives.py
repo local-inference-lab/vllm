@@ -2,14 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
+from vllm.config import VllmConfig
 from vllm.distributed.kv_events import BlockRemoved, BlockStored
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.boundary_checkpoint import (
+    BoundaryCheckpoint,
+    BoundaryCheckpointCache,
+)
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashListWithBlockSize,
@@ -49,6 +55,153 @@ def boundary_hash(req: Request, hash_block_size: int, num_tokens: int) -> BlockH
     # Every boundary at a hash_block_size multiple is just the fine-grained
     # chain hash ending there.
     return req.block_hashes[num_tokens // hash_block_size - 1]
+
+
+@pytest.mark.parametrize("boundary", [1, 7, 8, 9, 15, 16])
+def test_request_boundary_lookup_matches_exact_tokens_and_cache_salt(boundary):
+    """Endpoints need neither hash alignment nor per-token prefix hashes."""
+    pool = BlockPool(8, True, 8)
+    cache = BoundaryCheckpointCache(pool)
+    tokens = list(range(17))
+    request = make_request("producer", tokens, 8, sha256)
+    blocks = pool.get_new_blocks(2)
+    checkpoint = BoundaryCheckpoint(
+        cache.next_id(), boundary, ((blocks[0].block_id,),), (blocks[1].block_id,)
+    )
+    cache.stage(request, checkpoint, num_ranks=1)
+    assert cache.acknowledge(checkpoint.checkpoint_id, 0)
+    pool.free_blocks(blocks)
+    assert cache.find(request, 17) == checkpoint
+    assert cache.find(request, boundary - 1) is None
+    divergent = tokens.copy()
+    divergent[boundary - 1] += 100
+    assert cache.find(make_request("branch", divergent, 8, sha256), 17) is None
+    isolated = Request(
+        "isolated",
+        tokens,
+        SamplingParams(max_tokens=1),
+        None,
+        cache_salt="other tenant",
+        block_hasher=get_request_block_hasher(8, sha256),
+    )
+    assert cache.find(isolated, 17) is None
+    assert len(request.block_hashes) == 2
+
+
+def test_request_boundary_publication_waits_for_every_rank_and_pins_readers():
+    pool = BlockPool(5, True, 8)
+    cache = BoundaryCheckpointCache(pool)
+    request = make_request("producer", [1, 2, 3], 8, sha256)
+    blocks = pool.get_new_blocks(2)
+    checkpoint = BoundaryCheckpoint(cache.next_id(), 3, ((1,),), (2,))
+    cache.stage(request, checkpoint, num_ranks=2)
+    pool.free_blocks(blocks)
+    assert not cache.acknowledge(checkpoint.checkpoint_id, 0)
+    assert not cache.acknowledge(checkpoint.checkpoint_id, 0)
+    assert cache.find(request, 3) is None
+    assert all(block.ref_cnt == 1 for block in blocks)
+    assert cache.acknowledge(checkpoint.checkpoint_id, 1)
+    assert cache.acquire(checkpoint.checkpoint_id) == checkpoint
+    other = pool.get_new_blocks(2)
+    assert {b.block_id for b in other}.isdisjoint({1, 2})
+    cache.release(checkpoint)
+    pool.get_new_blocks(1)
+    assert cache.find(request, 3) is None
+    assert len(cache) == 0
+
+
+def test_request_boundary_invalidation_during_copy_prevents_publication():
+    pool = BlockPool(4, True, 8)
+    cache = BoundaryCheckpointCache(pool)
+    request = make_request("producer", [1, 2, 3], 8, sha256)
+    blocks = pool.get_new_blocks(2)
+    checkpoint = BoundaryCheckpoint(cache.next_id(), 3, ((1,),), (2,))
+    cache.stage(request, checkpoint, num_ranks=2)
+    pool.free_blocks(blocks)
+    pool.evict_blocks({2})
+    assert all(block.ref_cnt == 1 for block in blocks)
+    assert not cache.acknowledge(checkpoint.checkpoint_id, 0)
+    assert not cache.acknowledge(checkpoint.checkpoint_id, 1)
+    assert cache.find(request, 3) is None
+    assert pool.reset_prefix_cache()
+
+
+def test_request_boundaries_fall_back_for_oversized_stop_sets():
+    request = make_request("many stops", [1, 2, 3], 8, sha256)
+    assert BoundaryCheckpointCache.supports_request(request)
+    request.sampling_params.stop_token_ids = list(range(256))
+    assert not BoundaryCheckpointCache.supports_request(request)
+
+
+@pytest.mark.parametrize("method", [None, "mtp", "dflash"])
+@pytest.mark.parametrize("dcp", [1, 2, 4])
+@pytest.mark.parametrize("external_cache", [False, True])
+def test_glm_boundary_adapter_requires_gpu_resident_atomic_state(
+    monkeypatch, method, dcp, external_cache
+):
+    """DCP and DFlash are supported; external checkpoint persistence is not."""
+    monkeypatch.setattr(
+        "vllm.platforms.current_platform",
+        SimpleNamespace(is_cuda=lambda: True),
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            recurrent_checkpoint_policy="auto",
+            enable_prefix_caching=True,
+            mamba_cache_mode="align",
+            kv_cache_layout=None,
+            kv_offloading_size=None,
+        ),
+        model_config=SimpleNamespace(
+            enable_sleep_mode=False,
+            enable_return_routed_experts=False,
+            hf_text_config=SimpleNamespace(model_type="glm5_next_text"),
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            decode_context_parallel_size=dcp,
+            prefill_context_parallel_size=1,
+        ),
+        speculative_config=(
+            None
+            if method is None
+            else SimpleNamespace(
+                method=method,
+                uses_dynamic_speculative_decoding=lambda: False,
+            )
+        ),
+        use_v2_model_runner=True,
+        lora_config=None,
+        kv_transfer_config=object() if external_cache else None,
+    )
+    adapter_enabled = VllmConfig.use_request_boundary_checkpoints.fget(config)
+    assert adapter_enabled is not external_cache
+
+
+def test_request_boundary_branches_deduplicate_and_survive_sibling_eviction():
+    pool = BlockPool(12, True, 8)
+    cache = BoundaryCheckpointCache(pool)
+    checkpoints = []
+    for tokens in ([1, 2, 3], [1, 2, 4, 5], [1, 2], [1, 2, 3]):
+        request = make_request("producer", list(tokens), 8, sha256)
+        block = pool.get_new_blocks(1)[0]
+        checkpoint = BoundaryCheckpoint(
+            cache.next_id(), len(tokens), ((block.block_id,),)
+        )
+        cache.stage(request, checkpoint, num_ranks=1)
+        cache.acknowledge(checkpoint.checkpoint_id, 0)
+        pool.free_blocks([block])
+        checkpoints.append(checkpoint)
+    assert len(cache) == 3
+    request = make_request("continuation", [1, 2, 3, 9], 8, sha256)
+    assert cache.find(request, 4) == checkpoints[3]
+    pool.evict_blocks({checkpoints[3].block_ids[0][0]})
+    assert cache.find(request, 4) == checkpoints[2]
+    sibling = make_request("sibling", [1, 2, 4, 5, 6], 8, sha256)
+    assert cache.find(sibling, 5) == checkpoints[1]
+    assert pool.reset_prefix_cache()
+    assert cache.find(sibling, 5) is None
 
 
 def cache_full_block_and_partial_tail(
@@ -460,3 +613,64 @@ def test_partial_block_promotes_to_direct_full_block_hash(dcp_world_size: int):
     )
     assert pool.get_cached_block(promoted_full_hash, [kv_cache_group_id]) == [blocks[1]]
     assert pool.get_cached_block(partial_hash, [kv_cache_group_id]) is None
+
+
+@pytest.mark.parametrize("tail", ["alias", "unregistered", "null"])
+def test_replay_preserves_partial_alias_residency(tail):
+    req = make_request("alias-replay", list(range(16)), 2, sha256)
+    pool = BlockPool(3, True, 2, True)
+    blocks = pool.get_new_blocks(2)
+    pool.cache_full_blocks(req, blocks, 0, 2, 8, 0)
+    if tail == "alias":
+        pool.cache_partial_block(req, blocks[1], 10, 0, 8)
+    pool.take_events()
+    primary_hash = blocks[1].block_hash
+    aliases = {
+        key: set(value) for key, value in pool.cached_block_hashes_by_block.items()
+    }
+    returned = [blocks[0], pool.null_block if tail == "null" else blocks[1]]
+    pool.emit_cached_block_events(req, returned, 10, 8, 0)
+    events = pool.take_events()
+    assert len(events) == (2 if tail == "alias" else 1)
+    assert events[0].token_ids == list(range(8))
+    if tail == "alias":
+        assert events[1].block_hashes == [
+            kv_cache_utils.maybe_convert_block_hash(req.block_hashes[4])
+        ]
+        assert events[1].parent_block_hash == kv_cache_utils.maybe_convert_block_hash(
+            req.block_hashes[3]
+        )
+        assert events[1].token_ids == [8, 9]
+        assert events[1].block_size == 2
+    assert blocks[1].block_hash == primary_hash
+    assert pool.cached_block_hashes_by_block == aliases
+
+
+def test_sparse_promotion_removes_aliases_before_stored_runs():
+    req = make_request("promotion-runs", list(range(24)), 2, sha256)
+    pool = BlockPool(4, True, 2, True)
+    blocks = pool.get_new_blocks(3)
+    pool.cache_partial_block(req, blocks[0], 6, 0, 8)
+    pool.cache_partial_block(req, blocks[2], 22, 0, 8)
+    pool.take_events()
+    pool.cache_full_blocks(req, blocks, 0, 3, 8, 0, [True, False, True])
+    events = pool.take_events()
+    assert [type(event) for event in events] == [
+        BlockRemoved,
+        BlockRemoved,
+        BlockStored,
+        BlockStored,
+    ]
+    assert [event.block_hashes for event in events] == [
+        [kv_cache_utils.maybe_convert_block_hash(req.block_hashes[i])]
+        for i in (2, 10, 3, 11)
+    ]
+    pool.free_blocks(blocks)
+    assert pool.take_events() == []
+    pool.get_new_blocks(3)
+    removed = pool.take_events()
+    assert len(removed) == 2
+    assert all(isinstance(event, BlockRemoved) for event in removed)
+    assert {h for event in removed for h in event.block_hashes} == {
+        kv_cache_utils.maybe_convert_block_hash(req.block_hashes[i]) for i in (3, 11)
+    }

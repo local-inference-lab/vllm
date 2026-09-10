@@ -26,6 +26,11 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.model_executor.weight_transfer import (
+    allocate_weights,
+    copy_weight,
+    flush_weight_transfers,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
@@ -173,7 +178,9 @@ class RoutedExperts(PluggableLayer):
                 self.moe_config.intermediate_size
             )
 
-        self.quant_method.create_weights(layer=self, **moe_quant_params)
+        allocate_weights(
+            self.quant_method.create_weights, layer=self, **moe_quant_params
+        )
 
         self.lora_base_layer_prefix = ""
 
@@ -319,10 +326,10 @@ class RoutedExperts(PluggableLayer):
             # We have to keep the weight scales of w1 and w3 because
             # we need to re-quantize w1/w3 weights after weight loading.
             idx = 0 if shard_id == "w1" else 1
-            param_data[expert_id][idx] = self._to_scalar(loaded_weight)
+            copy_weight(param_data[expert_id][idx], self._to_scalar(loaded_weight))
         # If we are in the row parallel case (down_proj)
         elif shard_id == "w2":
-            param_data[expert_id] = self._to_scalar(loaded_weight)
+            copy_weight(param_data[expert_id], self._to_scalar(loaded_weight))
 
     def _load_combined_w13_weight_scale(
         self,
@@ -339,7 +346,7 @@ class RoutedExperts(PluggableLayer):
         loaded_weight = loaded_weight.narrow(
             shard_dim, shard_size * tp_rank, shard_size
         )
-        param.copy_(loaded_weight)
+        copy_weight(param, loaded_weight)
 
     def _load_model_weight_or_group_weight_scale(
         self,
@@ -397,7 +404,7 @@ class RoutedExperts(PluggableLayer):
                 hidden_dim=hidden_dim,
                 shard_dim=shard_dim,
             )
-            expert_data.copy_(loaded_weight)
+            copy_weight(expert_data, loaded_weight)
         elif shard_id in ("w1", "w3"):
             self._load_w13(
                 shard_id=shard_id,
@@ -523,7 +530,7 @@ class RoutedExperts(PluggableLayer):
             hidden_dim=hidden_dim,
             shard_dim=shard_dim,
         )
-        expert_data.copy_(loaded_weight)
+        copy_weight(expert_data, loaded_weight)
 
     def _load_w2(
         self,
@@ -558,17 +565,15 @@ class RoutedExperts(PluggableLayer):
             hidden_dim=hidden_dim,
             shard_dim=shard_dim,
         )
-        expert_data.copy_(loaded_weight)
+        copy_weight(expert_data, loaded_weight)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
     ):
         param_data = param.data
 
-        # Used for both scalar input_scale and the size-2 `weight_shape`
-        # param (compressed-tensors). Assign directly so both shapes load;
-        # _to_scalar's reshape(()) would reject the size-2 weight_shape.
-        param_data[expert_id] = loaded_weight
+        # Preserve vector weight_shape parameters as well as scalar scales.
+        copy_weight(param_data[expert_id], loaded_weight)
 
     def _load_g_idx(
         self,
@@ -587,7 +592,7 @@ class RoutedExperts(PluggableLayer):
             )
         else:
             assert shard_id in ("w1", "w3")
-            expert_data.copy_(loaded_weight)
+            copy_weight(expert_data, loaded_weight)
 
     @overload
     def weight_loader(
@@ -625,11 +630,11 @@ class RoutedExperts(PluggableLayer):
             # (FIXME) for gpt-oss all experts are combined
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
-                param.data[:, :dim1].copy_(loaded_weight)
+                copy_weight(param.data[:, :dim1], loaded_weight)
             else:
                 dim1 = loaded_weight.shape[1]
                 dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+                copy_weight(param.data[:, :dim1, :dim2], loaded_weight)
             return True if return_success else None
 
         quant_method_name = self.quant_method.__class__.__name__
@@ -689,7 +694,7 @@ class RoutedExperts(PluggableLayer):
                     loaded_weight,
                     hidden_dim=0,
                 )
-                expert_data.copy_(loaded_weight)
+                copy_weight(expert_data, loaded_weight)
             else:
                 self._load_w13(
                     shard_id=shard_id,
@@ -702,9 +707,6 @@ class RoutedExperts(PluggableLayer):
 
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:
-            # this is needed for compressed-tensors only
-            loaded_weight = loaded_weight.to(param.data.device)
-
             # ModelOpt NVFP4 stores w13 input scales as two logical shards.
             # The generic assignment below would broadcast w1/w3 into the
             # whole expert row, so the second shard would overwrite the first.
@@ -715,10 +717,15 @@ class RoutedExperts(PluggableLayer):
             ):
                 scale_expert_id = global_expert_id if use_global_sf else expert_id
                 scale_shard_id = 0 if shard_id == "w1" else 1
-                param.data[scale_expert_id][scale_shard_id] = self._to_scalar(
-                    loaded_weight
+                copy_weight(
+                    param.data[scale_expert_id][scale_shard_id],
+                    self._to_scalar(loaded_weight),
                 )
                 return True if return_success else None
+
+            if "compressed" in quant_method_name.lower():
+                flush_weight_transfers()
+                loaded_weight = loaded_weight.to(param.data.device)
 
             if (
                 "compressed" in quant_method_name.lower()
@@ -879,12 +886,24 @@ class RoutedExperts(PluggableLayer):
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
         expert_mapping = self.get_expert_mapping(include_fused=True)
+        per_expert_mapping: dict[str, list[tuple[str, str, int, str]]] = {}
+        for mapping in expert_mapping:
+            weight_name = mapping[1]
+            if weight_name.startswith("experts.") and weight_name.endswith("."):
+                prefix = weight_name.removeprefix("experts.").partition(".")[0]
+                per_expert_mapping.setdefault(prefix, []).append(mapping)
         for expert_name, loaded_weight in weights:
             qual_name = f"{self.layer_name}.{expert_name}"
             # Fused expert weights can be identified by their 3D tensors
             is_fused = loaded_weight.dim() == 3
+            mappings = expert_mapping
+            if not is_fused:
+                # Retain every physical replica and both halves of packed gate/up.
+                mappings = per_expert_mapping.get(
+                    expert_name.partition(".")[0], expert_mapping
+                )
             matched = False
-            for param_name, weight_name, expert_id, shard_id in expert_mapping:
+            for param_name, weight_name, expert_id, shard_id in mappings:
                 if weight_name not in qual_name:
                     if matched and is_fused:
                         break

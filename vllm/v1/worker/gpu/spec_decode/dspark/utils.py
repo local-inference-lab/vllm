@@ -20,7 +20,7 @@ def _resolve_dspark_attention_backend(
         return draft_backend
     # DeepSeek-V4 draft layers share the target's KV-cache layout. Other
     # DSpark architectures may use a different attention kind.
-    if draft_model_config.hf_config.model_type == "deepseek_v4":
+    if draft_model_config.hf_config.model_type in ("deepseek_v4", "deepseek_v41"):
         if target_backend is not None:
             logger.info_once(
                 "Using the target model's %s attention backend for the "
@@ -53,6 +53,14 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     draft_vllm_config = replace(
         vllm_config,
+        kernel_config=(
+            replace(
+                vllm_config.kernel_config,
+                moe_backend=speculative_config.moe_backend,
+            )
+            if speculative_config.moe_backend is not None
+            else vllm_config.kernel_config
+        ),
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),

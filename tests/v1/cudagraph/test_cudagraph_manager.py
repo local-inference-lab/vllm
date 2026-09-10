@@ -150,7 +150,100 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
     mock_cuda_graph.assert_called_once()
 
 
+def test_capture_synchronizes_auxiliary_warmup_streams(monkeypatch):
+    """CUDA graph capture starts only after warmup work has completed."""
+    lifecycle: list[str] = []
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: object(),
+    )
+
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=_create_vllm_config(),
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL,
+        decode_query_len=1,
+    )
+    desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=4,
+        num_reqs=4,
+        uniform_token_count=1,
+    )
+    manager._capture_descs[CUDAGraphMode.FULL] = [desc]
+
+    def create_forward_fn(_desc, warmup):
+        def forward_fn(_mode):
+            lifecycle.append("warmup-forward" if warmup else "capture-forward")
+
+        return forward_fn
+
+    @contextmanager
+    def fake_graph_capture(*args, **kwargs):
+        yield SimpleNamespace(stream=MagicMock())
+
+    @contextmanager
+    def fake_cuda_graph(*args, **kwargs):
+        lifecycle.append("capture-begin")
+        yield
+
+    fake_offloader = MagicMock()
+    with (
+        patch.object(gpu_cudagraph_utils, "graph_capture", fake_graph_capture),
+        patch.object(gpu_cudagraph_utils, "get_offloader", lambda: fake_offloader),
+        patch.object(gpu_cudagraph_utils.torch.cuda, "CUDAGraph"),
+        patch.object(gpu_cudagraph_utils.torch.cuda, "graph", fake_cuda_graph),
+        patch.object(
+            gpu_cudagraph_utils.torch.accelerator,
+            "synchronize",
+            side_effect=lambda: lifecycle.append("warmup-synchronize"),
+        ),
+    ):
+        manager.capture(create_forward_fn)
+
+    assert lifecycle == [
+        "warmup-forward",
+        "warmup-synchronize",
+        "capture-begin",
+        "capture-forward",
+    ]
+
+
 _DECODE_QUERY_LEN = 3
+
+
+def test_full_mode_prefers_decode_specialization_and_captures_mixed_batches(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform, "get_global_graph_pool", lambda: object()
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=_create_vllm_config(),
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL,
+        decode_query_len=1,
+        specialize_full_decode=True,
+    )
+    manager._graphs_captured = True
+    decode = manager.dispatch(2, 2, 1, 0, max_query_len=1)
+    prefill = manager.dispatch(1, 4, None, 0, max_query_len=4)
+    assert decode.cg_mode == prefill.cg_mode == CUDAGraphMode.FULL
+    assert decode.uniform_token_count == 1
+    assert prefill.uniform_token_count is None
+    assert decode != prefill
+    assert {decode, prefill} <= set(manager._capture_descs[CUDAGraphMode.FULL])
 
 
 def _create_decode_vllm_config(

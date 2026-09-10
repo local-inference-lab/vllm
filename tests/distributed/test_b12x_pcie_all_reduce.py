@@ -17,6 +17,7 @@ from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
     _dma_min_bytes,
     _oneshot_limits,
     _parse_byte_size,
+    _twoshot_max_bytes,
     get_b12x_pcie_allreduce,
 )
 from vllm.distributed.parallel_state import (
@@ -48,7 +49,19 @@ def _make_communicator(
     communicator._capture_stream = None
     communicator.allreduce_max_bytes = allreduce_max_bytes
     communicator.fused_max_bytes = fused_max_bytes
+    communicator._twoshot = None
+    communicator.twoshot_max_bytes = 0
     return communicator, runtime
+
+
+def _attach_twoshot(
+    communicator: B12xPcieAllReduce, *, max_bytes: int, accepts: bool = True
+) -> MagicMock:
+    twoshot = MagicMock()
+    twoshot.accepts.return_value = accepts
+    communicator._twoshot = twoshot
+    communicator.twoshot_max_bytes = max_bytes
+    return twoshot
 
 
 @pytest.mark.parametrize(
@@ -318,5 +331,156 @@ def test_b12x_fused_allreduce_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
         _run_b12x_fused_allreduce_gpu,
         args=(get_open_port(),),
         nprocs=2,
+        join=True,
+    )
+
+
+def test_twoshot_limit_defaults_to_768kb(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", raising=False)
+    assert _twoshot_max_bytes() == 768 << 10
+    monkeypatch.setenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", "2MB")
+    assert _twoshot_max_bytes() == 2 << 20
+    for disabled in ("0", "off", " NONE ", "", "disabled"):
+        monkeypatch.setenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", disabled)
+        assert _twoshot_max_bytes() == 0
+
+
+def test_midsize_allreduce_dispatches_twoshot() -> None:
+    communicator, runtime = _make_communicator(allreduce_max_bytes=16)
+    twoshot = _attach_twoshot(communicator, max_bytes=1 << 20)
+    twoshot.all_reduce.side_effect = lambda _, *, out: out
+    inp = torch.randn(64)  # 256 bytes: above the one-shot ceiling
+
+    assert communicator.should_custom_ar(inp)
+    out = communicator.custom_all_reduce(inp)
+    assert out is not None and out.shape == inp.shape and out is not inp
+    twoshot.all_reduce.assert_called_once_with(inp, out=out)
+    runtime.all_reduce.assert_not_called()
+
+
+def test_oneshot_keeps_priority_below_its_ceiling() -> None:
+    communicator, runtime = _make_communicator(allreduce_max_bytes=1024)
+    twoshot = _attach_twoshot(communicator, max_bytes=1 << 20)
+    expected = torch.empty(64)
+    runtime.all_reduce.return_value = expected
+    inp = torch.randn(64)
+
+    assert communicator.custom_all_reduce(inp) is expected
+    runtime.all_reduce.assert_called_once_with(inp, stream=None)
+    twoshot.all_reduce.assert_not_called()
+
+
+def test_twoshot_window_ends_at_its_limit() -> None:
+    communicator, runtime = _make_communicator(allreduce_max_bytes=16)
+    twoshot = _attach_twoshot(communicator, max_bytes=128)
+    dma = MagicMock()
+    dma.should_allreduce.return_value = True
+    expected = torch.empty(64)
+    dma.all_reduce.return_value = expected
+    communicator._dma = dma
+    inp = torch.randn(64)  # 256 bytes: above the two-shot window
+
+    assert communicator.custom_all_reduce(inp) is expected
+    twoshot.all_reduce.assert_not_called()
+    dma.all_reduce.assert_called_once_with(inp)
+
+
+def test_twoshot_respects_runtime_acceptance() -> None:
+    communicator, _ = _make_communicator(allreduce_max_bytes=16)
+    twoshot = _attach_twoshot(communicator, max_bytes=1 << 20, accepts=False)
+    inp = torch.randn(64)
+
+    assert not communicator.should_custom_ar(inp)
+    assert communicator.custom_all_reduce(inp) is None
+    twoshot.all_reduce.assert_not_called()
+
+
+def test_graph_warmup_returns_placeholder_for_twoshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    communicator, runtime = _make_communicator(allreduce_max_bytes=16)
+    twoshot = _attach_twoshot(communicator, max_bytes=1 << 20)
+    communicator._is_capturing = True
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        b12x_pcie_all_reduce, "_is_piecewise_cudagraph_runtime", lambda: False
+    )
+    inp = torch.randn(64)
+
+    out = communicator.custom_all_reduce(inp)
+    assert out is not None and out.shape == inp.shape and out is not inp
+    twoshot.all_reduce.assert_not_called()
+    runtime.all_reduce.assert_not_called()
+
+
+def test_graph_capture_supplies_caller_owned_twoshot_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    communicator, runtime = _make_communicator(allreduce_max_bytes=16)
+    twoshot = _attach_twoshot(communicator, max_bytes=1 << 20)
+    communicator._is_capturing = True
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    inp = torch.randn(64)
+    twoshot.all_reduce.side_effect = lambda _, *, out: out
+
+    out = communicator.custom_all_reduce(inp)
+
+    assert out is not None and out.shape == inp.shape and out is not inp
+    twoshot.all_reduce.assert_called_once_with(inp, out=out)
+    runtime.all_reduce.assert_not_called()
+
+
+def _run_b12x_twoshot_gpu(
+    rank: int, port: int, device_indices: tuple[int, ...]
+) -> None:
+    device_index = device_indices[rank]
+    device = torch.device(f"cuda:{device_index}")
+    torch.accelerator.set_device_index(device)
+    config = VllmConfig()
+    config.model_config = MagicMock()
+    config.model_config.dtype = torch.bfloat16
+    config.model_config.get_hidden_size.return_value = 4096
+    with set_current_vllm_config(config):
+        init_test_distributed_environment(
+            4, 1, rank, str(port), local_rank=device_index
+        )
+    tp_group = get_tp_group()
+    communicator = tp_group.device_communicator.b12x_ar_comm
+    assert communicator is not None and communicator._twoshot is not None
+
+    inp = torch.full((64, 4096), rank + 1, dtype=torch.bfloat16, device=device)
+    eager_out = tp_group.device_communicator.all_reduce(inp)
+    torch.testing.assert_close(eager_out, torch.full_like(inp, 10))
+
+    with graph_capture(device=device) as capture_context:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_context.stream):
+            graph_out = tp_group.device_communicator.all_reduce(inp)
+    graph_out_ptr = graph_out.data_ptr()
+    inp.fill_(rank + 2)
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert graph_out.data_ptr() == graph_out_ptr
+    torch.testing.assert_close(graph_out, torch.full_like(inp, 14))
+
+    destroy_model_parallel()
+    destroy_distributed_environment()
+
+
+@multi_gpu_test(num_gpus=4)
+@pytest.mark.skipif(
+    not current_platform.has_device_capability(120),
+    reason="B12X PCIe all-reduce requires SM120",
+)
+def test_b12x_twoshot_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("b12x.comm.pcie")
+    monkeypatch.setenv("VLLM_ENABLE_PCIE_ALLREDUCE", "1")
+    monkeypatch.setenv("VLLM_PCIE_ALLREDUCE_BACKEND", "b12x")
+    monkeypatch.setenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "16KB")
+    monkeypatch.setenv("VLLM_PCIE_DMA_MIN_BYTES", "off")
+    torch.multiprocessing.spawn(
+        _run_b12x_twoshot_gpu,
+        args=(get_open_port(), tuple(range(4))),
+        nprocs=4,
         join=True,
     )

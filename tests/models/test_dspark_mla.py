@@ -63,8 +63,9 @@ def test_dspark_mla_shares_frozen_target_weights_and_skips_training_head():
 @pytest.mark.cpu_test
 def test_dspark_markov_head_is_replicated(
     monkeypatch: pytest.MonkeyPatch,
+    default_vllm_config,
 ):
-    from vllm.model_executor.layers import logits_processor, vocab_parallel_embedding
+    from vllm.model_executor.layers import vocab_parallel_embedding
 
     monkeypatch.setattr(
         vocab_parallel_embedding, "get_tensor_model_parallel_rank", lambda: 3
@@ -74,12 +75,6 @@ def test_dspark_markov_head_is_replicated(
         "get_tensor_model_parallel_world_size",
         lambda: 8,
     )
-    monkeypatch.setattr(
-        logits_processor,
-        "get_current_vllm_config",
-        lambda: SimpleNamespace(model_config=None),
-    )
-
     head = DSparkMarkovHead(128, 128, 8, prefix="markov_head")
     assert head.markov_w2.tp_size == 1
     assert head.markov_w1.weight.shape == (128, 8)
@@ -100,6 +95,66 @@ def test_dspark_markov_head_is_replicated(
     bias = head.bias(markov_embed, logits_processor)
     assert markov_embed.shape == (2, 8)
     assert bias.shape == (2, 128)
+
+
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+def test_v41_dspark_retains_each_markov_embedding_during_graph_replay(
+    default_vllm_config,
+    monkeypatch,
+    id_dtype,
+):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native b12x Markov embedding requires SM12x")
+    monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "0")
+    from flashinfer.b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+    from vllm.models.deepseek_v4_1.nvidia.dspark import (
+        DSparkMarkovHead as V41DSparkMarkovHead,
+    )
+    from vllm.v1.worker import workspace
+
+    device = torch.device("cuda")
+    vocab, rank = 131, 128
+    with torch.device(device), torch.no_grad():
+        head = V41DSparkMarkovHead(vocab, vocab, rank, prefix="markov_head").bfloat16()
+        checkpoint = (
+            torch.arange(vocab, device=device)[:, None] / 16
+            + torch.arange(rank, device=device)[None, :] / 128
+        ).bfloat16()
+        default_weight_loader(head.markov_w1.weight, checkpoint)
+        head.process_weights_after_loading()
+        token_ids = [
+            torch.tensor(values, device=device, dtype=id_dtype)
+            for values in ([0, 1, 130], [64, 95, 96], [127, 17, 33])
+        ]
+        eager = [head.embed(ids) for ids in token_ids]
+        # A later Markov step must not overwrite an earlier retained result.
+        head.embed(token_ids[-1].roll(1))
+        for rows, ids in zip(eager, token_ids):
+            torch.testing.assert_close(rows, checkpoint[ids.long()], rtol=0, atol=0)
+
+        freeze_kernel_resolution("V4.1 retained DSpark Markov rows")
+        try:
+            graph = torch.cuda.CUDAGraph()
+            with workspace.collect_cuda_graph_capture_resources() as retained:
+                with torch.cuda.graph(graph):
+                    captured = [head.embed(ids) for ids in token_ids]
+            for offset in (1, 19):
+                for step, ids in enumerate(token_ids):
+                    ids.add_(offset + step).remainder_(vocab)
+                graph.replay()
+                torch.cuda.synchronize()
+                for rows, ids in zip(captured, token_ids):
+                    torch.testing.assert_close(
+                        rows,
+                        checkpoint[ids.long()],
+                        rtol=0,
+                        atol=0,
+                    )
+            del retained
+        finally:
+            unfreeze_kernel_resolution()
 
 
 @pytest.mark.cpu_test

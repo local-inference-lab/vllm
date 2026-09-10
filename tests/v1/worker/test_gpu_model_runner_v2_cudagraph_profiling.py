@@ -41,7 +41,10 @@ class _FakeCudaGraphManager(cgu.CudaGraphManager):
     ) -> None:
         self._needs_capture = needs_capture
         self.pool: Any = GLOBAL_POOL
-        descs = [object() for _ in range(num_full_descs)]
+        descs = [
+            SimpleNamespace(num_tokens=num_tokens)
+            for num_tokens in range(num_full_descs, 0, -1)
+        ]
         if piecewise_only:
             self._capture_descs = {CUDAGraphMode.PIECEWISE: descs}
         else:
@@ -162,7 +165,8 @@ def test_profile_cudagraph_memory_samples_and_extrapolates(monkeypatch):
     _patch_module(monkeypatch)
     gib = 1 << 30
     # Measured delta 1000 MiB includes the sampled FULL graphs (100 + 20 MiB).
-    # Extrapolated FULL cost for 3 graphs: 100 + 2 * 20 = 140 MiB.
+    # The sampled graphs have sizes 3 and 2. Scale the second sample by the
+    # remaining graph's 1/2 token ratio: 100 + 20 + 10 = 130 MiB.
     runner = _make_profiling_runner(
         CUDAGraphMode.FULL,
         num_full_descs=3,
@@ -172,7 +176,7 @@ def test_profile_cudagraph_memory_samples_and_extrapolates(monkeypatch):
 
     result = cgu.profile_cudagraph_memory(runner)
 
-    assert result == (1000 - (100 + 20) + (100 + 2 * 20)) * gib
+    assert result == (1000 - (100 + 20) + (100 + 20 + 10)) * gib
     # Bootstrap, capture, and teardown run in order.
     assert runner.events == ["init", "capture", "teardown"]
     # Capture must use a throwaway pool, not the persistent global pool.
@@ -287,17 +291,23 @@ def test_model_runner_delegates_to_cudagraph_utils(monkeypatch):
 
 def test_extrapolate_full_graph_memory():
     mib = 1 << 20
+    descs = [
+        cgu.BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens, None)
+        for num_tokens in (40, 32, 16, 8)
+    ]
     # No samples (e.g. no FULL graphs): nothing to add.
-    assert cgu._extrapolate_full_graph_memory([], 0) == 0
+    assert cgu._extrapolate_full_graph_memory([], []) == 0
     # A single graph costs exactly its sample.
-    assert cgu._extrapolate_full_graph_memory([100 * mib], 1) == 100 * mib
-    # First capture + per-graph cost for the rest.
+    assert cgu._extrapolate_full_graph_memory([100 * mib], descs[:1]) == 100 * mib
+    # Preserve sampled costs and scale the rest by their token counts.
     assert (
-        cgu._extrapolate_full_graph_memory([100 * mib, 20 * mib], 5)
-        == (100 + 4 * 20) * mib
+        cgu._extrapolate_full_graph_memory([100 * mib, 20 * mib], descs)
+        == (100 + 20 + 10 + 5) * mib
     )
     # Per-graph cost is floored to account for driver overhead.
-    assert cgu._extrapolate_full_graph_memory([100 * mib, 0], 3) == (100 + 2 * 1) * mib
+    assert (
+        cgu._extrapolate_full_graph_memory([100 * mib, 0], descs) == (100 + 3 * 1) * mib
+    )
 
 
 def test_profile_cudagraph_memory_clears_captured_graphs(monkeypatch):

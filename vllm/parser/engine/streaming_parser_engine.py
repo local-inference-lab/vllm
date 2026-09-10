@@ -300,6 +300,7 @@ class StreamingParserEngine:
             ParserState.TOOL_ARGS,
             ParserState.TOOL_NAME,
             ParserState.TOOL_BETWEEN,
+            ParserState.TOOL_ARG_END_PENDING,
         ):
             if self.tool_index >= 0:
                 events.append(
@@ -355,6 +356,7 @@ class StreamingParserEngine:
             ParserState.TOOL_NAME,
             ParserState.TOOL_ARGS,
             ParserState.TOOL_BETWEEN,
+            ParserState.TOOL_ARG_END_PENDING,
         }
     )
 
@@ -430,6 +432,9 @@ class StreamingParserEngine:
         return self._apply_transition(transition, value, token_count)
 
     def _emit_for_state(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
+        transition = self.config.non_whitespace_transitions.get(self.state)
+        if transition is not None and text.strip():
+            return self._apply_transition(transition, text, token_count)
         if self.state == ParserState.MESSAGE_HEADER:
             self._message_header_buffer += text
             self._message_header_token_count += token_count

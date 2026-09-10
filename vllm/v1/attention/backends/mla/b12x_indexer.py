@@ -2,18 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """B12x DSA indexer for non-compressed sparse MLA models."""
 
+import bisect
+import os
 from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.triton_utils import tl, triton
-from vllm.utils.b12x import get_b12x_dsa_indexer
+from vllm.utils.b12x import B12xWarmupUnit, get_b12x_dsa_indexer
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerBackend,
@@ -23,13 +26,27 @@ from vllm.v1.attention.backends.mla.indexer import (
     split_indexer_prefill_chunks,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.workspace import current_workspace_manager
 
 _INDEX_HEAD_DIM = 128
 _INDEX_SCALE_BYTES = 4
 _INDEX_PAGE_SIZE = 64
 _INDEX_PAGE_WIDTH = _INDEX_PAGE_SIZE * (_INDEX_HEAD_DIM + _INDEX_SCALE_BYTES)
-_PREFILL_ROUTE = "packed_contiguous"
+_PREFILL_PROFILE_SUPERTILE_K = 32 * 1024
+
+
+def _prefill_profile_q_rows(max_q_rows: int) -> int:
+    max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
+    supertile_k = int(
+        os.environ.get("B12X_PAGED_INDEX_SUPERTILE_K", _PREFILL_PROFILE_SUPERTILE_K)
+    )
+    supertile_k = max(supertile_k, 256)
+    return min(max(int(max_q_rows), 1), max(1, max_logits_elems // supertile_k))
+
+
+def _is_current_stream_capturing(tensor: torch.Tensor) -> bool:
+    return tensor.is_cuda and torch.cuda.is_current_stream_capturing()
 
 
 @dataclass
@@ -50,10 +67,6 @@ class B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
         super().__init__(*args, block_table_width=block_table_width, **kwargs)
         self.use_flattening = False
         self.supports_varlen = False
-        self.prefill_k_rows = _require_b12x_indexer().resolve_paged_prefill_k_rows(
-            max_page_table_width=block_table_width,
-            page_size=_INDEX_PAGE_SIZE,
-        )
         self.active_width_buffer = torch.zeros(
             (1,), dtype=torch.int32, device=self.device
         )
@@ -68,14 +81,13 @@ class B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
         num_decodes: int,
         max_logits_bytes: int,
     ) -> list[tuple[slice, slice]]:
-        budget_seq_lens = torch.full_like(
-            compressed_seq_lens_cpu[num_decodes:], self.prefill_k_rows
-        )
         return [
             chunk
             for prefill_idx in range(len(prefill_query_lens_cpu))
             for chunk in split_indexer_prefill_chunks(
-                budget_seq_lens[prefill_idx : prefill_idx + 1],
+                compressed_seq_lens_cpu[
+                    num_decodes + prefill_idx : num_decodes + prefill_idx + 1
+                ],
                 prefill_query_lens_cpu[prefill_idx : prefill_idx + 1],
                 self.max_prefill_buffer_size,
                 max_logits_bytes,
@@ -85,25 +97,13 @@ class B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
 
     def build(self, *args, **kwargs) -> DeepseekV32IndexerMetadata:
         metadata = super().build(*args, **kwargs)
+        self.active_width_buffer.fill_(int(metadata.max_seq_len))
         if metadata.decode is not None:
-            module = _require_b12x_indexer()
             decode = metadata.decode
             seq_lens = decode.seq_lens.reshape(-1).contiguous()
-            schedule_metadata = None
-            if module.uses_paged_schedule(
-                q_rows=int(seq_lens.shape[0]),
-                max_pages=int(decode.block_table.shape[1]),
-            ):
-                schedule_metadata = module.plan_paged_schedule(
-                    seq_lens,
-                    _INDEX_PAGE_SIZE,
-                    self.num_sms,
-                    out=self.scheduler_metadata_buffer,
-                )
-            self.active_width_buffer.fill_(int(metadata.max_seq_len))
             fields = vars(decode).copy()
             fields["seq_lens"] = seq_lens
-            fields["schedule_metadata"] = schedule_metadata
+            fields["schedule_metadata"] = None
             metadata.decode = B12xIndexerDecodeMetadata(
                 **fields,
                 active_width=self.active_width_buffer,
@@ -147,12 +147,9 @@ def _require_b12x_indexer() -> Any:
         )
     for name in (
         "Caps",
-        "SOURCE_LAYOUT_PAGED",
-        "index_topk_fp8",
+        "bind",
         "plan",
-        "plan_paged_schedule",
-        "resolve_paged_prefill_k_rows",
-        "uses_paged_schedule",
+        "run",
     ):
         getattr(module, name)
     return module
@@ -181,68 +178,35 @@ def _flatten_index_cache(kv_cache: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _assert_prefill_route(obj: object) -> None:
-    route = getattr(obj, "route", None)
-    if route is None:
-        route = getattr(getattr(obj, "layout", None), "route", None)
-    if route != _PREFILL_ROUTE:
-        raise RuntimeError(
-            f"B12X sparse prefill requires route {_PREFILL_ROUTE!r}, got {route!r}."
-        )
-
-
 def _run_paged_topk(
     *,
+    module: Any,
+    plan: Any,
     q: torch.Tensor,
     weights: torch.Tensor,
     kv_cache: torch.Tensor,
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
-    schedule_metadata: torch.Tensor | None,
     active_width: torch.Tensor | None,
     output: torch.Tensor,
     scores: torch.Tensor | None,
-    topk: int,
-    shared_page_table: bool,
 ) -> None:
-    module = _require_b12x_indexer()
-    plan = module.plan(
-        module.Caps(
-            device=q.device,
-            source_layout=module.SOURCE_LAYOUT_PAGED,
-            num_q_heads=int(q.shape[1]),
-            max_q_rows=max(int(q.shape[0]), 1),
-            max_page_table_width=max(int(block_table.shape[1]), 1),
-            topk=int(topk),
-            mode="prefill" if shared_page_table else "decode",
-            shared_page_table=shared_page_table,
-        )
-    )
-    if shared_page_table:
-        _assert_prefill_route(plan)
     scratch = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
-    binding = plan.bind(
+    if active_width is None:
+        raise RuntimeError("B12X DSA requires a device active-width scalar.")
+    binding = module.bind(
+        plan,
         scratch=scratch,
-        real_page_table=block_table,
-        cache_seqlens_int32=seq_lens,
-        active_width=active_width,
-        schedule_metadata=schedule_metadata,
-        expected_num_q_heads=int(q.shape[1]),
-        shared_page_table=shared_page_table,
-        output_physical_slots=False,
-    )
-    if shared_page_table:
-        _assert_prefill_route(binding)
-    module.index_topk_fp8(
         q_fp8=q,
-        weights=weights,
+        query_weights=weights,
         index_k_cache=_flatten_index_cache(kv_cache),
-        binding=binding,
-        page_size=module.PAGED_INDEX_PAGE_SIZE,
-        expected_num_q_heads=int(q.shape[1]),
-        out_indices=output,
-        out_scores=scores,
+        page_table=block_table,
+        cache_lengths=seq_lens,
+        active_width=active_width,
+        output_indices=output,
+        output_scores=scores,
     )
+    module.run(binding)
 
 
 @triton.jit
@@ -334,6 +298,8 @@ class B12xSparseIndexer(nn.Module):
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         compress_ratio: int = 1,
+        num_q_heads: int | None = None,
+        output_physical_slots: bool = False,
     ) -> None:
         super().__init__()
         del quant_block_size, scale_fmt, max_total_seq_len
@@ -351,39 +317,193 @@ class B12xSparseIndexer(nn.Module):
             )
         if topk_indices_buffer is None:
             raise ValueError("B12X indexing requires a top-k output buffer.")
-        _require_b12x_indexer()
+        if num_q_heads is None or int(num_q_heads) <= 0:
+            raise ValueError(
+                "B12X indexing requires a positive index query head count."
+            )
+        self._module = _require_b12x_indexer()
         self.k_cache = k_cache
         self.topk_tokens = int(topk_tokens)
         self.max_model_len = int(max_model_len)
         self.topk_indices_buffer = topk_indices_buffer
+        self.output_physical_slots = bool(output_physical_slots)
+        self.active_width_cap = torch.full(
+            (1,),
+            self.max_model_len,
+            dtype=torch.int32,
+            device=topk_indices_buffer.device,
+        )
+        max_q_rows = int(topk_indices_buffer.shape[0])
+        max_page_table_width = get_block_table_width(
+            max(1, (self.max_model_len + _INDEX_PAGE_SIZE - 1) // _INDEX_PAGE_SIZE),
+            _INDEX_PAGE_SIZE,
+        )
         from vllm.config import get_current_vllm_config
 
-        parallel_config = get_current_vllm_config().parallel_config
+        vllm_config = get_current_vllm_config()
+        scheduler_config = vllm_config.scheduler_config
+        parallel_config = vllm_config.parallel_config
+        max_num_seqs = int(scheduler_config.max_num_seqs)
+
+        def make_plan(*, mode: str, q_rows: int):
+            return self._module.plan(
+                self._module.Caps(
+                    device=topk_indices_buffer.device,
+                    num_q_heads=int(num_q_heads),
+                    max_q_rows=q_rows,
+                    max_page_table_width=max_page_table_width,
+                    topk=self.topk_tokens,
+                    mode=mode,
+                    max_batch=q_rows if mode == "decode" else max_num_seqs,
+                    output_index_space=(
+                        "physical" if self.output_physical_slots else "logical"
+                    ),
+                )
+            )
+
+        self._make_plan = make_plan
+        capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes or []
+        decode_plan_sizes = {
+            int(size) for size in capture_sizes if 0 < int(size) <= max_num_seqs
+        }
+        decode_plan_sizes.add(max_num_seqs)
+        self._decode_plan_sizes = sorted(decode_plan_sizes)
+        self._decode_plans = {
+            rows: make_plan(mode="decode", q_rows=rows)
+            for rows in self._decode_plan_sizes
+        }
+        prefill_profile_rows = _prefill_profile_q_rows(max_q_rows)
+        self._prefill_plans = {
+            prefill_profile_rows: make_plan(mode="prefill", q_rows=prefill_profile_rows)
+        }
+        self._prefill_plan_sizes = [prefill_profile_rows]
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        object.__setattr__(self, "b12x_warmup_provider", self)
 
-    def _reserve_profile_workspace(self, q: torch.Tensor) -> None:
-        module = _require_b12x_indexer()
-        page_table_width = max(
-            1, (self.max_model_len + _INDEX_PAGE_SIZE - 1) // _INDEX_PAGE_SIZE
-        )
-        for shared_page_table in (False, True):
-            plan = module.plan(
-                module.Caps(
-                    device=q.device,
-                    source_layout=module.SOURCE_LAYOUT_PAGED,
-                    num_q_heads=int(q.shape[1]),
-                    max_q_rows=max(int(q.shape[0]), 1),
-                    max_page_table_width=page_table_width,
-                    topk=self.topk_tokens,
-                    mode="prefill" if shared_page_table else "decode",
-                    shared_page_table=shared_page_table,
-                )
+    def _get_plan(self, mode: str, q_rows: int) -> Any:
+        q_rows = int(q_rows)
+        if mode == "decode":
+            index = bisect.bisect_left(self._decode_plan_sizes, q_rows)
+            if index < len(self._decode_plan_sizes):
+                return self._decode_plans[self._decode_plan_sizes[index]]
+            plans = self._decode_plans
+            plan_sizes = self._decode_plan_sizes
+        else:
+            index = bisect.bisect_left(self._prefill_plan_sizes, q_rows)
+            if index < len(self._prefill_plan_sizes):
+                return self._prefill_plans[self._prefill_plan_sizes[index]]
+            plans = self._prefill_plans
+            plan_sizes = self._prefill_plan_sizes
+        if _is_current_stream_capturing(self.topk_indices_buffer):
+            raise RuntimeError(
+                f"B12X DSA {mode} plan for {q_rows} rows was not prepared before "
+                "CUDA graph capture."
             )
-            if shared_page_table:
-                _assert_prefill_route(plan)
+        plan = self._make_plan(mode=mode, q_rows=q_rows)
+        plans[q_rows] = plan
+        bisect.insort(plan_sizes, q_rows)
+        return plan
+
+    def _reserve_profile_workspace(self) -> None:
+        for plan in (*self._decode_plans.values(), *self._prefill_plans.values()):
             current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
+
+    def get_b12x_warmup_unit(
+        self,
+        layer: torch.nn.Module,
+        token_counts: tuple[int, ...],
+        output_dtype: torch.dtype,
+    ) -> B12xWarmupUnit:
+        del layer, token_counts, output_dtype
+
+        def compile() -> None:
+            kv_cache = self.k_cache.kv_cache
+            if kv_cache.numel() == 0:
+                # Warmup before the index KV cache is allocated (the
+                # memory-profiling pass, which precedes the graph-memory
+                # profiler's capture loop). Compile against a placeholder
+                # cache with the production page layout: the compiled variants
+                # depend on the page layout, not the page count, so the
+                # post-allocation warmup and serving reuse them.
+                kv_cache = torch.zeros(
+                    (2, _INDEX_PAGE_SIZE, _INDEX_HEAD_DIM + _INDEX_SCALE_BYTES),
+                    dtype=torch.uint8,
+                    device=self.topk_indices_buffer.device,
+                )
+            plans = (*self._decode_plans.values(), *self._prefill_plans.values())
+            for plan in plans:
+                caps = plan.caps
+                rows = int(caps.max_q_rows)
+                mode = str(caps.mode)
+                q = torch.zeros(
+                    (rows, int(caps.num_q_heads), _INDEX_HEAD_DIM),
+                    dtype=torch.float8_e4m3fn,
+                    device=caps.device,
+                )
+                weights = torch.zeros(
+                    (rows, int(caps.num_q_heads)),
+                    dtype=torch.float32,
+                    device=caps.device,
+                )
+                cache_lengths = torch.full(
+                    (rows,),
+                    min(self.max_model_len, _INDEX_PAGE_SIZE),
+                    dtype=torch.int32,
+                    device=caps.device,
+                )
+                page_rows = rows if mode == "decode" else 1
+                page_table = torch.zeros(
+                    (page_rows, int(caps.max_page_table_width)),
+                    dtype=torch.int32,
+                    device=caps.device,
+                )
+                if mode == "prefill":
+                    page_table = page_table.expand(rows, -1)
+                output = torch.empty(
+                    (rows, self.topk_tokens),
+                    dtype=torch.int32,
+                    device=caps.device,
+                )
+                scores = (
+                    torch.empty_like(output, dtype=torch.float32)
+                    if self.dcp_world_size > 1
+                    else None
+                )
+                _run_paged_topk(
+                    module=self._module,
+                    plan=plan,
+                    q=q,
+                    weights=weights,
+                    kv_cache=kv_cache,
+                    seq_lens=cache_lengths,
+                    block_table=page_table,
+                    active_width=self.active_width_cap,
+                    output=output,
+                    scores=scores,
+                )
+
+        plan_key = tuple(
+            (
+                str(plan.caps.mode),
+                int(plan.caps.max_q_rows),
+                int(plan.caps.max_page_table_width),
+                getattr(plan.layout, "route", None),
+            )
+            for plan in (*self._decode_plans.values(), *self._prefill_plans.values())
+        )
+        return B12xWarmupUnit(
+            name="DSA indexer",
+            key=(
+                type(self),
+                self.topk_indices_buffer.device,
+                self.topk_tokens,
+                self.output_physical_slots,
+                plan_key,
+            ),
+            compile=compile,
+        )
 
     def forward(
         self,
@@ -405,7 +525,7 @@ class B12xSparseIndexer(nn.Module):
                 forward_context.cudagraph_runtime_mode == CUDAGraphMode.NONE
                 and forward_context.batch_descriptor is not None
             ):
-                self._reserve_profile_workspace(q_quant)
+                self._reserve_profile_workspace()
             return self.topk_indices_buffer
 
         metadata = cast(DeepseekV32IndexerMetadata, attn_metadata[self.k_cache.prefix])
@@ -427,7 +547,6 @@ class B12xSparseIndexer(nn.Module):
                 q_chunk = q_quant[start:end].contiguous()
                 weights_chunk = weights[start:end].contiguous()
                 output = self.topk_indices_buffer[start:end, : self.topk_tokens]
-                output.fill_(-1)
                 score_chunk = scores[start:end] if scores is not None else None
                 seq_lens = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks).contiguous()
                 local_rows = (
@@ -443,17 +562,16 @@ class B12xSparseIndexer(nn.Module):
                     int(q_chunk.shape[0]), active_pages
                 )
                 _run_paged_topk(
+                    module=self._module,
+                    plan=self._get_plan("prefill", int(q_chunk.shape[0])),
                     q=q_chunk,
                     weights=weights_chunk,
                     kv_cache=self.k_cache.kv_cache,
                     seq_lens=seq_lens,
                     block_table=block_table,
-                    schedule_metadata=None,
-                    active_width=None,
+                    active_width=self.active_width_cap,
                     output=output,
                     scores=score_chunk,
-                    topk=self.topk_tokens,
-                    shared_page_table=True,
                 )
                 if score_chunk is not None:
                     _merge_dcp_topk(
@@ -480,20 +598,18 @@ class B12xSparseIndexer(nn.Module):
                 )
             num_tokens = metadata.num_decode_tokens
             output = self.topk_indices_buffer[:num_tokens, : self.topk_tokens]
-            output.fill_(-1)
             score_slice = scores[:num_tokens] if scores is not None else None
             _run_paged_topk(
+                module=self._module,
+                plan=self._get_plan("decode", num_tokens),
                 q=q_quant[:num_tokens].contiguous(),
                 weights=weights[:num_tokens].contiguous(),
                 kv_cache=self.k_cache.kv_cache,
                 seq_lens=seq_lens[:num_tokens],
                 block_table=block_table[:num_tokens].contiguous(),
-                schedule_metadata=decode.schedule_metadata,
                 active_width=getattr(decode, "active_width", None),
                 output=output,
                 scores=score_slice,
-                topk=self.topk_tokens,
-                shared_page_table=False,
             )
             if score_slice is not None:
                 _merge_dcp_topk(

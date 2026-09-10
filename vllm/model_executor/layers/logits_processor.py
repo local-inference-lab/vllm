@@ -354,10 +354,23 @@ class LogitsProcessor(PluggableLayer):
         ids = ids.to(torch.int64) + lm_head.shard_indices.org_vocab_start_index
 
         if lm_head.tp_size > 1:
-            values = tensor_model_parallel_all_gather(values, dim=-1)
-            ids = tensor_model_parallel_all_gather(ids, dim=-1)
+            # One exchange carries both the values and the ids: the fp32
+            # values and the int32 ids (bit-cast, not converted) share a
+            # [..., 2k] fp32 row per rank.  One collective instead of two,
+            # 8 bytes per candidate instead of 10, and for even k the rows are
+            # 16-byte multiples, which the RoCE all-gather writes in place.
+            # Vocab ids fit in int32 and the values are widened to fp32 for
+            # the final scaling anyway, so nothing is lost in the packing.
+            batch_shape = values.shape[:-1]
+            packed = torch.cat(
+                [values.float(), ids.to(torch.int32).view(torch.float32)], dim=-1
+            )
+            gathered = tensor_model_parallel_all_gather(packed, dim=-1)
+            gathered = gathered.view(*batch_shape, lm_head.tp_size, 2 * k)
+            values = gathered[..., :k].reshape(*batch_shape, -1)
+            ids = gathered[..., k:].reshape(*batch_shape, -1).view(torch.int32)
             values, selected = _topk(values, k)
-            ids = ids.gather(-1, selected)
+            ids = ids.gather(-1, selected).to(torch.int64)
 
         values = values.float()
         if self.scale != 1.0:

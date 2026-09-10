@@ -102,3 +102,8 @@ def validate_cudagraph_capturing_enabled() -> None:
 def set_cudagraph_capturing_enabled(enabled: bool) -> None:
     global cudagraph_capturing_enabled
     cudagraph_capturing_enabled = enabled
+
+
+def is_cudagraph_capturing_enabled() -> bool:
+    """Return whether the model runner is preparing or capturing CUDA graphs."""
+    return cudagraph_capturing_enabled

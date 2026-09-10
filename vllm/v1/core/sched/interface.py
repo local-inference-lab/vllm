@@ -3,7 +3,7 @@
 import enum
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 
@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from vllm.config.kv_events import KVEventsConfig
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase
     from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
+    from vllm.v1.core.sched.compute_fairness import ComputeServiceClass
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.engine import EngineCoreOutputs
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -36,6 +37,14 @@ class PauseState(enum.IntEnum):
 
 
 class SchedulerInterface(ABC):
+    current_step: int
+    """Number of scheduling decisions completed by this scheduler.
+
+    Implementations initialize this counter to zero and increment it exactly
+    once at the start of every ``schedule`` call. Engine-level prefill cadence
+    reads the counter before the next scheduling decision.
+    """
+
     @abstractmethod
     def __init__(
         self,
@@ -71,15 +80,25 @@ class SchedulerInterface(ABC):
         preparing inputs to the model.
 
         Args:
-            throttle_prefills: DP prefill balancing. When True (set by the DP
-                engine core on non-cadence-aligned steps), new prefill compute is
-                deferred to a later step so prefills stay aligned across DP ranks;
-                automatically overridden when the rank is saturated.
+            throttle_prefills: When True, defer prefill compute while decode
+                requests are running. Engine cores use this signal on
+                non-cadence steps. A saturated prefill queue overrides the signal
+                so queued requests continue to make progress.
 
         Returns:
             A SchedulerOutput object containing information about the scheduled
             requests.
         """
+        raise NotImplementedError
+
+    def record_compute_time(
+        self,
+        service_class: "ComputeServiceClass",
+        elapsed_seconds: float,
+        *,
+        contended: bool,
+    ) -> None:
+        """Record model-execution feedback for adaptive scheduling."""
         raise NotImplementedError
 
     @abstractmethod
@@ -219,6 +238,14 @@ class SchedulerInterface(ABC):
                 will only reset the KV prefix cache when there is no running request
                 taking KV cache.
         """
+        raise NotImplementedError
+
+    def get_prefill_fairness(self) -> dict[str, Any]:
+        """Return the active decode/prefill fairness configuration."""
+        raise NotImplementedError
+
+    def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Replace the fairness configuration at an idle engine boundary."""
         raise NotImplementedError
 
     @abstractmethod

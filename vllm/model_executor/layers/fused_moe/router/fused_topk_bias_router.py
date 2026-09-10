@@ -122,6 +122,8 @@ def fused_topk_bias(
     input_tokens: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
+    bias_vl: torch.Tensor | None = None,
+    image_sentinel_lo: int = 0,
 ):
     if (
         input_tokens is not None
@@ -129,6 +131,23 @@ def fused_topk_bias(
         and input_tokens.dtype != hash_indices_table.dtype
     ):
         input_tokens = input_tokens.to(dtype=hash_indices_table.dtype)
+
+    if bias_vl is not None and image_sentinel_lo > 0:
+        if scoring_func != "sqrtsoftplus":
+            raise ValueError("DeepSeek V4 vision routing requires sqrtsoftplus scoring")
+        return dsv4_topk(
+            gating_output,
+            e_score_correction_bias,
+            torch.int32 if indices_type is None else indices_type,
+            routed_scaling_factor,
+            input_ids=input_tokens,
+            bias_vl=bias_vl,
+            image_sentinel_lo=image_sentinel_lo,
+            hash_indices_table=hash_indices_table,
+            is_padding=_get_padding_mask(gating_output.shape[0]),
+            topk=topk,
+            renormalize=renormalize,
+        )
 
     if not rocm_aiter_ops.is_fused_moe_enabled():
         assert hidden_states.size(0) == gating_output.size(0), (
@@ -306,6 +325,8 @@ class FusedTopKBiasRouter(BaseRouter):
         hash_indices_table: torch.Tensor | None = None,
         num_fused_shared_experts: int = 0,
         shared_expert_weight: float = 1.0,
+        bias_vl: torch.Tensor | None = None,
+        image_sentinel_lo: int = 0,
     ):
         super().__init__(
             top_k=top_k,
@@ -318,6 +339,11 @@ class FusedTopKBiasRouter(BaseRouter):
         self.routed_scaling_factor = routed_scaling_factor
         self.scoring_func = scoring_func
         self._hash_indices_table = hash_indices_table
+        # Vision bias: image sentinel tokens (five consecutive in-vocab ids
+        # starting at image_sentinel_lo) select experts with bias_vl instead
+        # of e_score_correction_bias / the hash table.
+        self.bias_vl = bias_vl
+        self.image_sentinel_lo = image_sentinel_lo
         # Fused shared experts: append constant slots (ids immediately after
         # the routed experts, [global, global+n)) routed to by every token at
         # ``shared_expert_weight``, AFTER the routed top-k is renormalized.
@@ -357,6 +383,8 @@ class FusedTopKBiasRouter(BaseRouter):
             input_tokens=input_ids,
             hash_indices_table=self._hash_indices_table,
             routed_scaling_factor=self.routed_scaling_factor,
+            bias_vl=self.bias_vl.data if self.bias_vl is not None else None,
+            image_sentinel_lo=self.image_sentinel_lo,
         )
 
         if self.num_fused_shared_experts > 0:

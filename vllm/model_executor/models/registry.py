@@ -366,6 +366,14 @@ _MULTIMODAL_MODELS = {
     "DeepseekVLV2ForCausalLM": ("deepseek_vl2", "DeepseekVLV2ForCausalLM"),
     "DeepseekOCRForCausalLM": ("deepseek_ocr", "DeepseekOCRForCausalLM"),
     "DeepseekOCR2ForCausalLM": ("deepseek_ocr2", "DeepseekOCR2ForCausalLM"),
+    "DeepseekV4ForConditionalGeneration": (
+        "vllm.models.deepseek_v4",
+        "DeepseekV4ForConditionalGeneration",
+    ),
+    "DeepseekV41ForCausalLM": (
+        "vllm.models.deepseek_v4_1",
+        "DeepseekV41ForCausalLM",
+    ),
     "Dots3NoteForCausalLM": (
         "vllm.models.dots3_note",
         "Dots3NoteForCausalLM",
@@ -634,6 +642,11 @@ _SPECULATIVE_DECODING_MODELS = {
     "MuseGlimmerAssistantModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
     "DFlashMuseGlimmerAssistantModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
     "DSparkDraftModel": ("vllm.models.deepseek_v4", "DSparkDeepseekV4ForCausalLM"),
+    "DSparkV41DraftModel": (
+        "vllm.models.deepseek_v4_1",
+        "DSparkDeepseekV4ForCausalLM",
+    ),
+    "Glm53DSparkForCausalLM": ("glm53_dspark", "Glm53DSparkForCausalLM"),
     "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
     "Qwen3OmniDSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
     "K3DSparkModel": (

@@ -129,6 +129,16 @@ class DeepseekV4SparseMLAMetadataBuilder(
         # Classify single-token queries (plus num_speculative_tokens via
         # supports_spec_as_decode=True) as decodes; longer queries go to prefill.
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        # DSpark reports parallel drafting, which doubles the speculative width
+        # above, but its target verifier consumes only the bonus token plus K
+        # draft tokens. The decode/prefill boundary must match the SWA builder's
+        # `decode_threshold`; the B12X attention path reads `num_prefills` from
+        # the SWA metadata and the C128A prefill indices from this builder.
+        spec_config = vllm_config.speculative_config
+        if spec_config is not None and spec_config.use_dspark():
+            self.reorder_batch_threshold = 1 + int(
+                spec_config.num_speculative_tokens or 0
+            )
         self.topk_tokens = self.model_config.hf_config.index_topk
 
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens

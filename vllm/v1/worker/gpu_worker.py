@@ -141,6 +141,29 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
+class _B12xRoceCheckedAsyncOutput(AsyncModelRunnerOutput):
+    """An asynchronous output whose completion is followed by the RoCEnante check."""
+
+    def __init__(
+        self, inner: AsyncModelRunnerOutput, check: Callable[[], None]
+    ) -> None:
+        self._inner = inner
+        self._check = check
+
+    def get_output(self) -> ModelRunnerOutput:
+        """Wait for the wrapped output, then run the fail-stop check.
+
+        Returns:
+            The completed ModelRunnerOutput.
+
+        Raises:
+            RuntimeError: When a RoCEnante wait timed out or its proxy died.
+        """
+        output = self._inner.get_output()
+        self._check()
+        return output
+
+
 class Worker(WorkerBase):
     def __init__(
         self,
@@ -524,6 +547,7 @@ class Worker(WorkerBase):
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             self.model_runner.profile_run()
+            self.model_runner.profile_glm_dcp_attention()
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -553,13 +577,23 @@ class Worker(WorkerBase):
             else 0
         )
 
-        self.total_consumed = profile_result.total_consumed
-        self.peak_activation_memory = (
-            profile_result.transient_peak_headroom + cudagraph_memory_estimate_applied
+        # Backend and CUDA-graph profiling can initialize communication pools,
+        # compiled modules, and other persistent device allocations after the
+        # main activation profile. Include their retained footprint before the
+        # remaining memory is assigned to production KV cache storage.
+        final_profile_snapshot = MemorySnapshot(device=self.device)
+        late_persistent_memory = max(
+            profile_result.after_profile.free_memory
+            - final_profile_snapshot.free_memory,
+            0,
         )
+        self.total_consumed = profile_result.total_consumed + late_persistent_memory
+        # KV admission subtracts the graph estimate separately. Post-capture
+        # recommendations add measured graph memory to this activation peak.
+        self.peak_activation_memory = profile_result.transient_peak_headroom
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
-        free_gpu_memory = profile_result.after_profile.free_memory
+        free_gpu_memory = final_profile_snapshot.free_memory
         # NOTE(woosuk): Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.
         assert self.init_snapshot.free_memory >= free_gpu_memory, (
@@ -574,6 +608,7 @@ class Worker(WorkerBase):
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
+            - late_persistent_memory
             - cudagraph_memory_estimate_applied
         )
 
@@ -894,6 +929,11 @@ class Worker(WorkerBase):
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()
 
+    def wait_for_boundary_checkpoint_copies(self) -> None:
+        state = getattr(self.model_runner, "boundary_checkpoint_state", None)
+        if state is not None:
+            state.wait_for_copies()
+
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
 
@@ -1066,7 +1106,47 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        return self._b12x_roce_guarded(self.model_runner.sample_tokens(grammar_output))
+
+    def _b12x_roce_health_check(self) -> Callable[[], None] | None:
+        """The RoCEnante health check of the TP communicator, if one is active.
+
+        Returns:
+            The check callable, or None when RoCEnante is not in use.
+        """
+        communicator = get_tp_group().device_communicator
+        comm = getattr(communicator, "b12x_ar_comm", None)
+        return getattr(comm, "check_health", None)
+
+    def _b12x_roce_guarded(self, output):
+        """Fail-stop RoCEnante check once the step's output is on the host.
+
+        A RoCEnante wait that timed out records itself and freezes the runtime.
+        A synchronous output already holds the sampled tokens on the host, so
+        every collective of the step has completed and the check runs now; an
+        asynchronous output is wrapped so the check runs right after its
+        ``get_output()`` completes the copy.  Either way a failed collective's
+        output never leaves the worker.  Every rank reaches the same state on
+        its own (a stalled rank starves its peers' waits), so the raise is
+        coordinated without a supervisor.  Two pinned-memory reads; no added
+        synchronization.
+
+        Args:
+            output: The model runner's output for this step, possibly None.
+
+        Returns:
+            The same output, or a wrapper for an asynchronous output.
+
+        Raises:
+            RuntimeError: When a RoCEnante wait timed out or its proxy died.
+        """
+        check = self._b12x_roce_health_check()
+        if check is None:
+            return output
+        if isinstance(output, AsyncModelRunnerOutput):
+            return _B12xRoceCheckedAsyncOutput(output, check)
+        check()
+        return output
 
     @torch.inference_mode()
     @with_gpu_sync_check
@@ -1142,7 +1222,7 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
-                return output
+                return self._b12x_roce_guarded(output)
 
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config

@@ -8,6 +8,11 @@ GLM-4.7 uses XML-like tool calls::
 
 The function name can be followed directly by the first ``<arg_key>`` tag,
 and tool calls may have no arguments.
+
+A literal tag inside an argument value has the same token ID as the
+structural tag, so position is the only signal: ``</tool_call>`` is
+structural only outside an argument value, and ``</arg_value>`` is structural
+only when the next non-whitespace text is ``<arg_key>`` or ``</tool_call>``.
 """
 
 from __future__ import annotations
@@ -41,12 +46,15 @@ ARG_KEY_END = "</arg_key>"
 ARG_VALUE_START = "<arg_value>"
 ARG_VALUE_END = "</arg_value>"
 
+# A complete argument ends at the first ``</arg_value>`` that is followed
+# by the next ``<arg_key>`` or by the end of the arguments. Any other
+# ``</arg_value>`` is data inside the value.
 _ARG_RE = re.compile(
     r"<arg_key>(?P<key>.*?)</arg_key>\s*"
-    r"<arg_value>(?P<value>.*?)</arg_value>",
+    r"<arg_value>(?P<value>.*?)</arg_value>(?=\s*(?:<arg_key>|$))",
     re.DOTALL,
 )
-_PARTIAL_ARG_RE = re.compile(
+_TAIL_ARG_RE = re.compile(
     r"<arg_key>(?P<key>.*?)</arg_key>\s*"
     r"<arg_value>(?P<value>.*)$",
     re.DOTALL,
@@ -55,17 +63,25 @@ _PARTIAL_ARG_RE = re.compile(
 
 def _glm47_arg_converter(raw_args: str, partial: bool) -> str:
     params: dict[str, object] = {}
+    pos = 0
 
     for match in _ARG_RE.finditer(raw_args):
+        if partial and match.end() == len(raw_args.rstrip()):
+            # The final </arg_value> may still turn out to be data once
+            # more text arrives, so leave it to the tail below.
+            break
         params[match.group("key").strip()] = match.group("value")
+        pos = match.end()
 
-    if partial:
-        remaining = _ARG_RE.sub("", raw_args)
-        match = _PARTIAL_ARG_RE.search(remaining)
-        if match:
-            key = match.group("key").strip()
-            if key:
-                params[key] = match.group("value")
+    tail = _TAIL_ARG_RE.search(raw_args, pos)
+    if tail:
+        key = tail.group("key").strip()
+        value = tail.group("value")
+        last_end = value.rfind(ARG_VALUE_END)
+        if last_end >= 0:
+            value = value[:last_end]
+        if key:
+            params[key] = value
 
     return json.dumps(params, ensure_ascii=False)
 
@@ -73,16 +89,36 @@ def _glm47_arg_converter(raw_args: str, partial: bool) -> str:
 @functools.cache
 def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
     arg_tag_transitions = {
-        (ParserState.TOOL_ARGS, terminal): Transition(
+        (ParserState.TOOL_NAME, "ARG_KEY_START"): Transition(
+            ParserState.TOOL_BETWEEN,
+            (EventType.ARG_VALUE_CHUNK,),
+        ),
+        (ParserState.TOOL_BETWEEN, "ARG_KEY_START"): Transition(
+            ParserState.TOOL_BETWEEN,
+            (EventType.ARG_VALUE_CHUNK,),
+        ),
+        (ParserState.TOOL_BETWEEN, "ARG_KEY_END"): Transition(
+            ParserState.TOOL_BETWEEN,
+            (EventType.ARG_VALUE_CHUNK,),
+        ),
+        (ParserState.TOOL_BETWEEN, "ARG_VALUE_START"): Transition(
             ParserState.TOOL_ARGS,
             (EventType.ARG_VALUE_CHUNK,),
-        )
-        for terminal in (
-            "ARG_KEY_START",
-            "ARG_KEY_END",
-            "ARG_VALUE_START",
-            "ARG_VALUE_END",
-        )
+        ),
+        # A </arg_value> is only structural if the next non-whitespace text
+        # is <arg_key> or </tool_call>; anything else means it was data.
+        (ParserState.TOOL_ARGS, "ARG_VALUE_END"): Transition(
+            ParserState.TOOL_ARG_END_PENDING,
+            (EventType.ARG_VALUE_CHUNK,),
+        ),
+        (ParserState.TOOL_ARG_END_PENDING, "ARG_VALUE_END"): Transition(
+            ParserState.TOOL_ARG_END_PENDING,
+            (EventType.ARG_VALUE_CHUNK,),
+        ),
+        (ParserState.TOOL_ARG_END_PENDING, "ARG_KEY_START"): Transition(
+            ParserState.TOOL_BETWEEN,
+            (EventType.ARG_VALUE_CHUNK,),
+        ),
     }
 
     reasoning_terminals = (
@@ -151,19 +187,33 @@ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
                 ParserState.TOOL_NAME,
                 (EventType.TOOL_CALL_START,),
             ),
-            (ParserState.TOOL_NAME, "ARG_KEY_START"): Transition(
-                ParserState.TOOL_ARGS,
-                (EventType.ARG_VALUE_CHUNK,),
-            ),
             (ParserState.TOOL_NAME, "TOOL_END"): Transition(
                 ParserState.CONTENT,
                 (EventType.TOOL_CALL_END,),
             ),
-            (ParserState.TOOL_ARGS, "TOOL_END"): Transition(
+            (ParserState.TOOL_BETWEEN, "TOOL_END"): Transition(
+                ParserState.CONTENT,
+                (EventType.TOOL_CALL_END,),
+            ),
+            (ParserState.TOOL_ARG_END_PENDING, "TOOL_END"): Transition(
                 ParserState.CONTENT,
                 (EventType.TOOL_CALL_END,),
             ),
             **arg_tag_transitions,
+        },
+        non_whitespace_transitions={
+            ParserState.TOOL_ARG_END_PENDING: Transition(
+                ParserState.TOOL_ARGS,
+                (EventType.ARG_VALUE_CHUNK,),
+            ),
+        },
+        content_events={
+            ParserState.CONTENT: EventType.TEXT_CHUNK,
+            ParserState.REASONING: EventType.REASONING_CHUNK,
+            ParserState.TOOL_NAME: EventType.TOOL_NAME,
+            ParserState.TOOL_ARGS: EventType.ARG_VALUE_CHUNK,
+            ParserState.TOOL_BETWEEN: EventType.ARG_VALUE_CHUNK,
+            ParserState.TOOL_ARG_END_PENDING: EventType.ARG_VALUE_CHUNK,
         },
         arg_converter=_glm47_arg_converter,
         stream_arg_deltas=True,

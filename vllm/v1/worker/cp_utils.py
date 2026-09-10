@@ -88,11 +88,16 @@ def get_dcp_dummy_context_len(
     create_mixed_batch: bool,
     is_graph_capturing: bool,
     uniform_decode: bool,
+    single_request_prefill: bool = False,
 ) -> int:
     if (
         dcp_world_size <= 1
         or not has_kv_cache_config
-        or not (create_mixed_batch or (is_graph_capturing and uniform_decode))
+        or not (
+            create_mixed_batch
+            or (is_graph_capturing and uniform_decode)
+            or single_request_prefill
+        )
     ):
         return 0
     return dcp_world_size * cp_kv_cache_interleave_size

@@ -353,6 +353,12 @@ class LLMEngine:
             reset_running_requests, reset_connector
         )
 
+    def get_prefill_fairness(self) -> dict[str, Any]:
+        return self.engine_core.get_prefill_fairness()
+
+    def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+        return self.engine_core.set_prefill_fairness(config)
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 

@@ -68,7 +68,7 @@ def _fp8_quant_and_cache_write(
     kv_cache_ptr,
     kv_cache_scale_ptr,
     cache_block_size,
-    cache_stride,
+    cache_block_stride,
     offsets,
     HEAD_DIM: tl.constexpr,
 ):
@@ -76,7 +76,7 @@ def _fp8_quant_and_cache_write(
 
     block_idx = slot_idx // cache_block_size
     block_offset = slot_idx % cache_block_size
-    block_start = block_idx * cache_block_size * cache_stride
+    block_start = block_idx * cache_block_stride
 
     tl.store(
         kv_cache_ptr + block_start + block_offset * HEAD_DIM + offsets,
@@ -135,9 +135,10 @@ def _fused_norm_rope_kernel(
     indexer_cache_ptr,
     indexer_cache_scale_ptr,
     indexer_cache_block_size,
-    indexer_cache_stride,
+    indexer_cache_block_stride,
     # MLA KV cache (concat kv_c_normed + k_pe_roped, uses slot_mapping_ptr)
     mla_cache_ptr,
+    mla_cache_block_size,
     mla_cache_block_stride,
     mla_cache_entry_stride,
     MLA_CACHE_FP8: tl.constexpr,
@@ -242,9 +243,8 @@ def _fused_norm_rope_kernel(
                 return
 
             slot_idx = tl.load(slot_mapping_ptr + tok_idx)
-            mla_block_size = mla_cache_block_stride // mla_cache_entry_stride
-            mla_block_idx = slot_idx // mla_block_size
-            mla_block_off = slot_idx % mla_block_size
+            mla_block_idx = slot_idx // mla_cache_block_size
+            mla_block_off = slot_idx % mla_cache_block_size
 
             if MLA_CACHE_DS_MLA:
                 # fp8_ds_mla layout (DeepSeek-V3.2, KV_DIM == 512): per-128-element
@@ -395,7 +395,7 @@ def _fused_norm_rope_kernel(
                 indexer_cache_ptr,
                 indexer_cache_scale_ptr,
                 indexer_cache_block_size,
-                indexer_cache_stride,
+                indexer_cache_block_stride,
                 index_k_block,
                 INDEX_K_DIM,
             )
@@ -464,13 +464,13 @@ def fused_norm_rope(
         assert slot_mapping is not None
         idx_cache_scale_view = indexer_k_cache.view(torch.uint8).view(torch.float32)
         idx_cache_block_size = indexer_k_cache.shape[1]
-        idx_cache_stride = indexer_k_cache.shape[2]
+        idx_cache_block_stride = indexer_k_cache.stride(0)
         if indexer_k_cache.dtype == torch.uint8:
             indexer_k_cache = indexer_k_cache.view(torch.float8_e4m3fn)
     else:
         idx_cache_scale_view = None
         idx_cache_block_size = 1
-        idx_cache_stride = 0
+        idx_cache_block_stride = 0
 
     # --- MLA KV cache setup ---
     mla_cache_ds_mla = mla_kv_cache_dtype == "fp8_ds_mla"
@@ -479,6 +479,7 @@ def fused_norm_rope(
     mla_ds_scale_view = torch.empty(0, dtype=torch.float32, device=device)
     mla_ds_rope_view = torch.empty(0, dtype=torch.bfloat16, device=device)
     if mla_kv_cache is not None:
+        mla_block_size = mla_kv_cache.shape[1]
         if mla_cache_ds_mla:
             # 656-byte custom layout addressed in bytes; mla_cache_ptr is the
             # 1-byte fp8 view, so block/entry strides are byte offsets and the
@@ -501,6 +502,7 @@ def fused_norm_rope(
     else:
         # Dummy cache values; a zero entry stride disables the cache write.
         mla_kv_cache = torch.empty(0, dtype=torch.bfloat16, device=device)
+        mla_block_size = 1
         mla_block_stride = 0
         mla_entry_stride = 0
         mla_k_scale = _dummy((1,), torch.float32, device)
@@ -565,9 +567,10 @@ def fused_norm_rope(
         indexer_k_cache,
         idx_cache_scale_view,
         idx_cache_block_size,
-        idx_cache_stride,
+        idx_cache_block_stride,
         # MLA KV cache (uses same slot_mapping)
         mla_kv_cache,
+        mla_block_size,
         mla_block_stride,
         mla_entry_stride,
         mla_cache_fp8,

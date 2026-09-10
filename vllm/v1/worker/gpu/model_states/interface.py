@@ -43,6 +43,8 @@ class ModelSpecificAttnMetadata:
 
 
 class ModelState(ABC):
+    specialize_full_decode_graphs: ClassVar[bool] = False
+    """Capture decode-specific graphs alongside general full-model graphs."""
     supports_prompt_embeds: ClassVar[bool] = False
     """Whether this state implements user-provided prompt embeddings."""
 
@@ -150,6 +152,14 @@ class ModelState(ABC):
         are gathered). Used by mamba "align" prefix caching to pre-copy state
         across block boundaries. No-op by default."""
         return None
+
+    def get_recurrent_checkpoint_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return persistent per-request auxiliary state for boundary caching."""
+        return ()
+
+    def get_recurrent_checkpoint_acceptance(self) -> torch.Tensor:
+        """Return per-request selector acceptance for boundary MTP replay."""
+        raise NotImplementedError
 
     def postprocess_state(
         self,

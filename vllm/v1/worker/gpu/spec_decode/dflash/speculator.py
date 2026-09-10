@@ -371,6 +371,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        context_kv_is_restored: bool = False,
     ) -> torch.Tensor:
         del num_speculative_tokens
         num_reqs = input_batch.num_reqs
@@ -385,13 +386,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
+        if not context_kv_is_restored:
+            if aux_hidden_states:
+                hidden_states = self.model.combine_hidden_states(
+                    torch.cat(aux_hidden_states, dim=-1)
+                )
+            else:
+                hidden_states = last_hidden_states
+            self.hidden_states[:num_target_tokens].copy_(
+                hidden_states[:num_target_tokens]
             )
-        else:
-            hidden_states = last_hidden_states
-        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
@@ -466,11 +470,12 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        self.model.precompute_and_store_context_kv(
-            self.hidden_states[:num_target_tokens],
-            self.context_positions[:num_target_tokens],
-            context_slots,
-        )
+        if not context_kv_is_restored:
+            self.model.precompute_and_store_context_kv(
+                self.hidden_states[:num_target_tokens],
+                self.context_positions[:num_target_tokens],
+                context_slots,
+            )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
@@ -764,7 +769,9 @@ def prepare_dflash_inputs(
     # per-request query length, not the total token count across the batch.
     max_target_query_len = int(input_batch.num_scheduled_tokens.max())
     max_tokens_per_req = max_target_query_len + num_query_per_req
-    BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
+    # Live context/query lengths control the grid, never the compiled tile.
+    # A length-derived constexpr causes first-request JIT after graph warmup.
+    BLOCK_SIZE = 256
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
     _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
         input_buffers.input_ids,

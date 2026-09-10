@@ -12,10 +12,13 @@ when the target itself is shrunk — which is what kept spec-decode archs like
 """
 
 import functools
+from contextlib import nullcontext
 
 import pytest
 from transformers import PretrainedConfig
 
+from vllm.config.model import ModelConfig
+from vllm.config.parallel import ParallelConfig
 from vllm.config.speculative import SpeculativeConfig
 
 
@@ -113,6 +116,44 @@ def test_inkling_override_exposes_all_mtp_depths():
     assert out.num_nextn_predict_layers == 8
     assert out.chain_hidden_post_norm is False
     assert out.local_layer_ids == [0, 2, 4]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "method,depth,valid",
+    [("dspark", 5, True), ("dspark", 7, True), ("mtp", 6, True), ("mtp", 7, False)],
+)
+def test_block_diffusion_depth_does_not_follow_mtp_layer_count(method, depth, valid):
+    """DSpark predicts a block independently of its three draft transformer layers."""
+    model = "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"
+    revision = "6821d6ad3681a4b137b066b76094fa82ebd0a380"
+    target = ModelConfig(
+        model=model,
+        revision=revision,
+        tokenizer_revision=revision,
+        tokenizer_mode="deepseek_v4",
+        trust_remote_code=True,
+        max_model_len=32768,
+    )
+    expected = (
+        nullcontext()
+        if valid
+        else pytest.raises(ValueError, match="must be divisible by n_predict=3")
+    )
+    with expected:
+        config = SpeculativeConfig(
+            target_model_config=target,
+            target_parallel_config=ParallelConfig(tensor_parallel_size=2),
+            model=model,
+            revision=revision,
+            method=method,
+            num_speculative_tokens=depth,
+            draft_sample_method="probabilistic",
+            enable_adaptive_verification=method == "dspark",
+        )
+        assert config.num_speculative_tokens == depth
+        assert config.draft_model_config.hf_config.num_nextn_predict_layers == 3
+        assert config.parallel_drafting == (method == "dspark")
 
 
 def _module_level_shrink(hf_config: PretrainedConfig) -> PretrainedConfig:

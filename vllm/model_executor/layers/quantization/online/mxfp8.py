@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 
 from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
+from vllm.model_executor.kernels.linear.mxfp8.b12x import B12xMxfp8LinearKernel
 from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
@@ -40,9 +41,15 @@ class Mxfp8OnlineLinearMethod(_Fp8OnlineLinearBase):
     FP8 with block-32 scales) during weight loading.
     """
 
-    def __init__(self):
+    def __init__(self, *, use_a16: bool | None = None):
         super().__init__()
         self.kernel = init_mxfp8_linear_kernel()
+        self.use_a16 = use_a16
+        if use_a16 and (
+            self.input_dtype != torch.bfloat16
+            or not isinstance(self.kernel, B12xMxfp8LinearKernel)
+        ):
+            raise ValueError("A16 LM heads require BF16 activations and b12x")
 
     def create_weights(
         self,
@@ -82,6 +89,8 @@ class Mxfp8OnlineLinearMethod(_Fp8OnlineLinearBase):
         replace_parameter(layer, "weight_scale", weight_scale.data)
 
         self.kernel.process_weights_after_loading(layer)
+        if self.use_a16 is not None and isinstance(self.kernel, B12xMxfp8LinearKernel):
+            layer.b12x_activation_mode = "a16" if self.use_a16 else "quantized"
 
         layer._already_called_process_weights_after_loading = True
 

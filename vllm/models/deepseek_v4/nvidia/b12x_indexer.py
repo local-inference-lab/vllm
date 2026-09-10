@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """B12x sparse indexer for DeepSeek V4."""
 
-from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
@@ -15,7 +14,6 @@ from vllm.utils.b12x import get_b12x_dsa_indexer
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
-    DeepSeekV32IndexerDecodeMetadata,
     DeepseekV32IndexerMetadata,
     DeepseekV32IndexerMetadataBuilder,
     split_indexer_prefill_chunks,
@@ -30,11 +28,6 @@ _INDEX_PAGE_WIDTH = _INDEX_PAGE_SIZE * (_INDEX_HEAD_DIM + _INDEX_SCALE_BYTES)
 _PREFILL_ROUTE = "packed_contiguous"
 
 
-@dataclass
-class DeepseekV4B12xIndexerDecodeMetadata(DeepSeekV32IndexerDecodeMetadata):
-    active_width: torch.Tensor | None = None
-
-
 class DeepseekV4B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
     @classmethod
     def get_cudagraph_support(
@@ -46,15 +39,8 @@ class DeepseekV4B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
 
     def __init__(self, *args, block_table_width: int, **kwargs) -> None:
         super().__init__(*args, block_table_width=block_table_width, **kwargs)
-        self.use_flattening = False
+        self.use_flattening = True
         self.supports_varlen = False
-        self.prefill_k_rows = _require_b12x_indexer().resolve_paged_prefill_k_rows(
-            max_page_table_width=block_table_width,
-            page_size=_INDEX_PAGE_SIZE,
-        )
-        self.active_width_buffer = torch.zeros(
-            (1,), dtype=torch.int32, device=self.device
-        )
 
     def _supports_native_decode(self, next_n: int) -> bool:
         return True
@@ -66,15 +52,13 @@ class DeepseekV4B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
         num_decodes: int,
         max_logits_bytes: int,
     ) -> list[tuple[slice, slice]]:
-        budget_seq_lens = torch.full_like(
-            compressed_seq_lens_cpu[num_decodes:],
-            self.prefill_k_rows,
-        )
         return [
             chunk
             for prefill_idx in range(len(prefill_query_lens_cpu))
             for chunk in split_indexer_prefill_chunks(
-                budget_seq_lens[prefill_idx : prefill_idx + 1],
+                compressed_seq_lens_cpu[
+                    num_decodes + prefill_idx : num_decodes + prefill_idx + 1
+                ],
                 prefill_query_lens_cpu[prefill_idx : prefill_idx + 1],
                 self.max_prefill_buffer_size,
                 max_logits_bytes,
@@ -82,40 +66,16 @@ class DeepseekV4B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
             )
         ]
 
-    def build(self, *args, **kwargs) -> DeepseekV32IndexerMetadata:
-        metadata = super().build(*args, **kwargs)
-        if metadata.decode is not None:
-            module = _require_b12x_indexer()
-            decode = metadata.decode
-            seq_lens = decode.seq_lens.reshape(-1).contiguous()
-            schedule_metadata = None
-            if module.uses_paged_schedule(
-                q_rows=int(seq_lens.shape[0]),
-                max_pages=int(decode.block_table.shape[1]),
-            ):
-                schedule_metadata = module.plan_paged_schedule(
-                    seq_lens,
-                    _INDEX_PAGE_SIZE,
-                    self.num_sms,
-                    out=self.scheduler_metadata_buffer,
-                )
-            active_width = (
-                int(metadata.max_seq_len) + int(self.compress_ratio) - 1
-            ) // int(self.compress_ratio)
-            self.active_width_buffer.fill_(active_width)
-            decode_fields = vars(decode).copy()
-            decode_fields["schedule_metadata"] = schedule_metadata
-            metadata.decode = DeepseekV4B12xIndexerDecodeMetadata(
-                **decode_fields,
-                active_width=self.active_width_buffer,
-            )
-        return metadata
-
 
 class DeepseekV4B12xIndexerBackend(DeepseekV4IndexerBackend):
     @classmethod
     def supports_pcp(cls) -> bool:
         return False
+
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        # Flattened rows use the device query lengths after draft trimming.
+        return True
 
     @staticmethod
     def get_name() -> str:
@@ -140,13 +100,11 @@ def _require_b12x_indexer() -> Any:
             f"{_INDEX_PAGE_SIZE}, got {module.PAGED_INDEX_PAGE_SIZE}."
         )
     for name in (
+        "Binding",
         "Caps",
-        "SOURCE_LAYOUT_PAGED",
-        "index_topk_fp8",
+        "bind",
         "plan",
-        "plan_paged_schedule",
-        "resolve_paged_prefill_k_rows",
-        "uses_paged_schedule",
+        "run",
     ):
         getattr(module, name)
     return module
@@ -179,6 +137,9 @@ def _assert_prefill_route(obj: object) -> None:
     route = getattr(obj, "route", None)
     if route is None:
         route = getattr(getattr(obj, "layout", None), "route", None)
+    if route is None:
+        plan = getattr(obj, "plan", None)
+        route = getattr(getattr(plan, "layout", None), "route", None)
     if route != _PREFILL_ROUTE:
         raise RuntimeError(
             f"B12x sparse prefill requires the packed-contiguous route, got {route!r}."
@@ -194,38 +155,29 @@ def _run_paged_topk(
     kv_cache: torch.Tensor,
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
-    schedule_metadata: torch.Tensor | None,
-    active_width: torch.Tensor | None,
+    active_width: torch.Tensor,
     output: torch.Tensor,
     scores: torch.Tensor | None,
-    topk: int,
     shared_page_table: bool,
 ) -> None:
     if shared_page_table:
         _assert_prefill_route(plan)
     scratch = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
-    binding = plan.bind(
+    binding = module.bind(
+        plan,
         scratch=scratch,
-        real_page_table=block_table,
-        cache_seqlens_int32=seq_lens,
+        q_fp8=q,
+        query_weights=weights,
+        index_k_cache=_flatten_index_cache(kv_cache),
+        page_table=block_table,
+        cache_lengths=seq_lens,
         active_width=active_width,
-        schedule_metadata=schedule_metadata,
-        expected_num_q_heads=int(q.shape[1]),
-        shared_page_table=shared_page_table,
-        output_physical_slots=False,
+        output_indices=output,
+        output_scores=scores,
     )
     if shared_page_table:
         _assert_prefill_route(binding)
-    module.index_topk_fp8(
-        q_fp8=q,
-        weights=weights,
-        index_k_cache=_flatten_index_cache(kv_cache),
-        binding=binding,
-        page_size=module.PAGED_INDEX_PAGE_SIZE,
-        expected_num_q_heads=int(q.shape[1]),
-        out_indices=output,
-        out_scores=scores,
-    )
+    module.run(binding)
 
 
 class B12xC4SparseIndexer(nn.Module):
@@ -266,7 +218,23 @@ class B12xC4SparseIndexer(nn.Module):
         self.topk_tokens = int(topk_tokens)
         self.max_model_len = int(max_model_len)
         self.topk_indices_buffer = topk_indices_buffer
+        self.register_buffer(
+            "_active_width",
+            torch.empty((1,), dtype=torch.int32, device=topk_indices_buffer.device),
+            persistent=False,
+        )
         self._b12x_plans: dict[tuple[object, ...], Any] = {}
+
+    def _set_active_width(
+        self,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        torch.amax(seq_lens, dim=0, keepdim=True, out=self._active_width)
+        return self._active_width.clamp_(
+            min=0,
+            max=int(block_table.shape[1]) * _INDEX_PAGE_SIZE,
+        )
 
     def _plan_paged_topk(
         self,
@@ -288,13 +256,11 @@ class B12xC4SparseIndexer(nn.Module):
             plan = module.plan(
                 module.Caps(
                     device=q.device,
-                    source_layout=module.SOURCE_LAYOUT_PAGED,
                     num_q_heads=int(q.shape[1]),
                     max_q_rows=max(int(q.shape[0]), 1),
                     max_page_table_width=max(int(block_table.shape[1]), 1),
                     topk=self.topk_tokens,
                     mode="prefill" if shared_page_table else "decode",
-                    shared_page_table=shared_page_table,
                 )
             )
             if shared_page_table:
@@ -313,13 +279,11 @@ class B12xC4SparseIndexer(nn.Module):
             plan = module.plan(
                 module.Caps(
                     device=q.device,
-                    source_layout=module.SOURCE_LAYOUT_PAGED,
                     num_q_heads=int(q.shape[1]),
                     max_q_rows=q_rows,
                     max_page_table_width=page_table_width,
                     topk=self.topk_tokens,
                     mode="prefill" if shared_page_table else "decode",
-                    shared_page_table=shared_page_table,
                 )
             )
             if shared_page_table:
@@ -341,9 +305,9 @@ class B12xC4SparseIndexer(nn.Module):
         scores: torch.Tensor | None = None,
         shared_page_table: bool,
         schedule_metadata: torch.Tensor | None = None,
-        active_width: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the shared C4 scorer against caller-owned paged metadata."""
+        del schedule_metadata
         if output.shape != (int(q.shape[0]), self.topk_tokens):
             raise ValueError(
                 "B12x C4 output must have shape "
@@ -355,7 +319,6 @@ class B12xC4SparseIndexer(nn.Module):
             raise ValueError(
                 "B12x C4 scores must be float32 with the same shape as output"
             )
-        output.fill_(-1)
         _run_paged_topk(
             module=self._b12x_indexer,
             plan=self._plan_paged_topk(
@@ -368,11 +331,9 @@ class B12xC4SparseIndexer(nn.Module):
             kv_cache=kv_cache,
             seq_lens=seq_lens,
             block_table=block_table,
-            schedule_metadata=schedule_metadata,
-            active_width=active_width,
+            active_width=self._set_active_width(seq_lens, block_table),
             output=output,
             scores=scores,
-            topk=self.topk_tokens,
             shared_page_table=shared_page_table,
         )
         return output
@@ -427,7 +388,6 @@ class B12xC4SparseIndexer(nn.Module):
                 block_table = chunk.block_table[:1, :active_pages].expand(
                     int(q_chunk.shape[0]), active_pages
                 )
-                output.fill_(-1)
                 _run_paged_topk(
                     module=self._b12x_indexer,
                     plan=self._plan_paged_topk(
@@ -440,11 +400,9 @@ class B12xC4SparseIndexer(nn.Module):
                     kv_cache=self.k_cache.kv_cache,
                     seq_lens=seq_lens,
                     block_table=block_table,
-                    schedule_metadata=None,
-                    active_width=None,
+                    active_width=self._set_active_width(seq_lens, block_table),
                     output=output,
                     scores=None,
-                    topk=self.topk_tokens,
                     shared_page_table=True,
                 )
 
@@ -465,8 +423,6 @@ class B12xC4SparseIndexer(nn.Module):
                 )
             num_tokens = metadata.num_decode_tokens
             output = self.topk_indices_buffer[:num_tokens, : self.topk_tokens]
-            output.fill_(-1)
-            active_width = getattr(decode, "active_width", None)
             _run_paged_topk(
                 module=self._b12x_indexer,
                 plan=self._plan_paged_topk(
@@ -479,11 +435,12 @@ class B12xC4SparseIndexer(nn.Module):
                 kv_cache=self.k_cache.kv_cache,
                 seq_lens=seq_lens[:num_tokens],
                 block_table=block_table[:num_tokens].contiguous(),
-                schedule_metadata=decode.schedule_metadata,
-                active_width=active_width,
+                active_width=self._set_active_width(
+                    seq_lens[:num_tokens],
+                    block_table[:num_tokens],
+                ),
                 output=output,
                 scores=None,
-                topk=self.topk_tokens,
                 shared_page_table=False,
             )
 

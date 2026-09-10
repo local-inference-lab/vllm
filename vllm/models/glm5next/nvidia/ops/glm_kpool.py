@@ -175,6 +175,7 @@ def _decode_update_kernel(
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     POOL_SIZE: tl.constexpr,
+    TAIL_CAPACITY: tl.constexpr,
     FP8_MAX: tl.constexpr,
     BLOCK_D: tl.constexpr,
     PACKED_MAIN_SLOTS: tl.constexpr,
@@ -187,7 +188,7 @@ def _decode_update_kernel(
     dim_mask = (dim < HEAD_DIM) & (state_slot >= 0)
     for row in tl.range(start, end):
         position = tl.load(positions + row).to(tl.int64)
-        physical_slot = position % POOL_SIZE
+        physical_slot = position % TAIL_CAPACITY
         current_key = tl.load(
             key + row * key_stride_0 + dim, mask=dim_mask, other=0.0
         ).to(tl.float32)
@@ -219,7 +220,8 @@ def _decode_update_kernel(
                 tail_offset = (
                     state_slot * tail_stride_0
                     + tail_stride_1
-                    + slot * tail_stride_2
+                    + ((position - POOL_SIZE + 1 + slot) % TAIL_CAPACITY)
+                    * tail_stride_2
                     + dim
                 )
                 score = tl.load(tail + tail_offset, mask=pool_mask, other=0.0).to(
@@ -237,7 +239,12 @@ def _decode_update_kernel(
             value = current_key
             score = current_gate
             if slot != POOL_SIZE - 1:
-                base = state_slot * tail_stride_0 + slot * tail_stride_2 + dim
+                base = (
+                    state_slot * tail_stride_0
+                    + ((position - POOL_SIZE + 1 + slot) % TAIL_CAPACITY)
+                    * tail_stride_2
+                    + dim
+                )
                 value = tl.load(tail + base, mask=pool_mask, other=0.0).to(tl.float32)
                 score = tl.load(
                     tail + base + tail_stride_1, mask=pool_mask, other=0.0
@@ -294,6 +301,7 @@ def _prefill_pool_kernel(
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     POOL_SIZE: tl.constexpr,
+    TAIL_CAPACITY: tl.constexpr,
     FP8_MAX: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -331,8 +339,9 @@ def _prefill_pool_kernel(
     for slot in tl.static_range(0, POOL_SIZE):
         source_row = completion_row - (POOL_SIZE - 1 - slot)
         from_current_chunk = source_row >= start
+        tail_slot = (completion_position - POOL_SIZE + 1 + slot) % TAIL_CAPACITY
         tail_offset = (
-            state_slot * tail_stride_0 + tail_stride_1 + slot * tail_stride_2 + dim
+            state_slot * tail_stride_0 + tail_stride_1 + tail_slot * tail_stride_2 + dim
         )
         current_score = tl.load(
             gate + source_row * gate_stride_0 + dim,
@@ -357,7 +366,8 @@ def _prefill_pool_kernel(
     for slot in tl.static_range(0, POOL_SIZE):
         source_row = completion_row - (POOL_SIZE - 1 - slot)
         from_current_chunk = source_row >= start
-        tail_offset = state_slot * tail_stride_0 + slot * tail_stride_2 + dim
+        tail_slot = (completion_position - POOL_SIZE + 1 + slot) % TAIL_CAPACITY
+        tail_offset = state_slot * tail_stride_0 + tail_slot * tail_stride_2 + dim
         current_value = tl.load(
             key + source_row * key_stride_0 + dim,
             mask=dim_mask & write_pool & from_current_chunk,
@@ -420,7 +430,7 @@ def _prefill_tail_kernel(
     key_stride_0,
     gate_stride_0,
     HEAD_DIM: tl.constexpr,
-    POOL_SIZE: tl.constexpr,
+    TAIL_CAPACITY: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     request = request_offset + tl.program_id(0)
@@ -430,11 +440,11 @@ def _prefill_tail_kernel(
     last_row = end - 1
     has_rows = end > start
     last_position = tl.load(positions + last_row, mask=has_rows, other=0).to(tl.int64)
-    last_physical_slot = last_position % POOL_SIZE
+    last_physical_slot = last_position % TAIL_CAPACITY
     dim = tl.arange(0, BLOCK_D)
     dim_mask = (dim < HEAD_DIM) & has_rows & (state_slot >= 0)
-    for slot in tl.static_range(0, POOL_SIZE):
-        distance = (last_physical_slot - slot + POOL_SIZE) % POOL_SIZE
+    for slot in tl.static_range(0, TAIL_CAPACITY):
+        distance = (last_physical_slot - slot + TAIL_CAPACITY) % TAIL_CAPACITY
         source_row = last_row - distance
         source_in_chunk = source_row >= start
         source_position = tl.load(
@@ -442,7 +452,9 @@ def _prefill_tail_kernel(
             mask=has_rows & source_in_chunk,
             other=-1,
         ).to(tl.int64)
-        write_slot = dim_mask & source_in_chunk & (source_position % POOL_SIZE == slot)
+        write_slot = (
+            dim_mask & source_in_chunk & (source_position % TAIL_CAPACITY == slot)
+        )
         value = tl.load(
             key + source_row * key_stride_0 + dim,
             mask=write_slot,
@@ -537,6 +549,7 @@ def update_decode_pools(
         PAGE_SIZE=page_size,
         HEAD_DIM=_HEAD_DIM,
         POOL_SIZE=_POOL_SIZE,
+        TAIL_CAPACITY=tail.shape[2],
         FP8_MAX=_FP8_MAX,
         BLOCK_D=128,
         num_warps=4,
@@ -571,7 +584,7 @@ def update_decode_pools(
             int(key.stride(0)),
             int(gate.stride(0)),
             HEAD_DIM=_HEAD_DIM,
-            POOL_SIZE=_POOL_SIZE,
+            TAIL_CAPACITY=tail.shape[2],
             BLOCK_D=128,
             num_warps=4,
         )
@@ -689,6 +702,121 @@ def gather_c4_block_table_rows(
             int(source.shape[1]),
             int(source.stride(0)),
             int(output.stride(0)),
+            BLOCK=block,
+            num_warps=4,
+        )
+
+
+@triton.jit
+def _prepare_c4_decode_metadata_kernel(
+    source,
+    request_ids,
+    positions,
+    output_table,
+    output_seq_lens,
+    rows,
+    source_width,
+    output_width,
+    source_stride,
+    output_stride,
+    parent_stride_pages,
+    dcp_size,
+    dcp_rank,
+    pool_interleave,
+    SUBPAGES_PER_PARENT: tl.constexpr,
+    POOL_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    linear = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    total = rows * output_width
+    mask = linear < total
+    row = linear // output_width
+    output_col = linear - row * output_width
+    request = tl.load(request_ids + row, mask=mask, other=0).to(tl.int64)
+    source_col = output_col // SUBPAGES_PER_PARENT
+    child_page = output_col - source_col * SUBPAGES_PER_PARENT
+    parent_page = tl.load(
+        source + request * source_stride + source_col,
+        mask=mask & (source_col < source_width),
+        other=-1,
+    ).to(tl.int64)
+    child_page_id = parent_page * parent_stride_pages.to(tl.int64) + child_page
+    child_page_id = tl.where(parent_page >= 0, child_page_id, -1)
+    tl.store(
+        output_table + row * output_stride + output_col,
+        child_page_id,
+        mask=mask,
+    )
+
+    first_column = mask & (output_col == 0)
+    position = tl.load(positions + row, mask=first_column, other=-1).to(tl.int64)
+    global_pool_len = (position + 1) // POOL_SIZE
+    rounds = global_pool_len // (dcp_size * pool_interleave)
+    remainder = global_pool_len % (dcp_size * pool_interleave)
+    remainder = tl.maximum(remainder - dcp_rank * pool_interleave, 0)
+    remainder = tl.minimum(remainder, pool_interleave)
+    local_pool_len = rounds * pool_interleave + remainder
+    tl.store(output_seq_lens + row, local_pool_len, mask=first_column)
+
+
+def prepare_c4_decode_metadata(
+    source: torch.Tensor,
+    request_ids: torch.Tensor,
+    positions: torch.Tensor,
+    output_table: torch.Tensor,
+    output_seq_lens: torch.Tensor,
+    *,
+    subpages_per_parent: int,
+    parent_stride_pages: int,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    pool_interleave: int = 1,
+) -> None:
+    """Gather expanded C4 page rows and write their local sequence lengths."""
+    if source.dtype != torch.int32 or request_ids.dtype != torch.int32:
+        raise TypeError("GLM block tables and request IDs must use int32")
+    if positions.dtype != torch.int64:
+        raise TypeError("GLM positions must use int64")
+    if output_table.dtype != torch.int32 or output_seq_lens.dtype != torch.int32:
+        raise TypeError("GLM decode metadata outputs must use int32")
+    if source.ndim != 2 or int(source.shape[1]) < 1:
+        raise ValueError("GLM parent block table must be non-empty and rank two")
+    if request_ids.ndim != 1:
+        raise ValueError("GLM decode request IDs must be rank one")
+    rows = int(request_ids.shape[0])
+    if positions.shape != (rows,):
+        raise ValueError("GLM selector positions must have one entry per row")
+    if subpages_per_parent < 1 or parent_stride_pages < 1:
+        raise ValueError("GLM C4 child-page geometry must be positive")
+    expected_width = int(source.shape[1]) * subpages_per_parent
+    if output_table.shape != (rows, expected_width):
+        raise ValueError("GLM decode block-table output has the wrong contract")
+    if output_seq_lens.shape != (rows,):
+        raise ValueError("GLM pool sequence lengths must have shape [rows]")
+    if dcp_size < 1 or not 0 <= dcp_rank < dcp_size:
+        raise ValueError("GLM pool DCP rank must be within the DCP world")
+    if pool_interleave < 1:
+        raise ValueError("GLM pool interleave must be positive")
+    if rows:
+        block = 256
+        total = rows * expected_width
+        _prepare_c4_decode_metadata_kernel[(triton.cdiv(total, block),)](
+            source,
+            request_ids,
+            positions,
+            output_table,
+            output_seq_lens,
+            rows,
+            int(source.shape[1]),
+            expected_width,
+            int(source.stride(0)),
+            int(output_table.stride(0)),
+            parent_stride_pages,
+            dcp_size,
+            dcp_rank,
+            pool_interleave,
+            SUBPAGES_PER_PARENT=subpages_per_parent,
+            POOL_SIZE=_POOL_SIZE,
             BLOCK=block,
             num_warps=4,
         )
@@ -821,5 +949,6 @@ __all__ = [
     "fwht128_quant_fp8",
     "gather_c4_block_table_rows",
     "pool_seq_lens",
+    "prepare_c4_decode_metadata",
     "update_decode_pools",
 ]

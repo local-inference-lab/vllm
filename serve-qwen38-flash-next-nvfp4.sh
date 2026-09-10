@@ -3,11 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${SCRIPT_DIR}/.venv/bin/python}"
-TRAFFICCONTROL_BIN="${TRAFFICCONTROL_BIN:-/home/luke/projects/trafficcontrol/target/release/trafficcontrol}"
 
 MODEL_PATH="${MODEL_PATH:-/data/models/qwen3.8-flash-next-mixed/qwen3.8-flash-next-180b-nvfp4-ple-mxfp8-attn-shared_vv1}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-flash-next-4p89bpw}"
-LOAD_FORMAT="${LOAD_FORMAT:-instanttensor}"
+LOAD_FORMAT="${LOAD_FORMAT:-fastsafetensors}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 TP_SIZE="${TP_SIZE:-2}"
@@ -25,7 +24,6 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-auto}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-3}"
-TC_TIMEOUT="${TC_TIMEOUT:-31536000}"
 TORCH_PROFILE_DIR="${TORCH_PROFILE_DIR:-}"
 TORCH_PROFILE_RECORD_SHAPES="${TORCH_PROFILE_RECORD_SHAPES:-0}"
 TORCH_PROFILE_WITH_MEMORY="${TORCH_PROFILE_WITH_MEMORY:-0}"
@@ -52,7 +50,9 @@ usage() {
     "Usage: $0 [launcher options] [vLLM options]" \
     "" \
     "Environment modes:" \
-    "  TP_SIZE=1                    Use one GPU and mapped-host n-gram tables." \
+    "  TP_SIZE=1                    Default to one GPU and host-RAM tables." \
+    "  VLLM_PLE_TABLE_MEMORY=disk    Read PLE table rows from disk." \
+    "  VLLM_PLE_TABLE_MEMORY=ram     Keep PLE tables in pinned host RAM." \
     "" \
     "Launcher options:" \
     "  --torch-profile [DIR]         Enable a four-step Torch CPU+CUDA capture." \
@@ -142,10 +142,6 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Create the venv with: uv venv --python 3.12" >&2
   exit 1
 fi
-if [[ ! -x "${TRAFFICCONTROL_BIN}" ]]; then
-  echo "TrafficControl not found or not executable: ${TRAFFICCONTROL_BIN}" >&2
-  exit 1
-fi
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
   echo "Model config not found: ${MODEL_PATH}/config.json" >&2
   exit 1
@@ -163,26 +159,6 @@ fi
 IFS=, read -r -a device_id_list <<< "${DEVICE_IDS}"
 if ((${#device_id_list[@]} != TP_SIZE)); then
   echo "TP_SIZE=${TP_SIZE} requires ${TP_SIZE} DEVICE_IDS; got '${DEVICE_IDS}'" >&2
-  exit 2
-fi
-first_device_id=$((10#${device_id_list[0]}))
-for ((index = 0; index < ${#device_id_list[@]}; index++)); do
-  device_id=$((10#${device_id_list[index]}))
-  if ((device_id != first_device_id + index)); then
-    echo "DEVICE_IDS must be contiguous for TrafficControl; got '${DEVICE_IDS}'" >&2
-    exit 2
-  fi
-done
-last_device_id=$((first_device_id + ${#device_id_list[@]} - 1))
-expected_tc_resource="physical-gpus-${first_device_id}-${last_device_id}"
-if [[ "${DEVICE_IDS}" != "${DEFAULT_DEVICE_IDS}" \
-  && -z "${B12X_TC_RESOURCE:-}" ]]; then
-  echo "B12X_TC_RESOURCE must be set explicitly when overriding DEVICE_IDS" >&2
-  exit 2
-fi
-if [[ -n "${B12X_TC_RESOURCE:-}" \
-  && "${B12X_TC_RESOURCE}" != "${expected_tc_resource}" ]]; then
-  echo "B12X_TC_RESOURCE must match DEVICE_IDS: expected '${expected_tc_resource}', got '${B12X_TC_RESOURCE}'" >&2
   exit 2
 fi
 if [[ "${VLLM_SSM_CONV_STATE_LAYOUT:-DS}" != DS ]]; then
@@ -207,11 +183,9 @@ export NCCL_PROTO="${NCCL_PROTO:-LL,LL128,Simple}"
 export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
 export VLLM_PCIE_ALLREDUCE_BACKEND="${VLLM_PCIE_ALLREDUCE_BACKEND:-b12x}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
-export VLLM_PLE_CPU_OFFLOAD
+export VLLM_PLE_CPU_OFFLOAD VLLM_PLE_TABLE_MEMORY
 export SAFETENSORS_FAST_GPU="${SAFETENSORS_FAST_GPU:-1}"
-export INSTANTTENSOR_BACKEND="${INSTANTTENSOR_BACKEND:-BUFFERED}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-export B12X_TC_RESOURCE="${expected_tc_resource}"
 
 printf -v speculative_config \
   '{"method":"mtp","num_speculative_tokens":%s}' \
@@ -273,6 +247,7 @@ command=(
   --device-ids "${DEVICE_IDS}"
   --tensor-parallel-size "${TP_SIZE}"
   --pipeline-parallel-size 1
+  --mm-encoder-tp-mode data
   --mamba-cache-mode align
   --enable-prefix-caching
   --enable-chunked-prefill
@@ -286,7 +261,6 @@ command=(
   --max-num-seqs "${MAX_NUM_SEQS}"
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
   --speculative-config "${speculative_config}"
-  --gdn-decode-kernel b12x
   --linear-backend b12x
   --moe-backend b12x
   --no-enable-flashinfer-autotune
@@ -298,10 +272,11 @@ command=(
 )
 
 cd "${SCRIPT_DIR}"
-printf 'Launching %s as %s on devices %s through %s\n' \
-  "${MODEL_PATH}" "${SERVED_MODEL_NAME}" "${DEVICE_IDS}" \
-  "${B12X_TC_RESOURCE}" >&2
-if [[ "${VLLM_PLE_CPU_OFFLOAD}" == 1 ]]; then
+printf 'Launching %s as %s on devices %s\n' \
+  "${MODEL_PATH}" "${SERVED_MODEL_NAME}" "${DEVICE_IDS}" >&2
+if [[ -n "${VLLM_PLE_TABLE_MEMORY:-}" ]]; then
+  printf 'PLE n-gram table storage default: %s\n' "${VLLM_PLE_TABLE_MEMORY}" >&2
+elif [[ "${VLLM_PLE_CPU_OFFLOAD}" == 1 ]]; then
   printf 'PLE n-gram tables: CUDA-mapped host DRAM\n' >&2
 fi
 if [[ -n "${TORCH_PROFILE_DIR}" ]]; then
@@ -310,8 +285,9 @@ if [[ -n "${TORCH_PROFILE_DIR}" ]]; then
   printf 'Trigger with b12x vllm-take-capture; auto-stop: %s engine steps.\n' \
     "${TORCH_PROFILE_MAX_ITERATIONS}" >&2
 fi
-exec "${TRAFFICCONTROL_BIN}" \
-  --resource-env B12X_TC_RESOURCE \
-  --slots 1 \
-  --timeout "${TC_TIMEOUT}" \
-  -- "${command[@]}"
+if [[ "${DRY_RUN:-0}" == 1 ]]; then
+  printf '%q ' "${command[@]}"
+  printf '\n'
+  exit 0
+fi
+exec "${command[@]}"

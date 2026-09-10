@@ -832,6 +832,12 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     "DeepseekOCR2ForCausalLM": _HfExamplesInfo(
         "deepseek-ai/DeepSeek-OCR-2",
     ),
+    "DeepseekV41ForCausalLM": _HfExamplesInfo(
+        "deepseek-ai/DeepSeek-V4.1-Flash",
+    ),
+    "DeepseekV4ForConditionalGeneration": _HfExamplesInfo(
+        "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+    ),
     "Dots3NoteForCausalLM": _HfExamplesInfo(
         "dots-studio/dots3-note-prev",
         is_available_online=False,
@@ -1507,6 +1513,11 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         speculative_model="deepseek-ai/DeepSeek-V4-Pro-DSpark",  # draft in mtp.*
         is_available_online=False,
         use_original_num_layers=True,  # DSpark has >1 draft block
+    ),
+    "DSparkV41DraftModel": _HfExamplesInfo(
+        "deepseek-ai/DeepSeek-V4.1-Flash",
+        speculative_model="deepseek-ai/DeepSeek-V4.1-Flash",
+        use_original_num_layers=True,
     ),
     "K3DSparkModel": _HfExamplesInfo(
         "moonshotai/Kimi-K3",

@@ -673,12 +673,15 @@ class SpeculativeConfig:
                     ],
                 }
             )
-        if hf_config.model_type == "deepseek_v4":
+        if hf_config.model_type in ("deepseek_v4", "deepseek_v41"):
+            is_v41 = hf_config.model_type == "deepseek_v41"
             hf_config.model_type = "deepseek_mtp"
-            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
-            hf_config.update(
-                {"n_predict": n_predict, "architectures": ["DeepSeekV4MTPModel"]}
-            )
+            overrides = {
+                "n_predict": getattr(hf_config, "num_nextn_predict_layers", None)
+            }
+            if not is_v41:
+                overrides["architectures"] = ["DeepSeekV4MTPModel"]
+            hf_config.update(overrides)
         if hf_config.model_type in ("pangu_ultra_moe"):
             hf_config.model_type = "pangu_ultra_moe_mtp"
         if hf_config.model_type == "pangu_ultra_moe_mtp":
@@ -1341,6 +1344,15 @@ class SpeculativeConfig:
                 ):
                     self.method = "mtp"
                     if (
+                        self.target_model_config is not None
+                        and self.target_model_config.hf_config.model_type
+                        == "deepseek_v41"
+                    ):
+                        raise ValueError(
+                            "DeepSeek V4.1 ships DSpark stages, not classic MTP. "
+                            "Use speculative method 'dspark' instead of 'mtp'."
+                        )
+                    if (
                         self.num_speculative_tokens > 1
                         and self.draft_model_config.hf_config.model_type
                         not in ("step3p5_mtp", "inkling_mtp")
@@ -1402,13 +1414,24 @@ class SpeculativeConfig:
                     not in self.draft_model_config.architectures
                     and "Gemma4DSparkModel" not in self.draft_model_config.architectures
                     and "K3DSparkModel" not in self.draft_model_config.architectures
+                    and "Glm53DSparkForCausalLM"
+                    not in self.draft_model_config.architectures
                 ):
-                    # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config
-                    # and its weights ship in the target checkpoint.
-                    self.draft_model_config.hf_config.model_type = "deepseek_v4"
-                    self.draft_model_config.hf_config.architectures = [
-                        "DSparkDraftModel"
+                    # DeepSeek DSpark stages ship in the target checkpoint.
+                    is_v41 = (
+                        self.target_model_config.hf_config.model_type == "deepseek_v41"
+                    )
+                    draft_hf_config = self.draft_model_config.hf_config
+                    draft_hf_config.model_type = (
+                        "deepseek_v41" if is_v41 else "deepseek_v4"
+                    )
+                    draft_hf_config.architectures = [
+                        "DSparkV41DraftModel" if is_v41 else "DSparkDraftModel"
                     ]
+                    if is_v41:
+                        draft_hf_config.n_predict = getattr(
+                            draft_hf_config, "dspark_block_size", None
+                        ) or getattr(draft_hf_config, "n_predict", None)
                     self.draft_model_config.quantization = (
                         self.target_model_config.quantization
                     )
@@ -1449,7 +1472,8 @@ class SpeculativeConfig:
                         # Default to max value defined in draft model config.
                         self.num_speculative_tokens = n_predict
                     elif (
-                        self.num_speculative_tokens > n_predict
+                        self.method not in ("dflash", "dspark")
+                        and self.num_speculative_tokens > n_predict
                         and self.num_speculative_tokens % n_predict != 0
                     ):
                         # Ensure divisibility for MTP module reuse.
@@ -1876,6 +1900,12 @@ class SpeculativeConfig:
         # target model hidden states"
         # TODO(ben): Refactor this so the naming is clearer
         return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+
+    def use_eagle_preserves_target_kv_cache(self) -> bool:
+        # Only eagle-family drafters share (and pollute via lookahead KV
+        # write) the target's full-attention KV cache groups; DFlash/DSpark
+        # draft from their own KV cache and never write target blocks.
+        return self.method in ("eagle", "eagle3", "mtp")
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"

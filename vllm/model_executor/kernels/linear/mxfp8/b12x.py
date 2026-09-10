@@ -12,11 +12,14 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
-from vllm.utils.b12x import B12xWarmupUnit, reuse_packed_weight_storage
 from vllm.utils.b12x import (
-    get_b12x_mxfp8_linear as _import_b12x_mxfp8,
+    B12xWarmupUnit,
+    get_b12x_dense_activation_mode,
+    reuse_packed_weight_storage,
 )
-from vllm.utils.torch_utils import current_stream
+from vllm.utils.b12x import (
+    get_b12x_blockscaled as _import_b12x_blockscaled,
+)
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
@@ -31,13 +34,23 @@ def _apply_b12x_mxfp8_packed_linear(
     input_2d = x.reshape(-1, x.shape[-1]).contiguous()
     output_shape = [*x.shape[:-1], int(packed_weight.out_features)]
 
-    mxfp8 = _import_b12x_mxfp8()
+    mode = layer.b12x_activation_mode
+    options = {}
+    if x.dtype == torch.bfloat16 and layer.b12x_bf16_input_supported:
+        options["mode"] = mode
+    else:
+        if mode == "a16":
+            raise ValueError(
+                "b12x MXFP8 A16 requires BF16 on SM120/SM121 with K%128=N%8=0"
+            )
+    mxfp8 = _import_b12x_blockscaled()
     assert mxfp8 is not None
     output = mxfp8.mm(
         input_2d,
         packed_weight,
         bias=bias,
         expected_m=max(1, int(input_2d.shape[0])),
+        **options,
     )
     return output.view(*output_shape)
 
@@ -55,11 +68,16 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
             return False, "b12x MXFP8 kernels are only available on CUDA"
         if not current_platform.is_device_capability_family(120):
             return False, "b12x MXFP8 kernels require a Blackwell 12x device"
-        mxfp8 = _import_b12x_mxfp8()
+        mxfp8 = _import_b12x_blockscaled()
         if mxfp8 is None:
             return False, "Install the B12X backend with `pip install vllm[b12x]`"
         if not mxfp8.is_supported():
-            return False, "b12x.gemm.mxfp8_linear is not supported"
+            return False, "b12x.gemm.blockscaled is not supported"
+        if not hasattr(mxfp8, "w8a16"):
+            return (
+                False,
+                "b12x MXFP8 requires a source build with dense precision selection",
+            )
         return True, None
 
     @classmethod
@@ -89,7 +107,7 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
             f"b12x MXFP8 weight_scale must be 2D, got {weight_scale.ndim}D"
         )
 
-        mxfp8 = _import_b12x_mxfp8()
+        mxfp8 = _import_b12x_blockscaled()
         assert mxfp8 is not None
         scale_k = in_features // MXFP8_BLOCK_SIZE
         packed_weight = mxfp8.pack_weight(
@@ -99,6 +117,12 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
         layer.b12x_mxfp8_packed_weight = reuse_packed_weight_storage(
             getattr(layer, "b12x_mxfp8_packed_weight", None),
             packed_weight,
+        )
+        layer.b12x_activation_mode = get_b12x_dense_activation_mode("mxfp8")
+        layer.b12x_bf16_input_supported = (
+            current_platform.is_device_capability_family(120)
+            and in_features % 128 == 0
+            and out_features % 8 == 0
         )
         replace_parameter(layer, "weight", weight.new_empty((0,)))
         replace_parameter(layer, "weight_scale", weight_scale.new_empty((0,)))
@@ -114,20 +138,13 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
         device = torch.device(packed_weight.weight.values.device)
 
         def compile() -> None:
-            mxfp8 = _import_b12x_mxfp8()
-            assert mxfp8 is not None
             for tokens in token_counts:
                 source = torch.zeros(
                     (tokens, int(packed_weight.in_features)),
                     dtype=output_dtype,
                     device=device,
                 )
-                mxfp8.mm(
-                    source,
-                    packed_weight,
-                    expected_m=max(1, int(tokens)),
-                    stream=current_stream().cuda_stream,
-                )
+                _apply_b12x_mxfp8_packed_linear(layer, source, None)
 
         return B12xWarmupUnit(
             name="MXFP8",
@@ -137,6 +154,8 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
                 int(packed_weight.in_features),
                 int(packed_weight.padded_in_features),
                 int(packed_weight.out_features),
+                layer.b12x_activation_mode,
+                layer.b12x_bf16_input_supported,
                 output_dtype,
             ),
             compile=compile,

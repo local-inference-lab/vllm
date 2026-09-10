@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -1752,6 +1753,74 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
 
         with pytest.raises(ValueError, match="max_num_seqs"):
             runner.initialize_kv_cache(kv_cache_config)
+
+
+@pytest.mark.parametrize("dummy_run_fails", [False, True])
+def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    dummy_run_fails: bool,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(
+        architecture="Glm5NextForConditionalGeneration"
+    )
+    runner.dcp_world_size = 4
+    runner.vllm_config = object()
+    runner.max_num_tokens = 4096
+    events: list[object] = []
+
+    runner._init_minimal_kv_cache_for_profiling = lambda: events.append("init-kv")
+
+    def dummy_run(*args, **kwargs):
+        events.append(("dummy-run", args, kwargs))
+        if dummy_run_fails:
+            raise RuntimeError("expected DCP profile failure")
+        return torch.empty(1), torch.empty(1)
+
+    runner._dummy_run = dummy_run
+    runner._sync_device = lambda: events.append("sync")
+    runner._cleanup_profiling_kv_cache = lambda: events.append("cleanup")
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_current_vllm_config",
+        lambda _: nullcontext(),
+    )
+
+    if dummy_run_fails:
+        with pytest.raises(RuntimeError, match="expected DCP profile failure"):
+            runner.profile_glm_dcp_attention()
+    else:
+        runner.profile_glm_dcp_attention()
+
+    assert events[0] == "init-kv"
+    assert events[1] == (
+        "dummy-run",
+        (4096,),
+        {
+            "force_attention": True,
+            "skip_eplb": True,
+            "is_profile": True,
+            "single_request_prefill": True,
+        },
+    )
+    assert events[-1] == "cleanup"
+    if not dummy_run_fails:
+        assert events[-2] == "sync"
+
+
+def test_glm_dcp_attention_profile_skips_non_glm_and_dcp1():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(architecture="OtherArchitecture")
+    runner.dcp_world_size = 4
+    runner._init_minimal_kv_cache_for_profiling = Mock()
+    runner.profile_glm_dcp_attention()
+    runner._init_minimal_kv_cache_for_profiling.assert_not_called()
+
+    runner.model_config.architecture = "Glm5NextForConditionalGeneration"
+    runner.dcp_world_size = 1
+    runner.profile_glm_dcp_attention()
+    runner._init_minimal_kv_cache_for_profiling.assert_not_called()
 
 
 class TestInitFp8KvScalesHybridModels:

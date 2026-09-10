@@ -392,3 +392,127 @@ def test_causal_conv1d_varlen(
     )
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
+
+
+def _run_update_both_paths(monkeypatch, run):
+    """Run ``run`` with the hoisted decode path and with the generic loop."""
+    from vllm.model_executor.layers.mamba.ops import causal_conv1d as conv_module
+
+    monkeypatch.setattr(conv_module, "_UPDATE_HOIST_ENABLED", True)
+    hoisted = run()
+    monkeypatch.setattr(conv_module, "_UPDATE_HOIST_ENABLED", False)
+    generic = run()
+    return hoisted, generic
+
+
+@pytest.mark.parametrize("itype", [torch.bfloat16])
+@pytest.mark.parametrize("silu_activation", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("seqlen", [1, 2, 5, 8])
+@pytest.mark.parametrize("batch", [1, 4, 8])
+@pytest.mark.parametrize("dim", [2048 + 16, 6144])
+def test_causal_conv1d_update_hoisted_path_is_bitwise(
+    monkeypatch, batch, dim, seqlen, has_bias, silu_activation, itype
+):
+    device = DEVICE
+    width = 4
+    set_random_seed(131 * seqlen + batch)
+    total_entries = 4 * batch + 1
+    x = torch.randn(batch, seqlen, dim, device=device, dtype=itype).transpose(1, 2)
+    conv_state = torch.randn(
+        total_entries, width - 1, dim, device=device, dtype=itype
+    ).transpose(1, 2)
+    weight = torch.randn(dim, width, device=device, dtype=itype)
+    bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
+    # +1 to skip the null block at index 0
+    conv_state_indices = (torch.randperm(total_entries - 1)[:batch] + 1).to(
+        dtype=torch.int32, device=device
+    )
+    activation = "silu" if silu_activation else None
+
+    def run():
+        state = conv_state.clone()
+        out = causal_conv1d_update(
+            x.clone(),
+            state,
+            weight,
+            bias,
+            activation=activation,
+            conv_state_indices=conv_state_indices,
+        )
+        return out, state
+
+    (out_h, state_h), (out_g, state_g) = _run_update_both_paths(monkeypatch, run)
+    assert torch.equal(out_h, out_g)
+    assert torch.equal(state_h, state_g)
+    out_ref = causal_conv1d_update_ref(
+        x.clone(),
+        conv_state[conv_state_indices].detach().clone(),
+        weight,
+        bias,
+        activation=activation,
+    )
+    assert torch.allclose(out_h, out_ref, rtol=1e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("itype", [torch.bfloat16])
+@pytest.mark.parametrize("silu_activation", [True])
+@pytest.mark.parametrize("has_bias", [True, False])
+@pytest.mark.parametrize("max_query_len", [1, 4, 8])
+@pytest.mark.parametrize("batch", [1, 4, 8])
+@pytest.mark.parametrize("dim", [2048 + 16, 6144])
+def test_causal_conv1d_update_hoisted_spec_decode_is_bitwise(
+    monkeypatch, batch, dim, max_query_len, has_bias, silu_activation, itype
+):
+    """Speculative-decode shape: varlen queries, accepted-token offsets and a
+    conv state that keeps the speculative window."""
+    device = DEVICE
+    width = 4
+    set_random_seed(977 * max_query_len + batch)
+    lengths = [1 + (i % max_query_len) for i in range(batch)]
+    lengths[0] = max_query_len
+    num_tokens = sum(lengths)
+    query_start_loc = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(lengths), 0)),
+        dtype=torch.int32,
+        device=device,
+    )
+    num_accepted_tokens = torch.tensor(
+        [1 + (i % max_query_len) for i in range(batch)],
+        dtype=torch.int32,
+        device=device,
+    )
+    total_entries = 4 * batch + 1
+    state_len = width - 1 + max_query_len
+    x = torch.randn(num_tokens, dim, device=device, dtype=itype)
+    conv_state = torch.randn(
+        total_entries, state_len, dim, device=device, dtype=itype
+    ).transpose(1, 2)
+    weight = torch.randn(dim, width, device=device, dtype=itype)
+    bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
+    conv_state_indices = (torch.randperm(total_entries - 1)[:batch] + 1).to(
+        dtype=torch.int32, device=device
+    )
+    activation = "silu" if silu_activation else None
+
+    def run():
+        state = conv_state.clone()
+        out = torch.empty_like(x)
+        causal_conv1d_update(
+            x.clone(),
+            state,
+            weight,
+            bias,
+            activation=activation,
+            conv_state_indices=conv_state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            query_start_loc=query_start_loc,
+            max_query_len=max_query_len,
+            out=out,
+        )
+        return out, state
+
+    (out_h, state_h), (out_g, state_g) = _run_update_both_paths(monkeypatch, run)
+    assert torch.equal(out_h, out_g)
+    assert torch.equal(state_h, state_g)
+    assert torch.isfinite(out_h.float()).all()

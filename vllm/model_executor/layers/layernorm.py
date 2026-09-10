@@ -12,6 +12,7 @@ from vllm import envs, ir
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.determinism.batch_invariant import rms_norm_batch_invariant
+from vllm.model_executor.weight_transfer import allocate_weights
 
 logger = init_logger(__name__)
 
@@ -60,7 +61,7 @@ class RMSNorm(CustomOp):
         )
         weight_dtype = dtype or torch.get_default_dtype()
         self.has_weight = has_weight
-        self.weight = torch.ones(hidden_size, dtype=weight_dtype)
+        self.weight = allocate_weights(torch.ones, hidden_size, dtype=weight_dtype)
         if self.has_weight:
             self.weight = nn.Parameter(self.weight)
 
@@ -145,7 +146,7 @@ class GemmaRMSNorm(CustomOp):
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.weight = nn.Parameter(allocate_weights(torch.zeros, hidden_size))
         self.variance_epsilon = eps
 
     def forward_native(
@@ -209,7 +210,9 @@ class RMSNormGated(CustomOp):
         super().__init__()
         self.eps = eps
         self.activation = activation
-        self.weight = nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.weight = nn.Parameter(
+            allocate_weights(torch.empty, hidden_size, **factory_kwargs)
+        )
         self.register_parameter("bias", None)
         self.group_size = group_size
         self.norm_before_gate = norm_before_gate
@@ -316,8 +319,12 @@ class LayerNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        self.weight = nn.Parameter(
+            allocate_weights(torch.ones, dim, dtype=torch.float32)
+        )
+        self.bias = nn.Parameter(
+            allocate_weights(torch.zeros, dim, dtype=torch.float32)
+        )
 
     def forward(self, x: torch.Tensor):
         return F.layer_norm(

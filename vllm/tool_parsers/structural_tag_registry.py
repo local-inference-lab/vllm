@@ -70,7 +70,7 @@ XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset(
         "deepseek_v4",
     }
 )
-VLLM_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset({"hermes", "kimi_k3"})
+VLLM_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset({"deepseek_v41", "hermes", "kimi_k3"})
 SUPPORTED_STRUCTURAL_TAG_MODELS = (
     XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS | VLLM_BUILTIN_STRUCTURAL_TAG_MODELS
 )
@@ -212,6 +212,107 @@ def get_function_parameters(function) -> dict[str, Any] | bool:
     if getattr(function, "strict", None) is False:
         return True
     return function.parameters if function.parameters is not None else True
+
+
+_V41_CALLS_START = "<｜DSML｜ calls>"
+_V41_CALLS_END = "</｜DSML｜ calls>"
+_V41_INVOKE_END = "</｜DSML｜ invoke>"
+_V41_PARAMETER_END = "</｜DSML｜ parameter>"
+
+
+@register_vllm_structural_tag("deepseek_v41")
+def get_deepseek_v41_structural_tag(
+    tools: list[FunctionToolParam],
+    builtin_tools: list[BuiltinToolParam],
+    tool_choice: SimplifiedToolChoice,
+    reasoning: bool,
+) -> StructuralTag:
+    # Serving enables this visible-text grammar after the reasoning boundary.
+    del builtin_tools, reasoning
+
+    if any(getattr(tool.function, "strict", None) is True for tool in tools):
+        raise ValueError(
+            "DeepSeek V4.1 strict tool schemas require a grammar backend with "
+            "spaced DSML parameter-schema support. The installed backend only "
+            "supports V4.1 tool names and syntax; set strict=false to use "
+            "non-strict tool calling."
+        )
+
+    parameter = TagFormat(
+        begin='<｜DSML｜ parameter name="',
+        content=SequenceFormat(
+            elements=[
+                RegexFormat(pattern=r'[^"]+'),
+                ConstStringFormat(value='" string="'),
+                OrFormat(
+                    elements=[
+                        SequenceFormat(
+                            elements=[
+                                ConstStringFormat(value='true">'),
+                                AnyTextFormat(
+                                    excludes=[
+                                        _V41_PARAMETER_END,
+                                        _V41_INVOKE_END,
+                                        _V41_CALLS_END,
+                                    ]
+                                ),
+                            ]
+                        ),
+                        SequenceFormat(
+                            elements=[
+                                ConstStringFormat(value='false">'),
+                                JSONSchemaFormat(json_schema=True),
+                            ]
+                        ),
+                    ]
+                ),
+            ]
+        ),
+        end=f"{_V41_PARAMETER_END}\n",
+    )
+    calls = TagsWithSeparatorFormat(
+        tags=[
+            TagFormat(
+                begin=f'<｜DSML｜ invoke name="{tool.function.name}">\n',
+                content=OrFormat(
+                    elements=[
+                        PlusFormat(content=parameter),
+                        ConstStringFormat(value="\n"),
+                    ]
+                ),
+                end=f"{_V41_INVOKE_END}\n",
+            )
+            for tool in tools
+        ],
+        separator="",
+        at_least_one=True,
+        stop_after_first=tool_choice == "forced",
+    )
+    if tool_choice == "auto":
+        return StructuralTag(
+            format=TriggeredTagsFormat(
+                triggers=[_V41_CALLS_START],
+                tags=[
+                    TagFormat(
+                        begin=f"{_V41_CALLS_START}\n",
+                        content=calls,
+                        end=_V41_CALLS_END,
+                    )
+                ],
+                excludes=["<think>", "</think>"],
+            )
+            if tools
+            else AnyTextFormat(excludes=["<think>", "</think>"])
+        )
+    return StructuralTag(
+        format=SequenceFormat(
+            elements=[
+                ConstStringFormat(value=f"\n\n{_V41_CALLS_START}\n"),
+                calls,
+                ConstStringFormat(value=_V41_CALLS_END),
+            ]
+        )
+    )
 
 
 def _hermes_tool_tags(tools: list[FunctionToolParam]) -> list[TagFormat]:
