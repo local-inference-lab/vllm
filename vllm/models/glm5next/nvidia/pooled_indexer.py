@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     )
 
 from .ops.glm_kpool import (
+    DecodeTailRing,
     expand_c4_block_table,
     expand_pool_ids,
     fwht128_quant_fp8,
@@ -69,6 +70,31 @@ class Glm5NextPooledIndexer(nn.Module):
         prefix: str,
         emit_physical_selection: bool = True,
     ) -> None:
+        """Build the GLM-5.3 C4 pooled selector for one sparse-MLA layer.
+
+        Args:
+            vllm_config: Engine configuration (scheduler, model, parallel and
+                speculative settings size the buffers).
+            config: GLM HF config; must carry the fixed C4 indexer geometry.
+            hidden_size: Model hidden size feeding ``wk`` and ``weights_proj``.
+            q_lora_rank: Query LoRA rank feeding ``wq_b``.
+            quant_config: Quantization for the projection layers, if any.
+            cache_config: KV cache configuration; supplies the block size.
+            topk_indices_buffer: Shared int32 ``[max_num_batched_tokens, 2051]``
+                token-selection output buffer.
+            pool_topk_indices_buffer: Shared int32
+                ``[max_num_batched_tokens, 512]`` pool-selection buffer.
+            main_layer_name: Attention layer name keying the metadata dict.
+            prefix: Parameter-name prefix for the projection layers.
+            emit_physical_selection: Whether decode-only steps emit physical
+                cache slots directly (MTP layers reuse request-relative ids).
+
+        Raises:
+            ValueError: If the cache config, buffers, geometry or DCP interleave
+                do not match the GLM-5.3 C4 contract.
+            TypeError: If a selection buffer is not int32.
+            RuntimeError: If the b12x build lacks pooled physical selection.
+        """
         super().__init__()
         if cache_config is None:
             raise ValueError("GLM pooled selection requires a paged cache")
@@ -216,6 +242,12 @@ class Glm5NextPooledIndexer(nn.Module):
             torch.empty_like(self._tail),
             persistent=False,
         )
+        # Speculative-decode ring bookkeeping: one saved row per target
+        # verify row (bonus + K drafts). Without speculation a single row
+        # keeps the restore path a no-op.
+        spec_config = vllm_config.speculative_config
+        num_spec = int(getattr(spec_config, "num_speculative_tokens", 0) or 0)
+        self._tail_ring = DecodeTailRing(self._tail, max_rows=1 + num_spec)
         self.register_buffer(
             "_q_fp8",
             torch.empty(
@@ -436,6 +468,27 @@ class Glm5NextPooledIndexer(nn.Module):
         positions: torch.Tensor,
         rotary_emb: nn.Module | None,
     ) -> torch.Tensor:
+        """Select the 2048 + tail attended tokens for every row of the batch.
+
+        Updates the FP8 C4 pools and the tail ring for this step, scores the
+        visible pools with the b12x indexer, and expands the selected pools to
+        token ids (physical slots for decode-only steps).
+
+        Args:
+            hidden_states: ``[rows, hidden_size]`` layer input.
+            q_lora: ``[rows, q_lora_rank]`` low-rank query activations.
+            positions: ``[rows]`` int64 token positions.
+            rotary_emb: Unused; GLM-5.3 indexer queries carry no RoPE.
+
+        Returns:
+            The ``[rows, 2051]`` int32 selection view into the shared buffer.
+
+        Raises:
+            RuntimeError: If ``q_lora`` or the selector metadata/cache is missing,
+                or the row accounting is inconsistent.
+            ValueError: If the batch exceeds the buffer rows or ``positions`` has
+                the wrong shape or dtype.
+        """
         del rotary_emb
         if q_lora is None:
             raise RuntimeError("GLM pooled selection requires q_lora_rank")
@@ -482,6 +535,9 @@ class Glm5NextPooledIndexer(nn.Module):
             raise RuntimeError("GLM selector cache is not bound")
         state_slots = self._state_slots(main_metadata)
         num_reqs = int(main_metadata.num_reqs)
+        num_accepted = getattr(main_metadata, "selector_num_accepted_tokens", None)
+        if num_accepted is not None:
+            num_accepted = num_accepted[:num_reqs]
         live_rows = int(main_metadata.num_actual_tokens)
         decode_rows = int(main_metadata.num_decode_tokens)
         num_decodes = int(main_metadata.num_decodes)
@@ -508,6 +564,8 @@ class Glm5NextPooledIndexer(nn.Module):
             main_metadata.slot_mapping[:rows],
             positions,
             num_reqs,
+            tail_ring=self._tail_ring,
+            num_accepted_tokens=num_accepted,
             num_decode_requests=num_decodes,
             max_query_len=int(main_metadata.max_query_len),
             model_block_size=self.block_size,
