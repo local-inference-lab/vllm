@@ -104,18 +104,23 @@ def _b12x_module(name: str) -> Any:
 
 
 def _resolve_ple_table_memory(additional_config: Any) -> str:
+    """Translate the public offload policy into a b12x storage mode."""
     if isinstance(additional_config, dict) and "ple_table_memory" in additional_config:
         table_memory = additional_config["ple_table_memory"]
     else:
         table_memory = envs.VLLM_PLE_TABLE_MEMORY
         if table_memory is None:
-            table_memory = "mapped_host" if envs.VLLM_PLE_CPU_OFFLOAD else "device"
-    if table_memory not in {"device", "mapped_host", "io_uring"}:
-        raise ValueError(
-            "additional_config.ple_table_memory must be 'device', "
-            f"'mapped_host', or 'io_uring', got {table_memory!r}"
-        )
-    return table_memory
+            return "mapped_host" if envs.VLLM_PLE_CPU_OFFLOAD else "device"
+    if table_memory == "ram":
+        return "mapped_host"
+    if table_memory == "disk":
+        return "io_uring"
+    if table_memory == "device":
+        return "device"
+    raise ValueError(
+        "additional_config.ple_table_memory must be 'device', "
+        f"'ram', or 'disk', got {table_memory!r}"
+    )
 
 
 def _copy_embedding_shard(

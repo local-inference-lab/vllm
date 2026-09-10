@@ -203,7 +203,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
     VLLM_PLE_CPU_OFFLOAD: bool = False
-    VLLM_PLE_TABLE_MEMORY: Literal["device", "mapped_host", "io_uring"] | None = None
+    VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk"] | None = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1683,11 +1683,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
     ),
-    # Qwen3.8-Flash-Next PLE storage policy, passed to the b12x planner.
+    # Qwen3.8-Flash-Next PLE offload policy, resolved by vLLM for b12x.
     "VLLM_PLE_TABLE_MEMORY": env_with_choices(
         "VLLM_PLE_TABLE_MEMORY",
         None,
-        ["device", "mapped_host", "io_uring"],
+        ["ram", "disk"],
     ),
     # Fallback when neither additional_config nor VLLM_PLE_TABLE_MEMORY selects
     # a policy: store PLE table payloads in CUDA-mapped host memory.

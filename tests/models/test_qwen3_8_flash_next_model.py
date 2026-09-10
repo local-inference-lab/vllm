@@ -439,22 +439,29 @@ def _set_tensor_attributes(module: nn.Module, *names: str) -> None:
         setattr(module, name, torch.empty(0))
 
 
-def test_ple_cpu_offload_env_alias(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("enabled", "backend"), [("0", "device"), ("1", "mapped_host")]
+)
+def test_ple_cpu_offload_env_alias(monkeypatch, enabled, backend) -> None:
     monkeypatch.delenv("VLLM_PLE_TABLE_MEMORY", raising=False)
-    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
-    assert ple_layer_module._resolve_ple_table_memory(None) == "mapped_host"
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", enabled)
+    assert ple_layer_module._resolve_ple_table_memory(None) == backend
 
 
-@pytest.mark.parametrize("memory", ["device", "io_uring"])
-def test_ple_table_memory_env_overrides_cpu_offload_flag(monkeypatch, memory) -> None:
-    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
-    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", memory)
-    assert ple_layer_module._resolve_ple_table_memory(None) == memory
+@pytest.mark.parametrize(
+    ("policy", "legacy_flag", "backend"),
+    [("ram", "0", "mapped_host"), ("disk", "1", "io_uring")],
+)
+def test_ple_table_memory_env_overrides_cpu_offload_flag(
+    monkeypatch, policy, legacy_flag, backend
+) -> None:
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", legacy_flag)
+    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", policy)
+    assert ple_layer_module._resolve_ple_table_memory(None) == backend
 
 
-@pytest.mark.parametrize("memory", ["mmap", "pread"])
-def test_ple_table_memory_env_rejects_removed_modes(monkeypatch, memory) -> None:
-    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", memory)
+def test_ple_table_memory_env_rejects_backend_names(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "io_uring")
     with pytest.raises(ValueError, match="VLLM_PLE_TABLE_MEMORY"):
         ple_layer_module._resolve_ple_table_memory(None)
 
@@ -474,7 +481,7 @@ def test_qwen3_8_prefers_b12x_gdn_unless_explicitly_overridden(monkeypatch) -> N
 
 def test_explicit_ple_table_memory_overrides_env_alias(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
-    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "io_uring")
+    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "disk")
     assert (
         ple_layer_module._resolve_ple_table_memory({"ple_table_memory": "device"})
         == "device"

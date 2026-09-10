@@ -65,23 +65,26 @@ own its storage. Reusable staging views stay inside the controlled executor.
 
 ## PLE table storage
 
-Qwen3.8-Flash-Next supports three storage policies:
+Choose the PLE offload backing with `VLLM_PLE_TABLE_MEMORY`:
 
-- `device`: GPU-resident tables.
-- `mapped_host`: CUDA-mapped, pinned host tables.
-- `io_uring`: bounded, explicit `O_DIRECT` reads from checkpoint files.
+- `ram`: CUDA-mapped, pinned host tables.
+- `disk`: bounded `O_DIRECT` reads from checkpoint files using io_uring.
 
-Select the policy in vLLM, which passes it to the b12x planner:
+Select the public policy in vLLM:
 
 ```sh
-VLLM_PLE_TABLE_MEMORY=io_uring vllm serve MODEL --load-format fastsafetensors
+VLLM_PLE_TABLE_MEMORY=disk vllm serve MODEL --load-format fastsafetensors
 ```
 
 The same environment variable works with `--load-format b12x`, `instanttensor`,
-or `safetensors`; no `--additional-config` is needed. Selection precedence is
-explicit `additional_config.ple_table_memory`, then `VLLM_PLE_TABLE_MEMORY`,
-then the existing `VLLM_PLE_CPU_OFFLOAD` boolean (`1` selects `mapped_host`,
-otherwise `device`). Matching vLLM and b12x packages are required.
+or `safetensors`; no `--additional-config` is needed. vLLM translates `ram` to
+B12X's `mapped_host` mode and `disk` to its `io_uring` mode; implementation names
+are not valid environment values.
+
+When the selector is unset, `VLLM_PLE_CPU_OFFLOAD=1` retains host-RAM offload;
+otherwise tables remain GPU-resident. Explicit `additional_config.ple_table_memory`
+overrides the environment. It accepts `ram`, `disk`, or `device`; `device`
+explicitly selects GPU-resident tables. Matching vLLM and b12x packages are required.
 
 The io_uring reader does not map, pin, or prewarm the entire table. It
 deduplicates requested 4 KiB blocks, coalesces adjacent blocks into reads of at

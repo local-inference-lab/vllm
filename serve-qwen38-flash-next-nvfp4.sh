@@ -50,9 +50,9 @@ usage() {
     "Usage: $0 [launcher options] [vLLM options]" \
     "" \
     "Environment modes:" \
-    "  TP_SIZE=1                    Default to one GPU and mapped-host tables." \
-    "  VLLM_PLE_TABLE_MEMORY=io_uring  Read PLE rows with bounded O_DIRECT I/O." \
-    "                                 Also accepts device and mapped_host." \
+    "  TP_SIZE=1                    Default to one GPU and host-RAM tables." \
+    "  VLLM_PLE_TABLE_MEMORY=disk    Read PLE table rows from disk." \
+    "  VLLM_PLE_TABLE_MEMORY=ram     Keep PLE tables in pinned host RAM." \
     "" \
     "Launcher options:" \
     "  --torch-profile [DIR]         Enable a four-step Torch CPU+CUDA capture." \
